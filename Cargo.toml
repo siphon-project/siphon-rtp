@@ -46,6 +46,9 @@ tikv-jemallocator = "0.6"
 proptest = "1"
 criterion = "0.5"
 tempfile = "3"
+tikv-jemalloc-ctl = { version = "0.6", features = [
+    "stats",
+] } # read jemalloc `stats.allocated` in the memory-leak gates
 
 # Release profile: keep symbols for perf work (mirrors siphon-sip's perf-investigation needs).
 [profile.release]

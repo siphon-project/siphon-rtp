@@ -66,6 +66,15 @@ impl<D: Datapath> Engine<D> {
         &self.datapath
     }
 
+    /// Number of live calls in the session registry.
+    ///
+    /// Used by the memory-leak soak to confirm the registry drains on teardown, and (later) by the
+    /// metrics surface as the `sessions` gauge.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.calls.len()
+    }
+
     /// Handle one control command, producing the result to return to the caller.
     pub async fn handle(&self, command: Command) -> CmdResult {
         match command {

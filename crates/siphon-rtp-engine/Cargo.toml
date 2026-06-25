@@ -36,3 +36,5 @@ tikv-jemallocator = { workspace = true }
 tokio = { workspace = true }
 siphon-rtp-proto = { path = "../siphon-rtp-proto" }
 siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }

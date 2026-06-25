@@ -13,6 +13,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
 
 [[bench]]
 name = "codec_bench"
