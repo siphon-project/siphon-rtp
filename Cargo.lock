@@ -945,6 +945,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "criterion",
+ "serde",
+ "serde_json",
  "siphon-rtp-codec",
  "thiserror",
  "tracing",
