@@ -931,6 +931,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphon-rtp-media"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "siphon-rtp-proto"
 version = "0.1.0"
 dependencies = [

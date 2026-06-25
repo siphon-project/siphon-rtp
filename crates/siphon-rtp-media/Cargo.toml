@@ -1,0 +1,15 @@
+# siphon-rtp-media — the media plane: RTP/RTCP packet model, jitter/PLC, resampling, the leg
+# pipeline, fan-out/fork, mixer, and stream bridges. Pure, sync, allocation-light, NIC-free.
+[package]
+name = "siphon-rtp-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
