@@ -7,5 +7,6 @@
 #![forbid(unsafe_code)]
 
 pub mod jitter;
+pub mod leg;
 pub mod rtcp;
 pub mod rtp;

@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Rust dependencies — keep the workspace lockfile current; group patch/minor bumps into one PR.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used by the workflows above.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

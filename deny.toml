@@ -1,0 +1,63 @@
+# cargo-deny — enforces siphon-rtp's hard rules at the dependency-graph level.
+# Local: `cargo deny check`  ·  CI: bans+sources gate every PR (ci.yml); advisories run weekly
+# (audit.yml). Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Evaluate the graph for the Linux media-plane targets we actually ship on.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[bans]
+# HARD RULE: pure Rust, ZERO C library deps. Codecs are hand-written; crypto/TLS is ring/rustls.
+# Ban the well-known C-FFI codec / DSP / TLS / SRTP crates so none can sneak in transitively.
+multiple-versions = "warn"
+wildcards = "warn"
+deny = [
+    { name = "openssl", reason = "C OpenSSL — TLS is rustls/ring (zero-C rule)." },
+    { name = "openssl-sys", reason = "C OpenSSL FFI — TLS is rustls/ring (zero-C rule)." },
+    { name = "native-tls", reason = "wraps the platform C TLS — use rustls (zero-C rule)." },
+    { name = "opus", reason = "libopus FFI — Opus is hand-written pure Rust (zero-C rule)." },
+    { name = "audiopus", reason = "libopus FFI — Opus is hand-written pure Rust (zero-C rule)." },
+    { name = "audiopus_sys", reason = "libopus FFI — Opus is hand-written pure Rust (zero-C rule)." },
+    { name = "magnum-opus", reason = "libopus FFI — Opus is hand-written pure Rust (zero-C rule)." },
+    { name = "ffmpeg-sys", reason = "FFmpeg FFI — no ffmpeg (zero-C rule)." },
+    { name = "ffmpeg-sys-next", reason = "FFmpeg FFI — no ffmpeg (zero-C rule)." },
+    { name = "ffmpeg-next", reason = "FFmpeg FFI — no ffmpeg (zero-C rule)." },
+    { name = "spandsp-sys", reason = "spandsp FFI — DSP is pure Rust (zero-C rule)." },
+    { name = "srtp2-sys", reason = "libsrtp FFI — SRTP is pure Rust / webrtc-rs (zero-C rule)." },
+    { name = "libsrtp2-sys", reason = "libsrtp FFI — SRTP is pure Rust / webrtc-rs (zero-C rule)." },
+    { name = "speexdsp-sys", reason = "speexdsp FFI — resampler is pure Rust (zero-C rule)." },
+    { name = "samplerate", reason = "libsamplerate FFI — resampler is pure Rust (zero-C rule)." },
+]
+
+[licenses]
+# The crate is MIT; keep dependencies OSI-permissive. Not yet wired into the CI gate (the deny job
+# runs `check bans sources`) until the dependency tree is license-audited — flip it on by adding
+# `licenses` to the ci.yml deny command once green locally.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

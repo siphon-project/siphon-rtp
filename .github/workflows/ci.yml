@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Only the latest commit on a ref matters — cancel superseded in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The house gate (CLAUDE.md): clippy must be clean across every target and feature.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Default features = UDP-loopback datapath (NIC-free); integration tests are NOT #[ignore]d,
+      # so they run here too. --locked keeps the build reproducible against the committed lockfile.
+      - run: cargo test --workspace --all-features --locked
+
+  msrv:
+    name: msrv (1.80)
+    runs-on: ubuntu-latest
+    env:
+      # rust-toolchain.toml pins `stable`; RUSTUP_TOOLCHAIN outranks that file, so cargo really
+      # builds on the declared MSRV instead of silently falling back to stable.
+      RUSTUP_TOOLCHAIN: "1.80.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.80.0
+      - uses: Swatinem/rust-cache@v2
+      # rust-version = "1.80": the shippable crates must compile on it (tests/benches excluded).
+      - run: cargo check --workspace --all-features --locked
+
+  docs:
+    name: doc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --all-features --locked
+
+  benches:
+    name: bench compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Keep the criterion perf gates compiling so they never bit-rot. The full
+      # ">10% regression fails CI" gate (CLAUDE.md) needs a stored baseline (critcmp /
+      # github-action-benchmark) — tracked as a follow-up; here we only prove they build.
+      - run: cargo bench --workspace --all-features --no-run --locked
+
+  deny:
+    name: cargo-deny (no C deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Enforces the #1 hard rule — pure Rust, ZERO C library deps — via deny.toml's ban list,
+      # plus the crates.io source allow-list. Time-varying RustSec advisories live in audit.yml so
+      # a new advisory never turns a green PR red on unchanged code.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans sources
+
+  # Single required status check for branch protection: green only if every job above is green.
+  ci:
+    name: CI passed
+    if: always()
+    needs: [fmt, clippy, test, msrv, docs, benches, deny]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed or was cancelled
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
+
+# NOTE: crates/siphon-rtp-ebpf* carry their own pinned-nightly toolchain (bpf-linker) and are not
+# yet workspace members. Add a dedicated nightly job when they land. CD (release / container) is
+# intentionally omitted for now.

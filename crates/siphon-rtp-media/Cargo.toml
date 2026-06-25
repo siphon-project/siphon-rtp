@@ -10,6 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+siphon-rtp-codec = { path = "../siphon-rtp-codec" }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
