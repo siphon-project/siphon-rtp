@@ -6,5 +6,6 @@
 //! NIC-free and unit-testable; the datapath and engine wire it to sockets.
 #![forbid(unsafe_code)]
 
+pub mod jitter;
 pub mod rtcp;
 pub mod rtp;
