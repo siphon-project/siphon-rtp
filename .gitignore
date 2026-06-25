@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Claude / AI artifacts — NEVER commit (house rule).
+CLAUDE.md
+.claude/
+*.plan
+plans/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Bench / profiling output
+/criterion
+perf.data*
+flamegraph*.svg

@@ -1,0 +1,6 @@
+# Parent workspace builds on stable. The eBPF crate (crates/siphon-rtp-ebpf/)
+# carries its own pinned-nightly rust-toolchain.toml so nightly/bpf-linker
+# never block normal development or CI logic tests.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

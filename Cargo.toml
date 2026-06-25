@@ -1,0 +1,50 @@
+# siphon-rtp — pure-Rust, kernel-accelerated media engine for SIPhon.
+# Workspace virtual manifest. Crates are added as they land (see plan milestones).
+[workspace]
+resolver = "2"
+members = [
+    "crates/siphon-rtp-proto",
+    "crates/siphon-rtp-codec",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/siphon-project/siphon-rtp"
+homepage = "https://github.com/siphon-project/siphon-rtp"
+
+# Shared dependency pins — kept in lockstep with siphon-sip's house versions.
+[workspace.dependencies]
+# Async runtime + channels
+tokio = { version = "1.50", features = ["full"] }
+flume = "0.12"
+# Buffers / ordered maps / concurrency
+bytes = "1.11"
+indexmap = { version = "2.13", features = ["serde"] }
+dashmap = "6"
+arc-swap = "1"
+# Transport
+socket2 = "0.6"
+# Control protocol (JSON over TCP) + serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+# Errors / logging
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# CLI / config
+clap = { version = "4", features = ["derive"] }
+# Allocator (arena contention under the async runtime — see plan §perf)
+tikv-jemallocator = "0.6"
+# Dev / test
+proptest = "1"
+criterion = "0.5"
+tempfile = "3"
+
+# Release profile: keep symbols for perf work (mirrors siphon-sip's perf-investigation needs).
+[profile.release]
+debug = true
+strip = false

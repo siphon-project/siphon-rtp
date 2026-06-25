@@ -1,0 +1,19 @@
+[package]
+name = "siphon-rtp-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "siphon-rtp pure-Rust audio codecs (G.711, L16, AMR-NB/WB foundation) — zero C deps"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "codec_bench"
+harness = false
