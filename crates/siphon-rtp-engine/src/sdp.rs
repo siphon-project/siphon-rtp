@@ -1,10 +1,10 @@
-//! Minimal SDP connection/port rewrite for the relay walking skeleton.
+//! Minimal SDP parse + connection/port rewrite for the relay walking skeleton.
 //!
 //! This is **not** a full SDP engine — it does exactly what offer/answer relay needs: find the
-//! audio media stream's remote transport address (its `c=` connection line + `m=audio` port) and
-//! rewrite both to point at an engine-allocated endpoint. The richer SDP surface (ICE, DTLS
-//! fingerprints, multiple m-lines, bandwidth, direction attributes) layers on later; this keeps
-//! the rewrite small, allocation-light, and exhaustively testable.
+//! audio stream's remote RTP/RTCP transport addresses (its `c=` connection line, `m=audio` port,
+//! `a=rtcp-mux` / `a=rtcp:` attributes per RFC 5761 / RFC 3605) and rewrite them to engine-
+//! allocated endpoints. The richer SDP surface (ICE, DTLS fingerprints, multiple m-lines,
+//! bandwidth, direction) layers on later.
 //!
 //! IPv4 only for now (VoLTE/PSTN media is IPv4); an IPv6 `c=IN IP6` path is a later addition.
 
@@ -27,7 +27,47 @@ pub enum SdpError {
 /// Line ending emitted by the rewriter (SDP mandates CRLF; RFC 4566 §5).
 const CRLF: &str = "\r\n";
 
-/// Parse the dotted-quad address from a `c=IN IP4 <addr>` line body (`IN IP4 <addr>`).
+/// The remote audio transport advertised by an SDP, plus its RTCP multiplexing intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaInfo {
+    /// Remote RTP address (the audio `c=`/`m=audio` transport).
+    pub remote_rtp: SocketAddr,
+    /// Remote RTCP address: the `a=rtcp:` port if present, else RTP port + 1 (RFC 3550); equal to
+    /// `remote_rtp` when `rtcp_mux` is set.
+    pub remote_rtcp: SocketAddr,
+    /// Whether the stream offered `a=rtcp-mux` (RTP and RTCP share one port, RFC 5761).
+    pub rtcp_mux: bool,
+}
+
+/// The engine endpoints to advertise in a rewritten SDP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineMedia {
+    /// The engine's RTP endpoint (advertised in `c=`/`m=audio`).
+    pub rtp: SocketAddr,
+    /// The engine's RTCP endpoint, when not multiplexed (advertised as `a=rtcp:`). `None` ⇒
+    /// rtcp-mux (any `a=rtcp:` line is dropped; RTCP rides the RTP port).
+    pub rtcp: Option<SocketAddr>,
+}
+
+/// A rewritten SDP plus the remote media info parsed from the input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rewritten {
+    /// The rewritten SDP advertising the engine endpoints.
+    pub sdp: String,
+    /// The remote audio info parsed from the input SDP.
+    pub media: MediaInfo,
+}
+
+/// Indices and values located in one scan of an SDP's audio stream.
+struct AudioScan {
+    session_conn: Option<(usize, IpAddr)>,
+    audio_media: Option<(usize, u16)>,
+    audio_conn: Option<(usize, IpAddr)>,
+    rtcp_mux: bool,
+    /// `a=rtcp:` line within the audio section: (line index, port).
+    audio_rtcp: Option<(usize, u16)>,
+}
+
 fn parse_connection_addr(value: &str) -> Option<IpAddr> {
     let mut parts = value.split_whitespace();
     match (parts.next(), parts.next(), parts.next()) {
@@ -36,7 +76,6 @@ fn parse_connection_addr(value: &str) -> Option<IpAddr> {
     }
 }
 
-/// Parse the port from an `m=audio <port> <proto> <fmt...>` line body (`audio <port> ...`).
 fn parse_media_port(value: &str) -> Option<u16> {
     let mut parts = value.split_whitespace();
     match parts.next() {
@@ -45,28 +84,26 @@ fn parse_media_port(value: &str) -> Option<u16> {
     }
 }
 
-/// The result of a rewrite: the new SDP text and the *original* audio transport address (the
-/// remote the engine must forward toward).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rewritten {
-    /// The rewritten SDP, advertising the engine endpoint.
-    pub sdp: String,
-    /// The remote audio address parsed from the input SDP.
-    pub remote: SocketAddr,
+/// Parse the port from an `a=rtcp:<port> [...]` attribute body (`rtcp:<port> ...`).
+fn parse_rtcp_attr(value: &str) -> Option<u16> {
+    value
+        .strip_prefix("rtcp:")?
+        .split_whitespace()
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
 }
 
-/// Rewrite the audio stream's connection address and port to `engine`, returning the new SDP and
-/// the remote audio address that was advertised in the input.
-///
-/// The connection line that applies to the audio stream is the media-level `c=` if present,
-/// otherwise the session-level `c=`. That line and the `m=audio` port are rewritten to `engine`.
-pub fn rewrite(sdp: &str, engine: SocketAddr) -> Result<Rewritten, SdpError> {
-    // Locate the session-level c= (before any m=) and the audio m= line + its media-level c=.
-    let mut session_conn: Option<(usize, IpAddr)> = None;
-    let mut audio_media: Option<(usize, u16)> = None;
-    let mut audio_conn: Option<(usize, IpAddr)> = None;
-    let mut seen_any_media = false;
-    let mut audio_is_current_media = false;
+/// Scan the SDP once, recording the audio stream's connection, port, and RTCP attributes.
+fn scan(sdp: &str) -> AudioScan {
+    let mut scan = AudioScan {
+        session_conn: None,
+        audio_media: None,
+        audio_conn: None,
+        rtcp_mux: false,
+        audio_rtcp: None,
+    };
+    let mut seen_media = false;
+    let mut in_audio = false;
 
     for (index, raw_line) in sdp.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -75,58 +112,116 @@ pub fn rewrite(sdp: &str, engine: SocketAddr) -> Result<Rewritten, SdpError> {
         };
         match key {
             "m" => {
-                let is_audio = audio_media.is_none() && parse_media_port(value).is_some();
-                if is_audio {
-                    let port = parse_media_port(value).ok_or(SdpError::MediaPort)?;
-                    audio_media = Some((index, port));
-                    audio_is_current_media = true;
-                } else {
-                    audio_is_current_media = false;
+                if scan.audio_media.is_none() {
+                    if let Some(port) = parse_media_port(value) {
+                        scan.audio_media = Some((index, port));
+                        in_audio = true;
+                        seen_media = true;
+                        continue;
+                    }
                 }
-                seen_any_media = true;
+                in_audio = false;
+                seen_media = true;
             }
             "c" => {
                 if let Some(addr) = parse_connection_addr(value) {
-                    if !seen_any_media {
-                        session_conn = Some((index, addr));
-                    } else if audio_is_current_media && audio_conn.is_none() {
-                        audio_conn = Some((index, addr));
+                    if !seen_media {
+                        scan.session_conn = Some((index, addr));
+                    } else if in_audio && scan.audio_conn.is_none() {
+                        scan.audio_conn = Some((index, addr));
                     }
+                }
+            }
+            "a" if in_audio => {
+                if value == "rtcp-mux" {
+                    scan.rtcp_mux = true;
+                } else if let Some(port) = parse_rtcp_attr(value) {
+                    scan.audio_rtcp = Some((index, port));
                 }
             }
             _ => {}
         }
     }
+    scan
+}
 
-    let (media_index, remote_port) = audio_media.ok_or(SdpError::NoAudioMedia)?;
-    let (conn_index, remote_ip) = audio_conn
-        .or(session_conn)
+/// Resolve the parsed [`MediaInfo`] from a scan.
+fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
+    let (_, rtp_port) = scan.audio_media.ok_or(SdpError::NoAudioMedia)?;
+    let (_, ip) = scan
+        .audio_conn
+        .or(scan.session_conn)
         .ok_or(SdpError::ConnectionAddress)?;
-    let remote = SocketAddr::new(remote_ip, remote_port);
+    let remote_rtp = SocketAddr::new(ip, rtp_port);
+    let remote_rtcp = if scan.rtcp_mux {
+        remote_rtp
+    } else {
+        let rtcp_port = scan
+            .audio_rtcp
+            .map(|(_, port)| port)
+            .unwrap_or(rtp_port.wrapping_add(1));
+        SocketAddr::new(ip, rtcp_port)
+    };
+    Ok(MediaInfo {
+        remote_rtp,
+        remote_rtcp,
+        rtcp_mux: scan.rtcp_mux,
+    })
+}
 
-    // Rebuild the SDP, rewriting only the audio m= port and the applicable c= address.
-    let mut out = String::with_capacity(sdp.len() + 16);
+/// Parse the remote audio transport info from an SDP without rewriting it.
+pub fn parse(sdp: &str) -> Result<MediaInfo, SdpError> {
+    media_info(&scan(sdp))
+}
+
+/// Rewrite the audio stream's RTP/RTCP transport to `engine`, returning the new SDP and the remote
+/// media info parsed from the input.
+///
+/// The connection line applying to the audio stream (media-level `c=` else session-level) and the
+/// `m=audio` port are rewritten to `engine.rtp`. For non-mux (`engine.rtcp = Some`), an `a=rtcp:`
+/// line is rewritten or inserted for the engine RTCP port; for mux (`engine.rtcp = None`), any
+/// `a=rtcp:` line is dropped (RTCP rides the RTP port).
+pub fn rewrite(sdp: &str, engine: EngineMedia) -> Result<Rewritten, SdpError> {
+    let scan = scan(sdp);
+    let media = media_info(&scan)?;
+    let (media_index, _) = scan.audio_media.ok_or(SdpError::NoAudioMedia)?;
+    let (conn_index, _) = scan
+        .audio_conn
+        .or(scan.session_conn)
+        .ok_or(SdpError::ConnectionAddress)?;
+    let rtcp_index = scan.audio_rtcp.map(|(index, _)| index);
+
+    let mut lines: Vec<String> = Vec::new();
     for (index, raw_line) in sdp.split('\n').enumerate() {
-        // Drop a synthetic trailing empty element from a final '\n' without duplicating it.
-        if index > 0 {
-            out.push_str(CRLF);
-        }
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if index == media_index {
-            out.push_str(&rewrite_media_line(line, engine.port()));
+            lines.push(rewrite_media_line(line, engine.rtp.port()));
+            // Insert a fresh a=rtcp line only if there is no existing one to rewrite in place.
+            if let Some(rtcp) = engine.rtcp {
+                if rtcp_index.is_none() {
+                    lines.push(format!("a=rtcp:{}", rtcp.port()));
+                }
+            }
         } else if index == conn_index {
-            out.push_str(&format!("c=IN IP4 {}", engine.ip()));
+            lines.push(format!("c=IN IP4 {}", engine.rtp.ip()));
+        } else if Some(index) == rtcp_index {
+            match engine.rtcp {
+                Some(rtcp) => lines.push(format!("a=rtcp:{}", rtcp.port())),
+                None => { /* mux: drop the explicit a=rtcp line */ }
+            }
         } else {
-            out.push_str(line);
+            lines.push(line.to_string());
         }
     }
 
-    Ok(Rewritten { sdp: out, remote })
+    Ok(Rewritten {
+        sdp: lines.join(CRLF),
+        media,
+    })
 }
 
 /// Replace the port (2nd field) of an `m=audio <port> ...` line, preserving the rest.
 fn rewrite_media_line(line: &str, port: u16) -> String {
-    // line == "m=audio <port> <proto> <fmt...>"
     let body = line.strip_prefix("m=").unwrap_or(line);
     let mut fields = body.split(' ');
     let media = fields.next().unwrap_or("audio");
@@ -158,63 +253,98 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_session_level_connection_and_port() {
-        let sdp = offer("203.0.113.7", 49170);
-        let engine: SocketAddr = "127.0.0.1:40000".parse().expect("engine addr");
-        let result = rewrite(&sdp, engine).expect("rewrite");
+    fn parse_defaults_rtcp_to_rtp_plus_one() {
+        let info = parse(&offer("203.0.113.7", 49170)).expect("parse");
+        assert_eq!(info.remote_rtp, "203.0.113.7:49170".parse().unwrap());
+        assert_eq!(info.remote_rtcp, "203.0.113.7:49171".parse().unwrap());
+        assert!(!info.rtcp_mux);
+    }
 
-        assert_eq!(result.remote, "203.0.113.7:49170".parse().expect("remote"));
-        // The rewritten SDP now advertises the engine endpoint.
+    #[test]
+    fn parse_honors_explicit_rtcp_attribute() {
+        let mut sdp = offer("203.0.113.7", 49170);
+        sdp.push_str("a=rtcp:53000\r\n");
+        let info = parse(&sdp).expect("parse");
+        assert_eq!(info.remote_rtcp, "203.0.113.7:53000".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_detects_rtcp_mux() {
+        let mut sdp = offer("203.0.113.7", 49170);
+        sdp.push_str("a=rtcp-mux\r\n");
+        let info = parse(&sdp).expect("parse");
+        assert!(info.rtcp_mux);
+        assert_eq!(info.remote_rtcp, info.remote_rtp, "mux shares the RTP port");
+    }
+
+    #[test]
+    fn rewrites_rtp_and_inserts_rtcp_for_non_mux() {
+        let sdp = offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: Some("127.0.0.1:40001".parse().unwrap()),
+        };
+        let result = rewrite(&sdp, engine).expect("rewrite");
+        assert_eq!(result.media.remote_rtp, "203.0.113.7:49170".parse().unwrap());
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8 96"));
-        // The original remote address is gone.
+        assert!(result.sdp.contains("a=rtcp:40001"), "engine RTCP port advertised");
         assert!(!result.sdp.contains("203.0.113.7"));
-        // Untouched lines survive verbatim.
-        assert!(result.sdp.contains("a=rtpmap:0 PCMU/8000"));
-        // Re-parsing the rewritten SDP yields the engine transport address.
-        let reparsed = rewrite(&result.sdp, "127.0.0.1:1".parse().expect("x")).expect("reparse");
-        assert_eq!(reparsed.remote, engine);
+        let reparsed = parse(&result.sdp).expect("reparse");
+        assert_eq!(reparsed.remote_rtp, engine.rtp);
+        assert_eq!(reparsed.remote_rtcp, "127.0.0.1:40001".parse().unwrap());
+    }
+
+    #[test]
+    fn rewrites_existing_rtcp_attribute_in_place() {
+        let mut sdp = offer("203.0.113.7", 49170);
+        sdp.push_str("a=rtcp:53000\r\n");
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: Some("127.0.0.1:40001".parse().unwrap()),
+        };
+        let result = rewrite(&sdp, engine).expect("rewrite");
+        assert!(result.sdp.contains("a=rtcp:40001"));
+        assert!(!result.sdp.contains("53000"));
+        assert_eq!(result.sdp.matches("a=rtcp:").count(), 1, "no duplicate a=rtcp");
+    }
+
+    #[test]
+    fn mux_drops_rtcp_attribute_and_keeps_mux_flag() {
+        let mut sdp = offer("203.0.113.7", 49170);
+        sdp.push_str("a=rtcp:53000\r\n");
+        sdp.push_str("a=rtcp-mux\r\n");
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let result = rewrite(&sdp, engine).expect("rewrite");
+        assert!(!result.sdp.contains("a=rtcp:"), "explicit a=rtcp dropped under mux");
+        assert!(result.sdp.contains("a=rtcp-mux"), "mux flag preserved");
     }
 
     #[test]
     fn media_level_connection_overrides_session_level() {
-        let sdp = "v=0\r\n\
-                   c=IN IP4 10.0.0.1\r\n\
-                   t=0 0\r\n\
-                   m=audio 5000 RTP/AVP 0\r\n\
-                   c=IN IP4 198.51.100.9\r\n";
-        let engine: SocketAddr = "127.0.0.1:41000".parse().expect("engine");
+        let sdp = "v=0\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\nc=IN IP4 198.51.100.9\r\n";
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:41000".parse().unwrap(),
+            rtcp: None,
+        };
         let result = rewrite(sdp, engine).expect("rewrite");
-        // Media-level c= is the audio stream's address.
-        assert_eq!(result.remote, "198.51.100.9:5000".parse().expect("remote"));
-        // Only the media-level c= is rewritten; the session-level c= is left intact.
+        assert_eq!(result.media.remote_rtp, "198.51.100.9:5000".parse().unwrap());
         assert!(result.sdp.contains("c=IN IP4 10.0.0.1"));
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(!result.sdp.contains("198.51.100.9"));
     }
 
     #[test]
-    fn preserves_line_count_and_order() {
-        let sdp = offer("192.0.2.1", 6000);
-        let result = rewrite(&sdp, "127.0.0.1:7000".parse().expect("e")).expect("rewrite");
+    fn rejects_missing_audio_and_connection() {
         assert_eq!(
-            sdp.lines().count(),
-            result.sdp.lines().count(),
-            "rewrite must not add or drop lines"
+            parse("v=0\r\nc=IN IP4 192.0.2.1\r\nm=video 5000 RTP/AVP 96\r\n"),
+            Err(SdpError::NoAudioMedia)
         );
-    }
-
-    #[test]
-    fn rejects_missing_audio() {
-        let sdp = "v=0\r\nc=IN IP4 192.0.2.1\r\nm=video 5000 RTP/AVP 96\r\n";
-        assert_eq!(rewrite(sdp, "127.0.0.1:1".parse().unwrap()), Err(SdpError::NoAudioMedia));
-    }
-
-    #[test]
-    fn rejects_missing_connection() {
-        let sdp = "v=0\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\n";
         assert_eq!(
-            rewrite(sdp, "127.0.0.1:1".parse().unwrap()),
+            parse("v=0\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\n"),
             Err(SdpError::ConnectionAddress)
         );
     }

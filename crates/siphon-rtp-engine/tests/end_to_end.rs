@@ -74,9 +74,7 @@ fn sdp_for(addr: SocketAddr) -> String {
 fn engine_addr(result: &CmdResult) -> SocketAddr {
     match result {
         CmdResult::Ok { sdp: Some(text), .. } => {
-            sdp::rewrite(text, "127.0.0.1:1".parse().unwrap())
-                .expect("parse engine addr")
-                .remote
+            sdp::parse(text).expect("parse engine addr").remote_rtp
         }
         other => panic!("expected Ok with sdp, got {other:?}"),
     }
