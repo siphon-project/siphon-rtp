@@ -5,6 +5,8 @@ resolver = "2"
 members = [
     "crates/siphon-rtp-proto",
     "crates/siphon-rtp-codec",
+    "crates/siphon-rtp-datapath",
+    "crates/siphon-rtp-engine",
 ]
 
 [workspace.package]

@@ -101,7 +101,7 @@ Crates:
 - `siphon-rtp-media` — RTP/SRTP, jitter/PLC, leg pipeline, fan-out, mixer, bridges (planned).
 - `siphon-rtp-datapath` — `Datapath` trait + UDP-loopback (CI) + XDP/AF_XDP backends (planned).
 - `siphon-rtp-ebpf*` — the aya XDP classifier (planned).
-- `siphon-rtpd` — the daemon: control front-ends, actor runtime, aya loader (planned).
+- `siphon-rtp-engine` — the daemon: control front-ends, actor runtime, aya loader (planned).
 
 ## Building & testing
 

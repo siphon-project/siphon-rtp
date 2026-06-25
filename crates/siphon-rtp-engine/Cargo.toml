@@ -1,0 +1,38 @@
+# siphon-rtp-engine — the engine daemon: JSON-over-TCP control front-end, session manager, and
+# (later) the actor runtime + aya loader. M1 walking skeleton: offer/answer/relay/delete on the
+# UDP-loopback datapath, NIC-free.
+[package]
+name = "siphon-rtp-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "siphon-rtp-engine"
+path = "src/main.rs"
+
+[lib]
+name = "siphon_rtp_engine"
+path = "src/lib.rs"
+
+[dependencies]
+siphon-rtp-proto = { path = "../siphon-rtp-proto" }
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+siphon-rtp-proto = { path = "../siphon-rtp-proto" }
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }

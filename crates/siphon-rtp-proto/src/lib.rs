@@ -1,4 +1,4 @@
-//! siphon-rtp control protocol — the wire contract between SIPhon and `siphon-rtpd`.
+//! siphon-rtp control protocol — the wire contract between SIPhon and `siphon-rtp-engine`.
 //!
 //! This crate is shared by both ends (SIPhon depends on it directly), so the types here
 //! *are* the contract. The native transport is length-prefixed JSON over a persistent TCP
