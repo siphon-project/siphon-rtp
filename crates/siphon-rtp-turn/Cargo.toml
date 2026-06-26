@@ -1,0 +1,39 @@
+# siphon-rtp-turn — the built-in pure-Rust TURN server (RFC 5766), a drop-in for coturn on the
+# WebRTC voice-AI legs. Standalone listeners (UDP now; TCP/TLS in M-T5/M-T6) draw relay ports from
+# the shared bounded datapath pool; the allocation state is a single-owner actor behind a flume
+# mailbox. Zero C: the STUN/TURN codec + MD5/HMAC-SHA1 are hand-rolled in siphon-rtp-stun.
+[package]
+name = "siphon-rtp-turn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "siphon-rtp TURN server (RFC 5766) — pure Rust, zero C, a built-in coturn replacement"
+
+[dependencies]
+siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
+tokio = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+bytes = { workspace = true }
+indexmap = { workspace = true }
+flume = { workspace = true }
+getrandom = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+proptest = { workspace = true }
+rcgen = { workspace = true }
+criterion = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+
+[[bench]]
+name = "turn_bench"
+harness = false
