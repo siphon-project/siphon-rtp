@@ -17,26 +17,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libzstd1 libxml2 libffi8 libtinfo6 libedit2 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust: stable (loader) + nightly with rust-src (eBPF build-std for bpfel-unknown-none).
+# Rust: stable (loader) + the PINNED nightly with rust-src (eBPF build-std for bpfel-unknown-none).
+# Pinned to nightly-2026-01-15 (LLVM 21.1.8) so it matches bpf-linker's rust-llvm-21 below — the
+# latest nightly's LLVM 22 dlopen-fails with the published bpf-linker. Keep in lockstep with
+# crates/siphon-rtp-xdp/ebpf/rust-toolchain.toml and build.rs.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN rustup toolchain install nightly --component rust-src
+RUN rustup toolchain install nightly-2026-01-15 --component rust-src
 
-# bpf-linker performs the final BPF link.
-#
-# TOOLCHAIN PIN (the one open item): bpf-linker's LLVM must match the nightly's LLVM. The eBPF
-# *code* compiles to bpfel cleanly; the only blocker is this version alignment. The current nightly
-# is LLVM 22.1.7, which is ahead of crates.io bpf-linker 0.10.3 (it loads the toolchain LLVM and
-# dlopen-fails on 22). Two ways to close it:
-#   (a) install LLVM 22 dev from apt.llvm.org + `LLVM_SYS_221_PREFIX` and build bpf-linker from git
-#       (keeps the bleeding-edge nightly); or
-#   (b) pin crates/siphon-rtp-xdp/ebpf/rust-toolchain.toml to a nightly whose LLVM bpf-linker 0.10.3
-#       supports, install that exact nightly here, and pass it via aya-build's Toolchain.
-# 0.10.3 (crates.io) is used below because it *compiles* cleanly; swap per (a)/(b) to finish the link.
-RUN cargo install bpf-linker --locked
+# bpf-linker performs the final BPF link. Built for rust-llvm-21 (loads the pinned nightly's LLVM 21
+# at link time) — no system LLVM needed.
+RUN cargo install bpf-linker --locked --no-default-features --features rust-llvm-21
 
 WORKDIR /build
 COPY . .
-
-# The loader is a standalone workspace; its build.rs invokes aya-build on the eBPF crate.
-RUN cd crates/siphon-rtp-xdp && cargo build --release

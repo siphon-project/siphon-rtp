@@ -21,8 +21,10 @@ fn main() {
             no_default_features: false,
             features: &[],
         }],
-        // Default toolchain (nightly) — needed for `-Z build-std`.
-        aya_build::Toolchain::default(),
+        // Pinned nightly (LLVM 21.1.8) — matches bpf-linker's rust-llvm-21; the bleeding-edge
+        // nightly's LLVM 22 dlopen-fails with the published bpf-linker. Keep in lockstep with
+        // ebpf/rust-toolchain.toml and the Dockerfile.xdp install.
+        aya_build::Toolchain::Custom("nightly-2026-01-15"),
     )
     .expect("build the eBPF program");
 }

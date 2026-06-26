@@ -1,5 +1,7 @@
 # The eBPF crate builds on nightly (needs build-std for bpfel-unknown-none + rust-src). Pinned and
 # isolated here so the parent workspace stays on stable — nightly/bpf-linker never block normal dev.
+# Pinned to LLVM 21.1.8 to match bpf-linker's rust-llvm-21 (the latest nightly's LLVM 22 dlopen-fails
+# with the published bpf-linker). Keep in lockstep with build.rs and deploy/Dockerfile.xdp.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-01-15"
 components = ["rust-src"]
