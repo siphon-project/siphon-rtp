@@ -1,5 +1,17 @@
-# Keep the build context small and free of artifacts / AI files.
-/target
+# Keep the docker build context small and free of artifacts / AI files.
+# (Both Dockerfiles `COPY . .`, so anything here is excluded from the context.)
+
+# Build artifacts — EVERY target dir, not just the root: the XDP loader and fuzz crates are their
+# own workspaces with their own target/ (root target alone is 16G; nested ones leak without **).
+target/
+**/target/
+**/*.rs.bk
+
+# cargo-fuzz data (keep the fuzz *sources*, drop the generated corpus/artifacts which grow large).
+fuzz/corpus/
+fuzz/artifacts/
+
+# git
 .git
 .gitignore
 
@@ -17,5 +29,6 @@ plans/
 
 # Bench / profiling output
 /criterion
+**/criterion/
 perf.data*
 flamegraph*.svg
