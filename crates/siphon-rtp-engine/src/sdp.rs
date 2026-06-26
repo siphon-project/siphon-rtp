@@ -348,4 +348,20 @@ mod tests {
             Err(SdpError::ConnectionAddress)
         );
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Arbitrary text (the SDP comes off the signalling path) must decode-or-error, never panic.
+        /// `(?s)` lets `.` match newlines so line-structured garbage is exercised too.
+        #[test]
+        fn parsers_never_panic(text in "(?s).{0,400}") {
+            let _ = parse(&text);
+            let engine = EngineMedia {
+                rtp: "192.0.2.1:10000".parse().expect("addr"),
+                rtcp: None,
+            };
+            let _ = rewrite(&text, engine);
+        }
+    }
 }

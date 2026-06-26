@@ -554,4 +554,33 @@ mod tests {
         let result: Result<Option<(Request, usize)>, _> = frame::decode(&buffer);
         assert!(matches!(result, Err(ProtoError::FrameTooLarge { .. })));
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The control framing eats untrusted bytes — arbitrary input must decode-or-error, never
+        /// panic (a corrupt length prefix or body is an `Err`, not a crash).
+        #[test]
+        fn frame_decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {
+            let _ = frame::decode::<Request>(&bytes);
+        }
+
+        /// `decode(encode(request))` round-trips over arbitrary ids/tags.
+        #[test]
+        fn request_survives_frame_roundtrip(
+            id in any::<u64>(),
+            call_id in "[a-z0-9@._-]{0,40}",
+            from_tag in "[a-z0-9]{0,20}",
+        ) {
+            let request = Request {
+                id,
+                command: Command::Delete { call_id, from_tag, to_tag: None },
+            };
+            let bytes = frame::encode(&request).expect("encode");
+            let (decoded, consumed): (Request, usize) =
+                frame::decode(&bytes).expect("decode").expect("complete");
+            prop_assert_eq!(decoded, request);
+            prop_assert_eq!(consumed, bytes.len());
+        }
+    }
 }

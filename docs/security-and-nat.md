@@ -260,7 +260,11 @@ out of bounds** — already a project hard rule; restated as part of this surfac
 - SDP parser ([engine/src/sdp.rs](../crates/siphon-rtp-engine/src/sdp.rs)) and the JSON / (future)
   NG-bencode control parser.
 - **Method:** `cargo-fuzz` (libFuzzer) targets in CI + `proptest` structural invariants
-  (`parse(serialize(x)) == x`, bounded output under arbitrary input).
+  (`parse(serialize(x)) == x`, bounded output under arbitrary input). **Landed (proptest, on
+  stable / in `cargo test`+CI):** no-panic over arbitrary input for the RTP & RTCP parsers, the SDP
+  parser, and the JSON control frame decoder, plus RTP write→parse and control encode→decode
+  round-trips. **Remaining:** `cargo-fuzz` libFuzzer targets for continuous fuzzing (need the
+  nightly toolchain, like the ebpf crates).
 
 ---
 

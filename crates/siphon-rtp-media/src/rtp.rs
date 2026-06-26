@@ -248,4 +248,36 @@ mod tests {
             Err(RtpError::OutputTooSmall { .. })
         ));
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A hostile datagram off the network must decode-or-error — never panic / OOB / spin.
+        #[test]
+        fn parse_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = RtpPacket::parse(&bytes);
+        }
+
+        /// `parse(write(header, payload))` round-trips every field over arbitrary valid headers.
+        #[test]
+        fn write_then_parse_roundtrips(
+            marker in any::<bool>(),
+            payload_type in 0u8..=127,
+            sequence in any::<u16>(),
+            timestamp in any::<u32>(),
+            ssrc in any::<u32>(),
+            payload in prop::collection::vec(any::<u8>(), 0..1400),
+        ) {
+            let header = RtpHeader { marker, payload_type, sequence, timestamp, ssrc };
+            let mut out = vec![0u8; FIXED_HEADER_LEN + payload.len()];
+            let len = write_packet(&header, &payload, &mut out).expect("sized buffer fits");
+            let parsed = RtpPacket::parse(&out[..len]).expect("parse our own packet");
+            prop_assert_eq!(parsed.marker, marker);
+            prop_assert_eq!(parsed.payload_type, payload_type);
+            prop_assert_eq!(parsed.sequence, sequence);
+            prop_assert_eq!(parsed.timestamp, timestamp);
+            prop_assert_eq!(parsed.ssrc, ssrc);
+            prop_assert_eq!(parsed.payload, &payload[..]);
+        }
+    }
 }

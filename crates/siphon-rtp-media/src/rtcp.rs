@@ -294,4 +294,15 @@ mod tests {
         assert_eq!(demux(&[0x80, 201]), Some(MuxKind::Rtcp));
         assert_eq!(demux(&[0x80]), None);
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Arbitrary (malformed / truncated / compound) bytes must decode-or-error, never panic.
+        #[test]
+        fn parsers_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = parse_compound(&bytes);
+            let _ = demux(&bytes);
+        }
+    }
 }
