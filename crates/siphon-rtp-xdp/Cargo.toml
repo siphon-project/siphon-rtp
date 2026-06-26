@@ -1,0 +1,31 @@
+# siphon-rtp-xdp — the XDP/AF_XDP datapath backend (userspace loader). Kept a SEPARATE crate from
+# siphon-rtp-datapath so the kernel-acceleration plumbing never disturbs the always-available
+# UDP-loopback backend; it implements the same `Datapath` trait. Userspace code builds on stable,
+# but its build.rs compiles the eBPF program (needs the pinned-nightly toolchain + bpf-linker), so
+# the crate is excluded from the default workspace and built only via the docker xdp toolchain.
+[package]
+name = "siphon-rtp-xdp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }
+siphon-rtp-ebpf-common = { path = "../siphon-rtp-ebpf-common" }
+aya = "0.13"
+aya-log = "0.2"
+libc = "0.2"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+aya-build = "0.1"
+
+# Standalone workspace: the parent (stable) toolchain never builds this crate; the docker xdp build
+# invokes it explicitly with nightly + bpf-linker on PATH.
+[workspace]
