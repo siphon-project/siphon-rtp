@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bridge;
+pub mod dtmf;
 pub mod jitter;
 pub mod leg;
 pub mod rtcp;
