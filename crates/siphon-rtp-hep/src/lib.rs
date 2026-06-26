@@ -10,6 +10,8 @@
 //! the standard chunk type ids enumerated in [`chunk`]).
 #![forbid(unsafe_code)]
 
+pub mod mos;
+
 use std::net::{IpAddr, SocketAddr};
 
 /// HEP3 magic id (first four bytes of every packet).
