@@ -49,6 +49,8 @@ impl Leg {
 struct Call {
     /// The control client that created the call; only it may answer/query/delete it.
     owner: ClientId,
+    /// Logical-clock tick at creation (offer), the media-timeout baseline before any media arrives.
+    created_tick: u64,
     from_tag: String,
     to_tag: Option<String>,
     near: Leg,
@@ -222,6 +224,7 @@ impl<D: Datapath> Engine<D> {
             call_id,
             Call {
                 owner: client,
+                created_tick: self.datapath.now_ticks(),
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -390,6 +393,40 @@ impl<D: Datapath> Engine<D> {
             to_tag: None,
             stats: Some(stats),
         }
+    }
+
+    /// Reap calls whose media has been idle (no accepted packet) for at least `idle_ticks`, freeing
+    /// their ports/FDs and registry/quota slots, and return the reaped call ids. Deterministic: it
+    /// reads the datapath's logical clock, so tests drive it via `advance_clock` rather than wall
+    /// time (never `Instant::now()`). (docs/security-and-nat.md §4 layer 6.)
+    pub async fn reap_idle(&self, idle_ticks: u64) -> Vec<String> {
+        let now = self.datapath.now_ticks();
+        // First pass (no `.await`, so holding the shard guards is fine): find the idle calls.
+        let mut stale = Vec::new();
+        for entry in self.calls.iter() {
+            let call = entry.value();
+            let mut last_activity = call.created_tick;
+            for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
+                if let Some(seen) = self.datapath.last_activity(endpoint) {
+                    last_activity = last_activity.max(seen);
+                }
+            }
+            if now.saturating_sub(last_activity) >= idle_ticks {
+                stale.push(entry.key().clone());
+            }
+        }
+        // Second pass: tear each idle call down (no map guard held across the awaits).
+        let mut reaped = Vec::new();
+        for call_id in stale {
+            if let Some((_, call)) = self.calls.remove(&call_id) {
+                for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
+                    self.datapath.remove_endpoint(endpoint).await;
+                }
+                self.release_client_call(call.owner);
+                reaped.push(call_id);
+            }
+        }
+        reaped
     }
 }
 
@@ -958,5 +995,60 @@ mod tests {
             matches!(retry, CmdResult::Ok { .. }),
             "freed quota admits the call"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_calls_are_reaped_and_active_ones_survive() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "c".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let _far = sdp::parse(&ok_sdp_text(&offer)).expect("far");
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "c".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
+        assert_eq!(engine.session_count(), 1);
+
+        // Advance to tick 4 (within the 5-tick window) and send media — stamps activity at tick 4.
+        engine.datapath().advance_clock(4);
+        phone_a
+            .send_to(&rtp(0x1234_5678), near.remote_rtp)
+            .await
+            .expect("send");
+        let _ = recv(&phone_b).await;
+
+        // Tick 8: idle since the packet (tick 4) is 4 < 5 → recent media keeps the call alive.
+        engine.datapath().advance_clock(4);
+        assert!(
+            engine.reap_idle(5).await.is_empty(),
+            "recent media defers reaping"
+        );
+        assert_eq!(engine.session_count(), 1);
+
+        // Tick 13: idle since tick 4 is 9 >= 5 → the silent call is reaped and its ports freed.
+        engine.datapath().advance_clock(5);
+        assert_eq!(engine.reap_idle(5).await, vec!["c".to_string()]);
+        assert_eq!(engine.session_count(), 0);
     }
 }

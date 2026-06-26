@@ -31,6 +31,8 @@ struct StatsAtomic {
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
     packets_dropped: AtomicU64,
+    /// Logical-clock tick of the last accepted packet (`0` = none), for the media-timeout sweep.
+    last_seen: AtomicU64,
 }
 
 impl StatsAtomic {
@@ -73,6 +75,8 @@ enum LatchOutcome {
 /// strong count reaches zero on teardown and [`Drop`] can abort the parked receive tasks.
 struct Inner {
     next_id: AtomicU64,
+    /// Logical clock (monotonic ticks) for the media-timeout sweep; advanced via `advance_clock`.
+    clock: AtomicU64,
     /// Live (reserved) endpoint count, capped at `max_endpoints` to bound port/FD use.
     live: AtomicUsize,
     /// Maximum concurrent media endpoints; `usize::MAX` is unbounded.
@@ -126,6 +130,11 @@ impl Inner {
                     in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
+
+                // The packet is accepted — stamp activity for the media-timeout sweep (§4 layer 6).
+                in_stats
+                    .last_seen
+                    .store(self.clock.load(Ordering::Relaxed), Ordering::Relaxed);
 
                 // Forward toward the peer endpoint: prefer its latched source (symmetric RTP) over
                 // its configured destination; drop if neither resolves (never forward into the void).
@@ -246,6 +255,7 @@ impl UdpLoopbackDatapath {
         Self {
             inner: Arc::new(Inner {
                 next_id: AtomicU64::new(0),
+                clock: AtomicU64::new(0),
                 live: AtomicUsize::new(0),
                 max_endpoints,
                 endpoints: DashMap::new(),
@@ -262,6 +272,13 @@ impl UdpLoopbackDatapath {
     #[must_use]
     pub fn rx(&self) -> flume::Receiver<RxPacket> {
         self.inner.redirect_rx.clone()
+    }
+
+    /// Advance the logical clock by `ticks`. The media-timeout sweep compares endpoint activity
+    /// against this clock; production advances it ~once per second, while tests advance it
+    /// explicitly so timeout behaviour is deterministic (never `Instant::now()`).
+    pub fn advance_clock(&self, ticks: u64) {
+        self.inner.clock.fetch_add(ticks, Ordering::Relaxed);
     }
 }
 
@@ -393,6 +410,17 @@ impl Datapath for UdpLoopbackDatapath {
 
     fn stats(&self, endpoint: EndpointId) -> Option<EndpointStats> {
         self.inner.endpoints.get(&endpoint).map(|e| e.stats.snapshot())
+    }
+
+    fn now_ticks(&self) -> u64 {
+        self.inner.clock.load(Ordering::Relaxed)
+    }
+
+    fn last_activity(&self, endpoint: EndpointId) -> Option<u64> {
+        self.inner
+            .endpoints
+            .get(&endpoint)
+            .map(|entry| entry.stats.last_seen.load(Ordering::Relaxed))
     }
 }
 
@@ -817,5 +845,20 @@ mod tests {
         datapath.remove_endpoint(leg_a.id).await;
         let leg_c = datapath.alloc_endpoint().await.expect("alloc after free");
         let _ = (leg_b, leg_c);
+    }
+
+    #[tokio::test]
+    async fn clock_and_last_activity_track_endpoints() {
+        let datapath = UdpLoopbackDatapath::new();
+        assert_eq!(datapath.now_ticks(), 0);
+        assert_eq!(datapath.last_activity(EndpointId(0)), None, "unknown endpoint");
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        assert_eq!(
+            datapath.last_activity(leg.id),
+            Some(0),
+            "no packets accepted yet"
+        );
+        datapath.advance_clock(5);
+        assert_eq!(datapath.now_ticks(), 5);
     }
 }

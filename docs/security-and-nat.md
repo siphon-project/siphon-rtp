@@ -193,14 +193,19 @@ is wrong, and encryption defeats A2 eavesdrop.
   zero-C hard rule. SDES key material must never transit a plaintext control channel.
 
 ### Layer 6 — Media timeout & dead-path teardown
-A flow that has received no *accepted* packet for `T` seconds is torn down and reported.
+A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
+
+> **Status (landed):** the **reaper** — `Engine::reap_idle(idle_ticks)` frees calls whose media has
+> been idle, returning their ports/FDs and registry/quota slots. Activity is stamped on every
+> accepted packet against the datapath's logical clock (`now_ticks` / `advance_clock` /
+> `last_activity`); the daemon advances it ~1 tick/s and sweeps. **Remaining:** delivering
+> `Event::MediaTimeout` to SIPhon (needs the server→SIPhon event-push channel, §5); today the reap
+> is logged.
 
 - Frees ports/FDs (availability), surfaces one-way-audio and failed-NAT cases, and is the non-ICE
   analogue of consent loss.
-- **Enforcement:** a periodic sweep over latch `last_seen`; new `Event::MediaTimeout` pushed to
-  SIPhon (the `Event` enum's `#[serde(other)] Unknown` arm keeps SIPhon forward-compatible).
-- **Determinism:** the sweep clock is an injected tick source — `tokio::time` in production, a logical
-  sample-clock in tests (project rule: never `Instant::now()` in deterministic tests).
+- **Determinism:** the sweep clock is an injected tick source — `tokio::time` advances it in
+  production, tests advance it explicitly via `advance_clock` (project rule: never `Instant::now()`).
 
 ### 4.7 Data-model changes implied
 > **Landed in M-S1:** `SourceFilter` (`Exact`/`Subnet`/`Any`) and `LatchPolicy`
@@ -295,12 +300,12 @@ inspection:
 **M-S1 — Secure latch (RTPBleed fix + correct NAT).**
 - **Landed:** layer 1 (RFC 7983 demux) + layer 2 (signalled-source gate) + layer 3 (SSRC-consistent
   latch) + the §4.7 `SourceFilter` / `LatchPolicy` / `ForwardRule` / SSRC latch-state change, wired
-  through `engine::answer` (`ingress_rule`). Tests on the UDP-loopback datapath: RTPBleed off-path
-  regression (datapath + engine end-to-end), mid-call wrong-SSRC hijack rejected, same-SSRC NAT
-  rebind followed, and non-RTP (STUN) demux drop.
-- **Remaining:** layer 6 (media-timeout + `last_seen` + the dead-path `Event`) and the `/24`
-  source-gate option (§9). Neither blocks the safe `SignalledOnly` default; this is the next
-  datapath increment.
+  through `engine::answer` (`ingress_rule`), plus **layer 6 media-timeout reaping** (`reap_idle`, on
+  the deterministic logical clock). Tests on the UDP-loopback datapath: RTPBleed off-path regression
+  (datapath + engine end-to-end), mid-call wrong-SSRC hijack rejected, same-SSRC NAT rebind followed,
+  non-RTP (STUN) demux drop, and idle-call reaping.
+- **Remaining:** delivering `Event::MediaTimeout` to SIPhon (needs the event-push channel, §5) and
+  the `/24` source-gate option (§9). Neither blocks the safe `SignalledOnly` default.
 
 **M-S2 — Control-plane & DoS hardening.** §5. **Landed:** the bounded media-port pool (clean `offer`
 failure on exhaustion, freed on `delete`); the **per-client call quota**; **per-verb authz** (calls

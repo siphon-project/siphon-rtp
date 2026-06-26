@@ -239,6 +239,16 @@ pub trait Datapath: Send + Sync {
 
     /// Snapshot an endpoint's counters, or `None` if it is unknown.
     fn stats(&self, endpoint: EndpointId) -> Option<EndpointStats>;
+
+    /// The backend's current logical clock (monotonic ticks). Drives the engine's media-timeout
+    /// sweep; the loopback backend's clock is advanced explicitly
+    /// ([`udp::UdpLoopbackDatapath::advance_clock`]) so timeout tests stay deterministic.
+    fn now_ticks(&self) -> u64;
+
+    /// The tick of the last **accepted** packet on `endpoint` (`0` if none yet), or `None` if the
+    /// endpoint is unknown. Feeds the media-timeout / dead-path sweep (docs/security-and-nat.md §4
+    /// layer 6).
+    fn last_activity(&self, endpoint: EndpointId) -> Option<u64>;
 }
 
 #[cfg(test)]

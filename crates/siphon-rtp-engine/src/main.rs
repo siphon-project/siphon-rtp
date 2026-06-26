@@ -45,6 +45,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if control_secret.is_some() {
         tracing::info!("control connections require authentication");
     }
+
+    // Media-timeout sweep: advance the logical clock ~1 tick/second and reap calls idle past the
+    // timeout, freeing their media ports (docs/security-and-nat.md §4 layer 6).
+    let sweeper = engine.clone();
+    tokio::spawn(async move {
+        const TIMEOUT_TICKS: u64 = 30; // ~30 s of silence
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            sweeper.datapath().advance_clock(1);
+            for call_id in sweeper.reap_idle(TIMEOUT_TICKS).await {
+                tracing::warn!(%call_id, "media timeout — call reaped");
+            }
+        }
+    });
+
     server::serve_with_auth(engine, listener, control_secret).await?;
     Ok(())
 }
