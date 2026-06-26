@@ -16,6 +16,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+flume = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

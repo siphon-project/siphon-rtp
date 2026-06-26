@@ -30,6 +30,9 @@ dashmap = "6"
 arc-swap = "1"
 # Transport
 socket2 = "0.6"
+# WebSocket bridges (pure-Rust: rustls/ring only, no native-tls/OpenSSL)
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
 # Control protocol (JSON over TCP) + serde
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -7,11 +7,13 @@
 
 pub mod protocol;
 pub mod session;
+pub mod ws;
 
 pub use protocol::{
     ControlMessage, Direction, Encoding, Endianness, MediaFormat, PlaySource, StartData,
 };
 pub use session::{BridgeSession, TickResult};
+pub use ws::{run_bridge, BridgeError};
 
 /// Encode i16 PCM samples to little-endian L16 bytes (the M1 binary-frame wire order).
 ///
