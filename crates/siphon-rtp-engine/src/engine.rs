@@ -15,9 +15,10 @@
 //! work; for plain relay the datapath's per-endpoint receive tasks are the data-plane workers.
 
 use dashmap::DashMap;
-use siphon_rtp_datapath::{Datapath, Endpoint, EndpointId, FlowAction, ForwardRule};
+use siphon_rtp_datapath::{Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig};
 use siphon_rtp_proto::{CmdResult, Command, Event, ProfileFlags, SessionStats};
 
+use crate::ice::{self, IceCredentials};
 use crate::sdp::{self, EngineMedia};
 
 /// Identity of a control client — one persistent JSON-over-TCP connection. A call is owned by the
@@ -51,6 +52,9 @@ struct Call {
     owner: ClientId,
     /// Logical-clock tick at creation (offer), the media-timeout baseline before any media arrives.
     created_tick: u64,
+    /// The engine's own ICE-lite credentials for this call (its identity as the ICE server), or
+    /// `None` for a non-ICE call.
+    ice: Option<IceCredentials>,
     from_tag: String,
     to_tag: Option<String>,
     near: Leg,
@@ -217,6 +221,15 @@ impl<D: Datapath> Engine<D> {
             }
         };
 
+        // ICE-lite: if the peer offered ICE, mint our own short-term credentials — advertised in the
+        // rewritten SDP and installed on the endpoints so the responder can validate the peer's
+        // connectivity checks (docs/security-and-nat.md §4 layer 4).
+        let ice_creds = if info.is_ice() {
+            ice::generate_credentials()
+        } else {
+            None
+        };
+
         // Two RTP endpoints, plus two companion RTCP endpoints unless the stream is muxed.
         let count = if info.rtcp_mux { 2 } else { 4 };
         let endpoints = match self.alloc_endpoints(count).await {
@@ -236,7 +249,11 @@ impl<D: Datapath> Engine<D> {
             rtp: far_rtp.local_addr,
             rtcp: far_rtcp.map(|endpoint| endpoint.local_addr),
         };
-        let rewritten = match sdp::rewrite(sdp, engine, None) {
+        let advert = ice_creds.as_ref().map(|creds| sdp::IceAdvertisement {
+            ufrag: creds.ufrag.as_str(),
+            pwd: creds.pwd.as_str(),
+        });
+        let rewritten = match sdp::rewrite(sdp, engine, advert) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 self.free(&endpoints).await;
@@ -252,6 +269,7 @@ impl<D: Datapath> Engine<D> {
             Call {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
+                ice: ice_creds,
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -282,14 +300,14 @@ impl<D: Datapath> Engine<D> {
     ) -> CmdResult {
         // Snapshot the leg endpoints under the guard, then release it. Only the owning client may
         // answer (A3 — docs/security-and-nat.md §5); to anyone else the call is unknown.
-        let (near, far) = match self.calls.get(call_id) {
+        let (near, far, ice_creds) = match self.calls.get(call_id) {
             Some(call) if call.owner == client => {
                 if call.from_tag != from_tag {
                     return CmdResult::Error {
                         reason: "from_tag mismatch on answer".to_string(),
                     };
                 }
-                (call.near, call.far)
+                (call.near, call.far, call.ice.clone())
             }
             _ => return unknown_call(call_id),
         };
@@ -308,7 +326,11 @@ impl<D: Datapath> Engine<D> {
             rtp: near.rtp.local_addr,
             rtcp: near.rtcp.map(|endpoint| endpoint.local_addr),
         };
-        let rewritten = match sdp::rewrite(sdp, engine, None) {
+        let advert = ice_creds.as_ref().map(|creds| sdp::IceAdvertisement {
+            ufrag: creds.ufrag.as_str(),
+            pwd: creds.pwd.as_str(),
+        });
+        let rewritten = match sdp::rewrite(sdp, engine, advert) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 return CmdResult::Error {
@@ -316,6 +338,11 @@ impl<D: Datapath> Engine<D> {
                 }
             }
         };
+
+        // ICE applies to a leg only when both ends use it: `near` faces A (which offered ICE iff we
+        // minted creds), `far` faces B (ICE iff its answer carries ICE).
+        let near_ice = ice_creds.is_some();
+        let far_ice = ice_creds.is_some() && info.is_ice();
 
         // Install the bidirectional RTP relay. Each endpoint's rule gates its ingress to the
         // SDP-signalled peer and latches per policy (RTPBleed fix — docs/security-and-nat.md §4):
@@ -327,6 +354,7 @@ impl<D: Datapath> Engine<D> {
                 Some(info.remote_rtp),
                 near.remote_rtp,
                 profile,
+                near_ice,
             )),
         ) {
             return error_result("install near->far RTP flow", &error);
@@ -338,6 +366,7 @@ impl<D: Datapath> Engine<D> {
                 near.remote_rtp,
                 Some(info.remote_rtp),
                 profile,
+                far_ice,
             )),
         ) {
             return error_result("install far->near RTP flow", &error);
@@ -352,6 +381,7 @@ impl<D: Datapath> Engine<D> {
                     Some(info.remote_rtcp),
                     near.remote_rtcp,
                     profile,
+                    false,
                 )),
             ) {
                 return error_result("install near->far RTCP flow", &error);
@@ -363,9 +393,23 @@ impl<D: Datapath> Engine<D> {
                     near.remote_rtcp,
                     Some(info.remote_rtcp),
                     profile,
+                    false,
                 )),
             ) {
                 return error_result("install far->near RTCP flow", &error);
+            }
+        }
+
+        // Enable the ICE connectivity-check responder on the RTP endpoints facing an ICE peer; the
+        // datapath then answers checks and adopts the validated source (RFC 8445).
+        if let Some(creds) = &ice_creds {
+            let config = IceConfig {
+                local_ufrag: creds.ufrag.clone(),
+                local_pwd: creds.pwd.clone(),
+            };
+            self.datapath.set_ice(near.rtp.id, Some(config.clone()));
+            if info.is_ice() {
+                self.datapath.set_ice(far.rtp.id, Some(config));
             }
         }
 
@@ -515,7 +559,13 @@ fn ingress_rule(
     out_dst: Option<std::net::SocketAddr>,
     expected_source: Option<std::net::SocketAddr>,
     profile: &ProfileFlags,
+    ice: bool,
 ) -> ForwardRule {
+    if ice {
+        // ICE validates the source via STUN connectivity checks (the datapath responder adopts the
+        // validated candidate), so accept any source and latch it.
+        return ForwardRule::symmetric(out_endpoint, out_dst);
+    }
     let symmetric = profile.flags.iter().any(|flag| flag == "symmetric");
     match (symmetric, expected_source) {
         (false, Some(addr)) => ForwardRule::signalled(out_endpoint, out_dst, addr.ip()),
@@ -1116,5 +1166,77 @@ mod tests {
                 from_tag: "ft".into()
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_offer_advertises_lite_and_the_endpoint_answers_checks() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        // A offers ICE.
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:AAAAAA\r\na=ice-pwd:apasswordapasswordapas\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port()
+        );
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ice".into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let offer_out = ok_sdp_text(&offer);
+        assert!(offer_out.contains("a=ice-lite"), "engine offers ICE-lite to B");
+        // The engine's advertised credentials (the same identity it installs on the endpoints).
+        let advertised = sdp::parse(&offer_out).expect("parse engine offer");
+        let engine_ufrag = advertised.ice_ufrag.clone().expect("engine ufrag");
+        let engine_pwd = advertised.ice_pwd.clone().expect("engine pwd");
+
+        // B answers with plain RTP (non-ICE).
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ice".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer_out = ok_sdp_text(&answer);
+        assert!(answer_out.contains("a=ice-lite"), "engine offers ICE-lite to A");
+        let near = sdp::parse(&answer_out).expect("parse engine answer");
+
+        // A runs a valid connectivity check against the engine's A-facing endpoint, signed with the
+        // engine's advertised password.
+        let username = format!("{engine_ufrag}:AAAAAA");
+        let check = siphon_rtp_stun::binding_request(&[7u8; 12], &username, engine_pwd.as_bytes());
+        phone_a
+            .send_to(&check, near.remote_rtp)
+            .await
+            .expect("send check");
+
+        // The endpoint answers with a Binding success response we can verify with the engine pwd.
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("no timeout")
+            .expect("recv response");
+        let response = siphon_rtp_stun::parse(&buffer[..len]).expect("parse response");
+        assert_eq!(response.message_type, siphon_rtp_stun::BINDING_SUCCESS);
+        assert!(siphon_rtp_stun::verify_message_integrity(
+            &buffer[..len],
+            engine_pwd.as_bytes()
+        ));
     }
 }

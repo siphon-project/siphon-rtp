@@ -174,9 +174,12 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > (`Datapath::set_ice`), a STUN Binding check whose `USERNAME` addresses us and whose
 > `MESSAGE-INTEGRITY` verifies with our local password is answered with a signed Binding success
 > response and **adopts the validated source as the media path** (superseding blind latching); a
-> forged check is dropped. **Remaining (engine side):** parse `ice-ufrag`/`ice-pwd`/candidates from
-> SDP, generate + advertise the engine's own ICE-lite credentials (`a=ice-lite`, needs a CSPRNG),
-> call `set_ice` at answer time, the full ICE state machine, and consent (RFC 7675).
+> forged check is dropped. **Engine wiring (landed):** `sdp::parse`/`rewrite` carry ICE, `engine::ice`
+> mints credentials from the OS CSPRNG, and at offer/answer the engine re-originates ICE as
+> **ICE-lite** — advertising `a=ice-lite` + its own ufrag/pwd + a host candidate and calling
+> `set_ice` on the ICE legs, which then answer checks and adopt the validated source; end-to-end
+> tested. **Remaining:** consent freshness (RFC 7675 — periodic re-checks / timeout), full (non-lite)
+> ICE for cases where the engine must *send* checks, and ICE on the non-mux RTCP companion port.
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
@@ -325,12 +328,12 @@ private to their creating `ClientId`); and optional shared-secret **control-chan
 `cargo-fuzz` continuous targets (proptest robustness already landed, §6).
 
 **M-S3 — ICE + consent.** Layer 4. **Landed:** the pure-Rust STUN codec (`siphon-rtp-stun`,
-vector-validated) and the **datapath connectivity-check responder** (`set_ice` + STUN-validated
-source adoption, answered with a signed Binding success response; forged checks dropped).
-**Remaining (engine side):** SDP `ice-ufrag`/`ice-pwd`/candidate parsing, generating + advertising
-the engine's own ICE-lite credentials (needs a CSPRNG), wiring `set_ice` at answer time, the ICE
-state machine, and consent freshness (RFC 7675) — the strongest NAT + anti-hijack story for
-ICE-capable peers.
+vector-validated), the datapath connectivity-check responder (`set_ice` + STUN-validated source
+adoption; forged checks dropped), and the engine **ICE-lite** wiring — credential generation (OS
+CSPRNG), SDP parse + ICE-lite re-origination (`a=ice-lite` + ufrag/pwd + host candidate), and
+`set_ice` on ICE legs at answer time; end-to-end tested. **Remaining:** consent freshness
+(RFC 7675), full (non-lite) ICE where the engine must send checks, and ICE on the non-mux RTCP
+companion port — the strongest NAT + anti-hijack story for ICE-capable peers.
 
 **M-S4 — SRTP / DTLS-SRTP (deferred).** Layer 5, scheduled when an SRTP/DTLS deployment lands. Seam
 (`transport_protocol`, `dtls`) is already reserved; build with ring/rustls/webrtc-rs only.

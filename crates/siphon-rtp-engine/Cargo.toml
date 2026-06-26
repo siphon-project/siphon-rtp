@@ -45,3 +45,4 @@ siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 proptest = { workspace = true }
+siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }

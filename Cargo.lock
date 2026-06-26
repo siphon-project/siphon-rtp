@@ -1197,6 +1197,7 @@ dependencies = [
  "proptest",
  "siphon-rtp-datapath",
  "siphon-rtp-proto",
+ "siphon-rtp-stun",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
