@@ -67,6 +67,26 @@ pub struct Impairments {
     pub jitter_ms: f64,
 }
 
+impl Impairments {
+    /// Derive impairments from an RTCP receiver-report block (RFC 3550 §6.4.1) plus a round-trip
+    /// time. `fraction_lost` is the 8-bit field (lost/256 over the interval); `jitter` is in RTP
+    /// timestamp units at `clock_rate_hz`; one-way delay is taken as half the RTT.
+    #[must_use]
+    pub fn from_rtcp(fraction_lost: u8, jitter: u32, clock_rate_hz: u32, rtt_ms: f64) -> Self {
+        let loss_percent = f64::from(fraction_lost) / 256.0 * 100.0;
+        let jitter_ms = if clock_rate_hz > 0 {
+            f64::from(jitter) / f64::from(clock_rate_hz) * 1000.0
+        } else {
+            0.0
+        };
+        Self {
+            loss_percent,
+            one_way_delay_ms: rtt_ms / 2.0,
+            jitter_ms,
+        }
+    }
+}
+
 /// The base E-model R-factor for an ideal narrowband connection (ITU-T G.107 default).
 const R0: f64 = 93.2;
 
@@ -192,5 +212,16 @@ mod tests {
     fn mos_is_clamped_to_the_valid_range() {
         assert_eq!(mos(-10.0), 1.0);
         assert_eq!(mos(150.0), 4.5);
+    }
+
+    #[test]
+    fn impairments_from_rtcp_fields() {
+        // fraction_lost 128/256 = 50%; jitter 160 units @ 8 kHz = 20 ms; RTT 100 ms → 50 ms one-way.
+        let impairments = Impairments::from_rtcp(128, 160, 8000, 100.0);
+        assert!((impairments.loss_percent - 50.0).abs() < 1e-9);
+        assert!((impairments.jitter_ms - 20.0).abs() < 1e-9);
+        assert!((impairments.one_way_delay_ms - 50.0).abs() < 1e-9);
+        // A zero clock rate is tolerated (no divide-by-zero).
+        assert_eq!(Impairments::from_rtcp(0, 99, 0, 0.0).jitter_ms, 0.0);
     }
 }
