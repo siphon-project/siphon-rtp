@@ -15,7 +15,7 @@
 //! - [`FlowAction::Drop`] discards it (e.g. a blocked or held leg).
 #![forbid(unsafe_code)]
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use bytes::Bytes;
 
@@ -45,28 +45,113 @@ pub enum FlowAction {
     Drop,
 }
 
-/// A relay rule: where forwarded datagrams leave and where they go.
+/// Which **source address** may send media to an endpoint — the signalled-source gate that closes
+/// the RTPBleed first-packet race (RFC 3264: the offer/answer address is the contract).
+/// See [`docs/security-and-nat.md`](../../../docs/security-and-nat.md) §4 layer 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceFilter {
+    /// Only this exact IP may send. The port is never gated — RTP/RTCP split and re-NAT move it.
+    Exact(IpAddr),
+    /// Any IP inside this CIDR block — carriers that split RTP/RTCP or re-NAT within a prefix.
+    Subnet(IpAddr, u8),
+    /// Accept any source. For symmetric-NAT legs where the signalled address is genuinely unusable;
+    /// opt-in per leg, never a silent default.
+    Any,
+}
+
+impl SourceFilter {
+    /// Whether `source` is permitted by this filter (address only; the port is never gated).
+    #[must_use]
+    pub fn accepts(&self, source: IpAddr) -> bool {
+        match *self {
+            SourceFilter::Any => true,
+            SourceFilter::Exact(addr) => addr == source,
+            SourceFilter::Subnet(network, prefix) => subnet_contains(network, prefix, source),
+        }
+    }
+}
+
+/// How (and whether) an endpoint learns its peer's real source — the latch lifecycle that follows a
+/// genuine NAT rebind but resists a hijack spray.
+/// See [`docs/security-and-nat.md`](../../../docs/security-and-nat.md) §4 layer 3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatchPolicy {
+    /// Never latch; forward only to the configured `out_dst`.
+    Off,
+    /// Latch only sources that pass the [`SourceFilter`]; re-latch a new source **only** if it
+    /// carries the same RTP SSRC (RFC 3550 §8) — a real rebind, not a spray. The safe default.
+    SignalledOnly,
+    /// Accept and latch the first source regardless of address (symmetric NAT); re-latch is still
+    /// SSRC-gated. Opt-in per leg via the `symmetric` profile flag.
+    Symmetric,
+}
+
+/// A relay rule installed on a receiving endpoint: where its datagrams are forwarded, plus the
+/// source gate and latch policy applied to the packets arriving on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForwardRule {
     /// The endpoint to transmit from — the socket facing the party we forward toward.
     pub out_endpoint: EndpointId,
-    /// The configured destination (from negotiated SDP). May be `None` until the answer lands;
-    /// in that window forwarding is suppressed unless a latched address is available.
+    /// The configured destination (from negotiated SDP). May be `None` until the answer lands; in
+    /// that window forwarding falls back to the latched source, or is suppressed if nothing latched.
     pub out_dst: Option<SocketAddr>,
-    /// When set, prefer the address latched from `out_endpoint`'s observed source over `out_dst`
-    /// — symmetric RTP / NAT traversal: reply to wherever the peer's packets actually came from.
-    pub allow_latch: bool,
+    /// Source-address gate for packets arriving on the endpoint this rule is installed on. Packets
+    /// from any other source are dropped before they can latch or be forwarded (RTPBleed defence).
+    pub accepted_source: SourceFilter,
+    /// Latch lifecycle for this endpoint's incoming source.
+    pub latch: LatchPolicy,
 }
 
 impl ForwardRule {
-    /// A forward rule toward `out_endpoint`/`out_dst` with latching enabled.
+    /// The safe default: forward toward `out_endpoint`/`out_dst`, accept only media whose source IP
+    /// is `expected` (the SDP-signalled peer), and latch `SignalledOnly`.
     #[must_use]
-    pub fn latching(out_endpoint: EndpointId, out_dst: Option<SocketAddr>) -> Self {
+    pub fn signalled(
+        out_endpoint: EndpointId,
+        out_dst: Option<SocketAddr>,
+        expected: IpAddr,
+    ) -> Self {
         Self {
             out_endpoint,
             out_dst,
-            allow_latch: true,
+            accepted_source: SourceFilter::Exact(expected),
+            latch: LatchPolicy::SignalledOnly,
         }
+    }
+
+    /// A symmetric-NAT leg: accept any source and latch the first (still SSRC-gated on re-latch).
+    /// Opt-in — only where the signalled address is unusable.
+    #[must_use]
+    pub fn symmetric(out_endpoint: EndpointId, out_dst: Option<SocketAddr>) -> Self {
+        Self {
+            out_endpoint,
+            out_dst,
+            accepted_source: SourceFilter::Any,
+            latch: LatchPolicy::Symmetric,
+        }
+    }
+}
+
+/// Whether `source` falls within the `network`/`prefix` CIDR block (same address family only).
+fn subnet_contains(network: IpAddr, prefix: u8, source: IpAddr) -> bool {
+    match (network, source) {
+        (IpAddr::V4(network), IpAddr::V4(source)) => {
+            let prefix = prefix.min(32);
+            if prefix == 0 {
+                return true;
+            }
+            let mask = u32::MAX << (32 - prefix);
+            (u32::from(network) & mask) == (u32::from(source) & mask)
+        }
+        (IpAddr::V6(network), IpAddr::V6(source)) => {
+            let prefix = prefix.min(128);
+            if prefix == 0 {
+                return true;
+            }
+            let mask = u128::MAX << (128 - prefix);
+            (u128::from(network) & mask) == (u128::from(source) & mask)
+        }
+        _ => false,
     }
 }
 
@@ -147,4 +232,58 @@ pub trait Datapath: Send + Sync {
 
     /// Snapshot an endpoint's counters, or `None` if it is unknown.
     fn stats(&self, endpoint: EndpointId) -> Option<EndpointStats>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn exact_filter_matches_only_that_ip() {
+        let filter = SourceFilter::Exact(ip(198, 51, 100, 7));
+        assert!(filter.accepts(ip(198, 51, 100, 7)));
+        assert!(!filter.accepts(ip(198, 51, 100, 8)));
+        assert!(!filter.accepts(ip(203, 0, 113, 7)));
+    }
+
+    #[test]
+    fn any_filter_accepts_everything() {
+        assert!(SourceFilter::Any.accepts(ip(10, 0, 0, 1)));
+        assert!(SourceFilter::Any.accepts(ip(203, 0, 113, 9)));
+    }
+
+    #[test]
+    fn subnet_filter_matches_within_prefix() {
+        let filter = SourceFilter::Subnet(ip(198, 51, 100, 0), 24);
+        assert!(filter.accepts(ip(198, 51, 100, 1)));
+        assert!(filter.accepts(ip(198, 51, 100, 254)));
+        assert!(!filter.accepts(ip(198, 51, 101, 1)));
+        // A /0 accepts everything; host bits of the network address are ignored.
+        assert!(SourceFilter::Subnet(ip(198, 51, 100, 5), 0).accepts(ip(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn subnet_rejects_mismatched_address_family() {
+        let v4 = SourceFilter::Subnet(ip(10, 0, 0, 0), 8);
+        assert!(!v4.accepts(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn rule_constructors_set_gate_and_latch() {
+        let endpoint = EndpointId(1);
+        let dst: SocketAddr = "203.0.113.5:6000".parse().expect("addr");
+
+        let signalled = ForwardRule::signalled(endpoint, Some(dst), ip(198, 51, 100, 1));
+        assert_eq!(signalled.latch, LatchPolicy::SignalledOnly);
+        assert_eq!(signalled.accepted_source, SourceFilter::Exact(ip(198, 51, 100, 1)));
+
+        let symmetric = ForwardRule::symmetric(endpoint, None);
+        assert_eq!(symmetric.latch, LatchPolicy::Symmetric);
+        assert_eq!(symmetric.accepted_source, SourceFilter::Any);
+    }
 }

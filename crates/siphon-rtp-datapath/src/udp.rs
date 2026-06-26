@@ -16,7 +16,7 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
 use crate::{
-    Datapath, DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction, RxPacket,
+    Datapath, DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction, LatchPolicy, RxPacket,
 };
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
@@ -52,15 +52,32 @@ struct EndpointEntry {
     task: JoinHandle<()>,
 }
 
+/// What the relay has learned about an endpoint's peer source: where it sends from and the RTP
+/// SSRC it carries (for SSRC-consistent re-latch). See `docs/security-and-nat.md` §4 layer 3.
+#[derive(Clone, Copy)]
+struct LatchState {
+    addr: SocketAddr,
+    ssrc: Option<u32>,
+}
+
+/// Verdict of the latch gate for one packet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LatchOutcome {
+    /// Forward this packet (and the latch now reflects its source).
+    Accept,
+    /// Drop this packet — a new source whose SSRC does not match the latched stream (hijack).
+    Reject,
+}
+
 /// Shared backend state. Held by the public handle (strong) and by receive tasks (weak), so the
 /// strong count reaches zero on teardown and [`Drop`] can abort the parked receive tasks.
 struct Inner {
     next_id: AtomicU64,
     endpoints: DashMap<EndpointId, EndpointEntry>,
     flows: DashMap<EndpointId, FlowAction>,
-    /// First observed source per endpoint (latch-once). Forward rules with `allow_latch` reply
-    /// to the latched source of their `out_endpoint` instead of the SDP-advertised address.
-    latched: DashMap<EndpointId, SocketAddr>,
+    /// Per-endpoint latched peer source (address + RTP SSRC). A packet from a new source re-latches
+    /// only with a matching SSRC — the RTPBleed/hijack gate, not a blind first-source latch.
+    latched: DashMap<EndpointId, LatchState>,
     redirect_tx: flume::Sender<RxPacket>,
     redirect_rx: flume::Receiver<RxPacket>,
 }
@@ -83,16 +100,31 @@ impl Inner {
         };
         match action {
             FlowAction::Forward(rule) => {
-                let destination = if rule.allow_latch {
-                    self.latched
-                        .get(&rule.out_endpoint)
-                        .map(|latched| *latched)
-                        .or(rule.out_dst)
-                } else {
-                    rule.out_dst
-                };
+                // Layer 2 — signalled-source gate: only the SDP-signalled peer may send here. This
+                // is the RTPBleed fix; an off-path source on another address is dropped before it
+                // can latch or be forwarded. (docs/security-and-nat.md §4 layer 2; RFC 3264.)
+                if !rule.accepted_source.accepts(source.ip()) {
+                    in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                // Layer 3 — SSRC-consistent latch: a new source re-latches only when it carries the
+                // same RTP SSRC (a genuine NAT rebind), never a hijack spray.
+                // (docs/security-and-nat.md §4 layer 3; RFC 3550 §8.)
+                if rule.latch != LatchPolicy::Off
+                    && self.update_latch(endpoint, source, rtp_ssrc(payload)) == LatchOutcome::Reject
+                {
+                    in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+
+                // Forward toward the peer endpoint: prefer its latched source (symmetric RTP) over
+                // its configured destination; drop if neither resolves (never forward into the void).
+                let destination = self
+                    .latched
+                    .get(&rule.out_endpoint)
+                    .map(|state| state.addr)
+                    .or(rule.out_dst);
                 let Some(destination) = destination else {
-                    // No negotiated address yet and nothing latched — nowhere to send.
                     in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
@@ -127,6 +159,41 @@ impl Inner {
             FlowAction::Drop => {
                 in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Apply the SSRC-consistent latch policy for a packet arriving on `endpoint` from `source`.
+    /// Returns [`LatchOutcome::Reject`] for a likely hijack (a new source whose RTP SSRC does not
+    /// match the latched stream); the caller then drops it. (docs/security-and-nat.md §4 layer 3.)
+    fn update_latch(
+        &self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        ssrc: Option<u32>,
+    ) -> LatchOutcome {
+        // Copy the current state out and drop the read guard before any insert (no re-entrant lock).
+        let current = self.latched.get(&endpoint).map(|state| *state);
+        match current {
+            None => {
+                self.latched.insert(endpoint, LatchState { addr: source, ssrc });
+                LatchOutcome::Accept
+            }
+            Some(state) if state.addr == source => {
+                // Same path; record the SSRC the first time we can read one.
+                if state.ssrc.is_none() && ssrc.is_some() {
+                    self.latched.insert(endpoint, LatchState { addr: source, ssrc });
+                }
+                LatchOutcome::Accept
+            }
+            Some(state) => match (state.ssrc, ssrc) {
+                // A new source that keeps the SSRC is a genuine NAT rebind — follow it.
+                (Some(known), Some(seen)) if known == seen => {
+                    self.latched.insert(endpoint, LatchState { addr: source, ssrc });
+                    LatchOutcome::Accept
+                }
+                // A new source with a different/unknown SSRC is a spray/hijack — reject, keep latch.
+                _ => LatchOutcome::Reject,
+            },
         }
     }
 }
@@ -178,7 +245,26 @@ impl UdpLoopbackDatapath {
     }
 }
 
-/// Per-endpoint receive loop: drain the socket, latch the source, apply the flow.
+/// The RTP SSRC (RFC 3550 §5.1, bytes 8–11) for latch identity, or `None` when the datagram is not
+/// an RTP media packet (too short, wrong version, or RTCP — RFC 5761: RTCP carries no comparable
+/// per-stream SSRC at this offset, so it never drives an SSRC re-latch). A purpose-built reader,
+/// not the full media parser, because on a muxed socket RTP and RTCP must be told apart by payload
+/// type, which `RtpPacket::parse` does not do.
+fn rtp_ssrc(payload: &[u8]) -> Option<u32> {
+    if payload.len() < 12 || payload[0] >> 6 != 2 {
+        return None;
+    }
+    let payload_type = payload[1] & 0x7F;
+    if (64..=95).contains(&payload_type) {
+        return None; // RTCP (RFC 5761 §4)
+    }
+    Some(u32::from_be_bytes([
+        payload[8], payload[9], payload[10], payload[11],
+    ]))
+}
+
+/// Per-endpoint receive loop: drain the socket and apply the installed flow (which gates the source
+/// and latches it per policy — see [`Inner::dispatch`]).
 async fn recv_loop(
     inner: Weak<Inner>,
     endpoint: EndpointId,
@@ -200,7 +286,6 @@ async fn recv_loop(
         let Some(inner) = inner.upgrade() else {
             return;
         };
-        inner.latched.entry(endpoint).or_insert(source);
         inner.dispatch(endpoint, source, &buffer[..len], &stats).await;
     }
 }
@@ -270,7 +355,7 @@ impl Datapath for UdpLoopbackDatapath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ForwardRule;
+    use crate::{ForwardRule, SourceFilter};
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -309,7 +394,8 @@ mod tests {
                 FlowAction::Forward(ForwardRule {
                     out_endpoint: leg_b.id,
                     out_dst: Some(addr_b),
-                    allow_latch: false,
+                    accepted_source: SourceFilter::Any,
+                    latch: LatchPolicy::Off,
                 }),
             )
             .expect("flow a");
@@ -319,7 +405,8 @@ mod tests {
                 FlowAction::Forward(ForwardRule {
                     out_endpoint: leg_a.id,
                     out_dst: Some(addr_a),
-                    allow_latch: false,
+                    accepted_source: SourceFilter::Any,
+                    latch: LatchPolicy::Off,
                 }),
             )
             .expect("flow b");
@@ -355,13 +442,13 @@ mod tests {
         datapath
             .install_flow(
                 leg_a.id,
-                FlowAction::Forward(ForwardRule::latching(leg_b.id, Some(addr_b))),
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(addr_b))),
             )
             .expect("flow a");
         datapath
             .install_flow(
                 leg_b.id,
-                FlowAction::Forward(ForwardRule::latching(leg_a.id, None)),
+                FlowAction::Forward(ForwardRule::symmetric(leg_a.id, None)),
             )
             .expect("flow b");
 
@@ -432,7 +519,8 @@ mod tests {
                 FlowAction::Forward(ForwardRule {
                     out_endpoint: leg_b.id,
                     out_dst: Some(addr_b),
-                    allow_latch: false,
+                    accepted_source: SourceFilter::Any,
+                    latch: LatchPolicy::Off,
                 }),
             )
             .expect("flow a");
@@ -504,5 +592,126 @@ mod tests {
             datapath.install_flow(leg.id, FlowAction::Drop),
             Err(DatapathError::UnknownEndpoint(_))
         ));
+    }
+
+    /// A test phone bound to a specific loopback address (127.0.0.0/8 is all loopback on Linux), so
+    /// the source gate — which keys on IP — can be exercised with distinct peers.
+    async fn phone_at(ip: Ipv4Addr) -> (UdpSocket, SocketAddr) {
+        let socket = UdpSocket::bind((ip, 0)).await.expect("bind phone");
+        let addr = socket.local_addr().expect("phone addr");
+        (socket, addr)
+    }
+
+    /// A minimal RTP packet (V=2, PT=0/PCMU) carrying `ssrc` and `sequence` — enough for the latch
+    /// to read an SSRC (RFC 3550 §5.1).
+    fn rtp(ssrc: u32, sequence: u16) -> Vec<u8> {
+        let mut packet = vec![0x80, 0x00];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes()); // timestamp
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(b"audio");
+        packet
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rtpbleed_off_path_source_is_gated_out() {
+        // RTPBleed regression: an attacker spraying the media port from another address must never
+        // latch or be forwarded — only the SDP-signalled peer's media flows.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (callee, callee_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::signalled(
+                    leg_b.id,
+                    Some(callee_addr),
+                    peer_addr.ip(),
+                )),
+            )
+            .expect("flow a");
+
+        // Attacker races first — the gate rejects it; nothing reaches the callee.
+        attacker
+            .send_to(&rtp(0xAAAA_AAAA, 1), leg_a.local_addr)
+            .await
+            .expect("attacker send");
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, callee.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "off-path attacker media must not be forwarded (RTPBleed)"
+        );
+
+        // The signalled peer's media flows.
+        peer.send_to(&rtp(0x1234_5678, 1), leg_a.local_addr)
+            .await
+            .expect("peer send");
+        let (data, from) = recv(&callee).await;
+        assert_eq!(data, rtp(0x1234_5678, 1));
+        assert_eq!(from, leg_b.local_addr);
+
+        // The rejected datagram is counted as dropped.
+        let mut dropped = 0;
+        for _ in 0..50 {
+            dropped = datapath.stats(leg_a.id).expect("stats").packets_dropped;
+            if dropped >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(dropped, 1, "attacker datagram counted as dropped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn symmetric_latch_follows_ssrc_rebind_but_rejects_hijack() {
+        // Under a symmetric (any-source) leg, the SSRC separates a NAT rebind from a hijack.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (rebind, _) = phone_at(Ipv4Addr::new(127, 0, 0, 5)).await;
+        let (hijacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 6)).await;
+        let (callee, callee_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(callee_addr))),
+            )
+            .expect("flow");
+
+        // First source latches and flows.
+        peer.send_to(&rtp(0x1111_1111, 1), leg_a.local_addr)
+            .await
+            .expect("peer send");
+        let (data, _) = recv(&callee).await;
+        assert_eq!(data, rtp(0x1111_1111, 1));
+
+        // New source, DIFFERENT SSRC — a hijack attempt; rejected, not forwarded.
+        hijacker
+            .send_to(&rtp(0x9999_9999, 2), leg_a.local_addr)
+            .await
+            .expect("hijacker send");
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, callee.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "a wrong-SSRC source must not hijack the latched stream"
+        );
+
+        // New source, SAME SSRC — a genuine NAT rebind; re-latches and flows.
+        rebind
+            .send_to(&rtp(0x1111_1111, 3), leg_a.local_addr)
+            .await
+            .expect("rebind send");
+        let (data, _) = recv(&callee).await;
+        assert_eq!(data, rtp(0x1111_1111, 3));
     }
 }

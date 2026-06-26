@@ -26,7 +26,13 @@ attacker). This document defines the one policy that satisfies both.
 
 ---
 
-## 2. The hole as it exists today (RTPBleed)
+## 2. RTPBleed: the original hole, and the fix
+
+> **Status — M-S1 (landed):** layers 2–3 below are implemented. The blind first-source `or_insert`
+> latch is gone; ingress is now **source-gated** and the latch is **SSRC-consistent** (`update_latch`
+> in [`udp.rs`](../crates/siphon-rtp-datapath/src/udp.rs); rules built by `ingress_rule` in
+> [`engine.rs`](../crates/siphon-rtp-engine/src/engine.rs) from the parsed SDP + `ProfileFlags`).
+> Layer 1 (demux) and layer 6 (media-timeout) remain — see §8. The original hole, for the record:
 
 [`crates/siphon-rtp-datapath/src/udp.rs`](../crates/siphon-rtp-datapath/src/udp.rs), `recv_loop`:
 
@@ -196,6 +202,10 @@ A flow that has received no *accepted* packet for `T` seconds is torn down and r
   sample-clock in tests (project rule: never `Instant::now()` in deterministic tests).
 
 ### 4.7 Data-model changes implied
+> **Landed in M-S1:** `SourceFilter` (`Exact`/`Subnet`/`Any`) and `LatchPolicy`
+> (`Off`/`SignalledOnly`/`Symmetric`) on `ForwardRule`, and an SSRC-aware latch state. The
+> `last_seen` field and the timeout sweep arrive with layer 6.
+
 Concrete, minimal, additive to the existing datapath seam:
 
 - **`ForwardRule`** ([datapath/src/lib.rs](../crates/siphon-rtp-datapath/src/lib.rs)) gains:
@@ -271,9 +281,15 @@ inspection:
 
 ## 8. Milestones (priority order for this posture)
 
-**M-S1 — Secure latch (RTPBleed fix + correct NAT).** Layers 1–3 + the §4.7 data-model change +
-media-timeout (layer 6) + the RTPBleed/hijack/demux/gate/timeout tests. Self-contained in
-datapath + engine, no crypto. *This is the next datapath increment and the highest-value item.*
+**M-S1 — Secure latch (RTPBleed fix + correct NAT).**
+- **Landed:** layer 2 (signalled-source gate) + layer 3 (SSRC-consistent latch) + the §4.7
+  `SourceFilter` / `LatchPolicy` / `ForwardRule` / SSRC latch-state change, wired through
+  `engine::answer` (`ingress_rule`). Tests on the UDP-loopback datapath: RTPBleed off-path
+  regression (datapath + engine end-to-end), mid-call wrong-SSRC hijack rejected, same-SSRC NAT
+  rebind followed.
+- **Remaining:** layer 1 (RFC 7983 demux), layer 6 (media-timeout + `last_seen` + the dead-path
+  `Event`), and the `/24` source-gate option (§9). None block the safe `SignalledOnly` default;
+  this is the next datapath increment.
 
 **M-S2 — Control-plane & DoS hardening.** §5: bounded port pool, per-client quota, per-verb authz,
 private bind + control-channel auth. Plus the fuzz/proptest targets from §6 wired into CI.

@@ -16,7 +16,7 @@
 
 use dashmap::DashMap;
 use siphon_rtp_datapath::{Datapath, Endpoint, EndpointId, FlowAction, ForwardRule};
-use siphon_rtp_proto::{CmdResult, Command, SessionStats};
+use siphon_rtp_proto::{CmdResult, Command, ProfileFlags, SessionStats};
 
 use crate::sdp::{self, EngineMedia};
 
@@ -90,8 +90,8 @@ impl<D: Datapath> Engine<D> {
                 from_tag,
                 to_tag,
                 sdp,
-                ..
-            } => self.answer(&call_id, &from_tag, to_tag, &sdp).await,
+                profile,
+            } => self.answer(&call_id, &from_tag, to_tag, &sdp, &profile).await,
             Command::Delete { call_id, .. } => self.delete(&call_id).await,
             Command::Query { call_id, .. } => self.query(&call_id),
             other => CmdResult::Error {
@@ -184,7 +184,14 @@ impl<D: Datapath> Engine<D> {
         ok_sdp(rewritten.sdp, None)
     }
 
-    async fn answer(&self, call_id: &str, from_tag: &str, to_tag: String, sdp: &str) -> CmdResult {
+    async fn answer(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: String,
+        sdp: &str,
+        profile: &ProfileFlags,
+    ) -> CmdResult {
         // Snapshot the leg endpoints + near remotes under the guard, then release it.
         let (near, far) = match self.calls.get(call_id) {
             Some(call) => {
@@ -221,16 +228,28 @@ impl<D: Datapath> Engine<D> {
             }
         };
 
-        // Install the bidirectional RTP relay (latching; the configured remote is the fallback).
+        // Install the bidirectional RTP relay. Each endpoint's rule gates its ingress to the
+        // SDP-signalled peer and latches per policy (RTPBleed fix — docs/security-and-nat.md §4):
+        // `near` receives from A (`near.remote_rtp`); `far` receives from B (`info.remote_rtp`).
         if let Err(error) = self.datapath.install_flow(
             near.rtp.id,
-            FlowAction::Forward(ForwardRule::latching(far.rtp.id, Some(info.remote_rtp))),
+            FlowAction::Forward(ingress_rule(
+                far.rtp.id,
+                Some(info.remote_rtp),
+                near.remote_rtp,
+                profile,
+            )),
         ) {
             return error_result("install near->far RTP flow", &error);
         }
         if let Err(error) = self.datapath.install_flow(
             far.rtp.id,
-            FlowAction::Forward(ForwardRule::latching(near.rtp.id, near.remote_rtp)),
+            FlowAction::Forward(ingress_rule(
+                near.rtp.id,
+                near.remote_rtp,
+                Some(info.remote_rtp),
+                profile,
+            )),
         ) {
             return error_result("install far->near RTP flow", &error);
         }
@@ -239,13 +258,23 @@ impl<D: Datapath> Engine<D> {
         if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
             if let Err(error) = self.datapath.install_flow(
                 near_rtcp.id,
-                FlowAction::Forward(ForwardRule::latching(far_rtcp.id, Some(info.remote_rtcp))),
+                FlowAction::Forward(ingress_rule(
+                    far_rtcp.id,
+                    Some(info.remote_rtcp),
+                    near.remote_rtcp,
+                    profile,
+                )),
             ) {
                 return error_result("install near->far RTCP flow", &error);
             }
             if let Err(error) = self.datapath.install_flow(
                 far_rtcp.id,
-                FlowAction::Forward(ForwardRule::latching(near_rtcp.id, near.remote_rtcp)),
+                FlowAction::Forward(ingress_rule(
+                    near_rtcp.id,
+                    near.remote_rtcp,
+                    Some(info.remote_rtcp),
+                    profile,
+                )),
             ) {
                 return error_result("install far->near RTCP flow", &error);
             }
@@ -336,6 +365,24 @@ fn unknown_call(call_id: &str) -> CmdResult {
 fn error_result(context: &str, error: &dyn std::fmt::Display) -> CmdResult {
     CmdResult::Error {
         reason: format!("{context}: {error}"),
+    }
+}
+
+/// Build the relay rule for one ingress endpoint: gate its incoming source to the SDP-signalled
+/// peer and latch `SignalledOnly` by default, or accept-any + `Symmetric` when the `symmetric`
+/// profile flag is set (or the peer address is not yet known). The RTPBleed-safe default —
+/// see `docs/security-and-nat.md` §4.7.
+fn ingress_rule(
+    out_endpoint: EndpointId,
+    out_dst: Option<std::net::SocketAddr>,
+    expected_source: Option<std::net::SocketAddr>,
+    profile: &ProfileFlags,
+) -> ForwardRule {
+    let symmetric = profile.flags.iter().any(|flag| flag == "symmetric");
+    match (symmetric, expected_source) {
+        (false, Some(addr)) => ForwardRule::signalled(out_endpoint, out_dst, addr.ip()),
+        // Symmetric leg, or the peer's address is not yet known: accept any source and latch.
+        _ => ForwardRule::symmetric(out_endpoint, out_dst),
     }
 }
 
@@ -583,5 +630,74 @@ mod tests {
             CmdResult::Error { reason } => assert!(reason.contains("stop_media")),
             other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    /// A test phone bound to a specific loopback address, so the engine's signalled-source gate can
+    /// be exercised with distinct peers (127.0.0.0/8 is all loopback on Linux).
+    async fn phone_at(ip: Ipv4Addr) -> (UdpSocket, SocketAddr) {
+        let socket = UdpSocket::bind((ip, 0)).await.expect("bind");
+        let addr = socket.local_addr().expect("addr");
+        (socket, addr)
+    }
+
+    /// A minimal RTP packet (V=2, PT=0/PCMU) carrying `ssrc` (RFC 3550 §5.1).
+    fn rtp(ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0];
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(b"audio");
+        packet
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_answer_gates_out_an_off_path_rtpbleed_source() {
+        // End-to-end: the engine must install a signalled-source gate from the SDP, so an attacker
+        // on another address cannot latch the media even if it sprays the port first.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
+
+        let offer = engine
+            .handle(Command::Offer {
+                call_id: "rtpbleed".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr_a, false),
+                profile: Default::default(),
+            })
+            .await;
+        let far = sdp::parse(&ok_sdp_text(&offer)).expect("far");
+
+        let answer = engine
+            .handle(Command::Answer {
+                call_id: "rtpbleed".into(),
+                from_tag: "a".into(),
+                to_tag: "b".into(),
+                sdp: sdp_for(addr_b, false),
+                profile: Default::default(),
+            })
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
+
+        // Attacker sprays the A-facing port first — gated out, never reaches B.
+        attacker
+            .send_to(&rtp(0xAAAA_AAAA), near.remote_rtp)
+            .await
+            .expect("attacker send");
+        let mut scratch = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(150), phone_b.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "off-path attacker must be gated out end-to-end (RTPBleed)"
+        );
+
+        // The signalled peer A flows to B.
+        phone_a
+            .send_to(&rtp(0x1234_5678), near.remote_rtp)
+            .await
+            .expect("peer send");
+        let (data, from) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x1234_5678));
+        assert_eq!(from, far.remote_rtp, "B sees media from the engine far-RTP port");
     }
 }
