@@ -10,8 +10,16 @@
 //! verify `MESSAGE-INTEGRITY`. The ICE state machine, the connectivity-check responder wired into
 //! the datapath `recv_loop`, and consent (RFC 7675) build on this. See `docs/security-and-nat.md`
 //! §4 layer 4.
+//!
+//! The [`turn`] submodule extends this with the TURN (RFC 5766) message set — Allocate / Refresh /
+//! CreatePermission / ChannelBind / Send / Data, the TURN attributes, `ChannelData` framing, and the
+//! long-term-credential key derivation (`MD5`/base64) — built on the same hand-rolled SHA-1 / HMAC /
+//! CRC-32 primitives and the [`MessageBuilder`], so the built-in TURN server (`siphon-rtp-turn`,
+//! M-T*) needs no new dependency. See `docs/security-and-nat.md` §11.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+pub mod turn;
 
 /// The STUN magic cookie (RFC 5389 §6).
 pub const MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -125,6 +133,63 @@ pub fn parse(data: &[u8]) -> Result<StunMessage, StunError> {
     })
 }
 
+/// Incrementally builds a STUN/TURN message: the 20-byte header (RFC 5389 §6), then attributes in
+/// wire order, then — on [`finish`](MessageBuilder::finish) — optionally a `MESSAGE-INTEGRITY`
+/// (HMAC-SHA1 over everything before it, RFC 5389 §15.4) and a `FINGERPRINT` (CRC-32 of the message
+/// XOR `0x5354554e`, RFC 5389 §15.5), appended last in that order. Backs the Binding builders below
+/// and every TURN response (RFC 5766).
+pub struct MessageBuilder {
+    message: Vec<u8>,
+}
+
+impl MessageBuilder {
+    /// Start a message of `message_type` (14-bit method + 2-bit class, RFC 5389 §6) carrying
+    /// `transaction_id`. The length field is a placeholder, fixed up as attributes are appended.
+    #[must_use]
+    pub fn new(message_type: u16, transaction_id: &[u8; 12]) -> Self {
+        let mut message = Vec::with_capacity(64);
+        message.extend_from_slice(&message_type.to_be_bytes());
+        message.extend_from_slice(&[0, 0]);
+        message.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        message.extend_from_slice(transaction_id);
+        Self { message }
+    }
+
+    /// Append one attribute (value zero-padded to a 4-byte boundary, RFC 5389 §15).
+    #[must_use]
+    pub fn attribute(mut self, attr_type: u16, value: &[u8]) -> Self {
+        push_attribute(&mut self.message, attr_type, value);
+        self
+    }
+
+    /// Finalize the message: append `MESSAGE-INTEGRITY` keyed by `integrity_key` (when `Some`), then
+    /// — when `fingerprint` is set — `FINGERPRINT`. The integrity HMAC covers the message with the
+    /// length field set through the 24-byte integrity attribute but the bytes taken *before* it
+    /// (RFC 5389 §15.4); FINGERPRINT then covers everything through its own 8 bytes (§15.5).
+    #[must_use]
+    pub fn finish(mut self, integrity_key: Option<&[u8]>, fingerprint: bool) -> Vec<u8> {
+        if let Some(key) = integrity_key {
+            let length = self.message.len() - HEADER_LEN + 24;
+            set_length(&mut self.message, length);
+            let mac = hmac_sha1(key, &self.message);
+            push_attribute(&mut self.message, ATTR_MESSAGE_INTEGRITY, &mac);
+        }
+        if fingerprint {
+            let length = self.message.len() - HEADER_LEN + 8;
+            set_length(&mut self.message, length);
+            let value = (crc32(&self.message) ^ FINGERPRINT_XOR).to_be_bytes();
+            push_attribute(&mut self.message, ATTR_FINGERPRINT, &value);
+        }
+        // Ensure the header length covers every attribute — for a message with neither
+        // MESSAGE-INTEGRITY nor FINGERPRINT (e.g. a Send/Data indication) the branches above never
+        // ran, so the placeholder would otherwise stay zero. Re-stating it is a no-op when they did,
+        // since both compute over the length value that equals the final total.
+        let length = self.message.len() - HEADER_LEN;
+        set_length(&mut self.message, length);
+        self.message
+    }
+}
+
 /// Build a Binding success response reflecting `mapped` back to the peer, with `FINGERPRINT` and —
 /// when `integrity_key` is `Some` (the short-term credential = the local ICE password) — a
 /// `MESSAGE-INTEGRITY` attribute (RFC 5389 §15.4). Attribute order is XOR-MAPPED-ADDRESS,
@@ -135,59 +200,21 @@ pub fn binding_success_response(
     mapped: SocketAddr,
     integrity_key: Option<&[u8]>,
 ) -> Vec<u8> {
-    let mut message = Vec::with_capacity(64);
-    message.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
-    message.extend_from_slice(&[0, 0]); // length placeholder, set per-attribute below
-    message.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-    message.extend_from_slice(transaction_id);
-
-    push_attribute(
-        &mut message,
-        ATTR_XOR_MAPPED_ADDRESS,
-        &encode_xor_mapped_address(mapped, transaction_id),
-    );
-
-    if let Some(key) = integrity_key {
-        // MESSAGE-INTEGRITY is the HMAC-SHA1 over the message with the length field set to cover
-        // everything through the integrity attribute (24 bytes), but computed over the bytes
-        // *before* it. (RFC 5389 §15.4.)
-        let length = message.len() - HEADER_LEN + 24;
-        set_length(&mut message, length);
-        let mac = hmac_sha1(key, &message);
-        push_attribute(&mut message, ATTR_MESSAGE_INTEGRITY, &mac);
-    }
-
-    // FINGERPRINT is the CRC-32 over the message (length set to cover the 8-byte fingerprint
-    // attribute) XOR 0x5354554e. (RFC 5389 §15.5.)
-    let length = message.len() - HEADER_LEN + 8;
-    set_length(&mut message, length);
-    let fingerprint = crc32(&message) ^ FINGERPRINT_XOR;
-    push_attribute(&mut message, ATTR_FINGERPRINT, &fingerprint.to_be_bytes());
-    message
+    MessageBuilder::new(BINDING_SUCCESS, transaction_id)
+        .attribute(
+            ATTR_XOR_MAPPED_ADDRESS,
+            &encode_xor_mapped_address(mapped, transaction_id),
+        )
+        .finish(integrity_key, true)
 }
 
 /// Build a Binding **request** carrying `username` and authenticated with `integrity_key` (the
 /// short-term credential), plus `FINGERPRINT` — an ICE connectivity check (RFC 8445 §7.1.2).
 #[must_use]
 pub fn binding_request(transaction_id: &[u8; 12], username: &str, integrity_key: &[u8]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(64);
-    message.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
-    message.extend_from_slice(&[0, 0]);
-    message.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-    message.extend_from_slice(transaction_id);
-
-    push_attribute(&mut message, ATTR_USERNAME, username.as_bytes());
-
-    let length = message.len() - HEADER_LEN + 24;
-    set_length(&mut message, length);
-    let mac = hmac_sha1(integrity_key, &message);
-    push_attribute(&mut message, ATTR_MESSAGE_INTEGRITY, &mac);
-
-    let length = message.len() - HEADER_LEN + 8;
-    set_length(&mut message, length);
-    let fingerprint = crc32(&message) ^ FINGERPRINT_XOR;
-    push_attribute(&mut message, ATTR_FINGERPRINT, &fingerprint.to_be_bytes());
-    message
+    MessageBuilder::new(BINDING_REQUEST, transaction_id)
+        .attribute(ATTR_USERNAME, username.as_bytes())
+        .finish(Some(integrity_key), true)
 }
 
 /// Verify a message's `MESSAGE-INTEGRITY` against `key` (the short-term credential). Returns false
@@ -362,8 +389,11 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     out
 }
 
-/// HMAC-SHA1 (RFC 2104) of `message` under `key`.
-fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
+/// HMAC-SHA1 (RFC 2104) of `message` under `key`. Exposed so the TURN server can derive the coturn
+/// REST credential `password = base64(HMAC-SHA1(static_auth_secret, username))` (RFC 5766 §4) and
+/// stamp stateless nonces with the same hand-rolled primitive — no new crypto dependency.
+#[must_use]
+pub fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
     const BLOCK: usize = 64;
     let mut block_key = [0u8; BLOCK];
     if key.len() > BLOCK {
