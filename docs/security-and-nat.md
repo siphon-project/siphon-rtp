@@ -240,8 +240,11 @@ Distinct from the media latch but part of the same security surface.
   engine threads `ClientId` from the server, which assigns one per accepted connection. **Caveat:**
   this binds identity to the *connection*; it assumes one persistent control connection per SIPhon
   instance. A shared identity across a connection pool needs the deferred control-channel auth.
-- **Channel security.** Authenticate the JSON-over-TCP control socket, bind it to a private
-  interface, and add TLS (and it becomes mandatory the day SDES key material rides it — §5).
+- **Channel security.** **Landed:** optional shared-secret authentication — when
+  `$SIPHON_RTP_CONTROL_SECRET` is set, a control connection must send `Authenticate` with the
+  matching token (constant-time compared) before any other verb is honoured (`serve_with_auth`).
+  **Remaining:** TLS on the control socket (mandatory the day SDES key material rides it) and binding
+  it to a private interface by config.
 - **Reflector/amplifier hygiene.** Do not forward toward a destination until it is validated (the
   layer-2 gate + "no forward before `answer`" already cover most of this); never echo to an
   unvalidated source.
@@ -300,10 +303,10 @@ inspection:
   datapath increment.
 
 **M-S2 — Control-plane & DoS hardening.** §5. **Landed:** the bounded media-port pool (clean `offer`
-failure on exhaustion, freed on `delete`); the **per-client call quota**; and **per-verb authz** —
-calls are private to their creating `ClientId`. **Remaining:** control-channel auth + private bind
-(and, once a server→SIPhon event-push channel exists, surfacing rejections), plus the fuzz/proptest
-targets from §6 wired into CI.
+failure on exhaustion, freed on `delete`); the **per-client call quota**; **per-verb authz** (calls
+private to their creating `ClientId`); and optional shared-secret **control-channel auth**
+(`serve_with_auth`). **Remaining:** TLS + private-interface bind on the control socket, and
+`cargo-fuzz` continuous targets (proptest robustness already landed, §6).
 
 **M-S3 — ICE + consent.** Layer 4: STUN over the layer-1 demux, ICE connectivity checks, consent
 freshness, the `ProfileFlags.ice` modes. Brings the strongest NAT + anti-hijack story for ICE-capable

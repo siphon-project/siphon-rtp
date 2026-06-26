@@ -128,6 +128,9 @@ pub enum Command {
         from_tag: String,
         to_tag: String,
     },
+    /// Authenticate the control connection with the server's shared secret. Handled by the control
+    /// server (not the session engine); required as the first command when a secret is configured.
+    Authenticate { token: String },
 }
 
 /// Source for [`Command::PlayMedia`]. Tagged on `"source"`.
@@ -405,6 +408,7 @@ mod tests {
                 from_tag: "f".into(),
                 to_tag: "t".into(),
             },
+            Command::Authenticate { token: "s3cret".into() },
         ];
         for command in &commands {
             roundtrip(&Request {

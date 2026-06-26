@@ -40,6 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(args.control).await?;
     tracing::info!(control = %args.control, "siphon-rtp-engine control server listening");
 
-    server::serve(engine, listener).await?;
+    // Optional control-plane shared secret, read from the environment so it never appears in argv.
+    let control_secret = std::env::var("SIPHON_RTP_CONTROL_SECRET").ok();
+    if control_secret.is_some() {
+        tracing::info!("control connections require authentication");
+    }
+    server::serve_with_auth(engine, listener, control_secret).await?;
     Ok(())
 }

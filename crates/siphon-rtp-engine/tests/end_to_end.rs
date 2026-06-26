@@ -173,3 +173,42 @@ async fn offer_answer_relay_delete_over_tcp_control() {
         .await;
     assert!(matches!(requery, CmdResult::Error { .. }));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_requires_authentication_when_a_secret_is_configured() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    tokio::spawn(async move {
+        let _ = server::serve_with_auth(engine, listener, Some("s3cret".to_string())).await;
+    });
+
+    let mut control = Control::connect(control_addr).await;
+
+    // A command before authenticating is rejected.
+    assert!(
+        matches!(control.request(Command::Ping).await, CmdResult::Error { .. }),
+        "commands are rejected before authentication"
+    );
+    // A wrong token is rejected.
+    assert!(matches!(
+        control
+            .request(Command::Authenticate {
+                token: "wrong".into()
+            })
+            .await,
+        CmdResult::Error { .. }
+    ));
+    // The correct token authenticates the connection; commands then work.
+    assert!(matches!(
+        control
+            .request(Command::Authenticate {
+                token: "s3cret".into()
+            })
+            .await,
+        CmdResult::Ok { .. }
+    ));
+    assert_eq!(control.request(Command::Ping).await, CmdResult::Pong);
+}

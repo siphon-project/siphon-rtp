@@ -419,6 +419,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::SubscribeRequest { .. } => "subscribe_request",
         Command::SubscribeAnswer { .. } => "subscribe_answer",
         Command::Unsubscribe { .. } => "unsubscribe",
+        Command::Authenticate { .. } => "authenticate",
     }
 }
 
