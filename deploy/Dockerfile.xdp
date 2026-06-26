@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# Compile-check the XDP datapath: the eBPF classifier (siphon-rtp-ebpf) + the userspace loader
+# (siphon-rtp-xdp). Kept separate from the main Dockerfile so the kernel-acceleration toolchain
+# (nightly + bpf-linker + LLVM) never bloats the engine image.
+#
+#   docker build -f deploy/Dockerfile.xdp -t siphon-rtp-xdp-check .
+#
+# Building the loader runs its build.rs → aya-build, which compiles the eBPF program with the eBPF
+# crate's own pinned nightly (rust-src / build-std) and bpf-linker, then embeds it; the loader
+# itself builds on stable + aya. A green build proves the whole XDP path compiles.
+
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl build-essential pkg-config clang llvm \
+        libzstd1 libxml2 libffi8 libtinfo6 libedit2 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust: stable (loader) + nightly with rust-src (eBPF build-std for bpfel-unknown-none).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup toolchain install nightly --component rust-src
+
+# bpf-linker performs the final BPF link.
+#
+# TOOLCHAIN PIN (the one open item): bpf-linker's LLVM must match the nightly's LLVM. The eBPF
+# *code* compiles to bpfel cleanly; the only blocker is this version alignment. The current nightly
+# is LLVM 22.1.7, which is ahead of crates.io bpf-linker 0.10.3 (it loads the toolchain LLVM and
+# dlopen-fails on 22). Two ways to close it:
+#   (a) install LLVM 22 dev from apt.llvm.org + `LLVM_SYS_221_PREFIX` and build bpf-linker from git
+#       (keeps the bleeding-edge nightly); or
+#   (b) pin crates/siphon-rtp-xdp/ebpf/rust-toolchain.toml to a nightly whose LLVM bpf-linker 0.10.3
+#       supports, install that exact nightly here, and pass it via aya-build's Toolchain.
+# 0.10.3 (crates.io) is used below because it *compiles* cleanly; swap per (a)/(b) to finish the link.
+RUN cargo install bpf-linker --locked
+
+WORKDIR /build
+COPY . .
+
+# The loader is a standalone workspace; its build.rs invokes aya-build on the eBPF crate.
+RUN cd crates/siphon-rtp-xdp && cargo build --release

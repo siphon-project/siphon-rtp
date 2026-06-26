@@ -11,7 +11,7 @@ publish = false
 
 [dependencies]
 aya-ebpf = "0.1"
-siphon-rtp-ebpf-common = { path = "../siphon-rtp-ebpf-common" }
+siphon-rtp-ebpf-common = { path = "../../siphon-rtp-ebpf-common" }
 
 [[bin]]
 name = "siphon-rtp-ebpf"
@@ -34,5 +34,5 @@ lto = true
 panic = "abort"
 codegen-units = 1
 
-# Standalone workspace so the parent (stable) toolchain never tries to build this crate.
-[workspace]
+# Member of the siphon-rtp-xdp loader's workspace (so aya-build can `cargo build --package
+# siphon-rtp-ebpf` from the loader), which is itself excluded from the parent stable workspace.
