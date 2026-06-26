@@ -1,0 +1,18 @@
+# siphon-rtp-stun — pure-Rust STUN (RFC 8489) message codec for ICE connectivity checks.
+# Deliberately dependency-light (thiserror only) so the datapath can use it on the hot path without
+# pulling in the media plane's heavier tree.
+[package]
+name = "siphon-rtp-stun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "siphon-rtp STUN (RFC 8489) message codec — pure Rust, zero C, for ICE connectivity checks"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

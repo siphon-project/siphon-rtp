@@ -1186,6 +1186,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphon-rtp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "dashmap",
+ "flume",
+ "proptest",
+ "siphon-rtp-datapath",
+ "siphon-rtp-proto",
+ "thiserror 2.0.18",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "siphon-rtp-codec"
 version = "0.1.0"
 dependencies = [
@@ -1202,6 +1221,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "flume",
+ "siphon-rtp-stun",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1217,24 +1237,6 @@ dependencies = [
 [[package]]
 name = "siphon-rtp-ebpf-common"
 version = "0.1.0"
-
-[[package]]
-name = "siphon-rtp-engine"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "clap",
- "dashmap",
- "proptest",
- "siphon-rtp-datapath",
- "siphon-rtp-proto",
- "thiserror 2.0.18",
- "tikv-jemalloc-ctl",
- "tikv-jemallocator",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "siphon-rtp-media"
@@ -1262,6 +1264,14 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "siphon-rtp-stun"
+version = "0.1.0"
+dependencies = [
+ "proptest",
  "thiserror 2.0.18",
 ]
 

@@ -13,5 +13,4 @@ pub mod jitter;
 pub mod leg;
 pub mod rtcp;
 pub mod rtp;
-pub mod stun;
 pub mod wav;

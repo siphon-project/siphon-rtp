@@ -202,6 +202,19 @@ pub enum DatapathError {
     Send(#[source] std::io::Error),
 }
 
+/// ICE-lite credentials for an endpoint — the engine's own short-term credential. Lets the datapath
+/// answer STUN connectivity checks (RFC 8445 §7.3) and adopt the validated source as the media path,
+/// superseding blind latching. See `docs/security-and-nat.md` §4 layer 4.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IceConfig {
+    /// The engine's local ICE username fragment; an incoming check's USERNAME must be
+    /// `<local_ufrag>:<remote_ufrag>`.
+    pub local_ufrag: String,
+    /// The engine's local ICE password; incoming `MESSAGE-INTEGRITY` is verified, and responses are
+    /// signed, with this.
+    pub local_pwd: String,
+}
+
 /// A media datapath: allocates endpoints, installs per-endpoint flows, moves packets, reports stats.
 ///
 /// Methods that touch sockets are `async`; the flow-table and stats operations are synchronous
@@ -249,6 +262,10 @@ pub trait Datapath: Send + Sync {
     /// endpoint is unknown. Feeds the media-timeout / dead-path sweep (docs/security-and-nat.md §4
     /// layer 6).
     fn last_activity(&self, endpoint: EndpointId) -> Option<u64>;
+
+    /// Install (or clear with `None`) ICE-lite credentials for an endpoint, enabling the datapath to
+    /// answer STUN connectivity checks on it and adopt the validated source (RFC 8445, layer 4).
+    fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>);
 }
 
 #[cfg(test)]

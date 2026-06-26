@@ -15,8 +15,11 @@ use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
+use siphon_rtp_stun as stun;
+
 use crate::{
-    Datapath, DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction, LatchPolicy, RxPacket,
+    Datapath, DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction, IceConfig, LatchPolicy,
+    RxPacket,
 };
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
@@ -86,6 +89,9 @@ struct Inner {
     /// Per-endpoint latched peer source (address + RTP SSRC). A packet from a new source re-latches
     /// only with a matching SSRC — the RTPBleed/hijack gate, not a blind first-source latch.
     latched: DashMap<EndpointId, LatchState>,
+    /// Per-endpoint ICE-lite credentials; when present, STUN checks are answered and the validated
+    /// source is adopted as the media path (RFC 8445).
+    ice: DashMap<EndpointId, IceConfig>,
     redirect_tx: flume::Sender<RxPacket>,
     redirect_rx: flume::Receiver<RxPacket>,
 }
@@ -261,6 +267,7 @@ impl UdpLoopbackDatapath {
                 endpoints: DashMap::new(),
                 flows: DashMap::new(),
                 latched: DashMap::new(),
+                ice: DashMap::new(),
                 redirect_tx,
                 redirect_rx,
             }),
@@ -307,6 +314,63 @@ fn rtp_ssrc(payload: &[u8]) -> Option<u32> {
     ]))
 }
 
+/// Answer a STUN connectivity check on an ICE-enabled endpoint: validate the request against our
+/// local credentials, adopt the validated source as the media path, and reply with a Binding
+/// success response (RFC 8445 §7.3 / RFC 5389). Invalid checks are dropped silently.
+async fn handle_stun(
+    socket: &UdpSocket,
+    endpoint: EndpointId,
+    source: SocketAddr,
+    datagram: &[u8],
+    ice: &IceConfig,
+    inner: &Inner,
+    stats: &StatsAtomic,
+) {
+    let request = match stun::parse(datagram) {
+        Ok(message) if message.is_binding_request() => message,
+        _ => {
+            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    // The USERNAME must address us (our ufrag first) and MESSAGE-INTEGRITY must verify with our
+    // local password — a challenge an off-path attacker cannot forge without the SDP it never saw.
+    let addressed_to_us = request
+        .username()
+        .and_then(|username| username.split(':').next())
+        .is_some_and(|ufrag| ufrag == ice.local_ufrag);
+    if !addressed_to_us || !stun::verify_message_integrity(datagram, ice.local_pwd.as_bytes()) {
+        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // Valid check: ICE supersedes blind latching — adopt the validated source, and count the check
+    // as activity so the media-timeout sweep treats the path as alive.
+    inner.latched.insert(
+        endpoint,
+        LatchState {
+            addr: source,
+            ssrc: None,
+        },
+    );
+    stats
+        .last_seen
+        .store(inner.clock.load(Ordering::Relaxed), Ordering::Relaxed);
+    let response = stun::binding_success_response(
+        &request.transaction_id,
+        source,
+        Some(ice.local_pwd.as_bytes()),
+    );
+    match socket.send_to(&response, source).await {
+        Ok(sent) => {
+            stats.packets_out.fetch_add(1, Ordering::Relaxed);
+            stats.bytes_out.fetch_add(sent as u64, Ordering::Relaxed);
+        }
+        Err(error) => {
+            tracing::debug!(?endpoint, %error, "failed to send STUN response");
+        }
+    }
+}
+
 /// Per-endpoint receive loop: drain the socket and apply the installed flow (which gates the source
 /// and latches it per policy — see [`Inner::dispatch`]).
 async fn recv_loop(
@@ -330,6 +394,20 @@ async fn recv_loop(
         let Some(inner) = inner.upgrade() else {
             return;
         };
+        // RFC 7983 demux for ICE: STUN (first byte 0..=3) drives connectivity checks on endpoints
+        // that carry ICE credentials; everything else takes the media path.
+        if matches!(buffer[..len].first(), Some(&first) if first <= 3) {
+            match inner.ice.get(&endpoint).map(|config| config.clone()) {
+                Some(ice) => {
+                    handle_stun(&socket, endpoint, source, &buffer[..len], &ice, &inner, &stats)
+                        .await;
+                }
+                None => {
+                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            continue;
+        }
         inner.dispatch(endpoint, source, &buffer[..len], &stats).await;
     }
 }
@@ -390,6 +468,7 @@ impl Datapath for UdpLoopbackDatapath {
         }
         self.inner.flows.remove(&endpoint);
         self.inner.latched.remove(&endpoint);
+        self.inner.ice.remove(&endpoint);
     }
 
     async fn send(
@@ -422,12 +501,23 @@ impl Datapath for UdpLoopbackDatapath {
             .get(&endpoint)
             .map(|entry| entry.stats.last_seen.load(Ordering::Relaxed))
     }
+
+    fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>) {
+        match config {
+            Some(config) => {
+                self.inner.ice.insert(endpoint, config);
+            }
+            None => {
+                self.inner.ice.remove(&endpoint);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ForwardRule, SourceFilter};
+    use crate::{ForwardRule, IceConfig, SourceFilter};
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -860,5 +950,74 @@ mod tests {
         );
         datapath.advance_clock(5);
         assert_eq!(datapath.now_ticks(), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_check_is_answered_and_adopts_the_validated_source() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        datapath.set_ice(
+            leg_a.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        let (callee, callee_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+        // ICE validation gates the source, so the media rule accepts any source and latches.
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(callee_addr))),
+            )
+            .expect("flow");
+
+        let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        // A valid connectivity check addressed to us, signed with our password.
+        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        peer.send_to(&check, leg_a.local_addr)
+            .await
+            .expect("send check");
+
+        // We answer with a Binding success response, integrity-signed with our password.
+        let (response, from) = recv(&peer).await;
+        assert_eq!(from, leg_a.local_addr);
+        let parsed = stun::parse(&response).expect("parse response");
+        assert_eq!(parsed.message_type, stun::BINDING_SUCCESS);
+        assert!(stun::verify_message_integrity(&response, b"engpass"));
+
+        // The validated source was adopted: the peer's media now relays to the callee.
+        peer.send_to(&rtp(0x1234_5678, 1), leg_a.local_addr)
+            .await
+            .expect("send rtp");
+        let (data, _) = recv(&callee).await;
+        assert_eq!(data, rtp(0x1234_5678, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_check_with_bad_integrity_is_dropped() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        datapath.set_ice(
+            leg.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        // Signed with the wrong password — an off-path forgery; it must not be answered.
+        let forged = stun::binding_request(&[0u8; 12], "ENG:remote", b"WRONG");
+        peer.send_to(&forged, leg.local_addr)
+            .await
+            .expect("send forged");
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, peer.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "a check failing MESSAGE-INTEGRITY must be dropped, not answered"
+        );
     }
 }

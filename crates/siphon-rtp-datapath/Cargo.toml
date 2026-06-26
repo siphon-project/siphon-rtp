@@ -8,8 +8,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "siphon-rtp datapath seam: backend-agnostic Datapath trait + NIC-free UDP-loopback backend"
 
 [dependencies]
+siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }
 tokio = { workspace = true }
 flume = { workspace = true }
 bytes = { workspace = true }

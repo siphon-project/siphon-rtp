@@ -166,6 +166,30 @@ pub fn binding_success_response(
     message
 }
 
+/// Build a Binding **request** carrying `username` and authenticated with `integrity_key` (the
+/// short-term credential), plus `FINGERPRINT` — an ICE connectivity check (RFC 8445 §7.1.2).
+#[must_use]
+pub fn binding_request(transaction_id: &[u8; 12], username: &str, integrity_key: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(64);
+    message.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
+    message.extend_from_slice(&[0, 0]);
+    message.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    message.extend_from_slice(transaction_id);
+
+    push_attribute(&mut message, ATTR_USERNAME, username.as_bytes());
+
+    let length = message.len() - HEADER_LEN + 24;
+    set_length(&mut message, length);
+    let mac = hmac_sha1(integrity_key, &message);
+    push_attribute(&mut message, ATTR_MESSAGE_INTEGRITY, &mac);
+
+    let length = message.len() - HEADER_LEN + 8;
+    set_length(&mut message, length);
+    let fingerprint = crc32(&message) ^ FINGERPRINT_XOR;
+    push_attribute(&mut message, ATTR_FINGERPRINT, &fingerprint.to_be_bytes());
+    message
+}
+
 /// Verify a message's `MESSAGE-INTEGRITY` against `key` (the short-term credential). Returns false
 /// if the attribute is absent, malformed, or the HMAC does not match. Constant-time on the compare.
 #[must_use]

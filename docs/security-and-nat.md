@@ -168,13 +168,15 @@ Latch state machine, per direction:
 ### Layer 4 — ICE supersedes blind latching where offered
 When SDP carries ICE, **connectivity checks replace latching** as the address-learning mechanism.
 
-> **Status (foundation landed):** the **STUN codec** (`siphon-rtp-media::stun`) — parse Binding
-> requests, build Binding success responses with `XOR-MAPPED-ADDRESS` + short-term `MESSAGE-INTEGRITY`
-> + `FINGERPRINT`, and verify integrity — is implemented in pure Rust (hand-rolled SHA-1 / HMAC /
-> CRC-32, zero new deps), validated against the SHA-1, HMAC (RFC 2202), and CRC-32 known-answer
-> vectors. **Remaining:** wiring the connectivity-check responder into the datapath `recv_loop`
-> behind the layer-1 STUN demux, parsing `ice-ufrag`/`ice-pwd`/candidates from SDP, the ICE state
-> machine, and consent (RFC 7675).
+> **Status (responder landed):** the **STUN codec** (`siphon-rtp-stun` — pure Rust, hand-rolled
+> SHA-1 / HMAC / CRC-32, validated against the SHA-1, HMAC (RFC 2202), and CRC-32 known-answer
+> vectors) **plus the datapath connectivity-check responder**: on an ICE endpoint
+> (`Datapath::set_ice`), a STUN Binding check whose `USERNAME` addresses us and whose
+> `MESSAGE-INTEGRITY` verifies with our local password is answered with a signed Binding success
+> response and **adopts the validated source as the media path** (superseding blind latching); a
+> forged check is dropped. **Remaining (engine side):** parse `ice-ufrag`/`ice-pwd`/candidates from
+> SDP, generate + advertise the engine's own ICE-lite credentials (`a=ice-lite`, needs a CSPRNG),
+> call `set_ice` at answer time, the full ICE state machine, and consent (RFC 7675).
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
@@ -322,11 +324,13 @@ private to their creating `ClientId`); and optional shared-secret **control-chan
 (`serve_with_auth`). **Remaining:** TLS + private-interface bind on the control socket, and
 `cargo-fuzz` continuous targets (proptest robustness already landed, §6).
 
-**M-S3 — ICE + consent.** Layer 4. **Landed:** the pure-Rust STUN message codec
-(`siphon-rtp-media::stun`) — Binding parse, success-response build, `MESSAGE-INTEGRITY` /
-`FINGERPRINT`, vector-validated. **Remaining:** the connectivity-check responder over the layer-1
-demux, SDP `ice-ufrag`/`ice-pwd`/candidate parsing, the ICE state machine, and consent freshness
-(RFC 7675) — the strongest NAT + anti-hijack story for ICE-capable peers.
+**M-S3 — ICE + consent.** Layer 4. **Landed:** the pure-Rust STUN codec (`siphon-rtp-stun`,
+vector-validated) and the **datapath connectivity-check responder** (`set_ice` + STUN-validated
+source adoption, answered with a signed Binding success response; forged checks dropped).
+**Remaining (engine side):** SDP `ice-ufrag`/`ice-pwd`/candidate parsing, generating + advertising
+the engine's own ICE-lite credentials (needs a CSPRNG), wiring `set_ice` at answer time, the ICE
+state machine, and consent freshness (RFC 7675) — the strongest NAT + anti-hijack story for
+ICE-capable peers.
 
 **M-S4 — SRTP / DTLS-SRTP (deferred).** Layer 5, scheduled when an SRTP/DTLS deployment lands. Seam
 (`transport_protocol`, `dtls`) is already reserved; build with ring/rustls/webrtc-rs only.
