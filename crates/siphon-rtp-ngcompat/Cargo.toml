@@ -14,3 +14,8 @@ homepage.workspace = true
 [dependencies]
 siphon-rtp-proto = { path = "../siphon-rtp-proto" }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
