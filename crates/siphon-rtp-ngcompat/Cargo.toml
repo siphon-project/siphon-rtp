@@ -1,0 +1,15 @@
+# siphon-rtp-ngcompat — the rtpengine NG/bencode-over-UDP control front-end. Lets existing
+# Kamailio/OpenSIPS/FreeSWITCH and SIPhon's bencode rtpengine client drive siphon-rtp unchanged:
+# it parses the NG bencode protocol into the internal Command and serializes results back.
+# Control-protocol parity only — no rtpengine kernel module (our in-kernel path is XDP).
+[package]
+name = "siphon-rtp-ngcompat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

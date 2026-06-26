@@ -12,6 +12,7 @@ members = [
     "crates/siphon-rtp-media",
     "crates/siphon-rtp-turn",
     "crates/siphon-rtp-hep",
+    "crates/siphon-rtp-ngcompat",
     "crates/siphon-rtp-engine",
 ]
 # The XDP loader is its own workspace (with the eBPF program crate at crates/siphon-rtp-xdp/ebpf,
