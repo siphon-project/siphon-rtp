@@ -242,6 +242,9 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// A call's media went silent past the timeout and the engine tore it down (dead-path
+    /// detection). Lets SIPhon release its own per-call state.
+    MediaTimeout { call_id: String, from_tag: String },
     /// Unknown / future event kind (forward-compat).
     #[serde(other)]
     Unknown,
@@ -489,8 +492,16 @@ mod tests {
     }
 
     #[test]
+    fn media_timeout_event_roundtrip() {
+        roundtrip(&Event::MediaTimeout {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+        });
+    }
+
+    #[test]
     fn unknown_event_is_forward_compatible() {
-        let json = r#"{"event":"media_timeout","call_id":"c"}"#;
+        let json = r#"{"event":"some_future_event","detail":"x"}"#;
         let event: Event = serde_json::from_str(json).expect("deserialize unknown");
         assert_eq!(event, Event::Unknown);
     }

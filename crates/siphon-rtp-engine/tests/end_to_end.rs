@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
-use siphon_rtp_proto::{frame, CmdResult, Command, Request, Response};
+use siphon_rtp_proto::{frame, CmdResult, Command, Event, Request, Response};
 use siphon_rtp_engine::{server, sdp, Engine};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -51,6 +51,25 @@ impl Control {
                 .expect("response not timed out")
                 .expect("read response");
             assert_ne!(read, 0, "control connection closed unexpectedly");
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// Read the next frame as a server-initiated [`Event`] (no request correlation).
+    async fn recv_event(&mut self) -> Event {
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some((event, consumed)) =
+                frame::decode::<Event>(&self.buffer).expect("decode event")
+            {
+                self.buffer.drain(..consumed);
+                return event;
+            }
+            let read = timeout(Duration::from_secs(2), self.stream.read(&mut chunk))
+                .await
+                .expect("event not timed out")
+                .expect("read event");
+            assert_ne!(read, 0, "control connection closed before event");
             self.buffer.extend_from_slice(&chunk[..read]);
         }
     }
@@ -211,4 +230,45 @@ async fn control_requires_authentication_when_a_secret_is_configured() {
         CmdResult::Ok { .. }
     ));
     assert_eq!(control.request(Command::Ping).await, CmdResult::Pong);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_timeout_event_is_pushed_over_the_control_connection() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    let serve_engine = engine.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(serve_engine, listener).await;
+    });
+
+    let mut control = Control::connect(control_addr).await;
+    let (_phone, addr) = phone().await;
+
+    // Offer a call over this control connection (so it owns the call).
+    let offer = control
+        .request(Command::Offer {
+            call_id: "doomed".into(),
+            from_tag: "ft".into(),
+            sdp: sdp_for(addr),
+            profile: Default::default(),
+        })
+        .await;
+    assert!(matches!(offer, CmdResult::Ok { .. }));
+
+    // Drive the media-timeout sweep on the shared engine handle: the call is silent, so it is reaped.
+    engine.datapath().advance_clock(40);
+    assert_eq!(engine.reap_idle(30).await, vec!["doomed".to_string()]);
+
+    // The engine pushes a MediaTimeout event down the same control connection.
+    let event = control.recv_event().await;
+    assert_eq!(
+        event,
+        Event::MediaTimeout {
+            call_id: "doomed".into(),
+            from_tag: "ft".into()
+        }
+    );
 }

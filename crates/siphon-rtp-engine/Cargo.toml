@@ -1,29 +1,34 @@
-# siphon-rtp-engine — the engine daemon: JSON-over-TCP control front-end, session manager, and
-# (later) the actor runtime + aya loader. M1 walking skeleton: offer/answer/relay/delete on the
-# UDP-loopback datapath, NIC-free.
+# siphon-rtp — the engine daemon (crate `siphon-rtp`, in dir `crates/siphon-rtp-engine/`):
+# JSON-over-TCP control front-end, session manager, and (later) the actor runtime + aya loader.
+# M1 walking skeleton: offer/answer/relay/delete on the UDP-loopback datapath, NIC-free.
+# This is the crate users install: `cargo install siphon-rtp` yields the `siphon-rtp` binary.
 [package]
-name = "siphon-rtp-engine"
+name = "siphon-rtp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "siphon-rtp — pure-Rust, kernel-accelerated RTP media engine daemon for SIPhon"
 
 [[bin]]
-name = "siphon-rtp-engine"
+name = "siphon-rtp"
 path = "src/main.rs"
 
+# The lib target keeps its historical name so the crate's own tests (`use siphon_rtp_engine::…`)
+# stay untouched; only the published package and the installed binary are renamed to `siphon-rtp`.
 [lib]
 name = "siphon_rtp_engine"
 path = "src/lib.rs"
 
 [dependencies]
-siphon-rtp-proto = { path = "../siphon-rtp-proto" }
-siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }
+siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.1.0" }
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
 tokio = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
+flume = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -34,8 +39,8 @@ tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-siphon-rtp-proto = { path = "../siphon-rtp-proto" }
-siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }
+siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.1.0" }
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 proptest = { workspace = true }

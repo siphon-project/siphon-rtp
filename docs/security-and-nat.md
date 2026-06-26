@@ -203,12 +203,12 @@ is wrong, and encryption defeats A2 eavesdrop.
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
 
-> **Status (landed):** the **reaper** — `Engine::reap_idle(idle_ticks)` frees calls whose media has
-> been idle, returning their ports/FDs and registry/quota slots. Activity is stamped on every
-> accepted packet against the datapath's logical clock (`now_ticks` / `advance_clock` /
-> `last_activity`); the daemon advances it ~1 tick/s and sweeps. **Remaining:** delivering
-> `Event::MediaTimeout` to SIPhon (needs the server→SIPhon event-push channel, §5); today the reap
-> is logged.
+> **Status (landed):** the **reaper + event delivery** — `Engine::reap_idle(idle_ticks)` frees calls
+> whose media has been idle (returning their ports/FDs and registry/quota slots) and pushes
+> `Event::MediaTimeout` to the owning control connection over the server's per-connection event
+> channel (`Engine::register_client` + the connection `select!`-loop; bounded, drop-on-backpressure).
+> Activity is stamped on every accepted packet against the datapath's logical clock (`now_ticks` /
+> `advance_clock` / `last_activity`); the daemon advances it ~1 tick/s and sweeps.
 
 - Frees ports/FDs (availability), surfaces one-way-audio and failed-NAT cases, and is the non-ICE
   analogue of consent loss.
@@ -312,8 +312,9 @@ inspection:
   the deterministic logical clock). Tests on the UDP-loopback datapath: RTPBleed off-path regression
   (datapath + engine end-to-end), mid-call wrong-SSRC hijack rejected, same-SSRC NAT rebind followed,
   non-RTP (STUN) demux drop, and idle-call reaping.
-- **Remaining:** delivering `Event::MediaTimeout` to SIPhon (needs the event-push channel, §5) and
-  the `/24` source-gate option (§9). Neither blocks the safe `SignalledOnly` default.
+- **Remaining:** the `/24` source-gate option (§9) — a tuning knob, not a gap. **M-S1 is otherwise
+  complete**: layers 1–3 + media-timeout reaping with `Event::MediaTimeout` delivered to SIPhon over
+  the new per-connection event channel.
 
 **M-S2 — Control-plane & DoS hardening.** §5. **Landed:** the bounded media-port pool (clean `offer`
 failure on exhaustion, freed on `delete`); the **per-client call quota**; **per-verb authz** (calls

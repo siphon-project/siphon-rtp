@@ -52,23 +52,45 @@ where
     }
 }
 
-/// Drive one connection: decode frames, dispatch to the engine, write back responses.
+/// Deregisters a client's event sink when its connection ends, on every exit path (clean close,
+/// error, or task drop).
+struct ClientGuard<D: Datapath> {
+    engine: Arc<Engine<D>>,
+    client: ClientId,
+}
+
+impl<D: Datapath> Drop for ClientGuard<D> {
+    fn drop(&mut self) {
+        self.engine.deregister_client(self.client);
+    }
+}
+
+/// Drive one connection: decode request frames and dispatch them, write back responses, and push
+/// the engine's asynchronous events (e.g. `MediaTimeout`) out the same socket.
 async fn handle_connection<D>(
     engine: Arc<Engine<D>>,
     client: ClientId,
     secret: Option<Arc<String>>,
-    mut stream: TcpStream,
+    stream: TcpStream,
 ) -> std::io::Result<()>
 where
     D: Datapath,
 {
+    let events = engine.register_client(client);
+    let _guard = ClientGuard {
+        engine: engine.clone(),
+        client,
+    };
+    // Split so the inbound-read future and the event/response writes borrow disjoint halves.
+    let (mut read_half, mut write_half) = stream.into_split();
+
     // With no configured secret the connection starts authenticated; otherwise it must authenticate
     // before any other command is honoured.
     let mut authenticated = secret.is_none();
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     loop {
-        // Drain every complete frame currently buffered before reading more.
+        // Drain every complete request frame currently buffered, writing each response.
         loop {
             match frame::decode::<Request>(&buffer) {
                 Ok(Some((request, consumed))) => {
@@ -97,7 +119,7 @@ where
                         result,
                     };
                     match frame::encode(&response) {
-                        Ok(bytes) => stream.write_all(&bytes).await?,
+                        Ok(bytes) => write_half.write_all(&bytes).await?,
                         Err(error) => {
                             tracing::error!(%error, "failed to encode control response");
                         }
@@ -111,11 +133,25 @@ where
             }
         }
 
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(()); // peer closed
+        // Wait for more inbound data or an event to push. Both arms are cancellation-safe: a read
+        // that loses the race drops without consuming, and an unreceived event stays queued.
+        tokio::select! {
+            read = read_half.read(&mut chunk) => {
+                let read = read?;
+                if read == 0 {
+                    return Ok(()); // peer closed
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            event = events.recv_async() => {
+                if let Ok(event) = event {
+                    match frame::encode(&event) {
+                        Ok(bytes) => write_half.write_all(&bytes).await?,
+                        Err(error) => tracing::error!(%error, "failed to encode control event"),
+                    }
+                }
+            }
         }
-        buffer.extend_from_slice(&chunk[..read]);
     }
 }
 

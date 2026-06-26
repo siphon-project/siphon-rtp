@@ -16,7 +16,7 @@
 
 use dashmap::DashMap;
 use siphon_rtp_datapath::{Datapath, Endpoint, EndpointId, FlowAction, ForwardRule};
-use siphon_rtp_proto::{CmdResult, Command, ProfileFlags, SessionStats};
+use siphon_rtp_proto::{CmdResult, Command, Event, ProfileFlags, SessionStats};
 
 use crate::sdp::{self, EngineMedia};
 
@@ -65,6 +65,8 @@ pub struct Engine<D: Datapath> {
     max_calls_per_client: usize,
     /// Live call count per client, for the per-client quota.
     client_calls: DashMap<ClientId, usize>,
+    /// Per-client async event sinks, registered by the control server one per connection.
+    events: DashMap<ClientId, flume::Sender<Event>>,
 }
 
 impl<D: Datapath> Engine<D> {
@@ -81,6 +83,7 @@ impl<D: Datapath> Engine<D> {
             calls: DashMap::new(),
             max_calls_per_client,
             client_calls: DashMap::new(),
+            events: DashMap::new(),
         }
     }
 
@@ -96,6 +99,30 @@ impl<D: Datapath> Engine<D> {
     #[must_use]
     pub fn session_count(&self) -> usize {
         self.calls.len()
+    }
+
+    /// Register `client`'s async event sink — one persistent control connection — and return the
+    /// receiver the control server drains to the wire. Bounded: events are dropped under
+    /// backpressure rather than blocking the engine on a slow control consumer.
+    pub fn register_client(&self, client: ClientId) -> flume::Receiver<Event> {
+        let (sender, receiver) = flume::bounded(64);
+        self.events.insert(client, sender);
+        receiver
+    }
+
+    /// Drop `client`'s event sink when its control connection closes.
+    pub fn deregister_client(&self, client: ClientId) {
+        self.events.remove(&client);
+    }
+
+    /// Push an asynchronous event to `client`, dropping it if the client is gone or its queue is
+    /// full (late events are worthless — never block the engine on a slow consumer).
+    fn push_event(&self, client: ClientId, event: Event) {
+        if let Some(sender) = self.events.get(&client) {
+            if sender.try_send(event).is_err() {
+                tracing::debug!(?client, "control event dropped (queue full or closed)");
+            }
+        }
     }
 
     /// Handle one control command from `client`, producing the result to return to the caller.
@@ -423,6 +450,13 @@ impl<D: Datapath> Engine<D> {
                     self.datapath.remove_endpoint(endpoint).await;
                 }
                 self.release_client_call(call.owner);
+                self.push_event(
+                    call.owner,
+                    Event::MediaTimeout {
+                        call_id: call_id.clone(),
+                        from_tag: call.from_tag,
+                    },
+                );
                 reaped.push(call_id);
             }
         }
@@ -1050,5 +1084,37 @@ mod tests {
         engine.datapath().advance_clock(5);
         assert_eq!(engine.reap_idle(5).await, vec!["c".to_string()]);
         assert_eq!(engine.session_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reaping_pushes_a_media_timeout_event_to_the_owner() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(3);
+        let events = engine.register_client(client);
+        let (_phone, addr) = phone().await;
+
+        engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: "gone".into(),
+                    from_tag: "ft".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        engine.datapath().advance_clock(10);
+        assert_eq!(engine.reap_idle(5).await, vec!["gone".to_string()]);
+
+        let event = events.try_recv().expect("a media-timeout event was pushed");
+        assert_eq!(
+            event,
+            Event::MediaTimeout {
+                call_id: "gone".into(),
+                from_tag: "ft".into()
+            }
+        );
     }
 }
