@@ -8,7 +8,9 @@
 
 pub mod bridge;
 pub mod dtmf;
+pub mod fanout;
 pub mod jitter;
 pub mod leg;
 pub mod rtcp;
 pub mod rtp;
+pub mod wav;
