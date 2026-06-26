@@ -27,8 +27,9 @@ pub enum SdpError {
 /// Line ending emitted by the rewriter (SDP mandates CRLF; RFC 4566 §5).
 const CRLF: &str = "\r\n";
 
-/// The remote audio transport advertised by an SDP, plus its RTCP multiplexing intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The remote audio transport advertised by an SDP, plus its RTCP multiplexing intent and any ICE
+/// credentials it offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaInfo {
     /// Remote RTP address (the audio `c=`/`m=audio` transport).
     pub remote_rtp: SocketAddr,
@@ -37,6 +38,18 @@ pub struct MediaInfo {
     pub remote_rtcp: SocketAddr,
     /// Whether the stream offered `a=rtcp-mux` (RTP and RTCP share one port, RFC 5761).
     pub rtcp_mux: bool,
+    /// The peer's ICE username fragment (`a=ice-ufrag`), if it offered ICE (RFC 8445).
+    pub ice_ufrag: Option<String>,
+    /// The peer's ICE password (`a=ice-pwd`), if it offered ICE.
+    pub ice_pwd: Option<String>,
+}
+
+impl MediaInfo {
+    /// Whether the peer offered ICE (carries an `a=ice-ufrag`).
+    #[must_use]
+    pub fn is_ice(&self) -> bool {
+        self.ice_ufrag.is_some()
+    }
 }
 
 /// The engine endpoints to advertise in a rewritten SDP.
@@ -66,6 +79,9 @@ struct AudioScan {
     rtcp_mux: bool,
     /// `a=rtcp:` line within the audio section: (line index, port).
     audio_rtcp: Option<(usize, u16)>,
+    /// Peer ICE credentials (`a=ice-ufrag` / `a=ice-pwd`), session- or media-level.
+    ice_ufrag: Option<String>,
+    ice_pwd: Option<String>,
 }
 
 fn parse_connection_addr(value: &str) -> Option<IpAddr> {
@@ -101,6 +117,8 @@ fn scan(sdp: &str) -> AudioScan {
         audio_conn: None,
         rtcp_mux: false,
         audio_rtcp: None,
+        ice_ufrag: None,
+        ice_pwd: None,
     };
     let mut seen_media = false;
     let mut in_audio = false;
@@ -132,11 +150,22 @@ fn scan(sdp: &str) -> AudioScan {
                     }
                 }
             }
-            "a" if in_audio => {
-                if value == "rtcp-mux" {
-                    scan.rtcp_mux = true;
-                } else if let Some(port) = parse_rtcp_attr(value) {
-                    scan.audio_rtcp = Some((index, port));
+            "a" => {
+                // ICE credentials may be session- or media-level; media-level overrides.
+                if let Some(ufrag) = value.strip_prefix("ice-ufrag:") {
+                    if in_audio || scan.ice_ufrag.is_none() {
+                        scan.ice_ufrag = Some(ufrag.trim().to_string());
+                    }
+                } else if let Some(pwd) = value.strip_prefix("ice-pwd:") {
+                    if in_audio || scan.ice_pwd.is_none() {
+                        scan.ice_pwd = Some(pwd.trim().to_string());
+                    }
+                } else if in_audio {
+                    if value == "rtcp-mux" {
+                        scan.rtcp_mux = true;
+                    } else if let Some(port) = parse_rtcp_attr(value) {
+                        scan.audio_rtcp = Some((index, port));
+                    }
                 }
             }
             _ => {}
@@ -166,12 +195,38 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         remote_rtp,
         remote_rtcp,
         rtcp_mux: scan.rtcp_mux,
+        ice_ufrag: scan.ice_ufrag.clone(),
+        ice_pwd: scan.ice_pwd.clone(),
     })
 }
 
 /// Parse the remote audio transport info from an SDP without rewriting it.
 pub fn parse(sdp: &str) -> Result<MediaInfo, SdpError> {
     media_info(&scan(sdp))
+}
+
+/// ICE-lite credentials to advertise in a rewritten SDP: `a=ice-lite` (session-level) plus
+/// `a=ice-ufrag` / `a=ice-pwd` and a host `a=candidate` for the engine's media address.
+#[derive(Debug, Clone, Copy)]
+pub struct IceAdvertisement<'a> {
+    /// The engine's local ICE username fragment.
+    pub ufrag: &'a str,
+    /// The engine's local ICE password.
+    pub pwd: &'a str,
+}
+
+/// Host-candidate priority (RFC 8445 §5.1.2): type-pref 126, local-pref 65535, component 1 (RTP).
+const HOST_CANDIDATE_PRIORITY: u32 = (126 << 24) | (65535 << 8) | 255;
+
+/// Whether `line` is an ICE attribute we re-originate (so the peer's copy is dropped on rewrite).
+fn is_ice_attribute(line: &str) -> bool {
+    line == "a=ice-lite"
+        || line.starts_with("a=ice-ufrag:")
+        || line.starts_with("a=ice-pwd:")
+        || line.starts_with("a=ice-options:")
+        || line.starts_with("a=candidate:")
+        || line.starts_with("a=remote-candidates:")
+        || line.starts_with("a=end-of-candidates")
 }
 
 /// Rewrite the audio stream's RTP/RTCP transport to `engine`, returning the new SDP and the remote
@@ -181,7 +236,15 @@ pub fn parse(sdp: &str) -> Result<MediaInfo, SdpError> {
 /// `m=audio` port are rewritten to `engine.rtp`. For non-mux (`engine.rtcp = Some`), an `a=rtcp:`
 /// line is rewritten or inserted for the engine RTCP port; for mux (`engine.rtcp = None`), any
 /// `a=rtcp:` line is dropped (RTCP rides the RTP port).
-pub fn rewrite(sdp: &str, engine: EngineMedia) -> Result<Rewritten, SdpError> {
+///
+/// When `ice` is `Some`, the engine re-originates ICE as ICE-lite: the peer's ICE attributes are
+/// dropped and replaced with `a=ice-lite` plus the engine's own `a=ice-ufrag`/`a=ice-pwd` and a host
+/// `a=candidate` for the engine RTP address (RFC 8445).
+pub fn rewrite(
+    sdp: &str,
+    engine: EngineMedia,
+    ice: Option<IceAdvertisement<'_>>,
+) -> Result<Rewritten, SdpError> {
     let scan = scan(sdp);
     let media = media_info(&scan)?;
     let (media_index, _) = scan.audio_media.ok_or(SdpError::NoAudioMedia)?;
@@ -194,13 +257,30 @@ pub fn rewrite(sdp: &str, engine: EngineMedia) -> Result<Rewritten, SdpError> {
     let mut lines: Vec<String> = Vec::new();
     for (index, raw_line) in sdp.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        // Re-originating ICE: drop the peer's ICE attributes; we advertise our own below.
+        if ice.is_some() && is_ice_attribute(line) {
+            continue;
+        }
         if index == media_index {
+            // `a=ice-lite` is session-level — emit it just before the media line (end of session).
+            if ice.is_some() {
+                lines.push("a=ice-lite".to_string());
+            }
             lines.push(rewrite_media_line(line, engine.rtp.port()));
             // Insert a fresh a=rtcp line only if there is no existing one to rewrite in place.
             if let Some(rtcp) = engine.rtcp {
                 if rtcp_index.is_none() {
                     lines.push(format!("a=rtcp:{}", rtcp.port()));
                 }
+            }
+            if let Some(ice) = ice {
+                lines.push(format!("a=ice-ufrag:{}", ice.ufrag));
+                lines.push(format!("a=ice-pwd:{}", ice.pwd));
+                lines.push(format!(
+                    "a=candidate:1 1 UDP {HOST_CANDIDATE_PRIORITY} {} {} typ host",
+                    engine.rtp.ip(),
+                    engine.rtp.port()
+                ));
             }
         } else if index == conn_index {
             lines.push(format!("c=IN IP4 {}", engine.rtp.ip()));
@@ -284,7 +364,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine).expect("rewrite");
+        let result = rewrite(&sdp, engine, None).expect("rewrite");
         assert_eq!(result.media.remote_rtp, "203.0.113.7:49170".parse().unwrap());
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8 96"));
@@ -303,7 +383,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine).expect("rewrite");
+        let result = rewrite(&sdp, engine, None).expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"));
         assert!(!result.sdp.contains("53000"));
         assert_eq!(result.sdp.matches("a=rtcp:").count(), 1, "no duplicate a=rtcp");
@@ -318,7 +398,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine).expect("rewrite");
+        let result = rewrite(&sdp, engine, None).expect("rewrite");
         assert!(!result.sdp.contains("a=rtcp:"), "explicit a=rtcp dropped under mux");
         assert!(result.sdp.contains("a=rtcp-mux"), "mux flag preserved");
     }
@@ -330,7 +410,7 @@ mod tests {
             rtp: "127.0.0.1:41000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(sdp, engine).expect("rewrite");
+        let result = rewrite(sdp, engine, None).expect("rewrite");
         assert_eq!(result.media.remote_rtp, "198.51.100.9:5000".parse().unwrap());
         assert!(result.sdp.contains("c=IN IP4 10.0.0.1"));
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
@@ -361,7 +441,71 @@ mod tests {
                 rtp: "192.0.2.1:10000".parse().expect("addr"),
                 rtcp: None,
             };
-            let _ = rewrite(&text, engine);
+            let _ = rewrite(&text, engine, None);
         }
+    }
+
+    fn ice_offer(addr: &str, port: u16) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {addr}\r\nt=0 0\r\n\
+             a=ice-ufrag:PEERUF\r\na=ice-pwd:peerpassword01234567\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:1 1 UDP 2130706431 {addr} {port} typ host\r\n"
+        )
+    }
+
+    #[test]
+    fn parse_extracts_ice_credentials() {
+        let info = parse(&ice_offer("203.0.113.7", 49170)).expect("parse");
+        assert!(info.is_ice());
+        assert_eq!(info.ice_ufrag.as_deref(), Some("PEERUF"));
+        assert_eq!(info.ice_pwd.as_deref(), Some("peerpassword01234567"));
+    }
+
+    #[test]
+    fn non_ice_offer_has_no_credentials() {
+        let info = parse(&offer("203.0.113.7", 49170)).expect("parse");
+        assert!(!info.is_ice());
+        assert!(info.ice_ufrag.is_none());
+    }
+
+    #[test]
+    fn rewrite_re_originates_ice_as_ice_lite() {
+        let sdp = ice_offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let advert = IceAdvertisement {
+            ufrag: "ENGUF",
+            pwd: "engpassword01234567",
+        };
+        let result = rewrite(&sdp, engine, Some(advert)).expect("rewrite");
+
+        // Our credentials and posture are advertised.
+        assert!(result.sdp.contains("a=ice-lite"));
+        assert!(result.sdp.contains("a=ice-ufrag:ENGUF"));
+        assert!(result.sdp.contains("a=ice-pwd:engpassword01234567"));
+        assert!(result
+            .sdp
+            .contains("a=candidate:1 1 UDP 2130706431 127.0.0.1 40000 typ host"));
+        // The peer's ICE attributes are gone.
+        assert!(!result.sdp.contains("PEERUF"));
+        assert!(!result.sdp.contains("peerpassword01234567"));
+        assert!(!result.sdp.contains("203.0.113.7"));
+        // The parsed media still reflects the peer's transport + ICE creds.
+        assert_eq!(result.media.ice_ufrag.as_deref(), Some("PEERUF"));
+    }
+
+    #[test]
+    fn rewrite_without_ice_leaves_no_ice_lines() {
+        let sdp = offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let result = rewrite(&sdp, engine, None).expect("rewrite");
+        assert!(!result.sdp.contains("a=ice-lite"));
+        assert!(!result.sdp.contains("a=ice-ufrag"));
     }
 }

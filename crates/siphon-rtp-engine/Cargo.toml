@@ -29,6 +29,7 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 flume = { workspace = true }
+getrandom = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

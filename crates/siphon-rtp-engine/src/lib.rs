@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod engine;
+pub mod ice;
 pub mod sdp;
 pub mod server;
 

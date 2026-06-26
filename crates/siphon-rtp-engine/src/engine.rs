@@ -236,7 +236,7 @@ impl<D: Datapath> Engine<D> {
             rtp: far_rtp.local_addr,
             rtcp: far_rtcp.map(|endpoint| endpoint.local_addr),
         };
-        let rewritten = match sdp::rewrite(sdp, engine) {
+        let rewritten = match sdp::rewrite(sdp, engine, None) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 self.free(&endpoints).await;
@@ -308,7 +308,7 @@ impl<D: Datapath> Engine<D> {
             rtp: near.rtp.local_addr,
             rtcp: near.rtcp.map(|endpoint| endpoint.local_addr),
         };
-        let rewritten = match sdp::rewrite(sdp, engine) {
+        let rewritten = match sdp::rewrite(sdp, engine, None) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 return CmdResult::Error {
