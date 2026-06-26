@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
-use siphon_rtp_engine::{server, Engine};
+use siphon_rtp_engine::{server, ClientId, Engine};
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_turn::{tls, SystemUnixClock, Turn, TurnConfig};
 use tokio::net::{TcpListener, UdpSocket};
@@ -29,6 +29,11 @@ struct Args {
     /// JSON-over-TCP control listen address.
     #[arg(long, default_value = "127.0.0.1:8080")]
     control: SocketAddr,
+
+    /// rtpengine NG/bencode control listen address (UDP) — lets SIPhon / Kamailio / OpenSIPS drive
+    /// the engine over the rtpengine protocol unchanged. Off unless given (rtpengine default :22222).
+    #[arg(long)]
+    ng: Option<SocketAddr>,
 
     /// TURN UDP listen address (`turn:`). TURN is enabled when `SIPHON_RTP_TURN_REALM` and
     /// `SIPHON_RTP_TURN_SECRET` are set; at least one `--turn-*` listener must then be given.
@@ -114,6 +119,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             Err(_) => tracing::warn!("SIPHON_RTP_HEP_COLLECTOR is not a valid socket address"),
         }
+    }
+
+    // Optional rtpengine NG/bencode control front-end (UDP) — the drop-in for SIPhon/Kamailio/
+    // OpenSIPS. NG is unauthenticated by design (trusted control network); the per-client call
+    // quota still applies via one dedicated NG client id. DTMF events go out-of-band (a later step).
+    if let Some(ng_addr) = args.ng {
+        let ng_socket = UdpSocket::bind(ng_addr).await?;
+        tracing::info!(ng = %ng_addr, "rtpengine NG control listening");
+        let ng_engine = engine.clone();
+        tokio::spawn(async move {
+            const NG_CLIENT: ClientId = ClientId(u64::MAX);
+            let handler = move |command| {
+                let engine = ng_engine.clone();
+                async move { engine.handle(NG_CLIENT, command).await }
+            };
+            if let Err(error) = siphon_rtp_ngcompat::server::serve(ng_socket, handler).await {
+                tracing::error!(%error, "NG control listener stopped");
+            }
+        });
     }
 
     server::serve_with_auth(engine, listener, control_secret).await?;

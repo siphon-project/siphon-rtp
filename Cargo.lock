@@ -1326,6 +1326,7 @@ dependencies = [
  "proptest",
  "siphon-rtp-datapath",
  "siphon-rtp-hep",
+ "siphon-rtp-ngcompat",
  "siphon-rtp-proto",
  "siphon-rtp-stun",
  "siphon-rtp-turn",
@@ -1393,6 +1394,16 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "siphon-rtp-ngcompat"
+version = "0.1.0"
+dependencies = [
+ "siphon-rtp-proto",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
