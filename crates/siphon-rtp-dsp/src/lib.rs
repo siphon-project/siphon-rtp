@@ -6,5 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod resample;
+pub mod vad;
 
 pub use resample::{ResampleError, Resampler};
+pub use vad::EnergyVad;
