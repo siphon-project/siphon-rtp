@@ -23,4 +23,4 @@ if ! ip link show siphon0 >/dev/null 2>&1; then
   echo "dev-entrypoint: veth siphon0 <-> siphon-peer up (10.201.0.1/2)" >&2
 fi
 
-exec /usr/local/bin/siphon-rtp-engine "$@"
+exec /usr/local/bin/siphon-rtp "$@"

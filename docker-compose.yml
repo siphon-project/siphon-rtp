@@ -9,6 +9,12 @@
 # XDP is opt-in until the eBPF crate lands: both profiles build the UDP-loopback binary today
 # (proving the caps/bpffs/veth wiring). Set CARGO_FEATURES=xdp under build.args to compile the aya
 # XDP datapath. With no caps at all the same image falls back to the UDP backend with a warning.
+#
+# The built-in TURN server (a coturn replacement) is enabled by SIPHON_RTP_TURN_REALM +
+# SIPHON_RTP_TURN_SECRET (coturn `static-auth-secret` REST profile) and serves turn:3478 (UDP+TCP)
+# below; turns:5349 (TLS) needs a mounted cert/key (see the commented block). NOTE: with the
+# UDP-loopback backend the relay leg binds loopback, so allocations + signalling work but media only
+# relays to loopback peers — real external relay needs the XDP/public datapath (CARGO_FEATURES=xdp).
 
 services:
   siphon-rtp-dev:
@@ -28,9 +34,29 @@ services:
       memlock: -1 # locked memory for BPF maps / UMEM
     volumes:
       - /sys/fs/bpf:/sys/fs/bpf:rw # bpffs for pinned maps
+      # turns: TLS — mount a cert/key and add --turn-tls below.
+      # - ./deploy/turn-tls:/etc/siphon-rtp/turn-tls:ro
+    environment:
+      # Dev credentials — CHANGE for anything reachable. coturn REST profile (static-auth-secret).
+      SIPHON_RTP_TURN_REALM: "${SIPHON_RTP_TURN_REALM:-siphon.local}"
+      SIPHON_RTP_TURN_SECRET: "${SIPHON_RTP_TURN_SECRET:-dev-insecure-secret-change-me}"
     ports:
       - "8080:8080" # JSON-over-TCP control
-    command: ["--control", "0.0.0.0:8080"]
+      - "3478:3478/udp" # TURN over UDP (turn:)
+      - "3478:3478/tcp" # TURN over TCP (turn:)
+      # - "5349:5349/tcp" # TURN over TLS (turns:) — enable with --turn-tls + a mounted cert
+    command:
+      [
+        "--control",
+        "0.0.0.0:8080",
+        "--turn-udp",
+        "0.0.0.0:3478",
+        "--turn-tcp",
+        "0.0.0.0:3478",
+        # "--turn-tls", "0.0.0.0:5349",
+        # "--turn-tls-cert", "/etc/siphon-rtp/turn-tls/cert.pem",
+        # "--turn-tls-key", "/etc/siphon-rtp/turn-tls/key.pem",
+      ]
 
   siphon-rtp-prod:
     profiles: ["prod"]
@@ -47,4 +73,24 @@ services:
       memlock: -1
     volumes:
       - /sys/fs/bpf:/sys/fs/bpf:rw
-    command: ["--control", "0.0.0.0:8080"]
+      # - ./deploy/turn-tls:/etc/siphon-rtp/turn-tls:ro # turns: cert/key
+    environment:
+      # Required in prod — fail fast if unset (no insecure default for a reachable relay).
+      SIPHON_RTP_TURN_REALM: "${SIPHON_RTP_TURN_REALM:?set the TURN realm}"
+      SIPHON_RTP_TURN_SECRET: "${SIPHON_RTP_TURN_SECRET:?set the TURN static-auth-secret}"
+    # Host network: TURN binds the host's 3478 (and 5349 for turns:). --turn-relay-ip advertises the
+    # host's reachable IP in XOR-RELAYED-ADDRESS when the relay socket's bound IP differs.
+    command:
+      [
+        "--control",
+        "0.0.0.0:8080",
+        "--turn-udp",
+        "0.0.0.0:3478",
+        "--turn-tcp",
+        "0.0.0.0:3478",
+        "--turn-relay-ip",
+        "${SIPHON_RTP_RELAY_IP:-0.0.0.0}",
+        # "--turn-tls", "0.0.0.0:5349",
+        # "--turn-tls-cert", "/etc/siphon-rtp/turn-tls/cert.pem",
+        # "--turn-tls-key", "/etc/siphon-rtp/turn-tls/key.pem",
+      ]

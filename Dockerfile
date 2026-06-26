@@ -33,24 +33,24 @@ FROM chef AS builder
 ARG CARGO_FEATURES=""
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl \
-        --recipe-path recipe.json -p siphon-rtp-engine ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
+        --recipe-path recipe.json -p siphon-rtp ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 COPY . .
 RUN cargo build --release --target x86_64-unknown-linux-musl \
-        -p siphon-rtp-engine ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
- && cp target/x86_64-unknown-linux-musl/release/siphon-rtp-engine /siphon-rtp-engine
+        -p siphon-rtp ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
+ && cp target/x86_64-unknown-linux-musl/release/siphon-rtp /siphon-rtp
 
 # ── Runtime (prod): distroless static, just the binary ───────────────────────────────────
 FROM gcr.io/distroless/static-debian12 AS runtime
-COPY --from=builder /siphon-rtp-engine /usr/local/bin/siphon-rtp-engine
+COPY --from=builder /siphon-rtp /usr/local/bin/siphon-rtp
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/siphon-rtp-engine"]
+ENTRYPOINT ["/usr/local/bin/siphon-rtp"]
 CMD ["--control", "0.0.0.0:8080"]
 
 # ── Runtime (dev): shell + iproute2 to set up a veth pair for SKB-mode XDP testing ───────
 FROM debian:trixie-slim AS runtime-dev
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /siphon-rtp-engine /usr/local/bin/siphon-rtp-engine
+COPY --from=builder /siphon-rtp /usr/local/bin/siphon-rtp
 COPY deploy/dev-entrypoint.sh /usr/local/bin/dev-entrypoint.sh
 RUN chmod +x /usr/local/bin/dev-entrypoint.sh
 EXPOSE 8080
