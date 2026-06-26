@@ -10,4 +10,4 @@ pub mod engine;
 pub mod sdp;
 pub mod server;
 
-pub use engine::Engine;
+pub use engine::{ClientId, Engine};

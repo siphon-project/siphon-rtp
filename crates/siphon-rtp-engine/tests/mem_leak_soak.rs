@@ -9,8 +9,11 @@
 //! real leak (a stranded `Call`, a recv task whose socket/buffer never freed).
 
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
-use siphon_rtp_engine::Engine;
+use siphon_rtp_engine::{ClientId, Engine};
 use siphon_rtp_proto::{CmdResult, Command};
+
+/// The soak drives the engine as a single control client.
+const CLIENT: ClientId = ClientId(1);
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -40,7 +43,7 @@ async fn offer_answer_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize)
     let call_id = format!("soak-{index}");
 
     let offer = engine
-        .handle(Command::Offer {
+        .handle(CLIENT, Command::Offer {
             call_id: call_id.clone(),
             from_tag: "tag-a".into(),
             sdp: sdp_for("198.51.100.1", 40_000),
@@ -50,7 +53,7 @@ async fn offer_answer_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize)
     assert_ok(&offer, "offer");
 
     let answer = engine
-        .handle(Command::Answer {
+        .handle(CLIENT, Command::Answer {
             call_id: call_id.clone(),
             from_tag: "tag-a".into(),
             to_tag: "tag-b".into(),
@@ -61,7 +64,7 @@ async fn offer_answer_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize)
     assert_ok(&answer, "answer");
 
     let delete = engine
-        .handle(Command::Delete {
+        .handle(CLIENT, Command::Delete {
             call_id,
             from_tag: "tag-a".into(),
             to_tag: None,

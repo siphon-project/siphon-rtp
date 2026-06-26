@@ -20,6 +20,13 @@ use siphon_rtp_proto::{CmdResult, Command, ProfileFlags, SessionStats};
 
 use crate::sdp::{self, EngineMedia};
 
+/// Identity of a control client — one persistent JSON-over-TCP connection. A call is owned by the
+/// client that created it via `offer`; only that client may answer, query, or delete it (A3 —
+/// docs/security-and-nat.md §5). This assumes one persistent control connection per SIPhon instance;
+/// a shared identity across a connection pool needs the deferred control-channel auth.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ClientId(pub u64);
+
 /// One side of a call: an RTP endpoint, an optional companion RTCP endpoint (absent under
 /// rtcp-mux), and the remote addresses learned from that side's SDP.
 #[derive(Debug, Clone, Copy)]
@@ -37,9 +44,11 @@ impl Leg {
     }
 }
 
-/// A negotiated (or half-negotiated) call: its two legs.
+/// A negotiated (or half-negotiated) call: its owner and its two legs.
 #[derive(Debug)]
 struct Call {
+    /// The control client that created the call; only it may answer/query/delete it.
+    owner: ClientId,
     from_tag: String,
     to_tag: Option<String>,
     near: Leg,
@@ -50,14 +59,26 @@ struct Call {
 pub struct Engine<D: Datapath> {
     datapath: D,
     calls: DashMap<String, Call>,
+    /// Maximum concurrent calls per control client; `usize::MAX` is unbounded.
+    max_calls_per_client: usize,
+    /// Live call count per client, for the per-client quota.
+    client_calls: DashMap<ClientId, usize>,
 }
 
 impl<D: Datapath> Engine<D> {
-    /// Create an engine over `datapath`.
+    /// Create an engine over `datapath` with no per-client call quota.
     pub fn new(datapath: D) -> Self {
+        Self::with_max_calls_per_client(datapath, usize::MAX)
+    }
+
+    /// Create an engine that admits at most `max_calls_per_client` concurrent calls per control
+    /// client — a soft DoS quota (the datapath media-port pool is the hard cap).
+    pub fn with_max_calls_per_client(datapath: D, max_calls_per_client: usize) -> Self {
         Self {
             datapath,
             calls: DashMap::new(),
+            max_calls_per_client,
+            client_calls: DashMap::new(),
         }
     }
 
@@ -75,8 +96,8 @@ impl<D: Datapath> Engine<D> {
         self.calls.len()
     }
 
-    /// Handle one control command, producing the result to return to the caller.
-    pub async fn handle(&self, command: Command) -> CmdResult {
+    /// Handle one control command from `client`, producing the result to return to the caller.
+    pub async fn handle(&self, client: ClientId, command: Command) -> CmdResult {
         match command {
             Command::Ping => CmdResult::Pong,
             Command::Offer {
@@ -84,16 +105,19 @@ impl<D: Datapath> Engine<D> {
                 from_tag,
                 sdp,
                 ..
-            } => self.offer(call_id, from_tag, &sdp).await,
+            } => self.offer(client, call_id, from_tag, &sdp).await,
             Command::Answer {
                 call_id,
                 from_tag,
                 to_tag,
                 sdp,
                 profile,
-            } => self.answer(&call_id, &from_tag, to_tag, &sdp, &profile).await,
-            Command::Delete { call_id, .. } => self.delete(&call_id).await,
-            Command::Query { call_id, .. } => self.query(&call_id),
+            } => {
+                self.answer(client, &call_id, &from_tag, to_tag, &sdp, &profile)
+                    .await
+            }
+            Command::Delete { call_id, .. } => self.delete(client, &call_id).await,
+            Command::Query { call_id, .. } => self.query(client, &call_id),
             other => CmdResult::Error {
                 reason: format!("unsupported command: {}", command_name(&other)),
             },
@@ -123,7 +147,38 @@ impl<D: Datapath> Engine<D> {
         }
     }
 
-    async fn offer(&self, call_id: String, from_tag: String, sdp: &str) -> CmdResult {
+    /// Current live call count for `client`.
+    fn client_call_count(&self, client: ClientId) -> usize {
+        self.client_calls.get(&client).map_or(0, |count| *count)
+    }
+
+    /// Release one call from `client`'s quota, dropping the entry when it reaches zero so the map
+    /// does not retain rows for disconnected clients.
+    fn release_client_call(&self, client: ClientId) {
+        let mut drained = false;
+        if let Some(mut count) = self.client_calls.get_mut(&client) {
+            *count = count.saturating_sub(1);
+            drained = *count == 0;
+        }
+        if drained {
+            self.client_calls.remove_if(&client, |_, &count| count == 0);
+        }
+    }
+
+    async fn offer(
+        &self,
+        client: ClientId,
+        call_id: String,
+        from_tag: String,
+        sdp: &str,
+    ) -> CmdResult {
+        // Soft per-client call quota (the datapath media-port pool is the hard cap). Reject before
+        // allocating anything. (A3 / DoS — docs/security-and-nat.md §5.)
+        if self.client_call_count(client) >= self.max_calls_per_client {
+            return CmdResult::Error {
+                reason: "per-client call quota exceeded".to_string(),
+            };
+        }
         let info = match sdp::parse(sdp) {
             Ok(info) => info,
             Err(error) => {
@@ -162,9 +217,11 @@ impl<D: Datapath> Engine<D> {
             }
         };
 
+        *self.client_calls.entry(client).or_insert(0) += 1;
         self.calls.insert(
             call_id,
             Call {
+                owner: client,
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -186,15 +243,17 @@ impl<D: Datapath> Engine<D> {
 
     async fn answer(
         &self,
+        client: ClientId,
         call_id: &str,
         from_tag: &str,
         to_tag: String,
         sdp: &str,
         profile: &ProfileFlags,
     ) -> CmdResult {
-        // Snapshot the leg endpoints + near remotes under the guard, then release it.
+        // Snapshot the leg endpoints under the guard, then release it. Only the owning client may
+        // answer (A3 — docs/security-and-nat.md §5); to anyone else the call is unknown.
         let (near, far) = match self.calls.get(call_id) {
-            Some(call) => {
+            Some(call) if call.owner == client => {
                 if call.from_tag != from_tag {
                     return CmdResult::Error {
                         reason: "from_tag mismatch on answer".to_string(),
@@ -202,7 +261,7 @@ impl<D: Datapath> Engine<D> {
                 }
                 (call.near, call.far)
             }
-            None => return unknown_call(call_id),
+            _ => return unknown_call(call_id),
         };
 
         let info = match sdp::parse(sdp) {
@@ -288,12 +347,15 @@ impl<D: Datapath> Engine<D> {
         ok_sdp(rewritten.sdp, Some(to_tag))
     }
 
-    async fn delete(&self, call_id: &str) -> CmdResult {
-        match self.calls.remove(call_id) {
+    async fn delete(&self, client: ClientId, call_id: &str) -> CmdResult {
+        // Only the client that created the call may tear it down (A3 — docs §5). A non-owner (or a
+        // missing call) gets `unknown_call`, so it cannot even probe for a call's existence.
+        match self.calls.remove_if(call_id, |_, call| call.owner == client) {
             Some((_, call)) => {
                 for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
                     self.datapath.remove_endpoint(endpoint).await;
                 }
+                self.release_client_call(call.owner);
                 CmdResult::Ok {
                     sdp: None,
                     duration_ms: None,
@@ -305,10 +367,14 @@ impl<D: Datapath> Engine<D> {
         }
     }
 
-    fn query(&self, call_id: &str) -> CmdResult {
+    fn query(&self, client: ClientId, call_id: &str) -> CmdResult {
         let Some(call) = self.calls.get(call_id) else {
             return unknown_call(call_id);
         };
+        // A call is invisible to clients that do not own it (A3 — docs §5).
+        if call.owner != client {
+            return unknown_call(call_id);
+        }
         let mut stats = SessionStats::default();
         for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
             let leg = self.datapath.stats(endpoint).unwrap_or_default();
@@ -395,6 +461,9 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
 
+    /// The default control client for tests that don't exercise per-client isolation.
+    const CLIENT: ClientId = ClientId(1);
+
     async fn phone() -> (UdpSocket, SocketAddr) {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind");
         let addr = socket.local_addr().expect("addr");
@@ -431,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn ping_pongs() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
-        assert_eq!(engine.handle(Command::Ping).await, CmdResult::Pong);
+        assert_eq!(engine.handle(CLIENT, Command::Ping).await, CmdResult::Pong);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -441,7 +510,7 @@ mod tests {
         let (phone_b, addr_b) = phone().await;
 
         let offer = engine
-            .handle(Command::Offer {
+            .handle(CLIENT, Command::Offer {
                 call_id: "call-1".into(),
                 from_tag: "tag-a".into(),
                 sdp: sdp_for(addr_a, false),
@@ -451,7 +520,7 @@ mod tests {
         let far_rtp = sdp::parse(&ok_sdp_text(&offer)).expect("parse far").remote_rtp;
 
         let answer = engine
-            .handle(Command::Answer {
+            .handle(CLIENT, Command::Answer {
                 call_id: "call-1".into(),
                 from_tag: "tag-a".into(),
                 to_tag: "tag-b".into(),
@@ -481,7 +550,7 @@ mod tests {
         let mut stats = SessionStats::default();
         for _ in 0..50 {
             if let CmdResult::Ok { stats: Some(s), .. } = engine
-                .handle(Command::Query {
+                .handle(CLIENT, Command::Query {
                     call_id: "call-1".into(),
                     from_tag: "tag-a".into(),
                     to_tag: None,
@@ -499,7 +568,7 @@ mod tests {
         assert_eq!(stats.packets_out, 2);
 
         let delete = engine
-            .handle(Command::Delete {
+            .handle(CLIENT, Command::Delete {
                 call_id: "call-1".into(),
                 from_tag: "tag-a".into(),
                 to_tag: None,
@@ -524,7 +593,7 @@ mod tests {
             addr_rtcp_a.port()
         );
         let offer = engine
-            .handle(Command::Offer {
+            .handle(CLIENT, Command::Offer {
                 call_id: "rtcp-call".into(),
                 from_tag: "a".into(),
                 sdp: offer_sdp,
@@ -540,7 +609,7 @@ mod tests {
             addr_rtcp_b.port()
         );
         let answer = engine
-            .handle(Command::Answer {
+            .handle(CLIENT, Command::Answer {
                 call_id: "rtcp-call".into(),
                 from_tag: "a".into(),
                 to_tag: "b".into(),
@@ -571,7 +640,7 @@ mod tests {
         let (phone_b, addr_b) = phone().await;
 
         let offer = engine
-            .handle(Command::Offer {
+            .handle(CLIENT, Command::Offer {
                 call_id: "mux".into(),
                 from_tag: "a".into(),
                 sdp: sdp_for(addr_a, true),
@@ -583,7 +652,7 @@ mod tests {
         assert!(!ok_sdp_text(&offer).contains("a=rtcp:"), "no companion port advertised under mux");
 
         let answer = engine
-            .handle(Command::Answer {
+            .handle(CLIENT, Command::Answer {
                 call_id: "mux".into(),
                 from_tag: "a".into(),
                 to_tag: "b".into(),
@@ -604,7 +673,7 @@ mod tests {
     async fn answer_and_delete_unknown_call_error() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let answer = engine
-            .handle(Command::Answer {
+            .handle(CLIENT, Command::Answer {
                 call_id: "nope".into(),
                 from_tag: "a".into(),
                 to_tag: "b".into(),
@@ -615,7 +684,7 @@ mod tests {
         assert!(matches!(answer, CmdResult::Error { .. }));
 
         let delete = engine
-            .handle(Command::Delete {
+            .handle(CLIENT, Command::Delete {
                 call_id: "nope".into(),
                 from_tag: "a".into(),
                 to_tag: None,
@@ -628,7 +697,7 @@ mod tests {
     async fn unsupported_command_reports_error() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let result = engine
-            .handle(Command::StopMedia {
+            .handle(CLIENT, Command::StopMedia {
                 call_id: "c".into(),
                 from_tag: "f".into(),
             })
@@ -665,7 +734,7 @@ mod tests {
         let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
 
         let offer = engine
-            .handle(Command::Offer {
+            .handle(CLIENT, Command::Offer {
                 call_id: "rtpbleed".into(),
                 from_tag: "a".into(),
                 sdp: sdp_for(addr_a, false),
@@ -675,7 +744,7 @@ mod tests {
         let far = sdp::parse(&ok_sdp_text(&offer)).expect("far");
 
         let answer = engine
-            .handle(Command::Answer {
+            .handle(CLIENT, Command::Answer {
                 call_id: "rtpbleed".into(),
                 from_tag: "a".into(),
                 to_tag: "b".into(),
@@ -716,7 +785,7 @@ mod tests {
         let (_phone_b, addr_b) = phone().await;
 
         let first = engine
-            .handle(Command::Offer {
+            .handle(CLIENT, Command::Offer {
                 call_id: "c1".into(),
                 from_tag: "a".into(),
                 sdp: sdp_for(addr_a, false),
@@ -726,7 +795,7 @@ mod tests {
         assert!(matches!(first, CmdResult::Ok { .. }), "first offer fits the pool");
 
         let second = engine
-            .handle(Command::Offer {
+            .handle(CLIENT, Command::Offer {
                 call_id: "c2".into(),
                 from_tag: "a".into(),
                 sdp: sdp_for(addr_b, false),
@@ -740,7 +809,7 @@ mod tests {
 
         // Tearing down the first call frees its four ports; the second offer now fits.
         let delete = engine
-            .handle(Command::Delete {
+            .handle(CLIENT, Command::Delete {
                 call_id: "c1".into(),
                 from_tag: "a".into(),
                 to_tag: None,
@@ -748,7 +817,7 @@ mod tests {
             .await;
         assert!(matches!(delete, CmdResult::Ok { .. }));
         let retry = engine
-            .handle(Command::Offer {
+            .handle(CLIENT, Command::Offer {
                 call_id: "c2".into(),
                 from_tag: "a".into(),
                 sdp: sdp_for(addr_b, false),
@@ -756,5 +825,137 @@ mod tests {
             })
             .await;
         assert!(matches!(retry, CmdResult::Ok { .. }), "freed pool admits the call");
+    }
+
+    #[tokio::test]
+    async fn a_call_is_private_to_its_creating_client() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let owner = ClientId(10);
+        let intruder = ClientId(20);
+
+        let offer = engine
+            .handle(
+                owner,
+                Command::Offer {
+                    call_id: "private".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(matches!(offer, CmdResult::Ok { .. }));
+
+        // The intruder cannot see the call: both query and delete report it as unknown.
+        let query = engine
+            .handle(
+                intruder,
+                Command::Query {
+                    call_id: "private".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(query, CmdResult::Error { .. }),
+            "non-owner query is rejected"
+        );
+        let delete = engine
+            .handle(
+                intruder,
+                Command::Delete {
+                    call_id: "private".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(delete, CmdResult::Error { .. }),
+            "non-owner delete is rejected"
+        );
+
+        // The intruder's delete did nothing — the owner still has its call.
+        let owner_query = engine
+            .handle(
+                owner,
+                Command::Query {
+                    call_id: "private".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(owner_query, CmdResult::Ok { .. }),
+            "owner still sees its call"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_client_call_quota_is_enforced_and_freed_on_delete() {
+        let engine = Engine::with_max_calls_per_client(UdpLoopbackDatapath::new(), 1);
+        let client = ClientId(7);
+        let (_a, addr_a) = phone().await;
+        let (_b, addr_b) = phone().await;
+
+        let first = engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: "q1".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(matches!(first, CmdResult::Ok { .. }));
+
+        let second = engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: "q2".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(second, CmdResult::Error { .. }),
+            "over quota is rejected"
+        );
+
+        // Freeing the first call returns the quota slot.
+        let delete = engine
+            .handle(
+                client,
+                Command::Delete {
+                    call_id: "q1".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(delete, CmdResult::Ok { .. }));
+        let retry = engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: "q2".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(retry, CmdResult::Ok { .. }),
+            "freed quota admits the call"
+        );
     }
 }

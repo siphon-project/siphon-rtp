@@ -12,19 +12,23 @@ use siphon_rtp_proto::{frame, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::engine::Engine;
+use crate::engine::{ClientId, Engine};
 
 /// Accept loop: serve control connections against `engine` until the listener errors.
 pub async fn serve<D>(engine: Arc<Engine<D>>, listener: TcpListener) -> std::io::Result<()>
 where
     D: Datapath + 'static,
 {
+    // Each accepted connection gets a distinct identity; a call is private to the connection that
+    // created it (docs/security-and-nat.md §5).
+    let next_client_id = std::sync::atomic::AtomicU64::new(0);
     loop {
         let (stream, peer) = listener.accept().await?;
-        tracing::debug!(%peer, "control connection accepted");
+        let client = ClientId(next_client_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        tracing::debug!(%peer, ?client, "control connection accepted");
         let engine = engine.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(engine, stream).await {
+            if let Err(error) = handle_connection(engine, client, stream).await {
                 tracing::warn!(%peer, %error, "control connection closed with error");
             }
         });
@@ -34,6 +38,7 @@ where
 /// Drive one connection: decode frames, dispatch to the engine, write back responses.
 async fn handle_connection<D>(
     engine: Arc<Engine<D>>,
+    client: ClientId,
     mut stream: TcpStream,
 ) -> std::io::Result<()>
 where
@@ -49,7 +54,7 @@ where
                     buffer.drain(..consumed);
                     let response = Response {
                         id: request.id,
-                        result: engine.handle(request.command).await,
+                        result: engine.handle(client, request.command).await,
                     };
                     match frame::encode(&response) {
                         Ok(bytes) => stream.write_all(&bytes).await?,

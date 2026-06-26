@@ -234,11 +234,12 @@ Distinct from the media latch but part of the same security surface.
   `PoolExhausted`, so `offer` fails cleanly and frees the ports on `delete` instead of exhausting
   host FDs. **Remaining:** a **per-client quota** (needs control-client identity) and wiring the cap
   to daemon config.
-- **Control authz.** `answer` checks `from_tag`, but `Delete` and `Query`
-  ([engine.rs:179](../crates/siphon-rtp-engine/src/engine.rs#L179),
-  [engine.rs:195](../crates/siphon-rtp-engine/src/engine.rs#L195)) do **not** bind to caller
-  identity — any client can tear down or inspect any call. Bind every verb to the authenticated
-  control session that created the call.
+- **Control authz.** **Landed:** every call is owned by the `ClientId` of the control connection
+  that created it via `offer`; `answer` / `query` / `delete` from any other client see the call as
+  unknown (so a client cannot tear down, inspect, or even probe for a call it does not own). The
+  engine threads `ClientId` from the server, which assigns one per accepted connection. **Caveat:**
+  this binds identity to the *connection*; it assumes one persistent control connection per SIPhon
+  instance. A shared identity across a connection pool needs the deferred control-channel auth.
 - **Channel security.** Authenticate the JSON-over-TCP control socket, bind it to a private
   interface, and add TLS (and it becomes mandatory the day SDES key material rides it — §5).
 - **Reflector/amplifier hygiene.** Do not forward toward a destination until it is validated (the
@@ -295,9 +296,10 @@ inspection:
   datapath increment.
 
 **M-S2 — Control-plane & DoS hardening.** §5. **Landed:** the bounded media-port pool (clean `offer`
-failure on exhaustion, freed on `delete`). **Remaining:** per-client quota, per-verb authz, private
-bind + control-channel auth (these need control-client identity and a server→SIPhon event-push
-channel, neither of which exists yet), plus the fuzz/proptest targets from §6 wired into CI.
+failure on exhaustion, freed on `delete`); the **per-client call quota**; and **per-verb authz** —
+calls are private to their creating `ClientId`. **Remaining:** control-channel auth + private bind
+(and, once a server→SIPhon event-push channel exists, surfacing rejections), plus the fuzz/proptest
+targets from §6 wired into CI.
 
 **M-S3 — ICE + consent.** Layer 4: STUN over the layer-1 demux, ICE connectivity checks, consent
 freshness, the `ProfileFlags.ice` modes. Brings the strongest NAT + anti-hijack story for ICE-capable
