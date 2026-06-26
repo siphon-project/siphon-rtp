@@ -32,7 +32,8 @@ attacker). This document defines the one policy that satisfies both.
 > latch is gone; ingress is now **source-gated** and the latch is **SSRC-consistent** (`update_latch`
 > in [`udp.rs`](../crates/siphon-rtp-datapath/src/udp.rs); rules built by `ingress_rule` in
 > [`engine.rs`](../crates/siphon-rtp-engine/src/engine.rs) from the parsed SDP + `ProfileFlags`).
-> Layer 1 (demux) and layer 6 (media-timeout) remain — see §8. The original hole, for the record:
+> Layer 1 (RFC 7983 demux) is in too; only layer 6 (media-timeout) remains — see §8. The original
+> hole, for the record:
 
 [`crates/siphon-rtp-datapath/src/udp.rs`](../crates/siphon-rtp-datapath/src/udp.rs), `recv_loop`:
 
@@ -282,14 +283,14 @@ inspection:
 ## 8. Milestones (priority order for this posture)
 
 **M-S1 — Secure latch (RTPBleed fix + correct NAT).**
-- **Landed:** layer 2 (signalled-source gate) + layer 3 (SSRC-consistent latch) + the §4.7
-  `SourceFilter` / `LatchPolicy` / `ForwardRule` / SSRC latch-state change, wired through
-  `engine::answer` (`ingress_rule`). Tests on the UDP-loopback datapath: RTPBleed off-path
+- **Landed:** layer 1 (RFC 7983 demux) + layer 2 (signalled-source gate) + layer 3 (SSRC-consistent
+  latch) + the §4.7 `SourceFilter` / `LatchPolicy` / `ForwardRule` / SSRC latch-state change, wired
+  through `engine::answer` (`ingress_rule`). Tests on the UDP-loopback datapath: RTPBleed off-path
   regression (datapath + engine end-to-end), mid-call wrong-SSRC hijack rejected, same-SSRC NAT
-  rebind followed.
-- **Remaining:** layer 1 (RFC 7983 demux), layer 6 (media-timeout + `last_seen` + the dead-path
-  `Event`), and the `/24` source-gate option (§9). None block the safe `SignalledOnly` default;
-  this is the next datapath increment.
+  rebind followed, and non-RTP (STUN) demux drop.
+- **Remaining:** layer 6 (media-timeout + `last_seen` + the dead-path `Event`) and the `/24`
+  source-gate option (§9). Neither blocks the safe `SignalledOnly` default; this is the next
+  datapath increment.
 
 **M-S2 — Control-plane & DoS hardening.** §5: bounded port pool, per-client quota, per-verb authz,
 private bind + control-channel auth. Plus the fuzz/proptest targets from §6 wired into CI.

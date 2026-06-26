@@ -89,6 +89,15 @@ async fn recv(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     (buffer[..len].to_vec(), from)
 }
 
+/// A minimal RTP packet (V=2, PT=0/PCMU) carrying `ssrc` — the relay's layer-1 demux only forwards
+/// RTP/RTCP (RFC 7983), so media fixtures must be RTP-shaped.
+fn rtp(ssrc: u32) -> Vec<u8> {
+    let mut packet = vec![0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0];
+    packet.extend_from_slice(&ssrc.to_be_bytes());
+    packet.extend_from_slice(b"voice");
+    packet
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offer_answer_relay_delete_over_tcp_control() {
     // Start the engine + control server on an ephemeral loopback port.
@@ -133,15 +142,15 @@ async fn offer_answer_relay_delete_over_tcp_control() {
     let near_addr = engine_addr(&answer);
 
     // Relay A → B.
-    phone_a.send_to(b"voice-a", near_addr).await.expect("send a");
+    phone_a.send_to(&rtp(0x0A0A_0A0A), near_addr).await.expect("send a");
     let (data, from) = recv(&phone_b).await;
-    assert_eq!(data, b"voice-a");
+    assert_eq!(data, rtp(0x0A0A_0A0A));
     assert_eq!(from, far_addr);
 
     // Relay B → A.
-    phone_b.send_to(b"voice-b", far_addr).await.expect("send b");
+    phone_b.send_to(&rtp(0x0B0B_0B0B), far_addr).await.expect("send b");
     let (data, from) = recv(&phone_a).await;
-    assert_eq!(data, b"voice-b");
+    assert_eq!(data, rtp(0x0B0B_0B0B));
     assert_eq!(from, near_addr);
 
     // Delete tears it down.

@@ -461,14 +461,20 @@ mod tests {
             .await;
         let near_rtp = sdp::parse(&ok_sdp_text(&answer)).expect("parse near").remote_rtp;
 
-        phone_a.send_to(b"rtp-a", near_rtp).await.expect("send a");
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), near_rtp)
+            .await
+            .expect("send a");
         let (data, from) = recv(&phone_b).await;
-        assert_eq!(data, b"rtp-a");
+        assert_eq!(data, rtp(0x0A0A_0A0A));
         assert_eq!(from, far_rtp);
 
-        phone_b.send_to(b"rtp-b", far_rtp).await.expect("send b");
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), far_rtp)
+            .await
+            .expect("send b");
         let (data, from) = recv(&phone_a).await;
-        assert_eq!(data, b"rtp-b");
+        assert_eq!(data, rtp(0x0B0B_0B0B));
         assert_eq!(from, near_rtp);
 
         // Stats: poll for packets_out to settle (counted after the forwarding send).
@@ -545,13 +551,14 @@ mod tests {
         let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
 
         // RTP relays on the RTP ports.
-        rtp_a.send_to(b"rtp", near.remote_rtp).await.expect("rtp a");
-        assert_eq!(recv(&rtp_b).await.0, b"rtp");
+        rtp_a.send_to(&rtp(0x0A0A_0A0A), near.remote_rtp).await.expect("rtp a");
+        assert_eq!(recv(&rtp_b).await.0, rtp(0x0A0A_0A0A));
 
-        // RTCP relays on the dedicated RTCP ports.
-        rtcp_a.send_to(b"rtcp-sr", near.remote_rtcp).await.expect("rtcp a");
+        // RTCP relays on the dedicated RTCP ports (RTCP SR, first byte 0x80 / PT 200).
+        let rtcp_sr = vec![0x80u8, 0xC8, 0x00, 0x06, 0x11, 0x22, 0x33, 0x44];
+        rtcp_a.send_to(&rtcp_sr, near.remote_rtcp).await.expect("rtcp a");
         let (data, from) = recv(&rtcp_b).await;
-        assert_eq!(data, b"rtcp-sr");
+        assert_eq!(data, rtcp_sr);
         assert_eq!(from, far.remote_rtcp, "B's RTCP arrives from the engine far-RTCP port");
 
         let _ = (addr_rtcp_a, addr_rtcp_b);

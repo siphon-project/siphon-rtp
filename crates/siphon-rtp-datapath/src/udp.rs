@@ -100,6 +100,12 @@ impl Inner {
         };
         match action {
             FlowAction::Forward(rule) => {
+                // Layer 1 — RFC 7983 demux: only RTP/RTCP may drive the relay or move the latch;
+                // STUN/DTLS/garbage are dropped here. (docs/security-and-nat.md §4 layer 1.)
+                if !is_rtp_or_rtcp(payload) {
+                    in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 // Layer 2 — signalled-source gate: only the SDP-signalled peer may send here. This
                 // is the RTPBleed fix; an off-path source on another address is dropped before it
                 // can latch or be forwarded. (docs/security-and-nat.md §4 layer 2; RFC 3264.)
@@ -243,6 +249,13 @@ impl UdpLoopbackDatapath {
     pub fn rx(&self) -> flume::Receiver<RxPacket> {
         self.inner.redirect_rx.clone()
     }
+}
+
+/// RFC 7983 first-byte demux on a media socket: only RTP/RTCP (128–191) may drive the relay or move
+/// the latch. STUN/DTLS/TURN/garbage are dropped in M-S1 (ICE/DTLS land in M-S3/M-S4).
+/// See `docs/security-and-nat.md` §4 layer 1.
+fn is_rtp_or_rtcp(payload: &[u8]) -> bool {
+    matches!(payload.first(), Some(&byte0) if (128..=191).contains(&byte0))
 }
 
 /// The RTP SSRC (RFC 3550 §5.1, bytes 8–11) for latch identity, or `None` when the datagram is not
@@ -413,20 +426,20 @@ mod tests {
 
         // A -> engine(leg_a) -> phone_b, leaving from the engine's B-facing port.
         phone_a
-            .send_to(b"from-a", leg_a.local_addr)
+            .send_to(&rtp(0x0A0A_0A0A, 1), leg_a.local_addr)
             .await
             .expect("send a");
         let (data, from) = recv(&phone_b).await;
-        assert_eq!(data, b"from-a");
+        assert_eq!(data, rtp(0x0A0A_0A0A, 1));
         assert_eq!(from, leg_b.local_addr);
 
         // B -> engine(leg_b) -> phone_a, leaving from the engine's A-facing port.
         phone_b
-            .send_to(b"from-b", leg_b.local_addr)
+            .send_to(&rtp(0x0B0B_0B0B, 1), leg_b.local_addr)
             .await
             .expect("send b");
         let (data, from) = recv(&phone_a).await;
-        assert_eq!(data, b"from-b");
+        assert_eq!(data, rtp(0x0B0B_0B0B, 1));
         assert_eq!(from, leg_a.local_addr);
     }
 
@@ -454,30 +467,32 @@ mod tests {
 
         // Before A has spoken, B->A has no destination and must be dropped (not delivered).
         phone_b
-            .send_to(b"early", leg_b.local_addr)
+            .send_to(&rtp(0x0B0B_0B0B, 1), leg_b.local_addr)
             .await
             .expect("send early");
         let mut scratch = [0u8; MAX_DATAGRAM];
         assert!(
-            timeout(NEGATIVE, phone_a.recv_from(&mut scratch)).await.is_err(),
+            timeout(NEGATIVE, phone_a.recv_from(&mut scratch))
+                .await
+                .is_err(),
             "B->A must not be delivered before A is latched"
         );
 
         // A speaks: this latches leg_a's source to phone_a, and is forwarded to B.
         phone_a
-            .send_to(b"a-first", leg_a.local_addr)
+            .send_to(&rtp(0x0A0A_0A0A, 1), leg_a.local_addr)
             .await
             .expect("send a");
         let (data, _) = recv(&phone_b).await;
-        assert_eq!(data, b"a-first");
+        assert_eq!(data, rtp(0x0A0A_0A0A, 1));
 
         // Now B->A resolves via the latched address even though out_dst was None.
         phone_b
-            .send_to(b"b-reply", leg_b.local_addr)
+            .send_to(&rtp(0x0B0B_0B0B, 2), leg_b.local_addr)
             .await
             .expect("send b");
         let (data, from) = recv(&phone_a).await;
-        assert_eq!(data, b"b-reply");
+        assert_eq!(data, rtp(0x0B0B_0B0B, 2));
         assert_eq!(from, leg_a.local_addr);
         let _ = addr_a;
     }
@@ -528,8 +543,9 @@ mod tests {
             .install_flow(leg_b.id, FlowAction::Drop)
             .expect("drop flow");
 
+        let forwarded = rtp(0x00C0_FFEE, 1);
         phone_a
-            .send_to(b"counted", leg_a.local_addr)
+            .send_to(&forwarded, leg_a.local_addr)
             .await
             .expect("send a");
         let _ = recv(&phone_b).await;
@@ -554,7 +570,7 @@ mod tests {
         assert_eq!(stats_a.packets_in, 1);
         let stats_b = datapath.stats(leg_b.id).expect("stats b");
         assert_eq!(stats_b.packets_out, 1, "one datagram forwarded out of B");
-        assert_eq!(stats_b.bytes_out, b"counted".len() as u64);
+        assert_eq!(stats_b.bytes_out, forwarded.len() as u64);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -713,5 +729,46 @@ mod tests {
             .expect("rebind send");
         let (data, _) = recv(&callee).await;
         assert_eq!(data, rtp(0x1111_1111, 3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demux_drops_non_rtp_without_latching() {
+        // A non-RTP datagram (e.g. a STUN binding) on the media port must be dropped by the layer-1
+        // demux — never forwarded, never latched — even on a symmetric (any-source) leg.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (sender, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (callee, callee_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(callee_addr))),
+            )
+            .expect("flow");
+
+        // STUN-shaped datagram (first byte 0x00) — dropped, not forwarded.
+        sender
+            .send_to(
+                &[0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42],
+                leg_a.local_addr,
+            )
+            .await
+            .expect("stun send");
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, callee.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "a non-RTP datagram must not be forwarded"
+        );
+
+        // A real RTP packet then flows — proving the STUN packet left no latch behind.
+        sender
+            .send_to(&rtp(0x2222_2222, 1), leg_a.local_addr)
+            .await
+            .expect("rtp send");
+        let (data, _) = recv(&callee).await;
+        assert_eq!(data, rtp(0x2222_2222, 1));
     }
 }
