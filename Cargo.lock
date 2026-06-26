@@ -1215,12 +1215,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphon-rtp-ebpf-common"
+version = "0.1.0"
+
+[[package]]
 name = "siphon-rtp-engine"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
  "dashmap",
+ "proptest",
  "siphon-rtp-datapath",
  "siphon-rtp-proto",
  "thiserror 2.0.18",
@@ -1239,6 +1244,7 @@ dependencies = [
  "criterion",
  "flume",
  "futures-util",
+ "proptest",
  "serde",
  "serde_json",
  "siphon-rtp-codec",

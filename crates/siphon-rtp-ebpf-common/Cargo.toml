@@ -1,0 +1,14 @@
+# siphon-rtp-ebpf-common — the XDP map ABI shared by the kernel program (siphon-rtp-ebpf, no_std
+# nightly) and the userspace loader (siphon-rtp-datapath, feature="xdp"). Pure POD #[repr(C)]
+# structs — no_std, no deps — so it builds on stable and the ABI is unit-tested here. The aya::Pod
+# impls are added behind a `user` feature alongside the loader.
+[package]
+name = "siphon-rtp-ebpf-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
