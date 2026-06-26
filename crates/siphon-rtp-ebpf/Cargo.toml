@@ -1,0 +1,38 @@
+# siphon-rtp-ebpf — the XDP classifier program (no_std, kernel-side aya). Built for
+# bpfel-unknown-none by aya-build using THIS crate's own pinned-nightly rust-toolchain.toml, so the
+# parent workspace stays on stable. It is its own workspace (the `[workspace]` table below) and is
+# excluded from the parent — `cargo test` never touches nightly/eBPF.
+[package]
+name = "siphon-rtp-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.1"
+siphon-rtp-ebpf-common = { path = "../siphon-rtp-ebpf-common" }
+
+[[bin]]
+name = "siphon-rtp-ebpf"
+path = "src/main.rs"
+
+# eBPF programs must be optimized (the verifier rejects un-optimized output) and panic=abort.
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
+
+# Standalone workspace so the parent (stable) toolchain never tries to build this crate.
+[workspace]

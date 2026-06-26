@@ -1,0 +1,5 @@
+# The eBPF crate builds on nightly (needs build-std for bpfel-unknown-none + rust-src). Pinned and
+# isolated here so the parent workspace stays on stable — nightly/bpf-linker never block normal dev.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

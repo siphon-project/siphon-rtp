@@ -11,6 +11,9 @@ members = [
     "crates/siphon-rtp-media",
     "crates/siphon-rtp-engine",
 ]
+# The eBPF program builds on its own pinned nightly (bpfel target); aya-build compiles it when the
+# `xdp` feature is on. Excluded so the stable workspace and `cargo test` never touch it.
+exclude = ["crates/siphon-rtp-ebpf"]
 
 [workspace.package]
 version = "0.1.0"
