@@ -10,11 +10,14 @@ members = [
     "crates/siphon-rtp-dsp",
     "crates/siphon-rtp-ebpf-common",
     "crates/siphon-rtp-media",
+    "crates/siphon-rtp-turn",
+    "crates/siphon-rtp-hep",
     "crates/siphon-rtp-engine",
 ]
-# The eBPF program builds on its own pinned nightly (bpfel target); aya-build compiles it when the
-# `xdp` feature is on. Excluded so the stable workspace and `cargo test` never touch it.
-exclude = ["crates/siphon-rtp-ebpf"]
+# The XDP loader is its own workspace (with the eBPF program crate at crates/siphon-rtp-xdp/ebpf,
+# built on a pinned nightly via aya-build). Excluded so the stable workspace / `cargo test` never
+# touch nightly/eBPF.
+exclude = ["crates/siphon-rtp-xdp"]
 
 [workspace.package]
 version = "0.1.0"
@@ -36,6 +39,21 @@ dashmap = "6"
 arc-swap = "1"
 # Transport
 socket2 = "0.6"
+# TLS — turns: (TURN over TLS) and, later, DTLS-SRTP. Pure-Rust: rustls on the **ring** backend only
+# (never aws-lc-rs, which bundles C/asm) — the project's zero-C rule allows ring/rustls explicitly.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+rustls-pemfile = "2"
+rcgen = "0.13"
 # Randomness — ICE credential generation (OS CSPRNG; no bundled C crypto)
 getrandom = "0.2"
 # WebSocket bridges (pure-Rust: rustls/ring only, no native-tls/OpenSSL)

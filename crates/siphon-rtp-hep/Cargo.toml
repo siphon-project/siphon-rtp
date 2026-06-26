@@ -1,0 +1,13 @@
+# siphon-rtp-hep — HEP3 (Homer Encapsulation Protocol v3) packet encoding for QoS/RTCP telemetry
+# export to a Homer capture node. Pure Rust, zero dependencies (std only).
+[package]
+name = "siphon-rtp-hep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "siphon-rtp HEP3 (Homer) telemetry encoding — RTCP/QoS capture export, pure Rust, zero deps"
+
+[dependencies]
