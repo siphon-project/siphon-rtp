@@ -15,7 +15,9 @@
 //! work; for plain relay the datapath's per-endpoint receive tasks are the data-plane workers.
 
 use dashmap::DashMap;
-use siphon_rtp_datapath::{Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig};
+use siphon_rtp_datapath::{
+    Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy, SourceFilter,
+};
 use siphon_rtp_proto::{CmdResult, Command, Event, ProfileFlags, SessionStats};
 
 use crate::ice::{self, IceCredentials};
@@ -574,10 +576,24 @@ fn ingress_rule(
         return ForwardRule::symmetric(out_endpoint, out_dst);
     }
     let symmetric = profile.flags.iter().any(|flag| flag == "symmetric");
-    match (symmetric, expected_source) {
-        (false, Some(addr)) => ForwardRule::signalled(out_endpoint, out_dst, addr.ip()),
+    let Some(addr) = expected_source.filter(|_| !symmetric) else {
         // Symmetric leg, or the peer's address is not yet known: accept any source and latch.
-        _ => ForwardRule::symmetric(out_endpoint, out_dst),
+        return ForwardRule::symmetric(out_endpoint, out_dst);
+    };
+    // Default: exact source-IP gate (the tightest RTPBleed defence). `subnet-source` loosens it to
+    // the signalled IP's /24 (v4) or /64 (v6) for carriers that re-NAT or split RTP/RTCP within a
+    // block (docs/security-and-nat.md §9).
+    let accepted_source = if profile.flags.iter().any(|flag| flag == "subnet-source") {
+        let prefix = if addr.is_ipv4() { 24 } else { 64 };
+        SourceFilter::Subnet(addr.ip(), prefix)
+    } else {
+        SourceFilter::Exact(addr.ip())
+    };
+    ForwardRule {
+        out_endpoint,
+        out_dst,
+        accepted_source,
+        latch: LatchPolicy::SignalledOnly,
     }
 }
 
@@ -1245,5 +1261,63 @@ mod tests {
             &buffer[..len],
             engine_pwd.as_bytes()
         ));
+    }
+
+    /// An SDP whose `c=` claims `ip` (not necessarily where its media actually arrives from).
+    fn sdp_claiming(ip: &str, port: u16) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subnet_source_flag_admits_a_same_24_source() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        // A is signalled as 127.0.0.2 but its media actually arrives from 127.0.0.50 (same /24, e.g.
+        // a carrier that re-NATs within a block); B is signalled at its real address.
+        let (phone_a, _addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 50)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 51)).await;
+        let profile = ProfileFlags {
+            flags: vec!["subnet-source".to_string()],
+            ..Default::default()
+        };
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "subnet".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_claiming("127.0.0.2", 5000),
+                    profile: profile.clone(),
+                },
+            )
+            .await;
+        let far = sdp::parse(&ok_sdp_text(&offer)).expect("far");
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "subnet".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile,
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
+
+        // 127.0.0.50 shares 127.0.0.0/24 with the signalled 127.0.0.2, so the subnet gate accepts it
+        // (an exact gate would reject) and A's media relays to B.
+        phone_a
+            .send_to(&rtp(0x00AB_00AB), near.remote_rtp)
+            .await
+            .expect("send a");
+        let (data, from) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x00AB_00AB));
+        assert_eq!(from, far.remote_rtp);
     }
 }

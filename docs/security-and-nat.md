@@ -344,9 +344,10 @@ ICE-capable peers.
 ---
 
 ## 9. Open decisions
-- **Source-gate strictness default** — exact IP vs `/24` for `SignalledOnly`. Carrier NAT and split
-  RTP/RTCP argue for `/24`; tighter is safer. Likely a per-leg `ProfileFlags` choice with a `/24`
-  default and an exact-match opt-in.
+- **Source-gate strictness** — **resolved:** the default is **exact** source-IP (the tightest
+  RTPBleed defence); the per-leg `subnet-source` `ProfileFlags` flag loosens it to the signalled IP's
+  `/24` (v4) / `/64` (v6) for carriers that re-NAT or split RTP/RTCP within a block. (Security-first
+  default — the reverse of rtpengine's looser default.)
 - **Symmetric/`port-latching` policy** — when SIPhon should set `Symmetric` for a leg (which NAT
   classes warrant abandoning the source gate). Needs the SIPhon-side signalling rule.
 - **Media-timeout `T`** — default seconds before dead-path teardown, and whether RTCP-only traffic
