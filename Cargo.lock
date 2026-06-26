@@ -1208,6 +1208,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphon-rtp-dsp"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "siphon-rtp-engine"
 version = "0.1.0"
 dependencies = [

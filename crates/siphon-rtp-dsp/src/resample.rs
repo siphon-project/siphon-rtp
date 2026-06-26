@@ -1,0 +1,283 @@
+//! A streaming rational resampler (polyphase FIR) for the telephony ↔ voice-AI rate boundary.
+//!
+//! Converts between 8 / 16 / 24 / 48 kHz by an exact rational ratio `L/M` (`L = out/gcd`,
+//! `M = in/gcd`): a windowed-sinc prototype low-pass, decomposed into `L` polyphase branches, runs
+//! per output sample using `i = ⌊nM/L⌋` and phase `nM mod L`. It carries filter history across
+//! calls, so feeding 20 ms frames produces a continuous stream. Deterministic (no clock, no
+//! randomness): the same input always yields the same output, so it golden-tests cleanly.
+
+use std::f32::consts::PI;
+
+/// Errors constructing a resampler.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResampleError {
+    /// A sample rate was zero.
+    #[error("sample rate must be non-zero")]
+    ZeroRate,
+}
+
+/// A streaming polyphase rational resampler.
+#[derive(Debug, Clone)]
+pub struct Resampler {
+    input_rate: u32,
+    output_rate: u32,
+    /// Upsample factor `L` and downsample factor `M` (the reduced ratio out/in).
+    upsample: u64,
+    downsample: u64,
+    taps_per_phase: usize,
+    /// Polyphase branches, row-major `[phase][tap]`, `upsample` rows of `taps_per_phase`.
+    branches: Vec<f32>,
+    /// The most recent `taps_per_phase` input samples (oldest first); the filter delay line.
+    history: Vec<f32>,
+    /// Absolute count of input samples consumed so far.
+    inputs_seen: u64,
+    /// Index of the next output sample to emit.
+    output_index: u64,
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
+fn sinc(x: f32) -> f32 {
+    if x.abs() < 1.0e-7 {
+        1.0
+    } else {
+        let pix = PI * x;
+        pix.sin() / pix
+    }
+}
+
+impl Resampler {
+    /// A resampler from `input_rate` to `output_rate` with a default 32-tap-per-phase filter.
+    pub fn new(input_rate: u32, output_rate: u32) -> Result<Self, ResampleError> {
+        Self::with_taps(input_rate, output_rate, 32)
+    }
+
+    /// A resampler with an explicit polyphase tap count (quality/cost knob).
+    pub fn with_taps(
+        input_rate: u32,
+        output_rate: u32,
+        taps_per_phase: usize,
+    ) -> Result<Self, ResampleError> {
+        if input_rate == 0 || output_rate == 0 {
+            return Err(ResampleError::ZeroRate);
+        }
+        let divisor = gcd(u64::from(input_rate), u64::from(output_rate));
+        let upsample = u64::from(output_rate) / divisor;
+        let downsample = u64::from(input_rate) / divisor;
+        let taps_per_phase = taps_per_phase.max(2);
+
+        let length = taps_per_phase * upsample as usize;
+        // Prototype low-pass at the upsampled rate: cutoff = 1 / (2·max(L,M)) of that Nyquist,
+        // DC-gain L so each polyphase branch passes a constant at unity.
+        let cutoff = 0.5 / upsample.max(downsample) as f32;
+        let center = (length - 1) as f32 / 2.0;
+        let mut prototype = vec![0.0f32; length];
+        for (index, tap) in prototype.iter_mut().enumerate() {
+            let position = index as f32 - center;
+            let window = 0.5 - 0.5 * (2.0 * PI * index as f32 / (length - 1) as f32).cos(); // Hann
+            *tap = upsample as f32 * 2.0 * cutoff * sinc(2.0 * cutoff * position) * window;
+        }
+
+        // Polyphase decomposition: branch p gets prototype[p], prototype[p+L], …
+        let mut branches = vec![0.0f32; length];
+        for phase in 0..upsample as usize {
+            for tap in 0..taps_per_phase {
+                let source = phase + tap * upsample as usize;
+                branches[phase * taps_per_phase + tap] =
+                    if source < length { prototype[source] } else { 0.0 };
+            }
+        }
+
+        Ok(Self {
+            input_rate,
+            output_rate,
+            upsample,
+            downsample,
+            taps_per_phase,
+            branches,
+            history: Vec::with_capacity(taps_per_phase),
+            inputs_seen: 0,
+            output_index: 0,
+        })
+    }
+
+    /// Input sample rate (Hz).
+    #[must_use]
+    pub fn input_rate(&self) -> u32 {
+        self.input_rate
+    }
+
+    /// Output sample rate (Hz).
+    #[must_use]
+    pub fn output_rate(&self) -> u32 {
+        self.output_rate
+    }
+
+    /// Whether input and output rates are equal (the resampler is a pass-through).
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        self.upsample == self.downsample
+    }
+
+    /// Resample `input`, appending the produced samples to `output`.
+    pub fn process(&mut self, input: &[i16], output: &mut Vec<i16>) {
+        for &sample in input {
+            self.push(f32::from(sample));
+            let newest = self.inputs_seen - 1;
+            // Emit every output whose source input index has now arrived.
+            loop {
+                let position = self.output_index * self.downsample;
+                let source_index = position / self.upsample;
+                if source_index > newest {
+                    break;
+                }
+                let phase = (position % self.upsample) as usize;
+                output.push(self.filter(phase, source_index));
+                self.output_index += 1;
+            }
+        }
+    }
+
+    /// Reset the filter history and counters (e.g. on a stream discontinuity).
+    pub fn reset(&mut self) {
+        self.history.clear();
+        self.inputs_seen = 0;
+        self.output_index = 0;
+    }
+
+    fn push(&mut self, sample: f32) {
+        if self.history.len() == self.taps_per_phase {
+            self.history.remove(0);
+        }
+        self.history.push(sample);
+        self.inputs_seen += 1;
+    }
+
+    /// Convolve branch `phase` against the history ending at absolute input `source_index`.
+    fn filter(&self, phase: usize, source_index: u64) -> i16 {
+        let history_start = self.inputs_seen - self.history.len() as u64;
+        let branch = &self.branches[phase * self.taps_per_phase..(phase + 1) * self.taps_per_phase];
+        let mut acc = 0.0f32;
+        for (tap, coefficient) in branch.iter().enumerate() {
+            let absolute = source_index as i64 - tap as i64;
+            if absolute < 0 || (absolute as u64) < history_start {
+                continue; // pre-roll: samples before the stream started are zero
+            }
+            let position = (absolute as u64 - history_start) as usize;
+            acc += coefficient * self.history[position];
+        }
+        let rounded = acc.round();
+        if rounded >= f32::from(i16::MAX) {
+            i16::MAX
+        } else if rounded <= f32::from(i16::MIN) {
+            i16::MIN
+        } else {
+            rounded as i16
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduces_ratio_via_gcd() {
+        let resampler = Resampler::new(16000, 24000).expect("build");
+        // 16000:24000 → 2:3.
+        assert_eq!(resampler.downsample, 2);
+        assert_eq!(resampler.upsample, 3);
+    }
+
+    #[test]
+    fn identity_rate_passes_through() {
+        let mut resampler = Resampler::new(8000, 8000).expect("build");
+        assert!(resampler.is_identity());
+        let input: Vec<i16> = (0..160).map(|index| (index * 50) as i16).collect();
+        let mut output = Vec::new();
+        resampler.process(&input, &mut output);
+        assert_eq!(output.len(), input.len());
+    }
+
+    #[test]
+    fn upsampling_doubles_sample_count() {
+        let mut resampler = Resampler::new(8000, 16000).expect("build");
+        let input = vec![0i16; 160]; // 20 ms at 8 kHz
+        let mut output = Vec::new();
+        resampler.process(&input, &mut output);
+        // 2× output, within a few samples of filter latency.
+        assert!((315..=325).contains(&output.len()), "got {}", output.len());
+    }
+
+    #[test]
+    fn downsampling_halves_sample_count() {
+        let mut resampler = Resampler::new(16000, 8000).expect("build");
+        let input = vec![0i16; 320];
+        let mut output = Vec::new();
+        resampler.process(&input, &mut output);
+        assert!((155..=165).contains(&output.len()), "got {}", output.len());
+    }
+
+    #[test]
+    fn constant_signal_is_preserved() {
+        let mut resampler = Resampler::new(8000, 24000).expect("build");
+        let input = vec![1000i16; 400];
+        let mut output = Vec::new();
+        resampler.process(&input, &mut output);
+        // After the filter fills, the constant passes through near unity gain.
+        let steady = &output[output.len() / 2..];
+        let average: f32 = steady.iter().map(|&s| f32::from(s)).sum::<f32>() / steady.len() as f32;
+        assert!((average - 1000.0).abs() < 20.0, "steady-state average {average}");
+    }
+
+    #[test]
+    fn streaming_matches_single_block() {
+        // Feeding in two halves must equal feeding the whole at once (history continuity).
+        let signal: Vec<i16> = (0..200)
+            .map(|index| ((index as f32 * 0.2).sin() * 8000.0) as i16)
+            .collect();
+
+        let mut whole = Resampler::new(8000, 16000).expect("build");
+        let mut whole_out = Vec::new();
+        whole.process(&signal, &mut whole_out);
+
+        let mut split = Resampler::new(8000, 16000).expect("build");
+        let mut split_out = Vec::new();
+        split.process(&signal[..100], &mut split_out);
+        split.process(&signal[100..], &mut split_out);
+
+        assert_eq!(whole_out, split_out, "streaming must be split-invariant");
+    }
+
+    #[test]
+    fn preserves_a_low_frequency_sine_amplitude() {
+        // A 300 Hz tone at 8 kHz, upsampled to 16 kHz, keeps its amplitude (well below cutoff).
+        let amplitude = 10000.0f32;
+        let input: Vec<i16> = (0..800)
+            .map(|n| (amplitude * (2.0 * PI * 300.0 * n as f32 / 8000.0).sin()) as i16)
+            .collect();
+        let mut resampler = Resampler::new(8000, 16000).expect("build");
+        let mut output = Vec::new();
+        resampler.process(&input, &mut output);
+        let peak = output[output.len() / 2..]
+            .iter()
+            .map(|&s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (peak as f32) > amplitude * 0.85,
+            "peak {peak} should be near {amplitude}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_rate() {
+        assert!(matches!(Resampler::new(0, 8000), Err(ResampleError::ZeroRate)));
+        assert!(matches!(Resampler::new(8000, 0), Err(ResampleError::ZeroRate)));
+    }
+}

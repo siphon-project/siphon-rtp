@@ -1,0 +1,13 @@
+# siphon-rtp-dsp — pure-Rust audio DSP: resampler now; VAD / NS / AEC to follow. NIC-free, sync,
+# deterministic (logical sample-clock, never Instant::now()).
+[package]
+name = "siphon-rtp-dsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
