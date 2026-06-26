@@ -1,0 +1,50 @@
+# siphon-rtp in containers, including XDP. Two profiles (the plan's dev/prod split):
+#
+#   dev  — veth pair + SKB-mode (generic) XDP. Runs on any kernel >= 5.10, no NIC driver ZC needed.
+#           docker compose --profile dev up --build
+#
+#   prod — host network + native/zero-copy XDP on the host NIC.
+#           docker compose --profile prod up --build
+#
+# XDP is opt-in until the eBPF crate lands: both profiles build the UDP-loopback binary today
+# (proving the caps/bpffs/veth wiring). Set CARGO_FEATURES=xdp under build.args to compile the aya
+# XDP datapath. With no caps at all the same image falls back to the UDP backend with a warning.
+
+services:
+  siphon-rtp-dev:
+    profiles: ["dev"]
+    build:
+      context: .
+      target: runtime-dev
+      args:
+        CARGO_FEATURES: "" # set to "xdp" once crates/siphon-rtp-ebpf exists
+    cap_add:
+      - NET_ADMIN # attach XDP, manage the veth
+      - BPF # load programs / maps (kernels >= 5.8)
+      - SYS_ADMIN # mount bpffs on kernels < 5.8
+    security_opt:
+      - seccomp=unconfined # allow the bpf() syscalls
+    ulimits:
+      memlock: -1 # locked memory for BPF maps / UMEM
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf:rw # bpffs for pinned maps
+    ports:
+      - "8080:8080" # JSON-over-TCP control
+    command: ["--control", "0.0.0.0:8080"]
+
+  siphon-rtp-prod:
+    profiles: ["prod"]
+    build:
+      context: .
+      target: runtime
+      args:
+        CARGO_FEATURES: "" # set to "xdp" for the kernel-accelerated datapath
+    network_mode: host # AF_XDP on the host NIC
+    cap_add:
+      - NET_ADMIN
+      - BPF
+    ulimits:
+      memlock: -1
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+    command: ["--control", "0.0.0.0:8080"]
