@@ -15,9 +15,14 @@
 //! work; for plain relay the datapath's per-endpoint receive tasks are the data-plane workers.
 
 use dashmap::DashMap;
+use std::sync::Arc;
+
 use siphon_rtp_datapath::{
-    Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy, SourceFilter,
+    Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy, ObservedRtcp,
+    SourceFilter,
 };
+use siphon_rtp_hep::exporter::HepExporter;
+use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_proto::{CmdResult, Command, Event, ProfileFlags, SessionStats};
 
 use crate::ice::{self, IceCredentials};
@@ -73,6 +78,8 @@ pub struct Engine<D: Datapath> {
     client_calls: DashMap<ClientId, usize>,
     /// Per-client async event sinks, registered by the control server one per connection.
     events: DashMap<ClientId, flume::Sender<Event>>,
+    /// Reverse index endpoint → call-id, correlating observed RTCP back to its call (HEP telemetry).
+    endpoint_calls: DashMap<EndpointId, String>,
 }
 
 impl<D: Datapath> Engine<D> {
@@ -90,6 +97,7 @@ impl<D: Datapath> Engine<D> {
             max_calls_per_client,
             client_calls: DashMap::new(),
             events: DashMap::new(),
+            endpoint_calls: DashMap::new(),
         }
     }
 
@@ -266,6 +274,13 @@ impl<D: Datapath> Engine<D> {
         };
 
         *self.client_calls.entry(client).or_insert(0) += 1;
+        // Index this call's endpoints so observed RTCP can be correlated back to the call-id.
+        for endpoint in [Some(near_rtp), near_rtcp, Some(far_rtp), far_rtcp]
+            .into_iter()
+            .flatten()
+        {
+            self.endpoint_calls.insert(endpoint.id, call_id.clone());
+        }
         self.calls.insert(
             call_id,
             Call {
@@ -437,6 +452,7 @@ impl<D: Datapath> Engine<D> {
             Some((_, call)) => {
                 for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
                     self.datapath.remove_endpoint(endpoint).await;
+                    self.endpoint_calls.remove(&endpoint);
                 }
                 self.release_client_call(call.owner);
                 CmdResult::Ok {
@@ -501,6 +517,7 @@ impl<D: Datapath> Engine<D> {
             if let Some((_, call)) = self.calls.remove(&call_id) {
                 for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
                     self.datapath.remove_endpoint(endpoint).await;
+                    self.endpoint_calls.remove(&endpoint);
                 }
                 self.release_client_call(call.owner);
                 self.push_event(
@@ -514,6 +531,68 @@ impl<D: Datapath> Engine<D> {
             }
         }
         reaped
+    }
+
+    /// The call-id owning `endpoint`, if any — RTCP-telemetry correlation.
+    #[must_use]
+    pub fn call_for_endpoint(&self, endpoint: EndpointId) -> Option<String> {
+        self.endpoint_calls
+            .get(&endpoint)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Drain observed relayed RTCP and export each datagram as a HEP capture to `exporter` (a
+    /// VoIPmonitor / Homer collector), correlated by call-id. Runs until the datapath's observation
+    /// stream closes; fire-and-forget — export errors are logged, never propagated, so telemetry
+    /// never disturbs the media path.
+    pub async fn run_rtcp_export(self: Arc<Self>, exporter: HepExporter, capture_agent_id: u32) {
+        let observations = self.datapath.observe_rtcp();
+        while let Ok(observed) = observations.recv_async().await {
+            let Some(call_id) = self.call_for_endpoint(observed.endpoint) else {
+                continue;
+            };
+            let (timestamp_secs, timestamp_micros) = wall_clock_now();
+            let capture = rtcp_capture(
+                &observed,
+                call_id,
+                capture_agent_id,
+                timestamp_secs,
+                timestamp_micros,
+            );
+            if let Err(error) = exporter.export(&capture).await {
+                tracing::debug!(%error, "HEP RTCP export failed");
+            }
+        }
+    }
+}
+
+/// Build a HEP RTCP capture from an observed relayed RTCP datagram (`protocol_type` = RTCP).
+fn rtcp_capture(
+    observed: &ObservedRtcp,
+    call_id: String,
+    capture_agent_id: u32,
+    timestamp_secs: u32,
+    timestamp_micros: u32,
+) -> Capture {
+    Capture {
+        src: observed.source,
+        dst: observed.destination,
+        timestamp_secs,
+        timestamp_micros,
+        protocol_type: protocol_type::RTCP,
+        capture_agent_id,
+        correlation_id: Some(call_id),
+        payload: observed.payload.to_vec(),
+    }
+}
+
+/// Wall-clock seconds + microseconds since the Unix epoch, for HEP capture timestamps (a genuine
+/// real-time capture stamp — distinct from the logical media-timeout clock).
+fn wall_clock_now() -> (u32, u32) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => (elapsed.as_secs() as u32, elapsed.subsec_micros()),
+        Err(_) => (0, 0),
     }
 }
 
@@ -1319,5 +1398,70 @@ mod tests {
         let (data, from) = recv(&phone_b).await;
         assert_eq!(data, rtp(0x00AB_00AB));
         assert_eq!(from, far.remote_rtp);
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|window| window == needle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relayed_rtcp_is_exported_to_the_hep_collector() {
+        let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+
+        // Stand in for VoIPmonitor's HEP input with a loopback UDP socket.
+        let collector = UdpSocket::bind("127.0.0.1:0").await.expect("bind collector");
+        let collector_addr = collector.local_addr().expect("collector addr");
+        let exporter = HepExporter::connect(collector_addr).await.expect("connect");
+        tokio::spawn(engine.clone().run_rtcp_export(exporter, 7));
+        // Let the export task enable the RTCP observation tap before any media flows.
+        tokio::task::yield_now().await;
+
+        // A muxed call (RTCP rides the RTP port), so one send exercises the path.
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "qos".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let _far = sdp::parse(&ok_sdp_text(&offer)).expect("far");
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "qos".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
+
+        // A sends an RTCP SR through the relay (mux: on the near RTP port).
+        let report = vec![0x80u8, 200, 0x00, 0x06, 0x11, 0x22, 0x33, 0x44];
+        phone_a
+            .send_to(&report, near.remote_rtp)
+            .await
+            .expect("send rtcp");
+        assert_eq!(recv(&phone_b).await.0, report, "RTCP relays to B");
+
+        // The HEP collector receives a HEP3 packet carrying the RTCP, correlated by call-id.
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(2), collector.recv_from(&mut buffer))
+            .await
+            .expect("no timeout")
+            .expect("recv hep");
+        let packet = &buffer[..len];
+        assert_eq!(&packet[..4], b"HEP3");
+        assert!(contains_bytes(packet, &report), "HEP carries the relayed RTCP");
+        assert!(contains_bytes(packet, b"qos"), "HEP correlation id = call-id");
     }
 }

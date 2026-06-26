@@ -1164,6 +1164,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1316,8 +1325,10 @@ dependencies = [
  "getrandom 0.2.17",
  "proptest",
  "siphon-rtp-datapath",
+ "siphon-rtp-hep",
  "siphon-rtp-proto",
  "siphon-rtp-stun",
+ "siphon-rtp-turn",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -1409,15 +1420,19 @@ name = "siphon-rtp-turn"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "criterion",
  "flume",
  "getrandom 0.2.17",
  "indexmap",
  "proptest",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "siphon-rtp-datapath",
  "siphon-rtp-stun",
  "thiserror 2.0.18",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
  "tracing",

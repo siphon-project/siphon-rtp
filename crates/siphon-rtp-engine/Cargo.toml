@@ -25,6 +25,8 @@ path = "src/lib.rs"
 [dependencies]
 siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.1.0" }
 siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
+siphon-rtp-turn = { path = "../siphon-rtp-turn", version = "0.1.0" }
+siphon-rtp-hep = { path = "../siphon-rtp-hep", version = "0.1.0" }
 tokio = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }

@@ -1,15 +1,21 @@
-//! siphon-rtp-engine binary: start the control server over the capability-selected datapath.
+//! siphon-rtp-engine binary: start the control server (and the built-in TURN server) over the
+//! capability-selected datapath.
 //!
 //! M1 binds the UDP-loopback backend unconditionally; XDP/AF_XDP selection by capability
-//! detection (NET_ADMIN/BPF probe → graceful fallback) lands with the XDP backend.
+//! detection (NET_ADMIN/BPF probe → graceful fallback) lands with the XDP backend. The TURN server
+//! (`turn:`/`turns:`, a coturn replacement) shares that one datapath, so its relay ports come from
+//! the same bounded pool and its allocations expire on the same logical clock.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_engine::{server, Engine};
-use tokio::net::TcpListener;
+use siphon_rtp_hep::exporter::HepExporter;
+use siphon_rtp_turn::{tls, SystemUnixClock, Turn, TurnConfig};
+use tokio::net::{TcpListener, UdpSocket};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(not(target_env = "msvc"))]
@@ -23,6 +29,27 @@ struct Args {
     /// JSON-over-TCP control listen address.
     #[arg(long, default_value = "127.0.0.1:8080")]
     control: SocketAddr,
+
+    /// TURN UDP listen address (`turn:`). TURN is enabled when `SIPHON_RTP_TURN_REALM` and
+    /// `SIPHON_RTP_TURN_SECRET` are set; at least one `--turn-*` listener must then be given.
+    #[arg(long)]
+    turn_udp: Option<SocketAddr>,
+    /// TURN TCP listen address (`turn:` over TCP, RFC 6062).
+    #[arg(long)]
+    turn_tcp: Option<SocketAddr>,
+    /// TURN TLS listen address (`turns:`). Requires `--turn-tls-cert` and `--turn-tls-key`.
+    #[arg(long)]
+    turn_tls: Option<SocketAddr>,
+    /// PEM certificate-chain file for the `turns:` listener.
+    #[arg(long)]
+    turn_tls_cert: Option<PathBuf>,
+    /// PEM private-key file for the `turns:` listener.
+    #[arg(long)]
+    turn_tls_key: Option<PathBuf>,
+    /// Public IP to advertise in XOR-RELAYED-ADDRESS when the relay socket's bound IP is not the
+    /// reachable one (e.g. a NAT'd host). Defaults to the datapath-assigned address.
+    #[arg(long)]
+    turn_relay_ip: Option<IpAddr>,
 }
 
 #[tokio::main]
@@ -33,9 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // M1: the always-available NIC-free backend. XDP backend slots in behind the same trait.
+    // M1: the always-available NIC-free backend. XDP backend slots in behind the same trait. The
+    // engine and the TURN server share one datapath (cloning shares the pool + logical clock).
     let datapath = UdpLoopbackDatapath::new();
-    let engine = Arc::new(Engine::new(datapath));
+    let engine = Arc::new(Engine::new(datapath.clone()));
 
     let listener = TcpListener::bind(args.control).await?;
     tracing::info!(control = %args.control, "siphon-rtp-engine control server listening");
@@ -46,9 +74,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("control connections require authentication");
     }
 
-    // Media-timeout sweep: advance the logical clock ~1 tick/second and reap calls idle past the
-    // timeout, freeing their media ports (docs/security-and-nat.md §4 layer 6).
+    // The built-in TURN server (coturn replacement), if configured.
+    let turn = spawn_turn(Arc::new(datapath.clone()), &args).await?;
+
+    // Media-timeout sweep: advance the logical clock ~1 tick/second, reap calls idle past the
+    // timeout (docs/security-and-nat.md §4 layer 6), and reap expired TURN allocations on the same
+    // clock (§11).
     let sweeper = engine.clone();
+    let turn_sweeper = turn.clone();
     tokio::spawn(async move {
         const TIMEOUT_TICKS: u64 = 30; // ~30 s of silence
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -58,9 +91,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for call_id in sweeper.reap_idle(TIMEOUT_TICKS).await {
                 tracing::warn!(%call_id, "media timeout — call reaped");
             }
+            if let Some(turn) = &turn_sweeper {
+                turn.reap();
+            }
         }
     });
 
+    // Optional HEP telemetry export of relayed RTCP to a VoIPmonitor / Homer collector, enabled by
+    // SIPHON_RTP_HEP_COLLECTOR=<ip:port> (+ optional SIPHON_RTP_HEP_AGENT_ID).
+    if let Ok(collector) = std::env::var("SIPHON_RTP_HEP_COLLECTOR") {
+        match collector.parse::<SocketAddr>() {
+            Ok(addr) => match HepExporter::connect(addr).await {
+                Ok(exporter) => {
+                    let agent_id = std::env::var("SIPHON_RTP_HEP_AGENT_ID")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0);
+                    tracing::info!(collector = %addr, "HEP RTCP export enabled");
+                    tokio::spawn(engine.clone().run_rtcp_export(exporter, agent_id));
+                }
+                Err(error) => tracing::warn!(%error, "HEP export disabled: connect failed"),
+            },
+            Err(_) => tracing::warn!("SIPHON_RTP_HEP_COLLECTOR is not a valid socket address"),
+        }
+    }
+
     server::serve_with_auth(engine, listener, control_secret).await?;
     Ok(())
+}
+
+/// Build and start the TURN server when `SIPHON_RTP_TURN_REALM` + `SIPHON_RTP_TURN_SECRET` are set,
+/// spawning whichever of the UDP/TCP/TLS listeners are configured. Returns `None` when TURN is off.
+async fn spawn_turn(
+    datapath: Arc<UdpLoopbackDatapath>,
+    args: &Args,
+) -> Result<Option<Turn>, Box<dyn std::error::Error>> {
+    let (Some(realm), Some(secret)) = (
+        std::env::var("SIPHON_RTP_TURN_REALM").ok(),
+        std::env::var("SIPHON_RTP_TURN_SECRET").ok(),
+    ) else {
+        return Ok(None);
+    };
+
+    let mut config = TurnConfig::new(realm.clone(), secret.into_bytes());
+    config.relay_address = args.turn_relay_ip;
+    let turn = Turn::spawn(datapath, config, Arc::new(SystemUnixClock))?;
+    tracing::info!(realm, "TURN server enabled (coturn replacement)");
+
+    if let Some(addr) = args.turn_udp {
+        let socket = UdpSocket::bind(addr).await?;
+        tracing::info!(turn_udp = %addr, "TURN UDP listening");
+        let turn = turn.clone();
+        tokio::spawn(async move {
+            let _ = turn.serve_udp(socket).await;
+        });
+    }
+    if let Some(addr) = args.turn_tcp {
+        let tcp = TcpListener::bind(addr).await?;
+        tracing::info!(turn_tcp = %addr, "TURN TCP listening");
+        let turn = turn.clone();
+        tokio::spawn(async move {
+            let _ = turn.serve_tcp(tcp).await;
+        });
+    }
+    if let Some(addr) = args.turn_tls {
+        let (Some(cert), Some(key)) = (&args.turn_tls_cert, &args.turn_tls_key) else {
+            return Err("turns: (--turn-tls) requires --turn-tls-cert and --turn-tls-key".into());
+        };
+        tls::install_crypto_provider();
+        let acceptor = tls::acceptor_from_pem(cert, key)?;
+        let tls_listener = TcpListener::bind(addr).await?;
+        tracing::info!(turn_tls = %addr, "TURN TLS listening");
+        let turn = turn.clone();
+        tokio::spawn(async move {
+            let _ = turn.serve_tls(tls_listener, acceptor).await;
+        });
+    }
+
+    if args.turn_udp.is_none() && args.turn_tcp.is_none() && args.turn_tls.is_none() {
+        tracing::warn!("TURN is configured but no --turn-udp/--turn-tcp/--turn-tls listener was given");
+    }
+    Ok(Some(turn))
 }
