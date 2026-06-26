@@ -395,18 +395,17 @@ async fn recv_loop(
             return;
         };
         // RFC 7983 demux for ICE: STUN (first byte 0..=3) drives connectivity checks on endpoints
-        // that carry ICE credentials; everything else takes the media path.
+        // that carry ICE credentials.
         if matches!(buffer[..len].first(), Some(&first) if first <= 3) {
-            match inner.ice.get(&endpoint).map(|config| config.clone()) {
-                Some(ice) => {
-                    handle_stun(&socket, endpoint, source, &buffer[..len], &ice, &inner, &stats)
-                        .await;
-                }
-                None => {
-                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                }
+            if let Some(ice) = inner.ice.get(&endpoint).map(|config| config.clone()) {
+                handle_stun(&socket, endpoint, source, &buffer[..len], &ice, &inner, &stats).await;
+                continue;
             }
-            continue;
+            // No ICE credentials: do *not* drop here — fall through to the installed flow. A TURN
+            // relay endpoint (`FlowAction::Redirect`, docs/security-and-nat.md §11) must hand
+            // whatever the peer sends — including STUN-shaped bytes — to the allocation actor. A
+            // media `Forward` endpoint still drops non-RTP inside `dispatch` (the layer-1 demux), so
+            // this never lets STUN reach the media latch.
         }
         inner.dispatch(endpoint, source, &buffer[..len], &stats).await;
     }
@@ -667,6 +666,41 @@ mod tests {
         assert_eq!(packet.endpoint, leg.id);
         assert_eq!(packet.source, addr);
         assert_eq!(&packet.data[..], b"media-frame");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redirect_delivers_stun_shaped_datagram_raw_without_latching() {
+        // A TURN relay endpoint (FlowAction::Redirect, no ICE creds) must hand the allocation actor
+        // whatever the peer sends — including a STUN/TURN-shaped datagram (first byte in 0..=3) that
+        // a media socket's layer-1 demux would drop — raw, and must never write the media latch.
+        // (docs/security-and-nat.md §11.)
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (phone, addr) = phone().await;
+        datapath
+            .install_flow(leg.id, FlowAction::Redirect)
+            .expect("redirect flow");
+        let rx = datapath.rx();
+
+        // First byte 0x00: the STUN/TURN band. On a media (Forward) port this is layer-1 dropped.
+        let datagram = [0x00u8, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42, 1, 2, 3, 4];
+        phone
+            .send_to(&datagram, leg.local_addr)
+            .await
+            .expect("send");
+        let packet = timeout(SHORT, rx.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("packet");
+        assert_eq!(packet.endpoint, leg.id);
+        assert_eq!(packet.source, addr);
+        assert_eq!(&packet.data[..], &datagram);
+        // The latch is never written for a Redirect endpoint — the TURN permission model is the
+        // source gate, not symmetric-RTP latching.
+        assert!(
+            datapath.inner.latched.get(&leg.id).is_none(),
+            "a Redirect endpoint must never latch"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1018,6 +1052,38 @@ mod tests {
                 .await
                 .is_err(),
             "a check failing MESSAGE-INTEGRITY must be dropped, not answered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_check_counts_as_activity_for_the_media_timeout_sweep() {
+        // Consent (RFC 7675): a valid connectivity check refreshes the endpoint's last-activity, so
+        // the media-timeout sweep keeps an ICE path alive while checks flow (and reaps it once they
+        // stop).
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        datapath.set_ice(
+            leg.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        assert_eq!(datapath.last_activity(leg.id), Some(0), "no activity yet");
+
+        datapath.advance_clock(7);
+        let check = stun::binding_request(&[1u8; 12], "ENG:remote", b"engpass");
+        peer.send_to(&check, leg.local_addr)
+            .await
+            .expect("send check");
+        // Await the response so the check has been fully processed (activity stamped).
+        let _ = recv(&peer).await;
+
+        assert_eq!(
+            datapath.last_activity(leg.id),
+            Some(7),
+            "a valid consent check stamps activity at the current tick"
         );
     }
 }

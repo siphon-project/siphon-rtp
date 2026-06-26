@@ -381,7 +381,7 @@ impl<D: Datapath> Engine<D> {
                     Some(info.remote_rtcp),
                     near.remote_rtcp,
                     profile,
-                    false,
+                    near_ice,
                 )),
             ) {
                 return error_result("install near->far RTCP flow", &error);
@@ -393,7 +393,7 @@ impl<D: Datapath> Engine<D> {
                     near.remote_rtcp,
                     Some(info.remote_rtcp),
                     profile,
-                    false,
+                    far_ice,
                 )),
             ) {
                 return error_result("install far->near RTCP flow", &error);
@@ -407,9 +407,16 @@ impl<D: Datapath> Engine<D> {
                 local_ufrag: creds.ufrag.clone(),
                 local_pwd: creds.pwd.clone(),
             };
-            self.datapath.set_ice(near.rtp.id, Some(config.clone()));
+            // `near` faces A (which offered ICE); enable the responder on its RTP and, under
+            // non-mux, its companion RTCP endpoint.
+            for endpoint in near.endpoint_ids() {
+                self.datapath.set_ice(endpoint, Some(config.clone()));
+            }
+            // `far` faces B; enable only when B also offered ICE.
             if info.is_ice() {
-                self.datapath.set_ice(far.rtp.id, Some(config));
+                for endpoint in far.endpoint_ids() {
+                    self.datapath.set_ice(endpoint, Some(config.clone()));
+                }
             }
         }
 

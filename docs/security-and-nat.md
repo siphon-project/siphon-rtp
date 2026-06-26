@@ -178,8 +178,10 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > mints credentials from the OS CSPRNG, and at offer/answer the engine re-originates ICE as
 > **ICE-lite** — advertising `a=ice-lite` + its own ufrag/pwd + a host candidate and calling
 > `set_ice` on the ICE legs, which then answer checks and adopt the validated source; end-to-end
-> tested. **Remaining:** consent freshness (RFC 7675 — periodic re-checks / timeout), full (non-lite)
-> ICE for cases where the engine must *send* checks, and ICE on the non-mux RTCP companion port.
+> tested. **Remaining:** full (non-lite) ICE for cases where the engine must *send* connectivity
+> checks (the engine as ICE controlling agent). Consent loss is handled — a valid check stamps
+> activity, so the media-timeout sweep reaps an ICE path that stops receiving checks — and RTCP-port
+> ICE under non-mux is wired.
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
@@ -331,9 +333,10 @@ private to their creating `ClientId`); and optional shared-secret **control-chan
 vector-validated), the datapath connectivity-check responder (`set_ice` + STUN-validated source
 adoption; forged checks dropped), and the engine **ICE-lite** wiring — credential generation (OS
 CSPRNG), SDP parse + ICE-lite re-origination (`a=ice-lite` + ufrag/pwd + host candidate), and
-`set_ice` on ICE legs at answer time; end-to-end tested. **Remaining:** consent freshness
-(RFC 7675), full (non-lite) ICE where the engine must send checks, and ICE on the non-mux RTCP
-companion port — the strongest NAT + anti-hijack story for ICE-capable peers.
+`set_ice` on every endpoint of an ICE leg (RTP + non-mux RTCP) at answer time; end-to-end tested.
+Consent loss is handled via the media-timeout sweep (a valid check stamps activity). **Remaining:**
+full (non-lite) ICE where the engine must *send* checks — the strongest NAT + anti-hijack story for
+ICE-capable peers.
 
 **M-S4 — SRTP / DTLS-SRTP (deferred).** Layer 5, scheduled when an SRTP/DTLS deployment lands. Seam
 (`transport_protocol`, `dtls`) is already reserved; build with ring/rustls/webrtc-rs only.
