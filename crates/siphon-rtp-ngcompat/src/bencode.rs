@@ -38,7 +38,7 @@ pub enum BencodeError {
     /// Trailing bytes after a complete top-level value.
     #[error("{0} trailing bytes after value")]
     TrailingBytes(usize),
-    /// A dict key that is not a byte string, or keys out of order.
+    /// A dict key that is not a byte string, or a duplicated key.
     #[error("malformed dict at offset {0}")]
     BadDict(usize),
 }
@@ -239,7 +239,6 @@ impl Parser<'_> {
         let start = self.pos;
         self.pos += 1; // 'd'
         let mut dict = BTreeMap::new();
-        let mut previous: Option<Vec<u8>> = None;
         loop {
             if self.peek()? == b'e' {
                 self.pos += 1;
@@ -249,15 +248,13 @@ impl Parser<'_> {
                 Value::Bytes(bytes) => bytes,
                 _ => return Err(BencodeError::BadDict(start)),
             };
-            // Keys must be strictly increasing (canonical bencode).
-            if let Some(previous) = &previous {
-                if &key <= previous {
-                    return Err(BencodeError::BadDict(start));
-                }
-            }
-            previous = Some(key.clone());
             let value = self.parse_value()?;
-            dict.insert(key, value);
+            // rtpengine clients (e.g. SIPhon) emit dict keys in insertion order, not canonical
+            // sorted order — accept any order; reject only a genuinely duplicated key. (Our own
+            // responses still encode sorted via the BTreeMap, which is valid.)
+            if dict.insert(key, value).is_some() {
+                return Err(BencodeError::BadDict(start));
+            }
         }
     }
 
@@ -333,8 +330,12 @@ mod tests {
     }
 
     #[test]
-    fn dict_rejects_unsorted_or_duplicate_keys_on_decode() {
-        assert!(matches!(decode(b"d1:zi1e1:ai2ee"), Err(BencodeError::BadDict(_))));
+    fn dict_accepts_unsorted_keys_but_rejects_duplicates() {
+        // rtpengine clients (SIPhon) emit insertion order, not canonical sorted order — accept it.
+        let value = decode(b"d1:zi1e1:ai2ee").expect("unsorted keys accepted");
+        assert_eq!(value.get("z").and_then(Value::as_integer), Some(1));
+        assert_eq!(value.get("a").and_then(Value::as_integer), Some(2));
+        // A genuine duplicate key is still rejected.
         assert!(matches!(decode(b"d1:ai1e1:ai2ee"), Err(BencodeError::BadDict(_))));
     }
 
