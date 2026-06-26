@@ -190,6 +190,13 @@ pub enum DatapathError {
     /// A method referenced an endpoint the backend does not know.
     #[error("unknown endpoint {0:?}")]
     UnknownEndpoint(EndpointId),
+    /// The media-port pool is full; no new endpoint can be allocated until one is freed. Guards
+    /// against port/FD exhaustion (docs/security-and-nat.md §5).
+    #[error("media-port pool exhausted (limit {limit})")]
+    PoolExhausted {
+        /// The configured maximum number of concurrent endpoints.
+        limit: usize,
+    },
     /// Transmitting a datagram failed.
     #[error("send failed: {0}")]
     Send(#[source] std::io::Error),

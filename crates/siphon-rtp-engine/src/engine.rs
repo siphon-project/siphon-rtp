@@ -707,4 +707,54 @@ mod tests {
         assert_eq!(data, rtp(0x1234_5678));
         assert_eq!(from, far.remote_rtp, "B sees media from the engine far-RTP port");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_fails_cleanly_when_port_pool_exhausted_and_frees_on_delete() {
+        // A non-mux call needs four endpoints (RTP + RTCP per leg); cap the pool at exactly four.
+        let engine = Engine::new(UdpLoopbackDatapath::with_max_endpoints(4));
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        let first = engine
+            .handle(Command::Offer {
+                call_id: "c1".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr_a, false),
+                profile: Default::default(),
+            })
+            .await;
+        assert!(matches!(first, CmdResult::Ok { .. }), "first offer fits the pool");
+
+        let second = engine
+            .handle(Command::Offer {
+                call_id: "c2".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr_b, false),
+                profile: Default::default(),
+            })
+            .await;
+        assert!(
+            matches!(second, CmdResult::Error { .. }),
+            "an exhausted pool is a clean error, not a host-FD blowout"
+        );
+
+        // Tearing down the first call frees its four ports; the second offer now fits.
+        let delete = engine
+            .handle(Command::Delete {
+                call_id: "c1".into(),
+                from_tag: "a".into(),
+                to_tag: None,
+            })
+            .await;
+        assert!(matches!(delete, CmdResult::Ok { .. }));
+        let retry = engine
+            .handle(Command::Offer {
+                call_id: "c2".into(),
+                from_tag: "a".into(),
+                sdp: sdp_for(addr_b, false),
+                profile: Default::default(),
+            })
+            .await;
+        assert!(matches!(retry, CmdResult::Ok { .. }), "freed pool admits the call");
+    }
 }

@@ -7,7 +7,7 @@
 //! or NIC, so it is the CI datapath and the behavioural reference the XDP backend must match.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
@@ -73,6 +73,10 @@ enum LatchOutcome {
 /// strong count reaches zero on teardown and [`Drop`] can abort the parked receive tasks.
 struct Inner {
     next_id: AtomicU64,
+    /// Live (reserved) endpoint count, capped at `max_endpoints` to bound port/FD use.
+    live: AtomicUsize,
+    /// Maximum concurrent media endpoints; `usize::MAX` is unbounded.
+    max_endpoints: usize,
     endpoints: DashMap<EndpointId, EndpointEntry>,
     flows: DashMap<EndpointId, FlowAction>,
     /// Per-endpoint latched peer source (address + RTP SSRC). A packet from a new source re-latches
@@ -227,13 +231,23 @@ impl Default for UdpLoopbackDatapath {
 }
 
 impl UdpLoopbackDatapath {
-    /// Create an empty backend with no endpoints.
+    /// Create an empty, unbounded backend (no media-port cap).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_max_endpoints(usize::MAX)
+    }
+
+    /// Create a backend that allocates at most `max_endpoints` concurrent media endpoints; further
+    /// `alloc_endpoint` calls fail with [`DatapathError::PoolExhausted`] until one is freed. This is
+    /// the port/FD-exhaustion guard (docs/security-and-nat.md §5).
+    #[must_use]
+    pub fn with_max_endpoints(max_endpoints: usize) -> Self {
         let (redirect_tx, redirect_rx) = flume::unbounded();
         Self {
             inner: Arc::new(Inner {
                 next_id: AtomicU64::new(0),
+                live: AtomicUsize::new(0),
+                max_endpoints,
                 endpoints: DashMap::new(),
                 flows: DashMap::new(),
                 latched: DashMap::new(),
@@ -305,10 +319,25 @@ async fn recv_loop(
 
 impl Datapath for UdpLoopbackDatapath {
     async fn alloc_endpoint(&self) -> Result<Endpoint, DatapathError> {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        // Reserve a pool slot up front so a concurrent burst cannot overshoot the cap (port/FD
+        // exhaustion guard — docs/security-and-nat.md §5). Release the reservation on any failure.
+        let reserved = self.inner.live.fetch_add(1, Ordering::AcqRel) + 1;
+        if reserved > self.inner.max_endpoints {
+            self.inner.live.fetch_sub(1, Ordering::AcqRel);
+            return Err(DatapathError::PoolExhausted {
+                limit: self.inner.max_endpoints,
+            });
+        }
+        let bind = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
-            .map_err(DatapathError::Bind)?;
-        let local_addr = socket.local_addr().map_err(DatapathError::Bind)?;
+            .and_then(|socket| socket.local_addr().map(|addr| (socket, addr)));
+        let (socket, local_addr) = match bind {
+            Ok(bound) => bound,
+            Err(error) => {
+                self.inner.live.fetch_sub(1, Ordering::AcqRel);
+                return Err(DatapathError::Bind(error));
+            }
+        };
         let socket = Arc::new(socket);
         let id = EndpointId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let stats = Arc::new(StatsAtomic::default());
@@ -339,6 +368,8 @@ impl Datapath for UdpLoopbackDatapath {
     async fn remove_endpoint(&self, endpoint: EndpointId) {
         if let Some((_, entry)) = self.inner.endpoints.remove(&endpoint) {
             entry.task.abort();
+            // Release the pool slot only when an endpoint was actually removed (idempotent).
+            self.inner.live.fetch_sub(1, Ordering::AcqRel);
         }
         self.inner.flows.remove(&endpoint);
         self.inner.latched.remove(&endpoint);
@@ -770,5 +801,21 @@ mod tests {
             .expect("rtp send");
         let (data, _) = recv(&callee).await;
         assert_eq!(data, rtp(0x2222_2222, 1));
+    }
+
+    #[tokio::test]
+    async fn endpoint_pool_is_bounded_and_frees_on_remove() {
+        let datapath = UdpLoopbackDatapath::with_max_endpoints(2);
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        // The pool is full — a third allocation fails cleanly, not by exhausting host FDs.
+        assert!(matches!(
+            datapath.alloc_endpoint().await,
+            Err(DatapathError::PoolExhausted { limit: 2 })
+        ));
+        // Freeing a slot admits a new allocation.
+        datapath.remove_endpoint(leg_a.id).await;
+        let leg_c = datapath.alloc_endpoint().await.expect("alloc after free");
+        let _ = (leg_b, leg_c);
     }
 }

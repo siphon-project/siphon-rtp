@@ -229,9 +229,11 @@ Concrete, minimal, additive to the existing datapath seam:
 
 Distinct from the media latch but part of the same security surface.
 
-- **Port/FD exhaustion.** `alloc_endpoint` is unbounded today; a buggy or hostile client exhausts the
-  host. Add a **bounded media-port pool** (configured range) and a **per-client quota**; `offer`
-  fails cleanly when the pool is drained.
+- **Port/FD exhaustion.** **Landed:** `alloc_endpoint` is now bounded — `UdpLoopbackDatapath`
+  caps concurrent endpoints (`with_max_endpoints`, strict atomic reservation) and returns
+  `PoolExhausted`, so `offer` fails cleanly and frees the ports on `delete` instead of exhausting
+  host FDs. **Remaining:** a **per-client quota** (needs control-client identity) and wiring the cap
+  to daemon config.
 - **Control authz.** `answer` checks `from_tag`, but `Delete` and `Query`
   ([engine.rs:179](../crates/siphon-rtp-engine/src/engine.rs#L179),
   [engine.rs:195](../crates/siphon-rtp-engine/src/engine.rs#L195)) do **not** bind to caller
@@ -292,8 +294,10 @@ inspection:
   source-gate option (§9). Neither blocks the safe `SignalledOnly` default; this is the next
   datapath increment.
 
-**M-S2 — Control-plane & DoS hardening.** §5: bounded port pool, per-client quota, per-verb authz,
-private bind + control-channel auth. Plus the fuzz/proptest targets from §6 wired into CI.
+**M-S2 — Control-plane & DoS hardening.** §5. **Landed:** the bounded media-port pool (clean `offer`
+failure on exhaustion, freed on `delete`). **Remaining:** per-client quota, per-verb authz, private
+bind + control-channel auth (these need control-client identity and a server→SIPhon event-push
+channel, neither of which exists yet), plus the fuzz/proptest targets from §6 wired into CI.
 
 **M-S3 — ICE + consent.** Layer 4: STUN over the layer-1 demux, ICE connectivity checks, consent
 freshness, the `ProfileFlags.ice` modes. Brings the strongest NAT + anti-hijack story for ICE-capable
