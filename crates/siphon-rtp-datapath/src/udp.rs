@@ -7,7 +7,7 @@
 //! or NIC, so it is the CI datapath and the behavioural reference the XDP backend must match.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
@@ -19,7 +19,7 @@ use siphon_rtp_stun as stun;
 
 use crate::{
     Datapath, DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction, IceConfig, LatchPolicy,
-    RxPacket,
+    ObservedRtcp, RxPacket,
 };
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
@@ -94,6 +94,10 @@ struct Inner {
     ice: DashMap<EndpointId, IceConfig>,
     redirect_tx: flume::Sender<RxPacket>,
     redirect_rx: flume::Receiver<RxPacket>,
+    /// Telemetry tap: when enabled, relayed RTCP is copied here (bounded, dropped on backpressure).
+    observe_enabled: AtomicBool,
+    observe_tx: flume::Sender<ObservedRtcp>,
+    observe_rx: flume::Receiver<ObservedRtcp>,
 }
 
 impl Inner {
@@ -169,6 +173,16 @@ impl Inner {
                         tracing::warn!(?endpoint, %error, "forward send failed");
                         in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+
+                // Telemetry tap: copy relayed RTCP to observers (off by default; never blocks relay).
+                if self.observe_enabled.load(Ordering::Relaxed) && is_rtcp(payload) {
+                    let _ = self.observe_tx.try_send(ObservedRtcp {
+                        endpoint,
+                        source,
+                        destination,
+                        payload: Bytes::copy_from_slice(payload),
+                    });
                 }
             }
             FlowAction::Redirect => {
@@ -258,6 +272,7 @@ impl UdpLoopbackDatapath {
     #[must_use]
     pub fn with_max_endpoints(max_endpoints: usize) -> Self {
         let (redirect_tx, redirect_rx) = flume::unbounded();
+        let (observe_tx, observe_rx) = flume::bounded(256);
         Self {
             inner: Arc::new(Inner {
                 next_id: AtomicU64::new(0),
@@ -270,15 +285,11 @@ impl UdpLoopbackDatapath {
                 ice: DashMap::new(),
                 redirect_tx,
                 redirect_rx,
+                observe_enabled: AtomicBool::new(false),
+                observe_tx,
+                observe_rx,
             }),
         }
-    }
-
-    /// A receiver for datagrams delivered by [`FlowAction::Redirect`] flows. Clone-per-consumer;
-    /// all redirected endpoints share this single stream.
-    #[must_use]
-    pub fn rx(&self) -> flume::Receiver<RxPacket> {
-        self.inner.redirect_rx.clone()
     }
 
     /// Advance the logical clock by `ticks`. The media-timeout sweep compares endpoint activity
@@ -294,6 +305,13 @@ impl UdpLoopbackDatapath {
 /// See `docs/security-and-nat.md` §4 layer 1.
 fn is_rtp_or_rtcp(payload: &[u8]) -> bool {
     matches!(payload.first(), Some(&byte0) if (128..=191).contains(&byte0))
+}
+
+/// Whether `payload` is specifically RTCP: in the RTP/RTCP demux range with an RTCP payload type —
+/// the second byte's 7-bit field in 64..=95 (RFC 5761 §4).
+fn is_rtcp(payload: &[u8]) -> bool {
+    is_rtp_or_rtcp(payload)
+        && matches!(payload.get(1), Some(&byte1) if (64..=95).contains(&(byte1 & 0x7F)))
 }
 
 /// The RTP SSRC (RFC 3550 §5.1, bytes 8–11) for latch identity, or `None` when the datagram is not
@@ -510,6 +528,16 @@ impl Datapath for UdpLoopbackDatapath {
                 self.inner.ice.remove(&endpoint);
             }
         }
+    }
+
+    fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp> {
+        self.inner.observe_enabled.store(true, Ordering::Relaxed);
+        self.inner.observe_rx.clone()
+    }
+
+    /// A clone of the shared Redirect stream; all redirected endpoints feed this one MPMC receiver.
+    fn rx(&self) -> flume::Receiver<RxPacket> {
+        self.inner.redirect_rx.clone()
     }
 }
 
@@ -1085,5 +1113,40 @@ mod tests {
             Some(7),
             "a valid consent check stamps activity at the current tick"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observes_relayed_rtcp_only() {
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (callee, callee_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(callee_addr))),
+            )
+            .expect("flow");
+        let observations = datapath.observe_rtcp();
+
+        // An RTP packet relays but is not observed (the tap is RTCP-only).
+        peer.send_to(&rtp(0x1234_5678, 1), leg_a.local_addr)
+            .await
+            .expect("rtp");
+        assert_eq!(recv(&callee).await.0, rtp(0x1234_5678, 1));
+
+        // An RTCP SR (second byte 200 → PT 72, in 64..=95) relays and is observed.
+        let report = vec![0x80u8, 200, 0x00, 0x06, 0x11, 0x22, 0x33, 0x44];
+        peer.send_to(&report, leg_a.local_addr)
+            .await
+            .expect("rtcp");
+        assert_eq!(recv(&callee).await.0, report);
+
+        let observed = observations.try_recv().expect("the RTCP was observed");
+        assert_eq!(observed.endpoint, leg_a.id);
+        assert_eq!(observed.destination, callee_addr);
+        assert_eq!(&observed.payload[..], &report[..]);
+        assert!(observations.try_recv().is_err(), "the RTP was not observed");
     }
 }

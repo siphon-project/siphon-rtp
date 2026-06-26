@@ -266,6 +266,31 @@ pub trait Datapath: Send + Sync {
     /// Install (or clear with `None`) ICE-lite credentials for an endpoint, enabling the datapath to
     /// answer STUN connectivity checks on it and adopt the validated source (RFC 8445, layer 4).
     fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>);
+
+    /// A receiver for datagrams delivered by [`FlowAction::Redirect`] flows — the userspace slow path
+    /// (SRTP/transcode/WS, and the built-in TURN relay, docs/security-and-nat.md §11). Clone-per-
+    /// consumer; all redirected endpoints share this single MPMC stream, so a single dispatcher
+    /// should own it and route each [`RxPacket`] to the owning subsystem by [`EndpointId`].
+    fn rx(&self) -> flume::Receiver<RxPacket>;
+
+    /// Enable observation of **relayed RTCP** and return a receiver of the observed datagrams, for
+    /// telemetry export (e.g. HEP to a VoIPmonitor / Homer collector). Bounded — observations are
+    /// dropped under backpressure, never blocking the relay. Idempotent; all callers share one stream.
+    fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp>;
+}
+
+/// A relayed RTCP datagram observed on the datapath, for telemetry export. `source` sent it; the
+/// relay forwarded it to `destination`.
+#[derive(Clone, Debug)]
+pub struct ObservedRtcp {
+    /// The endpoint the RTCP arrived on (maps back to a call leg).
+    pub endpoint: EndpointId,
+    /// The address the RTCP was received from.
+    pub source: SocketAddr,
+    /// The address the relay forwarded it to.
+    pub destination: SocketAddr,
+    /// The RTCP datagram bytes.
+    pub payload: Bytes,
 }
 
 #[cfg(test)]
