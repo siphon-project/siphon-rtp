@@ -168,6 +168,14 @@ Latch state machine, per direction:
 ### Layer 4 — ICE supersedes blind latching where offered
 When SDP carries ICE, **connectivity checks replace latching** as the address-learning mechanism.
 
+> **Status (foundation landed):** the **STUN codec** (`siphon-rtp-media::stun`) — parse Binding
+> requests, build Binding success responses with `XOR-MAPPED-ADDRESS` + short-term `MESSAGE-INTEGRITY`
+> + `FINGERPRINT`, and verify integrity — is implemented in pure Rust (hand-rolled SHA-1 / HMAC /
+> CRC-32, zero new deps), validated against the SHA-1, HMAC (RFC 2202), and CRC-32 known-answer
+> vectors. **Remaining:** wiring the connectivity-check responder into the datapath `recv_loop`
+> behind the layer-1 STUN demux, parsing `ice-ufrag`/`ice-pwd`/candidates from SDP, the ICE state
+> machine, and consent (RFC 7675).
+
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
   never saw. The validated candidate pair, not "first packet wins", becomes the path.
@@ -313,9 +321,11 @@ private to their creating `ClientId`); and optional shared-secret **control-chan
 (`serve_with_auth`). **Remaining:** TLS + private-interface bind on the control socket, and
 `cargo-fuzz` continuous targets (proptest robustness already landed, §6).
 
-**M-S3 — ICE + consent.** Layer 4: STUN over the layer-1 demux, ICE connectivity checks, consent
-freshness, the `ProfileFlags.ice` modes. Brings the strongest NAT + anti-hijack story for ICE-capable
-peers.
+**M-S3 — ICE + consent.** Layer 4. **Landed:** the pure-Rust STUN message codec
+(`siphon-rtp-media::stun`) — Binding parse, success-response build, `MESSAGE-INTEGRITY` /
+`FINGERPRINT`, vector-validated. **Remaining:** the connectivity-check responder over the layer-1
+demux, SDP `ice-ufrag`/`ice-pwd`/candidate parsing, the ICE state machine, and consent freshness
+(RFC 7675) — the strongest NAT + anti-hijack story for ICE-capable peers.
 
 **M-S4 — SRTP / DTLS-SRTP (deferred).** Layer 5, scheduled when an SRTP/DTLS deployment lands. Seam
 (`transport_protocol`, `dtls`) is already reserved; build with ring/rustls/webrtc-rs only.
