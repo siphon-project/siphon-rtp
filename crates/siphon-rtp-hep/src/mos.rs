@@ -27,6 +27,20 @@ pub enum Codec {
 }
 
 impl Codec {
+    /// A short codec name for QoS reports.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Codec::G711 => "G711",
+            Codec::G722 => "G722",
+            Codec::G729 => "G729",
+            Codec::G723_1 => "G723.1",
+            Codec::AmrNb => "AMR-NB",
+            Codec::AmrWb => "AMR-WB",
+            Codec::Opus => "Opus",
+        }
+    }
+
     /// `(Ie, Bpl)` — equipment impairment factor and packet-loss robustness factor.
     /// Narrowband values are ITU-T G.113 Appendix I; wideband codecs are approximations.
     fn impairment_factors(self) -> (f64, f64) {

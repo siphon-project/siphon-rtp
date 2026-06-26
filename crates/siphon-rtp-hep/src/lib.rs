@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod mos;
+pub mod report;
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -138,6 +139,30 @@ impl Capture {
         packet.extend_from_slice(&(total as u16).to_be_bytes());
         packet.extend_from_slice(&chunks);
         packet
+    }
+
+    /// Build a HEP3 **report** capture (`protocol_type` = [`protocol_type::REPORT_JSON`]) carrying a
+    /// [`report::QosReport`]'s JSON, correlated by the report's call-id. `src`/`dst` are the stream's
+    /// media addresses.
+    #[must_use]
+    pub fn from_qos_report(
+        src: SocketAddr,
+        dst: SocketAddr,
+        timestamp_secs: u32,
+        timestamp_micros: u32,
+        capture_agent_id: u32,
+        report: &report::QosReport,
+    ) -> Self {
+        Capture {
+            src,
+            dst,
+            timestamp_secs,
+            timestamp_micros,
+            protocol_type: protocol_type::REPORT_JSON,
+            capture_agent_id,
+            correlation_id: Some(report.correlation_id.clone()),
+            payload: report.to_json().into_bytes(),
+        }
     }
 }
 
@@ -276,5 +301,34 @@ mod tests {
         );
         let chunks = decode_chunks(&packet);
         assert_eq!(value(&chunks, chunk::PAYLOAD).map(|v| v.len()), Some(200));
+    }
+
+    #[test]
+    fn qos_report_capture_carries_the_report_json() {
+        let report = report::QosReport::new(
+            "call-9@host",
+            42,
+            mos::Codec::G711,
+            mos::Impairments {
+                loss_percent: 0.0,
+                one_way_delay_ms: 0.0,
+                jitter_ms: 0.0,
+            },
+        );
+        let capture = Capture::from_qos_report(
+            "198.51.100.1:6000".parse().unwrap(),
+            "203.0.113.1:6000".parse().unwrap(),
+            1,
+            0,
+            7,
+            &report,
+        );
+        assert_eq!(capture.protocol_type, protocol_type::REPORT_JSON);
+        assert_eq!(capture.correlation_id.as_deref(), Some("call-9@host"));
+        let chunks = decode_chunks(&capture.encode());
+        let payload = value(&chunks, chunk::PAYLOAD).expect("payload");
+        let json = std::str::from_utf8(payload).expect("utf8 payload");
+        assert!(json.contains(r#""codec":"G711""#));
+        assert!(json.contains(r#""mos":"#));
     }
 }
