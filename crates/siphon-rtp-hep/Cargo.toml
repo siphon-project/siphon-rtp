@@ -8,6 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "siphon-rtp HEP3 (Homer) telemetry encoding — RTCP/QoS capture export, pure Rust, zero deps"
+description = "siphon-rtp HEP3 (Homer) telemetry — RTCP/QoS capture encoding, MOS, and UDP export"
 
 [dependencies]
+tokio = { workspace = true }

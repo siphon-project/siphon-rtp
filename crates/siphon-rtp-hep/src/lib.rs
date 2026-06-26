@@ -10,6 +10,7 @@
 //! the standard chunk type ids enumerated in [`chunk`]).
 #![forbid(unsafe_code)]
 
+pub mod exporter;
 pub mod mos;
 pub mod report;
 

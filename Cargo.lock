@@ -1363,6 +1363,9 @@ version = "0.1.0"
 [[package]]
 name = "siphon-rtp-hep"
 version = "0.1.0"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "siphon-rtp-media"
