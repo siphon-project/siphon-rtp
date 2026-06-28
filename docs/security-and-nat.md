@@ -341,6 +341,18 @@ ICE-capable peers.
 **M-S4 — SRTP / DTLS-SRTP (deferred).** Layer 5, scheduled when an SRTP/DTLS deployment lands. Seam
 (`transport_protocol`, `dtls`) is already reserved; build with ring/rustls/webrtc-rs only.
 
+**M-T — Built-in TURN server (RFC 5766), a coturn replacement.** §11. **Landed (M-T1–M-T7):** the
+`siphon-rtp-turn` crate — the allocation actor, the coturn REST credential + stateless nonce, the
+permission/channel/refresh state machine, the anti-abuse controls, and the **UDP + TCP + TLS**
+listeners — drawing relay ports from the shared bounded datapath pool; wired into the daemon
+(`--turn-udp/tcp/tls`, realm+secret from env) and the compose profiles, with a criterion relay bench
+and a jemalloc allocation-churn soak. The codec lives in `siphon-rtp-stun::turn`. End-to-end tested on
+the loopback datapath over every transport. **M-T8 (XDP channel-relay fast path) — foundation landed,
+kernel TX remaining:** the map ABI (`TurnPeerKey`/`TurnChannelKey` etc. in `siphon-rtp-ebpf-common`,
+ABI-tested) and the userspace `TurnFastPath` seam (installed on ChannelBind, withdrawn on teardown;
+mock-tested) are in; the in-kernel ChannelData rewrite + `XDP_TX` is specified in the eBPF program's
+docs and lands with the generic `XDP_TX` path it shares.
+
 ---
 
 ## 9. Open decisions
@@ -360,4 +372,64 @@ ICE-capable peers.
 RFC 3264 (offer/answer) · RFC 3550 §5,§8 / 3551 (RTP/RTCP) · RFC 4961 (symmetric RTP/RTCP) ·
 RFC 6263 (RTP NAT keepalives) · RFC 7983 (STUN/DTLS/RTP demux) · RFC 8445 / 8839 / 8489 (ICE / SDP-for-ICE / STUN) ·
 RFC 7675 (ICE consent freshness) · RFC 3711 (SRTP) · RFC 5764 (DTLS-SRTP) · RFC 4568 (SDES) ·
-RFC 4566 (SDP) · RFC 5761 / 3605 (rtcp-mux / a=rtcp). RTPBleed: Enable Security advisory, 2017.
+RFC 4566 (SDP) · RFC 5761 / 3605 (rtcp-mux / a=rtcp) · RFC 5766 / 8656 (TURN) · RFC 6062 (TURN-over-TCP) ·
+RFC 1321 (MD5) · RFC 4648 (base64) · RFC 2104 / 2202 (HMAC). RTPBleed: Enable Security advisory, 2017.
+
+---
+
+## 11. Built-in TURN server (RFC 5766) — the open-relay threat model
+
+The engine ships its own TURN relay (`siphon-rtp-turn`), a drop-in for coturn on the WebRTC voice-AI
+legs, so the deployment runs no external relay. A TURN server hands an authenticated client a public
+relay address and forwards traffic between that address and arbitrary peers — i.e. it is, by
+construction, **the open-relay / reflection primitive the rest of this document defends against**.
+The same discipline applies: authenticate before relaying, gate every packet, never forward into the
+void, and bound the resources.
+
+### 11.1 Relay model
+- **Standalone listeners, shared relay pool.** Clients reach the server directly on its own ports
+  (UDP `turn:`, TCP, TLS `turns:`), independent of the JSON control plane. Each allocation's **relay**
+  endpoint is drawn from the **same bounded [`Datapath`] pool** the media plane uses, so the
+  port/FD-exhaustion guard (§5) and the future XDP/AF_XDP acceleration both apply unchanged.
+- **Relay bind posture.** The relay socket binds the datapath's configured IP (`UdpLoopbackDatapath::
+  with_bind_ip`): **loopback in CI / NIC-free runs**, a **routable IP in production** so real peers can
+  reach the relay. Prefer a *specific* public IP — the transmitted source then matches what the client
+  was told — and use the TURN server's `relay_address` (`--turn-relay-ip`) to advertise the reachable
+  address in XOR-RELAYED-ADDRESS when the bound IP differs (e.g. a `0.0.0.0` bind or a NAT'd host). A
+  loopback bind relays only loopback peers, so a production relay needs a routable bind (or the XDP/
+  public datapath).
+- **Single-owner actor.** All allocation state lives in one task (`AllocationManager`) reached only
+  through a bounded `flume` mailbox — no shared lock over allocation state, no lock across an `.await`
+  (CLAUDE.md concurrency rules). Peer datagrams arrive on the relay endpoint via `FlowAction::Redirect`
+  and are routed to the actor by a single dispatcher that owns the shared `Datapath::rx()` stream.
+- **Datapath relaxation (cited at the enforcement point).** A relay endpoint must forward *whatever*
+  the peer sends, including STUN/TURN-shaped bytes a media socket would drop at layer 1. So `recv_loop`
+  delivers raw datagrams to a non-ICE `Redirect` endpoint instead of swallowing first-byte ≤3
+  (`udp.rs`). This **never** weakens the media plane: the layer-1 demux still drops ChannelData/STUN on
+  *media* (`Forward`) sockets; ChannelData is only ever expected on the TURN server's **own** listener
+  sockets, and a `Redirect` endpoint never writes the media latch (the TURN permission model is its
+  source gate — see R2).
+
+### 11.2 Enforcement (each cited where it runs, in `siphon-rtp-turn`)
+| # | Control | Spec | Enforcement |
+|---|---|---|---|
+| R1 | **Mandatory auth on Allocate** — no anonymous allocations; a missing/invalid credential gets a 401 challenge with REALM + a fresh NONCE. Credentials are the coturn REST profile (`username = <unix-expiry>[:id]`, `password = base64(HMAC-SHA1(secret, username))`, key = `MD5(username:realm:password)`); the server recomputes the password and **enforces the embedded expiry**, so it stores no per-user secrets. | RFC 5766 §4, RFC 5389 §10.2 | `credentials::CredentialVerifier`; `manager::require_auth` |
+| R2 | **Permission-gate every relayed packet, both directions** — a peer datagram with no live permission for its IP is dropped; a Send/ChannelData to an unpermitted peer is dropped. This *is* the relay's source gate; there is **no blind latch** (contrast layers 2–3). | RFC 5766 §8/§9/§10 | `handle_relay_inbound`, `handle_send_indication`, `handle_channel_data` |
+| R3 | **Peer-IP denylist** (anti-SSRF / anti-reflection): loopback / link-local / multicast / private ranges / the server's own IPs are refused at CreatePermission and ChannelBind with 403, and re-checked on every relayed packet. | (coturn `denied-peer-ip`) | `PeerIpPolicy::permits` |
+| R4 | **Resource bounds:** relay ports come from the bounded pool → 508 on exhaustion; a per-credential allocation quota → 486. | §5, RFC 5766 §6.2 | `AllocationManager` quota; `Datapath::alloc_endpoint` |
+| R5 | **Lifetimes + explicit teardown:** allocation (600 s), permission (300 s), channel (600 s) all expire on the **logical clock**, swept by the TURN reaper (the analogue of the media-timeout sweep — *not* `Engine::reap_idle`, which would mistake a relay for an idle call); a Refresh with LIFETIME 0 deletes and frees the relay port. | RFC 5766 §6.2/§7/§8/§11 | `reap`, `delete_allocation` |
+| R6 | **Per-allocation bandwidth cap** (optional) bounds a single allocation's relayed bytes. | — | `within_budget` |
+| R7 | **Stateless nonce** = `base64(issued_tick ‖ HMAC(secret, issued_tick ‖ client_ip))`, bound to the client and validated by an age check against the logical clock → 438 Stale Nonce. No per-nonce map to exhaust. | RFC 5389 §10.2 | `credentials::NonceFactory` |
+| R8 | **Allocation isolation** — 437 Allocation Mismatch for a second Allocate on a live 5-tuple or a non-Allocate verb without one; an Allocate retransmission (same transaction id) replays the cached response, never a 437. The 5-tuple includes the server transport + protocol, so a client's UDP/TCP/TLS allocations never collide. | RFC 5766 §6.2 | `handle_allocate` |
+
+### 11.3 Scope / deviations
+- **Credentials:** the RFC 5766 long-term mechanism (MESSAGE-INTEGRITY = HMAC-SHA1, key =
+  `MD5(username:realm:password)`). RFC 8656 MESSAGE-INTEGRITY-SHA256 is a deferred seam.
+- **EVEN-PORT / RESERVATION-TOKEN** are rejected with 508 (cited deviation): the ephemeral `:0` relay
+  pool gives no port-number control, and WebRTC never requests them.
+- **Peer transport** is always UDP, even for TURN-over-TCP/TLS clients (browser posture); RFC 6062
+  TCP-relay-*to-peer* is out of scope.
+- The **acceptance tests** (`crates/siphon-rtp-turn/tests/turn_server.rs`) drive a real client over the
+  loopback datapath: the full Allocate → CreatePermission → ChannelBind → relay round-trip both ways,
+  plus 401 / 437 / 438 / 403, relay-without-permission drop, idempotent retransmit, and Refresh(0)
+  teardown — the §7-style adversarial validation, applied to the relay.
