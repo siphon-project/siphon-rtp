@@ -203,6 +203,22 @@ pub fn l_shr(l_var1: i32, var2: i16) -> i32 {
     l_var1 >> var2
 }
 
+/// 32-bit arithmetic right shift with rounding: `L_shr` then add the bit shifted past the LSB
+/// (ITU-T `L_shr_r`). For `var2 > 31` the result is 0; for `var2 <= 0` it is a plain shift.
+#[inline]
+#[must_use]
+pub fn l_shr_r(l_var1: i32, var2: i16) -> i32 {
+    if var2 > 31 {
+        return 0;
+    }
+    let l_var_out = l_shr(l_var1, var2);
+    if var2 > 0 && (l_var1 & (1i32 << (var2 - 1))) != 0 {
+        l_var_out + 1
+    } else {
+        l_var_out
+    }
+}
+
 /// Saturating left shift of a 32-bit value (negative count shifts right).
 #[inline]
 #[must_use]
@@ -301,6 +317,19 @@ mod tests {
         assert_eq!(saturate(40000), i16::MAX);
         assert_eq!(saturate(-40000), i16::MIN);
         assert_eq!(saturate(123), 123);
+    }
+
+    #[test]
+    fn l_shr_r_rounds_on_the_dropped_bit() {
+        // No rounding when the bit shifted past the LSB is 0.
+        assert_eq!(l_shr_r(0b100, 1), 0b10);
+        // Round up when it is 1: 0b110 >> 1 = 0b11, dropped bit (bit0) = 0 → 0b11.
+        assert_eq!(l_shr_r(0b110, 1), 0b11);
+        // 0b111 >> 1 = 0b11, dropped bit0 = 1 → 0b11 + 1 = 0b100.
+        assert_eq!(l_shr_r(0b111, 1), 0b100);
+        // var2 > 31 → 0; var2 <= 0 behaves as a plain (left) shift, no rounding.
+        assert_eq!(l_shr_r(0x7FFF_FFFF, 32), 0);
+        assert_eq!(l_shr_r(0x4000_0000, 30), 1);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! [`AmrNb`]/[`AmrWb`] codecs return [`CodecError::Unsupported`] rather than panicking.
 
 pub mod basic_ops;
+pub mod math_op;
 pub mod payload;
 
 use crate::{CodecError, CodecParams, Decoder, Encoder};
