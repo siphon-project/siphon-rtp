@@ -7,4 +7,5 @@
 pub mod constants;
 pub mod filters;
 pub mod lpc;
+pub mod codebook;
 pub mod pitch;
