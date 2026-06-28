@@ -5,7 +5,11 @@
 //! coefficients. Both directions are a cos / acos approximated by a 129-point table + linear
 //! interpolation. `isp_isf` is the inverse (used for the stability factor and concealment).
 
-use crate::amr::basic_ops::{add, extract_l, l_mult, l_shl, l_shr, round_word, shl, shr, sub};
+use crate::amr::basic_ops::{
+    add, extract_l, l_abs, l_add, l_mult, l_msu, l_shl, l_shr, l_shr_r, l_sub, norm_l, round_word,
+    shl, shr, shr_r, sub,
+};
+use crate::amr::oper_32b::{l_extract, mpy_32_16};
 
 /// `cos(x)` in Q15 over 128 segments (TS 26.173 `isp_isf.tab`). 129 real entries; one extra
 /// duplicate of the last so the `table[ind+1]` read at `ind = 128` (where the offset is always 0)
@@ -87,6 +91,124 @@ pub fn isp_isf(isp: &[i16], isf: &mut [i16], m: usize) {
     isf[m - 1] = shr(isf[m - 1], 1);
 }
 
+/// Expand the product polynomial `F1(z)` or `F2(z) = prod(1 - 2·isp_i·z⁻¹ + z⁻²)` from the ISPs
+/// (`Get_isp_pol`), all in Q23. `isp` is offset to the even (F1) or odd (F2) ISPs; `f` is `f[0..=n]`.
+fn get_isp_pol(isp: &[i16], f: &mut [i32], n: usize) {
+    f[0] = l_mult(4096, 1024); // 1.0 in Q23
+    f[1] = l_mult(isp[0], -256); // -2·isp[0] in Q23
+    let mut fp = 2usize; // f pointer
+    let mut ip = 2usize; // isp pointer
+    for i in 2..=n {
+        f[fp] = f[fp - 2];
+        for _ in 1..i {
+            let (hi, lo) = l_extract(f[fp - 1]);
+            let t0 = l_shl(mpy_32_16(hi, lo, isp[ip]), 1);
+            f[fp] = l_sub(f[fp], t0);
+            f[fp] = l_add(f[fp], f[fp - 2]);
+            fp -= 1;
+        }
+        f[fp] = l_msu(f[fp], isp[ip], 256);
+        fp += i;
+        ip += 2;
+    }
+}
+
+/// As [`get_isp_pol`] but with the Q-scaling for the 16 kHz HF-synthesis order (`Get_isp_pol_16kHz`).
+fn get_isp_pol_16khz(isp: &[i16], f: &mut [i32], n: usize) {
+    f[0] = l_mult(4096, 256);
+    f[1] = l_mult(isp[0], -64);
+    let mut fp = 2usize;
+    let mut ip = 2usize;
+    for i in 2..=n {
+        f[fp] = f[fp - 2];
+        for _ in 1..i {
+            let (hi, lo) = l_extract(f[fp - 1]);
+            let t0 = l_shl(mpy_32_16(hi, lo, isp[ip]), 1);
+            f[fp] = l_sub(f[fp], t0);
+            f[fp] = l_add(f[fp], f[fp - 2]);
+            fp -= 1;
+        }
+        f[fp] = l_msu(f[fp], isp[ip], 64);
+        fp += i;
+        ip += 2;
+    }
+}
+
+/// ISP → LP coefficients (`Isp_Az`): `A(z) = (F1(z) + F2(z))/2` where `F1`/`F2` are built from the
+/// even/odd ISPs. `isp` is Q15 length `m`; `a` is `a[0..=m]` in Q12 (`a[0] = 1.0 = 4096`).
+/// `adaptive_scaling` rescales on overflow (the analysis posture; the decoder passes `false`).
+pub fn isp_az(isp: &[i16], a: &mut [i16], m: usize, adaptive_scaling: bool) {
+    let nc = m >> 1;
+    let mut f1 = [0i32; 11]; // NC16k + 1
+    let mut f2 = [0i32; 10]; // NC16k
+
+    if nc > 8 {
+        get_isp_pol_16khz(isp, &mut f1, nc);
+        for value in f1.iter_mut().take(nc + 1) {
+            *value = l_shl(*value, 2);
+        }
+        get_isp_pol_16khz(&isp[1..], &mut f2, nc - 1);
+        for value in f2.iter_mut().take(nc) {
+            *value = l_shl(*value, 2);
+        }
+    } else {
+        get_isp_pol(isp, &mut f1, nc);
+        get_isp_pol(&isp[1..], &mut f2, nc - 1);
+    }
+
+    // F2(z) *= (1 - z^-2).
+    for i in (2..nc).rev() {
+        f2[i] = l_sub(f2[i], f2[i - 2]);
+    }
+
+    // F1 *= (1 + isp[m-1]); F2 *= (1 - isp[m-1]).
+    let last = isp[m - 1];
+    for i in 0..nc {
+        let (hi, lo) = l_extract(f1[i]);
+        f1[i] = l_add(f1[i], mpy_32_16(hi, lo, last));
+        let (hi, lo) = l_extract(f2[i]);
+        f2[i] = l_sub(f2[i], mpy_32_16(hi, lo, last));
+    }
+
+    // A(z) = (F1 + F2)/2: a[i] = 0.5·(f1[i]+f2[i]), a[m-i] = 0.5·(f1[i]-f2[i]).
+    a[0] = 4096;
+    let mut tmax = 1i32;
+    let mut j = m - 1;
+    for i in 1..nc {
+        let sum = l_add(f1[i], f2[i]);
+        tmax |= l_abs(sum);
+        a[i] = extract_l(l_shr_r(sum, 12)); // Q23 → Q12, ·0.5
+        let diff = l_sub(f1[i], f2[i]);
+        tmax |= l_abs(diff);
+        a[j] = extract_l(l_shr_r(diff, 12));
+        j -= 1;
+    }
+
+    // Rescale if an overflow occurred and adaptive scaling is enabled.
+    let mut q = if adaptive_scaling { sub(4, norm_l(tmax)) } else { 0 };
+    let q_sug;
+    if q > 0 {
+        q_sug = add(12, q);
+        let mut j = m - 1;
+        for i in 1..nc {
+            a[i] = extract_l(l_shr_r(l_add(f1[i], f2[i]), q_sug));
+            a[j] = extract_l(l_shr_r(l_sub(f1[i], f2[i]), q_sug));
+            j -= 1;
+        }
+        a[0] = shr(a[0], q);
+    } else {
+        q_sug = 12;
+        q = 0;
+    }
+
+    // a[nc] = 0.5·f1[nc]·(1 + isp[m-1]).
+    let (hi, lo) = l_extract(f1[nc]);
+    let t0 = l_add(f1[nc], mpy_32_16(hi, lo, last));
+    a[nc] = extract_l(l_shr_r(t0, q_sug));
+    // a[m] = isp[m-1], Q15 → Q12.
+    a[m] = shr_r(last, add(3, q));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +228,34 @@ mod tests {
         let mut isf = [0i16; M];
         isp_isf(&[32767; M], &mut isf, M);
         assert!(isf.iter().all(|&v| v == 0));
+    }
+
+    /// A realistic dequantized ISF envelope (monotonically increasing, Q15).
+    const ISF: [i16; M] = [
+        500, 1100, 1900, 2800, 3900, 5100, 6400, 7800, 9200, 10500, 11700, 12700, 13500, 14100,
+        14600, 7000,
+    ];
+
+    #[test]
+    fn isp_az_structural_invariants() {
+        let mut isp = [0i16; M];
+        isf_isp(&ISF, &mut isp, M);
+        let mut a = [0i16; M + 1];
+        isp_az(&isp, &mut a, M, false);
+        assert_eq!(a[0], 4096, "a[0] = 1.0 in Q12");
+        // a[m] = isp[m-1] converted Q15 → Q12 (>>3 with rounding).
+        assert_eq!(a[M], super::shr_r(isp[M - 1], 3));
+    }
+
+    #[test]
+    fn isp_az_is_deterministic() {
+        let mut isp = [0i16; M];
+        isf_isp(&ISF, &mut isp, M);
+        let mut a = [0i16; M + 1];
+        let mut b = [0i16; M + 1];
+        isp_az(&isp, &mut a, M, false);
+        isp_az(&isp, &mut b, M, false);
+        assert_eq!(a, b);
     }
 
     #[test]

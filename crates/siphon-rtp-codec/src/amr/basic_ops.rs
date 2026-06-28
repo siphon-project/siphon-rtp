@@ -219,6 +219,33 @@ pub fn l_shr_r(l_var1: i32, var2: i16) -> i32 {
     }
 }
 
+/// 16-bit arithmetic right shift with rounding (ITU-T `shr_r`): `shr` then add the bit shifted past
+/// the LSB. For `var2 > 15` the result is 0.
+#[inline]
+#[must_use]
+pub fn shr_r(var1: i16, var2: i16) -> i16 {
+    if var2 > 15 {
+        return 0;
+    }
+    let var_out = shr(var1, var2);
+    if var2 > 0 && (var1 & (1i16 << (var2 - 1))) != 0 {
+        var_out + 1 // var2 > 0 ⇒ var_out ≤ 0x3FFF, so +1 cannot overflow
+    } else {
+        var_out
+    }
+}
+
+/// Absolute value of a 32-bit integer (ITU-T `L_abs`); `MIN` saturates to `MAX`.
+#[inline]
+#[must_use]
+pub fn l_abs(l_var1: i32) -> i32 {
+    if l_var1 == i32::MIN {
+        i32::MAX
+    } else {
+        l_var1.abs()
+    }
+}
+
 /// Saturating left shift of a 32-bit value (negative count shifts right).
 #[inline]
 #[must_use]
@@ -330,6 +357,21 @@ mod tests {
         // var2 > 31 → 0; var2 <= 0 behaves as a plain (left) shift, no rounding.
         assert_eq!(l_shr_r(0x7FFF_FFFF, 32), 0);
         assert_eq!(l_shr_r(0x4000_0000, 30), 1);
+    }
+
+    #[test]
+    fn shr_r_rounds_16bit() {
+        assert_eq!(shr_r(0b100, 1), 0b10); // dropped bit 0 → no round
+        assert_eq!(shr_r(0b111, 1), 0b100); // dropped bit 1 → round up
+        assert_eq!(shr_r(100, 0), 100); // no shift, no round
+        assert_eq!(shr_r(1, 16), 0); // var2 > 15 → 0
+    }
+
+    #[test]
+    fn l_abs_saturates_min() {
+        assert_eq!(l_abs(-5), 5);
+        assert_eq!(l_abs(5), 5);
+        assert_eq!(l_abs(i32::MIN), i32::MAX);
     }
 
     #[test]
