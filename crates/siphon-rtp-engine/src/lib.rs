@@ -10,5 +10,6 @@ pub mod engine;
 pub mod ice;
 pub mod sdp;
 pub mod server;
+pub mod srtp_bridge;
 
 pub use engine::{ClientId, Engine};

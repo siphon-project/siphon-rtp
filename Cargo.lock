@@ -1377,6 +1377,7 @@ dependencies = [
  "siphon-rtp-hep",
  "siphon-rtp-ngcompat",
  "siphon-rtp-proto",
+ "siphon-rtp-srtp",
  "siphon-rtp-stun",
  "siphon-rtp-turn",
  "thiserror 2.0.18",
