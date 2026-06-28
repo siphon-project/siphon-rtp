@@ -19,3 +19,10 @@ subtle = "2.6"
 base64 = "0.22"
 getrandom = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "srtp_bench"
+harness = false

@@ -1474,6 +1474,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "base64",
+ "criterion",
  "ctr",
  "getrandom 0.2.17",
  "hmac",
