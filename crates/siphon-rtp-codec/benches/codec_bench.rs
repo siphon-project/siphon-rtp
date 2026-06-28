@@ -1,9 +1,10 @@
 //! Criterion perf gates for the codec hot paths. `cargo bench -p siphon-rtp-codec`.
 //!
-//! These lock per-frame cost so a regression fails CI (the AMR kernels are benched here once
-//! their DSP lands).
+//! These lock per-frame / per-subframe cost so a regression fails CI. The AMR-WB decoder kernels
+//! are benched per-tier as the DSP lands (the full `decode` bench joins once `dec_main` is wired).
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use siphon_rtp_codec::amr::wb::{constants, filters, lpc, pitch};
 use siphon_rtp_codec::amr::basic_ops;
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::{Decoder, Encoder};
@@ -61,5 +62,77 @@ fn bench_basic_ops(criterion: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_g711, bench_basic_ops);
+/// AMR-WB decode hot-path kernels (µs/frame and µs/subframe), the ported DSP tiers.
+fn bench_amrwb_dsp(criterion: &mut Criterion) {
+    const M: usize = constants::M;
+    const SUBFR: usize = constants::L_SUBFR;
+
+    // A realistic ISP from a dequantized ISF envelope.
+    let isf: [i16; M] = [
+        500, 1100, 1900, 2800, 3900, 5100, 6400, 7800, 9200, 10500, 11700, 12700, 13500, 14100,
+        14600, 7000,
+    ];
+    let mut isp = [0i16; M];
+    lpc::isf_isp(&isf, &mut isp, M);
+
+    // ISP → 4 subframe LP coefficient sets (per 20 ms frame): the LPC reconstruction.
+    let mut az = [0i16; 4 * (M + 1)];
+    criterion.bench_function("amrwb_int_isp_frame", |bencher| {
+        bencher.iter(|| {
+            lpc::int_isp(
+                black_box(&isp),
+                black_box(&isp),
+                black_box(&[8192, 16384, 24576]),
+                black_box(&mut az),
+            )
+        });
+    });
+
+    // One ISP → LP-coefficient conversion (Chebyshev), called 4×/frame inside int_isp.
+    let mut a = [0i16; M + 1];
+    criterion.bench_function("amrwb_isp_az", |bencher| {
+        bencher.iter(|| lpc::isp_az(black_box(&isp), black_box(&mut a), M, false));
+    });
+
+    // Order-16 LPC synthesis, one subframe.
+    lpc::isp_az(&isp, &mut a, M, false);
+    let exc: Vec<i16> = (0..SUBFR).map(|i| ((i * 131 % 512) as i16) - 256).collect();
+    let mut sig_hi = vec![0i16; M + SUBFR];
+    let mut sig_lo = vec![0i16; M + SUBFR];
+    criterion.bench_function("amrwb_syn_filt_subfr", |bencher| {
+        bencher.iter(|| {
+            filters::syn_filt_32(
+                black_box(&a),
+                M,
+                black_box(&exc),
+                0,
+                &mut sig_hi,
+                &mut sig_lo,
+                SUBFR,
+            )
+        });
+    });
+
+    // Adaptive-codebook (pitch) interpolation, one subframe.
+    let history = constants::PIT_MAX + constants::L_INTERPOL;
+    let mut pexc = vec![0i16; history + SUBFR];
+    for (i, v) in pexc.iter_mut().enumerate() {
+        *v = ((i * 97 % 400) as i16) - 200;
+    }
+    criterion.bench_function("amrwb_pred_lt4_subfr", |bencher| {
+        bencher.iter(|| pitch::pred_lt4(black_box(&mut pexc), history, 100, 2, SUBFR));
+    });
+
+    // 12.8 → 16 kHz 5/4 oversampler, one subframe.
+    let sig12k8: Vec<i16> = (0..SUBFR).map(|i| ((i * 211 % 2000) as i16) - 1000).collect();
+    let mut sig16k = vec![0i16; SUBFR * 5 / 4];
+    let mut mem = [0i16; 24]; // 2 * NB_COEF_UP
+    criterion.bench_function("amrwb_oversamp_subfr", |bencher| {
+        bencher.iter(|| {
+            filters::oversamp_16k(black_box(&sig12k8), SUBFR, black_box(&mut sig16k), &mut mem)
+        });
+    });
+}
+
+criterion_group!(benches, bench_g711, bench_basic_ops, bench_amrwb_dsp);
 criterion_main!(benches);
