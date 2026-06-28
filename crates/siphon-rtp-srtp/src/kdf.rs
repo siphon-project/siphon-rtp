@@ -13,14 +13,21 @@ type AesCm = ctr::Ctr128BE<Aes128>;
 /// SRTP master-salt length (112 bits, RFC 3711 §8.2).
 pub const MASTER_SALT_LEN: usize = 14;
 
-/// KDF labels (RFC 3711 §4.3.2).
+/// KDF labels (RFC 3711 §4.3.2). RTP and RTCP derive *separate* session keys from the same master
+/// key/salt — labels 0/1/2 for SRTP, 3/4/5 for SRTCP.
 pub mod label {
-    /// Session encryption (cipher) key.
+    /// SRTP session encryption (cipher) key.
     pub const RTP_ENCRYPTION: u8 = 0x00;
-    /// Session authentication key.
+    /// SRTP session authentication key.
     pub const RTP_AUTHENTICATION: u8 = 0x01;
-    /// Session salt.
+    /// SRTP session salt.
     pub const RTP_SALT: u8 = 0x02;
+    /// SRTCP session encryption (cipher) key.
+    pub const RTCP_ENCRYPTION: u8 = 0x03;
+    /// SRTCP session authentication key.
+    pub const RTCP_AUTHENTICATION: u8 = 0x04;
+    /// SRTCP session salt.
+    pub const RTCP_SALT: u8 = 0x05;
 }
 
 /// Generate `out.len()` bytes of AES-CM keystream into `out`: encrypt zeros under `key` starting

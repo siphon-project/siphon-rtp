@@ -17,6 +17,7 @@ use subtle::ConstantTimeEq;
 
 pub mod kdf;
 pub mod sdes;
+pub mod srtcp;
 
 use kdf::MASTER_SALT_LEN;
 use sdes::SrtpKeyMaterial;
@@ -157,7 +158,7 @@ impl SrtpContext {
 }
 
 /// The AES-CM IV for one packet (RFC 3711 §4.1.1): `session_salt·2¹⁶ ⊕ SSRC·2⁶⁴ ⊕ index·2¹⁶`.
-fn cipher_iv(salt: &[u8; MASTER_SALT_LEN], ssrc: u32, index: u64) -> [u8; 16] {
+pub(crate) fn cipher_iv(salt: &[u8; MASTER_SALT_LEN], ssrc: u32, index: u64) -> [u8; 16] {
     let mut iv = [0u8; 16];
     iv[..MASTER_SALT_LEN].copy_from_slice(salt);
     for (offset, byte) in ssrc.to_be_bytes().iter().enumerate() {
@@ -170,7 +171,24 @@ fn cipher_iv(salt: &[u8; MASTER_SALT_LEN], ssrc: u32, index: u64) -> [u8; 16] {
     iv
 }
 
-/// HMAC-SHA1 over `data || ROC`, truncated to 80 bits.
+/// AES-CM encrypt/decrypt `buf` in place under `key` from counter `iv` (the cipher is its own
+/// inverse). Shared by SRTP and SRTCP.
+pub(crate) fn apply_aes_cm(key: &[u8; 16], iv: &[u8; 16], buf: &mut [u8]) {
+    AesCm::new(key.into(), iv.into()).apply_keystream(buf);
+}
+
+/// HMAC-SHA1 over `data`, truncated to 80 bits. Shared by SRTP (which passes `header||cipher||ROC`)
+/// and SRTCP (which passes the authenticated portion through the SRTCP-index field).
+pub(crate) fn hmac_sha1_80(key: &[u8; 20], data: &[u8]) -> [u8; AUTH_TAG_LEN] {
+    let mut mac = HmacSha1::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    let full = mac.finalize().into_bytes();
+    let mut tag = [0u8; AUTH_TAG_LEN];
+    tag.copy_from_slice(&full[..AUTH_TAG_LEN]);
+    tag
+}
+
+/// HMAC-SHA1-80 over `data || ROC` — the SRTP authentication input (RFC 3711 §4.2).
 fn auth_tag(key: &[u8; 20], data: &[u8], roc: u32) -> [u8; AUTH_TAG_LEN] {
     let mut mac = HmacSha1::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
