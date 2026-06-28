@@ -93,6 +93,85 @@ pub struct FlowAction {
     pub redirect_queue: u32,
 }
 
+// --- TURN channel-relay fast path (docs/security-and-nat.md §11, M-T8) -----------------------
+//
+// Once a TURN client binds a channel (RFC 5766 §11) the per-packet relay is a fixed rewrite the
+// kernel can do without userspace: peer→client prepends a 4-byte ChannelData header and TX's to the
+// client; client→peer strips it and TX's to the peer. The userspace TURN server programs these two
+// maps on ChannelBind and removes them on teardown; control packets (Allocate/Refresh/permissions,
+// Send/Data indications, non-channel data) always go to userspace via `action::REDIRECT`.
+//
+// IPv4 only, like the rest of the ABI. The kernel rewrite + `XDP_TX` is the hardware-verified half;
+// these POD types are the contract both sides build to.
+
+/// Key into the `TURN_PEERS` map (peer→client direction): a peer's transport as observed on a relay
+/// endpoint. The relay transport is unique per allocation, so `(relay, peer)` identifies the channel.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TurnPeerKey {
+    /// Relay endpoint IPv4 (network byte order) — the datagram's destination.
+    pub relay_ipv4: u32,
+    /// Peer IPv4 (network byte order) — the datagram's source.
+    pub peer_ipv4: u32,
+    /// Relay endpoint UDP port (network byte order).
+    pub relay_port: u16,
+    /// Peer UDP port (network byte order).
+    pub peer_port: u16,
+}
+
+/// Value in `TURN_PEERS`: how to deliver a peer datagram to the client as ChannelData — prepend the
+/// `channel` header and `XDP_TX` to `client` from the server `listener` transport.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TurnClientRoute {
+    /// Client IPv4 (network byte order) — the TX destination.
+    pub client_ipv4: u32,
+    /// Server listener IPv4 the client allocated on (network byte order) — the TX source.
+    pub listener_ipv4: u32,
+    /// Client UDP port (network byte order).
+    pub client_port: u16,
+    /// Server listener UDP port (network byte order).
+    pub listener_port: u16,
+    /// Channel number (host byte order) prepended in the ChannelData header.
+    pub channel: u16,
+    /// Padding to a fixed 16-byte value.
+    pub _pad: u16,
+}
+
+/// Key into the `TURN_CHANNELS` map (client→peer direction): a ChannelData stream from a client,
+/// identified by the listener it arrived on, the client source, and the channel number.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TurnChannelKey {
+    /// Server listener IPv4 (network byte order) — the datagram's destination.
+    pub listener_ipv4: u32,
+    /// Client IPv4 (network byte order) — the datagram's source.
+    pub client_ipv4: u32,
+    /// Server listener UDP port (network byte order).
+    pub listener_port: u16,
+    /// Client UDP port (network byte order).
+    pub client_port: u16,
+    /// Channel number (host byte order) read from the ChannelData header.
+    pub channel: u16,
+    /// Padding to a fixed 16-byte key.
+    pub _pad: u16,
+}
+
+/// Value in `TURN_CHANNELS`: how to relay a client's ChannelData payload — strip the header and
+/// `XDP_TX` to `peer` from the allocation's `relay` endpoint.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TurnPeerRoute {
+    /// Peer IPv4 (network byte order) — the TX destination.
+    pub peer_ipv4: u32,
+    /// Relay endpoint IPv4 (network byte order) — the TX source.
+    pub relay_ipv4: u32,
+    /// Peer UDP port (network byte order).
+    pub peer_port: u16,
+    /// Relay endpoint UDP port (network byte order).
+    pub relay_port: u16,
+}
+
 /// Per-CPU counters in the `STATS` map (summed across CPUs by the loader).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -146,6 +225,31 @@ mod tests {
         assert_eq!(size_of::<FlowStats>(), 40);
         assert_eq!(align_of::<FlowStats>(), 8);
         assert_eq!(offset_of!(FlowStats, packets_dropped), 32);
+    }
+
+    #[test]
+    fn turn_channel_relay_abi_is_stable() {
+        // The TURN fast-path map ABI — userspace TURN server and the kernel rewrite must agree.
+        assert_eq!(size_of::<TurnPeerKey>(), 12);
+        assert_eq!(align_of::<TurnPeerKey>(), 4);
+        assert_eq!(offset_of!(TurnPeerKey, peer_ipv4), 4);
+        assert_eq!(offset_of!(TurnPeerKey, relay_port), 8);
+        assert_eq!(offset_of!(TurnPeerKey, peer_port), 10);
+
+        assert_eq!(size_of::<TurnClientRoute>(), 16);
+        assert_eq!(align_of::<TurnClientRoute>(), 4);
+        assert_eq!(offset_of!(TurnClientRoute, listener_ipv4), 4);
+        assert_eq!(offset_of!(TurnClientRoute, channel), 12);
+
+        assert_eq!(size_of::<TurnChannelKey>(), 16);
+        assert_eq!(align_of::<TurnChannelKey>(), 4);
+        assert_eq!(offset_of!(TurnChannelKey, client_ipv4), 4);
+        assert_eq!(offset_of!(TurnChannelKey, channel), 12);
+
+        assert_eq!(size_of::<TurnPeerRoute>(), 12);
+        assert_eq!(align_of::<TurnPeerRoute>(), 4);
+        assert_eq!(offset_of!(TurnPeerRoute, relay_ipv4), 4);
+        assert_eq!(offset_of!(TurnPeerRoute, peer_port), 8);
     }
 
     #[test]

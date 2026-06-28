@@ -11,6 +11,31 @@
 //! checksum fixup) is a later optimisation; until then every matched flow rides the AF_XDP slow
 //! path, which is where SRTP/decode/transcode/WS already live. The source-gate runs in-kernel
 //! regardless, so spoofed sources are dropped before they ever reach userspace.
+//!
+//! ## TURN channel-relay fast path (M-T8 — planned, gated on `XDP_TX`)
+//!
+//! Once a TURN client binds a channel (RFC 5766 §11; docs/security-and-nat.md §11) the per-packet
+//! relay is a fixed rewrite the kernel can do without ever touching userspace. The userspace TURN
+//! server (`siphon-rtp-turn`) already programs the seam — its `TurnFastPath` installs a `ChannelRoute`
+//! on ChannelBind and withdraws it on teardown — and the shared ABI is the
+//! [`TurnPeerKey`]→[`TurnClientRoute`] / [`TurnChannelKey`]→[`TurnPeerRoute`] map pairs in
+//! `siphon-rtp-ebpf-common`. The kernel dispatch this enables, *checked before the generic `FLOWS`
+//! redirect so an established channel bypasses the AF_XDP slow path:*
+//!
+//! - **peer → client:** dest = a relay endpoint, src = peer ⇒ look up `TURN_PEERS{relay, peer}`; on a
+//!   hit, `bpf_xdp_adjust_head(-4)`, write the 4-byte ChannelData header (channel + length), rewrite
+//!   L2/L3/L4 to the client from the listener transport, fix checksums, `XDP_TX`.
+//! - **client → peer:** dest = a listener, payload is ChannelData (first two bits `01`) ⇒ read the
+//!   channel, look up `TURN_CHANNELS{listener, client, channel}`; on a hit, strip the 4-byte header
+//!   (`bpf_xdp_adjust_head(+4)`), rewrite to the peer from the relay transport, fix checksums,
+//!   `XDP_TX`.
+//! - everything else (Allocate/Refresh/CreatePermission/ChannelBind, Send/Data indications,
+//!   non-channel data) falls through to `action::REDIRECT` and is handled in userspace.
+//!
+//! This shares the generic `XDP_TX` rewrite + checksum machinery, so it lands with that work — only
+//! the two map lookups and the 4-byte header adjust are TURN-specific. Permission gating is implicit:
+//! a route exists only while its channel is bound, and the userspace server enforces every permission
+//! on the control path before it ever programs a route.
 #![no_std]
 #![no_main]
 
