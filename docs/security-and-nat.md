@@ -194,18 +194,39 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 - **Note:** for non-ICE legacy VoLTE/PSTN UAs (the common case), layers 1–3 are the whole story; ICE
   applies to ICE-capable peers (RCS, WebRTC bridges, modern clients).
 
-### Layer 5 — SRTP / DTLS-SRTP (DEFERRED in this posture)
+### Layer 5 — SRTP / DTLS-SRTP
 The cryptographic fix: authenticated media cannot be injected or silently hijacked even if the latch
 is wrong, and encryption defeats A2 eavesdrop.
 
-- **Status:** deferred. Target deployments carry confidentiality at the network layer (IPsec / private
-  bearer), so layers 1–3 + ICE meet the *integrity/availability* goals without crypto. We design the
-  seam now and schedule the work when an SRTP/DTLS-SRTP deployment is on the roadmap.
-- **Seam (already present):** `ProfileFlags.transport_protocol` (`RTP/SAVP[F]`,
-  `UDP/TLS/RTP/SAVPF`), `ProfileFlags.dtls` (`passive`/`active`/`off`).
-- **Spec when built:** RFC 3711 (SRTP), RFC 5764 (DTLS-SRTP), RFC 4568 (SDES — keys in SDP, so
-  requires TLS on the signalling path). Pure-Rust only: ring / rustls / webrtc-rs, per the project's
-  zero-C hard rule. SDES key material must never transit a plaintext control channel.
+> **Status (landed — SDES bridge):** SRTP over **SDES** (RFC 4568 `a=crypto`) is implemented and
+> wired for the `RTP/AVP` ↔ `RTP/SAVP` **bridge** topology (Scenario 1). The crypto core is the
+> isolated [`siphon-rtp-srtp`](../crates/siphon-rtp-srtp) crate: AES-CM + HMAC-SHA1 key derivation
+> validated bit-exact against the RFC 3711 §4.3.2 vectors, SRTP (§3.3) and SRTCP (§3.4)
+> protect/unprotect for `AES_CM_128_HMAC_SHA1_80`, and `SecureLeg` (the directional in/out contexts +
+> RFC 5761 RTP/RTCP demux). Pure-Rust RustCrypto (`aes`/`ctr`/`hmac`/`sha1`) — **not** ring, which has
+> no AES-CM; still zero-C. The engine generates its SDES key on a secure leg, parses the peer's, and
+> bridges plaintext ↔ SRTP via the userspace `Redirect` path (`engine/src/srtp_bridge.rs`).
+>
+> **DTLS-SRTP remains deferred** (the WebRTC keying path, RFC 5764) — the seam is the same profile
+> flags below.
+
+- **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
+  `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The
+  bridge therefore **re-enforces** the signalled-source gate itself (`bridge_source_filter`, the same
+  `Exact`/`Subnet`/`Any` policy as `ingress_rule`) before any crypto — an off-path spray is dropped at
+  the bridge, not decrypted. SRTP auth (HMAC-SHA1-80) is the second line: a forged packet from the
+  gated address still fails authentication and is dropped (the rollover counter advances only after
+  auth succeeds). Anti-replay (the explicit SRTCP index / SRTP sliding window) is a later hardening
+  layer.
+- **Key direction (the footgun `SecureLeg` pins down).** Outbound (engine→peer) encrypts with the
+  engine's *own* offered key (the `a=crypto` it advertised); inbound (peer→engine) decrypts with the
+  *peer's* answered key. The peer's `a=crypto` is always re-originated (dropped and replaced), like
+  ICE — a secure leg's key never leaks onto the plaintext leg's rewritten SDP.
+- **Seam (present):** `ProfileFlags.transport_protocol` (`RTP/SAVP[F]`, `UDP/TLS/RTP/SAVPF`) selects a
+  secure leg; `ProfileFlags.dtls` (`passive`/`active`/`off`) reserved for DTLS-SRTP.
+- **Spec:** RFC 3711 (SRTP/SRTCP), RFC 4568 (SDES — keys in SDP, so the signalling path must be TLS),
+  RFC 5764 (DTLS-SRTP, deferred). Pure-Rust only, per the zero-C hard rule. **SDES key material must
+  never transit a plaintext control channel** — keys in `a=crypto` are only as safe as the signalling.
 
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
