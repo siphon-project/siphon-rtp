@@ -6,7 +6,7 @@
 //! (reply to wherever the peer's packets actually arrive from). This backend needs no privileges
 //! or NIC, so it is the CI datapath and the behavioural reference the XDP backend must match.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -84,6 +84,9 @@ struct Inner {
     live: AtomicUsize,
     /// Maximum concurrent media endpoints; `usize::MAX` is unbounded.
     max_endpoints: usize,
+    /// The local IP every endpoint socket binds. Loopback by default (the NIC-free CI posture); a
+    /// routable IP in production so relay/media sockets are reachable by real peers.
+    bind_ip: IpAddr,
     endpoints: DashMap<EndpointId, EndpointEntry>,
     flows: DashMap<EndpointId, FlowAction>,
     /// Per-endpoint latched peer source (address + RTP SSRC). A packet from a new source re-latches
@@ -268,9 +271,30 @@ impl UdpLoopbackDatapath {
 
     /// Create a backend that allocates at most `max_endpoints` concurrent media endpoints; further
     /// `alloc_endpoint` calls fail with [`DatapathError::PoolExhausted`] until one is freed. This is
-    /// the port/FD-exhaustion guard (docs/security-and-nat.md §5).
+    /// the port/FD-exhaustion guard (docs/security-and-nat.md §5). Sockets bind loopback.
     #[must_use]
     pub fn with_max_endpoints(max_endpoints: usize) -> Self {
+        Self::build(IpAddr::V4(Ipv4Addr::LOCALHOST), max_endpoints)
+    }
+
+    /// Create a backend whose endpoint sockets bind `bind_ip` instead of loopback — the production
+    /// relay posture, so relay/media sockets are reachable by real peers. Prefer a specific routable
+    /// IP (the transmitted source then matches the advertised address); `0.0.0.0` binds every
+    /// interface but lets the kernel pick the source per route, so advertise the reachable IP
+    /// separately (the TURN server's `--turn-relay-ip`). Unbounded pool.
+    #[must_use]
+    pub fn with_bind_ip(bind_ip: IpAddr) -> Self {
+        Self::build(bind_ip, usize::MAX)
+    }
+
+    /// As [`with_bind_ip`](Self::with_bind_ip), also bounding the endpoint pool
+    /// ([`with_max_endpoints`](Self::with_max_endpoints)).
+    #[must_use]
+    pub fn with_bind_ip_and_max_endpoints(bind_ip: IpAddr, max_endpoints: usize) -> Self {
+        Self::build(bind_ip, max_endpoints)
+    }
+
+    fn build(bind_ip: IpAddr, max_endpoints: usize) -> Self {
         let (redirect_tx, redirect_rx) = flume::unbounded();
         let (observe_tx, observe_rx) = flume::bounded(256);
         Self {
@@ -279,6 +303,7 @@ impl UdpLoopbackDatapath {
                 clock: AtomicU64::new(0),
                 live: AtomicUsize::new(0),
                 max_endpoints,
+                bind_ip,
                 endpoints: DashMap::new(),
                 flows: DashMap::new(),
                 latched: DashMap::new(),
@@ -440,7 +465,7 @@ impl Datapath for UdpLoopbackDatapath {
                 limit: self.inner.max_endpoints,
             });
         }
-        let bind = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        let bind = UdpSocket::bind((self.inner.bind_ip, 0))
             .await
             .and_then(|socket| socket.local_addr().map(|addr| (socket, addr)));
         let (socket, local_addr) = match bind {
@@ -997,6 +1022,37 @@ mod tests {
         datapath.remove_endpoint(leg_a.id).await;
         let leg_c = datapath.alloc_endpoint().await.expect("alloc after free");
         let _ = (leg_b, leg_c);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoints_bind_the_configured_ip_and_relay() {
+        // The production posture: endpoints bind a chosen, routable IP rather than loopback's
+        // default, so the relay is reachable by real peers. 127.0.0.0/8 is entirely loopback on
+        // Linux, so a non-default 127.0.0.x address exercises the configurability NIC-free.
+        let bind_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9));
+        let datapath = UdpLoopbackDatapath::with_bind_ip(bind_ip);
+        let relay = datapath.alloc_endpoint().await.expect("alloc");
+        assert_eq!(
+            relay.local_addr.ip(),
+            bind_ip,
+            "the endpoint binds the configured IP, not loopback"
+        );
+
+        // It still relays: a Redirect flow delivers a peer datagram raw (the TURN relay path).
+        datapath
+            .install_flow(relay.id, FlowAction::Redirect)
+            .expect("flow");
+        let rx = datapath.rx();
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        peer.send_to(b"peer-media", relay.local_addr)
+            .await
+            .expect("peer send");
+        let packet = timeout(SHORT, rx.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("packet");
+        assert_eq!(packet.source, peer_addr);
+        assert_eq!(&packet.data[..], b"peer-media");
     }
 
     #[tokio::test]
