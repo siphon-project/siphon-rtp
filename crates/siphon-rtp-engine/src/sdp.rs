@@ -10,6 +10,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use siphon_rtp_srtp::sdes::CryptoAttribute;
+
 /// Errors from SDP parsing/rewrite.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SdpError {
@@ -38,6 +40,10 @@ pub struct MediaInfo {
     pub remote_rtcp: SocketAddr,
     /// Whether the stream offered `a=rtcp-mux` (RTP and RTCP share one port, RFC 5761).
     pub rtcp_mux: bool,
+    /// Whether the `m=audio` transport is a secure profile (`RTP/SAVP`[F]) — an SRTP stream.
+    pub secure: bool,
+    /// The `a=crypto` lines offered (RFC 4568 SDES), in order — the peer's SRTP key candidates.
+    pub crypto: Vec<CryptoAttribute>,
     /// The peer's ICE username fragment (`a=ice-ufrag`), if it offered ICE (RFC 8445).
     pub ice_ufrag: Option<String>,
     /// The peer's ICE password (`a=ice-pwd`), if it offered ICE.
@@ -79,6 +85,10 @@ struct AudioScan {
     rtcp_mux: bool,
     /// `a=rtcp:` line within the audio section: (line index, port).
     audio_rtcp: Option<(usize, u16)>,
+    /// The `m=audio` transport profile (the third field, e.g. `RTP/AVP` or `RTP/SAVP`).
+    transport: Option<String>,
+    /// Parsed `a=crypto` lines in the audio section, in order (RFC 4568).
+    crypto: Vec<CryptoAttribute>,
     /// Peer ICE credentials (`a=ice-ufrag` / `a=ice-pwd`), session- or media-level.
     ice_ufrag: Option<String>,
     ice_pwd: Option<String>,
@@ -117,6 +127,8 @@ fn scan(sdp: &str) -> AudioScan {
         audio_conn: None,
         rtcp_mux: false,
         audio_rtcp: None,
+        transport: None,
+        crypto: Vec::new(),
         ice_ufrag: None,
         ice_pwd: None,
     };
@@ -133,6 +145,8 @@ fn scan(sdp: &str) -> AudioScan {
                 if scan.audio_media.is_none() {
                     if let Some(port) = parse_media_port(value) {
                         scan.audio_media = Some((index, port));
+                        // The transport profile is the third whitespace field: `audio <port> <proto>`.
+                        scan.transport = value.split_whitespace().nth(2).map(str::to_string);
                         in_audio = true;
                         seen_media = true;
                         continue;
@@ -165,6 +179,11 @@ fn scan(sdp: &str) -> AudioScan {
                         scan.rtcp_mux = true;
                     } else if let Some(port) = parse_rtcp_attr(value) {
                         scan.audio_rtcp = Some((index, port));
+                    } else if value.starts_with("crypto:") {
+                        // RFC 4568 SDES key; ignore lines we cannot parse (unknown suite, bad key).
+                        if let Ok(crypto) = CryptoAttribute::parse(value) {
+                            scan.crypto.push(crypto);
+                        }
                     }
                 }
             }
@@ -195,6 +214,12 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         remote_rtp,
         remote_rtcp,
         rtcp_mux: scan.rtcp_mux,
+        // A secure profile is any `RTP/SAVP` variant (SDES today; DTLS-SRTP `UDP/TLS/...` later).
+        secure: scan
+            .transport
+            .as_deref()
+            .is_some_and(|transport| transport.contains("SAVP")),
+        crypto: scan.crypto.clone(),
         ice_ufrag: scan.ice_ufrag.clone(),
         ice_pwd: scan.ice_pwd.clone(),
     })
@@ -213,6 +238,26 @@ pub struct IceAdvertisement<'a> {
     pub ufrag: &'a str,
     /// The engine's local ICE password.
     pub pwd: &'a str,
+}
+
+/// How to advertise the audio stream's security on rewrite (RFC 3264 transport + RFC 4568 SDES).
+#[derive(Debug, Clone, Copy)]
+pub enum SecurityAdvertisement {
+    /// Plaintext `RTP/AVP`: force the transport profile and strip any `a=crypto` lines.
+    Plain,
+    /// Secure `RTP/SAVP`: force the transport, strip the peer's `a=crypto`, and advertise this one
+    /// (the engine's own offered SDES key for the leg).
+    Secure(CryptoAttribute),
+}
+
+impl SecurityAdvertisement {
+    /// The `m=audio` transport profile to advertise.
+    fn transport(self) -> &'static str {
+        match self {
+            SecurityAdvertisement::Plain => "RTP/AVP",
+            SecurityAdvertisement::Secure(_) => "RTP/SAVP",
+        }
+    }
 }
 
 /// Host-candidate priority (RFC 8445 §5.1.2): type-pref 126, local-pref 65535, component 1 (RTP).
@@ -244,6 +289,7 @@ pub fn rewrite(
     sdp: &str,
     engine: EngineMedia,
     ice: Option<IceAdvertisement<'_>>,
+    security: Option<SecurityAdvertisement>,
 ) -> Result<Rewritten, SdpError> {
     let scan = scan(sdp);
     let media = media_info(&scan)?;
@@ -261,17 +307,29 @@ pub fn rewrite(
         if ice.is_some() && is_ice_attribute(line) {
             continue;
         }
+        // Re-originating SRTP keying: drop the peer's `a=crypto`; we advertise our own (or none).
+        if security.is_some() && line.starts_with("a=crypto:") {
+            continue;
+        }
         if index == media_index {
             // `a=ice-lite` is session-level — emit it just before the media line (end of session).
             if ice.is_some() {
                 lines.push("a=ice-lite".to_string());
             }
-            lines.push(rewrite_media_line(line, engine.rtp.port()));
+            lines.push(rewrite_media_line(
+                line,
+                engine.rtp.port(),
+                security.map(SecurityAdvertisement::transport),
+            ));
             // Insert a fresh a=rtcp line only if there is no existing one to rewrite in place.
             if let Some(rtcp) = engine.rtcp {
                 if rtcp_index.is_none() {
                     lines.push(format!("a=rtcp:{}", rtcp.port()));
                 }
+            }
+            // Advertise the engine's SDES key on a secure leg (RFC 4568).
+            if let Some(SecurityAdvertisement::Secure(crypto)) = security {
+                lines.push(format!("a={}", crypto.to_attribute_value()));
             }
             if let Some(ice) = ice {
                 lines.push(format!("a=ice-ufrag:{}", ice.ufrag));
@@ -300,17 +358,20 @@ pub fn rewrite(
     })
 }
 
-/// Replace the port (2nd field) of an `m=audio <port> ...` line, preserving the rest.
-fn rewrite_media_line(line: &str, port: u16) -> String {
+/// Replace the port (2nd field) of an `m=audio <port> <proto> <fmt...>` line and, when `transport`
+/// is `Some`, the transport profile (3rd field), preserving the media type and format list.
+fn rewrite_media_line(line: &str, port: u16, transport: Option<&str>) -> String {
     let body = line.strip_prefix("m=").unwrap_or(line);
     let mut fields = body.split(' ');
     let media = fields.next().unwrap_or("audio");
     let _old_port = fields.next();
-    let rest: Vec<&str> = fields.collect();
-    if rest.is_empty() {
-        format!("m={media} {port}")
+    let proto = fields.next();
+    let formats: Vec<&str> = fields.collect();
+    let proto = transport.or(proto).unwrap_or("RTP/AVP");
+    if formats.is_empty() {
+        format!("m={media} {port} {proto}")
     } else {
-        format!("m={media} {port} {}", rest.join(" "))
+        format!("m={media} {port} {proto} {}", formats.join(" "))
     }
 }
 
@@ -364,7 +425,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, None, None).expect("rewrite");
         assert_eq!(result.media.remote_rtp, "203.0.113.7:49170".parse().unwrap());
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8 96"));
@@ -383,7 +444,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, None, None).expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"));
         assert!(!result.sdp.contains("53000"));
         assert_eq!(result.sdp.matches("a=rtcp:").count(), 1, "no duplicate a=rtcp");
@@ -398,7 +459,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, None, None).expect("rewrite");
         assert!(!result.sdp.contains("a=rtcp:"), "explicit a=rtcp dropped under mux");
         assert!(result.sdp.contains("a=rtcp-mux"), "mux flag preserved");
     }
@@ -410,7 +471,7 @@ mod tests {
             rtp: "127.0.0.1:41000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(sdp, engine, None).expect("rewrite");
+        let result = rewrite(sdp, engine, None, None).expect("rewrite");
         assert_eq!(result.media.remote_rtp, "198.51.100.9:5000".parse().unwrap());
         assert!(result.sdp.contains("c=IN IP4 10.0.0.1"));
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
@@ -441,7 +502,7 @@ mod tests {
                 rtp: "192.0.2.1:10000".parse().expect("addr"),
                 rtcp: None,
             };
-            let _ = rewrite(&text, engine, None);
+            let _ = rewrite(&text, engine, None, None);
         }
     }
 
@@ -480,7 +541,7 @@ mod tests {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
         };
-        let result = rewrite(&sdp, engine, Some(advert)).expect("rewrite");
+        let result = rewrite(&sdp, engine, Some(advert), None).expect("rewrite");
 
         // Our credentials and posture are advertised.
         assert!(result.sdp.contains("a=ice-lite"));
@@ -504,8 +565,62 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, None, None).expect("rewrite");
         assert!(!result.sdp.contains("a=ice-lite"));
         assert!(!result.sdp.contains("a=ice-ufrag"));
+    }
+
+    /// An `RTP/SAVP` (SDES) offer carrying one RFC 4568 `a=crypto` line.
+    fn savp_offer(addr: &str, port: u16) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {addr}\r\nt=0 0\r\n\
+             m=audio {port} RTP/SAVP 0 8\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n"
+        )
+    }
+
+    #[test]
+    fn parse_detects_savp_and_crypto() {
+        let info = parse(&savp_offer("203.0.113.7", 49170)).expect("parse");
+        assert!(info.secure, "RTP/SAVP is a secure profile");
+        assert_eq!(info.crypto.len(), 1);
+        assert_eq!(info.crypto[0].tag, 1);
+        // A plaintext offer is not secure and carries no crypto.
+        let plain = parse(&offer("203.0.113.7", 49170)).expect("parse");
+        assert!(!plain.secure);
+        assert!(plain.crypto.is_empty());
+    }
+
+    #[test]
+    fn rewrite_secure_advertises_savp_and_our_crypto() {
+        use siphon_rtp_srtp::sdes::CryptoSuite;
+        // Bridge an AVP offer up to SAVP: force the transport and advertise the engine's key.
+        let sdp = offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let result = rewrite(&sdp, engine, None, Some(SecurityAdvertisement::Secure(ours)))
+            .expect("rewrite");
+        assert!(result.sdp.contains("m=audio 40000 RTP/SAVP 0 8 96"), "{}", result.sdp);
+        assert!(result.sdp.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"));
+    }
+
+    #[test]
+    fn rewrite_plain_forces_avp_and_strips_crypto() {
+        // Bridge a SAVP answer down to AVP: force the transport and drop the peer's a=crypto.
+        let sdp = savp_offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let result =
+            rewrite(&sdp, engine, None, Some(SecurityAdvertisement::Plain)).expect("rewrite");
+        assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8"), "{}", result.sdp);
+        assert!(!result.sdp.contains("a=crypto:"), "peer crypto stripped: {}", result.sdp);
+        // The parsed input still reports the peer's secure profile + key.
+        assert!(result.media.secure);
+        assert_eq!(result.media.crypto.len(), 1);
     }
 }

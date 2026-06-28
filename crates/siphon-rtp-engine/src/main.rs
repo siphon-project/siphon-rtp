@@ -12,9 +12,11 @@ use std::sync::Arc;
 
 use clap::Parser;
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+use siphon_rtp_datapath::{Datapath, RxPacket};
+use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher;
 use siphon_rtp_engine::{server, ClientId, Engine};
 use siphon_rtp_hep::exporter::HepExporter;
-use siphon_rtp_turn::{tls, SystemUnixClock, Turn, TurnConfig};
+use siphon_rtp_turn::{tls, NoFastPath, SystemUnixClock, Turn, TurnConfig};
 use tokio::net::{TcpListener, UdpSocket};
 use tracing_subscriber::EnvFilter;
 
@@ -90,8 +92,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("control connections require authentication");
     }
 
-    // The built-in TURN server (coturn replacement), if configured.
-    let turn = spawn_turn(Arc::new(datapath.clone()), &args).await?;
+    // The built-in TURN server (coturn replacement), if configured. It no longer drains the
+    // datapath's Redirect stream itself — the unified dispatcher below feeds it its relay packets.
+    let (turn, turn_relay) = spawn_turn(Arc::new(datapath.clone()), &args).await?;
+
+    // The single redirect dispatcher: own `datapath.rx()` and route each redirected datagram by
+    // EndpointId to the SRTP bridge or (when running) the TURN relay — the sole consumer of the
+    // shared Redirect stream (docs/security-and-nat.md §11; the datapath's single-dispatcher rule).
+    tokio::spawn(run_redirect_dispatcher(
+        datapath.rx(),
+        engine.bridge(),
+        turn_relay,
+    ));
 
     // Media-timeout sweep: advance the logical clock ~1 tick/second, reap calls idle past the
     // timeout (docs/security-and-nat.md §4 layer 6), and reap expired TURN allocations on the same
@@ -160,17 +172,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn spawn_turn(
     datapath: Arc<UdpLoopbackDatapath>,
     args: &Args,
-) -> Result<Option<Turn>, Box<dyn std::error::Error>> {
+) -> Result<(Option<Turn>, Option<flume::Sender<RxPacket>>), Box<dyn std::error::Error>> {
     let (Some(realm), Some(secret)) = (
         std::env::var("SIPHON_RTP_TURN_REALM").ok(),
         std::env::var("SIPHON_RTP_TURN_SECRET").ok(),
     ) else {
-        return Ok(None);
+        return Ok((None, None));
     };
 
     let mut config = TurnConfig::new(realm.clone(), secret.into_bytes());
     config.relay_address = args.turn_relay_ip;
-    let turn = Turn::spawn(datapath, config, Arc::new(SystemUnixClock))?;
+    // TURN's relay packets are fed by the redirect dispatcher (it shares datapath.rx() with the SRTP
+    // bridge), not drained by TURN directly. Drop-newest on a full mailbox — late media is worthless.
+    let (relay_tx, relay_rx) = flume::bounded(2048);
+    let turn = Turn::spawn_with_relay_source(
+        datapath,
+        config,
+        Arc::new(SystemUnixClock),
+        Box::new(NoFastPath),
+        relay_rx,
+    )?;
     tracing::info!(realm, "TURN server enabled (coturn replacement)");
 
     if let Some(addr) = args.turn_udp {
@@ -206,5 +227,5 @@ async fn spawn_turn(
     if args.turn_udp.is_none() && args.turn_tcp.is_none() && args.turn_tls.is_none() {
         tracing::warn!("TURN is configured but no --turn-udp/--turn-tcp/--turn-tls listener was given");
     }
-    Ok(Some(turn))
+    Ok((Some(turn), Some(relay_tx)))
 }

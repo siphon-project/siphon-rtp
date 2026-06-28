@@ -24,9 +24,12 @@ use siphon_rtp_datapath::{
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_proto::{CmdResult, Command, Event, ProfileFlags, SessionStats};
+use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 
 use crate::ice::{self, IceCredentials};
-use crate::sdp::{self, EngineMedia};
+use crate::sdp::{self, EngineMedia, SecurityAdvertisement};
+use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
 
 /// Identity of a control client — one persistent JSON-over-TCP connection. A call is owned by the
 /// client that created it via `offer`; only that client may answer, query, or delete it (A3 —
@@ -66,6 +69,10 @@ struct Call {
     to_tag: Option<String>,
     near: Leg,
     far: Leg,
+    /// When the far (answerer) leg is offered as secure (`RTP/SAVP`), the engine's own SDES key
+    /// advertised to B — kept to key the SRTP bridge once B's answer brings its key. `None` for a
+    /// plain relay. (Scenario 1: AVP near ↔ SAVP far; the reverse, a secure near, is a follow-up.)
+    far_local_crypto: Option<CryptoAttribute>,
 }
 
 /// The session engine, generic over a [`Datapath`] backend.
@@ -80,17 +87,27 @@ pub struct Engine<D: Datapath> {
     events: DashMap<ClientId, flume::Sender<Event>>,
     /// Reverse index endpoint → call-id, correlating observed RTCP back to its call (HEP telemetry).
     endpoint_calls: DashMap<EndpointId, String>,
+    /// The userspace SRTP bridge: the `Redirect`-path crypto for secure (`RTP/SAVP`) legs. Shared
+    /// with the redirect dispatcher (see [`crate::srtp_bridge`]).
+    bridge: Arc<SrtpBridge<D>>,
 }
 
 impl<D: Datapath> Engine<D> {
     /// Create an engine over `datapath` with no per-client call quota.
-    pub fn new(datapath: D) -> Self {
+    pub fn new(datapath: D) -> Self
+    where
+        D: Clone,
+    {
         Self::with_max_calls_per_client(datapath, usize::MAX)
     }
 
     /// Create an engine that admits at most `max_calls_per_client` concurrent calls per control
     /// client — a soft DoS quota (the datapath media-port pool is the hard cap).
-    pub fn with_max_calls_per_client(datapath: D, max_calls_per_client: usize) -> Self {
+    pub fn with_max_calls_per_client(datapath: D, max_calls_per_client: usize) -> Self
+    where
+        D: Clone,
+    {
+        let bridge = Arc::new(SrtpBridge::new(datapath.clone()));
         Self {
             datapath,
             calls: DashMap::new(),
@@ -98,12 +115,19 @@ impl<D: Datapath> Engine<D> {
             client_calls: DashMap::new(),
             events: DashMap::new(),
             endpoint_calls: DashMap::new(),
+            bridge,
         }
     }
 
     /// Borrow the underlying datapath (used by tests and, later, the media pipeline).
     pub fn datapath(&self) -> &D {
         &self.datapath
+    }
+
+    /// The shared SRTP bridge — handed to the redirect dispatcher so it can route bridge-owned
+    /// endpoints' datagrams here (see [`crate::srtp_bridge::run_redirect_dispatcher`]).
+    pub fn bridge(&self) -> Arc<SrtpBridge<D>> {
+        self.bridge.clone()
     }
 
     /// Number of live calls in the session registry.
@@ -147,8 +171,11 @@ impl<D: Datapath> Engine<D> {
                 call_id,
                 from_tag,
                 sdp,
-                ..
-            } => self.offer(client, call_id, from_tag, &sdp).await,
+                profile,
+            } => {
+                self.offer(client, call_id, from_tag, &sdp, &profile)
+                    .await
+            }
             Command::Answer {
                 call_id,
                 from_tag,
@@ -214,6 +241,7 @@ impl<D: Datapath> Engine<D> {
         call_id: String,
         from_tag: String,
         sdp: &str,
+        profile: &ProfileFlags,
     ) -> CmdResult {
         // Soft per-client call quota (the datapath media-port pool is the hard cap). Reject before
         // allocating anything. (A3 / DoS — docs/security-and-nat.md §5.)
@@ -263,7 +291,29 @@ impl<D: Datapath> Engine<D> {
             ufrag: creds.ufrag.as_str(),
             pwd: creds.pwd.as_str(),
         });
-        let rewritten = match sdp::rewrite(sdp, engine, advert) {
+
+        // SRTP bridge (Scenario 1): when the control profile asks for a secure far leg
+        // (transport-protocol RTP/SAVP), mint our own SDES key and advertise RTP/SAVP + a=crypto to
+        // B. B's answer brings its key and `answer` wires the bridge. The reverse (a secure near
+        // leg, i.e. A offered SAVP) is a follow-up — see Call::far_local_crypto.
+        let far_secure = profile
+            .transport_protocol
+            .as_deref()
+            .is_some_and(|protocol| protocol.contains("SAVP"));
+        let far_local_crypto = if far_secure {
+            match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+                Ok(crypto) => Some(crypto),
+                Err(error) => {
+                    self.free(&endpoints).await;
+                    return error_result("generate SDES key", &error);
+                }
+            }
+        } else {
+            None
+        };
+        let security = far_local_crypto.map(SecurityAdvertisement::Secure);
+
+        let rewritten = match sdp::rewrite(sdp, engine, advert, security) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 self.free(&endpoints).await;
@@ -301,6 +351,7 @@ impl<D: Datapath> Engine<D> {
                     remote_rtp: None,
                     remote_rtcp: None,
                 },
+                far_local_crypto,
             },
         );
         ok_sdp(rewritten.sdp, None)
@@ -317,14 +368,14 @@ impl<D: Datapath> Engine<D> {
     ) -> CmdResult {
         // Snapshot the leg endpoints under the guard, then release it. Only the owning client may
         // answer (A3 — docs/security-and-nat.md §5); to anyone else the call is unknown.
-        let (near, far, ice_creds) = match self.calls.get(call_id) {
+        let (near, far, ice_creds, far_local_crypto) = match self.calls.get(call_id) {
             Some(call) if call.owner == client => {
                 if call.from_tag != from_tag {
                     return CmdResult::Error {
                         reason: "from_tag mismatch on answer".to_string(),
                     };
                 }
-                (call.near, call.far, call.ice.clone())
+                (call.near, call.far, call.ice.clone(), call.far_local_crypto)
             }
             _ => return unknown_call(call_id),
         };
@@ -347,7 +398,10 @@ impl<D: Datapath> Engine<D> {
             ufrag: creds.ufrag.as_str(),
             pwd: creds.pwd.as_str(),
         });
-        let rewritten = match sdp::rewrite(sdp, engine, advert) {
+        // The answer to A advertises the near leg; on an SRTP bridge that side is plain (RTP/AVP), so
+        // force AVP and strip crypto. A plain relay leaves transport/crypto untouched.
+        let security = far_local_crypto.map(|_| SecurityAdvertisement::Plain);
+        let rewritten = match sdp::rewrite(sdp, engine, advert, security) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 return CmdResult::Error {
@@ -361,59 +415,115 @@ impl<D: Datapath> Engine<D> {
         let near_ice = ice_creds.is_some();
         let far_ice = ice_creds.is_some() && info.is_ice();
 
-        // Install the bidirectional RTP relay. Each endpoint's rule gates its ingress to the
-        // SDP-signalled peer and latches per policy (RTPBleed fix — docs/security-and-nat.md §4):
-        // `near` receives from A (`near.remote_rtp`); `far` receives from B (`info.remote_rtp`).
-        if let Err(error) = self.datapath.install_flow(
-            near.rtp.id,
-            FlowAction::Forward(ingress_rule(
-                far.rtp.id,
-                Some(info.remote_rtp),
-                near.remote_rtp,
-                profile,
-                near_ice,
-            )),
-        ) {
-            return error_result("install near->far RTP flow", &error);
-        }
-        if let Err(error) = self.datapath.install_flow(
-            far.rtp.id,
-            FlowAction::Forward(ingress_rule(
-                near.rtp.id,
-                near.remote_rtp,
-                Some(info.remote_rtp),
-                profile,
-                far_ice,
-            )),
-        ) {
-            return error_result("install far->near RTP flow", &error);
-        }
-
-        // Companion RTCP relay when not muxed. (Under mux, RTCP rides the RTP endpoints already.)
-        if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
+        if let Some(far_local) = far_local_crypto {
+            // Secure far (B) leg → userspace SRTP bridge: terminate SRTP/SRTCP on B and relay
+            // plaintext on A. B's answer must carry its SDES key to key the inbound contexts.
+            let Some(far_remote) = info.crypto.first().copied() else {
+                return error_result("SAVP answer", &"missing a=crypto in the answer");
+            };
+            let (Some(a_rtp), Some(a_rtcp)) = (near.remote_rtp, near.remote_rtcp) else {
+                return error_result("SRTP bridge", &"near leg has no signalled address");
+            };
+            // Redirect every leg endpoint so the bridge sees (and crypts) both directions.
+            for endpoint in near.endpoint_ids().chain(far.endpoint_ids()) {
+                if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                    return error_result("install SRTP bridge redirect", &error);
+                }
+            }
+            let mut flows = vec![
+                // A (plain) ingress → encrypt for B → out the far endpoint toward B.
+                BridgeFlowPlan {
+                    endpoint: near.rtp.id,
+                    op: BridgeOp::Encrypt,
+                    accepted_source: bridge_source_filter(profile, a_rtp),
+                    out_endpoint: far.rtp.id,
+                    out_dst: info.remote_rtp,
+                },
+                // B (secure) ingress → decrypt for A → out the near endpoint toward A.
+                BridgeFlowPlan {
+                    endpoint: far.rtp.id,
+                    op: BridgeOp::Decrypt,
+                    accepted_source: bridge_source_filter(profile, info.remote_rtp),
+                    out_endpoint: near.rtp.id,
+                    out_dst: a_rtp,
+                },
+            ];
+            if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
+                flows.push(BridgeFlowPlan {
+                    endpoint: near_rtcp.id,
+                    op: BridgeOp::Encrypt,
+                    accepted_source: bridge_source_filter(profile, a_rtcp),
+                    out_endpoint: far_rtcp.id,
+                    out_dst: info.remote_rtcp,
+                });
+                flows.push(BridgeFlowPlan {
+                    endpoint: far_rtcp.id,
+                    op: BridgeOp::Decrypt,
+                    accepted_source: bridge_source_filter(profile, info.remote_rtcp),
+                    out_endpoint: near_rtcp.id,
+                    out_dst: a_rtcp,
+                });
+            }
+            self.bridge.register(BridgeCallPlan {
+                leg: SecureLeg::new(&far_local.key, &far_remote.key),
+                flows,
+            });
+        } else {
+            // Plain relay: the in-datapath Forward fast path. Each endpoint's rule gates its ingress
+            // to the SDP-signalled peer and latches per policy (RTPBleed fix —
+            // docs/security-and-nat.md §4): `near` receives from A (`near.remote_rtp`); `far` from B
+            // (`info.remote_rtp`).
             if let Err(error) = self.datapath.install_flow(
-                near_rtcp.id,
+                near.rtp.id,
                 FlowAction::Forward(ingress_rule(
-                    far_rtcp.id,
-                    Some(info.remote_rtcp),
-                    near.remote_rtcp,
+                    far.rtp.id,
+                    Some(info.remote_rtp),
+                    near.remote_rtp,
                     profile,
                     near_ice,
                 )),
             ) {
-                return error_result("install near->far RTCP flow", &error);
+                return error_result("install near->far RTP flow", &error);
             }
             if let Err(error) = self.datapath.install_flow(
-                far_rtcp.id,
+                far.rtp.id,
                 FlowAction::Forward(ingress_rule(
-                    near_rtcp.id,
-                    near.remote_rtcp,
-                    Some(info.remote_rtcp),
+                    near.rtp.id,
+                    near.remote_rtp,
+                    Some(info.remote_rtp),
                     profile,
                     far_ice,
                 )),
             ) {
-                return error_result("install far->near RTCP flow", &error);
+                return error_result("install far->near RTP flow", &error);
+            }
+
+            // Companion RTCP relay when not muxed. (Under mux, RTCP rides the RTP endpoints already.)
+            if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
+                if let Err(error) = self.datapath.install_flow(
+                    near_rtcp.id,
+                    FlowAction::Forward(ingress_rule(
+                        far_rtcp.id,
+                        Some(info.remote_rtcp),
+                        near.remote_rtcp,
+                        profile,
+                        near_ice,
+                    )),
+                ) {
+                    return error_result("install near->far RTCP flow", &error);
+                }
+                if let Err(error) = self.datapath.install_flow(
+                    far_rtcp.id,
+                    FlowAction::Forward(ingress_rule(
+                        near_rtcp.id,
+                        near.remote_rtcp,
+                        Some(info.remote_rtcp),
+                        profile,
+                        far_ice,
+                    )),
+                ) {
+                    return error_result("install far->near RTCP flow", &error);
+                }
             }
         }
 
@@ -450,7 +560,14 @@ impl<D: Datapath> Engine<D> {
         // missing call) gets `unknown_call`, so it cannot even probe for a call's existence.
         match self.calls.remove_if(call_id, |_, call| call.owner == client) {
             Some((_, call)) => {
-                for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
+                let endpoints: Vec<EndpointId> = call
+                    .near
+                    .endpoint_ids()
+                    .chain(call.far.endpoint_ids())
+                    .collect();
+                // Drop any SRTP-bridge flows first (a no-op for a plain relay), then free the sockets.
+                self.bridge.deregister(endpoints.iter().copied());
+                for endpoint in endpoints {
                     self.datapath.remove_endpoint(endpoint).await;
                     self.endpoint_calls.remove(&endpoint);
                 }
@@ -676,6 +793,22 @@ fn ingress_rule(
     }
 }
 
+/// The source-address gate for an SRTP-bridge leg, mirroring [`ingress_rule`]'s policy: an exact
+/// source-IP gate by default (the tightest RTPBleed defence), the signalled /24 (v4) or /64 (v6)
+/// under `subnet-source`, or any source under `symmetric`. The bridge enforces this itself because
+/// the `Redirect` path bypasses the datapath's Forward-path source gate (docs/security-and-nat.md
+/// §4 layer 2).
+fn bridge_source_filter(profile: &ProfileFlags, addr: std::net::SocketAddr) -> SourceFilter {
+    if profile.flags.iter().any(|flag| flag == "symmetric") {
+        SourceFilter::Any
+    } else if profile.flags.iter().any(|flag| flag == "subnet-source") {
+        let prefix = if addr.is_ipv4() { 24 } else { 64 };
+        SourceFilter::Subnet(addr.ip(), prefix)
+    } else {
+        SourceFilter::Exact(addr.ip())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,10 +854,101 @@ mod tests {
         (buffer[..len].to_vec(), from)
     }
 
+    /// A `RTP/SAVP` answer SDP at `addr` carrying `crypto` (rtcp-mux, so it is a single port).
+    fn savp_answer_sdp(addr: SocketAddr, crypto: &CryptoAttribute) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/SAVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\na={crypto_line}\r\n",
+            ip = addr.ip(),
+            port = addr.port(),
+            crypto_line = crypto.to_attribute_value(),
+        )
+    }
+
+    fn rtp_packet(seq: u16, ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0x80, 0x00];
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 0]);
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(b"amr-wb-frame----");
+        packet
+    }
+
     #[tokio::test]
     async fn ping_pongs() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         assert_eq!(engine.handle(CLIENT, Command::Ping).await, CmdResult::Pong);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn savp_bridge_relays_avp_plaintext_to_savp_srtp_both_ways() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::SrtpContext;
+
+        // Scenario 1: A is plain RTP/AVP, the control asks for a secure RTP/SAVP far leg, and the
+        // engine bridges the two — SRTP terminated on B, plaintext relayed to A. Driven end-to-end
+        // through the control plane with the redirect dispatcher live.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), None));
+
+        let (phone_a, addr_a) = phone().await; // plain (AVP) caller A
+        let (phone_b, addr_b) = phone().await; // secure (SAVP) callee B
+
+        // A offers plaintext RTP/AVP; the profile asks for a secure far leg (rtpengine model).
+        let profile = ProfileFlags {
+            transport_protocol: Some("RTP/SAVP".into()),
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "savp-1".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile,
+            })
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("parse offer reply");
+        assert!(offer_reply.secure, "the engine offers RTP/SAVP to B");
+        let engine_far_key = *offer_reply.crypto.first().expect("engine a=crypto to B");
+        let far_addr = offer_reply.remote_rtp; // the engine's B-facing endpoint
+
+        // B answers RTP/SAVP with its own SDES key.
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answer = engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "savp-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &b_key),
+                profile: ProfileFlags::default(),
+            })
+            .await;
+        let answer_reply = sdp::parse(&ok_sdp_text(&answer)).expect("parse answer reply");
+        assert!(!answer_reply.secure, "the answer to A is plaintext RTP/AVP");
+        assert!(answer_reply.crypto.is_empty(), "no crypto leaks to the plain leg");
+        let near_addr = answer_reply.remote_rtp; // the engine's A-facing endpoint
+
+        // A → engine(near) → bridge encrypts → B receives SRTP, decryptable with the engine's key.
+        let from_a = rtp_packet(100, 0x0A0A_0A0A);
+        phone_a.send_to(&from_a, near_addr).await.expect("a send");
+        let (srtp, from) = recv(&phone_b).await;
+        assert_eq!(from, far_addr, "media leaves the engine's B-facing port");
+        assert_ne!(srtp, from_a, "B receives SRTP, not plaintext");
+        let mut b_decrypt = SrtpContext::from_key_material(&engine_far_key.key);
+        let mut recovered = Vec::new();
+        b_decrypt.unprotect(&srtp, &mut recovered).expect("B decrypts the engine's SRTP");
+        assert_eq!(recovered, from_a);
+
+        // B → engine(far) as SRTP (B's key) → bridge decrypts → A receives plaintext.
+        let from_b = rtp_packet(200, 0x0B0B_0B0B);
+        let mut b_encrypt = SrtpContext::from_key_material(&b_key.key);
+        let mut srtp_b = Vec::new();
+        b_encrypt.protect(&from_b, &mut srtp_b).expect("B encrypts");
+        phone_b.send_to(&srtp_b, far_addr).await.expect("b send");
+        let (recovered_a, from) = recv(&phone_a).await;
+        assert_eq!(from, near_addr, "media leaves the engine's A-facing port");
+        assert_eq!(recovered_a, from_b, "A receives the decrypted plaintext");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
