@@ -55,6 +55,12 @@ struct Args {
     /// reachable one (e.g. a NAT'd host). Defaults to the datapath-assigned address.
     #[arg(long)]
     turn_relay_ip: Option<IpAddr>,
+
+    /// Bind relay/media sockets to this IP instead of loopback — the production posture so the relay
+    /// is reachable by real peers (docs/security-and-nat.md §11.1). With a `0.0.0.0` bind or a NAT'd
+    /// host, pair with `--turn-relay-ip` to advertise the reachable address.
+    #[arg(long)]
+    relay_bind_ip: Option<IpAddr>,
 }
 
 #[tokio::main]
@@ -67,7 +73,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // M1: the always-available NIC-free backend. XDP backend slots in behind the same trait. The
     // engine and the TURN server share one datapath (cloning shares the pool + logical clock).
-    let datapath = UdpLoopbackDatapath::new();
+    // Endpoints bind loopback by default; `--relay-bind-ip` binds a routable IP so the relay reaches
+    // real peers (docs/security-and-nat.md §11.1).
+    let datapath = match args.relay_bind_ip {
+        Some(ip) => UdpLoopbackDatapath::with_bind_ip(ip),
+        None => UdpLoopbackDatapath::new(),
+    };
     let engine = Arc::new(Engine::new(datapath.clone()));
 
     let listener = TcpListener::bind(args.control).await?;
