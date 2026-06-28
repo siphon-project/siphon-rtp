@@ -6,10 +6,11 @@
 //! interpolation. `isp_isf` is the inverse (used for the stability factor and concealment).
 
 use crate::amr::basic_ops::{
-    add, extract_l, l_abs, l_add, l_mult, l_msu, l_shl, l_shr, l_shr_r, l_sub, norm_l, round_word,
-    shl, shr, shr_r, sub,
+    add, extract_l, l_abs, l_add, l_mac, l_mult, l_msu, l_shl, l_shr, l_shr_r, l_sub, norm_l,
+    round_word, shl, shr, shr_r, sub,
 };
 use crate::amr::oper_32b::{l_extract, mpy_32_16};
+use crate::amr::wb::constants::M as ORDER;
 
 /// `cos(x)` in Q15 over 128 segments (TS 26.173 `isp_isf.tab`). 129 real entries; one extra
 /// duplicate of the last so the `table[ind+1]` read at `ind = 128` (where the offset is always 0)
@@ -209,6 +210,24 @@ pub fn isp_az(isp: &[i16], a: &mut [i16], m: usize, adaptive_scaling: bool) {
     a[m] = shr_r(last, add(3, q));
 }
 
+/// Interpolate the ISPs across the 4 subframes and convert each set to LP coefficients (`Int_isp`).
+/// Subframes 0-2 blend `isp_old`→`isp_new` by `frac[0..3]` (Q15); subframe 3 uses `isp_new`. `az`
+/// receives the 4 coefficient sets back-to-back, each `M+1` long (length `4·(M+1)`).
+pub fn int_isp(isp_old: &[i16], isp_new: &[i16], frac: &[i16], az: &mut [i16]) {
+    const MP1: usize = ORDER + 1;
+    let mut isp = [0i16; ORDER];
+    for (k, &fac_new) in frac.iter().enumerate().take(3) {
+        let fac_old = add(sub(32767, fac_new), 1); // 1.0 - fac_new
+        for i in 0..ORDER {
+            let l_tmp = l_mac(l_mult(isp_old[i], fac_old), isp_new[i], fac_new);
+            isp[i] = round_word(l_tmp);
+        }
+        isp_az(&isp, &mut az[k * MP1..], ORDER, false);
+    }
+    // 4th subframe: isp_new (frac = 1.0).
+    isp_az(isp_new, &mut az[3 * MP1..], ORDER, false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +264,23 @@ mod tests {
         assert_eq!(a[0], 4096, "a[0] = 1.0 in Q12");
         // a[m] = isp[m-1] converted Q15 → Q12 (>>3 with rounding).
         assert_eq!(a[M], super::shr_r(isp[M - 1], 3));
+    }
+
+    #[test]
+    fn int_isp_with_equal_endpoints_repeats_the_coefficients() {
+        // isp_old == isp_new → interpolation is a no-op, so all 4 subframes share one A(z).
+        let mut isp = [0i16; M];
+        isf_isp(&ISF, &mut isp, M);
+        let mut az = [0i16; 4 * (M + 1)];
+        int_isp(&isp, &isp, &[8192, 16384, 24576], &mut az);
+
+        let mut reference = [0i16; M + 1];
+        isp_az(&isp, &mut reference, M, false);
+        for subframe in 0..4 {
+            let block = &az[subframe * (M + 1)..(subframe + 1) * (M + 1)];
+            assert_eq!(block, &reference, "subframe {subframe}");
+            assert_eq!(block[0], 4096);
+        }
     }
 
     #[test]
