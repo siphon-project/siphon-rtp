@@ -1472,7 +1472,9 @@ name = "siphon-rtp-srtp"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "base64",
  "ctr",
+ "getrandom 0.2.17",
  "hmac",
  "sha1",
  "subtle",

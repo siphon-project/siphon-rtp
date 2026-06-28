@@ -16,8 +16,10 @@ use sha1::Sha1;
 use subtle::ConstantTimeEq;
 
 pub mod kdf;
+pub mod sdes;
 
 use kdf::MASTER_SALT_LEN;
+use sdes::SrtpKeyMaterial;
 
 type AesCm = ctr::Ctr128BE<Aes128>;
 type HmacSha1 = Hmac<Sha1>;
@@ -104,6 +106,12 @@ impl SrtpContext {
             session_auth,
             streams: HashMap::new(),
         }
+    }
+
+    /// Build a context from SDES [`SrtpKeyMaterial`] (a parsed/generated `a=crypto` inline key).
+    #[must_use]
+    pub fn from_key_material(material: &SrtpKeyMaterial) -> Self {
+        Self::new(&material.master_key, &material.master_salt)
     }
 
     /// Encrypt + authenticate an RTP packet into `out` (cleared first): `header || AES-CM(payload) ||
