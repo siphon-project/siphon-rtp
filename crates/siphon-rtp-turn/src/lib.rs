@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use siphon_rtp_datapath::Datapath;
+use siphon_rtp_datapath::{Datapath, RxPacket};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
@@ -356,6 +356,27 @@ impl Turn {
     where
         D: Datapath + 'static,
     {
+        // Standalone: TURN is the sole consumer of the datapath's shared Redirect stream.
+        let relay_rx = datapath.rx();
+        Self::spawn_with_relay_source(datapath, config, unix_clock, fast_path, relay_rx)
+    }
+
+    /// As [`spawn_with_fast_path`](Turn::spawn_with_fast_path), but draining `relay_rx` for relayed
+    /// peer datagrams instead of `datapath.rx()` directly. Use this when a **central redirect
+    /// dispatcher** owns the datapath's shared Redirect stream and routes only TURN's relay packets
+    /// here — the posture when the engine runs the TURN server and the SRTP media bridge over one
+    /// datapath (both use `FlowAction::Redirect`, so the dispatcher demuxes by `EndpointId`). The
+    /// provided receiver should deliver only datagrams for TURN relay endpoints.
+    pub fn spawn_with_relay_source<D>(
+        datapath: Arc<D>,
+        config: TurnConfig,
+        unix_clock: Arc<dyn UnixClock>,
+        fast_path: Box<dyn TurnFastPath>,
+        relay_rx: flume::Receiver<RxPacket>,
+    ) -> Result<Self, TurnError>
+    where
+        D: Datapath + 'static,
+    {
         let mut nonce_secret = [0u8; 32];
         getrandom::getrandom(&mut nonce_secret).map_err(|e| TurnError::Entropy(e.to_string()))?;
         let nonce = NonceFactory::new(nonce_secret, config.nonce_lifetime);
@@ -365,12 +386,9 @@ impl Turn {
             AllocationManager::new(datapath.clone(), config, unix_clock, nonce, fast_path);
         tokio::spawn(manager.run(client_rx));
 
-        // The single consumer of the datapath's shared Redirect stream: route every relayed peer
-        // datagram to the allocation actor (the only Redirect user today; the media plane's future
-        // Redirect consumer would demux by EndpointId here). Drop-newest on a full mailbox — late
-        // media is worthless (docs/security-and-nat.md §11; CLAUDE.md concurrency rules).
+        // Drain redirected peer datagrams into the allocation actor. Drop-newest on a full mailbox —
+        // late media is worthless (docs/security-and-nat.md §11; CLAUDE.md concurrency rules).
         let relay_tx = client_tx.clone();
-        let relay_rx = datapath.rx();
         tokio::spawn(async move {
             while let Ok(packet) = relay_rx.recv_async().await {
                 let message = Message::RelayInbound {

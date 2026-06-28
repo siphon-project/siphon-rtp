@@ -157,9 +157,37 @@ impl<D: Datapath> SrtpBridge<D> {
     }
 }
 
+/// Run the redirect dispatcher: drain the datapath's shared Redirect stream and route each datagram
+/// by [`EndpointId`] — bridge-owned endpoints to the [`SrtpBridge`], everything else to the TURN
+/// relay sink (when TURN is running). This is the single owner of `datapath.rx()` the datapath
+/// design calls for ("a single dispatcher should own it and route each RxPacket to the owning
+/// subsystem by EndpointId"). Runs until the redirect stream closes (datapath shutdown).
+pub async fn run_redirect_dispatcher<D: Datapath>(
+    redirect_rx: flume::Receiver<RxPacket>,
+    bridge: Arc<SrtpBridge<D>>,
+    turn_relay: Option<flume::Sender<RxPacket>>,
+) {
+    while let Ok(packet) = redirect_rx.recv_async().await {
+        if bridge.owns(packet.endpoint) {
+            bridge.handle(packet).await;
+        } else if let Some(turn) = &turn_relay {
+            // Drop-newest on a full TURN mailbox — late media is worthless.
+            if turn.try_send(packet).is_err() {
+                tracing::trace!("TURN relay sink full or closed; dropping redirected datagram");
+            }
+        } else {
+            tracing::debug!(
+                endpoint = ?packet.endpoint,
+                "redirected datagram with no consumer; dropped"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
@@ -326,6 +354,58 @@ mod tests {
         assert!(
             timeout(NEGATIVE, phone_a.recv_from(&mut scratch)).await.is_err(),
             "an unauthenticated SRTP packet must not be forwarded to the plain leg"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatcher_routes_owned_to_bridge_and_rest_to_turn() {
+        let datapath = UdpLoopbackDatapath::new();
+        let owned = datapath.alloc_endpoint().await.expect("alloc");
+        let bridge = Arc::new(SrtpBridge::new(datapath));
+        bridge.register(BridgeCallPlan {
+            leg: SecureLeg::new(&key(1), &key(2)),
+            flows: vec![BridgeFlowPlan {
+                endpoint: owned.id,
+                op: BridgeOp::Decrypt,
+                accepted_source: SourceFilter::Any,
+                out_endpoint: owned.id,
+                out_dst: owned.local_addr,
+            }],
+        });
+
+        let (feed, redirect_rx) = flume::unbounded();
+        let (turn_tx, turn_rx) = flume::bounded(16);
+        tokio::spawn(run_redirect_dispatcher(
+            redirect_rx,
+            bridge.clone(),
+            Some(turn_tx),
+        ));
+
+        // A datagram for an endpoint the bridge does not own is routed to the TURN sink.
+        let other = EndpointId(987_654);
+        feed.send(RxPacket {
+            endpoint: other,
+            source: "127.0.0.1:5000".parse().expect("addr"),
+            data: Bytes::from_static(b"turn-relay-data"),
+        })
+        .expect("feed");
+        let routed = timeout(SHORT, turn_rx.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("packet");
+        assert_eq!(routed.endpoint, other);
+
+        // A datagram for a bridge-owned endpoint is consumed by the bridge (it fails crypto and is
+        // dropped here, but it must never be misrouted to TURN).
+        feed.send(RxPacket {
+            endpoint: owned.id,
+            source: "127.0.0.1:5001".parse().expect("addr"),
+            data: Bytes::from_static(b"not-a-valid-srtp-packet"),
+        })
+        .expect("feed");
+        assert!(
+            timeout(NEGATIVE, turn_rx.recv_async()).await.is_err(),
+            "a bridge-owned datagram must not be routed to TURN"
         );
     }
 
