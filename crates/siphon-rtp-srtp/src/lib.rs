@@ -16,6 +16,7 @@ use sha1::Sha1;
 use subtle::ConstantTimeEq;
 
 pub mod kdf;
+pub mod leg;
 pub mod sdes;
 pub mod srtcp;
 
