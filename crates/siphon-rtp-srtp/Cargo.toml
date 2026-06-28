@@ -1,0 +1,19 @@
+# siphon-rtp-srtp — pure-Rust SRTP/SRTCP (RFC 3711) for the SDES bridge legs. AES-CM + HMAC-SHA1
+# via the RustCrypto primitives (pure Rust, zero C — no libsrtp/OpenSSL). Isolated from the engine
+# so the crypto core validates against the RFC vectors on its own.
+[package]
+name = "siphon-rtp-srtp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+aes = "0.8"
+ctr = "0.9"
+hmac = "0.12"
+sha1 = "0.10"
+subtle = "2.6"
+thiserror = { workspace = true }
