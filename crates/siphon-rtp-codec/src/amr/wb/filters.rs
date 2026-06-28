@@ -5,7 +5,10 @@
 //! [`deemph`] / [`deemph2`] are the single-precision variants used elsewhere. Each carries `mem`
 //! (`y[-1]`) across calls.
 
-use crate::amr::basic_ops::{l_deposit_h, l_mac, l_mult, l_shl, round_word, shr};
+use crate::amr::basic_ops::{
+    add, extract_h, extract_l, l_deposit_h, l_mac, l_msu, l_mult, l_shl, l_shr, norm_s, round_word,
+    shr, sub,
+};
 
 /// De-emphasis on a Q15-deposited signal: `y[n] = x[n] + mu·y[n-1]`, in place. `mem` is `y[-1]`.
 pub fn deemph(x: &mut [i16], mu: i16, mem: &mut i16) {
@@ -65,6 +68,46 @@ pub fn deemph_32(x_hi: &[i16], x_lo: &[i16], y: &mut [i16], mu: i16, mem: &mut i
     *mem = y[len - 1];
 }
 
+/// Order-`m` LPC synthesis at the 12.8 kHz core (TS 26.173 `Syn_filt_32`): `1/A(z)` driven by the
+/// `Qnew`-scaled excitation, producing the synthesis as a split `(sig_hi, sig_lo)` 32-bit signal for
+/// extra precision in the recursion.
+///
+/// `a` is `a[0..=m]` (Q12). `sig_hi`/`sig_lo` are length `m + lg`: indices `[0..m)` are the carried
+/// filter memory (the previous frame's last `m` synthesis samples), and `[m..m+lg)` receive this
+/// block's output. `exc` is length `lg`.
+pub fn syn_filt_32(
+    a: &[i16],
+    m: usize,
+    exc: &[i16],
+    q_new: i16,
+    sig_hi: &mut [i16],
+    sig_lo: &mut [i16],
+    lg: usize,
+) {
+    let s = sub(norm_s(a[0]), 2);
+    let a0 = shr(a[0], add(4, q_new)); // input / 16 and >> Qnew
+
+    for i in 0..lg {
+        // Low-part feedback: -sum(sig_lo[i-j]·a[j]).
+        let mut l_tmp = 0i32;
+        for j in 1..=m {
+            l_tmp = l_msu(l_tmp, sig_lo[m + i - j], a[j]);
+        }
+        l_tmp = l_shr(l_tmp, 16 - 4); // sig_lo carried << 4
+        l_tmp = l_mac(l_tmp, exc[i], a0);
+        // High-part feedback: -sum(sig_hi[i-j]·a[j]).
+        for j in 1..=m {
+            l_tmp = l_msu(l_tmp, sig_hi[m + i - j], a[j]);
+        }
+        l_tmp = l_shl(l_tmp, add(3, s)); // a in Q12
+
+        let hi = extract_h(l_tmp); // bits 16..31
+        sig_hi[m + i] = hi;
+        l_tmp = l_shr(l_tmp, 4);
+        sig_lo[m + i] = extract_l(l_msu(l_tmp, hi, 2048)); // bits 4..15
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +148,28 @@ mod tests {
         deemph(&mut [], PREEMPH_FAC, &mut mem);
         deemph_32(&[], &[], &mut [], PREEMPH_FAC, &mut mem);
         assert_eq!(mem, 42);
+    }
+
+    #[test]
+    fn syn_filt_zero_excitation_is_silent() {
+        // 1/A(z) of zero excitation with zero memory → zero synthesis.
+        let a = [4096i16, -2048, 0, 0]; // a[0]=1.0 Q12, m=3
+        let mut sig_hi = vec![0i16; 3 + 4];
+        let mut sig_lo = vec![0i16; 3 + 4];
+        syn_filt_32(&a, 3, &[0; 4], 0, &mut sig_hi, &mut sig_lo, 4);
+        assert!(sig_hi.iter().all(|&v| v == 0));
+        assert!(sig_lo.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn syn_filt_unity_gain_passes_excitation() {
+        // a = [1.0, 0] (m=1, no prediction) → the synthesis is the scaled excitation. exc=16, Qnew=0:
+        // 16·a0(256)·2 (L_mac) ·8 (<<3) = 65536 = hi(1)<<16, lo=0.
+        let a = [4096i16, 0];
+        let mut sig_hi = vec![0i16; 1 + 1];
+        let mut sig_lo = vec![0i16; 1 + 1];
+        syn_filt_32(&a, 1, &[16], 0, &mut sig_hi, &mut sig_lo, 1);
+        assert_eq!(sig_hi[1], 1);
+        assert_eq!(sig_lo[1], 0);
     }
 }
