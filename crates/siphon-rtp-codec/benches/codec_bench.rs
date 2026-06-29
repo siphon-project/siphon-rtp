@@ -5,8 +5,9 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use siphon_rtp_codec::amr::wb::dec_main::{decode_frame, DecoderState};
-use siphon_rtp_codec::amr::wb::{constants, filters, lpc, pitch};
+use siphon_rtp_codec::amr::wb::{codebook, constants, filters, lpc, pitch};
 use siphon_rtp_codec::amr::basic_ops;
+use siphon_rtp_codec::amr::AMRWB_SPEECH_BITS;
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::{Decoder, Encoder};
 
@@ -137,44 +138,62 @@ fn bench_amrwb_dsp(criterion: &mut Criterion) {
     });
 }
 
-/// Full mode-0 (6.60 kbit/s) frame decode (µs/frame): the whole `dec_main` pipeline including the
-/// 16 kHz HF synthesis. Reads a real speech frame from the 3GPP `tst_m0.cod` vector; if the
-/// (gitignored) vector is absent the bench is skipped so CI without the vectors still builds.
-fn bench_amrwb_decode(criterion: &mut Criterion) {
-    const COD_FRAME_WORDS: usize = 3 + 132;
-
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("../../reference/amr-wb/testv/tst_m0.cod");
-    let Ok(cod) = std::fs::read(&path) else {
-        return; // vectors not present in this checkout
-    };
-    let cod_words: Vec<i16> = cod
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect();
-
-    // Pick frame 8 — the first frame with real (non-silence, post-homing) speech energy.
-    let frame_index = 8usize;
-    let base = frame_index * COD_FRAME_WORDS;
-    let bits: Vec<i16> = cod_words[base + 3..base + COD_FRAME_WORDS].to_vec();
-
-    // Warm the decoder state through the preceding frames so the bench frame sees realistic memory.
-    let mut state = DecoderState::new();
-    let mut out = vec![0i16; constants::L_FRAME16K];
-    for f in 0..frame_index {
-        let fb = &cod_words[f * COD_FRAME_WORDS + 3..(f + 1) * COD_FRAME_WORDS];
-        decode_frame(&mut state, fb, &mut out);
-    }
-    let warm = state.clone();
-
-    criterion.bench_function("amrwb_decode_mode0_frame", |bencher| {
-        // Clone the warmed state outside the timed section so only the decode is measured.
-        bencher.iter_batched(
-            || warm.clone(),
-            |mut st| decode_frame(&mut st, black_box(&bits), black_box(&mut out)),
-            BatchSize::SmallInput,
-        );
+/// The 4-track algebraic codebook decode (µs/subframe), the per-subframe innovative-code kernel for
+/// the higher modes. Benches the 36-bit (mode-2 / 12.65k VoLTE) and 88-bit (mode 7/8) budgets.
+fn bench_amrwb_codebook(criterion: &mut Criterion) {
+    let mut code = [0i16; constants::L_SUBFR];
+    let ind36 = [0x12i16, 0x55, 0x1AA, 0x0FF];
+    criterion.bench_function("amrwb_dec_acelp_4t64_36bit", |bencher| {
+        bencher.iter(|| codebook::dec_acelp_4t64(black_box(&ind36), 36, black_box(&mut code)));
     });
+    let ind88 = [0x123i16, 0x456, 0x789, 0x2AB, 0x3CD, 0x1EF, 0x012, 0x345];
+    criterion.bench_function("amrwb_dec_acelp_4t64_88bit", |bencher| {
+        bencher.iter(|| codebook::dec_acelp_4t64(black_box(&ind88), 88, black_box(&mut code)));
+    });
+}
+
+/// Full per-mode frame decode (µs/frame): the whole `dec_main` pipeline including the 16 kHz HF
+/// synthesis, for every speech mode 0..=8. Reads a real warmed-up speech frame from the 3GPP
+/// `tst_mN.cod` vectors; if a (gitignored) vector is absent that mode's bench is skipped so CI
+/// without the vectors still builds.
+fn bench_amrwb_decode(criterion: &mut Criterion) {
+    for mode in 0u8..=8 {
+        let nb_bits = AMRWB_SPEECH_BITS[mode as usize] as usize;
+        let cod_frame_words = 3 + nb_bits;
+
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push(format!("../../reference/amr-wb/testv/tst_m{mode}.cod"));
+        let Ok(cod) = std::fs::read(&path) else {
+            continue; // vectors not present in this checkout
+        };
+        let cod_words: Vec<i16> = cod
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        // Pick frame 8 — the first frame with real (non-silence, post-homing) speech energy.
+        let frame_index = 8usize;
+        let base = frame_index * cod_frame_words;
+        let bits: Vec<i16> = cod_words[base + 3..base + cod_frame_words].to_vec();
+
+        // Warm the decoder state through the preceding frames so the bench sees realistic memory.
+        let mut state = DecoderState::new();
+        let mut out = vec![0i16; constants::L_FRAME16K];
+        for f in 0..frame_index {
+            let fb = &cod_words[f * cod_frame_words + 3..(f + 1) * cod_frame_words];
+            decode_frame(&mut state, mode, fb, &mut out);
+        }
+        let warm = state.clone();
+
+        criterion.bench_function(&format!("amrwb_decode_mode{mode}_frame"), |bencher| {
+            // Clone the warmed state outside the timed section so only the decode is measured.
+            bencher.iter_batched(
+                || warm.clone(),
+                |mut st| decode_frame(&mut st, mode, black_box(&bits), black_box(&mut out)),
+                BatchSize::SmallInput,
+            );
+        });
+    }
 }
 
 criterion_group!(
@@ -182,6 +201,7 @@ criterion_group!(
     bench_g711,
     bench_basic_ops,
     bench_amrwb_dsp,
+    bench_amrwb_codebook,
     bench_amrwb_decode
 );
 criterion_main!(benches);

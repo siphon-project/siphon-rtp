@@ -290,12 +290,15 @@ impl Encoder for AmrNb {
 
 /// AMR-WB codec (16 kHz, mono, 20 ms = 320 samples).
 ///
-/// Decode is wired for **mode 0** (6.60 kbit/s) end to end, bit-exact against the 3GPP `tst_m0`
-/// vector; the higher modes and DTX/CNG/PLC remain WIP and return [`CodecError::Unsupported`].
+/// Decode is wired for **all 9 speech modes** (6.60 .. 23.85 kbit/s) end to end, bit-exact against
+/// the 3GPP `tst_mN` vectors, plus bad-frame concealment ([`Decoder::conceal`]). DTX/CNG (comfort
+/// noise) remains WIP and returns [`CodecError::Unsupported`].
 #[derive(Debug, Clone)]
 pub struct AmrWb {
     params: CodecParams,
     decoder_state: Box<wb::dec_main::DecoderState>,
+    /// Last decoded speech mode (0..=8), used to size concealed frames after a loss.
+    last_mode: u8,
 }
 
 impl Default for AmrWb {
@@ -315,19 +318,40 @@ impl AmrWb {
                 ptime_ms: 20,
             },
             decoder_state: Box::new(wb::dec_main::DecoderState::new()),
+            last_mode: 0,
         }
     }
 
-    /// Decode one mode-0 (6.60 kbit/s) frame from its 132 speech bits already in
-    /// encoder/`Bits2prm` order (the `.cod` order). Writes `L_FRAME16K` (320) samples to `out`.
+    /// Decode one speech frame of `mode` (0..=8) from its speech bits already in encoder/`Bits2prm`
+    /// order (the `.cod` order). Writes `L_FRAME16K` (320) samples to `out`.
     ///
-    /// This is the bit-exact core used by the `tst_m0` acceptance test; the RTP [`Decoder::decode`]
+    /// This is the bit-exact core used by the `tst_mN` acceptance tests; the RTP [`Decoder::decode`]
     /// path un-sorts the RFC 4867 payload before calling into the same core.
-    pub fn decode_mode0_bits(&mut self, bits: &[i16], out: &mut [i16]) -> Result<usize, CodecError> {
+    pub fn decode_mode_bits(
+        &mut self,
+        mode: u8,
+        bits: &[i16],
+        out: &mut [i16],
+    ) -> Result<usize, CodecError> {
+        if mode > 8 {
+            return Err(CodecError::Unsupported("AMR-WB mode out of range"));
+        }
         if out.len() < wb::constants::L_FRAME16K {
             return Err(CodecError::Malformed("AMR-WB output buffer too small"));
         }
-        Ok(wb::dec_main::decode_frame(&mut self.decoder_state, bits, out))
+        self.last_mode = mode;
+        Ok(wb::dec_main::decode_frame(
+            &mut self.decoder_state,
+            mode,
+            bits,
+            out,
+        ))
+    }
+
+    /// Decode one mode-0 (6.60 kbit/s) frame from its 132 encoder-order speech bits (compat shim for
+    /// [`Self::decode_mode_bits`] with `mode = 0`).
+    pub fn decode_mode0_bits(&mut self, bits: &[i16], out: &mut [i16]) -> Result<usize, CodecError> {
+        self.decode_mode_bits(0, bits, out)
     }
 
     /// The codec's native parameters (inherent shortcut; the trait methods also expose this).
@@ -351,9 +375,9 @@ impl Decoder for AmrWb {
         self.params.frame_samples()
     }
 
-    /// Decode one AMR-WB RTP frame. Mode 0 (6.60 kbit/s) is wired bit-exact; the payload's first
-    /// frame is un-sorted from RFC 4867 order to encoder order before the core decode. Higher modes
-    /// and SID/no-data frames are not yet supported.
+    /// Decode one AMR-WB RTP frame. All 9 speech modes (0..=8) are wired bit-exact; the payload's
+    /// first frame is un-sorted from RFC 4867 order to encoder order before the core decode.
+    /// SID/no-data frames are not yet supported (DTX/CNG is a separate tier).
     fn decode(&mut self, payload: &[u8], out: &mut [i16]) -> Result<usize, CodecError> {
         // Default to octet-aligned framing (the common VoLTE posture); fall back to
         // bandwidth-efficient if that does not parse cleanly.
@@ -364,26 +388,33 @@ impl Decoder for AmrWb {
             .first()
             .ok_or(CodecError::Malformed("AMR-WB payload has no frames"))?;
         match frame.frame_type {
-            0 => {
-                if frame.data.len() < AmrWbMode::Mr660.bytes() {
-                    return Err(CodecError::Malformed("AMR-WB mode-0 frame truncated"));
+            mode @ 0..=8 => {
+                let wb_mode = AmrWbMode::from_frame_type(mode)
+                    .ok_or(CodecError::Unsupported("AMR-WB invalid speech mode"))?;
+                if frame.data.len() < wb_mode.bytes() {
+                    return Err(CodecError::Malformed("AMR-WB speech frame truncated"));
                 }
-                let bits = wb::bitstream::unsort_mode0(&frame.data);
-                self.decode_mode0_bits(&bits, out)
+                let bits = wb::bitstream::unsort(&frame.data, mode);
+                self.decode_mode_bits(mode, &bits, out)
             }
-            1..=8 => Err(CodecError::Unsupported(
-                "AMR-WB decode for modes 1..=8 not yet implemented",
-            )),
             _ => Err(CodecError::Unsupported(
-                "AMR-WB SID/no-data/PLC decode not yet implemented",
+                "AMR-WB SID/no-data decode not yet implemented",
             )),
         }
     }
 
-    fn conceal(&mut self, _out: &mut [i16]) -> Result<usize, CodecError> {
-        // Bad-frame concealment (lag/gain/ISF extrapolation) is a separate tier; the speech path is
-        // wired first. Returning Unsupported is deliberate — we never emit guessed audio.
-        Err(CodecError::Unsupported("AMR-WB PLC not yet implemented"))
+    /// Conceal one lost/erased AMR-WB frame (bad-frame branch of `dec_main.c`): lag/gain/ISF
+    /// extrapolation and energy fade, producing a faded continuation of the last decoded mode.
+    /// Writes `L_FRAME16K` (320) samples. Never panics, never emits guessed bitstream audio.
+    fn conceal(&mut self, out: &mut [i16]) -> Result<usize, CodecError> {
+        if out.len() < wb::constants::L_FRAME16K {
+            return Err(CodecError::Malformed("AMR-WB output buffer too small"));
+        }
+        Ok(wb::dec_main::conceal(
+            &mut self.decoder_state,
+            self.last_mode,
+            out,
+        ))
     }
 }
 
