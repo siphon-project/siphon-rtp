@@ -4,6 +4,7 @@
 //! payload-type table) onto a concrete [`Decoder`]/[`Encoder`] pair. The media slow path resolves a
 //! leg's codec here once, at call setup, then runs the returned trait objects per frame.
 
+use crate::amr::AmrWb;
 use crate::g711::{Variant, G711};
 use crate::l16::L16;
 use crate::{CodecError, Decoder, Encoder};
@@ -74,6 +75,9 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         "PCMU" => Ok(Box::new(G711::new(Variant::Ulaw, spec.ptime_ms))),
         "PCMA" => Ok(Box::new(G711::new(Variant::Alaw, spec.ptime_ms))),
         "L16" => Ok(Box::new(L16::new(spec.clock_rate_hz, spec.ptime_ms))),
+        // AMR-WB decode is bit-exact for all 9 modes (the RTP path un-sorts the RFC 4867 payload);
+        // the encoder is not yet implemented, so encoding AMR-WB still returns Unsupported below.
+        "AMR-WB" => Ok(Box::new(AmrWb::new())),
         _ => Err(CodecError::Unsupported(unsupported_name(&spec.encoding_name))),
     }
 }
@@ -93,7 +97,7 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
 fn unsupported_name(encoding_name: &str) -> &'static str {
     match encoding_name {
         "G722" => "G.722 codec not yet implemented",
-        "AMR-WB" => "AMR-WB codec not yet wired into the factory",
+        "AMR-WB" => "AMR-WB encoder not yet implemented (decode is supported)",
         "AMR" => "AMR-NB codec not yet implemented",
         "OPUS" => "Opus codec not yet implemented",
         "TELEPHONE-EVENT" => "telephone-event is not an audio codec",
@@ -148,6 +152,16 @@ mod tests {
     fn unimplemented_codec_is_unsupported_not_panic() {
         let spec = CodecSpec::new(96, "opus", 48000, 2, 20);
         assert!(matches!(decoder_for(&spec), Err(CodecError::Unsupported(_))));
+        assert!(matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))));
+    }
+
+    #[test]
+    fn amr_wb_decoder_is_wired_encoder_is_unsupported() {
+        let spec = CodecSpec::new(96, "AMR-WB", 16000, 1, 20);
+        let decoder = decoder_for(&spec).expect("AMR-WB decode is wired");
+        assert_eq!(decoder.params().sample_rate_hz, 16000);
+        assert_eq!(decoder.frame_samples(), 320, "16 kHz / 20 ms");
+        // No AMR-WB encoder yet — encoding must fail cleanly, not panic.
         assert!(matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))));
     }
 
