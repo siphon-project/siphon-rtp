@@ -103,7 +103,13 @@ pub struct EncoderState {
     gp_clip: [i16; 2],
     qua_gain: [i16; 4],
     hp_wsp_mem: [i16; 9],
-    old_hp_wsp: [i16; (L_FRAME / 2) / OPL_DECIM + (PIT_MAX / OPL_DECIM)],
+    // cod_main.h: `old_hp_wsp[L_FRAME / OPL_DECIM + PIT_MAX / OPL_DECIM]` — sized for the 7k
+    // (NBBITS_7K) path where `Pitch_med_ol` runs once over the *whole* L_FRAME/OPL_DECIM-sample
+    // decimated frame (the higher modes use the half-frame `(L_FRAME/2)/OPL_DECIM` window twice and
+    // never reach past `(L_FRAME/2)/OPL_DECIM + PIT_MAX/OPL_DECIM`). Init only zeroes that smaller
+    // prefix (cod_main.c `Set_zero(.., (L_FRAME/2)/OPL_DECIM + PIT_MAX/OPL_DECIM)`); the tail is
+    // written by `hp_wsp` before it is read, so zeroing the whole array here is bit-equivalent.
+    old_hp_wsp: [i16; L_FRAME / OPL_DECIM + (PIT_MAX / OPL_DECIM)],
     old_t0_med: i16,
     ol_gain: i16,
     ada_w: i16,
@@ -149,7 +155,7 @@ impl EncoderState {
             gp_clip: [0; 2],
             qua_gain: [0; 4],
             hp_wsp_mem: [0; 9],
-            old_hp_wsp: [0; (L_FRAME / 2) / OPL_DECIM + (PIT_MAX / OPL_DECIM)],
+            old_hp_wsp: [0; L_FRAME / OPL_DECIM + (PIT_MAX / OPL_DECIM)],
             old_t0_med: 40,
             ol_gain: 0,
             ada_w: 0,

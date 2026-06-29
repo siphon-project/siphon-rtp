@@ -680,6 +680,42 @@ mod tests {
         );
     }
 
+    /// The 4-track ACELP (`ACELP_4t64_fx`) modes share the same encode pipeline as mode 2 and the
+    /// same per-mode `Prm2bits` packing; once mode 2 is byte-exact the rest of the 4t64 family
+    /// (modes 2..=7) encodes the reference `tst.inp` byte-for-byte against `tst_mN.cod` too. (Modes
+    /// 0/1 use the 2-track `ACELP_2t64_fx` + 36-bit ISF path; mode 8 needs the high-band tier — those
+    /// encoder tiers are not yet bit-exact and are excluded here.)
+    #[test]
+    fn encodes_full_mode3_vector_bit_exact() {
+        let (frames, mismatch) = check_mode_vector(3);
+        assert!(mismatch.is_none(), "mode 3: {frames} frames, first mismatch {mismatch:?}");
+    }
+
+    #[test]
+    fn encodes_full_mode4_vector_bit_exact() {
+        let (frames, mismatch) = check_mode_vector(4);
+        assert!(mismatch.is_none(), "mode 4: {frames} frames, first mismatch {mismatch:?}");
+    }
+
+    #[test]
+    fn encodes_full_mode5_vector_bit_exact() {
+        let (frames, mismatch) = check_mode_vector(5);
+        assert!(mismatch.is_none(), "mode 5: {frames} frames, first mismatch {mismatch:?}");
+    }
+
+    #[test]
+    fn encodes_full_mode6_vector_bit_exact() {
+        let (frames, mismatch) = check_mode_vector(6);
+        assert!(mismatch.is_none(), "mode 6: {frames} frames, first mismatch {mismatch:?}");
+    }
+
+    #[test]
+    fn encodes_full_mode7_vector_bit_exact() {
+        let (frames, mismatch) = check_mode_vector(7);
+        assert!(mismatch.is_none(), "mode 7: {frames} frames, first mismatch {mismatch:?}");
+    }
+
+
     #[test]
     fn decode_rtp_mode0_matches_the_reference_vector() {
         // End-to-end RTP path: parse → un-sort → mode-0 decode → homing, over the first 3 frames of
