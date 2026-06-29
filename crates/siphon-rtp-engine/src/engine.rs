@@ -38,6 +38,7 @@ use crate::ws_bridge::WsRegistry;
 
 use siphon_rtp_media::bridge::protocol::{Direction as WsDirection, MediaFormat};
 use siphon_rtp_media::bridge::{run_bridge, BridgeSession};
+use siphon_rtp_media::fork::RtpForkSink;
 use siphon_rtp_media::jitter::JitterBuffer;
 use siphon_rtp_media::leg::MediaLeg;
 
@@ -86,6 +87,9 @@ struct Call {
     /// The near (offerer) leg's primary audio codec, captured at offer — paired with the answer's
     /// codec to decide whether the call transcodes (the media slow path).
     near_codec: Option<CodecSpec>,
+    /// The far (answerer) leg's primary audio codec, captured at answer — the fork codec for a
+    /// `subscribe_request` that forks leg B. `None` until the call is answered.
+    far_codec: Option<CodecSpec>,
     /// The near leg's negotiated RFC 4733 telephone-event payload type, if any.
     near_telephone_event: Option<u8>,
     /// How this call's media is handled once answered (set in `answer`).
@@ -93,6 +97,32 @@ struct Call {
     /// For a passthrough relay, the forward actions installed at answer — kept so `block`/`unblock`
     /// can flip the endpoints to `Drop` and restore them. Empty for media/SRTP calls.
     relay_flows: Vec<(EndpointId, FlowAction)>,
+}
+
+/// A SIPREC / monitor media subscription on a media-processing call (RFC 7866): one source leg's
+/// decoded audio is re-encoded toward a send-only subscriber (a Session Recording Server, SRS).
+///
+/// `subscribe_request` allocates the subscriber endpoint and records the subscription as *pending*
+/// (no `srs_rtp`, no `drain_task`) — media cannot flow until `subscribe_answer` brings the SRS's
+/// address. `subscribe_answer` attaches the fork to the [`MediaCall`] and spawns the drain task.
+/// The subscriber is **send-only** (engine → SRS): the engine never opens a Forward/Redirect flow on
+/// `subscriber_endpoint`, so it accepts no inbound media (RTPBleed has no surface here).
+struct Subscription {
+    /// The subscription identity returned to the controller as the UAS to-tag.
+    subscription_id: String,
+    /// Which source leg is forked: `true` ⇒ leg A's decoded audio, `false` ⇒ leg B's. Mirrors
+    /// [`crate::media_pipeline::MediaControl::AddFork`]'s `source_a`.
+    source_a: bool,
+    /// The engine endpoint the forked RTP is transmitted from (send-only toward the SRS).
+    subscriber_endpoint: Endpoint,
+    /// The fork codec (the source leg's negotiated codec, or a trivially-available transcode target).
+    codec: CodecSpec,
+    /// The SRS's RTP address, learned from `subscribe_answer`. `None` while the subscription is
+    /// pending (offered but not yet answered) — no media flows until it is known.
+    srs_rtp: Option<std::net::SocketAddr>,
+    /// The drain task pumping the fork's output channel to the datapath; spawned at answer, aborted on
+    /// unsubscribe / teardown. `None` while pending.
+    drain_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// How a call's media is carried once answered. The resolver picks this from the profile + the two
@@ -136,6 +166,9 @@ pub struct Engine<D: Datapath> {
     /// the redirect dispatcher, which routes WS-owned endpoints' datagrams here (see
     /// [`crate::ws_bridge`]).
     ws: Arc<WsRegistry>,
+    /// SIPREC / monitor media subscriptions, keyed by call-id (RFC 7866). Each entry's source leg is
+    /// forked to a send-only subscriber endpoint; freed alongside the parent call on delete/reap.
+    subscriptions: DashMap<String, Vec<Subscription>>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -164,6 +197,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             bridge,
             media: Arc::new(MediaRegistry::default()),
             ws: Arc::new(WsRegistry::default()),
+            subscriptions: DashMap::new(),
         }
     }
 
@@ -272,6 +306,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 volume_dbm0,
                 ..
             } => self.play_dtmf(client, &call_id, &from_tag, &code, duration_ms, volume_dbm0),
+            Command::SubscribeRequest {
+                call_id,
+                from_tags,
+                sdp,
+                profile,
+            } => {
+                self.subscribe_request(client, &call_id, &from_tags, sdp.as_deref(), &profile)
+                    .await
+            }
+            Command::SubscribeAnswer {
+                call_id,
+                from_tag,
+                to_tag,
+                sdp,
+                ..
+            } => {
+                self.subscribe_answer(client, &call_id, &from_tag, &to_tag, &sdp)
+                    .await
+            }
+            Command::Unsubscribe {
+                call_id,
+                from_tag,
+                to_tag,
+            } => self.unsubscribe(client, &call_id, &from_tag, &to_tag).await,
             other => CmdResult::Error {
                 reason: format!("unsupported command: {}", command_name(&other)),
             },
@@ -450,6 +508,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 },
                 far_local_crypto,
                 near_codec: near_codec.clone(),
+                far_codec: None,
                 near_telephone_event: info.telephone_event_payload_type(),
                 pipeline,
                 relay_flows: Vec::new(),
@@ -578,6 +637,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .endpoint_ids()
                 .chain(call.far.endpoint_ids())
                 .collect();
+            // Free any SIPREC subscriptions first (detach forks, abort drains, free subscriber ports)
+            // before the media actor is deregistered.
+            self.drop_subscriptions(call_id).await;
             self.bridge.deregister(endpoints.iter().copied());
             self.media.deregister(call_id);
             self.ws.deregister(call_id);
@@ -922,6 +984,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.to_tag = Some(to_tag.clone());
             call.far.remote_rtp = Some(info.remote_rtp);
             call.far.remote_rtcp = Some(info.remote_rtcp);
+            call.far_codec = info.primary_codec();
             call.pipeline = pipeline;
             call.relay_flows = relay_flows;
         }
@@ -938,10 +1001,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .endpoint_ids()
                     .chain(call.far.endpoint_ids())
                     .collect();
-                // Drop any SRTP-bridge, media-pipeline, or WS-bridge flows first (a no-op for a plain
+                // Drop any SIPREC subscriptions (detach forks, abort drains, free subscriber ports),
+                // then any SRTP-bridge, media-pipeline, or WS-bridge flows (a no-op for a plain
                 // relay), then free the sockets. `media.deregister` aborts the call's actor and
                 // flushes any recording; `ws.deregister` aborts the bridge + drain tasks (closing the
                 // WS connection).
+                self.drop_subscriptions(call_id).await;
                 self.bridge.deregister(endpoints.iter().copied());
                 self.media.deregister(call_id);
                 self.ws.deregister(call_id);
@@ -1144,6 +1209,263 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// SIPREC / monitor `subscribe_request` (RFC 7866): the engine **offers** one source leg's media
+    /// to a send-only subscriber (a Session Recording Server). It picks the source leg from
+    /// `from_tags[0]`, allocates one subscriber endpoint, chooses the fork codec (the source leg's
+    /// negotiated codec, or a trivially-available `profile.transport_protocol` is not consulted for
+    /// codec here — only the source codec / a static-PT transcode target), records a *pending*
+    /// subscription, and returns an SDP offer advertising the engine's subscriber endpoint + that
+    /// codec. No media flows until `subscribe_answer` brings the SRS's address.
+    ///
+    /// v1 limitations: forking requires a **media-processing call** (decoded PCM is the fork source);
+    /// a passthrough/SRTP/WS call is rejected (promotion is out of scope). Only one source leg is
+    /// forked per request — extra `from_tags` are ignored (and noted).
+    async fn subscribe_request(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tags: &[String],
+        sdp: Option<&str>,
+        _profile: &ProfileFlags,
+    ) -> CmdResult {
+        // The controller offers media to the SRS — it sends no SDP on the request. (An SDP-bearing
+        // request, i.e. the SRS offering to the engine, is a follow-up; reject it clearly for now.)
+        if sdp.is_some() {
+            return error_result(
+                "subscribe_request",
+                &"SDP-offer-from-subscriber is not supported (the engine offers; send sdp: null)",
+            );
+        }
+        let Some((call_from, call_to)) =
+            self.owned_call(client, call_id, |call| (call.from_tag.clone(), call.to_tag.clone()))
+        else {
+            return unknown_call(call_id);
+        };
+        // Forking re-encodes a leg's decoded PCM, so it needs the media slow path. A plain
+        // passthrough / SRTP / WS call has no decoded audio to tap — reject (do not promote it).
+        if !self.media.is_media_call(call_id) {
+            return error_result(
+                "subscribe_request",
+                &"requires a media-processing (transcode/record) call; \
+                  a passthrough/SRTP/WS call cannot be forked in v1",
+            );
+        }
+        if from_tags.len() > 1 {
+            tracing::warn!(
+                call_id,
+                requested = from_tags.len(),
+                "subscribe_request: only the first from_tag is forked in v1; the rest are ignored"
+            );
+        }
+        // Pick the source leg from `from_tags[0]`: the call's `from_tag` ⇒ leg A, the `to_tag` ⇒ leg
+        // B, default A. `source_a` is the [`MediaControl::AddFork`] selector.
+        let source_a = match from_tags.first() {
+            Some(tag) if matches!(call_to.as_deref(), Some(to_tag) if to_tag == tag) => false,
+            Some(tag) if *tag == call_from => true,
+            _ => true,
+        };
+
+        // The fork codec = the source leg's negotiated codec. (A `profile`-named transcode target is
+        // only adopted when trivially available; for v1 we reuse the source codec — the simplest,
+        // always-buildable choice.)
+        let Some(codec) = self.owned_call(client, call_id, |call| {
+            if source_a {
+                call.near_codec.clone()
+            } else {
+                call.far_codec.clone()
+            }
+        }) else {
+            return unknown_call(call_id);
+        };
+        let Some(codec) = codec else {
+            return error_result(
+                "subscribe_request",
+                &"the source leg has no negotiated codec to fork",
+            );
+        };
+        // The engine can only build an SDP/encoder for codecs it implements; fail early otherwise.
+        if factory::encoder_for(&codec).is_err() {
+            return error_result(
+                "subscribe_request",
+                &format!("fork codec {} is not implemented", codec.encoding_name),
+            );
+        }
+
+        // Allocate the single send-only subscriber endpoint.
+        let subscriber_endpoint = match self.alloc_endpoints(1).await {
+            Ok(mut endpoints) => endpoints.remove(0),
+            Err(reason) => return error_result("subscribe_request", &reason),
+        };
+
+        // The subscription id (returned as the UAS to-tag) names this subscription for answer/teardown.
+        let subscription_id = subscription_tag();
+        let offer = subscriber_offer_sdp(subscriber_endpoint.local_addr, &codec);
+
+        self.subscriptions
+            .entry(call_id.to_string())
+            .or_default()
+            .push(Subscription {
+                subscription_id: subscription_id.clone(),
+                source_a,
+                subscriber_endpoint,
+                codec,
+                srs_rtp: None,
+                drain_task: None,
+            });
+
+        CmdResult::Ok {
+            sdp: Some(offer),
+            duration_ms: None,
+            to_tag: Some(subscription_id),
+            stats: None,
+        }
+    }
+
+    /// SIPREC `subscribe_answer` (RFC 7866): the SRS's answer brings its RTP address. Parse it, then
+    /// attach an [`RtpForkSink`] on the chosen source leg's direction and spawn the drain task that
+    /// pumps the fork's RTP out the subscriber endpoint toward the SRS. The subscriber is send-only —
+    /// the engine installs no inbound flow on `subscriber_endpoint`, so no RTPBleed surface exists.
+    async fn subscribe_answer(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        _from_tag: &str,
+        to_tag: &str,
+        sdp: &str,
+    ) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        let info = match sdp::parse(sdp) {
+            Ok(info) => info,
+            Err(error) => {
+                return error_result("subscribe_answer: parse SRS SDP", &error);
+            }
+        };
+        let srs_rtp = info.remote_rtp;
+
+        // Locate the pending subscription named by `to_tag`, build its fork, and spawn its drain.
+        let (source_a, subscriber_endpoint, codec) = {
+            let Some(subscriptions) = self.subscriptions.get(call_id) else {
+                return error_result("subscribe_answer", &"no subscription for this call");
+            };
+            let Some(subscription) = subscriptions
+                .iter()
+                .find(|subscription| subscription.subscription_id == to_tag)
+            else {
+                return error_result("subscribe_answer", &format!("unknown subscription {to_tag}"));
+            };
+            if subscription.srs_rtp.is_some() {
+                return error_result("subscribe_answer", &"subscription is already answered");
+            }
+            (
+                subscription.source_a,
+                subscription.subscriber_endpoint,
+                subscription.codec.clone(),
+            )
+        };
+
+        // Build the fork's encoder + output channel. The drain task owns the receiver and forwards
+        // each re-encoded RTP packet out the subscriber endpoint toward the SRS (send-only).
+        let encoder = match factory::encoder_for(&codec) {
+            Ok(encoder) => encoder,
+            Err(error) => return error_result("subscribe_answer: fork encoder", &error),
+        };
+        let (fork_sender, fork_receiver) = flume::bounded::<bytes::Bytes>(1024);
+        let sink = RtpForkSink::new(encoder, fork_sender, random_ssrc(), codec.payload_type);
+
+        // Attach the fork to the running media actor. If the actor is gone (call torn down between the
+        // ownership check and here), free the endpoint and report the call unknown.
+        if !self
+            .media
+            .control(call_id, MediaControl::AddFork {
+                source_a,
+                sink: Box::new(sink),
+            })
+        {
+            self.datapath.remove_endpoint(subscriber_endpoint.id).await;
+            return error_result("subscribe_answer", &"media call is no longer active");
+        }
+
+        // The drain: forward each forked RTP packet out the subscriber endpoint toward the SRS.
+        let datapath = self.datapath.clone();
+        let drain_endpoint = subscriber_endpoint.id;
+        let drain_task = tokio::spawn(async move {
+            while let Ok(packet) = fork_receiver.recv_async().await {
+                if let Err(error) = datapath.send(drain_endpoint, srs_rtp, &packet).await {
+                    tracing::debug!(%error, "subscribe fork send failed");
+                }
+            }
+        });
+
+        // Record the now-active subscription (address + drain task) for unsubscribe / teardown.
+        if let Some(mut subscriptions) = self.subscriptions.get_mut(call_id) {
+            if let Some(subscription) = subscriptions
+                .iter_mut()
+                .find(|subscription| subscription.subscription_id == to_tag)
+            {
+                subscription.srs_rtp = Some(srs_rtp);
+                subscription.drain_task = Some(drain_task);
+            }
+        }
+        ok_empty()
+    }
+
+    /// SIPREC `unsubscribe` (RFC 7866): detach the fork from the media actor, abort its drain task,
+    /// free the subscriber endpoint, and drop the subscription record. Only the owning client may.
+    async fn unsubscribe(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        _from_tag: &str,
+        to_tag: &str,
+    ) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        // Remove the named subscription from the call's list (drop the empty list when none remain).
+        let removed = {
+            let Some(mut subscriptions) = self.subscriptions.get_mut(call_id) else {
+                return error_result("unsubscribe", &"no subscription for this call");
+            };
+            let Some(position) = subscriptions
+                .iter()
+                .position(|subscription| subscription.subscription_id == to_tag)
+            else {
+                return error_result("unsubscribe", &format!("unknown subscription {to_tag}"));
+            };
+            subscriptions.remove(position)
+        };
+        self.subscriptions.remove_if(call_id, |_, list| list.is_empty());
+        self.detach_subscription(call_id, removed).await;
+        ok_empty()
+    }
+
+    /// Tear one subscription down: detach its fork (if attached), abort its drain task, and free its
+    /// subscriber endpoint. Shared by `unsubscribe` and call teardown.
+    async fn detach_subscription(&self, call_id: &str, subscription: Subscription) {
+        // Detach the fork from the actor (best-effort: the actor may already be gone on teardown).
+        self.media.control(call_id, MediaControl::RemoveFork {
+            source_a: subscription.source_a,
+        });
+        if let Some(task) = subscription.drain_task {
+            task.abort();
+        }
+        self.datapath
+            .remove_endpoint(subscription.subscriber_endpoint.id)
+            .await;
+    }
+
+    /// Free every subscription on a call (delete / reap / half-built teardown). Detaches each fork,
+    /// aborts its drain, and frees its subscriber endpoint.
+    async fn drop_subscriptions(&self, call_id: &str) {
+        if let Some((_, subscriptions)) = self.subscriptions.remove(call_id) {
+            for subscription in subscriptions {
+                self.detach_subscription(call_id, subscription).await;
+            }
+        }
+    }
+
     /// Reap calls whose media has been idle (no accepted packet) for at least `idle_ticks`, freeing
     /// their ports/FDs and registry/quota slots, and return the reaped call ids. Deterministic: it
     /// reads the datapath's logical clock, so tests drive it via `advance_clock` rather than wall
@@ -1170,6 +1492,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if let Some((_, call)) = self.calls.remove(&call_id) {
                 let endpoints: Vec<EndpointId> =
                     call.near.endpoint_ids().chain(call.far.endpoint_ids()).collect();
+                self.drop_subscriptions(&call_id).await;
                 self.bridge.deregister(endpoints.iter().copied());
                 self.media.deregister(&call_id);
                 self.ws.deregister(&call_id);
@@ -1345,6 +1668,61 @@ fn random_ssrc() -> u32 {
         return 0x5310_0000; // "SIP0" — a stable fallback when the CSPRNG is unavailable
     }
     u32::from_be_bytes(bytes)
+}
+
+/// A fresh subscription identity, returned to the controller as the SIPREC UAS to-tag and used to
+/// name the subscription on answer / unsubscribe. Random hex from the CSPRNG (a stable fallback when
+/// it is unavailable — never panics), prefixed so it is recognisable in logs.
+fn subscription_tag() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        return "sub-00000000".to_string();
+    }
+    format!("sub-{}", hex_lower(&bytes))
+}
+
+/// Lowercase-hex encode a byte slice (no external dependency; used for the subscription tag).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Build the SIPREC subscriber SDP **offer** (engine → SRS): a minimal send-only audio stream
+/// advertising the engine's subscriber endpoint + the fork codec (RFC 4566 §5 line order
+/// `v= o= s= c= t= m=`; RFC 3264 §5.1 `a=sendonly` — the engine only transmits to the SRS, which is
+/// the RTPBleed-safe posture: no inbound media is accepted on this endpoint).
+fn subscriber_offer_sdp(local_addr: std::net::SocketAddr, codec: &CodecSpec) -> String {
+    let payload_type = codec.payload_type;
+    let mut sdp = String::new();
+    use std::fmt::Write as _;
+    // RFC 4566 §5: mandatory lines in order. o= uses a fixed session id/version (one offer per
+    // subscription); s=- is the standard "no name"; t=0 0 is an unbounded session.
+    let _ = write!(
+        sdp,
+        "v=0\r\n\
+         o=- 0 0 IN IP4 {ip}\r\n\
+         s=siphon-rtp-siprec\r\n\
+         c=IN IP4 {ip}\r\n\
+         t=0 0\r\n\
+         m=audio {port} RTP/AVP {payload_type}\r\n\
+         a=rtpmap:{payload_type} {name}/{clock}{channels}\r\n\
+         a=sendonly\r\n",
+        ip = local_addr.ip(),
+        port = local_addr.port(),
+        name = codec.encoding_name,
+        clock = codec.clock_rate_hz,
+        // RFC 4566 §6: the optional /channels suffix is emitted only for multi-channel codecs.
+        channels = if codec.channels > 1 {
+            format!("/{}", codec.channels)
+        } else {
+            String::new()
+        },
+    );
+    sdp
 }
 
 fn command_name(command: &Command) -> &'static str {
@@ -1671,6 +2049,179 @@ mod tests {
             .await;
         assert!(matches!(deleted, CmdResult::Ok { .. }));
         assert!(!engine.media().is_media_call("xcode-1"), "media call deregistered");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn siprec_subscribe_forks_leg_a_to_an_srs_then_unsubscribe_and_delete() {
+        // SIPREC end-to-end (RFC 7866): a transcoding media call, then subscribe_request offers leg
+        // A's media to a Session Recording Server, subscribe_answer points the fork at the SRS, A's
+        // RTP is forked there, unsubscribe stops it, and delete tears the call (and subscription) down.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        let (srs, srs_addr) = phone().await; // the Session Recording Server's media socket
+
+        // A offers PCMU, B answers PCMA → a transcoding media call (so there is decoded PCM to fork).
+        engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "siprec-1".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            })
+            .await;
+        let answer = engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "siprec-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                profile: Default::default(),
+            })
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer)).expect("answer reply").remote_rtp;
+        assert!(engine.media().is_media_call("siprec-1"));
+
+        // subscribe_request: the engine offers leg A's media to the SRS and returns an SDP offer + a
+        // subscription to-tag. Leg A's negotiated codec is PCMU (PT 0).
+        let subscribe = engine
+            .handle(CLIENT, Command::SubscribeRequest {
+                call_id: "siprec-1".into(),
+                from_tags: vec!["tag-a".into()],
+                sdp: None,
+                profile: Default::default(),
+            })
+            .await;
+        let (offer_sdp, subscription_tag) = match subscribe {
+            CmdResult::Ok { sdp: Some(sdp), to_tag: Some(to_tag), .. } => (sdp, to_tag),
+            other => panic!("expected an SDP offer + to_tag, got {other:?}"),
+        };
+        let offer_info = sdp::parse(&offer_sdp).expect("parse subscriber offer");
+        assert_eq!(offer_info.primary_codec().expect("codec").encoding_name, "PCMU");
+        assert!(offer_sdp.contains("a=sendonly"), "subscriber stream is send-only (RFC 3264)");
+
+        // subscribe_answer: the SRS answers with its own media address. The fork attaches to leg A.
+        let srs_answer_sdp = sdp_single_codec(srs_addr, 0, "PCMU");
+        let answered = engine
+            .handle(CLIENT, Command::SubscribeAnswer {
+                call_id: "siprec-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: subscription_tag.clone(),
+                sdp: srs_answer_sdp,
+                profile: Default::default(),
+            })
+            .await;
+        assert!(matches!(answered, CmdResult::Ok { .. }), "subscribe_answer ok: {answered:?}");
+
+        // A sends µ-law RTP through the engine; B gets the A-law transcode AND the SRS gets forked RTP.
+        let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
+        phone_a.send_to(&from_a, near_addr).await.expect("a send");
+        let (_to_b, _) = recv(&phone_b).await; // the normal transcoded leg is undisturbed
+        let (forked, from) = recv(&srs).await;
+        assert_eq!(from, offer_info.remote_rtp, "fork leaves the engine's subscriber port");
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&forked).expect("parse forked rtp");
+        assert_eq!(parsed.payload_type, 0, "SRS receives leg A's codec (µ-law, PT 0)");
+        assert_eq!(parsed.payload.len(), 160);
+
+        // unsubscribe: the fork stops; A's media still transcodes to B.
+        let unsubscribed = engine
+            .handle(CLIENT, Command::Unsubscribe {
+                call_id: "siprec-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: subscription_tag,
+            })
+            .await;
+        assert!(matches!(unsubscribed, CmdResult::Ok { .. }));
+
+        // Drain any already-in-flight forked packets, then prove no more arrive after unsubscribe.
+        let mut drain = [0u8; 2048];
+        while srs.try_recv_from(&mut drain).is_ok() {}
+        phone_a.send_to(&g711_rtp(0, 101, 0x0A0A_0A0A, 0xFF), near_addr).await.expect("a send");
+        let (_to_b_again, _) = recv(&phone_b).await; // B still receives transcoded media
+        let mut scratch = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(200), srs.recv_from(&mut scratch)).await.is_err(),
+            "no more forked packets reach the SRS after unsubscribe"
+        );
+
+        // delete: tears the call down cleanly (the subscription is already gone).
+        let deleted = engine
+            .handle(CLIENT, Command::Delete {
+                call_id: "siprec-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            })
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+        assert!(!engine.media().is_media_call("siprec-1"), "media call deregistered");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn siprec_subscription_is_freed_when_the_parent_call_is_deleted() {
+        // A subscription left open at delete must be torn down with the call (forks detached, drain
+        // aborted, subscriber port freed) — no orphaned task or leaked endpoint.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let (_srs, srs_addr) = phone().await;
+
+        engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "siprec-2".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            })
+            .await;
+        engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "siprec-2".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                profile: Default::default(),
+            })
+            .await;
+        let subscribe = engine
+            .handle(CLIENT, Command::SubscribeRequest {
+                call_id: "siprec-2".into(),
+                from_tags: vec!["tag-a".into()],
+                sdp: None,
+                profile: Default::default(),
+            })
+            .await;
+        let subscription_tag = match subscribe {
+            CmdResult::Ok { to_tag: Some(to_tag), .. } => to_tag,
+            other => panic!("expected a to_tag, got {other:?}"),
+        };
+        engine
+            .handle(CLIENT, Command::SubscribeAnswer {
+                call_id: "siprec-2".into(),
+                from_tag: "tag-a".into(),
+                to_tag: subscription_tag,
+                sdp: sdp_single_codec(srs_addr, 0, "PCMU"),
+                profile: Default::default(),
+            })
+            .await;
+
+        // Delete the call without unsubscribing first: teardown must drain the subscription too.
+        let deleted = engine
+            .handle(CLIENT, Command::Delete {
+                call_id: "siprec-2".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            })
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+        assert_eq!(engine.session_count(), 0, "the call drained from the registry");
     }
 
     /// A µ-law (PCMU, PT 0) RTP packet: a 160-sample / 20 ms frame carrying `payload_byte`.
@@ -2134,20 +2685,72 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_command_reports_error() {
-        // SubscribeRequest (SIPREC fork) is not yet wired; the dispatcher names it in the error.
+        // `authenticate` is handled by the control server, not the session engine, so the engine's
+        // dispatcher reports it as unsupported and names it in the error. (SubscribeRequest is now a
+        // wired SIPREC verb — see the subscribe_* tests below.)
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let result = engine
+            .handle(CLIENT, Command::Authenticate {
+                token: "s3cret".into(),
+            })
+            .await;
+        match result {
+            CmdResult::Error { reason } => assert!(reason.contains("authenticate")),
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_request_on_a_passthrough_call_is_rejected() {
+        // A plain relay (same codec both sides) is not a media-processing call; forking needs decode.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "fork-relay".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            })
+            .await;
+        engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "fork-relay".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: Default::default(),
+            })
+            .await;
+        let result = engine
             .handle(CLIENT, Command::SubscribeRequest {
-                call_id: "c".into(),
-                from_tags: vec!["f".into()],
+                call_id: "fork-relay".into(),
+                from_tags: vec!["tag-a".into()],
                 sdp: None,
                 profile: Default::default(),
             })
             .await;
         match result {
-            CmdResult::Error { reason } => assert!(reason.contains("subscribe_request")),
+            CmdResult::Error { reason } => {
+                assert!(reason.contains("media-processing"), "v1 limitation named: {reason}");
+            }
             other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn subscribe_request_on_an_unknown_call_is_unknown() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let result = engine
+            .handle(CLIENT, Command::SubscribeRequest {
+                call_id: "nope".into(),
+                from_tags: vec!["f".into()],
+                sdp: None,
+                profile: Default::default(),
+            })
+            .await;
+        assert!(matches!(result, CmdResult::Error { .. }), "unknown call ⇒ error");
     }
 
     #[tokio::test]

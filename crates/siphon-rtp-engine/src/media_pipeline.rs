@@ -28,6 +28,7 @@ use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_media::dtmf::{DtmfDetector, DtmfGenerator};
+use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::player::PcmPlayer;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_media::wav::WavRecorder;
@@ -84,6 +85,10 @@ pub struct Direction {
     dtmf: DtmfDetector,
     /// Records the decoded ingress audio when the call is recorded.
     recorder: Option<WavRecorder>,
+    /// SIPREC / monitor fork sinks fed the decoded ingress audio (post-decode, pre-encode — the same
+    /// PCM the recorder sees). Each re-encodes for a send-only subscriber (a Session Recording Server,
+    /// RFC 7866 §6). Empty unless a `subscribe_request`/`subscribe_answer` attached one.
+    forks: Vec<Box<dyn MediaSink>>,
     /// Replace egress audio with comfort silence (digit-suppression / hold).
     silenced: bool,
     /// Drop egress audio entirely (not even silence).
@@ -173,6 +178,7 @@ impl Direction {
             telephone_event_out: config.telephone_event_out,
             dtmf: DtmfDetector::new(),
             recorder: config.recorder,
+            forks: Vec::new(),
             silenced: false,
             blocked: false,
             egress_sample_rate: egress_rate,
@@ -341,8 +347,14 @@ impl Direction {
         };
         let decoded = &decoded[..samples];
         if let Some(recorder) = self.recorder.as_mut() {
-            use siphon_rtp_media::fanout::MediaSink as _;
             recorder.write_pcm(decoded);
+        }
+        // SIPREC / monitor fork: re-encode the decoded ingress PCM toward each subscriber. Fed the
+        // same raw decoded audio as the recorder (pre-silence, pre-resample) so a fork captures what
+        // the leg actually said, independent of hold/mute state on the A↔B path (RFC 7866 §6). A full
+        // or disconnected subscriber drops the frame inside the sink — it never stalls the transcode.
+        for fork in &mut self.forks {
+            fork.write_pcm(decoded);
         }
 
         let silence;
@@ -564,6 +576,46 @@ impl MediaCall {
         self.b_to_a.injection = None;
     }
 
+    /// The direction whose **ingress** decodes a leg's audio: leg A's RTP is decoded by `a_to_b`
+    /// (its ingress faces A), leg B's by `b_to_a`. SIPREC forks a source leg's decoded audio, so it
+    /// taps the direction that decodes that leg — not the one whose egress faces it (RFC 7866 §6).
+    fn ingress_direction(&mut self, source_a: bool) -> &mut Direction {
+        if source_a {
+            &mut self.a_to_b
+        } else {
+            &mut self.b_to_a
+        }
+    }
+
+    /// Attach a SIPREC / monitor fork sink to a source leg's decoded ingress audio
+    /// ([`MediaControl::AddFork`]). `source_a` selects which leg is forked: `true` ⇒ leg A's audio,
+    /// `false` ⇒ leg B's. The sink (an [`super::engine`]-built `RtpForkSink`) re-encodes each decoded
+    /// frame toward the subscriber; the engine drains its output channel to the datapath.
+    pub fn add_fork(&mut self, source_a: bool, sink: Box<dyn MediaSink>) {
+        self.ingress_direction(source_a).forks.push(sink);
+    }
+
+    /// Detach every fork on a source leg's ingress ([`MediaControl::RemoveFork`]). Finalizes each sink
+    /// (a no-op for `RtpForkSink`) and drops it, closing its output channel so the engine's drain task
+    /// exits cleanly.
+    pub fn remove_forks(&mut self, source_a: bool) {
+        let direction = self.ingress_direction(source_a);
+        for fork in &mut direction.forks {
+            fork.finish();
+        }
+        direction.forks.clear();
+    }
+
+    /// Number of forks attached to a source leg's ingress (test/observability helper).
+    #[must_use]
+    pub fn fork_count(&self, source_a: bool) -> usize {
+        if source_a {
+            self.a_to_b.forks.len()
+        } else {
+            self.b_to_a.forks.len()
+        }
+    }
+
     /// Advance any active injections by one playout tick, emitting their egress packets.
     pub fn tick(&mut self, out: &mut Vec<Outbound>) {
         self.a_to_b.tick_injection(out);
@@ -614,6 +666,15 @@ pub enum MediaControl {
     },
     /// Stop any prompt / DTMF injection on both directions.
     StopPlay,
+    /// Attach a SIPREC / monitor fork to a source leg's decoded ingress audio (`source_a` selects
+    /// leg A vs leg B). The engine builds the `RtpForkSink` and owns the matching output channel +
+    /// drain task (RFC 7866 SIPREC; the subscriber is send-only — engine → SRS — no inbound media).
+    AddFork {
+        source_a: bool,
+        sink: Box<dyn MediaSink>,
+    },
+    /// Detach every fork on a source leg's ingress, closing their output channels.
+    RemoveFork { source_a: bool },
     /// Tear the call down: flush recordings and exit the actor loop.
     Stop,
 }
@@ -753,6 +814,12 @@ async fn run_media_call<D>(
                         call.start_play_dtmf(toward_a, digit, duration_ms, volume);
                     }
                     MediaInput::Control(MediaControl::StopPlay) => call.stop_play(),
+                    MediaInput::Control(MediaControl::AddFork { source_a, sink }) => {
+                        call.add_fork(source_a, sink);
+                    }
+                    MediaInput::Control(MediaControl::RemoveFork { source_a }) => {
+                        call.remove_forks(source_a);
+                    }
                     MediaInput::Control(MediaControl::Stop) => break,
                 }
             }
@@ -1086,6 +1153,95 @@ mod tests {
         };
         let mut call = MediaCall::new("c", "a", None, a_to_b, b_to_a, true, None);
         assert!(!call.start_play_dtmf(true, '5', 100, 10), "no telephone-event ⇒ cannot inject");
+    }
+
+    #[test]
+    fn a_fork_emits_rtp_alongside_the_transcoded_egress() {
+        use siphon_rtp_media::fork::RtpForkSink;
+
+        // Fork leg A's decoded audio to a subscriber as µ-law (PT 0, SSRC 0xFEED_F00D), while A→B
+        // still transcodes to A-law. One ingress packet ⇒ one transcoded egress AND one forked RTP.
+        let mut call = ulaw_alaw_call();
+        let (fork_tx, fork_rx) = flume::bounded(8);
+        let sink = RtpForkSink::new(Box::new(G711::ulaw()), fork_tx, 0xFEED_F00D, 0);
+        call.add_fork(true, Box::new(sink));
+        assert_eq!(call.fork_count(true), 1);
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(100, 0x40)), &mut out, &mut events);
+
+        // The normal transcoded packet toward B is undisturbed (A-law, PT 8, the A→B egress SSRC).
+        assert_eq!(out.len(), 1, "one transcoded packet toward B");
+        let egress = RtpPacket::parse(&out[0].data).expect("egress parse");
+        assert_eq!(egress.payload_type, 8, "B still gets A-law");
+        assert_eq!(egress.ssrc, 0xB000_0001);
+
+        // The fork received a well-formed RTP packet with the subscriber's PT/SSRC.
+        let forked_bytes = fork_rx.try_recv().expect("one forked packet");
+        let forked = RtpPacket::parse(&forked_bytes).expect("fork parse");
+        assert_eq!(forked.payload_type, 0, "fork re-encoded as µ-law (PT 0)");
+        assert_eq!(forked.ssrc, 0xFEED_F00D, "fork stamped with the subscriber SSRC");
+        assert_eq!(forked.sequence, 0, "fork egress sequence starts at 0");
+        assert_eq!(forked.payload.len(), 160);
+
+        // A second ingress packet advances the fork's egress sequence independently of the A→B stream.
+        out.clear();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(101, 0x40)), &mut out, &mut events);
+        let second_bytes = fork_rx.try_recv().expect("second forked packet");
+        let second = RtpPacket::parse(&second_bytes).expect("parse");
+        assert_eq!(second.sequence, 1, "fork sequence advances per frame");
+    }
+
+    #[test]
+    fn remove_fork_stops_forwarding_and_keeps_transcode() {
+        use siphon_rtp_media::fork::RtpForkSink;
+
+        let mut call = ulaw_alaw_call();
+        let (fork_tx, fork_rx) = flume::bounded(8);
+        call.add_fork(true, Box::new(RtpForkSink::new(Box::new(G711::ulaw()), fork_tx, 7, 0)));
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0x40)), &mut out, &mut events);
+        assert!(fork_rx.try_recv().is_ok(), "fork forwarded while attached");
+
+        call.remove_forks(true);
+        assert_eq!(call.fork_count(true), 0);
+        out.clear();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(2, 0x40)), &mut out, &mut events);
+        assert_eq!(out.len(), 1, "transcode toward B continues after the fork is removed");
+        assert!(fork_rx.try_recv().is_err(), "no more forked packets after remove");
+    }
+
+    #[test]
+    fn a_fork_does_not_disturb_dtmf_extraction() {
+        use siphon_rtp_media::fork::RtpForkSink;
+
+        // A telephone-event packet is handled out of band (no decode), so the fork sees nothing, and
+        // the DTMF event + repacketization are unchanged with a fork attached (regression guard).
+        let mut call = ulaw_alaw_call();
+        let (fork_tx, fork_rx) = flume::bounded(8);
+        call.add_fork(true, Box::new(RtpForkSink::new(Box::new(G711::ulaw()), fork_tx, 9, 0)));
+
+        let event_payload = [5u8, 0x80 | 10, 0x03, 0x20];
+        let header = RtpHeader {
+            marker: true,
+            payload_type: 101,
+            sequence: 1,
+            timestamp: 16000,
+            ssrc: 0x1111_2222,
+        };
+        let mut buffer = vec![0u8; 16];
+        let len = write_packet(&header, &event_payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, buffer), &mut out, &mut events);
+        assert_eq!(events.len(), 1, "DTMF still extracted with a fork attached");
+        assert_eq!(out.len(), 1, "telephone-event still repacketized");
+        assert!(fork_rx.try_recv().is_err(), "the fork only sees decoded audio, not DTMF");
     }
 
     #[test]
