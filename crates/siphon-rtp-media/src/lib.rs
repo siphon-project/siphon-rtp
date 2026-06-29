@@ -9,8 +9,10 @@
 pub mod bridge;
 pub mod dtmf;
 pub mod fanout;
+pub mod fork;
 pub mod jitter;
 pub mod leg;
+pub mod player;
 pub mod rtcp;
 pub mod rtp;
 pub mod wav;

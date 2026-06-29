@@ -8,9 +8,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "siphon-rtp media plane: RTP/RTCP, jitter/PLC, fan-out/fork, mixer, and stream bridges"
 
 [dependencies]
-siphon-rtp-codec = { path = "../siphon-rtp-codec" }
+siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.1.0" }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -27,4 +28,8 @@ proptest = { workspace = true }
 
 [[bench]]
 name = "relay_bench"
+harness = false
+
+[[bench]]
+name = "media_blocks_bench"
 harness = false
