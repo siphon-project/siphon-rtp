@@ -1010,12 +1010,14 @@ pub fn acelp_2t64_fx(dn: &mut [i16], cn: &[i16], hh: &[i16], code: &mut [i16], y
     // rrixiy[1024]
     let mut rrixiy = [0i16; MSIZE];
     {
-        let mut pos = MSIZE - 1;
-        let mut pos2 = MSIZE - 2;
+        // c2t64fx.c: pos/pos2 are Word16 (signed); their final `pos -= NB_POS` underflows to -1 but
+        // is never used after the loop exits, so keep them signed to mirror the C exactly.
+        let mut pos: isize = (MSIZE - 1) as isize;
+        let mut pos2: isize = (MSIZE - 2) as isize;
         let mut ptr_hf = h_base + 1;
         for k in 0..NB_POS_2T {
-            let mut p1 = pos as isize;
-            let mut p0 = pos2 as isize;
+            let mut p1 = pos;
+            let mut p0 = pos2;
             let mut cor = 0x0000_8000i32;
             let mut ptr_h1 = h_base;
             let mut ptr_h2 = ptr_hf;
@@ -1033,7 +1035,7 @@ pub fn acelp_2t64_fx(dn: &mut [i16], cn: &[i16], hh: &[i16], code: &mut [i16], y
             }
             cor = l_mac(cor, h_buf[ptr_h1], h_buf[ptr_h2]);
             rrixiy[p1 as usize] = extract_h(cor);
-            pos -= NB_POS_2T;
+            pos -= NB_POS_2T as isize;
             pos2 -= 1;
             ptr_hf += STEP;
         }

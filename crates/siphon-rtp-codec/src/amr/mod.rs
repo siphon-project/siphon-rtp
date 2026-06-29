@@ -671,6 +671,20 @@ mod tests {
         (n_frames, None)
     }
 
+    /// Mode 0 (6.60 kbit/s) uses the 2-track `ACELP_2t64_fx` codebook and 36-bit ISF path.
+    #[test]
+    fn encodes_full_mode0_vector_bit_exact() {
+        let (frames, mismatch) = check_mode_vector(0);
+        assert!(mismatch.is_none(), "mode 0: {frames} frames, first mismatch {mismatch:?}");
+    }
+
+    /// Mode 1 (8.85 kbit/s): same 2t64 codebook as mode 0 but the higher-rate per-mode packing.
+    #[test]
+    fn encodes_full_mode1_vector_bit_exact() {
+        let (frames, mismatch) = check_mode_vector(1);
+        assert!(mismatch.is_none(), "mode 1: {frames} frames, first mismatch {mismatch:?}");
+    }
+
     #[test]
     fn encodes_full_mode2_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(2);
@@ -682,9 +696,8 @@ mod tests {
 
     /// The 4-track ACELP (`ACELP_4t64_fx`) modes share the same encode pipeline as mode 2 and the
     /// same per-mode `Prm2bits` packing; once mode 2 is byte-exact the rest of the 4t64 family
-    /// (modes 2..=7) encodes the reference `tst.inp` byte-for-byte against `tst_mN.cod` too. (Modes
-    /// 0/1 use the 2-track `ACELP_2t64_fx` + 36-bit ISF path; mode 8 needs the high-band tier — those
-    /// encoder tiers are not yet bit-exact and are excluded here.)
+    /// (modes 2..=7) encodes the reference `tst.inp` byte-for-byte against `tst_mN.cod` too. (Mode 8
+    /// additionally needs the high-band / `synthesis()` tier, not yet implemented, so it is excluded.)
     #[test]
     fn encodes_full_mode3_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(3);
