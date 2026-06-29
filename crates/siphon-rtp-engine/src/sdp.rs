@@ -6,7 +6,10 @@
 //! allocated endpoints. The richer SDP surface (ICE, DTLS fingerprints, multiple m-lines,
 //! bandwidth, direction) layers on later.
 //!
-//! IPv4 only for now (VoLTE/PSTN media is IPv4); an IPv6 `c=IN IP6` path is a later addition.
+//! Both IPv4 (`c=IN IP4`) and IPv6 (`c=IN IP6`) connection lines are recognised (RFC 4566 §5.7);
+//! the rewriter emits the addrtype of the engine endpoint's own family, so a v6 call is advertised
+//! as `c=IN IP6` and a v4 call as `c=IN IP4`. VoLTE/IMS deployments run IPv6-only access networks,
+//! so the relay must follow `IN IP6` end to end.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -25,8 +28,9 @@ pub enum SdpError {
     /// The `m=audio` line's port field was missing or not a number.
     #[error("malformed m=audio port")]
     MediaPort,
-    /// No usable `c=IN IP4 <addr>` connection line applied to the audio stream.
-    #[error("no IPv4 connection address for audio stream")]
+    /// No usable `c=IN IP4`/`c=IN IP6 <addr>` connection line applied to the audio stream
+    /// (RFC 4566 §5.7).
+    #[error("no connection address for audio stream")]
     ConnectionAddress,
 }
 
@@ -184,10 +188,16 @@ fn parse_rtpmap(value: &str) -> Option<RtpMap> {
     })
 }
 
+/// Parse a `c=` connection line body (`IN IP4 <addr>` or `IN IP6 <addr>`, RFC 4566 §5.7). The
+/// addrtype declares the family, so the parsed address must match it — an `IP6` line carrying an
+/// IPv4 literal (or vice versa) is rejected rather than silently mis-typed. Multicast TTL/count
+/// suffixes (`<addr>/<ttl>`) are not split here; unicast media (the relay's only case) carries a
+/// bare address.
 fn parse_connection_addr(value: &str) -> Option<IpAddr> {
     let mut parts = value.split_whitespace();
     match (parts.next(), parts.next(), parts.next()) {
         (Some("IN"), Some("IP4"), Some(addr)) => addr.parse::<IpAddr>().ok().filter(IpAddr::is_ipv4),
+        (Some("IN"), Some("IP6"), Some(addr)) => addr.parse::<IpAddr>().ok().filter(IpAddr::is_ipv6),
         _ => None,
     }
 }
@@ -369,6 +379,17 @@ impl SecurityAdvertisement {
 /// Host-candidate priority (RFC 8445 §5.1.2): type-pref 126, local-pref 65535, component 1 (RTP).
 const HOST_CANDIDATE_PRIORITY: u32 = (126 << 24) | (65535 << 8) | 255;
 
+/// The SDP `addrtype` token for an IP address family (RFC 4566 §5.7): `IP4` for IPv4, `IP6` for
+/// IPv6. Used to emit the `c=` connection line (and the ICE `a=candidate`) in the family of the
+/// engine endpoint we advertise — so a v6 engine endpoint is signalled as `c=IN IP6`.
+fn addrtype(ip: IpAddr) -> &'static str {
+    if ip.is_ipv6() {
+        "IP6"
+    } else {
+        "IP4"
+    }
+}
+
 /// Whether `line` is an ICE attribute we re-originate (so the peer's copy is dropped on rewrite).
 fn is_ice_attribute(line: &str) -> bool {
     line == "a=ice-lite"
@@ -440,6 +461,9 @@ pub fn rewrite(
             if let Some(ice) = ice {
                 lines.push(format!("a=ice-ufrag:{}", ice.ufrag));
                 lines.push(format!("a=ice-pwd:{}", ice.pwd));
+                // RFC 8839 §5.1: the candidate's connection-address is a bare IP literal in either
+                // family — `IpAddr`'s Display emits a v6 literal without brackets, exactly as the
+                // `a=candidate` grammar requires (brackets are an `m=`/`c=`-line concern only).
                 lines.push(format!(
                     "a=candidate:1 1 UDP {HOST_CANDIDATE_PRIORITY} {} {} typ host",
                     engine.rtp.ip(),
@@ -447,7 +471,10 @@ pub fn rewrite(
                 ));
             }
         } else if index == conn_index {
-            lines.push(format!("c=IN IP4 {}", engine.rtp.ip()));
+            // RFC 4566 §5.7: emit the addrtype of the engine endpoint's own family (`IP4`/`IP6`),
+            // so a v6 engine endpoint is advertised as `c=IN IP6` and a v4 one as `c=IN IP4`.
+            let ip = engine.rtp.ip();
+            lines.push(format!("c=IN {} {}", addrtype(ip), ip));
         } else if Some(index) == rtcp_index {
             match engine.rtcp {
                 Some(rtcp) => lines.push(format!("a=rtcp:{}", rtcp.port())),
@@ -582,6 +609,111 @@ mod tests {
         assert!(result.sdp.contains("c=IN IP4 10.0.0.1"));
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(!result.sdp.contains("198.51.100.9"));
+    }
+
+    /// An IPv6 offer (RFC 4566 §5.7 `c=IN IP6`) at both session and media level.
+    fn offer_v6(addr: &str, port: u16) -> String {
+        format!(
+            "v=0\r\n\
+             o=alice 2890844526 2890844526 IN IP6 host.invalid\r\n\
+             s=-\r\n\
+             c=IN IP6 {addr}\r\n\
+             t=0 0\r\n\
+             m=audio {port} RTP/AVP 0 8 96\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=rtpmap:96 telephone-event/8000\r\n"
+        )
+    }
+
+    #[test]
+    fn parse_recognizes_ipv6_session_connection() {
+        // RFC 4566 §5.7: `c=IN IP6 <addr>` carries the remote v6 transport; remote_rtp/rtcp become v6.
+        let info = parse(&offer_v6("2001:db8::1", 49170)).expect("parse v6");
+        assert_eq!(info.remote_rtp, "[2001:db8::1]:49170".parse().unwrap());
+        assert_eq!(info.remote_rtcp, "[2001:db8::1]:49171".parse().unwrap());
+        assert!(info.remote_rtp.is_ipv6());
+        assert!(!info.rtcp_mux);
+    }
+
+    #[test]
+    fn parse_recognizes_ipv6_media_level_connection() {
+        // A media-level `c=IN IP6` overrides a session-level one, exactly as for IPv4.
+        let sdp = "v=0\r\nc=IN IP6 2001:db8::a\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\nc=IN IP6 2001:db8::b\r\n";
+        let info = parse(sdp).expect("parse v6 media-level");
+        assert_eq!(info.remote_rtp, "[2001:db8::b]:5000".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_rejects_addrtype_family_mismatch() {
+        // RFC 4566 §5.7: the addrtype declares the family. An `IP6` line carrying an IPv4 literal
+        // (or `IP4` carrying a v6 literal) is not a usable connection address.
+        let sdp = "v=0\r\nc=IN IP6 192.0.2.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\n";
+        assert_eq!(parse(sdp), Err(SdpError::ConnectionAddress));
+        let sdp = "v=0\r\nc=IN IP4 2001:db8::1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\n";
+        assert_eq!(parse(sdp), Err(SdpError::ConnectionAddress));
+    }
+
+    #[test]
+    fn rewrite_to_v6_engine_emits_ip6_connection_and_media() {
+        // RFC 4566 §5.7: rewriting to a v6 engine endpoint must emit `c=IN IP6` (addrtype follows the
+        // engine endpoint's family), the engine's v6 address, and the engine ports.
+        let sdp = offer_v6("2001:db8::1", 49170);
+        let engine = EngineMedia {
+            rtp: "[::1]:40000".parse().unwrap(),
+            rtcp: Some("[::1]:40001".parse().unwrap()),
+        };
+        let result = rewrite(&sdp, engine, None, None).expect("rewrite v6");
+        assert_eq!(result.media.remote_rtp, "[2001:db8::1]:49170".parse().unwrap());
+        assert!(result.sdp.contains("c=IN IP6 ::1"), "{}", result.sdp);
+        assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8 96"), "{}", result.sdp);
+        assert!(result.sdp.contains("a=rtcp:40001"), "engine v6 RTCP port advertised");
+        assert!(!result.sdp.contains("2001:db8::1"), "peer address removed");
+        assert!(!result.sdp.contains("IP4"), "no IPv4 addrtype on a v6 rewrite");
+        // The rewritten SDP reparses to the v6 engine transport.
+        let reparsed = parse(&result.sdp).expect("reparse v6");
+        assert_eq!(reparsed.remote_rtp, engine.rtp);
+        assert_eq!(reparsed.remote_rtcp, "[::1]:40001".parse().unwrap());
+    }
+
+    #[test]
+    fn rewrite_v6_re_originates_ice_with_v6_candidate() {
+        // RFC 8839 §5.1: the host candidate's connection-address is a bare v6 literal (no brackets).
+        let sdp = "v=0\r\no=- 1 1 IN IP6 host.invalid\r\ns=-\r\nc=IN IP6 2001:db8::7\r\nt=0 0\r\n\
+             a=ice-ufrag:PEERUF\r\na=ice-pwd:peerpassword01234567\r\n\
+             m=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let engine = EngineMedia {
+            rtp: "[::1]:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let advert = IceAdvertisement {
+            ufrag: "ENGUF",
+            pwd: "engpassword01234567",
+        };
+        let result = rewrite(sdp, engine, Some(advert), None).expect("rewrite v6 ice");
+        assert!(result.sdp.contains("c=IN IP6 ::1"));
+        assert!(
+            result
+                .sdp
+                .contains("a=candidate:1 1 UDP 2130706431 ::1 40000 typ host"),
+            "v6 host candidate as a bare literal: {}",
+            result.sdp
+        );
+        assert!(!result.sdp.contains("2001:db8::7"), "peer v6 address removed");
+    }
+
+    #[test]
+    fn ipv4_rewrite_is_unchanged_after_v6_support() {
+        // Regression: a v4 engine endpoint must still emit `c=IN IP4` (addrtype follows the family),
+        // proving the addrtype is picked from the endpoint, not hardcoded either way.
+        let sdp = offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let result = rewrite(&sdp, engine, None, None).expect("rewrite v4");
+        assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
+        assert!(!result.sdp.contains("IP6"), "no IPv6 addrtype on a v4 rewrite");
     }
 
     #[test]

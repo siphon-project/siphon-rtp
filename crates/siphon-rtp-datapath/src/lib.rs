@@ -34,6 +34,29 @@ pub struct Endpoint {
     pub local_addr: SocketAddr,
 }
 
+/// The IP address family a media endpoint binds — the family of the peer's signalled `c=` line
+/// (RFC 4566 §5.7 `IP4`/`IP6`). The engine asks the datapath for an endpoint of the family that
+/// matches the call's signalled media address, so a `c=IN IP6` call gets a v6 engine endpoint (and
+/// the rewritten SDP advertises `c=IN IP6`) and a `c=IN IP4` call gets v4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// IPv4 (`c=IN IP4`).
+    V4,
+    /// IPv6 (`c=IN IP6`).
+    V6,
+}
+
+impl AddressFamily {
+    /// The address family of an [`IpAddr`].
+    #[must_use]
+    pub fn of(addr: IpAddr) -> Self {
+        match addr {
+            IpAddr::V4(_) => AddressFamily::V4,
+            IpAddr::V6(_) => AddressFamily::V6,
+        }
+    }
+}
+
 /// What the backend does with datagrams arriving at an endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowAction {
@@ -221,10 +244,24 @@ pub struct IceConfig {
 /// (lock-free maps). Implementors are `Send + Sync` so a single instance is shared across the
 /// actor runtime.
 pub trait Datapath: Send + Sync {
-    /// Allocate and bind a new media endpoint, starting its receive loop.
+    /// Allocate and bind a new media endpoint, starting its receive loop. The endpoint binds the
+    /// backend's configured/default address family (loopback IPv4 on the loopback backend unless a
+    /// bind IP was configured).
     fn alloc_endpoint(
         &self,
     ) -> impl std::future::Future<Output = Result<Endpoint, DatapathError>> + Send;
+
+    /// Allocate and bind a new media endpoint of a specific address family — the family of the
+    /// peer's signalled `c=` line (RFC 4566 §5.7), so a `c=IN IP6` call gets a v6 engine endpoint
+    /// and a `c=IN IP4` call gets v4. The default delegates to [`alloc_endpoint`](Self::alloc_endpoint),
+    /// ignoring the family, for single-family backends (the XDP fast path is IPv4-only); backends that
+    /// can bind either family (the loopback backend) override this.
+    fn alloc_endpoint_for(
+        &self,
+        _family: AddressFamily,
+    ) -> impl std::future::Future<Output = Result<Endpoint, DatapathError>> + Send {
+        self.alloc_endpoint()
+    }
 
     /// Install (or replace) the flow action for an endpoint.
     fn install_flow(

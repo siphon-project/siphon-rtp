@@ -6,7 +6,7 @@
 //! (reply to wherever the peer's packets actually arrive from). This backend needs no privileges
 //! or NIC, so it is the CI datapath and the behavioural reference the XDP backend must match.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -18,8 +18,8 @@ use tokio::task::JoinHandle;
 use siphon_rtp_stun as stun;
 
 use crate::{
-    Datapath, DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction, IceConfig, LatchPolicy,
-    ObservedRtcp, RxPacket,
+    AddressFamily, Datapath, DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction,
+    IceConfig, LatchPolicy, ObservedRtcp, RxPacket,
 };
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
@@ -323,6 +323,58 @@ impl UdpLoopbackDatapath {
     pub fn advance_clock(&self, ticks: u64) {
         self.inner.clock.fetch_add(ticks, Ordering::Relaxed);
     }
+
+    /// Resolve the local IP to bind for a requested address family. When the configured `bind_ip`
+    /// already matches the family it is used verbatim (so a production v6 bind IP, or a non-default
+    /// loopback v4, is honoured); otherwise the loopback of the requested family is used
+    /// (`127.0.0.1` for v4, `::1` for v6) — the NIC-free CI posture for a call signalled in a family
+    /// the backend was not configured for.
+    fn bind_ip_for(&self, family: AddressFamily) -> IpAddr {
+        match (self.inner.bind_ip, family) {
+            (addr @ IpAddr::V4(_), AddressFamily::V4) => addr,
+            (addr @ IpAddr::V6(_), AddressFamily::V6) => addr,
+            (_, AddressFamily::V4) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            (_, AddressFamily::V6) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        }
+    }
+
+    /// Allocate and bind a media endpoint on `bind_ip`, starting its receive loop. Shared by
+    /// [`alloc_endpoint`](Datapath::alloc_endpoint) (the configured/default family) and
+    /// [`alloc_endpoint_for`](Datapath::alloc_endpoint_for) (a requested family).
+    async fn alloc_on(&self, bind_ip: IpAddr) -> Result<Endpoint, DatapathError> {
+        // Reserve a pool slot up front so a concurrent burst cannot overshoot the cap (port/FD
+        // exhaustion guard — docs/security-and-nat.md §5). Release the reservation on any failure.
+        let reserved = self.inner.live.fetch_add(1, Ordering::AcqRel) + 1;
+        if reserved > self.inner.max_endpoints {
+            self.inner.live.fetch_sub(1, Ordering::AcqRel);
+            return Err(DatapathError::PoolExhausted {
+                limit: self.inner.max_endpoints,
+            });
+        }
+        let bind = UdpSocket::bind((bind_ip, 0))
+            .await
+            .and_then(|socket| socket.local_addr().map(|addr| (socket, addr)));
+        let (socket, local_addr) = match bind {
+            Ok(bound) => bound,
+            Err(error) => {
+                self.inner.live.fetch_sub(1, Ordering::AcqRel);
+                return Err(DatapathError::Bind(error));
+            }
+        };
+        let socket = Arc::new(socket);
+        let id = EndpointId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
+        let stats = Arc::new(StatsAtomic::default());
+        let task = tokio::spawn(recv_loop(
+            Arc::downgrade(&self.inner),
+            id,
+            socket.clone(),
+            stats.clone(),
+        ));
+        self.inner
+            .endpoints
+            .insert(id, EndpointEntry { socket, stats, task });
+        Ok(Endpoint { id, local_addr })
+    }
 }
 
 /// RFC 7983 first-byte demux on a media socket: only RTP/RTCP (128–191) may drive the relay or move
@@ -456,38 +508,14 @@ async fn recv_loop(
 
 impl Datapath for UdpLoopbackDatapath {
     async fn alloc_endpoint(&self) -> Result<Endpoint, DatapathError> {
-        // Reserve a pool slot up front so a concurrent burst cannot overshoot the cap (port/FD
-        // exhaustion guard — docs/security-and-nat.md §5). Release the reservation on any failure.
-        let reserved = self.inner.live.fetch_add(1, Ordering::AcqRel) + 1;
-        if reserved > self.inner.max_endpoints {
-            self.inner.live.fetch_sub(1, Ordering::AcqRel);
-            return Err(DatapathError::PoolExhausted {
-                limit: self.inner.max_endpoints,
-            });
-        }
-        let bind = UdpSocket::bind((self.inner.bind_ip, 0))
-            .await
-            .and_then(|socket| socket.local_addr().map(|addr| (socket, addr)));
-        let (socket, local_addr) = match bind {
-            Ok(bound) => bound,
-            Err(error) => {
-                self.inner.live.fetch_sub(1, Ordering::AcqRel);
-                return Err(DatapathError::Bind(error));
-            }
-        };
-        let socket = Arc::new(socket);
-        let id = EndpointId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let stats = Arc::new(StatsAtomic::default());
-        let task = tokio::spawn(recv_loop(
-            Arc::downgrade(&self.inner),
-            id,
-            socket.clone(),
-            stats.clone(),
-        ));
-        self.inner
-            .endpoints
-            .insert(id, EndpointEntry { socket, stats, task });
-        Ok(Endpoint { id, local_addr })
+        self.alloc_on(self.inner.bind_ip).await
+    }
+
+    async fn alloc_endpoint_for(
+        &self,
+        family: AddressFamily,
+    ) -> Result<Endpoint, DatapathError> {
+        self.alloc_on(self.bind_ip_for(family)).await
     }
 
     fn install_flow(&self, endpoint: EndpointId, action: FlowAction) -> Result<(), DatapathError> {
@@ -1053,6 +1081,55 @@ mod tests {
             .expect("packet");
         assert_eq!(packet.source, peer_addr);
         assert_eq!(&packet.data[..], b"peer-media");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alloc_endpoint_for_v6_binds_loopback_and_round_trips() {
+        // A v6-signalled call asks the datapath for a v6 endpoint; it must bind `::1` and relay a
+        // datagram between two `::1` sockets (RFC 4566 §5.7 `IN IP6`). The default backend binds
+        // loopback v4, so the family is what selects v6 here.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath
+            .alloc_endpoint_for(AddressFamily::V6)
+            .await
+            .expect("alloc v6 a");
+        let leg_b = datapath
+            .alloc_endpoint_for(AddressFamily::V6)
+            .await
+            .expect("alloc v6 b");
+        assert!(leg_a.local_addr.is_ipv6(), "v6 endpoint binds an IPv6 address");
+        assert_eq!(leg_a.local_addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+
+        // Two `::1` phones standing in for the v6 peers.
+        let phone_a = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind v6 phone a");
+        let addr_a = phone_a.local_addr().expect("v6 addr a");
+        let phone_b = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind v6 phone b");
+        let addr_b = phone_b.local_addr().expect("v6 addr b");
+
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule {
+                    out_endpoint: leg_b.id,
+                    out_dst: Some(addr_b),
+                    accepted_source: SourceFilter::Exact(addr_a.ip()),
+                    latch: LatchPolicy::SignalledOnly,
+                }),
+            )
+            .expect("flow a");
+
+        // A -> engine(leg_a) -> phone_b, leaving from the engine's v6 B-facing port.
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A, 1), leg_a.local_addr)
+            .await
+            .expect("send a");
+        let (data, from) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A, 1));
+        assert_eq!(from, leg_b.local_addr);
     }
 
     #[tokio::test]

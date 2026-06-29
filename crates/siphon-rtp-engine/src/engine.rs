@@ -18,8 +18,8 @@ use dashmap::DashMap;
 use std::sync::Arc;
 
 use siphon_rtp_datapath::{
-    Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy, ObservedRtcp,
-    SourceFilter,
+    AddressFamily, Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy,
+    ObservedRtcp, SourceFilter,
 };
 use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_hep::exporter::HepExporter;
@@ -367,11 +367,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// Allocate `count` endpoints, rolling back all of them if any allocation fails.
-    async fn alloc_endpoints(&self, count: usize) -> Result<Vec<Endpoint>, String> {
+    /// Allocate `count` endpoints of `family`, rolling back all of them if any allocation fails. The
+    /// family is the address family of the call's signalled `c=` line (RFC 4566 §5.7), so a
+    /// `c=IN IP6` call gets v6 engine endpoints and a `c=IN IP4` call gets v4.
+    async fn alloc_endpoints(
+        &self,
+        count: usize,
+        family: AddressFamily,
+    ) -> Result<Vec<Endpoint>, String> {
         let mut endpoints = Vec::with_capacity(count);
         for _ in 0..count {
-            match self.datapath.alloc_endpoint().await {
+            match self.datapath.alloc_endpoint_for(family).await {
                 Ok(endpoint) => endpoints.push(endpoint),
                 Err(error) => {
                     for allocated in &endpoints {
@@ -441,9 +447,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None
         };
 
-        // Two RTP endpoints, plus two companion RTCP endpoints unless the stream is muxed.
+        // Two RTP endpoints, plus two companion RTCP endpoints unless the stream is muxed. Bind the
+        // engine endpoints in the address family of the offer's signalled `c=` line (RFC 4566 §5.7),
+        // so a `c=IN IP6` offer is relayed on v6 engine ports (and advertised back as `c=IN IP6`).
+        // A mixed-family call (A v4 ↔ B v6) is IPv4↔IPv6 interworking — a separate roadmap item; here
+        // both legs share the offer family, which covers the IPv6-only-network VoLTE case.
+        let family = AddressFamily::of(info.remote_rtp.ip());
         let count = if info.rtcp_mux { 2 } else { 4 };
-        let endpoints = match self.alloc_endpoints(count).await {
+        let endpoints = match self.alloc_endpoints(count, family).await {
             Ok(endpoints) => endpoints,
             Err(reason) => return CmdResult::Error { reason },
         };
@@ -1281,13 +1292,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         // Snapshot the leg identity/codecs/pipeline under the ownership guard (A3 — docs §5).
-        let Some((call_to, near_codec, far_codec, pipeline)) =
+        let Some((call_to, near_codec, far_codec, pipeline, family)) =
             self.owned_call(client, call_id, |call| {
                 (
                     call.to_tag.clone(),
                     call.near_codec.clone(),
                     call.far_codec.clone(),
                     call.pipeline,
+                    // The subscriber endpoint binds the call's address family (RFC 4566 §5.7), so a
+                    // v6 call's SIPREC tee is offered to the SRS on a v6 endpoint (`c=IN IP6`).
+                    AddressFamily::of(call.near.rtp.local_addr.ip()),
                 )
             })
         else {
@@ -1342,8 +1356,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        // Allocate the single send-only subscriber endpoint.
-        let subscriber_endpoint = match self.alloc_endpoints(1).await {
+        // Allocate the single send-only subscriber endpoint in the call's address family.
+        let subscriber_endpoint = match self.alloc_endpoints(1, family).await {
             Ok(mut endpoints) => endpoints.remove(0),
             Err(reason) => return error_result("subscribe_request", &reason),
         };
@@ -1844,12 +1858,15 @@ fn subscriber_offer_sdp(local_addr: std::net::SocketAddr, codec: &CodecSpec) -> 
     use std::fmt::Write as _;
     // RFC 4566 §5: mandatory lines in order. o= uses a fixed session id/version (one offer per
     // subscription); s=- is the standard "no name"; t=0 0 is an unbounded session.
+    // RFC 4566 §5.7: the addrtype (`IP4`/`IP6`) follows the subscriber endpoint's own family, so a
+    // v6 SIPREC tee is offered to the SRS as `c=IN IP6`.
+    let addrtype = if local_addr.is_ipv6() { "IP6" } else { "IP4" };
     let _ = write!(
         sdp,
         "v=0\r\n\
-         o=- 0 0 IN IP4 {ip}\r\n\
+         o=- 0 0 IN {addrtype} {ip}\r\n\
          s=siphon-rtp-siprec\r\n\
-         c=IN IP4 {ip}\r\n\
+         c=IN {addrtype} {ip}\r\n\
          t=0 0\r\n\
          m=audio {port} RTP/AVP {payload_type}\r\n\
          a=rtpmap:{payload_type} {name}/{clock}{channels}\r\n\
@@ -1973,15 +1990,27 @@ mod tests {
         (socket, addr)
     }
 
-    /// A two-port SDP: RTP at `addr`, RTCP at `addr`+1 (default), optional `a=rtcp-mux`.
+    /// A two-port SDP: RTP at `addr`, RTCP at `addr`+1 (default), optional `a=rtcp-mux`. The
+    /// addrtype (RFC 4566 §5.7) follows `rtp`'s family, so this builds an `IN IP6` offer for a v6
+    /// socket and `IN IP4` for a v4 one.
     fn sdp_for(rtp: SocketAddr, mux: bool) -> String {
         let mux_line = if mux { "a=rtcp-mux\r\n" } else { "" };
+        let addrtype = if rtp.is_ipv6() { "IP6" } else { "IP4" };
         format!(
-            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+            "v=0\r\no=- 1 1 IN {addrtype} {ip}\r\ns=-\r\nc=IN {addrtype} {ip}\r\nt=0 0\r\n\
              m=audio {port} RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\n{mux_line}",
             ip = rtp.ip(),
             port = rtp.port()
         )
+    }
+
+    /// A test "phone" bound to IPv6 loopback (`::1`) — the v6 counterpart of [`phone`].
+    async fn phone_v6() -> (UdpSocket, SocketAddr) {
+        let socket = UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind v6");
+        let addr = socket.local_addr().expect("v6 addr");
+        (socket, addr)
     }
 
     fn ok_sdp_text(result: &CmdResult) -> String {
@@ -2865,6 +2894,72 @@ mod tests {
         let delete = engine
             .handle(CLIENT, Command::Delete {
                 call_id: "call-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            })
+            .await;
+        assert!(matches!(delete, CmdResult::Ok { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_answer_relays_rtp_over_ipv6_loopback() {
+        // End-to-end on IPv6 (RFC 4566 §5.7 `c=IN IP6`): an `IN IP6 ::1` offer/answer must allocate
+        // v6 engine endpoints, advertise `c=IN IP6`, and relay RTP between two `::1` phones. Mirrors
+        // `offer_answer_relays_rtp_then_query_and_delete` on v6 loopback. `::1` binds in this
+        // environment (verified), so this test runs unconditionally; it would only need gating on a
+        // host without an IPv6 loopback.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone_v6().await;
+        let (phone_b, addr_b) = phone_v6().await;
+
+        let offer = engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "call-v6".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, false),
+                profile: Default::default(),
+            })
+            .await;
+        let offer_sdp = ok_sdp_text(&offer);
+        assert!(offer_sdp.contains("c=IN IP6 ::1"), "v6 offer rewrite: {offer_sdp}");
+        let far_rtp = sdp::parse(&offer_sdp).expect("parse far").remote_rtp;
+        assert!(far_rtp.is_ipv6(), "the far engine endpoint is v6");
+
+        let answer = engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "call-v6".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_b, false),
+                profile: Default::default(),
+            })
+            .await;
+        let answer_sdp = ok_sdp_text(&answer);
+        assert!(answer_sdp.contains("c=IN IP6 ::1"), "v6 answer rewrite: {answer_sdp}");
+        let near_rtp = sdp::parse(&answer_sdp).expect("parse near").remote_rtp;
+        assert!(near_rtp.is_ipv6(), "the near engine endpoint is v6");
+
+        // A -> engine -> B over v6 loopback.
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), near_rtp)
+            .await
+            .expect("send a");
+        let (data, from) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A));
+        assert_eq!(from, far_rtp);
+
+        // B -> engine -> A over v6 loopback.
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), far_rtp)
+            .await
+            .expect("send b");
+        let (data, from) = recv(&phone_a).await;
+        assert_eq!(data, rtp(0x0B0B_0B0B));
+        assert_eq!(from, near_rtp);
+
+        let delete = engine
+            .handle(CLIENT, Command::Delete {
+                call_id: "call-v6".into(),
                 from_tag: "tag-a".into(),
                 to_tag: None,
             })
