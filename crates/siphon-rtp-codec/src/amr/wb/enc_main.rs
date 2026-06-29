@@ -1,15 +1,12 @@
-// AMR-WB encoder — WORK IN PROGRESS: not yet wired into the codec factory or validated
-// bit-exact. Ported from the 3GPP fixed-point C reference (index loops / manual slice
-// copies mirror the C, plus not-yet-used WIP code); these style + dead-code lints are
-// quieted module-wide until the encoder is complete and validated, then revisited.
+// AMR-WB encoder. Ported bit-exact from the 3GPP fixed-point C reference; the index loops and
+// manual slice copies deliberately mirror the C (`cod_main.c` et al.) line-for-line so the port can
+// be audited against the spec source, so the matching idiom-style lints are quieted module-wide.
+// (`dead_code` covers the mode-8 high-band helpers that are reachable only once that tier lands.)
 #![allow(
     clippy::needless_range_loop,
     clippy::manual_memcpy,
     clippy::explicit_counter_loop,
-    clippy::manual_div_ceil,
-    clippy::unnecessary_to_owned,
-    dead_code,
-    unused
+    dead_code
 )]
 
 //! AMR-WB encoder orchestration (3GPP TS 26.190 / TS 26.173 `cod_main.c` `coder()`), ported
@@ -25,12 +22,10 @@ use crate::amr::basic_ops::{
     round_word, shl, shr, sub,
 };
 use crate::amr::wb::bitstream::parm_serial;
-use crate::amr::wb::codebook::{dec_acelp_2t64, dec_acelp_4t64};
 use crate::amr::wb::constants::{GP_CLIP, L_INTERPOL, PIT_MAX, PIT_MIN, PIT_SHARP};
 use crate::amr::wb::enc_acelp::{
     acelp_2t64_fx, convolve, cor_h_x, g_pitch, gp_clip, gp_clip_test_gain_pit, gp_clip_test_isf,
-    init_gp_clip, init_q_gain2, preemph, preemph2, q_gain2, quant_2p_2n1, quant_3p_3n1,
-    quant_4p_4n, quant_5p_5n, quant_6p_6n_2, quant_1p_n1, syn_filt, updt_tar, voice_factor,
+    init_gp_clip, init_q_gain2, preemph, preemph2, q_gain2, syn_filt, updt_tar, voice_factor,
 };
 use crate::amr::wb::enc_lpc::{
     autocorr, az_isp, decim_12k8, hp50_12k8, lag_window, levinson, lp_decim2, qpisf_2s_36b,
@@ -273,7 +268,7 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         }
     }
     let tmp = extract_h(l_max);
-    let mut shift = if tmp == 0 {
+    let shift = if tmp == 0 {
         Q_MAX
     } else {
         let mut s = sub(norm_s(tmp), 1);
@@ -683,7 +678,7 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
 
         // ---- closed-loop fractional pitch ----
         let mut t0_frac = 0i16;
-        let mut t0;
+        let t0;
         if sub(ser_size, NBBITS_9K) <= 0 {
             t0 = crate::amr::wb::enc_acelp::pitch_fr4(
                 &old_exc, exc_off + i_subfr, &xn, &h1, t0_min, t0_max, &mut t0_frac, pit_flag,
