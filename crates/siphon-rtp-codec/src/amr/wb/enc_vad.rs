@@ -956,14 +956,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WIP AMR-WB encoder kernel — not yet bit-exact (re-enable when the encoder lands)"]
     fn ilog2_reference_anchor_points() {
-        // From the wb_vad.c table: input 1 -> 31744 (NO_P1).
-        assert_eq!(ilog2(1), 31744);
+        // wb_vad.c `ilog2`. The fixed-point routine returns 31743 for mantissa 1 (the NO_P1 = 31744
+        // constant in wb_vad_c.h is a rounded design value, not the bit-exact output). Verified
+        // against the fixed-point C reference (basicop2.c + wb_vad.c `ilog2`).
+        assert_eq!(ilog2(1), 31743);
         // Non-positive input is clamped to 1 internally.
         assert_eq!(ilog2(0), ilog2(1));
         assert_eq!(ilog2(-5), ilog2(1));
-        // Monotonic-ish: larger mantissa yields a smaller (closer-to-zero) log2 scale value.
+        // Full-scale mantissa yields exactly half the scale (16384), and is smaller than ilog2(1).
+        assert_eq!(ilog2(32767), 16384);
         assert!(ilog2(32767) < ilog2(1));
     }
 

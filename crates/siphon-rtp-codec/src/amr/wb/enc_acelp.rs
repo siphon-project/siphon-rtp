@@ -1726,14 +1726,16 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "WIP AMR-WB encoder kernel — not yet bit-exact (re-enable when the encoder lands)"]
     fn convolve_unit_impulse() {
-        // h = unit impulse (Q15 1.0 = 32767) → y ≈ x (rounded by L_mac).
+        // convolve.c `Convolve`: y[n] = round(Σ L_mac(x[i], h[n-i])).
+        // With h[0] = 0.5 in Q15 (16384), each tap is L_mac(0, x, 16384) = x·16384·2 = x·32768,
+        // and round(x·32768) = (x·32768 + 0x8000) >> 16 = x/2 (rounded). So y == x/2.
+        // Ground truth from the fixed-point C reference (basicop2.c + convolve.c).
         let x = [100i16, 200, 300, 400];
-        let h = [16384i16, 0, 0, 0]; // 0.5 in Q15 → L_mac doubles → ~x
+        let h = [16384i16, 0, 0, 0];
         let mut y = [0i16; 4];
         convolve(&x, &h, &mut y, 4);
-        assert_eq!(y[0], 100);
+        assert_eq!(y, [50, 100, 150, 200]);
     }
 
     #[test]
@@ -1756,16 +1758,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WIP AMR-WB encoder kernel — not yet bit-exact (re-enable when the encoder lands)"]
     fn syn_filt_unity_passes_input() {
-        // a=[1,0] (no prediction): y == x/2 ... actually a0=shr(4096,1)=2048, L_mult x·2048<<? -> x.
+        // syn_filt.c `Syn_filt`: with a = [4096, 0] (Q12 1.0, no prediction term) the filter is a
+        // pure gain. a0 = shr(4096, 1) = 2048; s = norm_s(4096) - 2 = 1; the per-sample accumulator
+        // is L_mult(x, 2048) = x·2048·2, scaled by L_shl(·, 3 + 1) and rounded → x/2.
+        // Ground truth from the fixed-point C reference (basicop2.c + syn_filt.c).
         let a = [4096i16, 0];
         let x = [100i16, 200, 300, 400];
         let mut y = [0i16; 4];
         let mut mem = [0i16; 1];
         syn_filt(&a, 1, &x, &mut y, 4, &mut mem, true);
-        assert_eq!(y, [100, 200, 300, 400]);
-        assert_eq!(mem[0], 400);
+        assert_eq!(y, [50, 100, 150, 200]);
+        // Carried state is the last output sample.
+        assert_eq!(mem[0], 200);
     }
 
     #[test]

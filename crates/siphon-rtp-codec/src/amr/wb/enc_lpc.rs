@@ -805,14 +805,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WIP AMR-WB encoder kernel — not yet bit-exact (re-enable when the encoder lands)"]
     fn residu_is_linear_filter() {
-        // a=[1,0]: residual == input.
+        // residu.c `Residu`: y[i] = round(L_shl(L_mult(x[i], a[0]) + Σ L_mac(a[j], x[i-j]), 3 + 1)).
+        // With a = [4096, 0] (Q12 1.0, no prediction term): s = L_mult(x, 4096) = x·4096·2,
+        // L_shl(s, 4) and round → 2·x. So the residual of a Q12-1.0 coefficient is 2× the input.
+        // Ground truth from the fixed-point C reference (basicop2.c + residu.c).
         let a = [4096i16, 0];
         let x = [0i16, 0, 10, 20, 30, 40];
         let mut y = [0i16; 4];
         residu(&a, 1, &x, 2, &mut y, 4);
-        assert_eq!(y, [10, 20, 30, 40]);
+        assert_eq!(y, [20, 40, 60, 80]);
     }
 
     #[test]
