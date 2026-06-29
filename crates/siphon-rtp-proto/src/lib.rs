@@ -175,6 +175,14 @@ pub struct ProfileFlags {
     /// Recording output directory/path, when recording.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_path: Option<String>,
+    /// Attach this call's offerer (leg A) audio to an external WebSocket media server (the
+    /// mod_audio_stream / voice-AI integration). When set on `offer`/`answer`, the engine dials this
+    /// URI as a WebSocket client and bridges leg A's RTP to it (decode → L16 uplink, L16 downlink →
+    /// encode); the A↔B relay/transcode path is not wired in this mode (the WS server is A's far
+    /// side). A native siphon-rtp extension — the NG/bencode front-end does not set it. `ws://` only
+    /// for v1 (`wss://` is a follow-up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_uri: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -341,6 +349,7 @@ mod tests {
                     ice: Some("remove".to_string()),
                     replace: vec!["origin".to_string()],
                     direction: vec!["external".to_string(), "internal".to_string()],
+                    ws_uri: Some("ws://127.0.0.1:9001/stream".to_string()),
                     ..Default::default()
                 },
             },
@@ -353,6 +362,22 @@ mod tests {
         assert_eq!(json["command"], "offer");
         assert_eq!(json["call_id"], "abc@host");
         assert_eq!(json["profile"]["transport_protocol"], "RTP/SAVP");
+        assert_eq!(json["profile"]["ws_uri"], "ws://127.0.0.1:9001/stream");
+    }
+
+    #[test]
+    fn ws_uri_defaults_to_none_and_is_omitted_when_unset() {
+        // Additive, optional: an offer without ws_uri deserializes fine and the field is omitted from
+        // the wire when unset (skip_serializing_if), so the native extension stays invisible to the
+        // NG/bencode front-end which never sets it.
+        let json = r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n"}"#;
+        let command: Command = serde_json::from_str(json).expect("deserialize");
+        match command {
+            Command::Offer { profile, .. } => assert_eq!(profile.ws_uri, None),
+            other => panic!("expected offer, got {other:?}"),
+        }
+        let serialized = serde_json::to_value(ProfileFlags::default()).expect("to_value");
+        assert!(serialized.get("ws_uri").is_none(), "ws_uri omitted when unset");
     }
 
     #[test]

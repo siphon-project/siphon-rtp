@@ -34,6 +34,12 @@ use crate::ice::{self, IceCredentials};
 use crate::media_pipeline::{DirectionConfig, MediaCall, MediaControl, MediaRegistry};
 use crate::sdp::{self, EngineMedia, SecurityAdvertisement};
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
+use crate::ws_bridge::WsRegistry;
+
+use siphon_rtp_media::bridge::protocol::{Direction as WsDirection, MediaFormat};
+use siphon_rtp_media::bridge::{run_bridge, BridgeSession};
+use siphon_rtp_media::jitter::JitterBuffer;
+use siphon_rtp_media::leg::MediaLeg;
 
 /// Identity of a control client — one persistent JSON-over-TCP connection. A call is owned by the
 /// client that created it via `offer`; only that client may answer, query, or delete it (A3 —
@@ -99,6 +105,9 @@ enum PipelineKind {
     Srtp,
     /// Userspace media slow path: transcode / record / DTMF-extraction via a [`MediaCall`] actor.
     Media,
+    /// WebSocket bridge: leg A's audio is attached to an external WS media server (mod_audio_stream /
+    /// voice-AI). The A↔B relay/transcode path is not wired — the WS server is A's far side.
+    Ws,
 }
 
 /// The session engine, generic over a [`Datapath`] backend.
@@ -123,6 +132,10 @@ pub struct Engine<D: Datapath> {
     /// redirect dispatcher, which routes media-owned endpoints' datagrams here (see
     /// [`crate::media_pipeline`]).
     media: Arc<MediaRegistry>,
+    /// The WebSocket-bridge slow path: per-call WS bridges (mod_audio_stream / voice-AI). Shared with
+    /// the redirect dispatcher, which routes WS-owned endpoints' datagrams here (see
+    /// [`crate::ws_bridge`]).
+    ws: Arc<WsRegistry>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -150,6 +163,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             endpoint_calls: DashMap::new(),
             bridge,
             media: Arc::new(MediaRegistry::default()),
+            ws: Arc::new(WsRegistry::default()),
         }
     }
 
@@ -168,6 +182,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// endpoints' datagrams to the per-call transcode/record/DTMF actors.
     pub fn media(&self) -> Arc<MediaRegistry> {
         self.media.clone()
+    }
+
+    /// The shared WebSocket-bridge registry — handed to the redirect dispatcher so it can route
+    /// WS-owned endpoints' datagrams to the per-call WS bridges.
+    pub fn ws(&self) -> Arc<WsRegistry> {
+        self.ws.clone()
     }
 
     /// Number of live calls in the session registry.
@@ -387,6 +407,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
 
+        // WebSocket bridge (mod_audio_stream / voice-AI): a native siphon-rtp extension. When the
+        // profile carries `ws_uri`, leg A (the offerer) is bridged to that WS server using A's
+        // negotiated (primary) codec — the engine dials the WS as a client and pumps A's audio in
+        // both directions. The A↔B relay/transcode path is not wired in this mode (the WS is A's far
+        // side). Resolved at offer because A's codec + signalled address are both known here.
+        let near_codec = info.primary_codec();
+        let ws_uri = profile.ws_uri.clone();
+        let pipeline = if ws_uri.is_some() {
+            PipelineKind::Ws
+        } else {
+            PipelineKind::Passthrough
+        };
+
         *self.client_calls.entry(client).or_insert(0) += 1;
         // Index this call's endpoints so observed RTCP can be correlated back to the call-id.
         for endpoint in [Some(near_rtp), near_rtcp, Some(far_rtp), far_rtcp]
@@ -396,7 +429,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.endpoint_calls.insert(endpoint.id, call_id.clone());
         }
         self.calls.insert(
-            call_id,
+            call_id.clone(),
             Call {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
@@ -416,13 +449,144 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtcp: None,
                 },
                 far_local_crypto,
-                near_codec: info.primary_codec(),
+                near_codec: near_codec.clone(),
                 near_telephone_event: info.telephone_event_payload_type(),
-                pipeline: PipelineKind::Passthrough,
+                pipeline,
                 relay_flows: Vec::new(),
             },
         );
+
+        // Stand the WS bridge up now that the call is recorded (so a dispatch can find its route). On
+        // any failure (no codec, redirect install, or dial), tear the half-built call back down.
+        if let Some(ws_uri) = ws_uri {
+            if let Err(reason) = self
+                .setup_ws_bridge(
+                    &call_id,
+                    &ws_uri,
+                    near_rtp,
+                    info.remote_rtp,
+                    near_codec.as_ref(),
+                    bridge_source_filter(profile, info.remote_rtp),
+                )
+                .await
+            {
+                self.teardown_call(&call_id).await;
+                return error_result("ws bridge", &reason);
+            }
+        }
+
         ok_sdp(rewritten.sdp, None)
+    }
+
+    /// Stand up the WebSocket bridge for leg A: install `Redirect` on A's RTP endpoint, dial the WS
+    /// server as a client, build a [`BridgeSession`] on a [`MediaLeg`] in A's codec, and spawn the
+    /// bridge + the rtp_out→datapath drain task, registering both in the [`WsRegistry`]. The bridge's
+    /// `rtp_in` is fed by the redirect dispatcher (gated by `accepted_source` — RTPBleed defence,
+    /// `Redirect` skips the datapath gate). `ws://` only for v1 (`wss://` is a follow-up).
+    async fn setup_ws_bridge(
+        &self,
+        call_id: &str,
+        ws_uri: &str,
+        endpoint_a: Endpoint,
+        a_rtp: std::net::SocketAddr,
+        codec: Option<&CodecSpec>,
+        accepted_source: SourceFilter,
+    ) -> Result<(), String> {
+        let Some(codec) = codec else {
+            return Err("offer carried no usable audio codec for the WS bridge".to_string());
+        };
+        // Build A's codec pair for the leg: decode A's RTP → L16 uplink; encode L16 downlink → A's RTP.
+        let decoder = factory::decoder_for(codec).map_err(|error| error.to_string())?;
+        let encoder = factory::encoder_for(codec).map_err(|error| error.to_string())?;
+        let ptime = std::time::Duration::from_millis(u64::from(codec.ptime_ms.max(1)));
+
+        // Redirect A's RTP so the dispatcher routes it here (the WS bridge owns leg A's media).
+        self.datapath
+            .install_flow(endpoint_a.id, FlowAction::Redirect)
+            .map_err(|error| format!("install WS bridge redirect: {error}"))?;
+
+        // Dial the WS server as a client (ws:// for v1). connect_async returns the stream + the HTTP
+        // upgrade response; we keep only the stream.
+        let (socket, _response) = tokio_tungstenite::connect_async(ws_uri)
+            .await
+            .map_err(|error| format!("dial {ws_uri}: {error}"))?;
+
+        // A jitter buffer shallow enough for low-latency voice-AI (target 1, cap 16 — the bridge
+        // pops one frame per ptime tick, the consumer's cadence being the sample-tick clock).
+        let leg = MediaLeg::new(
+            decoder,
+            encoder,
+            JitterBuffer::new(1, 16),
+            random_ssrc(),
+            codec.payload_type,
+        );
+        // The WS media format advertised in `start`: L16 at A's clock rate, mono, little-endian.
+        let format = MediaFormat {
+            encoding: siphon_rtp_media::bridge::protocol::Encoding::L16,
+            sample_rate: codec.clock_rate_hz,
+            channels: 1,
+            bit_depth: 16,
+            endianness: siphon_rtp_media::bridge::protocol::Endianness::Little,
+            ptime: codec.ptime_ms.max(1),
+        };
+        let session = BridgeSession::new(
+            leg,
+            format,
+            format!("ws-{call_id}"),
+            call_id.to_string(),
+            WsDirection::Duplex,
+            8, // playout cap (drop-oldest): late audio is worthless
+        );
+
+        let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
+        let (rtp_out_tx, rtp_out_rx) = flume::bounded::<bytes::Bytes>(1024);
+
+        // The bridge: pump A's RTP (rtp_in) ↔ WS, render WS downlink to RTP (rtp_out).
+        let bridge_task = tokio::spawn(async move {
+            if let Err(error) = run_bridge(socket, session, rtp_in_rx, rtp_out_tx, ptime).await {
+                tracing::debug!(%error, "ws bridge exited with error");
+            }
+        });
+        // The drain: forward each rendered downlink RTP packet out A's endpoint toward A.
+        let datapath = self.datapath.clone();
+        let drain_endpoint = endpoint_a.id;
+        let drain_task = tokio::spawn(async move {
+            while let Ok(packet) = rtp_out_rx.recv_async().await {
+                if let Err(error) = datapath.send(drain_endpoint, a_rtp, &packet).await {
+                    tracing::debug!(%error, "ws bridge downlink send failed");
+                }
+            }
+        });
+
+        self.ws.register(
+            call_id.to_string(),
+            endpoint_a.id,
+            accepted_source,
+            rtp_in_tx,
+            bridge_task,
+            drain_task,
+        );
+        Ok(())
+    }
+
+    /// Tear down a call's datapath + slow-path state without an ownership check (an internal cleanup
+    /// for a half-built call). Frees the sockets and drops any bridge / media / WS registration.
+    async fn teardown_call(&self, call_id: &str) {
+        if let Some((_, call)) = self.calls.remove(call_id) {
+            let endpoints: Vec<EndpointId> = call
+                .near
+                .endpoint_ids()
+                .chain(call.far.endpoint_ids())
+                .collect();
+            self.bridge.deregister(endpoints.iter().copied());
+            self.media.deregister(call_id);
+            self.ws.deregister(call_id);
+            for endpoint in endpoints {
+                self.datapath.remove_endpoint(endpoint).await;
+                self.endpoint_calls.remove(&endpoint);
+            }
+            self.release_client_call(call.owner);
+        }
     }
 
     async fn answer(
@@ -436,7 +600,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ) -> CmdResult {
         // Snapshot the leg endpoints under the guard, then release it. Only the owning client may
         // answer (A3 — docs/security-and-nat.md §5); to anyone else the call is unknown.
-        let (near, far, ice_creds, far_local_crypto, near_codec, near_telephone_event) =
+        let (near, far, ice_creds, far_local_crypto, near_codec, near_telephone_event, offer_pipeline) =
             match self.calls.get(call_id) {
                 Some(call) if call.owner == client => {
                     if call.from_tag != from_tag {
@@ -451,6 +615,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         call.far_local_crypto,
                         call.near_codec.clone(),
                         call.near_telephone_event,
+                        call.pipeline,
                     )
                 }
                 _ => return unknown_call(call_id),
@@ -487,6 +652,41 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         };
+
+        // WebSocket bridge: if this call is (or is now being) bridged to a WS media server, leg A's
+        // audio is already (or now) pumped to the WS — the A↔B relay/transcode path is deliberately
+        // not wired (the WS server is A's far side). The bridge is normally stood up at offer; honour
+        // `ws_uri` arriving first at answer too (set it up against A's stored codec/address).
+        let already_ws = offer_pipeline == PipelineKind::Ws;
+        if already_ws || profile.ws_uri.is_some() {
+            if !already_ws {
+                let Some(a_rtp) = near.remote_rtp else {
+                    return error_result("ws bridge", &"near leg has no signalled address");
+                };
+                if let Some(ws_uri) = profile.ws_uri.clone() {
+                    if let Err(reason) = self
+                        .setup_ws_bridge(
+                            call_id,
+                            &ws_uri,
+                            near.rtp,
+                            a_rtp,
+                            near_codec.as_ref(),
+                            bridge_source_filter(profile, a_rtp),
+                        )
+                        .await
+                    {
+                        return error_result("ws bridge", &reason);
+                    }
+                }
+            }
+            if let Some(mut call) = self.calls.get_mut(call_id) {
+                call.to_tag = Some(to_tag.clone());
+                call.far.remote_rtp = Some(info.remote_rtp);
+                call.far.remote_rtcp = Some(info.remote_rtcp);
+                call.pipeline = PipelineKind::Ws;
+            }
+            return ok_sdp(rewritten.sdp, Some(to_tag));
+        }
 
         // ICE applies to a leg only when both ends use it: `near` faces A (which offered ICE iff we
         // minted creds), `far` faces B (ICE iff its answer carries ICE).
@@ -738,11 +938,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .endpoint_ids()
                     .chain(call.far.endpoint_ids())
                     .collect();
-                // Drop any SRTP-bridge or media-pipeline flows first (a no-op for a plain relay),
-                // then free the sockets. `media.deregister` aborts the call's actor and flushes any
-                // recording.
+                // Drop any SRTP-bridge, media-pipeline, or WS-bridge flows first (a no-op for a plain
+                // relay), then free the sockets. `media.deregister` aborts the call's actor and
+                // flushes any recording; `ws.deregister` aborts the bridge + drain tasks (closing the
+                // WS connection).
                 self.bridge.deregister(endpoints.iter().copied());
                 self.media.deregister(call_id);
+                self.ws.deregister(call_id);
                 for endpoint in endpoints {
                     self.datapath.remove_endpoint(endpoint).await;
                     self.endpoint_calls.remove(&endpoint);
@@ -970,6 +1172,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.near.endpoint_ids().chain(call.far.endpoint_ids()).collect();
                 self.bridge.deregister(endpoints.iter().copied());
                 self.media.deregister(&call_id);
+                self.ws.deregister(&call_id);
                 for endpoint in endpoints {
                     self.datapath.remove_endpoint(endpoint).await;
                     self.endpoint_calls.remove(&endpoint);
@@ -1312,7 +1515,7 @@ mod tests {
         // through the control plane with the redirect dispatcher live.
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
 
         let (phone_a, addr_a) = phone().await; // plain (AVP) caller A
         let (phone_b, addr_b) = phone().await; // secure (SAVP) callee B
@@ -1402,7 +1605,7 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
 
         let (phone_a, addr_a) = phone().await;
         let (phone_b, addr_b) = phone().await;
@@ -1470,12 +1673,171 @@ mod tests {
         assert!(!engine.media().is_media_call("xcode-1"), "media call deregistered");
     }
 
+    /// A µ-law (PCMU, PT 0) RTP packet: a 160-sample / 20 ms frame carrying `payload_byte`.
+    fn ulaw_rtp_packet(sequence: u16, ssrc: u32, payload_byte: u8) -> Vec<u8> {
+        let mut packet = vec![0x80, 0x00];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&(u32::from(sequence) * 160).to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&[payload_byte; 160]);
+        packet
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_attaches_leg_a_to_a_websocket_server_end_to_end() {
+        // The mod_audio_stream headline: a control client sets `ws_uri`, the engine dials that WS
+        // server and bridges leg A's audio to it. Driven end-to-end through the control plane with the
+        // redirect dispatcher live; proves the start handshake, the uplink, the downlink, and teardown.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use futures_util::{SinkExt, StreamExt};
+        use siphon_rtp_media::bridge::pcm_to_l16_le;
+        use siphon_rtp_media::bridge::protocol::ControlMessage;
+        use tokio_tungstenite::tungstenite::Message;
+
+        // Stand up a local WebSocket server: it relays each received frame out `ws_rx`, and forwards a
+        // downlink frame requested via `down_tx` into the socket toward the engine.
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ws");
+        let ws_addr = ws_listener.local_addr().expect("ws addr");
+        let (ws_tx, ws_rx) = flume::unbounded::<Message>();
+        let (down_tx, down_rx) = flume::unbounded::<Vec<u8>>();
+        tokio::spawn(async move {
+            let (stream, _) = ws_listener.accept().await.expect("accept ws");
+            let socket = tokio_tungstenite::accept_async(stream).await.expect("ws handshake");
+            let (mut sink, mut source) = socket.split();
+            loop {
+                tokio::select! {
+                    incoming = source.next() => match incoming {
+                        Some(Ok(message)) => {
+                            if ws_tx.send(message).is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    },
+                    downlink = down_rx.recv_async() => match downlink {
+                        Ok(bytes) => {
+                            if sink.send(Message::Binary(bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                }
+            }
+        });
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+
+        // A offers PCMU with `ws_uri` set → the engine dials the WS and bridges leg A to it.
+        let profile = ProfileFlags {
+            ws_uri: Some(format!("ws://{ws_addr}/stream")),
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "ws-1".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile,
+            })
+            .await;
+        assert!(matches!(offer, CmdResult::Ok { .. }), "ws offer succeeds");
+        assert!(engine.ws().is_ws_call("ws-1"), "the call is a WS-bridge call");
+
+        // An answer (B answers PCMU too) returns the engine's A-facing endpoint without wiring A↔B.
+        let answer = engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "ws-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: ProfileFlags::default(),
+            })
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer)).expect("answer reply").remote_rtp;
+
+        // 1. The WS server receives a `start` text frame first (the mod_audio_stream handshake).
+        let first = timeout(Duration::from_secs(3), ws_rx.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("a frame");
+        match first {
+            Message::Text(text) => assert!(
+                matches!(ControlMessage::from_json(&text), Ok(ControlMessage::Start(_))),
+                "first WS frame is `start`"
+            ),
+            other => panic!("expected start text frame, got {other:?}"),
+        }
+
+        // 2. Uplink: phone A sends µ-law RTP to the engine's A-facing port; the WS server gets an L16
+        //    binary uplink frame (8 kHz / 20 ms = 320 bytes).
+        phone_a
+            .send_to(&ulaw_rtp_packet(7, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let mut got_uplink = false;
+        for _ in 0..30 {
+            let frame = timeout(Duration::from_secs(2), ws_rx.recv_async())
+                .await
+                .expect("no timeout")
+                .expect("a frame");
+            if let Message::Binary(bytes) = frame {
+                assert_eq!(bytes.len(), 320, "8k/20ms L16 uplink");
+                got_uplink = true;
+                break;
+            }
+        }
+        assert!(got_uplink, "expected an uplink L16 binary frame on the WS");
+
+        // 3. Downlink: the WS server sends a binary L16 frame; phone A receives an RTP packet (the
+        //    bridge encodes it in A's codec and the drain task sends it toward A).
+        let mut l16 = [0u8; 320];
+        pcm_to_l16_le(&[2000i16; 160], &mut l16);
+        down_tx.send(l16.to_vec()).expect("queue downlink");
+        let mut got_downlink = false;
+        for _ in 0..30 {
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+            {
+                let packet =
+                    siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).expect("parse rtp");
+                assert_eq!(packet.payload_type, 0, "downlink encoded in A's codec (µ-law)");
+                assert_eq!(packet.payload.len(), 160, "8k/20ms µ-law frame");
+                got_downlink = true;
+                break;
+            }
+        }
+        assert!(got_downlink, "expected a downlink RTP packet toward phone A");
+
+        // 4. Teardown: delete frees the WS bridge (route + tasks).
+        let deleted = engine
+            .handle(CLIENT, Command::Delete {
+                call_id: "ws-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            })
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+        assert!(!engine.ws().is_ws_call("ws-1"), "WS call deregistered on delete");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn play_dtmf_emits_telephone_events_on_a_media_call() {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
 
         let (phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;

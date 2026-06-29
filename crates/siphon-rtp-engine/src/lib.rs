@@ -12,5 +12,6 @@ pub mod media_pipeline;
 pub mod sdp;
 pub mod server;
 pub mod srtp_bridge;
+pub mod ws_bridge;
 
 pub use engine::{ClientId, Engine};

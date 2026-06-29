@@ -103,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         datapath.rx(),
         engine.bridge(),
         engine.media(),
+        engine.ws(),
         turn_relay,
     ));
 
