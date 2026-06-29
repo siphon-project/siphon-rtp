@@ -672,7 +672,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "AMR-WB encoder bit-exactness WIP; run explicitly to measure progress"]
     fn encodes_full_mode2_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(2);
         assert!(

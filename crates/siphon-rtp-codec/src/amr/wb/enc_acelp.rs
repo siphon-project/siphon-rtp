@@ -769,7 +769,10 @@ pub fn q_gain2(
         }
         (&T_QUA_GAIN6B, 0, size)
     } else {
-        // pt at 1/4 of table
+        // q_gain2.c: `p = t_qua_gain7b + RANGE` is Word16* arithmetic — `p` points at *word* RANGE
+        // (= entry RANGE/2, the 1/4 point of the 128-entry table), and `p += 2` advances one full
+        // (pitch, code) pair per step, so `*p` at iteration i is the pitch gain of entry RANGE/2 + i,
+        // i.e. word RANGE + 2*i. (NOT entry RANGE + i.)
         let mut j = NB_QUA_GAIN7B - RANGE;
         if sub(gp_clip_flag, 1) == 0 {
             j -= 27;
@@ -777,7 +780,7 @@ pub fn q_gain2(
         let mut min_ind = 0usize;
         let g_pitch = *gain_pit;
         for i in 0..j {
-            if sub(g_pitch, T_QUA_GAIN7B[2 * (RANGE + i)]) > 0 {
+            if sub(g_pitch, T_QUA_GAIN7B[RANGE + 2 * i]) > 0 {
                 min_ind += 1;
             }
         }
