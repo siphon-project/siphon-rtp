@@ -17,7 +17,7 @@ categories = ["network-programming", "cryptography"]
 [dependencies]
 aes = "0.8"
 ctr = "0.9"
-hmac = "0.12"
+hmac = "0.13"
 sha1 = "0.10"
 subtle = "2.6"
 base64 = "0.22"
