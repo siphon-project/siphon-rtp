@@ -228,6 +228,32 @@ is wrong, and encryption defeats A2 eavesdrop.
   RFC 5764 (DTLS-SRTP, deferred). Pure-Rust only, per the zero-C hard rule. **SDES key material must
   never transit a plaintext control channel** — keys in `a=crypto` are only as safe as the signalling.
 
+### Layer 5b — The media (transcode / record / DTMF) Redirect path
+The transcode/record/DTMF-extraction slow path (`engine/src/media_pipeline.rs`) shares the SRTP
+bridge's posture because it runs on the **same `FlowAction::Redirect`** seam, which bypasses the
+datapath's Forward-path layer-2 gate.
+
+> **Status (landed — media slow path):** when the two legs' negotiated codecs differ, or recording is
+> requested, the call is resolved to `PipelineKind::Media` and both RTP legs are set to `Redirect`.
+> The redirect dispatcher (`run_redirect_dispatcher`) routes each datagram by `EndpointId` —
+> SRTP-bridge endpoints to the bridge, media endpoints to the owning per-call `MediaCall` actor,
+> everything else to TURN. Each `MediaCall` decodes the ingress codec, optionally records/silences,
+> re-encodes the peer's codec, and transmits via `Datapath::send`. RFC 4733 telephone-events are
+> extracted to `Event::Dtmf` (the control plane) and repacketized onto the egress stream.
+
+- **Source gate (RTPBleed, restated for `Redirect`).** Each direction re-enforces the signalled-source
+  gate (`MediaCall::process` checks `SourceFilter::accepts` before any decode, using the same
+  `Exact`/`Subnet`/`Any` policy as the relay and the SRTP bridge). An off-path spray is dropped before
+  it can be transcoded or latched.
+- **Symmetric latch.** When a party's gated packet is accepted, the reverse direction's egress
+  destination is latched to that observed source (RFC 3550 symmetric RTP), so a NATed peer is replied
+  to where its media actually originates — consistent with the Forward-path latch, but enforced in the
+  actor because `Redirect` skips it.
+- **RTCP & unknown packets** are relayed verbatim (RFC 5761 demux on the payload-type byte); only audio
+  RTP is transcoded. Companion (non-mux) RTCP stays on the in-datapath Forward fast path.
+- **Injected media** (PlayMedia prompts, PlayDtmf bursts) is emitted on the engine's *own* egress SSRC
+  and sequence space, never echoing an attacker-supplied stream.
+
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
 
