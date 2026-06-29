@@ -41,7 +41,21 @@ pub enum BencodeError {
     /// A dict key that is not a byte string, or a duplicated key.
     #[error("malformed dict at offset {0}")]
     BadDict(usize),
+    /// Nesting exceeded [`MAX_DEPTH`] — a hostile, deeply-nested value that would otherwise overflow
+    /// the recursive-descent parser's call stack.
+    #[error("nesting too deep (>{0}) at this offset")]
+    TooDeep(usize),
 }
+
+/// Maximum container nesting (lists/dicts) the decoder accepts.
+///
+/// rtpengine NG dicts are shallow — a request dict with a `flags`/`codec` list or dict inside is at
+/// most a handful of levels. An attacker, though, can send a datagram of nothing but `l`/`d` bytes;
+/// recursive descent would then recurse once per byte and overflow the call stack (a process abort —
+/// a single-packet DoS, violating the "never panic / never crash on hostile input" rule). Capping
+/// the depth turns that into a clean [`BencodeError::TooDeep`]. The bound is far above any legitimate
+/// NG message yet far below where the stack is in danger.
+pub const MAX_DEPTH: usize = 64;
 
 impl Value {
     /// Convenience: a UTF-8 byte-string value.
@@ -102,7 +116,7 @@ impl Value {
 /// Decode exactly one bencode value, rejecting trailing bytes.
 pub fn decode(input: &[u8]) -> Result<Value, BencodeError> {
     let mut parser = Parser { input, pos: 0 };
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(0)?;
     if parser.pos != input.len() {
         return Err(BencodeError::TrailingBytes(input.len() - parser.pos));
     }
@@ -113,7 +127,7 @@ pub fn decode(input: &[u8]) -> Result<Value, BencodeError> {
 /// the NG framing, which has a cookie before the dict).
 pub fn decode_prefix(input: &[u8]) -> Result<(Value, usize), BencodeError> {
     let mut parser = Parser { input, pos: 0 };
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(0)?;
     Ok((value, parser.pos))
 }
 
@@ -177,11 +191,24 @@ impl Parser<'_> {
         self.input.get(self.pos).copied().ok_or(BencodeError::UnexpectedEnd)
     }
 
-    fn parse_value(&mut self) -> Result<Value, BencodeError> {
+    /// Enter a container at `depth`, returning the child depth or [`BencodeError::TooDeep`] when the
+    /// nesting limit ([`MAX_DEPTH`]) is reached — the guard that keeps the recursive descent off the
+    /// stack-overflow cliff on a hostile, deeply-nested datagram.
+    fn descend(&self, depth: usize) -> Result<usize, BencodeError> {
+        if depth >= MAX_DEPTH {
+            return Err(BencodeError::TooDeep(self.pos));
+        }
+        Ok(depth + 1)
+    }
+
+    /// Parse one value. `depth` is the current container-nesting level; lists and dicts increment it
+    /// and reject once it would exceed [`MAX_DEPTH`], so a hostile deeply-nested datagram errors
+    /// instead of overflowing the stack.
+    fn parse_value(&mut self, depth: usize) -> Result<Value, BencodeError> {
         match self.peek()? {
             b'i' => self.parse_integer(),
-            b'l' => self.parse_list(),
-            b'd' => self.parse_dict(),
+            b'l' => self.parse_list(depth),
+            b'd' => self.parse_dict(depth),
             b'0'..=b'9' => self.parse_bytes(),
             other => Err(BencodeError::Unexpected(other, self.pos)),
         }
@@ -223,7 +250,8 @@ impl Parser<'_> {
         Ok(Value::Bytes(self.input[data_start..data_end].to_vec()))
     }
 
-    fn parse_list(&mut self) -> Result<Value, BencodeError> {
+    fn parse_list(&mut self, depth: usize) -> Result<Value, BencodeError> {
+        let inner = self.descend(depth)?;
         self.pos += 1; // 'l'
         let mut items = Vec::new();
         loop {
@@ -231,11 +259,12 @@ impl Parser<'_> {
                 self.pos += 1;
                 return Ok(Value::List(items));
             }
-            items.push(self.parse_value()?);
+            items.push(self.parse_value(inner)?);
         }
     }
 
-    fn parse_dict(&mut self) -> Result<Value, BencodeError> {
+    fn parse_dict(&mut self, depth: usize) -> Result<Value, BencodeError> {
+        let inner = self.descend(depth)?;
         let start = self.pos;
         self.pos += 1; // 'd'
         let mut dict = BTreeMap::new();
@@ -244,11 +273,11 @@ impl Parser<'_> {
                 self.pos += 1;
                 return Ok(Value::Dict(dict));
             }
-            let key = match self.parse_value()? {
+            let key = match self.parse_value(inner)? {
                 Value::Bytes(bytes) => bytes,
                 _ => return Err(BencodeError::BadDict(start)),
             };
-            let value = self.parse_value()?;
+            let value = self.parse_value(inner)?;
             // rtpengine clients (e.g. SIPhon) emit dict keys in insertion order, not canonical
             // sorted order — accept any order; reject only a genuinely duplicated key. (Our own
             // responses still encode sorted via the BTreeMap, which is valid.)
@@ -343,6 +372,58 @@ mod tests {
     fn rejects_trailing_bytes_and_garbage() {
         assert!(matches!(decode(b"i1ei2e"), Err(BencodeError::TrailingBytes(3))));
         assert!(matches!(decode(b"x"), Err(BencodeError::Unexpected(b'x', 0))));
+    }
+
+    #[test]
+    fn deeply_nested_lists_error_rather_than_overflow_the_stack() {
+        // A hostile NG datagram of nothing but `l`s is unbounded recursion in a naive recursive
+        // descent → stack overflow (process abort, a one-packet DoS). The parser must cap nesting
+        // and return an error. Driven on a small-stack thread so the cap is proven, not the OS's
+        // generous main-thread stack: without the depth limit this thread aborts.
+        let depth = 200_000;
+        let mut data = vec![b'l'; depth];
+        data.extend(std::iter::repeat(b'e').take(depth));
+        let result = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || decode(&data))
+            .expect("spawn")
+            .join()
+            .expect("parser thread must not crash (stack overflow)");
+        assert!(matches!(result, Err(BencodeError::TooDeep(_))));
+    }
+
+    #[test]
+    fn deeply_nested_dicts_error_rather_than_overflow_the_stack() {
+        // Same attack via dicts: `d1:ad1:ad1:a…` — each level adds a frame to the recursion.
+        let levels = 100_000;
+        let mut data = Vec::new();
+        for _ in 0..levels {
+            data.extend_from_slice(b"d1:a");
+        }
+        data.extend_from_slice(b"de"); // innermost value: an empty dict
+        data.resize(data.len() + levels, b'e'); // close every opened dict
+        let result = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || decode(&data))
+            .expect("spawn")
+            .join()
+            .expect("parser thread must not crash (stack overflow)");
+        assert!(matches!(result, Err(BencodeError::TooDeep(_))));
+    }
+
+    #[test]
+    fn nesting_within_the_limit_still_decodes() {
+        // A modest nest (well under the cap) round-trips fine, so the limit doesn't break real input.
+        let depth = 32;
+        let mut data = vec![b'l'; depth];
+        data.extend(std::iter::repeat(b'e').take(depth));
+        let value = decode(&data).expect("modest nesting decodes");
+        // Unwrap `depth` lists down to the innermost empty list.
+        let mut current = &value;
+        for _ in 0..depth - 1 {
+            current = &current.as_list().expect("list")[0];
+        }
+        assert_eq!(current.as_list().map(<[Value]>::len), Some(0));
     }
 
     #[test]

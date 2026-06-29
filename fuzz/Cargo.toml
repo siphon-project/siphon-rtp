@@ -1,0 +1,63 @@
+[package]
+name = "siphon-rtp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent workspace: cargo-fuzz builds with its own sanitizer profile and lockfile,
+# and `cargo test --workspace` must never pull this nightly-only crate in.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Every crate with a parser that eats untrusted bytes off the network gets a fuzz target. The codec
+# crate is deliberately excluded here (its AMR/Opus payload fuzzers are a separate follow-up — see
+# the README in this directory).
+siphon-rtp-media = { path = "../crates/siphon-rtp-media" }
+siphon-rtp-engine = { package = "siphon-rtp", path = "../crates/siphon-rtp-engine" }
+siphon-rtp-ngcompat = { path = "../crates/siphon-rtp-ngcompat" }
+siphon-rtp-proto = { path = "../crates/siphon-rtp-proto" }
+siphon-rtp-stun = { path = "../crates/siphon-rtp-stun" }
+
+# RFC 3550/3551/5761 — RTP header, compound RTCP, rtcp-mux classifier.
+[[bin]]
+name = "rtp_parser_fuzz"
+path = "fuzz_targets/rtp_parser_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 4566/3264 — SDP parse + offer/answer rewrite against a fixed engine endpoint.
+[[bin]]
+name = "sdp_fuzz"
+path = "fuzz_targets/sdp_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# rtpengine NG/bencode — bencode decode + cookie split + NG command mapping.
+[[bin]]
+name = "bencode_fuzz"
+path = "fuzz_targets/bencode_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# Native JSON control framing — length-prefix + JSON Request decode.
+[[bin]]
+name = "proto_frame_fuzz"
+path = "fuzz_targets/proto_frame_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 5389/5766 — STUN message + attribute TLV parse, TURN ChannelData framing.
+[[bin]]
+name = "stun_fuzz"
+path = "fuzz_targets/stun_fuzz.rs"
+test = false
+doc = false
+bench = false
