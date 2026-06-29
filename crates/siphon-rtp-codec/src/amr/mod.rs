@@ -300,6 +300,10 @@ pub struct AmrWb {
     encoder_state: Box<wb::enc_main::EncoderState>,
     /// Last decoded speech mode (0..=8), used to size concealed frames after a loss.
     last_mode: u8,
+    /// Target speech mode for [`Encoder::encode`] (0..=8). Defaults to 2 (12.65 kbit/s) — the common
+    /// VoLTE rate. Per-call selection (SDP `mode-set` / RFC 4867 CMR) is set via
+    /// [`AmrWb::with_encode_mode`]; per-frame CMR adaptation is a follow-up.
+    encode_mode: u8,
 }
 
 impl Default for AmrWb {
@@ -321,7 +325,16 @@ impl AmrWb {
             decoder_state: Box::new(wb::dec_main::DecoderState::new()),
             encoder_state: Box::new(wb::enc_main::EncoderState::new()),
             last_mode: 0,
+            encode_mode: 2,
         }
+    }
+
+    /// Set the target speech mode (0..=8) for [`Encoder::encode`] (e.g. from the SDP `mode-set`).
+    /// Out-of-range values are clamped to mode 8.
+    #[must_use]
+    pub fn with_encode_mode(mut self, mode: u8) -> Self {
+        self.encode_mode = mode.min(8);
+        self
     }
 
     /// Encode one 20 ms frame (320 samples @ 16 kHz) at `mode` (0..=8) into its speech bits in
@@ -469,10 +482,30 @@ impl Encoder for AmrWb {
     fn frame_samples(&self) -> usize {
         self.params.frame_samples()
     }
-    fn encode(&mut self, _pcm: &[i16], _out: &mut [u8]) -> Result<usize, CodecError> {
-        Err(CodecError::Unsupported(
-            "AMR-WB encode DSP not yet implemented",
-        ))
+    /// Encode one 20 ms frame (320 samples @ 16 kHz) into an RFC 4867 **octet-aligned** single-frame
+    /// AMR-WB payload at the configured [`AmrWb::with_encode_mode`] mode (default 2 / 12.65 kbit/s):
+    /// the bit-exact core ([`AmrWb::encode_mode_bits`]) → RFC 4867 sort/pack → `CMR | ToC | speech`.
+    /// CMR = 15 (no mode request); ToC = `F=0, FT=mode, Q=1` (RFC 4867 §4.3.2 / §4.4).
+    fn encode(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, CodecError> {
+        let mode = self.encode_mode;
+        let nb_bits = AmrWbMode::from_frame_type(mode)
+            .ok_or(CodecError::Unsupported("AMR-WB invalid speech mode"))?
+            .bits() as usize;
+        let mut bits = [0i16; 477]; // max AMRWB_SPEECH_BITS (mode 8)
+        self.encode_mode_bits(mode, pcm, &mut bits[..nb_bits])?;
+        let speech = wb::bitstream::pack(&bits[..nb_bits], mode);
+        // Octet-aligned single-frame payload: CMR byte + ToC byte + speech bytes.
+        let total = 2 + speech.len();
+        if out.len() < total {
+            return Err(CodecError::OutputTooSmall {
+                needed: total,
+                have: out.len(),
+            });
+        }
+        out[0] = 0xF0; // CMR = 15 (no codec-mode request), low 4 bits reserved = 0
+        out[1] = (mode << 3) | 0x04; // F=0 (last frame), FT=mode, Q=1 (good)
+        out[2..total].copy_from_slice(&speech);
+        Ok(total)
     }
 }
 
@@ -496,6 +529,32 @@ mod tests {
         assert_eq!(AmrWbMode::Mr2385.bits(), 477);
         assert_eq!(AmrWbMode::Mr2385.bytes(), 60);
         assert_eq!(AmrWbMode::Mr1265.frame_type(), 2);
+    }
+
+    #[test]
+    fn amr_wb_encode_produces_a_decodable_octet_aligned_payload() {
+        // A deterministic 20 ms input frame (integer pattern — encode is deterministic in it).
+        let pcm: Vec<i16> = (0..wb::constants::L_FRAME16K)
+            .map(|i| (((i as i32 * 137) % 8000) - 4000) as i16)
+            .collect();
+        let mut encoder = AmrWb::new(); // default encode mode 2 (12.65 kbit/s — VoLTE)
+        let mut payload = [0u8; 64];
+        let len = encoder.encode(&pcm, &mut payload).expect("AMR-WB encode");
+        // CMR(1) + ToC(1) + ceil(253/8)=32 speech bytes for mode 2.
+        assert_eq!(len, 2 + 32);
+        let parsed =
+            payload::AmrPayload::parse_amr_wb(&payload[..len], true).expect("parse octet-aligned");
+        assert_eq!(parsed.cmr, 15, "CMR = no codec-mode request");
+        assert_eq!(parsed.frames.len(), 1);
+        assert_eq!(parsed.frames[0].frame_type, 2, "mode 2 / 12.65k");
+        assert!(parsed.frames[0].quality_ok, "Q bit set (good frame)");
+        // The emitted payload round-trips through the public RTP decode path.
+        let mut decoder = AmrWb::new();
+        let mut out = [0i16; wb::constants::L_FRAME16K];
+        assert_eq!(
+            decoder.decode(&payload[..len], &mut out).expect("AMR-WB decode"),
+            wb::constants::L_FRAME16K
+        );
     }
 
     #[test]
@@ -593,7 +652,7 @@ mod tests {
 
     #[test]
     fn amr_codecs_report_params() {
-        // AMR-NB DSP is still WIP; AMR-WB encode is WIP, but AMR-WB mode-0 decode is wired.
+        // AMR-NB DSP is still WIP; AMR-WB decode (all modes) and encode (modes 0-7) are wired.
         let mut nb = AmrNb::new();
         assert_eq!(nb.frame_samples(), 160);
         assert_eq!(nb.params().sample_rate_hz, 8000);
@@ -605,10 +664,8 @@ mod tests {
         let mut wb = AmrWb::new();
         assert_eq!(wb.frame_samples(), 320);
         assert_eq!(wb.params().sample_rate_hz, 16000);
-        assert!(matches!(
-            wb.encode(&[0i16; 320], &mut [0u8; 64]),
-            Err(CodecError::Unsupported(_))
-        ));
+        // AMR-WB encode is wired: a silent frame encodes to a well-formed mode-2 octet-aligned payload.
+        assert!(matches!(wb.encode(&[0i16; 320], &mut [0u8; 64]), Ok(34)));
     }
 
     /// Build an octet-aligned RFC 4867 mode-0 payload from a `.cod` frame's encoder-order bits by

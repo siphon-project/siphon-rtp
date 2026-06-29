@@ -385,6 +385,22 @@ pub fn unsort(data: &[u8], mode: u8) -> Vec<i16> {
     prms
 }
 
+/// Pack encoder-order `BIT_0`/`BIT_1` speech bits into an RTP-payload speech frame (MSB-first bytes,
+/// the trailing partial byte zero-padded) for `mode` (0..=8) — the exact inverse of [`unsort`], using
+/// the RFC 4867 sort table. Produces `ceil(NB_BITS[mode] / 8)` bytes: the per-frame speech data the
+/// [`crate::amr::payload`] framer wraps with the CMR + ToC. Bits beyond `bits.len()` pack as 0.
+#[must_use]
+pub fn pack(bits: &[i16], mode: u8) -> Vec<u8> {
+    let sort = sort_table(mode);
+    let mut data = vec![0u8; sort.len().div_ceil(8)];
+    for (i, &source) in sort.iter().enumerate() {
+        if bits.get(source as usize).copied().unwrap_or(BIT_0) == BIT_1 {
+            data[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    data
+}
+
 /// Un-sort 132 RTP-payload bits (MSB-first in `data`) into encoder-order `BIT_0`/`BIT_1` words for
 /// the core mode-0 decoder (`SORT_660`). `data` must hold at least 17 bytes (132 bits).
 #[must_use]
@@ -570,6 +586,20 @@ mod tests {
             }
             let recovered = unsort(&payload, mode);
             assert_eq!(recovered, enc, "mode {mode} unsort recovers encoder order");
+        }
+    }
+
+    #[test]
+    fn pack_is_the_inverse_of_unsort() {
+        // The encode-side packer must be the exact inverse of the decode-side un-sorter for every mode.
+        for mode in 0u8..=8 {
+            let nbits = NB_BITS[mode as usize];
+            let enc: Vec<i16> = (0..nbits)
+                .map(|i| if i % 5 == 0 || i % 7 == 0 { BIT_1 } else { BIT_0 })
+                .collect();
+            let payload = pack(&enc, mode);
+            assert_eq!(payload.len(), nbits.div_ceil(8), "mode {mode} packed length");
+            assert_eq!(unsort(&payload, mode), enc, "mode {mode}: unsort(pack(bits)) == bits");
         }
     }
 }
