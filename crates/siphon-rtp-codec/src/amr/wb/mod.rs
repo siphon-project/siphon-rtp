@@ -4,10 +4,16 @@
 //!
 //! See `reference/amr-wb/DECODER_PORTING.md` for the tier roadmap and per-frame pipeline.
 
+pub mod bitstream;
 pub mod codebook;
 pub mod constants;
+pub mod dec_main;
+pub mod enhance;
 pub mod filters;
+pub mod gains;
+pub mod homing;
 pub mod isf_dequant;
 mod isf_tables;
 pub mod lpc;
 pub mod pitch;
+mod tables;

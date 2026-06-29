@@ -288,10 +288,14 @@ impl Encoder for AmrNb {
     }
 }
 
-/// AMR-WB codec (16 kHz, mono, 20 ms = 320 samples). DSP is WIP — see module docs.
+/// AMR-WB codec (16 kHz, mono, 20 ms = 320 samples).
+///
+/// Decode is wired for **mode 0** (6.60 kbit/s) end to end, bit-exact against the 3GPP `tst_m0`
+/// vector; the higher modes and DTX/CNG/PLC remain WIP and return [`CodecError::Unsupported`].
 #[derive(Debug, Clone)]
 pub struct AmrWb {
     params: CodecParams,
+    decoder_state: Box<wb::dec_main::DecoderState>,
 }
 
 impl Default for AmrWb {
@@ -310,7 +314,20 @@ impl AmrWb {
                 channels: 1,
                 ptime_ms: 20,
             },
+            decoder_state: Box::new(wb::dec_main::DecoderState::new()),
         }
+    }
+
+    /// Decode one mode-0 (6.60 kbit/s) frame from its 132 speech bits already in
+    /// encoder/`Bits2prm` order (the `.cod` order). Writes `L_FRAME16K` (320) samples to `out`.
+    ///
+    /// This is the bit-exact core used by the `tst_m0` acceptance test; the RTP [`Decoder::decode`]
+    /// path un-sorts the RFC 4867 payload before calling into the same core.
+    pub fn decode_mode0_bits(&mut self, bits: &[i16], out: &mut [i16]) -> Result<usize, CodecError> {
+        if out.len() < wb::constants::L_FRAME16K {
+            return Err(CodecError::Malformed("AMR-WB output buffer too small"));
+        }
+        Ok(wb::dec_main::decode_frame(&mut self.decoder_state, bits, out))
     }
 
     /// The codec's native parameters (inherent shortcut; the trait methods also expose this).
@@ -333,12 +350,39 @@ impl Decoder for AmrWb {
     fn frame_samples(&self) -> usize {
         self.params.frame_samples()
     }
-    fn decode(&mut self, _payload: &[u8], _out: &mut [i16]) -> Result<usize, CodecError> {
-        Err(CodecError::Unsupported(
-            "AMR-WB decode DSP not yet implemented",
-        ))
+
+    /// Decode one AMR-WB RTP frame. Mode 0 (6.60 kbit/s) is wired bit-exact; the payload's first
+    /// frame is un-sorted from RFC 4867 order to encoder order before the core decode. Higher modes
+    /// and SID/no-data frames are not yet supported.
+    fn decode(&mut self, payload: &[u8], out: &mut [i16]) -> Result<usize, CodecError> {
+        // Default to octet-aligned framing (the common VoLTE posture); fall back to
+        // bandwidth-efficient if that does not parse cleanly.
+        let parsed = payload::AmrPayload::parse_amr_wb(payload, true)
+            .or_else(|_| payload::AmrPayload::parse_amr_wb(payload, false))?;
+        let frame = parsed
+            .frames
+            .first()
+            .ok_or(CodecError::Malformed("AMR-WB payload has no frames"))?;
+        match frame.frame_type {
+            0 => {
+                if frame.data.len() < AmrWbMode::Mr660.bytes() {
+                    return Err(CodecError::Malformed("AMR-WB mode-0 frame truncated"));
+                }
+                let bits = wb::bitstream::unsort_mode0(&frame.data);
+                self.decode_mode0_bits(&bits, out)
+            }
+            1..=8 => Err(CodecError::Unsupported(
+                "AMR-WB decode for modes 1..=8 not yet implemented",
+            )),
+            _ => Err(CodecError::Unsupported(
+                "AMR-WB SID/no-data/PLC decode not yet implemented",
+            )),
+        }
     }
+
     fn conceal(&mut self, _out: &mut [i16]) -> Result<usize, CodecError> {
+        // Bad-frame concealment (lag/gain/ISF extrapolation) is a separate tier; the speech path is
+        // wired first. Returning Unsupported is deliberate — we never emit guessed audio.
         Err(CodecError::Unsupported("AMR-WB PLC not yet implemented"))
     }
 }
@@ -473,7 +517,8 @@ mod tests {
     }
 
     #[test]
-    fn amr_codecs_report_params_but_decode_is_wip() {
+    fn amr_codecs_report_params() {
+        // AMR-NB DSP is still WIP; AMR-WB encode is WIP, but AMR-WB mode-0 decode is wired.
         let mut nb = AmrNb::new();
         assert_eq!(nb.frame_samples(), 160);
         assert_eq!(nb.params().sample_rate_hz, 8000);
@@ -489,5 +534,57 @@ mod tests {
             wb.encode(&[0i16; 320], &mut [0u8; 64]),
             Err(CodecError::Unsupported(_))
         ));
+    }
+
+    /// Build an octet-aligned RFC 4867 mode-0 payload from a `.cod` frame's encoder-order bits by
+    /// re-sorting them into RTP payload order (the inverse of `unsort_mode0`).
+    fn rtp_payload_from_encoder_bits(enc_bits: &[i16]) -> Vec<u8> {
+        use wb::bitstream::{BIT_1, SORT_660};
+        let mut data = vec![0u8; AmrWbMode::Mr660.bytes()];
+        for (i, &src) in SORT_660.iter().enumerate() {
+            if enc_bits[src as usize] == BIT_1 {
+                data[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        // CMR=0xF (no request) + one ToC (FT=0, no follow, quality ok) + frame data.
+        let mut payload = vec![0xF0u8, Toc { follow: false, frame_type: 0, quality_ok: true }.to_octet()];
+        payload.extend_from_slice(&data);
+        payload
+    }
+
+    #[test]
+    fn decode_rtp_mode0_matches_the_reference_vector() {
+        // End-to-end RTP path: parse → un-sort → mode-0 decode → homing, over the first 3 frames of
+        // tst_m0, compared sample-for-sample with the official .out. Exercises decode() + unsort.
+        let mut cod_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        cod_path.push("../../reference/amr-wb/testv/tst_m0.cod");
+        let mut out_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        out_path.push("../../reference/amr-wb/testv/tst_m0.out");
+        let cod = std::fs::read(&cod_path).expect("tst_m0.cod");
+        let out = std::fs::read(&out_path).expect("tst_m0.out");
+        let cod_words: Vec<i16> = cod
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let ref_pcm: Vec<i16> = out
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        const COD_FRAME_WORDS: usize = 3 + 132;
+        let mut wb = AmrWb::new();
+        let mut decoded = [0i16; 320];
+        for f in 0..3 {
+            let base = f * COD_FRAME_WORDS;
+            let enc_bits = &cod_words[base + 3..base + COD_FRAME_WORDS];
+            let payload = rtp_payload_from_encoder_bits(enc_bits);
+            let n = wb.decode(&payload, &mut decoded).expect("decode");
+            assert_eq!(n, 320);
+            assert_eq!(
+                &decoded[..],
+                &ref_pcm[f * 320..(f + 1) * 320],
+                "RTP decode frame {f} must equal the reference vector"
+            );
+        }
     }
 }
