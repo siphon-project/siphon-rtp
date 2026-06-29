@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "siphon-rtp control protocol: serde types + length-prefixed JSON framing (shared with SIPhon)"
+readme = "README.md"
+keywords = ["rtp", "voip", "rtpengine", "sip", "media"]
+categories = ["network-programming"]
 
 [dependencies]
 serde = { workspace = true }
