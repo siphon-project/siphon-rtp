@@ -1,0 +1,16 @@
+[package]
+name = "siphon-rtp-simd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "siphon-rtp pure-Rust SIMD DSP primitives (runtime-detected AVX2 + scalar fallback) — zero C deps"
+keywords = ["simd", "dsp", "avx2", "fir", "audio"]
+categories = ["multimedia::audio", "hardware-support"]
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }

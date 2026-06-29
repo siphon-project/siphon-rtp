@@ -4,6 +4,7 @@
 resolver = "2"
 members = [
     "crates/siphon-rtp-proto",
+    "crates/siphon-rtp-simd",
     "crates/siphon-rtp-codec",
     "crates/siphon-rtp-stun",
     "crates/siphon-rtp-datapath",

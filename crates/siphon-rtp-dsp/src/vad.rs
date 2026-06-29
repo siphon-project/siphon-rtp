@@ -35,8 +35,8 @@ impl EnergyVad {
         if frame.is_empty() {
             return 0;
         }
-        let sum: i64 = frame.iter().map(|&sample| i64::from(sample) * i64::from(sample)).sum();
-        sum / frame.len() as i64
+        // SIMD sum-of-squares (AVX2 + scalar fallback); exact i64, bit-identical to the scalar sum.
+        siphon_rtp_simd::sum_sq_i16(frame) / frame.len() as i64
     }
 
     /// Classify one frame, returning whether it is (or is held as) speech.

@@ -6,6 +6,7 @@
 //! calls, so feeding 20 ms frames produces a continuous stream. Deterministic (no clock, no
 //! randomness): the same input always yields the same output, so it golden-tests cleanly.
 
+use siphon_rtp_simd::fir_dot_f32;
 use std::f32::consts::PI;
 
 /// Errors constructing a resampler.
@@ -25,8 +26,10 @@ pub struct Resampler {
     upsample: u64,
     downsample: u64,
     taps_per_phase: usize,
-    /// Polyphase branches, row-major `[phase][tap]`, `upsample` rows of `taps_per_phase`.
-    branches: Vec<f32>,
+    /// Polyphase branches, row-major `[phase][tap]`, `upsample` rows of `taps_per_phase`, with each
+    /// row **tap-reversed** so a filtered output is one contiguous dot of the oldest-first `history`
+    /// against `branches_rev[phase][taps - 1 - base ..]` (see [`Resampler::filter`]).
+    branches_rev: Vec<f32>,
     /// The most recent `taps_per_phase` input samples (oldest first); the filter delay line.
     history: Vec<f32>,
     /// Absolute count of input samples consumed so far.
@@ -83,13 +86,14 @@ impl Resampler {
             *tap = upsample as f32 * 2.0 * cutoff * sinc(2.0 * cutoff * position) * window;
         }
 
-        // Polyphase decomposition: branch p gets prototype[p], prototype[p+L], …
-        let mut branches = vec![0.0f32; length];
+        // Polyphase decomposition: branch p gets prototype[p], prototype[p+L], …, then each row is
+        // tap-reversed so [`filter`] can dot the oldest-first history against a contiguous tail.
+        let mut branches_rev = vec![0.0f32; length];
         for phase in 0..upsample as usize {
             for tap in 0..taps_per_phase {
                 let source = phase + tap * upsample as usize;
-                branches[phase * taps_per_phase + tap] =
-                    if source < length { prototype[source] } else { 0.0 };
+                let coefficient = if source < length { prototype[source] } else { 0.0 };
+                branches_rev[phase * taps_per_phase + (taps_per_phase - 1 - tap)] = coefficient;
             }
         }
 
@@ -99,7 +103,7 @@ impl Resampler {
             upsample,
             downsample,
             taps_per_phase,
-            branches,
+            branches_rev,
             history: Vec::with_capacity(taps_per_phase),
             inputs_seen: 0,
             output_index: 0,
@@ -159,18 +163,20 @@ impl Resampler {
     }
 
     /// Convolve branch `phase` against the history ending at absolute input `source_index`.
+    ///
+    /// The original per-tap form `Σ branch[tap]·history[base − tap]` (with `base = source_index −
+    /// history_start`, valid taps `0..=base`) is exactly `Σ_p history[p]·branch[base − p]`, i.e. one
+    /// contiguous dot of `history[..=base]` against the reversed branch tail
+    /// `branches_rev[phase][taps − 1 − base ..]` — vectorized via `fir_dot_f32`.
     fn filter(&self, phase: usize, source_index: u64) -> i16 {
         let history_start = self.inputs_seen - self.history.len() as u64;
-        let branch = &self.branches[phase * self.taps_per_phase..(phase + 1) * self.taps_per_phase];
-        let mut acc = 0.0f32;
-        for (tap, coefficient) in branch.iter().enumerate() {
-            let absolute = source_index as i64 - tap as i64;
-            if absolute < 0 || (absolute as u64) < history_start {
-                continue; // pre-roll: samples before the stream started are zero
-            }
-            let position = (absolute as u64 - history_start) as usize;
-            acc += coefficient * self.history[position];
+        if source_index < history_start {
+            return 0; // every tap is a pre-stream zero
         }
+        let base = (source_index - history_start) as usize; // ≤ history.len() − 1
+        let taps = self.taps_per_phase;
+        let coefficients = &self.branches_rev[phase * taps + (taps - 1 - base)..(phase + 1) * taps];
+        let acc = fir_dot_f32(&self.history[..=base], coefficients);
         let rounded = acc.round();
         if rounded >= f32::from(i16::MAX) {
             i16::MAX

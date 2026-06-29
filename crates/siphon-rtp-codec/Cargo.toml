@@ -13,6 +13,7 @@ categories = ["multimedia::audio"]
 
 [dependencies]
 thiserror = { workspace = true }
+siphon-rtp-simd = { path = "../siphon-rtp-simd" }
 
 [dev-dependencies]
 criterion = { workspace = true }

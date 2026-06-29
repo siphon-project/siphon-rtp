@@ -1399,6 +1399,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "proptest",
+ "siphon-rtp-simd",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -1421,6 +1422,8 @@ dependencies = [
 name = "siphon-rtp-dsp"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "siphon-rtp-simd",
  "thiserror 2.0.18",
 ]
 
@@ -1472,6 +1475,13 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "siphon-rtp-simd"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
