@@ -10,6 +10,7 @@
 //! packet-loss concealment ([`Decoder::conceal`]) as a first-class operation.
 
 pub mod amr;
+pub mod factory;
 pub mod g711;
 pub mod l16;
 
