@@ -1,6 +1,13 @@
+# Dependabot — weekly, grouped to keep PR noise low.
+#
+# NOTE: cargo PRs must NOT be auto-merged. CLAUDE.md mandates the perf baseline + memory-leak soak
+# before every commit, and CI does not run the perf gate — a crate bump that is green in CI can
+# still regress throughput or leak. Treat each cargo PR as "green CI AND I ran the perf/mem
+# baseline". github-actions and docker bumps are safe to merge on green CI.
 version: 2
 updates:
-  # Rust dependencies — keep the workspace lockfile current; group patch/minor bumps into one PR.
+  # Rust crate dependencies — one grouped PR for all minor/patch bumps; major bumps arrive as
+  # individual PRs to review deliberately.
   - package-ecosystem: cargo
     directory: "/"
     schedule:
@@ -8,12 +15,25 @@ updates:
     open-pull-requests-limit: 5
     groups:
       cargo-minor-patch:
-        update-types:
-          - minor
-          - patch
+        update-types: ["minor", "patch"]
 
-  # GitHub Actions used by the workflows above.
+  # The fuzz crate is its own (detached) workspace, so it needs a separate cargo entry.
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+
+  # Pinned action versions in the workflows (checkout, rust-cache, docker/*, cargo-deny, …).
   - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Dockerfile base images (debian:trixie-slim, distroless/static).
+  - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly

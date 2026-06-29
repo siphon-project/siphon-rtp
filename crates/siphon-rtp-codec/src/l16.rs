@@ -94,6 +94,10 @@ impl Encoder for L16 {
         }
         Ok(needed)
     }
+
+    fn is_stateless(&self) -> bool {
+        true // raw big-endian PCM samples — no inter-frame state
+    }
 }
 
 #[cfg(test)]

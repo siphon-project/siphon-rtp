@@ -9,6 +9,7 @@ homepage.workspace = true
 description = "siphon-rtp pure-Rust SIMD DSP primitives (runtime-detected AVX2 + scalar fallback) — zero C deps"
 keywords = ["simd", "dsp", "avx2", "fir", "audio"]
 categories = ["multimedia::audio", "hardware-support"]
+readme = "README.md"
 
 [dependencies]
 

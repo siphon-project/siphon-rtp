@@ -254,6 +254,38 @@ datapath's Forward-path layer-2 gate.
 - **Injected media** (PlayMedia prompts, PlayDtmf bursts) is emitted on the engine's *own* egress SSRC
   and sequence space, never echoing an attacker-supplied stream.
 
+### Layer 5c — The conference (MCU) Redirect path
+The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,
+so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the send-only SIPREC tee,
+**every participant endpoint is a full inbound surface**, so the gate matters on each one.
+
+> **Status (landed — conference MCU):** `conference_join` allocates one engine endpoint per
+> participant, sets it to `Redirect`, and seats the participant in a per-room `Conference` actor; the
+> redirect dispatcher gains a `conference.owns(ep)` arm (order: bridge → media → ws → conference →
+> TURN). The room is **clock-driven** — a 20 ms tick pops one frame per participant, mixes
+> mixed-minus-self (`saturate(Σ others)`), and transmits each participant its mix via `Datapath::send`.
+
+- **Source gate (RTPBleed, restated for `Redirect`).** `Conference::ingest` checks
+  `SourceFilter::accepts` for the participant's endpoint **before** the packet enters the jitter buffer
+  (same `Exact`/`Subnet`/`Any` policy). A spoofed source never reaches the mix — proven by
+  `unsignalled_source_is_dropped_from_the_mix`.
+- **Constrained latch.** An accepted participant's egress destination is latched to its observed
+  source (symmetric RTP), so a NATed leg is replied to where its media originates.
+- **Never into the void.** A participant whose destination is not yet resolved is **not transmitted
+  to** (`destination_usable` gate) — the room drops that egress rather than guessing.
+- **Idle reap.** A gated-in packet stamps the endpoint's activity (`Datapath::note_activity` — the
+  `Redirect` arm does not stamp `last_seen` itself); a spoofed source that fails the gate does **not**,
+  so it cannot keep a dead path alive. The daemon sweep reaps participants idle past the media timeout
+  and tears down a room once empty (the conference analogue of Layer 6).
+- **RTCP & telephone-events** are split off before the jitter buffer (RFC 5761 demux + RFC 4733 PT
+  match) so they cannot corrupt the decoder: inbound RTCP is dropped (we generate, but do not consume,
+  reception stats); a telephone-event is detected and surfaced as `Event::Dtmf` on the control channel.
+  Each participant's mix is stamped with the engine's **own** per-leg egress SSRC, and a periodic RTCP
+  Sender Report (RC=0, no reception blocks) is emitted per participant for lip-sync + liveness.
+- **Room bridging** crosses the only actor boundary in the design: a bounded, drop-oldest `flume`
+  channel carries one room's *participant-only* mix (never its full mix, so a bridge cannot echo a
+  room back to itself) to another room — no shared state between room actors (single-owner rule).
+
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
 

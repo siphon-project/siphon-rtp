@@ -9,10 +9,19 @@
 //! per-frame heap allocation. Decoders carry adaptive state (`&mut self`) and expose
 //! packet-loss concealment ([`Decoder::conceal`]) as a first-class operation.
 
+// AMR-NB/AMR-WB transcoding is patent-encumbered (3GPP pool) — gated behind the off-by-default
+// `amr` feature. Passthrough/relay of AMR is unaffected (it never builds a codec). See
+// `docs/codec-licensing.md` and the `[features]` section of Cargo.toml.
+#[cfg(feature = "amr")]
 pub mod amr;
+pub mod cn;
 pub mod factory;
 pub mod g711;
+pub mod g722;
+pub mod g726;
+pub mod gsm_fr;
 pub mod l16;
+pub mod opus;
 
 /// Codec configuration: native sample rate, channel count, and packetization time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +80,15 @@ pub trait Encoder: Send {
     /// not from the (possibly different) native sample rate.
     fn rtp_clock_rate_hz(&self) -> u32 {
         self.params().sample_rate_hz
+    }
+
+    /// Whether this encoder is **stateless** — each frame encodes independently of prior frames, so
+    /// encoding identical PCM always yields identical bytes (G.711, L16). The conference mixer's
+    /// shared-encode path relies on this: it encodes the common listener mix **once** and fans the
+    /// payload out to every listener on that codec. Stateful codecs (ADPCM, ACELP) must override to
+    /// keep `false` — sharing their output across legs with divergent histories would corrupt it.
+    fn is_stateless(&self) -> bool {
+        false
     }
 }
 

@@ -1,0 +1,8 @@
+# Clippy configuration for siphon-rtp (convention ported from siphon-sip).
+#
+# too-many-arguments-threshold: RTP/RTCP/SDP and control handlers legitimately carry many protocol
+# fields (transport endpoints, SSRC/sequence/timestamp state, codec coordinates), so the default
+# threshold of 7 yields false positives on inherently-wide media-plane signatures. Raise it to 12
+# (siphon-sip's value) so the lint still flags genuinely-egregious 13+ signatures while accepting
+# the domain's wide-but-honest functions — instead of scattering `#[allow(too_many_arguments)]`.
+too-many-arguments-threshold = 12

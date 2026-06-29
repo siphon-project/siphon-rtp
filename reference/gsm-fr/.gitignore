@@ -1,0 +1,8 @@
+# GSM 06.10 Full-Rate (RPE-LTP) reference material. Read as the algorithm reference to *port* to
+# pure Rust — never compiled, never committed. Mirrors reference/amr-wb/.
+c-code/
+
+# The official 3GPP/ETSI GSM 06.10 digital test sequences (the bit-exact acceptance criteria: the
+# SEQ*.{cod,dec} / *.run analysis-synthesis sequences). Kept untracked until git-lfs is configured,
+# then committed via LFS — never as raw binaries in normal git history.
+testv/

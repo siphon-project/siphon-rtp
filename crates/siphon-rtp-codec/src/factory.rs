@@ -4,10 +4,27 @@
 //! payload-type table) onto a concrete [`Decoder`]/[`Encoder`] pair. The media slow path resolves a
 //! leg's codec here once, at call setup, then runs the returned trait objects per frame.
 
+#[cfg(feature = "amr")]
 use crate::amr::AmrWb;
+use crate::cn::Cn;
 use crate::g711::{Variant, G711};
+use crate::g722::G722;
+use crate::g726::{Rate, G726};
+use crate::gsm_fr::GsmFr;
 use crate::l16::L16;
 use crate::{CodecError, Decoder, Encoder};
+
+/// Map an SDP encoding name to a G.726 bit rate (RFC 3551 §4.5.4 names `G726-16/24/32/40`; `G721`
+/// is the deprecated alias for `G726-32`). Returns `None` for any non-G.726 name.
+fn g726_rate(encoding_name: &str) -> Option<Rate> {
+    match encoding_name {
+        "G726-16" => Some(Rate::R16),
+        "G726-24" => Some(Rate::R24),
+        "G726-32" | "G721" => Some(Rate::R32),
+        "G726-40" => Some(Rate::R40),
+        _ => None,
+    }
+}
 
 /// A negotiated codec for one RTP stream: the wire payload type plus the encoding parameters needed
 /// to build the codec. `encoding_name` is the `a=rtpmap` token (e.g. `"PCMU"`, `"L16"`, `"AMR-WB"`),
@@ -54,11 +71,21 @@ impl CodecSpec {
         // RFC 3551 §6 audio payload types (clock rate, channels).
         let (name, clock, channels) = match payload_type {
             0 => ("PCMU", 8000, 1),
+            3 => ("GSM", 8000, 1), // GSM 06.10 Full-Rate.
             8 => ("PCMA", 8000, 1),
             9 => ("G722", 8000, 1), // RTP clock is 8000 even though G.722 samples at 16 kHz.
+            13 => ("CN", 8000, 1),  // RFC 3389 comfort noise.
             _ => return None,
         };
         Some(Self::new(payload_type, name, clock, channels, ptime_ms))
+    }
+
+    /// Whether this spec names RFC 3389 comfort noise (PT 13 / `CN`). Like telephone-event, CN is a
+    /// secondary payload type the media path recognizes mid-stream and decodes through a generator,
+    /// rather than the leg's primary audio codec.
+    #[must_use]
+    pub fn is_comfort_noise(&self) -> bool {
+        self.encoding_name == "CN"
     }
 
     /// Whether this spec names the RFC 4733 telephone-event "codec" (DTMF), which the media path
@@ -71,12 +98,23 @@ impl CodecSpec {
 
 /// Build a decoder for `spec`, or [`CodecError::Unsupported`] when the codec is not implemented.
 pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
+    if let Some(rate) = g726_rate(&spec.encoding_name) {
+        return Ok(Box::new(G726::new(rate, spec.ptime_ms)));
+    }
     match spec.encoding_name.as_str() {
         "PCMU" => Ok(Box::new(G711::new(Variant::Ulaw, spec.ptime_ms))),
         "PCMA" => Ok(Box::new(G711::new(Variant::Alaw, spec.ptime_ms))),
+        "G722" => Ok(Box::new(G722::new(spec.ptime_ms))),
+        "GSM" => Ok(Box::new(GsmFr::new())),
         "L16" => Ok(Box::new(L16::new(spec.clock_rate_hz, spec.ptime_ms))),
+        // RFC 3389 comfort noise: a decode-side generator. There is no audio "encoder" — CN packets
+        // are emitted by a VAD/DTX media-path policy, not by a per-frame encoder (see `encoder_for`).
+        "CN" => Ok(Box::new(Cn::new(spec.clock_rate_hz, spec.ptime_ms))),
         // AMR-WB decode is bit-exact for all 9 modes (the RTP path un-sorts the RFC 4867 payload);
         // the encoder is not yet implemented, so encoding AMR-WB still returns Unsupported below.
+        // Gated behind the `amr` feature (patent-encumbered transcoding — see docs/codec-licensing.md);
+        // AMR passthrough/relay does not reach here and is always available.
+        #[cfg(feature = "amr")]
         "AMR-WB" => Ok(Box::new(AmrWb::new())),
         _ => Err(CodecError::Unsupported(unsupported_name(&spec.encoding_name))),
     }
@@ -84,9 +122,14 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
 
 /// Build an encoder for `spec`, or [`CodecError::Unsupported`] when the codec is not implemented.
 pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
+    if let Some(rate) = g726_rate(&spec.encoding_name) {
+        return Ok(Box::new(G726::new(rate, spec.ptime_ms)));
+    }
     match spec.encoding_name.as_str() {
         "PCMU" => Ok(Box::new(G711::new(Variant::Ulaw, spec.ptime_ms))),
         "PCMA" => Ok(Box::new(G711::new(Variant::Alaw, spec.ptime_ms))),
+        "G722" => Ok(Box::new(G722::new(spec.ptime_ms))),
+        "GSM" => Ok(Box::new(GsmFr::new())),
         "L16" => Ok(Box::new(L16::new(spec.clock_rate_hz, spec.ptime_ms))),
         _ => Err(CodecError::Unsupported(unsupported_name(&spec.encoding_name))),
     }
@@ -96,9 +139,16 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
 /// `&'static str`, so we can only name codecs we know about).
 fn unsupported_name(encoding_name: &str) -> &'static str {
     match encoding_name {
-        "G722" => "G.722 codec not yet implemented",
+        "CN" => "comfort-noise generation (DTX) is a media-path policy, not an audio encoder",
+        #[cfg(feature = "amr")]
         "AMR-WB" => "AMR-WB encoder not yet implemented (decode is supported)",
+        #[cfg(feature = "amr")]
         "AMR" => "AMR-NB codec not yet implemented",
+        #[cfg(not(feature = "amr"))]
+        "AMR" | "AMR-WB" => {
+            "AMR transcoding requires the `amr` build feature (patent-licensed — see \
+             docs/codec-licensing.md); AMR passthrough/relay is always available"
+        }
         "OPUS" => "Opus codec not yet implemented",
         "TELEPHONE-EVENT" => "telephone-event is not an audio codec",
         _ => "unknown or unsupported codec",
@@ -125,6 +175,52 @@ mod tests {
         assert_eq!(spec.encoding_name, "PCMA");
         assert!(decoder_for(&spec).is_ok());
         assert!(encoder_for(&spec).is_ok());
+    }
+
+    #[test]
+    fn builds_g722_from_static_payload_type() {
+        let spec = CodecSpec::from_static_payload_type(9, 20).expect("G722 is static PT 9");
+        assert_eq!(spec.encoding_name, "G722");
+        // RFC 3551 §4.5.2: the RTP clock is 8 kHz even though G.722 carries 16 kHz audio.
+        assert_eq!(spec.clock_rate_hz, 8000);
+        let decoder = decoder_for(&spec).expect("g722 decoder");
+        assert_eq!(decoder.params().sample_rate_hz, 16000, "native PCM rate is 16 kHz");
+        let encoder = encoder_for(&spec).expect("g722 encoder");
+        assert_eq!(encoder.rtp_clock_rate_hz(), 8000, "RTP timestamp clock stays 8 kHz");
+    }
+
+    #[test]
+    fn builds_gsm_fr_from_static_payload_type() {
+        let spec = CodecSpec::from_static_payload_type(3, 20).expect("GSM is static PT 3");
+        assert_eq!(spec.encoding_name, "GSM");
+        assert_eq!(spec.clock_rate_hz, 8000);
+        let decoder = decoder_for(&spec).expect("gsm decoder");
+        assert_eq!(decoder.frame_samples(), 160);
+        assert!(encoder_for(&spec).is_ok(), "gsm encoder");
+    }
+
+    #[test]
+    fn builds_g726_all_rates_and_g721_alias() {
+        // RFC 3551 §4.5.4 names + the deprecated G721 alias for G726-32; all 8 kHz, encode + decode.
+        for name in ["G726-16", "G726-24", "G726-32", "G726-40", "G721"] {
+            let spec = CodecSpec::new(96, name, 8000, 1, 20);
+            let decoder = decoder_for(&spec).unwrap_or_else(|_| panic!("{name} decoder"));
+            assert_eq!(decoder.params().sample_rate_hz, 8000, "{name}");
+            assert!(encoder_for(&spec).is_ok(), "{name} encoder");
+        }
+    }
+
+    #[test]
+    fn comfort_noise_decodes_but_has_no_encoder() {
+        // RFC 3389 CN (static PT 13): a decode-side generator only — the encode side is a DTX policy.
+        let spec = CodecSpec::from_static_payload_type(13, 20).expect("CN is static PT 13");
+        assert_eq!(spec.encoding_name, "CN");
+        assert!(spec.is_comfort_noise());
+        assert!(decoder_for(&spec).is_ok(), "CN generator builds as a decoder");
+        assert!(
+            matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))),
+            "CN has no per-frame audio encoder"
+        );
     }
 
     #[test]
@@ -155,14 +251,16 @@ mod tests {
         assert!(matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))));
     }
 
+    #[cfg(not(feature = "amr"))]
     #[test]
-    fn amr_wb_decoder_is_wired_encoder_is_unsupported() {
-        let spec = CodecSpec::new(96, "AMR-WB", 16000, 1, 20);
-        let decoder = decoder_for(&spec).expect("AMR-WB decode is wired");
-        assert_eq!(decoder.params().sample_rate_hz, 16000);
-        assert_eq!(decoder.frame_samples(), 320, "16 kHz / 20 ms");
-        // No AMR-WB encoder yet — encoding must fail cleanly, not panic.
-        assert!(matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))));
+    fn amr_transcoding_is_unsupported_without_the_amr_feature() {
+        // Default build: AMR transcoding is gated off (patent-encumbered). Both directions must
+        // return Unsupported — never panic. (Passthrough/relay never reaches the factory.)
+        for name in ["AMR", "AMR-WB"] {
+            let spec = CodecSpec::new(96, name, 16000, 1, 20);
+            assert!(matches!(decoder_for(&spec), Err(CodecError::Unsupported(_))), "{name}");
+            assert!(matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))), "{name}");
+        }
     }
 
     #[test]

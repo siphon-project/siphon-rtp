@@ -46,12 +46,20 @@ pub struct MediaLeg {
     egress_ssrc: u32,
     egress_payload_type: u8,
     frame_samples: usize,
+    /// Egress RTP timestamp step per packet, in **RTP-clock** units. Equals the egress codec frame
+    /// size for every codec whose RTP clock matches its sample rate, but not for G.722 (16 kHz audio
+    /// clocked at 8 kHz, RFC 3551 §4.5.2 — there it is half the sample count).
+    egress_timestamp_increment: u32,
+    /// Total packets emitted on this leg's egress stream (RTCP SR sender packet count, RFC 3550 §6.4.1).
+    egress_packets: u32,
+    /// Total payload octets emitted (RTCP SR sender octet count — excludes RTP header/padding).
+    egress_octets: u32,
 }
 
 impl MediaLeg {
     /// Build a leg from a decoder/encoder pair and a primed jitter buffer. `egress_ssrc` and
-    /// `egress_payload_type` stamp packets the leg emits; the timestamp advances by one codec
-    /// frame per emitted packet.
+    /// `egress_payload_type` stamp packets the leg emits; the timestamp advances by one egress codec
+    /// frame (at the codec's RTP clock) per emitted packet.
     pub fn new(
         decoder: Box<dyn Decoder>,
         encoder: Box<dyn Encoder>,
@@ -60,6 +68,18 @@ impl MediaLeg {
         egress_payload_type: u8,
     ) -> Self {
         let frame_samples = decoder.frame_samples();
+        // RFC 3551 §4.5.2: the egress RTP timestamp advances at the codec's RTP clock, which is not
+        // always its sample rate (G.722 clocks RTP at 8 kHz while sampling 16 kHz). Derive the step
+        // from the encoder so a G.722 leg advances 160 — not 320 — per 20 ms packet.
+        let egress_params = encoder.params();
+        let egress_rate = egress_params.sample_rate_hz;
+        let egress_frame_samples = encoder.frame_samples() as u32;
+        let egress_timestamp_increment = if egress_rate == 0 {
+            egress_frame_samples
+        } else {
+            ((u64::from(egress_frame_samples) * u64::from(encoder.rtp_clock_rate_hz()))
+                / u64::from(egress_rate)) as u32
+        };
         Self {
             decoder,
             encoder,
@@ -69,6 +89,9 @@ impl MediaLeg {
             egress_ssrc,
             egress_payload_type,
             frame_samples,
+            egress_timestamp_increment,
+            egress_packets: 0,
+            egress_octets: 0,
         }
     }
 
@@ -106,18 +129,69 @@ impl MediaLeg {
     /// sequence advances by one and the timestamp by one codec frame.
     pub fn encode_rtp(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, LegError> {
         let mut payload = [0u8; MAX_PAYLOAD];
-        let payload_len = self.encoder.encode(pcm, &mut payload)?;
+        let payload_len = self.encode_payload(pcm, &mut payload)?;
+        self.packetize(&payload[..payload_len], false, out)
+    }
+
+    /// Encode one PCM frame into a bare codec payload (no RTP framing, no counter advance), returning
+    /// the payload length. This is the **shared-encode** primitive the conference mixer uses: encode
+    /// the one shared listener mix a single time, then [`MediaLeg::packetize`] that payload into each
+    /// listener leg's own RTP stream — one encode, N sends.
+    pub fn encode_payload(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, LegError> {
+        self.encoder.encode(pcm, out).map_err(LegError::from)
+    }
+
+    /// Frame a pre-encoded codec payload into an RTP packet stamped with **this leg's own**
+    /// sequence / timestamp / SSRC (RFC 3550 §5.1), advancing both counters by one packet / one codec
+    /// frame. `marker` sets the marker bit — the conference sets it on the first egress packet of a
+    /// talkspurt, false in steady state. Returns the packet length.
+    pub fn packetize(
+        &mut self,
+        payload: &[u8],
+        marker: bool,
+        out: &mut [u8],
+    ) -> Result<usize, LegError> {
         let header = RtpHeader {
-            marker: false,
+            marker,
             payload_type: self.egress_payload_type,
             sequence: self.egress_sequence,
             timestamp: self.egress_timestamp,
             ssrc: self.egress_ssrc,
         };
-        let total = write_packet(&header, &payload[..payload_len], out)?;
+        let total = write_packet(&header, payload, out)?;
         self.egress_sequence = self.egress_sequence.wrapping_add(1);
-        self.egress_timestamp = self.egress_timestamp.wrapping_add(self.frame_samples as u32);
+        self.egress_timestamp = self
+            .egress_timestamp
+            .wrapping_add(self.egress_timestamp_increment);
+        self.egress_packets = self.egress_packets.wrapping_add(1);
+        self.egress_octets = self.egress_octets.wrapping_add(payload.len() as u32);
         Ok(total)
+    }
+
+    /// The current egress RTP timestamp (the value the next packet will carry) — the RTCP SR's RTP
+    /// timestamp field, mapped to the SR's NTP wall-clock time (RFC 3550 §6.4.1).
+    #[must_use]
+    pub fn egress_timestamp(&self) -> u32 {
+        self.egress_timestamp
+    }
+
+    /// Total packets emitted on this leg's egress stream (RTCP SR sender packet count).
+    #[must_use]
+    pub fn egress_packets(&self) -> u32 {
+        self.egress_packets
+    }
+
+    /// Total payload octets emitted on this leg's egress stream (RTCP SR sender octet count).
+    #[must_use]
+    pub fn egress_octets(&self) -> u32 {
+        self.egress_octets
+    }
+
+    /// The synthesized egress SSRC stamped on this leg's outgoing packets (RFC 3550 §5.1). Each
+    /// conference participant carries a distinct SSRC even when several share one shared-encode payload.
+    #[must_use]
+    pub fn egress_ssrc(&self) -> u32 {
+        self.egress_ssrc
     }
 
     /// Jitter-buffer counters for this leg.
@@ -229,5 +303,69 @@ mod tests {
         direct.encode(&pcm_in, &mut payload).expect("ref encode");
         direct.decode(&payload, &mut reference).expect("ref decode");
         assert_eq!(pcm_out, reference);
+    }
+
+    #[test]
+    fn shared_encode_payload_fans_out_to_distinct_streams() {
+        // The conference shared-encode path: encode the listener mix once, then packetize the SAME
+        // payload into two legs that each stamp their own SSRC / sequence. The bytes on the wire
+        // share a payload but are distinct RTP streams (RFC 3550 §5.1).
+        let mut source = ulaw_leg();
+        let pcm = [4321i16; 160];
+        let mut payload = [0u8; 200];
+        let payload_len = source.encode_payload(&pcm, &mut payload).expect("encode once");
+
+        let mut leg_a = MediaLeg::new(
+            Box::new(G711::ulaw()),
+            Box::new(G711::ulaw()),
+            JitterBuffer::new(1, 16),
+            0x1111_1111,
+            0,
+        );
+        let mut leg_b = MediaLeg::new(
+            Box::new(G711::ulaw()),
+            Box::new(G711::ulaw()),
+            JitterBuffer::new(1, 16),
+            0x2222_2222,
+            0,
+        );
+
+        let mut out_a = [0u8; 200];
+        let mut out_b = [0u8; 200];
+        let len_a = leg_a
+            .packetize(&payload[..payload_len], true, &mut out_a)
+            .expect("packetize a");
+        let len_b = leg_b
+            .packetize(&payload[..payload_len], false, &mut out_b)
+            .expect("packetize b");
+
+        let packet_a = RtpPacket::parse(&out_a[..len_a]).expect("parse a");
+        let packet_b = RtpPacket::parse(&out_b[..len_b]).expect("parse b");
+        assert_eq!(packet_a.payload, packet_b.payload, "one encode, shared payload");
+        assert_eq!(packet_a.ssrc, 0x1111_1111);
+        assert_eq!(packet_b.ssrc, 0x2222_2222);
+        assert_ne!(packet_a.ssrc, packet_b.ssrc, "distinct egress streams");
+    }
+
+    #[test]
+    fn encode_rtp_matches_encode_payload_then_packetize() {
+        // encode_rtp is exactly encode_payload + packetize(marker = false): the split must not change
+        // the bytes the existing 2-party callers produce.
+        let mut split = ulaw_leg();
+        let mut combined = ulaw_leg();
+        let pcm = [777i16; 160];
+
+        let mut payload = [0u8; 200];
+        let mut via_split = [0u8; 200];
+        let payload_len = split.encode_payload(&pcm, &mut payload).expect("encode");
+        let split_len = split
+            .packetize(&payload[..payload_len], false, &mut via_split)
+            .expect("packetize");
+
+        let mut via_combined = [0u8; 200];
+        let combined_len = combined.encode_rtp(&pcm, &mut via_combined).expect("encode_rtp");
+
+        assert_eq!(&via_split[..split_len], &via_combined[..combined_len]);
+        assert_eq!(split.egress_ssrc(), combined.egress_ssrc());
     }
 }

@@ -1,0 +1,7 @@
+# ITU-T G.726 (full-band ADPCM, 16/24/32/40 kbit/s) reference material. Read as the algorithm
+# reference to *port* to pure Rust — never compiled, never committed. Mirrors reference/amr-wb/.
+c-code/
+
+# The official ITU-T G.726 digital test sequences (the bit-exact acceptance criteria). Kept
+# untracked until git-lfs is configured for them, then committed via LFS — never as raw binaries.
+testv/

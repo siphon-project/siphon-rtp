@@ -1,0 +1,9 @@
+# ITU-T G.722 (sub-band ADPCM) reference material. Read as the algorithm reference to *port* to
+# pure Rust — never compiled, never committed (licensing + bloat). Mirrors reference/amr-wb/.
+c-code/
+
+# The official ITU-T G.722 digital test sequences (the bit-exact acceptance criteria: the encoder
+# input/output and decoder input/output reference files). The ITU-T STL ships no G.722 test cases
+# (openitu/STL issue #23); the sequences come with the G.722 Recommendation itself. Kept untracked
+# until git-lfs is configured for them, then committed via LFS — never as raw binaries in history.
+testv/

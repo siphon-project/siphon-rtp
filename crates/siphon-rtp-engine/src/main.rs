@@ -125,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine.bridge(),
         engine.media(),
         engine.ws(),
+        engine.conference(),
         turn_relay,
     ));
 
@@ -142,6 +143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sweeper.datapath().advance_clock(1);
             for call_id in sweeper.reap_idle(timeout_ticks).await {
                 tracing::warn!(%call_id, "media timeout — call reaped");
+            }
+            let reaped = sweeper.reap_idle_conferences(timeout_ticks).await;
+            if reaped > 0 {
+                tracing::warn!(participants = reaped, "media timeout — conference participants reaped");
             }
             if let Some(turn) = &turn_sweeper {
                 turn.reap();

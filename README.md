@@ -67,7 +67,8 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **WebSocket bridge (raw PCM)** | — | Planned (M1 headline) |
 | **OpenAI Realtime / gRPC / WebRTC bridges** | — | Planned |
 | **VAD / noise suppression / echo cancellation** | — | Planned (all pure-Rust) |
-| **Forking (SIPREC) + conferencing (MCU)** | RFC 7866 | Planned |
+| **Forking (SIPREC raw-RTP tee)** | RFC 7866 | Implemented |
+| **Conferencing (MCU: mix-minus-self, active-speaker, whisper/monitor, room bridging)** | — | Implemented — N-party mixer, JSON control |
 | **Opus / G.722 / EVS** | RFC 6716 / G.722 | Planned (codec track) |
 
 ## Performance
@@ -236,7 +237,7 @@ Crates:
 - **`siphon-rtp-simd`** — pure-Rust SIMD DSP primitives (runtime-detected AVX2 + scalar fallback)
   shared by the codec and dsp hot paths.
 - `siphon-rtp-dsp` — resampler (done, SIMD); VAD / NS / AEC (VAD done, rest planned).
-- `siphon-rtp-media` — RTP/SRTP, jitter/PLC, leg pipeline, fan-out, mixer, bridges (planned).
+- `siphon-rtp-media` — RTP/RTCP, jitter/PLC, leg pipeline, fan-out/fork, the MCU mixer, stream bridges.
 - `siphon-rtp-datapath` — `Datapath` trait + UDP-loopback (CI) + XDP/AF_XDP backends (planned).
 - `siphon-rtp-ebpf*` — the aya XDP classifier (planned).
 - **`siphon-rtp`** — the installable daemon binary (dir `crates/siphon-rtp-engine/`): control

@@ -19,6 +19,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// SDP and play-media blobs are the only large payloads and stay well under this.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
+/// serde `default` for a `bool` field that should default to `true`.
+fn default_true() -> bool {
+    true
+}
+
 /// A control request from SIPhon to the engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
@@ -104,6 +109,18 @@ pub enum Command {
     BlockMedia { call_id: String, from_tag: String },
     /// Resume forwarding after [`Command::BlockMedia`].
     UnblockMedia { call_id: String, from_tag: String },
+    /// Loop a leg's inbound audio straight back to itself (the classic echo test).
+    /// `enabled` defaults to `true`; send `false` to stop echoing and resume normal
+    /// forwarding. Requires a media-processing (transcoding) call, the same gate as
+    /// [`Command::PlayMedia`]. DTMF detection and media-timeout still fire while echoing.
+    Echo {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+        #[serde(default = "default_true")]
+        enabled: bool,
+    },
     /// Create a media subscription (SIPREC / MPTY). `from_tags` may list multiple legs.
     SubscribeRequest {
         call_id: String,
@@ -128,9 +145,75 @@ pub enum Command {
         from_tag: String,
         to_tag: String,
     },
+    /// Join (or lazily create) an audio conference (MCU). The participant offers SDP and, on the
+    /// answer, hears the room's mixed-minus-self audio; `role` places it in the audio routing matrix.
+    ConferenceJoin {
+        conference_id: String,
+        from_tag: String,
+        sdp: String,
+        #[serde(default)]
+        role: ConferenceRole,
+        #[serde(default)]
+        profile: ProfileFlags,
+    },
+    /// Leave a conference (by participant `from_tag`). The room is torn down when its last participant
+    /// leaves.
+    ConferenceLeave {
+        conference_id: String,
+        from_tag: String,
+    },
+    /// Live-update a participant's conference role / routing (mute, whisper, supervisor monitor, …).
+    ConferenceRoute {
+        conference_id: String,
+        from_tag: String,
+        role: ConferenceRole,
+    },
+    /// Bridge two conferences (plan §7 room bridging) so each room hears the other's participants,
+    /// in the given direction(s).
+    ConferenceBridge {
+        conference_id_a: String,
+        conference_id_b: String,
+        #[serde(default)]
+        direction: BridgeDirection,
+    },
     /// Authenticate the control connection with the server's shared secret. Handled by the control
     /// server (not the session engine); required as the first command when a secret is configured.
     Authenticate { token: String },
+}
+
+/// A participant's role in a conference — the audio routing matrix (call-centre / PBX). Tagged on
+/// `"role"`. The symmetric "everyone hears everyone" conference is the [`ConferenceRole::Talker`] case.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum ConferenceRole {
+    /// Hears the room (mixed-minus-self) and is heard — a normal participant (the default).
+    #[default]
+    Talker,
+    /// Hears the room, contributes nothing (a webinar attendee / music-on-hold).
+    Listener,
+    /// Seated but muted — hears the room, contributes nothing.
+    Muted,
+    /// Whispers privately to one participant (supervisor coaching). Excluded from the public room mix.
+    Whisper { target: String },
+    /// Monitors one participant directly (supervisor listen), the target unaware; may also whisper.
+    Monitor {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        whisper_target: Option<String>,
+    },
+}
+
+/// The direction(s) audio flows across a conference bridge ([`Command::ConferenceBridge`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeDirection {
+    /// Both rooms hear each other (the default).
+    #[default]
+    Both,
+    /// Only room A's participants are heard in room B.
+    AToB,
+    /// Only room B's participants are heard in room A.
+    BToA,
 }
 
 /// Source for [`Command::PlayMedia`]. Tagged on `"source"`.
@@ -253,6 +336,13 @@ pub enum Event {
     /// A call's media went silent past the timeout and the engine tore it down (dead-path
     /// detection). Lets SIPhon release its own per-call state.
     MediaTimeout { call_id: String, from_tag: String },
+    /// The active (dominant) speaker in a conference changed. `from_tag` is the new speaker's leg
+    /// tag, or `None` when the floor went silent (no one speaking). Drives floor control / UI.
+    ActiveSpeaker {
+        conference_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_tag: Option<String>,
+    },
     /// Unknown / future event kind (forward-compat).
     #[serde(other)]
     Unknown,
@@ -425,6 +515,12 @@ mod tests {
                 call_id: "c".into(),
                 from_tag: "f".into(),
             },
+            Command::Echo {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                to_tag: None,
+                enabled: true,
+            },
             Command::SubscribeRequest {
                 call_id: "c".into(),
                 from_tags: vec!["a".into(), "b".into()],
@@ -444,6 +540,36 @@ mod tests {
                 command: command.clone(),
             });
         }
+    }
+
+    #[test]
+    fn echo_enabled_defaults_to_true_and_wire_shape() {
+        // Minimal echo frame (no to_tag, no enabled) — `enabled` must default to true so
+        // `rtpengine.echo(call)` turns echo on with the smallest possible payload.
+        let json = r#"{"command":"echo","call_id":"c","from_tag":"f"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::Echo { enabled, to_tag, .. } => {
+                assert!(enabled, "enabled must default to true");
+                assert_eq!(to_tag, None);
+            }
+            other => panic!("expected echo, got {other:?}"),
+        }
+
+        // Explicit disable roundtrips and keeps the snake_case verb tag.
+        let request = Request {
+            id: 9,
+            command: Command::Echo {
+                call_id: "abc@host".into(),
+                from_tag: "ft".into(),
+                to_tag: Some("tt".into()),
+                enabled: false,
+            },
+        };
+        roundtrip(&request);
+        let value = serde_json::to_value(&request).expect("to_value");
+        assert_eq!(value["command"], "echo");
+        assert_eq!(value["enabled"], false);
+        assert_eq!(value["to_tag"], "tt");
     }
 
     #[test]

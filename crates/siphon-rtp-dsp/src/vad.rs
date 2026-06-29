@@ -41,7 +41,14 @@ impl EnergyVad {
 
     /// Classify one frame, returning whether it is (or is held as) speech.
     pub fn is_speech(&mut self, frame: &[i16]) -> bool {
-        if Self::energy(frame) >= self.threshold {
+        self.is_speech_with_energy(Self::energy(frame))
+    }
+
+    /// Classify a frame from its **already-computed** [`EnergyVad::energy`], advancing the hangover.
+    /// Lets a caller that already needs the energy (e.g. the conference mixer ranks speakers by it)
+    /// avoid summing the frame twice.
+    pub fn is_speech_with_energy(&mut self, energy: i64) -> bool {
+        if energy >= self.threshold {
             self.hangover = self.hangover_frames;
             true
         } else if self.hangover > 0 {
@@ -98,6 +105,19 @@ mod tests {
         // Constant amplitude 100 → energy 10_000.
         assert_eq!(EnergyVad::energy(&[100i16; 64]), 10_000);
         assert_eq!(EnergyVad::energy(&[]), 0);
+    }
+
+    #[test]
+    fn is_speech_with_energy_matches_is_speech() {
+        // The precomputed-energy entry point must classify identically to the frame-summing one.
+        let frame = tone(4000, 160);
+        let energy = EnergyVad::energy(&frame);
+        let mut a = EnergyVad::new(1_000_000, 3);
+        let mut b = EnergyVad::new(1_000_000, 3);
+        for _ in 0..6 {
+            assert_eq!(a.is_speech(&frame), b.is_speech_with_energy(energy));
+            assert_eq!(a.is_speech(&[0i16; 160]), b.is_speech_with_energy(EnergyVad::energy(&[0i16; 160])));
+        }
     }
 
     #[test]

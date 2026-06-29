@@ -11,9 +11,19 @@ readme = "README.md"
 keywords = ["codec", "audio", "g711", "amr", "voip"]
 categories = ["multimedia::audio"]
 
+[features]
+default = []
+# ── Patent-encumbered codecs: OFF by default ──────────────────────────────────────────────────
+# These features gate codec TRANSCODING (decode/encode) only. Passthrough/relay of ANY codec is
+# always available and carries no patent exposure — the codec is never executed, packets are
+# forwarded byte-for-byte (rtpengine's default posture). Enabling a feature below is an explicit
+# statement that YOU, the operator, hold the necessary patent licence for that codec in your
+# jurisdiction. See docs/codec-licensing.md. (g729 / evs added when those codecs land.)
+amr = [] # AMR-NB / AMR-WB (3GPP TS 26.071 / 26.171) — the VoLTE codecs.
+
 [dependencies]
 thiserror = { workspace = true }
-siphon-rtp-simd = { path = "../siphon-rtp-simd" }
+siphon-rtp-simd = { path = "../siphon-rtp-simd", version = "0.1.0" }
 
 [dev-dependencies]
 criterion = { workspace = true }

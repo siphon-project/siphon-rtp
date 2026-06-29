@@ -10,7 +10,7 @@
 
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_engine::{ClientId, Engine};
-use siphon_rtp_proto::{CmdResult, Command};
+use siphon_rtp_proto::{CmdResult, Command, ConferenceRole};
 
 /// The soak drives the engine as a single control client.
 const CLIENT: ClientId = ClientId(1);
@@ -110,6 +110,62 @@ async fn offer_answer_delete_does_not_leak() {
     assert!(
         after <= before + tolerance,
         "engine leaked {} bytes over 2000 churned calls (before={before}, after={after})",
+        after.saturating_sub(before)
+    );
+}
+
+/// Churn one conference room through `join ×3 → leave ×3` — the room actor spawns on the first join
+/// and is torn down (task aborted, endpoint freed) on the last leave.
+async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let conference_id = format!("soak-room-{index}");
+    for participant in 0..3 {
+        let join = engine
+            .handle(CLIENT, Command::ConferenceJoin {
+                conference_id: conference_id.clone(),
+                from_tag: format!("p{participant}"),
+                sdp: sdp_for("198.51.100.1", 40_000 + participant as u16),
+                role: ConferenceRole::Talker,
+                profile: Default::default(),
+            })
+            .await;
+        assert_ok(&join, "conference_join");
+    }
+    for participant in 0..3 {
+        let leave = engine
+            .handle(CLIENT, Command::ConferenceLeave {
+                conference_id: conference_id.clone(),
+                from_tag: format!("p{participant}"),
+            })
+            .await;
+        assert_ok(&leave, "conference_leave");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conference_join_leave_does_not_leak() {
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let _prime = allocated_bytes();
+
+    // Warm up: rooms, per-participant mixers/jitter, endpoints all settle into steady state.
+    for index in 0..100 {
+        conference_join_leave(&engine, index).await;
+    }
+    quiesce().await;
+    assert_eq!(engine.conference().room_count(), 0, "rooms drained after warmup");
+    let before = allocated_bytes();
+
+    // Each cycle spawns a room actor + 3 participant legs/endpoints and frees them all on leave.
+    for index in 100..1_100 {
+        conference_join_leave(&engine, index).await;
+    }
+    quiesce().await;
+    let after = allocated_bytes();
+
+    assert_eq!(engine.conference().room_count(), 0, "rooms drained after soak");
+    let tolerance = 512 * 1024;
+    assert!(
+        after <= before + tolerance,
+        "conferences leaked {} bytes over 1000 churned rooms (before={before}, after={after})",
         after.saturating_sub(before)
     );
 }

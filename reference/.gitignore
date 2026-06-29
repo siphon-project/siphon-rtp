@@ -1,0 +1,8 @@
+# AMR-WB 3GPP TS 26.173 ANSI-C fixed-point reference. Fetched (3gpp.org) to *port* to pure Rust —
+# read as the algorithm reference, never compiled and never committed (3GPP licensing + bloat).
+amr-wb/c-code/
+
+# The official test vectors (testv/: tst_mN.cod bitstreams + tst_mN.out decoded PCM) are the
+# bit-exact acceptance criteria. They are kept untracked until git-lfs is configured for them, then
+# committed via LFS (see project memory) — they must never enter normal git history as binaries.
+amr-wb/testv/

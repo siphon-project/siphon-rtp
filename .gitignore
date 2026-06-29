@@ -2,6 +2,12 @@
 /target
 **/*.rs.bk
 
+# cargo-fuzz: build output, generated corpora, and crash artifacts (the targets are tracked).
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+
 # Claude / AI artifacts — NEVER commit (house rule).
 CLAUDE.md
 .claude/

@@ -495,12 +495,19 @@ impl Direction {
             None => pre_resample,
         };
 
+        self.emit_pcm(egress_pcm, parsed.marker, out);
+    }
+
+    /// Encode one frame of egress PCM and append the resulting RTP packet to `out`, advancing this
+    /// direction's egress sequence/timestamp. Shared by the transcode path ([`Direction::handle`])
+    /// and the echo path ([`Direction::echo_into`]); `pcm` must already be at the egress codec's rate.
+    fn emit_pcm(&mut self, pcm: &[i16], marker: bool, out: &mut Vec<Outbound>) {
         let mut payload = [0u8; MAX_RTP];
-        let Ok(payload_len) = self.encoder.encode(egress_pcm, &mut payload) else {
+        let Ok(payload_len) = self.encoder.encode(pcm, &mut payload) else {
             return;
         };
         let header = RtpHeader {
-            marker: parsed.marker,
+            marker,
             payload_type: self.egress_payload_type,
             sequence: self.egress_sequence,
             timestamp: self.egress_timestamp,
@@ -516,6 +523,54 @@ impl Direction {
             self.egress_sequence = self.egress_sequence.wrapping_add(1);
             self.egress_timestamp = self.egress_timestamp.wrapping_add(self.egress_timestamp_increment);
         }
+    }
+
+    /// Echo this direction's ingress audio straight back to the party that sent it (the classic echo
+    /// test). `self` decodes the ingress (its decoder faces the sending party); `egress` is the
+    /// direction whose egress faces that same party, used to re-encode + transmit the audio home.
+    ///
+    /// RFC 4733 telephone-events are still detected and emitted as [`Event::Dtmf`] (so the SBC can end
+    /// the test on `#`) but are not echoed; RTCP is ignored. Both directions carry the party's single
+    /// negotiated codec, so no resampling is needed — the decoded PCM feeds the egress encoder directly.
+    fn echo_into(
+        &mut self,
+        egress: &mut Direction,
+        data: &[u8],
+        dtmf_meta: DtmfMeta<'_>,
+        out: &mut Vec<Outbound>,
+        events: &mut Vec<Event>,
+    ) {
+        if data.len() < 2 {
+            return;
+        }
+        // RFC 5761 demux: ignore RTCP on the echo path (nothing to reflect).
+        let packet_type = data[1] & 0x7f;
+        if (64..=95).contains(&packet_type) {
+            return;
+        }
+        let Ok(parsed) = RtpPacket::parse(data) else {
+            return;
+        };
+        // Detect DTMF so the caller can end the echo test on a digit; do not echo the tone itself.
+        if Some(parsed.payload_type) == self.telephone_event_in {
+            if let Ok(Some(event)) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
+                events.push(Event::Dtmf {
+                    call_id: dtmf_meta.call_id.to_string(),
+                    from_tag: dtmf_meta.from_tag.to_string(),
+                    to_tag: dtmf_meta.to_tag.map(str::to_string),
+                    digit: event.digit.to_string(),
+                    duration_ms: u32::from(event.duration) / 8,
+                    volume: -i32::from(event.volume),
+                    source: None,
+                });
+            }
+            return;
+        }
+        let mut decoded = [0i16; MAX_PCM];
+        let Ok(samples) = self.decoder.decode(parsed.payload, &mut decoded) else {
+            return;
+        };
+        egress.emit_pcm(&decoded[..samples], parsed.marker, out);
     }
 
     /// Repacketize a telephone-event onto the egress stream: keep the event's RTP timestamp (RFC 4733
@@ -565,6 +620,9 @@ pub struct MediaCall {
     b_to_a: Direction,
     /// Latch each party's observed source so the reverse direction replies symmetrically (RFC 3550).
     latch: bool,
+    /// Echo-test mode: reflect each party's ingress audio straight back to itself instead of
+    /// forwarding it to the peer ([`MediaControl::Echo`]). Off for normal calls.
+    echo: bool,
     /// Where to write the recorded WAV on teardown, when recording.
     record_path: Option<String>,
 }
@@ -588,6 +646,7 @@ impl MediaCall {
             a_to_b: Direction::new(a_to_b),
             b_to_a: Direction::new(b_to_a),
             latch,
+            echo: false,
             record_path,
         }
     }
@@ -613,6 +672,7 @@ impl MediaCall {
             a_to_b: Direction::new_relay(a_to_b),
             b_to_a: Direction::new_relay(b_to_a),
             latch,
+            echo: false,
             record_path: None,
         }
     }
@@ -648,7 +708,12 @@ impl MediaCall {
             if self.latch {
                 self.b_to_a.egress_dst = packet.source;
             }
-            self.a_to_b.handle(&packet.data, meta, out, events);
+            if self.echo {
+                // Echo A back to A: decode on a_to_b (faces A), re-encode on b_to_a (egress faces A).
+                self.a_to_b.echo_into(&mut self.b_to_a, &packet.data, meta, out, events);
+            } else {
+                self.a_to_b.handle(&packet.data, meta, out, events);
+            }
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
             if !self.b_to_a.accepted_source.accepts(packet.source.ip()) {
                 tracing::debug!(source = %packet.source, "media-pipeline dropped packet from unsignalled source");
@@ -657,8 +722,18 @@ impl MediaCall {
             if self.latch {
                 self.a_to_b.egress_dst = packet.source;
             }
-            self.b_to_a.handle(&packet.data, meta, out, events);
+            if self.echo {
+                self.b_to_a.echo_into(&mut self.a_to_b, &packet.data, meta, out, events);
+            } else {
+                self.b_to_a.handle(&packet.data, meta, out, events);
+            }
         }
+    }
+
+    /// Enable or disable echo-test mode ([`Command::Echo`]): when on, each party's ingress audio is
+    /// reflected straight back to itself instead of being forwarded to the peer.
+    pub fn set_echo(&mut self, echo: bool) {
+        self.echo = echo;
     }
 
     /// Toggle comfort-silence on both egress directions ([`Command::SilenceMedia`]).
@@ -834,6 +909,8 @@ pub enum MediaControl {
     Silence(bool),
     /// Drop egress audio (`true`) or resume (`false`).
     Block(bool),
+    /// Echo each party's ingress audio back to itself (`true`) or resume normal forwarding (`false`).
+    Echo(bool),
     /// Play a prompt toward a party (`toward_a`): the player owns its source-rate PCM.
     PlayAudio { toward_a: bool, player: Box<PcmPlayer> },
     /// Play a DTMF burst toward a party; the reply channel reports whether it could start.
@@ -1022,6 +1099,7 @@ async fn run_media_call<D>(
                     }
                     MediaInput::Control(MediaControl::Silence(on)) => call.set_silenced(on),
                     MediaInput::Control(MediaControl::Block(on)) => call.set_blocked(on),
+                    MediaInput::Control(MediaControl::Echo(on)) => call.set_echo(on),
                     MediaInput::Control(MediaControl::PlayAudio { toward_a, player }) => {
                         call.start_play_audio(toward_a, *player);
                     }
@@ -1077,6 +1155,7 @@ async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
 mod tests {
     use super::*;
     use siphon_rtp_codec::g711::G711;
+    use siphon_rtp_codec::g722::G722;
     use siphon_rtp_codec::l16::L16;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1145,6 +1224,23 @@ mod tests {
         }
     }
 
+    /// A G.722 RTP packet: PT 9, a 160-byte payload (20 ms of codes), timestamp on the 8 kHz RTP
+    /// clock (RFC 3551 §4.5.2 — 160 timestamp units per 20 ms despite 16 kHz audio).
+    fn g722_rtp(sequence: u16) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 9,
+            sequence,
+            timestamp: u32::from(sequence) * 160,
+            ssrc: 0x1234_5678,
+        };
+        let payload = [0x55u8; 160];
+        let mut buffer = vec![0u8; 12 + payload.len()];
+        let len = write_packet(&header, &payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
     #[test]
     fn transcodes_ulaw_to_alaw_for_the_far_leg() {
         let mut call = ulaw_alaw_call();
@@ -1177,6 +1273,57 @@ mod tests {
         assert_eq!(second.sequence, 1);
         assert_eq!(first.timestamp, 0);
         assert_eq!(second.timestamp, 160, "one 8 kHz/20 ms frame");
+    }
+
+    #[test]
+    fn g722_egress_timestamp_steps_at_8khz_rtp_clock() {
+        // A G.722 leg decodes 320 PCM samples per 20 ms frame, but its RTP timestamp clock is
+        // 8 kHz (RFC 3551 §4.5.2), so the synthesized egress timestamp must advance by 160 — not
+        // 320 — per packet. This proves Phase 0's RTP-clock-vs-native-rate split composes with the
+        // codec's `rtp_clock_rate_hz()` end to end through the transcode path.
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            decoder: Box::new(G722::new(20)),
+            encoder: Box::new(G722::new(20)),
+            egress_ssrc: 0xB000_0009,
+            egress_payload_type: 9,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Any,
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: Box::new(G722::new(20)),
+            encoder: Box::new(G722::new(20)),
+            egress_ssrc: 0xA000_0009,
+            egress_payload_type: 9,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+        let mut call =
+            MediaCall::new("g722", "tag-a", Some("tag-b".into()), a_to_b, b_to_a, true, None);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, g722_rtp(1)), &mut out, &mut events);
+        call.process(&rx(1, A_ADDR, g722_rtp(2)), &mut out, &mut events);
+
+        assert_eq!(out.len(), 2, "one transcoded G.722 packet per ingress frame");
+        let first = RtpPacket::parse(&out[0].data).expect("first");
+        let second = RtpPacket::parse(&out[1].data).expect("second");
+        assert_eq!(first.payload_type, 9, "re-encoded as G.722 (PT 9)");
+        assert_eq!(first.payload.len(), 160, "320 PCM samples → 160 G.722 bytes");
+        assert_eq!(first.timestamp, 0);
+        assert_eq!(
+            second.timestamp, 160,
+            "G.722 egress advances at the 8 kHz RTP clock (160/frame), not the 320-sample count"
+        );
     }
 
     #[test]
@@ -1291,6 +1438,63 @@ mod tests {
         assert_eq!(relayed.payload_type, 101);
         assert_eq!(relayed.ssrc, 0xB000_0001, "stamped with the A→B egress SSRC");
         assert_eq!(relayed.timestamp, 16000, "event RTP timestamp preserved");
+    }
+
+    #[test]
+    fn echo_reflects_ingress_back_to_the_sender() {
+        let mut call = ulaw_alaw_call();
+        call.set_echo(true);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // A speaks µ-law toward the engine; with echo on, it must come straight back to A.
+        call.process(&rx(1, A_ADDR, ulaw_rtp(100, 0xFF)), &mut out, &mut events);
+
+        assert_eq!(out.len(), 1, "exactly one packet, reflected back to the sender");
+        let datagram = &out[0];
+        assert_eq!(datagram.endpoint, endpoint(1), "echoed out A's own socket, not toward B");
+        assert_eq!(datagram.dst, addr(A_ADDR), "echoed back to A's address");
+        let packet = RtpPacket::parse(&datagram.data).expect("parse");
+        assert_eq!(packet.payload_type, 0, "re-encoded in A's own codec (µ-law PT 0)");
+        assert_eq!(packet.ssrc, 0xA000_0001, "stamped with the toward-A egress SSRC");
+        // Same codec in and out → decode+encode is idempotent, so A hears exactly what it sent.
+        assert_eq!(packet.payload, &[0xFFu8; 160][..]);
+        assert!(events.is_empty());
+
+        // Toggling echo off restores normal forwarding toward the far leg.
+        call.set_echo(false);
+        out.clear();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(101, 0x00)), &mut out, &mut events);
+        assert_eq!(out[0].endpoint, endpoint(2), "echo off → transcoded toward B again");
+    }
+
+    #[test]
+    fn echo_still_detects_dtmf_without_echoing_the_tone() {
+        let mut call = ulaw_alaw_call();
+        call.set_echo(true);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // RFC 4733 '#' (event 11), End bit set — the digit the SBC echo test uses to hang up.
+        let event_payload = [11u8, 0x80 | 10, 0x03, 0x20];
+        let header = RtpHeader {
+            marker: true,
+            payload_type: 101,
+            sequence: 1,
+            timestamp: 16000,
+            ssrc: 0x1111_2222,
+        };
+        let mut buffer = vec![0u8; 16];
+        let len = write_packet(&header, &event_payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+
+        call.process(&rx(1, A_ADDR, buffer), &mut out, &mut events);
+        assert_eq!(events.len(), 1, "DTMF still surfaces during echo (so '#' can end the test)");
+        match &events[0] {
+            Event::Dtmf { digit, .. } => assert_eq!(digit, "#"),
+            other => panic!("expected DTMF, got {other:?}"),
+        }
+        assert!(out.is_empty(), "the DTMF tone itself is not echoed back");
     }
 
     #[test]

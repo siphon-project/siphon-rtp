@@ -6,6 +6,7 @@
 //! logic drives the UDP-loopback backend today and the XDP backend once it lands.
 #![forbid(unsafe_code)]
 
+pub mod conference;
 pub mod engine;
 pub mod ice;
 pub mod media_pipeline;

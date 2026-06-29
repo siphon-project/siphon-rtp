@@ -26,10 +26,14 @@ use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::player::{PcmPlayer, WavSource};
 use siphon_rtp_media::wav::WavRecorder;
-use siphon_rtp_proto::{CmdResult, Command, Event, PlayMediaSource, ProfileFlags, SessionStats};
+use siphon_rtp_proto::{
+    BridgeDirection, CmdResult, Command, ConferenceRole, Event, PlayMediaSource, ProfileFlags,
+    SessionStats,
+};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 
+use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
 use crate::ice::{self, IceCredentials};
 use crate::media_pipeline::{
     DirectionConfig, MediaCall, MediaControl, MediaRegistry, RawTee, RelayConfig,
@@ -43,6 +47,7 @@ use siphon_rtp_media::bridge::protocol::{Direction as WsDirection, MediaFormat};
 use siphon_rtp_media::bridge::{run_bridge, BridgeSession};
 use siphon_rtp_media::jitter::JitterBuffer;
 use siphon_rtp_media::leg::MediaLeg;
+use siphon_rtp_media::mixer::Role;
 
 /// Identity of a control client — one persistent JSON-over-TCP connection. A call is owned by the
 /// client that created it via `offer`; only that client may answer, query, or delete it (A3 —
@@ -166,6 +171,9 @@ pub struct Engine<D: Datapath> {
     /// the redirect dispatcher, which routes WS-owned endpoints' datagrams here (see
     /// [`crate::ws_bridge`]).
     ws: Arc<WsRegistry>,
+    /// The conference (MCU) slow path: per-room N-party mixers. Shared with the redirect dispatcher,
+    /// which routes conference-owned participant endpoints' datagrams here (see [`crate::conference`]).
+    conference: Arc<ConferenceRegistry>,
     /// SIPREC / monitor media subscriptions, keyed by call-id (RFC 7866). Each entry's source leg is
     /// forked to a send-only subscriber endpoint; freed alongside the parent call on delete/reap.
     subscriptions: DashMap<String, Vec<Subscription>>,
@@ -200,6 +208,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             bridge,
             media: Arc::new(MediaRegistry::default()),
             ws: Arc::new(WsRegistry::default()),
+            conference: Arc::new(ConferenceRegistry::default()),
             subscriptions: DashMap::new(),
             metrics: Arc::new(Metrics::new()),
         }
@@ -233,6 +242,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// WS-owned endpoints' datagrams to the per-call WS bridges.
     pub fn ws(&self) -> Arc<WsRegistry> {
         self.ws.clone()
+    }
+
+    /// The shared conference registry — handed to the redirect dispatcher so it can route
+    /// conference-owned participant endpoints' datagrams to the per-room mixer actors.
+    pub fn conference(&self) -> Arc<ConferenceRegistry> {
+        self.conference.clone()
     }
 
     /// Number of live calls in the session registry.
@@ -361,6 +376,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 to_tag,
             } => self.unsubscribe(client, &call_id, &from_tag, &to_tag).await,
+            Command::Echo {
+                call_id,
+                from_tag,
+                enabled,
+                ..
+            } => self.set_echo(client, &call_id, &from_tag, enabled),
+            Command::ConferenceJoin {
+                conference_id,
+                from_tag,
+                sdp,
+                role,
+                profile,
+            } => {
+                self.conference_join(client, &conference_id, from_tag, &sdp, role, &profile)
+                    .await
+            }
+            Command::ConferenceLeave {
+                conference_id,
+                from_tag,
+            } => self.conference_leave(&conference_id, &from_tag).await,
+            Command::ConferenceRoute {
+                conference_id,
+                from_tag,
+                role,
+            } => self.conference_route(&conference_id, &from_tag, role),
+            Command::ConferenceBridge {
+                conference_id_a,
+                conference_id_b,
+                direction,
+            } => self.conference_bridge(&conference_id_a, &conference_id_b, direction),
             other => CmdResult::Error {
                 reason: format!("unsupported command: {}", command_name(&other)),
             },
@@ -1146,6 +1191,174 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Enable or disable echo-test mode on a call ([`Command::Echo`]): each party's ingress audio is
+    /// reflected straight back to itself. Like silence, this requires a media-processing (transcode)
+    /// call — a plain relay forwards opaque payloads and cannot loop them. Only the owning client may
+    /// control the call. `from_tag` is accepted for protocol symmetry; echo applies to the whole call.
+    fn set_echo(&self, client: ClientId, call_id: &str, _from_tag: &str, enabled: bool) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        if self.media.is_transcoding_call(call_id)
+            && self.media.control(call_id, MediaControl::Echo(enabled))
+        {
+            ok_empty()
+        } else {
+            error_result(
+                "echo",
+                &"call is not a media-processing call (transcode/record/stream required)",
+            )
+        }
+    }
+
+    /// Join (or lazily create) an audio conference ([`Command::ConferenceJoin`]). The participant
+    /// offers SDP; the engine allocates one endpoint, seats it in the room's mixer, and answers with
+    /// the engine endpoint advertising the participant's codec (sendrecv) — the participant then hears
+    /// the room's mixed-minus-self audio. Each participant endpoint is a full inbound surface, so the
+    /// source gate + constrained latch are enforced on ingress (RTPBleed, docs §4).
+    async fn conference_join(
+        &self,
+        client: ClientId,
+        conference_id: &str,
+        from_tag: String,
+        sdp: &str,
+        role: ConferenceRole,
+        profile: &ProfileFlags,
+    ) -> CmdResult {
+        let info = match sdp::parse(sdp) {
+            Ok(info) => info,
+            Err(error) => return error_result("conference_join: SDP parse", &error),
+        };
+        // v1 mixes plaintext RTP only — ICE / DTLS-SRTP conference legs are a follow-up.
+        if info.is_ice() {
+            return error_result("conference_join", &"ICE conference legs are not supported yet");
+        }
+        let Some(codec) = info.primary_codec() else {
+            return error_result("conference_join", &"offer has no audio codec");
+        };
+        // Build the participant's codecs. `encoder_for` rejects a decode-only codec (AMR-WB): we can
+        // mix in such a leg's audio but cannot encode the room back to it yet, so the seat is refused.
+        let decoder = match factory::decoder_for(&codec) {
+            Ok(decoder) => decoder,
+            Err(error) => return error_result("conference_join: decoder", &error),
+        };
+        let encoder = match factory::encoder_for(&codec) {
+            Ok(encoder) => encoder,
+            Err(_) => {
+                return error_result(
+                    "conference_join",
+                    &format!(
+                        "codec {} cannot be encoded toward a participant yet (e.g. AMR-WB)",
+                        codec.encoding_name
+                    ),
+                )
+            }
+        };
+        // One engine endpoint in the offer's address family, redirected to the conference actor.
+        let family = AddressFamily::of(info.remote_rtp.ip());
+        let endpoint = match self.alloc_endpoints(1, family).await {
+            Ok(mut endpoints) => endpoints.remove(0),
+            Err(reason) => return error_result("conference_join", &reason),
+        };
+        if let Err(error) = self.datapath.install_flow(endpoint.id, FlowAction::Redirect) {
+            self.free(&[endpoint]).await;
+            return error_result("conference_join: install redirect", &error);
+        }
+        // RTPBleed gate: exact signalled-source by default; accept-any only for an explicit symmetric
+        // leg. The constrained latch then learns the reply address from the gated source.
+        let accepted_source = if profile.flags.iter().any(|flag| flag == "symmetric") {
+            SourceFilter::Any
+        } else {
+            SourceFilter::Exact(info.remote_rtp.ip())
+        };
+        let config = ParticipantConfig {
+            tag: from_tag.clone(),
+            decoder,
+            encoder,
+            ingress_endpoint: endpoint.id,
+            egress_endpoint: endpoint.id,
+            egress_dst: info.remote_rtp,
+            accepted_source,
+            latch: true,
+            egress_ssrc: random_ssrc(),
+            egress_payload_type: codec.payload_type,
+            telephone_event_in: info.telephone_event_payload_type(),
+            routing: routing_of(role),
+        };
+        let events = self.events.get(&client).map(|sink| sink.value().clone());
+        let joined_tick = self.datapath.now_ticks();
+        if !self
+            .conference
+            .join(conference_id, config, joined_tick, self.datapath.clone(), events)
+        {
+            self.free(&[endpoint]).await;
+            return error_result("conference_join", &"failed to seat participant");
+        }
+        self.endpoint_calls.insert(endpoint.id, conference_id.to_string());
+
+        // Answer: advertise the engine endpoint, keep the participant's codec, sendrecv.
+        let engine = EngineMedia { rtp: endpoint.local_addr, rtcp: None };
+        match sdp::rewrite(sdp, engine, None, None) {
+            Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
+            Err(error) => {
+                let _ = self.conference.leave(conference_id, &from_tag);
+                self.endpoint_calls.remove(&endpoint.id);
+                self.datapath.remove_endpoint(endpoint.id).await;
+                error_result("conference_join: SDP rewrite", &error)
+            }
+        }
+    }
+
+    /// Remove a participant from a conference ([`Command::ConferenceLeave`]), freeing its endpoint and
+    /// tearing the room down once empty.
+    async fn conference_leave(&self, conference_id: &str, from_tag: &str) -> CmdResult {
+        match self.conference.leave(conference_id, from_tag) {
+            Some(endpoint) => {
+                self.endpoint_calls.remove(&endpoint);
+                self.datapath.remove_endpoint(endpoint).await;
+                ok_empty()
+            }
+            None => error_result("conference_leave", &"no such conference participant"),
+        }
+    }
+
+    /// Live-update a participant's conference role / routing ([`Command::ConferenceRoute`]).
+    fn conference_route(
+        &self,
+        conference_id: &str,
+        from_tag: &str,
+        role: ConferenceRole,
+    ) -> CmdResult {
+        if self.conference.route(conference_id, from_tag, routing_of(role)) {
+            ok_empty()
+        } else {
+            error_result("conference_route", &"no such conference or participant")
+        }
+    }
+
+    /// Bridge two conferences ([`Command::ConferenceBridge`]) so each room hears the other's
+    /// participants, in the requested direction(s).
+    fn conference_bridge(
+        &self,
+        conference_id_a: &str,
+        conference_id_b: &str,
+        direction: BridgeDirection,
+    ) -> CmdResult {
+        let (a_to_b, b_to_a) = match direction {
+            BridgeDirection::Both => (true, true),
+            BridgeDirection::AToB => (true, false),
+            BridgeDirection::BToA => (false, true),
+        };
+        if self
+            .conference
+            .bridge(conference_id_a, conference_id_b, a_to_b, b_to_a)
+        {
+            ok_empty()
+        } else {
+            error_result("conference_bridge", &"one or both conferences do not exist")
+        }
+    }
+
     /// Run `f` against a call the client owns, or `None` if the call is unknown or owned by another
     /// client (A3 — a call is invisible to non-owners, docs §5).
     fn owned_call<T>(&self, client: ClientId, call_id: &str, f: impl FnOnce(&Call) -> T) -> Option<T> {
@@ -1668,6 +1881,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         reaped
     }
 
+    /// Reap conference participants whose media has been idle for at least `idle_ticks`, freeing their
+    /// endpoints and tearing down any room left empty (the conference analogue of [`Engine::reap_idle`]
+    /// — abandoned legs / a control client that disconnected without leaving never leak a room). Driven
+    /// by the datapath's logical clock, so tests advance it via `advance_clock`.
+    pub async fn reap_idle_conferences(&self, idle_ticks: u64) -> usize {
+        let now = self.datapath.now_ticks();
+        let freed = self
+            .conference
+            .reap_idle(now, idle_ticks, |endpoint| self.datapath.last_activity(endpoint));
+        for endpoint in &freed {
+            self.datapath.remove_endpoint(*endpoint).await;
+            self.endpoint_calls.remove(endpoint);
+        }
+        freed.len()
+    }
+
     /// The call-id owning `endpoint`, if any — RTCP-telemetry correlation.
     #[must_use]
     pub fn call_for_endpoint(&self, endpoint: EndpointId) -> Option<String> {
@@ -1897,11 +2126,16 @@ fn command_name(command: &Command) -> &'static str {
         Command::PlayDtmf { .. } => "play_dtmf",
         Command::SilenceMedia { .. } => "silence_media",
         Command::UnsilenceMedia { .. } => "unsilence_media",
+        Command::Echo { .. } => "echo",
         Command::BlockMedia { .. } => "block_media",
         Command::UnblockMedia { .. } => "unblock_media",
         Command::SubscribeRequest { .. } => "subscribe_request",
         Command::SubscribeAnswer { .. } => "subscribe_answer",
         Command::Unsubscribe { .. } => "unsubscribe",
+        Command::ConferenceJoin { .. } => "conference_join",
+        Command::ConferenceLeave { .. } => "conference_leave",
+        Command::ConferenceRoute { .. } => "conference_route",
+        Command::ConferenceBridge { .. } => "conference_bridge",
         Command::Authenticate { .. } => "authenticate",
     }
 }
@@ -1909,6 +2143,42 @@ fn command_name(command: &Command) -> &'static str {
 fn unknown_call(call_id: &str) -> CmdResult {
     CmdResult::Error {
         reason: format!("unknown call: {call_id}"),
+    }
+}
+
+/// Map a control-plane [`ConferenceRole`] to the conference's internal [`Routing`]. A whisperer stays
+/// a talker whose audio is private to one target; a monitor is a listener that hears one target
+/// directly (and may also whisper to it).
+fn routing_of(role: ConferenceRole) -> Routing {
+    match role {
+        ConferenceRole::Talker => Routing {
+            role: Role::Talker,
+            whisper_target: None,
+            monitor_target: None,
+        },
+        ConferenceRole::Listener => Routing {
+            role: Role::Listener,
+            whisper_target: None,
+            monitor_target: None,
+        },
+        ConferenceRole::Muted => Routing {
+            role: Role::Muted,
+            whisper_target: None,
+            monitor_target: None,
+        },
+        ConferenceRole::Whisper { target } => Routing {
+            role: Role::Talker,
+            whisper_target: Some(target),
+            monitor_target: None,
+        },
+        ConferenceRole::Monitor {
+            target,
+            whisper_target,
+        } => Routing {
+            role: Role::Listener,
+            whisper_target,
+            monitor_target: Some(target),
+        },
     }
 }
 
@@ -2065,7 +2335,7 @@ mod tests {
         // through the control plane with the redirect dispatcher live.
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
 
         let (phone_a, addr_a) = phone().await; // plain (AVP) caller A
         let (phone_b, addr_b) = phone().await; // secure (SAVP) callee B
@@ -2126,6 +2396,201 @@ mod tests {
         assert_eq!(recovered_a, from_b, "A receives the decrypted plaintext");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conference_mixes_two_participants_end_to_end() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_codec::g711::G711;
+        use siphon_rtp_codec::Decoder as _;
+        use siphon_rtp_dsp::EnergyVad;
+        use siphon_rtp_media::rtp::RtpPacket;
+
+        // Two callers join one room over the JSON control plane, exchange loud G.711, and each hears
+        // the other's audio mixed back — the full path: join → endpoint alloc → Redirect → dispatcher
+        // → mixer actor → 20 ms tick → egress.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        let join_a = engine
+            .handle(CLIENT, Command::ConferenceJoin {
+                conference_id: "room-1".into(),
+                from_tag: "alice".into(),
+                sdp: sdp_for(addr_a, true),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            })
+            .await;
+        let engine_a = sdp::parse(&ok_sdp_text(&join_a)).expect("A answer").remote_rtp;
+        let join_b = engine
+            .handle(CLIENT, Command::ConferenceJoin {
+                conference_id: "room-1".into(),
+                from_tag: "bob".into(),
+                sdp: sdp_for(addr_b, true),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            })
+            .await;
+        let engine_b = sdp::parse(&ok_sdp_text(&join_b)).expect("B answer").remote_rtp;
+
+        // Both speak loud G.711 (µ-law 0x00 ≈ full scale); fill the jitter buffers well past the
+        // priming depth so there is a window during which each is heard.
+        for sequence in 0..30 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x00), engine_a)
+                .await
+                .expect("a send");
+            phone_b
+                .send_to(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x00), engine_b)
+                .await
+                .expect("b send");
+        }
+
+        // The 20 ms room ticker mixes and sends each participant the other's audio. The first frame
+        // or two are silence (before the peer's jitter buffer primes), so scan a few frames.
+        let mut decoder = G711::ulaw();
+        let mut heard_loud = false;
+        for _ in 0..8 {
+            let (mix_a, from_a) = recv(&phone_a).await;
+            assert_eq!(from_a, engine_a, "A hears the mix from its engine port");
+            let packet = RtpPacket::parse(&mix_a).expect("A egress RTP");
+            assert_eq!(packet.payload_type, 0, "G.711 µ-law egress");
+            let mut pcm = vec![0i16; 320];
+            let samples = decoder.decode(packet.payload, &mut pcm).expect("decode");
+            if EnergyVad::energy(&pcm[..samples]) > 1_000_000 {
+                heard_loud = true;
+                break;
+            }
+        }
+        assert!(heard_loud, "A hears B's loud audio (mixed-minus-self) within a few frames");
+        let (_mix_b, from_b) = recv(&phone_b).await;
+        assert_eq!(from_b, engine_b, "B hears the mix from its engine port");
+
+        // Leaving releases each participant; the empty room is torn down.
+        for tag in ["alice", "bob"] {
+            let left = engine
+                .handle(CLIENT, Command::ConferenceLeave {
+                    conference_id: "room-1".into(),
+                    from_tag: tag.into(),
+                })
+                .await;
+            assert!(matches!(left, CmdResult::Ok { .. }), "{tag} leaves: {left:?}");
+        }
+        assert!(!engine.conference().contains("room-1"), "empty room torn down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conference_bridge_command_wires_two_rooms() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        // Bridging non-existent rooms is an error.
+        let missing = engine
+            .handle(CLIENT, Command::ConferenceBridge {
+                conference_id_a: "ghost-1".into(),
+                conference_id_b: "ghost-2".into(),
+                direction: BridgeDirection::Both,
+            })
+            .await;
+        assert!(matches!(missing, CmdResult::Error { .. }), "no such rooms: {missing:?}");
+
+        // Seat a participant in each of two rooms, then bridge them.
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        for (room, tag, addr) in [("room-x", "alice", addr_a), ("room-y", "bob", addr_b)] {
+            let joined = engine
+                .handle(CLIENT, Command::ConferenceJoin {
+                    conference_id: room.into(),
+                    from_tag: tag.into(),
+                    sdp: sdp_for(addr, true),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                })
+                .await;
+            assert!(matches!(joined, CmdResult::Ok { .. }), "{tag} joins {room}: {joined:?}");
+        }
+        let bridged = engine
+            .handle(CLIENT, Command::ConferenceBridge {
+                conference_id_a: "room-x".into(),
+                conference_id_b: "room-y".into(),
+                direction: BridgeDirection::Both,
+            })
+            .await;
+        assert!(matches!(bridged, CmdResult::Ok { .. }), "rooms bridge: {bridged:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conference_reaps_idle_participants() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let mut engine_a = addr_a; // overwritten with alice's engine port below
+        for (tag, addr) in [("alice", addr_a), ("bob", addr_b)] {
+            let joined = engine
+                .handle(CLIENT, Command::ConferenceJoin {
+                    conference_id: "room".into(),
+                    from_tag: tag.into(),
+                    sdp: sdp_for(addr, true),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                })
+                .await;
+            let port = sdp::parse(&ok_sdp_text(&joined)).expect("answer").remote_rtp;
+            if tag == "alice" {
+                engine_a = port;
+            }
+        }
+
+        // Advance the logical clock, then alice sends media (stamping her endpoint's activity); bob
+        // stays silent. With idle_ticks = 3, bob is idle since tick 0 (now 4 ⇒ reaped) but alice's
+        // activity is fresh (kept).
+        engine.datapath().advance_clock(4);
+        phone_a
+            .send_to(&g711_rtp(0, 0, 0x0A0A_0A0A, 0x00), engine_a)
+            .await
+            .expect("a send");
+        tokio::time::sleep(Duration::from_millis(30)).await; // let the datapath stamp activity
+
+        assert_eq!(engine.reap_idle_conferences(3).await, 1, "the silent participant is reaped");
+        assert!(engine.conference().contains("room"), "the active participant keeps the room alive");
+
+        // Advance past alice's activity too — now the room drains and is torn down.
+        engine.datapath().advance_clock(5);
+        assert!(engine.reap_idle_conferences(3).await >= 1, "the now-idle participant is reaped");
+        assert!(!engine.conference().contains("room"), "empty room torn down");
+    }
+
     /// A G.711 RTP packet (160-sample frame) for transcode tests.
     fn g711_rtp(payload_type: u8, sequence: u16, ssrc: u32, payload_byte: u8) -> Vec<u8> {
         let mut packet = vec![0x80, payload_type];
@@ -2155,7 +2620,7 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
 
         let (phone_a, addr_a) = phone().await;
         let (phone_b, addr_b) = phone().await;
@@ -2231,7 +2696,7 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
 
         let (phone_a, addr_a) = phone().await;
         let (phone_b, addr_b) = phone().await;
@@ -2339,7 +2804,7 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
 
         let (_phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
@@ -2406,7 +2871,7 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
 
         let (phone_a, addr_a) = phone().await;
         let (phone_b, addr_b) = phone().await;
@@ -2519,7 +2984,7 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
 
         let (_phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
@@ -2618,6 +3083,7 @@ mod tests {
             engine.bridge(),
             engine.media(),
             engine.ws(),
+            engine.conference(),
             None,
         ));
 
@@ -2722,7 +3188,7 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
 
         let (phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;

@@ -120,6 +120,33 @@ fn be32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+/// Length of a minimal Sender Report carrying no reception-report blocks (RFC 3550 §6.4.1).
+pub const SENDER_REPORT_LEN: usize = 28;
+
+/// Build a minimal RTCP **Sender Report** (RC = 0, no reception-report blocks — the engine drops
+/// inbound RTCP, so it reports no reception stats). The conference emits one per egress stream so a
+/// receiver gets the NTP↔RTP mapping for lip-sync and a liveness signal (RFC 3550 §6.4.1).
+#[must_use]
+pub fn write_sender_report(
+    ssrc: u32,
+    ntp_timestamp: u64,
+    rtp_timestamp: u32,
+    packet_count: u32,
+    octet_count: u32,
+) -> [u8; SENDER_REPORT_LEN] {
+    let mut out = [0u8; SENDER_REPORT_LEN];
+    out[0] = 0x80; // V=2, P=0, RC=0
+    out[1] = 200; // PT = SR
+    // Length in 32-bit words minus one: (28 / 4) − 1 = 6.
+    out[2..4].copy_from_slice(&6u16.to_be_bytes());
+    out[4..8].copy_from_slice(&ssrc.to_be_bytes());
+    out[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
+    out[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
+    out[20..24].copy_from_slice(&packet_count.to_be_bytes());
+    out[24..28].copy_from_slice(&octet_count.to_be_bytes());
+    out
+}
+
 fn read_report_blocks(body: &[u8], count: usize) -> Vec<ReportBlock> {
     let mut reports = Vec::with_capacity(count);
     for index in 0..count {
@@ -255,6 +282,26 @@ mod tests {
                 assert_eq!(report.packet_count, 200);
                 assert_eq!(report.octet_count, 0x0001_0000);
                 assert!(report.reports.is_empty());
+            }
+            other => panic!("expected SR, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writes_a_parseable_sender_report() {
+        // The SR we build must round-trip through the parser, field for field.
+        let bytes = write_sender_report(0xDEAD_BEEF, 0x1122_3344_5566_7788, 0x0001_0000, 42, 6720);
+        assert_eq!(bytes.len(), SENDER_REPORT_LEN);
+        let packets = parse_compound(&bytes).expect("parse");
+        assert_eq!(packets.len(), 1);
+        match &packets[0] {
+            RtcpPacket::SenderReport(report) => {
+                assert_eq!(report.ssrc, 0xDEAD_BEEF);
+                assert_eq!(report.ntp_timestamp, 0x1122_3344_5566_7788);
+                assert_eq!(report.rtp_timestamp, 0x0001_0000);
+                assert_eq!(report.packet_count, 42);
+                assert_eq!(report.octet_count, 6720);
+                assert!(report.reports.is_empty(), "no reception blocks (RC = 0)");
             }
             other => panic!("expected SR, got {other:?}"),
         }

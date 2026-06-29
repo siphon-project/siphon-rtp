@@ -3,14 +3,25 @@
 //! These lock per-frame / per-subframe cost so a regression fails CI. The AMR-WB decoder kernels
 //! are benched per-tier, plus the full mode-0 frame decode (`dec_main`) once it is wired.
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use siphon_rtp_codec::amr::wb::dec_main::{decode_frame, DecoderState};
-use siphon_rtp_codec::amr::wb::{codebook, constants, filters, lpc, pitch};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+#[cfg(feature = "amr")]
+use criterion::BatchSize;
+#[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::basic_ops;
+#[cfg(feature = "amr")]
+use siphon_rtp_codec::amr::wb::dec_main::{decode_frame, DecoderState};
+#[cfg(feature = "amr")]
+use siphon_rtp_codec::amr::wb::{codebook, constants, filters, lpc, pitch};
+#[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::AMRWB_SPEECH_BITS;
+use siphon_rtp_codec::cn::Cn;
 use siphon_rtp_codec::g711::G711;
+use siphon_rtp_codec::g722::G722;
+use siphon_rtp_codec::g726::{Rate, G726};
+use siphon_rtp_codec::gsm_fr::GsmFr;
 use siphon_rtp_codec::{Decoder, Encoder};
 
+#[cfg(feature = "amr")]
 use std::path::PathBuf;
 
 /// One 20 ms frame of 8 kHz audio.
@@ -52,6 +63,109 @@ fn bench_g711(criterion: &mut Criterion) {
     });
 }
 
+/// G.722 sub-band ADPCM encode/decode cost per 20 ms frame (320 samples ↔ 160 bytes). Encode and
+/// decode are stateful, so per-call cost is what the relay datapath pays per frame.
+fn bench_g722(criterion: &mut Criterion) {
+    const G722_FRAME: usize = 320; // 20 ms at 16 kHz
+    let pcm: Vec<i16> = (0..G722_FRAME)
+        .map(|i| (((i as i32 * 401) % 65536) - 32768) as i16)
+        .collect();
+    let mut payload = vec![0u8; G722_FRAME / 2];
+    let mut out_pcm = vec![0i16; G722_FRAME];
+
+    let mut encoder = G722::new(20);
+    criterion.bench_function("g722_encode_frame", |bencher| {
+        bencher.iter(|| {
+            encoder
+                .encode(black_box(&pcm), black_box(&mut payload))
+                .expect("encode")
+        });
+    });
+
+    // Seed a representative payload from a fresh encoder, then bench the stateful decode.
+    G722::new(20).encode(&pcm, &mut payload).expect("seed payload");
+    let mut decoder = G722::new(20);
+    criterion.bench_function("g722_decode_frame", |bencher| {
+        bencher.iter(|| {
+            decoder
+                .decode(black_box(&payload), black_box(&mut out_pcm))
+                .expect("decode")
+        });
+    });
+}
+
+/// G.726 ADPCM encode/decode cost per 20 ms frame at 32 kbit/s (the common VoIP rate; 160 samples ↔
+/// 80 bytes). The 16/24/40 kbit/s rates share the same per-sample cost.
+fn bench_g726(criterion: &mut Criterion) {
+    const G726_FRAME: usize = 160; // 20 ms at 8 kHz
+    let pcm: Vec<i16> = (0..G726_FRAME)
+        .map(|i| (((i as i32 * 401) % 65536) - 32768) as i16)
+        .collect();
+    let mut payload = vec![0u8; 80]; // 4 bits/sample × 160 / 8
+    let mut out_pcm = vec![0i16; G726_FRAME];
+
+    let mut encoder = G726::new(Rate::R32, 20);
+    criterion.bench_function("g726_32_encode_frame", |bencher| {
+        bencher.iter(|| {
+            encoder
+                .encode(black_box(&pcm), black_box(&mut payload))
+                .expect("encode")
+        });
+    });
+
+    G726::new(Rate::R32, 20).encode(&pcm, &mut payload).expect("seed payload");
+    let mut decoder = G726::new(Rate::R32, 20);
+    criterion.bench_function("g726_32_decode_frame", |bencher| {
+        bencher.iter(|| {
+            decoder
+                .decode(black_box(&payload), black_box(&mut out_pcm))
+                .expect("decode")
+        });
+    });
+}
+
+/// GSM 06.10 Full-Rate (RPE-LTP) encode/decode cost per 20 ms frame (160 samples ↔ 33 bytes).
+fn bench_gsm_fr(criterion: &mut Criterion) {
+    let pcm: Vec<i16> = (0..160usize)
+        .map(|i| (((i as i32 * 401) % 65536) - 32768) as i16)
+        .collect();
+    let mut payload = vec![0u8; 33];
+    let mut out_pcm = vec![0i16; 160];
+
+    let mut encoder = GsmFr::new();
+    criterion.bench_function("gsm_fr_encode_frame", |bencher| {
+        bencher.iter(|| {
+            encoder
+                .encode(black_box(&pcm), black_box(&mut payload))
+                .expect("encode")
+        });
+    });
+
+    GsmFr::new().encode(&pcm, &mut payload).expect("seed payload");
+    let mut decoder = GsmFr::new();
+    criterion.bench_function("gsm_fr_decode_frame", |bencher| {
+        bencher.iter(|| {
+            decoder
+                .decode(black_box(&payload), black_box(&mut out_pcm))
+                .expect("decode")
+        });
+    });
+}
+
+/// RFC 3389 comfort-noise generation cost per 20 ms frame (a CN level byte → 160 noise samples).
+fn bench_cn(criterion: &mut Criterion) {
+    let mut codec = Cn::new(8000, 20);
+    let mut out = vec![0i16; 160];
+    criterion.bench_function("cn_generate_frame", |bencher| {
+        bencher.iter(|| {
+            codec
+                .decode(black_box(&[40u8]), black_box(&mut out))
+                .expect("cn")
+        });
+    });
+}
+
+#[cfg(feature = "amr")]
 fn bench_basic_ops(criterion: &mut Criterion) {
     // A correlation-style MAC loop — the shape of the AMR pitch/FIR hot kernels.
     let signal: Vec<i16> = sample_pcm();
@@ -67,6 +181,7 @@ fn bench_basic_ops(criterion: &mut Criterion) {
 }
 
 /// AMR-WB decode hot-path kernels (µs/frame and µs/subframe), the ported DSP tiers.
+#[cfg(feature = "amr")]
 fn bench_amrwb_dsp(criterion: &mut Criterion) {
     const M: usize = constants::M;
     const SUBFR: usize = constants::L_SUBFR;
@@ -140,6 +255,7 @@ fn bench_amrwb_dsp(criterion: &mut Criterion) {
 
 /// The 4-track algebraic codebook decode (µs/subframe), the per-subframe innovative-code kernel for
 /// the higher modes. Benches the 36-bit (mode-2 / 12.65k VoLTE) and 88-bit (mode 7/8) budgets.
+#[cfg(feature = "amr")]
 fn bench_amrwb_codebook(criterion: &mut Criterion) {
     let mut code = [0i16; constants::L_SUBFR];
     let ind36 = [0x12i16, 0x55, 0x1AA, 0x0FF];
@@ -156,6 +272,7 @@ fn bench_amrwb_codebook(criterion: &mut Criterion) {
 /// synthesis, for every speech mode 0..=8. Reads a real warmed-up speech frame from the 3GPP
 /// `tst_mN.cod` vectors; if a (gitignored) vector is absent that mode's bench is skipped so CI
 /// without the vectors still builds.
+#[cfg(feature = "amr")]
 fn bench_amrwb_decode(criterion: &mut Criterion) {
     for mode in 0u8..=8 {
         let nb_bits = AMRWB_SPEECH_BITS[mode as usize] as usize;
@@ -196,12 +313,20 @@ fn bench_amrwb_decode(criterion: &mut Criterion) {
     }
 }
 
+// AMR-WB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
+#[cfg(feature = "amr")]
 criterion_group!(
     benches,
     bench_g711,
+    bench_g722,
+    bench_g726,
+    bench_gsm_fr,
+    bench_cn,
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
     bench_amrwb_decode
 );
+#[cfg(not(feature = "amr"))]
+criterion_group!(benches, bench_g711, bench_g722, bench_g726, bench_gsm_fr, bench_cn);
 criterion_main!(benches);

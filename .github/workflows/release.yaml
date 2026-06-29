@@ -1,0 +1,199 @@
+# .github/workflows/release.yaml — build, package, and publish on tag push.
+#
+# Adapted from siphon-sip's release.yaml for siphon-rtp's reality: a pure-Rust *workspace* (5
+# crates, no PyO3/Python/SDK). Differences from siphon-sip:
+#   * no Python/libsctp/PyO3 setup, no PyPI job (there is no Python SDK);
+#   * crates.io publishes the whole WORKSPACE (`cargo publish --workspace`), not one crate;
+#   * docker builds the Dockerfile's `runtime` (musl/distroless) target;
+#   * .deb/.rpm are intentionally omitted until the engine carries packaging metadata
+#     (`[package.metadata.deb]` / `[package.metadata.generate-rpm]`) + a systemd unit under dist/.
+#
+# PREREQUISITES for the crates-io job (see the chat notes):
+#   1. Add a `version` to the inter-crate path deps (crates.io rejects path-only deps).
+#   2. Pre-create + own each crate on crates.io, then configure Trusted Publishing (OIDC) on each,
+#      pointing at this repo + this workflow file.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# Least privilege by default; each job elevates only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  # ── Version gate ─────────────────────────────────────────────────────────
+  # The git tag is the single source of truth. Refuse to publish if the workspace version
+  # ([workspace.package] in Cargo.toml) doesn't match the tag, so a stray in-tree bump can never
+  # ship a mismatched crate/image. Every member inherits it via `version.workspace = true`.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Workspace version must equal the tag
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
+          echo "tag=$tag_version cargo=$cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::workspace version ($cargo_version) does not match tag ($tag_version) — bump [workspace.package].version in the release commit."
+            exit 1
+          fi
+
+  # ── Build the engine binary + tarball (per target) ───────────────────────
+  build:
+    needs: verify-version
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross linker (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p siphon-rtp
+        env:
+          # jemalloc (the one accepted -sys dep) cross-compiles with the gnu cross toolchain.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package tarball
+        run: |
+          ARCHIVE="siphon-rtp-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          tar czf "$ARCHIVE" \
+            -C target/${{ matrix.target }}/release siphon-rtp \
+            -C "${{ github.workspace }}" LICENSE README.md
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  # ── Publish the whole workspace to crates.io (OIDC Trusted Publishing) ────
+  # `cargo publish --workspace` orders the crates (proto/codec/datapath/media → engine) and waits
+  # for each to land in the index before publishing its dependents. The OIDC token is scoped to the
+  # crates that list this repo+workflow as a Trusted Publisher — configure that on EACH crate first.
+  crates-io:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      id-token: write # mint a short-lived crates.io token via GitHub OIDC — no stored secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Authenticate to crates.io (OIDC Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish workspace
+        run: cargo publish --workspace --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # ── Docker image → GHCR (runtime = musl/distroless) ──────────────────────
+  docker:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io/<owner>/<repo>
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64 # Dockerfile pins x86_64-unknown-linux-musl
+
+  # ── SBOM (SPDX 2.3 + CycloneDX 1.4), attached to the release ─────────────
+  sbom:
+    runs-on: ubuntu-latest
+    needs: verify-version
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-sbom
+        run: cargo install cargo-sbom
+      - name: Generate SPDX + CycloneDX SBOMs
+        run: |
+          cargo sbom --output-format spdx_json_2_3 > "siphon-rtp-${GITHUB_REF_NAME}.spdx.json"
+          cargo sbom --output-format cyclone_dx_json_1_4 > "siphon-rtp-${GITHUB_REF_NAME}.cdx.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            siphon-rtp-*.spdx.json
+            siphon-rtp-*.cdx.json
+
+  # ── GitHub Release with artifacts ────────────────────────────────────────
+  github-release:
+    runs-on: ubuntu-latest
+    needs: [build, crates-io, docker, sbom]
+    permissions:
+      contents: write # create the release and upload assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.spdx.json
+            artifacts/*.cdx.json

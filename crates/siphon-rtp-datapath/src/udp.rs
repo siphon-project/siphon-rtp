@@ -572,6 +572,15 @@ impl Datapath for UdpLoopbackDatapath {
             .map(|entry| entry.stats.last_seen.load(Ordering::Relaxed))
     }
 
+    fn note_activity(&self, endpoint: EndpointId) {
+        if let Some(entry) = self.inner.endpoints.get(&endpoint) {
+            entry
+                .stats
+                .last_seen
+                .store(self.inner.clock.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
     fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>) {
         match config {
             Some(config) => {

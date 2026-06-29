@@ -12,6 +12,7 @@ pub mod fanout;
 pub mod fork;
 pub mod jitter;
 pub mod leg;
+pub mod mixer;
 pub mod player;
 pub mod rtcp;
 pub mod rtp;

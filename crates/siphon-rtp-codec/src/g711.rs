@@ -256,6 +256,10 @@ impl Encoder for G711 {
         }
         Ok(pcm.len())
     }
+
+    fn is_stateless(&self) -> bool {
+        true // each sample maps through a fixed LUT — no inter-frame state
+    }
 }
 
 #[cfg(test)]

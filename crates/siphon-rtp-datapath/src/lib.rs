@@ -300,6 +300,13 @@ pub trait Datapath: Send + Sync {
     /// layer 6).
     fn last_activity(&self, endpoint: EndpointId) -> Option<u64>;
 
+    /// Stamp `endpoint`'s activity at the current logical tick. The `Forward` fast path stamps
+    /// activity itself (it sees every accepted packet), but a `Redirect`-path consumer (SRTP bridge,
+    /// media actor, conference) accepts packets in userspace, so it calls this after its own
+    /// signalled-source gate to keep the media-timeout sweep accurate. Default no-op for backends that
+    /// do not track activity.
+    fn note_activity(&self, _endpoint: EndpointId) {}
+
     /// Install (or clear with `None`) ICE-lite credentials for an endpoint, enabling the datapath to
     /// answer STUN connectivity checks on it and adopt the validated source (RFC 8445, layer 4).
     fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>);
