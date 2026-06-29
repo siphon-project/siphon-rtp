@@ -596,7 +596,8 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         }
         // Syn_filt(p_Aq, M, &exc[i_subfr], error+M, L_SUBFR, error, 0)
         {
-            let exc_slice: Vec<i16> = old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR].to_vec();
+            let mut exc_slice = [0i16; L_SUBFR];
+            exc_slice.copy_from_slice(&old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR]);
             let mut mem = [0i16; M];
             mem.copy_from_slice(&error[..M]);
             let mut out = [0i16; L_SUBFR];
@@ -627,7 +628,8 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
             weight_a(&a[p_a..p_a + M + 1], &mut ap, GAMMA1, M);
             // Syn_filt(Ap, M, code+M, code+M, L_SUBFR/2, code, 0): mem=code[0..M]
             {
-                let inp: Vec<i16> = code[M..M + L_SUBFR / 2].to_vec();
+                let mut inp = [0i16; L_SUBFR / 2];
+                inp.copy_from_slice(&code[M..M + L_SUBFR / 2]);
                 let mut mem = [0i16; M];
                 mem.copy_from_slice(&code[..M]);
                 let mut out = [0i16; L_SUBFR / 2];
@@ -909,7 +911,8 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
 
         // Syn_filt to update mem_syn
         {
-            let exc_slice: Vec<i16> = old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR].to_vec();
+            let mut exc_slice = [0i16; L_SUBFR];
+            exc_slice.copy_from_slice(&old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR]);
             let mut synth = [0i16; L_SUBFR];
             syn_filt(&aq[p_aq..p_aq + M + 1], M, &exc_slice, &mut synth, L_SUBFR, &mut state.mem_syn, true);
         }

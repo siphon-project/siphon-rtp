@@ -367,8 +367,13 @@ pub fn preemph2(x: &mut [i16], mu: i16, lg: usize, mem: &mut i16) {
 /// LPC synthesis `1/A(z)` (`syn_filt.c` `Syn_filt`). `mem[m]` is the carried state. `x`/`y` are `lg`
 /// long. When `update` the new state is written back to `mem`.
 pub fn syn_filt(a: &[i16], m: usize, x: &[i16], y: &mut [i16], lg: usize, mem: &mut [i16], update: bool) {
-    // y_buf = [mem(m)] ++ [output(lg)]
-    let mut y_buf = vec![0i16; m + lg];
+    // y_buf = [mem(m)] ++ [output(lg)]. The encoder/decoder only ever call this with m <= M and
+    // lg <= L_SUBFR, so a fixed M+L_SUBFR stack scratch avoids a per-call heap allocation on the
+    // hot path (caller-owned buffers; zero per-frame heap is a project invariant).
+    const LPC_ORDER: usize = 16; // AMR-WB `M`
+    const Y_BUF_MAX: usize = LPC_ORDER + L_SUBFR;
+    debug_assert!(m + lg <= Y_BUF_MAX, "syn_filt y_buf overflow: m={m} lg={lg}");
+    let mut y_buf = [0i16; Y_BUF_MAX];
     y_buf[..m].copy_from_slice(&mem[..m]);
 
     let s = sub(norm_s(a[0]), 2);

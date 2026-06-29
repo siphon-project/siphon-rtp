@@ -696,7 +696,11 @@ pub fn qpisf_2s_36b(
         }
     }
 
-    dpisf_2s_36b(indice, isf_q, past_isfq, &isf_q.to_vec(), isf_buf, false, true);
+    // dpisf reads the pre-quantization isf while writing isf_q in place; snapshot it on the stack
+    // (M words, once per frame) instead of a heap to_vec to keep the hot path allocation-free.
+    let mut isf_in = [0i16; M];
+    isf_in[..isf_q.len()].copy_from_slice(isf_q);
+    dpisf_2s_36b(indice, isf_q, past_isfq, &isf_in[..isf_q.len()], isf_buf, false, true);
 }
 
 /// 46-bit ISF quantizer (`qpisf_2s.c` `Qpisf_2s_46b`). Writes 7 indices to `indice[0..7]`.
@@ -760,7 +764,9 @@ pub fn qpisf_2s_46b(
         }
     }
 
-    dpisf_2s_46b(indice, isf_q, past_isfq, &isf_q.to_vec(), isf_buf, false, true);
+    let mut isf_in = [0i16; M];
+    isf_in[..isf_q.len()].copy_from_slice(isf_q);
+    dpisf_2s_46b(indice, isf_q, past_isfq, &isf_in[..isf_q.len()], isf_buf, false, true);
 }
 
 #[cfg(test)]
