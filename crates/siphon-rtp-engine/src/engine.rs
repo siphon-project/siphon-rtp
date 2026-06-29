@@ -31,7 +31,9 @@ use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 
 use crate::ice::{self, IceCredentials};
-use crate::media_pipeline::{DirectionConfig, MediaCall, MediaControl, MediaRegistry};
+use crate::media_pipeline::{
+    DirectionConfig, MediaCall, MediaControl, MediaRegistry, RawTee, RelayConfig,
+};
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, SecurityAdvertisement};
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
@@ -39,7 +41,6 @@ use crate::ws_bridge::WsRegistry;
 
 use siphon_rtp_media::bridge::protocol::{Direction as WsDirection, MediaFormat};
 use siphon_rtp_media::bridge::{run_bridge, BridgeSession};
-use siphon_rtp_media::fork::RtpForkSink;
 use siphon_rtp_media::jitter::JitterBuffer;
 use siphon_rtp_media::leg::MediaLeg;
 
@@ -100,30 +101,28 @@ struct Call {
     relay_flows: Vec<(EndpointId, FlowAction)>,
 }
 
-/// A SIPREC / monitor media subscription on a media-processing call (RFC 7866): one source leg's
-/// decoded audio is re-encoded toward a send-only subscriber (a Session Recording Server, SRS).
+/// A SIPREC / monitor media subscription (RFC 7866): one or more source legs' **raw ingress RTP** is
+/// tee'd byte-for-byte toward a send-only subscriber (a Session Recording Server, SRS). Unlike a
+/// re-encode fork, the raw tee carries each leg's negotiated codec verbatim — so it works on a plain
+/// G.711 relay and on a codec the engine has no encoder for (AMR-WB), with no transcode.
 ///
 /// `subscribe_request` allocates the subscriber endpoint and records the subscription as *pending*
-/// (no `srs_rtp`, no `drain_task`) — media cannot flow until `subscribe_answer` brings the SRS's
-/// address. `subscribe_answer` attaches the fork to the [`MediaCall`] and spawns the drain task.
-/// The subscriber is **send-only** (engine → SRS): the engine never opens a Forward/Redirect flow on
-/// `subscriber_endpoint`, so it accepts no inbound media (RTPBleed has no surface here).
+/// (no `srs_rtp`, no installed tee) — media cannot flow until `subscribe_answer` brings the SRS's
+/// address. `subscribe_answer` installs a raw tee on each tapped leg of the call's [`MediaCall`]. The
+/// subscriber is **send-only** (engine → SRS): the engine never opens a Forward/Redirect flow on
+/// `subscriber_endpoint`, so it accepts no inbound media (RTPBleed has no surface here — §4).
 struct Subscription {
     /// The subscription identity returned to the controller as the UAS to-tag.
     subscription_id: String,
-    /// Which source leg is forked: `true` ⇒ leg A's decoded audio, `false` ⇒ leg B's. Mirrors
-    /// [`crate::media_pipeline::MediaControl::AddFork`]'s `source_a`.
-    source_a: bool,
-    /// The engine endpoint the forked RTP is transmitted from (send-only toward the SRS).
+    /// Which source legs are tee'd: each entry is a leg selector (`true` ⇒ leg A, `false` ⇒ leg B).
+    /// More than one entry is an MPTY subscription (each named leg is a separate tap into this one
+    /// subscriber). Mirrors [`crate::media_pipeline::MediaControl::AddRawTee`]'s `source_a`.
+    taps: Vec<bool>,
+    /// The engine endpoint the tee'd RTP is transmitted from (send-only toward the SRS).
     subscriber_endpoint: Endpoint,
-    /// The fork codec (the source leg's negotiated codec, or a trivially-available transcode target).
-    codec: CodecSpec,
     /// The SRS's RTP address, learned from `subscribe_answer`. `None` while the subscription is
     /// pending (offered but not yet answered) — no media flows until it is known.
     srs_rtp: Option<std::net::SocketAddr>,
-    /// The drain task pumping the fork's output channel to the datapath; spawned at answer, aborted on
-    /// unsubscribe / teardown. `None` while pending.
-    drain_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// How a call's media is carried once answered. The resolver picks this from the profile + the two
@@ -604,6 +603,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // A jitter buffer shallow enough for low-latency voice-AI (target 1, cap 16 — the bridge
         // pops one frame per ptime tick, the consumer's cadence being the sample-tick clock).
+        // The WS uplink PCM is at the codec's *native* sample rate (what the decoder emits), which is
+        // not the RTP clock for G.722 (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2). Capture it
+        // before the decoder is moved into the leg.
+        let bridge_pcm_rate = decoder.params().sample_rate_hz;
         let leg = MediaLeg::new(
             decoder,
             encoder,
@@ -611,10 +614,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             random_ssrc(),
             codec.payload_type,
         );
-        // The WS media format advertised in `start`: L16 at A's clock rate, mono, little-endian.
+        // The WS media format advertised in `start`: L16 at the leg's native PCM rate, mono, LE.
         let format = MediaFormat {
             encoding: siphon_rtp_media::bridge::protocol::Encoding::L16,
-            sample_rate: codec.clock_rate_hz,
+            sample_rate: bridge_pcm_rate,
             channels: 1,
             bit_depth: 16,
             endianness: siphon_rtp_media::bridge::protocol::Endianness::Little,
@@ -1118,7 +1121,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
-        if self.media.control(call_id, MediaControl::Silence(silence)) {
+        // Silence synthesizes comfort noise in the egress codec — a transcoding call only. A promoted
+        // relay-only call (SIPREC on a passthrough relay) forwards opaque payloads and cannot.
+        if self.media.is_transcoding_call(call_id)
+            && self.media.control(call_id, MediaControl::Silence(silence))
+        {
             ok_empty()
         } else {
             error_result(
@@ -1151,7 +1158,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         else {
             return unknown_call(call_id);
         };
-        if !self.media.is_media_call(call_id) {
+        if !self.media.is_transcoding_call(call_id) {
             return error_result(
                 "play_media",
                 &"requires a media-processing call (transcode/record/stream)",
@@ -1214,7 +1221,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         else {
             return unknown_call(call_id);
         };
-        if !self.media.is_media_call(call_id) {
+        if !self.media.is_transcoding_call(call_id) {
             return error_result("play_dtmf", &"requires a media-processing call");
         }
         let Some(digit) = code.chars().next() else {
@@ -1241,17 +1248,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// SIPREC / monitor `subscribe_request` (RFC 7866): the engine **offers** one source leg's media
-    /// to a send-only subscriber (a Session Recording Server). It picks the source leg from
-    /// `from_tags[0]`, allocates one subscriber endpoint, chooses the fork codec (the source leg's
-    /// negotiated codec, or a trivially-available `profile.transport_protocol` is not consulted for
-    /// codec here — only the source codec / a static-PT transcode target), records a *pending*
-    /// subscription, and returns an SDP offer advertising the engine's subscriber endpoint + that
-    /// codec. No media flows until `subscribe_answer` brings the SRS's address.
+    /// SIPREC / monitor `subscribe_request` (RFC 7866): the engine **offers** one or more source
+    /// legs' media to a send-only subscriber (a Session Recording Server, SRS). It resolves the source
+    /// legs from `from_tags` (an MPTY subscription taps every named leg), allocates one subscriber
+    /// endpoint, advertises the (first) source leg's negotiated codec in the offer's `a=rtpmap`
+    /// (RFC 4566 §6) with `a=sendonly` (RFC 3264 §5.1), records a *pending* subscription, and returns
+    /// the offer. No media flows until `subscribe_answer` brings the SRS's address.
     ///
-    /// v1 limitations: forking requires a **media-processing call** (decoded PCM is the fork source);
-    /// a passthrough/SRTP/WS call is rejected (promotion is out of scope). Only one source leg is
-    /// forked per request — extra `from_tags` are ignored (and noted).
+    /// The tee copies the source leg's **original ingress RTP byte-for-byte** — its negotiated codec,
+    /// no re-encode — so it works on **any** call: a plain G.711 relay, a transcoding call, and a
+    /// codec the engine cannot encode (AMR-WB). A plain passthrough relay (the in-kernel `Forward`
+    /// fast path) is **promoted** to userspace here so the tee has somewhere to attach; a secure
+    /// (SRTP-bridge) or WS-bridge call cannot be tee'd yet and is rejected.
+    ///
+    /// MPTY: each named leg becomes a separate tap into the one subscription. A true N-way *mix* into
+    /// a single stream is a later feature — for now the SRS receives each leg's stream interleaved on
+    /// the one subscriber endpoint (distinguishable by SSRC, RFC 3550).
     async fn subscribe_request(
         &self,
         client: ClientId,
@@ -1268,59 +1280,66 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 &"SDP-offer-from-subscriber is not supported (the engine offers; send sdp: null)",
             );
         }
-        let Some((call_from, call_to)) =
-            self.owned_call(client, call_id, |call| (call.from_tag.clone(), call.to_tag.clone()))
+        // Snapshot the leg identity/codecs/pipeline under the ownership guard (A3 — docs §5).
+        let Some((call_to, near_codec, far_codec, pipeline)) =
+            self.owned_call(client, call_id, |call| {
+                (
+                    call.to_tag.clone(),
+                    call.near_codec.clone(),
+                    call.far_codec.clone(),
+                    call.pipeline,
+                )
+            })
         else {
             return unknown_call(call_id);
         };
-        // Forking re-encodes a leg's decoded PCM, so it needs the media slow path. A plain
-        // passthrough / SRTP / WS call has no decoded audio to tap — reject (do not promote it).
-        if !self.media.is_media_call(call_id) {
+        // A secure (SRTP-bridge) or WS-bridge leg cannot be raw-tee'd: the on-the-wire bytes are
+        // encrypted / off to a WS server, not the leg's clear negotiated codec. Reject clearly.
+        if matches!(pipeline, PipelineKind::Srtp | PipelineKind::Ws) {
             return error_result(
                 "subscribe_request",
-                &"requires a media-processing (transcode/record) call; \
-                  a passthrough/SRTP/WS call cannot be forked in v1",
+                &"SIPREC on a secure (SRTP) or WebSocket-bridged call is not supported yet",
             );
         }
-        if from_tags.len() > 1 {
-            tracing::warn!(
-                call_id,
-                requested = from_tags.len(),
-                "subscribe_request: only the first from_tag is forked in v1; the rest are ignored"
-            );
-        }
-        // Pick the source leg from `from_tags[0]`: the call's `from_tag` ⇒ leg A, the `to_tag` ⇒ leg
-        // B, default A. `source_a` is the [`MediaControl::AddFork`] selector.
-        let source_a = match from_tags.first() {
-            Some(tag) if matches!(call_to.as_deref(), Some(to_tag) if to_tag == tag) => false,
-            Some(tag) if *tag == call_from => true,
-            _ => true,
+
+        // Resolve each named leg to a tap selector (`true` ⇒ leg A, `false` ⇒ leg B). An empty
+        // `from_tags` defaults to leg A. Duplicate / unknown tags collapse to leg A (the offerer).
+        let taps: Vec<bool> = if from_tags.is_empty() {
+            vec![true]
+        } else {
+            let mut taps = Vec::with_capacity(from_tags.len());
+            for tag in from_tags {
+                // The call's to_tag ⇒ leg B; anything else (the from_tag, or unknown) ⇒ leg A.
+                let source_a = !matches!(call_to.as_deref(), Some(to_tag) if to_tag == *tag);
+                if !taps.contains(&source_a) {
+                    taps.push(source_a);
+                }
+            }
+            taps
         };
 
-        // The fork codec = the source leg's negotiated codec. (A `profile`-named transcode target is
-        // only adopted when trivially available; for v1 we reuse the source codec — the simplest,
-        // always-buildable choice.)
-        let Some(codec) = self.owned_call(client, call_id, |call| {
-            if source_a {
-                call.near_codec.clone()
-            } else {
-                call.far_codec.clone()
-            }
-        }) else {
-            return unknown_call(call_id);
+        // The codec advertised in the offer = the (first tapped) source leg's negotiated codec.
+        let first_tap_source_a = taps.first().copied().unwrap_or(true);
+        let codec = if first_tap_source_a {
+            near_codec
+        } else {
+            far_codec
         };
         let Some(codec) = codec else {
             return error_result(
                 "subscribe_request",
-                &"the source leg has no negotiated codec to fork",
+                &"the source leg has no negotiated codec to advertise",
             );
         };
-        // The engine can only build an SDP/encoder for codecs it implements; fail early otherwise.
-        if factory::encoder_for(&codec).is_err() {
-            return error_result(
-                "subscribe_request",
-                &format!("fork codec {} is not implemented", codec.encoding_name),
-            );
+
+        // Promote a plain passthrough relay to userspace so the tee has an actor to attach to.
+        // Idempotent across subscriptions on the same call: a second subscribe finds it already a
+        // media call and skips. On a call that already runs in the media slow path (transcode/record)
+        // this is a no-op.
+        if pipeline == PipelineKind::Passthrough && !self.media.is_media_call(call_id) {
+            if let Err(reason) = self.promote_passthrough(call_id).await {
+                return error_result("subscribe_request: promote relay", &reason);
+            }
         }
 
         // Allocate the single send-only subscriber endpoint.
@@ -1338,11 +1357,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .or_default()
             .push(Subscription {
                 subscription_id: subscription_id.clone(),
-                source_a,
+                taps,
                 subscriber_endpoint,
-                codec,
                 srs_rtp: None,
-                drain_task: None,
             });
 
         CmdResult::Ok {
@@ -1353,10 +1370,108 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Promote a plain passthrough relay (the in-kernel `FlowAction::Forward` fast path) to a
+    /// userspace **relay-only** [`MediaCall`], so a SIPREC raw tee has an actor to attach to. The
+    /// in-kernel `Forward` path has no userspace tap; here we switch each RTP endpoint from `Forward`
+    /// to `Redirect`, and run a lightweight raw relay that re-enforces the exact same source gate +
+    /// symmetric latch the `Forward` rule did (RTPBleed defence — `Redirect` bypasses the datapath
+    /// gate, docs/security-and-nat.md §4) and forwards each packet verbatim to the original peer, plus
+    /// the raw tee. Reconstructs both relay directions from the call's stored `relay_flows`.
+    async fn promote_passthrough(&self, call_id: &str) -> Result<(), String> {
+        // Read the two RTP forward rules + leg identity out of the stored relay flows. `relay_flows`
+        // for a passthrough call is [near.rtp, far.rtp, (near.rtcp, far.rtcp)] — we tee/relay only RTP.
+        let Some((from_tag, to_tag, relay_flows)) = self.owned_call_internal(call_id, |call| {
+            (call.from_tag.clone(), call.to_tag.clone(), call.relay_flows.clone())
+        }) else {
+            return Err("call no longer exists".to_string());
+        };
+
+        // The first two entries are the RTP rules (near, then far) — see `answer`'s passthrough arm.
+        let rtp_flows: Vec<(EndpointId, ForwardRule)> = relay_flows
+            .iter()
+            .filter_map(|(endpoint, action)| match action {
+                FlowAction::Forward(rule) => Some((*endpoint, *rule)),
+                _ => None,
+            })
+            .collect();
+        let [(near_endpoint, near_rule), (far_endpoint, far_rule)] = rtp_flows.as_slice()[..2]
+            .try_into()
+            .map_err(|_| "passthrough call has no installed RTP relay flows".to_string())?;
+
+        // `near_rule` is installed on near.rtp: it gates A's source and forwards toward far/out_dst (B).
+        // Build the relay-only directions: A→B forwards out far's endpoint to B; B→A out near's to A.
+        let Some(b_dst) = near_rule.out_dst else {
+            return Err("passthrough relay has no destination toward B".to_string());
+        };
+        let Some(a_dst) = far_rule.out_dst else {
+            return Err("passthrough relay has no destination toward A".to_string());
+        };
+        let a_to_b = RelayConfig {
+            ingress_endpoint: near_endpoint,
+            accepted_source: near_rule.accepted_source,
+            egress_endpoint: near_rule.out_endpoint,
+            egress_dst: b_dst,
+        };
+        let b_to_a = RelayConfig {
+            ingress_endpoint: far_endpoint,
+            accepted_source: far_rule.accepted_source,
+            egress_endpoint: far_rule.out_endpoint,
+            egress_dst: a_dst,
+        };
+        // Latch when either side's policy latches (the passthrough default is SignalledOnly/Symmetric).
+        let latch = near_rule.latch != LatchPolicy::Off || far_rule.latch != LatchPolicy::Off;
+
+        // Switch both RTP endpoints to Redirect so the dispatcher routes them to the media actor.
+        for endpoint in [near_endpoint, far_endpoint] {
+            self.datapath
+                .install_flow(endpoint, FlowAction::Redirect)
+                .map_err(|error| format!("install relay redirect: {error}"))?;
+        }
+        let call = MediaCall::new_relay(call_id.to_string(), from_tag, to_tag, a_to_b, b_to_a, latch);
+        self.media.register(call, self.datapath.clone(), None);
+
+        // Record the promotion on the Call so demotion can restore the in-kernel Forward rules.
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.pipeline = PipelineKind::Media;
+        }
+        Ok(())
+    }
+
+    /// Demote a promoted passthrough relay back to the in-kernel `FlowAction::Forward` fast path once
+    /// its last SIPREC subscription is gone: deregister the relay-only [`MediaCall`] actor and
+    /// reinstall the stored `Forward` rules (the same ones promotion redirected away from). Best-effort
+    /// — on any install error the call is left redirected (still relaying through the actor), which is
+    /// correct if slower, and logged.
+    async fn demote_to_passthrough(&self, call_id: &str) {
+        let Some(relay_flows) =
+            self.owned_call_internal(call_id, |call| call.relay_flows.clone())
+        else {
+            return;
+        };
+        // Tear down the relay-only actor (drops its routes), then restore the kernel Forward rules.
+        self.media.deregister(call_id);
+        for (endpoint, action) in &relay_flows {
+            if let Err(error) = self.datapath.install_flow(*endpoint, *action) {
+                tracing::warn!(%error, call_id, "demote: failed to reinstall Forward rule; leg stays redirected");
+                return;
+            }
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.pipeline = PipelineKind::Passthrough;
+        }
+    }
+
+    /// Run `f` against a call by id without an ownership check (an internal helper for promotion /
+    /// demotion, which already validated ownership via the public verb). Returns `None` if unknown.
+    fn owned_call_internal<T>(&self, call_id: &str, f: impl FnOnce(&Call) -> T) -> Option<T> {
+        self.calls.get(call_id).map(|call| f(&call))
+    }
+
     /// SIPREC `subscribe_answer` (RFC 7866): the SRS's answer brings its RTP address. Parse it, then
-    /// attach an [`RtpForkSink`] on the chosen source leg's direction and spawn the drain task that
-    /// pumps the fork's RTP out the subscriber endpoint toward the SRS. The subscriber is send-only —
-    /// the engine installs no inbound flow on `subscriber_endpoint`, so no RTPBleed surface exists.
+    /// install a raw-RTP tee on each tapped source leg of the call's [`MediaCall`], copying the leg's
+    /// original ingress RTP byte-for-byte out the subscriber endpoint toward the SRS. The subscriber is
+    /// send-only — the engine installs no inbound flow on `subscriber_endpoint`, so no RTPBleed surface
+    /// exists (docs/security-and-nat.md §4).
     async fn subscribe_answer(
         &self,
         client: ClientId,
@@ -1376,8 +1491,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let srs_rtp = info.remote_rtp;
 
-        // Locate the pending subscription named by `to_tag`, build its fork, and spawn its drain.
-        let (source_a, subscriber_endpoint, codec) = {
+        // Locate the pending subscription named by `to_tag` and read its taps + subscriber endpoint.
+        let (taps, subscriber_endpoint) = {
             let Some(subscriptions) = self.subscriptions.get(call_id) else {
                 return error_result("subscribe_answer", &"no subscription for this call");
             };
@@ -1390,61 +1505,46 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if subscription.srs_rtp.is_some() {
                 return error_result("subscribe_answer", &"subscription is already answered");
             }
-            (
-                subscription.source_a,
-                subscription.subscriber_endpoint,
-                subscription.codec.clone(),
-            )
+            (subscription.taps.clone(), subscription.subscriber_endpoint)
         };
 
-        // Build the fork's encoder + output channel. The drain task owns the receiver and forwards
-        // each re-encoded RTP packet out the subscriber endpoint toward the SRS (send-only).
-        let encoder = match factory::encoder_for(&codec) {
-            Ok(encoder) => encoder,
-            Err(error) => return error_result("subscribe_answer: fork encoder", &error),
+        // Install a raw tee on each tapped leg of the running media actor (no encoder — the leg's
+        // original ingress RTP is copied byte-for-byte toward the SRS, RFC 7866 §6). If the actor is
+        // gone (call torn down between the ownership check and here), free the endpoint and report it.
+        let tee = RawTee {
+            subscriber_endpoint: subscriber_endpoint.id,
+            srs_dst: srs_rtp,
         };
-        let (fork_sender, fork_receiver) = flume::bounded::<bytes::Bytes>(1024);
-        let sink = RtpForkSink::new(encoder, fork_sender, random_ssrc(), codec.payload_type);
-
-        // Attach the fork to the running media actor. If the actor is gone (call torn down between the
-        // ownership check and here), free the endpoint and report the call unknown.
-        if !self
-            .media
-            .control(call_id, MediaControl::AddFork {
-                source_a,
-                sink: Box::new(sink),
-            })
-        {
+        let mut attached = false;
+        for source_a in &taps {
+            if self.media.control(call_id, MediaControl::AddRawTee {
+                source_a: *source_a,
+                tee,
+            }) {
+                attached = true;
+            }
+        }
+        if !attached {
             self.datapath.remove_endpoint(subscriber_endpoint.id).await;
             return error_result("subscribe_answer", &"media call is no longer active");
         }
 
-        // The drain: forward each forked RTP packet out the subscriber endpoint toward the SRS.
-        let datapath = self.datapath.clone();
-        let drain_endpoint = subscriber_endpoint.id;
-        let drain_task = tokio::spawn(async move {
-            while let Ok(packet) = fork_receiver.recv_async().await {
-                if let Err(error) = datapath.send(drain_endpoint, srs_rtp, &packet).await {
-                    tracing::debug!(%error, "subscribe fork send failed");
-                }
-            }
-        });
-
-        // Record the now-active subscription (address + drain task) for unsubscribe / teardown.
+        // Record the now-active subscription (the SRS address) for unsubscribe / teardown.
         if let Some(mut subscriptions) = self.subscriptions.get_mut(call_id) {
             if let Some(subscription) = subscriptions
                 .iter_mut()
                 .find(|subscription| subscription.subscription_id == to_tag)
             {
                 subscription.srs_rtp = Some(srs_rtp);
-                subscription.drain_task = Some(drain_task);
             }
         }
         ok_empty()
     }
 
-    /// SIPREC `unsubscribe` (RFC 7866): detach the fork from the media actor, abort its drain task,
-    /// free the subscriber endpoint, and drop the subscription record. Only the owning client may.
+    /// SIPREC `unsubscribe` (RFC 7866): detach the raw tee from every tapped leg of the media actor,
+    /// free the subscriber endpoint, drop the subscription record, and — if this was the last
+    /// subscription on a promoted passthrough relay — demote the call back to the in-kernel `Forward`
+    /// fast path. Only the owning client may.
     async fn unsubscribe(
         &self,
         client: ClientId,
@@ -1455,8 +1555,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
-        // Remove the named subscription from the call's list (drop the empty list when none remain).
-        let removed = {
+        // Remove the named subscription from the call's list, noting whether the list is now empty.
+        let (removed, none_remain) = {
             let Some(mut subscriptions) = self.subscriptions.get_mut(call_id) else {
                 return error_result("unsubscribe", &"no subscription for this call");
             };
@@ -1466,30 +1566,38 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             else {
                 return error_result("unsubscribe", &format!("unknown subscription {to_tag}"));
             };
-            subscriptions.remove(position)
+            let removed = subscriptions.remove(position);
+            (removed, subscriptions.is_empty())
         };
         self.subscriptions.remove_if(call_id, |_, list| list.is_empty());
         self.detach_subscription(call_id, removed).await;
+        // Once no subscription remains on a relay we promoted for SIPREC, demote it back to the
+        // in-kernel Forward fast path (the relay leg keeps flowing throughout). `is_relay_call` keeps
+        // this scoped to promoted passthrough relays — a genuine transcoding call is never demoted.
+        if none_remain && self.media.is_relay_call(call_id) {
+            self.demote_to_passthrough(call_id).await;
+        }
         ok_empty()
     }
 
-    /// Tear one subscription down: detach its fork (if attached), abort its drain task, and free its
-    /// subscriber endpoint. Shared by `unsubscribe` and call teardown.
+    /// Tear one subscription down: remove its raw tee from every tapped leg (if the actor is still
+    /// alive) and free its subscriber endpoint. Shared by `unsubscribe` and call teardown. (No drain
+    /// task to abort — the raw tee emits through the actor's own send path.)
     async fn detach_subscription(&self, call_id: &str, subscription: Subscription) {
-        // Detach the fork from the actor (best-effort: the actor may already be gone on teardown).
-        self.media.control(call_id, MediaControl::RemoveFork {
-            source_a: subscription.source_a,
-        });
-        if let Some(task) = subscription.drain_task {
-            task.abort();
+        for source_a in &subscription.taps {
+            self.media.control(call_id, MediaControl::RemoveRawTee {
+                source_a: *source_a,
+                subscriber_endpoint: subscription.subscriber_endpoint.id,
+            });
         }
         self.datapath
             .remove_endpoint(subscription.subscriber_endpoint.id)
             .await;
     }
 
-    /// Free every subscription on a call (delete / reap / half-built teardown). Detaches each fork,
-    /// aborts its drain, and frees its subscriber endpoint.
+    /// Free every subscription on a call (delete / reap / half-built teardown). Detaches each tee and
+    /// frees its subscriber endpoint. (No demotion here — the whole call, including any promoted relay
+    /// actor, is being torn down by the caller.)
     async fn drop_subscriptions(&self, call_id: &str) {
         if let Some((_, subscriptions)) = self.subscriptions.remove(call_id) {
             for subscription in subscriptions {
@@ -1670,7 +1778,10 @@ fn build_direction(
 ) -> Result<DirectionConfig, String> {
     let decoder = factory::decoder_for(ingress_codec).map_err(|error| error.to_string())?;
     let encoder = factory::encoder_for(egress_codec).map_err(|error| error.to_string())?;
-    let recorder = record_path.map(|_| WavRecorder::new(ingress_codec.clock_rate_hz, 1));
+    // Record at the codec's *native* PCM rate (what the decoder emits), not the RTP clock — they
+    // differ for G.722 (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2), and a clock-rate WAV header
+    // would replay the recording at the wrong pitch.
+    let recorder = record_path.map(|_| WavRecorder::new(decoder.params().sample_rate_hz, 1));
     Ok(DirectionConfig {
         ingress_endpoint,
         accepted_source,
@@ -2149,15 +2260,15 @@ mod tests {
             .await;
         assert!(matches!(answered, CmdResult::Ok { .. }), "subscribe_answer ok: {answered:?}");
 
-        // A sends µ-law RTP through the engine; B gets the A-law transcode AND the SRS gets forked RTP.
+        // A sends µ-law RTP through the engine; B gets the A-law transcode AND the SRS gets leg A's
+        // RAW ingress RTP byte-for-byte (the raw tee, not a re-encode): same SSRC, sequence, payload.
         let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
         phone_a.send_to(&from_a, near_addr).await.expect("a send");
-        let (_to_b, _) = recv(&phone_b).await; // the normal transcoded leg is undisturbed
+        let (to_b, _) = recv(&phone_b).await; // the normal transcoded leg is undisturbed
         let (forked, from) = recv(&srs).await;
         assert_eq!(from, offer_info.remote_rtp, "fork leaves the engine's subscriber port");
-        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&forked).expect("parse forked rtp");
-        assert_eq!(parsed.payload_type, 0, "SRS receives leg A's codec (µ-law, PT 0)");
-        assert_eq!(parsed.payload.len(), 160);
+        assert_eq!(forked, from_a, "SRS receives leg A's ORIGINAL RTP byte-for-byte (raw tee)");
+        assert_ne!(to_b, from_a, "B still gets the genuinely transcoded A-law stream");
 
         // unsubscribe: the fork stops; A's media still transcodes to B.
         let unsubscribed = engine
@@ -2194,8 +2305,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn siprec_subscription_is_freed_when_the_parent_call_is_deleted() {
-        // A subscription left open at delete must be torn down with the call (forks detached, drain
-        // aborted, subscriber port freed) — no orphaned task or leaked endpoint.
+        // A subscription left open at delete must be torn down with the call (raw tees detached,
+        // subscriber port freed) — no orphaned task or leaked endpoint.
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
@@ -2254,6 +2365,168 @@ mod tests {
             .await;
         assert!(matches!(deleted, CmdResult::Ok { .. }));
         assert_eq!(engine.session_count(), 0, "the call drained from the registry");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn siprec_subscribe_forks_a_plain_passthrough_relay_to_an_srs() {
+        // The headline: SIPREC on a PLAIN G.711 RELAY (same codec both sides → Passthrough, the
+        // in-kernel Forward fast path). subscribe_request promotes the relay to userspace, the raw tee
+        // copies leg A's ORIGINAL RTP to the SRS byte-for-byte (no re-encode), AND the original peer B
+        // keeps receiving the relayed RTP. Then unsubscribe stops the SRS feed (B still flows) and
+        // demotes back to the kernel path; delete tears it down.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        let (srs, srs_addr) = phone().await;
+
+        // A offers PCMU, B answers PCMU → same codec → a plain Passthrough relay (no media actor).
+        let offer = engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "siprec-relay".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            })
+            .await;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply").remote_rtp;
+        let answer = engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "siprec-relay".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                profile: Default::default(),
+            })
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer)).expect("answer reply").remote_rtp;
+        assert!(!engine.media().is_media_call("siprec-relay"), "a plain relay has no media actor");
+
+        // subscribe_request: the engine offers leg A's media + promotes the relay to userspace.
+        let subscribe = engine
+            .handle(CLIENT, Command::SubscribeRequest {
+                call_id: "siprec-relay".into(),
+                from_tags: vec!["tag-a".into()],
+                sdp: None,
+                profile: Default::default(),
+            })
+            .await;
+        let (offer_sdp, subscription_tag) = match subscribe {
+            CmdResult::Ok { sdp: Some(sdp), to_tag: Some(to_tag), .. } => (sdp, to_tag),
+            other => panic!("expected an SDP offer + to_tag, got {other:?}"),
+        };
+        let offer_info = sdp::parse(&offer_sdp).expect("parse subscriber offer");
+        assert_eq!(
+            offer_info.primary_codec().expect("codec").encoding_name,
+            "PCMU",
+            "offer advertises the source leg's actual codec (RFC 4566)"
+        );
+        assert!(offer_sdp.contains("a=sendonly"), "subscriber stream is send-only (RFC 3264)");
+        assert!(engine.media().is_relay_call("siprec-relay"), "the relay was promoted to userspace");
+
+        // subscribe_answer: the SRS answers with its media address; the raw tee attaches to leg A.
+        let answered = engine
+            .handle(CLIENT, Command::SubscribeAnswer {
+                call_id: "siprec-relay".into(),
+                from_tag: "tag-a".into(),
+                to_tag: subscription_tag.clone(),
+                sdp: sdp_single_codec(srs_addr, 0, "PCMU"),
+                profile: Default::default(),
+            })
+            .await;
+        assert!(matches!(answered, CmdResult::Ok { .. }), "subscribe_answer ok: {answered:?}");
+
+        // A sends RTP: (1) B still receives the relayed RTP, (2) the SRS receives the byte-identical
+        // original RTP (raw tee, not re-encoded).
+        let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
+        phone_a.send_to(&from_a, near_addr).await.expect("a send");
+        let (to_b, from_b_engine) = recv(&phone_b).await;
+        assert_eq!(from_b_engine, far_addr, "B's media leaves the engine's far port");
+        assert_eq!(to_b, from_a, "B still receives the relayed RTP verbatim");
+        let (forked, from) = recv(&srs).await;
+        assert_eq!(from, offer_info.remote_rtp, "tee leaves the engine's subscriber port");
+        assert_eq!(forked, from_a, "SRS receives leg A's ORIGINAL RTP byte-for-byte (raw tee)");
+
+        // unsubscribe: the SRS feed stops; B still flows; the call demotes back to the kernel path.
+        let unsubscribed = engine
+            .handle(CLIENT, Command::Unsubscribe {
+                call_id: "siprec-relay".into(),
+                from_tag: "tag-a".into(),
+                to_tag: subscription_tag,
+            })
+            .await;
+        assert!(matches!(unsubscribed, CmdResult::Ok { .. }));
+        assert!(!engine.media().is_media_call("siprec-relay"), "demoted: no media actor remains");
+
+        let mut drain = [0u8; 2048];
+        while srs.try_recv_from(&mut drain).is_ok() {}
+        phone_a.send_to(&g711_rtp(0, 101, 0x0A0A_0A0A, 0xFF), near_addr).await.expect("a send");
+        let (to_b_again, _) = recv(&phone_b).await; // B still relays after demotion
+        assert_eq!(to_b_again, g711_rtp(0, 101, 0x0A0A_0A0A, 0xFF), "B keeps relaying post-demote");
+        let mut scratch = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(200), srs.recv_from(&mut scratch)).await.is_err(),
+            "no more tee'd packets reach the SRS after unsubscribe"
+        );
+
+        let deleted = engine
+            .handle(CLIENT, Command::Delete {
+                call_id: "siprec-relay".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            })
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+        assert_eq!(engine.session_count(), 0, "the call drained from the registry");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_request_rejects_a_secure_call() {
+        // SIPREC on an SRTP-bridge leg is not supported (the wire bytes are ciphertext, not the leg's
+        // clear codec) — subscribe_request must reject it clearly rather than tee garbage.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), None));
+
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        let profile = ProfileFlags {
+            transport_protocol: Some("RTP/SAVP".into()),
+            ..Default::default()
+        };
+        engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "savp-siprec".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile,
+            })
+            .await;
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "savp-siprec".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: savp_answer_sdp(addr_b, &b_key),
+                profile: ProfileFlags::default(),
+            })
+            .await;
+
+        let result = engine
+            .handle(CLIENT, Command::SubscribeRequest {
+                call_id: "savp-siprec".into(),
+                from_tags: vec!["tag-a".into()],
+                sdp: None,
+                profile: Default::default(),
+            })
+            .await;
+        assert!(matches!(result, CmdResult::Error { .. }), "SIPREC on a secure call is rejected");
     }
 
     /// A µ-law (PCMU, PT 0) RTP packet: a 160-sample / 20 ms frame carrying `payload_byte`.
@@ -2733,8 +3006,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_request_on_a_passthrough_call_is_rejected() {
-        // A plain relay (same codec both sides) is not a media-processing call; forking needs decode.
+    async fn subscribe_request_on_a_passthrough_call_promotes_and_offers() {
+        // A plain relay (same codec both sides) IS now subscribable: subscribe_request promotes it to
+        // userspace and returns a send-only SDP offer advertising the source leg's codec (raw tee).
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let (_phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
@@ -2755,6 +3029,7 @@ mod tests {
                 profile: Default::default(),
             })
             .await;
+        assert!(!engine.media().is_media_call("fork-relay"), "starts as a plain relay");
         let result = engine
             .handle(CLIENT, Command::SubscribeRequest {
                 call_id: "fork-relay".into(),
@@ -2764,11 +3039,13 @@ mod tests {
             })
             .await;
         match result {
-            CmdResult::Error { reason } => {
-                assert!(reason.contains("media-processing"), "v1 limitation named: {reason}");
+            CmdResult::Ok { sdp: Some(sdp), to_tag: Some(_), .. } => {
+                assert!(sdp.contains("a=sendonly"), "send-only subscriber offer (RFC 3264)");
+                assert!(sdp.contains("PCMU"), "advertises the source leg's codec (RFC 4566)");
             }
-            other => panic!("expected error, got {other:?}"),
+            other => panic!("expected an SDP offer, got {other:?}"),
         }
+        assert!(engine.media().is_relay_call("fork-relay"), "the relay was promoted to userspace");
     }
 
     #[tokio::test]

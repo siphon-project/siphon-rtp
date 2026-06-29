@@ -63,6 +63,15 @@ pub trait Encoder: Send {
     ///
     /// Errors instead of panicking on a too-small output buffer or wrong input length.
     fn encode(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, CodecError>;
+
+    /// The RTP timestamp clock for this codec, in Hz (RFC 3551 §4.5). Defaults to the native sample
+    /// rate, which is correct for every telephony codec **except G.722**: it samples 16 kHz audio
+    /// but, for historical reasons, clocks its RTP timestamps at 8 kHz (RFC 3551 §4.5.2), so the
+    /// G.722 codec overrides this. The synthesized-egress timestamp step is derived from this rate,
+    /// not from the (possibly different) native sample rate.
+    fn rtp_clock_rate_hz(&self) -> u32 {
+        self.params().sample_rate_hz
+    }
 }
 
 /// Errors produced by codecs.

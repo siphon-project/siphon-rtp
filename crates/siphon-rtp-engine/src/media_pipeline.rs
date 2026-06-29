@@ -54,11 +54,29 @@ pub struct Outbound {
     pub data: Bytes,
 }
 
+/// A SIPREC / monitor raw-RTP tee target on one direction's ingress: the original ingress RTP is
+/// copied verbatim out `subscriber_endpoint` toward `srs_dst` (a Session Recording Server, RFC 7866
+/// §6). The tee carries the source leg's **negotiated codec, byte-for-byte** — no decode/re-encode —
+/// so it works for any codec (G.711, AMR-WB, …) regardless of whether the engine has an encoder for
+/// it. The subscriber is send-only: the engine never installs an inbound flow on `subscriber_endpoint`
+/// (no RTPBleed surface — docs/security-and-nat.md §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawTee {
+    /// The engine endpoint the forked RTP is transmitted from (send-only toward the SRS).
+    pub subscriber_endpoint: EndpointId,
+    /// The SRS's RTP address (from `subscribe_answer`).
+    pub srs_dst: SocketAddr,
+}
+
 /// One direction of a media-processing call: ingress codec → (resample) → egress codec.
 ///
 /// "Direction" means the flow of media from one party toward the other. `a_to_b` decodes party A's
 /// ingress and encodes it for party B; `b_to_a` is the reverse. The egress sequence/timestamp/SSRC
 /// belong to the *synthesized* stream the engine sends to the receiving party.
+///
+/// A direction may run in **relay-only** mode (`relay_only`): it forwards the ingress RTP verbatim to
+/// the peer (no decode/encode), used when a plain passthrough call is promoted to userspace so a
+/// SIPREC raw tee can be added to it. In that mode the codec fields are unused (a no-op G.711 pair).
 pub struct Direction {
     /// The endpoint datagrams arrive on for this direction (the sending party's engine socket).
     ingress_endpoint: EndpointId,
@@ -68,6 +86,12 @@ pub struct Direction {
     egress_endpoint: EndpointId,
     /// Where to transmit (the receiving party's address; latched to its observed source).
     egress_dst: SocketAddr,
+    /// When `true`, forward the ingress RTP verbatim to the peer (no transcode) — a promoted
+    /// passthrough relay. The codec fields below are unused in this mode.
+    relay_only: bool,
+    /// SIPREC / monitor raw-RTP tee targets: each receives the **original ingress RTP** byte-for-byte
+    /// (RFC 7866 §6). Independent of transcode/relay — added/removed by `subscribe_answer`/`unsubscribe`.
+    raw_tee: Vec<RawTee>,
     decoder: Box<dyn Decoder>,
     encoder: Box<dyn Encoder>,
     /// Sample-rate converter when the ingress codec rate differs from the egress codec rate.
@@ -76,8 +100,12 @@ pub struct Direction {
     egress_timestamp: u32,
     egress_ssrc: u32,
     egress_payload_type: u8,
-    /// Egress PCM samples per frame — the timestamp increment for the synthesized stream.
+    /// Egress PCM samples per frame at the codec's *native* rate (sizes the encode work / ptime).
     egress_frame_samples: u32,
+    /// Egress RTP timestamp step per packet, in *RTP-clock* units (ptime × RTP clock ÷ 1000). Equal
+    /// to `egress_frame_samples` for every codec whose RTP clock matches its sample rate, but not for
+    /// G.722 (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2) — there it is half the sample count.
+    egress_timestamp_increment: u32,
     /// Ingress RFC 4733 telephone-event payload type, if negotiated.
     telephone_event_in: Option<u8>,
     /// Egress RFC 4733 telephone-event payload type (what the receiving party expects).
@@ -149,6 +177,15 @@ pub struct DirectionConfig {
     pub recorder: Option<WavRecorder>,
 }
 
+/// Per-direction parameters for a **relay-only** direction (a promoted passthrough leg): just the
+/// ingress gate and where to forward verbatim. No codecs — the RTP is copied untouched.
+pub struct RelayConfig {
+    pub ingress_endpoint: EndpointId,
+    pub accepted_source: SourceFilter,
+    pub egress_endpoint: EndpointId,
+    pub egress_dst: SocketAddr,
+}
+
 impl Direction {
     fn new(config: DirectionConfig) -> Self {
         let ingress_rate = config.decoder.params().sample_rate_hz;
@@ -161,11 +198,24 @@ impl Direction {
             Resampler::new(ingress_rate, egress_rate).ok()
         };
         let egress_frame_samples = egress_params.frame_samples() as u32;
+        // RFC 3551 §4.5.2: the synthesized-egress RTP timestamp advances at the codec's RTP clock,
+        // which is not always the native sample rate — G.722 clocks RTP at 8 kHz while sampling
+        // 16 kHz audio. So the per-packet step is native-samples × RTP-clock ÷ native-rate (= the
+        // 8 kHz / 16 kHz halving for G.722; an identity for every other telephony codec).
+        let egress_rtp_clock = config.encoder.rtp_clock_rate_hz();
+        let egress_timestamp_increment = if egress_rate == 0 {
+            egress_frame_samples
+        } else {
+            ((u64::from(egress_frame_samples) * u64::from(egress_rtp_clock)) / u64::from(egress_rate))
+                as u32
+        };
         Self {
             ingress_endpoint: config.ingress_endpoint,
             accepted_source: config.accepted_source,
             egress_endpoint: config.egress_endpoint,
             egress_dst: config.egress_dst,
+            relay_only: false,
+            raw_tee: Vec::new(),
             decoder: config.decoder,
             encoder: config.encoder,
             resampler,
@@ -174,6 +224,7 @@ impl Direction {
             egress_ssrc: config.egress_ssrc,
             egress_payload_type: config.egress_payload_type,
             egress_frame_samples,
+            egress_timestamp_increment,
             telephone_event_in: config.telephone_event_in,
             telephone_event_out: config.telephone_event_out,
             dtmf: DtmfDetector::new(),
@@ -183,6 +234,54 @@ impl Direction {
             blocked: false,
             egress_sample_rate: egress_rate,
             injection: None,
+        }
+    }
+
+    /// Build a **relay-only** direction: ingress RTP is forwarded verbatim to the peer (no
+    /// decode/encode). Used when a plain passthrough call is promoted to userspace so a SIPREC raw
+    /// tee can be attached. The codec fields are unused; a trivial G.711 µ-law pair stands in so the
+    /// struct is fully constructed (it is never invoked in this mode).
+    fn new_relay(config: RelayConfig) -> Self {
+        Self {
+            ingress_endpoint: config.ingress_endpoint,
+            accepted_source: config.accepted_source,
+            egress_endpoint: config.egress_endpoint,
+            egress_dst: config.egress_dst,
+            relay_only: true,
+            raw_tee: Vec::new(),
+            decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
+            encoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
+            resampler: None,
+            egress_sequence: 0,
+            egress_timestamp: 0,
+            egress_ssrc: 0,
+            egress_payload_type: 0,
+            egress_frame_samples: 0,
+            egress_timestamp_increment: 0,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            dtmf: DtmfDetector::new(),
+            recorder: None,
+            forks: Vec::new(),
+            silenced: false,
+            blocked: false,
+            egress_sample_rate: 0,
+            injection: None,
+        }
+    }
+
+    /// Emit the raw-RTP tee for one accepted ingress datagram: copy the **original ingress bytes**
+    /// verbatim out each subscriber endpoint toward its SRS (SIPREC raw tee — RFC 7866 §6). No
+    /// decode/re-encode, so it carries the source leg's negotiated codec byte-for-byte and works for
+    /// any codec the engine cannot encode (e.g. AMR-WB). Applied to RTP, RTCP, and DTMF alike — the
+    /// SRS receives exactly what the leg sent.
+    fn tee_raw(&self, data: &[u8], out: &mut Vec<Outbound>) {
+        for tee in &self.raw_tee {
+            out.push(Outbound {
+                endpoint: tee.subscriber_endpoint,
+                dst: tee.srs_dst,
+                data: Bytes::copy_from_slice(data),
+            });
         }
     }
 
@@ -288,7 +387,7 @@ impl Direction {
                 data: Bytes::copy_from_slice(&buffer[..total]),
             });
             self.egress_sequence = self.egress_sequence.wrapping_add(1);
-            self.egress_timestamp = self.egress_timestamp.wrapping_add(self.egress_frame_samples);
+            self.egress_timestamp = self.egress_timestamp.wrapping_add(self.egress_timestamp_increment);
         }
     }
 
@@ -298,6 +397,26 @@ impl Direction {
         if data.len() < 2 {
             return;
         }
+        // SIPREC raw tee (RFC 7866 §6): copy the original ingress RTP/RTCP/DTMF byte-for-byte to each
+        // subscriber's SRS before any transcode/relay. The SRS records the leg's *actual* media in its
+        // negotiated codec — independent of hold/mute/transcode on the A↔B path.
+        self.tee_raw(data, out);
+
+        // Relay-only (promoted passthrough): forward the ingress RTP verbatim to the peer — no
+        // decode/encode. (The raw tee above already copied it to any subscriber, regardless of
+        // `blocked`, so the SRS still records a held leg — RFC 7866 §6.) `blocked` suppresses the
+        // peer-bound forward so block/unblock still works after promotion.
+        if self.relay_only {
+            if !self.blocked {
+                out.push(Outbound {
+                    endpoint: self.egress_endpoint,
+                    dst: self.egress_dst,
+                    data: Bytes::copy_from_slice(data),
+                });
+            }
+            return;
+        }
+
         // RFC 5761 demux: payload-type byte 64..=95 marks RTCP — relay it verbatim, untranscoded.
         let packet_type = data[1] & 0x7f;
         if (64..=95).contains(&packet_type) {
@@ -395,7 +514,7 @@ impl Direction {
                 data: Bytes::copy_from_slice(&buffer[..total]),
             });
             self.egress_sequence = self.egress_sequence.wrapping_add(1);
-            self.egress_timestamp = self.egress_timestamp.wrapping_add(self.egress_frame_samples);
+            self.egress_timestamp = self.egress_timestamp.wrapping_add(self.egress_timestamp_increment);
         }
     }
 
@@ -473,10 +592,43 @@ impl MediaCall {
         }
     }
 
+    /// Build a **relay-only** call: both directions forward their ingress RTP verbatim to the peer
+    /// (no transcode). Used when a plain passthrough relay is promoted to userspace so a SIPREC raw
+    /// tee can be attached to a leg (the in-kernel `Forward` fast path has no userspace tap). The
+    /// per-direction source gate + symmetric latch are re-enforced exactly as the `Forward` rule did
+    /// (RTPBleed defence — the Redirect path bypasses the datapath gate, docs/security-and-nat.md §4).
+    #[must_use]
+    pub fn new_relay(
+        call_id: impl Into<String>,
+        from_tag: impl Into<String>,
+        to_tag: Option<String>,
+        a_to_b: RelayConfig,
+        b_to_a: RelayConfig,
+        latch: bool,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            from_tag: from_tag.into(),
+            to_tag,
+            a_to_b: Direction::new_relay(a_to_b),
+            b_to_a: Direction::new_relay(b_to_a),
+            latch,
+            record_path: None,
+        }
+    }
+
     /// The endpoints this call owns (for registry routing and teardown).
     #[must_use]
     pub fn endpoints(&self) -> [EndpointId; 2] {
         [self.a_to_b.ingress_endpoint, self.b_to_a.ingress_endpoint]
+    }
+
+    /// Whether this is a relay-only call (a promoted passthrough leg, no transcode). Lets the engine
+    /// keep its media-only guards (silence / play / DTMF require a transcoding call) correct after a
+    /// passthrough call is promoted for SIPREC.
+    #[must_use]
+    pub fn is_relay_only(&self) -> bool {
+        self.a_to_b.relay_only && self.b_to_a.relay_only
     }
 
     /// Process one redirected datagram, gating its source and latching the reverse direction's
@@ -616,6 +768,33 @@ impl MediaCall {
         }
     }
 
+    /// Attach a SIPREC / monitor **raw-RTP tee** to a source leg's ingress ([`MediaControl::AddRawTee`]).
+    /// `source_a` selects the leg: `true` ⇒ leg A's ingress, `false` ⇒ leg B's. Each accepted ingress
+    /// datagram is copied byte-for-byte toward the SRS (the leg's negotiated codec, RFC 7866 §6) — no
+    /// decode/re-encode, so it works for any codec the engine cannot encode (e.g. AMR-WB).
+    pub fn add_raw_tee(&mut self, source_a: bool, tee: RawTee) {
+        self.ingress_direction(source_a).raw_tee.push(tee);
+    }
+
+    /// Remove the raw tee for a specific subscriber endpoint on a source leg's ingress
+    /// ([`MediaControl::RemoveRawTee`]). Removing one subscriber leaves any others intact (MPTY: one
+    /// subscription may tap several legs, and a leg may carry several subscriptions).
+    pub fn remove_raw_tee(&mut self, source_a: bool, subscriber_endpoint: EndpointId) {
+        self.ingress_direction(source_a)
+            .raw_tee
+            .retain(|tee| tee.subscriber_endpoint != subscriber_endpoint);
+    }
+
+    /// Number of raw-tee targets on a source leg's ingress (test/observability helper).
+    #[must_use]
+    pub fn raw_tee_count(&self, source_a: bool) -> usize {
+        if source_a {
+            self.a_to_b.raw_tee.len()
+        } else {
+            self.b_to_a.raw_tee.len()
+        }
+    }
+
     /// Advance any active injections by one playout tick, emitting their egress packets.
     pub fn tick(&mut self, out: &mut Vec<Outbound>) {
         self.a_to_b.tick_injection(out);
@@ -675,6 +854,16 @@ pub enum MediaControl {
     },
     /// Detach every fork on a source leg's ingress, closing their output channels.
     RemoveFork { source_a: bool },
+    /// Attach a SIPREC / monitor **raw-RTP tee** to a source leg's ingress (`source_a` selects leg A
+    /// vs leg B). The leg's original ingress RTP is copied byte-for-byte toward the SRS — its
+    /// negotiated codec, no re-encode (RFC 7866 §6). Send-only: the engine installs no inbound flow on
+    /// the subscriber endpoint, so there is no RTPBleed surface.
+    AddRawTee { source_a: bool, tee: RawTee },
+    /// Remove the raw tee for a subscriber endpoint on a source leg's ingress.
+    RemoveRawTee {
+        source_a: bool,
+        subscriber_endpoint: EndpointId,
+    },
     /// Tear the call down: flush recordings and exit the actor loop.
     Stop,
 }
@@ -703,6 +892,9 @@ struct CallHandle {
     mailbox: flume::Sender<MediaInput>,
     endpoints: [EndpointId; 2],
     task: tokio::task::JoinHandle<()>,
+    /// `true` for a promoted passthrough relay (no transcode) — distinguishes it from a transcoding
+    /// call so the engine's silence/play/DTMF guards stay correct.
+    relay_only: bool,
 }
 
 impl MediaRegistry {
@@ -730,6 +922,7 @@ impl MediaRegistry {
     {
         let call_id = call.call_id.clone();
         let endpoints = call.endpoints();
+        let relay_only = call.is_relay_only();
         let (mailbox, inbox) = flume::bounded(1024);
         for endpoint in endpoints {
             self.routes.insert(endpoint, mailbox.clone());
@@ -741,6 +934,7 @@ impl MediaRegistry {
                 mailbox,
                 endpoints,
                 task,
+                relay_only,
             },
         );
     }
@@ -753,10 +947,31 @@ impl MediaRegistry {
         }
     }
 
-    /// Whether `call_id` is a media-processing call.
+    /// Whether `call_id` is registered in the media slow path at all (transcoding **or** a promoted
+    /// relay-only call). A SIPREC raw tee can attach to either, so `subscribe_request` checks this.
     #[must_use]
     pub fn is_media_call(&self, call_id: &str) -> bool {
         self.calls.contains_key(call_id)
+    }
+
+    /// Whether `call_id` is a **transcoding** media call (decode/re-encode), i.e. registered and not
+    /// relay-only. The silence/play/DTMF verbs need a transcoding call (they own the egress codec); a
+    /// promoted passthrough relay forwards opaque payloads and cannot synthesize audio.
+    #[must_use]
+    pub fn is_transcoding_call(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|handle| !handle.relay_only)
+    }
+
+    /// Whether `call_id` is a promoted relay-only call (a passthrough leg taken to userspace for a
+    /// SIPREC raw tee). Used to decide whether `unsubscribe` should demote it back to in-kernel
+    /// `Forward` once its last subscription is gone.
+    #[must_use]
+    pub fn is_relay_call(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|handle| handle.relay_only)
     }
 
     /// Tear a call's actor down: stop it (flushing recordings), drop its routes, and abort the task.
@@ -819,6 +1034,12 @@ async fn run_media_call<D>(
                     }
                     MediaInput::Control(MediaControl::RemoveFork { source_a }) => {
                         call.remove_forks(source_a);
+                    }
+                    MediaInput::Control(MediaControl::AddRawTee { source_a, tee }) => {
+                        call.add_raw_tee(source_a, tee);
+                    }
+                    MediaInput::Control(MediaControl::RemoveRawTee { source_a, subscriber_endpoint }) => {
+                        call.remove_raw_tee(source_a, subscriber_endpoint);
                     }
                     MediaInput::Control(MediaControl::Stop) => break,
                 }
@@ -1242,6 +1463,143 @@ mod tests {
         assert_eq!(events.len(), 1, "DTMF still extracted with a fork attached");
         assert_eq!(out.len(), 1, "telephone-event still repacketized");
         assert!(fork_rx.try_recv().is_err(), "the fork only sees decoded audio, not DTMF");
+    }
+
+    fn tee(subscriber: u64, srs: &str) -> RawTee {
+        RawTee {
+            subscriber_endpoint: endpoint(subscriber),
+            srs_dst: addr(srs),
+        }
+    }
+
+    #[test]
+    fn raw_tee_copies_leg_a_original_rtp_byte_for_byte_alongside_transcode() {
+        // SIPREC raw tee: leg A's ORIGINAL ingress RTP is copied verbatim to the subscriber while the
+        // A→B transcode (µ-law → A-law) continues. No re-encode — the SRS sees exactly what A sent.
+        let mut call = ulaw_alaw_call();
+        call.add_raw_tee(true, tee(99, "127.0.0.9:7000"));
+        assert_eq!(call.raw_tee_count(true), 1);
+
+        let original = ulaw_rtp(100, 0x40);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, original.clone()), &mut out, &mut events);
+
+        // Two outbound: the raw tee (emitted first) and the transcoded packet toward B.
+        assert_eq!(out.len(), 2, "one raw tee + one transcoded egress");
+        let teed = out.iter().find(|o| o.endpoint == endpoint(99)).expect("tee outbound");
+        assert_eq!(teed.dst, addr("127.0.0.9:7000"), "tee goes to the SRS");
+        assert_eq!(&teed.data[..], &original[..], "SRS receives A's ORIGINAL RTP byte-for-byte");
+        let to_b = out.iter().find(|o| o.endpoint == endpoint(2)).expect("transcoded egress");
+        let parsed = RtpPacket::parse(&to_b.data).expect("parse");
+        assert_eq!(parsed.payload_type, 8, "B still gets A-law (genuinely transcoded)");
+    }
+
+    #[test]
+    fn raw_tee_tees_rtcp_and_dtmf_verbatim_too() {
+        // The raw tee copies whatever arrives — RTP, RTCP, telephone-event — so the SRS records the
+        // leg's actual media stream untouched (RFC 7866 §6).
+        let mut call = ulaw_alaw_call();
+        call.add_raw_tee(true, tee(99, "127.0.0.9:7000"));
+
+        // An RTCP Sender Report on leg A.
+        let rtcp = vec![0x80u8, 200, 0x00, 0x06, 0xDE, 0xAD, 0xBE, 0xEF];
+        let mut out = Vec::new();
+        call.process(&rx(1, A_ADDR, rtcp.clone()), &mut out, &mut Vec::new());
+        let teed = out.iter().find(|o| o.endpoint == endpoint(99)).expect("tee");
+        assert_eq!(&teed.data[..], &rtcp[..], "RTCP tee'd verbatim");
+    }
+
+    #[test]
+    fn remove_raw_tee_stops_only_the_named_subscriber() {
+        // Two subscribers tap leg A; removing one leaves the other intact (MPTY / multi-SRS).
+        let mut call = ulaw_alaw_call();
+        call.add_raw_tee(true, tee(91, "127.0.0.9:7000"));
+        call.add_raw_tee(true, tee(92, "127.0.0.9:8000"));
+        assert_eq!(call.raw_tee_count(true), 2);
+
+        call.remove_raw_tee(true, endpoint(91));
+        assert_eq!(call.raw_tee_count(true), 1);
+
+        let mut out = Vec::new();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0x40)), &mut out, &mut Vec::new());
+        assert!(out.iter().all(|o| o.endpoint != endpoint(91)), "removed subscriber gets nothing");
+        assert!(out.iter().any(|o| o.endpoint == endpoint(92)), "the other subscriber still tee'd");
+    }
+
+    /// A relay-only call (a promoted passthrough leg): both directions forward verbatim, no codecs.
+    fn relay_call() -> MediaCall {
+        let a_to_b = RelayConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+        };
+        let b_to_a = RelayConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+        };
+        MediaCall::new_relay("relay", "tag-a", Some("tag-b".into()), a_to_b, b_to_a, true)
+    }
+
+    #[test]
+    fn relay_only_forwards_ingress_verbatim_to_the_peer() {
+        // A promoted passthrough relay forwards the ingress RTP byte-for-byte to the peer (no encode).
+        let mut call = relay_call();
+        assert!(call.is_relay_only());
+        let original = ulaw_rtp(7, 0xAB);
+        let mut out = Vec::new();
+        call.process(&rx(1, A_ADDR, original.clone()), &mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1, "one verbatim forward toward B");
+        assert_eq!(out[0].endpoint, endpoint(2), "forwarded out B's socket");
+        assert_eq!(out[0].dst, addr(B_ADDR));
+        assert_eq!(&out[0].data[..], &original[..], "forwarded byte-for-byte");
+    }
+
+    #[test]
+    fn relay_only_gates_off_source_and_tees_to_the_srs() {
+        let mut call = relay_call();
+        call.add_raw_tee(true, tee(99, "127.0.0.9:7000"));
+
+        // Off-source packet on leg A is gated out (RTPBleed defence) — no forward, no tee.
+        let mut out = Vec::new();
+        call.process(&rx(1, "127.0.0.99:5000", ulaw_rtp(1, 0xFF)), &mut out, &mut Vec::new());
+        assert!(out.is_empty(), "off-source packet dropped before forward or tee");
+
+        // A signalled packet forwards to B AND tees to the SRS.
+        let original = ulaw_rtp(2, 0x40);
+        out.clear();
+        call.process(&rx(1, A_ADDR, original.clone()), &mut out, &mut Vec::new());
+        let to_b = out.iter().find(|o| o.endpoint == endpoint(2)).expect("relay to B");
+        assert_eq!(&to_b.data[..], &original[..], "relayed verbatim to B");
+        let teed = out.iter().find(|o| o.endpoint == endpoint(99)).expect("tee to SRS");
+        assert_eq!(&teed.data[..], &original[..], "tee'd verbatim to the SRS");
+    }
+
+    #[test]
+    fn relay_only_latches_the_observed_source_for_the_reverse_direction() {
+        // B replies from an unexpected port (symmetric NAT); the A→B direction latches it.
+        let mut call = relay_call();
+        let observed = "127.0.0.3:55555";
+        let mut out = Vec::new();
+        call.process(&rx(2, observed, alaw_rtp(1, 0x55)), &mut out, &mut Vec::new());
+        out.clear();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0xFF)), &mut out, &mut Vec::new());
+        assert_eq!(out[0].dst, addr(observed), "A→B latched to B's observed source");
+    }
+
+    #[test]
+    fn relay_only_block_suppresses_the_forward_but_still_tees() {
+        // Block on a promoted relay suppresses the peer forward; the SRS still records the held leg.
+        let mut call = relay_call();
+        call.add_raw_tee(true, tee(99, "127.0.0.9:7000"));
+        call.set_blocked(true);
+        let mut out = Vec::new();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0xFF)), &mut out, &mut Vec::new());
+        assert!(out.iter().all(|o| o.endpoint != endpoint(2)), "blocked: no forward to B");
+        assert!(out.iter().any(|o| o.endpoint == endpoint(99)), "but the SRS still gets the media");
     }
 
     #[test]
