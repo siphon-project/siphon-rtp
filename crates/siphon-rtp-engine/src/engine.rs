@@ -32,6 +32,7 @@ use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 
 use crate::ice::{self, IceCredentials};
 use crate::media_pipeline::{DirectionConfig, MediaCall, MediaControl, MediaRegistry};
+use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, SecurityAdvertisement};
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
 use crate::ws_bridge::WsRegistry;
@@ -169,6 +170,9 @@ pub struct Engine<D: Datapath> {
     /// SIPREC / monitor media subscriptions, keyed by call-id (RFC 7866). Each entry's source leg is
     /// forked to a send-only subscriber endpoint; freed alongside the parent call on delete/reap.
     subscriptions: DashMap<String, Vec<Subscription>>,
+    /// Operational counters (offers/answers/deletes/errors), incremented on the control path and
+    /// rendered by the `/metrics` HTTP endpoint. Shared so the metrics server reads the same surface.
+    metrics: Arc<Metrics>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -198,7 +202,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             media: Arc::new(MediaRegistry::default()),
             ws: Arc::new(WsRegistry::default()),
             subscriptions: DashMap::new(),
+            metrics: Arc::new(Metrics::new()),
         }
+    }
+
+    /// The shared operational metrics — handed to the `/metrics` HTTP endpoint so it renders the
+    /// same counters the control path increments, alongside the live `session_count()` gauge.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
     }
 
     /// Borrow the underlying datapath (used by tests and, later, the media pipeline).
@@ -258,7 +270,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Handle one control command from `client`, producing the result to return to the caller.
+    ///
+    /// Increments the operational counters as a side effect: per-command totals (offer/answer/
+    /// delete) before dispatch, and `control_errors_total` whenever the result is an error — so the
+    /// `/metrics` surface reflects every command this engine processed (including over the NG and WS
+    /// front-ends, which all funnel through here).
     pub async fn handle(&self, client: ClientId, command: Command) -> CmdResult {
+        match &command {
+            Command::Offer { .. } => self.metrics.record_offer(),
+            Command::Answer { .. } => self.metrics.record_answer(),
+            Command::Delete { .. } => self.metrics.record_delete(),
+            _ => {}
+        }
+        let result = self.dispatch(client, command).await;
+        if matches!(result, CmdResult::Error { .. }) {
+            self.metrics.record_control_error();
+        }
+        result
+    }
+
+    /// Dispatch one control command to its handler (the metric-free inner of [`Self::handle`]).
+    async fn dispatch(&self, client: ClientId, command: Command) -> CmdResult {
         match command {
             Command::Ping => CmdResult::Pong,
             Command::Offer {

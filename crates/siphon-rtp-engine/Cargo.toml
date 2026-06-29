@@ -49,6 +49,9 @@ clap = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true }
+# Read jemalloc `stats.allocated` for the `siphon_rtp_jemalloc_allocated_bytes` metric (the same
+# allocator surface the leak gate uses). Pure Rust over the jemalloc already linked as the allocator.
+tikv-jemalloc-ctl = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

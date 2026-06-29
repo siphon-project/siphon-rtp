@@ -14,7 +14,7 @@ use clap::Parser;
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::{Datapath, RxPacket};
 use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher;
-use siphon_rtp_engine::{server, ClientId, Engine};
+use siphon_rtp_engine::{metrics, server, shutdown, ClientId, Engine};
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_turn::{tls, NoFastPath, SystemUnixClock, Turn, TurnConfig};
 use tokio::net::{TcpListener, UdpSocket};
@@ -63,6 +63,27 @@ struct Args {
     /// host, pair with `--turn-relay-ip` to advertise the reachable address.
     #[arg(long)]
     relay_bind_ip: Option<IpAddr>,
+
+    /// Prometheus metrics + health HTTP listen address. Off unless given. Exposes `GET /metrics`
+    /// (OpenMetrics text), `GET /healthz` (liveness), and `GET /readyz` (readiness).
+    #[arg(long)]
+    metrics_addr: Option<SocketAddr>,
+
+    /// Per-connection control request cap (requests/second). 0 disables the limit. The default is
+    /// generous for a legitimate SIPhon controller; floods beyond it are rejected, not processed.
+    #[arg(long, default_value_t = server::DEFAULT_MAX_CONTROL_RPS)]
+    max_control_rps: u64,
+
+    /// Reap a call after this many seconds with no accepted media (dead-path detection,
+    /// docs/security-and-nat.md §4 layer 6). Advanced on the same logical clock as the sweeper.
+    #[arg(long, default_value_t = 30)]
+    media_timeout_secs: u64,
+
+    /// Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting. The
+    /// daemon stops accepting new control connections immediately, then waits up to this long for
+    /// the live session count to reach 0.
+    #[arg(long, default_value_t = 25)]
+    shutdown_grace_secs: u64,
 }
 
 #[tokio::main]
@@ -112,13 +133,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // clock (§11).
     let sweeper = engine.clone();
     let turn_sweeper = turn.clone();
+    let timeout_ticks = args.media_timeout_secs;
+    tracing::info!(media_timeout_secs = timeout_ticks, "media-timeout sweeper enabled");
     tokio::spawn(async move {
-        const TIMEOUT_TICKS: u64 = 30; // ~30 s of silence
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             ticker.tick().await;
             sweeper.datapath().advance_clock(1);
-            for call_id in sweeper.reap_idle(TIMEOUT_TICKS).await {
+            for call_id in sweeper.reap_idle(timeout_ticks).await {
                 tracing::warn!(%call_id, "media timeout — call reaped");
             }
             if let Some(turn) = &turn_sweeper {
@@ -126,6 +148,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+
+    // Optional Prometheus metrics + health HTTP endpoint. Hand-rolled HTTP/1.1 (no hyper/axum) over
+    // a dedicated TcpListener; `/metrics` renders the engine's control counters + live gauges.
+    if let Some(metrics_addr) = args.metrics_addr {
+        let metrics_listener = TcpListener::bind(metrics_addr).await?;
+        tracing::info!(metrics = %metrics_addr, "metrics + health HTTP endpoint listening");
+        let metrics = engine.metrics();
+        let session_engine = engine.clone();
+        let sessions = move || session_engine.session_count() as u64;
+        tokio::spawn(metrics::serve_metrics(metrics_listener, metrics, sessions));
+    }
 
     // Optional HEP telemetry export of relayed RTCP to a VoIPmonitor / Homer collector, enabled by
     // SIPHON_RTP_HEP_COLLECTOR=<ip:port> (+ optional SIPHON_RTP_HEP_AGENT_ID).
@@ -165,8 +198,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    server::serve_with_auth(engine, listener, control_secret).await?;
+    // Graceful shutdown: a watch-backed flag tripped on the first SIGTERM/SIGINT. The accept loop
+    // selects on it and stops admitting new control connections; the daemon then drains live calls
+    // for a bounded grace period before returning from main so every Drop (sockets, actors) runs.
+    let (shutdown_trigger, shutdown_flag) = shutdown::channel();
+    tokio::spawn(async move {
+        shutdown::wait_for_signal().await;
+        tracing::info!("shutdown signal received; draining");
+        shutdown_trigger.trigger();
+    });
+
+    // Run the control accept loop until shutdown is requested (or the listener errors).
+    server::serve_with_options(
+        engine.clone(),
+        listener,
+        control_secret,
+        shutdown_flag,
+        args.max_control_rps,
+    )
+    .await?;
+
+    // Drained out of the accept loop: no new connections are admitted. Wait up to the grace period
+    // for in-flight calls to finish before returning (and tearing everything down).
+    drain_sessions(&engine, std::time::Duration::from_secs(args.shutdown_grace_secs)).await;
+    tracing::info!("siphon-rtp-engine shutting down");
     Ok(())
+}
+
+/// Poll the live session count down to zero, up to `grace`. Logs how many calls remained if the
+/// grace period elapses first (they are then torn down abruptly on return). Deterministic-friendly:
+/// a 0 session count returns immediately; a 0 grace skips the wait entirely.
+async fn drain_sessions<D>(engine: &Engine<D>, grace: std::time::Duration)
+where
+    D: Datapath + Clone + Send + 'static,
+{
+    if engine.session_count() == 0 || grace.is_zero() {
+        return;
+    }
+    tracing::info!(
+        sessions = engine.session_count(),
+        grace_secs = grace.as_secs(),
+        "draining live sessions before exit"
+    );
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(200));
+    loop {
+        poll.tick().await;
+        let remaining = engine.session_count();
+        if remaining == 0 {
+            tracing::info!("all sessions drained");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(remaining, "grace period elapsed; exiting with sessions still live");
+            return;
+        }
+    }
 }
 
 /// Build and start the TURN server when `SIPHON_RTP_TURN_REALM` + `SIPHON_RTP_TURN_SECRET` are set,

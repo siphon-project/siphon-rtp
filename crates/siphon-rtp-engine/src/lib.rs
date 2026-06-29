@@ -9,9 +9,12 @@
 pub mod engine;
 pub mod ice;
 pub mod media_pipeline;
+pub mod metrics;
 pub mod sdp;
 pub mod server;
+pub mod shutdown;
 pub mod srtp_bridge;
 pub mod ws_bridge;
 
 pub use engine::{ClientId, Engine};
+pub use metrics::Metrics;
