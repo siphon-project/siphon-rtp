@@ -158,18 +158,22 @@ impl<D: Datapath> SrtpBridge<D> {
 }
 
 /// Run the redirect dispatcher: drain the datapath's shared Redirect stream and route each datagram
-/// by [`EndpointId`] — bridge-owned endpoints to the [`SrtpBridge`], everything else to the TURN
+/// by [`EndpointId`] — bridge-owned endpoints to the [`SrtpBridge`], media-owned endpoints to the
+/// per-call media actor ([`crate::media_pipeline::MediaRegistry`]), and everything else to the TURN
 /// relay sink (when TURN is running). This is the single owner of `datapath.rx()` the datapath
 /// design calls for ("a single dispatcher should own it and route each RxPacket to the owning
 /// subsystem by EndpointId"). Runs until the redirect stream closes (datapath shutdown).
 pub async fn run_redirect_dispatcher<D: Datapath>(
     redirect_rx: flume::Receiver<RxPacket>,
     bridge: Arc<SrtpBridge<D>>,
+    media: Arc<crate::media_pipeline::MediaRegistry>,
     turn_relay: Option<flume::Sender<RxPacket>>,
 ) {
     while let Ok(packet) = redirect_rx.recv_async().await {
         if bridge.owns(packet.endpoint) {
             bridge.handle(packet).await;
+        } else if media.owns(packet.endpoint) {
+            media.dispatch(packet);
         } else if let Some(turn) = &turn_relay {
             // Drop-newest on a full TURN mailbox — late media is worthless.
             if turn.try_send(packet).is_err() {
@@ -375,9 +379,11 @@ mod tests {
 
         let (feed, redirect_rx) = flume::unbounded();
         let (turn_tx, turn_rx) = flume::bounded(16);
+        let media = Arc::new(crate::media_pipeline::MediaRegistry::default());
         tokio::spawn(run_redirect_dispatcher(
             redirect_rx,
             bridge.clone(),
+            media,
             Some(turn_tx),
         ));
 

@@ -21,13 +21,17 @@ use siphon_rtp_datapath::{
     Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy, ObservedRtcp,
     SourceFilter,
 };
+use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::{protocol_type, Capture};
-use siphon_rtp_proto::{CmdResult, Command, Event, ProfileFlags, SessionStats};
+use siphon_rtp_media::player::{PcmPlayer, WavSource};
+use siphon_rtp_media::wav::WavRecorder;
+use siphon_rtp_proto::{CmdResult, Command, Event, PlayMediaSource, ProfileFlags, SessionStats};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 
 use crate::ice::{self, IceCredentials};
+use crate::media_pipeline::{DirectionConfig, MediaCall, MediaControl, MediaRegistry};
 use crate::sdp::{self, EngineMedia, SecurityAdvertisement};
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
 
@@ -73,9 +77,34 @@ struct Call {
     /// advertised to B — kept to key the SRTP bridge once B's answer brings its key. `None` for a
     /// plain relay. (Scenario 1: AVP near ↔ SAVP far; the reverse, a secure near, is a follow-up.)
     far_local_crypto: Option<CryptoAttribute>,
+    /// The near (offerer) leg's primary audio codec, captured at offer — paired with the answer's
+    /// codec to decide whether the call transcodes (the media slow path).
+    near_codec: Option<CodecSpec>,
+    /// The near leg's negotiated RFC 4733 telephone-event payload type, if any.
+    near_telephone_event: Option<u8>,
+    /// How this call's media is handled once answered (set in `answer`).
+    pipeline: PipelineKind,
+    /// For a passthrough relay, the forward actions installed at answer — kept so `block`/`unblock`
+    /// can flip the endpoints to `Drop` and restore them. Empty for media/SRTP calls.
+    relay_flows: Vec<(EndpointId, FlowAction)>,
+}
+
+/// How a call's media is carried once answered. The resolver picks this from the profile + the two
+/// legs' negotiated codecs (see [`Engine::resolve_pipeline`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineKind {
+    /// Plain in-datapath relay (the `Forward` fast path) — both legs share a codec, no record/stream.
+    Passthrough,
+    /// Userspace SRTP bridge (an `RTP/AVP` ↔ `RTP/SAVP` secure leg).
+    Srtp,
+    /// Userspace media slow path: transcode / record / DTMF-extraction via a [`MediaCall`] actor.
+    Media,
 }
 
 /// The session engine, generic over a [`Datapath`] backend.
+///
+/// The backend must be `Clone + 'static` (already true of every backend): the media slow path
+/// spawns a per-call actor that owns a datapath handle.
 pub struct Engine<D: Datapath> {
     datapath: D,
     calls: DashMap<String, Call>,
@@ -90,9 +119,13 @@ pub struct Engine<D: Datapath> {
     /// The userspace SRTP bridge: the `Redirect`-path crypto for secure (`RTP/SAVP`) legs. Shared
     /// with the redirect dispatcher (see [`crate::srtp_bridge`]).
     bridge: Arc<SrtpBridge<D>>,
+    /// The userspace media slow path: per-call transcode / record / DTMF actors. Shared with the
+    /// redirect dispatcher, which routes media-owned endpoints' datagrams here (see
+    /// [`crate::media_pipeline`]).
+    media: Arc<MediaRegistry>,
 }
 
-impl<D: Datapath> Engine<D> {
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Create an engine over `datapath` with no per-client call quota.
     pub fn new(datapath: D) -> Self
     where
@@ -116,6 +149,7 @@ impl<D: Datapath> Engine<D> {
             events: DashMap::new(),
             endpoint_calls: DashMap::new(),
             bridge,
+            media: Arc::new(MediaRegistry::default()),
         }
     }
 
@@ -128,6 +162,12 @@ impl<D: Datapath> Engine<D> {
     /// endpoints' datagrams here (see [`crate::srtp_bridge::run_redirect_dispatcher`]).
     pub fn bridge(&self) -> Arc<SrtpBridge<D>> {
         self.bridge.clone()
+    }
+
+    /// The shared media registry — handed to the redirect dispatcher so it can route media-owned
+    /// endpoints' datagrams to the per-call transcode/record/DTMF actors.
+    pub fn media(&self) -> Arc<MediaRegistry> {
+        self.media.clone()
     }
 
     /// Number of live calls in the session registry.
@@ -188,6 +228,30 @@ impl<D: Datapath> Engine<D> {
             }
             Command::Delete { call_id, .. } => self.delete(client, &call_id).await,
             Command::Query { call_id, .. } => self.query(client, &call_id),
+            Command::BlockMedia { call_id, .. } => self.set_block(client, &call_id, true).await,
+            Command::UnblockMedia { call_id, .. } => self.set_block(client, &call_id, false).await,
+            Command::SilenceMedia { call_id, .. } => self.set_silence(client, &call_id, true),
+            Command::UnsilenceMedia { call_id, .. } => self.set_silence(client, &call_id, false),
+            Command::PlayMedia {
+                call_id,
+                from_tag,
+                source,
+                repeat_times,
+                start_pos_ms,
+                ..
+            } => {
+                self.play_media(client, &call_id, &from_tag, source, repeat_times, start_pos_ms)
+                    .await
+            }
+            Command::StopMedia { call_id, from_tag } => self.stop_media(client, &call_id, &from_tag),
+            Command::PlayDtmf {
+                call_id,
+                from_tag,
+                code,
+                duration_ms,
+                volume_dbm0,
+                ..
+            } => self.play_dtmf(client, &call_id, &from_tag, &code, duration_ms, volume_dbm0),
             other => CmdResult::Error {
                 reason: format!("unsupported command: {}", command_name(&other)),
             },
@@ -352,6 +416,10 @@ impl<D: Datapath> Engine<D> {
                     remote_rtcp: None,
                 },
                 far_local_crypto,
+                near_codec: info.primary_codec(),
+                near_telephone_event: info.telephone_event_payload_type(),
+                pipeline: PipelineKind::Passthrough,
+                relay_flows: Vec::new(),
             },
         );
         ok_sdp(rewritten.sdp, None)
@@ -368,17 +436,27 @@ impl<D: Datapath> Engine<D> {
     ) -> CmdResult {
         // Snapshot the leg endpoints under the guard, then release it. Only the owning client may
         // answer (A3 — docs/security-and-nat.md §5); to anyone else the call is unknown.
-        let (near, far, ice_creds, far_local_crypto) = match self.calls.get(call_id) {
-            Some(call) if call.owner == client => {
-                if call.from_tag != from_tag {
-                    return CmdResult::Error {
-                        reason: "from_tag mismatch on answer".to_string(),
-                    };
+        let (near, far, ice_creds, far_local_crypto, near_codec, near_telephone_event) =
+            match self.calls.get(call_id) {
+                Some(call) if call.owner == client => {
+                    if call.from_tag != from_tag {
+                        return CmdResult::Error {
+                            reason: "from_tag mismatch on answer".to_string(),
+                        };
+                    }
+                    (
+                        call.near,
+                        call.far,
+                        call.ice.clone(),
+                        call.far_local_crypto,
+                        call.near_codec.clone(),
+                        call.near_telephone_event,
+                    )
                 }
-                (call.near, call.far, call.ice.clone(), call.far_local_crypto)
-            }
-            _ => return unknown_call(call_id),
-        };
+                _ => return unknown_call(call_id),
+            };
+        // The owner's async event sink (DTMF events flow here from the media actor), if registered.
+        let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
 
         let info = match sdp::parse(sdp) {
             Ok(info) => info,
@@ -415,7 +493,15 @@ impl<D: Datapath> Engine<D> {
         let near_ice = ice_creds.is_some();
         let far_ice = ice_creds.is_some() && info.is_ice();
 
-        if let Some(far_local) = far_local_crypto {
+        // Resolve how this call's media is carried: an SRTP bridge (secure far leg), the userspace
+        // media slow path (transcode / record), or the in-datapath plain relay.
+        let pipeline = resolve_pipeline(near_codec.as_ref(), &info, profile, far_local_crypto);
+        // For a passthrough relay, remember the installed forward actions so `block` can flip the
+        // endpoints to `Drop` and `unblock` can restore them.
+        let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
+
+        if pipeline == PipelineKind::Srtp {
+            let far_local = far_local_crypto.expect("Srtp pipeline ⇒ far_local_crypto is set");
             // Secure far (B) leg → userspace SRTP bridge: terminate SRTP/SRTCP on B and relay
             // plaintext on A. B's answer must carry its SDES key to key the inbound contexts.
             let Some(far_remote) = info.crypto.first().copied() else {
@@ -468,39 +554,63 @@ impl<D: Datapath> Engine<D> {
                 leg: SecureLeg::new(&far_local.key, &far_remote.key),
                 flows,
             });
-        } else {
-            // Plain relay: the in-datapath Forward fast path. Each endpoint's rule gates its ingress
-            // to the SDP-signalled peer and latches per policy (RTPBleed fix —
-            // docs/security-and-nat.md §4): `near` receives from A (`near.remote_rtp`); `far` from B
-            // (`info.remote_rtp`).
-            if let Err(error) = self.datapath.install_flow(
-                near.rtp.id,
-                FlowAction::Forward(ingress_rule(
-                    far.rtp.id,
-                    Some(info.remote_rtp),
-                    near.remote_rtp,
-                    profile,
-                    near_ice,
-                )),
-            ) {
-                return error_result("install near->far RTP flow", &error);
-            }
-            if let Err(error) = self.datapath.install_flow(
-                far.rtp.id,
-                FlowAction::Forward(ingress_rule(
-                    near.rtp.id,
-                    near.remote_rtp,
-                    Some(info.remote_rtp),
-                    profile,
-                    far_ice,
-                )),
-            ) {
-                return error_result("install far->near RTP flow", &error);
-            }
+        } else if pipeline == PipelineKind::Media {
+            // Userspace media slow path: redirect both RTP legs to a per-call transcode/record/DTMF
+            // actor. A's codec is the offer's primary codec; B's is the answer's. RTCP (non-mux)
+            // still relays in-datapath — it is not transcoded.
+            let Some(a_rtp) = near.remote_rtp else {
+                return error_result("media pipeline", &"near leg has no signalled address");
+            };
+            let Some(near_codec) = near_codec.clone() else {
+                return error_result("media pipeline", &"offer carried no usable audio codec");
+            };
+            let Some(far_codec) = info.primary_codec() else {
+                return error_result("media pipeline", &"answer carried no usable audio codec");
+            };
+            let record_path = profile
+                .record_call
+                .then(|| profile.record_path.clone())
+                .flatten();
 
-            // Companion RTCP relay when not muxed. (Under mux, RTCP rides the RTP endpoints already.)
+            // Build the two transcode directions (decode ingress codec → encode peer's codec).
+            let a_to_b = match build_direction(
+                near.rtp.id,
+                bridge_source_filter(profile, a_rtp),
+                far.rtp.id,
+                info.remote_rtp,
+                &near_codec,
+                &far_codec,
+                near_telephone_event,
+                info.telephone_event_payload_type(),
+                record_path.as_deref(),
+            ) {
+                Ok(direction) => direction,
+                Err(reason) => return error_result("media pipeline (A→B)", &reason),
+            };
+            let b_to_a = match build_direction(
+                far.rtp.id,
+                bridge_source_filter(profile, info.remote_rtp),
+                near.rtp.id,
+                a_rtp,
+                &far_codec,
+                &near_codec,
+                info.telephone_event_payload_type(),
+                near_telephone_event,
+                record_path.as_deref(),
+            ) {
+                Ok(direction) => direction,
+                Err(reason) => return error_result("media pipeline (B→A)", &reason),
+            };
+
+            // Redirect the RTP legs to the actor (mux ⇒ RTCP rides these; the actor relays it).
+            for endpoint in [near.rtp.id, far.rtp.id] {
+                if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                    return error_result("install media redirect", &error);
+                }
+            }
+            // Relay companion RTCP in-datapath when not muxed (RTCP is never transcoded).
             if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
-                if let Err(error) = self.datapath.install_flow(
+                let _ = self.datapath.install_flow(
                     near_rtcp.id,
                     FlowAction::Forward(ingress_rule(
                         far_rtcp.id,
@@ -509,10 +619,8 @@ impl<D: Datapath> Engine<D> {
                         profile,
                         near_ice,
                     )),
-                ) {
-                    return error_result("install near->far RTCP flow", &error);
-                }
-                if let Err(error) = self.datapath.install_flow(
+                );
+                let _ = self.datapath.install_flow(
                     far_rtcp.id,
                     FlowAction::Forward(ingress_rule(
                         near_rtcp.id,
@@ -521,9 +629,72 @@ impl<D: Datapath> Engine<D> {
                         profile,
                         far_ice,
                     )),
-                ) {
+                );
+            }
+
+            let latch = !profile.flags.iter().any(|flag| flag == "no-latch");
+            let call = MediaCall::new(
+                call_id.to_string(),
+                from_tag.to_string(),
+                Some(to_tag.clone()),
+                a_to_b,
+                b_to_a,
+                latch,
+                record_path,
+            );
+            self.media.register(call, self.datapath.clone(), owner_events);
+        } else {
+            // Plain relay: the in-datapath Forward fast path. Each endpoint's rule gates its ingress
+            // to the SDP-signalled peer and latches per policy (RTPBleed fix —
+            // docs/security-and-nat.md §4): `near` receives from A (`near.remote_rtp`); `far` from B
+            // (`info.remote_rtp`).
+            let near_action = FlowAction::Forward(ingress_rule(
+                far.rtp.id,
+                Some(info.remote_rtp),
+                near.remote_rtp,
+                profile,
+                near_ice,
+            ));
+            if let Err(error) = self.datapath.install_flow(near.rtp.id, near_action) {
+                return error_result("install near->far RTP flow", &error);
+            }
+            relay_flows.push((near.rtp.id, near_action));
+            let far_action = FlowAction::Forward(ingress_rule(
+                near.rtp.id,
+                near.remote_rtp,
+                Some(info.remote_rtp),
+                profile,
+                far_ice,
+            ));
+            if let Err(error) = self.datapath.install_flow(far.rtp.id, far_action) {
+                return error_result("install far->near RTP flow", &error);
+            }
+            relay_flows.push((far.rtp.id, far_action));
+
+            // Companion RTCP relay when not muxed. (Under mux, RTCP rides the RTP endpoints already.)
+            if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
+                let near_rtcp_action = FlowAction::Forward(ingress_rule(
+                    far_rtcp.id,
+                    Some(info.remote_rtcp),
+                    near.remote_rtcp,
+                    profile,
+                    near_ice,
+                ));
+                if let Err(error) = self.datapath.install_flow(near_rtcp.id, near_rtcp_action) {
+                    return error_result("install near->far RTCP flow", &error);
+                }
+                relay_flows.push((near_rtcp.id, near_rtcp_action));
+                let far_rtcp_action = FlowAction::Forward(ingress_rule(
+                    near_rtcp.id,
+                    near.remote_rtcp,
+                    Some(info.remote_rtcp),
+                    profile,
+                    far_ice,
+                ));
+                if let Err(error) = self.datapath.install_flow(far_rtcp.id, far_rtcp_action) {
                     return error_result("install far->near RTCP flow", &error);
                 }
+                relay_flows.push((far_rtcp.id, far_rtcp_action));
             }
         }
 
@@ -551,6 +722,8 @@ impl<D: Datapath> Engine<D> {
             call.to_tag = Some(to_tag.clone());
             call.far.remote_rtp = Some(info.remote_rtp);
             call.far.remote_rtcp = Some(info.remote_rtcp);
+            call.pipeline = pipeline;
+            call.relay_flows = relay_flows;
         }
         ok_sdp(rewritten.sdp, Some(to_tag))
     }
@@ -565,8 +738,11 @@ impl<D: Datapath> Engine<D> {
                     .endpoint_ids()
                     .chain(call.far.endpoint_ids())
                     .collect();
-                // Drop any SRTP-bridge flows first (a no-op for a plain relay), then free the sockets.
+                // Drop any SRTP-bridge or media-pipeline flows first (a no-op for a plain relay),
+                // then free the sockets. `media.deregister` aborts the call's actor and flushes any
+                // recording.
                 self.bridge.deregister(endpoints.iter().copied());
+                self.media.deregister(call_id);
                 for endpoint in endpoints {
                     self.datapath.remove_endpoint(endpoint).await;
                     self.endpoint_calls.remove(&endpoint);
@@ -608,6 +784,164 @@ impl<D: Datapath> Engine<D> {
         }
     }
 
+    /// Drop (`block = true`) or resume (`block = false`) a call's media. A media-processing call
+    /// flips its actor's egress; a plain relay flips its datapath flows to `Drop` and back. Only the
+    /// owning client may control the call (A3 — docs §5).
+    async fn set_block(&self, client: ClientId, call_id: &str, block: bool) -> CmdResult {
+        let Some(relay_flows) = self.owned_call(client, call_id, |call| call.relay_flows.clone())
+        else {
+            return unknown_call(call_id);
+        };
+        if self.media.is_media_call(call_id) {
+            self.media.control(call_id, MediaControl::Block(block));
+            return ok_empty();
+        }
+        if relay_flows.is_empty() {
+            return error_result(
+                "block",
+                &"call is not answered as a plain relay (SRTP-bridge block is not supported)",
+            );
+        }
+        // Plain relay: flip each endpoint to Drop, or restore its stored forward action.
+        for (endpoint, action) in &relay_flows {
+            let next = if block { FlowAction::Drop } else { *action };
+            if let Err(error) = self.datapath.install_flow(*endpoint, next) {
+                return error_result("block: install flow", &error);
+            }
+        }
+        ok_empty()
+    }
+
+    /// Replace a call's egress audio with comfort silence (`silence = true`) or resume it. Requires a
+    /// media-processing call (decode/re-encode); a plain relay forwards opaque payloads and cannot
+    /// synthesize silence. Only the owning client may control the call.
+    fn set_silence(&self, client: ClientId, call_id: &str, silence: bool) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        if self.media.control(call_id, MediaControl::Silence(silence)) {
+            ok_empty()
+        } else {
+            error_result(
+                "silence",
+                &"call is not a media-processing call (transcode/record/stream required)",
+            )
+        }
+    }
+
+    /// Run `f` against a call the client owns, or `None` if the call is unknown or owned by another
+    /// client (A3 — a call is invisible to non-owners, docs §5).
+    fn owned_call<T>(&self, client: ClientId, call_id: &str, f: impl FnOnce(&Call) -> T) -> Option<T> {
+        let call = self.calls.get(call_id)?;
+        (call.owner == client).then(|| f(&call))
+    }
+
+    /// Inject a prompt / announcement toward a leg ([`Command::PlayMedia`]). Requires a
+    /// media-processing call (the actor owns the egress codec). The source is a WAV file/blob.
+    async fn play_media(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+        source: PlayMediaSource,
+        repeat_times: Option<u64>,
+        start_pos_ms: Option<u64>,
+    ) -> CmdResult {
+        let Some((call_from, call_to)) =
+            self.owned_call(client, call_id, |call| (call.from_tag.clone(), call.to_tag.clone()))
+        else {
+            return unknown_call(call_id);
+        };
+        if !self.media.is_media_call(call_id) {
+            return error_result(
+                "play_media",
+                &"requires a media-processing call (transcode/record/stream)",
+            );
+        }
+        let bytes = match source {
+            PlayMediaSource::Blob { data } => data,
+            PlayMediaSource::File { path } => match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(error) => return error_result("play_media: read file", &error),
+            },
+            PlayMediaSource::DbId { .. } => {
+                return error_result("play_media", &"db-id media source is not supported")
+            }
+        };
+        let wav = match WavSource::parse(&bytes) {
+            Ok(wav) => wav,
+            Err(error) => return error_result("play_media: parse WAV", &error),
+        };
+        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
+        let repeat = repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        let start = start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        let player = PcmPlayer::new(&wav, repeat, start);
+        let toward_a = resolve_toward_a(from_tag, &call_from, call_to.as_deref());
+        self.media.control(
+            call_id,
+            MediaControl::PlayAudio {
+                toward_a,
+                player: Box::new(player),
+            },
+        );
+        ok_empty()
+    }
+
+    /// Stop any prompt / DTMF playback on a call ([`Command::StopMedia`]).
+    fn stop_media(&self, client: ClientId, call_id: &str, _from_tag: &str) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        if self.media.control(call_id, MediaControl::StopPlay) {
+            ok_empty()
+        } else {
+            error_result("stop_media", &"call has no active media playback")
+        }
+    }
+
+    /// Inject an RFC 4733 DTMF burst toward a leg ([`Command::PlayDtmf`]). Requires a media-processing
+    /// call with a negotiated telephone-event payload type on the target leg.
+    fn play_dtmf(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+        code: &str,
+        duration_ms: Option<u64>,
+        volume_dbm0: Option<i64>,
+    ) -> CmdResult {
+        let Some((call_from, call_to)) =
+            self.owned_call(client, call_id, |call| (call.from_tag.clone(), call.to_tag.clone()))
+        else {
+            return unknown_call(call_id);
+        };
+        if !self.media.is_media_call(call_id) {
+            return error_result("play_dtmf", &"requires a media-processing call");
+        }
+        let Some(digit) = code.chars().next() else {
+            return error_result("play_dtmf", &"empty DTMF code");
+        };
+        let duration = duration_ms.unwrap_or(250).min(u64::from(u32::MAX)) as u32;
+        // `volume_dbm0` is a (negative) dBm0 power level; the generator takes its magnitude (0..=63).
+        let volume = volume_dbm0
+            .map(|value| value.unsigned_abs().min(63) as u8)
+            .unwrap_or(10);
+        let toward_a = resolve_toward_a(from_tag, &call_from, call_to.as_deref());
+        if self.media.control(
+            call_id,
+            MediaControl::PlayDtmf {
+                toward_a,
+                digit,
+                duration_ms: duration,
+                volume,
+            },
+        ) {
+            ok_empty()
+        } else {
+            error_result("play_dtmf", &"call is not a media-processing call")
+        }
+    }
+
     /// Reap calls whose media has been idle (no accepted packet) for at least `idle_ticks`, freeing
     /// their ports/FDs and registry/quota slots, and return the reaped call ids. Deterministic: it
     /// reads the datapath's logical clock, so tests drive it via `advance_clock` rather than wall
@@ -632,7 +966,11 @@ impl<D: Datapath> Engine<D> {
         let mut reaped = Vec::new();
         for call_id in stale {
             if let Some((_, call)) = self.calls.remove(&call_id) {
-                for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
+                let endpoints: Vec<EndpointId> =
+                    call.near.endpoint_ids().chain(call.far.endpoint_ids()).collect();
+                self.bridge.deregister(endpoints.iter().copied());
+                self.media.deregister(&call_id);
+                for endpoint in endpoints {
                     self.datapath.remove_endpoint(endpoint).await;
                     self.endpoint_calls.remove(&endpoint);
                 }
@@ -720,6 +1058,90 @@ fn ok_sdp(sdp: String, to_tag: Option<String>) -> CmdResult {
         to_tag,
         stats: None,
     }
+}
+
+/// A bare success (no SDP/stats) — the reply to control verbs like block/silence.
+fn ok_empty() -> CmdResult {
+    CmdResult::Ok {
+        sdp: None,
+        duration_ms: None,
+        to_tag: None,
+        stats: None,
+    }
+}
+
+/// Decide how a call's media is carried once answered: an SRTP bridge (secure far leg), the
+/// userspace media slow path (transcode requested or recording on), or the in-datapath plain relay.
+fn resolve_pipeline(
+    near_codec: Option<&CodecSpec>,
+    info: &sdp::MediaInfo,
+    profile: &ProfileFlags,
+    far_local_crypto: Option<CryptoAttribute>,
+) -> PipelineKind {
+    if far_local_crypto.is_some() {
+        return PipelineKind::Srtp;
+    }
+    // Transcode when the two legs' primary codecs differ in encoding or clock rate.
+    let transcode = match (near_codec, info.primary_codec()) {
+        (Some(near), Some(far)) => {
+            !near.encoding_name.eq_ignore_ascii_case(&far.encoding_name)
+                || near.clock_rate_hz != far.clock_rate_hz
+        }
+        _ => false,
+    };
+    if profile.record_call || transcode {
+        PipelineKind::Media
+    } else {
+        PipelineKind::Passthrough
+    }
+}
+
+/// Build one transcode direction's config: decode the ingress codec, encode the egress codec, and
+/// (when recording) capture the decoded ingress audio. Fails if either codec is unimplemented.
+#[allow(clippy::too_many_arguments)]
+fn build_direction(
+    ingress_endpoint: EndpointId,
+    accepted_source: SourceFilter,
+    egress_endpoint: EndpointId,
+    egress_dst: std::net::SocketAddr,
+    ingress_codec: &CodecSpec,
+    egress_codec: &CodecSpec,
+    telephone_event_in: Option<u8>,
+    telephone_event_out: Option<u8>,
+    record_path: Option<&str>,
+) -> Result<DirectionConfig, String> {
+    let decoder = factory::decoder_for(ingress_codec).map_err(|error| error.to_string())?;
+    let encoder = factory::encoder_for(egress_codec).map_err(|error| error.to_string())?;
+    let recorder = record_path.map(|_| WavRecorder::new(ingress_codec.clock_rate_hz, 1));
+    Ok(DirectionConfig {
+        ingress_endpoint,
+        accepted_source,
+        egress_endpoint,
+        egress_dst,
+        decoder,
+        encoder,
+        egress_ssrc: random_ssrc(),
+        egress_payload_type: egress_codec.payload_type,
+        telephone_event_in,
+        telephone_event_out,
+        recorder,
+    })
+}
+
+/// Which party a play/DTMF verb targets: the leg named by `from_tag`. Matching the call's `to_tag`
+/// (party B) plays toward B; otherwise toward A (the offerer) — the default.
+fn resolve_toward_a(from_tag: &str, _call_from: &str, call_to: Option<&str>) -> bool {
+    !matches!(call_to, Some(to_tag) if to_tag == from_tag)
+}
+
+/// A fresh SSRC for a synthesized (transcoded) egress stream, from the OS CSPRNG (RFC 3550 §8 wants
+/// a random SSRC). Falls back to a fixed value if the CSPRNG is unavailable — never panics.
+fn random_ssrc() -> u32 {
+    let mut bytes = [0u8; 4];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        return 0x5310_0000; // "SIP0" — a stable fallback when the CSPRNG is unavailable
+    }
+    u32::from_be_bytes(bytes)
 }
 
 fn command_name(command: &Command) -> &'static str {
@@ -890,7 +1312,7 @@ mod tests {
         // through the control plane with the redirect dispatcher live.
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), None));
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), None));
 
         let (phone_a, addr_a) = phone().await; // plain (AVP) caller A
         let (phone_b, addr_b) = phone().await; // secure (SAVP) callee B
@@ -949,6 +1371,213 @@ mod tests {
         let (recovered_a, from) = recv(&phone_a).await;
         assert_eq!(from, near_addr, "media leaves the engine's A-facing port");
         assert_eq!(recovered_a, from_b, "A receives the decrypted plaintext");
+    }
+
+    /// A G.711 RTP packet (160-sample frame) for transcode tests.
+    fn g711_rtp(payload_type: u8, sequence: u16, ssrc: u32, payload_byte: u8) -> Vec<u8> {
+        let mut packet = vec![0x80, payload_type];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&(u32::from(sequence) * 160).to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&[payload_byte; 160]);
+        packet
+    }
+
+    /// An SDP advertising a single static audio codec (mux), for transcode answers.
+    fn sdp_single_codec(rtp: SocketAddr, payload_type: u8, name: &str) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP {pt}\r\na=rtpmap:{pt} {name}/8000\r\na=rtcp-mux\r\n",
+            ip = rtp.ip(),
+            port = rtp.port(),
+            pt = payload_type,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_answer_transcodes_ulaw_to_alaw_end_to_end() {
+        // A offers PCMU (µ-law); B answers PCMA (A-law). The differing codecs resolve to the media
+        // slow path, which redirects both legs to a transcoding actor — proven end-to-end through the
+        // control plane with the redirect dispatcher live.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), None));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        // A's offer advertises PCMU as its primary codec (the `sdp_for` fixture: `0 8`, rtpmap PCMU).
+        let offer = engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "xcode-1".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            })
+            .await;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply").remote_rtp;
+
+        // B answers PCMA only → near=PCMU, far=PCMA → transcode.
+        let answer = engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "xcode-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                profile: Default::default(),
+            })
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer)).expect("answer reply").remote_rtp;
+
+        // A → engine(near) → transcode → B receives A-law (PT 8), not the original µ-law.
+        let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
+        phone_a.send_to(&from_a, near_addr).await.expect("a send");
+        let (transcoded, from) = recv(&phone_b).await;
+        assert_eq!(from, far_addr, "media leaves the engine's B-facing port");
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&transcoded).expect("parse");
+        assert_eq!(parsed.payload_type, 8, "B receives A-law (PT 8)");
+        assert_eq!(parsed.payload.len(), 160);
+        assert_ne!(parsed.payload, &from_a[12..], "payload genuinely transcoded");
+
+        // B → engine(far) → transcode → A receives µ-law (PT 0).
+        let from_b = g711_rtp(8, 200, 0x0B0B_0B0B, 0x55);
+        phone_b.send_to(&from_b, far_addr).await.expect("b send");
+        let (back, from) = recv(&phone_a).await;
+        assert_eq!(from, near_addr, "media leaves the engine's A-facing port");
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&back).expect("parse");
+        assert_eq!(parsed.payload_type, 0, "A receives µ-law (PT 0)");
+
+        // The call is a media-processing call; block then unblock via the control plane.
+        assert!(engine.media().is_media_call("xcode-1"));
+        let blocked = engine
+            .handle(CLIENT, Command::BlockMedia {
+                call_id: "xcode-1".into(),
+                from_tag: "tag-a".into(),
+            })
+            .await;
+        assert!(matches!(blocked, CmdResult::Ok { .. }));
+
+        // Teardown frees the media actor and routes.
+        let deleted = engine
+            .handle(CLIENT, Command::Delete {
+                call_id: "xcode-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            })
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+        assert!(!engine.media().is_media_call("xcode-1"), "media call deregistered");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_dtmf_emits_telephone_events_on_a_media_call() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), None));
+
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        // A offers PCMU + telephone-event 101; B answers PCMA + telephone-event 101 → a transcoding
+        // media call where A's leg carries DTMF.
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\na=rtcp-mux\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+        );
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\na=rtcp-mux\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+        );
+        engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "dtmf-1".into(),
+                from_tag: "tag-a".into(),
+                sdp: offer_sdp,
+                profile: Default::default(),
+            })
+            .await;
+        engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "dtmf-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: answer_sdp,
+                profile: Default::default(),
+            })
+            .await;
+        assert!(engine.media().is_media_call("dtmf-1"));
+
+        // Play DTMF '7' toward A; the actor's playout clock injects RFC 4733 events out A's socket.
+        let played = engine
+            .handle(CLIENT, Command::PlayDtmf {
+                call_id: "dtmf-1".into(),
+                from_tag: "tag-a".into(),
+                code: "7".into(),
+                duration_ms: Some(120),
+                volume_dbm0: Some(-10),
+                pause_ms: None,
+                to_tag: None,
+            })
+            .await;
+        assert!(matches!(played, CmdResult::Ok { .. }));
+
+        // The first telephone-event packet (PT 96) reaches A within a few playout ticks.
+        let mut saw_event = false;
+        for _ in 0..20 {
+            let mut buffer = [0u8; 256];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(100), phone_a.recv_from(&mut buffer)).await
+            {
+                let packet =
+                    siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).expect("parse");
+                if packet.payload_type == 101 {
+                    assert_eq!(packet.payload[0], 7, "RFC 4733 event code for '7'");
+                    saw_event = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_event, "expected a telephone-event packet toward A");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silence_on_a_passthrough_call_is_rejected() {
+        // A plain relay (same codec both sides) is not a media-processing call; silence needs decode.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(CLIENT, Command::Offer {
+                call_id: "relay-1".into(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for(addr_a, true),
+                profile: Default::default(),
+            })
+            .await;
+        engine
+            .handle(CLIENT, Command::Answer {
+                call_id: "relay-1".into(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for(addr_b, true),
+                profile: Default::default(),
+            })
+            .await;
+        let result = engine
+            .handle(CLIENT, Command::SilenceMedia {
+                call_id: "relay-1".into(),
+                from_tag: "tag-a".into(),
+            })
+            .await;
+        assert!(matches!(result, CmdResult::Error { .. }), "silence needs a media call");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1143,17 +1772,32 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_command_reports_error() {
+        // SubscribeRequest (SIPREC fork) is not yet wired; the dispatcher names it in the error.
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let result = engine
-            .handle(CLIENT, Command::StopMedia {
+            .handle(CLIENT, Command::SubscribeRequest {
                 call_id: "c".into(),
-                from_tag: "f".into(),
+                from_tags: vec!["f".into()],
+                sdp: None,
+                profile: Default::default(),
             })
             .await;
         match result {
-            CmdResult::Error { reason } => assert!(reason.contains("stop_media")),
+            CmdResult::Error { reason } => assert!(reason.contains("subscribe_request")),
             other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stop_media_on_unknown_call_errors() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let result = engine
+            .handle(CLIENT, Command::StopMedia {
+                call_id: "nope".into(),
+                from_tag: "f".into(),
+            })
+            .await;
+        assert!(matches!(result, CmdResult::Error { .. }), "unknown call ⇒ error");
     }
 
     /// A test phone bound to a specific loopback address, so the engine's signalled-source gate can

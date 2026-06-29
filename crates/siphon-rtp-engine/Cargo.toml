@@ -29,7 +29,12 @@ siphon-rtp-srtp = { path = "../siphon-rtp-srtp", version = "0.1.0" }
 siphon-rtp-turn = { path = "../siphon-rtp-turn", version = "0.1.0" }
 siphon-rtp-hep = { path = "../siphon-rtp-hep", version = "0.1.0" }
 siphon-rtp-ngcompat = { path = "../siphon-rtp-ngcompat", version = "0.1.0" }
+siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.1.0" }
+siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.1.0" }
+siphon-rtp-dsp = { path = "../siphon-rtp-dsp", version = "0.1.0" }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 flume = { workspace = true }

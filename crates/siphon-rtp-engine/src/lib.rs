@@ -8,6 +8,7 @@
 
 pub mod engine;
 pub mod ice;
+pub mod media_pipeline;
 pub mod sdp;
 pub mod server;
 pub mod srtp_bridge;

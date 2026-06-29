@@ -18,7 +18,7 @@ use crate::engine::{ClientId, Engine};
 /// network. Use [`serve_with_auth`] to require a shared secret.
 pub async fn serve<D>(engine: Arc<Engine<D>>, listener: TcpListener) -> std::io::Result<()>
 where
-    D: Datapath + 'static,
+    D: Datapath + Clone + Send + 'static,
 {
     serve_with_auth(engine, listener, None).await
 }
@@ -32,7 +32,7 @@ pub async fn serve_with_auth<D>(
     secret: Option<String>,
 ) -> std::io::Result<()>
 where
-    D: Datapath + 'static,
+    D: Datapath + Clone + Send + 'static,
 {
     let secret = secret.map(Arc::new);
     // Each accepted connection gets a distinct identity; a call is private to the connection that
@@ -54,12 +54,12 @@ where
 
 /// Deregisters a client's event sink when its connection ends, on every exit path (clean close,
 /// error, or task drop).
-struct ClientGuard<D: Datapath> {
+struct ClientGuard<D: Datapath + Clone + Send + 'static> {
     engine: Arc<Engine<D>>,
     client: ClientId,
 }
 
-impl<D: Datapath> Drop for ClientGuard<D> {
+impl<D: Datapath + Clone + Send + 'static> Drop for ClientGuard<D> {
     fn drop(&mut self) {
         self.engine.deregister_client(self.client);
     }
@@ -74,7 +74,7 @@ async fn handle_connection<D>(
     stream: TcpStream,
 ) -> std::io::Result<()>
 where
-    D: Datapath,
+    D: Datapath + Clone + Send + 'static,
 {
     let events = engine.register_client(client);
     let _guard = ClientGuard {

@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(run_redirect_dispatcher(
         datapath.rx(),
         engine.bridge(),
+        engine.media(),
         turn_relay,
     ));
 
