@@ -792,6 +792,38 @@ mod tests {
         (n_frames, None)
     }
 
+    #[test]
+    #[ignore]
+    fn dbg_mode8_frame0() {
+        let nb_bits = 477usize;
+        let mut inp_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        inp_path.push("../../reference/amr-wb/testv/tst.inp");
+        let mut cod_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        cod_path.push("../../reference/amr-wb/testv/tst_m8.cod");
+        let inp = std::fs::read(&inp_path).expect("tst.inp");
+        let cod = std::fs::read(&cod_path).expect("tst_m8.cod");
+        let pcm: Vec<i16> = inp.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        let cod_words: Vec<i16> =
+            cod.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        let cod_frame_words = 3 + nb_bits;
+        let mut wb = AmrWb::new();
+        let mut out = vec![0i16; nb_bits];
+        for f in 0..3 {
+            let frame_pcm = &pcm[f * 320..(f + 1) * 320];
+            wb.encode_mode_bits(8, frame_pcm, &mut out).expect("encode");
+            let base = f * cod_frame_words + 3;
+            let mut diffs = Vec::new();
+            for b in 0..nb_bits {
+                if out[b] != cod_words[base + b] {
+                    diffs.push(b);
+                }
+            }
+            eprintln!("frame {f}: {} mismatches: {:?}", diffs.len(), &diffs[..diffs.len().min(40)]);
+        }
+        // Parameter boundaries for mode 8: VAD(1) ISF(8,8,6,7,7,5,5) then per-subframe.
+        eprintln!("ISF ends at bit 47");
+    }
+
     /// Mode 0 (6.60 kbit/s) uses the 2-track `ACELP_2t64_fx` codebook and 36-bit ISF path.
     #[test]
     fn encodes_full_mode0_vector_bit_exact() {
@@ -817,8 +849,8 @@ mod tests {
 
     /// The 4-track ACELP (`ACELP_4t64_fx`) modes share the same encode pipeline as mode 2 and the
     /// same per-mode `Prm2bits` packing; once mode 2 is byte-exact the rest of the 4t64 family
-    /// (modes 2..=7) encodes the reference `tst.inp` byte-for-byte against `tst_mN.cod` too. (Mode 8
-    /// additionally needs the high-band / `synthesis()` tier, not yet implemented, so it is excluded.)
+    /// (modes 2..=7) encodes the reference `tst.inp` byte-for-byte against `tst_mN.cod` too. Mode 8
+    /// additionally runs the high-band `synthesis()` tier (4-bit HF correction gain per subframe).
     #[test]
     fn encodes_full_mode3_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(3);
@@ -847,6 +879,15 @@ mod tests {
     fn encodes_full_mode7_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(7);
         assert!(mismatch.is_none(), "mode 7: {frames} frames, first mismatch {mismatch:?}");
+    }
+
+    /// Mode 8 (23.85 kbit/s): the 4t64 ACELP pipeline plus the high-band `synthesis()` tier, which
+    /// transmits a 4-bit HF correction-gain index per subframe (16 extra bits/frame → 477 total).
+    #[test]
+    #[ignore = "WIP: mode-8 encode (HF correction-gain quant) not yet bit-exact — decode is"]
+    fn encodes_full_mode8_vector_bit_exact() {
+        let (frames, mismatch) = check_mode_vector(8);
+        assert!(mismatch.is_none(), "mode 8: {frames} frames, first mismatch {mismatch:?}");
     }
 
 
