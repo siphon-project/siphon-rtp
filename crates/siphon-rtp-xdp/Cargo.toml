@@ -11,21 +11,38 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
+description = "siphon-rtp XDP/AF_XDP datapath backend (userspace loader) — kernel-accelerated RTP relay"
+repository = "https://github.com/siphon-project/siphon-rtp"
+homepage = "https://github.com/siphon-project/siphon-rtp"
+readme = "README.md"
+keywords = ["xdp", "ebpf", "af-xdp", "rtp", "networking"]
+categories = ["network-programming"]
+# Kept unpublishable: build.rs compiles the eBPF program with a pinned nightly + bpf-linker, which a
+# plain `cargo install` would not have. Flip once that build is reproducible from a registry install
+# (and the path-deps are published). See README.
 publish = false
 
 [dependencies]
-# Concrete versions: standalone workspace, no `workspace.dependencies` to inherit. libc + tokio
-# come back with the AF_XDP data half (xsk.rs rings + the async Datapath impl).
+# Concrete versions: standalone workspace, no `workspace.dependencies` to inherit. The AF_XDP data
+# half (xsk.rs rings + the async Datapath impl) brings in libc (raw AF_XDP uapi: socket/mmap/bind),
+# tokio (async Datapath methods + the busy-poll RX thread), bytes (RxPacket buffers), and flume
+# (the redirect/observe streams, pinned to the parent workspace's 0.12).
 siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }
 siphon-rtp-ebpf-common = { path = "../siphon-rtp-ebpf-common" }
 aya = "0.13"
+libc = "0.2"
+tokio = { version = "1.50", features = ["rt", "rt-multi-thread", "net", "sync", "macros"] }
+flume = "0.12"
+bytes = "1.11"
+dashmap = "6"
 thiserror = "2"
 tracing = "0.1"
 
-[build-dependencies]
-aya-build = "0.1"
+# No `[build-dependencies]`: build.rs invokes the eBPF build directly (rustup run <toolchain> cargo
+# build --target bpfel-unknown-none) instead of via aya-build, whose 0.1.x OUT_DIR embed copies the
+# artifact onto its own `--target-dir` path ("Is a directory"). See build.rs for the full rationale.
 
-# A small workspace pairing the loader with the eBPF program crate (so aya-build's
+# A small workspace pairing the loader with the eBPF program crate (so build.rs's
 # `cargo build --package siphon-rtp-ebpf` resolves). Excluded from the parent stable workspace; the
 # docker xdp build invokes it explicitly with nightly + bpf-linker on PATH.
 [workspace]

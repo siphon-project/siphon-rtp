@@ -31,3 +31,8 @@ RUN cargo install bpf-linker --locked --no-default-features --features rust-llvm
 
 WORKDIR /build
 COPY . .
+
+# The loader is a standalone workspace; its build.rs invokes aya-build on the eBPF crate (pinned
+# nightly + bpf-linker), then the loader + AF_XDP data half build on stable. A green build proves the
+# whole XDP datapath (control + data) compiles.
+RUN cd crates/siphon-rtp-xdp && cargo build --release

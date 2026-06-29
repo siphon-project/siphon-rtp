@@ -7,11 +7,16 @@ name = "siphon-rtp-ebpf"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "siphon-rtp XDP classifier — the no_std kernel-side eBPF program (bpfel-unknown-none)"
+repository = "https://github.com/siphon-project/siphon-rtp"
+homepage = "https://github.com/siphon-project/siphon-rtp"
+readme = "README.md"
+# Kept unpublishable: an eBPF program compiles to BPF bytecode, not a consumable registry library.
 publish = false
 
 [dependencies]
 aya-ebpf = "0.1"
-siphon-rtp-ebpf-common = { path = "../../siphon-rtp-ebpf-common" }
+siphon-rtp-ebpf-common = { path = "../../siphon-rtp-ebpf-common", version = "0.1.0" }
 
 [[bin]]
 name = "siphon-rtp-ebpf"
