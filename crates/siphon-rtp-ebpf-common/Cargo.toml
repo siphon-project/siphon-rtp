@@ -10,5 +10,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "siphon-rtp eBPF/XDP map ABI: shared #[repr(C)] POD structs for the kernel program + loader"
+readme = "README.md"
+keywords = ["ebpf", "xdp", "networking", "rtp", "abi"]
+categories = ["network-programming"]
 
 [dependencies]

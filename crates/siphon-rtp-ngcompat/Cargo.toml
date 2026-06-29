@@ -10,9 +10,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "siphon-rtp rtpengine NG/bencode control front-end — drop-in for Kamailio/OpenSIPS/FreeSWITCH"
+readme = "README.md"
+keywords = ["rtpengine", "bencode", "sip", "rtp", "voip"]
+categories = ["network-programming"]
 
 [dependencies]
-siphon-rtp-proto = { path = "../siphon-rtp-proto" }
+siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.1.0" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

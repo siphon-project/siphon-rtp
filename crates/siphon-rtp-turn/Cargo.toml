@@ -11,6 +11,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "siphon-rtp TURN server (RFC 5766) — pure Rust, zero C, a built-in coturn replacement"
+readme = "README.md"
+keywords = ["turn", "stun", "ice", "webrtc", "nat"]
+categories = ["network-programming"]
 
 [dependencies]
 siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }

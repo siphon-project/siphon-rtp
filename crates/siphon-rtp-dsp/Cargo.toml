@@ -8,6 +8,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "siphon-rtp pure-Rust audio DSP: resampler (VAD/NS/AEC to follow) — deterministic, zero C deps"
+readme = "README.md"
+keywords = ["dsp", "audio", "resampler", "voip", "media"]
+categories = ["multimedia::audio"]
 
 [dependencies]
 thiserror = { workspace = true }

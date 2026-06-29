@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "siphon-rtp datapath seam: backend-agnostic Datapath trait + NIC-free UDP-loopback backend"
+readme = "README.md"
+keywords = ["rtp", "udp", "relay", "networking", "voip"]
+categories = ["network-programming"]
 
 [dependencies]
 siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }

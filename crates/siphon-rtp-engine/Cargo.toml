@@ -11,6 +11,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "siphon-rtp — pure-Rust, kernel-accelerated RTP media engine daemon for SIPhon"
+readme = "README.md"
+keywords = ["rtp", "voip", "media", "sip", "rtpengine"]
+categories = ["network-programming", "multimedia::audio"]
 
 [[bin]]
 name = "siphon-rtp"

@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "siphon-rtp media plane: RTP/RTCP, jitter/PLC, fan-out/fork, mixer, and stream bridges"
+readme = "README.md"
+keywords = ["rtp", "rtcp", "jitter", "voip", "media"]
+categories = ["network-programming", "multimedia::audio"]
 
 [dependencies]
 siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.1.0" }

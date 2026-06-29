@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "siphon-rtp HEP3 (Homer) telemetry — RTCP/QoS capture encoding, MOS, and UDP export"
+readme = "README.md"
+keywords = ["hep", "homer", "rtcp", "telemetry", "voip"]
+categories = ["network-programming"]
 
 [dependencies]
 tokio = { workspace = true }

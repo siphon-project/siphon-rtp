@@ -9,6 +9,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+description = "siphon-rtp pure-Rust SRTP/SRTCP (RFC 3711): AES-CM + HMAC-SHA1 via RustCrypto, zero C deps"
+readme = "README.md"
+keywords = ["srtp", "rtp", "crypto", "webrtc", "voip"]
+categories = ["network-programming", "cryptography"]
 
 [dependencies]
 aes = "0.8"

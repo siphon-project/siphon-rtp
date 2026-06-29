@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "siphon-rtp pure-Rust audio codecs (G.711, L16, AMR-NB/WB foundation) — zero C deps"
+readme = "README.md"
+keywords = ["codec", "audio", "g711", "amr", "voip"]
+categories = ["multimedia::audio"]
 
 [dependencies]
 thiserror = { workspace = true }

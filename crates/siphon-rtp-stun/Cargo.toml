@@ -10,6 +10,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "siphon-rtp STUN (RFC 8489) message codec — pure Rust, zero C, for ICE connectivity checks"
+readme = "README.md"
+keywords = ["stun", "ice", "webrtc", "voip", "nat"]
+categories = ["network-programming"]
 
 [dependencies]
 thiserror = { workspace = true }
