@@ -6,7 +6,7 @@
 //! `−127`). This is the *encoder output order* — exactly the bit order stored in the G.192 `.cod`
 //! file — not the RTP-sorted order (which `payload.rs` un-sorts before reaching here).
 
-use crate::amr::basic_ops::{add, shl};
+use crate::amr::basic_ops::{add, shl, shr};
 
 /// The reference's `BIT_1` marker (`+127`); any other value is treated as `BIT_0`.
 pub const BIT_1: i16 = 127;
@@ -396,6 +396,23 @@ pub fn unsort_mode0(data: &[u8]) -> [i16; 132] {
         prms[dest as usize] = if bit != 0 { BIT_1 } else { BIT_0 };
     }
     prms
+}
+
+/// Pack a parameter `value` into `no_of_bits` `BIT_0`/`BIT_1` words, MSB-first, advancing `*pos`
+/// (the encoder-side `Parm_serial` / `Prm2bits` of `bits.c`). The reference writes the LSB into the
+/// highest index of the field and decrements, so the net layout is MSB-first; this writes the same
+/// order directly. `prms` must have room for `*pos + no_of_bits` words.
+pub fn parm_serial(value: i16, no_of_bits: i16, prms: &mut [i16], pos: &mut usize) {
+    let n = no_of_bits as usize;
+    let mut v = value;
+    // C: *prms += no_of_bits; then for i in 0..n writes *--(*prms) = bit(value lsb); value >>= 1.
+    // Equivalent: bit (n-1-i) from the LSB goes to prms[base + i] (MSB-first).
+    for i in (0..n).rev() {
+        let bit = v & 0x0001;
+        prms[*pos + i] = if bit == 0 { BIT_0 } else { BIT_1 };
+        v = shr(v, 1);
+    }
+    *pos += n;
 }
 
 /// A forward, MSB-first cursor over a slice of AMR-WB bit words.

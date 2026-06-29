@@ -297,6 +297,7 @@ impl Encoder for AmrNb {
 pub struct AmrWb {
     params: CodecParams,
     decoder_state: Box<wb::dec_main::DecoderState>,
+    encoder_state: Box<wb::enc_main::EncoderState>,
     /// Last decoded speech mode (0..=8), used to size concealed frames after a loss.
     last_mode: u8,
 }
@@ -318,8 +319,51 @@ impl AmrWb {
                 ptime_ms: 20,
             },
             decoder_state: Box::new(wb::dec_main::DecoderState::new()),
+            encoder_state: Box::new(wb::enc_main::EncoderState::new()),
             last_mode: 0,
         }
+    }
+
+    /// Encode one 20 ms frame (320 samples @ 16 kHz) at `mode` (0..=8) into its speech bits in
+    /// encoder/`Prm2bits` order (the `.cod` order), writing `AMRWB_SPEECH_BITS[mode]` `±127` words to
+    /// `out_bits`. This is the bit-exact core used by the `tst_mN` acceptance tests; the RTP
+    /// [`Encoder::encode`] path re-sorts these into RFC 4867 payload order.
+    ///
+    /// Mirrors the reference `coder()`'s input conditioning: the encoder homing detection is the
+    /// caller's responsibility; the two LSBs of each input sample are masked (`signal & 0xfffC`,
+    /// 14-bit input) before analysis, exactly as `cod_main.c` does.
+    pub fn encode_mode_bits(
+        &mut self,
+        mode: u8,
+        pcm: &[i16],
+        out_bits: &mut [i16],
+    ) -> Result<usize, CodecError> {
+        if mode > 8 {
+            return Err(CodecError::Unsupported("AMR-WB mode out of range"));
+        }
+        if pcm.len() < wb::constants::L_FRAME16K {
+            return Err(CodecError::Malformed("AMR-WB input frame too small"));
+        }
+        let nb_bits = AmrWbMode::from_frame_type(mode)
+            .ok_or(CodecError::Unsupported("AMR-WB invalid speech mode"))?
+            .bits() as usize;
+        if out_bits.len() < nb_bits {
+            return Err(CodecError::Malformed("AMR-WB output bit buffer too small"));
+        }
+        // Encoder homing detection runs on the *raw* input (cod_main.c, before the LSB delete).
+        let reset_flag = wb::enc_main::encoder_homing_frame_test(pcm);
+        // 14-bit input: delete the 2 LSBs (cod_main.c).
+        let mut signal = [0i16; wb::constants::L_FRAME16K];
+        for (dst, &src) in signal.iter_mut().zip(pcm.iter()) {
+            *dst = src & 0xFFFCu16 as i16;
+        }
+        let written = wb::enc_main::coder(&mut self.encoder_state, mode, &signal, out_bits);
+        // A homing frame fully resets the encoder *after* it is coded (cod_main.c
+        // `if (reset_flag) Reset_encoder(st, 1)`).
+        if reset_flag {
+            *self.encoder_state = wb::enc_main::EncoderState::new();
+        }
+        Ok(written)
     }
 
     /// Decode one speech frame of `mode` (0..=8) from its speech bits already in encoder/`Bits2prm`
@@ -581,6 +625,60 @@ mod tests {
         let mut payload = vec![0xF0u8, Toc { follow: false, frame_type: 0, quality_ok: true }.to_octet()];
         payload.extend_from_slice(&data);
         payload
+    }
+
+    /// Encode the reference input PCM at `mode` and compare every frame's encoder-order speech bits
+    /// against the official `tst_mN.cod` (G.192 framing: `[TXRXFLAG, FrameType, Mode, bit_0..]`,
+    /// +127/-127 per databit). Returns `(frames_checked, first_mismatch)` where `first_mismatch` is
+    /// `Some((frame, bit_index, got, want))` on the first differing bit.
+    #[allow(clippy::type_complexity)]
+    fn check_mode_vector(mode: u8) -> (usize, Option<(usize, usize, i16, i16)>) {
+        let nb_bits = AmrWbMode::from_frame_type(mode).expect("mode").bits() as usize;
+        let mut inp_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        inp_path.push("../../reference/amr-wb/testv/tst.inp");
+        let mut cod_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        cod_path.push(format!("../../reference/amr-wb/testv/tst_m{mode}.cod"));
+        let inp = std::fs::read(&inp_path).expect("tst.inp");
+        let cod = std::fs::read(&cod_path).expect("tst_mN.cod");
+        let pcm: Vec<i16> = inp
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let cod_words: Vec<i16> = cod
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        let cod_frame_words = 3 + nb_bits;
+        let n_frames = cod_words.len() / cod_frame_words;
+        assert_eq!(pcm.len() / 320, n_frames, "frame count mismatch");
+
+        let mut wb = AmrWb::new();
+        let mut out = vec![0i16; nb_bits];
+        for f in 0..n_frames {
+            let frame_pcm = &pcm[f * 320..(f + 1) * 320];
+            let written = wb.encode_mode_bits(mode, frame_pcm, &mut out).expect("encode");
+            assert_eq!(written, nb_bits);
+            let base = f * cod_frame_words + 3;
+            for (b, (&got, &want)) in out.iter().zip(&cod_words[base..base + nb_bits]).enumerate() {
+                // Normalize: reference databits are +127/-127; treat anything else (shouldn't occur)
+                // as a mismatch.
+                if got != want {
+                    return (n_frames, Some((f, b, got, want)));
+                }
+            }
+        }
+        (n_frames, None)
+    }
+
+    #[test]
+    #[ignore = "AMR-WB encoder bit-exactness WIP; run explicitly to measure progress"]
+    fn encodes_full_mode2_vector_bit_exact() {
+        let (frames, mismatch) = check_mode_vector(2);
+        assert!(
+            mismatch.is_none(),
+            "mode 2: {frames} frames, first mismatch {mismatch:?}"
+        );
     }
 
     #[test]

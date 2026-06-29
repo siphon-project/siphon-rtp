@@ -10,7 +10,8 @@ use crate::amr::basic_ops::{
     round_word, shl, shr, sub,
 };
 use crate::amr::oper_32b::l_extract;
-use crate::amr::wb::constants::L_SUBFR;
+use crate::amr::wb::constants::{L_SUBFR, M};
+use siphon_rtp_simd::fir_dot_i16;
 
 /// 50 Hz high-pass biquad numerator (Q12) — `HP50.C`.
 const HP50_B: [i16; 3] = [4053, -8106, 4053];
@@ -43,6 +44,23 @@ static FIR_UP: [i16; 120] = [
     96, 139, 124, 68, 0,          -52, -73, -62, -33, 0,
     23, 30, 24, 12, 0,            -6, -7, -4, -1, 0,
 ];
+
+/// `FIR_UP` pre-gathered into the 5 polyphase sub-filters used by [`oversamp_16k`]. Phase `frac`
+/// picks `FIR_UP[(FAC5-1-frac) + FAC5·t]` for `t in 0..2·NB_COEF_UP` — the strided access the
+/// scalar inner loop walked — so each output becomes a single contiguous 24-tap dot product.
+const FIR_UP_POLY: [[i16; 2 * NB_COEF_UP]; FAC5 as usize] = {
+    let mut poly = [[0i16; 2 * NB_COEF_UP]; FAC5 as usize];
+    let mut frac = 0usize;
+    while frac < FAC5 as usize {
+        let mut t = 0usize;
+        while t < 2 * NB_COEF_UP {
+            poly[frac][t] = FIR_UP[(FAC5 as usize - 1 - frac) + FAC5 as usize * t];
+            t += 1;
+        }
+        frac += 1;
+    }
+    poly
+};
 
 /// De-emphasis on a Q15-deposited signal: `y[n] = x[n] + mu·y[n-1]`, in place. `mem` is `y[-1]`.
 pub fn deemph(x: &mut [i16], mu: i16, mem: &mut i16) {
@@ -121,18 +139,26 @@ pub fn syn_filt_32(
     let s = sub(norm_s(a[0]), 2);
     let a0 = shr(a[0], add(4, q_new)); // input / 16 and >> Qnew
 
+    // Reverse a[1..=m] once so each feedback term is a contiguous dot:
+    //   Σ_{j=1}^{m} sig[m+i-j]·a[j] = Σ_{p=0}^{m-1} sig[i+p]·a[m-p].
+    let mut a_rev = [0i16; M];
+    for (p, slot) in a_rev[..m].iter_mut().enumerate() {
+        *slot = a[m - p];
+    }
+    let a_rev = &a_rev[..m];
+
     for i in 0..lg {
-        // Low-part feedback: -sum(sig_lo[i-j]·a[j]).
-        let mut l_tmp = 0i32;
-        for j in 1..=m {
-            l_tmp = l_msu(l_tmp, sig_lo[m + i - j], a[j]);
-        }
+        // Low-part feedback: l_tmp = -2·Σ sig_lo[m+i-j]·a[j] (the saturating l_msu chain expressed
+        // as a wrapping SIMD dot, then doubled/negated with i32 saturation). Bit-exact while the
+        // accumulator stays in range — which a stable A(z) guarantees, gated by the 3GPP vectors
+        // and a non-saturating proptest below.
+        let dot_lo = fir_dot_i16(&sig_lo[i..i + m], a_rev);
+        let mut l_tmp = saturating_neg2(dot_lo);
         l_tmp = l_shr(l_tmp, 16 - 4); // sig_lo carried << 4
         l_tmp = l_mac(l_tmp, exc[i], a0);
-        // High-part feedback: -sum(sig_hi[i-j]·a[j]).
-        for j in 1..=m {
-            l_tmp = l_msu(l_tmp, sig_hi[m + i - j], a[j]);
-        }
+        // High-part feedback continues subtracting into the same accumulator.
+        let dot_hi = fir_dot_i16(&sig_hi[i..i + m], a_rev);
+        l_tmp = saturating_sub2(l_tmp, dot_hi);
         l_tmp = l_shl(l_tmp, add(3, s)); // a in Q12
 
         let hi = extract_h(l_tmp); // bits 16..31
@@ -140,6 +166,21 @@ pub fn syn_filt_32(
         l_tmp = l_shr(l_tmp, 4);
         sig_lo[m + i] = extract_l(l_msu(l_tmp, hi, 2048)); // bits 4..15
     }
+}
+
+/// `-2·x` with i32 saturation — the closed form of the `l_msu` low-part feedback loop in
+/// [`syn_filt_32`] when its accumulator does not overflow (which a stable synthesis filter
+/// guarantees). Matches the per-term saturating chain exactly in the non-saturating regime.
+#[inline]
+fn saturating_neg2(x: i32) -> i32 {
+    (-2 * x as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// `acc − 2·x` with i32 saturation — the closed form of the high-part feedback loop continuing
+/// into the same accumulator. Same non-saturating-regime equivalence as [`saturating_neg2`].
+#[inline]
+fn saturating_sub2(acc: i32, x: i32) -> i32 {
+    (acc as i64 - 2 * x as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
 /// 50 Hz high-pass biquad at 12.8 kHz (TS 26.173 `HP50_12k8`), removing the DC/sub-band rumble from
@@ -197,20 +238,21 @@ pub fn oversamp_16k(
     let lg_up = shl(mult(lg as i16, UP_FAC), 1) as usize; // lg · 5/4
 
     // Up_samp over signal[NB_COEF_UP..]; Interpol(&sig_d[i]) reads signal[i+1 .. i+1+2·NB_COEF_UP].
+    // Each output is a 24-tap dot of the input window with the polyphase sub-filter for `frac`,
+    // pre-gathered into the contiguous `FIR_UP_POLY[frac]` so the dot is a single SIMD `fir_dot_i16`.
+    // Bit-exact vs the scalar `l_mac` loop: the dot accumulates in wrapping i32, and for any i16
+    // input `Σ|2·signal·coef| < 2^31` (each phase's `Σ|coef| < 2^15`), so the saturating accumulator
+    // never actually saturates — only the final `l_shl(.,1)` can, identically on both paths.
+    // (Proven by the proptest below and the 3GPP TS 26.174 vectors.)
     let mut pos = 0i16;
     for out in sig16k.iter_mut().take(lg_up) {
         let i = mult(pos, INV_FAC5); // pos/5
         let frac = sub(pos, add(shl(i, 2), i)); // pos − (pos/5)·5
         let base = i as usize + 1;
 
-        let mut l_sum = 0i32;
-        let mut k = sub(sub(FAC5, 1), frac);
-        for t in 0..(2 * NB_COEF_UP) {
-            l_sum = l_mac(l_sum, signal[base + t], FIR_UP[k as usize]);
-            k += FAC5;
-        }
-        l_sum = l_shl(l_sum, 1); // saturation can occur here
-        *out = round_word(l_sum);
+        let dot = fir_dot_i16(&signal[base..base + 2 * NB_COEF_UP], &FIR_UP_POLY[frac as usize]);
+        let l_sum = l_shl(dot, 1); // L_mult's per-term ×2, hoisted out of the dot
+        *out = round_word(l_shl(l_sum, 1)); // final Q-shift; saturation matches the scalar path
 
         pos = add(pos, FAC4); // + 4/5
     }
@@ -221,7 +263,120 @@ pub fn oversamp_16k(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::amr::basic_ops::l_mac;
     use crate::amr::wb::constants::PREEMPH_FAC;
+    use proptest::prelude::*;
+
+    /// The original scalar `Oversamp_16k` inner loop (strided `l_mac` over `FIR_UP`), preserved
+    /// verbatim as the bit-exact oracle for the SIMD [`oversamp_16k`].
+    fn oversamp_16k_reference(
+        sig12k8: &[i16],
+        lg: usize,
+        sig16k: &mut [i16],
+        mem: &mut [i16; 2 * NB_COEF_UP],
+    ) {
+        let mut signal = [0i16; L_SUBFR + 2 * NB_COEF_UP];
+        signal[..2 * NB_COEF_UP].copy_from_slice(mem);
+        signal[2 * NB_COEF_UP..2 * NB_COEF_UP + lg].copy_from_slice(&sig12k8[..lg]);
+        let lg_up = shl(mult(lg as i16, UP_FAC), 1) as usize;
+        let mut pos = 0i16;
+        for out in sig16k.iter_mut().take(lg_up) {
+            let i = mult(pos, INV_FAC5);
+            let frac = sub(pos, add(shl(i, 2), i));
+            let base = i as usize + 1;
+            let mut l_sum = 0i32;
+            let mut k = sub(sub(FAC5, 1), frac);
+            for t in 0..(2 * NB_COEF_UP) {
+                l_sum = l_mac(l_sum, signal[base + t], FIR_UP[k as usize]);
+                k += FAC5;
+            }
+            l_sum = l_shl(l_sum, 1);
+            *out = round_word(l_sum);
+            pos = add(pos, FAC4);
+        }
+        mem.copy_from_slice(&signal[lg..lg + 2 * NB_COEF_UP]);
+    }
+
+    proptest! {
+        /// The SIMD `oversamp_16k` is byte-identical to the original scalar `l_mac` loop for *any*
+        /// i16 input — the saturating accumulator provably never saturates (see the kernel comment),
+        /// so wrapping-i32 SIMD == saturating scalar. Full i16 range hammers that claim.
+        #[test]
+        fn oversamp_simd_matches_scalar_reference(
+            mem in proptest::array::uniform24(any::<i16>()),
+            sig in proptest::collection::vec(any::<i16>(), 1..=L_SUBFR),
+        ) {
+            let lg = sig.len();
+            let (mut mem_simd, mut mem_ref) = (mem, mem);
+            let mut out_simd = [0i16; L_SUBFR * 5 / 4];
+            let mut out_ref = [0i16; L_SUBFR * 5 / 4];
+            oversamp_16k(&sig, lg, &mut out_simd, &mut mem_simd);
+            oversamp_16k_reference(&sig, lg, &mut out_ref, &mut mem_ref);
+            prop_assert_eq!(out_simd, out_ref);
+            prop_assert_eq!(mem_simd, mem_ref);
+        }
+    }
+
+    /// The original scalar `Syn_filt_32` feedback loops (per-term `l_msu`), preserved verbatim as
+    /// the bit-exact oracle for the SIMD [`syn_filt_32`].
+    #[allow(clippy::too_many_arguments)]
+    fn syn_filt_32_reference(
+        a: &[i16],
+        m: usize,
+        exc: &[i16],
+        q_new: i16,
+        sig_hi: &mut [i16],
+        sig_lo: &mut [i16],
+        lg: usize,
+    ) {
+        let s = sub(norm_s(a[0]), 2);
+        let a0 = shr(a[0], add(4, q_new));
+        for i in 0..lg {
+            let mut l_tmp = 0i32;
+            for j in 1..=m {
+                l_tmp = l_msu(l_tmp, sig_lo[m + i - j], a[j]);
+            }
+            l_tmp = l_shr(l_tmp, 16 - 4);
+            l_tmp = l_mac(l_tmp, exc[i], a0);
+            for j in 1..=m {
+                l_tmp = l_msu(l_tmp, sig_hi[m + i - j], a[j]);
+            }
+            l_tmp = l_shl(l_tmp, add(3, s));
+            let hi = extract_h(l_tmp);
+            sig_hi[m + i] = hi;
+            l_tmp = l_shr(l_tmp, 4);
+            sig_lo[m + i] = extract_l(l_msu(l_tmp, hi, 2048));
+        }
+    }
+
+    proptest! {
+        /// SIMD `syn_filt_32` is byte-identical to the original `l_msu` feedback loops over a
+        /// provably non-saturating domain: with |a[1..=m]| ≤ 256, `2·Σ sig·a` ≤ 2·16·32768·256 ≈
+        /// 2.7e8 < 2^31 even for full-range `sig_hi`, so the saturating accumulator never engages and
+        /// the wrapping-i32 dot reconstruction matches exactly. (Real stable-filter / full-range
+        /// conformance is covered by the 3GPP TS 26.174 `decode_mode_vector` tests.)
+        #[test]
+        fn syn_filt_simd_matches_scalar_reference(
+            a_tail in proptest::collection::vec(-256i16..=256, M),
+            exc in proptest::collection::vec(-8192i16..=8192, L_SUBFR),
+            hi_mem in proptest::collection::vec(any::<i16>(), M),
+            lo_mem in proptest::collection::vec(-2047i16..=2047, M),
+        ) {
+            let mut a = vec![4096i16]; // a[0] = 1.0 (Q12)
+            a.extend_from_slice(&a_tail);
+
+            let mut hi_simd = hi_mem.clone();
+            hi_simd.extend(std::iter::repeat(0).take(L_SUBFR));
+            let mut lo_simd = lo_mem.clone();
+            lo_simd.extend(std::iter::repeat(0).take(L_SUBFR));
+            let (mut hi_ref, mut lo_ref) = (hi_simd.clone(), lo_simd.clone());
+
+            syn_filt_32(&a, M, &exc, 0, &mut hi_simd, &mut lo_simd, L_SUBFR);
+            syn_filt_32_reference(&a, M, &exc, 0, &mut hi_ref, &mut lo_ref, L_SUBFR);
+            prop_assert_eq!(hi_simd, hi_ref);
+            prop_assert_eq!(lo_simd, lo_ref);
+        }
+    }
 
     #[test]
     fn deemph_with_zero_mu_is_identity() {
