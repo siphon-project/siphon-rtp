@@ -6,3 +6,9 @@ amr-wb/c-code/
 # bit-exact acceptance criteria. They are kept untracked until git-lfs is configured for them, then
 # committed via LFS (see project memory) — they must never enter normal git history as binaries.
 amr-wb/testv/
+
+# Opus RFC 6716 conformance reference data — the official testvectorNN.bit/.dec, the locally
+# generated CELT-only oracle vectors (celt_only/, from a libopus OPUS_SET_FORCE_MODE oracle), and any
+# libopus source/oracle build artifacts. All reference-only acceptance data: never committed (bloat +
+# licensing), kept untracked like the AMR-WB vectors. Tests skip-when-absent.
+opus/

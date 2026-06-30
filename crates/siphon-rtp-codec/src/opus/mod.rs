@@ -14,4 +14,6 @@
 //! `opus_compare` tolerance metric (a perceptual spectral comparison, *not* bit-exact PCM — a
 //! conformant Opus decoder need not be sample-identical), wired once CELT + SILK decode exist.
 
+pub mod celt;
+pub mod packet;
 pub mod range_coder;

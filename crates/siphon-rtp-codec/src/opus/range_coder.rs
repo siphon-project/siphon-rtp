@@ -111,10 +111,25 @@ impl<'a> RangeDecoder<'a> {
         ec_tell(self.nbits_total, self.rng)
     }
 
+    /// The current range-coder normalization register `rng` (libopus `dec->rng`). CELT resyncs its
+    /// cross-frame fold/anti-collapse PRNG seed to this at frame end (`st->rng = dec->rng`,
+    /// `celt_decoder.c:1597`), so the next frame's noise fold is seeded from the entropy state.
+    #[must_use]
+    pub fn rng(&self) -> u32 {
+        self.rng
+    }
+
     /// Bits read so far in 1/8-bit units.
     #[must_use]
     pub fn tell_frac(&self) -> u32 {
         ec_tell_frac(self.nbits_total, self.rng)
+    }
+
+    /// Total buffer size in bits (libopus `dec->storage*8`) — the absolute bit budget the CELT
+    /// coarse-energy decode compares `tell()` against.
+    #[must_use]
+    pub fn storage_bits(&self) -> u32 {
+        self.storage * 8
     }
 
     #[inline]
