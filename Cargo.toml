@@ -58,7 +58,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 # PEM parsing — the maintained successor to the now-unmaintained rustls-pemfile (RUSTSEC-2025-0134).
 # Its PemObject API has lived in rustls-pki-types since 1.9; depend on it directly per that advisory.
 rustls-pki-types = { version = "1.9", features = ["alloc"] }
-rcgen = "0.13"
+rcgen = "0.14"
 # Randomness — ICE credential generation (OS CSPRNG; no bundled C crypto)
 getrandom = "0.3"
 # WebSocket bridges (pure-Rust: rustls/ring only, no native-tls/OpenSSL)
