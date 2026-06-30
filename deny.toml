@@ -13,7 +13,14 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2024-0436: `paste` is unmaintained. It is a compile-time-only proc-macro (no runtime or
+    # network surface, not a vulnerability) reached transitively through `tikv-jemalloc-ctl`, which we
+    # use *only* as a dev-dependency for the jemalloc `allocated` memory-leak soak gate (a hard project
+    # rule). We don't own that edge and there is no safe upgrade; drop this ignore once
+    # tikv-jemalloc-ctl moves off paste.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; compile-time-only, dev-dep via tikv-jemalloc-ctl, no upgrade" },
+]
 
 [bans]
 # HARD RULE: pure Rust, ZERO C library deps. Codecs are hand-written; crypto/TLS is ring/rustls.

@@ -19,8 +19,8 @@
 //! ([`convolve`], [`syn_filt`], [`preemph`]/[`preemph2`], `residu`), the pitch-gain
 //! ([`g_pitch`], `g_pitch.c`) and pitch-gain clipping ([`gp_clip`] etc, `gpclip.c`), the
 //! target/correlation prep ([`updt_tar`], [`cor_h_x`]), the **algebraic codebook search**
-//! ([`acelp_2t64_fx`] for mode 0 / [`acelp_4t64_fx`] for modes 1-8, `c2t64fx.c`/`c4t64fx.c`) with
-//! the pulse-index encoders ([`q_pulse`], `q_pulse.c`), the gain VQ ([`q_gain2`], `q_gain2.c`), and
+//! ([`acelp_2t64_fx`] for mode 0 / `acelp_4t64_fx` for modes 1-8, `c2t64fx.c`/`c4t64fx.c`) with
+//! the pulse-index encoders (`q_pulse`, `q_pulse.c`), the gain VQ ([`q_gain2`], `q_gain2.c`), and
 //! the voicing factor ([`voice_factor`], `voicefac.c`).
 
 use crate::amr::basic_ops::{

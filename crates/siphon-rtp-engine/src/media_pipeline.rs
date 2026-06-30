@@ -609,7 +609,7 @@ struct DtmfMeta<'a> {
 /// A media-processing call: two directions plus the call identity for event correlation.
 ///
 /// `process` is pure and synchronous — feed it a redirected datagram, collect the datagrams to send
-/// and DTMF events to emit. The async actor ([`run_media_call`]) wraps it with the datapath I/O.
+/// and DTMF events to emit. The async actor (`run_media_call`) wraps it with the datapath I/O.
 pub struct MediaCall {
     call_id: String,
     from_tag: String,
@@ -730,19 +730,19 @@ impl MediaCall {
         }
     }
 
-    /// Enable or disable echo-test mode ([`Command::Echo`]): when on, each party's ingress audio is
+    /// Enable or disable echo-test mode (`Command::Echo`): when on, each party's ingress audio is
     /// reflected straight back to itself instead of being forwarded to the peer.
     pub fn set_echo(&mut self, echo: bool) {
         self.echo = echo;
     }
 
-    /// Toggle comfort-silence on both egress directions ([`Command::SilenceMedia`]).
+    /// Toggle comfort-silence on both egress directions (`Command::SilenceMedia`).
     pub fn set_silenced(&mut self, silenced: bool) {
         self.a_to_b.silenced = silenced;
         self.b_to_a.silenced = silenced;
     }
 
-    /// Toggle full egress blocking on both directions ([`Command::BlockMedia`]).
+    /// Toggle full egress blocking on both directions (`Command::BlockMedia`).
     pub fn set_blocked(&mut self, blocked: bool) {
         self.a_to_b.blocked = blocked;
         self.b_to_a.blocked = blocked;
@@ -757,7 +757,7 @@ impl MediaCall {
         }
     }
 
-    /// Start a prompt / announcement toward a party ([`Command::PlayMedia`]). The player carries the
+    /// Start a prompt / announcement toward a party (`Command::PlayMedia`). The player carries the
     /// source-rate PCM; a resampler is built when it differs from the egress codec rate.
     pub fn start_play_audio(&mut self, toward_a: bool, player: PcmPlayer) {
         let direction = self.direction_toward(toward_a);
@@ -769,7 +769,7 @@ impl MediaCall {
         direction.injection = Some(Injection::Audio { player, resampler });
     }
 
-    /// Start a DTMF burst toward a party ([`Command::PlayDtmf`]). Returns `false` if the party has no
+    /// Start a DTMF burst toward a party (`Command::PlayDtmf`). Returns `false` if the party has no
     /// negotiated telephone-event payload type to carry it.
     pub fn start_play_dtmf(
         &mut self,
@@ -797,7 +797,7 @@ impl MediaCall {
         true
     }
 
-    /// Stop any prompt / DTMF injection on both directions ([`Command::StopMedia`]).
+    /// Stop any prompt / DTMF injection on both directions (`Command::StopMedia`).
     pub fn stop_play(&mut self) {
         self.a_to_b.injection = None;
         self.b_to_a.injection = None;

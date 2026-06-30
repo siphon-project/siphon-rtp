@@ -60,7 +60,7 @@ struct Flow {
     leg: Arc<Mutex<SecureLeg>>,
 }
 
-/// The bridge registry: redirected endpoint → its [`Flow`]. Shared (`Arc`) between the control path
+/// The bridge registry: redirected endpoint → its `Flow`. Shared (`Arc`) between the control path
 /// (which registers/deregisters per call) and the redirect dispatcher (which calls [`Self::handle`]).
 pub struct SrtpBridge<D: Datapath> {
     datapath: D,

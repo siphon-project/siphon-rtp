@@ -1,7 +1,7 @@
 //! Operational metrics, the `/metrics` + health HTTP endpoint, and the control-plane rate limiter.
 //!
 //! Production hardening for the engine daemon:
-//! - [`Metrics`] — a set of process-wide [`AtomicU64`](std::sync::atomic::AtomicU64) counters,
+//! - [`Metrics`] — a set of process-wide [`AtomicU64`] counters,
 //!   shared via `Arc`, rendered to the Prometheus/OpenMetrics text exposition format.
 //! - [`serve_metrics`] — a deliberately minimal, hand-rolled HTTP/1.1 server (no hyper/axum/warp,
 //!   keeping deps lean and the pure-Rust posture intact) exposing `/metrics`, `/healthz`, `/readyz`.

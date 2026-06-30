@@ -42,10 +42,18 @@ fn crafted_malformed_frames_never_panic() {
     }
 }
 
+// The seed corpus (`fuzz/corpus/proto_frame_fuzz/`) is fuzzer-generated and gitignored, so a clean
+// checkout (CI) has nothing to replay — the no-panic guarantee there rests on
+// `crafted_malformed_frames_never_panic` above (which includes a valid frame) and the crate's inline
+// proptests. When a developer has run the fuzzer locally, this additionally replays every retained
+// seed; none may panic, and at least one valid seed must still decode to a `Request`.
 #[test]
 fn corpus_seeds_never_panic_and_valid_seed_decodes() {
     let seeds = corpus_seeds();
-    assert!(!seeds.is_empty(), "seed corpus must exist at fuzz/corpus/proto_frame_fuzz/");
+    if seeds.is_empty() {
+        eprintln!("proto seed corpus absent — skipping corpus replay");
+        return;
+    }
     let mut decoded_a_full_frame = false;
     for seed in seeds {
         if let Ok(Some((_request, _consumed))) = frame::decode::<Request>(&seed) {

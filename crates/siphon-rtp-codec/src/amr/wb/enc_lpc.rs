@@ -20,7 +20,7 @@
 //!
 //! Ported bit-exact on the shared fixed-point operators ([`crate::amr::basic_ops`],
 //! [`crate::amr::oper_32b`]). The decoder already owns the ISP↔ISF + Az conversions
-//! ([`crate::amr::wb::lpc`]) and the ISF codebooks ([`crate::amr::wb::isf_tables`]); the quantizer
+//! ([`crate::amr::wb::lpc`]) and the ISF codebooks (`crate::amr::wb::isf_tables`); the quantizer
 //! searches the same tables the dequantizer reads.
 
 use crate::amr::basic_ops::{
