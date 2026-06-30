@@ -46,6 +46,21 @@ pub struct Metrics {
     conference_leaves_total: AtomicU64,
 }
 
+/// A point-in-time read of the monotonic control-plane counters, taken by [`Metrics::snapshot`] for
+/// the `statistics` control command. Holds no live gauge — the engine pairs it with its session
+/// count when building the [`EngineStatistics`](siphon_rtp_proto::EngineStatistics) reply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    /// Total `offer` commands accepted since start.
+    pub offers_total: u64,
+    /// Total `answer` commands accepted since start.
+    pub answers_total: u64,
+    /// Total `delete` commands accepted since start.
+    pub deletes_total: u64,
+    /// Total control commands that returned an error result since start.
+    pub control_errors_total: u64,
+}
+
 impl Metrics {
     /// A fresh metrics surface with every counter at zero.
     #[must_use]
@@ -87,6 +102,23 @@ impl Metrics {
     /// Count an accepted `conference leave` command.
     pub fn record_conference_leave(&self) {
         self.conference_leaves_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the global process counters the `statistics` control command exposes — offers, answers,
+    /// deletes, and control errors (all monotonic since start). The live `sessions` gauge is *not*
+    /// here: it lives on the engine's session registry, which the caller pairs with this snapshot.
+    ///
+    /// A plain relaxed load of each atomic; the four values are sampled independently (no global
+    /// barrier), which is correct for read-only telemetry — `statistics` is a census, not a
+    /// transaction.
+    #[must_use]
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            offers_total: self.offers_total.load(Ordering::Relaxed),
+            answers_total: self.answers_total.load(Ordering::Relaxed),
+            deletes_total: self.deletes_total.load(Ordering::Relaxed),
+            control_errors_total: self.control_errors_total.load(Ordering::Relaxed),
+        }
     }
 
     /// Render the Prometheus/OpenMetrics text exposition for the current counters plus the on-demand
@@ -446,6 +478,34 @@ mod tests {
         // Every series carries a HELP line.
         assert_eq!(body.matches("# HELP ").count(), 11);
         assert_eq!(body.matches("# TYPE ").count(), 11);
+    }
+
+    #[test]
+    fn snapshot_reads_the_monotonic_counters() {
+        let metrics = Metrics::new();
+        // A fresh surface snapshots to all-zero.
+        assert_eq!(metrics.snapshot(), MetricsSnapshot::default());
+
+        metrics.record_offer();
+        metrics.record_offer();
+        metrics.record_answer();
+        metrics.record_delete();
+        metrics.record_delete();
+        metrics.record_delete();
+        metrics.record_control_error();
+        // Rate-limited / conference counters are not part of the statistics snapshot.
+        metrics.record_rate_limited();
+        metrics.record_conference_join();
+
+        assert_eq!(
+            metrics.snapshot(),
+            MetricsSnapshot {
+                offers_total: 2,
+                answers_total: 1,
+                deletes_total: 3,
+                control_errors_total: 1,
+            }
+        );
     }
 
     #[test]

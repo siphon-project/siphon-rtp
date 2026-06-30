@@ -71,6 +71,15 @@ pub enum Command {
     },
     /// Liveness check — answered with [`CmdResult::Pong`].
     Ping,
+    /// Enumerate the live call-ids this engine is handling — answered with [`CmdResult::List`].
+    /// A read-only census of the session registry (rtpengine NG `list`). Scoped to the calling
+    /// control client: only the caller's own calls are returned (A3 — the same ownership gate that
+    /// hides a call from `query`/`delete` by a non-owner; docs/security-and-nat.md §5).
+    List,
+    /// Read the engine's global process counters (calls offered/answered/deleted, current live
+    /// sessions, control errors) — answered with [`CmdResult::Statistics`]. A read-only snapshot of
+    /// the operational metrics surface (rtpengine NG `statistics`); process-wide, not per-client.
+    Statistics,
     /// Inject an audio prompt into a leg.
     PlayMedia {
         call_id: String,
@@ -301,8 +310,30 @@ pub enum CmdResult {
     },
     /// Answer to [`Command::Ping`].
     Pong,
+    /// Answer to [`Command::List`]: the live call-ids the calling client owns. Order is unspecified
+    /// (the registry is unordered); an empty list means the client has no live calls.
+    List { call_ids: Vec<String> },
+    /// Answer to [`Command::Statistics`]: the engine's global process counters.
+    Statistics { statistics: EngineStatistics },
     /// Failure with a human-readable reason.
     Error { reason: String },
+}
+
+/// Global, process-wide engine counters returned by [`Command::Statistics`]. A read-only snapshot of
+/// the operational metrics surface (the same monotonic counters the `/metrics` endpoint renders),
+/// plus the live session gauge — never per-call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineStatistics {
+    /// Total `offer` commands accepted since start (monotonic).
+    pub offers_total: u64,
+    /// Total `answer` commands accepted since start (monotonic).
+    pub answers_total: u64,
+    /// Total `delete` commands accepted since start (monotonic).
+    pub deletes_total: u64,
+    /// Total control commands that returned an error result since start (monotonic).
+    pub control_errors_total: u64,
+    /// Live calls currently in the session registry (a gauge, not a running total).
+    pub sessions: u64,
 }
 
 /// Session statistics returned by [`Command::Query`].
@@ -510,6 +541,8 @@ mod tests {
                 to_tag: None,
             },
             Command::Ping,
+            Command::List,
+            Command::Statistics,
             Command::PlayMedia {
                 call_id: "c".into(),
                 from_tag: "f".into(),
@@ -636,6 +669,31 @@ mod tests {
             },
         });
         roundtrip(&Response {
+            id: 5,
+            result: CmdResult::List {
+                call_ids: vec!["a@host".into(), "b@host".into()],
+            },
+        });
+        // An empty list (no live calls) round-trips too.
+        roundtrip(&Response {
+            id: 6,
+            result: CmdResult::List {
+                call_ids: Vec::new(),
+            },
+        });
+        roundtrip(&Response {
+            id: 7,
+            result: CmdResult::Statistics {
+                statistics: EngineStatistics {
+                    offers_total: 10,
+                    answers_total: 9,
+                    deletes_total: 8,
+                    control_errors_total: 1,
+                    sessions: 2,
+                },
+            },
+        });
+        roundtrip(&Response {
             id: 4,
             result: CmdResult::Ok {
                 sdp: None,
@@ -650,6 +708,61 @@ mod tests {
                 }),
             },
         });
+    }
+
+    #[test]
+    fn list_and_statistics_wire_shape() {
+        // The verbs are bare, internally-tagged on "command" in snake_case.
+        let list = serde_json::to_value(&Request {
+            id: 1,
+            command: Command::List,
+        })
+        .expect("to_value");
+        assert_eq!(list["command"], "list");
+        let statistics = serde_json::to_value(&Request {
+            id: 2,
+            command: Command::Statistics,
+        })
+        .expect("to_value");
+        assert_eq!(statistics["command"], "statistics");
+
+        // The minimal verbs deserialize from just their command tag.
+        assert_eq!(
+            serde_json::from_str::<Command>(r#"{"command":"list"}"#).expect("list"),
+            Command::List
+        );
+        assert_eq!(
+            serde_json::from_str::<Command>(r#"{"command":"statistics"}"#).expect("statistics"),
+            Command::Statistics
+        );
+
+        // The results tag on "result" in snake_case and carry their payload fields.
+        let list_result = serde_json::to_value(&Response {
+            id: 3,
+            result: CmdResult::List {
+                call_ids: vec!["c1".into()],
+            },
+        })
+        .expect("to_value");
+        assert_eq!(list_result["result"], "list");
+        assert_eq!(list_result["call_ids"][0], "c1");
+
+        let stats_result = serde_json::to_value(&Response {
+            id: 4,
+            result: CmdResult::Statistics {
+                statistics: EngineStatistics {
+                    offers_total: 3,
+                    sessions: 1,
+                    ..Default::default()
+                },
+            },
+        })
+        .expect("to_value");
+        assert_eq!(stats_result["result"], "statistics");
+        assert_eq!(stats_result["statistics"]["offers_total"], 3);
+        assert_eq!(stats_result["statistics"]["sessions"], 1);
+        // A field left at its default still serializes (no skip on the counters).
+        assert_eq!(stats_result["statistics"]["answers_total"], 0);
     }
 
     #[test]
