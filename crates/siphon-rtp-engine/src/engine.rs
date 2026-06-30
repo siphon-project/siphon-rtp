@@ -2080,9 +2080,6 @@ fn resolve_pipeline(
     profile: &ProfileFlags,
     far_local_crypto: Option<CryptoAttribute>,
 ) -> PipelineKind {
-    if far_local_crypto.is_some() {
-        return PipelineKind::Srtp;
-    }
     // Transcode when the two legs' primary codecs differ in encoding or clock rate.
     let transcode = match (near_codec, info.primary_codec()) {
         (Some(near), Some(far)) => {
@@ -2091,6 +2088,20 @@ fn resolve_pipeline(
         }
         _ => false,
     };
+    if far_local_crypto.is_some() {
+        // The SRTP bridge terminates crypto but does NOT transcode (docs/security-and-nat.md): a
+        // secure far leg whose codec differs from the near leg would otherwise be mis-bridged with
+        // the near-leg codec. Combined SRTP + transcode is a deferred topology — warn loudly rather
+        // than silently relay the wrong codec. (Not exercised by the plaintext BGCF/SBC trial.)
+        if transcode {
+            tracing::warn!(
+                "secure (RTP/SAVP) far leg with a codec mismatch: the SRTP bridge does not \
+                 transcode, so the near-leg codec is relayed as-is — SRTP + transcode is not yet \
+                 supported (see docs/security-and-nat.md)"
+            );
+        }
+        return PipelineKind::Srtp;
+    }
     if profile.record_call || transcode {
         PipelineKind::Media
     } else {
@@ -2809,6 +2820,129 @@ mod tests {
             port = rtp.port(),
             pt = payload_type,
         )
+    }
+
+    /// Encode 20 ms of 16 kHz PCM into an RFC 4867 octet-aligned AMR-WB RTP packet (PT 96) — what a
+    /// VoLTE UE puts on the wire. `amr`-feature-gated (patent-licensed — docs/codec-licensing.md).
+    #[cfg(feature = "amr")]
+    fn amr_wb_rtp(sequence: u16, ssrc: u32) -> Vec<u8> {
+        use siphon_rtp_codec::factory::{encoder_for, CodecSpec};
+        let mut encoder =
+            encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("amr-wb encoder");
+        let pcm: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.20).sin() * 6000.0) as i16)
+            .collect();
+        let mut amr_payload = vec![0u8; 256];
+        let written = encoder.encode(&pcm, &mut amr_payload).expect("encode amr-wb");
+        let mut packet = vec![0x80, 96];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&(u32::from(sequence) * 320).to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&amr_payload[..written]);
+        packet
+    }
+
+    /// BGCF/SBC PSTN breakout, end to end through the control plane: A offers VoLTE **AMR-WB (16 kHz)**,
+    /// B answers PSTN **G.711a (8 kHz)**. The codec + clock-rate mismatch resolves to the media slow
+    /// path, which redirects both legs to a transcoding actor (decode → 16↔8 kHz resample → re-encode).
+    /// Proves AMR-WB RTP in → G.711a RTP out (and the reverse) over the real datapath + redirect
+    /// dispatcher — the first scenario worthy of a live siphon-sip rtpengine trial. `amr`-feature-gated.
+    #[cfg(feature = "amr")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_answer_transcodes_amr_wb_to_g711a_end_to_end() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        // A offers AMR-WB on dynamic PT 96 at 16 kHz (the VoLTE leg).
+        let amr_offer = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=rtcp-mux\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+        );
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "volte-pstn".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: amr_offer,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+
+        // B answers G.711a only → near = AMR-WB (16 kHz), far = PCMA (8 kHz) → transcode + resample.
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "volte-pstn".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        assert!(
+            engine.media().is_media_call("volte-pstn"),
+            "AMR-WB↔G.711a resolves to the transcoding media slow path"
+        );
+
+        // A → engine(near): AMR-WB in; B receives genuinely transcoded G.711a (PT 8, 160 bytes @ 8 kHz).
+        phone_a
+            .send_to(&amr_wb_rtp(0, 0xAAAA_AAAA), near_addr)
+            .await
+            .expect("a send amr-wb");
+        let (transcoded, from) = recv(&phone_b).await;
+        assert_eq!(from, far_addr, "media leaves the engine's B-facing port");
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&transcoded).expect("parse");
+        assert_eq!(parsed.payload_type, 8, "B receives G.711a (PT 8)");
+        assert_eq!(parsed.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
+        assert!(
+            parsed.payload.iter().any(|&byte| byte != 0xD5),
+            "transcoded G.711a carries non-silence audio"
+        );
+
+        // B → engine(far): G.711a in; A receives re-encoded AMR-WB (PT 96).
+        let from_b = g711_rtp(8, 200, 0x0B0B_0B0B, 0x55);
+        phone_b.send_to(&from_b, far_addr).await.expect("b send");
+        let (back, from) = recv(&phone_a).await;
+        assert_eq!(from, near_addr, "media leaves the engine's A-facing port");
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&back).expect("parse");
+        assert_eq!(parsed.payload_type, 96, "A receives AMR-WB (PT 96)");
+        assert!(!parsed.payload.is_empty(), "AMR-WB egress carries a frame");
+
+        let deleted = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "volte-pstn".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

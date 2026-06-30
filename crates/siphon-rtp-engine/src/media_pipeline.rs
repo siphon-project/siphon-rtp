@@ -1298,6 +1298,100 @@ mod tests {
         assert!(events.is_empty());
     }
 
+    /// An AMR-WB RTP packet (PT 96) carrying `payload`, with the 16 kHz RTP clock (320 ts units per
+    /// 20 ms frame).
+    #[cfg(feature = "amr")]
+    fn amr_wb_rtp(sequence: u16, payload: &[u8]) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 96,
+            sequence,
+            timestamp: u32::from(sequence) * 320,
+            ssrc: 0x1234_5678,
+        };
+        let mut buffer = vec![0u8; 12 + payload.len()];
+        let len = write_packet(&header, payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    /// The BGCF/SBC PSTN-breakout core: a VoLTE AMR-WB (16 kHz) leg transcoded to a PSTN G.711a
+    /// (8 kHz) leg through the media slow path — decode → 16→8 kHz resample → re-encode. Drives the
+    /// real `process()` (the same call the live actor makes at run_media_call:1116), so it proves the
+    /// transcode+resample chain deterministically, independent of the async datapath. Feature-gated
+    /// on `amr` (patent-licensed — docs/codec-licensing.md).
+    #[cfg(feature = "amr")]
+    #[test]
+    fn transcodes_amr_wb_to_g711a_with_resampling() {
+        use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
+
+        // Encode 20 ms of 16 kHz PCM into an RFC 4867 octet-aligned AMR-WB payload (VoLTE wire form).
+        let mut amr_encoder =
+            encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("amr-wb encoder");
+        let pcm: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.20).sin() * 6000.0) as i16)
+            .collect();
+        let mut amr_payload = vec![0u8; 256];
+        let written = amr_encoder
+            .encode(&pcm, &mut amr_payload)
+            .expect("encode amr-wb");
+        amr_payload.truncate(written);
+        assert!(written > 0, "AMR-WB encoder produced a payload");
+
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            decoder: decoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20))
+                .expect("amr-wb decoder"),
+            encoder: encoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma encoder"),
+            egress_ssrc: 0xB000_0008,
+            egress_payload_type: 8,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: decoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma decoder"),
+            encoder: encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20))
+                .expect("amr-wb encoder"),
+            egress_ssrc: 0xA000_0060,
+            egress_payload_type: 96,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+        let mut call = MediaCall::new(
+            "amr-call",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        );
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, amr_wb_rtp(1, &amr_payload)), &mut out, &mut events);
+
+        assert_eq!(out.len(), 1, "one transcoded G.711a packet toward B");
+        let datagram = &out[0];
+        assert_eq!(datagram.endpoint, endpoint(2), "sent from B's engine socket");
+        let packet = RtpPacket::parse(&datagram.data).expect("parse");
+        assert_eq!(packet.payload_type, 8, "re-encoded as G.711a (PT 8)");
+        assert_eq!(packet.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
+        assert_eq!(packet.ssrc, 0xB000_0008, "stamped with the A→B egress SSRC");
+        assert!(
+            packet.payload.iter().any(|&byte| byte != 0xD5),
+            "transcoded G.711a carries non-silence audio"
+        );
+    }
+
     #[test]
     fn egress_sequence_and_timestamp_advance_per_packet() {
         let mut call = ulaw_alaw_call();
