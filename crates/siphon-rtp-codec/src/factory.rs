@@ -41,6 +41,10 @@ pub struct CodecSpec {
     pub channels: u8,
     /// Packetization time in milliseconds.
     pub ptime_ms: u8,
+    /// Egress encode mode for a variable-rate codec (AMR-WB speech mode 0..=8), when the peer's SDP
+    /// `a=fmtp` `mode-set` constrains it. `None` ⇒ the codec's own default (AMR-WB mode 2 / 12.65
+    /// kbit/s). Honoured by [`encoder_for`]; ignored by decoders (the wire frame carries its own mode).
+    pub encode_mode: Option<u8>,
 }
 
 impl CodecSpec {
@@ -59,7 +63,15 @@ impl CodecSpec {
             clock_rate_hz,
             channels: channels.max(1),
             ptime_ms: ptime_ms.max(1),
+            encode_mode: None,
         }
+    }
+
+    /// Set the egress encode mode (e.g. resolved from an SDP `mode-set`). Chainable on [`new`].
+    #[must_use]
+    pub fn with_encode_mode(mut self, mode: Option<u8>) -> Self {
+        self.encode_mode = mode;
+        self
     }
 
     /// Resolve a static (RFC 3551) payload type to a spec when no `a=rtpmap` is present.
@@ -141,9 +153,13 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
         "GSM" => Ok(Box::new(GsmFr::new())),
         "L16" => Ok(Box::new(L16::new(spec.clock_rate_hz, spec.ptime_ms))),
         // AMR-WB encode is bit-exact (modes 0–7) against 3GPP TS 26.174 — same `amr`-feature gate as
-        // decode (docs/codec-licensing.md). Defaults to mode 2 (12.65 kbit/s).
+        // decode (docs/codec-licensing.md). The egress mode is the SDP `mode-set`-resolved
+        // `spec.encode_mode` when present, else the codec default (mode 2 / 12.65 kbit/s).
         #[cfg(feature = "amr")]
-        "AMR-WB" => Ok(Box::new(AmrWb::new())),
+        "AMR-WB" => Ok(Box::new(match spec.encode_mode {
+            Some(mode) => AmrWb::new().with_encode_mode(mode),
+            None => AmrWb::new(),
+        })),
         _ => Err(CodecError::Unsupported(unsupported_name(
             &spec.encoding_name,
         ))),
@@ -309,6 +325,26 @@ mod tests {
         let wb = CodecSpec::new(96, "AMR-WB", 16000, 1, 20);
         assert!(decoder_for(&wb).is_ok(), "AMR-WB decoder");
         assert!(encoder_for(&wb).is_ok(), "AMR-WB encoder");
+    }
+
+    #[cfg(feature = "amr")]
+    #[test]
+    fn amr_wb_encoder_honours_the_spec_encode_mode() {
+        // The SDP-`mode-set`-resolved `encode_mode` selects the egress AMR-WB speech mode; the RFC
+        // 4867 octet-aligned ToC byte (byte 1) carries the frame type FT in bits 6..3.
+        let pcm: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.2).sin() * 6000.0) as i16)
+            .collect();
+        let mut payload = vec![0u8; 64];
+
+        let mut mode0 = encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20).with_encode_mode(Some(0)))
+            .expect("amr-wb encoder");
+        assert!(mode0.encode(&pcm, &mut payload).expect("encode") > 0);
+        assert_eq!((payload[1] >> 3) & 0x0F, 0, "egress frame is mode 0 (ToC FT=0)");
+
+        let mut default = encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("encoder");
+        assert!(default.encode(&pcm, &mut payload).expect("encode") > 0);
+        assert_eq!((payload[1] >> 3) & 0x0F, 2, "default egress frame is mode 2 (ToC FT=2)");
     }
 
     #[cfg(feature = "amr")]
