@@ -206,8 +206,8 @@ impl Direction {
         let egress_timestamp_increment = if egress_rate == 0 {
             egress_frame_samples
         } else {
-            ((u64::from(egress_frame_samples) * u64::from(egress_rtp_clock)) / u64::from(egress_rate))
-                as u32
+            ((u64::from(egress_frame_samples) * u64::from(egress_rtp_clock))
+                / u64::from(egress_rate)) as u32
         };
         Self {
             ingress_endpoint: config.ingress_endpoint,
@@ -387,13 +387,21 @@ impl Direction {
                 data: Bytes::copy_from_slice(&buffer[..total]),
             });
             self.egress_sequence = self.egress_sequence.wrapping_add(1);
-            self.egress_timestamp = self.egress_timestamp.wrapping_add(self.egress_timestamp_increment);
+            self.egress_timestamp = self
+                .egress_timestamp
+                .wrapping_add(self.egress_timestamp_increment);
         }
     }
 
     /// Transform one accepted datagram for this direction, appending any outbound datagrams and DTMF
     /// events. `source`-gating and latching are the caller's responsibility (it owns both directions).
-    fn handle(&mut self, data: &[u8], dtmf_meta: DtmfMeta<'_>, out: &mut Vec<Outbound>, events: &mut Vec<Event>) {
+    fn handle(
+        &mut self,
+        data: &[u8],
+        dtmf_meta: DtmfMeta<'_>,
+        out: &mut Vec<Outbound>,
+        events: &mut Vec<Event>,
+    ) {
         if data.len() < 2 {
             return;
         }
@@ -521,7 +529,9 @@ impl Direction {
                 data: Bytes::copy_from_slice(&buffer[..total]),
             });
             self.egress_sequence = self.egress_sequence.wrapping_add(1);
-            self.egress_timestamp = self.egress_timestamp.wrapping_add(self.egress_timestamp_increment);
+            self.egress_timestamp = self
+                .egress_timestamp
+                .wrapping_add(self.egress_timestamp_increment);
         }
     }
 
@@ -710,7 +720,8 @@ impl MediaCall {
             }
             if self.echo {
                 // Echo A back to A: decode on a_to_b (faces A), re-encode on b_to_a (egress faces A).
-                self.a_to_b.echo_into(&mut self.b_to_a, &packet.data, meta, out, events);
+                self.a_to_b
+                    .echo_into(&mut self.b_to_a, &packet.data, meta, out, events);
             } else {
                 self.a_to_b.handle(&packet.data, meta, out, events);
             }
@@ -723,7 +734,8 @@ impl MediaCall {
                 self.a_to_b.egress_dst = packet.source;
             }
             if self.echo {
-                self.b_to_a.echo_into(&mut self.a_to_b, &packet.data, meta, out, events);
+                self.b_to_a
+                    .echo_into(&mut self.a_to_b, &packet.data, meta, out, events);
             } else {
                 self.b_to_a.handle(&packet.data, meta, out, events);
             }
@@ -891,12 +903,18 @@ impl MediaCall {
         };
         if let Some(recorder) = self.a_to_b.recorder.take() {
             if recorder.sample_count() > 0 {
-                files.push((format!("{base}/{}-a.wav", self.call_id), recorder.into_wav()));
+                files.push((
+                    format!("{base}/{}-a.wav", self.call_id),
+                    recorder.into_wav(),
+                ));
             }
         }
         if let Some(recorder) = self.b_to_a.recorder.take() {
             if recorder.sample_count() > 0 {
-                files.push((format!("{base}/{}-b.wav", self.call_id), recorder.into_wav()));
+                files.push((
+                    format!("{base}/{}-b.wav", self.call_id),
+                    recorder.into_wav(),
+                ));
             }
         }
         files
@@ -912,7 +930,10 @@ pub enum MediaControl {
     /// Echo each party's ingress audio back to itself (`true`) or resume normal forwarding (`false`).
     Echo(bool),
     /// Play a prompt toward a party (`toward_a`): the player owns its source-rate PCM.
-    PlayAudio { toward_a: bool, player: Box<PcmPlayer> },
+    PlayAudio {
+        toward_a: bool,
+        player: Box<PcmPlayer>,
+    },
     /// Play a DTMF burst toward a party; the reply channel reports whether it could start.
     PlayDtmf {
         toward_a: bool,
@@ -1019,7 +1040,10 @@ impl MediaRegistry {
     /// Send a control op to a call's actor, returning `false` if there is no such media call.
     pub fn control(&self, call_id: &str, control: MediaControl) -> bool {
         match self.calls.get(call_id) {
-            Some(handle) => handle.mailbox.try_send(MediaInput::Control(control)).is_ok(),
+            Some(handle) => handle
+                .mailbox
+                .try_send(MediaInput::Control(control))
+                .is_ok(),
             None => false,
         }
     }
@@ -1054,7 +1078,9 @@ impl MediaRegistry {
     /// Tear a call's actor down: stop it (flushing recordings), drop its routes, and abort the task.
     pub fn deregister(&self, call_id: &str) {
         if let Some((_, handle)) = self.calls.remove(call_id) {
-            let _ = handle.mailbox.try_send(MediaInput::Control(MediaControl::Stop));
+            let _ = handle
+                .mailbox
+                .try_send(MediaInput::Control(MediaControl::Stop));
             for endpoint in handle.endpoints {
                 self.routes.remove(&endpoint);
             }
@@ -1145,7 +1171,10 @@ async fn run_media_call<D>(
 /// propagated — a transient socket error must not stall the actor.
 async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
     for datagram in outbound.drain(..) {
-        if let Err(error) = datapath.send(datagram.endpoint, datagram.dst, &datagram.data).await {
+        if let Err(error) = datapath
+            .send(datagram.endpoint, datagram.dst, &datagram.data)
+            .await
+        {
             tracing::debug!(%error, "media-pipeline send failed");
         }
     }
@@ -1198,7 +1227,15 @@ mod tests {
             telephone_event_out: Some(101),
             recorder: None,
         };
-        MediaCall::new("call-1", "tag-a", Some("tag-b".into()), a_to_b, b_to_a, true, None)
+        MediaCall::new(
+            "call-1",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        )
     }
 
     fn ulaw_rtp(sequence: u16, payload_byte: u8) -> Vec<u8> {
@@ -1220,6 +1257,7 @@ mod tests {
         RxPacket {
             endpoint: endpoint(endpoint_id),
             source: addr(source),
+            arrival: 0,
             data: Bytes::from(data),
         }
     }
@@ -1307,18 +1345,33 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
         };
-        let mut call =
-            MediaCall::new("g722", "tag-a", Some("tag-b".into()), a_to_b, b_to_a, true, None);
+        let mut call = MediaCall::new(
+            "g722",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        );
         let mut out = Vec::new();
         let mut events = Vec::new();
         call.process(&rx(1, A_ADDR, g722_rtp(1)), &mut out, &mut events);
         call.process(&rx(1, A_ADDR, g722_rtp(2)), &mut out, &mut events);
 
-        assert_eq!(out.len(), 2, "one transcoded G.722 packet per ingress frame");
+        assert_eq!(
+            out.len(),
+            2,
+            "one transcoded G.722 packet per ingress frame"
+        );
         let first = RtpPacket::parse(&out[0].data).expect("first");
         let second = RtpPacket::parse(&out[1].data).expect("second");
         assert_eq!(first.payload_type, 9, "re-encoded as G.722 (PT 9)");
-        assert_eq!(first.payload.len(), 160, "320 PCM samples → 160 G.722 bytes");
+        assert_eq!(
+            first.payload.len(),
+            160,
+            "320 PCM samples → 160 G.722 bytes"
+        );
         assert_eq!(first.timestamp, 0);
         assert_eq!(
             second.timestamp, 160,
@@ -1332,7 +1385,11 @@ mod tests {
         let mut out = Vec::new();
         let mut events = Vec::new();
         // An attacker on a different IP sprays A's endpoint — gated out before any transcode.
-        call.process(&rx(1, "127.0.0.9:5000", ulaw_rtp(1, 0xFF)), &mut out, &mut events);
+        call.process(
+            &rx(1, "127.0.0.9:5000", ulaw_rtp(1, 0xFF)),
+            &mut out,
+            &mut events,
+        );
         assert!(out.is_empty(), "off-source packet must not be forwarded");
     }
 
@@ -1348,7 +1405,11 @@ mod tests {
         // Now A sends; its packet should go to B's observed (latched) source.
         out.clear();
         call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0xFF)), &mut out, &mut events);
-        assert_eq!(out[0].dst, addr(observed), "A→B latched to B's observed source");
+        assert_eq!(
+            out[0].dst,
+            addr(observed),
+            "A→B latched to B's observed source"
+        );
     }
 
     fn alaw_rtp(sequence: u16, payload_byte: u8) -> Vec<u8> {
@@ -1426,7 +1487,12 @@ mod tests {
         call.process(&rx(1, A_ADDR, buffer), &mut out, &mut events);
         assert_eq!(events.len(), 1, "one DTMF event extracted");
         match &events[0] {
-            Event::Dtmf { digit, duration_ms, call_id, .. } => {
+            Event::Dtmf {
+                digit,
+                duration_ms,
+                call_id,
+                ..
+            } => {
                 assert_eq!(digit, "5");
                 assert_eq!(duration_ms, &100, "800 samples / 8 = 100 ms");
                 assert_eq!(call_id, "call-1");
@@ -1436,7 +1502,10 @@ mod tests {
         assert_eq!(out.len(), 1, "telephone-event repacketized onto egress");
         let relayed = RtpPacket::parse(&out[0].data).expect("parse");
         assert_eq!(relayed.payload_type, 101);
-        assert_eq!(relayed.ssrc, 0xB000_0001, "stamped with the A→B egress SSRC");
+        assert_eq!(
+            relayed.ssrc, 0xB000_0001,
+            "stamped with the A→B egress SSRC"
+        );
         assert_eq!(relayed.timestamp, 16000, "event RTP timestamp preserved");
     }
 
@@ -1450,13 +1519,27 @@ mod tests {
         // A speaks µ-law toward the engine; with echo on, it must come straight back to A.
         call.process(&rx(1, A_ADDR, ulaw_rtp(100, 0xFF)), &mut out, &mut events);
 
-        assert_eq!(out.len(), 1, "exactly one packet, reflected back to the sender");
+        assert_eq!(
+            out.len(),
+            1,
+            "exactly one packet, reflected back to the sender"
+        );
         let datagram = &out[0];
-        assert_eq!(datagram.endpoint, endpoint(1), "echoed out A's own socket, not toward B");
+        assert_eq!(
+            datagram.endpoint,
+            endpoint(1),
+            "echoed out A's own socket, not toward B"
+        );
         assert_eq!(datagram.dst, addr(A_ADDR), "echoed back to A's address");
         let packet = RtpPacket::parse(&datagram.data).expect("parse");
-        assert_eq!(packet.payload_type, 0, "re-encoded in A's own codec (µ-law PT 0)");
-        assert_eq!(packet.ssrc, 0xA000_0001, "stamped with the toward-A egress SSRC");
+        assert_eq!(
+            packet.payload_type, 0,
+            "re-encoded in A's own codec (µ-law PT 0)"
+        );
+        assert_eq!(
+            packet.ssrc, 0xA000_0001,
+            "stamped with the toward-A egress SSRC"
+        );
         // Same codec in and out → decode+encode is idempotent, so A hears exactly what it sent.
         assert_eq!(packet.payload, &[0xFFu8; 160][..]);
         assert!(events.is_empty());
@@ -1465,7 +1548,11 @@ mod tests {
         call.set_echo(false);
         out.clear();
         call.process(&rx(1, A_ADDR, ulaw_rtp(101, 0x00)), &mut out, &mut events);
-        assert_eq!(out[0].endpoint, endpoint(2), "echo off → transcoded toward B again");
+        assert_eq!(
+            out[0].endpoint,
+            endpoint(2),
+            "echo off → transcoded toward B again"
+        );
     }
 
     #[test]
@@ -1489,7 +1576,11 @@ mod tests {
         buffer.truncate(len);
 
         call.process(&rx(1, A_ADDR, buffer), &mut out, &mut events);
-        assert_eq!(events.len(), 1, "DTMF still surfaces during echo (so '#' can end the test)");
+        assert_eq!(
+            events.len(),
+            1,
+            "DTMF still surfaces during echo (so '#' can end the test)"
+        );
         match &events[0] {
             Event::Dtmf { digit, .. } => assert_eq!(digit, "#"),
             other => panic!("expected DTMF, got {other:?}"),
@@ -1518,12 +1609,18 @@ mod tests {
         assert_eq!(out.len(), 1, "one prompt packet per playout tick");
         let packet = RtpPacket::parse(&out[0].data).expect("parse");
         assert_eq!(out[0].endpoint, endpoint(1), "prompt goes out A's socket");
-        assert_eq!(packet.payload_type, 0, "prompt encoded in A's codec (µ-law)");
+        assert_eq!(
+            packet.payload_type, 0,
+            "prompt encoded in A's codec (µ-law)"
+        );
 
         // While the prompt plays toward A, B→A transcode is suppressed (A hears the prompt only).
         out.clear();
         call.process(&rx(2, B_ADDR, alaw_rtp(1, 0x55)), &mut out, &mut Vec::new());
-        assert!(out.is_empty(), "transcode toward A is suppressed during playback");
+        assert!(
+            out.is_empty(),
+            "transcode toward A is suppressed during playback"
+        );
 
         // Second tick drains the rest; a third finds the prompt exhausted and clears the injection.
         out.clear();
@@ -1531,20 +1628,29 @@ mod tests {
         assert_eq!(out.len(), 1);
         out.clear();
         call.tick(&mut out);
-        assert!(!call.has_injection(), "injection cleared when the prompt ends");
+        assert!(
+            !call.has_injection(),
+            "injection cleared when the prompt ends"
+        );
     }
 
     #[test]
     fn play_dtmf_injects_telephone_events_toward_the_target() {
         let mut call = ulaw_alaw_call();
-        assert!(call.start_play_dtmf(true, '5', 100, 10), "A negotiated telephone-event");
+        assert!(
+            call.start_play_dtmf(true, '5', 100, 10),
+            "A negotiated telephone-event"
+        );
         let mut out = Vec::new();
         call.tick(&mut out);
         assert_eq!(out.len(), 1);
         let packet = RtpPacket::parse(&out[0].data).expect("parse");
         assert_eq!(packet.payload_type, 101, "egress telephone-event PT");
         assert_eq!(packet.payload[0], 5, "RFC 4733 event code for '5'");
-        assert!(packet.marker, "first packet of the event carries the marker");
+        assert!(
+            packet.marker,
+            "first packet of the event carries the marker"
+        );
     }
 
     #[test]
@@ -1577,7 +1683,10 @@ mod tests {
             recorder: None,
         };
         let mut call = MediaCall::new("c", "a", None, a_to_b, b_to_a, true, None);
-        assert!(!call.start_play_dtmf(true, '5', 100, 10), "no telephone-event ⇒ cannot inject");
+        assert!(
+            !call.start_play_dtmf(true, '5', 100, 10),
+            "no telephone-event ⇒ cannot inject"
+        );
     }
 
     #[test]
@@ -1606,7 +1715,10 @@ mod tests {
         let forked_bytes = fork_rx.try_recv().expect("one forked packet");
         let forked = RtpPacket::parse(&forked_bytes).expect("fork parse");
         assert_eq!(forked.payload_type, 0, "fork re-encoded as µ-law (PT 0)");
-        assert_eq!(forked.ssrc, 0xFEED_F00D, "fork stamped with the subscriber SSRC");
+        assert_eq!(
+            forked.ssrc, 0xFEED_F00D,
+            "fork stamped with the subscriber SSRC"
+        );
         assert_eq!(forked.sequence, 0, "fork egress sequence starts at 0");
         assert_eq!(forked.payload.len(), 160);
 
@@ -1624,7 +1736,10 @@ mod tests {
 
         let mut call = ulaw_alaw_call();
         let (fork_tx, fork_rx) = flume::bounded(8);
-        call.add_fork(true, Box::new(RtpForkSink::new(Box::new(G711::ulaw()), fork_tx, 7, 0)));
+        call.add_fork(
+            true,
+            Box::new(RtpForkSink::new(Box::new(G711::ulaw()), fork_tx, 7, 0)),
+        );
 
         let mut out = Vec::new();
         let mut events = Vec::new();
@@ -1635,8 +1750,15 @@ mod tests {
         assert_eq!(call.fork_count(true), 0);
         out.clear();
         call.process(&rx(1, A_ADDR, ulaw_rtp(2, 0x40)), &mut out, &mut events);
-        assert_eq!(out.len(), 1, "transcode toward B continues after the fork is removed");
-        assert!(fork_rx.try_recv().is_err(), "no more forked packets after remove");
+        assert_eq!(
+            out.len(),
+            1,
+            "transcode toward B continues after the fork is removed"
+        );
+        assert!(
+            fork_rx.try_recv().is_err(),
+            "no more forked packets after remove"
+        );
     }
 
     #[test]
@@ -1647,7 +1769,10 @@ mod tests {
         // the DTMF event + repacketization are unchanged with a fork attached (regression guard).
         let mut call = ulaw_alaw_call();
         let (fork_tx, fork_rx) = flume::bounded(8);
-        call.add_fork(true, Box::new(RtpForkSink::new(Box::new(G711::ulaw()), fork_tx, 9, 0)));
+        call.add_fork(
+            true,
+            Box::new(RtpForkSink::new(Box::new(G711::ulaw()), fork_tx, 9, 0)),
+        );
 
         let event_payload = [5u8, 0x80 | 10, 0x03, 0x20];
         let header = RtpHeader {
@@ -1666,7 +1791,10 @@ mod tests {
         call.process(&rx(1, A_ADDR, buffer), &mut out, &mut events);
         assert_eq!(events.len(), 1, "DTMF still extracted with a fork attached");
         assert_eq!(out.len(), 1, "telephone-event still repacketized");
-        assert!(fork_rx.try_recv().is_err(), "the fork only sees decoded audio, not DTMF");
+        assert!(
+            fork_rx.try_recv().is_err(),
+            "the fork only sees decoded audio, not DTMF"
+        );
     }
 
     fn tee(subscriber: u64, srs: &str) -> RawTee {
@@ -1691,12 +1819,25 @@ mod tests {
 
         // Two outbound: the raw tee (emitted first) and the transcoded packet toward B.
         assert_eq!(out.len(), 2, "one raw tee + one transcoded egress");
-        let teed = out.iter().find(|o| o.endpoint == endpoint(99)).expect("tee outbound");
+        let teed = out
+            .iter()
+            .find(|o| o.endpoint == endpoint(99))
+            .expect("tee outbound");
         assert_eq!(teed.dst, addr("127.0.0.9:7000"), "tee goes to the SRS");
-        assert_eq!(&teed.data[..], &original[..], "SRS receives A's ORIGINAL RTP byte-for-byte");
-        let to_b = out.iter().find(|o| o.endpoint == endpoint(2)).expect("transcoded egress");
+        assert_eq!(
+            &teed.data[..],
+            &original[..],
+            "SRS receives A's ORIGINAL RTP byte-for-byte"
+        );
+        let to_b = out
+            .iter()
+            .find(|o| o.endpoint == endpoint(2))
+            .expect("transcoded egress");
         let parsed = RtpPacket::parse(&to_b.data).expect("parse");
-        assert_eq!(parsed.payload_type, 8, "B still gets A-law (genuinely transcoded)");
+        assert_eq!(
+            parsed.payload_type, 8,
+            "B still gets A-law (genuinely transcoded)"
+        );
     }
 
     #[test]
@@ -1710,7 +1851,10 @@ mod tests {
         let rtcp = vec![0x80u8, 200, 0x00, 0x06, 0xDE, 0xAD, 0xBE, 0xEF];
         let mut out = Vec::new();
         call.process(&rx(1, A_ADDR, rtcp.clone()), &mut out, &mut Vec::new());
-        let teed = out.iter().find(|o| o.endpoint == endpoint(99)).expect("tee");
+        let teed = out
+            .iter()
+            .find(|o| o.endpoint == endpoint(99))
+            .expect("tee");
         assert_eq!(&teed.data[..], &rtcp[..], "RTCP tee'd verbatim");
     }
 
@@ -1727,8 +1871,14 @@ mod tests {
 
         let mut out = Vec::new();
         call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0x40)), &mut out, &mut Vec::new());
-        assert!(out.iter().all(|o| o.endpoint != endpoint(91)), "removed subscriber gets nothing");
-        assert!(out.iter().any(|o| o.endpoint == endpoint(92)), "the other subscriber still tee'd");
+        assert!(
+            out.iter().all(|o| o.endpoint != endpoint(91)),
+            "removed subscriber gets nothing"
+        );
+        assert!(
+            out.iter().any(|o| o.endpoint == endpoint(92)),
+            "the other subscriber still tee'd"
+        );
     }
 
     /// A relay-only call (a promoted passthrough leg): both directions forward verbatim, no codecs.
@@ -1769,16 +1919,29 @@ mod tests {
 
         // Off-source packet on leg A is gated out (RTPBleed defence) — no forward, no tee.
         let mut out = Vec::new();
-        call.process(&rx(1, "127.0.0.99:5000", ulaw_rtp(1, 0xFF)), &mut out, &mut Vec::new());
-        assert!(out.is_empty(), "off-source packet dropped before forward or tee");
+        call.process(
+            &rx(1, "127.0.0.99:5000", ulaw_rtp(1, 0xFF)),
+            &mut out,
+            &mut Vec::new(),
+        );
+        assert!(
+            out.is_empty(),
+            "off-source packet dropped before forward or tee"
+        );
 
         // A signalled packet forwards to B AND tees to the SRS.
         let original = ulaw_rtp(2, 0x40);
         out.clear();
         call.process(&rx(1, A_ADDR, original.clone()), &mut out, &mut Vec::new());
-        let to_b = out.iter().find(|o| o.endpoint == endpoint(2)).expect("relay to B");
+        let to_b = out
+            .iter()
+            .find(|o| o.endpoint == endpoint(2))
+            .expect("relay to B");
         assert_eq!(&to_b.data[..], &original[..], "relayed verbatim to B");
-        let teed = out.iter().find(|o| o.endpoint == endpoint(99)).expect("tee to SRS");
+        let teed = out
+            .iter()
+            .find(|o| o.endpoint == endpoint(99))
+            .expect("tee to SRS");
         assert_eq!(&teed.data[..], &original[..], "tee'd verbatim to the SRS");
     }
 
@@ -1788,10 +1951,18 @@ mod tests {
         let mut call = relay_call();
         let observed = "127.0.0.3:55555";
         let mut out = Vec::new();
-        call.process(&rx(2, observed, alaw_rtp(1, 0x55)), &mut out, &mut Vec::new());
+        call.process(
+            &rx(2, observed, alaw_rtp(1, 0x55)),
+            &mut out,
+            &mut Vec::new(),
+        );
         out.clear();
         call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0xFF)), &mut out, &mut Vec::new());
-        assert_eq!(out[0].dst, addr(observed), "A→B latched to B's observed source");
+        assert_eq!(
+            out[0].dst,
+            addr(observed),
+            "A→B latched to B's observed source"
+        );
     }
 
     #[test]
@@ -1802,8 +1973,14 @@ mod tests {
         call.set_blocked(true);
         let mut out = Vec::new();
         call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0xFF)), &mut out, &mut Vec::new());
-        assert!(out.iter().all(|o| o.endpoint != endpoint(2)), "blocked: no forward to B");
-        assert!(out.iter().any(|o| o.endpoint == endpoint(99)), "but the SRS still gets the media");
+        assert!(
+            out.iter().all(|o| o.endpoint != endpoint(2)),
+            "blocked: no forward to B"
+        );
+        assert!(
+            out.iter().any(|o| o.endpoint == endpoint(99)),
+            "but the SRS still gets the media"
+        );
     }
 
     #[test]

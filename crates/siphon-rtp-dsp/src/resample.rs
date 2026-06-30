@@ -92,7 +92,11 @@ impl Resampler {
         for phase in 0..upsample as usize {
             for tap in 0..taps_per_phase {
                 let source = phase + tap * upsample as usize;
-                let coefficient = if source < length { prototype[source] } else { 0.0 };
+                let coefficient = if source < length {
+                    prototype[source]
+                } else {
+                    0.0
+                };
                 branches_rev[phase * taps_per_phase + (taps_per_phase - 1 - tap)] = coefficient;
             }
         }
@@ -238,7 +242,10 @@ mod tests {
         // After the filter fills, the constant passes through near unity gain.
         let steady = &output[output.len() / 2..];
         let average: f32 = steady.iter().map(|&s| f32::from(s)).sum::<f32>() / steady.len() as f32;
-        assert!((average - 1000.0).abs() < 20.0, "steady-state average {average}");
+        assert!(
+            (average - 1000.0).abs() < 20.0,
+            "steady-state average {average}"
+        );
     }
 
     #[test]
@@ -283,7 +290,13 @@ mod tests {
 
     #[test]
     fn rejects_zero_rate() {
-        assert!(matches!(Resampler::new(0, 8000), Err(ResampleError::ZeroRate)));
-        assert!(matches!(Resampler::new(8000, 0), Err(ResampleError::ZeroRate)));
+        assert!(matches!(
+            Resampler::new(0, 8000),
+            Err(ResampleError::ZeroRate)
+        ));
+        assert!(matches!(
+            Resampler::new(8000, 0),
+            Err(ResampleError::ZeroRate)
+        ));
     }
 }

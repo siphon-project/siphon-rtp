@@ -50,45 +50,100 @@ async fn metrics_and_health_endpoint_over_tcp() {
     // unknown call → CmdResult::Error → control_errors_total).
     let host = "198.51.100.10"; // RFC 5737 documentation range
     let offer = engine
-        .handle(CLIENT, Command::Offer {
-            call_id: "call-metrics".to_string(),
-            from_tag: "a-tag".to_string(),
-            sdp: sdp_for(host, 4000),
-            profile: Default::default(),
-        })
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: "call-metrics".to_string(),
+                from_tag: "a-tag".to_string(),
+                sdp: sdp_for(host, 4000),
+                profile: Default::default(),
+            },
+        )
         .await;
     assert!(matches!(offer, CmdResult::Ok { .. }), "offer accepted");
 
     let bad_delete = engine
-        .handle(CLIENT, Command::Delete {
-            call_id: "does-not-exist".to_string(),
-            from_tag: "a-tag".to_string(),
-            to_tag: None,
-        })
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: "does-not-exist".to_string(),
+                from_tag: "a-tag".to_string(),
+                to_tag: None,
+            },
+        )
         .await;
-    assert!(matches!(bad_delete, CmdResult::Error { .. }), "delete of unknown call errors");
+    assert!(
+        matches!(bad_delete, CmdResult::Error { .. }),
+        "delete of unknown call errors"
+    );
+
+    // Join a conference so the conference gauge + counter move: one live room, one join counted.
+    let join = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "room-metrics".to_string(),
+                from_tag: "c-tag".to_string(),
+                sdp: sdp_for(host, 4100),
+                role: Default::default(),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(join, CmdResult::Ok { .. }),
+        "conference join accepted"
+    );
 
     // Stand the metrics HTTP server up on an ephemeral port.
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .await
         .expect("bind metrics listener");
     let addr = listener.local_addr().expect("metrics local addr");
-    let session_engine = engine.clone();
-    let sessions = move || session_engine.session_count() as u64;
-    tokio::spawn(metrics::serve_metrics(listener, engine.metrics(), sessions));
+    let gauge_engine = engine.clone();
+    let live = move || {
+        let conference = gauge_engine.conference();
+        metrics::LiveGauges {
+            sessions: gauge_engine.session_count() as u64,
+            conference_rooms: conference.room_count() as u64,
+            conference_participants: conference.participant_count() as u64,
+        }
+    };
+    tokio::spawn(metrics::serve_metrics(listener, engine.metrics(), live));
 
     // GET /metrics — OpenMetrics body with the moved counters and the live sessions gauge (== 1).
     let metrics_response = http_get(addr, "/metrics").await;
-    assert!(metrics_response.starts_with("HTTP/1.1 200 OK\r\n"), "metrics 200");
+    assert!(
+        metrics_response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "metrics 200"
+    );
     assert!(
         metrics_response.contains("Content-Type: text/plain; version=0.0.4\r\n"),
         "metrics content type"
     );
-    assert!(metrics_response.contains("siphon_rtp_sessions 1\n"), "one live session");
-    assert!(metrics_response.contains("siphon_rtp_offers_total 1\n"), "one offer counted");
+    assert!(
+        metrics_response.contains("siphon_rtp_sessions 1\n"),
+        "one live session"
+    );
+    assert!(
+        metrics_response.contains("siphon_rtp_offers_total 1\n"),
+        "one offer counted"
+    );
     assert!(
         metrics_response.contains("siphon_rtp_control_errors_total 1\n"),
         "one control error counted"
+    );
+    assert!(
+        metrics_response.contains("siphon_rtp_conference_rooms 1\n"),
+        "one live conference room"
+    );
+    assert!(
+        metrics_response.contains("siphon_rtp_conference_participants 1\n"),
+        "one live conference participant"
+    );
+    assert!(
+        metrics_response.contains("siphon_rtp_conference_joins_total 1\n"),
+        "one conference join counted"
     );
     assert!(
         metrics_response.contains("siphon_rtp_jemalloc_allocated_bytes "),
@@ -103,5 +158,8 @@ async fn metrics_and_health_endpoint_over_tcp() {
 
     // An unknown path is a 404 (and the server does not panic / hang).
     let not_found = http_get(addr, "/nope").await;
-    assert!(not_found.starts_with("HTTP/1.1 404 Not Found\r\n"), "unknown path 404");
+    assert!(
+        not_found.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "unknown path 404"
+    );
 }

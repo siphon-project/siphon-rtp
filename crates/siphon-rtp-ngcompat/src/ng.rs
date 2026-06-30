@@ -33,7 +33,10 @@ pub enum NgError {
 
 /// Split an NG datagram into the (opaque) cookie and the bencode body, on the first space.
 pub fn split_cookie(datagram: &[u8]) -> Result<(&[u8], &[u8]), NgError> {
-    let space = datagram.iter().position(|&byte| byte == b' ').ok_or(NgError::NoCookie)?;
+    let space = datagram
+        .iter()
+        .position(|&byte| byte == b' ')
+        .ok_or(NgError::NoCookie)?;
     Ok((&datagram[..space], &datagram[space + 1..]))
 }
 
@@ -160,9 +163,13 @@ fn parse_play_media(request: &Value) -> Result<Command, NgError> {
     let source = if let Some(path) = optional_str(request, "file") {
         PlayMediaSource::File { path }
     } else if let Some(blob) = request.get("blob").and_then(Value::as_bytes) {
-        PlayMediaSource::Blob { data: blob.to_vec() }
+        PlayMediaSource::Blob {
+            data: blob.to_vec(),
+        }
     } else if let Some(id) = request.get("db-id").and_then(Value::as_integer) {
-        PlayMediaSource::DbId { id: id.max(0) as u64 }
+        PlayMediaSource::DbId {
+            id: id.max(0) as u64,
+        }
     } else {
         return Err(NgError::MissingKey("file|blob|db-id"));
     };
@@ -245,13 +252,21 @@ fn optional_str(dict: &Value, key: &str) -> Option<String> {
 }
 
 fn optional_u64(dict: &Value, key: &str) -> Option<u64> {
-    dict.get(key).and_then(Value::as_integer).and_then(|value| u64::try_from(value).ok())
+    dict.get(key)
+        .and_then(Value::as_integer)
+        .and_then(|value| u64::try_from(value).ok())
 }
 
 fn string_list(dict: &Value, key: &str) -> Vec<String> {
     dict.get(key)
         .and_then(Value::as_list)
-        .map(|items| items.iter().filter_map(Value::as_str).map(String::from).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -299,23 +314,39 @@ mod tests {
                 ("command", Value::string("offer")),
                 ("call-id", Value::string("cid-1")),
                 ("from-tag", Value::string("ftag")),
-                ("sdp", Value::string("v=0\r\nm=audio 8000 RTP/SAVP 96\r\na=rtpmap:96 AMR-WB/16000\r\n")),
+                (
+                    "sdp",
+                    Value::string(
+                        "v=0\r\nm=audio 8000 RTP/SAVP 96\r\na=rtpmap:96 AMR-WB/16000\r\n",
+                    ),
+                ),
                 ("transport-protocol", Value::string("RTP/AVP")),
                 ("ICE", Value::string("remove")),
                 ("replace", Value::List(vec![Value::string("origin")])),
-                ("direction", Value::List(vec![Value::string("external"), Value::string("internal")])),
+                (
+                    "direction",
+                    Value::List(vec![Value::string("external"), Value::string("internal")]),
+                ),
             ],
         );
         let (_, command) = parse_datagram(&bytes);
         match command {
-            Command::Offer { call_id, from_tag, profile, sdp } => {
+            Command::Offer {
+                call_id,
+                from_tag,
+                profile,
+                sdp,
+            } => {
                 assert_eq!(call_id, "cid-1");
                 assert_eq!(from_tag, "ftag");
                 assert_eq!(profile.transport_protocol.as_deref(), Some("RTP/AVP"));
                 assert_eq!(profile.ice.as_deref(), Some("remove"));
                 assert_eq!(profile.replace, vec!["origin"]);
                 assert_eq!(profile.direction, vec!["external", "internal"]);
-                assert!(profile.flags.is_empty(), "no codec flags in the bridge scenario");
+                assert!(
+                    profile.flags.is_empty(),
+                    "no codec flags in the bridge scenario"
+                );
                 assert!(sdp.contains("AMR-WB/16000"));
             }
             other => panic!("expected offer, got {other:?}"),
@@ -331,12 +362,20 @@ mod tests {
                 ("command", Value::string("offer")),
                 ("call-id", Value::string("cid-2")),
                 ("from-tag", Value::string("ftag")),
-                ("sdp", Value::string("v=0\r\nm=audio 8000 RTP/SAVP 96\r\na=rtpmap:96 AMR-WB/16000\r\n")),
+                (
+                    "sdp",
+                    Value::string(
+                        "v=0\r\nm=audio 8000 RTP/SAVP 96\r\na=rtpmap:96 AMR-WB/16000\r\n",
+                    ),
+                ),
                 ("transport-protocol", Value::string("RTP/AVP")),
-                ("flags", Value::List(vec![
-                    Value::string("codec-transcode-PCMA"),
-                    Value::string("codec-mask-AMR-WB"),
-                ])),
+                (
+                    "flags",
+                    Value::List(vec![
+                        Value::string("codec-transcode-PCMA"),
+                        Value::string("codec-mask-AMR-WB"),
+                    ]),
+                ),
             ],
         );
         let (_, command) = parse_datagram(&bytes);
@@ -350,7 +389,10 @@ mod tests {
     #[test]
     fn structured_codec_dict_normalizes_into_flags() {
         let mut codec = std::collections::BTreeMap::new();
-        codec.insert(b"transcode".to_vec(), Value::List(vec![Value::string("PCMA")]));
+        codec.insert(
+            b"transcode".to_vec(),
+            Value::List(vec![Value::string("PCMA")]),
+        );
         codec.insert(b"mask".to_vec(), Value::List(vec![Value::string("AMR-WB")]));
         let bytes = datagram(
             "x",
@@ -386,7 +428,9 @@ mod tests {
         );
         let (_, command) = parse_datagram(&bytes);
         match command {
-            Command::Answer { to_tag, profile, .. } => {
+            Command::Answer {
+                to_tag, profile, ..
+            } => {
                 assert_eq!(to_tag, "t");
                 assert_eq!(profile.transport_protocol.as_deref(), Some("RTP/SAVP"));
             }
@@ -442,13 +486,20 @@ mod tests {
     fn serialize_results_match_contract() {
         // pong
         assert_eq!(
-            serialize_result(&CmdResult::Pong).get("result").and_then(Value::as_str),
+            serialize_result(&CmdResult::Pong)
+                .get("result")
+                .and_then(Value::as_str),
             Some("pong")
         );
         // error → result + error-reason
-        let error = serialize_result(&CmdResult::Error { reason: "no such call".into() });
+        let error = serialize_result(&CmdResult::Error {
+            reason: "no such call".into(),
+        });
         assert_eq!(error.get("result").and_then(Value::as_str), Some("error"));
-        assert_eq!(error.get("error-reason").and_then(Value::as_str), Some("no such call"));
+        assert_eq!(
+            error.get("error-reason").and_then(Value::as_str),
+            Some("no such call")
+        );
         // ok + sdp
         let ok = serialize_result(&CmdResult::Ok {
             sdp: Some("v=0\r\nm=audio 30000 RTP/SAVP 96\r\n".into()),
@@ -457,7 +508,11 @@ mod tests {
             stats: None,
         });
         assert_eq!(ok.get("result").and_then(Value::as_str), Some("ok"));
-        assert!(ok.get("sdp").and_then(Value::as_str).unwrap().contains("RTP/SAVP"));
+        assert!(ok
+            .get("sdp")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("RTP/SAVP"));
     }
 
     #[test]

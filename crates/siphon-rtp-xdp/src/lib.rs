@@ -290,6 +290,11 @@ struct Inner {
     next_port: AtomicU64,
     /// Logical monotonic clock (ticks), advanced by the engine's sweep — never `Instant::now()`.
     clock: AtomicU64,
+    /// Real-time monotonic origin for **arrival** timestamps and `now_micros` (RTCP interarrival
+    /// jitter / DLSR, RFC 3550 §6.4.1). Distinct from the logical sweep `clock` above: this is
+    /// wall-clock-rate elapsed time, shared with the datapath thread so a packet's arrival and a
+    /// report's "now" read one clock. Production only — XDP runs on a real NIC, not in CI.
+    start: std::time::Instant,
     /// The engine-local relay IPv4 every endpoint advertises and the kernel keys flows on.
     local_ip: Ipv4Addr,
     /// Receiver end of the redirect stream; the sole sender lives on the datapath thread.
@@ -348,6 +353,7 @@ impl XdpDatapath {
         let (observe_tx, observe_rx) = flume::bounded(256);
         let (tx_commands, tx_rx) = flume::unbounded::<TxRequest>();
         let endpoints: Arc<DashMap<EndpointId, EndpointRecord>> = Arc::new(DashMap::new());
+        let start = std::time::Instant::now();
 
         let inner = Arc::new(Inner {
             loader: Mutex::new(loader),
@@ -357,6 +363,7 @@ impl XdpDatapath {
             next_id: AtomicU64::new(0),
             next_port: AtomicU64::new(0),
             clock: AtomicU64::new(0),
+            start,
             local_ip,
             redirect_rx,
             observe_tx,
@@ -374,7 +381,14 @@ impl XdpDatapath {
         let handle = std::thread::Builder::new()
             .name("siphon-xdp-datapath".to_string())
             .spawn(move || {
-                datapath_loop(socket, tx_rx, thread_redirect, thread_endpoints, local_ip_copy);
+                datapath_loop(
+                    socket,
+                    tx_rx,
+                    thread_redirect,
+                    thread_endpoints,
+                    local_ip_copy,
+                    start,
+                );
             })
             .map_err(|error| XdpError::Xsk(xsk::XskError::Socket(error)))?;
         *inner.datapath_thread.lock().expect("datapath_thread lock") = Some(handle);
@@ -506,11 +520,15 @@ fn datapath_loop(
     redirect: flume::Sender<RxPacket>,
     endpoints: Arc<DashMap<EndpointId, EndpointRecord>>,
     _local_ip: Ipv4Addr,
+    start: std::time::Instant,
 ) {
     loop {
         // Drain RX: parse each frame, map its destination transport to an endpoint, push the payload
         // onto the redirect stream. The in-kernel classifier already gated the source.
         let received = socket.rx_burst(64);
+        // One arrival stamp per burst: frames in a burst arrived together off the NIC, so reading the
+        // real-time clock once (not per packet) keeps the RX hot loop cheap (RFC 3550 §6.4.1 jitter).
+        let arrival = start.elapsed().as_micros() as u64;
         for packet in &received {
             let Some(parsed) = headers::parse_udp_frame(&packet.frame) else {
                 continue;
@@ -524,6 +542,7 @@ fn datapath_loop(
             let rx_packet = RxPacket {
                 endpoint,
                 source: SocketAddr::new(IpAddr::V4(parsed.src_ip), parsed.src_port),
+                arrival,
                 data: Bytes::copy_from_slice(payload),
             };
             if redirect.send(rx_packet).is_err() {
@@ -722,6 +741,12 @@ impl Datapath for XdpDatapath {
 
     fn now_ticks(&self) -> u64 {
         self.inner.clock.load(Ordering::Relaxed)
+    }
+
+    fn now_micros(&self) -> u64 {
+        // The same real-time clock the RX thread stamps arrival from, so a participant's packet
+        // arrival and its reception report's "now" (for DLSR) are read on one clock (RFC 3550 §6.4.1).
+        self.inner.start.elapsed().as_micros() as u64
     }
 
     fn last_activity(&self, endpoint: EndpointId) -> Option<u64> {

@@ -85,7 +85,8 @@ impl Value {
     /// Borrow as a UTF-8 string (None if not bytes or not valid UTF-8).
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
-        self.as_bytes().and_then(|bytes| std::str::from_utf8(bytes).ok())
+        self.as_bytes()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
     }
 
     /// As an integer.
@@ -188,7 +189,10 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn peek(&self) -> Result<u8, BencodeError> {
-        self.input.get(self.pos).copied().ok_or(BencodeError::UnexpectedEnd)
+        self.input
+            .get(self.pos)
+            .copied()
+            .ok_or(BencodeError::UnexpectedEnd)
     }
 
     /// Enter a container at `depth`, returning the child depth or [`BencodeError::TooDeep`] when the
@@ -223,7 +227,9 @@ impl Parser<'_> {
         if !is_canonical_integer(text) {
             return Err(BencodeError::BadInteger(start));
         }
-        let number = text.parse::<i64>().map_err(|_| BencodeError::BadInteger(start))?;
+        let number = text
+            .parse::<i64>()
+            .map_err(|_| BencodeError::BadInteger(start))?;
         self.pos = end + 1; // past 'e'
         Ok(Value::Integer(number))
     }
@@ -231,8 +237,8 @@ impl Parser<'_> {
     fn parse_bytes(&mut self) -> Result<Value, BencodeError> {
         let start = self.pos;
         let colon = self.find(b':').ok_or(BencodeError::BadLength(start))?;
-        let length_text =
-            std::str::from_utf8(&self.input[self.pos..colon]).map_err(|_| BencodeError::BadLength(start))?;
+        let length_text = std::str::from_utf8(&self.input[self.pos..colon])
+            .map_err(|_| BencodeError::BadLength(start))?;
         // No leading zeros in the length (canonical), and it must be all digits.
         if length_text.is_empty()
             || (length_text.starts_with('0') && length_text.len() > 1)
@@ -240,9 +246,13 @@ impl Parser<'_> {
         {
             return Err(BencodeError::BadLength(start));
         }
-        let length: usize = length_text.parse().map_err(|_| BencodeError::BadLength(start))?;
+        let length: usize = length_text
+            .parse()
+            .map_err(|_| BencodeError::BadLength(start))?;
         let data_start = colon + 1;
-        let data_end = data_start.checked_add(length).ok_or(BencodeError::BadLength(start))?;
+        let data_end = data_start
+            .checked_add(length)
+            .ok_or(BencodeError::BadLength(start))?;
         if data_end > self.input.len() {
             return Err(BencodeError::UnexpectedEnd);
         }
@@ -310,7 +320,12 @@ mod tests {
     fn roundtrip(value: &Value) {
         let encoded = encode(value);
         let decoded = decode(&encoded).expect("decode");
-        assert_eq!(&decoded, value, "roundtrip via {:?}", String::from_utf8_lossy(&encoded));
+        assert_eq!(
+            &decoded,
+            value,
+            "roundtrip via {:?}",
+            String::from_utf8_lossy(&encoded)
+        );
     }
 
     #[test]
@@ -331,8 +346,14 @@ mod tests {
         assert_eq!(decode(b"0:").unwrap(), Value::Bytes(Vec::new()));
         assert_eq!(encode(&Value::string("spam")), b"4:spam");
         // Binary content survives.
-        assert_eq!(decode(b"3:\x00\xff\x80").unwrap(), Value::Bytes(vec![0, 0xFF, 0x80]));
-        assert!(matches!(decode(b"5:spam"), Err(BencodeError::UnexpectedEnd)));
+        assert_eq!(
+            decode(b"3:\x00\xff\x80").unwrap(),
+            Value::Bytes(vec![0, 0xFF, 0x80])
+        );
+        assert!(matches!(
+            decode(b"5:spam"),
+            Err(BencodeError::UnexpectedEnd)
+        ));
         assert!(matches!(decode(b"01:a"), Err(BencodeError::BadLength(_))));
     }
 
@@ -365,13 +386,22 @@ mod tests {
         assert_eq!(value.get("z").and_then(Value::as_integer), Some(1));
         assert_eq!(value.get("a").and_then(Value::as_integer), Some(2));
         // A genuine duplicate key is still rejected.
-        assert!(matches!(decode(b"d1:ai1e1:ai2ee"), Err(BencodeError::BadDict(_))));
+        assert!(matches!(
+            decode(b"d1:ai1e1:ai2ee"),
+            Err(BencodeError::BadDict(_))
+        ));
     }
 
     #[test]
     fn rejects_trailing_bytes_and_garbage() {
-        assert!(matches!(decode(b"i1ei2e"), Err(BencodeError::TrailingBytes(3))));
-        assert!(matches!(decode(b"x"), Err(BencodeError::Unexpected(b'x', 0))));
+        assert!(matches!(
+            decode(b"i1ei2e"),
+            Err(BencodeError::TrailingBytes(3))
+        ));
+        assert!(matches!(
+            decode(b"x"),
+            Err(BencodeError::Unexpected(b'x', 0))
+        ));
     }
 
     #[test]
@@ -442,7 +472,13 @@ mod tests {
             ("from-tag", Value::string("aBcD")),
             ("ICE", Value::string("remove")),
             ("transport-protocol", Value::string("RTP/AVP")),
-            ("flags", Value::List(vec![Value::string("trust-address"), Value::string("symmetric")])),
+            (
+                "flags",
+                Value::List(vec![
+                    Value::string("trust-address"),
+                    Value::string("symmetric"),
+                ]),
+            ),
             ("sdp", Value::string("v=0\r\nc=IN IP4 203.0.113.5\r\n")),
         ]);
         roundtrip(&value);

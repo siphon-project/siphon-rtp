@@ -15,6 +15,12 @@ readme = "README.md"
 keywords = ["rtp", "voip", "media", "sip", "rtpengine"]
 categories = ["network-programming", "multimedia::audio"]
 
+[features]
+default = []
+# Build the patent-encumbered AMR-NB/AMR-WB codecs into the engine (transcode + conference egress).
+# Off by default; passthrough/relay of AMR is always available. See docs/codec-licensing.md.
+amr = ["siphon-rtp-codec/amr"]
+
 [[bin]]
 name = "siphon-rtp"
 path = "src/main.rs"

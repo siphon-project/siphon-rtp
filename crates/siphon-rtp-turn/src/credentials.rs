@@ -60,9 +60,11 @@ impl CredentialVerifier {
     ) -> AuthResult {
         // The long-term mechanism requires USERNAME + REALM + NONCE + MESSAGE-INTEGRITY; any missing
         // ⇒ this is the first (unauthenticated) request — challenge it.
-        let (Some(username), Some(realm), Some(nonce_value)) =
-            (message.username(), turn::realm(message), turn::nonce(message))
-        else {
+        let (Some(username), Some(realm), Some(nonce_value)) = (
+            message.username(),
+            turn::realm(message),
+            turn::nonce(message),
+        ) else {
             return AuthResult::Unauthorized;
         };
         if message.attribute(turn::ATTR_MESSAGE_INTEGRITY).is_none() {
@@ -138,7 +140,12 @@ impl NonceFactory {
     }
 
     /// Validate a NONCE attribute value (the base64 text we issued) for `client` at `now_tick`.
-    pub(crate) fn check(&self, nonce_value: &[u8], client: SocketAddr, now_tick: u64) -> NonceStatus {
+    pub(crate) fn check(
+        &self,
+        nonce_value: &[u8],
+        client: SocketAddr,
+        now_tick: u64,
+    ) -> NonceStatus {
         let Ok(text) = std::str::from_utf8(nonce_value) else {
             return NonceStatus::Invalid;
         };
@@ -199,9 +206,15 @@ mod tests {
     fn nonce_round_trips_within_lifetime_and_goes_stale() {
         let factory = NonceFactory::new([7u8; 32], 100);
         let nonce = factory.issue(client(), 1_000);
-        assert_eq!(factory.check(nonce.as_bytes(), client(), 1_050), NonceStatus::Valid);
+        assert_eq!(
+            factory.check(nonce.as_bytes(), client(), 1_050),
+            NonceStatus::Valid
+        );
         // Past its lifetime → stale (the 438 trigger).
-        assert_eq!(factory.check(nonce.as_bytes(), client(), 1_101), NonceStatus::Stale);
+        assert_eq!(
+            factory.check(nonce.as_bytes(), client(), 1_101),
+            NonceStatus::Stale
+        );
     }
 
     #[test]
@@ -210,12 +223,21 @@ mod tests {
         let nonce = factory.issue(client(), 10);
         // A different client cannot reuse it.
         let other: SocketAddr = "203.0.113.9:40000".parse().expect("addr");
-        assert_eq!(factory.check(nonce.as_bytes(), other, 11), NonceStatus::Invalid);
+        assert_eq!(
+            factory.check(nonce.as_bytes(), other, 11),
+            NonceStatus::Invalid
+        );
         // A different secret rejects it (no shared MAC key).
         let attacker = NonceFactory::new([4u8; 32], 100);
-        assert_eq!(attacker.check(nonce.as_bytes(), client(), 11), NonceStatus::Invalid);
+        assert_eq!(
+            attacker.check(nonce.as_bytes(), client(), 11),
+            NonceStatus::Invalid
+        );
         // Garbage is rejected, not panicked on.
-        assert_eq!(factory.check(b"not-base64!!", client(), 11), NonceStatus::Invalid);
+        assert_eq!(
+            factory.check(b"not-base64!!", client(), 11),
+            NonceStatus::Invalid
+        );
         assert_eq!(factory.check(b"", client(), 11), NonceStatus::Invalid);
     }
 
@@ -237,7 +259,10 @@ mod tests {
         let request = build_authed_allocate(username, &realm, nonce.as_bytes(), &key);
         let parsed = stun::parse(&request).expect("parse");
         match verifier.authenticate(&parsed, &request, 1_000, &nonce_factory, 1, client) {
-            AuthResult::Ok { username: u, key: k } => {
+            AuthResult::Ok {
+                username: u,
+                key: k,
+            } => {
                 assert_eq!(u, username);
                 assert_eq!(k, key);
             }

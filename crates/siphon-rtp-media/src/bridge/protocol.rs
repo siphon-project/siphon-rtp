@@ -80,7 +80,8 @@ impl MediaFormat {
     /// Bytes in one binary audio frame at this format (L16).
     #[must_use]
     pub fn frame_bytes(&self) -> usize {
-        let samples = (self.sample_rate as usize / 1000) * self.ptime as usize * self.channels as usize;
+        let samples =
+            (self.sample_rate as usize / 1000) * self.ptime as usize * self.channels as usize;
         samples * (self.bit_depth as usize / 8)
     }
 }
@@ -373,7 +374,8 @@ mod tests {
 
     #[test]
     fn play_start_defaults_interruptible_true() {
-        let json = r#"{"type":"play_start","data":{"streamId":"s","playId":"p","source":"binary"}}"#;
+        let json =
+            r#"{"type":"play_start","data":{"streamId":"s","playId":"p","source":"binary"}}"#;
         let message = ControlMessage::from_json(json).expect("parse");
         match message {
             ControlMessage::PlayStart(data) => {

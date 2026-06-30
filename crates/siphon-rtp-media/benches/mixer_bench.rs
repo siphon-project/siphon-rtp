@@ -31,7 +31,14 @@ fn bench_full_room(criterion: &mut Criterion) {
     for participants in [3usize, 10, 32] {
         let pcm = talker_frames(participants);
         let (roles, energy, speaking) = columns(participants, participants);
-        let inputs = MixInputs { pcm: &pcm, roles: &roles, energy: &energy, speaking: &speaking, external: None, frame_len: ROOM_FRAME };
+        let inputs = MixInputs {
+            pcm: &pcm,
+            roles: &roles,
+            energy: &energy,
+            speaking: &speaking,
+            external: None,
+            frame_len: ROOM_FRAME,
+        };
         let mut mixer = Mixer::new(participants, ROOM_FRAME);
         group.bench_with_input(
             BenchmarkId::from_parameter(participants),
@@ -52,7 +59,14 @@ fn bench_webinar(criterion: &mut Criterion) {
     let participants = 60usize;
     let pcm = talker_frames(participants);
     let (roles, energy, speaking) = columns(participants, participants);
-    let inputs = MixInputs { pcm: &pcm, roles: &roles, energy: &energy, speaking: &speaking, external: None, frame_len: ROOM_FRAME };
+    let inputs = MixInputs {
+        pcm: &pcm,
+        roles: &roles,
+        energy: &energy,
+        speaking: &speaking,
+        external: None,
+        frame_len: ROOM_FRAME,
+    };
     let mut mixer = Mixer::new(participants, ROOM_FRAME);
     criterion.bench_function("mixer_webinar_60p_top3_20ms", |bencher| {
         bencher.iter(|| {

@@ -60,7 +60,8 @@ pub(crate) async fn serve_tcp(
         let _ = stream.set_nodelay(true);
         let client_tx = client_tx.clone();
         tokio::spawn(async move {
-            handle_stream_connection(client_tx, stream, client, server, TransportProtocol::Tcp).await;
+            handle_stream_connection(client_tx, stream, client, server, TransportProtocol::Tcp)
+                .await;
         });
     }
 }
@@ -81,8 +82,14 @@ pub(crate) async fn serve_tls(
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls) => {
-                    handle_stream_connection(client_tx, tls, client, server, TransportProtocol::Tls)
-                        .await;
+                    handle_stream_connection(
+                        client_tx,
+                        tls,
+                        client,
+                        server,
+                        TransportProtocol::Tls,
+                    )
+                    .await;
                 }
                 Err(error) => tracing::debug!(%client, %error, "TURN TLS handshake failed"),
             }
@@ -206,13 +213,17 @@ mod tests {
     fn frames_stun_and_channel_data_and_rejects_garbage() {
         // A STUN message frames by its 20-byte header + 4-aligned length.
         let stun_message = stun::binding_request(&[0u8; 12], "user", b"key");
-        assert!(matches!(next_frame(&stun_message), FramePeek::Ready(n) if n == stun_message.len()));
+        assert!(
+            matches!(next_frame(&stun_message), FramePeek::Ready(n) if n == stun_message.len())
+        );
         // Incomplete → Need.
         assert!(matches!(next_frame(&stun_message[..10]), FramePeek::Need));
 
         // A ChannelData message frames by its padded length (RFC 5766 §11.5).
         let channel_data = turn::encode_channel_data(0x4001, b"odd", true);
-        assert!(matches!(next_frame(&channel_data), FramePeek::Ready(n) if n == channel_data.len()));
+        assert!(
+            matches!(next_frame(&channel_data), FramePeek::Ready(n) if n == channel_data.len())
+        );
 
         // A STUN-shaped header with a bad cookie is a desync.
         let mut bad = stun_message.clone();

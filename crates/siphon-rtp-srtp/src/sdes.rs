@@ -206,7 +206,8 @@ mod tests {
 
     #[test]
     fn round_trips_generate_to_parse() {
-        let generated = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let generated =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         let line = generated.to_attribute_value();
         assert!(line.starts_with("crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"));
         let parsed = CryptoAttribute::parse(&line).expect("parse");
@@ -250,7 +251,10 @@ mod tests {
         // 20-byte (too short) inline value.
         let short = STANDARD.encode([0u8; 20]);
         let value = format!("crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{short}");
-        assert_eq!(CryptoAttribute::parse(&value), Err(SdesError::KeyLength(20)));
+        assert_eq!(
+            CryptoAttribute::parse(&value),
+            Err(SdesError::KeyLength(20))
+        );
     }
 
     #[test]

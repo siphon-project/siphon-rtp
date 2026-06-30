@@ -107,7 +107,11 @@ mod tests {
     fn computes_r_factor_and_mos() {
         let report = sample();
         assert_eq!(report.codec, "G711");
-        assert!(report.mos > 4.0 && report.mos < 4.4, "light loss G.711: {}", report.mos);
+        assert!(
+            report.mos > 4.0 && report.mos < 4.4,
+            "light loss G.711: {}",
+            report.mos
+        );
         assert!(report.r_factor > 80.0);
     }
 

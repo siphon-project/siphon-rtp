@@ -106,7 +106,11 @@ impl ClientTransport {
                 }
             }
             ClientTransport::Stream { writer } => {
-                if writer.send_async(Bytes::copy_from_slice(message)).await.is_err() {
+                if writer
+                    .send_async(Bytes::copy_from_slice(message))
+                    .await
+                    .is_err()
+                {
                     tracing::debug!("TURN stream writer closed");
                 }
             }
@@ -442,7 +446,12 @@ impl Turn {
     /// The number of live allocations — a metrics surface and the leak-soak's drain-to-zero check.
     pub async fn allocation_count(&self) -> usize {
         let (reply, response) = tokio::sync::oneshot::channel();
-        if self.client_tx.send_async(Message::Count(reply)).await.is_err() {
+        if self
+            .client_tx
+            .send_async(Message::Count(reply))
+            .await
+            .is_err()
+        {
             return 0;
         }
         response.await.unwrap_or(0)

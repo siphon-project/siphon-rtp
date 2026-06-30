@@ -89,7 +89,9 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
@@ -135,7 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sweeper = engine.clone();
     let turn_sweeper = turn.clone();
     let timeout_ticks = args.media_timeout_secs;
-    tracing::info!(media_timeout_secs = timeout_ticks, "media-timeout sweeper enabled");
+    tracing::info!(
+        media_timeout_secs = timeout_ticks,
+        "media-timeout sweeper enabled"
+    );
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
@@ -146,7 +151,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let reaped = sweeper.reap_idle_conferences(timeout_ticks).await;
             if reaped > 0 {
-                tracing::warn!(participants = reaped, "media timeout — conference participants reaped");
+                tracing::warn!(
+                    participants = reaped,
+                    "media timeout — conference participants reaped"
+                );
             }
             if let Some(turn) = &turn_sweeper {
                 turn.reap();
@@ -160,9 +168,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let metrics_listener = TcpListener::bind(metrics_addr).await?;
         tracing::info!(metrics = %metrics_addr, "metrics + health HTTP endpoint listening");
         let metrics = engine.metrics();
-        let session_engine = engine.clone();
-        let sessions = move || session_engine.session_count() as u64;
-        tokio::spawn(metrics::serve_metrics(metrics_listener, metrics, sessions));
+        let gauge_engine = engine.clone();
+        let live = move || {
+            let conference = gauge_engine.conference();
+            metrics::LiveGauges {
+                sessions: gauge_engine.session_count() as u64,
+                conference_rooms: conference.room_count() as u64,
+                conference_participants: conference.participant_count() as u64,
+            }
+        };
+        tokio::spawn(metrics::serve_metrics(metrics_listener, metrics, live));
     }
 
     // Optional HEP telemetry export of relayed RTCP to a VoIPmonitor / Homer collector, enabled by
@@ -225,7 +240,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Drained out of the accept loop: no new connections are admitted. Wait up to the grace period
     // for in-flight calls to finish before returning (and tearing everything down).
-    drain_sessions(&engine, std::time::Duration::from_secs(args.shutdown_grace_secs)).await;
+    drain_sessions(
+        &engine,
+        std::time::Duration::from_secs(args.shutdown_grace_secs),
+    )
+    .await;
     tracing::info!("siphon-rtp-engine shutting down");
     Ok(())
 }
@@ -255,7 +274,10 @@ where
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            tracing::warn!(remaining, "grace period elapsed; exiting with sessions still live");
+            tracing::warn!(
+                remaining,
+                "grace period elapsed; exiting with sessions still live"
+            );
             return;
         }
     }
@@ -319,7 +341,9 @@ async fn spawn_turn(
     }
 
     if args.turn_udp.is_none() && args.turn_tcp.is_none() && args.turn_tls.is_none() {
-        tracing::warn!("TURN is configured but no --turn-udp/--turn-tcp/--turn-tls listener was given");
+        tracing::warn!(
+            "TURN is configured but no --turn-udp/--turn-tcp/--turn-tls listener was given"
+        );
     }
     Ok((Some(turn), Some(relay_tx)))
 }

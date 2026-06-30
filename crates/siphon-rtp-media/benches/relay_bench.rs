@@ -44,8 +44,8 @@ fn bench_relay(criterion: &mut Criterion) {
                 timestamp: packet.timestamp,
                 ssrc: 0xCAFE_BABE, // re-originated SSRC
             };
-            let len =
-                write_packet(black_box(&header), packet.payload, black_box(&mut out)).expect("write");
+            let len = write_packet(black_box(&header), packet.payload, black_box(&mut out))
+                .expect("write");
             black_box(len)
         });
     });

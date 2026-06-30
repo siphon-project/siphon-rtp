@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+use siphon_rtp_engine::{sdp, server, Engine};
 use siphon_rtp_proto::{frame, CmdResult, Command, Event, Request, Response};
-use siphon_rtp_engine::{server, sdp, Engine};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -76,7 +76,9 @@ impl Control {
 }
 
 async fn phone() -> (UdpSocket, SocketAddr) {
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind phone");
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind phone");
     let addr = socket.local_addr().expect("phone addr");
     (socket, addr)
 }
@@ -92,9 +94,9 @@ fn sdp_for(addr: SocketAddr) -> String {
 
 fn engine_addr(result: &CmdResult) -> SocketAddr {
     match result {
-        CmdResult::Ok { sdp: Some(text), .. } => {
-            sdp::parse(text).expect("parse engine addr").remote_rtp
-        }
+        CmdResult::Ok {
+            sdp: Some(text), ..
+        } => sdp::parse(text).expect("parse engine addr").remote_rtp,
         other => panic!("expected Ok with sdp, got {other:?}"),
     }
 }
@@ -161,13 +163,19 @@ async fn offer_answer_relay_delete_over_tcp_control() {
     let near_addr = engine_addr(&answer);
 
     // Relay A → B.
-    phone_a.send_to(&rtp(0x0A0A_0A0A), near_addr).await.expect("send a");
+    phone_a
+        .send_to(&rtp(0x0A0A_0A0A), near_addr)
+        .await
+        .expect("send a");
     let (data, from) = recv(&phone_b).await;
     assert_eq!(data, rtp(0x0A0A_0A0A));
     assert_eq!(from, far_addr);
 
     // Relay B → A.
-    phone_b.send_to(&rtp(0x0B0B_0B0B), far_addr).await.expect("send b");
+    phone_b
+        .send_to(&rtp(0x0B0B_0B0B), far_addr)
+        .await
+        .expect("send b");
     let (data, from) = recv(&phone_a).await;
     assert_eq!(data, rtp(0x0B0B_0B0B));
     assert_eq!(from, near_addr);
@@ -208,7 +216,10 @@ async fn control_requires_authentication_when_a_secret_is_configured() {
 
     // A command before authenticating is rejected.
     assert!(
-        matches!(control.request(Command::Ping).await, CmdResult::Error { .. }),
+        matches!(
+            control.request(Command::Ping).await,
+            CmdResult::Error { .. }
+        ),
         "commands are rejected before authentication"
     );
     // A wrong token is rejected.

@@ -39,9 +39,24 @@ impl SrtcpContext {
         let mut session_key = [0u8; 16];
         let mut session_salt = [0u8; MASTER_SALT_LEN];
         let mut session_auth = [0u8; 20];
-        kdf::derive(master_key, master_salt, kdf::label::RTCP_ENCRYPTION, &mut session_key);
-        kdf::derive(master_key, master_salt, kdf::label::RTCP_SALT, &mut session_salt);
-        kdf::derive(master_key, master_salt, kdf::label::RTCP_AUTHENTICATION, &mut session_auth);
+        kdf::derive(
+            master_key,
+            master_salt,
+            kdf::label::RTCP_ENCRYPTION,
+            &mut session_key,
+        );
+        kdf::derive(
+            master_key,
+            master_salt,
+            kdf::label::RTCP_SALT,
+            &mut session_salt,
+        );
+        kdf::derive(
+            master_key,
+            master_salt,
+            kdf::label::RTCP_AUTHENTICATION,
+            &mut session_auth,
+        );
         Self {
             session_key,
             session_salt,
@@ -146,13 +161,23 @@ mod tests {
         sender.protect(&plain, &mut srtcp).expect("protect");
         // header(8) + payload(20) + index(4) + tag(10).
         assert_eq!(srtcp.len(), plain.len() + INDEX_TRAILER_LEN + AUTH_TAG_LEN);
-        assert_eq!(&srtcp[..CLEAR_HEADER_LEN], &plain[..CLEAR_HEADER_LEN], "8-byte header clear");
-        assert_ne!(&srtcp[CLEAR_HEADER_LEN..28], &plain[CLEAR_HEADER_LEN..], "payload encrypted");
+        assert_eq!(
+            &srtcp[..CLEAR_HEADER_LEN],
+            &plain[..CLEAR_HEADER_LEN],
+            "8-byte header clear"
+        );
+        assert_ne!(
+            &srtcp[CLEAR_HEADER_LEN..28],
+            &plain[CLEAR_HEADER_LEN..],
+            "payload encrypted"
+        );
         // Encrypt flag set on the index trailer.
         assert_eq!(srtcp[28] & 0x80, 0x80);
 
         let mut recovered = Vec::new();
-        receiver.unprotect(&srtcp, &mut recovered).expect("unprotect");
+        receiver
+            .unprotect(&srtcp, &mut recovered)
+            .expect("unprotect");
         assert_eq!(recovered, plain);
     }
 
@@ -161,12 +186,17 @@ mod tests {
         let mut sender = context();
         let mut first = Vec::new();
         let mut second = Vec::new();
-        sender.protect(&rtcp(1, &[0; 12]), &mut first).expect("protect");
-        sender.protect(&rtcp(1, &[0; 12]), &mut second).expect("protect");
+        sender
+            .protect(&rtcp(1, &[0; 12]), &mut first)
+            .expect("protect");
+        sender
+            .protect(&rtcp(1, &[0; 12]), &mut second)
+            .expect("protect");
         // Index trailer is the 4 bytes before the 10-byte tag.
         let index_of = |srtcp: &[u8]| {
             let at = srtcp.len() - AUTH_TAG_LEN - INDEX_TRAILER_LEN;
-            u32::from_be_bytes([srtcp[at], srtcp[at + 1], srtcp[at + 2], srtcp[at + 3]]) & INDEX_MASK
+            u32::from_be_bytes([srtcp[at], srtcp[at + 1], srtcp[at + 2], srtcp[at + 3]])
+                & INDEX_MASK
         };
         assert_eq!(index_of(&first), 0);
         assert_eq!(index_of(&second), 1);
@@ -177,17 +207,25 @@ mod tests {
         let mut sender = context();
         let mut receiver = context();
         let mut srtcp = Vec::new();
-        sender.protect(&rtcp(0x1234, &[0x55; 16]), &mut srtcp).expect("protect");
+        sender
+            .protect(&rtcp(0x1234, &[0x55; 16]), &mut srtcp)
+            .expect("protect");
 
         let mut forged = srtcp.clone();
         forged[10] ^= 0x01; // flip a ciphertext byte
         let mut out = Vec::new();
-        assert_eq!(receiver.unprotect(&forged, &mut out), Err(SrtpError::AuthFailed));
+        assert_eq!(
+            receiver.unprotect(&forged, &mut out),
+            Err(SrtpError::AuthFailed)
+        );
 
         let mut bad_tag = srtcp.clone();
         let last = bad_tag.len() - 1;
         bad_tag[last] ^= 0x80;
-        assert_eq!(receiver.unprotect(&bad_tag, &mut out), Err(SrtpError::AuthFailed));
+        assert_eq!(
+            receiver.unprotect(&bad_tag, &mut out),
+            Err(SrtpError::AuthFailed)
+        );
     }
 
     #[test]
@@ -195,9 +233,14 @@ mod tests {
         let mut sender = context();
         let mut receiver = SrtcpContext::new(&[0x99u8; 16], &[0x88u8; MASTER_SALT_LEN]);
         let mut srtcp = Vec::new();
-        sender.protect(&rtcp(0xAAAA, &[0x10; 16]), &mut srtcp).expect("protect");
+        sender
+            .protect(&rtcp(0xAAAA, &[0x10; 16]), &mut srtcp)
+            .expect("protect");
         let mut out = Vec::new();
-        assert_eq!(receiver.unprotect(&srtcp, &mut out), Err(SrtpError::AuthFailed));
+        assert_eq!(
+            receiver.unprotect(&srtcp, &mut out),
+            Err(SrtpError::AuthFailed)
+        );
     }
 
     #[test]
@@ -208,8 +251,18 @@ mod tests {
         let master_salt = [0x22u8; MASTER_SALT_LEN];
         let mut srtcp_key = [0u8; 16];
         let mut srtp_key = [0u8; 16];
-        kdf::derive(&master_key, &master_salt, kdf::label::RTCP_ENCRYPTION, &mut srtcp_key);
-        kdf::derive(&master_key, &master_salt, kdf::label::RTP_ENCRYPTION, &mut srtp_key);
+        kdf::derive(
+            &master_key,
+            &master_salt,
+            kdf::label::RTCP_ENCRYPTION,
+            &mut srtcp_key,
+        );
+        kdf::derive(
+            &master_key,
+            &master_salt,
+            kdf::label::RTP_ENCRYPTION,
+            &mut srtp_key,
+        );
         assert_ne!(srtcp_key, srtp_key);
     }
 
@@ -222,7 +275,9 @@ mod tests {
         let mut srtcp = Vec::new();
         sender.protect(&plain, &mut srtcp).expect("protect");
         let mut recovered = Vec::new();
-        receiver.unprotect(&srtcp, &mut recovered).expect("unprotect");
+        receiver
+            .unprotect(&srtcp, &mut recovered)
+            .expect("unprotect");
         assert_eq!(recovered, plain);
     }
 
@@ -230,9 +285,15 @@ mod tests {
     fn rejects_short_and_bad_version() {
         let mut context = context();
         let mut out = Vec::new();
-        assert_eq!(context.protect(&[0u8; 4], &mut out), Err(SrtpError::TooShort));
+        assert_eq!(
+            context.protect(&[0u8; 4], &mut out),
+            Err(SrtpError::TooShort)
+        );
         // Unprotect needs at least header + index + tag.
-        assert_eq!(context.unprotect(&[0x80u8; 16], &mut out), Err(SrtpError::TooShort));
+        assert_eq!(
+            context.unprotect(&[0x80u8; 16], &mut out),
+            Err(SrtpError::TooShort)
+        );
         let mut bad = rtcp(1, &[0; 12]);
         bad[0] = 0x40; // version 1
         assert_eq!(context.protect(&bad, &mut out), Err(SrtpError::BadVersion));

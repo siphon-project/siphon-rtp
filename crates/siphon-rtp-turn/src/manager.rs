@@ -283,7 +283,11 @@ impl<D: Datapath> AllocationManager<D> {
             }
         };
         // Peer datagrams on the relay socket come back to this actor via the Redirect dispatcher.
-        if self.datapath.install_flow(relay.id, FlowAction::Redirect).is_err() {
+        if self
+            .datapath
+            .install_flow(relay.id, FlowAction::Redirect)
+            .is_err()
+        {
             self.datapath.remove_endpoint(relay.id).await;
             self.send_error(
                 method,
@@ -475,9 +479,10 @@ impl<D: Datapath> AllocationManager<D> {
             .await;
             return;
         }
-        let (Some(channel), Some(peer)) =
-            (turn::channel_number(message), turn::xor_peer_address(message))
-        else {
+        let (Some(channel), Some(peer)) = (
+            turn::channel_number(message),
+            turn::xor_peer_address(message),
+        ) else {
             self.send_error(
                 method,
                 &txid,
@@ -562,7 +567,8 @@ impl<D: Datapath> AllocationManager<D> {
 
     /// Handle a Send indication (RFC 5766 §10): client → peer, no auth, no response.
     async fn handle_send_indication(&mut self, five_tuple: FiveTuple, message: &StunMessage) {
-        let (Some(peer), Some(data)) = (turn::xor_peer_address(message), turn::data(message)) else {
+        let (Some(peer), Some(data)) = (turn::xor_peer_address(message), turn::data(message))
+        else {
             return;
         };
         if !self.config.denied_peers.permits(peer.ip()) {
@@ -674,7 +680,11 @@ impl<D: Datapath> AllocationManager<D> {
                 }
                 _ => Frame::Indication,
             };
-            (allocation.transport.clone(), frame, allocation.transport.is_stream())
+            (
+                allocation.transport.clone(),
+                frame,
+                allocation.transport.is_stream(),
+            )
         };
         let (transport, frame, pad) = routed;
         let message = match frame {

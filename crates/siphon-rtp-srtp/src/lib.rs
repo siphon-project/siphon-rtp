@@ -99,9 +99,24 @@ impl SrtpContext {
         let mut session_key = [0u8; 16];
         let mut session_salt = [0u8; MASTER_SALT_LEN];
         let mut session_auth = [0u8; 20];
-        kdf::derive(master_key, master_salt, kdf::label::RTP_ENCRYPTION, &mut session_key);
-        kdf::derive(master_key, master_salt, kdf::label::RTP_SALT, &mut session_salt);
-        kdf::derive(master_key, master_salt, kdf::label::RTP_AUTHENTICATION, &mut session_auth);
+        kdf::derive(
+            master_key,
+            master_salt,
+            kdf::label::RTP_ENCRYPTION,
+            &mut session_key,
+        );
+        kdf::derive(
+            master_key,
+            master_salt,
+            kdf::label::RTP_SALT,
+            &mut session_salt,
+        );
+        kdf::derive(
+            master_key,
+            master_salt,
+            kdf::label::RTP_AUTHENTICATION,
+            &mut session_auth,
+        );
         Self {
             session_key,
             session_salt,
@@ -261,7 +276,9 @@ mod tests {
         assert_ne!(&srtp[12..28], &plain[12..28], "payload encrypted");
 
         let mut recovered = Vec::new();
-        receiver.unprotect(&srtp, &mut recovered).expect("unprotect");
+        receiver
+            .unprotect(&srtp, &mut recovered)
+            .expect("unprotect");
         assert_eq!(recovered, plain);
     }
 
@@ -270,19 +287,27 @@ mod tests {
         let mut sender = context();
         let mut receiver = context();
         let mut srtp = Vec::new();
-        sender.protect(&rtp(1, 0x1234, 0x55), &mut srtp).expect("protect");
+        sender
+            .protect(&rtp(1, 0x1234, 0x55), &mut srtp)
+            .expect("protect");
 
         // Flip a ciphertext byte → auth must fail.
         let mut forged = srtp.clone();
         forged[14] ^= 0x01;
         let mut out = Vec::new();
-        assert_eq!(receiver.unprotect(&forged, &mut out), Err(SrtpError::AuthFailed));
+        assert_eq!(
+            receiver.unprotect(&forged, &mut out),
+            Err(SrtpError::AuthFailed)
+        );
 
         // Flip a tag byte → auth must fail.
         let mut bad_tag = srtp.clone();
         let last = bad_tag.len() - 1;
         bad_tag[last] ^= 0x80;
-        assert_eq!(receiver.unprotect(&bad_tag, &mut out), Err(SrtpError::AuthFailed));
+        assert_eq!(
+            receiver.unprotect(&bad_tag, &mut out),
+            Err(SrtpError::AuthFailed)
+        );
     }
 
     #[test]
@@ -290,9 +315,14 @@ mod tests {
         let mut sender = context();
         let mut receiver = SrtpContext::new(&[0x99u8; 16], &[0x88u8; MASTER_SALT_LEN]);
         let mut srtp = Vec::new();
-        sender.protect(&rtp(5, 0xAAAA, 0x10), &mut srtp).expect("protect");
+        sender
+            .protect(&rtp(5, 0xAAAA, 0x10), &mut srtp)
+            .expect("protect");
         let mut out = Vec::new();
-        assert_eq!(receiver.unprotect(&srtp, &mut out), Err(SrtpError::AuthFailed));
+        assert_eq!(
+            receiver.unprotect(&srtp, &mut out),
+            Err(SrtpError::AuthFailed)
+        );
     }
 
     #[test]
@@ -305,7 +335,9 @@ mod tests {
             let mut srtp = Vec::new();
             sender.protect(&plain, &mut srtp).expect("protect");
             let mut recovered = Vec::new();
-            receiver.unprotect(&srtp, &mut recovered).expect("unprotect across wrap");
+            receiver
+                .unprotect(&srtp, &mut recovered)
+                .expect("unprotect across wrap");
             assert_eq!(recovered, plain, "seq {seq}");
         }
     }
@@ -319,7 +351,9 @@ mod tests {
             let mut srtp = Vec::new();
             sender.protect(&plain, &mut srtp).expect("protect");
             let mut recovered = Vec::new();
-            receiver.unprotect(&srtp, &mut recovered).expect("unprotect");
+            receiver
+                .unprotect(&srtp, &mut recovered)
+                .expect("unprotect");
             assert_eq!(recovered, plain);
         }
     }
@@ -328,7 +362,10 @@ mod tests {
     fn rejects_short_and_bad_version() {
         let mut context = context();
         let mut out = Vec::new();
-        assert_eq!(context.protect(&[0u8; 8], &mut out), Err(SrtpError::TooShort));
+        assert_eq!(
+            context.protect(&[0u8; 8], &mut out),
+            Err(SrtpError::TooShort)
+        );
         let mut bad = rtp(1, 1, 1);
         bad[0] = 0x40; // version 1
         assert_eq!(context.protect(&bad, &mut out), Err(SrtpError::BadVersion));

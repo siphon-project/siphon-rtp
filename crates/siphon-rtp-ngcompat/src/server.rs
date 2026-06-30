@@ -89,7 +89,9 @@ mod tests {
     }
 
     async fn start_server() -> SocketAddr {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind");
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
         let addr = socket.local_addr().expect("addr");
         tokio::spawn(async move {
             let _ = serve(socket, stub).await;
@@ -121,18 +123,33 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ping_pong_over_udp_echoes_cookie() {
         let server = start_server().await;
-        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("client");
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("client");
 
-        let response = exchange(&client, server, &ng_datagram("cafe1234", &[("command", Value::string("ping"))])).await;
+        let response = exchange(
+            &client,
+            server,
+            &ng_datagram("cafe1234", &[("command", Value::string("ping"))]),
+        )
+        .await;
         let (cookie, body) = ng::split_cookie(&response).expect("split");
         assert_eq!(cookie, b"cafe1234", "cookie echoed verbatim");
-        assert_eq!(bencode::decode(body).unwrap().get("result").and_then(Value::as_str), Some("pong"));
+        assert_eq!(
+            bencode::decode(body)
+                .unwrap()
+                .get("result")
+                .and_then(Value::as_str),
+            Some("pong")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offer_returns_rewritten_sdp() {
         let server = start_server().await;
-        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("client");
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("client");
 
         let request = ng_datagram(
             "deadbeef",
@@ -148,18 +165,33 @@ mod tests {
         let (_, body) = ng::split_cookie(&response).expect("split");
         let dict = bencode::decode(body).expect("decode");
         assert_eq!(dict.get("result").and_then(Value::as_str), Some("ok"));
-        assert!(dict.get("sdp").and_then(Value::as_str).unwrap().contains("RTP/AVP"));
+        assert!(dict
+            .get("sdp")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("RTP/AVP"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_command_returns_error_not_silence() {
         let server = start_server().await;
-        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("client");
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("client");
 
-        let response = exchange(&client, server, &ng_datagram("k", &[("command", Value::string("frobnicate"))])).await;
+        let response = exchange(
+            &client,
+            server,
+            &ng_datagram("k", &[("command", Value::string("frobnicate"))]),
+        )
+        .await;
         let (_, body) = ng::split_cookie(&response).expect("split");
         let dict = bencode::decode(body).expect("decode");
         assert_eq!(dict.get("result").and_then(Value::as_str), Some("error"));
-        assert!(dict.get("error-reason").and_then(Value::as_str).unwrap().contains("frobnicate"));
+        assert!(dict
+            .get("error-reason")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("frobnicate"));
     }
 }

@@ -59,7 +59,9 @@ fn bench_srtp(criterion: &mut Criterion) {
         let mut context = srtp_context();
         let mut out = Vec::with_capacity(256);
         bencher.iter(|| {
-            context.protect(black_box(&plain), &mut out).expect("protect");
+            context
+                .protect(black_box(&plain), &mut out)
+                .expect("protect");
             black_box(out.len())
         });
     });
@@ -74,7 +76,9 @@ fn bench_srtp(criterion: &mut Criterion) {
         let mut receiver = srtp_context();
         let mut out = Vec::with_capacity(256);
         bencher.iter(|| {
-            receiver.unprotect(black_box(&srtp), &mut out).expect("unprotect");
+            receiver
+                .unprotect(black_box(&srtp), &mut out)
+                .expect("unprotect");
             black_box(out.len())
         });
     });
@@ -87,7 +91,9 @@ fn bench_srtcp(criterion: &mut Criterion) {
         let mut context = srtcp_context();
         let mut out = Vec::with_capacity(256);
         bencher.iter(|| {
-            context.protect(black_box(&plain), &mut out).expect("protect");
+            context
+                .protect(black_box(&plain), &mut out)
+                .expect("protect");
             black_box(out.len())
         });
     });
@@ -100,7 +106,9 @@ fn bench_srtcp(criterion: &mut Criterion) {
         let mut receiver = srtcp_context();
         let mut out = Vec::with_capacity(256);
         bencher.iter(|| {
-            receiver.unprotect(black_box(&srtcp), &mut out).expect("unprotect");
+            receiver
+                .unprotect(black_box(&srtcp), &mut out)
+                .expect("unprotect");
             black_box(out.len())
         });
     });
@@ -129,7 +137,9 @@ fn bench_secure_leg(criterion: &mut Criterion) {
         let mut leg = SecureLeg::new(&local, &remote);
         let mut out = Vec::with_capacity(256);
         bencher.iter(|| {
-            let kind = leg.unprotect(black_box(&srtp), &mut out).expect("unprotect");
+            let kind = leg
+                .unprotect(black_box(&srtp), &mut out)
+                .expect("unprotect");
             black_box(kind)
         });
     });
@@ -144,5 +154,11 @@ fn bench_setup(criterion: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_srtp, bench_srtcp, bench_secure_leg, bench_setup);
+criterion_group!(
+    benches,
+    bench_srtp,
+    bench_srtcp,
+    bench_secure_leg,
+    bench_setup
+);
 criterion_main!(benches);

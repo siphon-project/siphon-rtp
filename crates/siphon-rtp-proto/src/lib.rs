@@ -318,7 +318,10 @@ pub struct SessionStats {
 
 /// An asynchronous event pushed from the engine to SIPhon (no request correlation).
 /// `#[serde(other)]` keeps forward-compatibility: SIPhon tolerates new event kinds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// (No `Eq`: [`Event::CallQuality`] carries `f64` quality figures. `PartialEq` still derives, so
+/// `assert_eq!` in tests and value comparisons keep working.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     /// A DTMF digit was detected on a leg. Deserializes 1:1 into SIPhon's `DtmfEvent`.
@@ -342,6 +345,19 @@ pub enum Event {
         conference_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_tag: Option<String>,
+    },
+    /// Periodic per-leg reception-quality estimate (RFC 3550 RTCP statistics + ITU-T G.107 MOS), so
+    /// SIPhon surfaces live call quality without parsing RTCP itself. Emitted every few seconds per
+    /// conference participant.
+    CallQuality {
+        conference_id: String,
+        from_tag: String,
+        /// Interarrival jitter in milliseconds (RFC 3550 §6.4.1).
+        jitter_ms: f64,
+        /// Residual inbound packet loss, as a percentage.
+        loss_percent: f64,
+        /// Estimated MOS-CQE (ITU-T G.107), in `1.0..=4.5`.
+        mos: f64,
     },
     /// Unknown / future event kind (forward-compat).
     #[serde(other)]
@@ -467,7 +483,10 @@ mod tests {
             other => panic!("expected offer, got {other:?}"),
         }
         let serialized = serde_json::to_value(ProfileFlags::default()).expect("to_value");
-        assert!(serialized.get("ws_uri").is_none(), "ws_uri omitted when unset");
+        assert!(
+            serialized.get("ws_uri").is_none(),
+            "ws_uri omitted when unset"
+        );
     }
 
     #[test]
@@ -532,7 +551,9 @@ mod tests {
                 from_tag: "f".into(),
                 to_tag: "t".into(),
             },
-            Command::Authenticate { token: "s3cret".into() },
+            Command::Authenticate {
+                token: "s3cret".into(),
+            },
         ];
         for command in &commands {
             roundtrip(&Request {
@@ -548,7 +569,9 @@ mod tests {
         // `rtpengine.echo(call)` turns echo on with the smallest possible payload.
         let json = r#"{"command":"echo","call_id":"c","from_tag":"f"}"#;
         match serde_json::from_str::<Command>(json).expect("deserialize") {
-            Command::Echo { enabled, to_tag, .. } => {
+            Command::Echo {
+                enabled, to_tag, ..
+            } => {
                 assert!(enabled, "enabled must default to true");
                 assert_eq!(to_tag, None);
             }
@@ -648,6 +671,22 @@ mod tests {
             call_id: "c".into(),
             from_tag: "f".into(),
         });
+    }
+
+    #[test]
+    fn call_quality_event_roundtrip() {
+        let event = Event::CallQuality {
+            conference_id: "room".into(),
+            from_tag: "party-0".into(),
+            jitter_ms: 1.125,
+            loss_percent: 0.0,
+            mos: 4.41,
+        };
+        roundtrip(&event);
+        // The wire tag is snake_case, so SIPhon dispatches on "call_quality".
+        assert!(serde_json::to_string(&event)
+            .expect("serialize")
+            .contains("\"event\":\"call_quality\""));
     }
 
     #[test]

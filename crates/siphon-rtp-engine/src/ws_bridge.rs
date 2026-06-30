@@ -115,7 +115,9 @@ impl WsRegistry {
         // Drop on a full or closed mailbox — late audio is worthless, and a closed channel means the
         // bridge task has already exited.
         if route.rtp_in.try_send(packet.data).is_err() {
-            tracing::trace!("ws-bridge rtp-in mailbox full or closed; dropping redirected datagram");
+            tracing::trace!(
+                "ws-bridge rtp-in mailbox full or closed; dropping redirected datagram"
+            );
         }
     }
 
@@ -143,6 +145,7 @@ mod tests {
         RxPacket {
             endpoint: endpoint(endpoint_id),
             source: source.parse().expect("addr"),
+            arrival: 0,
             data: Bytes::copy_from_slice(data),
         }
     }
@@ -195,7 +198,10 @@ mod tests {
 
         // An attacker on a different IP sprays the endpoint — gated out before any bridge feed.
         registry.dispatch(rx(1, "127.0.0.9:5000", b"attacker"));
-        assert!(rtp_in_rx.try_recv().is_err(), "off-source packet must not reach the bridge");
+        assert!(
+            rtp_in_rx.try_recv().is_err(),
+            "off-source packet must not reach the bridge"
+        );
 
         registry.deregister("call-1");
     }

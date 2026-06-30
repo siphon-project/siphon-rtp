@@ -22,7 +22,9 @@ use siphon_rtp_media::wav::WavRecorder;
 /// A 1-second 8 kHz mono WAV source for the player bench.
 fn one_second_source() -> WavSource {
     let mut recorder = WavRecorder::new(8000, 1);
-    let body: Vec<i16> = (0..8000).map(|index| (index as i16).wrapping_mul(7)).collect();
+    let body: Vec<i16> = (0..8000)
+        .map(|index| (index as i16).wrapping_mul(7))
+        .collect();
     recorder.write_pcm(&body);
     WavSource::parse(&recorder.into_wav()).expect("parse")
 }
@@ -45,8 +47,8 @@ fn bench_dtmf_payload_gen(criterion: &mut Criterion) {
     criterion.bench_function("dtmf_next_payload", |bencher| {
         bencher.iter(|| {
             // One full digit burst (5 updates + 3 End) per iteration, '5' for 100 ms @ 8 kHz.
-            let mut generator =
-                DtmfGenerator::new('5', 100, DEFAULT_DTMF_VOLUME_DBM0, 8000, 20).expect("generator");
+            let mut generator = DtmfGenerator::new('5', 100, DEFAULT_DTMF_VOLUME_DBM0, 8000, 20)
+                .expect("generator");
             let mut count = 0usize;
             while let Some(payload) = generator.next_payload() {
                 black_box(payload.bytes);

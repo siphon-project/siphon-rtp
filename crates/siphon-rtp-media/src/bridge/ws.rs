@@ -185,7 +185,9 @@ mod tests {
         assert_eq!(packet.ssrc, 0x5555_6666);
 
         // 3. Uplink: an RTP packet from the call becomes a binary WS frame.
-        rtp_in_tx.send(Bytes::from(ulaw_packet(7, 0xFF))).expect("feed rtp");
+        rtp_in_tx
+            .send(Bytes::from(ulaw_packet(7, 0xFF)))
+            .expect("feed rtp");
         let mut got_uplink = false;
         for _ in 0..10 {
             let frame = timeout(Duration::from_secs(1), client_rx.next())
@@ -208,6 +210,9 @@ mod tests {
         });
         client_tx.send(Message::text(stop.to_json().expect("json"))).await.expect("send stop");
         let outcome = timeout(Duration::from_secs(2), bridge).await.expect("join");
-        assert!(outcome.expect("task").is_ok(), "bridge exits cleanly on stop");
+        assert!(
+            outcome.expect("task").is_ok(),
+            "bridge exits cleanly on stop"
+        );
     }
 }

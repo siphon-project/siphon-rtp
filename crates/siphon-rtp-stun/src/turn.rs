@@ -184,7 +184,10 @@ pub fn error_code_value(code: u16, reason: &str) -> Vec<u8> {
 /// The REQUESTED-TRANSPORT protocol number, if present (RFC 5766 §14.7).
 #[must_use]
 pub fn requested_transport(message: &StunMessage) -> Option<u8> {
-    message.attribute(ATTR_REQUESTED_TRANSPORT)?.first().copied()
+    message
+        .attribute(ATTR_REQUESTED_TRANSPORT)?
+        .first()
+        .copied()
 }
 
 /// The LIFETIME in seconds, if present (RFC 5766 §14.2).
@@ -372,15 +375,69 @@ const MD5_SHIFTS: [u32; 64] = [
 
 /// Per-round constants `K[i] = floor(2^32 · |sin(i + 1)|)` (RFC 1321 §3.4).
 const MD5_K: [u32; 64] = [
-    0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee, 0xf57c_0faf, 0x4787_c62a, 0xa830_4613,
-    0xfd46_9501, 0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be, 0x6b90_1122, 0xfd98_7193,
-    0xa679_438e, 0x49b4_0821, 0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa, 0xd62f_105d,
-    0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8, 0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
-    0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a, 0xfffa_3942, 0x8771_f681, 0x6d9d_6122,
-    0xfde5_380c, 0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70, 0x289b_7ec6, 0xeaa1_27fa,
-    0xd4ef_3085, 0x0488_1d05, 0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665, 0xf429_2244,
-    0x432a_ff97, 0xab94_23a7, 0xfc93_a039, 0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
-    0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1, 0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb,
+    0xd76a_a478,
+    0xe8c7_b756,
+    0x2420_70db,
+    0xc1bd_ceee,
+    0xf57c_0faf,
+    0x4787_c62a,
+    0xa830_4613,
+    0xfd46_9501,
+    0x6980_98d8,
+    0x8b44_f7af,
+    0xffff_5bb1,
+    0x895c_d7be,
+    0x6b90_1122,
+    0xfd98_7193,
+    0xa679_438e,
+    0x49b4_0821,
+    0xf61e_2562,
+    0xc040_b340,
+    0x265e_5a51,
+    0xe9b6_c7aa,
+    0xd62f_105d,
+    0x0244_1453,
+    0xd8a1_e681,
+    0xe7d3_fbc8,
+    0x21e1_cde6,
+    0xc337_07d6,
+    0xf4d5_0d87,
+    0x455a_14ed,
+    0xa9e3_e905,
+    0xfcef_a3f8,
+    0x676f_02d9,
+    0x8d2a_4c8a,
+    0xfffa_3942,
+    0x8771_f681,
+    0x6d9d_6122,
+    0xfde5_380c,
+    0xa4be_ea44,
+    0x4bde_cfa9,
+    0xf6bb_4b60,
+    0xbebf_bc70,
+    0x289b_7ec6,
+    0xeaa1_27fa,
+    0xd4ef_3085,
+    0x0488_1d05,
+    0xd9d4_d039,
+    0xe6db_99e5,
+    0x1fa2_7cf8,
+    0xc4ac_5665,
+    0xf429_2244,
+    0x432a_ff97,
+    0xab94_23a7,
+    0xfc93_a039,
+    0x655b_59c3,
+    0x8f0c_cc92,
+    0xffef_f47d,
+    0x8584_5dd1,
+    0x6fa8_7e4f,
+    0xfe2c_e6e0,
+    0xa301_4314,
+    0x4e08_11a1,
+    0xf753_7e82,
+    0xbd3a_f235,
+    0x2ad7_d2bb,
     0xeb86_d391,
 ];
 
@@ -388,8 +445,12 @@ const MD5_K: [u32; 64] = [
 /// long-term-credential key (never for integrity; the integrity HMAC is SHA-1).
 #[must_use]
 pub fn md5(input: &[u8]) -> [u8; 16] {
-    let (mut a0, mut b0, mut c0, mut d0) =
-        (0x6745_2301u32, 0xefcd_ab89u32, 0x98ba_dcfeu32, 0x1032_5476u32);
+    let (mut a0, mut b0, mut c0, mut d0) = (
+        0x6745_2301u32,
+        0xefcd_ab89u32,
+        0x98ba_dcfeu32,
+        0x1032_5476u32,
+    );
 
     let bit_len = (input.len() as u64).wrapping_mul(8);
     let mut message = input.to_vec();
@@ -412,10 +473,7 @@ pub fn md5(input: &[u8]) -> [u8; 16] {
                 32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (b | (!d)), (7 * i) % 16),
             };
-            let f = f
-                .wrapping_add(a)
-                .wrapping_add(MD5_K[i])
-                .wrapping_add(m[g]);
+            let f = f.wrapping_add(a).wrapping_add(MD5_K[i]).wrapping_add(m[g]);
             a = d;
             d = c;
             c = b;
@@ -435,7 +493,8 @@ pub fn md5(input: &[u8]) -> [u8; 16] {
     out
 }
 
-const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 encode (RFC 4648 §4, with `=` padding).
 #[must_use]
@@ -523,7 +582,10 @@ mod tests {
         assert_eq!(message_type(METHOD_REFRESH, CLASS_REQUEST), 0x0004);
         assert_eq!(message_type(METHOD_SEND, CLASS_INDICATION), 0x0016);
         assert_eq!(message_type(METHOD_DATA, CLASS_INDICATION), 0x0017);
-        assert_eq!(message_type(METHOD_CREATE_PERMISSION, CLASS_REQUEST), 0x0008);
+        assert_eq!(
+            message_type(METHOD_CREATE_PERMISSION, CLASS_REQUEST),
+            0x0008
+        );
         assert_eq!(message_type(METHOD_CHANNEL_BIND, CLASS_REQUEST), 0x0009);
 
         for method in [
@@ -577,7 +639,11 @@ mod tests {
             (b"foobar", "Zm9vYmFy"),
         ] {
             assert_eq!(base64_encode(plain), encoded, "encode {plain:?}");
-            assert_eq!(base64_decode(encoded).as_deref(), Some(plain), "decode {encoded}");
+            assert_eq!(
+                base64_decode(encoded).as_deref(),
+                Some(plain),
+                "decode {encoded}"
+            );
         }
         assert_eq!(base64_decode("not*base64"), None);
         assert_eq!(base64_decode("abc"), None, "non-multiple-of-4 rejected");
@@ -609,7 +675,10 @@ mod tests {
             .attribute(ATTR_USERNAME, username.as_bytes())
             .attribute(ATTR_REALM, realm.as_bytes())
             .attribute(ATTR_NONCE, b"nonce-value")
-            .attribute(ATTR_REQUESTED_TRANSPORT, &requested_transport_value(TRANSPORT_UDP))
+            .attribute(
+                ATTR_REQUESTED_TRANSPORT,
+                &requested_transport_value(TRANSPORT_UDP),
+            )
             .finish(Some(&key), false);
 
         let parsed = parse(&request).expect("parse allocate");
@@ -671,11 +740,17 @@ mod tests {
         assert_eq!(value[3], 1, "number");
         assert_eq!(&value[4..], b"Unauthorized");
         assert_eq!(error_code_value(ERROR_STALE_NONCE, "x")[2..4], [4, 38]);
-        assert_eq!(error_code_value(ERROR_INSUFFICIENT_CAPACITY, "x")[2..4], [5, 8]);
+        assert_eq!(
+            error_code_value(ERROR_INSUFFICIENT_CAPACITY, "x")[2..4],
+            [5, 8]
+        );
 
         // The accessor reconstructs the numeric code from a built error response.
         let response = MessageBuilder::new(message_type(METHOD_ALLOCATE, CLASS_ERROR), &[0u8; 12])
-            .attribute(ATTR_ERROR_CODE, &error_code_value(ERROR_STALE_NONCE, "Stale Nonce"))
+            .attribute(
+                ATTR_ERROR_CODE,
+                &error_code_value(ERROR_STALE_NONCE, "Stale Nonce"),
+            )
             .finish(None, false);
         let parsed = parse(&response).expect("parse error");
         assert_eq!(error_code(&parsed), Some(ERROR_STALE_NONCE));

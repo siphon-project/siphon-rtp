@@ -110,13 +110,15 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         // RFC 3389 comfort noise: a decode-side generator. There is no audio "encoder" — CN packets
         // are emitted by a VAD/DTX media-path policy, not by a per-frame encoder (see `encoder_for`).
         "CN" => Ok(Box::new(Cn::new(spec.clock_rate_hz, spec.ptime_ms))),
-        // AMR-WB decode is bit-exact for all 9 modes (the RTP path un-sorts the RFC 4867 payload);
-        // the encoder is not yet implemented, so encoding AMR-WB still returns Unsupported below.
-        // Gated behind the `amr` feature (patent-encumbered transcoding — see docs/codec-licensing.md);
-        // AMR passthrough/relay does not reach here and is always available.
+        // AMR-WB decode + encode are bit-exact for all 9 modes (the RTP path un-/re-sorts the RFC 4867
+        // payload), validated against the 3GPP TS 26.174 vectors. Gated behind the `amr` feature
+        // (patent-encumbered transcoding — see docs/codec-licensing.md); AMR passthrough/relay does not
+        // reach here and is always available.
         #[cfg(feature = "amr")]
         "AMR-WB" => Ok(Box::new(AmrWb::new())),
-        _ => Err(CodecError::Unsupported(unsupported_name(&spec.encoding_name))),
+        _ => Err(CodecError::Unsupported(unsupported_name(
+            &spec.encoding_name,
+        ))),
     }
 }
 
@@ -131,7 +133,13 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
         "G722" => Ok(Box::new(G722::new(spec.ptime_ms))),
         "GSM" => Ok(Box::new(GsmFr::new())),
         "L16" => Ok(Box::new(L16::new(spec.clock_rate_hz, spec.ptime_ms))),
-        _ => Err(CodecError::Unsupported(unsupported_name(&spec.encoding_name))),
+        // AMR-WB encode is bit-exact (modes 0–7) against 3GPP TS 26.174 — same `amr`-feature gate as
+        // decode (docs/codec-licensing.md). Defaults to mode 2 (12.65 kbit/s).
+        #[cfg(feature = "amr")]
+        "AMR-WB" => Ok(Box::new(AmrWb::new())),
+        _ => Err(CodecError::Unsupported(unsupported_name(
+            &spec.encoding_name,
+        ))),
     }
 }
 
@@ -140,8 +148,7 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
 fn unsupported_name(encoding_name: &str) -> &'static str {
     match encoding_name {
         "CN" => "comfort-noise generation (DTX) is a media-path policy, not an audio encoder",
-        #[cfg(feature = "amr")]
-        "AMR-WB" => "AMR-WB encoder not yet implemented (decode is supported)",
+        // AMR-WB (decode + encode) is wired when the `amr` feature is on, so it never reaches here then.
         #[cfg(feature = "amr")]
         "AMR" => "AMR-NB codec not yet implemented",
         #[cfg(not(feature = "amr"))]
@@ -184,9 +191,17 @@ mod tests {
         // RFC 3551 §4.5.2: the RTP clock is 8 kHz even though G.722 carries 16 kHz audio.
         assert_eq!(spec.clock_rate_hz, 8000);
         let decoder = decoder_for(&spec).expect("g722 decoder");
-        assert_eq!(decoder.params().sample_rate_hz, 16000, "native PCM rate is 16 kHz");
+        assert_eq!(
+            decoder.params().sample_rate_hz,
+            16000,
+            "native PCM rate is 16 kHz"
+        );
         let encoder = encoder_for(&spec).expect("g722 encoder");
-        assert_eq!(encoder.rtp_clock_rate_hz(), 8000, "RTP timestamp clock stays 8 kHz");
+        assert_eq!(
+            encoder.rtp_clock_rate_hz(),
+            8000,
+            "RTP timestamp clock stays 8 kHz"
+        );
     }
 
     #[test]
@@ -216,7 +231,10 @@ mod tests {
         let spec = CodecSpec::from_static_payload_type(13, 20).expect("CN is static PT 13");
         assert_eq!(spec.encoding_name, "CN");
         assert!(spec.is_comfort_noise());
-        assert!(decoder_for(&spec).is_ok(), "CN generator builds as a decoder");
+        assert!(
+            decoder_for(&spec).is_ok(),
+            "CN generator builds as a decoder"
+        );
         assert!(
             matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))),
             "CN has no per-frame audio encoder"
@@ -247,8 +265,14 @@ mod tests {
     #[test]
     fn unimplemented_codec_is_unsupported_not_panic() {
         let spec = CodecSpec::new(96, "opus", 48000, 2, 20);
-        assert!(matches!(decoder_for(&spec), Err(CodecError::Unsupported(_))));
-        assert!(matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))));
+        assert!(matches!(
+            decoder_for(&spec),
+            Err(CodecError::Unsupported(_))
+        ));
+        assert!(matches!(
+            encoder_for(&spec),
+            Err(CodecError::Unsupported(_))
+        ));
     }
 
     #[cfg(not(feature = "amr"))]
@@ -258,16 +282,40 @@ mod tests {
         // return Unsupported — never panic. (Passthrough/relay never reaches the factory.)
         for name in ["AMR", "AMR-WB"] {
             let spec = CodecSpec::new(96, name, 16000, 1, 20);
-            assert!(matches!(decoder_for(&spec), Err(CodecError::Unsupported(_))), "{name}");
-            assert!(matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))), "{name}");
+            assert!(
+                matches!(decoder_for(&spec), Err(CodecError::Unsupported(_))),
+                "{name}"
+            );
+            assert!(
+                matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))),
+                "{name}"
+            );
         }
+    }
+
+    #[cfg(feature = "amr")]
+    #[test]
+    fn amr_wb_decodes_and_encodes_with_the_amr_feature() {
+        // With the `amr` feature, AMR-WB builds in both directions (bit-exact, 3GPP TS 26.174) — so
+        // it can be a conference egress codec. AMR-NB is still unsupported.
+        let wb = CodecSpec::new(96, "AMR-WB", 16000, 1, 20);
+        assert!(decoder_for(&wb).is_ok(), "AMR-WB decoder");
+        assert!(encoder_for(&wb).is_ok(), "AMR-WB encoder");
+        let nb = CodecSpec::new(97, "AMR", 8000, 1, 20);
+        assert!(
+            matches!(encoder_for(&nb), Err(CodecError::Unsupported(_))),
+            "AMR-NB unsupported"
+        );
     }
 
     #[test]
     fn telephone_event_is_recognised_and_unsupported_as_audio() {
         let spec = CodecSpec::new(101, "telephone-event", 8000, 1, 20);
         assert!(spec.is_telephone_event());
-        assert!(matches!(decoder_for(&spec), Err(CodecError::Unsupported(_))));
+        assert!(matches!(
+            decoder_for(&spec),
+            Err(CodecError::Unsupported(_))
+        ));
     }
 
     #[test]
