@@ -10,6 +10,7 @@
 pub mod bitstream;
 pub mod codebook;
 pub mod constants;
+pub mod dec_main;
 pub mod filters;
 mod gain_tables;
 mod gain_vq_tables;
