@@ -7,6 +7,7 @@
 
 pub mod basic_ops;
 pub mod math_op;
+pub mod nb;
 pub mod oper_32b;
 pub mod payload;
 pub mod wb;
