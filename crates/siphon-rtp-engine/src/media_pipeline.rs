@@ -366,11 +366,7 @@ impl Direction {
                 };
                 let mut buffer = [0u8; MAX_RTP];
                 if let Ok(total) = write_packet(&header, &bytes, &mut buffer) {
-                    out.push(Outbound {
-                        endpoint: self.egress_endpoint,
-                        dst: self.egress_dst,
-                        data: Bytes::copy_from_slice(&buffer[..total]),
-                    });
+                    self.push_egress(&buffer[..total], out);
                     self.egress_sequence = self.egress_sequence.wrapping_add(1);
                 }
             }
@@ -640,11 +636,7 @@ impl Direction {
         };
         let mut buffer = [0u8; MAX_RTP];
         if let Ok(total) = write_packet(&header, parsed.payload, &mut buffer) {
-            out.push(Outbound {
-                endpoint: self.egress_endpoint,
-                dst: self.egress_dst,
-                data: Bytes::copy_from_slice(&buffer[..total]),
-            });
+            self.push_egress(&buffer[..total], out);
             self.egress_sequence = self.egress_sequence.wrapping_add(1);
         }
     }
@@ -1442,6 +1434,76 @@ mod tests {
             packet.payload.iter().any(|&byte| byte != 0xD5),
             "transcoded G.711a carries non-silence audio"
         );
+    }
+
+    #[test]
+    fn secure_egress_encrypts_relayed_telephone_event() {
+        // Regression: a repacketized RFC 4733 telephone-event toward a secure (RTP/SAVP) peer must be
+        // encrypted — it previously bypassed `push_egress` and leaked plaintext DTMF on the wire.
+        use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
+        use siphon_rtp_srtp::SrtpContext;
+
+        let local = SrtpKeyMaterial::from_inline_bytes(&[1u8; 30]).expect("local key");
+        let remote = SrtpKeyMaterial::from_inline_bytes(&[2u8; 30]).expect("remote key");
+        let leg = Arc::new(Mutex::new(SecureLeg::new(&local, &remote)));
+
+        let direction = |ingress: u64, src: &str, egress: u64, dst: &str, ssrc: u32| DirectionConfig {
+            ingress_endpoint: endpoint(ingress),
+            accepted_source: SourceFilter::Exact(addr(src).ip()),
+            egress_endpoint: endpoint(egress),
+            egress_dst: addr(dst),
+            decoder: Box::new(G711::ulaw()),
+            encoder: Box::new(G711::ulaw()),
+            egress_ssrc: ssrc,
+            egress_payload_type: 0,
+            telephone_event_in: Some(101),
+            telephone_event_out: Some(101),
+            recorder: None,
+        };
+        let mut call = MediaCall::new(
+            "te",
+            "a",
+            Some("b".into()),
+            direction(1, A_ADDR, 2, B_ADDR, 0xB000_0101), // A→B: plaintext in, secure egress
+            direction(2, B_ADDR, 1, A_ADDR, 0xA000_0101),
+            true,
+            None,
+        )
+        .with_far_secure_leg(leg);
+
+        // A plaintext telephone-event (PT 101, RFC 4733 4-byte event) from A.
+        let header = RtpHeader {
+            marker: true,
+            payload_type: 101,
+            sequence: 1,
+            timestamp: 160,
+            ssrc: 0x1234_5678,
+        };
+        let mut buffer = vec![0u8; 12 + 4];
+        let len = write_packet(&header, &[0x05, 0x0A, 0x01, 0x40], &mut buffer).expect("write");
+        buffer.truncate(len);
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, buffer.clone()), &mut out, &mut events);
+
+        let egress = out
+            .iter()
+            .find(|outbound| outbound.endpoint == endpoint(2))
+            .expect("an egress packet toward the secure peer B");
+        assert_ne!(
+            &egress.data[..],
+            &buffer[..],
+            "egress must not be the plaintext telephone-event"
+        );
+        // It is valid SRTP, decryptable with the engine's outbound (local) key to the event packet.
+        let mut decrypt = SrtpContext::from_key_material(&local);
+        let mut plain = Vec::new();
+        decrypt
+            .unprotect(&egress.data, &mut plain)
+            .expect("egress is valid SRTP");
+        let parsed = RtpPacket::parse(&plain).expect("decrypted telephone-event");
+        assert_eq!(parsed.payload_type, 101, "egress is the repacketized telephone-event");
     }
 
     #[test]
