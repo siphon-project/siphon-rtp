@@ -5,7 +5,7 @@
 //! leg's codec here once, at call setup, then runs the returned trait objects per frame.
 
 #[cfg(feature = "amr")]
-use crate::amr::AmrWb;
+use crate::amr::{AmrNb, AmrWb};
 use crate::cn::Cn;
 use crate::g711::{Variant, G711};
 use crate::g722::G722;
@@ -116,6 +116,13 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         // reach here and is always available.
         #[cfg(feature = "amr")]
         "AMR-WB" => Ok(Box::new(AmrWb::new())),
+        // AMR-NB decode is bit-exact for all 8 speech modes (0..=7) against 3GPP TS 26.074, with the
+        // RFC 4867 RTP payload un-sorted to encoder order in `AmrNb::decode`. Encode is still WIP
+        // (see `encoder_for`), so AMR-NB is reachable as a decode-side codec — transcode *out* to
+        // another codec, conference ingress, recording, and voice-AI WS legs — but not yet as an
+        // egress encoder. Same `amr`-feature gate (patent-licensed — docs/codec-licensing.md).
+        #[cfg(feature = "amr")]
+        "AMR" => Ok(Box::new(AmrNb::new())),
         _ => Err(CodecError::Unsupported(unsupported_name(
             &spec.encoding_name,
         ))),
@@ -148,9 +155,10 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
 fn unsupported_name(encoding_name: &str) -> &'static str {
     match encoding_name {
         "CN" => "comfort-noise generation (DTX) is a media-path policy, not an audio encoder",
-        // AMR-WB (decode + encode) is wired when the `amr` feature is on, so it never reaches here then.
+        // With `amr` on, AMR-WB (decode + encode) and AMR-NB decode are wired, so they never reach
+        // here. AMR-NB *encode* is still WIP — `encoder_for("AMR")` falls through to this message.
         #[cfg(feature = "amr")]
-        "AMR" => "AMR-NB codec not yet implemented",
+        "AMR" => "AMR-NB encode DSP not yet implemented (AMR-NB decode is supported)",
         #[cfg(not(feature = "amr"))]
         "AMR" | "AMR-WB" => {
             "AMR transcoding requires the `amr` build feature (patent-licensed — see \
@@ -297,14 +305,36 @@ mod tests {
     #[test]
     fn amr_wb_decodes_and_encodes_with_the_amr_feature() {
         // With the `amr` feature, AMR-WB builds in both directions (bit-exact, 3GPP TS 26.174) — so
-        // it can be a conference egress codec. AMR-NB is still unsupported.
+        // it can be a conference egress codec.
         let wb = CodecSpec::new(96, "AMR-WB", 16000, 1, 20);
         assert!(decoder_for(&wb).is_ok(), "AMR-WB decoder");
         assert!(encoder_for(&wb).is_ok(), "AMR-WB encoder");
+    }
+
+    #[cfg(feature = "amr")]
+    #[test]
+    fn amr_nb_decodes_but_encode_is_still_wip() {
+        // AMR-NB decode is bit-exact (3GPP TS 26.074) and now reachable from the factory, so AMR-NB
+        // is usable as a decode-side codec (transcode egress, conference ingress, recording, voice-AI
+        // WS). Encode DSP is still WIP, so `encoder_for` reports `Unsupported` rather than mis-encode.
         let nb = CodecSpec::new(97, "AMR", 8000, 1, 20);
+        let mut decoder = decoder_for(&nb).expect("AMR-NB decoder builds");
+        // A minimal RFC 4867 octet-aligned mode-0 (MR475) frame: CMR=0xF, then ToC (F=0, FT=0, Q=1),
+        // then 12 speech bytes — decodes to one 160-sample 8 kHz frame.
+        let payload = {
+            let mut bytes = vec![0xF0u8, 0x04];
+            bytes.extend(std::iter::repeat_n(0u8, 12));
+            bytes
+        };
+        let mut pcm = [0i16; 160];
+        assert_eq!(
+            decoder.decode(&payload, &mut pcm).expect("AMR-NB decodes"),
+            160,
+            "one 20 ms / 160-sample frame"
+        );
         assert!(
             matches!(encoder_for(&nb), Err(CodecError::Unsupported(_))),
-            "AMR-NB unsupported"
+            "AMR-NB encode is still WIP"
         );
     }
 
