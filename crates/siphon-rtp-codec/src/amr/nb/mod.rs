@@ -11,6 +11,8 @@ pub mod bitstream;
 pub mod codebook;
 pub mod constants;
 pub mod dec_main;
+pub mod enc_lpc;
+pub mod enc_tables;
 pub mod filters;
 mod gain_tables;
 mod gain_vq_tables;
