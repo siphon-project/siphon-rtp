@@ -18,7 +18,9 @@ const GAMMA3_MR122: [i16; M] = [22938, 16057, 11240, 7868, 5508, 3856, 2699, 188
 /// Spectral expansion factor `gamma3` for the other modes (`pstfilt.c` `gamma3`).
 const GAMMA3: [i16; M] = [18022, 9912, 5451, 2998, 1649, 907, 499, 274, 151, 83];
 /// Spectral expansion factor `gamma4` for MR122/MR102 (`pstfilt.c` `gamma4_MR122`).
-const GAMMA4_MR122: [i16; M] = [24576, 18432, 13824, 10368, 7776, 5832, 4374, 3281, 2461, 1846];
+const GAMMA4_MR122: [i16; M] = [
+    24576, 18432, 13824, 10368, 7776, 5832, 4374, 3281, 2461, 1846,
+];
 /// Spectral expansion factor `gamma4` for the other modes (`pstfilt.c` `gamma4`).
 const GAMMA4: [i16; M] = [22938, 16057, 11240, 7868, 5508, 3856, 2699, 1889, 1322, 925];
 
@@ -389,7 +391,15 @@ mod tests {
         let mut pd = PhDisp::new();
         let mut x = [10i16; L_SUBFR];
         let mut inno = [5i16; L_SUBFR];
-        pd.run(AmrNbMode::Mr1220 as usize, &mut x, 100, 8000, &mut inno, 8192, 2);
+        pd.run(
+            AmrNbMode::Mr1220 as usize,
+            &mut x,
+            100,
+            8000,
+            &mut inno,
+            8192,
+            2,
+        );
         // Deterministic, finite, and inno unchanged (no dispersion for MR122).
         assert!(inno.iter().all(|&v| v == 5));
         assert!(x.iter().any(|&v| v != 0));
@@ -403,7 +413,15 @@ mod tests {
         let mut inno = [0i16; L_SUBFR];
         inno[5] = 4096; // one pulse
         let inno_before = inno;
-        pd.run(AmrNbMode::Mr475 as usize, &mut x, 5000, 1000, &mut inno, 8192, 1);
+        pd.run(
+            AmrNbMode::Mr475 as usize,
+            &mut x,
+            5000,
+            1000,
+            &mut inno,
+            8192,
+            1,
+        );
         // ltpGain 1000 < 0.6 -> max dispersion; the single pulse is spread (circular convolution).
         assert_ne!(inno, inno_before);
     }

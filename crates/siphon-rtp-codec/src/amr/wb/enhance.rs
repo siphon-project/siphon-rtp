@@ -190,7 +190,15 @@ pub fn weight_a(a: &[i16], ap: &mut [i16], gamma: i16, m: usize) {
 ///
 /// `a` is `a[0..=m]` (Q12), `x` the input (`lg`), `y` the output (`lg`), and `mem[m]` the carried
 /// filter state. When `update` is set, the last `m` outputs are written back into `mem`.
-pub fn syn_filt(a: &[i16], m: usize, x: &[i16], y: &mut [i16], lg: usize, mem: &mut [i16], update: bool) {
+pub fn syn_filt(
+    a: &[i16],
+    m: usize,
+    x: &[i16],
+    y: &mut [i16],
+    lg: usize,
+    mem: &mut [i16],
+    update: bool,
+) {
     // y_buf = [mem (m)] ++ [outputs (lg)] on the stack (HF path is one subframe, lg <= L_SUBFR16k).
     let mut y_buf = [0i16; L_SUBFR16K + M16K];
     y_buf[..m].copy_from_slice(&mem[..m]);

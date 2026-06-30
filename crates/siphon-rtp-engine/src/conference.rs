@@ -114,7 +114,7 @@ pub struct ParticipantConfig {
     pub egress_payload_type: u8,
     /// The participant's codec as the G.107 MOS estimator knows it (`siphon-rtp-hep`), resolved from
     /// the negotiated encoding name — so an AMR-WB / G.722 leg is scored on its own impairment, not
-    /// the G.711 default. See [`hep_codec_for_name`].
+    /// the G.711 default. See `hep_codec_for_name`.
     pub mos_codec: siphon_rtp_hep::mos::Codec,
     /// The participant's RFC 4733 telephone-event PT, if negotiated (filtered out of the mix).
     pub telephone_event_in: Option<u8>,
@@ -509,7 +509,12 @@ impl Conference {
     /// interarrival jitter, and LSR/DLSR (from the peer's last SR, `now_micros` being the engine's
     /// monotonic-clock reading) — so the sender sees reception quality and can derive RTT
     /// (RFC 3550 §6.4.1).
-    pub fn build_sender_reports(&mut self, ntp_timestamp: u64, now_micros: u64, out: &mut Vec<Outbound>) {
+    pub fn build_sender_reports(
+        &mut self,
+        ntp_timestamp: u64,
+        now_micros: u64,
+        out: &mut Vec<Outbound>,
+    ) {
         let mut buffer = [0u8; rtcp::SENDER_REPORT_LEN + rtcp::RECEPTION_REPORT_LEN];
         for index in 0..self.participants.len() {
             let dst = self.participants[index].egress_dst;
@@ -1174,7 +1179,10 @@ impl ConferenceRegistry {
     /// — so it is always exact, with no separate counter to drift.
     #[must_use]
     pub fn participant_count(&self) -> usize {
-        self.rooms.iter().map(|room| room.value().members.len()).sum()
+        self.rooms
+            .iter()
+            .map(|room| room.value().members.len())
+            .sum()
     }
 
     /// Seat a participant, creating the room actor (over `datapath`, pushing events to `events`) if it
@@ -1929,7 +1937,12 @@ mod tests {
         let mut sr_buffer = [0u8; rtcp::SENDER_REPORT_LEN];
         let sr_len = rtcp::write_sender_report(0x1000_0000, sr_ntp, 0, 0, 0, &[], &mut sr_buffer)
             .expect("build inbound SR");
-        conference.ingest(&rx_at(1, "10.0.0.1:5000", sr_buffer[..sr_len].to_vec(), 90_000));
+        conference.ingest(&rx_at(
+            1,
+            "10.0.0.1:5000",
+            sr_buffer[..sr_len].to_vec(),
+            90_000,
+        ));
 
         // Build the engine's report 1.0 s after the SR arrived ⇒ DLSR = 1 s = 65536 units of 1/65536 s.
         let mut reports = Vec::new();
@@ -1969,7 +1982,11 @@ mod tests {
 
         let mut events = Vec::new();
         conference.build_quality_events(0.0, &mut events);
-        assert_eq!(events.len(), 1, "one quality event for the active participant");
+        assert_eq!(
+            events.len(),
+            1,
+            "one quality event for the active participant"
+        );
         match &events[0] {
             Event::CallQuality {
                 conference_id,
@@ -1980,7 +1997,10 @@ mod tests {
             } => {
                 assert_eq!(conference_id, "room");
                 assert_eq!(from_tag, "party-0");
-                assert!(*jitter_ms > 0.0, "drifting arrivals ⇒ jitter, got {jitter_ms}");
+                assert!(
+                    *jitter_ms > 0.0,
+                    "drifting arrivals ⇒ jitter, got {jitter_ms}"
+                );
                 assert_eq!(*loss_percent, 0.0, "all packets in order ⇒ no loss");
                 assert!(*mos > 4.0, "clean low-jitter call ⇒ good MOS, got {mos}");
             }

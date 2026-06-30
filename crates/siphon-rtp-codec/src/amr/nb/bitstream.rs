@@ -127,7 +127,11 @@ pub fn prm2bits(mode: usize, prm: &[i16], bits: &mut [i16]) {
     let bitno = BITNO[mode];
     let mut cursor = 0usize;
     for (index, &nbits) in bitno.iter().enumerate().take(PRMNO[mode]) {
-        int2bin(prm[index], nbits, &mut bits[cursor..cursor + nbits as usize]);
+        int2bin(
+            prm[index],
+            nbits,
+            &mut bits[cursor..cursor + nbits as usize],
+        );
         cursor += nbits as usize;
     }
 }

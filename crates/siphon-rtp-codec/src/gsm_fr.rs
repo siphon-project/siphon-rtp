@@ -662,7 +662,11 @@ fn rpe_grid_positioning(mc: i16, xmp: &[i16; 13], ep: &mut [i16]) {
 // ---- §4.3 Decoder ------------------------------------------------------------------------------
 
 fn long_term_synthesis_filtering(state: &mut GsmState, ncr: i16, bcr: i16, erp: &[i16; 40]) {
-    let nr = if !(40..=120).contains(&ncr) { state.nrp } else { ncr };
+    let nr = if !(40..=120).contains(&ncr) {
+        state.nrp
+    } else {
+        ncr
+    };
     state.nrp = nr;
     let brp = GSM_QLB[bcr as usize];
     for (k, &e) in erp.iter().enumerate() {
@@ -699,8 +703,9 @@ fn encode_frame(state: &mut GsmState, pcm: &[i16]) -> Frame {
         let mut cur = state.larpp[j];
         decode_lar(&frame.larc, &mut cur);
         state.larpp[j] = cur;
-        for (region, &(start, len)) in
-            [(0usize, 13usize), (13, 14), (27, 13), (40, 120)].iter().enumerate()
+        for (region, &(start, len)) in [(0usize, 13usize), (13, 14), (27, 13), (40, 120)]
+            .iter()
+            .enumerate()
         {
             let mut larp = [0i16; 8];
             interpolate_lar(&prev, &cur, region, &mut larp);
@@ -762,8 +767,9 @@ fn decode_frame(state: &mut GsmState, frame: &Frame) -> [i16; FRAME_SAMPLES] {
         let mut cur = state.larpp[j];
         decode_lar(&frame.larc, &mut cur);
         state.larpp[j] = cur;
-        for (region, &(start, len)) in
-            [(0usize, 13usize), (13, 14), (27, 13), (40, 120)].iter().enumerate()
+        for (region, &(start, len)) in [(0usize, 13usize), (13, 14), (27, 13), (40, 120)]
+            .iter()
+            .enumerate()
         {
             let mut larp = [0i16; 8];
             interpolate_lar(&prev, &cur, region, &mut larp);
@@ -799,11 +805,18 @@ fn pack(frame: &Frame) -> [u8; FRAME_BYTES] {
         let xb = s * 13;
         let xc = |i: usize| b(x[xb + i]);
         c[o] = (((b(nc[s]) & 0x7F) << 1) | ((b(bc[s]) >> 1) & 0x1)) as u8;
-        c[o + 1] = (((b(bc[s]) & 0x1) << 7) | ((b(mc[s]) & 0x3) << 5) | ((b(xx[s]) >> 1) & 0x1F)) as u8;
-        c[o + 2] = (((b(xx[s]) & 0x1) << 7) | ((xc(0) & 0x7) << 4) | ((xc(1) & 0x7) << 1) | ((xc(2) >> 2) & 0x1)) as u8;
+        c[o + 1] =
+            (((b(bc[s]) & 0x1) << 7) | ((b(mc[s]) & 0x3) << 5) | ((b(xx[s]) >> 1) & 0x1F)) as u8;
+        c[o + 2] = (((b(xx[s]) & 0x1) << 7)
+            | ((xc(0) & 0x7) << 4)
+            | ((xc(1) & 0x7) << 1)
+            | ((xc(2) >> 2) & 0x1)) as u8;
         c[o + 3] = (((xc(2) & 0x3) << 6) | ((xc(3) & 0x7) << 3) | (xc(4) & 0x7)) as u8;
         c[o + 4] = (((xc(5) & 0x7) << 5) | ((xc(6) & 0x7) << 2) | ((xc(7) >> 1) & 0x3)) as u8;
-        c[o + 5] = (((xc(7) & 0x1) << 7) | ((xc(8) & 0x7) << 4) | ((xc(9) & 0x7) << 1) | ((xc(10) >> 2) & 0x1)) as u8;
+        c[o + 5] = (((xc(7) & 0x1) << 7)
+            | ((xc(8) & 0x7) << 4)
+            | ((xc(9) & 0x7) << 1)
+            | ((xc(10) >> 2) & 0x1)) as u8;
         c[o + 6] = (((xc(10) & 0x3) << 6) | ((xc(11) & 0x7) << 3) | (xc(12) & 0x7)) as u8;
     }
     c
@@ -895,7 +908,9 @@ impl Decoder for GsmFr {
 
     fn decode(&mut self, payload: &[u8], out: &mut [i16]) -> Result<usize, CodecError> {
         if payload.len() % FRAME_BYTES != 0 {
-            return Err(CodecError::Malformed("GSM payload not a multiple of 33 bytes"));
+            return Err(CodecError::Malformed(
+                "GSM payload not a multiple of 33 bytes",
+            ));
         }
         let frames = payload.len() / FRAME_BYTES;
         let samples = frames * FRAME_SAMPLES;
@@ -947,7 +962,10 @@ impl Encoder for GsmFr {
             });
         }
         for f in 0..frames {
-            let frame = encode_frame(&mut self.state, &pcm[f * FRAME_SAMPLES..f * FRAME_SAMPLES + FRAME_SAMPLES]);
+            let frame = encode_frame(
+                &mut self.state,
+                &pcm[f * FRAME_SAMPLES..f * FRAME_SAMPLES + FRAME_SAMPLES],
+            );
             out[f * FRAME_BYTES..f * FRAME_BYTES + FRAME_BYTES].copy_from_slice(&pack(&frame));
         }
         Ok(bytes)
@@ -1075,7 +1093,9 @@ mod tests {
     fn decodes_arbitrary_bytes_without_panicking() {
         // A hostile/truncated GSM frame must decode-or-error, never panic / index out of bounds.
         let mut codec = GsmFr::new();
-        let payload: Vec<u8> = (0..33u32 * 8).map(|k| (k.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let payload: Vec<u8> = (0..33u32 * 8)
+            .map(|k| (k.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
         let mut out = vec![0i16; payload.len() / 33 * 160];
         assert!(codec.decode(&payload, &mut out).is_ok());
     }
@@ -1090,13 +1110,19 @@ mod tests {
     }
 
     fn read_i16_le(bytes: &[u8]) -> Vec<i16> {
-        bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
+        bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
     }
 
     /// Parse a `.cod` test vector: 76 little-endian u16 parameters per frame, in `gsm_explode`
     /// order (LARc[0..7] then 4× Nc, bc, Mc, xmaxc, xMc[0..12]).
     fn parse_cod(bytes: &[u8]) -> Vec<Frame> {
-        let words: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let words: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         words
             .chunks_exact(76)
             .map(|w| {
@@ -1124,8 +1150,10 @@ mod tests {
         // Encode Seq01.inp (LE i16 PCM, 160/frame) and require the produced 76-parameter Frame to
         // match Seq01.cod exactly, frame by frame (ETSI TS 06.10, no tolerance). Gitignored vectors
         // → skip gracefully when absent.
-        let (Ok(inp), Ok(cod)) = (std::fs::read(vector_path("Seq01.inp")), std::fs::read(vector_path("Seq01.cod")))
-        else {
+        let (Ok(inp), Ok(cod)) = (
+            std::fs::read(vector_path("Seq01.inp")),
+            std::fs::read(vector_path("Seq01.cod")),
+        ) else {
             eprintln!("GSM 06.10 vectors absent — skipping coder conformance");
             return;
         };
@@ -1140,14 +1168,20 @@ mod tests {
     }
 
     fn decoder_bit_exact(cod_name: &str, out_name: &str) {
-        let (Ok(cod), Ok(out)) = (std::fs::read(vector_path(cod_name)), std::fs::read(vector_path(out_name)))
-        else {
+        let (Ok(cod), Ok(out)) = (
+            std::fs::read(vector_path(cod_name)),
+            std::fs::read(vector_path(out_name)),
+        ) else {
             eprintln!("GSM 06.10 vectors absent — skipping decoder conformance ({cod_name})");
             return;
         };
         let frames = parse_cod(&cod);
         let ref_pcm = read_i16_le(&out);
-        assert_eq!(frames.len() * 160, ref_pcm.len(), "{cod_name} length mismatch");
+        assert_eq!(
+            frames.len() * 160,
+            ref_pcm.len(),
+            "{cod_name} length mismatch"
+        );
         let mut state = GsmState::new();
         for (k, frame) in frames.iter().enumerate() {
             let got = decode_frame(&mut state, frame);

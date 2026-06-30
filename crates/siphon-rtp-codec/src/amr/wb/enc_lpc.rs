@@ -198,7 +198,12 @@ fn interpol_down(sig: &[i16], center: isize, frac: i16) -> i16 {
 
 /// 16 kHz → 12.8 kHz decimation (`decim54.c` `Decim_12k8`). `sig16k` is `lg` input samples; `mem` is
 /// the 2·NB_COEF_DOWN-sample filter history (carried). Writes `mult(lg, DOWN_FAC)` output samples.
-pub fn decim_12k8(sig16k: &[i16], lg: usize, sig12k8: &mut [i16], mem: &mut [i16; 2 * NB_COEF_DOWN]) {
+pub fn decim_12k8(
+    sig16k: &[i16],
+    lg: usize,
+    sig12k8: &mut [i16],
+    mem: &mut [i16; 2 * NB_COEF_DOWN],
+) {
     // signal = [mem] ++ [sig16k(lg)]
     let mut signal = [0i16; L_FRAME16K + 2 * NB_COEF_DOWN];
     signal[..2 * NB_COEF_DOWN].copy_from_slice(mem);
@@ -613,7 +618,14 @@ fn sub_vq(x: &mut [i16], dico: &[i16], dim: usize, dico_size: usize) -> (i16, i3
 }
 
 /// `VQ_stage1` (`qpisf_2s.c`): keep the `surv` best survivors over the 1st-stage codebook.
-fn vq_stage1(x: &[i16], dico: &[i16], dim: usize, dico_size: usize, index: &mut [i16], surv: usize) {
+fn vq_stage1(
+    x: &[i16],
+    dico: &[i16],
+    dim: usize,
+    dico_size: usize,
+    index: &mut [i16],
+    surv: usize,
+) {
     let mut dist_min = [i32::MAX; N_SURV_MAX];
     for (i, slot) in index.iter_mut().enumerate().take(surv) {
         *slot = i as i16;
@@ -700,7 +712,15 @@ pub fn qpisf_2s_36b(
     // (M words, once per frame) instead of a heap to_vec to keep the hot path allocation-free.
     let mut isf_in = [0i16; M];
     isf_in[..isf_q.len()].copy_from_slice(isf_q);
-    dpisf_2s_36b(indice, isf_q, past_isfq, &isf_in[..isf_q.len()], isf_buf, false, true);
+    dpisf_2s_36b(
+        indice,
+        isf_q,
+        past_isfq,
+        &isf_in[..isf_q.len()],
+        isf_buf,
+        false,
+        true,
+    );
 }
 
 /// 46-bit ISF quantizer (`qpisf_2s.c` `Qpisf_2s_46b`). Writes 7 indices to `indice[0..7]`.
@@ -766,7 +786,15 @@ pub fn qpisf_2s_46b(
 
     let mut isf_in = [0i16; M];
     isf_in[..isf_q.len()].copy_from_slice(isf_q);
-    dpisf_2s_46b(indice, isf_q, past_isfq, &isf_in[..isf_q.len()], isf_buf, false, true);
+    dpisf_2s_46b(
+        indice,
+        isf_q,
+        past_isfq,
+        &isf_in[..isf_q.len()],
+        isf_buf,
+        false,
+        true,
+    );
 }
 
 #[cfg(test)]

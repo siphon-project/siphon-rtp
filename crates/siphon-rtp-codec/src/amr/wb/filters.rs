@@ -250,7 +250,10 @@ pub fn oversamp_16k(
         let frac = sub(pos, add(shl(i, 2), i)); // pos − (pos/5)·5
         let base = i as usize + 1;
 
-        let dot = fir_dot_i16(&signal[base..base + 2 * NB_COEF_UP], &FIR_UP_POLY[frac as usize]);
+        let dot = fir_dot_i16(
+            &signal[base..base + 2 * NB_COEF_UP],
+            &FIR_UP_POLY[frac as usize],
+        );
         let l_sum = l_shl(dot, 1); // L_mult's per-term ×2, hoisted out of the dot
         *out = round_word(l_shl(l_sum, 1)); // final Q-shift; saturation matches the scalar path
 

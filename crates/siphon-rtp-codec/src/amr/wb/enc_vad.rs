@@ -943,7 +943,11 @@ mod tests {
         let mut st = VadState::new();
         // A pitch gain above TONE_THR sets bit 0x4000 of tone_flag (after the right shift).
         wb_vad_tone_detection(&mut st, 32000);
-        assert_ne!(st.tone_flag & 0x4000, 0, "high pitch gain should set tone bit");
+        assert_ne!(
+            st.tone_flag & 0x4000,
+            0,
+            "high pitch gain should set tone bit"
+        );
 
         // A low pitch gain just shifts the register down; the previously-set bit migrates.
         let before = st.tone_flag;

@@ -1,7 +1,7 @@
 //! AMR-NB decoder main — 3GPP TS 26.073 `dec_amr.c` + `sp_dec.c` + `d_homing.c`. Ported bit-exact
 //! for the clean (error-free, NODTX) speech path.
 //!
-//! [`decode_frame`] is the public per-frame entry: serial bits (encoder/`.COD` order, `0`/`1`) +
+//! `decode_frame` is the public per-frame entry: serial bits (encoder/`.COD` order, `0`/`1`) +
 //! mode → 160 post-filtered, post-processed, 13-bit-truncated samples, plus the encoder/decoder
 //! homing-frame handling from `sp_dec.c`/`decoder.c`.
 //!
@@ -120,7 +120,13 @@ impl DecoderAmrState {
             prm = &prm[3..];
             int_lpc_1to3(&self.lsp_old, &lsp_new, az_dec);
         } else {
-            d_plsf_5(&mut self.lsf_state, bfi != 0, prm, &mut lsp_mid, &mut lsp_new);
+            d_plsf_5(
+                &mut self.lsf_state,
+                bfi != 0,
+                prm,
+                &mut lsp_mid,
+                &mut lsp_new,
+            );
             prm = &prm[5..];
             int_lpc_1and3(&self.lsp_old, &lsp_mid, &lsp_new, az_dec);
         }
@@ -265,7 +271,8 @@ impl DecoderAmrState {
                 gain_pit = gp;
                 gain_code = gc;
                 pit_sharp = gain_pit.min(SHARPMAX);
-                if mode == AmrNbMode::Mr1020 as usize && sub(self.old_t0, add(L_SUBFR as i16, 5)) > 0
+                if mode == AmrNbMode::Mr1020 as usize
+                    && sub(self.old_t0, add(L_SUBFR as i16, 5)) > 0
                 {
                     pit_sharp = shr(pit_sharp, 2);
                 }
@@ -459,7 +466,15 @@ impl DecoderAmrState {
                 excp[i] = add(excp[i], exc_enhanced[i]);
             }
             agc2(&exc_enhanced, &mut excp, L_SUBFR);
-            syn_filt_overflow(az, &excp, synth, L_SUBFR, &mut self.mem_syn, false, &mut overflow);
+            syn_filt_overflow(
+                az,
+                &excp,
+                synth,
+                L_SUBFR,
+                &mut self.mem_syn,
+                false,
+                &mut overflow,
+            );
         } else {
             syn_filt_overflow(
                 az,

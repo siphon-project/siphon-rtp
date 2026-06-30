@@ -1,7 +1,7 @@
 //! CELT band shape de-quantisation (RFC 6716 §4.3.4; libopus `celt/vq.c`, float path).
 //!
 //! **Phase 3c (band shape).** Decodes one band's normalised spectral shape: [`decode_pulses`]
-//! recovers the integer pulse vector, [`normalise_residual`] scales it to a unit-norm float vector,
+//! recovers the integer pulse vector, `normalise_residual` scales it to a unit-norm float vector,
 //! and [`exp_rotation`] applies the inverse spreading rotation. [`alg_unquant`] is the decoder entry
 //! point that chains these. The spreading rotation is an orthogonal (norm-preserving) transform, so
 //! it is validated by forward∘inverse = identity.
@@ -118,7 +118,7 @@ fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
 
 /// Decode one band's normalised shape into `x` (libopus `alg_unquant`, baseline non-QEXT path):
 /// `decode_pulses` → `normalise_residual` → inverse `exp_rotation`. Returns the anti-collapse mask.
-/// `n` must be ≤ [`MAX_BAND`], `k ≥ 1`.
+/// `n` must be ≤ `MAX_BAND`, `k ≥ 1`.
 pub fn alg_unquant(
     x: &mut [f32],
     n: usize,
@@ -166,11 +166,17 @@ mod tests {
     /// original vector (and preserve energy), across spreads, K, and block counts B.
     #[test]
     fn exp_rotation_forward_then_inverse_is_identity() {
-        for &(len, k, b) in &[(16usize, 3usize, 1usize), (24, 5, 1), (32, 4, 2), (48, 6, 4), (8, 1, 1)]
-        {
+        for &(len, k, b) in &[
+            (16usize, 3usize, 1usize),
+            (24, 5, 1),
+            (32, 4, 2),
+            (48, 6, 4),
+            (8, 1, 1),
+        ] {
             for spread in [SPREAD_LIGHT, SPREAD_NORMAL, SPREAD_AGGRESSIVE] {
-                let original: Vec<f32> =
-                    (0..len).map(|i| ((i as f32 * 0.37).sin()) * 0.5 + 0.1).collect();
+                let original: Vec<f32> = (0..len)
+                    .map(|i| ((i as f32 * 0.37).sin()) * 0.5 + 0.1)
+                    .collect();
                 let mut x = original.clone();
                 let e0: f32 = x.iter().map(|v| v * v).sum();
                 exp_rotation(&mut x, len, 1, b, k, spread);
@@ -240,10 +246,16 @@ mod tests {
             let mut dec = RangeDecoder::new(&buf);
             alg_unquant(&mut x, n, k, spread, b, &mut dec, 1.0);
 
-            assert!(approx_eq(&x, &expected, 1e-5), "n={n} k={k} b={b} spread={spread}");
+            assert!(
+                approx_eq(&x, &expected, 1e-5),
+                "n={n} k={k} b={b} spread={spread}"
+            );
             // Unit energy (gain = 1), since the rotation preserves norm.
             let energy: f32 = x.iter().map(|v| v * v).sum();
-            assert!((energy - 1.0).abs() < 1e-4, "n={n} k={k}: energy {energy} != 1");
+            assert!(
+                (energy - 1.0).abs() < 1e-4,
+                "n={n} k={k}: energy {energy} != 1"
+            );
         }
     }
 }

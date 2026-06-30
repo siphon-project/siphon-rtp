@@ -155,7 +155,7 @@ impl Toc {
 }
 
 /// A parsed Opus packet (RFC 6716 §3): the TOC plus the constituent frames (slices into the original
-/// buffer; a zero-length frame is DTX / "no data"). At most [`MAX_FRAMES`]; no heap allocation.
+/// buffer; a zero-length frame is DTX / "no data"). At most `MAX_FRAMES`; no heap allocation.
 #[derive(Debug)]
 pub struct OpusPacket<'a> {
     /// The table-of-contents byte.
@@ -229,7 +229,8 @@ pub fn parse(data: &[u8]) -> Result<OpusPacket<'_>, CodecError> {
         // Two VBR frames; the first length is prefixed.
         2 => {
             count = 2;
-            let (size, bytes) = parse_size(data.get(offset..).ok_or_else(invalid)?).ok_or_else(invalid)?;
+            let (size, bytes) =
+                parse_size(data.get(offset..).ok_or_else(invalid)?).ok_or_else(invalid)?;
             len -= bytes as i32;
             if size > len {
                 return Err(invalid());

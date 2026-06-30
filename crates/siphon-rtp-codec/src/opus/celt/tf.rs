@@ -121,7 +121,10 @@ mod tests {
                     let mut tf_res = vec![0i32; NB_BANDS];
                     let mut dec = RangeDecoder::new(&buf);
                     tf_decode(0, NB_BANDS, is_transient, &mut tf_res, lm, &mut dec);
-                    assert_eq!(tf_res, expected, "lm={lm} transient={is_transient} sel={tf_select_bit}");
+                    assert_eq!(
+                        tf_res, expected,
+                        "lm={lm} transient={is_transient} sel={tf_select_bit}"
+                    );
                 }
             }
         }

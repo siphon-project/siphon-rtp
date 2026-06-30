@@ -275,8 +275,8 @@ impl G726State {
 
     /// Pole predictor — two-tap IIR over the reconstructed-signal history (ITU-T G.726 `FILTEP`).
     fn predictor_pole(&self) -> i16 {
-        (i32::from(fmult(self.a[1] >> 2, self.sr[1])) + i32::from(fmult(self.a[0] >> 2, self.sr[0])))
-            as i16
+        (i32::from(fmult(self.a[1] >> 2, self.sr[1]))
+            + i32::from(fmult(self.a[0] >> 2, self.sr[0]))) as i16
     }
 
     /// Current quantizer step size `y` from the locked/unlocked multipliers (ITU-T G.726 `step_size`).
@@ -299,7 +299,16 @@ impl G726State {
     /// reproduced with `as i16` truncation — notably the `b[i]` leaky integrator, which legitimately
     /// wraps at the 16-bit boundary in the reference and must do so here for bit-exactness.
     #[allow(clippy::too_many_arguments)]
-    fn update(&mut self, y: i32, wi: i32, fi: i32, dq: i32, sr: i32, dqsez: i32, bits_per_sample: u32) {
+    fn update(
+        &mut self,
+        y: i32,
+        wi: i32,
+        fi: i32,
+        dq: i32,
+        sr: i32,
+        dqsez: i32,
+        bits_per_sample: u32,
+    ) {
         let pk0 = i32::from(dqsez < 0); // 1 if negative
         let mag = dq & 0x7FFF;
 
@@ -661,7 +670,9 @@ mod tests {
 
         let mut decoder = G726::new(rate, 20);
         let mut output = vec![0i16; n];
-        let decoded = decoder.decode(&payload[..produced], &mut output).expect("decode");
+        let decoded = decoder
+            .decode(&payload[..produced], &mut output)
+            .expect("decode");
         assert_eq!(decoded, n, "one sample out per sample in");
 
         let region = 400..(n - 8);
@@ -684,26 +695,47 @@ mod tests {
         let codec = G726::new(Rate::R32, 20);
         assert_eq!(codec.params().sample_rate_hz, 8000);
         assert_eq!(codec.frame_samples(), FRAME);
-        assert_eq!(Encoder::rtp_clock_rate_hz(&codec), 8000, "RTP clock == native rate");
+        assert_eq!(
+            Encoder::rtp_clock_rate_hz(&codec),
+            8000,
+            "RTP clock == native rate"
+        );
     }
 
     #[test]
     fn frame_packs_to_expected_byte_count() {
         // 160 samples → bits×160/8 bytes: 40/60/80/100 for 16/24/32/40 kbit/s.
-        for (rate, bytes) in [(Rate::R16, 40), (Rate::R24, 60), (Rate::R32, 80), (Rate::R40, 100)] {
+        for (rate, bytes) in [
+            (Rate::R16, 40),
+            (Rate::R24, 60),
+            (Rate::R32, 80),
+            (Rate::R40, 100),
+        ] {
             let mut codec = G726::new(rate, 20);
             let pcm = vec![0i16; FRAME];
             let mut out = vec![0u8; bytes];
-            assert_eq!(codec.encode(&pcm, &mut out).expect("encode"), bytes, "{rate:?}");
+            assert_eq!(
+                codec.encode(&pcm, &mut out).expect("encode"),
+                bytes,
+                "{rate:?}"
+            );
         }
     }
 
     #[test]
     fn roundtrip_reconstructs_at_every_rate() {
         // Higher rates reconstruct more faithfully; even 16 kbit/s must clearly track the signal.
-        for (rate, floor) in [(Rate::R16, 8.0), (Rate::R24, 12.0), (Rate::R32, 18.0), (Rate::R40, 22.0)] {
+        for (rate, floor) in [
+            (Rate::R16, 8.0),
+            (Rate::R24, 12.0),
+            (Rate::R32, 18.0),
+            (Rate::R40, 22.0),
+        ] {
             let snr = roundtrip_snr(rate);
-            assert!(snr > floor, "{rate:?} round-trip SNR {snr:.1} dB below {floor} dB floor");
+            assert!(
+                snr > floor,
+                "{rate:?} round-trip SNR {snr:.1} dB below {floor} dB floor"
+            );
         }
     }
 
@@ -717,7 +749,9 @@ mod tests {
 
     #[test]
     fn encode_is_deterministic_across_fresh_instances() {
-        let pcm: Vec<i16> = (0..FRAME).map(|k| ((k as i32 * 173) % 6000 - 3000) as i16).collect();
+        let pcm: Vec<i16> = (0..FRAME)
+            .map(|k| ((k as i32 * 173) % 6000 - 3000) as i16)
+            .collect();
         let mut a = vec![0u8; 80];
         let mut b = vec![0u8; 80];
         G726::new(Rate::R32, 20).encode(&pcm, &mut a).expect("a");
@@ -736,7 +770,11 @@ mod tests {
         let mut fresh = G726::new(Rate::R32, 20);
         let code0 = fresh.encode_sample(1000);
         let code1 = fresh.encode_sample(-1000);
-        assert_eq!(payload[0], (code0 & 0x0F) | (code1 << 4), "first cw low nibble, second high");
+        assert_eq!(
+            payload[0],
+            (code0 & 0x0F) | (code1 << 4),
+            "first cw low nibble, second high"
+        );
     }
 
     #[test]
@@ -770,7 +808,9 @@ mod tests {
         // truncated payload must decode-or-error, never panic / overflow / index out of bounds.
         for rate in [Rate::R16, Rate::R24, Rate::R32, Rate::R40] {
             let mut codec = G726::new(rate, 20);
-            let payload: Vec<u8> = (0..1024u32).map(|k| (k.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+            let payload: Vec<u8> = (0..1024u32)
+                .map(|k| (k.wrapping_mul(2_654_435_761) >> 24) as u8)
+                .collect();
             let mut out = vec![0i16; payload.len() * 8];
             assert!(codec.decode(&payload, &mut out).is_ok(), "{rate:?}");
         }
@@ -811,7 +851,11 @@ mod tests {
     /// G.726 §4.2.8 ADPCM-to-PCM tandem adjustment; logic from the spandsp reference).
     fn tandem_adjust_alaw(sr: i16, se: i32, y: i32, code: i32, rate: Rate) -> u8 {
         use crate::g711::{alaw_to_linear, linear_to_alaw};
-        let sr = if i32::from(sr) <= -32768 { -1 } else { i32::from(sr) };
+        let sr = if i32::from(sr) <= -32768 {
+            -1
+        } else {
+            i32::from(sr)
+        };
         let sp = linear_to_alaw((((sr >> 1) << 3).clamp(-32768, 32767)) as i16);
         let dx = (i32::from(alaw_to_linear(sp)) >> 2) - se;
         let id = i32::from(quantize(dx, y, rate.qtab(), rate.quantizer_states()));
@@ -822,7 +866,11 @@ mod tests {
         if (id ^ rate.sign_bit()) > (code ^ rate.sign_bit()) {
             // step one A-law level down
             if sp & 0x80 != 0 {
-                if sp == 0xD5 { 0x55 } else { toggled.wrapping_sub(1) ^ 0x55 }
+                if sp == 0xD5 {
+                    0x55
+                } else {
+                    toggled.wrapping_sub(1) ^ 0x55
+                }
             } else if sp == 0x2A {
                 0x2A
             } else {
@@ -831,7 +879,11 @@ mod tests {
         } else {
             // step one A-law level up
             if sp & 0x80 != 0 {
-                if sp == 0xAA { 0xAA } else { toggled.wrapping_add(1) ^ 0x55 }
+                if sp == 0xAA {
+                    0xAA
+                } else {
+                    toggled.wrapping_add(1) ^ 0x55
+                }
             } else if sp == 0x55 {
                 0xD5
             } else {
@@ -843,7 +895,11 @@ mod tests {
     /// Re-compand the decoder output to μ-law and one-step-adjust toward the original code.
     fn tandem_adjust_ulaw(sr: i16, se: i32, y: i32, code: i32, rate: Rate) -> u8 {
         use crate::g711::{linear_to_ulaw, ulaw_to_linear};
-        let sr = if i32::from(sr) <= -32768 { 0 } else { i32::from(sr) };
+        let sr = if i32::from(sr) <= -32768 {
+            0
+        } else {
+            i32::from(sr)
+        };
         let sp = linear_to_ulaw(((sr << 2).clamp(-32768, 32767)) as i16);
         let dx = (i32::from(ulaw_to_linear(sp)) >> 2) - se;
         let id = i32::from(quantize(dx, y, rate.qtab(), rate.quantizer_states()));
@@ -853,7 +909,11 @@ mod tests {
         if (id ^ rate.sign_bit()) > (code ^ rate.sign_bit()) {
             // step down
             if sp & 0x80 != 0 {
-                if sp == 0xFF { 0x7E } else { sp + 1 }
+                if sp == 0xFF {
+                    0x7E
+                } else {
+                    sp + 1
+                }
             } else if sp == 0x00 {
                 0x00
             } else {
@@ -862,7 +922,11 @@ mod tests {
         } else {
             // step up
             if sp & 0x80 != 0 {
-                if sp == 0x80 { 0x80 } else { sp - 1 }
+                if sp == 0x80 {
+                    0x80
+                } else {
+                    sp - 1
+                }
             } else if sp == 0x7F {
                 0xFE
             } else {
@@ -877,7 +941,11 @@ mod tests {
         // normal-range (nrm/rn) and overload (ovr/rv) reset sequences. Encoder: companded input →
         // G.711 expand → ADPCM → codes (compared to `.i`). Decoder: codes → ADPCM → tandem-adjusted
         // recompand → octets (compared to `.o`). Gitignored vectors → skip gracefully when absent.
-        let load = |name: &str| std::fs::read(vector_path(name)).ok().map(|b| read_octets(&b));
+        let load = |name: &str| {
+            std::fs::read(vector_path(name))
+                .ok()
+                .map(|b| read_octets(&b))
+        };
         let Some(_) = load("nrm.m") else {
             eprintln!("ITU G.726 vectors absent — skipping conformance test");
             return;
@@ -937,11 +1005,22 @@ mod tests {
                     if known_residual {
                         eprintln!(
                             "[known residual] {n}k {law} {input}: enc {}/{}, dec {}/{}",
-                            enc_bad.0, in_octets.len(), dec_bad.0, ref_codes.len()
+                            enc_bad.0,
+                            in_octets.len(),
+                            dec_bad.0,
+                            ref_codes.len()
                         );
                     } else {
-                        assert_eq!(enc_bad.0, 0, "{n}k {law} {input} encoder not bit-exact (first {:?})", enc_bad.1);
-                        assert_eq!(dec_bad.0, 0, "{n}k {law} {input} decoder not bit-exact (first {:?})", dec_bad.1);
+                        assert_eq!(
+                            enc_bad.0, 0,
+                            "{n}k {law} {input} encoder not bit-exact (first {:?})",
+                            enc_bad.1
+                        );
+                        assert_eq!(
+                            dec_bad.0, 0,
+                            "{n}k {law} {input} decoder not bit-exact (first {:?})",
+                            dec_bad.1
+                        );
                     }
                 }
             }

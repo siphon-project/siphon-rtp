@@ -35,14 +35,16 @@ fn drive(bytes: &[u8]) {
 #[test]
 fn crafted_malformed_datagrams_never_panic() {
     let samples: &[&[u8]] = &[
-        &[0xFF; 16],                                              // every bit set
-        &[0x8F, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],             // CC=15, no CSRCs present
+        &[0xFF; 16],                                 // every bit set
+        &[0x8F, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // CC=15, no CSRCs present
         // X=1, extension word count = 0xFFFF (claims a giant extension):
-        &[0x90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xBE, 0xDE, 0xFF, 0xFF],
-        &[0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF],          // P=1, pad byte 255 > payload
-        &[0x80, 200, 0xFF, 0xFF, 0, 0, 0, 0],                    // SR claiming 0xFFFF length words
-        &[0x80, 201, 0x00, 0x00],                                // RR length-words=0 (packet_len=4)
-        &[0x81, 202, 0x00, 0x01, 0, 0, 0, 0],                    // SDES (Other)
+        &[
+            0x90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xBE, 0xDE, 0xFF, 0xFF,
+        ],
+        &[0xA0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF], // P=1, pad byte 255 > payload
+        &[0x80, 200, 0xFF, 0xFF, 0, 0, 0, 0],           // SR claiming 0xFFFF length words
+        &[0x80, 201, 0x00, 0x00],                       // RR length-words=0 (packet_len=4)
+        &[0x81, 202, 0x00, 0x01, 0, 0, 0, 0],           // SDES (Other)
     ];
     for sample in samples {
         for end in 0..=sample.len() {

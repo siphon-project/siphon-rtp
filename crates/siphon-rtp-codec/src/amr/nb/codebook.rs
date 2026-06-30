@@ -176,7 +176,10 @@ fn decompress10(
     let ib = shl(crate::amr::basic_ops::mult(ia, 6554), 1);
     pos_indx[index2] = add(ib, shr(ic, 1));
 
-    pos_indx[index3] = add(shl(crate::amr::basic_ops::mult(msbs, 1311), 1), shr(lsbs, 2));
+    pos_indx[index3] = add(
+        shl(crate::amr::basic_ops::mult(msbs, 1311), 1),
+        shr(lsbs, 2),
+    );
 }
 
 /// Decompress the 8-pulse linear codeword into 4 signs + 8 positions (`d8_31pf.c` `decompress_code`).
@@ -202,7 +205,10 @@ fn decompress_code(indx: &[i16], sign_indx: &mut [i16; 4], pos_indx: &mut [i16; 
     let msbs0_24 = shr(add(extract_l(l_shr(l_mult(msbs, 25), 1)), 12), 5);
 
     let ia = mult(msbs0_24, 6554) & 1;
-    let mut ib = sub(msbs0_24, extract_l(l_shr(l_mult(mult(msbs0_24, 6554), 5), 1)));
+    let mut ib = sub(
+        msbs0_24,
+        extract_l(l_shr(l_mult(mult(msbs0_24, 6554), 5), 1)),
+    );
     if ia == 1 {
         ib = sub(4, ib);
     }
@@ -232,7 +238,11 @@ pub fn dec_8i40_31bits(index: &[i16], cod: &mut [i16]) {
         let i = linear_codewords[j];
         let i = extract_l(l_shr(l_mult(i, 4), 1));
         let pos1 = add(i, j as i16);
-        let mut sign = if linear_signs[j] == 0 { POS_CODE } else { -NEG_CODE };
+        let mut sign = if linear_signs[j] == 0 {
+            POS_CODE
+        } else {
+            -NEG_CODE
+        };
         cod[pos1 as usize] = sign;
 
         // pulse "j+4"

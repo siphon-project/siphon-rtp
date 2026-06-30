@@ -19,15 +19,13 @@
 //! the hangover never expires, so no `MRDTX` frame is ever produced and the framing is unchanged.
 
 use crate::amr::basic_ops::{
-    abs_s, add, div_s, extract_h, l_abs, l_add, l_deposit_h, l_mac, l_mult, l_msu, l_negate, l_shl,
+    abs_s, add, div_s, extract_h, l_abs, l_add, l_deposit_h, l_mac, l_msu, l_mult, l_negate, l_shl,
     l_sub, mult, norm_l, norm_s, round_word, shl, shr, sub,
 };
 use crate::amr::math_op::{dot_product12, isqrt_n, random};
 use crate::amr::oper_32b::{l_extract, mpy_32_16};
 use crate::amr::wb::bitstream::parm_serial;
 use crate::amr::wb::constants::{GP_CLIP, L_INTERPOL, L_SUBFR16K, PIT_MAX, PIT_MIN, PIT_SHARP};
-use crate::amr::wb::enhance::{filt_6k_7k, hp400_12k8};
-use crate::amr::wb::filters::{deemph_32, syn_filt_32};
 use crate::amr::wb::enc_acelp::{
     acelp_2t64_fx, convolve, cor_h_x, g_pitch, gp_clip, gp_clip_test_gain_pit, gp_clip_test_isf,
     init_gp_clip, init_q_gain2, preemph, preemph2, q_gain2, syn_filt, updt_tar, voice_factor,
@@ -39,6 +37,8 @@ use crate::amr::wb::enc_lpc::{
 };
 use crate::amr::wb::enc_pitch::{med_olag, pitch_med_ol, scale_mem_hp_wsp};
 use crate::amr::wb::enc_vad::{wb_vad, wb_vad_tone_detection, VadState};
+use crate::amr::wb::enhance::{filt_6k_7k, hp400_12k8};
+use crate::amr::wb::filters::{deemph_32, syn_filt_32};
 use crate::amr::wb::lpc::{int_isp, isf_isp, isp_isf};
 
 const M: usize = 16;
@@ -279,7 +279,8 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         let mut new_speech_buf = [0i16; L_FRAME + L_FILT];
         let mut mem = state.mem_decim;
         decim_12k8(speech16k, L_FRAME16K, &mut new_speech_buf, &mut mem);
-        old_speech[new_speech_off..new_speech_off + L_FRAME].copy_from_slice(&new_speech_buf[..L_FRAME]);
+        old_speech[new_speech_off..new_speech_off + L_FRAME]
+            .copy_from_slice(&new_speech_buf[..L_FRAME]);
         state.mem_decim = mem;
 
         // last L_FILT samples for autocorr window: code = mem_decim(2*L_FILT16k); error[0..L_FILT16k]=0
@@ -306,14 +307,17 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         // last L_FILT samples: code = mem_sig_in(6); HP50(new_speech+L_FRAME, L_FILT, code)
         let mut code = state.mem_sig_in; // copy of updated mem_sig_in (the C copies the *updated* mem)
         let mut tail = [0i16; L_FILT];
-        tail.copy_from_slice(&old_speech[new_speech_off + L_FRAME..new_speech_off + L_FRAME + L_FILT]);
+        tail.copy_from_slice(
+            &old_speech[new_speech_off + L_FRAME..new_speech_off + L_FRAME + L_FILT],
+        );
         hp50_12k8(&mut tail, L_FILT, &mut code);
-        old_speech[new_speech_off + L_FRAME..new_speech_off + L_FRAME + L_FILT].copy_from_slice(&tail);
+        old_speech[new_speech_off + L_FRAME..new_speech_off + L_FRAME + L_FILT]
+            .copy_from_slice(&tail);
     }
 
     // -------- Pre-emphasis with scaling --------
     let mu = shr(PREEMPH_FAC, 1); // Q15 -> Q14
-    // get max of new preemphased samples (L_FRAME + L_FILT)
+                                  // get max of new preemphased samples (L_FRAME + L_FILT)
     let mut l_max;
     {
         let ns = new_speech_off;
@@ -372,8 +376,16 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
     }
 
     // scale previous samples and memory
-    scale_sig(&mut old_speech[..L_TOTAL - L_FRAME - L_FILT], L_TOTAL - L_FRAME - L_FILT, exp);
-    scale_sig(&mut old_exc[..PIT_MAX + L_INTERPOL], PIT_MAX + L_INTERPOL, exp);
+    scale_sig(
+        &mut old_speech[..L_TOTAL - L_FRAME - L_FILT],
+        L_TOTAL - L_FRAME - L_FILT,
+        exp,
+    );
+    scale_sig(
+        &mut old_exc[..PIT_MAX + L_INTERPOL],
+        PIT_MAX + L_INTERPOL,
+        exp,
+    );
     scale_sig(&mut state.mem_syn, M, exp);
     scale_sig(&mut state.mem_decim2, 3, exp);
     {
@@ -426,7 +438,12 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
     let mut r_l = [0i16; M + 1];
     let mut a = [0i16; NB_SUBFR * (M + 1)];
     let mut rc = [0i16; M];
-    autocorr(&old_speech[p_window_off..p_window_off + L_WINDOW], M, &mut r_h, &mut r_l);
+    autocorr(
+        &old_speech[p_window_off..p_window_off + L_WINDOW],
+        M,
+        &mut r_h,
+        &mut r_l,
+    );
     lag_window(&mut r_h, &mut r_l);
     {
         let mut a0 = [0i16; M + 1];
@@ -445,7 +462,7 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
 
     // -------- Open-loop pitch --------
     let mut wsp = old_wsp; // working copy; we operate via wsp_off
-    // build weighted speech wsp[i_subfr..] = Residu(weight_a(A_subfr)) over present frame
+                           // build weighted speech wsp[i_subfr..] = Residu(weight_a(A_subfr)) over present frame
     {
         let mut p_a = 0usize; // index into a (per-subframe M+1)
         let mut i_subfr = 0usize;
@@ -490,7 +507,11 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         lp_decim2(&mut wsp[wsp_off..wsp_off + L_FRAME], L_FRAME, &mut mem);
         state.mem_decim2 = mem;
     }
-    scale_sig(&mut wsp[wsp_off..wsp_off + L_FRAME / OPL_DECIM], L_FRAME / OPL_DECIM, shift_ol);
+    scale_sig(
+        &mut wsp[wsp_off..wsp_off + L_FRAME / OPL_DECIM],
+        L_FRAME / OPL_DECIM,
+        shift_ol,
+    );
     // scale old_wsp (exp must be Q_new-Q_old): exp = add(exp, sub(shift, old_wsp_shift))
     exp = add(exp, sub(shift_ol, state.old_wsp_shift));
     state.old_wsp_shift = shift_ol;
@@ -568,14 +589,28 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
     // -------- ISF quantization --------
     let mut indice = [0i16; 8];
     if sub(ser_size, NBBITS_7K) <= 0 {
-        qpisf_2s_36b(&isf.clone(), &mut isf, &mut state.past_isfq, &mut state.isf_buf, &mut indice, 4);
+        qpisf_2s_36b(
+            &isf.clone(),
+            &mut isf,
+            &mut state.past_isfq,
+            &mut state.isf_buf,
+            &mut indice,
+            4,
+        );
         parm_serial(indice[0], 8, prms, &mut pos);
         parm_serial(indice[1], 8, prms, &mut pos);
         parm_serial(indice[2], 7, prms, &mut pos);
         parm_serial(indice[3], 7, prms, &mut pos);
         parm_serial(indice[4], 6, prms, &mut pos);
     } else {
-        qpisf_2s_46b(&isf.clone(), &mut isf, &mut state.past_isfq, &mut state.isf_buf, &mut indice, 4);
+        qpisf_2s_46b(
+            &isf.clone(),
+            &mut isf,
+            &mut state.past_isfq,
+            &mut state.isf_buf,
+            &mut indice,
+            4,
+        );
         parm_serial(indice[0], 8, prms, &mut pos);
         parm_serial(indice[1], 8, prms, &mut pos);
         parm_serial(indice[2], 6, prms, &mut pos);
@@ -621,7 +656,14 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         let mut i_subfr = 0usize;
         while i_subfr < L_FRAME {
             let mut out = [0i16; L_SUBFR];
-            residu(&aq[p_aq..p_aq + M + 1], M, &old_speech, speech_off + i_subfr, &mut out, L_SUBFR);
+            residu(
+                &aq[p_aq..p_aq + M + 1],
+                M,
+                &old_speech,
+                speech_off + i_subfr,
+                &mut out,
+                L_SUBFR,
+            );
             old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR].copy_from_slice(&out);
             p_aq += M + 1;
             i_subfr += L_SUBFR;
@@ -667,7 +709,14 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         // Residu(p_Aq, speech) -> exc[i_subfr]
         {
             let mut out = [0i16; L_SUBFR];
-            residu(&aq[p_aq..p_aq + M + 1], M, &old_speech, speech_off + i_subfr, &mut out, L_SUBFR);
+            residu(
+                &aq[p_aq..p_aq + M + 1],
+                M,
+                &old_speech,
+                speech_off + i_subfr,
+                &mut out,
+                L_SUBFR,
+            );
             old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR].copy_from_slice(&out);
         }
         // Syn_filt(p_Aq, M, &exc[i_subfr], error+M, L_SUBFR, error, 0)
@@ -677,7 +726,15 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
             let mut mem = [0i16; M];
             mem.copy_from_slice(&error[..M]);
             let mut out = [0i16; L_SUBFR];
-            syn_filt(&aq[p_aq..p_aq + M + 1], M, &exc_slice, &mut out, L_SUBFR, &mut mem, false);
+            syn_filt(
+                &aq[p_aq..p_aq + M + 1],
+                M,
+                &exc_slice,
+                &mut out,
+                L_SUBFR,
+                &mut mem,
+                false,
+            );
             error[M..M + L_SUBFR].copy_from_slice(&out);
         }
         let mut xn = [0i16; L_SUBFR];
@@ -728,7 +785,7 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
             let mut ap = [0i16; M + 1];
             weight_a(&a[p_a..p_a + M + 1], &mut ap, GAMMA1, M);
             error2[M..M + M].copy_from_slice(&ap[..M]); // Weight_a writes ap[0..=M]; but C does Weight_a(p_A, error+M, ..) writing M+1 coeffs into error[M..]
-            // Correct: Weight_a writes M+1 coefficients at error+M.
+                                                        // Correct: Weight_a writes M+1 coefficients at error+M.
             error2[M..M + M + 1].copy_from_slice(&ap);
             for i in 0..L_SUBFR {
                 let mut l_tmp = l_mult(error2[i + M], 16384);
@@ -762,8 +819,17 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         let t0;
         if sub(ser_size, NBBITS_9K) <= 0 {
             t0 = crate::amr::wb::enc_acelp::pitch_fr4(
-                &old_exc, exc_off + i_subfr, &xn, &h1, t0_min, t0_max, &mut t0_frac, pit_flag,
-                PIT_MIN as i16, PIT_FR1_8B, L_SUBFR,
+                &old_exc,
+                exc_off + i_subfr,
+                &xn,
+                &h1,
+                t0_min,
+                t0_max,
+                &mut t0_frac,
+                pit_flag,
+                PIT_MIN as i16,
+                PIT_FR1_8B,
+                L_SUBFR,
             );
             if pit_flag == 0 {
                 let index = if sub(t0, PIT_FR1_8B) < 0 {
@@ -788,16 +854,31 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
             }
         } else {
             t0 = crate::amr::wb::enc_acelp::pitch_fr4(
-                &old_exc, exc_off + i_subfr, &xn, &h1, t0_min, t0_max, &mut t0_frac, pit_flag,
-                PIT_FR2, PIT_FR1_9B, L_SUBFR,
+                &old_exc,
+                exc_off + i_subfr,
+                &xn,
+                &h1,
+                t0_min,
+                t0_max,
+                &mut t0_frac,
+                pit_flag,
+                PIT_FR2,
+                PIT_FR1_9B,
+                L_SUBFR,
             );
             if pit_flag == 0 {
                 let index = if sub(t0, PIT_FR2) < 0 {
                     sub(add(shl(t0, 2), t0_frac), PIT_MIN as i16 * 4)
                 } else if sub(t0, PIT_FR1_9B) < 0 {
-                    add(sub(add(shl(t0, 1), shr(t0_frac, 1)), PIT_FR2 * 2), (PIT_FR2 - PIT_MIN as i16) * 4)
+                    add(
+                        sub(add(shl(t0, 1), shr(t0_frac, 1)), PIT_FR2 * 2),
+                        (PIT_FR2 - PIT_MIN as i16) * 4,
+                    )
                 } else {
-                    add(add(sub(t0, PIT_FR1_9B), (PIT_FR2 - PIT_MIN as i16) * 4), (PIT_FR1_9B - PIT_FR2) * 2)
+                    add(
+                        add(sub(t0, PIT_FR1_9B), (PIT_FR2 - PIT_MIN as i16) * 4),
+                        (PIT_FR1_9B - PIT_FR2) * 2,
+                    )
                 };
                 parm_serial(index, 9, prms, &mut pos);
                 t0_min = sub(t0, 8);
@@ -830,7 +911,12 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         let mut xn2 = [0i16; L_SUBFR];
         let gain1;
         if sub(ser_size, NBBITS_9K) > 0 {
-            convolve(&old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR], &h1, &mut y1, L_SUBFR);
+            convolve(
+                &old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR],
+                &h1,
+                &mut y1,
+                L_SUBFR,
+            );
             let mut g = g_pitch(&xn, &y1, &mut g_coeff, L_SUBFR);
             if clip_gain != 0 && sub(g, GP_CLIP) > 0 {
                 g = GP_CLIP;
@@ -886,13 +972,22 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         // update cn for codebook search
         {
             let cn_copy = cn;
-            updt_tar(&cn_copy, &mut cn, &old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR], gain_pit, L_SUBFR);
+            updt_tar(
+                &cn_copy,
+                &mut cn,
+                &old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR],
+                gain_pit,
+                L_SUBFR,
+            );
         }
         scale_sig(&mut cn, L_SUBFR, shift);
 
         // include fixed-gain pitch contribution into h2[]
         if std::env::var("AMRWB_DBG").is_ok() {
-            eprintln!("RDBG PRE sf={i_subfr} tilt={} T0={t0} T0f={t0_frac} xn2={xn2:?}", state.tilt_code);
+            eprintln!(
+                "RDBG PRE sf={i_subfr} tilt={} T0={t0} T0f={t0_frac} xn2={xn2:?}",
+                state.tilt_code
+            );
         }
         {
             let mut t = 0i16;
@@ -914,14 +1009,20 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         } else {
             let nbbits = acelp_nbbits(ser_size);
             if std::env::var("AMRWB_DBG").is_ok() {
-                eprintln!(
-                    "RDBG ACELPIN sf={i_subfr} dn={:?}",
-                    &dn[..]
-                );
+                eprintln!("RDBG ACELPIN sf={i_subfr} dn={:?}", &dn[..]);
                 eprintln!("RDBG ACELPIN sf={i_subfr} h2={:?}", &h2[..]);
                 eprintln!("RDBG ACELPIN sf={i_subfr} cn={:?}", &cn[..]);
             }
-            acelp_4t64_search(&mut dn, &cn, &h2, &mut code, &mut y2, nbbits, ser_size, &mut indice_cb);
+            acelp_4t64_search(
+                &mut dn,
+                &cn,
+                &h2,
+                &mut code,
+                &mut y2,
+                nbbits,
+                ser_size,
+                &mut indice_cb,
+            );
             if std::env::var("AMRWB_DBG").is_ok() {
                 eprintln!(
                     "RDBG ACELPIDX sf={i_subfr}: {} {} {} {}",
@@ -944,8 +1045,18 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
             let mut gc = 0i32;
             let nbits = if sub(ser_size, NBBITS_9K) <= 0 { 6 } else { 7 };
             let index = q_gain2(
-                &xn, &y1, add(q_new, shift), &y2, &code, &g_coeff, L_SUBFR, nbits, &mut gain_pit,
-                &mut gc, clip_gain, &mut state.qua_gain,
+                &xn,
+                &y1,
+                add(q_new, shift),
+                &y2,
+                &code,
+                &g_coeff,
+                L_SUBFR,
+                nbits,
+                &mut gain_pit,
+                &mut gc,
+                clip_gain,
+                &mut state.qua_gain,
             );
             l_gain_code = gc;
             parm_serial(index, nbits, prms, &mut pos);
@@ -990,7 +1101,15 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
             let mut exc_slice = [0i16; L_SUBFR];
             exc_slice.copy_from_slice(&old_exc[exc_off + i_subfr..exc_off + i_subfr + L_SUBFR]);
             let mut synth = [0i16; L_SUBFR];
-            syn_filt(&aq[p_aq..p_aq + M + 1], M, &exc_slice, &mut synth, L_SUBFR, &mut state.mem_syn, true);
+            syn_filt(
+                &aq[p_aq..p_aq + M + 1],
+                M,
+                &exc_slice,
+                &mut synth,
+                L_SUBFR,
+                &mut state.mem_syn,
+                true,
+            );
         }
 
         // ---- Mode 8 (≥ 23.85k): high-band synthesis + transmitted 4-bit HF gain index ----
@@ -1069,9 +1188,15 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
     }
 
     // update memory for next frame
-    state.old_speech.copy_from_slice(&old_speech[L_FRAME..L_TOTAL]);
-    state.old_wsp.copy_from_slice(&wsp[L_FRAME / OPL_DECIM..L_FRAME / OPL_DECIM + PIT_MAX / OPL_DECIM]);
-    state.old_exc.copy_from_slice(&old_exc[L_FRAME..L_FRAME + PIT_MAX + L_INTERPOL]);
+    state
+        .old_speech
+        .copy_from_slice(&old_speech[L_FRAME..L_TOTAL]);
+    state
+        .old_wsp
+        .copy_from_slice(&wsp[L_FRAME / OPL_DECIM..L_FRAME / OPL_DECIM + PIT_MAX / OPL_DECIM]);
+    state
+        .old_exc
+        .copy_from_slice(&old_exc[L_FRAME..L_FRAME + PIT_MAX + L_INTERPOL]);
 
     pos
 }
@@ -1111,8 +1236,12 @@ fn synthesis(
 
     syn_filt_32(aq, M, exc, q_new, &mut synth_hi, &mut synth_lo, L_SUBFR);
 
-    state.mem_syn_hi.copy_from_slice(&synth_hi[L_SUBFR..L_SUBFR + M]);
-    state.mem_syn_lo.copy_from_slice(&synth_lo[L_SUBFR..L_SUBFR + M]);
+    state
+        .mem_syn_hi
+        .copy_from_slice(&synth_hi[L_SUBFR..L_SUBFR + M]);
+    state
+        .mem_syn_lo
+        .copy_from_slice(&synth_lo[L_SUBFR..L_SUBFR + M]);
 
     deemph_32(
         &synth_hi[M..],
@@ -1197,7 +1326,15 @@ fn synthesis(
     // variant (the `enc_acelp` one is sized for the 12.8 kHz L_SUBFR path only).
     weight_a(aq, &mut ap, 19661, M); // fac = 0.6
     let hf_in = hf;
-    crate::amr::wb::enhance::syn_filt(&ap, M, &hf_in, &mut hf, L_SUBFR16K, &mut state.mem_syn_hf, true);
+    crate::amr::wb::enhance::syn_filt(
+        &ap,
+        M,
+        &hf_in,
+        &mut hf,
+        L_SUBFR16K,
+        &mut state.mem_syn_hf,
+        true,
+    );
 
     // ---- Band-pass both the synthetic HF and the original HF to 6–7 kHz. ----
     filt_6k_7k(&mut hf, L_SUBFR16K, &mut state.mem_hf);
@@ -1271,7 +1408,13 @@ fn acelp_nbbits(ser_size: i16) -> i16 {
 }
 
 /// Pack the per-track ACELP indices for the given budget (`coder.c` `Parm_serial` block).
-fn emit_acelp_indices(nbbits: i16, _ser_size: i16, indice: &[i16], prms: &mut [i16], pos: &mut usize) {
+fn emit_acelp_indices(
+    nbbits: i16,
+    _ser_size: i16,
+    indice: &[i16],
+    prms: &mut [i16],
+    pos: &mut usize,
+) {
     match nbbits {
         20 => {
             for &v in indice.iter().take(4) {

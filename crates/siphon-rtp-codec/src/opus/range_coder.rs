@@ -455,9 +455,10 @@ impl<'a> RangeEncoder<'a> {
     pub fn enc_icdf(&mut self, s: usize, icdf: &[u8], ftb: u32) {
         let r = self.rng >> ftb;
         if s > 0 {
-            self.val = self
-                .val
-                .wrapping_add(self.rng.wrapping_sub(r.wrapping_mul(u32::from(icdf[s - 1]))));
+            self.val = self.val.wrapping_add(
+                self.rng
+                    .wrapping_sub(r.wrapping_mul(u32::from(icdf[s - 1]))),
+            );
             self.rng = r.wrapping_mul(u32::from(icdf[s - 1]) - u32::from(icdf[s]));
         } else {
             self.rng -= r.wrapping_mul(u32::from(icdf[s]));
@@ -469,9 +470,10 @@ impl<'a> RangeEncoder<'a> {
     pub fn enc_icdf16(&mut self, s: usize, icdf: &[u16], ftb: u32) {
         let r = self.rng >> ftb;
         if s > 0 {
-            self.val = self
-                .val
-                .wrapping_add(self.rng.wrapping_sub(r.wrapping_mul(u32::from(icdf[s - 1]))));
+            self.val = self.val.wrapping_add(
+                self.rng
+                    .wrapping_sub(r.wrapping_mul(u32::from(icdf[s - 1]))),
+            );
             self.rng = r.wrapping_mul(u32::from(icdf[s - 1]) - u32::from(icdf[s]));
         } else {
             self.rng -= r.wrapping_mul(u32::from(icdf[s]));
@@ -623,7 +625,7 @@ mod tests {
                 log.push((false, v, ft, enc.tell_frac()));
             }
             for bits in 1u32..16 {
-                let v = (bits.wrapping_mul(40_503) ) & ((1u32 << bits) - 1);
+                let v = (bits.wrapping_mul(40_503)) & ((1u32 << bits) - 1);
                 enc.enc_bits(v, bits);
                 log.push((true, v, bits, enc.tell_frac()));
             }
@@ -632,9 +634,17 @@ mod tests {
         }
         let mut dec = RangeDecoder::new(&buf);
         for &(is_raw, v, p, enc_tell) in &log {
-            let got = if is_raw { dec.dec_bits(p) } else { dec.dec_uint(p) };
+            let got = if is_raw {
+                dec.dec_bits(p)
+            } else {
+                dec.dec_uint(p)
+            };
             assert_eq!(got, v, "roundtrip mismatch (raw={is_raw}, param={p})");
-            assert_eq!(dec.tell_frac(), enc_tell, "tell_frac parity (raw={is_raw}, param={p})");
+            assert_eq!(
+                dec.tell_frac(),
+                enc_tell,
+                "tell_frac parity (raw={is_raw}, param={p})"
+            );
         }
         assert!(!dec.error());
     }
@@ -688,7 +698,10 @@ mod tests {
         for &i in &seq {
             let fs = dec.decode(ft);
             // Find which symbol fs falls into, then update.
-            let sym = bounds.iter().position(|&(fl, fh)| fs >= fl && fs < fh).expect("symbol");
+            let sym = bounds
+                .iter()
+                .position(|&(fl, fh)| fs >= fl && fs < fh)
+                .expect("symbol");
             assert_eq!(sym, i);
             let (fl, fh) = bounds[sym];
             dec.dec_update(fl, fh, ft);
@@ -711,7 +724,9 @@ mod tests {
     #[test]
     fn decoder_tolerates_arbitrary_bytes_without_panicking() {
         // A hostile/garbage buffer must decode-or-flag-error, never panic / index out of bounds.
-        let buf: Vec<u8> = (0..256u32).map(|k| (k.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let buf: Vec<u8> = (0..256u32)
+            .map(|k| (k.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
         let mut dec = RangeDecoder::new(&buf);
         for _ in 0..200 {
             let _ = dec.dec_uint(64);

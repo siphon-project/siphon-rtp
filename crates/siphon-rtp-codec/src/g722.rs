@@ -294,7 +294,11 @@ impl G722 {
         let high = &mut self.band[1];
         let eh = saturate(xhigh - high.s);
         let magnitude = if eh >= 0 { eh } else { -(eh + 1) };
-        let mih = if magnitude >= (564 * high.det) >> 12 { 2 } else { 1 };
+        let mih = if magnitude >= (564 * high.det) >> 12 {
+            2
+        } else {
+            1
+        };
         let ihigh = if eh < 0 { IHN[mih] } else { IHP[mih] };
         let dhigh = (high.det * QM2[ihigh as usize]) >> 15;
         high.nb = ((high.nb * 127) >> 7) + WH[RH2[ihigh as usize] as usize];
@@ -319,7 +323,10 @@ impl G722 {
             out_even += self.qmf_history[2 * i] * QMF_COEFFS[i];
             out_odd += self.qmf_history[2 * i + 1] * QMF_COEFFS[11 - i];
         }
-        (saturate(out_odd >> 11) as i16, saturate(out_even >> 11) as i16)
+        (
+            saturate(out_odd >> 11) as i16,
+            saturate(out_even >> 11) as i16,
+        )
     }
 
     /// Decode one G.722 code byte into the (low, high) reconstructed sub-band samples — the QMF-free
@@ -489,7 +496,9 @@ mod tests {
 
     #[test]
     fn encode_is_deterministic_across_fresh_instances() {
-        let pcm: Vec<i16> = (0..FRAME).map(|k| ((k as i32 * 211) % 4000 - 2000) as i16).collect();
+        let pcm: Vec<i16> = (0..FRAME)
+            .map(|k| ((k as i32 * 211) % 4000 - 2000) as i16)
+            .collect();
         let mut a = vec![0u8; FRAME / 2];
         let mut b = vec![0u8; FRAME / 2];
         G722::new(20).encode(&pcm, &mut a).expect("a");
@@ -593,7 +602,11 @@ mod tests {
         // (configurations 1 & 2 — the QMF is validated separately by round-trip SNR, exactly as the
         // ITU procedure intends). This is the official acceptance criterion for the SB-ADPCM core.
         // Vectors are gitignored / LFS-pending, so skip gracefully when absent.
-        let load = |name: &str| std::fs::read(vector_path(name)).ok().map(|b| parse_itu_hex(&b));
+        let load = |name: &str| {
+            std::fs::read(vector_path(name))
+                .ok()
+                .map(|b| parse_itu_hex(&b))
+        };
         let Some(t1c1) = load("T1C1.XMT") else {
             eprintln!("ITU G.722 Appendix II vectors absent — skipping conformance test");
             return;
@@ -625,8 +638,16 @@ mod tests {
             for k in active_range(cod) {
                 let code = ((cod[k] >> 8) & 0xFF) as u8;
                 let (rlow, rhigh) = codec.decode_subband(code);
-                assert_eq!((rlow << 1) as i16, lower[k] as i16, "decoder lower mismatch at word {k}");
-                assert_eq!((rhigh << 1) as i16, upper[k] as i16, "decoder upper mismatch at word {k}");
+                assert_eq!(
+                    (rlow << 1) as i16,
+                    lower[k] as i16,
+                    "decoder lower mismatch at word {k}"
+                );
+                assert_eq!(
+                    (rhigh << 1) as i16,
+                    upper[k] as i16,
+                    "decoder upper mismatch at word {k}"
+                );
             }
         };
         decode_case(
@@ -634,7 +655,8 @@ mod tests {
             &load("T3L1.RC1").expect("T3L1.RC1"),
             &load("T3H1.RC0").expect("T3H1.RC0"),
         );
-        if let (Some(c), Some(l), Some(h)) = (load("T1D3.COD"), load("T3L3.RC1"), load("T3H3.RC0")) {
+        if let (Some(c), Some(l), Some(h)) = (load("T1D3.COD"), load("T3L3.RC1"), load("T3H3.RC0"))
+        {
             decode_case(&c, &l, &h);
         }
     }
@@ -647,7 +669,9 @@ mod tests {
         let n = 1600;
         let mut encoder = G722::new(20);
         let mut payload = vec![0u8; n / 2];
-        encoder.encode(&vec![0i16; n], &mut payload).expect("encode");
+        encoder
+            .encode(&vec![0i16; n], &mut payload)
+            .expect("encode");
         let mut decoder = G722::new(20);
         let mut out = vec![0i16; n];
         decoder.decode(&payload, &mut out).expect("decode");
@@ -655,7 +679,11 @@ mod tests {
         assert!(
             out[400..].iter().all(|&s| s.unsigned_abs() < 256),
             "silence round-trip not quiet: peak {}",
-            out[400..].iter().map(|s| s.unsigned_abs()).max().unwrap_or(0)
+            out[400..]
+                .iter()
+                .map(|s| s.unsigned_abs())
+                .max()
+                .unwrap_or(0)
         );
     }
 
@@ -670,7 +698,9 @@ mod tests {
             .map(|k| (k.wrapping_mul(2_654_435_761) >> 24) as u8)
             .collect();
         let mut out = vec![0i16; payload.len() * 2];
-        let produced = decoder.decode(&payload, &mut out).expect("decode fills a full buffer");
+        let produced = decoder
+            .decode(&payload, &mut out)
+            .expect("decode fills a full buffer");
         assert_eq!(produced, payload.len() * 2);
         // A too-small buffer errors rather than writing out of bounds.
         let mut tiny = [0i16; 3];

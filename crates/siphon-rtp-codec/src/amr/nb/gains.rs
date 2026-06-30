@@ -89,7 +89,7 @@ pub fn gc_pred(st: &GcPredState, mode: usize, code: &[i16]) -> GcPredOut {
     if mode == MODE_MR122 {
         // ener_code = ener_code / 40  (1/40 = 26214 Q20)
         let mut ener_code = l_mult(round_word(ener_code), 26214); // Q30
-        // ener_code = 1/2 * Log2(ener_code)
+                                                                  // ener_code = 1/2 * Log2(ener_code)
         let (exp, frac) = log2(ener_code);
         ener_code = l_comp(sub(exp, 30), frac); // Q17
 

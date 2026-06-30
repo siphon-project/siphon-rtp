@@ -16,7 +16,15 @@ pub const COMBFILTER_MINPERIOD: usize = 15;
 pub const COMBFILTER_MAXPERIOD: usize = 1024;
 
 /// Constant-parameter 5-tap comb over `buf[base..base + n]` (libopus `comb_filter_const_c`, float).
-fn comb_filter_const(buf: &mut [f32], base: usize, n: usize, t: usize, g10: f32, g11: f32, g12: f32) {
+fn comb_filter_const(
+    buf: &mut [f32],
+    base: usize,
+    n: usize,
+    t: usize,
+    g10: f32,
+    g11: f32,
+    g12: f32,
+) {
     let mut x4 = buf[base - t - 2];
     let mut x3 = buf[base - t - 1];
     let mut x2 = buf[base - t];
@@ -105,7 +113,9 @@ mod tests {
         let (g10, g11, g12) = (0.3f32, 0.15, 0.07);
         let n = 200usize;
         // A deterministic history + current signal.
-        let signal: Vec<f32> = (0..BASE + n).map(|i| ((i as f32) * 0.21).sin() * 0.5).collect();
+        let signal: Vec<f32> = (0..BASE + n)
+            .map(|i| ((i as f32) * 0.21).sin() * 0.5)
+            .collect();
 
         let mut got = signal.clone();
         comb_filter_const(&mut got, BASE, n, t, g10, g11, g12);
@@ -139,10 +149,14 @@ mod tests {
         let g = 0.5f32;
         let tapset = 1usize;
         let n = 120usize;
-        let signal: Vec<f32> = (0..BASE + n).map(|i| (i as f32 * 0.17).sin() * 0.4).collect();
+        let signal: Vec<f32> = (0..BASE + n)
+            .map(|i| (i as f32 * 0.17).sin() * 0.4)
+            .collect();
 
         let mut got = signal.clone();
-        comb_filter(&mut got, BASE, n, t, t, g, g, tapset, tapset, &WINDOW120, 120);
+        comb_filter(
+            &mut got, BASE, n, t, t, g, g, tapset, tapset, &WINDOW120, 120,
+        );
 
         let mut want = signal.clone();
         let (g10, g11, g12) = (

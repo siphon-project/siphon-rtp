@@ -180,7 +180,10 @@ mod tests {
         // A smaller -dBov value is a louder noise floor (−30 dBov ≫ −60 dBov).
         let loud = rms(&decode_level(30, 30));
         let quiet = rms(&decode_level(60, 30));
-        assert!(loud > quiet * 4.0, "louder CN level must yield clearly more energy");
+        assert!(
+            loud > quiet * 4.0,
+            "louder CN level must yield clearly more energy"
+        );
     }
 
     #[test]
@@ -215,12 +218,17 @@ mod tests {
     fn conceal_continues_noise_at_last_level() {
         let mut codec = Cn::new(8000, 20);
         let mut frame = [0i16; FRAME];
-        codec.decode(&[35], &mut frame).expect("decode sets last level");
+        codec
+            .decode(&[35], &mut frame)
+            .expect("decode sets last level");
         let mut concealed = [0i16; FRAME];
         assert_eq!(codec.conceal(&mut concealed).expect("conceal"), FRAME);
         // Concealment keeps the hiss going (not silence) at roughly the established level.
         let level_35 = 32_768.0 * 10f64.powf(-35.0 / 20.0);
         let measured = rms(&concealed);
-        assert!(measured > level_35 * 0.4, "conceal should keep comfort noise audible");
+        assert!(
+            measured > level_35 * 0.4,
+            "conceal should keep comfort noise audible"
+        );
     }
 }

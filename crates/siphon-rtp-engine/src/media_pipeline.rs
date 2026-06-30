@@ -1421,11 +1421,19 @@ mod tests {
         );
         let mut out = Vec::new();
         let mut events = Vec::new();
-        call.process(&rx(1, A_ADDR, amr_wb_rtp(1, &amr_payload)), &mut out, &mut events);
+        call.process(
+            &rx(1, A_ADDR, amr_wb_rtp(1, &amr_payload)),
+            &mut out,
+            &mut events,
+        );
 
         assert_eq!(out.len(), 1, "one transcoded G.711a packet toward B");
         let datagram = &out[0];
-        assert_eq!(datagram.endpoint, endpoint(2), "sent from B's engine socket");
+        assert_eq!(
+            datagram.endpoint,
+            endpoint(2),
+            "sent from B's engine socket"
+        );
         let packet = RtpPacket::parse(&datagram.data).expect("parse");
         assert_eq!(packet.payload_type, 8, "re-encoded as G.711a (PT 8)");
         assert_eq!(packet.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
@@ -1447,19 +1455,20 @@ mod tests {
         let remote = SrtpKeyMaterial::from_inline_bytes(&[2u8; 30]).expect("remote key");
         let leg = Arc::new(Mutex::new(SecureLeg::new(&local, &remote)));
 
-        let direction = |ingress: u64, src: &str, egress: u64, dst: &str, ssrc: u32| DirectionConfig {
-            ingress_endpoint: endpoint(ingress),
-            accepted_source: SourceFilter::Exact(addr(src).ip()),
-            egress_endpoint: endpoint(egress),
-            egress_dst: addr(dst),
-            decoder: Box::new(G711::ulaw()),
-            encoder: Box::new(G711::ulaw()),
-            egress_ssrc: ssrc,
-            egress_payload_type: 0,
-            telephone_event_in: Some(101),
-            telephone_event_out: Some(101),
-            recorder: None,
-        };
+        let direction =
+            |ingress: u64, src: &str, egress: u64, dst: &str, ssrc: u32| DirectionConfig {
+                ingress_endpoint: endpoint(ingress),
+                accepted_source: SourceFilter::Exact(addr(src).ip()),
+                egress_endpoint: endpoint(egress),
+                egress_dst: addr(dst),
+                decoder: Box::new(G711::ulaw()),
+                encoder: Box::new(G711::ulaw()),
+                egress_ssrc: ssrc,
+                egress_payload_type: 0,
+                telephone_event_in: Some(101),
+                telephone_event_out: Some(101),
+                recorder: None,
+            };
         let mut call = MediaCall::new(
             "te",
             "a",
@@ -1503,7 +1512,10 @@ mod tests {
             .unprotect(&egress.data, &mut plain)
             .expect("egress is valid SRTP");
         let parsed = RtpPacket::parse(&plain).expect("decrypted telephone-event");
-        assert_eq!(parsed.payload_type, 101, "egress is the repacketized telephone-event");
+        assert_eq!(
+            parsed.payload_type, 101,
+            "egress is the repacketized telephone-event"
+        );
     }
 
     #[test]

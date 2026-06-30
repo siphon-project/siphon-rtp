@@ -158,7 +158,11 @@ impl CbGainAverage {
             let tmp_diff = sub(diff, threshold);
             let tmp1 = if tmp_diff > 0 { tmp_diff } else { 0 };
             // bgMix = min(0.25, max(0.0, diff-threshold)) / 0.25, in Q13
-            let mut bg_mix = if sub(2048, tmp1) < 0 { 8192 } else { shl(tmp1, 2) };
+            let mut bg_mix = if sub(2048, tmp1) < 0 {
+                8192
+            } else {
+                shl(tmp1, 2)
+            };
 
             if sub(self.hang_count, 40) < 0 || sub(diff, 5325) > 0 {
                 bg_mix = 8192; // disable mix if too short a time
@@ -234,7 +238,18 @@ mod tests {
         let mut st = CbGainAverage::new();
         let lsp = MEAN_LSF_5;
         let lsp_aver = MEAN_LSF_5;
-        let out = st.run(AmrNbMode::Mr475 as usize, 1000, &lsp, &lsp_aver, 0, 0, 0, 0, 0, 0);
+        let out = st.run(
+            AmrNbMode::Mr475 as usize,
+            1000,
+            &lsp,
+            &lsp_aver,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
         assert_eq!(out, 1000);
     }
 
@@ -243,7 +258,18 @@ mod tests {
         // MR74/MR795/MR122 are not in the smoothing branch: returns gain_code, state still updates.
         let mut st = CbGainAverage::new();
         let lsp = MEAN_LSF_5;
-        let out = st.run(AmrNbMode::Mr1220 as usize, 777, &lsp, &lsp, 0, 0, 0, 0, 0, 0);
+        let out = st.run(
+            AmrNbMode::Mr1220 as usize,
+            777,
+            &lsp,
+            &lsp,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
         assert_eq!(out, 777);
         assert_eq!(st.cb_gain_history[L_CBGAINHIST - 1], 777);
     }
@@ -256,7 +282,18 @@ mod tests {
         let lsp = MEAN_LSF_5;
         let mut last = 0i16;
         for _ in 0..45 {
-            last = st.run(AmrNbMode::Mr515 as usize, 1000, &lsp, &lsp, 0, 0, 0, 0, 0, 0);
+            last = st.run(
+                AmrNbMode::Mr515 as usize,
+                1000,
+                &lsp,
+                &lsp,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
         }
         // diff is ~0 (lsp == lsp_aver) so the mix engages once hangCount >= 40; the history is all
         // 1000 so cbGainMean ~= 1000 and the output stays near 1000 but the path is exercised.

@@ -49,11 +49,11 @@ fn crafted_malformed_ng_datagrams_never_panic() {
         b"d",
         b"de",
         b"d1:a",
-        b"l1:al",                        // unterminated nested list
-        b"d1:ai1e1:ai2ee",              // duplicate key
-        b"cookie d7:command4:pinge",     // full NG datagram
+        b"l1:al",                    // unterminated nested list
+        b"d1:ai1e1:ai2ee",           // duplicate key
+        b"cookie d7:command4:pinge", // full NG datagram
         b"no-space-here",
-        b" ",                            // empty cookie + empty body
+        b" ", // empty cookie + empty body
         b"x",
     ];
     for sample in samples {
