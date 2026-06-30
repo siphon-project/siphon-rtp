@@ -15,10 +15,14 @@ keywords = ["srtp", "rtp", "crypto", "webrtc", "voip"]
 categories = ["network-programming", "cryptography"]
 
 [dependencies]
-aes = "0.9"
-ctr = "0.10"
-hmac = "0.13"
-sha1 = "0.11"
+# Pinned below the RustCrypto 0.9 wave: aes 0.9 / ctr 0.10 (cipher 0.5) regress the SRTP AES-CTR hot
+# path 20–60% vs 0.8/0.9 (cipher 0.4) — the batched AES-NI block path is lost. These are not security
+# bumps (no RUSTSEC advisory on the 0.8/0.9/0.12/0.10 line); revisit the upgrade once upstream restores
+# the bulk path. See the perf-investigation log in CLAUDE.md.
+aes = "0.8"
+ctr = "0.9"
+hmac = "0.12"
+sha1 = "0.10"
 subtle = "2.6"
 base64 = "0.22"
 getrandom = { workspace = true }
