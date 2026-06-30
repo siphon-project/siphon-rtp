@@ -792,61 +792,6 @@ mod tests {
         (n_frames, None)
     }
 
-    #[test]
-    #[ignore]
-    fn dbg_mode8_frame0() {
-        let nb_bits = 477usize;
-        let mut inp_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        inp_path.push("../../reference/amr-wb/testv/tst.inp");
-        let mut cod_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        cod_path.push("../../reference/amr-wb/testv/tst_m8.cod");
-        let inp = std::fs::read(&inp_path).expect("tst.inp");
-        let cod = std::fs::read(&cod_path).expect("tst_m8.cod");
-        let pcm: Vec<i16> = inp.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
-        let cod_words: Vec<i16> =
-            cod.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
-        let cod_frame_words = 3 + nb_bits;
-        // The four 4-bit HF-correction-gain fields (one per subframe).
-        let hf_fields = [(152usize, 156usize), (258, 262), (367, 371), (473, 477)];
-        let idx = |bits: &[i16], lo: usize, hi: usize| -> i16 {
-            let mut v = 0i16;
-            for b in lo..hi {
-                v = (v << 1) | i16::from(bits[b] > 0);
-            }
-            v
-        };
-        let mut wb = AmrWb::new();
-        let mut out = vec![0i16; nb_bits];
-        let n_frames = pcm.len() / 320;
-        let mut total_diff_frames = 0;
-        for f in 0..n_frames {
-            let frame_pcm = &pcm[f * 320..(f + 1) * 320];
-            wb.encode_mode_bits(8, frame_pcm, &mut out).expect("encode");
-            let base = f * cod_frame_words + 3;
-            let mut diffs = Vec::new();
-            for b in 0..nb_bits {
-                if out[b] != cod_words[base + b] {
-                    diffs.push(b);
-                }
-            }
-            if !diffs.is_empty() {
-                total_diff_frames += 1;
-                let want_bits: Vec<i16> = cod_words[base..base + nb_bits].to_vec();
-                let got: Vec<i16> = hf_fields.iter().map(|&(lo, hi)| idx(&out, lo, hi)).collect();
-                let want: Vec<i16> =
-                    hf_fields.iter().map(|&(lo, hi)| idx(&want_bits, lo, hi)).collect();
-                eprintln!(
-                    "frame {f}: {} mismatch bits {:?}  HFidx got={:?} want={:?}",
-                    diffs.len(),
-                    &diffs[..diffs.len().min(40)],
-                    got,
-                    want
-                );
-            }
-        }
-        eprintln!("total frames with mismatches: {total_diff_frames} of {n_frames}");
-    }
-
     /// Mode 0 (6.60 kbit/s) uses the 2-track `ACELP_2t64_fx` codebook and 36-bit ISF path.
     #[test]
     fn encodes_full_mode0_vector_bit_exact() {
