@@ -50,7 +50,7 @@ where
     let (mut sink, mut stream) = socket.split();
 
     // The first text frame announces the leg + audio format (mod_audio_fork handshake order).
-    sink.send(Message::Text(session.start_message().to_json()?)).await?;
+    sink.send(Message::text(session.start_message().to_json()?)).await?;
 
     let mut ticker = interval(ptime);
     let mut uplink = vec![0u8; UPLINK_CAP];
@@ -63,10 +63,10 @@ where
         tokio::select! {
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Binary(bytes))) => session.on_ws_binary(&bytes),
-                Some(Ok(Message::Text(text))) => match ControlMessage::from_json(&text) {
+                Some(Ok(Message::Text(text))) => match ControlMessage::from_json(text.as_str()) {
                     Ok(control) => {
                         if let Some(reply) = session.on_control(control) {
-                            sink.send(Message::Text(reply.to_json()?)).await?;
+                            sink.send(Message::text(reply.to_json()?)).await?;
                         }
                     }
                     Err(error) => tracing::debug!(%error, "bridge ignoring malformed control frame"),
@@ -82,7 +82,7 @@ where
             _ = ticker.tick() => {
                 let result = session.tick(&mut uplink, &mut downlink);
                 if result.uplink_bytes > 0 {
-                    sink.send(Message::Binary(uplink[..result.uplink_bytes].to_vec())).await?;
+                    sink.send(Message::binary(uplink[..result.uplink_bytes].to_vec())).await?;
                 }
                 if result.downlink_bytes > 0 && rtp_out.send(Bytes::copy_from_slice(&downlink[..result.downlink_bytes])).is_err() {
                     break; // call side gone
@@ -166,7 +166,7 @@ mod tests {
             .expect("ok");
         match first {
             Message::Text(text) => assert!(matches!(
-                ControlMessage::from_json(&text),
+                ControlMessage::from_json(text.as_str()),
                 Ok(ControlMessage::Start(_))
             )),
             other => panic!("expected start text frame, got {other:?}"),
@@ -175,7 +175,7 @@ mod tests {
         // 2. Downlink: a binary L16 frame from the server is rendered to an RTP packet for the call.
         let mut l16 = [0u8; 320];
         pcm_to_l16_le(&[1000i16; 160], &mut l16);
-        client_tx.send(Message::Binary(l16.to_vec())).await.expect("send binary");
+        client_tx.send(Message::binary(l16.to_vec())).await.expect("send binary");
         let rtp = timeout(Duration::from_secs(2), rtp_out_rx.recv_async())
             .await
             .expect("no timeout")
@@ -206,7 +206,7 @@ mod tests {
             stream_id: "str_1".into(),
             reason: "done".into(),
         });
-        client_tx.send(Message::Text(stop.to_json().expect("json"))).await.expect("send stop");
+        client_tx.send(Message::text(stop.to_json().expect("json"))).await.expect("send stop");
         let outcome = timeout(Duration::from_secs(2), bridge).await.expect("join");
         assert!(outcome.expect("task").is_ok(), "bridge exits cleanly on stop");
     }

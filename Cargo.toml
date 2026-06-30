@@ -62,7 +62,7 @@ rcgen = "0.13"
 # Randomness — ICE credential generation (OS CSPRNG; no bundled C crypto)
 getrandom = "0.3"
 # WebSocket bridges (pure-Rust: rustls/ring only, no native-tls/OpenSSL)
-tokio-tungstenite = "0.21"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 # Control protocol (JSON over TCP) + serde
 serde = { version = "1", features = ["derive"] }
