@@ -382,7 +382,7 @@ mod tests {
         // generous main-thread stack: without the depth limit this thread aborts.
         let depth = 200_000;
         let mut data = vec![b'l'; depth];
-        data.extend(std::iter::repeat(b'e').take(depth));
+        data.extend(std::iter::repeat_n(b'e', depth));
         let result = std::thread::Builder::new()
             .stack_size(128 * 1024)
             .spawn(move || decode(&data))
@@ -416,7 +416,7 @@ mod tests {
         // A modest nest (well under the cap) round-trips fine, so the limit doesn't break real input.
         let depth = 32;
         let mut data = vec![b'l'; depth];
-        data.extend(std::iter::repeat(b'e').take(depth));
+        data.extend(std::iter::repeat_n(b'e', depth));
         let value = decode(&data).expect("modest nesting decodes");
         // Unwrap `depth` lists down to the innermost empty list.
         let mut current = &value;

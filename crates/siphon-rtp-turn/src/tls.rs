@@ -7,7 +7,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::pem::{self, PemObject};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
 use crate::TurnError;
@@ -39,7 +40,7 @@ pub fn acceptor_from_pem(cert_path: &Path, key_path: &Path) -> Result<TlsAccepto
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TurnError> {
     let bytes = std::fs::read(path)
         .map_err(|error| TurnError::Tls(format!("read {}: {error}", path.display())))?;
-    rustls_pemfile::certs(&mut bytes.as_slice())
+    CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| TurnError::Tls(format!("{}: {error}", path.display())))
 }
@@ -47,7 +48,8 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TurnError> {
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TurnError> {
     let bytes = std::fs::read(path)
         .map_err(|error| TurnError::Tls(format!("read {}: {error}", path.display())))?;
-    rustls_pemfile::private_key(&mut bytes.as_slice())
-        .map_err(|error| TurnError::Tls(format!("{}: {error}", path.display())))?
-        .ok_or_else(|| TurnError::Tls(format!("no private key in {}", path.display())))
+    PrivateKeyDer::from_pem_slice(&bytes).map_err(|error| match error {
+        pem::Error::NoItemsFound => TurnError::Tls(format!("no private key in {}", path.display())),
+        other => TurnError::Tls(format!("{}: {other}", path.display())),
+    })
 }

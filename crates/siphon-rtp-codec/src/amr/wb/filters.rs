@@ -366,9 +366,9 @@ mod tests {
             a.extend_from_slice(&a_tail);
 
             let mut hi_simd = hi_mem.clone();
-            hi_simd.extend(std::iter::repeat(0).take(L_SUBFR));
+            hi_simd.extend(std::iter::repeat_n(0, L_SUBFR));
             let mut lo_simd = lo_mem.clone();
-            lo_simd.extend(std::iter::repeat(0).take(L_SUBFR));
+            lo_simd.extend(std::iter::repeat_n(0, L_SUBFR));
             let (mut hi_ref, mut lo_ref) = (hi_simd.clone(), lo_simd.clone());
 
             syn_filt_32(&a, M, &exc, 0, &mut hi_simd, &mut lo_simd, L_SUBFR);

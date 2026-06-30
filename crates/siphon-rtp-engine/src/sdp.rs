@@ -48,7 +48,7 @@ pub struct MediaInfo {
     pub remote_rtcp: SocketAddr,
     /// Whether the stream offered `a=rtcp-mux` (RTP and RTCP share one port, RFC 5761).
     pub rtcp_mux: bool,
-    /// Whether the `m=audio` transport is a secure profile (`RTP/SAVP`[F]) — an SRTP stream.
+    /// Whether the `m=audio` transport is a secure profile (`RTP/SAVP` or `RTP/SAVPF`) — an SRTP stream.
     pub secure: bool,
     /// The `a=crypto` lines offered (RFC 4568 SDES), in order — the peer's SRTP key candidates.
     pub crypto: Vec<CryptoAttribute>,

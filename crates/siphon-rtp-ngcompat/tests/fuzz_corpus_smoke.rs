@@ -63,11 +63,14 @@ fn crafted_malformed_ng_datagrams_never_panic() {
     }
 }
 
+// The seed corpus (`fuzz/corpus/bencode_fuzz/`) is fuzzer-generated and gitignored, so a clean
+// checkout (CI) has nothing to replay — the no-panic guarantee there rests on
+// `crafted_malformed_ng_datagrams_never_panic` above and the crate's inline proptests. When a
+// developer has run the fuzzer locally, this additionally replays every retained seed; none may
+// panic, read out of bounds, or spin.
 #[test]
 fn corpus_seeds_never_panic() {
-    let seeds = corpus_seeds();
-    assert!(!seeds.is_empty(), "seed corpus must exist at fuzz/corpus/bencode_fuzz/");
-    for seed in seeds {
+    for seed in corpus_seeds() {
         drive(&seed);
     }
 }
@@ -77,7 +80,7 @@ fn deeply_nested_datagram_errors_instead_of_overflowing_the_stack() {
     // The fixed bug: a datagram of nothing but `l`/`d` openers recursed once per byte and aborted
     // the process via stack overflow. Driven on a small stack so the depth cap is what saves it.
     for opener in [b'l', b'd'] {
-        let payload: Vec<u8> = std::iter::repeat(opener).take(500_000).collect();
+        let payload: Vec<u8> = std::iter::repeat_n(opener, 500_000).collect();
         let result = std::thread::Builder::new()
             .stack_size(128 * 1024)
             .spawn(move || bencode::decode(&payload))

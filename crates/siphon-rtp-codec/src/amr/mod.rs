@@ -608,7 +608,7 @@ mod tests {
             quality_ok: true,
         };
         let mut payload = vec![0xF0, toc.to_octet()];
-        payload.extend(std::iter::repeat(0u8).take(AmrNbMode::Mr1220.bytes()));
+        payload.extend(std::iter::repeat_n(0u8, AmrNbMode::Mr1220.bytes()));
 
         let header = parse_octet_aligned(&payload).expect("parse");
         assert_eq!(header.cmr, 0xF);
@@ -695,8 +695,12 @@ mod tests {
         inp_path.push("../../reference/amr-wb/testv/tst.inp");
         let mut cod_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         cod_path.push(format!("../../reference/amr-wb/testv/tst_m{mode}.cod"));
-        let inp = std::fs::read(&inp_path).expect("tst.inp");
-        let cod = std::fs::read(&cod_path).expect("tst_mN.cod");
+        // Vectors are gitignored / LFS-pending, so skip gracefully when absent (matches g722/g726).
+        let (Some(inp), Some(cod)) = (std::fs::read(&inp_path).ok(), std::fs::read(&cod_path).ok())
+        else {
+            eprintln!("AMR-WB reference vectors absent — skipping encode mode {mode} conformance");
+            return (0, None);
+        };
         let pcm: Vec<i16> = inp
             .chunks_exact(2)
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
@@ -794,8 +798,12 @@ mod tests {
         cod_path.push("../../reference/amr-wb/testv/tst_m0.cod");
         let mut out_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         out_path.push("../../reference/amr-wb/testv/tst_m0.out");
-        let cod = std::fs::read(&cod_path).expect("tst_m0.cod");
-        let out = std::fs::read(&out_path).expect("tst_m0.out");
+        // Vectors are gitignored / LFS-pending, so skip gracefully when absent (matches g722/g726).
+        let (Some(cod), Some(out)) = (std::fs::read(&cod_path).ok(), std::fs::read(&out_path).ok())
+        else {
+            eprintln!("AMR-WB reference vectors absent — skipping decode_rtp_mode0 conformance");
+            return;
+        };
         let cod_words: Vec<i16> = cod
             .chunks_exact(2)
             .map(|c| i16::from_le_bytes([c[0], c[1]]))

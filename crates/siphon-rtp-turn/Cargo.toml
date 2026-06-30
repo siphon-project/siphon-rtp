@@ -21,7 +21,7 @@ siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
 tokio = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 bytes = { workspace = true }
 indexmap = { workspace = true }
 flume = { workspace = true }

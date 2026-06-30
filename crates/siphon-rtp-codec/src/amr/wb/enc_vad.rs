@@ -15,8 +15,8 @@
 //! AMR-WB Voice Activity Detection (3GPP TS 26.190 encoder), bit-exact port of `wb_vad.c`
 //! (`reference/amr-wb/c-code/wb_vad.c`) and its constants `wb_vad_c.h`.
 //!
-//! The VAD divides each 256-sample (20 ms @ 12.8 kHz) frame into [`COMPLEN`] = 12 sub-bands via a
-//! tree of half-band decimating filters ([`filter5`] / [`filter3`]), tracks a per-band background
+//! The VAD divides each 256-sample (20 ms @ 12.8 kHz) frame into `COMPLEN` = 12 sub-bands via a
+//! tree of half-band decimating filters (`filter5` / `filter3`), tracks a per-band background
 //! noise estimate, and produces a per-frame speech/noise decision with hangover. It carries all
 //! state across frames in [`VadState`] (the C `VadVars`).
 //!
@@ -808,7 +808,7 @@ pub fn wb_vad_tone_detection(st: &mut VadState, p_gain: i16) {
 }
 
 /// Main Voice Activity Detection for AMR-WB — `wb_vad.c` `wb_vad`. `in_buf` must hold one
-/// [`FRAME_LEN`] = 256-sample frame. Returns 1 = speech, 0 = noise.
+/// `FRAME_LEN` = 256-sample frame. Returns 1 = speech, 0 = noise.
 ///
 /// # Panics
 /// Does not panic for a correctly-sized frame. If `in_buf.len() < FRAME_LEN` the indexing into the

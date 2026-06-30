@@ -8,7 +8,7 @@
 //! port/FD-exhaustion guard and (later) the XDP/AF_XDP acceleration both apply for free.
 //!
 //! Design (per the project's concurrency rules):
-//! - **Single-owner actor.** All allocation state lives in one task ([`manager`]) reached only
+//! - **Single-owner actor.** All allocation state lives in one task (the `manager` module) reached only
 //!   through a bounded `flume` mailbox — no `Arc<Mutex<…>>` over allocation state, no lock held
 //!   across an `.await`.
 //! - **Pure Rust, zero C.** The STUN/TURN codec and the `MD5`/HMAC-SHA1 credential crypto are

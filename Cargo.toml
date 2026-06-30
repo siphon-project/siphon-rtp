@@ -25,7 +25,7 @@ exclude = ["crates/siphon-rtp-xdp"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.86"
 license = "MIT"
 repository = "https://github.com/siphon-project/siphon-rtp"
 homepage = "https://github.com/siphon-project/siphon-rtp"
@@ -55,7 +55,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
     "logging",
 ] }
-rustls-pemfile = "2"
+# PEM parsing — the maintained successor to the now-unmaintained rustls-pemfile (RUSTSEC-2025-0134).
+# Its PemObject API has lived in rustls-pki-types since 1.9; depend on it directly per that advisory.
+rustls-pki-types = { version = "1.9", features = ["alloc"] }
 rcgen = "0.13"
 # Randomness — ICE credential generation (OS CSPRNG; no bundled C crypto)
 getrandom = "0.2"

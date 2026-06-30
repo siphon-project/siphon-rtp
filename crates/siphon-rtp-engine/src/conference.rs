@@ -4,13 +4,13 @@
 //! ingress packet → one egress packet), a conference mixes **many** legs and is *clock-driven*: a
 //! 20 ms room tick pops one frame from every participant, mixes them, and emits one egress frame to
 //! every participant — independent of each leg's arrival timing. Each participant is a
-//! [`MediaLeg`](siphon_rtp_media::leg::MediaLeg) (jitter + decode + encode + its own egress SSRC)
+//! [`MediaLeg`] (jitter + decode + encode + its own egress SSRC)
 //! plus a resampler pair to/from the room rate and an energy VAD; the room math lives in
-//! [`Mixer`](siphon_rtp_media::mixer::Mixer).
+//! [`Mixer`].
 //!
 //! Like the other slow-path actors this is split into a **pure, synchronous** core ([`Conference`] —
 //! feed it datagrams via [`Conference::ingest`], advance it with [`Conference::tick`], collect the
-//! datagrams to send) and a thin async wrapper ([`run_conference`]) that does the datapath I/O off a
+//! datagrams to send) and a thin async wrapper (`run_conference`) that does the datapath I/O off a
 //! `tokio` interval. The core takes a logical clock from its tick cadence (never `Instant::now()`),
 //! so it unit-tests deterministically without sockets.
 //!
@@ -40,7 +40,7 @@ use siphon_rtp_proto::Event;
 use crate::media_pipeline::Outbound;
 
 /// The wideband room rate. A room runs at this rate whenever any participant is wideband (>8 kHz) or
-/// the room is bridged; an all-narrowband, unbridged room drops to [`NARROWBAND_RATE_HZ`] so it pays
+/// the room is bridged; an all-narrowband, unbridged room drops to `NARROWBAND_RATE_HZ` so it pays
 /// no resampling at all (the common all-G.711 / PSTN conference).
 pub const ROOM_RATE_HZ: u32 = 16_000;
 /// The narrowband fast-path room rate (all-G.711/G.726/PSTN, unbridged).

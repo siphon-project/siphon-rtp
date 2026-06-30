@@ -493,14 +493,14 @@ impl<D: Datapath> AllocationManager<D> {
         let consistent = self.allocations.get(&five_tuple).is_some_and(|allocation| {
             // RFC 5766 §11.2: a channel must not rebind to a different peer, nor a peer to a
             // different channel.
-            !allocation
+            allocation
                 .channels
                 .get(&channel)
-                .is_some_and(|binding| binding.peer != peer)
-                && !allocation
+                .is_none_or(|binding| binding.peer == peer)
+                && allocation
                     .peer_to_channel
                     .get(&peer)
-                    .is_some_and(|bound| *bound != channel)
+                    .is_none_or(|bound| *bound == channel)
         });
         if !turn::valid_channel_number(channel) || !consistent {
             self.send_error(
@@ -574,10 +574,10 @@ impl<D: Datapath> AllocationManager<D> {
                 return;
             };
             // A Send to a peer with no permission is silently discarded (RFC 5766 §10).
-            if !allocation
+            if allocation
                 .permissions
                 .get(&peer.ip())
-                .is_some_and(|expiry| *expiry > now_tick)
+                .is_none_or(|expiry| *expiry <= now_tick)
             {
                 return;
             }
@@ -650,10 +650,10 @@ impl<D: Datapath> AllocationManager<D> {
                 return;
             };
             // No permission for this peer's IP → drop (RFC 5766 §8).
-            if !allocation
+            if allocation
                 .permissions
                 .get(&peer.ip())
-                .is_some_and(|expiry| *expiry > now_tick)
+                .is_none_or(|expiry| *expiry <= now_tick)
             {
                 return;
             }
