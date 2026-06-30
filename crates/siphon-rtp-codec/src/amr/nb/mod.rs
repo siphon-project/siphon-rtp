@@ -8,6 +8,7 @@
 //! algebraic codebook → gains → decoder main (+ post-filter / homing) → encoder.
 
 pub mod bitstream;
+pub mod codebook;
 pub mod constants;
 mod gain_tables;
 pub mod lpc;
