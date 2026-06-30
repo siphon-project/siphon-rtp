@@ -10,9 +10,11 @@
 pub mod bitstream;
 pub mod codebook;
 pub mod constants;
+pub mod filters;
 mod gain_tables;
 mod gain_vq_tables;
 pub mod gains;
 pub mod lpc;
 mod lpc_tables;
+mod math_nb;
 pub mod pitch;
