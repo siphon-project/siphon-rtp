@@ -9,3 +9,5 @@
 
 pub mod bitstream;
 pub mod constants;
+pub mod lpc;
+mod lpc_tables;
