@@ -13,6 +13,8 @@ use siphon_rtp_codec::amr::wb::dec_main::{decode_frame, DecoderState};
 #[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::wb::{codebook, constants, filters, lpc, pitch};
 #[cfg(feature = "amr")]
+use siphon_rtp_codec::amr::nb::dec_main::SpeechDecoder as NbSpeechDecoder;
+#[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::AMRWB_SPEECH_BITS;
 use siphon_rtp_codec::cn::Cn;
 use siphon_rtp_codec::g711::G711;
@@ -313,7 +315,58 @@ fn bench_amrwb_decode(criterion: &mut Criterion) {
     }
 }
 
-// AMR-WB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
+/// AMR-NB full per-frame decode (`dec_main`), one bench per speech mode (0..=7), over the official
+/// `T_<mode>` vectors. The decoder is warmed through the preceding frames so the timed decode sees
+/// realistic filter/predictor memory (not the post-reset transient).
+#[cfg(feature = "amr")]
+fn bench_amrnb_decode(criterion: &mut Criterion) {
+    // (mode index, vector tag) for the 8 speech modes.
+    const MODES: [(usize, &str); 8] = [
+        (0, "475"),
+        (1, "515"),
+        (2, "59"),
+        (3, "67"),
+        (4, "74"),
+        (5, "795"),
+        (6, "102"),
+        (7, "122"),
+    ];
+    const FRAME_WORDS: usize = 250; // 1 + 244 + 1 + 4
+
+    for (mode, tag) in MODES {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push(format!("../../reference/amr-nb/testv/NODTX/T_{tag}/T01_{tag}.COD"));
+        let Ok(cod) = std::fs::read(&path) else {
+            continue; // vectors not present in this checkout
+        };
+        let cod_words: Vec<i16> = cod
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        let frame_index = 12usize.min(cod_words.len() / FRAME_WORDS - 1);
+        let base = frame_index * FRAME_WORDS;
+        let bits: Vec<i16> = cod_words[base + 1..base + 1 + 244].to_vec();
+
+        let mut dec = NbSpeechDecoder::new();
+        let mut out = vec![0i16; FRAME];
+        for f in 0..frame_index {
+            let fb = &cod_words[f * FRAME_WORDS + 1..f * FRAME_WORDS + 1 + 244];
+            dec.decode_frame(mode, fb, &mut out);
+        }
+        let warm = dec.clone();
+
+        criterion.bench_function(&format!("amrnb_decode_mode{mode}_frame"), |bencher| {
+            bencher.iter_batched(
+                || warm.clone(),
+                |mut st| st.decode_frame(mode, black_box(&bits), black_box(&mut out)),
+                BatchSize::SmallInput,
+            );
+        });
+    }
+}
+
+// AMR-WB/NB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
 #[cfg(feature = "amr")]
 criterion_group!(
     benches,
@@ -325,7 +378,8 @@ criterion_group!(
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
-    bench_amrwb_decode
+    bench_amrwb_decode,
+    bench_amrnb_decode
 );
 #[cfg(not(feature = "amr"))]
 criterion_group!(benches, bench_g711, bench_g722, bench_g726, bench_gsm_fr, bench_cn);
