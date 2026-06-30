@@ -19,3 +19,4 @@ mod lpc_tables;
 mod math_nb;
 pub mod pitch;
 pub mod postfilter;
+pub mod support;

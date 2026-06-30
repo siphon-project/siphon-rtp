@@ -14,6 +14,25 @@ use crate::amr::oper_32b::{l_extract, mpy_32_16};
 /// `M` outputs. The internal `L_shl(s, 3)` + `round` saturate — bit-exact with the reference (this is
 /// what trips the decoder's overflow re-scale).
 pub fn syn_filt(a: &[i16], x: &[i16], y: &mut [i16], lg: usize, mem: &mut [i16], update: bool) {
+    let mut overflow = false;
+    syn_filt_overflow(a, x, y, lg, mem, update, &mut overflow);
+}
+
+/// As [`syn_filt`], but reports whether the saturating `L_shl(s, 3)` overflowed on any sample
+/// (`overflow` is set, never cleared). The decoder reads this to trigger its excitation re-scale
+/// (`dec_amr.c`: `Overflow = 0; Syn_filt(...); if (Overflow) ...`). Bit-exact: the reference's global
+/// `Overflow` is set inside `L_shl` when the 32-bit value cannot be shifted left by 3 without
+/// saturating; `round`'s `L_add` cannot overflow here because the input is already 16-bit-range
+/// after the (possibly saturated) `L_shl`.
+pub fn syn_filt_overflow(
+    a: &[i16],
+    x: &[i16],
+    y: &mut [i16],
+    lg: usize,
+    mem: &mut [i16],
+    update: bool,
+    overflow: &mut bool,
+) {
     // tmp holds M memory words followed by the lg outputs (max lg = L_SUBFR = 40).
     let mut tmp = [0i16; M + 40];
     tmp[..M].copy_from_slice(&mem[..M]);
@@ -24,7 +43,14 @@ pub fn syn_filt(a: &[i16], x: &[i16], y: &mut [i16], lg: usize, mem: &mut [i16],
             // yy[-j] where yy currently points at tmp[M+i]
             s = l_msu(s, a[j], tmp[M + i - j]);
         }
-        s = l_shl(s, 3);
+        // L_shl(s, 3) sets Overflow if the value saturates.
+        let shifted = l_shl(s, 3);
+        if (s > 0 && shifted == i32::MAX && s != i32::MAX)
+            || (s < 0 && shifted == i32::MIN && s != i32::MIN)
+        {
+            *overflow = true;
+        }
+        s = shifted;
         tmp[M + i] = round_word(s);
     }
 

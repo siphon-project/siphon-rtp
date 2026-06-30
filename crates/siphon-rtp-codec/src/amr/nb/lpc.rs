@@ -13,8 +13,8 @@ use crate::amr::basic_ops::{
 use crate::amr::nb::constants::{LSF_GAP, LSP_PRED_FAC_MR122, M, MP1};
 use crate::amr::nb::lpc_tables::{
     DICO1_LSF_3, DICO1_LSF_5, DICO2_LSF_3, DICO2_LSF_5, DICO3_LSF_3, DICO3_LSF_5, DICO4_LSF_5,
-    DICO5_LSF_5, LSF_LSP_SLOPE, LSF_LSP_TABLE, MEAN_LSF, MR515_3_LSF, MR795_1_LSF, PAST_RQ_INIT,
-    PRED_FAC,
+    DICO5_LSF_5, LSF_LSP_SLOPE, LSF_LSP_TABLE, MEAN_LSF, MEAN_LSF_5, MR515_3_LSF, MR795_1_LSF,
+    PAST_RQ_INIT, PRED_FAC,
 };
 use crate::amr::AmrNbMode;
 
@@ -48,10 +48,13 @@ impl Default for DPlsfState {
 
 impl DPlsfState {
     /// Reset state: zero the prediction error, seed `past_lsf_q` with `mean_lsf` (`D_plsf_reset`).
+    /// `D_plsf_reset` (d_plsf.c) includes `q_plsf_5.tab`, so the seed is the **5-split** mean
+    /// ([`MEAN_LSF_5`], `1384, 2077, …`) — distinct from the 3-split [`MEAN_LSF`] used inside
+    /// [`d_plsf_3`].
     #[must_use]
     pub fn new() -> Self {
         let mut past_lsf_q = [0i16; M];
-        past_lsf_q.copy_from_slice(&MEAN_LSF);
+        past_lsf_q.copy_from_slice(&MEAN_LSF_5);
         Self {
             past_r_q: [0i16; M],
             past_lsf_q,
@@ -256,11 +259,11 @@ pub fn d_plsf_5(
 
     if bfi {
         for i in 0..M {
-            lsf1_q[i] = add(mult(st.past_lsf_q[i], ALPHA_5), mult(MEAN_LSF[i], ONE_ALPHA_5));
+            lsf1_q[i] = add(mult(st.past_lsf_q[i], ALPHA_5), mult(MEAN_LSF_5[i], ONE_ALPHA_5));
             lsf2_q[i] = lsf1_q[i];
         }
         for i in 0..M {
-            let temp = add(MEAN_LSF[i], mult(st.past_r_q[i], LSP_PRED_FAC_MR122));
+            let temp = add(MEAN_LSF_5[i], mult(st.past_r_q[i], LSP_PRED_FAC_MR122));
             st.past_r_q[i] = sub(lsf2_q[i], temp);
         }
     } else {
@@ -309,7 +312,7 @@ pub fn d_plsf_5(
         lsf2_r[9] = DICO5_LSF_5[p + 3];
 
         for i in 0..M {
-            let temp = add(MEAN_LSF[i], mult(st.past_r_q[i], LSP_PRED_FAC_MR122));
+            let temp = add(MEAN_LSF_5[i], mult(st.past_r_q[i], LSP_PRED_FAC_MR122));
             lsf1_q[i] = add(lsf1_r[i], temp);
             lsf2_q[i] = add(lsf2_r[i], temp);
             st.past_r_q[i] = lsf2_r[i];
@@ -372,7 +375,7 @@ mod tests {
     #[test]
     fn reset_seeds_past_lsf_with_mean() {
         let st = DPlsfState::new();
-        assert_eq!(st.past_lsf_q, MEAN_LSF);
+        assert_eq!(st.past_lsf_q, MEAN_LSF_5);
         assert_eq!(st.past_r_q, [0i16; M]);
     }
 

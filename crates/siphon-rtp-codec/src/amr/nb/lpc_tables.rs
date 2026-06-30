@@ -38,7 +38,7 @@ pub static PAST_RQ_INIT: [i16; 80] = [
     -314, -191, -203, -330, -160, -103, -51, 131, 338, 515,
 ];
 
-/// Mean LSF vector (`q_plsf_3.tab`/`q_plsf_5.tab` `mean_lsf[10]`).
+/// Mean LSF vector for the 3-split decoder (`q_plsf_3.tab` `mean_lsf[10]`).
 #[rustfmt::skip]
 pub static MEAN_LSF: [i16; 10] = [
     1546, 2272, 3778, 5488, 6972, 8382, 10047, 11229, 12766, 13714,
@@ -821,6 +821,12 @@ pub static MR795_1_LSF: [i16; 1536] = [
     -84, -445, -1389, 414, 313, 1045, 29, -343, 65,
     1552, 1647, 980, 183, -91, -829, 1273, 1413, 360,
     553, 272, -107, 1587, 3149, 2603,
+];
+
+/// Mean LSF vector for the 5-split (MR122) decoder + the D_plsf/lsp_avg reset (`q_plsf_5.tab` `mean_lsf[10]`). Distinct from the 3-split `MEAN_LSF`.
+#[rustfmt::skip]
+pub static MEAN_LSF_5: [i16; 10] = [
+    1384, 2077, 3420, 5108, 6742, 8122, 9863, 11092, 12714, 13701,
 ];
 
 /// MR122 split-MQ codebook 1 (`q_plsf_5.tab` `dico1_lsf`, x4).
