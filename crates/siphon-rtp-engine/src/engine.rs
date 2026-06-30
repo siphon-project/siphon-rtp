@@ -3066,7 +3066,7 @@ mod tests {
                     },
                     downlink = down_rx.recv_async() => match downlink {
                         Ok(bytes) => {
-                            if sink.send(Message::Binary(bytes)).await.is_err() {
+                            if sink.send(Message::binary(bytes)).await.is_err() {
                                 break;
                             }
                         }
@@ -3124,7 +3124,7 @@ mod tests {
             .expect("a frame");
         match first {
             Message::Text(text) => assert!(
-                matches!(ControlMessage::from_json(&text), Ok(ControlMessage::Start(_))),
+                matches!(ControlMessage::from_json(text.as_str()), Ok(ControlMessage::Start(_))),
                 "first WS frame is `start`"
             ),
             other => panic!("expected start text frame, got {other:?}"),
