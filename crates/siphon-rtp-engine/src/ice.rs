@@ -33,7 +33,7 @@ pub fn generate_credentials() -> Option<IceCredentials> {
 
 fn random_ice_string(len: usize) -> Option<String> {
     let mut bytes = vec![0u8; len];
-    getrandom::getrandom(&mut bytes).ok()?;
+    getrandom::fill(&mut bytes).ok()?;
     Some(
         bytes
             .iter()
