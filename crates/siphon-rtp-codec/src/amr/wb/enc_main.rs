@@ -148,8 +148,19 @@ pub struct EncoderState {
     mem_hf2: [i16; 30],
     /// Random memory for HF noise generation (`seed2`).
     seed2: i16,
-    /// HF-gain smoothing factor (`gain_alpha`); the non-DTX path always re-clamps it to 32767.
+    /// HF-gain smoothing factor (`gain_alpha`). Re-scaled by `dtx_hangover_count / 7` every
+    /// subframe in `synthesis()`, then re-clamped to 32767 while `dtx_hangover_count > 6`.
     gain_alpha: i16,
+    /// DTX speech-hangover counter (`dtx_encState.dtxHangoverCount`, `dtx.c` `tx_dtx_handler`).
+    /// The reference test vectors are generated with DTX enabled (`testv/test_enc.bat`: `coder
+    /// -dtx N`), so the mode-8 `synthesis()` `gain_alpha` update reads this evolving count rather
+    /// than the fixed `DTX_HANG_CONST`. Reset to 7 on every speech frame, decremented (floor 0) on
+    /// each non-speech frame. Only mode 8 reads it.
+    dtx_hangover_count: i16,
+    /// DTX decoder-analysis elapsed-frame counter (`dtx_encState.decAnaElapsedCount`). Tracked so
+    /// the hangover state machine matches the reference exactly; for active-speech input it stays
+    /// saturated and never forces the comfort-noise (`MRDTX`) path.
+    dec_ana_elapsed_count: i16,
     vad: VadState,
 }
 
@@ -208,6 +219,9 @@ impl EncoderState {
             mem_hf2: [0; 30],
             seed2: 21845,
             gain_alpha: 32767,
+            // `dtx_enc_reset()`: dtxHangoverCount = DTX_HANG_CONST (7), decAnaElapsedCount = 32767.
+            dtx_hangover_count: DTX_HANG_CONST,
+            dec_ana_elapsed_count: 32767,
             vad: VadState::new(),
         };
         init_gp_clip(&mut s.gp_clip);
@@ -384,7 +398,26 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         }
     }
 
-    // (non-DTX) write VAD flag as the 1st parameter
+    // -------- DTX speech-hangover state machine (`dtx.c` `tx_dtx_handler`) --------
+    // The reference test vectors are generated with DTX enabled (`testv/test_enc.bat`), so this
+    // runs every frame to keep `dtx_hangover_count` in lock-step with the reference. Only mode 8's
+    // `synthesis()` reads the count (via `gain_alpha`); the SID/comfort-noise (`MRDTX`) branch is
+    // never taken for active-speech input (`tst.inp`), so the bitstream framing is unchanged for
+    // all modes — modes 0..=7 stay byte-exact whether or not this runs.
+    state.dec_ana_elapsed_count = add(state.dec_ana_elapsed_count, 1);
+    if vad_flag != 0 {
+        state.dtx_hangover_count = DTX_HANG_CONST;
+    } else if state.dtx_hangover_count == 0 {
+        // Out of decoder-analysis hangover: the reference would switch to `MRDTX` (comfort noise).
+        // `tst.inp` never reaches this; the speech-only encode path does not implement SID frames.
+        state.dec_ana_elapsed_count = 0;
+    } else {
+        state.dtx_hangover_count = sub(state.dtx_hangover_count, 1);
+        // `decAnaElapsedCount + dtxHangoverCount < DTX_ELAPSED_FRAMES_THRESH` would also force
+        // `MRDTX`; for active speech `decAnaElapsedCount` stays saturated so this never trips.
+    }
+
+    // (non-DTX framing) write VAD flag as the 1st parameter
     parm_serial(vad_flag, 1, prms, &mut pos);
 
     // -------- LP analysis --------
@@ -1042,7 +1075,7 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
     pos
 }
 
-/// `cnst.h` `DTX_HANG_CONST` — the constant `dtxHangoverCount` the non-DTX speech path always sees.
+/// `dtx.h` `DTX_HANG_CONST` — the speech-hangover reload value (`dtx.c` `tx_dtx_handler`).
 const DTX_HANG_CONST: i16 = 7;
 
 /// Analysis-side high-band synthesis with HF correction-gain quantization (`cod_main.c`
@@ -1053,8 +1086,10 @@ const DTX_HANG_CONST: i16 = 7;
 /// pick the best of 16 quantised correction gains (`HP_gain`). Updates every HF filter memory so the
 /// next subframe stays in lock-step with the decoder, and returns the 4-bit `HP_gain` index.
 ///
-/// Non-DTX only: `dtxHangoverCount` is fixed at `DTX_HANG_CONST` (7), which makes the `gain_alpha`
-/// update re-clamp to 32767 every subframe (TS 26.190; `cod_main.c` lines 1593..1599).
+/// The `gain_alpha` mix-factor is re-scaled by `state.dtx_hangover_count / 7` each subframe, then
+/// re-clamped to 32767 while the count is still > 6 (TS 26.190; `cod_main.c` lines 1593..1599). The
+/// reference vectors are produced with DTX enabled, so on hangover frames the count is < 7 and
+/// `gain_alpha` decays, biasing `HP_corr_gain` toward the estimated gain.
 fn synthesis(
     state: &mut EncoderState,
     aq: &[i16],
@@ -1186,10 +1221,12 @@ fn synthesis(
     let hp_calc_gain = extract_h(l_tmp);
 
     // ---- Mix calculated and estimated gains by `gain_alpha`. ----
-    // gain_alpha *= dtxHangoverCount/7, then forced to 32767 because dtxHangoverCount (7) > 6.
-    let l_tmp = l_shl(l_mult(DTX_HANG_CONST, 4681), 15);
+    // `gain_alpha *= dtxHangoverCount / 7` (`cod_main.c` 1593..1599); re-clamped to 32767 only
+    // while the count is still > 6 (i.e. on speech frames). On DTX hangover frames the count is
+    // < 7, so `gain_alpha` decays multiplicatively across the four subframes.
+    let l_tmp = l_shl(l_mult(state.dtx_hangover_count, 4681), 15);
     state.gain_alpha = mult(state.gain_alpha, extract_h(l_tmp));
-    if sub(DTX_HANG_CONST, 6) > 0 {
+    if sub(state.dtx_hangover_count, 6) > 0 {
         state.gain_alpha = 32767;
     }
     let hp_est_gain_q14 = shr(hp_est_gain, 1); // Q15 → Q14

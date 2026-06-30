@@ -906,8 +906,9 @@ mod tests {
 
     /// Mode 8 (23.85 kbit/s): the 4t64 ACELP pipeline plus the high-band `synthesis()` tier, which
     /// transmits a 4-bit HF correction-gain index per subframe (16 extra bits/frame → 477 total).
+    /// The reference `tst_m8.cod` is generated with DTX enabled (`testv/test_enc.bat`), so the
+    /// `synthesis()` `gain_alpha` update is driven by the live DTX speech-hangover count.
     #[test]
-    #[ignore = "WIP: mode-8 encode (HF correction-gain quant) not yet bit-exact — decode is"]
     fn encodes_full_mode8_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(8);
         assert!(mismatch.is_none(), "mode 8: {frames} frames, first mismatch {mismatch:?}");
