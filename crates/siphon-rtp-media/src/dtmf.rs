@@ -112,7 +112,11 @@ impl DtmfDetector {
 
     /// Feed one telephone-event RTP packet (its timestamp and payload). Returns the press exactly
     /// once, when the event's End bit is observed.
-    pub fn on_packet(&mut self, rtp_timestamp: u32, payload: &[u8]) -> Result<Option<DtmfEvent>, DtmfError> {
+    pub fn on_packet(
+        &mut self,
+        rtp_timestamp: u32,
+        payload: &[u8],
+    ) -> Result<Option<DtmfEvent>, DtmfError> {
         let event = TelephoneEvent::parse(payload)?;
 
         let is_new = !matches!(self.current, Some((timestamp, _)) if timestamp == rtp_timestamp);
@@ -205,8 +209,11 @@ impl DtmfGenerator {
             .clamp(1, u64::from(u16::MAX)) as u16;
         let requested_samples = (clock_rate_hz as u64 * u64::from(duration_ms)) / 1000;
         // Round up to a whole packet so the final update carries the full requested duration.
-        let packets = requested_samples.div_ceil(u64::from(samples_per_packet)).max(1);
-        let total_samples = (packets * u64::from(samples_per_packet)).min(u64::from(u16::MAX)) as u16;
+        let packets = requested_samples
+            .div_ceil(u64::from(samples_per_packet))
+            .max(1);
+        let total_samples =
+            (packets * u64::from(samples_per_packet)).min(u64::from(u16::MAX)) as u16;
 
         Some(Self {
             event_code,
@@ -236,7 +243,12 @@ impl DtmfGenerator {
         // Byte 1: E (bit 7), R (bit 6, always 0), volume (bits 5-0).
         let end_reserved_volume = (u8::from(end) << 7) | self.volume;
         let [duration_high, duration_low] = duration.to_be_bytes();
-        [self.event_code, end_reserved_volume, duration_high, duration_low]
+        [
+            self.event_code,
+            end_reserved_volume,
+            duration_high,
+            duration_low,
+        ]
     }
 
     /// Pull the next telephone-event payload, or `None` once the whole burst (updates + redundant
@@ -301,43 +313,89 @@ mod tests {
     #[test]
     fn maps_all_dtmf_digits() {
         let cases = [
-            (0u8, '0'), (9, '9'), (10, '*'), (11, '#'), (12, 'A'), (13, 'B'), (14, 'C'), (15, 'D'),
+            (0u8, '0'),
+            (9, '9'),
+            (10, '*'),
+            (11, '#'),
+            (12, 'A'),
+            (13, 'B'),
+            (14, 'C'),
+            (15, 'D'),
         ];
         for (code, digit) in cases {
-            assert_eq!(TelephoneEvent::parse(&payload(code, false, 0, 0)).unwrap().digit(), Some(digit));
+            assert_eq!(
+                TelephoneEvent::parse(&payload(code, false, 0, 0))
+                    .unwrap()
+                    .digit(),
+                Some(digit)
+            );
         }
         // A tone (event >= 16) is not a DTMF digit.
-        assert_eq!(TelephoneEvent::parse(&payload(16, false, 0, 0)).unwrap().digit(), None);
+        assert_eq!(
+            TelephoneEvent::parse(&payload(16, false, 0, 0))
+                .unwrap()
+                .digit(),
+            None
+        );
     }
 
     #[test]
     fn emits_once_per_press_on_end_bit() {
         let mut detector = DtmfDetector::new();
         // Three packets of one event at timestamp 1000; only the last sets End.
-        assert_eq!(detector.on_packet(1000, &payload(7, false, 8, 160)).unwrap(), None);
-        assert_eq!(detector.on_packet(1000, &payload(7, false, 8, 320)).unwrap(), None);
+        assert_eq!(
+            detector
+                .on_packet(1000, &payload(7, false, 8, 160))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            detector
+                .on_packet(1000, &payload(7, false, 8, 320))
+                .unwrap(),
+            None
+        );
         let emitted = detector.on_packet(1000, &payload(7, true, 8, 480)).unwrap();
         assert_eq!(
             emitted,
-            Some(DtmfEvent { digit: '7', event_code: 7, duration: 480, volume: 8 })
+            Some(DtmfEvent {
+                digit: '7',
+                event_code: 7,
+                duration: 480,
+                volume: 8
+            })
         );
     }
 
     #[test]
     fn dedupes_redundant_end_packets() {
         let mut detector = DtmfDetector::new();
-        detector.on_packet(2000, &payload(3, false, 8, 160)).unwrap();
-        assert!(detector.on_packet(2000, &payload(3, true, 8, 320)).unwrap().is_some());
+        detector
+            .on_packet(2000, &payload(3, false, 8, 160))
+            .unwrap();
+        assert!(detector
+            .on_packet(2000, &payload(3, true, 8, 320))
+            .unwrap()
+            .is_some());
         // RFC 4733 sends the End packet up to three times; only the first emits.
-        assert_eq!(detector.on_packet(2000, &payload(3, true, 8, 320)).unwrap(), None);
-        assert_eq!(detector.on_packet(2000, &payload(3, true, 8, 320)).unwrap(), None);
+        assert_eq!(
+            detector.on_packet(2000, &payload(3, true, 8, 320)).unwrap(),
+            None
+        );
+        assert_eq!(
+            detector.on_packet(2000, &payload(3, true, 8, 320)).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn distinguishes_consecutive_presses_by_timestamp() {
         let mut detector = DtmfDetector::new();
         // Press '1' at ts 100.
-        assert!(detector.on_packet(100, &payload(1, true, 8, 160)).unwrap().is_some());
+        assert!(detector
+            .on_packet(100, &payload(1, true, 8, 160))
+            .unwrap()
+            .is_some());
         // Press '2' at a new timestamp.
         let second = detector.on_packet(260, &payload(2, true, 8, 160)).unwrap();
         assert_eq!(second.map(|event| event.digit), Some('2'));
@@ -355,8 +413,15 @@ mod tests {
         // The generator's digit→code table and the parser's code→digit table are inverses across
         // every DTMF key (RFC 4733 §3.2).
         let cases = [
-            ('0', 0u8), ('5', 5), ('9', 9), ('*', 10), ('#', 11),
-            ('A', 12), ('B', 13), ('C', 14), ('D', 15),
+            ('0', 0u8),
+            ('5', 5),
+            ('9', 9),
+            ('*', 10),
+            ('#', 11),
+            ('A', 12),
+            ('B', 13),
+            ('C', 14),
+            ('D', 15),
         ];
         for (digit, code) in cases {
             assert_eq!(digit_to_event_code(digit), Some(code), "digit {digit}");
@@ -399,7 +464,10 @@ mod tests {
             let parsed = TelephoneEvent::parse(&payloads[index].bytes).expect("parse update");
             assert_eq!(parsed.event, 5);
             assert!(!parsed.end, "update packet {index} must not set End");
-            assert_eq!(parsed.duration, expected, "cumulative duration at packet {index}");
+            assert_eq!(
+                parsed.duration, expected,
+                "cumulative duration at packet {index}"
+            );
             assert_eq!(parsed.volume, DEFAULT_DTMF_VOLUME_DBM0);
             assert!(!payloads[index].is_end);
         }

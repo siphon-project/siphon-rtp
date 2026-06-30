@@ -129,7 +129,11 @@ impl Capture {
             &self.capture_agent_id.to_be_bytes(),
         );
         if let Some(correlation_id) = &self.correlation_id {
-            push_chunk(&mut chunks, chunk::CORRELATION_ID, correlation_id.as_bytes());
+            push_chunk(
+                &mut chunks,
+                chunk::CORRELATION_ID,
+                correlation_id.as_bytes(),
+            );
         }
         push_chunk(&mut chunks, chunk::PAYLOAD, &self.payload);
 
@@ -229,12 +233,25 @@ mod tests {
         let packet = capture.encode();
         let chunks = decode_chunks(&packet);
 
-        assert_eq!(value(&chunks, chunk::IP_FAMILY), Some(&[2u8][..]), "AF_INET");
+        assert_eq!(
+            value(&chunks, chunk::IP_FAMILY),
+            Some(&[2u8][..]),
+            "AF_INET"
+        );
         assert_eq!(value(&chunks, chunk::IP_PROTOCOL), Some(&[17u8][..]), "UDP");
-        assert_eq!(value(&chunks, chunk::IPV4_SRC), Some(&[198, 51, 100, 7][..]));
+        assert_eq!(
+            value(&chunks, chunk::IPV4_SRC),
+            Some(&[198, 51, 100, 7][..])
+        );
         assert_eq!(value(&chunks, chunk::IPV4_DST), Some(&[203, 0, 113, 9][..]));
-        assert_eq!(value(&chunks, chunk::SRC_PORT), Some(&6000u16.to_be_bytes()[..]));
-        assert_eq!(value(&chunks, chunk::DST_PORT), Some(&6002u16.to_be_bytes()[..]));
+        assert_eq!(
+            value(&chunks, chunk::SRC_PORT),
+            Some(&6000u16.to_be_bytes()[..])
+        );
+        assert_eq!(
+            value(&chunks, chunk::DST_PORT),
+            Some(&6002u16.to_be_bytes()[..])
+        );
         assert_eq!(
             value(&chunks, chunk::TIMESTAMP_SECS),
             Some(&0x1122_3344u32.to_be_bytes()[..])
@@ -274,7 +291,11 @@ mod tests {
         let packet = capture.encode();
         let chunks = decode_chunks(&packet);
 
-        assert_eq!(value(&chunks, chunk::IP_FAMILY), Some(&[10u8][..]), "AF_INET6");
+        assert_eq!(
+            value(&chunks, chunk::IP_FAMILY),
+            Some(&[10u8][..]),
+            "AF_INET6"
+        );
         assert_eq!(value(&chunks, chunk::IPV6_SRC).map(|v| v.len()), Some(16));
         assert!(value(&chunks, chunk::IPV4_SRC).is_none());
         // No correlation id chunk when none is supplied.

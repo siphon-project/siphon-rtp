@@ -204,8 +204,7 @@ impl PcmPlayer {
         }
 
         let sample_rate_hz = source.sample_rate_hz();
-        let loop_start =
-            ((start_pos_ms as u64 * sample_rate_hz as u64) / 1000) as usize;
+        let loop_start = ((start_pos_ms as u64 * sample_rate_hz as u64) / 1000) as usize;
         let loop_start = loop_start.min(mono.len());
 
         Self {
@@ -287,7 +286,12 @@ mod tests {
     use crate::wav::WavRecorder;
 
     fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-        u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
     }
 
     /// Build a RIFF/WAVE buffer directly from explicit byte fixtures (so the reader is not tested
@@ -326,7 +330,9 @@ mod tests {
     fn roundtrips_recorder_output_sample_exact() {
         // WavRecorder::into_wav → WavSource::parse must be sample-exact.
         let mut recorder = WavRecorder::new(16000, 1);
-        let pcm: Vec<i16> = (0..320).map(|index| ((index * 101) as i16).wrapping_sub(160)).collect();
+        let pcm: Vec<i16> = (0..320)
+            .map(|index| ((index * 101) as i16).wrapping_sub(160))
+            .collect();
         recorder.write_pcm(&pcm);
         let wav = recorder.into_wav();
 
@@ -361,7 +367,7 @@ mod tests {
         buffer.extend_from_slice(&3u32.to_le_bytes());
         buffer.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
         buffer.push(0x00); // pad byte for odd length
-        // fmt
+                           // fmt
         buffer.extend_from_slice(b"fmt ");
         buffer.extend_from_slice(&16u32.to_le_bytes());
         buffer.extend_from_slice(&1u16.to_le_bytes());
@@ -386,7 +392,10 @@ mod tests {
 
     #[test]
     fn rejects_garbage_header() {
-        assert_eq!(WavSource::parse(b"not a wav file at all"), Err(WavError::NotRiffWave));
+        assert_eq!(
+            WavSource::parse(b"not a wav file at all"),
+            Err(WavError::NotRiffWave)
+        );
     }
 
     #[test]
@@ -437,7 +446,10 @@ mod tests {
         buffer.extend_from_slice(&32u16.to_le_bytes()); // 32-bit
         buffer.extend_from_slice(b"data");
         buffer.extend_from_slice(&0u32.to_le_bytes());
-        assert_eq!(WavSource::parse(&buffer), Err(WavError::BadBitsPerSample(32)));
+        assert_eq!(
+            WavSource::parse(&buffer),
+            Err(WavError::BadBitsPerSample(32))
+        );
     }
 
     #[test]

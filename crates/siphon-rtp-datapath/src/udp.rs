@@ -138,7 +138,8 @@ impl Inner {
                 // same RTP SSRC (a genuine NAT rebind), never a hijack spray.
                 // (docs/security-and-nat.md §4 layer 3; RFC 3550 §8.)
                 if rule.latch != LatchPolicy::Off
-                    && self.update_latch(endpoint, source, rtp_ssrc(payload)) == LatchOutcome::Reject
+                    && self.update_latch(endpoint, source, rtp_ssrc(payload))
+                        == LatchOutcome::Reject
                 {
                     in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -192,6 +193,10 @@ impl Inner {
                 let packet = RxPacket {
                     endpoint,
                     source,
+                    // Loopback (CI) backend: derive arrival from the logical tick clock (one tick =
+                    // 20 ms) so it stays deterministic and `Instant`-free. Real-time precision is the
+                    // XDP backend's job; jitter unit tests stamp `arrival` on the packet directly.
+                    arrival: self.clock.load(Ordering::Relaxed).saturating_mul(20_000),
                     data: Bytes::copy_from_slice(payload),
                 };
                 if self.redirect_tx.send(packet).is_err() {
@@ -217,20 +222,23 @@ impl Inner {
         let current = self.latched.get(&endpoint).map(|state| *state);
         match current {
             None => {
-                self.latched.insert(endpoint, LatchState { addr: source, ssrc });
+                self.latched
+                    .insert(endpoint, LatchState { addr: source, ssrc });
                 LatchOutcome::Accept
             }
             Some(state) if state.addr == source => {
                 // Same path; record the SSRC the first time we can read one.
                 if state.ssrc.is_none() && ssrc.is_some() {
-                    self.latched.insert(endpoint, LatchState { addr: source, ssrc });
+                    self.latched
+                        .insert(endpoint, LatchState { addr: source, ssrc });
                 }
                 LatchOutcome::Accept
             }
             Some(state) => match (state.ssrc, ssrc) {
                 // A new source that keeps the SSRC is a genuine NAT rebind — follow it.
                 (Some(known), Some(seen)) if known == seen => {
-                    self.latched.insert(endpoint, LatchState { addr: source, ssrc });
+                    self.latched
+                        .insert(endpoint, LatchState { addr: source, ssrc });
                     LatchOutcome::Accept
                 }
                 // A new source with a different/unknown SSRC is a spray/hijack — reject, keep latch.
@@ -370,9 +378,14 @@ impl UdpLoopbackDatapath {
             socket.clone(),
             stats.clone(),
         ));
-        self.inner
-            .endpoints
-            .insert(id, EndpointEntry { socket, stats, task });
+        self.inner.endpoints.insert(
+            id,
+            EndpointEntry {
+                socket,
+                stats,
+                task,
+            },
+        );
         Ok(Endpoint { id, local_addr })
     }
 }
@@ -405,7 +418,10 @@ fn rtp_ssrc(payload: &[u8]) -> Option<u32> {
         return None; // RTCP (RFC 5761 §4)
     }
     Some(u32::from_be_bytes([
-        payload[8], payload[9], payload[10], payload[11],
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
     ]))
 }
 
@@ -493,7 +509,16 @@ async fn recv_loop(
         // that carry ICE credentials.
         if matches!(buffer[..len].first(), Some(&first) if first <= 3) {
             if let Some(ice) = inner.ice.get(&endpoint).map(|config| config.clone()) {
-                handle_stun(&socket, endpoint, source, &buffer[..len], &ice, &inner, &stats).await;
+                handle_stun(
+                    &socket,
+                    endpoint,
+                    source,
+                    &buffer[..len],
+                    &ice,
+                    &inner,
+                    &stats,
+                )
+                .await;
                 continue;
             }
             // No ICE credentials: do *not* drop here — fall through to the installed flow. A TURN
@@ -502,7 +527,9 @@ async fn recv_loop(
             // media `Forward` endpoint still drops non-RTP inside `dispatch` (the layer-1 demux), so
             // this never lets STUN reach the media latch.
         }
-        inner.dispatch(endpoint, source, &buffer[..len], &stats).await;
+        inner
+            .dispatch(endpoint, source, &buffer[..len], &stats)
+            .await;
     }
 }
 
@@ -511,10 +538,7 @@ impl Datapath for UdpLoopbackDatapath {
         self.alloc_on(self.inner.bind_ip).await
     }
 
-    async fn alloc_endpoint_for(
-        &self,
-        family: AddressFamily,
-    ) -> Result<Endpoint, DatapathError> {
+    async fn alloc_endpoint_for(&self, family: AddressFamily) -> Result<Endpoint, DatapathError> {
         self.alloc_on(self.bind_ip_for(family)).await
     }
 
@@ -551,14 +575,20 @@ impl Datapath for UdpLoopbackDatapath {
             Some(entry) => (entry.socket.clone(), entry.stats.clone()),
             None => return Err(DatapathError::UnknownEndpoint(endpoint)),
         };
-        let sent = socket.send_to(data, dst).await.map_err(DatapathError::Send)?;
+        let sent = socket
+            .send_to(data, dst)
+            .await
+            .map_err(DatapathError::Send)?;
         stats.packets_out.fetch_add(1, Ordering::Relaxed);
         stats.bytes_out.fetch_add(sent as u64, Ordering::Relaxed);
         Ok(sent)
     }
 
     fn stats(&self, endpoint: EndpointId) -> Option<EndpointStats> {
-        self.inner.endpoints.get(&endpoint).map(|e| e.stats.snapshot())
+        self.inner
+            .endpoints
+            .get(&endpoint)
+            .map(|e| e.stats.snapshot())
     }
 
     fn now_ticks(&self) -> u64 {
@@ -852,7 +882,10 @@ mod tests {
         let leg = datapath.alloc_endpoint().await.expect("alloc");
         let (phone, addr) = phone().await;
 
-        let sent = datapath.send(leg.id, addr, b"injected").await.expect("send");
+        let sent = datapath
+            .send(leg.id, addr, b"injected")
+            .await
+            .expect("send");
         assert_eq!(sent, b"injected".len());
         let (data, from) = recv(&phone).await;
         assert_eq!(data, b"injected");
@@ -865,7 +898,13 @@ mod tests {
         let datapath = UdpLoopbackDatapath::new();
         let result = datapath.install_flow(EndpointId(999), FlowAction::Drop);
         assert!(matches!(result, Err(DatapathError::UnknownEndpoint(_))));
-        let result = datapath.send(EndpointId(999), "127.0.0.1:5000".parse().expect("addr"), b"x").await;
+        let result = datapath
+            .send(
+                EndpointId(999),
+                "127.0.0.1:5000".parse().expect("addr"),
+                b"x",
+            )
+            .await;
         assert!(matches!(result, Err(DatapathError::UnknownEndpoint(_))));
     }
 
@@ -1106,7 +1145,10 @@ mod tests {
             .alloc_endpoint_for(AddressFamily::V6)
             .await
             .expect("alloc v6 b");
-        assert!(leg_a.local_addr.is_ipv6(), "v6 endpoint binds an IPv6 address");
+        assert!(
+            leg_a.local_addr.is_ipv6(),
+            "v6 endpoint binds an IPv6 address"
+        );
         assert_eq!(leg_a.local_addr.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
 
         // Two `::1` phones standing in for the v6 peers.
@@ -1145,7 +1187,11 @@ mod tests {
     async fn clock_and_last_activity_track_endpoints() {
         let datapath = UdpLoopbackDatapath::new();
         assert_eq!(datapath.now_ticks(), 0);
-        assert_eq!(datapath.last_activity(EndpointId(0)), None, "unknown endpoint");
+        assert_eq!(
+            datapath.last_activity(EndpointId(0)),
+            None,
+            "unknown endpoint"
+        );
         let leg = datapath.alloc_endpoint().await.expect("alloc");
         assert_eq!(
             datapath.last_activity(leg.id),
@@ -1280,9 +1326,7 @@ mod tests {
 
         // An RTCP SR (second byte 200 → PT 72, in 64..=95) relays and is observed.
         let report = vec![0x80u8, 200, 0x00, 0x06, 0x11, 0x22, 0x33, 0x44];
-        peer.send_to(&report, leg_a.local_addr)
-            .await
-            .expect("rtcp");
+        peer.send_to(&report, leg_a.local_addr).await.expect("rtcp");
         assert_eq!(recv(&callee).await.0, report);
 
         let observed = observations.try_recv().expect("the RTCP was observed");

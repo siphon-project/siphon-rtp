@@ -71,7 +71,13 @@ mod tests {
 
     fn tone(amplitude: i16, len: usize) -> Vec<i16> {
         (0..len)
-            .map(|index| if index % 2 == 0 { amplitude } else { -amplitude })
+            .map(|index| {
+                if index % 2 == 0 {
+                    amplitude
+                } else {
+                    -amplitude
+                }
+            })
             .collect()
     }
 
@@ -92,7 +98,7 @@ mod tests {
     fn hangover_holds_speech_through_brief_dips() {
         let mut vad = EnergyVad::new(1_000_000, 3);
         assert!(vad.is_speech(&tone(4000, 160))); // speech, arms hangover = 3
-        // Three silent frames are still held as speech.
+                                                  // Three silent frames are still held as speech.
         assert!(vad.is_speech(&[0i16; 160]));
         assert!(vad.is_speech(&[0i16; 160]));
         assert!(vad.is_speech(&[0i16; 160]));
@@ -116,7 +122,10 @@ mod tests {
         let mut b = EnergyVad::new(1_000_000, 3);
         for _ in 0..6 {
             assert_eq!(a.is_speech(&frame), b.is_speech_with_energy(energy));
-            assert_eq!(a.is_speech(&[0i16; 160]), b.is_speech_with_energy(EnergyVad::energy(&[0i16; 160])));
+            assert_eq!(
+                a.is_speech(&[0i16; 160]),
+                b.is_speech_with_energy(EnergyVad::energy(&[0i16; 160]))
+            );
         }
     }
 

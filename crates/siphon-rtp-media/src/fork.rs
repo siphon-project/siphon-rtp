@@ -103,8 +103,11 @@ impl RtpForkSink {
             }
         };
 
-        let total = match write_packet(&header, &payload[..payload_len], self.scratch.as_mut_slice())
-        {
+        let total = match write_packet(
+            &header,
+            &payload[..payload_len],
+            self.scratch.as_mut_slice(),
+        ) {
             Ok(total) => total,
             Err(_) => {
                 self.dropped += 1;
@@ -120,7 +123,10 @@ impl RtpForkSink {
 
         // Bounded, non-blocking: a full mailbox drops this frame (late media is worthless) rather
         // than blocking the shared decode. Disconnect (subscriber gone) is also a drop.
-        match self.output.try_send(Bytes::copy_from_slice(&self.scratch[..total])) {
+        match self
+            .output
+            .try_send(Bytes::copy_from_slice(&self.scratch[..total]))
+        {
             Ok(()) => {
                 self.forwarded += 1;
                 true
@@ -170,7 +176,11 @@ mod tests {
         assert_eq!(packet.payload_type, PCMU_PAYLOAD_TYPE);
         assert_eq!(packet.sequence, 0);
         assert_eq!(packet.timestamp, 0);
-        assert_eq!(packet.payload.len(), 160, "160-sample G.711 frame → 160-byte payload");
+        assert_eq!(
+            packet.payload.len(),
+            160,
+            "160-sample G.711 frame → 160-byte payload"
+        );
         assert_eq!(fork.forwarded(), 1);
         assert_eq!(fork.dropped(), 0);
     }
@@ -206,7 +216,11 @@ mod tests {
         for _ in 0..5 {
             fork.write_pcm(&pcm); // never blocks even though nothing is draining
         }
-        assert_eq!(fork.forwarded(), 2, "only the bounded capacity made it through");
+        assert_eq!(
+            fork.forwarded(),
+            2,
+            "only the bounded capacity made it through"
+        );
         assert_eq!(fork.dropped(), 3, "the rest were dropped, not queued");
 
         // The two buffered packets are still well-formed and the dropped frames left a sequence gap.
@@ -236,7 +250,11 @@ mod tests {
         fork.write_pcm(&pcm);
         let next_bytes = receiver.try_recv().expect("next");
         let next = RtpPacket::parse(&next_bytes).expect("parse");
-        assert_eq!(next.timestamp, 160 * 3, "clock advanced across the dropped frames");
+        assert_eq!(
+            next.timestamp,
+            160 * 3,
+            "clock advanced across the dropped frames"
+        );
         assert_eq!(next.sequence, 3);
     }
 
@@ -269,7 +287,10 @@ mod tests {
         let mut fork = ulaw_fork(sender);
         fork.write_pcm(&[0i16; 160]);
         fork.finish(); // default no-op
-        assert!(receiver.try_recv().is_ok(), "buffered packet survives finish");
+        assert!(
+            receiver.try_recv().is_ok(),
+            "buffered packet survives finish"
+        );
     }
 
     #[test]
@@ -280,6 +301,9 @@ mod tests {
         let mut fanout = FanOut::new();
         fanout.add(Box::new(ulaw_fork(sender)));
         fanout.write_pcm(&[100i16; 160]);
-        assert!(receiver.try_recv().is_ok(), "fork received the fanned-out frame");
+        assert!(
+            receiver.try_recv().is_ok(),
+            "fork received the fanned-out frame"
+        );
     }
 }

@@ -120,12 +120,37 @@ fn be32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-/// Length of a minimal Sender Report carrying no reception-report blocks (RFC 3550 §6.4.1).
+/// Length of a Sender Report header (no reception-report blocks), RFC 3550 §6.4.1.
 pub const SENDER_REPORT_LEN: usize = 28;
+/// Length of one reception-report block, RFC 3550 §6.4.1.
+pub const RECEPTION_REPORT_LEN: usize = 24;
 
-/// Build a minimal RTCP **Sender Report** (RC = 0, no reception-report blocks — the engine drops
-/// inbound RTCP, so it reports no reception stats). The conference emits one per egress stream so a
-/// receiver gets the NTP↔RTP mapping for lip-sync and a liveness signal (RFC 3550 §6.4.1).
+/// A reception-report block (RFC 3550 §6.4.1) — the engine's view of one inbound stream. The
+/// conference reports cumulative loss and the extended highest sequence; `jitter` / `last_sr` /
+/// `delay_last_sr` are `0` (not estimated — the engine does not consume inbound RTCP or per-packet
+/// arrival timing), and `fraction_lost` is `0` for now (cumulative loss carries the real signal).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReceptionReport {
+    /// SSRC of the source being reported on.
+    pub ssrc: u32,
+    /// Fraction of packets lost since the previous report (`0..=255` ⇒ `0..1`).
+    pub fraction_lost: u8,
+    /// Cumulative packets lost (24-bit; the top byte is ignored).
+    pub cumulative_lost: u32,
+    /// Extended highest sequence number received.
+    pub extended_highest_seq: u32,
+    /// Interarrival jitter estimate.
+    pub jitter: u32,
+    /// Middle 32 bits of the last SR's NTP timestamp from this source.
+    pub last_sr: u32,
+    /// Delay since the last SR, in 1/65536 s.
+    pub delay_last_sr: u32,
+}
+
+/// Write an RTCP **Sender Report** with `reports` reception blocks (`RC = reports.len()`, capped at
+/// 31) into `out`, returning its length — or `None` if `out` is too small. The conference emits one
+/// per egress stream so a receiver gets the NTP↔RTP mapping (lip-sync) + liveness, plus the engine's
+/// reception report on that participant's inbound stream (RFC 3550 §6.4.1).
 #[must_use]
 pub fn write_sender_report(
     ssrc: u32,
@@ -133,25 +158,46 @@ pub fn write_sender_report(
     rtp_timestamp: u32,
     packet_count: u32,
     octet_count: u32,
-) -> [u8; SENDER_REPORT_LEN] {
-    let mut out = [0u8; SENDER_REPORT_LEN];
-    out[0] = 0x80; // V=2, P=0, RC=0
+    reports: &[ReceptionReport],
+    out: &mut [u8],
+) -> Option<usize> {
+    let report_count = reports.len().min(31);
+    let total = SENDER_REPORT_LEN + report_count * RECEPTION_REPORT_LEN;
+    if out.len() < total {
+        return None;
+    }
+    out[0] = 0x80 | report_count as u8; // V=2, P=0, RC
     out[1] = 200; // PT = SR
-    // Length in 32-bit words minus one: (28 / 4) − 1 = 6.
-    out[2..4].copy_from_slice(&6u16.to_be_bytes());
+    let length_words = (total / 4 - 1) as u16;
+    out[2..4].copy_from_slice(&length_words.to_be_bytes());
     out[4..8].copy_from_slice(&ssrc.to_be_bytes());
     out[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
     out[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
     out[20..24].copy_from_slice(&packet_count.to_be_bytes());
     out[24..28].copy_from_slice(&octet_count.to_be_bytes());
-    out
+    for (index, report) in reports.iter().take(report_count).enumerate() {
+        let base = SENDER_REPORT_LEN + index * RECEPTION_REPORT_LEN;
+        out[base..base + 4].copy_from_slice(&report.ssrc.to_be_bytes());
+        // Fraction lost (1 byte) + cumulative lost (low 24 bits).
+        out[base + 4] = report.fraction_lost;
+        let cumulative = (report.cumulative_lost & 0x00FF_FFFF).to_be_bytes();
+        out[base + 5..base + 8].copy_from_slice(&cumulative[1..4]);
+        out[base + 8..base + 12].copy_from_slice(&report.extended_highest_seq.to_be_bytes());
+        out[base + 12..base + 16].copy_from_slice(&report.jitter.to_be_bytes());
+        out[base + 16..base + 20].copy_from_slice(&report.last_sr.to_be_bytes());
+        out[base + 20..base + 24].copy_from_slice(&report.delay_last_sr.to_be_bytes());
+    }
+    Some(total)
 }
 
 fn read_report_blocks(body: &[u8], count: usize) -> Vec<ReportBlock> {
     let mut reports = Vec::with_capacity(count);
     for index in 0..count {
         let start = index * REPORT_BLOCK_LEN;
-        match body.get(start..start + REPORT_BLOCK_LEN).and_then(ReportBlock::parse) {
+        match body
+            .get(start..start + REPORT_BLOCK_LEN)
+            .and_then(ReportBlock::parse)
+        {
             Some(block) => reports.push(block),
             None => break,
         }
@@ -185,7 +231,8 @@ pub fn parse_compound(buffer: &[u8]) -> Result<Vec<RtcpPacket>, RtcpError> {
             packet_type::SENDER_REPORT if body.len() >= 24 => {
                 packets.push(RtcpPacket::SenderReport(SenderReport {
                     ssrc: be32(&body[0..4]),
-                    ntp_timestamp: (u64::from(be32(&body[4..8])) << 32) | u64::from(be32(&body[8..12])),
+                    ntp_timestamp: (u64::from(be32(&body[4..8])) << 32)
+                        | u64::from(be32(&body[8..12])),
                     rtp_timestamp: be32(&body[12..16]),
                     packet_count: be32(&body[16..20]),
                     octet_count: be32(&body[20..24]),
@@ -236,7 +283,7 @@ mod tests {
         // RR: V2, RC=1, PT=201, length=7 words (32 bytes total). Reporter ssrc + 1 report block.
         let mut buffer = vec![0x81, 201, 0x00, 0x07];
         buffer.extend_from_slice(&0xAAAA_BBBBu32.to_be_bytes()); // reporter ssrc
-        // report block
+                                                                 // report block
         buffer.extend_from_slice(&0x1111_2222u32.to_be_bytes()); // ssrc
         buffer.push(0x10); // fraction lost
         buffer.extend_from_slice(&[0x00, 0x00, 0x05]); // cumulative lost = 5
@@ -290,9 +337,19 @@ mod tests {
     #[test]
     fn writes_a_parseable_sender_report() {
         // The SR we build must round-trip through the parser, field for field.
-        let bytes = write_sender_report(0xDEAD_BEEF, 0x1122_3344_5566_7788, 0x0001_0000, 42, 6720);
-        assert_eq!(bytes.len(), SENDER_REPORT_LEN);
-        let packets = parse_compound(&bytes).expect("parse");
+        let mut buffer = [0u8; 64];
+        let len = write_sender_report(
+            0xDEAD_BEEF,
+            0x1122_3344_5566_7788,
+            0x0001_0000,
+            42,
+            6720,
+            &[],
+            &mut buffer,
+        )
+        .expect("write");
+        assert_eq!(len, SENDER_REPORT_LEN);
+        let packets = parse_compound(&buffer[..len]).expect("parse");
         assert_eq!(packets.len(), 1);
         match &packets[0] {
             RtcpPacket::SenderReport(report) => {
@@ -302,6 +359,42 @@ mod tests {
                 assert_eq!(report.packet_count, 42);
                 assert_eq!(report.octet_count, 6720);
                 assert!(report.reports.is_empty(), "no reception blocks (RC = 0)");
+            }
+            other => panic!("expected SR, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writes_a_sender_report_with_a_reception_block() {
+        // SR + one reception report (RC = 1) round-trips through the parser.
+        let report = ReceptionReport {
+            ssrc: 0xAABB_CCDD,
+            fraction_lost: 0,
+            cumulative_lost: 5,
+            extended_highest_seq: 0x0001_2345,
+            ..ReceptionReport::default()
+        };
+        let mut buffer = [0u8; 64];
+        let len = write_sender_report(
+            0x1111_2222,
+            0,
+            0x0000_1000,
+            100,
+            16_000,
+            &[report],
+            &mut buffer,
+        )
+        .expect("write");
+        assert_eq!(len, SENDER_REPORT_LEN + RECEPTION_REPORT_LEN);
+        let packets = parse_compound(&buffer[..len]).expect("parse");
+        match &packets[0] {
+            RtcpPacket::SenderReport(sr) => {
+                assert_eq!(sr.ssrc, 0x1111_2222);
+                assert_eq!(sr.reports.len(), 1, "one reception block");
+                let block = &sr.reports[0];
+                assert_eq!(block.ssrc, 0xAABB_CCDD);
+                assert_eq!(block.cumulative_lost, 5);
+                assert_eq!(block.highest_sequence, 0x0001_2345);
             }
             other => panic!("expected SR, got {other:?}"),
         }

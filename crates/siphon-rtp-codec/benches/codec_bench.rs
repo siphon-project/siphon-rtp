@@ -3,17 +3,19 @@
 //! These lock per-frame / per-subframe cost so a regression fails CI. The AMR-WB decoder kernels
 //! are benched per-tier, plus the full mode-0 frame decode (`dec_main`) once it is wired.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(feature = "amr")]
 use criterion::BatchSize;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::basic_ops;
+#[cfg(feature = "amr")]
+use siphon_rtp_codec::amr::nb::dec_main::SpeechDecoder as NbSpeechDecoder;
 #[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::wb::dec_main::{decode_frame, DecoderState};
 #[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::wb::{codebook, constants, filters, lpc, pitch};
 #[cfg(feature = "amr")]
-use siphon_rtp_codec::amr::AMRWB_SPEECH_BITS;
+use siphon_rtp_codec::amr::{AmrWb, AMRWB_SPEECH_BITS};
 use siphon_rtp_codec::cn::Cn;
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::g722::G722;
@@ -83,7 +85,9 @@ fn bench_g722(criterion: &mut Criterion) {
     });
 
     // Seed a representative payload from a fresh encoder, then bench the stateful decode.
-    G722::new(20).encode(&pcm, &mut payload).expect("seed payload");
+    G722::new(20)
+        .encode(&pcm, &mut payload)
+        .expect("seed payload");
     let mut decoder = G722::new(20);
     criterion.bench_function("g722_decode_frame", |bencher| {
         bencher.iter(|| {
@@ -113,7 +117,9 @@ fn bench_g726(criterion: &mut Criterion) {
         });
     });
 
-    G726::new(Rate::R32, 20).encode(&pcm, &mut payload).expect("seed payload");
+    G726::new(Rate::R32, 20)
+        .encode(&pcm, &mut payload)
+        .expect("seed payload");
     let mut decoder = G726::new(Rate::R32, 20);
     criterion.bench_function("g726_32_decode_frame", |bencher| {
         bencher.iter(|| {
@@ -141,7 +147,9 @@ fn bench_gsm_fr(criterion: &mut Criterion) {
         });
     });
 
-    GsmFr::new().encode(&pcm, &mut payload).expect("seed payload");
+    GsmFr::new()
+        .encode(&pcm, &mut payload)
+        .expect("seed payload");
     let mut decoder = GsmFr::new();
     criterion.bench_function("gsm_fr_decode_frame", |bencher| {
         bencher.iter(|| {
@@ -243,7 +251,9 @@ fn bench_amrwb_dsp(criterion: &mut Criterion) {
     });
 
     // 12.8 → 16 kHz 5/4 oversampler, one subframe.
-    let sig12k8: Vec<i16> = (0..SUBFR).map(|i| ((i * 211 % 2000) as i16) - 1000).collect();
+    let sig12k8: Vec<i16> = (0..SUBFR)
+        .map(|i| ((i * 211 % 2000) as i16) - 1000)
+        .collect();
     let mut sig16k = vec![0i16; SUBFR * 5 / 4];
     let mut mem = [0i16; 24]; // 2 * NB_COEF_UP
     criterion.bench_function("amrwb_oversamp_subfr", |bencher| {
@@ -313,7 +323,111 @@ fn bench_amrwb_decode(criterion: &mut Criterion) {
     }
 }
 
-// AMR-WB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
+/// AMR-NB full per-frame decode (`dec_main`), one bench per speech mode (0..=7), over the official
+/// `T_<mode>` vectors. The decoder is warmed through the preceding frames so the timed decode sees
+/// realistic filter/predictor memory (not the post-reset transient).
+#[cfg(feature = "amr")]
+fn bench_amrnb_decode(criterion: &mut Criterion) {
+    // (mode index, vector tag) for the 8 speech modes.
+    const MODES: [(usize, &str); 8] = [
+        (0, "475"),
+        (1, "515"),
+        (2, "59"),
+        (3, "67"),
+        (4, "74"),
+        (5, "795"),
+        (6, "102"),
+        (7, "122"),
+    ];
+    const FRAME_WORDS: usize = 250; // 1 + 244 + 1 + 4
+
+    for (mode, tag) in MODES {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push(format!(
+            "../../reference/amr-nb/testv/NODTX/T_{tag}/T01_{tag}.COD"
+        ));
+        let Ok(cod) = std::fs::read(&path) else {
+            continue; // vectors not present in this checkout
+        };
+        let cod_words: Vec<i16> = cod
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        let frame_index = 12usize.min(cod_words.len() / FRAME_WORDS - 1);
+        let base = frame_index * FRAME_WORDS;
+        let bits: Vec<i16> = cod_words[base + 1..base + 1 + 244].to_vec();
+
+        let mut dec = NbSpeechDecoder::new();
+        let mut out = vec![0i16; FRAME];
+        for f in 0..frame_index {
+            let fb = &cod_words[f * FRAME_WORDS + 1..f * FRAME_WORDS + 1 + 244];
+            dec.decode_frame(mode, fb, &mut out);
+        }
+        let warm = dec.clone();
+
+        criterion.bench_function(&format!("amrnb_decode_mode{mode}_frame"), |bencher| {
+            bencher.iter_batched(
+                || warm.clone(),
+                |mut st| st.decode_frame(mode, black_box(&bits), black_box(&mut out)),
+                BatchSize::SmallInput,
+            );
+        });
+    }
+}
+
+/// Full per-mode frame encode (µs/frame): the whole `coder()` analysis pipeline, for every speech
+/// mode 0..=8. Mode 8 additionally pays for the high-band `synthesis()` + HF-gain quantization.
+/// Reads a real warmed-up speech frame from the 3GPP `tst.inp` input; if the (gitignored) input is
+/// absent the bench is skipped so CI without the vectors still builds.
+#[cfg(feature = "amr")]
+fn bench_amrwb_encode(criterion: &mut Criterion) {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("../../reference/amr-wb/testv/tst.inp");
+    let Ok(inp) = std::fs::read(&path) else {
+        return; // input vector not present in this checkout
+    };
+    let pcm: Vec<i16> = inp
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let n_frames = pcm.len() / constants::L_FRAME16K;
+    // Pick frame 8 — the first frame with real (non-silence, post-homing) speech energy.
+    let frame_index = 8usize;
+    if n_frames <= frame_index {
+        return;
+    }
+
+    for mode in 0u8..=8 {
+        let nb_bits = AMRWB_SPEECH_BITS[mode as usize] as usize;
+        let frame_pcm: Vec<i16> = pcm
+            [frame_index * constants::L_FRAME16K..(frame_index + 1) * constants::L_FRAME16K]
+            .to_vec();
+
+        // Warm the encoder state through the preceding frames so the bench sees realistic memory.
+        let mut warm = AmrWb::new();
+        let mut out = vec![0i16; nb_bits];
+        for f in 0..frame_index {
+            let fp = &pcm[f * constants::L_FRAME16K..(f + 1) * constants::L_FRAME16K];
+            warm.encode_mode_bits(mode, fp, &mut out)
+                .expect("warm encode");
+        }
+
+        criterion.bench_function(&format!("amrwb_encode_mode{mode}_frame"), |bencher| {
+            // Clone the warmed state outside the timed section so only the encode is measured.
+            bencher.iter_batched(
+                || warm.clone(),
+                |mut st| {
+                    st.encode_mode_bits(mode, black_box(&frame_pcm), black_box(&mut out))
+                        .expect("encode")
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+}
+
+// AMR-WB/NB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
 #[cfg(feature = "amr")]
 criterion_group!(
     benches,
@@ -325,8 +439,17 @@ criterion_group!(
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
-    bench_amrwb_decode
+    bench_amrwb_decode,
+    bench_amrnb_decode,
+    bench_amrwb_encode
 );
 #[cfg(not(feature = "amr"))]
-criterion_group!(benches, bench_g711, bench_g722, bench_g726, bench_gsm_fr, bench_cn);
+criterion_group!(
+    benches,
+    bench_g711,
+    bench_g722,
+    bench_g726,
+    bench_gsm_fr,
+    bench_cn
+);
 criterion_main!(benches);

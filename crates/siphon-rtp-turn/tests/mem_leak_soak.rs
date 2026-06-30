@@ -123,8 +123,12 @@ async fn allocate_relay_delete_does_not_leak() {
     let datapath = UdpLoopbackDatapath::new();
     let mut config = TurnConfig::new(REALM, SECRET);
     config.denied_peers = PeerIpPolicy::permissive();
-    let turn = Turn::spawn(Arc::new(datapath.clone()), config, Arc::new(FixedUnixClock::new(1_000)))
-        .expect("spawn");
+    let turn = Turn::spawn(
+        Arc::new(datapath.clone()),
+        config,
+        Arc::new(FixedUnixClock::new(1_000)),
+    )
+    .expect("spawn");
     let listener = UdpSocket::bind(("127.0.0.1", 0)).await.expect("listener");
     let server = listener.local_addr().expect("addr");
     let serving = turn.clone();

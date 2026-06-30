@@ -36,9 +36,18 @@ fn mix_tick_makes_no_heap_allocation() {
         .map(|index| vec![((index as i16) * 41).wrapping_add(7); FRAME])
         .collect();
     let roles = vec![Role::Talker; PARTICIPANTS];
-    let energy: Vec<i64> = (0..PARTICIPANTS).map(|index| (index as i64 + 1) * 1_000).collect();
+    let energy: Vec<i64> = (0..PARTICIPANTS)
+        .map(|index| (index as i64 + 1) * 1_000)
+        .collect();
     let speaking = vec![true; PARTICIPANTS];
-    let inputs = MixInputs { pcm: &pcm, roles: &roles, energy: &energy, speaking: &speaking, external: None, frame_len: FRAME };
+    let inputs = MixInputs {
+        pcm: &pcm,
+        roles: &roles,
+        energy: &energy,
+        speaking: &speaking,
+        external: None,
+        frame_len: FRAME,
+    };
     let mut mixer = Mixer::new(PARTICIPANTS, FRAME);
 
     // Warm up one tick so any one-time lazy init is paid before we sample.
@@ -52,7 +61,8 @@ fn mix_tick_makes_no_heap_allocation() {
     let after = ALLOCATIONS.load(Ordering::Relaxed);
 
     assert_eq!(
-        after, before,
+        after,
+        before,
         "mix tick allocated {} times across 1000 ticks (must be zero)",
         after - before
     );

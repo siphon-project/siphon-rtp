@@ -143,7 +143,10 @@ mod tests {
     #[test]
     fn pristine_g711_is_near_toll_quality() {
         let mos = estimate_mos(Codec::G711, clean());
-        assert!((4.3..=4.5).contains(&mos), "G.711 clean MOS ~4.4, got {mos}");
+        assert!(
+            (4.3..=4.5).contains(&mos),
+            "G.711 clean MOS ~4.4, got {mos}"
+        );
     }
 
     #[test]
@@ -185,7 +188,10 @@ mod tests {
                 ..clean()
             },
         );
-        assert!(low - high > 20.0, "delay past the knee costs R sharply ({low} -> {high})");
+        assert!(
+            low - high > 20.0,
+            "delay past the knee costs R sharply ({low} -> {high})"
+        );
     }
 
     #[test]
@@ -198,14 +204,20 @@ mod tests {
                 ..clean()
             },
         );
-        assert!(no_jitter > jittery, "jitter inflates buffering delay and lowers R");
+        assert!(
+            no_jitter > jittery,
+            "jitter inflates buffering delay and lowers R"
+        );
     }
 
     #[test]
     fn lower_bitrate_codec_scores_below_g711_at_equal_conditions() {
         let g711 = estimate_mos(Codec::G711, clean());
         let g729 = estimate_mos(Codec::G729, clean());
-        assert!(g711 > g729, "G.729 (Ie=11) < G.711 (Ie=0): {g711} vs {g729}");
+        assert!(
+            g711 > g729,
+            "G.729 (Ie=11) < G.711 (Ie=0): {g711} vs {g729}"
+        );
     }
 
     #[test]

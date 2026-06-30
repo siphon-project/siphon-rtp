@@ -193,7 +193,10 @@ where
     // ChannelBind.
     let channel = 0x4001u16;
     let bind = authed(turn::METHOD_CHANNEL_BIND, &[3u8; 12], &nonce)
-        .attribute(turn::ATTR_CHANNEL_NUMBER, &turn::channel_number_value(channel))
+        .attribute(
+            turn::ATTR_CHANNEL_NUMBER,
+            &turn::channel_number_value(channel),
+        )
         .attribute(
             turn::ATTR_XOR_PEER_ADDRESS,
             &turn::xor_address_value(peer_addr, &[3u8; 12]),
@@ -248,7 +251,8 @@ fn tls_pair() -> (TlsAcceptor, TlsConnector) {
     // Install the ring crypto provider once per process (ignored if already installed).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
     let cert_der = CertificateDer::from(certified.cert.der().to_vec());
     let key_der =
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));

@@ -1,28 +1,33 @@
 // AMR-WB encoder. Ported bit-exact from the 3GPP fixed-point C reference; the index loops and
 // manual slice copies deliberately mirror the C (`cod_main.c` et al.) line-for-line so the port can
 // be audited against the spec source, so the matching idiom-style lints are quieted module-wide.
-// (`dead_code` covers the mode-8 high-band helpers that are reachable only once that tier lands.)
 #![allow(
     clippy::needless_range_loop,
     clippy::manual_memcpy,
-    clippy::explicit_counter_loop,
-    dead_code
+    clippy::explicit_counter_loop
 )]
 
 //! AMR-WB encoder orchestration (3GPP TS 26.190 / TS 26.173 `cod_main.c` `coder()`), ported
 //! bit-exact. Drives the per-20 ms-frame analysis: pre-processing → LP analysis → ISF quantization →
 //! open-loop pitch → per-subframe (closed-loop pitch, algebraic codebook search, gain VQ, excitation
-//! and filter-memory updates) → `Prm2bits` parameter packing.
+//! and filter-memory updates) → `Prm2bits` parameter packing. Mode 8 (23.85 kbit/s) additionally
+//! runs the high-band `synthesis()` tier and packs the 4-bit HF correction-gain index per subframe.
 //!
-//! Non-DTX (`allow_dtx == 0`) speech path only; the comfort-noise (`MRDTX`) and the mode-8 high-band
-//! gain quantization (`synthesis()`) tiers are not yet wired (mode 8 omits the final 4-bit HF index).
+//! Speech path only: the comfort-noise / SID (`MRDTX`) frames are not emitted. The DTX
+//! speech-hangover counter *is* tracked, however, because the reference vectors are produced with
+//! DTX enabled and the mode-8 `synthesis()` `gain_alpha` update reads it. For active-speech input
+//! the hangover never expires, so no `MRDTX` frame is ever produced and the framing is unchanged.
 
 use crate::amr::basic_ops::{
-    abs_s, add, extract_h, l_abs, l_deposit_h, l_mac, l_msu, l_mult, l_negate, l_shl, mult, norm_s,
-    round_word, shl, shr, sub,
+    abs_s, add, div_s, extract_h, l_abs, l_add, l_deposit_h, l_mac, l_mult, l_msu, l_negate, l_shl,
+    l_sub, mult, norm_l, norm_s, round_word, shl, shr, sub,
 };
+use crate::amr::math_op::{dot_product12, isqrt_n, random};
+use crate::amr::oper_32b::{l_extract, mpy_32_16};
 use crate::amr::wb::bitstream::parm_serial;
-use crate::amr::wb::constants::{GP_CLIP, L_INTERPOL, PIT_MAX, PIT_MIN, PIT_SHARP};
+use crate::amr::wb::constants::{GP_CLIP, L_INTERPOL, L_SUBFR16K, PIT_MAX, PIT_MIN, PIT_SHARP};
+use crate::amr::wb::enhance::{filt_6k_7k, hp400_12k8};
+use crate::amr::wb::filters::{deemph_32, syn_filt_32};
 use crate::amr::wb::enc_acelp::{
     acelp_2t64_fx, convolve, cor_h_x, g_pitch, gp_clip, gp_clip_test_gain_pit, gp_clip_test_isf,
     init_gp_clip, init_q_gain2, preemph, preemph2, q_gain2, syn_filt, updt_tar, voice_factor,
@@ -54,6 +59,14 @@ const NBBITS_24K: i16 = 477;
 
 /// `nb_of_bits[mode]` (`bits.h`), speech modes 0..=8.
 const NB_OF_BITS: [i16; 9] = [132, 177, 253, 285, 317, 365, 397, 461, 477];
+
+/// HF correction-gain quantization table (`cod_main.c` `HP_gain[16]`); only mode 8 (≥ 23.85k)
+/// transmits the nearest index into it. Mirrors the decoder's `HP_GAIN`.
+#[rustfmt::skip]
+const HP_GAIN: [i16; 16] = [
+    3624, 4673, 5597, 6479, 7425, 8378, 9324, 10264,
+    11210, 12206, 13391, 14844, 16770, 19655, 24289, 32728,
+];
 
 /// LPC interpolation fractions {0.45, 0.8, 0.96} Q15 (`cod_main.c` `interpol_frac`, last 1.0 implicit).
 const INTERPOL_FRAC: [i16; 3] = [14746, 26214, 31457];
@@ -115,6 +128,40 @@ pub struct EncoderState {
     q_old: i16,
     q_max: [i16; 2],
     vad_hist: i16,
+    // Mode-8 (23.85 kbit/s) high-band gain analysis state (`cod_main.h`); only the `synthesis()`
+    // tier reads/writes these, and only mode 8 transmits the resulting 4-bit HF gain index.
+    /// Noise-enhancer gain threshold (`L_gc_thres`).
+    l_gc_thres: i32,
+    /// Modified synthesis memory MSB / LSB (`mem_syn_hi[M]`, `mem_syn_lo[M]`).
+    mem_syn_hi: [i16; M],
+    mem_syn_lo: [i16; M],
+    /// Speech de-emphasis filter memory (`mem_deemph`).
+    mem_deemph: i16,
+    /// HP50 filter memory for the synthesis output (`mem_sig_out[6]`).
+    mem_sig_out: [i16; 6],
+    /// HP400 filter memory for synthesis (`mem_hp400[6]`).
+    mem_hp400: [i16; 6],
+    /// HF synthesis memory (`mem_syn_hf[M]`).
+    mem_syn_hf: [i16; M],
+    /// HF band-pass filter memory for the synthesised noise (`mem_hf[2*L_FILT16k]` → 30).
+    mem_hf: [i16; 30],
+    /// HF band-pass filter memory for the original-signal reference (`mem_hf2[2*L_FILT16k]` → 30).
+    mem_hf2: [i16; 30],
+    /// Random memory for HF noise generation (`seed2`).
+    seed2: i16,
+    /// HF-gain smoothing factor (`gain_alpha`). Re-scaled by `dtx_hangover_count / 7` every
+    /// subframe in `synthesis()`, then re-clamped to 32767 while `dtx_hangover_count > 6`.
+    gain_alpha: i16,
+    /// DTX speech-hangover counter (`dtx_encState.dtxHangoverCount`, `dtx.c` `tx_dtx_handler`).
+    /// The reference test vectors are generated with DTX enabled (`testv/test_enc.bat`: `coder
+    /// -dtx N`), so the mode-8 `synthesis()` `gain_alpha` update reads this evolving count rather
+    /// than the fixed `DTX_HANG_CONST`. Reset to 7 on every speech frame, decremented (floor 0) on
+    /// each non-speech frame. Only mode 8 reads it.
+    dtx_hangover_count: i16,
+    /// DTX decoder-analysis elapsed-frame counter (`dtx_encState.decAnaElapsedCount`). Tracked so
+    /// the hangover state machine matches the reference exactly; for active-speech input it stays
+    /// saturated and never forces the comfort-noise (`MRDTX`) path.
+    dec_ana_elapsed_count: i16,
     vad: VadState,
 }
 
@@ -161,6 +208,21 @@ impl EncoderState {
             q_old: 15,
             q_max: [15, 15],
             vad_hist: 0,
+            // `Reset_encoder(st, 1)`: all HF memories zero; `seed2 = 21845`, `gain_alpha = 32767`.
+            l_gc_thres: 0,
+            mem_syn_hi: [0; M],
+            mem_syn_lo: [0; M],
+            mem_deemph: 0,
+            mem_sig_out: [0; 6],
+            mem_hp400: [0; 6],
+            mem_syn_hf: [0; M],
+            mem_hf: [0; 30],
+            mem_hf2: [0; 30],
+            seed2: 21845,
+            gain_alpha: 32767,
+            // `dtx_enc_reset()`: dtxHangoverCount = DTX_HANG_CONST (7), decAnaElapsedCount = 32767.
+            dtx_hangover_count: DTX_HANG_CONST,
+            dec_ana_elapsed_count: 32767,
             vad: VadState::new(),
         };
         init_gp_clip(&mut s.gp_clip);
@@ -337,7 +399,26 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         }
     }
 
-    // (non-DTX) write VAD flag as the 1st parameter
+    // -------- DTX speech-hangover state machine (`dtx.c` `tx_dtx_handler`) --------
+    // The reference test vectors are generated with DTX enabled (`testv/test_enc.bat`), so this
+    // runs every frame to keep `dtx_hangover_count` in lock-step with the reference. Only mode 8's
+    // `synthesis()` reads the count (via `gain_alpha`); the SID/comfort-noise (`MRDTX`) branch is
+    // never taken for active-speech input (`tst.inp`), so the bitstream framing is unchanged for
+    // all modes — modes 0..=7 stay byte-exact whether or not this runs.
+    state.dec_ana_elapsed_count = add(state.dec_ana_elapsed_count, 1);
+    if vad_flag != 0 {
+        state.dtx_hangover_count = DTX_HANG_CONST;
+    } else if state.dtx_hangover_count == 0 {
+        // Out of decoder-analysis hangover: the reference would switch to `MRDTX` (comfort noise).
+        // `tst.inp` never reaches this; the speech-only encode path does not implement SID frames.
+        state.dec_ana_elapsed_count = 0;
+    } else {
+        state.dtx_hangover_count = sub(state.dtx_hangover_count, 1);
+        // `decAnaElapsedCount + dtxHangoverCount < DTX_ELAPSED_FRAMES_THRESH` would also force
+        // `MRDTX`; for active speech `decAnaElapsedCount` stays saturated so this never trips.
+    }
+
+    // (non-DTX framing) write VAD flag as the 1st parameter
     parm_serial(vad_flag, 1, prms, &mut pos);
 
     // -------- LP analysis --------
@@ -911,10 +992,76 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
             let mut synth = [0i16; L_SUBFR];
             syn_filt(&aq[p_aq..p_aq + M + 1], M, &exc_slice, &mut synth, L_SUBFR, &mut state.mem_syn, true);
         }
-        // (mode 8 high-band synthesis + 4-bit index omitted; see module docs.)
-        let _ = (stab_fac, &l_gain_code);
-        l_gain_code = 0;
-        let _ = l_gain_code;
+
+        // ---- Mode 8 (≥ 23.85k): high-band synthesis + transmitted 4-bit HF gain index ----
+        // `cod_main.c` `coder()`: only the highest mode runs the noise/pitch enhancer on `code[]`,
+        // rebuilds the enhanced excitation `exc2`, then `synthesis()` quantises the HF correction
+        // gain. Lower modes estimate the HF gain at the decoder and transmit nothing.
+        if sub(ser_size, NBBITS_24K) >= 0 {
+            // Noise enhancer (`cod_main.c` lines 1303..1338): nudge L_gain_code toward the gain
+            // threshold by up to 1.5 dB when the signal is noisy and the LPC filter is stable.
+            let tmp_ne = sub(16384, shr(voice_fac, 1)); // 1=unvoiced, 0=voiced
+            let fac = mult(stab_fac, tmp_ne);
+
+            let (gc_hi, gc_lo) = l_extract(l_gain_code);
+            let mut l_thr = l_gain_code;
+            if l_sub(l_thr, state.l_gc_thres) < 0 {
+                l_thr = l_add(l_thr, mpy_32_16(gc_hi, gc_lo, 6226));
+                if l_sub(l_thr, state.l_gc_thres) > 0 {
+                    l_thr = state.l_gc_thres;
+                }
+            } else {
+                l_thr = mpy_32_16(gc_hi, gc_lo, 27536);
+                if l_sub(l_thr, state.l_gc_thres) < 0 {
+                    l_thr = state.l_gc_thres;
+                }
+            }
+            state.l_gc_thres = l_thr;
+
+            let (gc_hi, gc_lo) = l_extract(l_gain_code);
+            l_gain_code = mpy_32_16(gc_hi, gc_lo, sub(32767, fac));
+            let (thr_hi, thr_lo) = l_extract(l_thr);
+            l_gain_code = l_add(l_gain_code, mpy_32_16(thr_hi, thr_lo, fac));
+
+            // Pitch enhancer (`cod_main.c` lines 1340..1364): smooth FIR high-pass of `code[]`
+            // toward `code2[]`, weighted by the voicing factor.
+            let tmp_pe = add(shr(voice_fac, 3), 4096); // 0.25=voiced, 0=unvoiced
+            let mut code2 = [0i16; L_SUBFR];
+            let mut l_tmp = l_deposit_h(code[0]);
+            l_tmp = l_msu(l_tmp, code[1], tmp_pe);
+            code2[0] = round_word(l_tmp);
+            for i in 1..(L_SUBFR - 1) {
+                let mut l_tmp = l_deposit_h(code[i]);
+                l_tmp = l_msu(l_tmp, code[i + 1], tmp_pe);
+                l_tmp = l_msu(l_tmp, code[i - 1], tmp_pe);
+                code2[i] = round_word(l_tmp);
+            }
+            let mut l_tmp = l_deposit_h(code[L_SUBFR - 1]);
+            l_tmp = l_msu(l_tmp, code[L_SUBFR - 2], tmp_pe);
+            code2[L_SUBFR - 1] = round_word(l_tmp);
+
+            // Build enhanced excitation `exc2` (`cod_main.c` lines 1368..1377). `exc2` still holds
+            // the adaptive (gain_pit) contribution from the re-copy above.
+            let gain_code = round_word(l_shl(l_gain_code, q_new));
+            for i in 0..L_SUBFR {
+                let mut l_tmp = l_mult(code2[i], gain_code);
+                l_tmp = l_shl(l_tmp, 5);
+                l_tmp = l_mac(l_tmp, exc2[i], gain_pit);
+                l_tmp = l_shl(l_tmp, 1); // saturation can occur here
+                exc2[i] = round_word(l_tmp);
+            }
+
+            // High-band synthesis + HF-gain quantisation; emit the 4-bit index per subframe.
+            let out_off = i_subfr * 5 / 4;
+            let corr_gain = synthesis(
+                state,
+                &aq[p_aq..p_aq + M + 1],
+                &mut exc2,
+                q_new,
+                &speech16k[out_off..out_off + L_SUBFR16K],
+            );
+            parm_serial(corr_gain, 4, prms, &mut pos);
+        }
 
         p_a += M + 1;
         p_aq += M + 1;
@@ -927,6 +1074,181 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
     state.old_exc.copy_from_slice(&old_exc[L_FRAME..L_FRAME + PIT_MAX + L_INTERPOL]);
 
     pos
+}
+
+/// `dtx.h` `DTX_HANG_CONST` — the speech-hangover reload value (`dtx.c` `tx_dtx_handler`).
+const DTX_HANG_CONST: i16 = 7;
+
+/// Analysis-side high-band synthesis with HF correction-gain quantization (`cod_main.c`
+/// `synthesis()`), the mode-8 (23.85k) counterpart of the decoder's `synthesis()`.
+///
+/// Synthesises the 12.8 kHz speech for `exc`, generates the 5.5–7.5 kHz HF noise the decoder would
+/// produce, then matches its energy against the high band of the *original* 16 kHz `synth16k` to
+/// pick the best of 16 quantised correction gains (`HP_gain`). Updates every HF filter memory so the
+/// next subframe stays in lock-step with the decoder, and returns the 4-bit `HP_gain` index.
+///
+/// The `gain_alpha` mix-factor is re-scaled by `state.dtx_hangover_count / 7` each subframe, then
+/// re-clamped to 32767 while the count is still > 6 (TS 26.190; `cod_main.c` lines 1593..1599). The
+/// reference vectors are produced with DTX enabled, so on hangover frames the count is < 7 and
+/// `gain_alpha` decays, biasing `HP_corr_gain` toward the estimated gain.
+fn synthesis(
+    state: &mut EncoderState,
+    aq: &[i16],
+    exc: &mut [i16],
+    q_new: i16,
+    synth16k: &[i16],
+) -> i16 {
+    let mut synth_hi = [0i16; M + L_SUBFR];
+    let mut synth_lo = [0i16; M + L_SUBFR];
+    let mut synth = [0i16; L_SUBFR];
+    let mut hf = [0i16; L_SUBFR16K];
+    let mut hf_sp = [0i16; L_SUBFR16K]; // HF from the original signal (gain reference)
+    let mut ap = [0i16; M + 1];
+
+    // ---- 12.8 kHz speech synthesis: 1/A(z), deemphasis, HP50. ----
+    synth_hi[..M].copy_from_slice(&state.mem_syn_hi);
+    synth_lo[..M].copy_from_slice(&state.mem_syn_lo);
+
+    syn_filt_32(aq, M, exc, q_new, &mut synth_hi, &mut synth_lo, L_SUBFR);
+
+    state.mem_syn_hi.copy_from_slice(&synth_hi[L_SUBFR..L_SUBFR + M]);
+    state.mem_syn_lo.copy_from_slice(&synth_lo[L_SUBFR..L_SUBFR + M]);
+
+    deemph_32(
+        &synth_hi[M..],
+        &synth_lo[M..],
+        &mut synth,
+        PREEMPH_FAC,
+        &mut state.mem_deemph,
+    );
+
+    hp50_12k8(&mut synth, L_SUBFR, &mut state.mem_sig_out);
+
+    // Original speech as the reference for high-band gain quantization.
+    hf_sp[..L_SUBFR16K].copy_from_slice(&synth16k[..L_SUBFR16K]);
+
+    // ---- HF noise synthesis: white noise scaled to the excitation energy. ----
+    for sample in hf.iter_mut().take(L_SUBFR16K) {
+        *sample = shr(random(&mut state.seed2), 3);
+    }
+
+    let mut exc_scaled = [0i16; L_SUBFR];
+    exc_scaled.copy_from_slice(&exc[..L_SUBFR]);
+    scale_sig(&mut exc_scaled, L_SUBFR, -3);
+    let q_new_hf = sub(q_new, 3);
+
+    let (l_ee, exp_ener0) = dot_product12(&exc_scaled, &exc_scaled, L_SUBFR);
+    let ener = extract_h(l_ee);
+    let exp_ener = sub(exp_ener0, add(q_new_hf, q_new_hf));
+
+    let (l_hh, mut exp) = dot_product12(&hf, &hf, L_SUBFR16K);
+    let mut tmp = extract_h(l_hh);
+    if sub(tmp, ener) > 0 {
+        tmp = shr(tmp, 1); // be sure tmp < ener
+        exp = add(exp, 1);
+    }
+    let mut l_tmp = l_deposit_h(div_s(tmp, ener));
+    exp = sub(exp, exp_ener);
+    isqrt_n(&mut l_tmp, &mut exp);
+    l_tmp = l_shl(l_tmp, add(exp, 1)); // L_tmp x 2, Q31
+    tmp = extract_h(l_tmp); // 2 * sqrt(ener_exc / ener_hf)
+    for sample in hf.iter_mut().take(L_SUBFR16K) {
+        *sample = mult(*sample, tmp);
+    }
+
+    // ---- Tilt of synthesis speech → estimated HF gain (`HP_est_gain`). ----
+    hp400_12k8(&mut synth, L_SUBFR, &mut state.mem_hp400);
+
+    let mut l_r0 = 1i32;
+    for &v in &synth[..L_SUBFR] {
+        l_r0 = l_mac(l_r0, v, v);
+    }
+    exp = norm_l(l_r0);
+    let ener_r0 = extract_h(l_shl(l_r0, exp));
+
+    let mut l_r1 = 1i32;
+    for i in 1..L_SUBFR {
+        l_r1 = l_mac(l_r1, synth[i], synth[i - 1]);
+    }
+    let r1 = extract_h(l_shl(l_r1, exp));
+    let fac = if r1 > 0 { div_s(r1, ener_r0) } else { 0 };
+
+    let gain1 = sub(32767, fac);
+    let mut gain2 = mult(sub(32767, fac), 20480);
+    gain2 = shl(gain2, 1);
+
+    let (weight1, weight2) = if state.vad_hist > 0 {
+        (0i16, 32767i16)
+    } else {
+        (32767i16, 0i16)
+    };
+    let mut tmp = mult(weight1, gain1);
+    tmp = add(tmp, mult(weight2, gain2));
+    if tmp != 0 {
+        tmp = add(tmp, 1);
+    }
+    let mut hp_est_gain = tmp;
+    if sub(hp_est_gain, 3277) < 0 {
+        hp_est_gain = 3277; // 0.1 in Q15
+    }
+
+    // ---- HF synthesis filter (>7k path: weight Aq by 0.6, Syn_filt order M). ----
+    // The HF `Syn_filt` runs over a full L_SUBFR16K (80) block, so use the wide-buffer `enhance`
+    // variant (the `enc_acelp` one is sized for the 12.8 kHz L_SUBFR path only).
+    weight_a(aq, &mut ap, 19661, M); // fac = 0.6
+    let hf_in = hf;
+    crate::amr::wb::enhance::syn_filt(&ap, M, &hf_in, &mut hf, L_SUBFR16K, &mut state.mem_syn_hf, true);
+
+    // ---- Band-pass both the synthetic HF and the original HF to 6–7 kHz. ----
+    filt_6k_7k(&mut hf, L_SUBFR16K, &mut state.mem_hf);
+    filt_6k_7k(&mut hf_sp, L_SUBFR16K, &mut state.mem_hf2);
+
+    // ---- Calculated HF gain (`HP_calc_gain`): sqrt(ener_original / ener_synth_hf). ----
+    scale_sig(&mut hf_sp, L_SUBFR16K, -1);
+    let (l_sp, exp_ener0) = dot_product12(&hf_sp, &hf_sp, L_SUBFR16K);
+    let ener = extract_h(l_sp);
+    let exp_ener = exp_ener0;
+
+    let (l_hh2, mut exp) = dot_product12(&hf, &hf, L_SUBFR16K);
+    let mut tmp = extract_h(l_hh2);
+    if sub(tmp, ener) > 0 {
+        tmp = shr(tmp, 1); // be sure tmp < ener
+        exp = add(exp, 1);
+    }
+    let mut l_tmp = l_deposit_h(div_s(tmp, ener));
+    exp = sub(exp, exp_ener);
+    isqrt_n(&mut l_tmp, &mut exp);
+    l_tmp = l_shl(l_tmp, exp); // Q31
+    let hp_calc_gain = extract_h(l_tmp);
+
+    // ---- Mix calculated and estimated gains by `gain_alpha`. ----
+    // `gain_alpha *= dtxHangoverCount / 7` (`cod_main.c` 1593..1599); re-clamped to 32767 only
+    // while the count is still > 6 (i.e. on speech frames). On DTX hangover frames the count is
+    // < 7, so `gain_alpha` decays multiplicatively across the four subframes.
+    let l_tmp = l_shl(l_mult(state.dtx_hangover_count, 4681), 15);
+    state.gain_alpha = mult(state.gain_alpha, extract_h(l_tmp));
+    if sub(state.dtx_hangover_count, 6) > 0 {
+        state.gain_alpha = 32767;
+    }
+    let hp_est_gain_q14 = shr(hp_est_gain, 1); // Q15 → Q14
+    let hp_corr_gain = add(
+        mult(hp_calc_gain, state.gain_alpha),
+        mult(sub(32767, state.gain_alpha), hp_est_gain_q14),
+    );
+
+    // ---- Quantize the correction gain: nearest of the 16 `HP_gain` entries. ----
+    let mut dist_min = 32767i16;
+    let mut hp_gain_ind = 0i16;
+    for i in 0..16 {
+        let d = sub(hp_corr_gain, HP_GAIN[i]);
+        let dist = mult(d, d);
+        if sub(dist_min, dist) > 0 {
+            dist_min = dist;
+            hp_gain_ind = i as i16;
+        }
+    }
+
+    hp_gain_ind
 }
 
 /// Map `ser_size` to the ACELP pulse budget (`coder.c` mode dispatch).

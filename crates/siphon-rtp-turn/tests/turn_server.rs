@@ -36,7 +36,9 @@ async fn start(config: TurnConfig) -> Server {
     let datapath = UdpLoopbackDatapath::new();
     let clock = Arc::new(FixedUnixClock::new(1_000));
     let turn = Turn::spawn(Arc::new(datapath.clone()), config, clock.clone()).expect("spawn turn");
-    let socket = UdpSocket::bind(("127.0.0.1", 0)).await.expect("bind listener");
+    let socket = UdpSocket::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind listener");
     let addr = socket.local_addr().expect("listener addr");
     let serving = turn.clone();
     tokio::spawn(async move {
@@ -137,7 +139,9 @@ async fn obtain_nonce(socket: &UdpSocket, server: SocketAddr) -> Vec<u8> {
     assert_eq!(turn::class_of(challenge.message_type), turn::CLASS_ERROR);
     assert_eq!(turn::error_code(&challenge), Some(turn::ERROR_UNAUTHORIZED));
     assert_eq!(turn::realm(&challenge), Some(REALM));
-    turn::nonce(&challenge).expect("nonce in challenge").to_vec()
+    turn::nonce(&challenge)
+        .expect("nonce in challenge")
+        .to_vec()
 }
 
 const USER: &str = "2000000000:webrtc"; // expiry far beyond the test clock (1000)
@@ -153,7 +157,10 @@ async fn allocate(socket: &UdpSocket, server: SocketAddr) -> (SocketAddr, Vec<u8
         )
         .finish();
     let raw_request = request.clone();
-    socket.send_to(&raw_request, server).await.expect("send allocate");
+    socket
+        .send_to(&raw_request, server)
+        .await
+        .expect("send allocate");
     let mut buffer = [0u8; 2048];
     let (len, _) = timeout(SHORT, socket.recv_from(&mut buffer))
         .await
@@ -185,12 +192,18 @@ async fn allocate_permission_channel_bind_relays_both_ways() {
     let response = exchange(
         &client,
         server.addr,
-        &authed(turn::METHOD_CREATE_PERMISSION, &[2u8; 12], USER, &nonce, &key)
-            .attribute(
-                turn::ATTR_XOR_PEER_ADDRESS,
-                &turn::xor_address_value(peer_addr, &[2u8; 12]),
-            )
-            .finish(),
+        &authed(
+            turn::METHOD_CREATE_PERMISSION,
+            &[2u8; 12],
+            USER,
+            &nonce,
+            &key,
+        )
+        .attribute(
+            turn::ATTR_XOR_PEER_ADDRESS,
+            &turn::xor_address_value(peer_addr, &[2u8; 12]),
+        )
+        .finish(),
     )
     .await;
     assert_eq!(turn::class_of(response.message_type), turn::CLASS_SUCCESS);
@@ -201,7 +214,10 @@ async fn allocate_permission_channel_bind_relays_both_ways() {
         &client,
         server.addr,
         &authed(turn::METHOD_CHANNEL_BIND, &[3u8; 12], USER, &nonce, &key)
-            .attribute(turn::ATTR_CHANNEL_NUMBER, &turn::channel_number_value(channel))
+            .attribute(
+                turn::ATTR_CHANNEL_NUMBER,
+                &turn::channel_number_value(channel),
+            )
             .attribute(
                 turn::ATTR_XOR_PEER_ADDRESS,
                 &turn::xor_address_value(peer_addr, &[3u8; 12]),
@@ -214,7 +230,10 @@ async fn allocate_permission_channel_bind_relays_both_ways() {
     // client → peer over ChannelData: the peer receives the payload from the relay address.
     let to_peer = b"audio-from-client";
     client
-        .send_to(&turn::encode_channel_data(channel, to_peer, false), server.addr)
+        .send_to(
+            &turn::encode_channel_data(channel, to_peer, false),
+            server.addr,
+        )
         .await
         .expect("send channel data");
     let (data, from) = recv(&peer).await;
@@ -242,12 +261,18 @@ async fn send_indication_and_data_indication_relay_with_only_a_permission() {
     let response = exchange(
         &client,
         server.addr,
-        &authed(turn::METHOD_CREATE_PERMISSION, &[2u8; 12], USER, &nonce, &key)
-            .attribute(
-                turn::ATTR_XOR_PEER_ADDRESS,
-                &turn::xor_address_value(peer_addr, &[2u8; 12]),
-            )
-            .finish(),
+        &authed(
+            turn::METHOD_CREATE_PERMISSION,
+            &[2u8; 12],
+            USER,
+            &nonce,
+            &key,
+        )
+        .attribute(
+            turn::ATTR_XOR_PEER_ADDRESS,
+            &turn::xor_address_value(peer_addr, &[2u8; 12]),
+        )
+        .finish(),
     )
     .await;
     assert_eq!(turn::class_of(response.message_type), turn::CLASS_SUCCESS);
@@ -264,17 +289,25 @@ async fn send_indication_and_data_indication_relay_with_only_a_permission() {
     )
     .attribute(turn::ATTR_DATA, b"hello-peer")
     .finish(None, false);
-    client.send_to(&send, server.addr).await.expect("send indication");
+    client
+        .send_to(&send, server.addr)
+        .await
+        .expect("send indication");
     let (data, from) = recv(&peer).await;
     assert_eq!(data, b"hello-peer");
     assert_eq!(from, relay);
 
     // peer → client: delivered as a Data indication (no channel bound).
-    peer.send_to(b"hello-client", relay).await.expect("send to relay");
+    peer.send_to(b"hello-client", relay)
+        .await
+        .expect("send to relay");
     let (data, _) = recv(&client).await;
     let indication = stun::parse(&data).expect("data indication");
     assert_eq!(turn::method_of(indication.message_type), turn::METHOD_DATA);
-    assert_eq!(turn::class_of(indication.message_type), turn::CLASS_INDICATION);
+    assert_eq!(
+        turn::class_of(indication.message_type),
+        turn::CLASS_INDICATION
+    );
     assert_eq!(turn::xor_peer_address(&indication), Some(peer_addr));
     assert_eq!(turn::data(&indication), Some(&b"hello-client"[..]));
 }
@@ -287,10 +320,14 @@ async fn relay_without_permission_is_dropped() {
     let (relay, _nonce, _key) = allocate(&client, server.addr).await;
 
     // No permission installed: the peer's datagram on the relay must not reach the client.
-    peer.send_to(b"unsolicited", relay).await.expect("send to relay");
+    peer.send_to(b"unsolicited", relay)
+        .await
+        .expect("send to relay");
     let mut buffer = [0u8; 2048];
     assert!(
-        timeout(NEGATIVE, client.recv_from(&mut buffer)).await.is_err(),
+        timeout(NEGATIVE, client.recv_from(&mut buffer))
+            .await
+            .is_err(),
         "a peer with no permission must not be relayed to the client (RFC 5766 §8)"
     );
 }
@@ -322,7 +359,10 @@ async fn second_allocate_on_a_live_5_tuple_is_mismatch() {
     )
     .await;
     assert_eq!(turn::class_of(response.message_type), turn::CLASS_ERROR);
-    assert_eq!(turn::error_code(&response), Some(turn::ERROR_ALLOCATION_MISMATCH));
+    assert_eq!(
+        turn::error_code(&response),
+        Some(turn::ERROR_ALLOCATION_MISMATCH)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -387,12 +427,18 @@ async fn denied_peer_is_forbidden() {
     let response = exchange(
         &client,
         server.addr,
-        &authed(turn::METHOD_CREATE_PERMISSION, &[2u8; 12], USER, &nonce, &key)
-            .attribute(
-                turn::ATTR_XOR_PEER_ADDRESS,
-                &turn::xor_address_value(peer_addr, &[2u8; 12]),
-            )
-            .finish(),
+        &authed(
+            turn::METHOD_CREATE_PERMISSION,
+            &[2u8; 12],
+            USER,
+            &nonce,
+            &key,
+        )
+        .attribute(
+            turn::ATTR_XOR_PEER_ADDRESS,
+            &turn::xor_address_value(peer_addr, &[2u8; 12]),
+        )
+        .finish(),
     )
     .await;
     assert_eq!(turn::class_of(response.message_type), turn::CLASS_ERROR);
@@ -445,7 +491,10 @@ async fn channel_bind_programs_the_fast_path_and_delete_withdraws_it() {
         &client,
         server,
         &authed(turn::METHOD_CHANNEL_BIND, &[3u8; 12], USER, &nonce, &key)
-            .attribute(turn::ATTR_CHANNEL_NUMBER, &turn::channel_number_value(channel))
+            .attribute(
+                turn::ATTR_CHANNEL_NUMBER,
+                &turn::channel_number_value(channel),
+            )
             .attribute(
                 turn::ATTR_XOR_PEER_ADDRESS,
                 &turn::xor_address_value(peer_addr, &[3u8; 12]),
@@ -488,12 +537,18 @@ async fn refresh_zero_deletes_allocation_and_frees_the_relay() {
     exchange(
         &client,
         server.addr,
-        &authed(turn::METHOD_CREATE_PERMISSION, &[2u8; 12], USER, &nonce, &key)
-            .attribute(
-                turn::ATTR_XOR_PEER_ADDRESS,
-                &turn::xor_address_value(peer_addr, &[2u8; 12]),
-            )
-            .finish(),
+        &authed(
+            turn::METHOD_CREATE_PERMISSION,
+            &[2u8; 12],
+            USER,
+            &nonce,
+            &key,
+        )
+        .attribute(
+            turn::ATTR_XOR_PEER_ADDRESS,
+            &turn::xor_address_value(peer_addr, &[2u8; 12]),
+        )
+        .finish(),
     )
     .await;
 
@@ -509,10 +564,14 @@ async fn refresh_zero_deletes_allocation_and_frees_the_relay() {
     assert_eq!(turn::lifetime(&response), Some(0));
 
     // The allocation is gone: a peer datagram on the (freed) relay reaches no one.
-    peer.send_to(b"after-delete", relay).await.expect("send to relay");
+    peer.send_to(b"after-delete", relay)
+        .await
+        .expect("send to relay");
     let mut buffer = [0u8; 2048];
     assert!(
-        timeout(NEGATIVE, client.recv_from(&mut buffer)).await.is_err(),
+        timeout(NEGATIVE, client.recv_from(&mut buffer))
+            .await
+            .is_err(),
         "a deleted allocation relays nothing"
     );
     // Keep the handle alive until the end so the server task isn't dropped early.

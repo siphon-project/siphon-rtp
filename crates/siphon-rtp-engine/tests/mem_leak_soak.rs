@@ -43,32 +43,41 @@ async fn offer_answer_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize)
     let call_id = format!("soak-{index}");
 
     let offer = engine
-        .handle(CLIENT, Command::Offer {
-            call_id: call_id.clone(),
-            from_tag: "tag-a".into(),
-            sdp: sdp_for("198.51.100.1", 40_000),
-            profile: Default::default(),
-        })
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for("198.51.100.1", 40_000),
+                profile: Default::default(),
+            },
+        )
         .await;
     assert_ok(&offer, "offer");
 
     let answer = engine
-        .handle(CLIENT, Command::Answer {
-            call_id: call_id.clone(),
-            from_tag: "tag-a".into(),
-            to_tag: "tag-b".into(),
-            sdp: sdp_for("203.0.113.1", 41_000),
-            profile: Default::default(),
-        })
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for("203.0.113.1", 41_000),
+                profile: Default::default(),
+            },
+        )
         .await;
     assert_ok(&answer, "answer");
 
     let delete = engine
-        .handle(CLIENT, Command::Delete {
-            call_id,
-            from_tag: "tag-a".into(),
-            to_tag: None,
-        })
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id,
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
         .await;
     assert_ok(&delete, "delete");
 }
@@ -120,22 +129,28 @@ async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usiz
     let conference_id = format!("soak-room-{index}");
     for participant in 0..3 {
         let join = engine
-            .handle(CLIENT, Command::ConferenceJoin {
-                conference_id: conference_id.clone(),
-                from_tag: format!("p{participant}"),
-                sdp: sdp_for("198.51.100.1", 40_000 + participant as u16),
-                role: ConferenceRole::Talker,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: conference_id.clone(),
+                    from_tag: format!("p{participant}"),
+                    sdp: sdp_for("198.51.100.1", 40_000 + participant as u16),
+                    role: ConferenceRole::Talker,
+                    profile: Default::default(),
+                },
+            )
             .await;
         assert_ok(&join, "conference_join");
     }
     for participant in 0..3 {
         let leave = engine
-            .handle(CLIENT, Command::ConferenceLeave {
-                conference_id: conference_id.clone(),
-                from_tag: format!("p{participant}"),
-            })
+            .handle(
+                CLIENT,
+                Command::ConferenceLeave {
+                    conference_id: conference_id.clone(),
+                    from_tag: format!("p{participant}"),
+                },
+            )
             .await;
         assert_ok(&leave, "conference_leave");
     }
@@ -151,7 +166,11 @@ async fn conference_join_leave_does_not_leak() {
         conference_join_leave(&engine, index).await;
     }
     quiesce().await;
-    assert_eq!(engine.conference().room_count(), 0, "rooms drained after warmup");
+    assert_eq!(
+        engine.conference().room_count(),
+        0,
+        "rooms drained after warmup"
+    );
     let before = allocated_bytes();
 
     // Each cycle spawns a room actor + 3 participant legs/endpoints and frees them all on leave.
@@ -161,7 +180,11 @@ async fn conference_join_leave_does_not_leak() {
     quiesce().await;
     let after = allocated_bytes();
 
-    assert_eq!(engine.conference().room_count(), 0, "rooms drained after soak");
+    assert_eq!(
+        engine.conference().room_count(),
+        0,
+        "rooms drained after soak"
+    );
     let tolerance = 512 * 1024;
     assert!(
         after <= before + tolerance,

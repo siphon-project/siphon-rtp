@@ -185,6 +185,12 @@ pub struct RxPacket {
     pub endpoint: EndpointId,
     /// The observed source address.
     pub source: SocketAddr,
+    /// Receive-time clock reading in **microseconds**, stamped the moment the datagram came off the
+    /// wire — the arrival time the RTCP interarrival-jitter estimate (RFC 3550 §6.4.1) needs.
+    /// Stamped at *receive*, not at actor-ingest, so it reflects network timing rather than queueing
+    /// latency. The loopback backend derives it from its logical clock (deterministic); a real-time
+    /// backend (XDP) stamps a monotonic microsecond clock.
+    pub arrival: u64,
     /// The datagram payload.
     pub data: Bytes,
 }
@@ -264,20 +270,14 @@ pub trait Datapath: Send + Sync {
     }
 
     /// Install (or replace) the flow action for an endpoint.
-    fn install_flow(
-        &self,
-        endpoint: EndpointId,
-        action: FlowAction,
-    ) -> Result<(), DatapathError>;
+    fn install_flow(&self, endpoint: EndpointId, action: FlowAction) -> Result<(), DatapathError>;
 
     /// Remove an endpoint's flow; subsequent datagrams are dropped until a new flow is installed.
     fn remove_flow(&self, endpoint: EndpointId);
 
     /// Tear down an endpoint, stopping its receive loop and freeing its socket.
-    fn remove_endpoint(
-        &self,
-        endpoint: EndpointId,
-    ) -> impl std::future::Future<Output = ()> + Send;
+    fn remove_endpoint(&self, endpoint: EndpointId)
+        -> impl std::future::Future<Output = ()> + Send;
 
     /// Transmit a datagram from `endpoint` to `dst` (e.g. injected media / playback).
     fn send(
@@ -294,6 +294,14 @@ pub trait Datapath: Send + Sync {
     /// sweep; the loopback backend's clock is advanced explicitly
     /// ([`udp::UdpLoopbackDatapath::advance_clock`]) so timeout tests stay deterministic.
     fn now_ticks(&self) -> u64;
+
+    /// The backend's current clock in **microseconds** — the finer-grained companion to
+    /// [`now_ticks`](Self::now_ticks), used for RTCP interarrival jitter / DLSR (RFC 3550 §6.4.1).
+    /// The default derives it from the tick clock (one tick = 20 ms), which keeps the loopback
+    /// backend deterministic; a real-time backend (XDP) overrides it with a monotonic µs clock.
+    fn now_micros(&self) -> u64 {
+        self.now_ticks().saturating_mul(20_000)
+    }
 
     /// The tick of the last **accepted** packet on `endpoint` (`0` if none yet), or `None` if the
     /// endpoint is unknown. Feeds the media-timeout / dead-path sweep (docs/security-and-nat.md §4
@@ -383,7 +391,10 @@ mod tests {
 
         let signalled = ForwardRule::signalled(endpoint, Some(dst), ip(198, 51, 100, 1));
         assert_eq!(signalled.latch, LatchPolicy::SignalledOnly);
-        assert_eq!(signalled.accepted_source, SourceFilter::Exact(ip(198, 51, 100, 1)));
+        assert_eq!(
+            signalled.accepted_source,
+            SourceFilter::Exact(ip(198, 51, 100, 1))
+        );
 
         let symmetric = ForwardRule::symmetric(endpoint, None);
         assert_eq!(symmetric.latch, LatchPolicy::Symmetric);

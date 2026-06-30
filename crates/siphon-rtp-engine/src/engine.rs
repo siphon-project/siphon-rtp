@@ -15,13 +15,13 @@
 //! work; for plain relay the datapath's per-endpoint receive tasks are the data-plane workers.
 
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_datapath::{
     AddressFamily, Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy,
     ObservedRtcp, SourceFilter,
 };
-use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::player::{PcmPlayer, WavSource};
@@ -140,6 +140,10 @@ enum PipelineKind {
     Srtp,
     /// Userspace media slow path: transcode / record / DTMF-extraction via a [`MediaCall`] actor.
     Media,
+    /// Secure **and** transcoding: the far (`RTP/SAVP`) leg's codec differs from the near (plaintext)
+    /// leg's, so the [`MediaCall`] actor decrypts the secure ingress, transcodes, and encrypts the
+    /// secure egress — one shared SRTP leg threaded into both directions (BGCF/SBC PSTN breakout).
+    SrtpMedia,
     /// WebSocket bridge: leg A's audio is attached to an external WS media server (mod_audio_stream /
     /// voice-AI). The A↔B relay/transcode path is not wired — the WS server is A's far side.
     Ws,
@@ -294,6 +298,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Command::Offer { .. } => self.metrics.record_offer(),
             Command::Answer { .. } => self.metrics.record_answer(),
             Command::Delete { .. } => self.metrics.record_delete(),
+            Command::ConferenceJoin { .. } => self.metrics.record_conference_join(),
+            Command::ConferenceLeave { .. } => self.metrics.record_conference_leave(),
             _ => {}
         }
         let result = self.dispatch(client, command).await;
@@ -312,10 +318,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 sdp,
                 profile,
-            } => {
-                self.offer(client, call_id, from_tag, &sdp, &profile)
-                    .await
-            }
+            } => self.offer(client, call_id, from_tag, &sdp, &profile).await,
             Command::Answer {
                 call_id,
                 from_tag,
@@ -340,10 +343,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 start_pos_ms,
                 ..
             } => {
-                self.play_media(client, &call_id, &from_tag, source, repeat_times, start_pos_ms)
-                    .await
+                self.play_media(
+                    client,
+                    &call_id,
+                    &from_tag,
+                    source,
+                    repeat_times,
+                    start_pos_ms,
+                )
+                .await
             }
-            Command::StopMedia { call_id, from_tag } => self.stop_media(client, &call_id, &from_tag),
+            Command::StopMedia { call_id, from_tag } => {
+                self.stop_media(client, &call_id, &from_tag)
+            }
             Command::PlayDtmf {
                 call_id,
                 from_tag,
@@ -753,26 +765,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ) -> CmdResult {
         // Snapshot the leg endpoints under the guard, then release it. Only the owning client may
         // answer (A3 — docs/security-and-nat.md §5); to anyone else the call is unknown.
-        let (near, far, ice_creds, far_local_crypto, near_codec, near_telephone_event, offer_pipeline) =
-            match self.calls.get(call_id) {
-                Some(call) if call.owner == client => {
-                    if call.from_tag != from_tag {
-                        return CmdResult::Error {
-                            reason: "from_tag mismatch on answer".to_string(),
-                        };
-                    }
-                    (
-                        call.near,
-                        call.far,
-                        call.ice.clone(),
-                        call.far_local_crypto,
-                        call.near_codec.clone(),
-                        call.near_telephone_event,
-                        call.pipeline,
-                    )
+        let (
+            near,
+            far,
+            ice_creds,
+            far_local_crypto,
+            near_codec,
+            near_telephone_event,
+            offer_pipeline,
+        ) = match self.calls.get(call_id) {
+            Some(call) if call.owner == client => {
+                if call.from_tag != from_tag {
+                    return CmdResult::Error {
+                        reason: "from_tag mismatch on answer".to_string(),
+                    };
                 }
-                _ => return unknown_call(call_id),
-            };
+                (
+                    call.near,
+                    call.far,
+                    call.ice.clone(),
+                    call.far_local_crypto,
+                    call.near_codec.clone(),
+                    call.near_telephone_event,
+                    call.pipeline,
+                )
+            }
+            _ => return unknown_call(call_id),
+        };
         // The owner's async event sink (DTMF events flow here from the media actor), if registered.
         let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
 
@@ -907,6 +926,83 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 leg: SecureLeg::new(&far_local.key, &far_remote.key),
                 flows,
             });
+        } else if pipeline == PipelineKind::SrtpMedia {
+            // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
+            // the media actor decrypts B's SRTP, transcodes, and encrypts toward B (and the reverse),
+            // sharing one SecureLeg across both directions. RTCP rides the muxed RTP endpoint and is
+            // (de)crypted there too. (rtcp-mux posture; a non-muxed secure-transcode RTCP companion
+            // is a follow-up — see docs/security-and-nat.md.)
+            let far_local = far_local_crypto.expect("SrtpMedia ⇒ far_local_crypto is set");
+            let Some(far_remote) = info.crypto.first().copied() else {
+                return error_result("SAVP answer", &"missing a=crypto in the answer");
+            };
+            let Some(a_rtp) = near.remote_rtp else {
+                return error_result("secure media pipeline", &"near leg has no signalled address");
+            };
+            let Some(near_codec) = near_codec.clone() else {
+                return error_result(
+                    "secure media pipeline",
+                    &"offer carried no usable audio codec",
+                );
+            };
+            let Some(far_codec) = info.primary_codec() else {
+                return error_result(
+                    "secure media pipeline",
+                    &"answer carried no usable audio codec",
+                );
+            };
+            let record_path = profile
+                .record_call
+                .then(|| profile.record_path.clone())
+                .flatten();
+            let a_to_b = match build_direction(
+                near.rtp.id,
+                bridge_source_filter(profile, a_rtp),
+                far.rtp.id,
+                info.remote_rtp,
+                &near_codec,
+                &far_codec,
+                near_telephone_event,
+                info.telephone_event_payload_type(),
+                record_path.as_deref(),
+            ) {
+                Ok(direction) => direction,
+                Err(reason) => return error_result("secure media pipeline (A→B)", &reason),
+            };
+            let b_to_a = match build_direction(
+                far.rtp.id,
+                bridge_source_filter(profile, info.remote_rtp),
+                near.rtp.id,
+                a_rtp,
+                &far_codec,
+                &near_codec,
+                info.telephone_event_payload_type(),
+                near_telephone_event,
+                record_path.as_deref(),
+            ) {
+                Ok(direction) => direction,
+                Err(reason) => return error_result("secure media pipeline (B→A)", &reason),
+            };
+            // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them, (de)crypted in-actor).
+            for endpoint in [near.rtp.id, far.rtp.id] {
+                if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                    return error_result("install secure media redirect", &error);
+                }
+            }
+            let leg = Arc::new(Mutex::new(SecureLeg::new(&far_local.key, &far_remote.key)));
+            let latch = !profile.flags.iter().any(|flag| flag == "no-latch");
+            let call = MediaCall::new(
+                call_id.to_string(),
+                from_tag.to_string(),
+                Some(to_tag.clone()),
+                a_to_b,
+                b_to_a,
+                latch,
+                record_path,
+            )
+            .with_far_secure_leg(leg);
+            self.media
+                .register(call, self.datapath.clone(), owner_events);
         } else if pipeline == PipelineKind::Media {
             // Userspace media slow path: redirect both RTP legs to a per-call transcode/record/DTMF
             // actor. A's codec is the offer's primary codec; B's is the answer's. RTCP (non-mux)
@@ -995,7 +1091,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 latch,
                 record_path,
             );
-            self.media.register(call, self.datapath.clone(), owner_events);
+            self.media
+                .register(call, self.datapath.clone(), owner_events);
         } else {
             // Plain relay: the in-datapath Forward fast path. Each endpoint's rule gates its ingress
             // to the SDP-signalled peer and latches per policy (RTPBleed fix —
@@ -1085,7 +1182,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     async fn delete(&self, client: ClientId, call_id: &str) -> CmdResult {
         // Only the client that created the call may tear it down (A3 — docs §5). A non-owner (or a
         // missing call) gets `unknown_call`, so it cannot even probe for a call's existence.
-        match self.calls.remove_if(call_id, |_, call| call.owner == client) {
+        match self
+            .calls
+            .remove_if(call_id, |_, call| call.owner == client)
+        {
             Some((_, call)) => {
                 let endpoints: Vec<EndpointId> = call
                     .near
@@ -1195,7 +1295,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// reflected straight back to itself. Like silence, this requires a media-processing (transcode)
     /// call — a plain relay forwards opaque payloads and cannot loop them. Only the owning client may
     /// control the call. `from_tag` is accepted for protocol symmetry; echo applies to the whole call.
-    fn set_echo(&self, client: ClientId, call_id: &str, _from_tag: &str, enabled: bool) -> CmdResult {
+    fn set_echo(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        _from_tag: &str,
+        enabled: bool,
+    ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
@@ -1229,9 +1335,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(info) => info,
             Err(error) => return error_result("conference_join: SDP parse", &error),
         };
-        // v1 mixes plaintext RTP only — ICE / DTLS-SRTP conference legs are a follow-up.
+        // Plain RTP/AVP and SDES RTP/SAVP conference legs are supported; ICE / DTLS-SRTP (WebRTC)
+        // conference legs are a follow-up (the SDES secure leg is wired below).
         if info.is_ice() {
-            return error_result("conference_join", &"ICE conference legs are not supported yet");
+            return error_result(
+                "conference_join",
+                &"ICE / DTLS-SRTP conference legs are not supported yet (use plain RTP/AVP or SDES RTP/SAVP)",
+            );
         }
         let Some(codec) = info.primary_codec() else {
             return error_result("conference_join", &"offer has no audio codec");
@@ -1248,7 +1358,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result(
                     "conference_join",
                     &format!(
-                        "codec {} cannot be encoded toward a participant yet (e.g. AMR-WB)",
+                        "codec {} has no encoder, so the room mix cannot be sent to this participant \
+                         (AMR-WB needs the `amr` build feature; Opus/AMR-NB are not yet implemented)",
                         codec.encoding_name
                     ),
                 )
@@ -1260,7 +1371,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(mut endpoints) => endpoints.remove(0),
             Err(reason) => return error_result("conference_join", &reason),
         };
-        if let Err(error) = self.datapath.install_flow(endpoint.id, FlowAction::Redirect) {
+        if let Err(error) = self
+            .datapath
+            .install_flow(endpoint.id, FlowAction::Redirect)
+        {
             self.free(&[endpoint]).await;
             return error_result("conference_join: install redirect", &error);
         }
@@ -1270,6 +1384,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             SourceFilter::Any
         } else {
             SourceFilter::Exact(info.remote_rtp.ip())
+        };
+        // SDES-SRTP (RTP/SAVP): the participant offered a secure leg + its a=crypto. Mint our own key,
+        // build the secure leg (decrypt inbound with theirs, encrypt outbound with ours), and answer
+        // RTP/SAVP + a=crypto. (DTLS-SRTP / ICE WebRTC legs remain a follow-up — see the is_ice() guard.)
+        let (secure, security) = if info.secure {
+            let Some(remote) = info.crypto.first().copied() else {
+                self.free(&[endpoint]).await;
+                return error_result(
+                    "conference_join",
+                    &"RTP/SAVP offer without a usable a=crypto",
+                );
+            };
+            let local = match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+                Ok(local) => local,
+                Err(error) => {
+                    self.free(&[endpoint]).await;
+                    return error_result("conference_join: generate SDES key", &error);
+                }
+            };
+            (
+                Some(SecureLeg::new(&local.key, &remote.key)),
+                Some(SecurityAdvertisement::Secure(local)),
+            )
+        } else {
+            (None, None)
         };
         let config = ParticipantConfig {
             tag: from_tag.clone(),
@@ -1282,23 +1421,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             latch: true,
             egress_ssrc: random_ssrc(),
             egress_payload_type: codec.payload_type,
+            mos_codec: crate::conference::hep_codec_for_name(&codec.encoding_name),
             telephone_event_in: info.telephone_event_payload_type(),
+            secure,
             routing: routing_of(role),
         };
         let events = self.events.get(&client).map(|sink| sink.value().clone());
         let joined_tick = self.datapath.now_ticks();
-        if !self
-            .conference
-            .join(conference_id, config, joined_tick, self.datapath.clone(), events)
-        {
+        if !self.conference.join(
+            conference_id,
+            config,
+            joined_tick,
+            self.datapath.clone(),
+            events,
+        ) {
             self.free(&[endpoint]).await;
             return error_result("conference_join", &"failed to seat participant");
         }
-        self.endpoint_calls.insert(endpoint.id, conference_id.to_string());
+        self.endpoint_calls
+            .insert(endpoint.id, conference_id.to_string());
 
-        // Answer: advertise the engine endpoint, keep the participant's codec, sendrecv.
-        let engine = EngineMedia { rtp: endpoint.local_addr, rtcp: None };
-        match sdp::rewrite(sdp, engine, None, None) {
+        // Answer: advertise the engine endpoint, keep the participant's codec, sendrecv, and (for a
+        // secure leg) RTP/SAVP + the engine's a=crypto.
+        let engine = EngineMedia {
+            rtp: endpoint.local_addr,
+            rtcp: None,
+        };
+        match sdp::rewrite(sdp, engine, None, security) {
             Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);
@@ -1329,7 +1478,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         from_tag: &str,
         role: ConferenceRole,
     ) -> CmdResult {
-        if self.conference.route(conference_id, from_tag, routing_of(role)) {
+        if self
+            .conference
+            .route(conference_id, from_tag, routing_of(role))
+        {
             ok_empty()
         } else {
             error_result("conference_route", &"no such conference or participant")
@@ -1361,7 +1513,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// Run `f` against a call the client owns, or `None` if the call is unknown or owned by another
     /// client (A3 — a call is invisible to non-owners, docs §5).
-    fn owned_call<T>(&self, client: ClientId, call_id: &str, f: impl FnOnce(&Call) -> T) -> Option<T> {
+    fn owned_call<T>(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        f: impl FnOnce(&Call) -> T,
+    ) -> Option<T> {
         let call = self.calls.get(call_id)?;
         (call.owner == client).then(|| f(&call))
     }
@@ -1377,9 +1534,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         repeat_times: Option<u64>,
         start_pos_ms: Option<u64>,
     ) -> CmdResult {
-        let Some((call_from, call_to)) =
-            self.owned_call(client, call_id, |call| (call.from_tag.clone(), call.to_tag.clone()))
-        else {
+        let Some((call_from, call_to)) = self.owned_call(client, call_id, |call| {
+            (call.from_tag.clone(), call.to_tag.clone())
+        }) else {
             return unknown_call(call_id);
         };
         if !self.media.is_transcoding_call(call_id) {
@@ -1440,9 +1597,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         duration_ms: Option<u64>,
         volume_dbm0: Option<i64>,
     ) -> CmdResult {
-        let Some((call_from, call_to)) =
-            self.owned_call(client, call_id, |call| (call.from_tag.clone(), call.to_tag.clone()))
-        else {
+        let Some((call_from, call_to)) = self.owned_call(client, call_id, |call| {
+            (call.from_tag.clone(), call.to_tag.clone())
+        }) else {
             return unknown_call(call_id);
         };
         if !self.media.is_transcoding_call(call_id) {
@@ -1608,7 +1765,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Read the two RTP forward rules + leg identity out of the stored relay flows. `relay_flows`
         // for a passthrough call is [near.rtp, far.rtp, (near.rtcp, far.rtcp)] — we tee/relay only RTP.
         let Some((from_tag, to_tag, relay_flows)) = self.owned_call_internal(call_id, |call| {
-            (call.from_tag.clone(), call.to_tag.clone(), call.relay_flows.clone())
+            (
+                call.from_tag.clone(),
+                call.to_tag.clone(),
+                call.relay_flows.clone(),
+            )
         }) else {
             return Err("call no longer exists".to_string());
         };
@@ -1654,7 +1815,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .install_flow(endpoint, FlowAction::Redirect)
                 .map_err(|error| format!("install relay redirect: {error}"))?;
         }
-        let call = MediaCall::new_relay(call_id.to_string(), from_tag, to_tag, a_to_b, b_to_a, latch);
+        let call =
+            MediaCall::new_relay(call_id.to_string(), from_tag, to_tag, a_to_b, b_to_a, latch);
         self.media.register(call, self.datapath.clone(), None);
 
         // Record the promotion on the Call so demotion can restore the in-kernel Forward rules.
@@ -1670,8 +1832,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// — on any install error the call is left redirected (still relaying through the actor), which is
     /// correct if slower, and logged.
     async fn demote_to_passthrough(&self, call_id: &str) {
-        let Some(relay_flows) =
-            self.owned_call_internal(call_id, |call| call.relay_flows.clone())
+        let Some(relay_flows) = self.owned_call_internal(call_id, |call| call.relay_flows.clone())
         else {
             return;
         };
@@ -1727,7 +1888,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .iter()
                 .find(|subscription| subscription.subscription_id == to_tag)
             else {
-                return error_result("subscribe_answer", &format!("unknown subscription {to_tag}"));
+                return error_result(
+                    "subscribe_answer",
+                    &format!("unknown subscription {to_tag}"),
+                );
             };
             if subscription.srs_rtp.is_some() {
                 return error_result("subscribe_answer", &"subscription is already answered");
@@ -1744,10 +1908,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let mut attached = false;
         for source_a in &taps {
-            if self.media.control(call_id, MediaControl::AddRawTee {
-                source_a: *source_a,
-                tee,
-            }) {
+            if self.media.control(
+                call_id,
+                MediaControl::AddRawTee {
+                    source_a: *source_a,
+                    tee,
+                },
+            ) {
                 attached = true;
             }
         }
@@ -1796,7 +1963,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let removed = subscriptions.remove(position);
             (removed, subscriptions.is_empty())
         };
-        self.subscriptions.remove_if(call_id, |_, list| list.is_empty());
+        self.subscriptions
+            .remove_if(call_id, |_, list| list.is_empty());
         self.detach_subscription(call_id, removed).await;
         // Once no subscription remains on a relay we promoted for SIPREC, demote it back to the
         // in-kernel Forward fast path (the relay leg keeps flowing throughout). `is_relay_call` keeps
@@ -1812,10 +1980,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// task to abort — the raw tee emits through the actor's own send path.)
     async fn detach_subscription(&self, call_id: &str, subscription: Subscription) {
         for source_a in &subscription.taps {
-            self.media.control(call_id, MediaControl::RemoveRawTee {
-                source_a: *source_a,
-                subscriber_endpoint: subscription.subscriber_endpoint.id,
-            });
+            self.media.control(
+                call_id,
+                MediaControl::RemoveRawTee {
+                    source_a: *source_a,
+                    subscriber_endpoint: subscription.subscriber_endpoint.id,
+                },
+            );
         }
         self.datapath
             .remove_endpoint(subscription.subscriber_endpoint.id)
@@ -1857,8 +2028,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut reaped = Vec::new();
         for call_id in stale {
             if let Some((_, call)) = self.calls.remove(&call_id) {
-                let endpoints: Vec<EndpointId> =
-                    call.near.endpoint_ids().chain(call.far.endpoint_ids()).collect();
+                let endpoints: Vec<EndpointId> = call
+                    .near
+                    .endpoint_ids()
+                    .chain(call.far.endpoint_ids())
+                    .collect();
                 self.drop_subscriptions(&call_id).await;
                 self.bridge.deregister(endpoints.iter().copied());
                 self.media.deregister(&call_id);
@@ -1887,9 +2061,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// by the datapath's logical clock, so tests advance it via `advance_clock`.
     pub async fn reap_idle_conferences(&self, idle_ticks: u64) -> usize {
         let now = self.datapath.now_ticks();
-        let freed = self
-            .conference
-            .reap_idle(now, idle_ticks, |endpoint| self.datapath.last_activity(endpoint));
+        let freed = self.conference.reap_idle(now, idle_ticks, |endpoint| {
+            self.datapath.last_activity(endpoint)
+        });
         for endpoint in &freed {
             self.datapath.remove_endpoint(*endpoint).await;
             self.endpoint_calls.remove(endpoint);
@@ -1987,9 +2161,6 @@ fn resolve_pipeline(
     profile: &ProfileFlags,
     far_local_crypto: Option<CryptoAttribute>,
 ) -> PipelineKind {
-    if far_local_crypto.is_some() {
-        return PipelineKind::Srtp;
-    }
     // Transcode when the two legs' primary codecs differ in encoding or clock rate.
     let transcode = match (near_codec, info.primary_codec()) {
         (Some(near), Some(far)) => {
@@ -1998,6 +2169,16 @@ fn resolve_pipeline(
         }
         _ => false,
     };
+    if far_local_crypto.is_some() {
+        // Secure far leg: the plain SRTP bridge when both legs share a codec (crypto only), or the
+        // secure transcoding media slow path when they differ — decrypt → transcode → encrypt
+        // (BGCF/SBC: a secure AMR-WB access leg ↔ a plaintext G.711 PSTN leg).
+        return if transcode {
+            PipelineKind::SrtpMedia
+        } else {
+            PipelineKind::Srtp
+        };
+    }
     if profile.record_call || transcode {
         PipelineKind::Media
     } else {
@@ -2255,7 +2436,9 @@ mod tests {
     const CLIENT: ClientId = ClientId(1);
 
     async fn phone() -> (UdpSocket, SocketAddr) {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind");
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
         let addr = socket.local_addr().expect("addr");
         (socket, addr)
     }
@@ -2335,7 +2518,14 @@ mod tests {
         // through the control plane with the redirect dispatcher live.
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
 
         let (phone_a, addr_a) = phone().await; // plain (AVP) caller A
         let (phone_b, addr_b) = phone().await; // secure (SAVP) callee B
@@ -2346,12 +2536,15 @@ mod tests {
             ..Default::default()
         };
         let offer = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "savp-1".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile,
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "savp-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile,
+                },
+            )
             .await;
         let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("parse offer reply");
         assert!(offer_reply.secure, "the engine offers RTP/SAVP to B");
@@ -2361,17 +2554,23 @@ mod tests {
         // B answers RTP/SAVP with its own SDES key.
         let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "savp-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: savp_answer_sdp(addr_b, &b_key),
-                profile: ProfileFlags::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "savp-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: savp_answer_sdp(addr_b, &b_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
             .await;
         let answer_reply = sdp::parse(&ok_sdp_text(&answer)).expect("parse answer reply");
         assert!(!answer_reply.secure, "the answer to A is plaintext RTP/AVP");
-        assert!(answer_reply.crypto.is_empty(), "no crypto leaks to the plain leg");
+        assert!(
+            answer_reply.crypto.is_empty(),
+            "no crypto leaks to the plain leg"
+        );
         let near_addr = answer_reply.remote_rtp; // the engine's A-facing endpoint
 
         // A → engine(near) → bridge encrypts → B receives SRTP, decryptable with the engine's key.
@@ -2382,7 +2581,9 @@ mod tests {
         assert_ne!(srtp, from_a, "B receives SRTP, not plaintext");
         let mut b_decrypt = SrtpContext::from_key_material(&engine_far_key.key);
         let mut recovered = Vec::new();
-        b_decrypt.unprotect(&srtp, &mut recovered).expect("B decrypts the engine's SRTP");
+        b_decrypt
+            .unprotect(&srtp, &mut recovered)
+            .expect("B decrypts the engine's SRTP");
         assert_eq!(recovered, from_a);
 
         // B → engine(far) as SRTP (B's key) → bridge decrypts → A receives plaintext.
@@ -2394,6 +2595,115 @@ mod tests {
         let (recovered_a, from) = recv(&phone_a).await;
         assert_eq!(from, near_addr, "media leaves the engine's A-facing port");
         assert_eq!(recovered_a, from_b, "A receives the decrypted plaintext");
+    }
+
+    /// An `RTP/SAVP` answer SDP advertising AMR-WB (PT 96, 16 kHz) at `addr` with `crypto` (rtcp-mux).
+    #[cfg(feature = "amr")]
+    fn savp_amr_wb_answer_sdp(addr: SocketAddr, crypto: &CryptoAttribute) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/SAVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=rtcp-mux\r\na={crypto_line}\r\n",
+            ip = addr.ip(),
+            port = addr.port(),
+            crypto_line = crypto.to_attribute_value(),
+        )
+    }
+
+    /// BGCF/SBC, the secure transcode: a secure `RTP/SAVP` **AMR-WB (16 kHz)** far leg ↔ a plaintext
+    /// `RTP/AVP` **G.711 µ-law (8 kHz)** near leg. The engine decrypts B's SRTP, transcodes (16↔8 kHz
+    /// resample), and encrypts toward B — and the reverse — in one `MediaCall` (`PipelineKind::SrtpMedia`),
+    /// driven end to end through the control plane + redirect dispatcher. `amr`-feature-gated.
+    #[cfg(feature = "amr")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn savp_amr_wb_far_leg_transcodes_to_plain_g711_both_ways() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::SrtpContext;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await; // plain G.711 (PSTN) side
+        let (phone_b, addr_b) = phone().await; // secure AMR-WB (VoLTE) side
+
+        // A offers plaintext G.711; the profile asks the engine to secure the far (B) leg.
+        let profile = ProfileFlags {
+            transport_protocol: Some("RTP/SAVP".into()),
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "savp-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile,
+                },
+            )
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
+        assert!(offer_reply.secure, "engine offers RTP/SAVP to B");
+        let engine_far_key = *offer_reply.crypto.first().expect("engine a=crypto to B");
+        let far_addr = offer_reply.remote_rtp;
+
+        // B answers RTP/SAVP AMR-WB with its own key → near = G.711 (8 kHz), far = AMR-WB (16 kHz),
+        // secure ⇒ the secure transcoding media slow path.
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "savp-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: savp_amr_wb_answer_sdp(addr_b, &b_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        assert!(
+            engine.media().is_media_call("savp-xcode"),
+            "secure + transcode resolves to the media slow path"
+        );
+
+        // A → engine(near): plaintext G.711 in; B receives SRTP that decrypts to transcoded AMR-WB.
+        let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
+        phone_a.send_to(&from_a, near_addr).await.expect("a send");
+        let (srtp, from) = recv(&phone_b).await;
+        assert_eq!(from, far_addr, "media leaves the engine's B-facing port");
+        assert_ne!(srtp, from_a, "B receives SRTP, not plaintext");
+        let mut b_decrypt = SrtpContext::from_key_material(&engine_far_key.key);
+        let mut amr = Vec::new();
+        b_decrypt
+            .unprotect(&srtp, &mut amr)
+            .expect("B decrypts the engine's SRTP");
+        let amr_rtp = siphon_rtp_media::rtp::RtpPacket::parse(&amr).expect("parse decrypted");
+        assert_eq!(amr_rtp.payload_type, 96, "B receives AMR-WB (PT 96)");
+        assert!(!amr_rtp.payload.is_empty(), "AMR-WB egress carries a frame");
+
+        // B → engine(far): AMR-WB SRTP (B's key) in; A receives plaintext transcoded G.711 µ-law.
+        let mut b_encrypt = SrtpContext::from_key_material(&b_key.key);
+        let mut srtp_b = Vec::new();
+        b_encrypt
+            .protect(&amr_wb_rtp(7, 0x0B0B_0B0B), &mut srtp_b)
+            .expect("B encrypts");
+        phone_b.send_to(&srtp_b, far_addr).await.expect("b send");
+        let (plain_a, from) = recv(&phone_a).await;
+        assert_eq!(from, near_addr, "media leaves the engine's A-facing port");
+        let g711 = siphon_rtp_media::rtp::RtpPacket::parse(&plain_a).expect("parse plaintext");
+        assert_eq!(g711.payload_type, 0, "A receives G.711 µ-law (PT 0)");
+        assert_eq!(g711.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2422,25 +2732,35 @@ mod tests {
         let (phone_b, addr_b) = phone().await;
 
         let join_a = engine
-            .handle(CLIENT, Command::ConferenceJoin {
-                conference_id: "room-1".into(),
-                from_tag: "alice".into(),
-                sdp: sdp_for(addr_a, true),
-                role: ConferenceRole::Talker,
-                profile: ProfileFlags::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "room-1".into(),
+                    from_tag: "alice".into(),
+                    sdp: sdp_for(addr_a, true),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
             .await;
-        let engine_a = sdp::parse(&ok_sdp_text(&join_a)).expect("A answer").remote_rtp;
+        let engine_a = sdp::parse(&ok_sdp_text(&join_a))
+            .expect("A answer")
+            .remote_rtp;
         let join_b = engine
-            .handle(CLIENT, Command::ConferenceJoin {
-                conference_id: "room-1".into(),
-                from_tag: "bob".into(),
-                sdp: sdp_for(addr_b, true),
-                role: ConferenceRole::Talker,
-                profile: ProfileFlags::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "room-1".into(),
+                    from_tag: "bob".into(),
+                    sdp: sdp_for(addr_b, true),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
             .await;
-        let engine_b = sdp::parse(&ok_sdp_text(&join_b)).expect("B answer").remote_rtp;
+        let engine_b = sdp::parse(&ok_sdp_text(&join_b))
+            .expect("B answer")
+            .remote_rtp;
 
         // Both speak loud G.711 (µ-law 0x00 ≈ full scale); fill the jitter buffers well past the
         // priming depth so there is a window during which each is heard.
@@ -2471,21 +2791,33 @@ mod tests {
                 break;
             }
         }
-        assert!(heard_loud, "A hears B's loud audio (mixed-minus-self) within a few frames");
+        assert!(
+            heard_loud,
+            "A hears B's loud audio (mixed-minus-self) within a few frames"
+        );
         let (_mix_b, from_b) = recv(&phone_b).await;
         assert_eq!(from_b, engine_b, "B hears the mix from its engine port");
 
         // Leaving releases each participant; the empty room is torn down.
         for tag in ["alice", "bob"] {
             let left = engine
-                .handle(CLIENT, Command::ConferenceLeave {
-                    conference_id: "room-1".into(),
-                    from_tag: tag.into(),
-                })
+                .handle(
+                    CLIENT,
+                    Command::ConferenceLeave {
+                        conference_id: "room-1".into(),
+                        from_tag: tag.into(),
+                    },
+                )
                 .await;
-            assert!(matches!(left, CmdResult::Ok { .. }), "{tag} leaves: {left:?}");
+            assert!(
+                matches!(left, CmdResult::Ok { .. }),
+                "{tag} leaves: {left:?}"
+            );
         }
-        assert!(!engine.conference().contains("room-1"), "empty room torn down");
+        assert!(
+            !engine.conference().contains("room-1"),
+            "empty room torn down"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2505,37 +2837,55 @@ mod tests {
 
         // Bridging non-existent rooms is an error.
         let missing = engine
-            .handle(CLIENT, Command::ConferenceBridge {
-                conference_id_a: "ghost-1".into(),
-                conference_id_b: "ghost-2".into(),
-                direction: BridgeDirection::Both,
-            })
+            .handle(
+                CLIENT,
+                Command::ConferenceBridge {
+                    conference_id_a: "ghost-1".into(),
+                    conference_id_b: "ghost-2".into(),
+                    direction: BridgeDirection::Both,
+                },
+            )
             .await;
-        assert!(matches!(missing, CmdResult::Error { .. }), "no such rooms: {missing:?}");
+        assert!(
+            matches!(missing, CmdResult::Error { .. }),
+            "no such rooms: {missing:?}"
+        );
 
         // Seat a participant in each of two rooms, then bridge them.
         let (_phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
         for (room, tag, addr) in [("room-x", "alice", addr_a), ("room-y", "bob", addr_b)] {
             let joined = engine
-                .handle(CLIENT, Command::ConferenceJoin {
-                    conference_id: room.into(),
-                    from_tag: tag.into(),
-                    sdp: sdp_for(addr, true),
-                    role: ConferenceRole::Talker,
-                    profile: ProfileFlags::default(),
-                })
+                .handle(
+                    CLIENT,
+                    Command::ConferenceJoin {
+                        conference_id: room.into(),
+                        from_tag: tag.into(),
+                        sdp: sdp_for(addr, true),
+                        role: ConferenceRole::Talker,
+                        profile: ProfileFlags::default(),
+                    },
+                )
                 .await;
-            assert!(matches!(joined, CmdResult::Ok { .. }), "{tag} joins {room}: {joined:?}");
+            assert!(
+                matches!(joined, CmdResult::Ok { .. }),
+                "{tag} joins {room}: {joined:?}"
+            );
         }
         let bridged = engine
-            .handle(CLIENT, Command::ConferenceBridge {
-                conference_id_a: "room-x".into(),
-                conference_id_b: "room-y".into(),
-                direction: BridgeDirection::Both,
-            })
+            .handle(
+                CLIENT,
+                Command::ConferenceBridge {
+                    conference_id_a: "room-x".into(),
+                    conference_id_b: "room-y".into(),
+                    direction: BridgeDirection::Both,
+                },
+            )
             .await;
-        assert!(matches!(bridged, CmdResult::Ok { .. }), "rooms bridge: {bridged:?}");
+        assert!(
+            matches!(bridged, CmdResult::Ok { .. }),
+            "rooms bridge: {bridged:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2558,15 +2908,20 @@ mod tests {
         let mut engine_a = addr_a; // overwritten with alice's engine port below
         for (tag, addr) in [("alice", addr_a), ("bob", addr_b)] {
             let joined = engine
-                .handle(CLIENT, Command::ConferenceJoin {
-                    conference_id: "room".into(),
-                    from_tag: tag.into(),
-                    sdp: sdp_for(addr, true),
-                    role: ConferenceRole::Talker,
-                    profile: ProfileFlags::default(),
-                })
+                .handle(
+                    CLIENT,
+                    Command::ConferenceJoin {
+                        conference_id: "room".into(),
+                        from_tag: tag.into(),
+                        sdp: sdp_for(addr, true),
+                        role: ConferenceRole::Talker,
+                        profile: ProfileFlags::default(),
+                    },
+                )
                 .await;
-            let port = sdp::parse(&ok_sdp_text(&joined)).expect("answer").remote_rtp;
+            let port = sdp::parse(&ok_sdp_text(&joined))
+                .expect("answer")
+                .remote_rtp;
             if tag == "alice" {
                 engine_a = port;
             }
@@ -2582,13 +2937,54 @@ mod tests {
             .expect("a send");
         tokio::time::sleep(Duration::from_millis(30)).await; // let the datapath stamp activity
 
-        assert_eq!(engine.reap_idle_conferences(3).await, 1, "the silent participant is reaped");
-        assert!(engine.conference().contains("room"), "the active participant keeps the room alive");
+        assert_eq!(
+            engine.reap_idle_conferences(3).await,
+            1,
+            "the silent participant is reaped"
+        );
+        assert!(
+            engine.conference().contains("room"),
+            "the active participant keeps the room alive"
+        );
 
         // Advance past alice's activity too — now the room drains and is torn down.
         engine.datapath().advance_clock(5);
-        assert!(engine.reap_idle_conferences(3).await >= 1, "the now-idle participant is reaped");
-        assert!(!engine.conference().contains("room"), "empty room torn down");
+        assert!(
+            engine.reap_idle_conferences(3).await >= 1,
+            "the now-idle participant is reaped"
+        );
+        assert!(
+            !engine.conference().contains("room"),
+            "empty room torn down"
+        );
+    }
+
+    #[tokio::test]
+    async fn conference_join_negotiates_sdes_srtp() {
+        // A participant offering RTP/SAVP + a=crypto is answered with RTP/SAVP + the engine's own
+        // a=crypto (SDES-SRTP secure conference leg).
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let peer_crypto =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let joined = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "secure-room".into(),
+                    from_tag: "alice".into(),
+                    sdp: savp_answer_sdp(addr, &peer_crypto),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let answer = sdp::parse(&ok_sdp_text(&joined)).expect("answer");
+        assert!(answer.secure, "the engine answers RTP/SAVP");
+        assert!(
+            !answer.crypto.is_empty(),
+            "the engine advertises its own a=crypto"
+        );
     }
 
     /// A G.711 RTP packet (160-sample frame) for transcode tests.
@@ -2612,6 +3008,129 @@ mod tests {
         )
     }
 
+    /// Encode 20 ms of 16 kHz PCM into an RFC 4867 octet-aligned AMR-WB RTP packet (PT 96) — what a
+    /// VoLTE UE puts on the wire. `amr`-feature-gated (patent-licensed — docs/codec-licensing.md).
+    #[cfg(feature = "amr")]
+    fn amr_wb_rtp(sequence: u16, ssrc: u32) -> Vec<u8> {
+        use siphon_rtp_codec::factory::{encoder_for, CodecSpec};
+        let mut encoder =
+            encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("amr-wb encoder");
+        let pcm: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.20).sin() * 6000.0) as i16)
+            .collect();
+        let mut amr_payload = vec![0u8; 256];
+        let written = encoder.encode(&pcm, &mut amr_payload).expect("encode amr-wb");
+        let mut packet = vec![0x80, 96];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&(u32::from(sequence) * 320).to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&amr_payload[..written]);
+        packet
+    }
+
+    /// BGCF/SBC PSTN breakout, end to end through the control plane: A offers VoLTE **AMR-WB (16 kHz)**,
+    /// B answers PSTN **G.711a (8 kHz)**. The codec + clock-rate mismatch resolves to the media slow
+    /// path, which redirects both legs to a transcoding actor (decode → 16↔8 kHz resample → re-encode).
+    /// Proves AMR-WB RTP in → G.711a RTP out (and the reverse) over the real datapath + redirect
+    /// dispatcher — the first scenario worthy of a live siphon-sip rtpengine trial. `amr`-feature-gated.
+    #[cfg(feature = "amr")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_answer_transcodes_amr_wb_to_g711a_end_to_end() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        // A offers AMR-WB on dynamic PT 96 at 16 kHz (the VoLTE leg).
+        let amr_offer = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=rtcp-mux\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+        );
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "volte-pstn".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: amr_offer,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+
+        // B answers G.711a only → near = AMR-WB (16 kHz), far = PCMA (8 kHz) → transcode + resample.
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "volte-pstn".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        assert!(
+            engine.media().is_media_call("volte-pstn"),
+            "AMR-WB↔G.711a resolves to the transcoding media slow path"
+        );
+
+        // A → engine(near): AMR-WB in; B receives genuinely transcoded G.711a (PT 8, 160 bytes @ 8 kHz).
+        phone_a
+            .send_to(&amr_wb_rtp(0, 0xAAAA_AAAA), near_addr)
+            .await
+            .expect("a send amr-wb");
+        let (transcoded, from) = recv(&phone_b).await;
+        assert_eq!(from, far_addr, "media leaves the engine's B-facing port");
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&transcoded).expect("parse");
+        assert_eq!(parsed.payload_type, 8, "B receives G.711a (PT 8)");
+        assert_eq!(parsed.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
+        assert!(
+            parsed.payload.iter().any(|&byte| byte != 0xD5),
+            "transcoded G.711a carries non-silence audio"
+        );
+
+        // B → engine(far): G.711a in; A receives re-encoded AMR-WB (PT 96).
+        let from_b = g711_rtp(8, 200, 0x0B0B_0B0B, 0x55);
+        phone_b.send_to(&from_b, far_addr).await.expect("b send");
+        let (back, from) = recv(&phone_a).await;
+        assert_eq!(from, near_addr, "media leaves the engine's A-facing port");
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&back).expect("parse");
+        assert_eq!(parsed.payload_type, 96, "A receives AMR-WB (PT 96)");
+        assert!(!parsed.payload.is_empty(), "AMR-WB egress carries a frame");
+
+        let deleted = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "volte-pstn".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offer_answer_transcodes_ulaw_to_alaw_end_to_end() {
         // A offers PCMU (µ-law); B answers PCMA (A-law). The differing codecs resolve to the media
@@ -2620,33 +3139,50 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
 
         let (phone_a, addr_a) = phone().await;
         let (phone_b, addr_b) = phone().await;
 
         // A's offer advertises PCMU as its primary codec (the `sdp_for` fixture: `0 8`, rtpmap PCMU).
         let offer = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "xcode-1".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "xcode-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply").remote_rtp;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
 
         // B answers PCMA only → near=PCMU, far=PCMA → transcode.
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "xcode-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_single_codec(addr_b, 8, "PCMA"),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "xcode-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        let near_addr = sdp::parse(&ok_sdp_text(&answer)).expect("answer reply").remote_rtp;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
 
         // A → engine(near) → transcode → B receives A-law (PT 8), not the original µ-law.
         let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
@@ -2656,7 +3192,11 @@ mod tests {
         let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&transcoded).expect("parse");
         assert_eq!(parsed.payload_type, 8, "B receives A-law (PT 8)");
         assert_eq!(parsed.payload.len(), 160);
-        assert_ne!(parsed.payload, &from_a[12..], "payload genuinely transcoded");
+        assert_ne!(
+            parsed.payload,
+            &from_a[12..],
+            "payload genuinely transcoded"
+        );
 
         // B → engine(far) → transcode → A receives µ-law (PT 0).
         let from_b = g711_rtp(8, 200, 0x0B0B_0B0B, 0x55);
@@ -2669,23 +3209,32 @@ mod tests {
         // The call is a media-processing call; block then unblock via the control plane.
         assert!(engine.media().is_media_call("xcode-1"));
         let blocked = engine
-            .handle(CLIENT, Command::BlockMedia {
-                call_id: "xcode-1".into(),
-                from_tag: "tag-a".into(),
-            })
+            .handle(
+                CLIENT,
+                Command::BlockMedia {
+                    call_id: "xcode-1".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
             .await;
         assert!(matches!(blocked, CmdResult::Ok { .. }));
 
         // Teardown frees the media actor and routes.
         let deleted = engine
-            .handle(CLIENT, Command::Delete {
-                call_id: "xcode-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "xcode-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(deleted, CmdResult::Ok { .. }));
-        assert!(!engine.media().is_media_call("xcode-1"), "media call deregistered");
+        assert!(
+            !engine.media().is_media_call("xcode-1"),
+            "media call deregistered"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2696,7 +3245,14 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
 
         let (phone_a, addr_a) = phone().await;
         let (phone_b, addr_b) = phone().await;
@@ -2704,55 +3260,82 @@ mod tests {
 
         // A offers PCMU, B answers PCMA → a transcoding media call (so there is decoded PCM to fork).
         engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "siprec-1".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "siprec-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "siprec-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_single_codec(addr_b, 8, "PCMA"),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "siprec-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        let near_addr = sdp::parse(&ok_sdp_text(&answer)).expect("answer reply").remote_rtp;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
         assert!(engine.media().is_media_call("siprec-1"));
 
         // subscribe_request: the engine offers leg A's media to the SRS and returns an SDP offer + a
         // subscription to-tag. Leg A's negotiated codec is PCMU (PT 0).
         let subscribe = engine
-            .handle(CLIENT, Command::SubscribeRequest {
-                call_id: "siprec-1".into(),
-                from_tags: vec!["tag-a".into()],
-                sdp: None,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::SubscribeRequest {
+                    call_id: "siprec-1".into(),
+                    from_tags: vec!["tag-a".into()],
+                    sdp: None,
+                    profile: Default::default(),
+                },
+            )
             .await;
         let (offer_sdp, subscription_tag) = match subscribe {
-            CmdResult::Ok { sdp: Some(sdp), to_tag: Some(to_tag), .. } => (sdp, to_tag),
+            CmdResult::Ok {
+                sdp: Some(sdp),
+                to_tag: Some(to_tag),
+                ..
+            } => (sdp, to_tag),
             other => panic!("expected an SDP offer + to_tag, got {other:?}"),
         };
         let offer_info = sdp::parse(&offer_sdp).expect("parse subscriber offer");
-        assert_eq!(offer_info.primary_codec().expect("codec").encoding_name, "PCMU");
-        assert!(offer_sdp.contains("a=sendonly"), "subscriber stream is send-only (RFC 3264)");
+        assert_eq!(
+            offer_info.primary_codec().expect("codec").encoding_name,
+            "PCMU"
+        );
+        assert!(
+            offer_sdp.contains("a=sendonly"),
+            "subscriber stream is send-only (RFC 3264)"
+        );
 
         // subscribe_answer: the SRS answers with its own media address. The fork attaches to leg A.
         let srs_answer_sdp = sdp_single_codec(srs_addr, 0, "PCMU");
         let answered = engine
-            .handle(CLIENT, Command::SubscribeAnswer {
-                call_id: "siprec-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: subscription_tag.clone(),
-                sdp: srs_answer_sdp,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::SubscribeAnswer {
+                    call_id: "siprec-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: subscription_tag.clone(),
+                    sdp: srs_answer_sdp,
+                    profile: Default::default(),
+                },
+            )
             .await;
-        assert!(matches!(answered, CmdResult::Ok { .. }), "subscribe_answer ok: {answered:?}");
+        assert!(
+            matches!(answered, CmdResult::Ok { .. }),
+            "subscribe_answer ok: {answered:?}"
+        );
 
         // A sends µ-law RTP through the engine; B gets the A-law transcode AND the SRS gets leg A's
         // RAW ingress RTP byte-for-byte (the raw tee, not a re-encode): same SSRC, sequence, payload.
@@ -2760,41 +3343,64 @@ mod tests {
         phone_a.send_to(&from_a, near_addr).await.expect("a send");
         let (to_b, _) = recv(&phone_b).await; // the normal transcoded leg is undisturbed
         let (forked, from) = recv(&srs).await;
-        assert_eq!(from, offer_info.remote_rtp, "fork leaves the engine's subscriber port");
-        assert_eq!(forked, from_a, "SRS receives leg A's ORIGINAL RTP byte-for-byte (raw tee)");
-        assert_ne!(to_b, from_a, "B still gets the genuinely transcoded A-law stream");
+        assert_eq!(
+            from, offer_info.remote_rtp,
+            "fork leaves the engine's subscriber port"
+        );
+        assert_eq!(
+            forked, from_a,
+            "SRS receives leg A's ORIGINAL RTP byte-for-byte (raw tee)"
+        );
+        assert_ne!(
+            to_b, from_a,
+            "B still gets the genuinely transcoded A-law stream"
+        );
 
         // unsubscribe: the fork stops; A's media still transcodes to B.
         let unsubscribed = engine
-            .handle(CLIENT, Command::Unsubscribe {
-                call_id: "siprec-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: subscription_tag,
-            })
+            .handle(
+                CLIENT,
+                Command::Unsubscribe {
+                    call_id: "siprec-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: subscription_tag,
+                },
+            )
             .await;
         assert!(matches!(unsubscribed, CmdResult::Ok { .. }));
 
         // Drain any already-in-flight forked packets, then prove no more arrive after unsubscribe.
         let mut drain = [0u8; 2048];
         while srs.try_recv_from(&mut drain).is_ok() {}
-        phone_a.send_to(&g711_rtp(0, 101, 0x0A0A_0A0A, 0xFF), near_addr).await.expect("a send");
+        phone_a
+            .send_to(&g711_rtp(0, 101, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
         let (_to_b_again, _) = recv(&phone_b).await; // B still receives transcoded media
         let mut scratch = [0u8; 2048];
         assert!(
-            timeout(Duration::from_millis(200), srs.recv_from(&mut scratch)).await.is_err(),
+            timeout(Duration::from_millis(200), srs.recv_from(&mut scratch))
+                .await
+                .is_err(),
             "no more forked packets reach the SRS after unsubscribe"
         );
 
         // delete: tears the call down cleanly (the subscription is already gone).
         let deleted = engine
-            .handle(CLIENT, Command::Delete {
-                call_id: "siprec-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "siprec-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(deleted, CmdResult::Ok { .. }));
-        assert!(!engine.media().is_media_call("siprec-1"), "media call deregistered");
+        assert!(
+            !engine.media().is_media_call("siprec-1"),
+            "media call deregistered"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2804,61 +3410,90 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
 
         let (_phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
         let (_srs, srs_addr) = phone().await;
 
         engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "siprec-2".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "siprec-2".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
         engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "siprec-2".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_single_codec(addr_b, 8, "PCMA"),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "siprec-2".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
             .await;
         let subscribe = engine
-            .handle(CLIENT, Command::SubscribeRequest {
-                call_id: "siprec-2".into(),
-                from_tags: vec!["tag-a".into()],
-                sdp: None,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::SubscribeRequest {
+                    call_id: "siprec-2".into(),
+                    from_tags: vec!["tag-a".into()],
+                    sdp: None,
+                    profile: Default::default(),
+                },
+            )
             .await;
         let subscription_tag = match subscribe {
-            CmdResult::Ok { to_tag: Some(to_tag), .. } => to_tag,
+            CmdResult::Ok {
+                to_tag: Some(to_tag),
+                ..
+            } => to_tag,
             other => panic!("expected a to_tag, got {other:?}"),
         };
         engine
-            .handle(CLIENT, Command::SubscribeAnswer {
-                call_id: "siprec-2".into(),
-                from_tag: "tag-a".into(),
-                to_tag: subscription_tag,
-                sdp: sdp_single_codec(srs_addr, 0, "PCMU"),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::SubscribeAnswer {
+                    call_id: "siprec-2".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: subscription_tag,
+                    sdp: sdp_single_codec(srs_addr, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
             .await;
 
         // Delete the call without unsubscribing first: teardown must drain the subscription too.
         let deleted = engine
-            .handle(CLIENT, Command::Delete {
-                call_id: "siprec-2".into(),
-                from_tag: "tag-a".into(),
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "siprec-2".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(deleted, CmdResult::Ok { .. }));
-        assert_eq!(engine.session_count(), 0, "the call drained from the registry");
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "the call drained from the registry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2871,7 +3506,14 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
 
         let (phone_a, addr_a) = phone().await;
         let (phone_b, addr_b) = phone().await;
@@ -2879,37 +3521,57 @@ mod tests {
 
         // A offers PCMU, B answers PCMU → same codec → a plain Passthrough relay (no media actor).
         let offer = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "siprec-relay".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "siprec-relay".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        let far_addr = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply").remote_rtp;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "siprec-relay".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_single_codec(addr_b, 0, "PCMU"),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "siprec-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        let near_addr = sdp::parse(&ok_sdp_text(&answer)).expect("answer reply").remote_rtp;
-        assert!(!engine.media().is_media_call("siprec-relay"), "a plain relay has no media actor");
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        assert!(
+            !engine.media().is_media_call("siprec-relay"),
+            "a plain relay has no media actor"
+        );
 
         // subscribe_request: the engine offers leg A's media + promotes the relay to userspace.
         let subscribe = engine
-            .handle(CLIENT, Command::SubscribeRequest {
-                call_id: "siprec-relay".into(),
-                from_tags: vec!["tag-a".into()],
-                sdp: None,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::SubscribeRequest {
+                    call_id: "siprec-relay".into(),
+                    from_tags: vec!["tag-a".into()],
+                    sdp: None,
+                    profile: Default::default(),
+                },
+            )
             .await;
         let (offer_sdp, subscription_tag) = match subscribe {
-            CmdResult::Ok { sdp: Some(sdp), to_tag: Some(to_tag), .. } => (sdp, to_tag),
+            CmdResult::Ok {
+                sdp: Some(sdp),
+                to_tag: Some(to_tag),
+                ..
+            } => (sdp, to_tag),
             other => panic!("expected an SDP offer + to_tag, got {other:?}"),
         };
         let offer_info = sdp::parse(&offer_sdp).expect("parse subscriber offer");
@@ -2918,63 +3580,106 @@ mod tests {
             "PCMU",
             "offer advertises the source leg's actual codec (RFC 4566)"
         );
-        assert!(offer_sdp.contains("a=sendonly"), "subscriber stream is send-only (RFC 3264)");
-        assert!(engine.media().is_relay_call("siprec-relay"), "the relay was promoted to userspace");
+        assert!(
+            offer_sdp.contains("a=sendonly"),
+            "subscriber stream is send-only (RFC 3264)"
+        );
+        assert!(
+            engine.media().is_relay_call("siprec-relay"),
+            "the relay was promoted to userspace"
+        );
 
         // subscribe_answer: the SRS answers with its media address; the raw tee attaches to leg A.
         let answered = engine
-            .handle(CLIENT, Command::SubscribeAnswer {
-                call_id: "siprec-relay".into(),
-                from_tag: "tag-a".into(),
-                to_tag: subscription_tag.clone(),
-                sdp: sdp_single_codec(srs_addr, 0, "PCMU"),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::SubscribeAnswer {
+                    call_id: "siprec-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: subscription_tag.clone(),
+                    sdp: sdp_single_codec(srs_addr, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        assert!(matches!(answered, CmdResult::Ok { .. }), "subscribe_answer ok: {answered:?}");
+        assert!(
+            matches!(answered, CmdResult::Ok { .. }),
+            "subscribe_answer ok: {answered:?}"
+        );
 
         // A sends RTP: (1) B still receives the relayed RTP, (2) the SRS receives the byte-identical
         // original RTP (raw tee, not re-encoded).
         let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
         phone_a.send_to(&from_a, near_addr).await.expect("a send");
         let (to_b, from_b_engine) = recv(&phone_b).await;
-        assert_eq!(from_b_engine, far_addr, "B's media leaves the engine's far port");
+        assert_eq!(
+            from_b_engine, far_addr,
+            "B's media leaves the engine's far port"
+        );
         assert_eq!(to_b, from_a, "B still receives the relayed RTP verbatim");
         let (forked, from) = recv(&srs).await;
-        assert_eq!(from, offer_info.remote_rtp, "tee leaves the engine's subscriber port");
-        assert_eq!(forked, from_a, "SRS receives leg A's ORIGINAL RTP byte-for-byte (raw tee)");
+        assert_eq!(
+            from, offer_info.remote_rtp,
+            "tee leaves the engine's subscriber port"
+        );
+        assert_eq!(
+            forked, from_a,
+            "SRS receives leg A's ORIGINAL RTP byte-for-byte (raw tee)"
+        );
 
         // unsubscribe: the SRS feed stops; B still flows; the call demotes back to the kernel path.
         let unsubscribed = engine
-            .handle(CLIENT, Command::Unsubscribe {
-                call_id: "siprec-relay".into(),
-                from_tag: "tag-a".into(),
-                to_tag: subscription_tag,
-            })
+            .handle(
+                CLIENT,
+                Command::Unsubscribe {
+                    call_id: "siprec-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: subscription_tag,
+                },
+            )
             .await;
         assert!(matches!(unsubscribed, CmdResult::Ok { .. }));
-        assert!(!engine.media().is_media_call("siprec-relay"), "demoted: no media actor remains");
+        assert!(
+            !engine.media().is_media_call("siprec-relay"),
+            "demoted: no media actor remains"
+        );
 
         let mut drain = [0u8; 2048];
         while srs.try_recv_from(&mut drain).is_ok() {}
-        phone_a.send_to(&g711_rtp(0, 101, 0x0A0A_0A0A, 0xFF), near_addr).await.expect("a send");
+        phone_a
+            .send_to(&g711_rtp(0, 101, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
         let (to_b_again, _) = recv(&phone_b).await; // B still relays after demotion
-        assert_eq!(to_b_again, g711_rtp(0, 101, 0x0A0A_0A0A, 0xFF), "B keeps relaying post-demote");
+        assert_eq!(
+            to_b_again,
+            g711_rtp(0, 101, 0x0A0A_0A0A, 0xFF),
+            "B keeps relaying post-demote"
+        );
         let mut scratch = [0u8; 2048];
         assert!(
-            timeout(Duration::from_millis(200), srs.recv_from(&mut scratch)).await.is_err(),
+            timeout(Duration::from_millis(200), srs.recv_from(&mut scratch))
+                .await
+                .is_err(),
             "no more tee'd packets reach the SRS after unsubscribe"
         );
 
         let deleted = engine
-            .handle(CLIENT, Command::Delete {
-                call_id: "siprec-relay".into(),
-                from_tag: "tag-a".into(),
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "siprec-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(deleted, CmdResult::Ok { .. }));
-        assert_eq!(engine.session_count(), 0, "the call drained from the registry");
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "the call drained from the registry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2984,7 +3689,14 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
 
         let (_phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
@@ -2994,33 +3706,45 @@ mod tests {
             ..Default::default()
         };
         engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "savp-siprec".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile,
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "savp-siprec".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile,
+                },
+            )
             .await;
         let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "savp-siprec".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: savp_answer_sdp(addr_b, &b_key),
-                profile: ProfileFlags::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "savp-siprec".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: savp_answer_sdp(addr_b, &b_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
             .await;
 
         let result = engine
-            .handle(CLIENT, Command::SubscribeRequest {
-                call_id: "savp-siprec".into(),
-                from_tags: vec!["tag-a".into()],
-                sdp: None,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::SubscribeRequest {
+                    call_id: "savp-siprec".into(),
+                    from_tags: vec!["tag-a".into()],
+                    sdp: None,
+                    profile: Default::default(),
+                },
+            )
             .await;
-        assert!(matches!(result, CmdResult::Error { .. }), "SIPREC on a secure call is rejected");
+        assert!(
+            matches!(result, CmdResult::Error { .. }),
+            "SIPREC on a secure call is rejected"
+        );
     }
 
     /// A µ-law (PCMU, PT 0) RTP packet: a 160-sample / 20 ms frame carrying `payload_byte`.
@@ -3046,13 +3770,17 @@ mod tests {
 
         // Stand up a local WebSocket server: it relays each received frame out `ws_rx`, and forwards a
         // downlink frame requested via `down_tx` into the socket toward the engine.
-        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ws");
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
         let ws_addr = ws_listener.local_addr().expect("ws addr");
         let (ws_tx, ws_rx) = flume::unbounded::<Message>();
         let (down_tx, down_rx) = flume::unbounded::<Vec<u8>>();
         tokio::spawn(async move {
             let (stream, _) = ws_listener.accept().await.expect("accept ws");
-            let socket = tokio_tungstenite::accept_async(stream).await.expect("ws handshake");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws handshake");
             let (mut sink, mut source) = socket.split();
             loop {
                 tokio::select! {
@@ -3095,27 +3823,38 @@ mod tests {
             ..Default::default()
         };
         let offer = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "ws-1".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile,
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile,
+                },
+            )
             .await;
         assert!(matches!(offer, CmdResult::Ok { .. }), "ws offer succeeds");
-        assert!(engine.ws().is_ws_call("ws-1"), "the call is a WS-bridge call");
+        assert!(
+            engine.ws().is_ws_call("ws-1"),
+            "the call is a WS-bridge call"
+        );
 
         // An answer (B answers PCMU too) returns the engine's A-facing endpoint without wiring A↔B.
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "ws-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_for(addr_a, true),
-                profile: ProfileFlags::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ws-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
             .await;
-        let near_addr = sdp::parse(&ok_sdp_text(&answer)).expect("answer reply").remote_rtp;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
 
         // 1. The WS server receives a `start` text frame first (the mod_audio_stream handshake).
         let first = timeout(Duration::from_secs(3), ws_rx.recv_async())
@@ -3163,24 +3902,36 @@ mod tests {
             {
                 let packet =
                     siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).expect("parse rtp");
-                assert_eq!(packet.payload_type, 0, "downlink encoded in A's codec (µ-law)");
+                assert_eq!(
+                    packet.payload_type, 0,
+                    "downlink encoded in A's codec (µ-law)"
+                );
                 assert_eq!(packet.payload.len(), 160, "8k/20ms µ-law frame");
                 got_downlink = true;
                 break;
             }
         }
-        assert!(got_downlink, "expected a downlink RTP packet toward phone A");
+        assert!(
+            got_downlink,
+            "expected a downlink RTP packet toward phone A"
+        );
 
         // 4. Teardown: delete frees the WS bridge (route + tasks).
         let deleted = engine
-            .handle(CLIENT, Command::Delete {
-                call_id: "ws-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "ws-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(deleted, CmdResult::Ok { .. }));
-        assert!(!engine.ws().is_ws_call("ws-1"), "WS call deregistered on delete");
+        assert!(
+            !engine.ws().is_ws_call("ws-1"),
+            "WS call deregistered on delete"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3188,7 +3939,14 @@ mod tests {
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
-        tokio::spawn(run_redirect_dispatcher(rx, engine.bridge(), engine.media(), engine.ws(), engine.conference(), None));
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
 
         let (phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
@@ -3210,35 +3968,44 @@ mod tests {
             port = addr_b.port(),
         );
         engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "dtmf-1".into(),
-                from_tag: "tag-a".into(),
-                sdp: offer_sdp,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dtmf-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
             .await;
         engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "dtmf-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: answer_sdp,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dtmf-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: Default::default(),
+                },
+            )
             .await;
         assert!(engine.media().is_media_call("dtmf-1"));
 
         // Play DTMF '7' toward A; the actor's playout clock injects RFC 4733 events out A's socket.
         let played = engine
-            .handle(CLIENT, Command::PlayDtmf {
-                call_id: "dtmf-1".into(),
-                from_tag: "tag-a".into(),
-                code: "7".into(),
-                duration_ms: Some(120),
-                volume_dbm0: Some(-10),
-                pause_ms: None,
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::PlayDtmf {
+                    call_id: "dtmf-1".into(),
+                    from_tag: "tag-a".into(),
+                    code: "7".into(),
+                    duration_ms: Some(120),
+                    volume_dbm0: Some(-10),
+                    pause_ms: None,
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(played, CmdResult::Ok { .. }));
 
@@ -3268,29 +4035,41 @@ mod tests {
         let (_phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
         engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "relay-1".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "relay-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
         engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "relay-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_for(addr_b, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "relay-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
         let result = engine
-            .handle(CLIENT, Command::SilenceMedia {
-                call_id: "relay-1".into(),
-                from_tag: "tag-a".into(),
-            })
+            .handle(
+                CLIENT,
+                Command::SilenceMedia {
+                    call_id: "relay-1".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
             .await;
-        assert!(matches!(result, CmdResult::Error { .. }), "silence needs a media call");
+        assert!(
+            matches!(result, CmdResult::Error { .. }),
+            "silence needs a media call"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3300,25 +4079,35 @@ mod tests {
         let (phone_b, addr_b) = phone().await;
 
         let offer = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "call-1".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, false),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "call-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        let far_rtp = sdp::parse(&ok_sdp_text(&offer)).expect("parse far").remote_rtp;
+        let far_rtp = sdp::parse(&ok_sdp_text(&offer))
+            .expect("parse far")
+            .remote_rtp;
 
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "call-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_for(addr_b, false),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "call-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        let near_rtp = sdp::parse(&ok_sdp_text(&answer)).expect("parse near").remote_rtp;
+        let near_rtp = sdp::parse(&ok_sdp_text(&answer))
+            .expect("parse near")
+            .remote_rtp;
 
         phone_a
             .send_to(&rtp(0x0A0A_0A0A), near_rtp)
@@ -3340,11 +4129,14 @@ mod tests {
         let mut stats = SessionStats::default();
         for _ in 0..50 {
             if let CmdResult::Ok { stats: Some(s), .. } = engine
-                .handle(CLIENT, Command::Query {
-                    call_id: "call-1".into(),
-                    from_tag: "tag-a".into(),
-                    to_tag: None,
-                })
+                .handle(
+                    CLIENT,
+                    Command::Query {
+                        call_id: "call-1".into(),
+                        from_tag: "tag-a".into(),
+                        to_tag: None,
+                    },
+                )
                 .await
             {
                 stats = s;
@@ -3358,11 +4150,14 @@ mod tests {
         assert_eq!(stats.packets_out, 2);
 
         let delete = engine
-            .handle(CLIENT, Command::Delete {
-                call_id: "call-1".into(),
-                from_tag: "tag-a".into(),
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "call-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(delete, CmdResult::Ok { .. }));
     }
@@ -3379,29 +4174,41 @@ mod tests {
         let (phone_b, addr_b) = phone_v6().await;
 
         let offer = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "call-v6".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, false),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "call-v6".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
             .await;
         let offer_sdp = ok_sdp_text(&offer);
-        assert!(offer_sdp.contains("c=IN IP6 ::1"), "v6 offer rewrite: {offer_sdp}");
+        assert!(
+            offer_sdp.contains("c=IN IP6 ::1"),
+            "v6 offer rewrite: {offer_sdp}"
+        );
         let far_rtp = sdp::parse(&offer_sdp).expect("parse far").remote_rtp;
         assert!(far_rtp.is_ipv6(), "the far engine endpoint is v6");
 
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "call-v6".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_for(addr_b, false),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "call-v6".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
             .await;
         let answer_sdp = ok_sdp_text(&answer);
-        assert!(answer_sdp.contains("c=IN IP6 ::1"), "v6 answer rewrite: {answer_sdp}");
+        assert!(
+            answer_sdp.contains("c=IN IP6 ::1"),
+            "v6 answer rewrite: {answer_sdp}"
+        );
         let near_rtp = sdp::parse(&answer_sdp).expect("parse near").remote_rtp;
         assert!(near_rtp.is_ipv6(), "the near engine endpoint is v6");
 
@@ -3424,11 +4231,14 @@ mod tests {
         assert_eq!(from, near_rtp);
 
         let delete = engine
-            .handle(CLIENT, Command::Delete {
-                call_id: "call-v6".into(),
-                from_tag: "tag-a".into(),
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "call-v6".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(delete, CmdResult::Ok { .. }));
     }
@@ -3449,15 +4259,22 @@ mod tests {
             addr_rtcp_a.port()
         );
         let offer = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "rtcp-call".into(),
-                from_tag: "a".into(),
-                sdp: offer_sdp,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "rtcp-call".into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
             .await;
         let far = sdp::parse(&ok_sdp_text(&offer)).expect("far");
-        assert_ne!(far.remote_rtcp.port(), far.remote_rtp.port() + 1, "engine RTCP is its own port");
+        assert_ne!(
+            far.remote_rtcp.port(),
+            far.remote_rtp.port() + 1,
+            "engine RTCP is its own port"
+        );
 
         let answer_sdp = format!(
             "v=0\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0\r\na=rtcp:{}\r\n",
@@ -3465,26 +4282,38 @@ mod tests {
             addr_rtcp_b.port()
         );
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "rtcp-call".into(),
-                from_tag: "a".into(),
-                to_tag: "b".into(),
-                sdp: answer_sdp,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "rtcp-call".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: answer_sdp,
+                    profile: Default::default(),
+                },
+            )
             .await;
         let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
 
         // RTP relays on the RTP ports.
-        rtp_a.send_to(&rtp(0x0A0A_0A0A), near.remote_rtp).await.expect("rtp a");
+        rtp_a
+            .send_to(&rtp(0x0A0A_0A0A), near.remote_rtp)
+            .await
+            .expect("rtp a");
         assert_eq!(recv(&rtp_b).await.0, rtp(0x0A0A_0A0A));
 
         // RTCP relays on the dedicated RTCP ports (RTCP SR, first byte 0x80 / PT 200).
         let rtcp_sr = vec![0x80u8, 0xC8, 0x00, 0x06, 0x11, 0x22, 0x33, 0x44];
-        rtcp_a.send_to(&rtcp_sr, near.remote_rtcp).await.expect("rtcp a");
+        rtcp_a
+            .send_to(&rtcp_sr, near.remote_rtcp)
+            .await
+            .expect("rtcp a");
         let (data, from) = recv(&rtcp_b).await;
         assert_eq!(data, rtcp_sr);
-        assert_eq!(from, far.remote_rtcp, "B's RTCP arrives from the engine far-RTCP port");
+        assert_eq!(
+            from, far.remote_rtcp,
+            "B's RTCP arrives from the engine far-RTCP port"
+        );
 
         let _ = (addr_rtcp_a, addr_rtcp_b);
     }
@@ -3496,32 +4325,47 @@ mod tests {
         let (phone_b, addr_b) = phone().await;
 
         let offer = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "mux".into(),
-                from_tag: "a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mux".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
         let far = sdp::parse(&ok_sdp_text(&offer)).expect("far");
         assert!(far.rtcp_mux);
-        assert!(!ok_sdp_text(&offer).contains("a=rtcp:"), "no companion port advertised under mux");
+        assert!(
+            !ok_sdp_text(&offer).contains("a=rtcp:"),
+            "no companion port advertised under mux"
+        );
 
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "mux".into(),
-                from_tag: "a".into(),
-                to_tag: "b".into(),
-                sdp: sdp_for(addr_b, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "mux".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
         let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
 
         // Both an RTP-looking and an RTCP-looking datagram relay over the single muxed port.
-        phone_a.send_to(b"\x80\x00rtp", near.remote_rtp).await.expect("rtp");
+        phone_a
+            .send_to(b"\x80\x00rtp", near.remote_rtp)
+            .await
+            .expect("rtp");
         assert_eq!(recv(&phone_b).await.0, b"\x80\x00rtp");
-        phone_b.send_to(b"\x80\xc8rtcp", far.remote_rtp).await.expect("rtcp");
+        phone_b
+            .send_to(b"\x80\xc8rtcp", far.remote_rtp)
+            .await
+            .expect("rtcp");
         assert_eq!(recv(&phone_a).await.0, b"\x80\xc8rtcp");
     }
 
@@ -3529,22 +4373,28 @@ mod tests {
     async fn answer_and_delete_unknown_call_error() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "nope".into(),
-                from_tag: "a".into(),
-                to_tag: "b".into(),
-                sdp: "v=0\r\nc=IN IP4 192.0.2.1\r\nm=audio 5000 RTP/AVP 0\r\n".into(),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "nope".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: "v=0\r\nc=IN IP4 192.0.2.1\r\nm=audio 5000 RTP/AVP 0\r\n".into(),
+                    profile: Default::default(),
+                },
+            )
             .await;
         assert!(matches!(answer, CmdResult::Error { .. }));
 
         let delete = engine
-            .handle(CLIENT, Command::Delete {
-                call_id: "nope".into(),
-                from_tag: "a".into(),
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "nope".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(delete, CmdResult::Error { .. }));
     }
@@ -3556,9 +4406,12 @@ mod tests {
         // wired SIPREC verb — see the subscribe_* tests below.)
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let result = engine
-            .handle(CLIENT, Command::Authenticate {
-                token: "s3cret".into(),
-            })
+            .handle(
+                CLIENT,
+                Command::Authenticate {
+                    token: "s3cret".into(),
+                },
+            )
             .await;
         match result {
             CmdResult::Error { reason } => assert!(reason.contains("authenticate")),
@@ -3574,65 +4427,102 @@ mod tests {
         let (_phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
         engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "fork-relay".into(),
-                from_tag: "tag-a".into(),
-                sdp: sdp_for(addr_a, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "fork-relay".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
         engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "fork-relay".into(),
-                from_tag: "tag-a".into(),
-                to_tag: "tag-b".into(),
-                sdp: sdp_for(addr_b, true),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "fork-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        assert!(!engine.media().is_media_call("fork-relay"), "starts as a plain relay");
+        assert!(
+            !engine.media().is_media_call("fork-relay"),
+            "starts as a plain relay"
+        );
         let result = engine
-            .handle(CLIENT, Command::SubscribeRequest {
-                call_id: "fork-relay".into(),
-                from_tags: vec!["tag-a".into()],
-                sdp: None,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::SubscribeRequest {
+                    call_id: "fork-relay".into(),
+                    from_tags: vec!["tag-a".into()],
+                    sdp: None,
+                    profile: Default::default(),
+                },
+            )
             .await;
         match result {
-            CmdResult::Ok { sdp: Some(sdp), to_tag: Some(_), .. } => {
-                assert!(sdp.contains("a=sendonly"), "send-only subscriber offer (RFC 3264)");
-                assert!(sdp.contains("PCMU"), "advertises the source leg's codec (RFC 4566)");
+            CmdResult::Ok {
+                sdp: Some(sdp),
+                to_tag: Some(_),
+                ..
+            } => {
+                assert!(
+                    sdp.contains("a=sendonly"),
+                    "send-only subscriber offer (RFC 3264)"
+                );
+                assert!(
+                    sdp.contains("PCMU"),
+                    "advertises the source leg's codec (RFC 4566)"
+                );
             }
             other => panic!("expected an SDP offer, got {other:?}"),
         }
-        assert!(engine.media().is_relay_call("fork-relay"), "the relay was promoted to userspace");
+        assert!(
+            engine.media().is_relay_call("fork-relay"),
+            "the relay was promoted to userspace"
+        );
     }
 
     #[tokio::test]
     async fn subscribe_request_on_an_unknown_call_is_unknown() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let result = engine
-            .handle(CLIENT, Command::SubscribeRequest {
-                call_id: "nope".into(),
-                from_tags: vec!["f".into()],
-                sdp: None,
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::SubscribeRequest {
+                    call_id: "nope".into(),
+                    from_tags: vec!["f".into()],
+                    sdp: None,
+                    profile: Default::default(),
+                },
+            )
             .await;
-        assert!(matches!(result, CmdResult::Error { .. }), "unknown call ⇒ error");
+        assert!(
+            matches!(result, CmdResult::Error { .. }),
+            "unknown call ⇒ error"
+        );
     }
 
     #[tokio::test]
     async fn stop_media_on_unknown_call_errors() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let result = engine
-            .handle(CLIENT, Command::StopMedia {
-                call_id: "nope".into(),
-                from_tag: "f".into(),
-            })
+            .handle(
+                CLIENT,
+                Command::StopMedia {
+                    call_id: "nope".into(),
+                    from_tag: "f".into(),
+                },
+            )
             .await;
-        assert!(matches!(result, CmdResult::Error { .. }), "unknown call ⇒ error");
+        assert!(
+            matches!(result, CmdResult::Error { .. }),
+            "unknown call ⇒ error"
+        );
     }
 
     /// A test phone bound to a specific loopback address, so the engine's signalled-source gate can
@@ -3661,23 +4551,29 @@ mod tests {
         let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
 
         let offer = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "rtpbleed".into(),
-                from_tag: "a".into(),
-                sdp: sdp_for(addr_a, false),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "rtpbleed".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
             .await;
         let far = sdp::parse(&ok_sdp_text(&offer)).expect("far");
 
         let answer = engine
-            .handle(CLIENT, Command::Answer {
-                call_id: "rtpbleed".into(),
-                from_tag: "a".into(),
-                to_tag: "b".into(),
-                sdp: sdp_for(addr_b, false),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "rtpbleed".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
             .await;
         let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
 
@@ -3701,7 +4597,10 @@ mod tests {
             .expect("peer send");
         let (data, from) = recv(&phone_b).await;
         assert_eq!(data, rtp(0x1234_5678));
-        assert_eq!(from, far.remote_rtp, "B sees media from the engine far-RTP port");
+        assert_eq!(
+            from, far.remote_rtp,
+            "B sees media from the engine far-RTP port"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3712,22 +4611,31 @@ mod tests {
         let (_phone_b, addr_b) = phone().await;
 
         let first = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "c1".into(),
-                from_tag: "a".into(),
-                sdp: sdp_for(addr_a, false),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "c1".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        assert!(matches!(first, CmdResult::Ok { .. }), "first offer fits the pool");
+        assert!(
+            matches!(first, CmdResult::Ok { .. }),
+            "first offer fits the pool"
+        );
 
         let second = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "c2".into(),
-                from_tag: "a".into(),
-                sdp: sdp_for(addr_b, false),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "c2".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
             .await;
         assert!(
             matches!(second, CmdResult::Error { .. }),
@@ -3736,22 +4644,31 @@ mod tests {
 
         // Tearing down the first call frees its four ports; the second offer now fits.
         let delete = engine
-            .handle(CLIENT, Command::Delete {
-                call_id: "c1".into(),
-                from_tag: "a".into(),
-                to_tag: None,
-            })
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "c1".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                },
+            )
             .await;
         assert!(matches!(delete, CmdResult::Ok { .. }));
         let retry = engine
-            .handle(CLIENT, Command::Offer {
-                call_id: "c2".into(),
-                from_tag: "a".into(),
-                sdp: sdp_for(addr_b, false),
-                profile: Default::default(),
-            })
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "c2".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
             .await;
-        assert!(matches!(retry, CmdResult::Ok { .. }), "freed pool admits the call");
+        assert!(
+            matches!(retry, CmdResult::Ok { .. }),
+            "freed pool admits the call"
+        );
     }
 
     #[tokio::test]
@@ -3999,7 +4916,10 @@ mod tests {
             )
             .await;
         let offer_out = ok_sdp_text(&offer);
-        assert!(offer_out.contains("a=ice-lite"), "engine offers ICE-lite to B");
+        assert!(
+            offer_out.contains("a=ice-lite"),
+            "engine offers ICE-lite to B"
+        );
         // The engine's advertised credentials (the same identity it installs on the endpoints).
         let advertised = sdp::parse(&offer_out).expect("parse engine offer");
         let engine_ufrag = advertised.ice_ufrag.clone().expect("engine ufrag");
@@ -4019,7 +4939,10 @@ mod tests {
             )
             .await;
         let answer_out = ok_sdp_text(&answer);
-        assert!(answer_out.contains("a=ice-lite"), "engine offers ICE-lite to A");
+        assert!(
+            answer_out.contains("a=ice-lite"),
+            "engine offers ICE-lite to A"
+        );
         let near = sdp::parse(&answer_out).expect("parse engine answer");
 
         // A runs a valid connectivity check against the engine's A-facing endpoint, signed with the
@@ -4104,7 +5027,9 @@ mod tests {
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack.windows(needle.len()).any(|window| window == needle)
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4112,7 +5037,9 @@ mod tests {
         let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
 
         // Stand in for VoIPmonitor's HEP input with a loopback UDP socket.
-        let collector = UdpSocket::bind("127.0.0.1:0").await.expect("bind collector");
+        let collector = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind collector");
         let collector_addr = collector.local_addr().expect("collector addr");
         let exporter = HepExporter::connect(collector_addr).await.expect("connect");
         tokio::spawn(engine.clone().run_rtcp_export(exporter, 7));
@@ -4164,7 +5091,13 @@ mod tests {
             .expect("recv hep");
         let packet = &buffer[..len];
         assert_eq!(&packet[..4], b"HEP3");
-        assert!(contains_bytes(packet, &report), "HEP carries the relayed RTCP");
-        assert!(contains_bytes(packet, b"qos"), "HEP correlation id = call-id");
+        assert!(
+            contains_bytes(packet, &report),
+            "HEP carries the relayed RTCP"
+        );
+        assert!(
+            contains_bytes(packet, b"qos"),
+            "HEP correlation id = call-id"
+        );
     }
 }

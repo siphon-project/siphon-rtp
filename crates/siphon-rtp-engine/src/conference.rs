@@ -36,6 +36,7 @@ use siphon_rtp_media::mixer::{MixInputs, Mixer, Monitor, Role, Whisper, MAX_PART
 use siphon_rtp_media::rtcp;
 use siphon_rtp_media::rtp::RtpPacket;
 use siphon_rtp_proto::Event;
+use siphon_rtp_srtp::leg::SecureLeg;
 
 use crate::media_pipeline::Outbound;
 
@@ -80,7 +81,11 @@ pub struct Routing {
 
 impl Default for Routing {
     fn default() -> Self {
-        Self { role: Role::Talker, whisper_target: None, monitor_target: None }
+        Self {
+            role: Role::Talker,
+            whisper_target: None,
+            monitor_target: None,
+        }
     }
 }
 
@@ -107,8 +112,15 @@ pub struct ParticipantConfig {
     pub egress_ssrc: u32,
     /// The egress RTP payload type (the participant's negotiated codec PT).
     pub egress_payload_type: u8,
+    /// The participant's codec as the G.107 MOS estimator knows it (`siphon-rtp-hep`), resolved from
+    /// the negotiated encoding name — so an AMR-WB / G.722 leg is scored on its own impairment, not
+    /// the G.711 default. See [`hep_codec_for_name`].
+    pub mos_codec: siphon_rtp_hep::mos::Codec,
     /// The participant's RFC 4733 telephone-event PT, if negotiated (filtered out of the mix).
     pub telephone_event_in: Option<u8>,
+    /// SDES-SRTP crypto for a secure (`RTP/SAVP`) participant: decrypt ingress / encrypt egress with
+    /// this leg's keys. `None` for a plain `RTP/AVP` participant.
+    pub secure: Option<SecureLeg>,
     /// Initial role / routing.
     pub routing: Routing,
 }
@@ -128,6 +140,8 @@ struct Participant {
     native_frame: usize,
     /// The egress RTP payload type (the participant's codec PT) — the shared-encode class key.
     egress_payload_type: u8,
+    /// This participant's codec for the G.107 MOS estimate (resolved at join from the encoding name).
+    mos_codec: siphon_rtp_hep::mos::Codec,
     /// Whether this participant's encoder is stateless (G.711 / L16) and so can share one encode of
     /// the listener mix with every other listener on the same codec.
     stateless: bool,
@@ -139,6 +153,8 @@ struct Participant {
     vad: EnergyVad,
     /// RFC 4733 telephone-event detector — emits one [`Event::Dtmf`] per completed key press.
     dtmf: DtmfDetector,
+    /// SDES-SRTP state for a secure participant (decrypt ingress / encrypt egress); `None` if plain.
+    secure: Option<SecureLeg>,
     routing: Routing,
     /// Whether the first egress packet has been emitted (sets the RTP marker bit, RFC 3550 §5.1).
     started: bool,
@@ -192,9 +208,22 @@ pub struct Conference {
     /// reused across ticks (`share_count` is the live length); only the first `share_count` are valid.
     share_classes: Vec<(u8, Vec<u8>)>,
     share_count: usize,
+    /// Shared room→8 kHz downsampler for the **mixed-rate** shared-encode path: when the room runs at
+    /// 16 kHz, narrowband listeners hear one downsampled copy of the listener mix (not each their own),
+    /// so the resample is shared too. `Some` only when the room is wideband.
+    listener_downsample: Option<Resampler>,
+    /// The listener mix downsampled to 8 kHz this tick (filled lazily by the first narrowband
+    /// shared-encode listener), reused by the rest.
+    listener_native_buf: Vec<i16>,
+    /// Whether `listener_native_buf` has been computed this tick.
+    listener_native_ready: bool,
     /// DTMF events detected on ingress this drain cycle (RFC 4733), drained by the actor to the
     /// control channel.
     pending_events: Vec<Event>,
+    /// SRTP scratch for secure participants: decrypted ingress (`clear_in`) and encrypted egress
+    /// (`secure_out`). Reused per packet — `SecureLeg::protect`/`unprotect` append to a `Vec`.
+    clear_in: Vec<u8>,
+    secure_out: Vec<u8>,
     /// The dominant speaker's tag as of the previous tick (for change detection).
     last_dominant_tag: Option<String>,
 }
@@ -210,7 +239,9 @@ impl Conference {
             top_m,
             room_rate: ROOM_RATE_HZ,
             room_frame: ROOM_FRAME,
-            room_rows: (0..MAX_PARTICIPANTS).map(|_| vec![0i16; ROOM_FRAME]).collect(),
+            room_rows: (0..MAX_PARTICIPANTS)
+                .map(|_| vec![0i16; ROOM_FRAME])
+                .collect(),
             roles: vec![Role::Talker; MAX_PARTICIPANTS],
             energy: vec![0i64; MAX_PARTICIPANTS],
             speaking: vec![false; MAX_PARTICIPANTS],
@@ -227,7 +258,13 @@ impl Conference {
             external_buf: vec![0i16; ROOM_FRAME],
             share_classes: Vec::new(),
             share_count: 0,
+            // The room starts wideband (16 kHz), so the room→8 kHz downsampler exists from the start.
+            listener_downsample: Resampler::new(ROOM_RATE_HZ, NARROWBAND_RATE_HZ).ok(),
+            listener_native_buf: vec![0i16; ROOM_FRAME],
+            listener_native_ready: false,
             pending_events: Vec::new(),
+            clear_in: Vec::with_capacity(MAX_RTP),
+            secure_out: Vec::with_capacity(MAX_RTP),
             last_dominant_tag: None,
         }
     }
@@ -267,7 +304,11 @@ impl Conference {
         if self.participants.len() >= MAX_PARTICIPANTS {
             return false;
         }
-        if self.participants.iter().any(|participant| participant.tag == config.tag) {
+        if self
+            .participants
+            .iter()
+            .any(|participant| participant.tag == config.tag)
+        {
             return false;
         }
         let native_rate = config.decoder.params().sample_rate_hz;
@@ -298,12 +339,14 @@ impl Conference {
             native_rate,
             native_frame,
             egress_payload_type,
+            mos_codec: config.mos_codec,
             stateless,
             telephone_event_in: config.telephone_event_in,
             to_room,
             from_room,
             vad: EnergyVad::new(VAD_THRESHOLD, VAD_HANGOVER_FRAMES),
             dtmf: DtmfDetector::new(),
+            secure: config.secure,
             routing: config.routing,
             started: false,
         });
@@ -313,7 +356,10 @@ impl Conference {
 
     /// Remove a participant by tag. Returns `true` if it was seated.
     pub fn remove_participant(&mut self, tag: &str) -> bool {
-        if let Some(position) = self.participants.iter().position(|participant| participant.tag == tag)
+        if let Some(position) = self
+            .participants
+            .iter()
+            .position(|participant| participant.tag == tag)
         {
             self.participants.remove(position);
             self.recompute_room_rate();
@@ -325,8 +371,10 @@ impl Conference {
 
     /// Live-update a participant's role / routing. Returns `true` if it was seated.
     pub fn set_routing(&mut self, tag: &str, routing: Routing) -> bool {
-        if let Some(participant) =
-            self.participants.iter_mut().find(|participant| participant.tag == tag)
+        if let Some(participant) = self
+            .participants
+            .iter_mut()
+            .find(|participant| participant.tag == tag)
         {
             participant.routing = routing;
             true
@@ -363,13 +411,34 @@ impl Conference {
         if participant.latch {
             participant.egress_dst = packet.source;
         }
-        let data = &packet.data;
+        // SRTP: decrypt a secure participant's packet first (the auth tag also proves authenticity —
+        // a forged/replayed packet fails here and is dropped). Plain legs pass through untouched.
+        let data: &[u8] = if let Some(secure) = participant.secure.as_mut() {
+            self.clear_in.clear();
+            if secure.unprotect(&packet.data, &mut self.clear_in).is_err() {
+                return false;
+            }
+            &self.clear_in
+        } else {
+            &packet.data
+        };
         if data.len() < 2 {
             return true; // gated in; too short to be audio, but the path is alive
         }
-        // RFC 5761 demux: payload-type byte 64..=95 marks RTCP — dropped (no per-leg RTCP yet).
+        // RFC 5761 demux: payload-type byte 64..=95 marks RTCP. We never mix it, but a Sender Report
+        // carries the sender's NTP timestamp, which we echo back as LSR (+ DLSR) in our own reception
+        // report so the peer can compute round-trip time (RFC 3550 §6.4.1). Consume it, then drop.
         let packet_type = data[1] & 0x7f;
         if (64..=95).contains(&packet_type) {
+            // Sender Report (V=2, PT=200): the 64-bit NTP timestamp sits at offset 8 (after the
+            // 8-byte header), so the packet must hold at least 16 bytes.
+            if data[0] >> 6 == 2 && data[1] == 200 && data.len() >= 16 {
+                if let Ok(ntp_bytes) = <[u8; 8]>::try_from(&data[8..16]) {
+                    participant
+                        .leg
+                        .record_sender_report(u64::from_be_bytes(ntp_bytes), packet.arrival);
+                }
+            }
             return true;
         }
         let Ok(parsed) = RtpPacket::parse(data) else {
@@ -392,7 +461,11 @@ impl Conference {
             }
             return true;
         }
-        let _ = participant.leg.ingest_rtp(data);
+        if participant.leg.ingest_rtp(data).is_ok() {
+            // Fold the receive-time arrival the datapath stamped into this leg's interarrival-jitter
+            // estimate (RFC 3550 §6.4.1) — stamped at receive, so it reflects network, not queue, timing.
+            participant.leg.observe_arrival(packet.arrival);
+        }
         true
     }
 
@@ -402,25 +475,92 @@ impl Conference {
         self.pending_events.drain(..)
     }
 
+    /// Append a periodic [`Event::CallQuality`] (RFC 3550 jitter/loss + ITU-T G.107 MOS) for every
+    /// participant that has received audio. `network_delay_ms` is the best-known one-way network
+    /// delay — pass `0.0` when it is not measured (the score then reflects jitter + loss + codec; the
+    /// jitter buffer's own delay is always folded in).
+    pub fn build_quality_events(&self, network_delay_ms: f64, out: &mut Vec<Event>) {
+        for participant in &self.participants {
+            if participant.leg.ingress_ssrc().is_none() {
+                continue; // no inbound stream measured yet
+            }
+            // MOS from the engine's canonical G.107 E-model (`siphon-rtp-hep`, shared with the HEP
+            // export path) — fed the leg's measured loss + jitter (one-way network delay unknown
+            // here, so 0; the jitter buffer's own delay is modelled inside the E-model).
+            let impairments = siphon_rtp_hep::mos::Impairments {
+                loss_percent: participant.leg.ingress_loss_percent(),
+                one_way_delay_ms: network_delay_ms,
+                jitter_ms: participant.leg.ingress_jitter_ms(),
+            };
+            out.push(Event::CallQuality {
+                conference_id: self.conference_id().to_string(),
+                from_tag: participant.tag.clone(),
+                jitter_ms: impairments.jitter_ms,
+                loss_percent: impairments.loss_percent,
+                mos: siphon_rtp_hep::mos::estimate_mos(participant.mos_codec, impairments),
+            });
+        }
+    }
+
     /// Build one RTCP **Sender Report** per participant with a resolved destination, for the given NTP
     /// wall-clock time, appending each as an [`Outbound`] toward the participant's endpoint (rtcp-mux,
-    /// RFC 5761). Lets receivers lip-sync the NTP↔RTP mapping and observe liveness (RFC 3550 §6.4.1).
-    pub fn build_sender_reports(&self, ntp_timestamp: u64, out: &mut Vec<Outbound>) {
-        for participant in &self.participants {
-            if !destination_usable(participant.egress_dst) {
+    /// RFC 5761). The SR carries the NTP↔RTP mapping (lip-sync) + sender counts, plus a reception
+    /// report on that participant's inbound stream — cumulative loss + extended highest sequence,
+    /// interarrival jitter, and LSR/DLSR (from the peer's last SR, `now_micros` being the engine's
+    /// monotonic-clock reading) — so the sender sees reception quality and can derive RTT
+    /// (RFC 3550 §6.4.1).
+    pub fn build_sender_reports(&mut self, ntp_timestamp: u64, now_micros: u64, out: &mut Vec<Outbound>) {
+        let mut buffer = [0u8; rtcp::SENDER_REPORT_LEN + rtcp::RECEPTION_REPORT_LEN];
+        for index in 0..self.participants.len() {
+            let dst = self.participants[index].egress_dst;
+            if !destination_usable(dst) {
                 continue;
             }
-            let report = rtcp::write_sender_report(
-                participant.leg.egress_ssrc(),
+            let egress_endpoint = self.participants[index].egress_endpoint;
+            let leg = &self.participants[index].leg;
+            let block;
+            let reports: &[rtcp::ReceptionReport] = if let Some(ssrc) = leg.ingress_ssrc() {
+                block = rtcp::ReceptionReport {
+                    ssrc,
+                    cumulative_lost: leg.jitter_stats().losses as u32,
+                    extended_highest_seq: leg.ingress_extended_highest_seq(),
+                    jitter: leg.ingress_jitter(),
+                    last_sr: leg.last_sr(),
+                    delay_last_sr: leg.delay_since_last_sr(now_micros),
+                    ..rtcp::ReceptionReport::default()
+                };
+                std::slice::from_ref(&block)
+            } else {
+                &[]
+            };
+            let Some(len) = rtcp::write_sender_report(
+                leg.egress_ssrc(),
                 ntp_timestamp,
-                participant.leg.egress_timestamp(),
-                participant.leg.egress_packets(),
-                participant.leg.egress_octets(),
-            );
+                leg.egress_timestamp(),
+                leg.egress_packets(),
+                leg.egress_octets(),
+                reports,
+                &mut buffer,
+            ) else {
+                continue;
+            };
+            // SRTCP-encrypt the report for a secure participant; plain legs send it as is.
+            let wire: &[u8] = if let Some(secure) = self.participants[index].secure.as_mut() {
+                self.secure_out.clear();
+                if secure
+                    .protect(&buffer[..len], &mut self.secure_out)
+                    .is_err()
+                {
+                    continue;
+                }
+                &self.secure_out
+            } else {
+                &buffer[..len]
+            };
             out.push(Outbound {
-                endpoint: participant.egress_endpoint,
-                dst: participant.egress_dst,
-                data: Bytes::copy_from_slice(&report),
+                endpoint: egress_endpoint,
+                dst,
+                data: Bytes::copy_from_slice(wire),
             });
         }
     }
@@ -451,8 +591,12 @@ impl Conference {
                     match participant.to_room.as_mut() {
                         Some(resampler) => {
                             self.resample_scratch.clear();
-                            resampler.process(&self.native_in[..samples], &mut self.resample_scratch);
-                            fill_padded(&mut self.room_rows[index][..room_frame], &self.resample_scratch);
+                            resampler
+                                .process(&self.native_in[..samples], &mut self.resample_scratch);
+                            fill_padded(
+                                &mut self.room_rows[index][..room_frame],
+                                &self.resample_scratch,
+                            );
                         }
                         None => fill_padded(
                             &mut self.room_rows[index][..room_frame],
@@ -485,7 +629,8 @@ impl Conference {
                 external,
                 frame_len: self.room_frame,
             };
-            self.mixer.mix(&inputs, &self.whispers, &self.monitors, self.top_m)
+            self.mixer
+                .mix(&inputs, &self.whispers, &self.monitors, self.top_m)
         };
 
         // Feed this room's local-participant mix onward to every bridged room.
@@ -495,6 +640,7 @@ impl Conference {
         // listener mix; resample room → native, encode, packetize with the leg's own SSRC, transmit.
         // Stateless listeners on the same codec share one encode of the listener mix (shared-encode).
         self.share_count = 0;
+        self.listener_native_ready = false;
         for index in 0..count {
             let dst = self.participants[index].egress_dst;
             if !destination_usable(dst) {
@@ -504,11 +650,14 @@ impl Conference {
             let marker = !self.participants[index].started;
             let native_frame = self.participants[index].native_frame;
 
-            // A listener (no distinct mix) on a stateless codec at the room rate shares the encode:
-            // the listener mix is already its native PCM, so encode it once per codec and fan out.
+            // A listener (no distinct mix) on a stateless codec shares the encode: either the listener
+            // mix is already its native PCM (native == room), or it is one shared room→8 kHz downsample
+            // (narrowband listener in a wideband room) — encode once per codec and fan out.
+            let native_rate = self.participants[index].native_rate;
             let shareable = !self.mixer.has_distinct_output(index)
                 && self.participants[index].stateless
-                && self.participants[index].native_rate == self.room_rate;
+                && (native_rate == self.room_rate
+                    || (native_rate == NARROWBAND_RATE_HZ && self.room_rate == ROOM_RATE_HZ));
 
             let payload_len = if shareable {
                 match self.shared_encode(index) {
@@ -542,10 +691,23 @@ impl Conference {
                 Ok(len) => len,
                 Err(_) => continue,
             };
+            // SRTP: encrypt the egress packet for a secure participant; plain legs send it as is.
+            let wire: &[u8] = if let Some(secure) = self.participants[index].secure.as_mut() {
+                self.secure_out.clear();
+                if secure
+                    .protect(&self.rtp[..rtp_len], &mut self.secure_out)
+                    .is_err()
+                {
+                    continue;
+                }
+                &self.secure_out
+            } else {
+                &self.rtp[..rtp_len]
+            };
             out.push(Outbound {
                 endpoint: egress_endpoint,
                 dst,
-                data: Bytes::copy_from_slice(&self.rtp[..rtp_len]),
+                data: Bytes::copy_from_slice(wire),
             });
             self.participants[index].started = true;
         }
@@ -568,17 +730,24 @@ impl Conference {
         self.monitors.clear();
         for (index, participant) in self.participants.iter().enumerate() {
             if let Some(target_tag) = &participant.routing.whisper_target {
-                if let Some(to) =
-                    self.participants.iter().position(|other| &other.tag == target_tag)
+                if let Some(to) = self
+                    .participants
+                    .iter()
+                    .position(|other| &other.tag == target_tag)
                 {
                     self.whispers.push(Whisper { from: index, to });
                 }
             }
             if let Some(target_tag) = &participant.routing.monitor_target {
-                if let Some(target) =
-                    self.participants.iter().position(|other| &other.tag == target_tag)
+                if let Some(target) = self
+                    .participants
+                    .iter()
+                    .position(|other| &other.tag == target_tag)
                 {
-                    self.monitors.push(Monitor { listener: index, target });
+                    self.monitors.push(Monitor {
+                        listener: index,
+                        target,
+                    });
                 }
             }
         }
@@ -598,21 +767,52 @@ impl Conference {
             self.payload[..len].copy_from_slice(&self.share_classes[slot].1);
             Some(len)
         } else {
-            // First listener of this codec this tick: encode the listener mix once and cache it.
-            let len = self.participants[index]
-                .leg
-                .encode_payload(self.mixer.listener_mix(), &mut self.payload)
-                .ok()?;
+            // First listener of this codec this tick: encode the listener mix once and cache it. When
+            // the listener's native rate differs from the room (a narrowband leg in a wideband room),
+            // encode the shared room→8 kHz downsample instead of the room-rate mix.
+            let native_rate = self.participants[index].native_rate;
+            let native_frame = self.participants[index].native_frame;
+            let len = if native_rate == self.room_rate {
+                self.participants[index]
+                    .leg
+                    .encode_payload(self.mixer.listener_mix(), &mut self.payload)
+                    .ok()?
+            } else {
+                self.ensure_listener_native();
+                self.participants[index]
+                    .leg
+                    .encode_payload(&self.listener_native_buf[..native_frame], &mut self.payload)
+                    .ok()?
+            };
             if self.share_count < self.share_classes.len() {
                 let slot = &mut self.share_classes[self.share_count];
                 slot.0 = payload_type;
                 slot.1.clear();
                 slot.1.extend_from_slice(&self.payload[..len]);
             } else {
-                self.share_classes.push((payload_type, self.payload[..len].to_vec()));
+                self.share_classes
+                    .push((payload_type, self.payload[..len].to_vec()));
             }
             self.share_count += 1;
             Some(len)
+        }
+    }
+
+    /// Downsample the listener mix to 8 kHz once per tick (shared by every narrowband shared-encode
+    /// listener), into [`Conference::listener_native_buf`].
+    fn ensure_listener_native(&mut self) {
+        if self.listener_native_ready {
+            return;
+        }
+        if let Some(resampler) = self.listener_downsample.as_mut() {
+            self.resample_scratch.clear();
+            resampler.process(self.mixer.listener_mix(), &mut self.resample_scratch);
+            let narrowband_frame = (NARROWBAND_RATE_HZ as usize / 1000) * 20;
+            fill_padded(
+                &mut self.listener_native_buf[..narrowband_frame],
+                &self.resample_scratch,
+            );
+            self.listener_native_ready = true;
         }
     }
 
@@ -700,6 +900,12 @@ impl Conference {
                 participant.to_room = to_room;
                 participant.from_room = from_room;
             }
+            // The shared room→8 kHz downsampler exists only when the room is wideband.
+            self.listener_downsample = if target == ROOM_RATE_HZ {
+                Resampler::new(ROOM_RATE_HZ, NARROWBAND_RATE_HZ).ok()
+            } else {
+                None
+            };
         }
     }
 }
@@ -790,6 +996,7 @@ async fn run_conference<D>(
     D: Datapath,
 {
     let mut outbound = Vec::new();
+    let mut quality_events: Vec<Event> = Vec::new();
     let mut ticks_since_report = 0u64;
     let mut ticker = tokio::time::interval(ROOM_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -855,18 +1062,51 @@ async fn run_conference<D>(
                 if ticks_since_report >= SR_INTERVAL_TICKS {
                     ticks_since_report = 0;
                     outbound.clear();
-                    conference.build_sender_reports(ntp_now(), &mut outbound);
+                    conference.build_sender_reports(ntp_now(), datapath.now_micros(), &mut outbound);
                     send_all(&datapath, &mut outbound).await;
+                    // Periodic per-participant quality estimate (jitter/loss/MOS) on the control
+                    // channel, so SIPhon sees live call quality without parsing RTCP itself.
+                    if let Some(sink) = &events {
+                        quality_events.clear();
+                        conference.build_quality_events(0.0, &mut quality_events);
+                        for event in quality_events.drain(..) {
+                            if sink.try_send(event).is_err() {
+                                tracing::debug!(
+                                    "conference quality event dropped (sink full or closed)"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+/// Map a negotiated `a=rtpmap` encoding name (uppercased, per [`CodecSpec`]) to the
+/// [`siphon_rtp_hep::mos::Codec`] the G.107 estimator scores. Codecs the estimator does not model
+/// (G.726, GSM-FR, CN) fall back to G.711 — the most optimistic, so their MOS is an upper bound.
+pub(crate) fn hep_codec_for_name(encoding_name: &str) -> siphon_rtp_hep::mos::Codec {
+    use siphon_rtp_hep::mos::Codec;
+    match encoding_name.to_ascii_uppercase().as_str() {
+        "PCMU" | "PCMA" => Codec::G711,
+        "G722" => Codec::G722,
+        "G729" | "G729A" | "G729AB" => Codec::G729,
+        "G723" | "G723.1" => Codec::G723_1,
+        "AMR-WB" | "AMRWB" => Codec::AmrWb,
+        "AMR" | "AMR-NB" | "AMRNB" => Codec::AmrNb,
+        "OPUS" => Codec::Opus,
+        _ => Codec::G711,
+    }
+}
+
 /// Transmit each queued datagram, draining `outbound`.
 async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
     for datagram in outbound.drain(..) {
-        if let Err(error) = datapath.send(datagram.endpoint, datagram.dst, &datagram.data).await {
+        if let Err(error) = datapath
+            .send(datagram.endpoint, datagram.dst, &datagram.data)
+            .await
+        {
             tracing::debug!(%error, "conference send failed");
         }
     }
@@ -929,6 +1169,14 @@ impl ConferenceRegistry {
         self.rooms.len()
     }
 
+    /// Total live participants across all rooms (the `conference_participants` metrics gauge). Reads
+    /// the per-room membership rosters — the source of truth maintained by `join`/`leave`/`reap_idle`
+    /// — so it is always exact, with no separate counter to drift.
+    #[must_use]
+    pub fn participant_count(&self) -> usize {
+        self.rooms.iter().map(|room| room.value().members.len()).sum()
+    }
+
     /// Seat a participant, creating the room actor (over `datapath`, pushing events to `events`) if it
     /// does not yet exist. Returns `false` if the actor's mailbox is gone.
     pub fn join<D>(
@@ -951,20 +1199,30 @@ impl ConferenceRegistry {
                 let (mailbox, inbox) = flume::bounded(1024);
                 let conference = Conference::new(conference_id.to_string(), DEFAULT_TOP_M);
                 let task = tokio::spawn(run_conference(conference, inbox, datapath, events));
-                ConferenceHandle { mailbox, members: Vec::new(), task }
+                ConferenceHandle {
+                    mailbox,
+                    members: Vec::new(),
+                    task,
+                }
             })
             .mailbox
             .clone();
 
         if mailbox
-            .try_send(ConferenceInput::Control(ConferenceControl::Add(Box::new(config))))
+            .try_send(ConferenceInput::Control(ConferenceControl::Add(Box::new(
+                config,
+            ))))
             .is_err()
         {
             return false;
         }
         self.routes.insert(endpoint, mailbox);
         if let Some(mut handle) = self.rooms.get_mut(conference_id) {
-            handle.members.push(ConferenceMember { tag, endpoint, joined_tick });
+            handle.members.push(ConferenceMember {
+                tag,
+                endpoint,
+                joined_tick,
+            });
         }
         true
     }
@@ -978,13 +1236,17 @@ impl ConferenceRegistry {
             let endpoint = handle.members.remove(position).endpoint;
             let _ = handle
                 .mailbox
-                .try_send(ConferenceInput::Control(ConferenceControl::Remove(tag.to_string())));
+                .try_send(ConferenceInput::Control(ConferenceControl::Remove(
+                    tag.to_string(),
+                )));
             (endpoint, handle.members.is_empty())
         };
         self.routes.remove(&endpoint);
         if empty {
             if let Some((_, handle)) = self.rooms.remove(conference_id) {
-                let _ = handle.mailbox.try_send(ConferenceInput::Control(ConferenceControl::Stop));
+                let _ = handle
+                    .mailbox
+                    .try_send(ConferenceInput::Control(ConferenceControl::Stop));
                 handle.task.abort();
             }
         }
@@ -996,7 +1258,10 @@ impl ConferenceRegistry {
         match self.rooms.get(conference_id) {
             Some(handle) => handle
                 .mailbox
-                .try_send(ConferenceInput::Control(ConferenceControl::Route(tag.to_string(), routing)))
+                .try_send(ConferenceInput::Control(ConferenceControl::Route(
+                    tag.to_string(),
+                    routing,
+                )))
                 .is_ok(),
             None => false,
         }
@@ -1012,13 +1277,21 @@ impl ConferenceRegistry {
         };
         if a_to_b {
             let (sender, receiver) = flume::bounded(2);
-            let _ = mailbox_a.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeOut(sender)));
-            let _ = mailbox_b.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeIn(receiver)));
+            let _ = mailbox_a.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeOut(
+                sender,
+            )));
+            let _ = mailbox_b.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeIn(
+                receiver,
+            )));
         }
         if b_to_a {
             let (sender, receiver) = flume::bounded(2);
-            let _ = mailbox_b.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeOut(sender)));
-            let _ = mailbox_a.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeIn(receiver)));
+            let _ = mailbox_b.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeOut(
+                sender,
+            )));
+            let _ = mailbox_a.try_send(ConferenceInput::Control(ConferenceControl::AddBridgeIn(
+                receiver,
+            )));
         }
         true
     }
@@ -1029,8 +1302,14 @@ impl ConferenceRegistry {
         let Some((_, handle)) = self.rooms.remove(conference_id) else {
             return Vec::new();
         };
-        let _ = handle.mailbox.try_send(ConferenceInput::Control(ConferenceControl::Stop));
-        let endpoints: Vec<EndpointId> = handle.members.iter().map(|member| member.endpoint).collect();
+        let _ = handle
+            .mailbox
+            .try_send(ConferenceInput::Control(ConferenceControl::Stop));
+        let endpoints: Vec<EndpointId> = handle
+            .members
+            .iter()
+            .map(|member| member.endpoint)
+            .collect();
         for endpoint in &endpoints {
             self.routes.remove(endpoint);
         }
@@ -1079,7 +1358,9 @@ impl ConferenceRegistry {
         }
         for conference_id in empty_rooms {
             if let Some((_, handle)) = self.rooms.remove(&conference_id) {
-                let _ = handle.mailbox.try_send(ConferenceInput::Control(ConferenceControl::Stop));
+                let _ = handle
+                    .mailbox
+                    .try_send(ConferenceInput::Control(ConferenceControl::Stop));
                 handle.task.abort();
             }
         }
@@ -1112,7 +1393,9 @@ mod tests {
             latch: false,
             egress_ssrc: 0xC000_0000 + index as u32,
             egress_payload_type: PCMU,
+            mos_codec: siphon_rtp_hep::mos::Codec::G711,
             telephone_event_in: Some(101),
+            secure: None,
             routing: Routing::default(),
         }
     }
@@ -1136,7 +1419,18 @@ mod tests {
     }
 
     fn rx(endpoint: u64, source: &str, data: Vec<u8>) -> RxPacket {
-        RxPacket { endpoint: EndpointId(endpoint), source: addr(source), data: Bytes::from(data) }
+        rx_at(endpoint, source, data, 0)
+    }
+
+    /// Like [`rx`] but with an explicit receive-time `arrival` (µs) — drives the deterministic RTCP
+    /// interarrival-jitter / DLSR tests (RFC 3550 §6.4.1) with no wall clock.
+    fn rx_at(endpoint: u64, source: &str, data: Vec<u8>, arrival: u64) -> RxPacket {
+        RxPacket {
+            endpoint: EndpointId(endpoint),
+            source: addr(source),
+            arrival,
+            data: Bytes::from(data),
+        }
     }
 
     fn decode_ulaw(rtp: &[u8]) -> Vec<i16> {
@@ -1186,7 +1480,11 @@ mod tests {
         }
         ssrcs.sort_unstable();
         ssrcs.dedup();
-        assert_eq!(ssrcs.len(), 3, "each participant carries a distinct egress SSRC");
+        assert_eq!(
+            ssrcs.len(),
+            3,
+            "each participant carries a distinct egress SSRC"
+        );
     }
 
     #[test]
@@ -1199,7 +1497,8 @@ mod tests {
 
         let loud = [6000i16; 160];
         for sequence in 0..10 {
-            conference.ingest(&rx(1, "10.0.0.99:5000", ulaw_rtp(0, sequence, &loud))); // wrong source
+            conference.ingest(&rx(1, "10.0.0.99:5000", ulaw_rtp(0, sequence, &loud)));
+            // wrong source
         }
 
         let mut out = Vec::new();
@@ -1226,7 +1525,8 @@ mod tests {
 
         let loud = [6000i16; 160];
         for sequence in 0..10 {
-            conference.ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, sequence, &loud))); // correct source
+            conference.ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, sequence, &loud)));
+            // correct source
         }
 
         let mut out = Vec::new();
@@ -1264,7 +1564,8 @@ mod tests {
             conference.tick(&mut out);
         }
         assert!(
-            out.iter().all(|datagram| datagram.endpoint == EndpointId(1)),
+            out.iter()
+                .all(|datagram| datagram.endpoint == EndpointId(1)),
             "only the resolved participant (endpoint 1) is transmitted to"
         );
     }
@@ -1312,7 +1613,10 @@ mod tests {
         for _ in 0..3 {
             out_b.clear();
             room_b.tick(&mut out_b);
-            if let Some(datagram) = out_b.iter().find(|datagram| datagram.endpoint == EndpointId(2)) {
+            if let Some(datagram) = out_b
+                .iter()
+                .find(|datagram| datagram.endpoint == EndpointId(2))
+            {
                 if frame_energy(&decode_ulaw(&datagram.data)) > VAD_THRESHOLD {
                     heard_across_bridge = true;
                     break;
@@ -1333,7 +1637,11 @@ mod tests {
         let mut conference = Conference::new("room".into(), 0);
         conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
         conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
-        assert_eq!(conference.room_rate(), 8_000, "all-narrowband room runs at 8 kHz");
+        assert_eq!(
+            conference.room_rate(),
+            8_000,
+            "all-narrowband room runs at 8 kHz"
+        );
 
         // A wideband (G.722, 16 kHz) participant joins → the room flips to 16 kHz.
         let mut wideband = ulaw_config(2, "10.0.0.3", "10.0.0.3:4000");
@@ -1341,11 +1649,19 @@ mod tests {
         wideband.encoder = Box::new(G722::new(20));
         wideband.egress_payload_type = 9;
         conference.add_participant(wideband);
-        assert_eq!(conference.room_rate(), 16_000, "a wideband leg forces 16 kHz");
+        assert_eq!(
+            conference.room_rate(),
+            16_000,
+            "a wideband leg forces 16 kHz"
+        );
 
         // It leaves → back to the narrowband fast path.
         conference.remove_participant("party-2");
-        assert_eq!(conference.room_rate(), 8_000, "narrowband again after the wideband leg leaves");
+        assert_eq!(
+            conference.room_rate(),
+            8_000,
+            "narrowband again after the wideband leg leaves"
+        );
 
         // Bridging forces the wideband rate even for an all-narrowband room.
         let (sender, _receiver) = flume::bounded(2);
@@ -1410,18 +1726,98 @@ mod tests {
             out.clear();
             conference.tick(&mut out);
         }
-        let listener_one = out.iter().find(|datagram| datagram.endpoint == EndpointId(2)).expect("p1");
-        let listener_two = out.iter().find(|datagram| datagram.endpoint == EndpointId(3)).expect("p2");
+        let listener_one = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(2))
+            .expect("p1");
+        let listener_two = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(3))
+            .expect("p2");
         let packet_one = RtpPacket::parse(&listener_one.data).expect("p1 rtp");
         let packet_two = RtpPacket::parse(&listener_two.data).expect("p2 rtp");
         assert_eq!(
             packet_one.payload, packet_two.payload,
             "listeners share one encoded listener-mix payload"
         );
-        assert_ne!(packet_one.ssrc, packet_two.ssrc, "but each is its own RTP stream");
+        assert_ne!(
+            packet_one.ssrc, packet_two.ssrc,
+            "but each is its own RTP stream"
+        );
         assert!(
             frame_energy(&decode_ulaw(&listener_one.data)) > VAD_THRESHOLD,
             "the listeners hear the talker"
+        );
+    }
+
+    #[test]
+    fn narrowband_listeners_share_a_downsampled_encode_in_a_wideband_room() {
+        // An L16/16 kHz talker forces a wideband room; two silent G.711/8 kHz listeners hear one
+        // shared room→8 kHz downsample of the listener mix, encoded once and fanned out.
+        use siphon_rtp_codec::l16::L16;
+        use siphon_rtp_codec::Encoder as _;
+
+        let mut conference = Conference::new("room".into(), 0);
+        let mut wideband = ulaw_config(0, "10.0.0.1", "10.0.0.1:4000");
+        wideband.decoder = Box::new(L16::new(16_000, 20));
+        wideband.encoder = Box::new(L16::new(16_000, 20));
+        wideband.egress_payload_type = 97;
+        conference.add_participant(wideband);
+        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+        conference.add_participant(ulaw_config(2, "10.0.0.3", "10.0.0.3:4000"));
+        assert_eq!(conference.room_rate(), 16_000, "wideband room");
+
+        // A loud L16 RTP frame (320 samples @ 16 kHz).
+        let l16_rtp = |sequence: u16| -> Vec<u8> {
+            let mut encoder = L16::new(16_000, 20);
+            let mut payload = [0u8; 640];
+            let len = encoder
+                .encode(&[6000i16; 320], &mut payload)
+                .expect("encode");
+            let header = RtpHeader {
+                marker: false,
+                payload_type: 97,
+                sequence,
+                timestamp: u32::from(sequence) * 320,
+                ssrc: 0x5151_5151,
+            };
+            let mut buffer = vec![0u8; 12 + len];
+            let written = write_packet(&header, &payload[..len], &mut buffer).expect("write");
+            buffer.truncate(written);
+            buffer
+        };
+        for sequence in 0..10 {
+            conference.ingest(&rx(1, "10.0.0.1:5000", l16_rtp(sequence)));
+        }
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.clear();
+            conference.tick(&mut out);
+        }
+        let listener_one = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(2))
+            .expect("l1");
+        let listener_two = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(3))
+            .expect("l2");
+        let packet_one = RtpPacket::parse(&listener_one.data).expect("p1");
+        let packet_two = RtpPacket::parse(&listener_two.data).expect("p2");
+        assert_eq!(packet_one.payload_type, 0, "G.711 listener egress");
+        assert_eq!(
+            packet_one.payload.len(),
+            160,
+            "downsampled 8 kHz / 20 ms G.711 frame"
+        );
+        assert_eq!(
+            packet_one.payload, packet_two.payload,
+            "narrowband listeners share one downsampled encode"
+        );
+        assert_ne!(packet_one.ssrc, packet_two.ssrc, "distinct streams");
+        assert!(
+            frame_energy(&decode_ulaw(&listener_one.data)) > VAD_THRESHOLD,
+            "the listeners hear the wideband talker"
         );
     }
 
@@ -1448,7 +1844,13 @@ mod tests {
         let events: Vec<Event> = conference.drain_events().collect();
         assert_eq!(events.len(), 1, "one DTMF event extracted");
         match &events[0] {
-            Event::Dtmf { digit, from_tag, call_id, duration_ms, .. } => {
+            Event::Dtmf {
+                digit,
+                from_tag,
+                call_id,
+                duration_ms,
+                ..
+            } => {
                 assert_eq!(digit, "5");
                 assert_eq!(from_tag, "party-0");
                 assert_eq!(call_id, "room");
@@ -1479,8 +1881,12 @@ mod tests {
 
         let ntp = 0x1122_3344_5566_7788u64;
         let mut reports = Vec::new();
-        conference.build_sender_reports(ntp, &mut reports);
-        assert_eq!(reports.len(), 2, "one SR per participant with a destination");
+        conference.build_sender_reports(ntp, 0, &mut reports);
+        assert_eq!(
+            reports.len(),
+            2,
+            "one SR per participant with a destination"
+        );
         let parsed = parse_compound(&reports[0].data).expect("parse SR");
         match &parsed[0] {
             RtcpPacket::SenderReport(report) => {
@@ -1488,9 +1894,229 @@ mod tests {
                 assert_eq!(report.ntp_timestamp, ntp);
                 assert_eq!(report.packet_count, ticks, "one egress packet per tick");
                 assert_eq!(report.octet_count, ticks * 160, "160-byte G.711 payloads");
+                // ...plus a reception report on party-0's inbound stream.
+                assert_eq!(report.reports.len(), 1, "a reception report block");
+                assert_eq!(
+                    report.reports[0].ssrc, 0x1000_0000,
+                    "party-0's inbound SSRC"
+                );
             }
             other => panic!("expected SR, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reception_report_carries_jitter_lsr_and_dlsr() {
+        use siphon_rtp_media::rtcp::{parse_compound, RtcpPacket};
+
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")));
+
+        // Four audio packets whose arrivals drift off their RTP timestamps build interarrival jitter
+        // (the schedule the MediaLeg unit test uses — jitter settles at 9 RTP units, RFC 3550 §6.4.1).
+        let pcm = [3000i16; 160];
+        for (sequence, &arrival) in [0u64, 20_000, 60_000, 80_000].iter().enumerate() {
+            conference.ingest(&rx_at(
+                1,
+                "10.0.0.1:5000",
+                ulaw_rtp(0, sequence as u16, &pcm),
+                arrival,
+            ));
+        }
+
+        // An inbound Sender Report (received at 90 ms) gives the engine an NTP timestamp to echo as LSR.
+        let sr_ntp = 0x1122_3344_5566_7788u64;
+        let mut sr_buffer = [0u8; rtcp::SENDER_REPORT_LEN];
+        let sr_len = rtcp::write_sender_report(0x1000_0000, sr_ntp, 0, 0, 0, &[], &mut sr_buffer)
+            .expect("build inbound SR");
+        conference.ingest(&rx_at(1, "10.0.0.1:5000", sr_buffer[..sr_len].to_vec(), 90_000));
+
+        // Build the engine's report 1.0 s after the SR arrived ⇒ DLSR = 1 s = 65536 units of 1/65536 s.
+        let mut reports = Vec::new();
+        conference.build_sender_reports(0xAABB_CCDD_1122_3344, 90_000 + 1_000_000, &mut reports);
+
+        let parsed = parse_compound(&reports[0].data).expect("parse SR");
+        let RtcpPacket::SenderReport(report) = &parsed[0] else {
+            panic!("expected SR, got {:?}", parsed[0]);
+        };
+        let block = report.reports[0];
+        assert_eq!(block.jitter, 9, "drifting arrivals ⇒ interarrival jitter");
+        assert_eq!(
+            block.last_sender_report, 0x3344_5566,
+            "LSR = middle 32 NTP bits of the inbound SR"
+        );
+        assert_eq!(
+            block.delay_since_last_sr, 65_536,
+            "DLSR = 1.0 s in 1/65536 s units"
+        );
+    }
+
+    #[test]
+    fn quality_events_carry_jitter_loss_and_mos() {
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")));
+
+        // In-order audio with drifting arrivals: builds jitter, no loss (RFC 3550 §6.4.1).
+        let pcm = [3000i16; 160];
+        for (sequence, &arrival) in [0u64, 20_000, 60_000, 80_000].iter().enumerate() {
+            conference.ingest(&rx_at(
+                1,
+                "10.0.0.1:5000",
+                ulaw_rtp(0, sequence as u16, &pcm),
+                arrival,
+            ));
+        }
+
+        let mut events = Vec::new();
+        conference.build_quality_events(0.0, &mut events);
+        assert_eq!(events.len(), 1, "one quality event for the active participant");
+        match &events[0] {
+            Event::CallQuality {
+                conference_id,
+                from_tag,
+                jitter_ms,
+                loss_percent,
+                mos,
+            } => {
+                assert_eq!(conference_id, "room");
+                assert_eq!(from_tag, "party-0");
+                assert!(*jitter_ms > 0.0, "drifting arrivals ⇒ jitter, got {jitter_ms}");
+                assert_eq!(*loss_percent, 0.0, "all packets in order ⇒ no loss");
+                assert!(*mos > 4.0, "clean low-jitter call ⇒ good MOS, got {mos}");
+            }
+            other => panic!("expected CallQuality, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hep_codec_maps_encoding_names() {
+        use siphon_rtp_hep::mos::Codec;
+        // Static + dynamic codecs the estimator models map to their own impairment...
+        assert_eq!(hep_codec_for_name("PCMU"), Codec::G711);
+        assert_eq!(hep_codec_for_name("pcma"), Codec::G711); // case-insensitive
+        assert_eq!(hep_codec_for_name("G722"), Codec::G722);
+        assert_eq!(hep_codec_for_name("AMR-WB"), Codec::AmrWb);
+        assert_eq!(hep_codec_for_name("AMR"), Codec::AmrNb);
+        assert_eq!(hep_codec_for_name("OPUS"), Codec::Opus);
+        assert_eq!(hep_codec_for_name("G729"), Codec::G729);
+        // ...and unmodelled ones (G.726, GSM-FR) fall back to G.711.
+        assert_eq!(hep_codec_for_name("G726-32"), Codec::G711);
+        assert_eq!(hep_codec_for_name("GSM"), Codec::G711);
+    }
+
+    #[cfg(feature = "amr")]
+    #[test]
+    fn amr_wb_listener_receives_amr_wb_egress() {
+        // A G.711 talker forces a 16 kHz room; an AMR-WB (16 kHz) listener receives the mix encoded
+        // as a valid RFC 4867 AMR-WB payload (the VoLTE-conference egress case).
+        use siphon_rtp_codec::amr::AmrWb;
+        use siphon_rtp_codec::Decoder as _;
+
+        let mut conference = Conference::new("room".into(), 0);
+        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
+        let mut wideband = ulaw_config(1, "10.0.0.2", "10.0.0.2:4000");
+        wideband.decoder = Box::new(AmrWb::new());
+        wideband.encoder = Box::new(AmrWb::new());
+        wideband.egress_payload_type = 96;
+        conference.add_participant(wideband);
+        assert_eq!(
+            conference.room_rate(),
+            16_000,
+            "wideband room for the AMR-WB leg"
+        );
+
+        let loud = [6000i16; 160];
+        for sequence in 0..10 {
+            conference.ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, sequence, &loud)));
+        }
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.clear();
+            conference.tick(&mut out);
+        }
+        let egress = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(2))
+            .expect("amr egress");
+        let packet = RtpPacket::parse(&egress.data).expect("rtp");
+        assert_eq!(packet.payload_type, 96, "AMR-WB egress payload type");
+        assert!(packet.payload.len() >= 2, "CMR + ToC + speech");
+        assert_eq!(packet.payload[0], 0xF0, "CMR = no codec-mode request");
+        // The payload round-trips through the AMR-WB decoder without error.
+        let mut decoder = AmrWb::new();
+        let mut pcm = vec![0i16; 320];
+        assert!(
+            decoder.decode(packet.payload, &mut pcm).is_ok(),
+            "valid AMR-WB payload"
+        );
+    }
+
+    #[test]
+    fn secure_participant_decrypts_ingress_and_encrypts_egress() {
+        // An SDES-SRTP participant: the engine decrypts its inbound audio into the mix and encrypts
+        // the room mix back to it. A plain participant validates the decrypt; decrypting the secure
+        // leg's egress validates the encrypt.
+        use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+        use siphon_rtp_srtp::SrtpContext;
+
+        let local =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("local key");
+        let remote =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("remote key");
+
+        let mut conference = Conference::new("room".into(), 0);
+        let mut secure = ulaw_config(0, "10.0.0.1", "10.0.0.1:4000");
+        secure.secure = Some(SecureLeg::new(&local.key, &remote.key));
+        conference.add_participant(secure);
+        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+
+        // The secure leg's UA encrypts its audio with the remote key; the plain leg sends plaintext.
+        let mut peer_encrypt = SrtpContext::from_key_material(&remote.key);
+        let loud = [6000i16; 160];
+        for sequence in 0..10 {
+            let mut srtp = Vec::new();
+            peer_encrypt
+                .protect(&ulaw_rtp(0, sequence, &loud), &mut srtp)
+                .expect("peer protect");
+            conference.ingest(&rx(1, "10.0.0.1:5000", srtp));
+            conference.ingest(&rx(2, "10.0.0.2:5000", ulaw_rtp(1, sequence, &loud)));
+        }
+
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.clear();
+            conference.tick(&mut out);
+        }
+
+        // The plain leg hears the secure talker → the engine decrypted its SRTP into the mix.
+        let plain = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(2))
+            .expect("plain egress");
+        assert!(
+            frame_energy(&decode_ulaw(&plain.data)) > VAD_THRESHOLD,
+            "the plain leg hears the decrypted secure talker"
+        );
+
+        // The secure leg's egress is SRTP; its UA decrypts it with the local key and hears the room.
+        let secure_egress = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(1))
+            .expect("secure egress");
+        let mut peer_decrypt = SrtpContext::from_key_material(&local.key);
+        let mut clear = Vec::new();
+        peer_decrypt
+            .unprotect(&secure_egress.data, &mut clear)
+            .expect("secure egress decrypts with the engine's offered key");
+        assert_ne!(
+            &secure_egress.data[..],
+            &clear[..],
+            "egress is SRTP, not plaintext"
+        );
+        assert!(
+            frame_energy(&decode_ulaw(&clear)) > VAD_THRESHOLD,
+            "the secure leg hears the room after decrypt"
+        );
     }
 
     #[test]
@@ -1500,5 +2126,39 @@ mod tests {
         let mut duplicate = ulaw_config(9, "10.0.0.9", "10.0.0.9:4000");
         duplicate.tag = "party-0".into();
         assert!(!conference.add_participant(duplicate), "tag already seated");
+    }
+
+    proptest::proptest! {
+        /// The conference ingest eats untrusted network bytes — RFC 5761 RTCP demux, RTP parse, SRTP
+        /// decrypt (secure leg), RFC 4733 telephone-event detect — then the tick decodes/resamples/
+        /// mixes/encodes what survived. Arbitrary input on either a plain or a secure leg must never
+        /// panic, index out of bounds, or loop: it parses-or-drops and keeps mixing.
+        #[test]
+        fn ingest_arbitrary_bytes_never_panics(
+            packets in proptest::collection::vec(
+                (1u64..=2, proptest::collection::vec(proptest::num::u8::ANY, 0usize..400)),
+                0usize..24,
+            ),
+        ) {
+            use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+
+            let local = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("local");
+            let remote = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("remote");
+            let mut conference = Conference::new("fuzz".into(), 0);
+            conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")); // plain (endpoint 1)
+            let mut secure = ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"); // SRTP (endpoint 2)
+            secure.secure = Some(SecureLeg::new(&local.key, &remote.key));
+            conference.add_participant(secure);
+
+            let mut out = Vec::new();
+            for (endpoint, data) in packets {
+                // Use the gated source so the bytes actually reach the parse/decrypt path.
+                let source = if endpoint == 1 { "10.0.0.1:5000" } else { "10.0.0.2:5000" };
+                conference.ingest(&rx(endpoint, source, data));
+                out.clear();
+                conference.tick(&mut out);
+                let _ = conference.drain_events().count();
+            }
+        }
     }
 }

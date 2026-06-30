@@ -88,7 +88,10 @@ mod tests {
     fn derives_session_auth_key() {
         let mut out = [0u8; 20];
         derive(&key16(), &salt14(), label::RTP_AUTHENTICATION, &mut out);
-        assert_eq!(out.to_vec(), hex("CEBE321F6FF7716B6FD4AB49AF256A156D38BAA4"));
+        assert_eq!(
+            out.to_vec(),
+            hex("CEBE321F6FF7716B6FD4AB49AF256A156D38BAA4")
+        );
     }
 
     #[test]

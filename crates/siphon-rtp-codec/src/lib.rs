@@ -58,6 +58,14 @@ pub trait Decoder: Send {
 
     /// Synthesize one concealment frame for a lost packet, returning samples written.
     fn conceal(&mut self, out: &mut [i16]) -> Result<usize, CodecError>;
+
+    /// The RTP timestamp clock for this codec's **inbound** stream, in Hz (RFC 3551 §4.5) — the rate
+    /// inbound RTP timestamps advance, which the RTCP interarrival-jitter estimate is measured in
+    /// (RFC 3550 §6.4.1). Defaults to the native sample rate; G.722 overrides it to 8 kHz (it clocks
+    /// RTP at 8 kHz while sampling 16 kHz, RFC 3551 §4.5.2), mirroring [`Encoder::rtp_clock_rate_hz`].
+    fn rtp_clock_rate_hz(&self) -> u32 {
+        self.params().sample_rate_hz
+    }
 }
 
 /// Encodes linear 16-bit PCM into codec payloads.

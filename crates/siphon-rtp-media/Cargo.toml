@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "mixer_bench"
 harness = false
+
+[[bench]]
+name = "qos_bench"
+harness = false

@@ -69,6 +69,7 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **VAD / noise suppression / echo cancellation** | — | Planned (all pure-Rust) |
 | **Forking (SIPREC raw-RTP tee)** | RFC 7866 | Implemented |
 | **Conferencing (MCU: mix-minus-self, active-speaker, whisper/monitor, room bridging)** | — | Implemented — N-party mixer, JSON control |
+| **Observability & QoS (Prometheus metrics, RTCP jitter/LSR/DLSR, G.107 MOS)** | RFC 3550 / ITU-T G.107 | Implemented — conference RR + `call_quality` events ([docs](docs/observability.md)) |
 | **Opus / G.722 / EVS** | RFC 6716 / G.722 | Planned (codec track) |
 
 ## Performance

@@ -265,8 +265,12 @@ mod tests {
         let (phone_a, addr_a) = phone(Ipv4Addr::new(127, 0, 0, 2)).await;
         let (phone_b, addr_b) = phone(Ipv4Addr::new(127, 0, 0, 3)).await;
 
-        datapath.install_flow(plain.id, FlowAction::Redirect).expect("redirect plain");
-        datapath.install_flow(secure.id, FlowAction::Redirect).expect("redirect secure");
+        datapath
+            .install_flow(plain.id, FlowAction::Redirect)
+            .expect("redirect plain");
+        datapath
+            .install_flow(secure.id, FlowAction::Redirect)
+            .expect("redirect secure");
 
         let local = key(0xAA);
         let remote = key(0xBB);
@@ -316,14 +320,19 @@ mod tests {
         let plaintext = rtp(1000, 0x1111_1111);
 
         // Phone A (plain) → engine plain endpoint → bridge encrypts → secure endpoint → phone B.
-        phone_a.send_to(&plaintext, harness.plain_addr).await.expect("send a");
+        phone_a
+            .send_to(&plaintext, harness.plain_addr)
+            .await
+            .expect("send a");
         let srtp = recv(&phone_b).await;
         assert_ne!(srtp, plaintext, "phone B receives SRTP, not plaintext");
 
         // Phone B holds the engine's offered (local) key and decrypts it back to the original.
         let mut decrypt = SrtpContext::from_key_material(&harness.local);
         let mut recovered = Vec::new();
-        decrypt.unprotect(&srtp, &mut recovered).expect("peer decrypt");
+        decrypt
+            .unprotect(&srtp, &mut recovered)
+            .expect("peer decrypt");
         assert_eq!(recovered, plaintext);
     }
 
@@ -335,8 +344,13 @@ mod tests {
         // Phone B encrypts with its answered (remote) key and sends SRTP to the secure endpoint.
         let mut encrypt = SrtpContext::from_key_material(&harness.remote);
         let mut srtp = Vec::new();
-        encrypt.protect(&plaintext, &mut srtp).expect("peer encrypt");
-        phone_b.send_to(&srtp, harness.secure_addr).await.expect("send b");
+        encrypt
+            .protect(&plaintext, &mut srtp)
+            .expect("peer encrypt");
+        phone_b
+            .send_to(&srtp, harness.secure_addr)
+            .await
+            .expect("send b");
 
         // Bridge decrypts → plain endpoint → phone A receives the original plaintext.
         let recovered = recv(&phone_a).await;
@@ -349,10 +363,15 @@ mod tests {
         // An attacker on a different IP sprays the plain endpoint — the bridge's source gate drops
         // it before any crypto/forward (RTPBleed defence on the Redirect path).
         let (attacker, _) = phone(Ipv4Addr::new(127, 0, 0, 9)).await;
-        attacker.send_to(&rtp(1, 0xDEAD), harness.plain_addr).await.expect("attacker send");
+        attacker
+            .send_to(&rtp(1, 0xDEAD), harness.plain_addr)
+            .await
+            .expect("attacker send");
         let mut scratch = [0u8; 2048];
         assert!(
-            timeout(NEGATIVE, phone_b.recv_from(&mut scratch)).await.is_err(),
+            timeout(NEGATIVE, phone_b.recv_from(&mut scratch))
+                .await
+                .is_err(),
             "an off-source packet must never reach the peer"
         );
     }
@@ -361,10 +380,15 @@ mod tests {
     async fn garbage_on_the_secure_leg_fails_auth_and_is_dropped() {
         let (harness, (phone_a, _), (phone_b, _)) = live_bridge().await;
         // A forged/unauthenticated datagram from the signalled secure peer fails SRTP auth → dropped.
-        phone_b.send_to(&rtp(1, 0x3333), harness.secure_addr).await.expect("send garbage");
+        phone_b
+            .send_to(&rtp(1, 0x3333), harness.secure_addr)
+            .await
+            .expect("send garbage");
         let mut scratch = [0u8; 2048];
         assert!(
-            timeout(NEGATIVE, phone_a.recv_from(&mut scratch)).await.is_err(),
+            timeout(NEGATIVE, phone_a.recv_from(&mut scratch))
+                .await
+                .is_err(),
             "an unauthenticated SRTP packet must not be forwarded to the plain leg"
         );
     }
@@ -404,6 +428,7 @@ mod tests {
         feed.send(RxPacket {
             endpoint: other,
             source: "127.0.0.1:5000".parse().expect("addr"),
+            arrival: 0,
             data: Bytes::from_static(b"turn-relay-data"),
         })
         .expect("feed");
@@ -418,6 +443,7 @@ mod tests {
         feed.send(RxPacket {
             endpoint: owned.id,
             source: "127.0.0.1:5001".parse().expect("addr"),
+            arrival: 0,
             data: Bytes::from_static(b"not-a-valid-srtp-packet"),
         })
         .expect("feed");

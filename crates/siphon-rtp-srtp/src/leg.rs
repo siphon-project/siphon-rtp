@@ -111,7 +111,7 @@ mod tests {
     fn demux_classifies_rtp_and_rtcp() {
         assert!(!is_rtcp(&rtp(1, 1))); // PT 0
         assert!(is_rtcp(&rtcp(1))); // PT 200 → &0x7F = 72
-        // PT 206 (PSFB) → &0x7F = 78, still RTCP; an RTP marker+PT 96 → &0x7F = 96, RTP.
+                                    // PT 206 (PSFB) → &0x7F = 78, still RTCP; an RTP marker+PT 96 → &0x7F = 96, RTP.
         assert!(is_rtcp(&[0x80, 206]));
         assert!(!is_rtcp(&[0x80, 0x80 | 96]));
         assert!(!is_rtcp(&[0x80])); // too short → RTP
@@ -126,12 +126,17 @@ mod tests {
 
         let plain = rtp(1000, 0x1111_1111);
         let mut srtp = Vec::new();
-        assert_eq!(leg.protect(&plain, &mut srtp).expect("protect"), PacketKind::Rtp);
+        assert_eq!(
+            leg.protect(&plain, &mut srtp).expect("protect"),
+            PacketKind::Rtp
+        );
 
         // A peer keyed with `local` (the engine's offered key) as its decrypt key recovers it.
         let mut peer_decrypt = SrtpContext::from_key_material(&local);
         let mut recovered = Vec::new();
-        peer_decrypt.unprotect(&srtp, &mut recovered).expect("peer unprotect");
+        peer_decrypt
+            .unprotect(&srtp, &mut recovered)
+            .expect("peer unprotect");
         assert_eq!(recovered, plain);
     }
 
@@ -145,10 +150,15 @@ mod tests {
         let plain = rtp(2000, 0x2222_2222);
         let mut peer_encrypt = SrtpContext::from_key_material(&remote);
         let mut srtp = Vec::new();
-        peer_encrypt.protect(&plain, &mut srtp).expect("peer protect");
+        peer_encrypt
+            .protect(&plain, &mut srtp)
+            .expect("peer protect");
 
         let mut recovered = Vec::new();
-        assert_eq!(leg.unprotect(&srtp, &mut recovered).expect("unprotect"), PacketKind::Rtp);
+        assert_eq!(
+            leg.unprotect(&srtp, &mut recovered).expect("unprotect"),
+            PacketKind::Rtp
+        );
         assert_eq!(recovered, plain);
     }
 
@@ -161,10 +171,14 @@ mod tests {
         // Outbound RTCP is SRTCP under the local key.
         let plain = rtcp(0x3333_3333);
         let mut srtcp = Vec::new();
-        assert_eq!(leg.protect(&plain, &mut srtcp).expect("protect"), PacketKind::Rtcp);
+        assert_eq!(
+            leg.protect(&plain, &mut srtcp).expect("protect"),
+            PacketKind::Rtcp
+        );
         let mut peer = SrtcpContext::from_key_material(&local);
         let mut recovered = Vec::new();
-        peer.unprotect(&srtcp, &mut recovered).expect("peer unprotect");
+        peer.unprotect(&srtcp, &mut recovered)
+            .expect("peer unprotect");
         assert_eq!(recovered, plain);
     }
 
@@ -174,7 +188,9 @@ mod tests {
         let mut leg = SecureLeg::new(&key(0xAA), &key(0xBB));
         let mut peer_encrypt = SrtpContext::from_key_material(&key(0xCC)); // wrong key
         let mut srtp = Vec::new();
-        peer_encrypt.protect(&rtp(1, 1), &mut srtp).expect("peer protect");
+        peer_encrypt
+            .protect(&rtp(1, 1), &mut srtp)
+            .expect("peer protect");
         let mut out = Vec::new();
         assert_eq!(leg.unprotect(&srtp, &mut out), Err(SrtpError::AuthFailed));
     }

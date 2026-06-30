@@ -16,10 +16,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// The engine's live gauge values, sampled fresh on each `/metrics` scrape.
+///
+/// The metrics module holds no engine state; the server is handed a closure that produces these at
+/// render time, so the gauges always reflect current registries without a borrow cycle.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LiveGauges {
+    /// Live calls in the session registry.
+    pub sessions: u64,
+    /// Live conference rooms in the conference registry.
+    pub conference_rooms: u64,
+    /// Live conference participants across all rooms.
+    pub conference_participants: u64,
+}
+
 /// Process-wide operational counters and gauges, shared via `Arc`.
 ///
 /// Counters are monotonic `AtomicU64`s incremented on the control path; gauges that track live
-/// state (session count, jemalloc live bytes) are read on demand at render time from the engine and
+/// state ([`LiveGauges`], jemalloc live bytes) are read on demand at render time from the engine and
 /// the allocator, so they are passed into [`Metrics::render`] rather than stored here.
 #[derive(Debug, Default)]
 pub struct Metrics {
@@ -28,6 +42,8 @@ pub struct Metrics {
     deletes_total: AtomicU64,
     control_errors_total: AtomicU64,
     control_rate_limited_total: AtomicU64,
+    conference_joins_total: AtomicU64,
+    conference_leaves_total: AtomicU64,
 }
 
 impl Metrics {
@@ -59,21 +75,36 @@ impl Metrics {
 
     /// Count a control command rejected by the per-connection rate limiter.
     pub fn record_rate_limited(&self) {
-        self.control_rate_limited_total.fetch_add(1, Ordering::Relaxed);
+        self.control_rate_limited_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Render the Prometheus/OpenMetrics text exposition for the current counters plus the two
-    /// on-demand gauges: `sessions` (live call count) and `jemalloc_allocated_bytes` (live heap).
+    /// Count an accepted `conference join` command.
+    pub fn record_conference_join(&self) {
+        self.conference_joins_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count an accepted `conference leave` command.
+    pub fn record_conference_leave(&self) {
+        self.conference_leaves_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Render the Prometheus/OpenMetrics text exposition for the current counters plus the on-demand
+    /// live [`LiveGauges`] (read from the engine at scrape time) and `jemalloc_allocated_bytes`
+    /// (live heap).
     ///
     /// The body is valid `text/plain; version=0.0.4`: each series carries a `# HELP` and `# TYPE`
     /// line, then the sample. Numbers only (no labels) keeps the surface trivially scrapeable.
     #[must_use]
-    pub fn render(&self, sessions: u64, jemalloc_allocated_bytes: u64) -> String {
+    pub fn render(&self, live: LiveGauges, jemalloc_allocated_bytes: u64) -> String {
         let offers = self.offers_total.load(Ordering::Relaxed);
         let answers = self.answers_total.load(Ordering::Relaxed);
         let deletes = self.deletes_total.load(Ordering::Relaxed);
         let errors = self.control_errors_total.load(Ordering::Relaxed);
         let rate_limited = self.control_rate_limited_total.load(Ordering::Relaxed);
+        let conference_joins = self.conference_joins_total.load(Ordering::Relaxed);
+        let conference_leaves = self.conference_leaves_total.load(Ordering::Relaxed);
 
         let mut output = String::with_capacity(1024);
         metric(
@@ -81,7 +112,21 @@ impl Metrics {
             "siphon_rtp_sessions",
             "Live calls in the session registry.",
             "gauge",
-            sessions,
+            live.sessions,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_conference_rooms",
+            "Live conference rooms in the conference registry.",
+            "gauge",
+            live.conference_rooms,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_conference_participants",
+            "Live conference participants across all rooms.",
+            "gauge",
+            live.conference_participants,
         );
         metric(
             &mut output,
@@ -117,6 +162,20 @@ impl Metrics {
             "Control commands rejected by the per-connection rate limiter.",
             "counter",
             rate_limited,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_conference_joins_total",
+            "Conference join commands accepted.",
+            "counter",
+            conference_joins,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_conference_leaves_total",
+            "Conference leave commands accepted.",
+            "counter",
+            conference_leaves,
         );
         metric(
             &mut output,
@@ -217,12 +276,12 @@ fn jemalloc_allocated_bytes() -> u64 {
 
 /// Serve the metrics + health HTTP endpoint on `listener` until it errors.
 ///
-/// `sessions` is a closure read on each `/metrics` scrape so the gauge reflects the live call count
+/// `live` is a closure read on each `/metrics` scrape so the live gauges reflect current state
 /// without the metrics module borrowing the engine's type. Each accepted connection is handled in
 /// its own task; a slow or malformed client never blocks the accept loop.
-pub async fn serve_metrics<F>(listener: TcpListener, metrics: std::sync::Arc<Metrics>, sessions: F)
+pub async fn serve_metrics<F>(listener: TcpListener, metrics: std::sync::Arc<Metrics>, live: F)
 where
-    F: Fn() -> u64 + Clone + Send + Sync + 'static,
+    F: Fn() -> LiveGauges + Clone + Send + Sync + 'static,
 {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -233,9 +292,9 @@ where
             }
         };
         let metrics = metrics.clone();
-        let sessions = sessions.clone();
+        let live = live.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_metrics_connection(stream, &metrics, &sessions).await {
+            if let Err(error) = handle_metrics_connection(stream, &metrics, &live).await {
                 tracing::debug!(%peer, %error, "metrics connection closed with error");
             }
         });
@@ -246,10 +305,10 @@ where
 async fn handle_metrics_connection<F>(
     mut stream: TcpStream,
     metrics: &Metrics,
-    sessions: &F,
+    live: &F,
 ) -> std::io::Result<()>
 where
-    F: Fn() -> u64,
+    F: Fn() -> LiveGauges,
 {
     // Read until we have the request line (the first CRLF). Bounded so a client cannot stream
     // unbounded bytes into our buffer before sending a newline (control-plane DoS hygiene).
@@ -273,7 +332,7 @@ where
 
     let response = match route_request_line(&request_line) {
         Route::Metrics => {
-            let body = metrics.render(sessions(), jemalloc_allocated_bytes());
+            let body = metrics.render(live(), jemalloc_allocated_bytes());
             http_response("200 OK", METRICS_CONTENT_TYPE, &body)
         }
         Route::Healthz => http_response("200 OK", "text/plain", "ok\n"),
@@ -352,29 +411,53 @@ mod tests {
         metrics.record_delete();
         metrics.record_control_error();
         metrics.record_rate_limited();
+        metrics.record_conference_join();
+        metrics.record_conference_join();
+        metrics.record_conference_join();
+        metrics.record_conference_leave();
 
-        let body = metrics.render(3, 4096);
+        let body = metrics.render(
+            LiveGauges {
+                sessions: 3,
+                conference_rooms: 5,
+                conference_participants: 9,
+            },
+            4096,
+        );
 
         // Gauges reflect the arguments; counters reflect the increments.
         assert!(body.contains("# TYPE siphon_rtp_sessions gauge\nsiphon_rtp_sessions 3\n"));
-        assert!(body.contains("# TYPE siphon_rtp_offers_total counter\nsiphon_rtp_offers_total 2\n"));
+        assert!(body.contains(
+            "# TYPE siphon_rtp_conference_rooms gauge\nsiphon_rtp_conference_rooms 5\n"
+        ));
+        assert!(body.contains(
+            "# TYPE siphon_rtp_conference_participants gauge\nsiphon_rtp_conference_participants 9\n"
+        ));
+        assert!(
+            body.contains("# TYPE siphon_rtp_offers_total counter\nsiphon_rtp_offers_total 2\n")
+        );
         assert!(body.contains("siphon_rtp_answers_total 1\n"));
         assert!(body.contains("siphon_rtp_deletes_total 1\n"));
         assert!(body.contains("siphon_rtp_control_errors_total 1\n"));
         assert!(body.contains("siphon_rtp_control_rate_limited_total 1\n"));
+        assert!(body.contains("siphon_rtp_conference_joins_total 3\n"));
+        assert!(body.contains("siphon_rtp_conference_leaves_total 1\n"));
         assert!(body.contains(
             "# TYPE siphon_rtp_jemalloc_allocated_bytes gauge\nsiphon_rtp_jemalloc_allocated_bytes 4096\n"
         ));
         // Every series carries a HELP line.
-        assert_eq!(body.matches("# HELP ").count(), 7);
-        assert_eq!(body.matches("# TYPE ").count(), 7);
+        assert_eq!(body.matches("# HELP ").count(), 11);
+        assert_eq!(body.matches("# TYPE ").count(), 11);
     }
 
     #[test]
     fn fresh_metrics_render_zeroes() {
-        let body = Metrics::new().render(0, 0);
+        let body = Metrics::new().render(LiveGauges::default(), 0);
         assert!(body.contains("siphon_rtp_offers_total 0\n"));
         assert!(body.contains("siphon_rtp_sessions 0\n"));
+        assert!(body.contains("siphon_rtp_conference_rooms 0\n"));
+        assert!(body.contains("siphon_rtp_conference_participants 0\n"));
+        assert!(body.contains("siphon_rtp_conference_joins_total 0\n"));
     }
 
     #[test]
@@ -386,7 +469,10 @@ mod tests {
 
     #[test]
     fn routes_path_with_query_string() {
-        assert_eq!(route_request_line("GET /metrics?foo=bar HTTP/1.0"), Route::Metrics);
+        assert_eq!(
+            route_request_line("GET /metrics?foo=bar HTTP/1.0"),
+            Route::Metrics
+        );
     }
 
     #[test]
@@ -397,8 +483,14 @@ mod tests {
 
     #[test]
     fn non_get_method_is_not_found() {
-        assert_eq!(route_request_line("POST /metrics HTTP/1.1"), Route::NotFound);
-        assert_eq!(route_request_line("DELETE /healthz HTTP/1.1"), Route::NotFound);
+        assert_eq!(
+            route_request_line("POST /metrics HTTP/1.1"),
+            Route::NotFound
+        );
+        assert_eq!(
+            route_request_line("DELETE /healthz HTTP/1.1"),
+            Route::NotFound
+        );
     }
 
     #[test]
@@ -423,7 +515,10 @@ mod tests {
         let mut limiter = RateLimiter::new(2);
         assert!(limiter.try_acquire());
         assert!(limiter.try_acquire());
-        assert!(!limiter.try_acquire(), "third request over a cap of 2 is rejected");
+        assert!(
+            !limiter.try_acquire(),
+            "third request over a cap of 2 is rejected"
+        );
         assert!(!limiter.try_acquire());
     }
 

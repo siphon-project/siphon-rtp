@@ -113,7 +113,11 @@ impl MediaInfo {
 
     /// Resolve a payload type to a [`CodecSpec`] via its rtpmap, else the static table.
     fn codec_spec(&self, payload_type: u8) -> Option<CodecSpec> {
-        if let Some(map) = self.rtpmaps.iter().find(|map| map.payload_type == payload_type) {
+        if let Some(map) = self
+            .rtpmaps
+            .iter()
+            .find(|map| map.payload_type == payload_type)
+        {
             return Some(CodecSpec::new(
                 payload_type,
                 &map.encoding_name,
@@ -196,8 +200,12 @@ fn parse_rtpmap(value: &str) -> Option<RtpMap> {
 fn parse_connection_addr(value: &str) -> Option<IpAddr> {
     let mut parts = value.split_whitespace();
     match (parts.next(), parts.next(), parts.next()) {
-        (Some("IN"), Some("IP4"), Some(addr)) => addr.parse::<IpAddr>().ok().filter(IpAddr::is_ipv4),
-        (Some("IN"), Some("IP6"), Some(addr)) => addr.parse::<IpAddr>().ok().filter(IpAddr::is_ipv6),
+        (Some("IN"), Some("IP4"), Some(addr)) => {
+            addr.parse::<IpAddr>().ok().filter(IpAddr::is_ipv4)
+        }
+        (Some("IN"), Some("IP6"), Some(addr)) => {
+            addr.parse::<IpAddr>().ok().filter(IpAddr::is_ipv6)
+        }
         _ => None,
     }
 }
@@ -252,8 +260,9 @@ fn scan(sdp: &str) -> AudioScan {
                         // follow it (the codec priority order).
                         let mut fields = value.split_whitespace();
                         scan.transport = fields.nth(2).map(str::to_string);
-                        scan.payload_types =
-                            fields.filter_map(|field| field.parse::<u8>().ok()).collect();
+                        scan.payload_types = fields
+                            .filter_map(|field| field.parse::<u8>().ok())
+                            .collect();
                         in_audio = true;
                         seen_media = true;
                         continue;
@@ -559,10 +568,16 @@ mod tests {
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
         let result = rewrite(&sdp, engine, None, None).expect("rewrite");
-        assert_eq!(result.media.remote_rtp, "203.0.113.7:49170".parse().unwrap());
+        assert_eq!(
+            result.media.remote_rtp,
+            "203.0.113.7:49170".parse().unwrap()
+        );
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8 96"));
-        assert!(result.sdp.contains("a=rtcp:40001"), "engine RTCP port advertised");
+        assert!(
+            result.sdp.contains("a=rtcp:40001"),
+            "engine RTCP port advertised"
+        );
         assert!(!result.sdp.contains("203.0.113.7"));
         let reparsed = parse(&result.sdp).expect("reparse");
         assert_eq!(reparsed.remote_rtp, engine.rtp);
@@ -580,7 +595,11 @@ mod tests {
         let result = rewrite(&sdp, engine, None, None).expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"));
         assert!(!result.sdp.contains("53000"));
-        assert_eq!(result.sdp.matches("a=rtcp:").count(), 1, "no duplicate a=rtcp");
+        assert_eq!(
+            result.sdp.matches("a=rtcp:").count(),
+            1,
+            "no duplicate a=rtcp"
+        );
     }
 
     #[test]
@@ -593,7 +612,10 @@ mod tests {
             rtcp: None,
         };
         let result = rewrite(&sdp, engine, None, None).expect("rewrite");
-        assert!(!result.sdp.contains("a=rtcp:"), "explicit a=rtcp dropped under mux");
+        assert!(
+            !result.sdp.contains("a=rtcp:"),
+            "explicit a=rtcp dropped under mux"
+        );
         assert!(result.sdp.contains("a=rtcp-mux"), "mux flag preserved");
     }
 
@@ -605,7 +627,10 @@ mod tests {
             rtcp: None,
         };
         let result = rewrite(sdp, engine, None, None).expect("rewrite");
-        assert_eq!(result.media.remote_rtp, "198.51.100.9:5000".parse().unwrap());
+        assert_eq!(
+            result.media.remote_rtp,
+            "198.51.100.9:5000".parse().unwrap()
+        );
         assert!(result.sdp.contains("c=IN IP4 10.0.0.1"));
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(!result.sdp.contains("198.51.100.9"));
@@ -664,12 +689,25 @@ mod tests {
             rtcp: Some("[::1]:40001".parse().unwrap()),
         };
         let result = rewrite(&sdp, engine, None, None).expect("rewrite v6");
-        assert_eq!(result.media.remote_rtp, "[2001:db8::1]:49170".parse().unwrap());
+        assert_eq!(
+            result.media.remote_rtp,
+            "[2001:db8::1]:49170".parse().unwrap()
+        );
         assert!(result.sdp.contains("c=IN IP6 ::1"), "{}", result.sdp);
-        assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8 96"), "{}", result.sdp);
-        assert!(result.sdp.contains("a=rtcp:40001"), "engine v6 RTCP port advertised");
+        assert!(
+            result.sdp.contains("m=audio 40000 RTP/AVP 0 8 96"),
+            "{}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("a=rtcp:40001"),
+            "engine v6 RTCP port advertised"
+        );
         assert!(!result.sdp.contains("2001:db8::1"), "peer address removed");
-        assert!(!result.sdp.contains("IP4"), "no IPv4 addrtype on a v6 rewrite");
+        assert!(
+            !result.sdp.contains("IP4"),
+            "no IPv4 addrtype on a v6 rewrite"
+        );
         // The rewritten SDP reparses to the v6 engine transport.
         let reparsed = parse(&result.sdp).expect("reparse v6");
         assert_eq!(reparsed.remote_rtp, engine.rtp);
@@ -699,7 +737,10 @@ mod tests {
             "v6 host candidate as a bare literal: {}",
             result.sdp
         );
-        assert!(!result.sdp.contains("2001:db8::7"), "peer v6 address removed");
+        assert!(
+            !result.sdp.contains("2001:db8::7"),
+            "peer v6 address removed"
+        );
     }
 
     #[test]
@@ -713,7 +754,10 @@ mod tests {
         };
         let result = rewrite(&sdp, engine, None, None).expect("rewrite v4");
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
-        assert!(!result.sdp.contains("IP6"), "no IPv6 addrtype on a v4 rewrite");
+        assert!(
+            !result.sdp.contains("IP6"),
+            "no IPv6 addrtype on a v4 rewrite"
+        );
     }
 
     #[test]
@@ -839,10 +883,21 @@ mod tests {
             rtcp: None,
         };
         let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
-        let result = rewrite(&sdp, engine, None, Some(SecurityAdvertisement::Secure(ours)))
-            .expect("rewrite");
-        assert!(result.sdp.contains("m=audio 40000 RTP/SAVP 0 8 96"), "{}", result.sdp);
-        assert!(result.sdp.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"));
+        let result = rewrite(
+            &sdp,
+            engine,
+            None,
+            Some(SecurityAdvertisement::Secure(ours)),
+        )
+        .expect("rewrite");
+        assert!(
+            result.sdp.contains("m=audio 40000 RTP/SAVP 0 8 96"),
+            "{}",
+            result.sdp
+        );
+        assert!(result
+            .sdp
+            .contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"));
     }
 
     #[test]
@@ -855,8 +910,16 @@ mod tests {
         };
         let result =
             rewrite(&sdp, engine, None, Some(SecurityAdvertisement::Plain)).expect("rewrite");
-        assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8"), "{}", result.sdp);
-        assert!(!result.sdp.contains("a=crypto:"), "peer crypto stripped: {}", result.sdp);
+        assert!(
+            result.sdp.contains("m=audio 40000 RTP/AVP 0 8"),
+            "{}",
+            result.sdp
+        );
+        assert!(
+            !result.sdp.contains("a=crypto:"),
+            "peer crypto stripped: {}",
+            result.sdp
+        );
         // The parsed input still reports the peer's secure profile + key.
         assert!(result.media.secure);
         assert_eq!(result.media.crypto.len(), 1);
@@ -877,7 +940,10 @@ mod tests {
         assert_eq!(codecs[0].payload_type, 0);
         assert_eq!(codecs[1].encoding_name, "PCMA");
         let primary = info.primary_codec().expect("primary");
-        assert_eq!(primary.encoding_name, "PCMU", "first offered codec is primary");
+        assert_eq!(
+            primary.encoding_name, "PCMU",
+            "first offered codec is primary"
+        );
     }
 
     #[test]

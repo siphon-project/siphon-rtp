@@ -54,6 +54,32 @@ pub struct MediaLeg {
     egress_packets: u32,
     /// Total payload octets emitted (RTCP SR sender octet count — excludes RTP header/padding).
     egress_octets: u32,
+    /// SSRC of the inbound stream (first packet seen), for the RTCP reception report (RFC 3550 §6.4.1).
+    ingress_ssrc: Option<u32>,
+    /// Highest inbound RTP sequence seen + the wrap count, for the extended-highest-seq RR field
+    /// (RFC 3550 Appendix A.1).
+    ingress_max_seq: u16,
+    ingress_cycles: u16,
+    /// First inbound sequence number seen, the base for `expected = highest − base + 1` in the loss
+    /// fraction the MOS estimate uses (RFC 3550 Appendix A.3); `None` before the first packet.
+    ingress_base_seq: Option<u16>,
+    /// Ingress RTP clock rate (Hz) — the rate inbound RTP timestamps advance, the unit the
+    /// interarrival-jitter estimate is measured in (RFC 3550 §6.4.1). From the decoder's codec.
+    ingress_clock_rate_hz: u32,
+    /// RTP timestamp of the most recent inbound packet, captured in `ingest_rtp` so `observe_arrival`
+    /// forms the transit time without re-parsing.
+    last_ingress_timestamp: u32,
+    /// Previous packet's transit (arrival − RTP timestamp, in RTP-clock units); `None` until the
+    /// second packet — the running input to the interarrival-jitter recurrence (RFC 3550 §A.8).
+    last_transit: Option<i32>,
+    /// Smoothed interarrival jitter, in RTP-clock units (RFC 3550 §6.4.1 / §A.8: the
+    /// `J += (|D| − J)/16` recurrence in floating point, reported truncated to a `u32`).
+    ingress_jitter: f64,
+    /// Middle 32 bits of the NTP timestamp from the most recent inbound Sender Report (the RR's LSR
+    /// field, RFC 3550 §6.4.1), or `0` before any SR is seen.
+    last_sr_ntp_middle: u32,
+    /// Arrival (µs) of the most recent inbound SR, for the RR's DLSR field; `None` before any SR.
+    last_sr_arrival_micros: Option<u64>,
 }
 
 impl MediaLeg {
@@ -68,6 +94,7 @@ impl MediaLeg {
         egress_payload_type: u8,
     ) -> Self {
         let frame_samples = decoder.frame_samples();
+        let ingress_clock_rate_hz = decoder.rtp_clock_rate_hz();
         // RFC 3551 §4.5.2: the egress RTP timestamp advances at the codec's RTP clock, which is not
         // always its sample rate (G.722 clocks RTP at 8 kHz while sampling 16 kHz). Derive the step
         // from the encoder so a G.722 leg advances 160 — not 320 — per 20 ms packet.
@@ -92,6 +119,16 @@ impl MediaLeg {
             egress_timestamp_increment,
             egress_packets: 0,
             egress_octets: 0,
+            ingress_ssrc: None,
+            ingress_max_seq: 0,
+            ingress_cycles: 0,
+            ingress_base_seq: None,
+            ingress_clock_rate_hz,
+            last_ingress_timestamp: 0,
+            last_transit: None,
+            ingress_jitter: 0.0,
+            last_sr_ntp_middle: 0,
+            last_sr_arrival_micros: None,
         }
     }
 
@@ -104,9 +141,130 @@ impl MediaLeg {
     /// Depacketize an inbound RTP packet and buffer its payload for playout.
     pub fn ingest_rtp(&mut self, packet: &[u8]) -> Result<PushResult, LegError> {
         let parsed = RtpPacket::parse(packet)?;
+        // Remember the timestamp so `observe_arrival` can form the transit time (RFC 3550 §6.4.1)
+        // without re-parsing the header.
+        self.last_ingress_timestamp = parsed.timestamp;
+        // Track the inbound SSRC + highest sequence (with wrap) for the RTCP reception report.
+        if self.ingress_ssrc.is_none() {
+            self.ingress_ssrc = Some(parsed.ssrc);
+            self.ingress_max_seq = parsed.sequence;
+            self.ingress_base_seq = Some(parsed.sequence);
+        } else if parsed.sequence.wrapping_sub(self.ingress_max_seq) < 0x8000 {
+            // `parsed.sequence` is ahead of the current max (RFC 1982 serial order); bump the wrap
+            // count when it rolled over.
+            if parsed.sequence < self.ingress_max_seq {
+                self.ingress_cycles = self.ingress_cycles.wrapping_add(1);
+            }
+            self.ingress_max_seq = parsed.sequence;
+        }
         Ok(self
             .jitter
             .push(parsed.sequence, Bytes::copy_from_slice(parsed.payload)))
+    }
+
+    /// SSRC of this leg's inbound stream (RFC 3550 §5.1), or `None` before the first packet — the
+    /// source the RTCP reception report describes.
+    #[must_use]
+    pub fn ingress_ssrc(&self) -> Option<u32> {
+        self.ingress_ssrc
+    }
+
+    /// Extended highest inbound sequence received: `cycles << 16 | highest_seq` (RFC 3550 Appendix
+    /// A.1) — the RTCP reception report's "extended highest sequence number" field.
+    #[must_use]
+    pub fn ingress_extended_highest_seq(&self) -> u32 {
+        (u32::from(self.ingress_cycles) << 16) | u32::from(self.ingress_max_seq)
+    }
+
+    /// Fold one inbound packet's arrival into the interarrival-jitter estimate (RFC 3550 §6.4.1 /
+    /// §A.8). Call once per accepted ingress packet, right after [`MediaLeg::ingest_rtp`] (which
+    /// records the packet's RTP timestamp). `arrival_micros` is the receive-time clock reading the
+    /// datapath stamped on the datagram — *not* an actor-ingest time, so it reflects network timing.
+    ///
+    /// `transit = arrival (sampled at the ingress RTP clock) − the packet's RTP timestamp`; the
+    /// jitter is the smoothed mean deviation of consecutive transits. All wrapping `u32`/`i32`
+    /// arithmetic per §A.8, so the 32-bit RTP-timestamp rollover is handled implicitly.
+    pub fn observe_arrival(&mut self, arrival_micros: u64) {
+        // Arrival sampled at the RTP clock rate as a wrapping u32 (§A.8 `arrival`). The u128
+        // intermediate keeps the rate multiply from overflowing on long-running streams.
+        let arrival_rtp = ((u128::from(arrival_micros)
+            * u128::from(self.ingress_clock_rate_hz))
+            / 1_000_000) as u32;
+        let transit = arrival_rtp.wrapping_sub(self.last_ingress_timestamp) as i32;
+        if let Some(previous) = self.last_transit {
+            let delta = (i64::from(transit) - i64::from(previous)).unsigned_abs() as f64;
+            self.ingress_jitter += (delta - self.ingress_jitter) / 16.0;
+        }
+        self.last_transit = Some(transit);
+    }
+
+    /// The current interarrival-jitter estimate in RTP-clock units (RFC 3550 §6.4.1), truncated to
+    /// the `u32` the reception report carries.
+    #[must_use]
+    pub fn ingress_jitter(&self) -> u32 {
+        self.ingress_jitter as u32
+    }
+
+    /// The interarrival-jitter estimate in **milliseconds** — the form the G.107 MOS estimator
+    /// (`siphon-rtp-hep`) folds into one-way delay. Converts the RTP-clock-unit jitter by the ingress
+    /// codec's clock rate.
+    #[must_use]
+    pub fn ingress_jitter_ms(&self) -> f64 {
+        if self.ingress_clock_rate_hz == 0 {
+            return 0.0;
+        }
+        // Derive from the same value the reception report carries, so jitter-in-ms and the RR agree.
+        f64::from(self.ingress_jitter()) * 1000.0 / f64::from(self.ingress_clock_rate_hz)
+    }
+
+    /// Residual inbound packet loss as a percentage — the jitter buffer's lost/concealed slots over
+    /// the packets expected so far (`expected = highest − base + 1`, RFC 3550 Appendix A.3). The
+    /// loss a listener actually hears, and the loss input to the MOS estimate. `0` before any packet.
+    #[must_use]
+    pub fn ingress_loss_percent(&self) -> f64 {
+        match self.ingress_base_seq {
+            Some(base) => {
+                let expected = self
+                    .ingress_extended_highest_seq()
+                    .wrapping_sub(u32::from(base))
+                    .wrapping_add(1);
+                if expected == 0 {
+                    0.0
+                } else {
+                    (self.jitter.stats().losses as f64 / f64::from(expected) * 100.0).clamp(0.0, 100.0)
+                }
+            }
+            None => 0.0,
+        }
+    }
+
+
+    /// Record an inbound Sender Report: its NTP timestamp's middle 32 bits become LSR, and
+    /// `arrival_micros` (when the SR was received) feeds DLSR (RFC 3550 §6.4.1).
+    pub fn record_sender_report(&mut self, ntp_timestamp: u64, arrival_micros: u64) {
+        self.last_sr_ntp_middle = ((ntp_timestamp >> 16) & 0xFFFF_FFFF) as u32;
+        self.last_sr_arrival_micros = Some(arrival_micros);
+    }
+
+    /// LSR for the reception report — the middle 32 bits of the last inbound SR's NTP timestamp, or
+    /// `0` if none has been seen (RFC 3550 §6.4.1).
+    #[must_use]
+    pub fn last_sr(&self) -> u32 {
+        self.last_sr_ntp_middle
+    }
+
+    /// DLSR for the reception report — the delay between receiving the last SR and `now_micros`, in
+    /// units of 1/65536 s, or `0` if no SR has been seen (RFC 3550 §6.4.1).
+    #[must_use]
+    pub fn delay_since_last_sr(&self, now_micros: u64) -> u32 {
+        match self.last_sr_arrival_micros {
+            Some(arrival) => {
+                let delay_micros = u128::from(now_micros.saturating_sub(arrival));
+                // µs → 1/65536 s: × 65536 / 1_000_000, saturating into the u32 field.
+                ((delay_micros * 65_536) / 1_000_000).min(u128::from(u32::MAX)) as u32
+            }
+            None => 0,
+        }
     }
 
     /// Produce the next PCM frame for playout: decode a buffered packet, conceal a gap, or report
@@ -251,7 +409,10 @@ mod tests {
         leg.ingest_rtp(&ulaw_packet(2, 0xFF)).expect("ingest 2"); // seq 1 lost
         let mut pcm = [0i16; 160];
         assert_eq!(leg.next_pcm(&mut pcm).expect("p0"), PcmFrame::Decoded(160));
-        assert_eq!(leg.next_pcm(&mut pcm).expect("conceal"), PcmFrame::Concealed(160));
+        assert_eq!(
+            leg.next_pcm(&mut pcm).expect("conceal"),
+            PcmFrame::Concealed(160)
+        );
         assert_eq!(leg.next_pcm(&mut pcm).expect("p2"), PcmFrame::Decoded(160));
         assert_eq!(leg.jitter_stats().losses, 1);
     }
@@ -283,6 +444,74 @@ mod tests {
     }
 
     #[test]
+    fn interarrival_jitter_tracks_arrival_deviation() {
+        // RFC 3550 §6.4.1 / §A.8: jitter is the smoothed mean deviation of consecutive transit times
+        // (arrival − RTP timestamp). G.711 clocks RTP at 8 kHz, so 1 RTP unit = 125 µs.
+        let mut leg = ulaw_leg();
+
+        // Two packets arriving exactly in step with their timestamps ⇒ zero jitter.
+        leg.ingest_rtp(&ulaw_packet(0, 0xFF)).expect("ingest 0"); // ts 0
+        leg.observe_arrival(0); // arrival_rtp 0 ⇒ transit 0
+        leg.ingest_rtp(&ulaw_packet(1, 0xFF)).expect("ingest 1"); // ts 160
+        leg.observe_arrival(20_000); // arrival_rtp 160 ⇒ transit 0 ⇒ D 0
+        assert_eq!(leg.ingress_jitter(), 0, "paced arrivals ⇒ no jitter");
+
+        // A packet arriving 320 RTP units late ⇒ transit jumps to 160 ⇒ jitter += 160/16 = 10.
+        leg.ingest_rtp(&ulaw_packet(2, 0xFF)).expect("ingest 2"); // ts 320
+        leg.observe_arrival(60_000); // arrival_rtp 480 ⇒ transit 160 ⇒ D 160
+        assert_eq!(leg.ingress_jitter(), 10);
+
+        // Back in step (transit 160 again) ⇒ D 0 ⇒ jitter decays: 10 + (0 − 10)/16 = 9.375 ⇒ 9.
+        leg.ingest_rtp(&ulaw_packet(3, 0xFF)).expect("ingest 3"); // ts 480
+        leg.observe_arrival(80_000); // arrival_rtp 640 ⇒ transit 160 ⇒ D 0
+        assert_eq!(leg.ingress_jitter(), 9);
+    }
+
+    #[test]
+    fn sender_report_yields_lsr_and_dlsr() {
+        // RFC 3550 §6.4.1: LSR = middle 32 bits of the last SR's NTP timestamp; DLSR = delay since
+        // receiving it, in units of 1/65536 s.
+        let mut leg = ulaw_leg();
+        assert_eq!(leg.last_sr(), 0, "no SR seen yet");
+        assert_eq!(leg.delay_since_last_sr(1_000_000), 0, "no SR ⇒ DLSR 0");
+
+        leg.record_sender_report(0x1122_3344_5566_7788, 1_000_000); // received at 1.0 s
+        assert_eq!(leg.last_sr(), 0x3344_5566, "middle 32 NTP bits");
+        // 0.5 s later: 0.5 × 65536 = 32768 units of 1/65536 s.
+        assert_eq!(leg.delay_since_last_sr(1_500_000), 32_768);
+    }
+
+    #[test]
+    fn jitter_in_ms_converts_by_the_codec_clock() {
+        let mut leg = ulaw_leg();
+        // The schedule from `interarrival_jitter_tracks_arrival_deviation` settles jitter at 9 RTP
+        // units, which at G.711's 8 kHz clock is 9/8000 s = 1.125 ms (the form the MOS estimator
+        // consumes).
+        leg.ingest_rtp(&ulaw_packet(0, 0xFF)).expect("0");
+        leg.observe_arrival(0);
+        leg.ingest_rtp(&ulaw_packet(1, 0xFF)).expect("1");
+        leg.observe_arrival(20_000);
+        leg.ingest_rtp(&ulaw_packet(2, 0xFF)).expect("2");
+        leg.observe_arrival(60_000);
+        leg.ingest_rtp(&ulaw_packet(3, 0xFF)).expect("3");
+        leg.observe_arrival(80_000);
+        assert!((leg.ingress_jitter_ms() - 1.125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn loss_percent_reflects_concealed_packets() {
+        let mut leg = ulaw_leg();
+        leg.ingest_rtp(&ulaw_packet(0, 0xFF)).expect("0");
+        leg.ingest_rtp(&ulaw_packet(2, 0xFF)).expect("2"); // seq 1 lost
+        let mut pcm = [0i16; 160];
+        leg.next_pcm(&mut pcm).expect("p0"); // decode seq 0
+        leg.next_pcm(&mut pcm).expect("conceal"); // seq 1 concealed ⇒ losses = 1
+        leg.next_pcm(&mut pcm).expect("p2"); // decode seq 2
+        // base seq 0, highest 2 ⇒ expected 3 packets; one concealed ⇒ 33.3 % loss.
+        assert!((leg.ingress_loss_percent() - 100.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
     fn encode_then_decode_roundtrips_through_g711() {
         // PCM → encode → RTP → ingest → decode → PCM should match G.711's lossy round-trip.
         let mut sender = ulaw_leg();
@@ -293,7 +522,10 @@ mod tests {
         let mut receiver = ulaw_leg();
         receiver.ingest_rtp(&rtp[..len]).expect("ingest");
         let mut pcm_out = [0i16; 160];
-        assert_eq!(receiver.next_pcm(&mut pcm_out).expect("decode"), PcmFrame::Decoded(160));
+        assert_eq!(
+            receiver.next_pcm(&mut pcm_out).expect("decode"),
+            PcmFrame::Decoded(160)
+        );
 
         // Direct G.711 reference round-trip for comparison.
         let mut direct = G711::ulaw();
@@ -313,7 +545,9 @@ mod tests {
         let mut source = ulaw_leg();
         let pcm = [4321i16; 160];
         let mut payload = [0u8; 200];
-        let payload_len = source.encode_payload(&pcm, &mut payload).expect("encode once");
+        let payload_len = source
+            .encode_payload(&pcm, &mut payload)
+            .expect("encode once");
 
         let mut leg_a = MediaLeg::new(
             Box::new(G711::ulaw()),
@@ -341,7 +575,10 @@ mod tests {
 
         let packet_a = RtpPacket::parse(&out_a[..len_a]).expect("parse a");
         let packet_b = RtpPacket::parse(&out_b[..len_b]).expect("parse b");
-        assert_eq!(packet_a.payload, packet_b.payload, "one encode, shared payload");
+        assert_eq!(
+            packet_a.payload, packet_b.payload,
+            "one encode, shared payload"
+        );
         assert_eq!(packet_a.ssrc, 0x1111_1111);
         assert_eq!(packet_b.ssrc, 0x2222_2222);
         assert_ne!(packet_a.ssrc, packet_b.ssrc, "distinct egress streams");
@@ -363,9 +600,32 @@ mod tests {
             .expect("packetize");
 
         let mut via_combined = [0u8; 200];
-        let combined_len = combined.encode_rtp(&pcm, &mut via_combined).expect("encode_rtp");
+        let combined_len = combined
+            .encode_rtp(&pcm, &mut via_combined)
+            .expect("encode_rtp");
 
         assert_eq!(&via_split[..split_len], &via_combined[..combined_len]);
         assert_eq!(split.egress_ssrc(), combined.egress_ssrc());
+    }
+
+    proptest::proptest! {
+        /// Folding arbitrary arrival times into the interarrival-jitter estimate (RFC 3550 §6.4.1)
+        /// never panics and keeps the estimate a finite, non-negative value — the recurrence is
+        /// bounded for any input (wrapping `u32`/`i32` transit arithmetic, §A.8).
+        #[test]
+        fn observe_arrival_keeps_jitter_finite(
+            arrivals in proptest::collection::vec(0u64..50_000_000, 0..64),
+        ) {
+            let mut leg = ulaw_leg();
+            for (index, arrival) in arrivals.into_iter().enumerate() {
+                let _ = leg.ingest_rtp(&ulaw_packet(index as u16, 0xFF));
+                leg.observe_arrival(arrival);
+                let jitter = leg.ingress_jitter_ms();
+                proptest::prop_assert!(
+                    jitter.is_finite() && jitter >= 0.0,
+                    "jitter must stay finite ≥ 0, got {jitter}"
+                );
+            }
+        }
     }
 }

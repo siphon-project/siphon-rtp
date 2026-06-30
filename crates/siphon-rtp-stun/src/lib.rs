@@ -90,7 +90,10 @@ impl StunMessage {
     /// The reflexive transport address from `XOR-MAPPED-ADDRESS`, if present.
     #[must_use]
     pub fn xor_mapped_address(&self) -> Option<SocketAddr> {
-        decode_xor_mapped_address(self.attribute(ATTR_XOR_MAPPED_ADDRESS)?, &self.transaction_id)
+        decode_xor_mapped_address(
+            self.attribute(ATTR_XOR_MAPPED_ADDRESS)?,
+            &self.transaction_id,
+        )
     }
 }
 
@@ -307,7 +310,9 @@ fn decode_xor_mapped_address(value: &[u8], transaction_id: &[u8; 12]) -> Option<
         0x02 => {
             let xored: [u8; 16] = value.get(4..20)?.try_into().ok()?;
             let mut addr = [0u8; 16];
-            for (slot, (byte, key)) in addr.iter_mut().zip(xored.iter().zip(xor_key(transaction_id)))
+            for (slot, (byte, key)) in addr
+                .iter_mut()
+                .zip(xored.iter().zip(xor_key(transaction_id)))
             {
                 *slot = byte ^ key;
             }
@@ -338,7 +343,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// SHA-1 (FIPS 180) of `data`.
 fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let mut h: [u32; 5] = [
+        0x6745_2301,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
     let bit_len = (data.len() as u64).wrapping_mul(8);
     let mut message = data.to_vec();
     message.push(0x80);
@@ -447,7 +458,10 @@ mod tests {
     fn sha1_known_answer() {
         // FIPS 180 / RFC 3174 test vectors.
         assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(hex(&sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            hex(&sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
         assert_eq!(
             hex(&sha1(
                 b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"

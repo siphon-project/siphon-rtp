@@ -139,7 +139,9 @@ impl Mixer {
             accum: vec![0; frame_capacity],
             listener_buf: vec![0; frame_capacity],
             participant_buf: vec![0; frame_capacity],
-            own: (0..participant_capacity).map(|_| vec![0; frame_capacity]).collect(),
+            own: (0..participant_capacity)
+                .map(|_| vec![0; frame_capacity])
+                .collect(),
             has_own: vec![false; participant_capacity],
             frame_len: 0,
             participant_count: 0,
@@ -171,7 +173,10 @@ impl Mixer {
             "mixer: parallel input slices must have equal length"
         );
         let frame_len = inputs.frame_len;
-        assert!(frame_len <= self.frame_capacity, "mixer: frame exceeds capacity");
+        assert!(
+            frame_len <= self.frame_capacity,
+            "mixer: frame exceeds capacity"
+        );
         self.frame_len = frame_len;
         self.participant_count = participant_count;
         for slot in self.has_own[..participant_count].iter_mut() {
@@ -203,7 +208,10 @@ impl Mixer {
             }
             // The local-participants-only mix, captured before any bridged audio is added — this is
             // what feeds onward to a bridged room (so a bridge never echoes a room back to itself).
-            for (dst, &total) in self.participant_buf[..frame_len].iter_mut().zip(accum.iter()) {
+            for (dst, &total) in self.participant_buf[..frame_len]
+                .iter_mut()
+                .zip(accum.iter())
+            {
                 *dst = saturate_i16(total);
             }
             // A bridged room's mix is heard by everyone — sum it in before computing outputs (so a
@@ -262,7 +270,11 @@ impl Mixer {
                     .zip(to_pcm.iter())
                 {
                     // The target's own base (room minus self if it is a talker) plus the whisper.
-                    let base = if to_active { total - i32::from(to_sample) } else { total };
+                    let base = if to_active {
+                        total - i32::from(to_sample)
+                    } else {
+                        total
+                    };
                     *dst = saturate_i16(base + i32::from(whisper_sample));
                 }
                 self.has_own[whisper.to] = true;
@@ -325,7 +337,8 @@ fn select_active_speakers(inputs: &MixInputs<'_>, private_sources: u64, top_m: u
     }
 
     let capacity = top_m.min(MAX_ACTIVE_SPEAKERS);
-    let mut best: [(i64, usize); MAX_ACTIVE_SPEAKERS] = [(i64::MIN, usize::MAX); MAX_ACTIVE_SPEAKERS];
+    let mut best: [(i64, usize); MAX_ACTIVE_SPEAKERS] =
+        [(i64::MIN, usize::MAX); MAX_ACTIVE_SPEAKERS];
     let mut count = 0usize;
     for (index, &role) in inputs.roles.iter().enumerate() {
         if !is_candidate(index, role) {
@@ -373,7 +386,14 @@ mod tests {
         speaking: &'a [bool],
         frame_len: usize,
     ) -> MixInputs<'a> {
-        MixInputs { pcm, roles, energy, speaking, external: None, frame_len }
+        MixInputs {
+            pcm,
+            roles,
+            energy,
+            speaking,
+            external: None,
+            frame_len,
+        }
     }
 
     #[test]
@@ -385,10 +405,26 @@ mod tests {
         let active = mixer.mix(&inputs(&pcm, &roles, &energy, &speaking, 4), &[], &[], 0);
 
         assert_eq!(active, 0b111, "all three speaking talkers are active");
-        assert_eq!(mixer.output_for(0), &[240i16; 4], "party 0 hears b + c = 200 + 40");
-        assert_eq!(mixer.output_for(1), &[140i16; 4], "party 1 hears a + c = 100 + 40");
-        assert_eq!(mixer.output_for(2), &[300i16; 4], "party 2 hears a + b = 100 + 200");
-        assert_eq!(mixer.listener_mix(), &[340i16; 4], "a pure listener would hear a + b + c");
+        assert_eq!(
+            mixer.output_for(0),
+            &[240i16; 4],
+            "party 0 hears b + c = 200 + 40"
+        );
+        assert_eq!(
+            mixer.output_for(1),
+            &[140i16; 4],
+            "party 1 hears a + c = 100 + 40"
+        );
+        assert_eq!(
+            mixer.output_for(2),
+            &[300i16; 4],
+            "party 2 hears a + b = 100 + 200"
+        );
+        assert_eq!(
+            mixer.listener_mix(),
+            &[340i16; 4],
+            "a pure listener would hear a + b + c"
+        );
     }
 
     #[test]
@@ -411,7 +447,11 @@ mod tests {
         let (roles, energy, speaking) = all_talkers(&pcm);
         let mut mixer = Mixer::new(2, 4);
         mixer.mix(&inputs(&pcm, &roles, &energy, &speaking, 4), &[], &[], 0);
-        assert_eq!(mixer.listener_mix(), &[i16::MAX; 4], "60000 clamps to i16::MAX");
+        assert_eq!(
+            mixer.listener_mix(),
+            &[i16::MAX; 4],
+            "60000 clamps to i16::MAX"
+        );
         // Party 0 hears only b (30000) — within range, no clamp.
         assert_eq!(mixer.output_for(0), &[30000i16; 4]);
     }
@@ -435,7 +475,12 @@ mod tests {
     #[test]
     fn top_m_gates_to_the_loudest_speakers() {
         // Four talkers, top_m = 2 → only the two loudest contribute; the quiet two become listeners.
-        let pcm = vec![vec![1000i16; 4], vec![900i16; 4], vec![10i16; 4], vec![20i16; 4]];
+        let pcm = vec![
+            vec![1000i16; 4],
+            vec![900i16; 4],
+            vec![10i16; 4],
+            vec![20i16; 4],
+        ];
         let roles = vec![Role::Talker; 4];
         let energy = vec![1_000_000i64, 810_000, 100, 400];
         let speaking = vec![true; 4];
@@ -464,9 +509,16 @@ mod tests {
         );
 
         // The supervisor is excluded from the public room sum.
-        assert_eq!(active, 0b101, "agent + customer contribute; supervisor is private");
+        assert_eq!(
+            active, 0b101,
+            "agent + customer contribute; supervisor is private"
+        );
         // Agent hears the room-minus-self (customer) PLUS the supervisor's whisper.
-        assert_eq!(mixer.output_for(0), &[1000i16; 4], "customer 300 + supervisor 700");
+        assert_eq!(
+            mixer.output_for(0),
+            &[1000i16; 4],
+            "customer 300 + supervisor 700"
+        );
         // Customer hears only the agent — never the supervisor.
         assert_eq!(mixer.output_for(2), &[100i16; 4]);
     }
@@ -481,7 +533,10 @@ mod tests {
         mixer.mix(
             &inputs(&pcm, &roles, &energy, &speaking, 4),
             &[],
-            &[Monitor { listener: 2, target: 1 }],
+            &[Monitor {
+                listener: 2,
+                target: 1,
+            }],
             0,
         );
         // Supervisor hears exactly the customer's audio.
@@ -504,9 +559,17 @@ mod tests {
         // Party 0 hears party 1 (200) + the bridged room (1000) = 1200; never its own 100.
         assert_eq!(mixer.output_for(0), &[1200i16; 4]);
         assert_eq!(mixer.output_for(1), &[1100i16; 4], "party 1: 100 + 1000");
-        assert_eq!(mixer.listener_mix(), &[1300i16; 4], "100 + 200 + 1000 bridged");
+        assert_eq!(
+            mixer.listener_mix(),
+            &[1300i16; 4],
+            "100 + 200 + 1000 bridged"
+        );
         // The bridge feed is the local participants only (300) — never the bridged 1000 echoed back.
-        assert_eq!(mixer.participant_mix(), &[300i16; 4], "100 + 200, no bridged audio");
+        assert_eq!(
+            mixer.participant_mix(),
+            &[300i16; 4],
+            "100 + 200, no bridged audio"
+        );
     }
 
     #[test]
