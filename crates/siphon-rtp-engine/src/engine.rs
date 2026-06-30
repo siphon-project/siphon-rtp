@@ -15,7 +15,7 @@
 //! work; for plain relay the datapath's per-endpoint receive tasks are the data-plane workers.
 
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_datapath::{
@@ -140,6 +140,10 @@ enum PipelineKind {
     Srtp,
     /// Userspace media slow path: transcode / record / DTMF-extraction via a [`MediaCall`] actor.
     Media,
+    /// Secure **and** transcoding: the far (`RTP/SAVP`) leg's codec differs from the near (plaintext)
+    /// leg's, so the [`MediaCall`] actor decrypts the secure ingress, transcodes, and encrypts the
+    /// secure egress — one shared SRTP leg threaded into both directions (BGCF/SBC PSTN breakout).
+    SrtpMedia,
     /// WebSocket bridge: leg A's audio is attached to an external WS media server (mod_audio_stream /
     /// voice-AI). The A↔B relay/transcode path is not wired — the WS server is A's far side.
     Ws,
@@ -922,6 +926,83 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 leg: SecureLeg::new(&far_local.key, &far_remote.key),
                 flows,
             });
+        } else if pipeline == PipelineKind::SrtpMedia {
+            // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
+            // the media actor decrypts B's SRTP, transcodes, and encrypts toward B (and the reverse),
+            // sharing one SecureLeg across both directions. RTCP rides the muxed RTP endpoint and is
+            // (de)crypted there too. (rtcp-mux posture; a non-muxed secure-transcode RTCP companion
+            // is a follow-up — see docs/security-and-nat.md.)
+            let far_local = far_local_crypto.expect("SrtpMedia ⇒ far_local_crypto is set");
+            let Some(far_remote) = info.crypto.first().copied() else {
+                return error_result("SAVP answer", &"missing a=crypto in the answer");
+            };
+            let Some(a_rtp) = near.remote_rtp else {
+                return error_result("secure media pipeline", &"near leg has no signalled address");
+            };
+            let Some(near_codec) = near_codec.clone() else {
+                return error_result(
+                    "secure media pipeline",
+                    &"offer carried no usable audio codec",
+                );
+            };
+            let Some(far_codec) = info.primary_codec() else {
+                return error_result(
+                    "secure media pipeline",
+                    &"answer carried no usable audio codec",
+                );
+            };
+            let record_path = profile
+                .record_call
+                .then(|| profile.record_path.clone())
+                .flatten();
+            let a_to_b = match build_direction(
+                near.rtp.id,
+                bridge_source_filter(profile, a_rtp),
+                far.rtp.id,
+                info.remote_rtp,
+                &near_codec,
+                &far_codec,
+                near_telephone_event,
+                info.telephone_event_payload_type(),
+                record_path.as_deref(),
+            ) {
+                Ok(direction) => direction,
+                Err(reason) => return error_result("secure media pipeline (A→B)", &reason),
+            };
+            let b_to_a = match build_direction(
+                far.rtp.id,
+                bridge_source_filter(profile, info.remote_rtp),
+                near.rtp.id,
+                a_rtp,
+                &far_codec,
+                &near_codec,
+                info.telephone_event_payload_type(),
+                near_telephone_event,
+                record_path.as_deref(),
+            ) {
+                Ok(direction) => direction,
+                Err(reason) => return error_result("secure media pipeline (B→A)", &reason),
+            };
+            // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them, (de)crypted in-actor).
+            for endpoint in [near.rtp.id, far.rtp.id] {
+                if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                    return error_result("install secure media redirect", &error);
+                }
+            }
+            let leg = Arc::new(Mutex::new(SecureLeg::new(&far_local.key, &far_remote.key)));
+            let latch = !profile.flags.iter().any(|flag| flag == "no-latch");
+            let call = MediaCall::new(
+                call_id.to_string(),
+                from_tag.to_string(),
+                Some(to_tag.clone()),
+                a_to_b,
+                b_to_a,
+                latch,
+                record_path,
+            )
+            .with_far_secure_leg(leg);
+            self.media
+                .register(call, self.datapath.clone(), owner_events);
         } else if pipeline == PipelineKind::Media {
             // Userspace media slow path: redirect both RTP legs to a per-call transcode/record/DTMF
             // actor. A's codec is the offer's primary codec; B's is the answer's. RTCP (non-mux)
@@ -2089,18 +2170,14 @@ fn resolve_pipeline(
         _ => false,
     };
     if far_local_crypto.is_some() {
-        // The SRTP bridge terminates crypto but does NOT transcode (docs/security-and-nat.md): a
-        // secure far leg whose codec differs from the near leg would otherwise be mis-bridged with
-        // the near-leg codec. Combined SRTP + transcode is a deferred topology — warn loudly rather
-        // than silently relay the wrong codec. (Not exercised by the plaintext BGCF/SBC trial.)
-        if transcode {
-            tracing::warn!(
-                "secure (RTP/SAVP) far leg with a codec mismatch: the SRTP bridge does not \
-                 transcode, so the near-leg codec is relayed as-is — SRTP + transcode is not yet \
-                 supported (see docs/security-and-nat.md)"
-            );
-        }
-        return PipelineKind::Srtp;
+        // Secure far leg: the plain SRTP bridge when both legs share a codec (crypto only), or the
+        // secure transcoding media slow path when they differ — decrypt → transcode → encrypt
+        // (BGCF/SBC: a secure AMR-WB access leg ↔ a plaintext G.711 PSTN leg).
+        return if transcode {
+            PipelineKind::SrtpMedia
+        } else {
+            PipelineKind::Srtp
+        };
     }
     if profile.record_call || transcode {
         PipelineKind::Media
@@ -2518,6 +2595,115 @@ mod tests {
         let (recovered_a, from) = recv(&phone_a).await;
         assert_eq!(from, near_addr, "media leaves the engine's A-facing port");
         assert_eq!(recovered_a, from_b, "A receives the decrypted plaintext");
+    }
+
+    /// An `RTP/SAVP` answer SDP advertising AMR-WB (PT 96, 16 kHz) at `addr` with `crypto` (rtcp-mux).
+    #[cfg(feature = "amr")]
+    fn savp_amr_wb_answer_sdp(addr: SocketAddr, crypto: &CryptoAttribute) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/SAVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=rtcp-mux\r\na={crypto_line}\r\n",
+            ip = addr.ip(),
+            port = addr.port(),
+            crypto_line = crypto.to_attribute_value(),
+        )
+    }
+
+    /// BGCF/SBC, the secure transcode: a secure `RTP/SAVP` **AMR-WB (16 kHz)** far leg ↔ a plaintext
+    /// `RTP/AVP` **G.711 µ-law (8 kHz)** near leg. The engine decrypts B's SRTP, transcodes (16↔8 kHz
+    /// resample), and encrypts toward B — and the reverse — in one `MediaCall` (`PipelineKind::SrtpMedia`),
+    /// driven end to end through the control plane + redirect dispatcher. `amr`-feature-gated.
+    #[cfg(feature = "amr")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn savp_amr_wb_far_leg_transcodes_to_plain_g711_both_ways() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::SrtpContext;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await; // plain G.711 (PSTN) side
+        let (phone_b, addr_b) = phone().await; // secure AMR-WB (VoLTE) side
+
+        // A offers plaintext G.711; the profile asks the engine to secure the far (B) leg.
+        let profile = ProfileFlags {
+            transport_protocol: Some("RTP/SAVP".into()),
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "savp-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile,
+                },
+            )
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
+        assert!(offer_reply.secure, "engine offers RTP/SAVP to B");
+        let engine_far_key = *offer_reply.crypto.first().expect("engine a=crypto to B");
+        let far_addr = offer_reply.remote_rtp;
+
+        // B answers RTP/SAVP AMR-WB with its own key → near = G.711 (8 kHz), far = AMR-WB (16 kHz),
+        // secure ⇒ the secure transcoding media slow path.
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "savp-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: savp_amr_wb_answer_sdp(addr_b, &b_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        assert!(
+            engine.media().is_media_call("savp-xcode"),
+            "secure + transcode resolves to the media slow path"
+        );
+
+        // A → engine(near): plaintext G.711 in; B receives SRTP that decrypts to transcoded AMR-WB.
+        let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
+        phone_a.send_to(&from_a, near_addr).await.expect("a send");
+        let (srtp, from) = recv(&phone_b).await;
+        assert_eq!(from, far_addr, "media leaves the engine's B-facing port");
+        assert_ne!(srtp, from_a, "B receives SRTP, not plaintext");
+        let mut b_decrypt = SrtpContext::from_key_material(&engine_far_key.key);
+        let mut amr = Vec::new();
+        b_decrypt
+            .unprotect(&srtp, &mut amr)
+            .expect("B decrypts the engine's SRTP");
+        let amr_rtp = siphon_rtp_media::rtp::RtpPacket::parse(&amr).expect("parse decrypted");
+        assert_eq!(amr_rtp.payload_type, 96, "B receives AMR-WB (PT 96)");
+        assert!(!amr_rtp.payload.is_empty(), "AMR-WB egress carries a frame");
+
+        // B → engine(far): AMR-WB SRTP (B's key) in; A receives plaintext transcoded G.711 µ-law.
+        let mut b_encrypt = SrtpContext::from_key_material(&b_key.key);
+        let mut srtp_b = Vec::new();
+        b_encrypt
+            .protect(&amr_wb_rtp(7, 0x0B0B_0B0B), &mut srtp_b)
+            .expect("B encrypts");
+        phone_b.send_to(&srtp_b, far_addr).await.expect("b send");
+        let (plain_a, from) = recv(&phone_a).await;
+        assert_eq!(from, near_addr, "media leaves the engine's A-facing port");
+        let g711 = siphon_rtp_media::rtp::RtpPacket::parse(&plain_a).expect("parse plaintext");
+        assert_eq!(g711.payload_type, 0, "A receives G.711 µ-law (PT 0)");
+        assert_eq!(g711.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -20,9 +20,11 @@
 //! + events out) so it unit-tests deterministically without sockets.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use siphon_rtp_srtp::leg::SecureLeg;
 
 use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
@@ -126,6 +128,14 @@ pub struct Direction {
     /// An active prompt / DTMF injection on this egress direction (PlayMedia / PlayDtmf). While set,
     /// transcoded audio toward this party is suppressed and the injected media plays instead.
     injection: Option<Injection>,
+    /// SDES-SRTP on a **secure + transcoding** leg (BGCF/SBC: e.g. a secure AMR-WB access leg ↔ a
+    /// plaintext G.711 PSTN leg). When the *ingress* faces the secure peer, `secure_ingress` decrypts
+    /// each datagram (SRTP→RTP / SRTCP→RTCP) before decode; when the *egress* faces the secure peer,
+    /// `secure_egress` encrypts each transcoded/relayed datagram before transmit. Both reference the
+    /// one shared [`SecureLeg`] for the call (single-owner actor ⇒ the `Mutex` is uncontended). `None`
+    /// on a plaintext leg — the existing transcode path is unchanged.
+    secure_ingress: Option<Arc<Mutex<SecureLeg>>>,
+    secure_egress: Option<Arc<Mutex<SecureLeg>>>,
 }
 
 /// One playout tick's egress action, computed while the injection is borrowed and applied after.
@@ -234,6 +244,8 @@ impl Direction {
             blocked: false,
             egress_sample_rate: egress_rate,
             injection: None,
+            secure_ingress: None,
+            secure_egress: None,
         }
     }
 
@@ -267,6 +279,8 @@ impl Direction {
             blocked: false,
             egress_sample_rate: 0,
             injection: None,
+            secure_ingress: None,
+            secure_egress: None,
         }
     }
 
@@ -381,11 +395,7 @@ impl Direction {
         };
         let mut buffer = [0u8; MAX_RTP];
         if let Ok(total) = write_packet(&header, &payload[..payload_len], &mut buffer) {
-            out.push(Outbound {
-                endpoint: self.egress_endpoint,
-                dst: self.egress_dst,
-                data: Bytes::copy_from_slice(&buffer[..total]),
-            });
+            self.push_egress(&buffer[..total], out);
             self.egress_sequence = self.egress_sequence.wrapping_add(1);
             self.egress_timestamp = self
                 .egress_timestamp
@@ -405,6 +415,22 @@ impl Direction {
         if data.len() < 2 {
             return;
         }
+        // Secure ingress (SDES-SRTP): decrypt before anything else, so the tee / relay / RFC 5761
+        // demux / decode all operate on plaintext. SecureLeg auto-demuxes SRTP vs SRTCP. A failed
+        // unprotect (bad auth / replay / wrong key) drops the datagram — never forward garbage.
+        let decrypted;
+        let data: &[u8] = if let Some(leg) = self.secure_ingress.as_ref() {
+            let mut plain = Vec::new();
+            let Ok(mut guard) = leg.lock() else { return };
+            if guard.unprotect(data, &mut plain).is_err() {
+                return;
+            }
+            drop(guard);
+            decrypted = plain;
+            &decrypted
+        } else {
+            data
+        };
         // SIPREC raw tee (RFC 7866 §6): copy the original ingress RTP/RTCP/DTMF byte-for-byte to each
         // subscriber's SRS before any transcode/relay. The SRS records the leg's *actual* media in its
         // negotiated codec — independent of hold/mute/transcode on the A↔B path.
@@ -425,14 +451,11 @@ impl Direction {
             return;
         }
 
-        // RFC 5761 demux: payload-type byte 64..=95 marks RTCP — relay it verbatim, untranscoded.
+        // RFC 5761 demux: payload-type byte 64..=95 marks RTCP — relay it (re-encrypting toward a
+        // secure egress), untranscoded.
         let packet_type = data[1] & 0x7f;
         if (64..=95).contains(&packet_type) {
-            out.push(Outbound {
-                endpoint: self.egress_endpoint,
-                dst: self.egress_dst,
-                data: Bytes::copy_from_slice(data),
-            });
+            self.push_egress(data, out);
             return;
         }
 
@@ -506,6 +529,28 @@ impl Direction {
         self.emit_pcm(egress_pcm, parsed.marker, out);
     }
 
+    /// Append one egress datagram toward this direction's peer, encrypting it (SRTP/SRTCP, auto-
+    /// demuxed by [`SecureLeg`]) first when the egress faces a secure peer. `plaintext` is a complete
+    /// RTP or RTCP packet; on a plaintext leg it is forwarded verbatim. A failed protect drops it.
+    fn push_egress(&self, plaintext: &[u8], out: &mut Vec<Outbound>) {
+        let data = if let Some(leg) = self.secure_egress.as_ref() {
+            let mut sealed = Vec::new();
+            let Ok(mut guard) = leg.lock() else { return };
+            if guard.protect(plaintext, &mut sealed).is_err() {
+                return;
+            }
+            drop(guard);
+            Bytes::from(sealed)
+        } else {
+            Bytes::copy_from_slice(plaintext)
+        };
+        out.push(Outbound {
+            endpoint: self.egress_endpoint,
+            dst: self.egress_dst,
+            data,
+        });
+    }
+
     /// Encode one frame of egress PCM and append the resulting RTP packet to `out`, advancing this
     /// direction's egress sequence/timestamp. Shared by the transcode path ([`Direction::handle`])
     /// and the echo path ([`Direction::echo_into`]); `pcm` must already be at the egress codec's rate.
@@ -523,11 +568,7 @@ impl Direction {
         };
         let mut buffer = [0u8; MAX_RTP];
         if let Ok(total) = write_packet(&header, &payload[..payload_len], &mut buffer) {
-            out.push(Outbound {
-                endpoint: self.egress_endpoint,
-                dst: self.egress_dst,
-                data: Bytes::copy_from_slice(&buffer[..total]),
-            });
+            self.push_egress(&buffer[..total], out);
             self.egress_sequence = self.egress_sequence.wrapping_add(1);
             self.egress_timestamp = self
                 .egress_timestamp
@@ -638,6 +679,17 @@ pub struct MediaCall {
 }
 
 impl MediaCall {
+    /// Install the call's shared SDES-SRTP leg for a **secure + transcoding** topology: the *far*
+    /// party (B) is the secure (`RTP/SAVP`) peer, A is plaintext. The A→B egress is encrypted and the
+    /// B→A ingress is decrypted against the one shared [`SecureLeg`] (single-owner actor ⇒ the `Mutex`
+    /// is uncontended). RTCP rides the same leg (SecureLeg auto-demuxes SRTCP).
+    #[must_use]
+    pub fn with_far_secure_leg(mut self, leg: Arc<Mutex<SecureLeg>>) -> Self {
+        self.a_to_b.secure_egress = Some(leg.clone());
+        self.b_to_a.secure_ingress = Some(leg);
+        self
+    }
+
     /// Build a call from its two directions and identity.
     #[must_use]
     pub fn new(
