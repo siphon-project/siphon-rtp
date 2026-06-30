@@ -3,17 +3,17 @@
 //! These lock per-frame / per-subframe cost so a regression fails CI. The AMR-WB decoder kernels
 //! are benched per-tier, plus the full mode-0 frame decode (`dec_main`) once it is wired.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(feature = "amr")]
 use criterion::BatchSize;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::basic_ops;
+#[cfg(feature = "amr")]
+use siphon_rtp_codec::amr::nb::dec_main::SpeechDecoder as NbSpeechDecoder;
 #[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::wb::dec_main::{decode_frame, DecoderState};
 #[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::wb::{codebook, constants, filters, lpc, pitch};
-#[cfg(feature = "amr")]
-use siphon_rtp_codec::amr::nb::dec_main::SpeechDecoder as NbSpeechDecoder;
 #[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::{AmrWb, AMRWB_SPEECH_BITS};
 use siphon_rtp_codec::cn::Cn;
@@ -85,7 +85,9 @@ fn bench_g722(criterion: &mut Criterion) {
     });
 
     // Seed a representative payload from a fresh encoder, then bench the stateful decode.
-    G722::new(20).encode(&pcm, &mut payload).expect("seed payload");
+    G722::new(20)
+        .encode(&pcm, &mut payload)
+        .expect("seed payload");
     let mut decoder = G722::new(20);
     criterion.bench_function("g722_decode_frame", |bencher| {
         bencher.iter(|| {
@@ -115,7 +117,9 @@ fn bench_g726(criterion: &mut Criterion) {
         });
     });
 
-    G726::new(Rate::R32, 20).encode(&pcm, &mut payload).expect("seed payload");
+    G726::new(Rate::R32, 20)
+        .encode(&pcm, &mut payload)
+        .expect("seed payload");
     let mut decoder = G726::new(Rate::R32, 20);
     criterion.bench_function("g726_32_decode_frame", |bencher| {
         bencher.iter(|| {
@@ -143,7 +147,9 @@ fn bench_gsm_fr(criterion: &mut Criterion) {
         });
     });
 
-    GsmFr::new().encode(&pcm, &mut payload).expect("seed payload");
+    GsmFr::new()
+        .encode(&pcm, &mut payload)
+        .expect("seed payload");
     let mut decoder = GsmFr::new();
     criterion.bench_function("gsm_fr_decode_frame", |bencher| {
         bencher.iter(|| {
@@ -245,7 +251,9 @@ fn bench_amrwb_dsp(criterion: &mut Criterion) {
     });
 
     // 12.8 → 16 kHz 5/4 oversampler, one subframe.
-    let sig12k8: Vec<i16> = (0..SUBFR).map(|i| ((i * 211 % 2000) as i16) - 1000).collect();
+    let sig12k8: Vec<i16> = (0..SUBFR)
+        .map(|i| ((i * 211 % 2000) as i16) - 1000)
+        .collect();
     let mut sig16k = vec![0i16; SUBFR * 5 / 4];
     let mut mem = [0i16; 24]; // 2 * NB_COEF_UP
     criterion.bench_function("amrwb_oversamp_subfr", |bencher| {
@@ -335,7 +343,9 @@ fn bench_amrnb_decode(criterion: &mut Criterion) {
 
     for (mode, tag) in MODES {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push(format!("../../reference/amr-nb/testv/NODTX/T_{tag}/T01_{tag}.COD"));
+        path.push(format!(
+            "../../reference/amr-nb/testv/NODTX/T_{tag}/T01_{tag}.COD"
+        ));
         let Ok(cod) = std::fs::read(&path) else {
             continue; // vectors not present in this checkout
         };
@@ -399,7 +409,8 @@ fn bench_amrwb_encode(criterion: &mut Criterion) {
         let mut out = vec![0i16; nb_bits];
         for f in 0..frame_index {
             let fp = &pcm[f * constants::L_FRAME16K..(f + 1) * constants::L_FRAME16K];
-            warm.encode_mode_bits(mode, fp, &mut out).expect("warm encode");
+            warm.encode_mode_bits(mode, fp, &mut out)
+                .expect("warm encode");
         }
 
         criterion.bench_function(&format!("amrwb_encode_mode{mode}_frame"), |bencher| {
@@ -433,5 +444,12 @@ criterion_group!(
     bench_amrwb_encode
 );
 #[cfg(not(feature = "amr"))]
-criterion_group!(benches, bench_g711, bench_g722, bench_g726, bench_gsm_fr, bench_cn);
+criterion_group!(
+    benches,
+    bench_g711,
+    bench_g722,
+    bench_g726,
+    bench_gsm_fr,
+    bench_cn
+);
 criterion_main!(benches);

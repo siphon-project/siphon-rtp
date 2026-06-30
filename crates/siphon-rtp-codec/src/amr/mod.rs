@@ -710,7 +710,7 @@ mod tests {
         // A well-formed octet-aligned MR475 single-frame payload (CMR=0xF, ToC FT=0 Q=1, 12 bytes)
         // decodes to one 160-sample frame.
         let mut nb_payload = vec![0xF0u8, Toc { follow: false, frame_type: 0, quality_ok: true }.to_octet()];
-        nb_payload.extend(std::iter::repeat(0u8).take(AmrNbMode::Mr475.bytes()));
+        nb_payload.extend(std::iter::repeat_n(0u8, AmrNbMode::Mr475.bytes()));
         assert!(matches!(
             nb.decode(&nb_payload, &mut [0i16; 160]),
             Ok(160)
