@@ -806,9 +806,20 @@ mod tests {
         let cod_words: Vec<i16> =
             cod.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
         let cod_frame_words = 3 + nb_bits;
+        // The four 4-bit HF-correction-gain fields (one per subframe).
+        let hf_fields = [(152usize, 156usize), (258, 262), (367, 371), (473, 477)];
+        let idx = |bits: &[i16], lo: usize, hi: usize| -> i16 {
+            let mut v = 0i16;
+            for b in lo..hi {
+                v = (v << 1) | i16::from(bits[b] > 0);
+            }
+            v
+        };
         let mut wb = AmrWb::new();
         let mut out = vec![0i16; nb_bits];
-        for f in 0..3 {
+        let n_frames = pcm.len() / 320;
+        let mut total_diff_frames = 0;
+        for f in 0..n_frames {
             let frame_pcm = &pcm[f * 320..(f + 1) * 320];
             wb.encode_mode_bits(8, frame_pcm, &mut out).expect("encode");
             let base = f * cod_frame_words + 3;
@@ -818,10 +829,22 @@ mod tests {
                     diffs.push(b);
                 }
             }
-            eprintln!("frame {f}: {} mismatches: {:?}", diffs.len(), &diffs[..diffs.len().min(40)]);
+            if !diffs.is_empty() {
+                total_diff_frames += 1;
+                let want_bits: Vec<i16> = cod_words[base..base + nb_bits].to_vec();
+                let got: Vec<i16> = hf_fields.iter().map(|&(lo, hi)| idx(&out, lo, hi)).collect();
+                let want: Vec<i16> =
+                    hf_fields.iter().map(|&(lo, hi)| idx(&want_bits, lo, hi)).collect();
+                eprintln!(
+                    "frame {f}: {} mismatch bits {:?}  HFidx got={:?} want={:?}",
+                    diffs.len(),
+                    &diffs[..diffs.len().min(40)],
+                    got,
+                    want
+                );
+            }
         }
-        // Parameter boundaries for mode 8: VAD(1) ISF(8,8,6,7,7,5,5) then per-subframe.
-        eprintln!("ISF ends at bit 47");
+        eprintln!("total frames with mismatches: {total_diff_frames} of {n_frames}");
     }
 
     /// Mode 0 (6.60 kbit/s) uses the 2-track `ACELP_2t64_fx` codebook and 36-bit ISF path.
