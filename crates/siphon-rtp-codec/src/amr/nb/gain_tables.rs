@@ -1,0 +1,51 @@
+//! AMR-NB gain quantization tables — 3GPP TS 26.073 `gains.tab`. Values verbatim.
+
+/// Pitch-gain scalar quantization table, Q14 (`gains.tab` `qua_gain_pitch[16]`).
+#[rustfmt::skip]
+pub static QUA_GAIN_PITCH: [i16; 16] = [
+    0, 3277, 6556, 8192, 9830, 11469, 12288, 13107,
+    13926, 14746, 15565, 16384, 17203, 18022, 18842, 19661,
+];
+
+/// Codebook-gain scalar quantization table (`gains.tab` `qua_gain_code[32*3]`). Each row is
+/// `(g_fac Q11, qua_ener_MR122 Q10, qua_ener Q10)`. Consumed by the gains tier (`gains.rs`).
+#[allow(dead_code)] // used by the gains tier, landed in a following commit
+#[rustfmt::skip]
+pub static QUA_GAIN_CODE: [i16; 96] = [
+    159, -3776, -22731,
+    206, -3394, -20428,
+    268, -3005, -18088,
+    349, -2615, -15739,
+    419, -2345, -14113,
+    482, -2138, -12867,
+    554, -1932, -11629,
+    637, -1726, -10387,
+    733, -1518, -9139,
+    842, -1314, -7906,
+    969, -1106, -6656,
+    1114, -900, -5416,
+    1281, -694, -4173,
+    1473, -487, -2931,
+    1694, -281, -1688,
+    1948, -75, -445,
+    2241, 133, 801,
+    2577, 339, 2044,
+    2963, 545, 3285,
+    3408, 752, 4530,
+    3919, 958, 5772,
+    4507, 1165, 7016,
+    5183, 1371, 8259,
+    5960, 1577, 9501,
+    6855, 1784, 10745,
+    7883, 1991, 11988,
+    9065, 2197, 13231,
+    10425, 2404, 14474,
+    12510, 2673, 16096,
+    16263, 3060, 18429,
+    21142, 3448, 20763,
+    27485, 3836, 23097,
+];
+
+/// Number of codebook-gain entries (`gains.tab` `NB_QUA_CODE`).
+#[allow(dead_code)] // used by the gains tier, landed in a following commit
+pub const NB_QUA_CODE: usize = 32;

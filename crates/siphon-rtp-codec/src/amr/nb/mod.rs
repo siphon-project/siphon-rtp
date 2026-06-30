@@ -9,5 +9,7 @@
 
 pub mod bitstream;
 pub mod constants;
+mod gain_tables;
 pub mod lpc;
 mod lpc_tables;
+pub mod pitch;
