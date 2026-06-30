@@ -1,21 +1,22 @@
 // AMR-WB encoder. Ported bit-exact from the 3GPP fixed-point C reference; the index loops and
 // manual slice copies deliberately mirror the C (`cod_main.c` et al.) line-for-line so the port can
 // be audited against the spec source, so the matching idiom-style lints are quieted module-wide.
-// (`dead_code` covers the mode-8 high-band helpers that are reachable only once that tier lands.)
 #![allow(
     clippy::needless_range_loop,
     clippy::manual_memcpy,
-    clippy::explicit_counter_loop,
-    dead_code
+    clippy::explicit_counter_loop
 )]
 
 //! AMR-WB encoder orchestration (3GPP TS 26.190 / TS 26.173 `cod_main.c` `coder()`), ported
 //! bit-exact. Drives the per-20 ms-frame analysis: pre-processing → LP analysis → ISF quantization →
 //! open-loop pitch → per-subframe (closed-loop pitch, algebraic codebook search, gain VQ, excitation
-//! and filter-memory updates) → `Prm2bits` parameter packing.
+//! and filter-memory updates) → `Prm2bits` parameter packing. Mode 8 (23.85 kbit/s) additionally
+//! runs the high-band `synthesis()` tier and packs the 4-bit HF correction-gain index per subframe.
 //!
-//! Non-DTX (`allow_dtx == 0`) speech path only; the comfort-noise (`MRDTX`) and the mode-8 high-band
-//! gain quantization (`synthesis()`) tiers are not yet wired (mode 8 omits the final 4-bit HF index).
+//! Speech path only: the comfort-noise / SID (`MRDTX`) frames are not emitted. The DTX
+//! speech-hangover counter *is* tracked, however, because the reference vectors are produced with
+//! DTX enabled and the mode-8 `synthesis()` `gain_alpha` update reads it. For active-speech input
+//! the hangover never expires, so no `MRDTX` frame is ever produced and the framing is unchanged.
 
 use crate::amr::basic_ops::{
     abs_s, add, div_s, extract_h, l_abs, l_add, l_deposit_h, l_mac, l_mult, l_msu, l_negate, l_shl,
