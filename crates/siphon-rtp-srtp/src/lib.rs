@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use aes::Aes128;
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use subtle::ConstantTimeEq;
 

@@ -15,10 +15,10 @@ keywords = ["srtp", "rtp", "crypto", "webrtc", "voip"]
 categories = ["network-programming", "cryptography"]
 
 [dependencies]
-aes = "0.8"
-ctr = "0.9"
-hmac = "0.12"
-sha1 = "0.10"
+aes = "0.9"
+ctr = "0.10"
+hmac = "0.13"
+sha1 = "0.11"
 subtle = "2.6"
 base64 = "0.22"
 getrandom = { workspace = true }
