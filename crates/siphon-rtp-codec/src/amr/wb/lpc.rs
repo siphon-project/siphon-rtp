@@ -6,7 +6,7 @@
 //! interpolation. `isp_isf` is the inverse (used for the stability factor and concealment).
 
 use crate::amr::basic_ops::{
-    add, extract_l, l_abs, l_add, l_mac, l_mult, l_msu, l_shl, l_shr, l_shr_r, l_sub, norm_l,
+    add, extract_l, l_abs, l_add, l_mac, l_msu, l_mult, l_shl, l_shr, l_shr_r, l_sub, norm_l,
     round_word, shl, shr, shr_r, sub,
 };
 use crate::amr::oper_32b::{l_extract, mpy_32_16};
@@ -67,7 +67,7 @@ pub fn isf_isp(isf: &[i16], isp: &mut [i16], m: usize) {
     for value in isp.iter_mut().take(m) {
         let ind = shr(*value, 7) as usize; // b7-b15
         let offset = *value & 0x007f; // b0-b6
-        // isp = table[ind] + (table[ind+1] - table[ind]) * offset / 128
+                                      // isp = table[ind] + (table[ind+1] - table[ind]) * offset / 128
         let l_tmp = l_mult(sub(TABLE[ind + 1], TABLE[ind]), offset);
         *value = add(TABLE[ind], extract_l(l_shr(l_tmp, 8)));
     }
@@ -186,7 +186,11 @@ pub fn isp_az(isp: &[i16], a: &mut [i16], m: usize, adaptive_scaling: bool) {
     }
 
     // Rescale if an overflow occurred and adaptive scaling is enabled.
-    let mut q = if adaptive_scaling { sub(4, norm_l(tmax)) } else { 0 };
+    let mut q = if adaptive_scaling {
+        sub(4, norm_l(tmax))
+    } else {
+        0
+    };
     let q_sug;
     if q > 0 {
         q_sug = add(12, q);

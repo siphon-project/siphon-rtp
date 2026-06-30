@@ -67,7 +67,7 @@ impl CodecSpec {
         }
     }
 
-    /// Set the egress encode mode (e.g. resolved from an SDP `mode-set`). Chainable on [`new`].
+    /// Set the egress encode mode (e.g. resolved from an SDP `mode-set`). Chainable on [`CodecSpec::new`].
     #[must_use]
     pub fn with_encode_mode(mut self, mode: Option<u8>) -> Self {
         self.encode_mode = mode;
@@ -337,14 +337,24 @@ mod tests {
             .collect();
         let mut payload = vec![0u8; 64];
 
-        let mut mode0 = encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20).with_encode_mode(Some(0)))
-            .expect("amr-wb encoder");
+        let mut mode0 =
+            encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20).with_encode_mode(Some(0)))
+                .expect("amr-wb encoder");
         assert!(mode0.encode(&pcm, &mut payload).expect("encode") > 0);
-        assert_eq!((payload[1] >> 3) & 0x0F, 0, "egress frame is mode 0 (ToC FT=0)");
+        assert_eq!(
+            (payload[1] >> 3) & 0x0F,
+            0,
+            "egress frame is mode 0 (ToC FT=0)"
+        );
 
-        let mut default = encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("encoder");
+        let mut default =
+            encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("encoder");
         assert!(default.encode(&pcm, &mut payload).expect("encode") > 0);
-        assert_eq!((payload[1] >> 3) & 0x0F, 2, "default egress frame is mode 2 (ToC FT=2)");
+        assert_eq!(
+            (payload[1] >> 3) & 0x0F,
+            2,
+            "default egress frame is mode 2 (ToC FT=2)"
+        );
     }
 
     #[cfg(feature = "amr")]

@@ -188,7 +188,11 @@ pub fn d_gain2(
     exp_gcode0 = sub(exp_gcode0, 14);
 
     // Read the quantized gains.
-    let table: &[i16] = if nbits == 6 { &T_QUA_GAIN6B } else { &T_QUA_GAIN7B };
+    let table: &[i16] = if nbits == 6 {
+        &T_QUA_GAIN6B
+    } else {
+        &T_QUA_GAIN7B
+    };
     let base = add(index, index) as usize;
     let gain_pit = table[base]; // Q14
     let g_code = table[base + 1]; // Q11

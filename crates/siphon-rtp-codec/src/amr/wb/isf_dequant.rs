@@ -193,7 +193,10 @@ mod tests {
         reorder_isf(&mut isf, ISF_GAP, 8);
         // Each ISF is at least ISF_GAP above the previous (or bumped up to meet it).
         for pair in isf[..7].windows(2) {
-            assert!(pair[1] - pair[0] >= ISF_GAP || pair[1] >= pair[0], "{pair:?}");
+            assert!(
+                pair[1] - pair[0] >= ISF_GAP || pair[1] >= pair[0],
+                "{pair:?}"
+            );
         }
         assert_eq!(isf[0], 128); // 100 < 128 → bumped
         assert_eq!(isf[1], 256); // 150 < 128+128 → bumped
@@ -204,7 +207,15 @@ mod tests {
         let mut isf_q = [0i16; M];
         let mut past = [0i16; M];
         let mut buf = [0i16; L_MEANBUF * M];
-        dpisf_2s_36b(&[0, 0, 0, 0, 0], &mut isf_q, &mut past, &[0; M], &mut buf, false, true);
+        dpisf_2s_36b(
+            &[0, 0, 0, 0, 0],
+            &mut isf_q,
+            &mut past,
+            &[0; M],
+            &mut buf,
+            false,
+            true,
+        );
         // Reorder spaces the first ORDER-1 ISFs (the last is left as decoded, per spec).
         for pair in isf_q[..ORDER - 1].windows(2) {
             assert!(pair[1] - pair[0] >= ISF_GAP, "ordered+spaced: {pair:?}");
@@ -248,9 +259,14 @@ mod tests {
         for row in buf.chunks_exact_mut(M) {
             row.copy_from_slice(&isfold);
         }
-        dpisf_2s_46b(&[0; 7], &mut isf_q, &mut past, &isfold, &mut buf, true, true);
+        dpisf_2s_46b(
+            &[0; 7], &mut isf_q, &mut past, &isfold, &mut buf, true, true,
+        );
         for pair in isf_q[..ORDER - 1].windows(2) {
-            assert!(pair[1] - pair[0] >= ISF_GAP, "concealed ISFs spaced: {pair:?}");
+            assert!(
+                pair[1] - pair[0] >= ISF_GAP,
+                "concealed ISFs spaced: {pair:?}"
+            );
         }
     }
 
@@ -260,7 +276,9 @@ mod tests {
             let mut isf_q = [0i16; M];
             let mut past = [0i16; M];
             let mut buf = [0i16; L_MEANBUF * M];
-            dpisf_2s_36b(indice, &mut isf_q, &mut past, &[0; M], &mut buf, false, true);
+            dpisf_2s_36b(
+                indice, &mut isf_q, &mut past, &[0; M], &mut buf, false, true,
+            );
             isf_q
         };
         assert_eq!(run(&[12, 7, 30, 5, 40]), run(&[12, 7, 30, 5, 40]));

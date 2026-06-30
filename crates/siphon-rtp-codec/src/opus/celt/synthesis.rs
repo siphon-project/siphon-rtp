@@ -124,7 +124,10 @@ mod tests {
             let approx = celt_exp2(x);
             let exact = 2.0f32.powf(x);
             let rel = (approx - exact).abs() / exact.max(1e-9);
-            assert!(rel < 1e-3, "celt_exp2({x}) = {approx}, 2^x = {exact}, rel {rel}");
+            assert!(
+                rel < 1e-3,
+                "celt_exp2({x}) = {approx}, 2^x = {exact}, rel {rel}"
+            );
         }
         assert_eq!(celt_exp2(-60.0), 0.0); // integer < -50 clamps to 0
     }
@@ -148,7 +151,13 @@ mod tests {
         let bin5 = E_BANDS[5] as usize;
         assert!((freq[bin5] - g5).abs() < 1e-3 * g5);
         // Tail above the last band is zeroed.
-        assert_eq!(freq[E_BANDS[NB_BANDS] as usize..n].iter().copied().sum::<f32>(), 0.0);
+        assert_eq!(
+            freq[E_BANDS[NB_BANDS] as usize..n]
+                .iter()
+                .copied()
+                .sum::<f32>(),
+            0.0
+        );
     }
 
     #[test]
@@ -189,7 +198,10 @@ mod tests {
     fn lcg_rand_matches_formula() {
         let mut seed = 12345u32;
         seed = celt_lcg_rand(seed);
-        assert_eq!(seed, 12345u32.wrapping_mul(1_664_525).wrapping_add(1_013_904_223));
+        assert_eq!(
+            seed,
+            12345u32.wrapping_mul(1_664_525).wrapping_add(1_013_904_223)
+        );
         // Deterministic and full-period-ish (no immediate fixed point).
         assert_ne!(celt_lcg_rand(seed), seed);
     }

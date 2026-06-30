@@ -458,7 +458,11 @@ impl AmrWb {
 
     /// Decode one mode-0 (6.60 kbit/s) frame from its 132 encoder-order speech bits (compat shim for
     /// [`Self::decode_mode_bits`] with `mode = 0`).
-    pub fn decode_mode0_bits(&mut self, bits: &[i16], out: &mut [i16]) -> Result<usize, CodecError> {
+    pub fn decode_mode0_bits(
+        &mut self,
+        bits: &[i16],
+        out: &mut [i16],
+    ) -> Result<usize, CodecError> {
         self.decode_mode_bits(0, bits, out)
     }
 
@@ -603,7 +607,9 @@ mod tests {
         let mut decoder = AmrWb::new();
         let mut out = [0i16; wb::constants::L_FRAME16K];
         assert_eq!(
-            decoder.decode(&payload[..len], &mut out).expect("AMR-WB decode"),
+            decoder
+                .decode(&payload[..len], &mut out)
+                .expect("AMR-WB decode"),
             wb::constants::L_FRAME16K
         );
     }
@@ -709,12 +715,17 @@ mod tests {
         assert_eq!(nb.params().sample_rate_hz, 8000);
         // A well-formed octet-aligned MR475 single-frame payload (CMR=0xF, ToC FT=0 Q=1, 12 bytes)
         // decodes to one 160-sample frame.
-        let mut nb_payload = vec![0xF0u8, Toc { follow: false, frame_type: 0, quality_ok: true }.to_octet()];
+        let mut nb_payload = vec![
+            0xF0u8,
+            Toc {
+                follow: false,
+                frame_type: 0,
+                quality_ok: true,
+            }
+            .to_octet(),
+        ];
         nb_payload.extend(std::iter::repeat_n(0u8, AmrNbMode::Mr475.bytes()));
-        assert!(matches!(
-            nb.decode(&nb_payload, &mut [0i16; 160]),
-            Ok(160)
-        ));
+        assert!(matches!(nb.decode(&nb_payload, &mut [0i16; 160]), Ok(160)));
         // Encode remains unimplemented.
         assert!(matches!(
             nb.encode(&[0i16; 160], &mut [0u8; 32]),
@@ -739,7 +750,15 @@ mod tests {
             }
         }
         // CMR=0xF (no request) + one ToC (FT=0, no follow, quality ok) + frame data.
-        let mut payload = vec![0xF0u8, Toc { follow: false, frame_type: 0, quality_ok: true }.to_octet()];
+        let mut payload = vec![
+            0xF0u8,
+            Toc {
+                follow: false,
+                frame_type: 0,
+                quality_ok: true,
+            }
+            .to_octet(),
+        ];
         payload.extend_from_slice(&data);
         payload
     }
@@ -778,7 +797,9 @@ mod tests {
         let mut out = vec![0i16; nb_bits];
         for f in 0..n_frames {
             let frame_pcm = &pcm[f * 320..(f + 1) * 320];
-            let written = wb.encode_mode_bits(mode, frame_pcm, &mut out).expect("encode");
+            let written = wb
+                .encode_mode_bits(mode, frame_pcm, &mut out)
+                .expect("encode");
             assert_eq!(written, nb_bits);
             let base = f * cod_frame_words + 3;
             for (b, (&got, &want)) in out.iter().zip(&cod_words[base..base + nb_bits]).enumerate() {
@@ -796,14 +817,20 @@ mod tests {
     #[test]
     fn encodes_full_mode0_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(0);
-        assert!(mismatch.is_none(), "mode 0: {frames} frames, first mismatch {mismatch:?}");
+        assert!(
+            mismatch.is_none(),
+            "mode 0: {frames} frames, first mismatch {mismatch:?}"
+        );
     }
 
     /// Mode 1 (8.85 kbit/s): same 2t64 codebook as mode 0 but the higher-rate per-mode packing.
     #[test]
     fn encodes_full_mode1_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(1);
-        assert!(mismatch.is_none(), "mode 1: {frames} frames, first mismatch {mismatch:?}");
+        assert!(
+            mismatch.is_none(),
+            "mode 1: {frames} frames, first mismatch {mismatch:?}"
+        );
     }
 
     #[test]
@@ -822,31 +849,46 @@ mod tests {
     #[test]
     fn encodes_full_mode3_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(3);
-        assert!(mismatch.is_none(), "mode 3: {frames} frames, first mismatch {mismatch:?}");
+        assert!(
+            mismatch.is_none(),
+            "mode 3: {frames} frames, first mismatch {mismatch:?}"
+        );
     }
 
     #[test]
     fn encodes_full_mode4_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(4);
-        assert!(mismatch.is_none(), "mode 4: {frames} frames, first mismatch {mismatch:?}");
+        assert!(
+            mismatch.is_none(),
+            "mode 4: {frames} frames, first mismatch {mismatch:?}"
+        );
     }
 
     #[test]
     fn encodes_full_mode5_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(5);
-        assert!(mismatch.is_none(), "mode 5: {frames} frames, first mismatch {mismatch:?}");
+        assert!(
+            mismatch.is_none(),
+            "mode 5: {frames} frames, first mismatch {mismatch:?}"
+        );
     }
 
     #[test]
     fn encodes_full_mode6_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(6);
-        assert!(mismatch.is_none(), "mode 6: {frames} frames, first mismatch {mismatch:?}");
+        assert!(
+            mismatch.is_none(),
+            "mode 6: {frames} frames, first mismatch {mismatch:?}"
+        );
     }
 
     #[test]
     fn encodes_full_mode7_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(7);
-        assert!(mismatch.is_none(), "mode 7: {frames} frames, first mismatch {mismatch:?}");
+        assert!(
+            mismatch.is_none(),
+            "mode 7: {frames} frames, first mismatch {mismatch:?}"
+        );
     }
 
     /// Mode 8 (23.85 kbit/s): the 4t64 ACELP pipeline plus the high-band `synthesis()` tier, which
@@ -856,9 +898,11 @@ mod tests {
     #[test]
     fn encodes_full_mode8_vector_bit_exact() {
         let (frames, mismatch) = check_mode_vector(8);
-        assert!(mismatch.is_none(), "mode 8: {frames} frames, first mismatch {mismatch:?}");
+        assert!(
+            mismatch.is_none(),
+            "mode 8: {frames} frames, first mismatch {mismatch:?}"
+        );
     }
-
 
     #[test]
     fn decode_rtp_mode0_matches_the_reference_vector() {

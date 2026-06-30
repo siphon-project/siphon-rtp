@@ -136,7 +136,8 @@ impl AmrPayload {
                 != 0;
             let frame_type = reader
                 .read(4)
-                .ok_or(CodecError::Malformed("truncated AMR ToC"))? as u8;
+                .ok_or(CodecError::Malformed("truncated AMR ToC"))?
+                as u8;
             let quality_ok = reader
                 .read(1)
                 .ok_or(CodecError::Malformed("truncated AMR ToC"))?
@@ -209,7 +210,8 @@ impl AmrPayload {
             }
             for frame in &self.frames {
                 let bits = frame_bits(frame.frame_type)
-                    .ok_or(CodecError::Malformed("reserved AMR frame type"))? as usize;
+                    .ok_or(CodecError::Malformed("reserved AMR frame type"))?
+                    as usize;
                 self.frame_data_len(frame, frame_bits)?; // length check
                 writer.write_bits_from_bytes(&frame.data, bits);
             }
@@ -223,11 +225,13 @@ impl AmrPayload {
         frame: &AmrFrame,
         frame_bits: fn(u8) -> Option<u16>,
     ) -> Result<usize, CodecError> {
-        let bits = frame_bits(frame.frame_type)
-            .ok_or(CodecError::Malformed("reserved AMR frame type"))?;
+        let bits =
+            frame_bits(frame.frame_type).ok_or(CodecError::Malformed("reserved AMR frame type"))?;
         let bytes = (bits as usize).div_ceil(8);
         if frame.data.len() < bytes {
-            return Err(CodecError::Malformed("AMR frame data shorter than its mode"));
+            return Err(CodecError::Malformed(
+                "AMR frame data shorter than its mode",
+            ));
         }
         Ok(bytes)
     }

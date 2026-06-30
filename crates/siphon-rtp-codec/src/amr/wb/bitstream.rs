@@ -595,11 +595,25 @@ mod tests {
         for mode in 0u8..=8 {
             let nbits = NB_BITS[mode as usize];
             let enc: Vec<i16> = (0..nbits)
-                .map(|i| if i % 5 == 0 || i % 7 == 0 { BIT_1 } else { BIT_0 })
+                .map(|i| {
+                    if i % 5 == 0 || i % 7 == 0 {
+                        BIT_1
+                    } else {
+                        BIT_0
+                    }
+                })
                 .collect();
             let payload = pack(&enc, mode);
-            assert_eq!(payload.len(), nbits.div_ceil(8), "mode {mode} packed length");
-            assert_eq!(unsort(&payload, mode), enc, "mode {mode}: unsort(pack(bits)) == bits");
+            assert_eq!(
+                payload.len(),
+                nbits.div_ceil(8),
+                "mode {mode} packed length"
+            );
+            assert_eq!(
+                unsort(&payload, mode),
+                enc,
+                "mode {mode}: unsort(pack(bits)) == bits"
+            );
         }
     }
 }

@@ -86,8 +86,7 @@ impl Metrics {
 
     /// Count an accepted `conference leave` command.
     pub fn record_conference_leave(&self) {
-        self.conference_leaves_total
-            .fetch_add(1, Ordering::Relaxed);
+        self.conference_leaves_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Render the Prometheus/OpenMetrics text exposition for the current counters plus the on-demand
@@ -427,9 +426,8 @@ mod tests {
 
         // Gauges reflect the arguments; counters reflect the increments.
         assert!(body.contains("# TYPE siphon_rtp_sessions gauge\nsiphon_rtp_sessions 3\n"));
-        assert!(body.contains(
-            "# TYPE siphon_rtp_conference_rooms gauge\nsiphon_rtp_conference_rooms 5\n"
-        ));
+        assert!(body
+            .contains("# TYPE siphon_rtp_conference_rooms gauge\nsiphon_rtp_conference_rooms 5\n"));
         assert!(body.contains(
             "# TYPE siphon_rtp_conference_participants gauge\nsiphon_rtp_conference_participants 9\n"
         ));

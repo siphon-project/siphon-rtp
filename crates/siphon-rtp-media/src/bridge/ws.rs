@@ -50,7 +50,8 @@ where
     let (mut sink, mut stream) = socket.split();
 
     // The first text frame announces the leg + audio format (mod_audio_fork handshake order).
-    sink.send(Message::text(session.start_message().to_json()?)).await?;
+    sink.send(Message::text(session.start_message().to_json()?))
+        .await?;
 
     let mut ticker = interval(ptime);
     let mut uplink = vec![0u8; UPLINK_CAP];
@@ -175,7 +176,10 @@ mod tests {
         // 2. Downlink: a binary L16 frame from the server is rendered to an RTP packet for the call.
         let mut l16 = [0u8; 320];
         pcm_to_l16_le(&[1000i16; 160], &mut l16);
-        client_tx.send(Message::binary(l16.to_vec())).await.expect("send binary");
+        client_tx
+            .send(Message::binary(l16.to_vec()))
+            .await
+            .expect("send binary");
         let rtp = timeout(Duration::from_secs(2), rtp_out_rx.recv_async())
             .await
             .expect("no timeout")
@@ -208,7 +212,10 @@ mod tests {
             stream_id: "str_1".into(),
             reason: "done".into(),
         });
-        client_tx.send(Message::text(stop.to_json().expect("json"))).await.expect("send stop");
+        client_tx
+            .send(Message::text(stop.to_json().expect("json")))
+            .await
+            .expect("send stop");
         let outcome = timeout(Duration::from_secs(2), bridge).await.expect("join");
         assert!(
             outcome.expect("task").is_ok(),

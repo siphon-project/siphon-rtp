@@ -28,7 +28,11 @@ pub fn dec_acelp_2t64(index: i16, code: &mut [i16]) {
     let i0 = (shr(index, 5) & 0x003E) as usize;
     let i1 = add(shl(index & 0x001F, 1), 1) as usize;
 
-    code[i0] = if (shr(index, 6) & NB_POS_2T) == 0 { 512 } else { -512 };
+    code[i0] = if (shr(index, 6) & NB_POS_2T) == 0 {
+        512
+    } else {
+        -512
+    };
     code[i1] = if (index & NB_POS_2T) == 0 { 512 } else { -512 };
 }
 
@@ -46,7 +50,7 @@ fn dec_1p_n1(index: i32, n: i16, offset: i16, pos: &mut [i16]) {
 /// Decode 2 pulses encoded with `2*N+1` bits (`q_pulse.c` `dec_2p_2N1`), writing `pos[0..2]`.
 fn dec_2p_2n1(index: i32, n: i16, offset: i16, pos: &mut [i16]) {
     let mask = l_deposit_l(sub(shl(1, n), 1)); // ((1<<N)-1)
-    // pos1 = (((index >> N) & mask) + offset)
+                                               // pos1 = (((index >> N) & mask) + offset)
     let mut pos1 = extract_l(l_add(l_shr(index, n) & mask, l_deposit_l(offset)));
     let tmp = shl(n, 1);
     let i = l_shr(index, tmp) & 1; // (index >> (2*N)) & 1
@@ -250,26 +254,38 @@ pub fn dec_acelp_4t64(index: &[i16], nbbits: i16, code: &mut [i16]) {
         64 => {
             for k in 0..NB_TRACK {
                 // L_index = (index[k] << 14) + index[k+NB_TRACK]
-                let l_index = l_add(l_shl(l_deposit_l(index[k]), 14), l_deposit_l(index[k + NB_TRACK]));
+                let l_index = l_add(
+                    l_shl(l_deposit_l(index[k]), 14),
+                    l_deposit_l(index[k + NB_TRACK]),
+                );
                 dec_4p_4n(l_index, 4, 0, &mut pos);
                 add_pulses(&pos, 4, k as i16, code);
             }
         }
         72 => {
             for k in 0..(NB_TRACK - 2) {
-                let l_index = l_add(l_shl(l_deposit_l(index[k]), 10), l_deposit_l(index[k + NB_TRACK]));
+                let l_index = l_add(
+                    l_shl(l_deposit_l(index[k]), 10),
+                    l_deposit_l(index[k + NB_TRACK]),
+                );
                 dec_5p_5n(l_index, 4, 0, &mut pos);
                 add_pulses(&pos, 5, k as i16, code);
             }
             for k in 2..NB_TRACK {
-                let l_index = l_add(l_shl(l_deposit_l(index[k]), 14), l_deposit_l(index[k + NB_TRACK]));
+                let l_index = l_add(
+                    l_shl(l_deposit_l(index[k]), 14),
+                    l_deposit_l(index[k + NB_TRACK]),
+                );
                 dec_4p_4n(l_index, 4, 0, &mut pos);
                 add_pulses(&pos, 4, k as i16, code);
             }
         }
         88 => {
             for k in 0..NB_TRACK {
-                let l_index = l_add(l_shl(l_deposit_l(index[k]), 11), l_deposit_l(index[k + NB_TRACK]));
+                let l_index = l_add(
+                    l_shl(l_deposit_l(index[k]), 11),
+                    l_deposit_l(index[k + NB_TRACK]),
+                );
                 dec_6p_6n_2(l_index, 4, 0, &mut pos);
                 add_pulses(&pos, 6, k as i16, code);
             }
@@ -341,8 +357,14 @@ mod tests {
             let found = pulses(&code);
             assert_eq!(found.len(), 2, "two pulses for {index}");
             let positions: Vec<usize> = found.iter().map(|(p, _)| *p).collect();
-            assert!(positions.iter().any(|p| p % 2 == 0), "even pulse for {index}");
-            assert!(positions.iter().any(|p| p % 2 == 1), "odd pulse for {index}");
+            assert!(
+                positions.iter().any(|p| p % 2 == 0),
+                "even pulse for {index}"
+            );
+            assert!(
+                positions.iter().any(|p| p % 2 == 1),
+                "odd pulse for {index}"
+            );
             assert!(found.iter().all(|(_, v)| v.abs() == 512));
         }
     }
@@ -371,7 +393,10 @@ mod tests {
         let found = pulses(&code);
         // Two pulses per track, but two pulses may coincide and sum to ±1024 or cancel to 0.
         let total: i32 = found.iter().map(|(_, v)| (v.abs() as i32) / 512).sum();
-        assert!(total <= 8 && total > 0, "at most 8 unit pulses, got {total}");
+        assert!(
+            total <= 8 && total > 0,
+            "at most 8 unit pulses, got {total}"
+        );
         // Every non-zero sample is a multiple of 512 in [-1024, 1024].
         assert!(found.iter().all(|(_, v)| v.abs() == 512 || v.abs() == 1024));
     }
@@ -390,7 +415,9 @@ mod tests {
         ];
         for (nbbits, nind) in budgets {
             for seed in 0..64i16 {
-                let index: Vec<i16> = (0..nind).map(|i| (seed * 7 + i as i16 * 13) & 0x3FFF).collect();
+                let index: Vec<i16> = (0..nind)
+                    .map(|i| (seed * 7 + i as i16 * 13) & 0x3FFF)
+                    .collect();
                 let mut code = [0i16; 64];
                 dec_acelp_4t64(&index, nbbits, &mut code);
                 assert!(code.iter().all(|&v| v.abs() <= 6 * 512), "nbbits {nbbits}");

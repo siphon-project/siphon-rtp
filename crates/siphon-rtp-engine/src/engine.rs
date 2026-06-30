@@ -937,7 +937,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result("SAVP answer", &"missing a=crypto in the answer");
             };
             let Some(a_rtp) = near.remote_rtp else {
-                return error_result("secure media pipeline", &"near leg has no signalled address");
+                return error_result(
+                    "secure media pipeline",
+                    &"near leg has no signalled address",
+                );
             };
             let Some(near_codec) = near_codec.clone() else {
                 return error_result(
@@ -3019,7 +3022,9 @@ mod tests {
             .map(|i| ((i as f32 * 0.20).sin() * 6000.0) as i16)
             .collect();
         let mut amr_payload = vec![0u8; 256];
-        let written = encoder.encode(&pcm, &mut amr_payload).expect("encode amr-wb");
+        let written = encoder
+            .encode(&pcm, &mut amr_payload)
+            .expect("encode amr-wb");
         let mut packet = vec![0x80, 96];
         packet.extend_from_slice(&sequence.to_be_bytes());
         packet.extend_from_slice(&(u32::from(sequence) * 320).to_be_bytes());
@@ -3863,7 +3868,10 @@ mod tests {
             .expect("a frame");
         match first {
             Message::Text(text) => assert!(
-                matches!(ControlMessage::from_json(text.as_str()), Ok(ControlMessage::Start(_))),
+                matches!(
+                    ControlMessage::from_json(text.as_str()),
+                    Ok(ControlMessage::Start(_))
+                ),
                 "first WS frame is `start`"
             ),
             other => panic!("expected start text frame, got {other:?}"),

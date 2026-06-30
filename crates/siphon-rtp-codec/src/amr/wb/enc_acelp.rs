@@ -145,7 +145,10 @@ pub fn quant_4p_4n(pos: &[i16], n: i16) -> i32 {
         0 => {
             let tmp = sub(shl(n, 2), 3);
             let mut idx = l_shl(1, tmp);
-            idx = l_add(idx, quant_4p_4n1(pos_b[0], pos_b[1], pos_b[2], pos_b[3], n_1));
+            idx = l_add(
+                idx,
+                quant_4p_4n1(pos_b[0], pos_b[1], pos_b[2], pos_b[3], n_1),
+            );
             idx
         }
         1 => {
@@ -366,13 +369,24 @@ pub fn preemph2(x: &mut [i16], mu: i16, lg: usize, mem: &mut i16) {
 
 /// LPC synthesis `1/A(z)` (`syn_filt.c` `Syn_filt`). `mem[m]` is the carried state. `x`/`y` are `lg`
 /// long. When `update` the new state is written back to `mem`.
-pub fn syn_filt(a: &[i16], m: usize, x: &[i16], y: &mut [i16], lg: usize, mem: &mut [i16], update: bool) {
+pub fn syn_filt(
+    a: &[i16],
+    m: usize,
+    x: &[i16],
+    y: &mut [i16],
+    lg: usize,
+    mem: &mut [i16],
+    update: bool,
+) {
     // y_buf = [mem(m)] ++ [output(lg)]. The encoder/decoder only ever call this with m <= M and
     // lg <= L_SUBFR, so a fixed M+L_SUBFR stack scratch avoids a per-call heap allocation on the
     // hot path (caller-owned buffers; zero per-frame heap is a project invariant).
     const LPC_ORDER: usize = 16; // AMR-WB `M`
     const Y_BUF_MAX: usize = LPC_ORDER + L_SUBFR;
-    debug_assert!(m + lg <= Y_BUF_MAX, "syn_filt y_buf overflow: m={m} lg={lg}");
+    debug_assert!(
+        m + lg <= Y_BUF_MAX,
+        "syn_filt y_buf overflow: m={m} lg={lg}"
+    );
     let mut y_buf = [0i16; Y_BUF_MAX];
     y_buf[..m].copy_from_slice(&mem[..m]);
 
@@ -424,7 +438,14 @@ pub fn g_pitch(xn: &[i16], y1: &[i16], g_coeff: &mut [i16], l_subfr: usize) -> i
 }
 
 /// Voicing factor in Q15, -1 unvoiced .. 1 voiced (`voicefac.c` `voice_factor`).
-pub fn voice_factor(exc: &[i16], q_exc: i16, gain_pit: i16, code: &[i16], gain_code: i16, l_subfr: usize) -> i16 {
+pub fn voice_factor(
+    exc: &[i16],
+    q_exc: i16,
+    gain_pit: i16,
+    code: &[i16],
+    gain_code: i16,
+    l_subfr: usize,
+) -> i16 {
     let (e1_l, mut exp1) = dot_product12(exc, exc, l_subfr);
     let mut ener1 = extract_h(e1_l);
     exp1 = sub(exp1, add(q_exc, q_exc));
@@ -619,7 +640,17 @@ pub fn pitch_fr4(
     let corr_v_offset = negate(t_min);
 
     let mut corr_v = [0i16; 40];
-    norm_corr(exc, exc_off, xn, h, l_subfr, t_min, t_max, &mut corr_v, corr_v_offset);
+    norm_corr(
+        exc,
+        exc_off,
+        xn,
+        h,
+        l_subfr,
+        t_min,
+        t_max,
+        &mut corr_v,
+        corr_v_offset,
+    );
 
     let mut max = corr_v[(corr_v_offset + t0_min) as usize];
     let mut t0 = t0_min;
@@ -686,7 +717,10 @@ pub fn init_gp_clip(mem: &mut [i16; 2]) {
 /// `gpclip.c` `Gp_clip`: return 1 if pitch-gain clipping should be applied.
 pub fn gp_clip(ser_size: i16, mem: &[i16; 2]) -> i16 {
     if ser_size == NBBITS_7K || ser_size == NBBITS_9K {
-        let thres = add(14746, mult(1638, extract_l(l_mult(mem[0], 16384 / DIST_ISF_MAX_IO))));
+        let thres = add(
+            14746,
+            mult(1638, extract_l(l_mult(mem[0], 16384 / DIST_ISF_MAX_IO))),
+        );
         if sub(mem[1], thres) > 0 {
             return 1;
         }
@@ -923,7 +957,14 @@ pub fn q_gain2(
 
 /// 2-pulse algebraic codebook search (`c2t64fx.c` `ACELP_2t64_fx`). Writes `code`/`y` (Q9) and the
 /// single 12-bit index to `index[0]`.
-pub fn acelp_2t64_fx(dn: &mut [i16], cn: &[i16], hh: &[i16], code: &mut [i16], y: &mut [i16], index: &mut [i16]) {
+pub fn acelp_2t64_fx(
+    dn: &mut [i16],
+    cn: &[i16],
+    hh: &[i16],
+    code: &mut [i16],
+    y: &mut [i16],
+    index: &mut [i16],
+) {
     const NB_TRACK: usize = 2;
     const STEP: usize = 2;
     const NB_POS_2T: usize = 32;
@@ -1490,7 +1531,10 @@ pub fn acelp_4t64_search(
         // emulate a flat pointer p0 over rows 0..4
         let mut row = 0usize;
         let mut col = 0usize;
-        let mut advance = |flat: &mut [[i16; MSIZE_4T]; NB_TRACK_4T], v: i16, row: &mut usize, col: &mut usize| {
+        let mut advance = |flat: &mut [[i16; MSIZE_4T]; NB_TRACK_4T],
+                           v: i16,
+                           row: &mut usize,
+                           col: &mut usize| {
             flat[*row][*col] = mult(flat[*row][*col], v);
             *col += 1;
             if *col == MSIZE_4T {
@@ -1547,10 +1591,21 @@ pub fn acelp_4t64_search(
             let ii = add(shl(i, 4), j);
             s = l_mac(s, rrixiy[ipos[0] as usize][ii as usize], 8192);
             alp = round_word(s);
-            let p0b = if sign[ix as usize] < 0 { h_inv_base as isize - ix as isize } else { h_base as isize - ix as isize };
-            let p1b = if sign[iy as usize] < 0 { h_inv_base as isize - iy as isize } else { h_base as isize - iy as isize };
+            let p0b = if sign[ix as usize] < 0 {
+                h_inv_base as isize - ix as isize
+            } else {
+                h_base as isize - ix as isize
+            };
+            let p1b = if sign[iy as usize] < 0 {
+                h_inv_base as isize - iy as isize
+            } else {
+                h_base as isize - iy as isize
+            };
             for i in 0..L_SUBFR {
-                vec[i] = add(h_buf[(p0b + i as isize) as usize], h_buf[(p1b + i as isize) as usize]);
+                vec[i] = add(
+                    h_buf[(p0b + i as isize) as usize],
+                    h_buf[(p1b + i as isize) as usize],
+                );
             }
             if nbbits == 44 {
                 ipos[8] = 0;
@@ -1566,14 +1621,39 @@ pub fn acelp_4t64_search(
             ind[1] = iy;
             ind[2] = ii;
             ind[3] = jj;
-            ps = add(add(add(dn[ix as usize], dn[iy as usize]), dn[ii as usize]), dn[jj as usize]);
-            let p0b = if sign[ix as usize] < 0 { h_inv_base as isize - ix as isize } else { h_base as isize - ix as isize };
-            let p1b = if sign[iy as usize] < 0 { h_inv_base as isize - iy as isize } else { h_base as isize - iy as isize };
-            let p2b = if sign[ii as usize] < 0 { h_inv_base as isize - ii as isize } else { h_base as isize - ii as isize };
-            let p3b = if sign[jj as usize] < 0 { h_inv_base as isize - jj as isize } else { h_base as isize - jj as isize };
+            ps = add(
+                add(add(dn[ix as usize], dn[iy as usize]), dn[ii as usize]),
+                dn[jj as usize],
+            );
+            let p0b = if sign[ix as usize] < 0 {
+                h_inv_base as isize - ix as isize
+            } else {
+                h_base as isize - ix as isize
+            };
+            let p1b = if sign[iy as usize] < 0 {
+                h_inv_base as isize - iy as isize
+            } else {
+                h_base as isize - iy as isize
+            };
+            let p2b = if sign[ii as usize] < 0 {
+                h_inv_base as isize - ii as isize
+            } else {
+                h_base as isize - ii as isize
+            };
+            let p3b = if sign[jj as usize] < 0 {
+                h_inv_base as isize - jj as isize
+            } else {
+                h_base as isize - jj as isize
+            };
             for i in 0..L_SUBFR {
                 vec[i] = add(
-                    add(add(h_buf[(p0b + i as isize) as usize], h_buf[(p1b + i as isize) as usize]), h_buf[(p2b + i as isize) as usize]),
+                    add(
+                        add(
+                            h_buf[(p0b + i as isize) as usize],
+                            h_buf[(p1b + i as isize) as usize],
+                        ),
+                        h_buf[(p2b + i as isize) as usize],
+                    ),
                     h_buf[(p3b + i as isize) as usize],
                 );
             }
@@ -1594,22 +1674,62 @@ pub fn acelp_4t64_search(
         while j < nb_pulse {
             let mut cor_x = [0i16; NB_POS_4T];
             let mut cor_y = [0i16; NB_POS_4T];
-            cor_h_vec(&h_buf, h_base, &vec, ipos[j] as usize, &sign, &rrixix, &mut cor_x);
-            cor_h_vec(&h_buf, h_base, &vec, ipos[j + 1] as usize, &sign, &rrixix, &mut cor_y);
+            cor_h_vec(
+                &h_buf,
+                h_base,
+                &vec,
+                ipos[j] as usize,
+                &sign,
+                &rrixix,
+                &mut cor_x,
+            );
+            cor_h_vec(
+                &h_buf,
+                h_base,
+                &vec,
+                ipos[j + 1] as usize,
+                &sign,
+                &rrixix,
+                &mut cor_y,
+            );
 
             let mut ix = 0i16;
             let mut iy = 0i16;
             search_ixiy(
-                nbpos[st], ipos[j] as usize, ipos[j + 1] as usize, &mut ps, &mut alp, &mut ix, &mut iy,
-                dn, &dn2, &cor_x, &cor_y, &rrixiy,
+                nbpos[st],
+                ipos[j] as usize,
+                ipos[j + 1] as usize,
+                &mut ps,
+                &mut alp,
+                &mut ix,
+                &mut iy,
+                dn,
+                &dn2,
+                &cor_x,
+                &cor_y,
+                &rrixiy,
             );
             ind[j] = ix;
             ind[j + 1] = iy;
 
-            let p0b = if sign[ix as usize] < 0 { h_inv_base as isize - ix as isize } else { h_base as isize - ix as isize };
-            let p1b = if sign[iy as usize] < 0 { h_inv_base as isize - iy as isize } else { h_base as isize - iy as isize };
+            let p0b = if sign[ix as usize] < 0 {
+                h_inv_base as isize - ix as isize
+            } else {
+                h_base as isize - ix as isize
+            };
+            let p1b = if sign[iy as usize] < 0 {
+                h_inv_base as isize - iy as isize
+            } else {
+                h_base as isize - iy as isize
+            };
             for i in 0..L_SUBFR {
-                vec[i] = add(vec[i], add(h_buf[(p0b + i as isize) as usize], h_buf[(p1b + i as isize) as usize]));
+                vec[i] = add(
+                    vec[i],
+                    add(
+                        h_buf[(p0b + i as isize) as usize],
+                        h_buf[(p1b + i as isize) as usize],
+                    ),
+                );
             }
             j += 2;
             st += 1;

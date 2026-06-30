@@ -202,7 +202,7 @@ unsafe fn sum_sq_i16_avx2(x: &[i16]) -> i64 {
         let v16 = _mm_loadu_si128(x.as_ptr().add(i) as *const __m128i); // 8 × i16
         let v32 = _mm256_cvtepi16_epi32(v16); // 8 × i32 (sign-extended)
         let sq = _mm256_mullo_epi32(v32, v32); // 8 × i32 squares (exact, ≤ 2^30)
-        // Widen the 8 i32 squares to i64 in two halves and accumulate (no overflow).
+                                               // Widen the 8 i32 squares to i64 in two halves and accumulate (no overflow).
         let lo = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(sq));
         let hi = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(sq, 1));
         acc = _mm256_add_epi64(acc, lo);
@@ -289,7 +289,10 @@ mod tests {
     #[test]
     fn sum_sq_matches_hand_computed() {
         assert_eq!(sum_sq_i16(&[3, -4]), 9 + 16);
-        assert_eq!(sum_sq_i16(&[i16::MIN]), i64::from(i16::MIN) * i64::from(i16::MIN));
+        assert_eq!(
+            sum_sq_i16(&[i16::MIN]),
+            i64::from(i16::MIN) * i64::from(i16::MIN)
+        );
         assert_eq!(sum_sq_i16(&[]), 0);
     }
 

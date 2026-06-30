@@ -289,11 +289,17 @@ fn kf_bfly4(
             let scratch0 = Complex::new(fout[f].re - fout[f + 2].re, fout[f].im - fout[f + 2].im);
             fout[f].re += fout[f + 2].re;
             fout[f].im += fout[f + 2].im;
-            let scratch1 = Complex::new(fout[f + 1].re + fout[f + 3].re, fout[f + 1].im + fout[f + 3].im);
+            let scratch1 = Complex::new(
+                fout[f + 1].re + fout[f + 3].re,
+                fout[f + 1].im + fout[f + 3].im,
+            );
             fout[f + 2] = Complex::new(fout[f].re - scratch1.re, fout[f].im - scratch1.im);
             fout[f].re += scratch1.re;
             fout[f].im += scratch1.im;
-            let scratch1 = Complex::new(fout[f + 1].re - fout[f + 3].re, fout[f + 1].im - fout[f + 3].im);
+            let scratch1 = Complex::new(
+                fout[f + 1].re - fout[f + 3].re,
+                fout[f + 1].im - fout[f + 3].im,
+            );
 
             fout[f + 1] = Complex::new(scratch0.re + scratch1.im, scratch0.im - scratch1.re);
             fout[f + 3] = Complex::new(scratch0.re - scratch1.im, scratch0.im + scratch1.re);
@@ -318,14 +324,18 @@ fn kf_bfly4(
                 scratch[5] = Complex::new(fout[f].re - scratch[1].re, fout[f].im - scratch[1].im);
                 fout[f].re += scratch[1].re;
                 fout[f].im += scratch[1].im;
-                scratch[3] = Complex::new(scratch[0].re + scratch[2].re, scratch[0].im + scratch[2].im);
-                scratch[4] = Complex::new(scratch[0].re - scratch[2].re, scratch[0].im - scratch[2].im);
+                scratch[3] =
+                    Complex::new(scratch[0].re + scratch[2].re, scratch[0].im + scratch[2].im);
+                scratch[4] =
+                    Complex::new(scratch[0].re - scratch[2].re, scratch[0].im - scratch[2].im);
                 fout[f + m2] = Complex::new(fout[f].re - scratch[3].re, fout[f].im - scratch[3].im);
                 fout[f].re += scratch[3].re;
                 fout[f].im += scratch[3].im;
 
-                fout[f + m] = Complex::new(scratch[5].re + scratch[4].im, scratch[5].im - scratch[4].re);
-                fout[f + m3] = Complex::new(scratch[5].re - scratch[4].im, scratch[5].im + scratch[4].re);
+                fout[f + m] =
+                    Complex::new(scratch[5].re + scratch[4].im, scratch[5].im - scratch[4].re);
+                fout[f + m3] =
+                    Complex::new(scratch[5].re - scratch[4].im, scratch[5].im + scratch[4].re);
             }
         }
     }
@@ -411,7 +421,8 @@ fn kf_bfly5(
             scratch[4] = c_mul(fout[f4 + u], twiddles[4 * u * fstride]);
 
             scratch[7] = Complex::new(scratch[1].re + scratch[4].re, scratch[1].im + scratch[4].im);
-            scratch[10] = Complex::new(scratch[1].re - scratch[4].re, scratch[1].im - scratch[4].im);
+            scratch[10] =
+                Complex::new(scratch[1].re - scratch[4].re, scratch[1].im - scratch[4].im);
             scratch[8] = Complex::new(scratch[2].re + scratch[3].re, scratch[2].im + scratch[3].im);
             scratch[9] = Complex::new(scratch[2].re - scratch[3].re, scratch[2].im - scratch[3].im);
 
@@ -428,8 +439,10 @@ fn kf_bfly5(
                 -(scratch[10].re * ya.im + scratch[9].re * yb.im),
             );
 
-            fout[f1 + u] = Complex::new(scratch[5].re - scratch[6].re, scratch[5].im - scratch[6].im);
-            fout[f4 + u] = Complex::new(scratch[5].re + scratch[6].re, scratch[5].im + scratch[6].im);
+            fout[f1 + u] =
+                Complex::new(scratch[5].re - scratch[6].re, scratch[5].im - scratch[6].im);
+            fout[f4 + u] =
+                Complex::new(scratch[5].re + scratch[6].re, scratch[5].im + scratch[6].im);
 
             scratch[11] = Complex::new(
                 scratch[0].re + (scratch[7].re * yb.re + scratch[8].re * ya.re),
@@ -440,8 +453,14 @@ fn kf_bfly5(
                 scratch[10].re * yb.im - scratch[9].re * ya.im,
             );
 
-            fout[f2 + u] = Complex::new(scratch[11].re + scratch[12].re, scratch[11].im + scratch[12].im);
-            fout[f3 + u] = Complex::new(scratch[11].re - scratch[12].re, scratch[11].im - scratch[12].im);
+            fout[f2 + u] = Complex::new(
+                scratch[11].re + scratch[12].re,
+                scratch[11].im + scratch[12].im,
+            );
+            fout[f3 + u] = Complex::new(
+                scratch[11].re - scratch[12].re,
+                scratch[11].im - scratch[12].im,
+            );
         }
     }
 }
@@ -544,8 +563,7 @@ impl MdctLookup {
             // f64 internally then narrow, like libopus.
             let mut t = Vec::with_capacity(n2);
             for i in 0..n2 {
-                let phase =
-                    2.0_f64 * std::f64::consts::PI * (i as f64 + 0.125) / n_shift as f64;
+                let phase = 2.0_f64 * std::f64::consts::PI * (i as f64 + 0.125) / n_shift as f64;
                 t.push(phase.cos() as f32);
             }
             trig.push(t);
@@ -894,9 +912,9 @@ mod tests {
             .map(|bin| {
                 let mut acc = 0.0_f64;
                 for (k, &x) in input.iter().take(n2).enumerate() {
-                    let phase = 2.0 * PI * (bin as f64 + 0.5 + 0.25 * nfft as f64)
-                        * (k as f64 + 0.5)
-                        / nfft as f64;
+                    let phase =
+                        2.0 * PI * (bin as f64 + 0.5 + 0.25 * nfft as f64) * (k as f64 + 0.5)
+                            / nfft as f64;
                     acc += x as f64 * phase.cos();
                 }
                 acc
@@ -1014,7 +1032,15 @@ mod tests {
             clt_mdct_backward(&lookup, blk, &mut ref_out, &window, overlap, shift, 1);
 
             let mut got = vec![0.0f32; nfft];
-            clt_mdct_backward(&lookup, &inter_in[block..], &mut got, &window, overlap, shift, b);
+            clt_mdct_backward(
+                &lookup,
+                &inter_in[block..],
+                &mut got,
+                &window,
+                overlap,
+                shift,
+                b,
+            );
 
             for (j, (&a, &c)) in ref_out.iter().zip(got.iter()).enumerate() {
                 assert!(

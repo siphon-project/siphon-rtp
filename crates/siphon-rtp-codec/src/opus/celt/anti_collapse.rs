@@ -99,12 +99,28 @@ mod tests {
         pulses[band] = 8;
 
         let seed = anti_collapse(
-            &mut x, &collapse_masks, lm, channels, size, band, band + 1, &log_e, &prev1, &prev2,
-            &pulses, 0x1234_5678,
+            &mut x,
+            &collapse_masks,
+            lm,
+            channels,
+            size,
+            band,
+            band + 1,
+            &log_e,
+            &prev1,
+            &prev2,
+            &pulses,
+            0x1234_5678,
         );
         // The whole band (n0<<lm = 16 bins) was filled and renormalised to unit energy.
-        let energy: f32 = x[band_off..band_off + (n0 << lm)].iter().map(|v| v * v).sum();
-        assert!((energy - 1.0).abs() < 1e-4, "renormalised band energy = {energy}");
+        let energy: f32 = x[band_off..band_off + (n0 << lm)]
+            .iter()
+            .map(|v| v * v)
+            .sum();
+        assert!(
+            (energy - 1.0).abs() < 1e-4,
+            "renormalised band energy = {energy}"
+        );
         assert!(x[band_off..band_off + (n0 << lm)].iter().all(|&v| v != 0.0));
         assert_ne!(seed, 0x1234_5678, "PRNG advanced");
     }
@@ -125,8 +141,18 @@ mod tests {
         let pulses = vec![4i32; NB_BANDS];
 
         anti_collapse(
-            &mut x, &collapse_masks, lm, channels, size, band, band + 1, &log_e, &prev, &prev,
-            &pulses, 42,
+            &mut x,
+            &collapse_masks,
+            lm,
+            channels,
+            size,
+            band,
+            band + 1,
+            &log_e,
+            &prev,
+            &prev,
+            &pulses,
+            42,
         );
         assert_eq!(x, original, "no collapsed blocks → band untouched");
     }

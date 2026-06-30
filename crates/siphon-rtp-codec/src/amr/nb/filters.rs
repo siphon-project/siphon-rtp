@@ -2,7 +2,7 @@
 //! `weight_a.c`, `preemph.c`, `agc.c`, `post_pro.c`. Ported bit-exact.
 
 use crate::amr::basic_ops::{
-    add, div_s, extract_h, extract_l, l_add, l_deposit_l, l_mac, l_mult, l_msu, l_shl, l_shr, mult,
+    add, div_s, extract_h, extract_l, l_add, l_deposit_l, l_mac, l_msu, l_mult, l_shl, l_shr, mult,
     norm_l, round_word, sub,
 };
 use crate::amr::nb::constants::M;
@@ -299,7 +299,7 @@ mod tests {
         let mut mem = 0i16;
         let mut sig = [1000i16, 1000, 1000, 1000];
         preemphasis(&mut mem, &mut sig, 16384, 4); // g = 0.5
-        // sig[i] -= 0.5*sig[i-1]; back-to-front. sig[3]=1000-500=500, etc. sig[0]=1000-0.5*mem(0).
+                                                   // sig[i] -= 0.5*sig[i-1]; back-to-front. sig[3]=1000-500=500, etc. sig[0]=1000-0.5*mem(0).
         assert_eq!(sig[0], 1000);
         assert_eq!(sig[1], 500);
         assert_eq!(sig[2], 500);

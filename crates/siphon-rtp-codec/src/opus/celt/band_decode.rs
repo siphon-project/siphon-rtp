@@ -1,8 +1,8 @@
 //! CELT recursive band decode (RFC 6716 §4.3.4; libopus `bands.c`, float decoder path).
 //!
-//! **Phase 3f (core).** The heart of CELT band decoding: [`compute_theta`] decodes the mid/side (or
-//! time-) split angle, and [`quant_partition`] recursively splits a band in half (coding the energy
-//! split with `theta`) down to leaves where [`alg_unquant`](crate::opus::celt::vq::alg_unquant)
+//! **Phase 3f (core).** The heart of CELT band decoding: `compute_theta` decodes the mid/side (or
+//! time-) split angle, and `quant_partition` recursively splits a band in half (coding the energy
+//! split with `theta`) down to leaves where [`alg_unquant`]
 //! decodes the PVQ shape (or noise/folding fills an empty band). [`quant_band_n1`] handles the
 //! single-coefficient case. These drive bits out of the shared [`BandCtx`] budget; the wrappers
 //! (`quant_band`/`quant_all_bands`) sit above and orchestrate tf-resolution + the per-band loop.
@@ -211,7 +211,9 @@ pub fn quant_partition(
         let new_big_b = (big_b + 1) >> 1;
 
         let mut sctx = SplitCtx::default();
-        compute_theta(ctx, &mut sctx, half, &mut b, new_big_b, b0, new_lm, false, &mut fill, dec);
+        compute_theta(
+            ctx, &mut sctx, half, &mut b, new_big_b, b0, new_lm, false, &mut fill, dec,
+        );
         let mid = sctx.imid as f32 / 32768.0;
         let side = sctx.iside as f32 / 32768.0;
         let mut delta = sctx.delta;
@@ -237,7 +239,16 @@ pub fn quant_partition(
         let cm;
         if mbits >= sbits {
             let mut cm0 = quant_partition(
-                ctx, x_lo, half, mbits, new_big_b, lb_lo, new_lm, gain * mid, fill, dec,
+                ctx,
+                x_lo,
+                half,
+                mbits,
+                new_big_b,
+                lb_lo,
+                new_lm,
+                gain * mid,
+                fill,
+                dec,
             );
             rebalance = mbits - (rebalance - ctx.remaining_bits);
             let sbits = if rebalance > 3 << BITRES && itheta != 0 {
@@ -246,13 +257,29 @@ pub fn quant_partition(
                 sbits
             };
             cm0 |= quant_partition(
-                ctx, x_hi, half, sbits, new_big_b, lb_hi, new_lm, gain * side, fill >> new_big_b,
+                ctx,
+                x_hi,
+                half,
+                sbits,
+                new_big_b,
+                lb_hi,
+                new_lm,
+                gain * side,
+                fill >> new_big_b,
                 dec,
             ) << (b0 >> 1);
             cm = cm0;
         } else {
             let mut cm0 = quant_partition(
-                ctx, x_hi, half, sbits, new_big_b, lb_hi, new_lm, gain * side, fill >> new_big_b,
+                ctx,
+                x_hi,
+                half,
+                sbits,
+                new_big_b,
+                lb_hi,
+                new_lm,
+                gain * side,
+                fill >> new_big_b,
                 dec,
             ) << (b0 >> 1);
             rebalance = sbits - (rebalance - ctx.remaining_bits);
@@ -262,7 +289,16 @@ pub fn quant_partition(
                 mbits
             };
             cm0 |= quant_partition(
-                ctx, x_lo, half, mbits, new_big_b, lb_lo, new_lm, gain * mid, fill, dec,
+                ctx,
+                x_lo,
+                half,
+                mbits,
+                new_big_b,
+                lb_lo,
+                new_lm,
+                gain * mid,
+                fill,
+                dec,
             );
             cm = cm0;
         }
@@ -293,7 +329,11 @@ pub fn quant_partition(
                 let cm = if let Some(lb) = lowband {
                     for j in 0..n {
                         ctx.seed = celt_lcg_rand(ctx.seed);
-                        let tmp = if ctx.seed & 0x8000 != 0 { 1.0 / 256.0 } else { -1.0 / 256.0 };
+                        let tmp = if ctx.seed & 0x8000 != 0 {
+                            1.0 / 256.0
+                        } else {
+                            -1.0 / 256.0
+                        };
                         x[j] = lb[j] + tmp;
                     }
                     fill as u32
@@ -407,7 +447,12 @@ pub fn quant_band(
 
     // Resynth: undo the reorganisation on the decoded X.
     if b0_new > 1 {
-        interleave_hadamard(x, n_b >> recombine as usize, b0_new << recombine as usize, long_blocks);
+        interleave_hadamard(
+            x,
+            n_b >> recombine as usize,
+            b0_new << recombine as usize,
+            long_blocks,
+        );
     }
     let mut n_b = n_b0;
     let mut big_b = b0_new;
@@ -504,7 +549,8 @@ pub fn quant_all_bands(
             0
         };
 
-        if (band_lo >= n + norm_offset || i == start + 1) && (update_lowband || lowband_offset == 0) {
+        if (band_lo >= n + norm_offset || i == start + 1) && (update_lowband || lowband_offset == 0)
+        {
             lowband_offset = i;
         }
         if i == start + 1 {
@@ -518,10 +564,9 @@ pub fn quant_all_bands(
         let mut effective_lowband: i32 = -1;
         let fill_init: u32;
         if lowband_offset != 0 && (spread != SPREAD_AGGRESSIVE || big_b > 1 || tf_change < 0) {
-            effective_lowband = ((m * E_BANDS[lowband_offset] as usize) as i32
-                - norm_offset as i32
-                - n as i32)
-                .max(0);
+            effective_lowband =
+                ((m * E_BANDS[lowband_offset] as usize) as i32 - norm_offset as i32 - n as i32)
+                    .max(0);
             let thresh = effective_lowband as usize + norm_offset;
             let mut fold_start = lowband_offset;
             loop {
@@ -563,7 +608,17 @@ pub fn quant_all_bands(
 
         let x = &mut x_[band_lo..band_hi];
         let x_cm = quant_band(
-            &mut ctx, x, n, b, big_b, lowband, lm, lowband_out, 1.0, fill_init as i32, dec,
+            &mut ctx,
+            x,
+            n,
+            b,
+            big_b,
+            lowband,
+            lm,
+            lowband_out,
+            1.0,
+            fill_init as i32,
+            dec,
         );
         collapse_masks[i] = x_cm as u8;
         balance += pulses[i] + tell;
@@ -582,7 +637,13 @@ mod tests {
     /// from end-to-end `opus_compare`; this guards the recursion + indexing.
     #[test]
     fn quant_partition_decodes_without_panic_and_stays_finite() {
-        for &(n, lm, big_b) in &[(16usize, 2i32, 1usize), (32, 3, 1), (8, 1, 2), (4, 1, 1), (48, 3, 4)] {
+        for &(n, lm, big_b) in &[
+            (16usize, 2i32, 1usize),
+            (32, 3, 1),
+            (8, 1, 2),
+            (4, 1, 1),
+            (48, 3, 4),
+        ] {
             // A deterministic, plausible bitstream.
             let mut buf = vec![0u8; 256];
             {
@@ -603,9 +664,26 @@ mod tests {
             };
             let mut x = vec![0.0f32; n];
             let mut dec = RangeDecoder::new(&buf);
-            let _cm = quant_partition(&mut ctx, &mut x, n, 300, big_b, None, lm, 1.0, (1 << big_b) - 1, &mut dec);
-            assert!(x.iter().all(|v| v.is_finite()), "n={n} lm={lm}: non-finite output");
-            assert!(ctx.remaining_bits < 400, "n={n} lm={lm}: budget not drawn down");
+            let _cm = quant_partition(
+                &mut ctx,
+                &mut x,
+                n,
+                300,
+                big_b,
+                None,
+                lm,
+                1.0,
+                (1 << big_b) - 1,
+                &mut dec,
+            );
+            assert!(
+                x.iter().all(|v| v.is_finite()),
+                "n={n} lm={lm}: non-finite output"
+            );
+            assert!(
+                ctx.remaining_bits < 400,
+                "n={n} lm={lm}: budget not drawn down"
+            );
         }
     }
 
@@ -652,7 +730,10 @@ mod tests {
                 &mut dec,
             );
             assert!(x.iter().all(|v| v.is_finite()), "n={n}: non-finite X");
-            assert!(lowband_out.iter().all(|v| v.is_finite()), "n={n}: non-finite lowband_out");
+            assert!(
+                lowband_out.iter().all(|v| v.is_finite()),
+                "n={n}: non-finite lowband_out"
+            );
         }
     }
 
@@ -677,8 +758,22 @@ mod tests {
         let mut seed = 0xABCD_1234u32;
         let mut dec = RangeDecoder::new(&buf);
         quant_all_bands(
-            0, NB_BANDS, &mut x, &mut collapse, &pulses, false, 2, 0, &tf_res, 6000, 0, lm,
-            NB_BANDS, &mut seed, true, &mut dec,
+            0,
+            NB_BANDS,
+            &mut x,
+            &mut collapse,
+            &pulses,
+            false,
+            2,
+            0,
+            &tf_res,
+            6000,
+            0,
+            lm,
+            NB_BANDS,
+            &mut seed,
+            true,
+            &mut dec,
         );
         assert!(x.iter().all(|v| v.is_finite()), "non-finite coefficients");
         let _ = seed; // (the fold/noise PRNG only advances when a band gets zero pulses)

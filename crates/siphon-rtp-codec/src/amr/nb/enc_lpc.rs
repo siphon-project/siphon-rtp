@@ -15,7 +15,9 @@ use crate::amr::basic_ops::{
     norm_l, norm_s, round_word, shr, sub,
 };
 use crate::amr::nb::constants::{L_WINDOW, M, MP1};
-use crate::amr::nb::enc_tables::{GRID, GRID_POINTS, LAG_H, LAG_L, WINDOW_160_80, WINDOW_200_40, WINDOW_232_8};
+use crate::amr::nb::enc_tables::{
+    GRID, GRID_POINTS, LAG_H, LAG_L, WINDOW_160_80, WINDOW_200_40, WINDOW_232_8,
+};
 use crate::amr::nb::lpc::lsp_az;
 use crate::amr::oper_32b::{div_32, l_comp, l_extract, mpy_32, mpy_32_16};
 use crate::amr::AmrNbMode;
@@ -53,7 +55,8 @@ impl PreProcessState {
             self.x0 = *sample;
 
             let mut l_tmp = mpy_32_16(self.y1_hi, self.y1_lo, PRE_A[1]);
-            l_tmp = crate::amr::basic_ops::l_add(l_tmp, mpy_32_16(self.y2_hi, self.y2_lo, PRE_A[2]));
+            l_tmp =
+                crate::amr::basic_ops::l_add(l_tmp, mpy_32_16(self.y2_hi, self.y2_lo, PRE_A[2]));
             l_tmp = l_mac(l_tmp, self.x0, PRE_B[0]);
             l_tmp = l_mac(l_tmp, self.x1, PRE_B[1]);
             l_tmp = l_mac(l_tmp, x2, PRE_B[2]);

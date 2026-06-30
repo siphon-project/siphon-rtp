@@ -40,7 +40,9 @@ fn parse_bit_stream(bytes: &[u8]) -> Result<Vec<BitPacket>, String> {
         ]) as usize;
         offset += 8; // skip len + final_range
         if len > 1 << 20 {
-            return Err(format!("implausible packet length {len} at offset {offset}"));
+            return Err(format!(
+                "implausible packet length {len} at offset {offset}"
+            ));
         }
         if offset + len > bytes.len() {
             return Err(format!("packet payload overruns file at offset {offset}"));
@@ -72,7 +74,10 @@ fn decode_celt_only(packets: &[BitPacket]) -> Result<Vec<u8>, String> {
         }
         let parsed = packet::parse(&bp.payload).map_err(|e| format!("packet {index}: {e:?}"))?;
         if parsed.toc.mode() != Mode::Celt {
-            return Err(format!("packet {index}: not CELT-only (mode {:?})", parsed.toc.mode()));
+            return Err(format!(
+                "packet {index}: not CELT-only (mode {:?})",
+                parsed.toc.mode()
+            ));
         }
         if parsed.toc.channels() != 1 {
             return Err(format!("packet {index}: not mono"));
@@ -132,7 +137,10 @@ fn celt_only_streams_match_libopus() {
         .unwrap_or_default();
     bit_files.sort();
     if bit_files.is_empty() {
-        eprintln!("celt-only conformance: no .bit files in {} — skipping", dir.display());
+        eprintln!(
+            "celt-only conformance: no .bit files in {} — skipping",
+            dir.display()
+        );
         return;
     }
 
@@ -140,7 +148,11 @@ fn celt_only_streams_match_libopus() {
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
     for bit_path in &bit_files {
-        let name = bit_path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let name = bit_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let dec_path = bit_path.with_extension("dec");
         let Ok(bytes) = std::fs::read(bit_path) else {
             skipped.push((name, "unreadable .bit".to_string()));
@@ -168,5 +180,9 @@ fn celt_only_streams_match_libopus() {
     }
 
     eprintln!("celt-only conformance: passed={passed:?} skipped={skipped:?} failed={failed:?}");
-    assert!(failed.is_empty(), "celt-only: {} stream(s) failed: {failed:?}", failed.len());
+    assert!(
+        failed.is_empty(),
+        "celt-only: {} stream(s) failed: {failed:?}",
+        failed.len()
+    );
 }

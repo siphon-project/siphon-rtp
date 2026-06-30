@@ -28,12 +28,12 @@ fn crafted_malformed_frames_never_panic() {
     let samples: &[&[u8]] = &[
         b"",
         b"\x00",
-        b"\x00\x00\x00",                 // partial header
-        b"\x00\x00\x00\x00",             // zero-length body
-        b"\xff\xff\xff\xff{}",           // length > MAX_FRAME_LEN → FrameTooLarge
-        b"\x00\x00\x00\x02{}",           // valid length, malformed Request
+        b"\x00\x00\x00",                                    // partial header
+        b"\x00\x00\x00\x00",                                // zero-length body
+        b"\xff\xff\xff\xff{}", // length > MAX_FRAME_LEN → FrameTooLarge
+        b"\x00\x00\x00\x02{}", // valid length, malformed Request
         b"\x00\x00\x00\x19{\"id\":1,\"command\":\"ping\"}", // valid frame
-        b"\x00\x00\x00\x19{\"id\":1,\"command\":\"pin",     // truncated body
+        b"\x00\x00\x00\x19{\"id\":1,\"command\":\"pin", // truncated body
     ];
     for sample in samples {
         for end in 0..=sample.len() {
@@ -60,5 +60,8 @@ fn corpus_seeds_never_panic_and_valid_seed_decodes() {
             decoded_a_full_frame = true;
         }
     }
-    assert!(decoded_a_full_frame, "at least one valid seed must decode to a Request");
+    assert!(
+        decoded_a_full_frame,
+        "at least one valid seed must decode to a Request"
+    );
 }

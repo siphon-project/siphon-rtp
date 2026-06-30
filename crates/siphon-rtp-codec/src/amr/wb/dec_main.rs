@@ -10,14 +10,14 @@
 //!
 //! DTX/CNG (comfort noise) is out of scope here; the speech and erasure paths are wired.
 
-use super::bitstream::{NB_BITS, SerialBits};
+use super::bitstream::{SerialBits, NB_BITS};
 use super::codebook::{dec_acelp_2t64, dec_acelp_4t64};
 use super::constants::{
     L_FRAME, L_FRAME16K, L_INTERPOL, L_SUBFR, L_SUBFR16K, M, M16K, PIT_MAX, PIT_SHARP, PREEMPH_FAC,
 };
 use super::enhance::{
-    agc2, filt_6k_7k, hp400_12k8, isf_extrapolation, phase_dispersion, preemph, scale_sig, syn_filt,
-    voice_factor, weight_a,
+    agc2, filt_6k_7k, hp400_12k8, isf_extrapolation, phase_dispersion, preemph, scale_sig,
+    syn_filt, voice_factor, weight_a,
 };
 use super::filters::{deemph_32, hp50_12k8, oversamp_16k, syn_filt_32};
 use super::gains::{d_gain2, init_d_gain2, DEC_GAIN_LEN};
@@ -205,7 +205,12 @@ impl DecoderState {
 /// (`decoder.c` per-frame flow): emit the constant `EHF_MASK` while homed and receiving a homing
 /// frame, reset the core after a homing frame, and mask the output to 14 bits. `bits` are the speech
 /// bits in encoder order (the `.cod` order). Returns `L_FRAME16K`.
-pub fn decode_frame(state: &mut DecoderState, mode: u8, bits: &[i16], synth16k: &mut [i16]) -> usize {
+pub fn decode_frame(
+    state: &mut DecoderState,
+    mode: u8,
+    bits: &[i16],
+    synth16k: &mut [i16],
+) -> usize {
     use super::homing::{homing_frame_test, homing_frame_test_first, EHF_MASK};
 
     // While homed, test only the first subframe of the incoming frame.
@@ -404,7 +409,11 @@ pub fn decode_speech(
                 if sub(index, (PIT_FR2 - PIT_MIN) * 4) < 0 {
                     t0 = add(PIT_MIN, shr(index, 2));
                     t0_frac = sub(index, shl(sub(t0, PIT_MIN), 2));
-                } else if sub(index, ((PIT_FR2 - PIT_MIN) * 4) + ((PIT_FR1_9B - PIT_FR2) * 2)) < 0 {
+                } else if sub(
+                    index,
+                    ((PIT_FR2 - PIT_MIN) * 4) + ((PIT_FR1_9B - PIT_FR2) * 2),
+                ) < 0
+                {
                     let index = sub(index, (PIT_FR2 - PIT_MIN) * 4);
                     t0 = add(PIT_FR2, shr(index, 1));
                     let mut tf = sub(index, shl(sub(t0, PIT_FR2), 1));
@@ -919,8 +928,12 @@ fn synthesis(
 
     syn_filt_32(aq, M, exc, q_new, &mut synth_hi, &mut synth_lo, L_SUBFR);
 
-    state.mem_syn_hi.copy_from_slice(&synth_hi[L_SUBFR..L_SUBFR + M]);
-    state.mem_syn_lo.copy_from_slice(&synth_lo[L_SUBFR..L_SUBFR + M]);
+    state
+        .mem_syn_hi
+        .copy_from_slice(&synth_hi[L_SUBFR..L_SUBFR + M]);
+    state
+        .mem_syn_lo
+        .copy_from_slice(&synth_lo[L_SUBFR..L_SUBFR + M]);
 
     deemph_32(
         &synth_hi[M..],
@@ -1018,12 +1031,28 @@ fn synthesis(
         isf_extrapolation(hf_isf);
         super::lpc::isp_az(hf_isf, &mut hf_a, M16K, false);
         weight_a(&hf_a, &mut ap, 29491, M16K); // fac = 0.9
-        syn_filt(&ap, M16K, &hf_in, &mut hf, L_SUBFR16K, &mut state.mem_syn_hf, true);
+        syn_filt(
+            &ap,
+            M16K,
+            &hf_in,
+            &mut hf,
+            L_SUBFR16K,
+            &mut state.mem_syn_hf,
+            true,
+        );
     } else {
         weight_a(aq, &mut ap, 19661, M); // fac = 0.6
         let mut mem_lo = [0i16; M];
         mem_lo.copy_from_slice(&state.mem_syn_hf[M16K - M..]);
-        syn_filt(&ap[..M + 1], M, &hf_in, &mut hf, L_SUBFR16K, &mut mem_lo, true);
+        syn_filt(
+            &ap[..M + 1],
+            M,
+            &hf_in,
+            &mut hf,
+            L_SUBFR16K,
+            &mut mem_lo,
+            true,
+        );
         state.mem_syn_hf[M16K - M..].copy_from_slice(&mem_lo);
     }
 

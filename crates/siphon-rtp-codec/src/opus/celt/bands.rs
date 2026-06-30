@@ -192,12 +192,16 @@ mod tests {
     fn hadamard_interleavers_are_inverses() {
         for hadamard in [false, true] {
             for &(n0, stride) in &[(4usize, 2usize), (3, 4), (2, 8), (5, 2), (1, 16)] {
-                let original: Vec<f32> =
-                    (0..n0 * stride).map(|i| (i as f32 * 0.7 + 0.1).cos()).collect();
+                let original: Vec<f32> = (0..n0 * stride)
+                    .map(|i| (i as f32 * 0.7 + 0.1).cos())
+                    .collect();
                 let mut x = original.clone();
                 deinterleave_hadamard(&mut x, n0, stride, hadamard);
                 interleave_hadamard(&mut x, n0, stride, hadamard);
-                assert!(approx_eq(&x, &original, 1e-6), "had={hadamard} n0={n0} stride={stride}");
+                assert!(
+                    approx_eq(&x, &original, 1e-6),
+                    "had={hadamard} n0={n0} stride={stride}"
+                );
             }
         }
     }
@@ -214,8 +218,23 @@ mod tests {
 
     #[test]
     fn isqrt32_matches_floor_sqrt() {
-        for &v in &[1u32, 2, 3, 4, 8, 15, 16, 17, 99, 100, 1000, 65535, 65536, 1 << 20, 0x7fff_ffff]
-        {
+        for &v in &[
+            1u32,
+            2,
+            3,
+            4,
+            8,
+            15,
+            16,
+            17,
+            99,
+            100,
+            1000,
+            65535,
+            65536,
+            1 << 20,
+            0x7fff_ffff,
+        ] {
             let expected = (f64::from(v)).sqrt().floor() as u32;
             assert_eq!(isqrt32(v), expected, "isqrt32({v})");
         }
@@ -244,7 +263,10 @@ mod tests {
             for b in [0i32, 50, 200, 1000] {
                 for stereo in [false, true] {
                     let qn = compute_qn(n, b, 0, 40, stereo);
-                    assert!((1..=256).contains(&qn), "n={n} b={b} stereo={stereo}: qn {qn}");
+                    assert!(
+                        (1..=256).contains(&qn),
+                        "n={n} b={b} stereo={stereo}: qn {qn}"
+                    );
                 }
             }
         }

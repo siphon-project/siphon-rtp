@@ -55,7 +55,14 @@ const HPWSP_B: [i16; 4] = [-3432, 10280, -10280, 3432];
 
 /// 3rd-order 180 Hz high-pass filter (`hp_wsp.c` `Hp_wsp`). `wsp[0..lg]` → `hp_wsp[0..lg]`; `mem[9]`
 /// holds `[y3_hi,y3_lo,y2_hi,y2_lo,y1_hi,y1_lo,x0,x1,x2]`.
-pub fn hp_wsp(wsp: &[i16], wsp_off: usize, hp_wsp_out: &mut [i16], hp_off: usize, lg: usize, mem: &mut [i16; 9]) {
+pub fn hp_wsp(
+    wsp: &[i16],
+    wsp_off: usize,
+    hp_wsp_out: &mut [i16],
+    hp_off: usize,
+    lg: usize,
+    mem: &mut [i16; 9],
+) {
     let mut y3_hi = mem[0];
     let mut y3_lo = mem[1];
     let mut y2_hi = mem[2];
@@ -144,7 +151,11 @@ pub fn pitch_med_ol(
     while i > l_min {
         let mut r0 = 0i32;
         for j in 0..l_frame as usize {
-            r0 = l_mac(r0, wsp[wsp_off + j], wsp[(wsp_off as isize + j as isize - i as isize) as usize]);
+            r0 = l_mac(
+                r0,
+                wsp[wsp_off + j],
+                wsp[(wsp_off as isize + j as isize - i as isize) as usize],
+            );
         }
         let (hi, lo) = l_extract(r0);
         r0 = mpy_32_16(hi, lo, CORRWEIGHT[ww as usize]);
@@ -165,7 +176,14 @@ pub fn pitch_med_ol(
 
     // hp_wsp = old_hp_wsp + L_max
     let hp_base = l_max as usize;
-    hp_wsp(wsp, wsp_off, old_hp_wsp, hp_base, l_frame as usize, hp_wsp_mem);
+    hp_wsp(
+        wsp,
+        wsp_off,
+        old_hp_wsp,
+        hp_base,
+        l_frame as usize,
+        hp_wsp_mem,
+    );
 
     let mut r0 = 0i32;
     let mut r1 = 1i32;

@@ -132,8 +132,7 @@ impl MediaInfo {
             // Honour an AMR-WB `mode-set` (RFC 4867 §8.1) by clamping the egress encode mode into
             // the allowed set, so the engine never sends the peer a mode it disallowed.
             if spec.encoding_name == "AMR-WB" {
-                if let Some((_, modes)) =
-                    self.mode_sets.iter().find(|(pt, _)| *pt == payload_type)
+                if let Some((_, modes)) = self.mode_sets.iter().find(|(pt, _)| *pt == payload_type)
                 {
                     return Some(spec.with_encode_mode(choose_amr_wb_mode(modes)));
                 }

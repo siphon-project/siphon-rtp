@@ -7,7 +7,7 @@
 //! and finally converts each subframe's LSP to LP coefficients ([`lsp_az`]).
 
 use crate::amr::basic_ops::{
-    add, extract_l, l_add, l_mult, l_msu, l_shl, l_shr, l_shr_r, l_sub, mult, negate, round_word,
+    add, extract_l, l_add, l_msu, l_mult, l_shl, l_shr, l_shr_r, l_sub, mult, negate, round_word,
     shl, shr, sub,
 };
 use crate::amr::nb::constants::{LSF_GAP, LSP_PRED_FAC_MR122, M, MP1};
@@ -49,7 +49,7 @@ impl Default for DPlsfState {
 impl DPlsfState {
     /// Reset state: zero the prediction error, seed `past_lsf_q` with `mean_lsf` (`D_plsf_reset`).
     /// `D_plsf_reset` (d_plsf.c) includes `q_plsf_5.tab`, so the seed is the **5-split** mean
-    /// ([`MEAN_LSF_5`], `1384, 2077, …`) — distinct from the 3-split [`MEAN_LSF`] used inside
+    /// (`MEAN_LSF_5`, `1384, 2077, …`) — distinct from the 3-split `MEAN_LSF` used inside
     /// [`d_plsf_3`].
     #[must_use]
     pub fn new() -> Self {
@@ -86,7 +86,7 @@ pub fn lsf_lsp(lsf: &[i16], lsp: &mut [i16], m: usize) {
     for i in 0..m {
         let ind = shr(lsf[i], 8) as usize; // b8..b15
         let offset = lsf[i] & 0x00ff; // b0..b7
-        // lsp = table[ind] + ((table[ind+1] - table[ind]) * offset) / 256
+                                      // lsp = table[ind] + ((table[ind+1] - table[ind]) * offset) / 256
         let l_tmp = l_mult(sub(LSF_LSP_TABLE[ind + 1], LSF_LSP_TABLE[ind]), offset);
         lsp[i] = add(LSF_LSP_TABLE[ind], extract_l(l_shr(l_tmp, 9)));
     }
@@ -171,7 +171,10 @@ pub fn d_plsf_3(st: &mut DPlsfState, mode: usize, bfi: bool, indice: &[i16], lsp
     if bfi {
         // bad frame: past LSFs shifted toward their mean
         for i in 0..M {
-            lsf1_q[i] = add(mult(st.past_lsf_q[i], ALPHA_3), mult(MEAN_LSF[i], ONE_ALPHA_3));
+            lsf1_q[i] = add(
+                mult(st.past_lsf_q[i], ALPHA_3),
+                mult(MEAN_LSF[i], ONE_ALPHA_3),
+            );
         }
         if mode != MODE_MRDTX {
             for i in 0..M {
@@ -259,7 +262,10 @@ pub fn d_plsf_5(
 
     if bfi {
         for i in 0..M {
-            lsf1_q[i] = add(mult(st.past_lsf_q[i], ALPHA_5), mult(MEAN_LSF_5[i], ONE_ALPHA_5));
+            lsf1_q[i] = add(
+                mult(st.past_lsf_q[i], ALPHA_5),
+                mult(MEAN_LSF_5[i], ONE_ALPHA_5),
+            );
             lsf2_q[i] = lsf1_q[i];
         }
         for i in 0..M {
@@ -428,7 +434,13 @@ mod tests {
         // Decode a zero-index frame; output LSPs must be strictly decreasing (valid cosine domain).
         let mut st = DPlsfState::new();
         let mut lsp = [0i16; M];
-        d_plsf_3(&mut st, AmrNbMode::Mr475 as usize, false, &[0, 0, 0], &mut lsp);
+        d_plsf_3(
+            &mut st,
+            AmrNbMode::Mr475 as usize,
+            false,
+            &[0, 0, 0],
+            &mut lsp,
+        );
         for i in 1..M {
             assert!(lsp[i] <= lsp[i - 1], "lsp must be non-increasing");
         }

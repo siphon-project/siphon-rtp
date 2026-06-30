@@ -60,7 +60,9 @@ fn parse_bit_stream(bytes: &[u8]) -> Result<Vec<BitPacket>, String> {
         offset += 8;
         // Sanity: an Opus packet is at most 1275 bytes/frame * 48 frames; cap generously.
         if len > 1 << 20 {
-            return Err(format!("implausible packet length {len} at offset {offset}"));
+            return Err(format!(
+                "implausible packet length {len} at offset {offset}"
+            ));
         }
         if offset + len > bytes.len() {
             return Err(format!("packet payload overruns file at offset {offset}"));
@@ -76,8 +78,7 @@ fn parse_bit_stream(bytes: &[u8]) -> Result<Vec<BitPacket>, String> {
 
 /// Locate the test-vector directory (`reference/opus/opus_testvectors`), if present.
 fn vector_dir() -> Option<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../reference/opus/opus_testvectors");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/opus/opus_testvectors");
     if dir.is_dir() {
         Some(dir)
     } else {
@@ -98,8 +99,8 @@ fn bit_framing_reader_parses_real_vectors() {
             eprintln!("opus conformance: {} missing — skipping", path.display());
             continue;
         };
-        let packets = parse_bit_stream(&bytes)
-            .unwrap_or_else(|error| panic!("vector {n:02}: {error}"));
+        let packets =
+            parse_bit_stream(&bytes).unwrap_or_else(|error| panic!("vector {n:02}: {error}"));
         assert!(!packets.is_empty(), "vector {n:02}: no packets parsed");
         // Every packet's TOC must parse and the framing must split cleanly — exercises the parser
         // against real-world data (all four framing codes, both channel counts, every config).
@@ -107,8 +108,8 @@ fn bit_framing_reader_parses_real_vectors() {
             if packet.payload.is_empty() {
                 continue; // DTX / empty packet is legal.
             }
-            let parsed = siphon_rtp_codec::opus::packet::parse(&packet.payload)
-                .unwrap_or_else(|error| {
+            let parsed =
+                siphon_rtp_codec::opus::packet::parse(&packet.payload).unwrap_or_else(|error| {
                     panic!("vector {n:02} packet {index}: framing parse failed: {error}")
                 });
             assert!(

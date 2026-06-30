@@ -187,8 +187,7 @@ impl MediaLeg {
     pub fn observe_arrival(&mut self, arrival_micros: u64) {
         // Arrival sampled at the RTP clock rate as a wrapping u32 (§A.8 `arrival`). The u128
         // intermediate keeps the rate multiply from overflowing on long-running streams.
-        let arrival_rtp = ((u128::from(arrival_micros)
-            * u128::from(self.ingress_clock_rate_hz))
+        let arrival_rtp = ((u128::from(arrival_micros) * u128::from(self.ingress_clock_rate_hz))
             / 1_000_000) as u32;
         let transit = arrival_rtp.wrapping_sub(self.last_ingress_timestamp) as i32;
         if let Some(previous) = self.last_transit {
@@ -231,13 +230,13 @@ impl MediaLeg {
                 if expected == 0 {
                     0.0
                 } else {
-                    (self.jitter.stats().losses as f64 / f64::from(expected) * 100.0).clamp(0.0, 100.0)
+                    (self.jitter.stats().losses as f64 / f64::from(expected) * 100.0)
+                        .clamp(0.0, 100.0)
                 }
             }
             None => 0.0,
         }
     }
-
 
     /// Record an inbound Sender Report: its NTP timestamp's middle 32 bits become LSR, and
     /// `arrival_micros` (when the SR was received) feeds DLSR (RFC 3550 §6.4.1).
@@ -507,7 +506,7 @@ mod tests {
         leg.next_pcm(&mut pcm).expect("p0"); // decode seq 0
         leg.next_pcm(&mut pcm).expect("conceal"); // seq 1 concealed ⇒ losses = 1
         leg.next_pcm(&mut pcm).expect("p2"); // decode seq 2
-        // base seq 0, highest 2 ⇒ expected 3 packets; one concealed ⇒ 33.3 % loss.
+                                             // base seq 0, highest 2 ⇒ expected 3 packets; one concealed ⇒ 33.3 % loss.
         assert!((leg.ingress_loss_percent() - 100.0 / 3.0).abs() < 0.01);
     }
 

@@ -5,7 +5,7 @@
 //! bit allocation, recursive band/PVQ decode, anti-collapse, inverse MDCT, comb post-filter,
 //! de-emphasis — already lives in its own module and is validated against the libopus float build.
 //! This module is the glue: a [`CeltDecoder`] state struct holding the persistent decoder fields
-//! ([`CELTDecoder`] in `celt_decoder.c:87`) and a decode entry point that drives those pieces in the
+//! (`CELTDecoder` in `celt_decoder.c:87`) and a decode entry point that drives those pieces in the
 //! exact order libopus does, with the exact 1/8-bit (`BITRES`) bit-budget arguments.
 //!
 //! Scope is deliberately narrow, matching the task: **mono (`C = 1`), CELT-only, valid data packet**.
@@ -26,8 +26,8 @@ use crate::opus::celt::postfilter::{comb_filter, COMBFILTER_MINPERIOD};
 use crate::opus::celt::rate::{clt_compute_allocation, init_caps};
 use crate::opus::celt::synthesis::{deemphasis, denormalise_bands, float_to_i16};
 use crate::opus::celt::tables::{
-    BITRES, E_BANDS, MAX_LM, NB_BANDS, OVERLAP, PREEMPH, SHORT_MDCT_SIZE, SPREAD_ICDF, SPREAD_NORMAL,
-    TAPSET_ICDF, TRIM_ICDF, WINDOW120,
+    BITRES, E_BANDS, MAX_LM, NB_BANDS, OVERLAP, PREEMPH, SHORT_MDCT_SIZE, SPREAD_ICDF,
+    SPREAD_NORMAL, TAPSET_ICDF, TRIM_ICDF, WINDOW120,
 };
 use crate::opus::celt::tf::tf_decode;
 use crate::opus::range_coder::RangeDecoder;
@@ -164,7 +164,8 @@ impl CeltDecoder {
         // On the mono path band E[NB_BANDS..] mirrors band E[..NB_BANDS] (kept in sync at frame end),
         // so this is the max of a value with itself; preserved for exactness.
         for i in 0..NB_BANDS {
-            self.old_band_energy[i] = self.old_band_energy[i].max(self.old_band_energy[NB_BANDS + i]);
+            self.old_band_energy[i] =
+                self.old_band_energy[i].max(self.old_band_energy[NB_BANDS + i]);
         }
 
         let total_bits_i = (frame.len() as i32) * 8; // total_bits = len*8 (celt_decoder.c:1315)
@@ -194,7 +195,7 @@ impl CeltDecoder {
         // keeps `dec_bit_logp` from being read unless the gate passes (identical bitstream order).
         if !silence && start == 0 && tell + 16 <= total_bits_i && dec.dec_bit_logp(1) {
             let octave = dec.dec_uint(6); // ec_dec_uint(dec, 6)
-            // postfilter_pitch = (16<<octave) + ec_dec_bits(4+octave) - 1
+                                          // postfilter_pitch = (16<<octave) + ec_dec_bits(4+octave) - 1
             let period = dec.dec_bits(4 + octave);
             postfilter_pitch = ((16u32 << octave) + period - 1) as usize;
             let qg = dec.dec_bits(3); // ec_dec_bits(dec, 3)
@@ -284,12 +285,11 @@ impl CeltDecoder {
         // bits = (len*8 << BITRES) - ec_tell_frac(dec) - 1   (1/8-bit units)
         let mut bits = (((frame.len() as i32) * 8) << BITRES) - dec.tell_frac() as i32 - 1;
         // anti_collapse_rsv = isTransient && LM>=2 && bits >= ((LM+2)<<BITRES) ? (1<<BITRES) : 0
-        let anti_collapse_rsv =
-            if is_transient && lm >= 2 && bits >= ((lm as i32 + 2) << BITRES) {
-                1 << BITRES
-            } else {
-                0
-            };
+        let anti_collapse_rsv = if is_transient && lm >= 2 && bits >= ((lm as i32 + 2) << BITRES) {
+            1 << BITRES
+        } else {
+            0
+        };
         bits -= anti_collapse_rsv;
 
         // ── Bit allocation (celt_decoder.c:1455) ─────────────────────────────────────────────────
@@ -405,7 +405,16 @@ impl CeltDecoder {
         // `old_band_energy` is `Copy` (a fixed array), so pass it by value — this both reads the
         // final per-band energy and sidesteps borrowing `self` immutably across the `&mut self` call.
         let band_energy = self.old_band_energy;
-        self.celt_synthesis(&x, &band_energy, start, eff_end, is_transient, lm, n, silence);
+        self.celt_synthesis(
+            &x,
+            &band_energy,
+            start,
+            eff_end,
+            is_transient,
+            lm,
+            n,
+            silence,
+        );
 
         // ── Comb post-filter on out_syn (celt_decoder.c:1541-1564) ───────────────────────────────
         // out_syn[0] = decode_mem + DECODE_BUFFER_SIZE - N; comb_filter is in place on the ring,
@@ -469,7 +478,11 @@ impl CeltDecoder {
             self.old_log_energy = self.old_band_energy;
         } else {
             // Transient: oldLogE = min(oldLogE, oldBandE).
-            for (log_e, &band_e) in self.old_log_energy.iter_mut().zip(self.old_band_energy.iter()) {
+            for (log_e, &band_e) in self
+                .old_log_energy
+                .iter_mut()
+                .zip(self.old_band_energy.iter())
+            {
                 *log_e = log_e.min(band_e);
             }
         }
@@ -626,11 +639,16 @@ mod tests {
 
         let mut decoder = CeltDecoder::new().expect("build");
         let mut pcm = vec![0i16; 960];
-        let written = decoder.decode(&buf, &mut pcm, 960).expect("silent frame decodes");
+        let written = decoder
+            .decode(&buf, &mut pcm, 960)
+            .expect("silent frame decodes");
         assert_eq!(written, 960);
         // De-emphasis of an all-zero SIG frame is ~silent; allow a small transient from the 1-pole
         // memory but assert it doesn't blow up.
-        assert!(pcm.iter().all(|&s| s.abs() < 4000), "silent frame should be quiet");
+        assert!(
+            pcm.iter().all(|&s| s.abs() < 4000),
+            "silent frame should be quiet"
+        );
     }
 
     #[test]

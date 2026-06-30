@@ -4,7 +4,7 @@
 //! **Phase 3c.** A band's spectral shape is coded as an `N`-dimensional integer pulse vector with
 //! exactly `K` unit pulses (`Σ|y_i| = K`), each non-zero coordinate carrying a sign — a Pyramid
 //! Vector Quantizer. There are `V(N,K)` such vectors; the encoder maps a vector to an index in
-//! `[0, V(N,K))` ([`icwrs`]) and the decoder maps it back ([`cwrsi`]), with one `ec_*_uint` over the
+//! `[0, V(N,K))` (`icwrs`) and the decoder maps it back (`cwrsi`), with one `ec_*_uint` over the
 //! range coder carrying the index. Exactly invertible, so it is validated standalone by **exhaustive
 //! enumeration** for small `(N,K)` plus an encode↔decode round-trip — no full-pipeline vectors needed.
 //!
@@ -230,7 +230,11 @@ mod tests {
                 let mut u = [0u32; U_SCRATCH];
                 ncwrs_urow(n, k, &mut u);
                 let yy = cwrsi(n, k, index, &mut y, &mut u);
-                assert_eq!(pulse_count(&y), k as i32, "n={n} k={k} idx={index}: pulse count");
+                assert_eq!(
+                    pulse_count(&y),
+                    k as i32,
+                    "n={n} k={k} idx={index}: pulse count"
+                );
                 let energy: i32 = y.iter().map(|&x| x * x).sum();
                 assert_eq!(yy as i32, energy, "n={n} k={k} idx={index}: yy");
                 let mut u2 = [0u32; U_SCRATCH];
@@ -248,14 +252,25 @@ mod tests {
     fn bijection_roundtrips_large_cases() {
         // Valid CELT (N,K): V(N,K) < 2^32. (176,4) and (24,3) exercise large N (the table row N=4/N=3
         // reaches K=176); (16,10)/(10,10) exercise large K; (2,64) exercises the n==2 tail.
-        for &(n, k) in &[(8usize, 8usize), (16, 10), (10, 10), (176, 4), (24, 3), (2, 64)] {
+        for &(n, k) in &[
+            (8usize, 8usize),
+            (16, 10),
+            (10, 10),
+            (176, 4),
+            (24, 3),
+            (2, 64),
+        ] {
             let vt = pvq_codebook_size(n, k);
             for &index in &[0u32, 1, 7, vt / 3, vt / 2, vt - 1] {
                 let mut u = [0u32; U_SCRATCH];
                 ncwrs_urow(n, k, &mut u);
                 let mut y = vec![0i32; n];
                 cwrsi(n, k, index, &mut y, &mut u);
-                assert_eq!(pulse_count(&y), k as i32, "n={n} k={k} idx={index}: pulse count");
+                assert_eq!(
+                    pulse_count(&y),
+                    k as i32,
+                    "n={n} k={k} idx={index}: pulse count"
+                );
                 let mut u2 = [0u32; U_SCRATCH];
                 let (nc, back) = icwrs(n, k, &y, &mut u2);
                 assert_eq!(nc, vt, "n={n} k={k}: codebook size");
