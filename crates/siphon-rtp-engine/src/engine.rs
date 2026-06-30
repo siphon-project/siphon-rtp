@@ -1340,6 +1340,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             latch: true,
             egress_ssrc: random_ssrc(),
             egress_payload_type: codec.payload_type,
+            mos_codec: crate::conference::hep_codec_for_name(&codec.encoding_name),
             telephone_event_in: info.telephone_event_payload_type(),
             secure,
             routing: routing_of(role),

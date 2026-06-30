@@ -112,6 +112,10 @@ pub struct ParticipantConfig {
     pub egress_ssrc: u32,
     /// The egress RTP payload type (the participant's negotiated codec PT).
     pub egress_payload_type: u8,
+    /// The participant's codec as the G.107 MOS estimator knows it (`siphon-rtp-hep`), resolved from
+    /// the negotiated encoding name — so an AMR-WB / G.722 leg is scored on its own impairment, not
+    /// the G.711 default. See [`hep_codec_for_name`].
+    pub mos_codec: siphon_rtp_hep::mos::Codec,
     /// The participant's RFC 4733 telephone-event PT, if negotiated (filtered out of the mix).
     pub telephone_event_in: Option<u8>,
     /// SDES-SRTP crypto for a secure (`RTP/SAVP`) participant: decrypt ingress / encrypt egress with
@@ -136,6 +140,8 @@ struct Participant {
     native_frame: usize,
     /// The egress RTP payload type (the participant's codec PT) — the shared-encode class key.
     egress_payload_type: u8,
+    /// This participant's codec for the G.107 MOS estimate (resolved at join from the encoding name).
+    mos_codec: siphon_rtp_hep::mos::Codec,
     /// Whether this participant's encoder is stateless (G.711 / L16) and so can share one encode of
     /// the listener mix with every other listener on the same codec.
     stateless: bool,
@@ -333,6 +339,7 @@ impl Conference {
             native_rate,
             native_frame,
             egress_payload_type,
+            mos_codec: config.mos_codec,
             stateless,
             telephone_event_in: config.telephone_event_in,
             to_room,
@@ -490,10 +497,7 @@ impl Conference {
                 from_tag: participant.tag.clone(),
                 jitter_ms: impairments.jitter_ms,
                 loss_percent: impairments.loss_percent,
-                mos: siphon_rtp_hep::mos::estimate_mos(
-                    hep_codec(participant.egress_payload_type),
-                    impairments,
-                ),
+                mos: siphon_rtp_hep::mos::estimate_mos(participant.mos_codec, impairments),
             });
         }
     }
@@ -1079,16 +1083,19 @@ async fn run_conference<D>(
     }
 }
 
-/// Map an egress RTP payload type to the [`siphon_rtp_hep::mos::Codec`] the G.107 estimator knows.
-/// Static types (RFC 3551) map directly; dynamic types (AMR/Opus) default to G.711 until the
-/// negotiated codec is threaded through — MOS is then an optimistic upper bound for those legs.
-fn hep_codec(payload_type: u8) -> siphon_rtp_hep::mos::Codec {
+/// Map a negotiated `a=rtpmap` encoding name (uppercased, per [`CodecSpec`]) to the
+/// [`siphon_rtp_hep::mos::Codec`] the G.107 estimator scores. Codecs the estimator does not model
+/// (G.726, GSM-FR, CN) fall back to G.711 — the most optimistic, so their MOS is an upper bound.
+pub(crate) fn hep_codec_for_name(encoding_name: &str) -> siphon_rtp_hep::mos::Codec {
     use siphon_rtp_hep::mos::Codec;
-    match payload_type {
-        0 | 8 => Codec::G711,
-        9 => Codec::G722,
-        4 => Codec::G723_1,
-        18 => Codec::G729,
+    match encoding_name.to_ascii_uppercase().as_str() {
+        "PCMU" | "PCMA" => Codec::G711,
+        "G722" => Codec::G722,
+        "G729" | "G729A" | "G729AB" => Codec::G729,
+        "G723" | "G723.1" => Codec::G723_1,
+        "AMR-WB" | "AMRWB" => Codec::AmrWb,
+        "AMR" | "AMR-NB" | "AMRNB" => Codec::AmrNb,
+        "OPUS" => Codec::Opus,
         _ => Codec::G711,
     }
 }
@@ -1386,6 +1393,7 @@ mod tests {
             latch: false,
             egress_ssrc: 0xC000_0000 + index as u32,
             egress_payload_type: PCMU,
+            mos_codec: siphon_rtp_hep::mos::Codec::G711,
             telephone_event_in: Some(101),
             secure: None,
             routing: Routing::default(),
@@ -1978,6 +1986,22 @@ mod tests {
             }
             other => panic!("expected CallQuality, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hep_codec_maps_encoding_names() {
+        use siphon_rtp_hep::mos::Codec;
+        // Static + dynamic codecs the estimator models map to their own impairment...
+        assert_eq!(hep_codec_for_name("PCMU"), Codec::G711);
+        assert_eq!(hep_codec_for_name("pcma"), Codec::G711); // case-insensitive
+        assert_eq!(hep_codec_for_name("G722"), Codec::G722);
+        assert_eq!(hep_codec_for_name("AMR-WB"), Codec::AmrWb);
+        assert_eq!(hep_codec_for_name("AMR"), Codec::AmrNb);
+        assert_eq!(hep_codec_for_name("OPUS"), Codec::Opus);
+        assert_eq!(hep_codec_for_name("G729"), Codec::G729);
+        // ...and unmodelled ones (G.726, GSM-FR) fall back to G.711.
+        assert_eq!(hep_codec_for_name("G726-32"), Codec::G711);
+        assert_eq!(hep_codec_for_name("GSM"), Codec::G711);
     }
 
     #[cfg(feature = "amr")]
