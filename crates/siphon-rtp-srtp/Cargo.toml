@@ -15,7 +15,7 @@ keywords = ["srtp", "rtp", "crypto", "webrtc", "voip"]
 categories = ["network-programming", "cryptography"]
 
 [dependencies]
-aes = "0.8"
+aes = "0.9"
 ctr = "0.9"
 hmac = "0.12"
 sha1 = "0.10"
