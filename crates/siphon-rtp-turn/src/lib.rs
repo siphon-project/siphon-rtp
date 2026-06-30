@@ -378,7 +378,7 @@ impl Turn {
         D: Datapath + 'static,
     {
         let mut nonce_secret = [0u8; 32];
-        getrandom::getrandom(&mut nonce_secret).map_err(|e| TurnError::Entropy(e.to_string()))?;
+        getrandom::fill(&mut nonce_secret).map_err(|e| TurnError::Entropy(e.to_string()))?;
         let nonce = NonceFactory::new(nonce_secret, config.nonce_lifetime);
 
         let (client_tx, client_rx) = flume::bounded::<Message>(2048);

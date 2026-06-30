@@ -2050,7 +2050,7 @@ fn resolve_toward_a(from_tag: &str, _call_from: &str, call_to: Option<&str>) -> 
 /// a random SSRC). Falls back to a fixed value if the CSPRNG is unavailable — never panics.
 fn random_ssrc() -> u32 {
     let mut bytes = [0u8; 4];
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         return 0x5310_0000; // "SIP0" — a stable fallback when the CSPRNG is unavailable
     }
     u32::from_be_bytes(bytes)
@@ -2061,7 +2061,7 @@ fn random_ssrc() -> u32 {
 /// it is unavailable — never panics), prefixed so it is recognisable in logs.
 fn subscription_tag() -> String {
     let mut bytes = [0u8; 8];
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         return "sub-00000000".to_string();
     }
     format!("sub-{}", hex_lower(&bytes))

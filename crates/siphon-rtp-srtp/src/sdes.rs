@@ -92,7 +92,7 @@ impl SrtpKeyMaterial {
     /// Fresh random key material from the OS CSPRNG (the engine's own offered key).
     pub fn generate() -> Result<Self, SdesError> {
         let mut bytes = [0u8; INLINE_KEY_LEN];
-        getrandom::getrandom(&mut bytes).map_err(|_| SdesError::Random)?;
+        getrandom::fill(&mut bytes).map_err(|_| SdesError::Random)?;
         Ok(Self::from_inline_bytes(&bytes).expect("INLINE_KEY_LEN bytes"))
     }
 
