@@ -9,7 +9,6 @@ pub static QUA_GAIN_PITCH: [i16; 16] = [
 
 /// Codebook-gain scalar quantization table (`gains.tab` `qua_gain_code[32*3]`). Each row is
 /// `(g_fac Q11, qua_ener_MR122 Q10, qua_ener Q10)`. Consumed by the gains tier (`gains.rs`).
-#[allow(dead_code)] // used by the gains tier, landed in a following commit
 #[rustfmt::skip]
 pub static QUA_GAIN_CODE: [i16; 96] = [
     159, -3776, -22731,
@@ -45,7 +44,3 @@ pub static QUA_GAIN_CODE: [i16; 96] = [
     21142, 3448, 20763,
     27485, 3836, 23097,
 ];
-
-/// Number of codebook-gain entries (`gains.tab` `NB_QUA_CODE`).
-#[allow(dead_code)] // used by the gains tier, landed in a following commit
-pub const NB_QUA_CODE: usize = 32;
