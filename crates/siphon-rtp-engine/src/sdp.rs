@@ -60,6 +60,10 @@ pub struct MediaInfo {
     pub payload_types: Vec<u8>,
     /// `a=rtpmap` entries for the audio stream (payload type → encoding name / clock / channels).
     pub rtpmaps: Vec<RtpMap>,
+    /// `a=fmtp` `mode-set` constraints (payload type → allowed AMR speech modes), for variable-rate
+    /// codecs (RFC 4867 §8.1). The engine clamps its egress encode mode into this set so it never
+    /// sends a mode the peer disallowed. Empty when no `mode-set` was offered.
+    pub mode_sets: Vec<(u8, Vec<u8>)>,
     /// The stream's `a=ptime` in milliseconds, if present (else the 20 ms telephony default).
     pub ptime_ms: u8,
 }
@@ -118,13 +122,23 @@ impl MediaInfo {
             .iter()
             .find(|map| map.payload_type == payload_type)
         {
-            return Some(CodecSpec::new(
+            let spec = CodecSpec::new(
                 payload_type,
                 &map.encoding_name,
                 map.clock_rate_hz,
                 map.channels,
                 self.ptime_ms,
-            ));
+            );
+            // Honour an AMR-WB `mode-set` (RFC 4867 §8.1) by clamping the egress encode mode into
+            // the allowed set, so the engine never sends the peer a mode it disallowed.
+            if spec.encoding_name == "AMR-WB" {
+                if let Some((_, modes)) =
+                    self.mode_sets.iter().find(|(pt, _)| *pt == payload_type)
+                {
+                    return Some(spec.with_encode_mode(choose_amr_wb_mode(modes)));
+                }
+            }
+            return Some(spec);
         }
         CodecSpec::from_static_payload_type(payload_type, self.ptime_ms)
     }
@@ -163,6 +177,8 @@ struct AudioScan {
     payload_types: Vec<u8>,
     /// `a=rtpmap` entries in the audio section.
     rtpmaps: Vec<RtpMap>,
+    /// `a=fmtp` `mode-set` constraints in the audio section (payload type → allowed AMR modes).
+    fmtp_mode_sets: Vec<(u8, Vec<u8>)>,
     /// The audio stream's `a=ptime`, if present.
     ptime_ms: Option<u8>,
     /// Parsed `a=crypto` lines in the audio section, in order (RFC 4568).
@@ -190,6 +206,45 @@ fn parse_rtpmap(value: &str) -> Option<RtpMap> {
         clock_rate_hz,
         channels,
     })
+}
+
+/// Parse an `a=fmtp:<pt> ...mode-set=<m0,m1,...>...` body into `(payload_type, allowed_modes)`.
+/// Returns `None` when the line carries no parseable payload type or no `mode-set` parameter — the
+/// engine only acts on `mode-set`; every other fmtp parameter is passed through untouched.
+fn parse_fmtp_mode_set(value: &str) -> Option<(u8, Vec<u8>)> {
+    let body = value.strip_prefix("fmtp:")?;
+    let (payload_type, params) = body.split_once(char::is_whitespace)?;
+    let payload_type = payload_type.trim().parse::<u8>().ok()?;
+    // fmtp params are `;`-separated `key=value` pairs in any order (RFC 4867 §8.1).
+    let modes_field = params
+        .split(';')
+        .map(str::trim)
+        .find_map(|param| param.strip_prefix("mode-set="))?;
+    let modes: Vec<u8> = modes_field
+        .split(',')
+        .filter_map(|token| token.trim().parse::<u8>().ok())
+        .filter(|&mode| mode <= 8)
+        .collect();
+    (!modes.is_empty()).then_some((payload_type, modes))
+}
+
+/// Choose the AMR-WB egress encode mode from an `allowed` `mode-set`: the engine default (mode 2 /
+/// 12.65 kbit/s) when permitted, else the highest allowed mode below it, else the lowest allowed —
+/// always a member of the set, so the engine never emits a mode the peer disallowed.
+fn choose_amr_wb_mode(allowed: &[u8]) -> Option<u8> {
+    const DEFAULT_MODE: u8 = 2;
+    if allowed.is_empty() {
+        return None;
+    }
+    if allowed.contains(&DEFAULT_MODE) {
+        return Some(DEFAULT_MODE);
+    }
+    allowed
+        .iter()
+        .copied()
+        .filter(|&mode| mode < DEFAULT_MODE)
+        .max()
+        .or_else(|| allowed.iter().copied().min())
 }
 
 /// Parse a `c=` connection line body (`IN IP4 <addr>` or `IN IP6 <addr>`, RFC 4566 §5.7). The
@@ -238,6 +293,7 @@ fn scan(sdp: &str) -> AudioScan {
         transport: None,
         payload_types: Vec::new(),
         rtpmaps: Vec::new(),
+        fmtp_mode_sets: Vec::new(),
         ptime_ms: None,
         crypto: Vec::new(),
         ice_ufrag: None,
@@ -304,6 +360,10 @@ fn scan(sdp: &str) -> AudioScan {
                         if let Some(rtpmap) = parse_rtpmap(value) {
                             scan.rtpmaps.push(rtpmap);
                         }
+                    } else if value.starts_with("fmtp:") {
+                        if let Some(mode_set) = parse_fmtp_mode_set(value) {
+                            scan.fmtp_mode_sets.push(mode_set);
+                        }
                     } else if let Some(ptime) = value.strip_prefix("ptime:") {
                         scan.ptime_ms = ptime.trim().parse::<u8>().ok();
                     }
@@ -346,6 +406,7 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         ice_pwd: scan.ice_pwd.clone(),
         payload_types: scan.payload_types.clone(),
         rtpmaps: scan.rtpmaps.clone(),
+        mode_sets: scan.fmtp_mode_sets.clone(),
         ptime_ms: scan.ptime_ms.unwrap_or(DEFAULT_PTIME_MS),
     })
 }
@@ -533,6 +594,48 @@ mod tests {
              a=rtpmap:8 PCMA/8000\r\n\
              a=rtpmap:96 telephone-event/8000\r\n"
         )
+    }
+
+    /// An AMR-WB offer (PT 96, 16 kHz) at `addr`, optionally carrying an `a=fmtp` `mode-set`.
+    fn amr_wb_offer(mode_set: Option<&str>) -> String {
+        let fmtp = match mode_set {
+            Some(modes) => format!("a=fmtp:96 mode-set={modes};octet-align=1\r\n"),
+            None => String::new(),
+        };
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n\
+             m=audio 5004 RTP/AVP 96\r\na=rtpmap:96 AMR-WB/16000\r\n{fmtp}"
+        )
+    }
+
+    fn amr_wb_encode_mode(mode_set: Option<&str>) -> Option<u8> {
+        parse(&amr_wb_offer(mode_set))
+            .expect("parse")
+            .primary_codec()
+            .expect("amr-wb codec")
+            .encode_mode
+    }
+
+    #[test]
+    fn amr_wb_mode_set_clamps_the_egress_encode_mode() {
+        // The mode-set is parsed onto the stream.
+        let info = parse(&amr_wb_offer(Some("0,1,2"))).expect("parse");
+        assert_eq!(info.mode_sets, vec![(96u8, vec![0u8, 1, 2])]);
+
+        // Default mode 2 allowed ⇒ encode at 2.
+        assert_eq!(amr_wb_encode_mode(Some("0,1,2")), Some(2));
+        // Order-independent and whitespace-tolerant.
+        assert_eq!(amr_wb_encode_mode(Some("2, 1, 0")), Some(2));
+        // Restricted below the default ⇒ the highest allowed below 2.
+        assert_eq!(amr_wb_encode_mode(Some("0,1")), Some(1));
+        // Entirely above the default ⇒ the lowest allowed (never a disallowed mode).
+        assert_eq!(amr_wb_encode_mode(Some("7,4")), Some(4));
+        // A single allowed mode is honoured exactly.
+        assert_eq!(amr_wb_encode_mode(Some("8")), Some(8));
+        // No mode-set ⇒ no constraint (the codec default, mode 2, applies downstream).
+        assert_eq!(amr_wb_encode_mode(None), None);
+        // Out-of-range tokens are ignored; an all-invalid set leaves no constraint.
+        assert_eq!(amr_wb_encode_mode(Some("9,42")), None);
     }
 
     #[test]
