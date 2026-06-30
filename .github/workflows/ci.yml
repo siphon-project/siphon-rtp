@@ -61,7 +61,7 @@ jobs:
       RUSTUP_TOOLCHAIN: "1.86.0"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@1.86.0
       - uses: Swatinem/rust-cache@v2
       # rust-version = "1.86": the shippable crates must compile on it (tests/benches excluded).
       # Floor set by transitive deps: clap_builder needs the 2024 edition (>=1.85) and the icu/idna
