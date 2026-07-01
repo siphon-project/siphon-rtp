@@ -554,7 +554,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let security = far_local_crypto.map(SecurityAdvertisement::Secure);
 
-        let rewritten = match sdp::rewrite(sdp, engine, advert, security) {
+        let mut rewritten = match sdp::rewrite(sdp, engine, advert, security) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 self.free(&endpoints).await;
@@ -563,6 +563,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 };
             }
         };
+        // rtpengine codec manipulation on the SDP offered to the far side: `codec-strip-X` removes a
+        // codec, `codec-transcode-X` adds one (the far side may then select it, engaging transcode).
+        let (codec_strip, codec_add) = parse_codec_flags(&profile.flags);
+        if !codec_strip.is_empty() || !codec_add.is_empty() {
+            rewritten.sdp = sdp::rewrite_codec_list(&rewritten.sdp, &codec_strip, &codec_add);
+        }
 
         // WebSocket bridge (mod_audio_stream / voice-AI): a native siphon-rtp extension. When the
         // profile carries `ws_uri`, leg A (the offerer) is bridged to that WS server using A's
@@ -2156,6 +2162,46 @@ fn ok_empty() -> CmdResult {
     }
 }
 
+/// Parse rtpengine codec-manipulation flags into SDP edits for [`sdp::rewrite_codec_list`]:
+/// `codec-strip-<NAME>` → an encoding name to drop from the SDP offered to the far side, and
+/// `codec-transcode-<NAME>` → a codec to add to that SDP. The engine's transcode pipeline then
+/// engages automatically when the far side selects a codec differing from the near leg's (no separate
+/// "force transcode" plumbing needed). Unknown / not-yet-encodable transcode targets are skipped so a
+/// forced codec never fails the call at answer. `codec-mask-X` (asymmetric hide) is a follow-up.
+fn parse_codec_flags(flags: &[String]) -> (Vec<String>, Vec<CodecSpec>) {
+    let mut strip = Vec::new();
+    let mut add = Vec::new();
+    for flag in flags {
+        if let Some(name) = flag.strip_prefix("codec-strip-") {
+            strip.push(name.to_string());
+        } else if let Some(name) = flag.strip_prefix("codec-transcode-") {
+            if let Some(spec) = transcode_codec_spec(name) {
+                add.push(spec);
+            }
+        }
+    }
+    (strip, add)
+}
+
+/// Map a `codec-transcode-<NAME>` target to a [`CodecSpec`] the engine can both advertise and
+/// **encode** (so the forced transcode does not fail at answer). Static codecs use their RFC 3551
+/// payload type; dynamic ones use a conventional number. `None` for an unknown or not-yet-encodable
+/// codec (e.g. AMR-NB, whose encoder is WIP; or AMR-WB without the `amr` build feature) — skipped.
+fn transcode_codec_spec(name: &str) -> Option<CodecSpec> {
+    let upper = name.to_ascii_uppercase();
+    let (payload_type, clock_rate_hz) = match upper.as_str() {
+        "PCMU" => (0u8, 8000u32),
+        "PCMA" => (8, 8000),
+        "G722" => (9, 8000),
+        "GSM" => (3, 8000),
+        "G726-32" => (96, 8000),
+        #[cfg(feature = "amr")]
+        "AMR-WB" => (96, 16000),
+        _ => return None,
+    };
+    Some(CodecSpec::new(payload_type, &upper, clock_rate_hz, 1, 20))
+}
+
 /// Decide how a call's media is carried once answered: an SRTP bridge (secure far leg), the
 /// userspace media slow path (transcode requested or recording on), or the in-datapath plain relay.
 fn resolve_pipeline(
@@ -2474,6 +2520,68 @@ mod tests {
             CmdResult::Ok { sdp: Some(sdp), .. } => sdp.clone(),
             other => panic!("expected Ok with sdp, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn offer_codec_strip_removes_the_codec_from_the_offered_sdp() {
+        // rtpengine `codec-strip-PCMA`: the SDP the engine offers the far side drops PCMA (static
+        // PT 8, resolved via the RFC 3551 table — `sdp_for` carries no rtpmap for it).
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let profile = ProfileFlags {
+            flags: vec!["codec-strip-PCMA".into()],
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "strip".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile,
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&offer);
+        let m_line = sdp
+            .lines()
+            .find(|l| l.starts_with("m=audio"))
+            .expect("m=audio line");
+        assert!(m_line.ends_with(" 0"), "only PCMU (PT 0) remains: {m_line}");
+        assert!(!m_line.contains(" 8"), "PCMA (PT 8) stripped: {m_line}");
+    }
+
+    #[tokio::test]
+    async fn offer_codec_transcode_adds_the_codec_to_the_offered_sdp() {
+        // rtpengine `codec-transcode-G722`: the engine adds G722 (PT 9 + rtpmap) to the offered SDP.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let profile = ProfileFlags {
+            flags: vec!["codec-transcode-G722".into()],
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "xcode".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile,
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&offer);
+        let m_line = sdp
+            .lines()
+            .find(|l| l.starts_with("m=audio"))
+            .expect("m=audio line");
+        assert!(m_line.ends_with(" 9"), "G722 (PT 9) appended: {m_line}");
+        assert!(
+            sdp.contains("a=rtpmap:9 G722/8000"),
+            "G722 rtpmap added: {sdp}"
+        );
     }
 
     async fn recv(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {

@@ -560,6 +560,136 @@ pub fn rewrite(
     })
 }
 
+/// Rewrite the audio `m=` codec list to honour rtpengine `codec-strip-X` / `codec-transcode-X`
+/// flags: drop every payload type whose encoding name is in `strip` (case-insensitive, matched via
+/// `a=rtpmap` or the RFC 3551 static table) — removing its `a=rtpmap`/`a=fmtp` lines too — and
+/// append each codec in `add` (its payload type on the `m=` line plus a fresh `a=rtpmap`).
+///
+/// Best-effort and conservative: returns the SDP unchanged when it has no `m=audio` line; never
+/// removes the **last** remaining audio codec (an empty `m=` list is invalid, RFC 4566 §5.14); and
+/// skips an `add` codec whose payload type is already present. Telephone-event (DTMF) is preserved
+/// unless explicitly named in `strip`.
+#[must_use]
+pub fn rewrite_codec_list(sdp: &str, strip: &[String], add: &[CodecSpec]) -> String {
+    if strip.is_empty() && add.is_empty() {
+        return sdp.to_string();
+    }
+    let lines: Vec<&str> = sdp.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+
+    // Locate the audio `m=` line and parse its payload-type list.
+    let Some(media_index) = lines
+        .iter()
+        .position(|l| l.starts_with("m=audio ") || *l == "m=audio")
+    else {
+        return sdp.to_string();
+    };
+    let media_fields: Vec<&str> = lines[media_index]
+        .strip_prefix("m=")
+        .unwrap_or(lines[media_index])
+        .split(' ')
+        .collect();
+    // m=audio <port> <proto> <pt...>
+    if media_fields.len() < 3 {
+        return sdp.to_string();
+    }
+    let payload_types: Vec<u8> = media_fields[3..]
+        .iter()
+        .filter_map(|f| f.parse::<u8>().ok())
+        .collect();
+
+    // Resolve each payload type to its encoding name (uppercased), via `a=rtpmap` then the static table.
+    let name_of = |payload_type: u8| -> Option<String> {
+        for line in &lines {
+            if let Some(map) = line
+                .strip_prefix("a=rtpmap:")
+                .and_then(|body| body.split_once(char::is_whitespace))
+            {
+                if map.0.trim().parse::<u8>().ok() == Some(payload_type) {
+                    return map
+                        .1
+                        .split('/')
+                        .next()
+                        .map(|n| n.trim().to_ascii_uppercase());
+                }
+            }
+        }
+        CodecSpec::from_static_payload_type(payload_type, DEFAULT_PTIME_MS)
+            .map(|spec| spec.encoding_name)
+    };
+    let strip_upper: Vec<String> = strip.iter().map(|s| s.to_ascii_uppercase()).collect();
+
+    // Payload types to remove: name in `strip`, but never empty the list.
+    let mut removed: Vec<u8> = payload_types
+        .iter()
+        .copied()
+        .filter(|pt| name_of(*pt).is_some_and(|name| strip_upper.contains(&name)))
+        .collect();
+    if removed.len() == payload_types.len() && !payload_types.is_empty() {
+        // Stripping everything would leave an invalid `m=` line — keep the first codec.
+        removed.retain(|pt| *pt != payload_types[0]);
+    }
+
+    // Payload types to add (skip any already present after removal).
+    let present: Vec<u8> = payload_types
+        .iter()
+        .copied()
+        .filter(|pt| !removed.contains(pt))
+        .collect();
+    let added: Vec<&CodecSpec> = add
+        .iter()
+        .filter(|spec| !present.contains(&spec.payload_type))
+        .collect();
+    if removed.is_empty() && added.is_empty() {
+        return sdp.to_string();
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + added.len());
+    for (index, line) in lines.iter().enumerate() {
+        if index == media_index {
+            let mut formats: Vec<String> = present
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            formats.extend(added.iter().map(|spec| spec.payload_type.to_string()));
+            out.push(format!(
+                "m={} {} {} {}",
+                media_fields[0],
+                media_fields[1],
+                media_fields[2],
+                formats.join(" ")
+            ));
+            // Insert `a=rtpmap` for each added codec right after the media line (RFC 4566 — order-free).
+            for spec in &added {
+                out.push(format!(
+                    "a=rtpmap:{} {}/{}",
+                    spec.payload_type, spec.encoding_name, spec.clock_rate_hz
+                ));
+            }
+            continue;
+        }
+        // Drop `a=rtpmap`/`a=fmtp` for removed payload types.
+        let attr_pt = line
+            .strip_prefix("a=rtpmap:")
+            .or_else(|| line.strip_prefix("a=fmtp:"))
+            .and_then(|body| body.split(|c: char| c.is_whitespace() || c == '/').next())
+            .and_then(|pt| pt.trim().parse::<u8>().ok());
+        if let Some(pt) = attr_pt {
+            if removed.contains(&pt) {
+                continue;
+            }
+        }
+        // Preserve the trailing empty line if the input ended with CRLF.
+        if !(index == lines.len() - 1 && line.is_empty()) {
+            out.push((*line).to_string());
+        }
+    }
+    let mut rewritten = out.join(CRLF);
+    if sdp.ends_with('\n') {
+        rewritten.push_str(CRLF);
+    }
+    rewritten
+}
+
 /// Replace the port (2nd field) of an `m=audio <port> <proto> <fmt...>` line and, when `transport`
 /// is `Some`, the transport profile (3rd field), preserving the media type and format list.
 fn rewrite_media_line(line: &str, port: u16, transport: Option<&str>) -> String {
@@ -1094,5 +1224,76 @@ mod tests {
         assert_eq!(primary.encoding_name, "L16");
         assert_eq!(primary.clock_rate_hz, 16000);
         assert_eq!(primary.channels, 1, "no /channels suffix → mono");
+    }
+
+    #[test]
+    fn codec_list_strips_a_named_codec_and_its_rtpmap() {
+        // m=audio 5004 RTP/AVP 0 8 96 (PCMU/PCMA/telephone-event); codec-strip-PCMA drops PT 8.
+        let out = rewrite_codec_list(&offer("203.0.113.9", 5004), &["PCMA".to_string()], &[]);
+        assert!(
+            out.contains("m=audio 5004 RTP/AVP 0 96"),
+            "PT 8 removed from m= line: {out}"
+        );
+        assert!(!out.contains("a=rtpmap:8 PCMA/8000"), "PCMA rtpmap removed");
+        assert!(out.contains("a=rtpmap:0 PCMU/8000"), "PCMU kept");
+        assert!(
+            out.contains("a=rtpmap:96 telephone-event/8000"),
+            "telephone-event kept"
+        );
+    }
+
+    #[test]
+    fn codec_list_adds_a_transcode_codec_with_rtpmap() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n\
+                   t=0 0\r\nm=audio 5004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let g722 = CodecSpec::new(9, "G722", 8000, 1, 20);
+        let out = rewrite_codec_list(sdp, &[], std::slice::from_ref(&g722));
+        assert!(
+            out.contains("m=audio 5004 RTP/AVP 0 9"),
+            "G722 PT appended: {out}"
+        );
+        assert!(out.contains("a=rtpmap:9 G722/8000"), "G722 rtpmap added");
+    }
+
+    #[test]
+    fn codec_list_strips_a_static_codec_without_rtpmap() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n\
+                   t=0 0\r\nm=audio 5004 RTP/AVP 0 8\r\n";
+        let out = rewrite_codec_list(sdp, &["PCMA".to_string()], &[]);
+        assert!(
+            out.contains("m=audio 5004 RTP/AVP 0"),
+            "PT 8 stripped via the static table (no rtpmap): {out}"
+        );
+        assert!(
+            !out.contains(" 8\r\n") && !out.ends_with(" 8"),
+            "no dangling PT 8"
+        );
+    }
+
+    #[test]
+    fn codec_list_never_empties_the_codec_list() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\n\
+                   t=0 0\r\nm=audio 5004 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n";
+        let out = rewrite_codec_list(sdp, &["PCMU".to_string(), "PCMA".to_string()], &[]);
+        assert!(
+            out.contains("m=audio 5004 RTP/AVP 0"),
+            "the first codec is kept rather than emptying the list: {out}"
+        );
+        assert!(out.contains("a=rtpmap:0 PCMU/8000"));
+    }
+
+    #[test]
+    fn codec_list_is_a_noop_when_nothing_changes() {
+        let sdp = offer("203.0.113.9", 5004);
+        assert_eq!(
+            rewrite_codec_list(&sdp, &[], &[]),
+            sdp,
+            "no flags → identity"
+        );
+        assert_eq!(
+            rewrite_codec_list(&sdp, &["OPUS".to_string()], &[]),
+            sdp,
+            "stripping an absent codec → identity"
+        );
     }
 }
