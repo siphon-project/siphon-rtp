@@ -3,6 +3,7 @@
 //! global allocator proves a tight `mix` loop allocates nothing after warm-up.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use siphon_rtp_media::mixer::{MixInputs, Mixer, Role};
@@ -12,10 +13,21 @@ struct CountingAllocator;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
-// SAFETY: every call delegates straight to the system allocator; we only bump a relaxed counter.
+thread_local! {
+    // Only the measuring thread arms counting. A *global* counter would also catch the libtest
+    // harness's background-thread allocations that land inside the wall-clock loop window — spurious
+    // on a slow (CI) runner. `const`-initialised so accessing it in `alloc` never itself allocates
+    // (no lazy Key / destructor registration), keeping the allocator re-entrancy-safe.
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+// SAFETY: every call delegates straight to the system allocator; we only bump a relaxed counter, and
+// only when the current thread has armed counting.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        if ARMED.with(Cell::get) {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
         System.alloc(layout)
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -53,12 +65,16 @@ fn mix_tick_makes_no_heap_allocation() {
     // Warm up one tick so any one-time lazy init is paid before we sample.
     let _ = mixer.mix(&inputs, &[], &[], 0);
 
+    // Arm counting on *this* thread only, so the sample is the mix loop's own allocations — not the
+    // libtest harness's background-thread churn during the same window.
+    ARMED.with(|armed| armed.set(true));
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     for _ in 0..1_000 {
         let active = mixer.mix(&inputs, &[], &[], 0);
         std::hint::black_box(active);
     }
     let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
 
     assert_eq!(
         after,
