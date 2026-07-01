@@ -48,6 +48,9 @@ pub fn parse_command(request: &Value) -> Result<Command, NgError> {
     let command = required_str(request, "command")?;
     match command.as_str() {
         "ping" => Ok(Command::Ping),
+        // Read-only census verbs: no keys beyond `command` (rtpengine NG `list` / `statistics`).
+        "list" => Ok(Command::List),
+        "statistics" => Ok(Command::Statistics),
         "offer" => Ok(Command::Offer {
             call_id: required_str(request, "call-id")?,
             from_tag: required_str(request, "from-tag")?,
@@ -122,6 +125,47 @@ pub fn serialize_result(result: &CmdResult) -> Value {
     match result {
         CmdResult::Pong => {
             dict.insert(b"result".to_vec(), Value::string("pong"));
+        }
+        CmdResult::List { call_ids } => {
+            // rtpengine `list` returns the call-ids under a `calls` list (each a bencode string).
+            dict.insert(b"result".to_vec(), Value::string("ok"));
+            dict.insert(
+                b"calls".to_vec(),
+                Value::List(
+                    call_ids
+                        .iter()
+                        .map(|call_id| Value::string(call_id))
+                        .collect(),
+                ),
+            );
+        }
+        CmdResult::Statistics { statistics } => {
+            // rtpengine `statistics` returns the global counters under a `statistics` sub-dict. The
+            // key names mirror the engine's own metric names (offers/answers/deletes/errors) plus the
+            // live `sessions` gauge, so a passive collector reads one consistent vocabulary.
+            dict.insert(b"result".to_vec(), Value::string("ok"));
+            let mut statistics_dict = std::collections::BTreeMap::new();
+            statistics_dict.insert(
+                b"offers".to_vec(),
+                Value::Integer(clamp_i64(statistics.offers_total)),
+            );
+            statistics_dict.insert(
+                b"answers".to_vec(),
+                Value::Integer(clamp_i64(statistics.answers_total)),
+            );
+            statistics_dict.insert(
+                b"deletes".to_vec(),
+                Value::Integer(clamp_i64(statistics.deletes_total)),
+            );
+            statistics_dict.insert(
+                b"errors".to_vec(),
+                Value::Integer(clamp_i64(statistics.control_errors_total)),
+            );
+            statistics_dict.insert(
+                b"sessions".to_vec(),
+                Value::Integer(clamp_i64(statistics.sessions)),
+            );
+            dict.insert(b"statistics".to_vec(), Value::Dict(statistics_dict));
         }
         CmdResult::Error { reason } => {
             dict.insert(b"result".to_vec(), Value::string("error"));
@@ -274,9 +318,17 @@ fn is_yes(dict: &Value, key: &str) -> bool {
     optional_str(dict, key).as_deref() == Some("yes")
 }
 
+/// Clamp a `u64` counter into bencode's signed `i64` integer space (bencode has no unsigned form).
+/// A real counter never approaches `i64::MAX`, so this only guards the theoretical overflow — it
+/// saturates rather than wrapping a telemetry value negative.
+fn clamp_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use siphon_rtp_proto::EngineStatistics;
 
     /// Build an NG request datagram from a logical command name + extra entries.
     fn datagram(cookie: &str, entries: &[(&str, Value)]) -> Vec<u8> {
@@ -469,6 +521,90 @@ mod tests {
             };
             assert!(profile.record_call, "record_call via key {key:?}");
         }
+    }
+
+    #[test]
+    fn list_and_statistics_need_no_call_id() {
+        // Both census verbs carry only `command` — no call-id / from-tag required.
+        let list = datagram("l1", &[("command", Value::string("list"))]);
+        let (cookie, command) = parse_datagram(&list);
+        assert_eq!(cookie, b"l1");
+        assert_eq!(command, Command::List);
+
+        let statistics = datagram("s1", &[("command", Value::string("statistics"))]);
+        let (cookie, command) = parse_datagram(&statistics);
+        assert_eq!(cookie, b"s1");
+        assert_eq!(command, Command::Statistics);
+    }
+
+    #[test]
+    fn list_result_encodes_calls_list() {
+        // A populated list → result:ok + a `calls` list of the call-id strings.
+        let populated = serialize_result(&CmdResult::List {
+            call_ids: vec!["call-a".into(), "call-b".into()],
+        });
+        assert_eq!(populated.get("result").and_then(Value::as_str), Some("ok"));
+        let calls = populated
+            .get("calls")
+            .and_then(Value::as_list)
+            .expect("calls list");
+        let names: Vec<&str> = calls.iter().filter_map(Value::as_str).collect();
+        assert_eq!(names, vec!["call-a", "call-b"]);
+
+        // An empty list still carries an (empty) `calls` list, not a missing key.
+        let empty = serialize_result(&CmdResult::List {
+            call_ids: Vec::new(),
+        });
+        assert_eq!(empty.get("result").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            empty.get("calls").and_then(Value::as_list).map(<[_]>::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn statistics_result_encodes_counter_dict() {
+        let result = serialize_result(&CmdResult::Statistics {
+            statistics: EngineStatistics {
+                offers_total: 12,
+                answers_total: 11,
+                deletes_total: 10,
+                control_errors_total: 2,
+                sessions: 3,
+            },
+        });
+        assert_eq!(result.get("result").and_then(Value::as_str), Some("ok"));
+        let statistics = result
+            .get("statistics")
+            .and_then(Value::as_dict)
+            .expect("statistics dict");
+        let counter = |key: &[u8]| statistics.get(key).and_then(Value::as_integer);
+        assert_eq!(counter(b"offers"), Some(12));
+        assert_eq!(counter(b"answers"), Some(11));
+        assert_eq!(counter(b"deletes"), Some(10));
+        assert_eq!(counter(b"errors"), Some(2));
+        assert_eq!(counter(b"sessions"), Some(3));
+    }
+
+    #[test]
+    fn statistics_result_clamps_oversize_counter() {
+        // A counter beyond i64::MAX saturates rather than wrapping negative (bencode is signed).
+        let result = serialize_result(&CmdResult::Statistics {
+            statistics: EngineStatistics {
+                offers_total: u64::MAX,
+                ..Default::default()
+            },
+        });
+        let statistics = result
+            .get("statistics")
+            .and_then(Value::as_dict)
+            .expect("statistics dict");
+        assert_eq!(
+            statistics
+                .get(b"offers".as_slice())
+                .and_then(Value::as_integer),
+            Some(i64::MAX)
+        );
     }
 
     #[test]

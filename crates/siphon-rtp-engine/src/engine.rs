@@ -27,8 +27,8 @@ use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::player::{PcmPlayer, WavSource};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
-    BridgeDirection, CmdResult, Command, ConferenceRole, Event, PlayMediaSource, ProfileFlags,
-    SessionStats,
+    BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, PlayMediaSource,
+    ProfileFlags, SessionStats,
 };
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
@@ -313,6 +313,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     async fn dispatch(&self, client: ClientId, command: Command) -> CmdResult {
         match command {
             Command::Ping => CmdResult::Pong,
+            Command::List => self.list(client),
+            Command::Statistics => self.statistics(),
             Command::Offer {
                 call_id,
                 from_tag,
@@ -1248,6 +1250,38 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             duration_ms: None,
             to_tag: None,
             stats: Some(stats),
+        }
+    }
+
+    /// Enumerate the live call-ids `client` owns ([`Command::List`]) — a read-only census of the
+    /// session registry (rtpengine NG `list`). Scoped to the calling client: a call is invisible to
+    /// clients that do not own it (A3 — docs §5), so the listing never leaks another client's
+    /// call-ids. Order is unspecified (the `DashMap` is unordered). Cheap and lock-light: a sharded
+    /// scan that clones only the matching keys.
+    fn list(&self, client: ClientId) -> CmdResult {
+        let call_ids = self
+            .calls
+            .iter()
+            .filter(|entry| entry.value().owner == client)
+            .map(|entry| entry.key().clone())
+            .collect();
+        CmdResult::List { call_ids }
+    }
+
+    /// Read the engine's global process counters ([`Command::Statistics`]) — a read-only snapshot of
+    /// the operational metrics surface (rtpengine NG `statistics`). The monotonic counters come from
+    /// the shared [`Metrics`] (the same surface `/metrics` renders); `sessions` is the live registry
+    /// gauge. Process-wide, not per-client — every client sees the same global figures.
+    fn statistics(&self) -> CmdResult {
+        let snapshot = self.metrics.snapshot();
+        CmdResult::Statistics {
+            statistics: EngineStatistics {
+                offers_total: snapshot.offers_total,
+                answers_total: snapshot.answers_total,
+                deletes_total: snapshot.deletes_total,
+                control_errors_total: snapshot.control_errors_total,
+                sessions: self.session_count() as u64,
+            },
         }
     }
 
@@ -2351,6 +2385,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Delete { .. } => "delete",
         Command::Query { .. } => "query",
         Command::Ping => "ping",
+        Command::List => "list",
+        Command::Statistics => "statistics",
         Command::PlayMedia { .. } => "play_media",
         Command::StopMedia { .. } => "stop_media",
         Command::PlayDtmf { .. } => "play_dtmf",
@@ -4917,6 +4953,150 @@ mod tests {
             matches!(retry, CmdResult::Ok { .. }),
             "freed quota admits the call"
         );
+    }
+
+    /// Pull the call-ids out of a `list` result (sorted for a stable assertion — the registry is
+    /// unordered).
+    fn list_call_ids(result: &CmdResult) -> Vec<String> {
+        match result {
+            CmdResult::List { call_ids } => {
+                let mut ids = call_ids.clone();
+                ids.sort();
+                ids
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_enumerates_the_callers_calls() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+
+        // 0 calls → an empty list.
+        let empty = engine.handle(CLIENT, Command::List).await;
+        assert_eq!(list_call_ids(&empty), Vec::<String>::new());
+
+        // 1 call → that call-id.
+        let (_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "one".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert_eq!(
+            list_call_ids(&engine.handle(CLIENT, Command::List).await),
+            vec!["one".to_string()]
+        );
+
+        // N calls → all of them.
+        let (_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "two".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert_eq!(
+            list_call_ids(&engine.handle(CLIENT, Command::List).await),
+            vec!["one".to_string(), "two".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_is_scoped_to_the_owning_client() {
+        // A call is invisible to clients that do not own it (A3 — docs §5); `list` honours the same
+        // ownership gate as `query`/`delete`, so it never leaks another client's call-ids.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let owner = ClientId(10);
+        let intruder = ClientId(20);
+        let (_a, addr_a) = phone().await;
+        engine
+            .handle(
+                owner,
+                Command::Offer {
+                    call_id: "owned".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            list_call_ids(&engine.handle(owner, Command::List).await),
+            vec!["owned".to_string()],
+            "owner sees its own call"
+        );
+        assert_eq!(
+            list_call_ids(&engine.handle(intruder, Command::List).await),
+            Vec::<String>::new(),
+            "a non-owner sees none of the owner's calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn statistics_reports_global_counters_and_live_sessions() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+
+        // Fresh engine → all counters zero, no live sessions.
+        let fresh = engine.handle(CLIENT, Command::Statistics).await;
+        assert_eq!(
+            fresh,
+            CmdResult::Statistics {
+                statistics: EngineStatistics::default(),
+            }
+        );
+
+        // One accepted offer bumps offers_total and the live sessions gauge.
+        let (_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "stat-call".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        // An error-producing command (unknown call delete) bumps control_errors_total.
+        let _ = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "no-such-call".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+
+        let CmdResult::Statistics { statistics } = engine.handle(CLIENT, Command::Statistics).await
+        else {
+            panic!("expected Statistics");
+        };
+        assert_eq!(statistics.offers_total, 1, "one offer accepted");
+        assert_eq!(statistics.answers_total, 0);
+        // The failed delete counts as an accepted delete attempt *and* a control error (handle
+        // records the per-command total before dispatch, then the error on the error result).
+        assert_eq!(statistics.deletes_total, 1, "delete attempt counted");
+        assert_eq!(
+            statistics.control_errors_total, 1,
+            "the unknown-call delete errored"
+        );
+        assert_eq!(statistics.sessions, 1, "the offered call is live");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

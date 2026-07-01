@@ -71,7 +71,8 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    /// A stub handler: pong for ping, an Ok-with-SDP for offer, error otherwise.
+    /// A stub handler: pong for ping, an Ok-with-SDP for offer, a census reply for list/statistics,
+    /// error otherwise.
     fn stub(command: Command) -> std::future::Ready<CmdResult> {
         let result = match command {
             Command::Ping => CmdResult::Pong,
@@ -80,6 +81,16 @@ mod tests {
                 duration_ms: None,
                 to_tag: None,
                 stats: None,
+            },
+            Command::List => CmdResult::List {
+                call_ids: vec!["call-x".into()],
+            },
+            Command::Statistics => CmdResult::Statistics {
+                statistics: siphon_rtp_proto::EngineStatistics {
+                    offers_total: 4,
+                    sessions: 2,
+                    ..Default::default()
+                },
             },
             _ => CmdResult::Error {
                 reason: "stub".into(),
@@ -170,6 +181,57 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap()
             .contains("RTP/AVP"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_and_statistics_round_trip_over_udp() {
+        let server = start_server().await;
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("client");
+
+        // `list` → result:ok + a `calls` list.
+        let list = exchange(
+            &client,
+            server,
+            &ng_datagram("l", &[("command", Value::string("list"))]),
+        )
+        .await;
+        let (_, body) = ng::split_cookie(&list).expect("split");
+        let dict = bencode::decode(body).expect("decode");
+        assert_eq!(dict.get("result").and_then(Value::as_str), Some("ok"));
+        let calls = dict.get("calls").and_then(Value::as_list).expect("calls");
+        assert_eq!(
+            calls.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+            vec!["call-x"]
+        );
+
+        // `statistics` → result:ok + a `statistics` counter dict.
+        let statistics = exchange(
+            &client,
+            server,
+            &ng_datagram("s", &[("command", Value::string("statistics"))]),
+        )
+        .await;
+        let (_, body) = ng::split_cookie(&statistics).expect("split");
+        let dict = bencode::decode(body).expect("decode");
+        assert_eq!(dict.get("result").and_then(Value::as_str), Some("ok"));
+        let statistics = dict
+            .get("statistics")
+            .and_then(Value::as_dict)
+            .expect("statistics dict");
+        assert_eq!(
+            statistics
+                .get(b"offers".as_slice())
+                .and_then(Value::as_integer),
+            Some(4)
+        );
+        assert_eq!(
+            statistics
+                .get(b"sessions".as_slice())
+                .and_then(Value::as_integer),
+            Some(2)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
