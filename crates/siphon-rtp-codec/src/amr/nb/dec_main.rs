@@ -665,13 +665,17 @@ mod tests {
 
     /// Decode every frame of a `.COD` vector and compare sample-for-sample against its `.OUT`.
     /// The `.COD` is the serial format: per frame [TX_type, 244 bits, mode, 4 unused] = 250 words.
-    fn check_decode_vector(mode: usize, tag: &str, file: &str) -> Result<usize, String> {
+    /// Returns `Ok(None)` when the (gitignored) 3GPP reference vectors are absent from the checkout —
+    /// the test then skips rather than fails (the convention for every vector-gated codec test); a
+    /// genuine sample mismatch still returns `Err`.
+    fn check_decode_vector(mode: usize, tag: &str, file: &str) -> Result<Option<usize>, String> {
         let mut cod_path = vector_dir();
         cod_path.push(format!("T_{tag}/{file}.COD"));
         let mut out_path = vector_dir();
         out_path.push(format!("T_{tag}/{file}.OUT"));
-        let cod = std::fs::read(&cod_path).map_err(|e| format!("{cod_path:?}: {e}"))?;
-        let out = std::fs::read(&out_path).map_err(|e| format!("{out_path:?}: {e}"))?;
+        let (Ok(cod), Ok(out)) = (std::fs::read(&cod_path), std::fs::read(&out_path)) else {
+            return Ok(None);
+        };
 
         let cod_words: Vec<i16> = cod
             .chunks_exact(2)
@@ -705,7 +709,7 @@ mod tests {
                 }
             }
         }
-        Ok(n_frames)
+        Ok(Some(n_frames))
     }
 
     #[test]
