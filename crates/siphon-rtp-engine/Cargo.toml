@@ -52,6 +52,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
+# Optional TOML config file (`--config`) deserialized into a serde struct; CLI args take precedence.
+serde = { workspace = true }
+toml = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true }
@@ -66,4 +69,5 @@ siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 proptest = { workspace = true }
+tempfile = { workspace = true }
 siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }

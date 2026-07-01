@@ -6,11 +6,15 @@
 //! (`turn:`/`turns:`, a coturn replacement) shares that one datapath, so its relay ports come from
 //! the same bounded pool and its allocations expire on the same logical clock.
 
+mod config;
+
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use config::{resolve_defaulted, resolve_optional, FileConfig};
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::{Datapath, RxPacket};
 use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher;
@@ -28,6 +32,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[derive(Parser, Debug)]
 #[command(name = "siphon-rtp-engine", version, about)]
 struct Args {
+    /// Optional TOML config file (rtpengine-style declarative config). Any value the file sets
+    /// overrides the built-in default; an explicit CLI flag still overrides the file. See
+    /// `config.example.toml` for the schema. A missing or malformed file is a fatal startup error.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
     /// JSON-over-TCP control listen address.
     #[arg(long, default_value = "127.0.0.1:8080")]
     control: SocketAddr,
@@ -76,38 +86,150 @@ struct Args {
 
     /// Reap a call after this many seconds with no accepted media (dead-path detection,
     /// docs/security-and-nat.md §4 layer 6). Advanced on the same logical clock as the sweeper.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_MEDIA_TIMEOUT_SECS)]
     media_timeout_secs: u64,
 
     /// Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting. The
     /// daemon stops accepting new control connections immediately, then waits up to this long for
     /// the live session count to reach 0.
-    #[arg(long, default_value_t = 25)]
+    #[arg(long, default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS)]
     shutdown_grace_secs: u64,
 }
 
+/// The daemon's runtime configuration after merging the CLI with the optional `--config` file.
+///
+/// Every field is fully resolved (no more precedence to apply): an explicit CLI flag beat the file,
+/// the file beat the built-in default. `main` and [`spawn_turn`] read from here, never from the raw
+/// `Args`, so there is exactly one place the precedence rule is applied — [`Resolved::resolve`].
+struct Resolved {
+    control: SocketAddr,
+    ng: Option<SocketAddr>,
+    relay_bind_ip: Option<IpAddr>,
+    metrics_addr: Option<SocketAddr>,
+    max_control_rps: u64,
+    media_timeout_secs: u64,
+    shutdown_grace_secs: u64,
+    turn_udp: Option<SocketAddr>,
+    turn_tcp: Option<SocketAddr>,
+    turn_tls: Option<SocketAddr>,
+    turn_tls_cert: Option<PathBuf>,
+    turn_tls_key: Option<PathBuf>,
+    turn_relay_ip: Option<IpAddr>,
+    /// Only carried through for the log filter: the file may set it, but the process environment
+    /// (`RUST_LOG` / the default-env filter) always wins, so it is applied before anything is logged.
+    log_filter: Option<String>,
+}
+
+impl Resolved {
+    /// Merge parsed CLI `args` (plus clap's `matches`, to tell an explicit flag from a defaulted
+    /// one) with the optional config `file`, applying the precedence rule documented on the
+    /// [`crate::config`] module: explicit CLI > file > default.
+    fn resolve(args: Args, matches: &ArgMatches, file: FileConfig) -> Self {
+        // A flag counts as "explicit" only when clap sourced it from the command line — a value left
+        // at its clap default must not mask a file setting.
+        let explicit = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+
+        Self {
+            control: resolve_defaulted(
+                args.control,
+                explicit("control"),
+                file.control,
+                default_control(),
+            ),
+            ng: resolve_optional(args.ng, file.ng),
+            relay_bind_ip: resolve_optional(args.relay_bind_ip, file.relay_bind_ip),
+            metrics_addr: resolve_optional(args.metrics_addr, file.metrics_addr),
+            max_control_rps: resolve_defaulted(
+                args.max_control_rps,
+                explicit("max_control_rps"),
+                file.max_control_rps,
+                server::DEFAULT_MAX_CONTROL_RPS,
+            ),
+            media_timeout_secs: resolve_defaulted(
+                args.media_timeout_secs,
+                explicit("media_timeout_secs"),
+                file.media_timeout_secs,
+                DEFAULT_MEDIA_TIMEOUT_SECS,
+            ),
+            shutdown_grace_secs: resolve_defaulted(
+                args.shutdown_grace_secs,
+                explicit("shutdown_grace_secs"),
+                file.shutdown_grace_secs,
+                DEFAULT_SHUTDOWN_GRACE_SECS,
+            ),
+            turn_udp: resolve_optional(args.turn_udp, file.turn_udp),
+            turn_tcp: resolve_optional(args.turn_tcp, file.turn_tcp),
+            turn_tls: resolve_optional(args.turn_tls, file.turn_tls),
+            turn_tls_cert: resolve_optional(args.turn_tls_cert, file.turn_tls_cert),
+            turn_tls_key: resolve_optional(args.turn_tls_key, file.turn_tls_key),
+            turn_relay_ip: resolve_optional(args.turn_relay_ip, file.turn_relay_ip),
+            log_filter: file.log_filter,
+        }
+    }
+}
+
+/// Built-in default for `--control` (kept in one place so the CLI default and the precedence
+/// fallback can never drift). Parsing a compile-time-constant literal that is always valid.
+fn default_control() -> SocketAddr {
+    SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 8080))
+}
+
+/// Built-in default for `--media-timeout-secs` (mirrors the clap `default_value_t`).
+const DEFAULT_MEDIA_TIMEOUT_SECS: u64 = 30;
+/// Built-in default for `--shutdown-grace-secs` (mirrors the clap `default_value_t`).
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 25;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Parse the CLI via `ArgMatches` (not just the typed struct) so the precedence merge can tell an
+    // explicit flag from a defaulted one (`ValueSource::CommandLine`). `matches`/`from_arg_matches`
+    // here handle `--help`/`--version`/parse errors exactly as `Args::parse()` would.
+    let matches = Args::command().get_matches();
+    let args = match Args::from_arg_matches(&matches) {
+        Ok(args) => args,
+        Err(error) => error.exit(),
+    };
 
-    let args = Args::parse();
+    // Load the optional `--config` TOML file. A missing/malformed file is fatal: fail loudly before
+    // the subscriber exists (no tracing yet) rather than starting with a half-applied config.
+    let file = match &args.config {
+        Some(path) => match FileConfig::load(path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("siphon-rtp-engine: {error}");
+                std::process::exit(1);
+            }
+        },
+        None => FileConfig::default(),
+    };
+
+    // Merge CLI over file over default, once, up front. Everything below reads `config`, not `args`.
+    let config = Resolved::resolve(args, &matches, file);
+
+    // Log filter precedence: the process environment (`RUST_LOG` / the default-env filter) wins; the
+    // config file's `log_filter` is the next fallback; then a built-in `info`. This keeps env-based
+    // overrides working while letting the config file set a default filter for operators.
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| match &config.log_filter {
+            Some(directive) => {
+                EnvFilter::try_new(directive).unwrap_or_else(|_| EnvFilter::new("info"))
+            }
+            None => EnvFilter::new("info"),
+        });
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     // M1: the always-available NIC-free backend. XDP backend slots in behind the same trait. The
     // engine and the TURN server share one datapath (cloning shares the pool + logical clock).
     // Endpoints bind loopback by default; `--relay-bind-ip` binds a routable IP so the relay reaches
     // real peers (docs/security-and-nat.md §11.1).
-    let datapath = match args.relay_bind_ip {
+    let datapath = match config.relay_bind_ip {
         Some(ip) => UdpLoopbackDatapath::with_bind_ip(ip),
         None => UdpLoopbackDatapath::new(),
     };
     let engine = Arc::new(Engine::new(datapath.clone()));
 
-    let listener = TcpListener::bind(args.control).await?;
-    tracing::info!(control = %args.control, "siphon-rtp-engine control server listening");
+    let listener = TcpListener::bind(config.control).await?;
+    tracing::info!(control = %config.control, "siphon-rtp-engine control server listening");
 
     // Optional control-plane shared secret, read from the environment so it never appears in argv.
     let control_secret = std::env::var("SIPHON_RTP_CONTROL_SECRET").ok();
@@ -117,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The built-in TURN server (coturn replacement), if configured. It no longer drains the
     // datapath's Redirect stream itself — the unified dispatcher below feeds it its relay packets.
-    let (turn, turn_relay) = spawn_turn(Arc::new(datapath.clone()), &args).await?;
+    let (turn, turn_relay) = spawn_turn(Arc::new(datapath.clone()), &config).await?;
 
     // The single redirect dispatcher: own `datapath.rx()` and route each redirected datagram by
     // EndpointId to the SRTP bridge or (when running) the TURN relay — the sole consumer of the
@@ -136,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // clock (§11).
     let sweeper = engine.clone();
     let turn_sweeper = turn.clone();
-    let timeout_ticks = args.media_timeout_secs;
+    let timeout_ticks = config.media_timeout_secs;
     tracing::info!(
         media_timeout_secs = timeout_ticks,
         "media-timeout sweeper enabled"
@@ -164,7 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Optional Prometheus metrics + health HTTP endpoint. Hand-rolled HTTP/1.1 (no hyper/axum) over
     // a dedicated TcpListener; `/metrics` renders the engine's control counters + live gauges.
-    if let Some(metrics_addr) = args.metrics_addr {
+    if let Some(metrics_addr) = config.metrics_addr {
         let metrics_listener = TcpListener::bind(metrics_addr).await?;
         tracing::info!(metrics = %metrics_addr, "metrics + health HTTP endpoint listening");
         let metrics = engine.metrics();
@@ -202,7 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Optional rtpengine NG/bencode control front-end (UDP) — the drop-in for SIPhon/Kamailio/
     // OpenSIPS. NG is unauthenticated by design (trusted control network); the per-client call
     // quota still applies via one dedicated NG client id. DTMF events go out-of-band (a later step).
-    if let Some(ng_addr) = args.ng {
+    if let Some(ng_addr) = config.ng {
         let ng_socket = UdpSocket::bind(ng_addr).await?;
         tracing::info!(ng = %ng_addr, "rtpengine NG control listening");
         let ng_engine = engine.clone();
@@ -234,7 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         control_secret,
         shutdown_flag,
-        args.max_control_rps,
+        config.max_control_rps,
     )
     .await?;
 
@@ -242,7 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // for in-flight calls to finish before returning (and tearing everything down).
     drain_sessions(
         &engine,
-        std::time::Duration::from_secs(args.shutdown_grace_secs),
+        std::time::Duration::from_secs(config.shutdown_grace_secs),
     )
     .await;
     tracing::info!("siphon-rtp-engine shutting down");
@@ -287,7 +409,7 @@ where
 /// spawning whichever of the UDP/TCP/TLS listeners are configured. Returns `None` when TURN is off.
 async fn spawn_turn(
     datapath: Arc<UdpLoopbackDatapath>,
-    args: &Args,
+    settings: &Resolved,
 ) -> Result<(Option<Turn>, Option<flume::Sender<RxPacket>>), Box<dyn std::error::Error>> {
     let (Some(realm), Some(secret)) = (
         std::env::var("SIPHON_RTP_TURN_REALM").ok(),
@@ -297,7 +419,7 @@ async fn spawn_turn(
     };
 
     let mut config = TurnConfig::new(realm.clone(), secret.into_bytes());
-    config.relay_address = args.turn_relay_ip;
+    config.relay_address = settings.turn_relay_ip;
     // TURN's relay packets are fed by the redirect dispatcher (it shares datapath.rx() with the SRTP
     // bridge), not drained by TURN directly. Drop-newest on a full mailbox — late media is worthless.
     let (relay_tx, relay_rx) = flume::bounded(2048);
@@ -310,7 +432,7 @@ async fn spawn_turn(
     )?;
     tracing::info!(realm, "TURN server enabled (coturn replacement)");
 
-    if let Some(addr) = args.turn_udp {
+    if let Some(addr) = settings.turn_udp {
         let socket = UdpSocket::bind(addr).await?;
         tracing::info!(turn_udp = %addr, "TURN UDP listening");
         let turn = turn.clone();
@@ -318,7 +440,7 @@ async fn spawn_turn(
             let _ = turn.serve_udp(socket).await;
         });
     }
-    if let Some(addr) = args.turn_tcp {
+    if let Some(addr) = settings.turn_tcp {
         let tcp = TcpListener::bind(addr).await?;
         tracing::info!(turn_tcp = %addr, "TURN TCP listening");
         let turn = turn.clone();
@@ -326,8 +448,8 @@ async fn spawn_turn(
             let _ = turn.serve_tcp(tcp).await;
         });
     }
-    if let Some(addr) = args.turn_tls {
-        let (Some(cert), Some(key)) = (&args.turn_tls_cert, &args.turn_tls_key) else {
+    if let Some(addr) = settings.turn_tls {
+        let (Some(cert), Some(key)) = (&settings.turn_tls_cert, &settings.turn_tls_key) else {
             return Err("turns: (--turn-tls) requires --turn-tls-cert and --turn-tls-key".into());
         };
         tls::install_crypto_provider();
@@ -340,7 +462,7 @@ async fn spawn_turn(
         });
     }
 
-    if args.turn_udp.is_none() && args.turn_tcp.is_none() && args.turn_tls.is_none() {
+    if settings.turn_udp.is_none() && settings.turn_tcp.is_none() && settings.turn_tls.is_none() {
         tracing::warn!(
             "TURN is configured but no --turn-udp/--turn-tcp/--turn-tls listener was given"
         );
