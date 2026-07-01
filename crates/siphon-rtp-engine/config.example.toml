@@ -1,0 +1,79 @@
+# siphon-rtp-engine — example TOML config file.
+#
+# Pass it with `--config /etc/siphon-rtp/config.toml`. It is entirely optional: the daemon runs with
+# just CLI flags (or all built-in defaults) and no config file at all.
+#
+# Precedence (highest wins):
+#   1. an explicit CLI flag  (something you actually typed on the command line)
+#   2. this config file      (any key set below)
+#   3. the built-in default
+#
+# So this file overrides the built-in defaults, and any CLI flag you pass overrides this file. Every
+# key is optional — set only the ones you want to override; unset keys fall through to the default.
+# Unknown/mistyped keys are a hard error (so a typo is loud, not silently ignored).
+#
+# Secrets are deliberately NOT config-file keys and are never on the command line either: the
+# control-plane shared secret, TURN realm/secret, and HEP collector are read from the environment
+# (SIPHON_RTP_CONTROL_SECRET, SIPHON_RTP_TURN_REALM, SIPHON_RTP_TURN_SECRET, SIPHON_RTP_HEP_COLLECTOR,
+# SIPHON_RTP_HEP_AGENT_ID) so they never land in argv or a world-readable file.
+
+# --- Control plane ------------------------------------------------------------------------------
+
+# JSON-over-TCP control listen address (CLI: --control). Default: "127.0.0.1:8080".
+control = "127.0.0.1:8080"
+
+# rtpengine NG/bencode control listen address, UDP (CLI: --ng). Off unless set (rtpengine default
+# :22222). Lets SIPhon / Kamailio / OpenSIPS drive the engine over the rtpengine protocol unchanged.
+# ng = "0.0.0.0:22222"
+
+# Per-connection control request cap, requests/second; 0 disables the limit (CLI: --max-control-rps).
+# max_control_rps = 5000
+
+# --- Media / relay ------------------------------------------------------------------------------
+
+# Bind relay/media sockets to this IP instead of loopback (CLI: --relay-bind-ip) — the production
+# posture so the relay is reachable by real peers. With a 0.0.0.0 bind or a NAT'd host, pair with
+# turn_relay_ip to advertise the reachable address.
+# relay_bind_ip = "0.0.0.0"
+
+# Reap a call after this many seconds with no accepted media (CLI: --media-timeout-secs).
+# Default: 30.
+# media_timeout_secs = 30
+
+# Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting
+# (CLI: --shutdown-grace-secs). Default: 25.
+# shutdown_grace_secs = 25
+
+# --- Observability ------------------------------------------------------------------------------
+
+# Prometheus metrics + health HTTP listen address (CLI: --metrics-addr). Off unless set. Exposes
+# GET /metrics (OpenMetrics), GET /healthz (liveness), GET /readyz (readiness).
+# metrics_addr = "127.0.0.1:9090"
+
+# `tracing` env-filter directive used only when the process environment does not set one
+# (RUST_LOG / the default-env filter always win over this). Not a CLI flag.
+# log_filter = "info,siphon_rtp_engine=debug"
+
+# --- TURN server (coturn replacement) -----------------------------------------------------------
+#
+# TURN is enabled when SIPHON_RTP_TURN_REALM and SIPHON_RTP_TURN_SECRET are set in the environment;
+# at least one turn_* listener must then be configured (here or via --turn-*).
+
+# TURN UDP listen address, `turn:` (CLI: --turn-udp).
+# turn_udp = "0.0.0.0:3478"
+
+# TURN TCP listen address, `turn:` over TCP, RFC 6062 (CLI: --turn-tcp).
+# turn_tcp = "0.0.0.0:3478"
+
+# TURN TLS listen address, `turns:` (CLI: --turn-tls). Requires turn_tls_cert + turn_tls_key.
+# turn_tls = "0.0.0.0:5349"
+
+# PEM certificate-chain file for the `turns:` listener (CLI: --turn-tls-cert).
+# turn_tls_cert = "/etc/siphon-rtp/turn.pem"
+
+# PEM private-key file for the `turns:` listener (CLI: --turn-tls-key).
+# turn_tls_key = "/etc/siphon-rtp/turn.key"
+
+# Public IP to advertise in XOR-RELAYED-ADDRESS when the relay socket's bound IP is not the
+# reachable one, e.g. a NAT'd host (CLI: --turn-relay-ip). Defaults to the datapath-assigned address.
+# turn_relay_ip = "203.0.113.7"
