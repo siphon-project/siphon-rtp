@@ -351,10 +351,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let gauge_engine = engine.clone();
         let live = move || {
             let conference = gauge_engine.conference();
+            let cluster = gauge_engine.cluster();
+            let sessions = gauge_engine.session_count() as u64;
+            let max_sessions = cluster.max_sessions();
+            let cpu_permille = cluster.cpu_permille();
             metrics::LiveGauges {
-                sessions: gauge_engine.session_count() as u64,
+                sessions,
                 conference_rooms: conference.room_count() as u64,
                 conference_participants: conference.participant_count() as u64,
+                max_sessions,
+                transcode_sessions: gauge_engine.transcode_session_count() as u64,
+                load_permille: cluster::load_permille(sessions, max_sessions, cpu_permille),
+                cpu_permille,
+                draining: cluster.is_draining(),
             }
         };
         tokio::spawn(metrics::serve_metrics(metrics_listener, metrics, live));
