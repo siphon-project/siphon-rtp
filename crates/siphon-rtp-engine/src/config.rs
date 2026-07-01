@@ -86,6 +86,12 @@ pub struct FileConfig {
     /// `tracing` env-filter directive used when the process environment does not set one
     /// (`RUST_LOG` / the default-env filter always win over this).
     pub log_filter: Option<String>,
+    /// Stable cluster node identifier advertised by the `load` / `node_info` control commands
+    /// (`--node-id`). Defaults to the host's `HOSTNAME` (else `siphon-rtp`) when unset.
+    pub node_id: Option<String>,
+    /// Advertised maximum concurrent sessions for cluster load reporting; `0` = unlimited
+    /// (`--max-sessions`). Drives the normalized load score a dispatcher ranks nodes by.
+    pub max_sessions: Option<u64>,
 }
 
 impl FileConfig {
@@ -163,6 +169,8 @@ mod tests {
             "turn_tls_key = \"/etc/siphon-rtp/turn.key\"\n",
             "turn_relay_ip = \"203.0.113.7\"\n",
             "log_filter = \"info,siphon_rtp_engine=debug\"\n",
+            "node_id = \"rtp-ams-3\"\n",
+            "max_sessions = 4000\n",
         );
 
         let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
@@ -198,6 +206,8 @@ mod tests {
             config.log_filter.as_deref(),
             Some("info,siphon_rtp_engine=debug")
         );
+        assert_eq!(config.node_id.as_deref(), Some("rtp-ams-3"));
+        assert_eq!(config.max_sessions, Some(4000));
     }
 
     /// An empty file is valid and yields all-`None` (every key falls through to the CLI default).

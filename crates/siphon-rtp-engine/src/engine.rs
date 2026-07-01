@@ -33,6 +33,7 @@ use siphon_rtp_proto::{
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 
+use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
 use crate::ice::{self, IceCredentials};
 use crate::media_pipeline::{
@@ -184,6 +185,10 @@ pub struct Engine<D: Datapath> {
     /// Operational counters (offers/answers/deletes/errors), incremented on the control path and
     /// rendered by the `/metrics` HTTP endpoint. Shared so the metrics server reads the same surface.
     metrics: Arc<Metrics>,
+    /// Cluster identity, capacity, and drain flag — the state behind the `load` / `node_info` /
+    /// `drain` / `undrain` control commands (see [`crate::cluster`]). Shared so the CPU sampler and
+    /// the control path see one surface.
+    cluster: Arc<ClusterState>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -215,7 +220,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             conference: Arc::new(ConferenceRegistry::default()),
             subscriptions: DashMap::new(),
             metrics: Arc::new(Metrics::new()),
+            cluster: Arc::new(ClusterState::new("siphon-rtp".to_string(), 0, Vec::new())),
         }
+    }
+
+    /// Replace the default cluster identity/capacity with operator-configured state (`main.rs`
+    /// wiring). A builder-style consuming setter so the daemon can `Engine::new(dp).with_cluster(..)`
+    /// before it is wrapped in an `Arc`; tests keep the zero-config default.
+    #[must_use]
+    pub fn with_cluster(mut self, cluster: Arc<ClusterState>) -> Self {
+        self.cluster = cluster;
+        self
+    }
+
+    /// The shared cluster state (identity, capacity, drain flag) — handed to the CPU sampler so it
+    /// publishes host-load samples into the same surface the `load` command reads.
+    #[must_use]
+    pub fn cluster(&self) -> Arc<ClusterState> {
+        self.cluster.clone()
     }
 
     /// The shared operational metrics — handed to the `/metrics` HTTP endpoint so it renders the
@@ -311,10 +333,34 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// Dispatch one control command to its handler (the metric-free inner of [`Self::handle`]).
     async fn dispatch(&self, client: ClientId, command: Command) -> CmdResult {
+        // Drain gate: a draining node runs its live calls to completion but admits no new session, so
+        // it can be taken out of a rolling upgrade cleanly. Reject the two session-creating verbs;
+        // everything else — query/delete/media-control on existing calls, and the cluster/census
+        // verbs — still works. (Matching without binding does not move `command`.)
+        if self.cluster.is_draining()
+            && matches!(
+                command,
+                Command::Offer { .. } | Command::ConferenceJoin { .. }
+            )
+        {
+            return CmdResult::Error {
+                reason: "node is draining; not accepting new sessions".to_string(),
+            };
+        }
         match command {
             Command::Ping => CmdResult::Pong,
             Command::List => self.list(client),
             Command::Statistics => self.statistics(),
+            Command::Load => self.load_snapshot(),
+            Command::NodeInfo => self.node_info(),
+            Command::Drain => {
+                self.cluster.set_draining(true);
+                ok_empty()
+            }
+            Command::Undrain => {
+                self.cluster.set_draining(false);
+                ok_empty()
+            }
             Command::Offer {
                 call_id,
                 from_tag,
@@ -1306,6 +1352,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sessions: self.session_count() as u64,
             },
         }
+    }
+
+    /// Report this engine's live load ([`Command::Load`]) for cluster placement — the live session
+    /// gauges, the transcoding subset, jemalloc live bytes, host CPU (best effort), and drain state,
+    /// all via the shared [`ClusterState`]. Process-wide, not per-client, like `statistics`.
+    fn load_snapshot(&self) -> CmdResult {
+        CmdResult::Load {
+            load: self.cluster.load(
+                self.session_count() as u64,
+                self.transcode_session_count() as u64,
+                crate::metrics::jemalloc_allocated_bytes(),
+            ),
+        }
+    }
+
+    /// Describe this engine's static identity and capabilities ([`Command::NodeInfo`]) so a
+    /// dispatcher routes a call only to a node that can serve it (codecs, features, capacity).
+    fn node_info(&self) -> CmdResult {
+        CmdResult::NodeInfo {
+            node: self
+                .cluster
+                .info(engine_version(), supported_codecs(), supported_features()),
+        }
+    }
+
+    /// Live count of transcoding calls (the media slow path minus promoted relay-only passthroughs) —
+    /// the expensive subset the cluster `load` command reports.
+    #[must_use]
+    pub fn transcode_session_count(&self) -> usize {
+        self.media.transcode_call_count()
     }
 
     /// Drop (`block = true`) or resume (`block = false`) a call's media. A media-processing call
@@ -2420,6 +2496,10 @@ fn command_name(command: &Command) -> &'static str {
         Command::Ping => "ping",
         Command::List => "list",
         Command::Statistics => "statistics",
+        Command::Load => "load",
+        Command::NodeInfo => "node_info",
+        Command::Drain => "drain",
+        Command::Undrain => "undrain",
         Command::PlayMedia { .. } => "play_media",
         Command::StopMedia { .. } => "stop_media",
         Command::PlayDtmf { .. } => "play_dtmf",
@@ -2437,6 +2517,53 @@ fn command_name(command: &Command) -> &'static str {
         Command::ConferenceBridge { .. } => "conference_bridge",
         Command::Authenticate { .. } => "authenticate",
     }
+}
+
+/// This engine's software version (the daemon crate version), advertised in `node_info`.
+fn engine_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// The codec payload names this build can relay or transcode, advertised in `node_info` so a
+/// dispatcher only routes a call to a node that can serve its codec. The always-available set (pure
+/// relay + the bit-exact pure-Rust codecs) plus the AMR family under the `amr` build feature — kept
+/// in step with `factory::encoder_for`.
+fn supported_codecs() -> Vec<String> {
+    let base = [
+        "PCMU",
+        "PCMA",
+        "G722",
+        "G726",
+        "GSM",
+        "CN",
+        "L16",
+        "telephone-event",
+    ];
+    // The AMR family is compiled in only under the `amr` build feature (docs/codec-licensing.md).
+    #[cfg(feature = "amr")]
+    let extra: &[&str] = &["AMR-WB", "AMR"];
+    #[cfg(not(feature = "amr"))]
+    let extra: &[&str] = &[];
+    base.iter()
+        .chain(extra.iter())
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// The capability flags this build ships, advertised in `node_info`.
+fn supported_features() -> Vec<String> {
+    vec![
+        "relay".to_string(),
+        "transcode".to_string(),
+        "srtp".to_string(),
+        "conference".to_string(),
+        "record".to_string(),
+        "websocket".to_string(),
+        "ng".to_string(),
+        "hep".to_string(),
+        "ice".to_string(),
+        "turn".to_string(),
+    ]
 }
 
 fn unknown_call(call_id: &str) -> CmdResult {
@@ -2775,6 +2902,79 @@ mod tests {
     async fn ping_pongs() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         assert_eq!(engine.handle(CLIENT, Command::Ping).await, CmdResult::Pong);
+    }
+
+    #[tokio::test]
+    async fn load_reports_configured_capacity_and_gauges() {
+        let cluster = std::sync::Arc::new(crate::cluster::ClusterState::new(
+            "rtp-test-1".to_string(),
+            4000,
+            vec!["203.0.113.10".to_string()],
+        ));
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_cluster(cluster);
+        let CmdResult::Load { load } = engine.handle(CLIENT, Command::Load).await else {
+            panic!("expected load result");
+        };
+        assert_eq!(load.node_id, "rtp-test-1");
+        assert_eq!(load.max_sessions, 4000);
+        assert_eq!(load.sessions, 0, "no live calls yet");
+        assert_eq!(load.load_permille, 0, "empty node is 0 load");
+        assert_eq!(load.transcode_sessions, 0);
+        assert!(!load.draining);
+    }
+
+    #[tokio::test]
+    async fn node_info_reports_identity_and_capabilities() {
+        let cluster = std::sync::Arc::new(crate::cluster::ClusterState::new(
+            "rtp-test-2".to_string(),
+            1000,
+            vec!["203.0.113.11".to_string()],
+        ));
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_cluster(cluster);
+        let CmdResult::NodeInfo { node } = engine.handle(CLIENT, Command::NodeInfo).await else {
+            panic!("expected node_info result");
+        };
+        assert_eq!(node.node_id, "rtp-test-2");
+        assert_eq!(node.max_sessions, 1000);
+        assert_eq!(node.media_addresses, vec!["203.0.113.11".to_string()]);
+        assert!(
+            node.codecs.iter().any(|codec| codec == "PCMU"),
+            "advertises G.711"
+        );
+        assert!(node.features.iter().any(|feature| feature == "relay"));
+        assert_eq!(node.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn drain_refuses_new_offers_but_keeps_serving_control() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let offer = || Command::Offer {
+            call_id: "drain-call".to_string(),
+            from_tag: "ft".to_string(),
+            sdp: sdp_for(addr, true),
+            profile: ProfileFlags::default(),
+        };
+
+        // Enter drain mode: a new offer is refused with a "draining" reason...
+        assert_eq!(engine.handle(CLIENT, Command::Drain).await, ok_empty());
+        match engine.handle(CLIENT, offer()).await {
+            CmdResult::Error { reason } => assert!(reason.contains("draining"), "{reason}"),
+            other => panic!("expected drain rejection, got {other:?}"),
+        }
+        // ...but liveness and the cluster/census verbs still answer, and `load` shows draining.
+        assert_eq!(engine.handle(CLIENT, Command::Ping).await, CmdResult::Pong);
+        let CmdResult::Load { load } = engine.handle(CLIENT, Command::Load).await else {
+            panic!("load");
+        };
+        assert!(load.draining, "load snapshot reflects drain state");
+
+        // Undrain re-opens admission: the same offer now succeeds.
+        assert_eq!(engine.handle(CLIENT, Command::Undrain).await, ok_empty());
+        assert!(
+            matches!(engine.handle(CLIENT, offer()).await, CmdResult::Ok { .. }),
+            "offer admitted again after undrain"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
