@@ -80,6 +80,23 @@ pub enum Command {
     /// sessions, control errors) — answered with [`CmdResult::Statistics`]. A read-only snapshot of
     /// the operational metrics surface (rtpengine NG `statistics`); process-wide, not per-client.
     Statistics,
+    /// Report this engine's live load for cluster placement — answered with [`CmdResult::Load`]. The
+    /// read-only snapshot a SIP media dispatcher polls to rank a pool of engines: live vs. maximum
+    /// sessions, a normalized load score, the transcoding-call subset, allocator live bytes, host CPU
+    /// (best effort), and whether the node is draining. Process-wide, not per-client.
+    Load,
+    /// Describe this engine's static identity and capabilities — answered with
+    /// [`CmdResult::NodeInfo`]. Lets a dispatcher route a call only to a *capable* node: node id,
+    /// advertised media addresses, supported codecs and features, session capacity, and version. It
+    /// changes rarely, so a dispatcher reads it once and caches it (unlike [`Command::Load`]).
+    NodeInfo,
+    /// Enter drain mode: stop admitting **new** sessions ([`Command::Offer`] / [`Command::ConferenceJoin`]
+    /// are rejected) while every live call runs to completion untouched — the primitive behind a
+    /// zero-downtime rolling upgrade. Idempotent; answered with [`CmdResult::Ok`]. Reversed by
+    /// [`Command::Undrain`].
+    Drain,
+    /// Leave drain mode: resume admitting new sessions. Idempotent; answered with [`CmdResult::Ok`].
+    Undrain,
     /// Inject an audio prompt into a leg.
     PlayMedia {
         call_id: String,
@@ -320,6 +337,10 @@ pub enum CmdResult {
     List { call_ids: Vec<String> },
     /// Answer to [`Command::Statistics`]: the engine's global process counters.
     Statistics { statistics: EngineStatistics },
+    /// Answer to [`Command::Load`]: this engine's live load snapshot for cluster placement.
+    Load { load: NodeLoad },
+    /// Answer to [`Command::NodeInfo`]: this engine's static identity and capabilities.
+    NodeInfo { node: NodeInfo },
     /// Failure with a human-readable reason.
     Error { reason: String },
 }
@@ -339,6 +360,56 @@ pub struct EngineStatistics {
     pub control_errors_total: u64,
     /// Live calls currently in the session registry (a gauge, not a running total).
     pub sessions: u64,
+}
+
+/// This engine's live load, returned by [`Command::Load`] — the cluster-placement view a SIP media
+/// dispatcher polls to pick the least-loaded node capable of a call. Every figure is an integer, so
+/// the payload compares exactly across the wire (no float ambiguity in a dispatcher's ranking).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLoad {
+    /// Stable identifier for this engine instance (config `node_id`).
+    pub node_id: String,
+    /// Live calls currently in the session registry (a gauge).
+    pub sessions: u64,
+    /// Configured maximum concurrent sessions; `0` means "unlimited / not advertised".
+    pub max_sessions: u64,
+    /// Normalized load in per-mille (0..=1000), where 1000 means at or over capacity. A dispatcher
+    /// ranks nodes by this single figure; it folds session utilization with host CPU (when known),
+    /// taking whichever is higher — the tighter of the two constraints.
+    pub load_permille: u16,
+    /// The subset of live sessions that are transcoding — the expensive calls, distinct from plain
+    /// relay — so a dispatcher can weight a node's real cost, not just its raw call count.
+    pub transcode_sessions: u64,
+    /// Host CPU utilization in per-mille (0..=1000), best effort; `None` when unavailable (no sampler
+    /// running yet, or a platform without `/proc/stat`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_permille: Option<u16>,
+    /// Live bytes allocated (jemalloc `stats.allocated`); `0` when the allocator surface is
+    /// unavailable. A steady climb at flat session count signals a leak (see the memory-leak gate).
+    pub jemalloc_allocated_bytes: u64,
+    /// Whether this node is draining (rejecting new sessions); skip a draining node for placement
+    /// even at low load.
+    pub draining: bool,
+}
+
+/// This engine's static identity and capabilities, returned by [`Command::NodeInfo`]. A dispatcher
+/// reads it once (it rarely changes) to route a call only to a node that can actually serve it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeInfo {
+    /// Stable identifier for this engine instance (config `node_id`).
+    pub node_id: String,
+    /// Engine software version (the daemon crate version).
+    pub version: String,
+    /// Media addresses this engine advertises for relayed RTP — the reachable IPs a peer sends to.
+    pub media_addresses: Vec<String>,
+    /// Codecs this build can relay/transcode (RTP payload names, e.g. `PCMU`, `AMR-WB`).
+    pub codecs: Vec<String>,
+    /// Capability flags this build ships (e.g. `relay`, `transcode`, `srtp`, `conference`).
+    pub features: Vec<String>,
+    /// Configured maximum concurrent sessions; `0` means "unlimited / not advertised".
+    pub max_sessions: u64,
+    /// Whether this node is currently draining.
+    pub draining: bool,
 }
 
 /// Session statistics returned by [`Command::Query`].
@@ -548,6 +619,10 @@ mod tests {
             Command::Ping,
             Command::List,
             Command::Statistics,
+            Command::Load,
+            Command::NodeInfo,
+            Command::Drain,
+            Command::Undrain,
             Command::PlayMedia {
                 call_id: "c".into(),
                 from_tag: "f".into(),
@@ -699,6 +774,51 @@ mod tests {
             },
         });
         roundtrip(&Response {
+            id: 8,
+            result: CmdResult::Load {
+                load: NodeLoad {
+                    node_id: "rtp-node-1".into(),
+                    sessions: 812,
+                    max_sessions: 4000,
+                    load_permille: 203,
+                    transcode_sessions: 140,
+                    cpu_permille: Some(247),
+                    jemalloc_allocated_bytes: 734_003_200,
+                    draining: false,
+                },
+            },
+        });
+        // A load snapshot with no CPU sample omits `cpu_permille` on the wire and round-trips.
+        roundtrip(&Response {
+            id: 9,
+            result: CmdResult::Load {
+                load: NodeLoad {
+                    node_id: "rtp-node-2".into(),
+                    sessions: 0,
+                    max_sessions: 0,
+                    load_permille: 0,
+                    transcode_sessions: 0,
+                    cpu_permille: None,
+                    jemalloc_allocated_bytes: 0,
+                    draining: true,
+                },
+            },
+        });
+        roundtrip(&Response {
+            id: 10,
+            result: CmdResult::NodeInfo {
+                node: NodeInfo {
+                    node_id: "rtp-node-1".into(),
+                    version: "0.1.0".into(),
+                    media_addresses: vec!["203.0.113.10".into(), "2001:db8::10".into()],
+                    codecs: vec!["PCMU".into(), "PCMA".into(), "AMR-WB".into()],
+                    features: vec!["relay".into(), "transcode".into(), "srtp".into()],
+                    max_sessions: 4000,
+                    draining: false,
+                },
+            },
+        });
+        roundtrip(&Response {
             id: 4,
             result: CmdResult::Ok {
                 sdp: None,
@@ -768,6 +888,88 @@ mod tests {
         assert_eq!(stats_result["statistics"]["sessions"], 1);
         // A field left at its default still serializes (no skip on the counters).
         assert_eq!(stats_result["statistics"]["answers_total"], 0);
+    }
+
+    #[test]
+    fn cluster_commands_wire_shape() {
+        // The cluster verbs are bare, internally-tagged on "command" in snake_case.
+        for (command, tag) in [
+            (Command::Load, "load"),
+            (Command::NodeInfo, "node_info"),
+            (Command::Drain, "drain"),
+            (Command::Undrain, "undrain"),
+        ] {
+            let value = serde_json::to_value(&Request {
+                id: 1,
+                command: command.clone(),
+            })
+            .expect("to_value");
+            assert_eq!(value["command"], tag, "{command:?} serializes as {tag}");
+            let json = format!(r#"{{"command":"{tag}"}}"#);
+            assert_eq!(
+                serde_json::from_str::<Command>(&json).expect("deserialize bare verb"),
+                command,
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_results_wire_shape() {
+        // `load` tags on "result":"load" and nests the snapshot under "load"; a present CPU sample is
+        // carried and an absent one is omitted (skip_serializing_if).
+        let load = serde_json::to_value(&Response {
+            id: 1,
+            result: CmdResult::Load {
+                load: NodeLoad {
+                    node_id: "rtp-node-1".into(),
+                    sessions: 812,
+                    max_sessions: 4000,
+                    load_permille: 203,
+                    transcode_sessions: 140,
+                    cpu_permille: Some(247),
+                    jemalloc_allocated_bytes: 734_003_200,
+                    draining: false,
+                },
+            },
+        })
+        .expect("to_value");
+        assert_eq!(load["result"], "load");
+        assert_eq!(load["load"]["node_id"], "rtp-node-1");
+        assert_eq!(load["load"]["load_permille"], 203);
+        assert_eq!(load["load"]["cpu_permille"], 247);
+        assert_eq!(load["load"]["draining"], false);
+
+        let no_cpu = serde_json::to_value(&CmdResult::Load {
+            load: NodeLoad {
+                cpu_permille: None,
+                ..Default::default()
+            },
+        })
+        .expect("to_value");
+        assert!(
+            no_cpu["load"].get("cpu_permille").is_none(),
+            "cpu_permille omitted when unsampled"
+        );
+
+        // `node_info` tags on "result":"node_info" and nests under "node".
+        let info = serde_json::to_value(&Response {
+            id: 2,
+            result: CmdResult::NodeInfo {
+                node: NodeInfo {
+                    node_id: "rtp-node-1".into(),
+                    version: "0.1.0".into(),
+                    media_addresses: vec!["203.0.113.10".into()],
+                    codecs: vec!["PCMU".into(), "AMR-WB".into()],
+                    features: vec!["relay".into(), "srtp".into()],
+                    max_sessions: 4000,
+                    draining: false,
+                },
+            },
+        })
+        .expect("to_value");
+        assert_eq!(info["result"], "node_info");
+        assert_eq!(info["node"]["codecs"][1], "AMR-WB");
+        assert_eq!(info["node"]["max_sessions"], 4000);
     }
 
     #[test]

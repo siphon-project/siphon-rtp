@@ -291,7 +291,7 @@ fn http_response(status_line: &str, content_type: &str, body: &str) -> String {
 /// Returns 0 if the allocator stats are unavailable (a non-jemalloc target / read failure) so the
 /// metrics endpoint never fails on a best-effort gauge.
 #[cfg(not(target_env = "msvc"))]
-fn jemalloc_allocated_bytes() -> u64 {
+pub(crate) fn jemalloc_allocated_bytes() -> u64 {
     if tikv_jemalloc_ctl::epoch::advance().is_err() {
         return 0;
     }
@@ -301,7 +301,7 @@ fn jemalloc_allocated_bytes() -> u64 {
 }
 
 #[cfg(target_env = "msvc")]
-fn jemalloc_allocated_bytes() -> u64 {
+pub(crate) fn jemalloc_allocated_bytes() -> u64 {
     0
 }
 

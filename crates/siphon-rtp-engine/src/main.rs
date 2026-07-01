@@ -18,7 +18,7 @@ use config::{resolve_defaulted, resolve_optional, FileConfig};
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::{Datapath, RxPacket};
 use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher;
-use siphon_rtp_engine::{metrics, server, shutdown, ClientId, Engine};
+use siphon_rtp_engine::{cluster, metrics, server, shutdown, ClientId, Engine};
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_turn::{tls, NoFastPath, SystemUnixClock, Turn, TurnConfig};
 use tokio::net::{TcpListener, UdpSocket};
@@ -94,6 +94,17 @@ struct Args {
     /// the live session count to reach 0.
     #[arg(long, default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS)]
     shutdown_grace_secs: u64,
+
+    /// Stable cluster node identifier reported by the `load` / `node_info` control commands so a SIP
+    /// dispatcher can tell engines apart. Defaults to the host's `HOSTNAME` (else `siphon-rtp`).
+    #[arg(long)]
+    node_id: Option<String>,
+
+    /// Advertised maximum concurrent sessions for cluster load reporting (`0` = unlimited). Drives
+    /// the normalized load score a dispatcher ranks nodes by; it does not itself cap admission (the
+    /// per-client quota and the datapath port pool do that).
+    #[arg(long, default_value_t = DEFAULT_MAX_SESSIONS)]
+    max_sessions: u64,
 }
 
 /// The daemon's runtime configuration after merging the CLI with the optional `--config` file.
@@ -118,6 +129,10 @@ struct Resolved {
     /// Only carried through for the log filter: the file may set it, but the process environment
     /// (`RUST_LOG` / the default-env filter) always wins, so it is applied before anything is logged.
     log_filter: Option<String>,
+    /// Cluster node id (`load` / `node_info`); `None` here means "fall back to `HOSTNAME`" at build.
+    node_id: Option<String>,
+    /// Advertised maximum concurrent sessions for cluster load reporting (`0` = unlimited).
+    max_sessions: u64,
 }
 
 impl Resolved {
@@ -164,6 +179,13 @@ impl Resolved {
             turn_tls_key: resolve_optional(args.turn_tls_key, file.turn_tls_key),
             turn_relay_ip: resolve_optional(args.turn_relay_ip, file.turn_relay_ip),
             log_filter: file.log_filter,
+            node_id: resolve_optional(args.node_id, file.node_id),
+            max_sessions: resolve_defaulted(
+                args.max_sessions,
+                explicit("max_sessions"),
+                file.max_sessions,
+                DEFAULT_MAX_SESSIONS,
+            ),
         }
     }
 }
@@ -172,6 +194,19 @@ impl Resolved {
 /// fallback can never drift). Parsing a compile-time-constant literal that is always valid.
 fn default_control() -> SocketAddr {
     SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 8080))
+}
+
+/// Built-in default for `--max-sessions` (mirrors the clap `default_value_t`). `0` = unlimited: the
+/// node advertises no session cap and its load score is driven by CPU alone until one is configured.
+const DEFAULT_MAX_SESSIONS: u64 = 0;
+
+/// Default cluster node id when neither `--node-id` nor the config file set one: the host's
+/// `HOSTNAME` environment variable if present and non-empty, otherwise the literal `siphon-rtp`.
+fn default_node_id() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "siphon-rtp".to_string())
 }
 
 /// Built-in default for `--media-timeout-secs` (mirrors the clap `default_value_t`).
@@ -226,7 +261,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(ip) => UdpLoopbackDatapath::with_bind_ip(ip),
         None => UdpLoopbackDatapath::new(),
     };
-    let engine = Arc::new(Engine::new(datapath.clone()));
+
+    // Cluster state for the `load` / `node_info` / `drain` control commands. The node id falls back
+    // to the host's `HOSTNAME` (else `siphon-rtp`); the advertised media address is the routable
+    // relay bind IP (skipping a `0.0.0.0` wildcard, which is not a reachable address to hand a peer).
+    let node_id = config.node_id.clone().unwrap_or_else(default_node_id);
+    let media_addresses = config
+        .relay_bind_ip
+        .filter(|ip| !ip.is_unspecified())
+        .map(|ip| vec![ip.to_string()])
+        .unwrap_or_default();
+    let cluster = Arc::new(cluster::ClusterState::new(
+        node_id.clone(),
+        config.max_sessions,
+        media_addresses,
+    ));
+    tracing::info!(
+        node_id = %node_id,
+        max_sessions = config.max_sessions,
+        "cluster node identity registered"
+    );
+    let engine = Arc::new(Engine::new(datapath.clone()).with_cluster(cluster.clone()));
+
+    // Best-effort host-CPU sampler feeding the `load` command's load score (~1 Hz, off-reactor).
+    cluster::spawn_cpu_sampler(cluster, cluster::DEFAULT_CPU_SAMPLE_INTERVAL);
 
     let listener = TcpListener::bind(config.control).await?;
     tracing::info!(control = %config.control, "siphon-rtp-engine control server listening");

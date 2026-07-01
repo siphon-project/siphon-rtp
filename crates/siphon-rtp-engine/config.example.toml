@@ -40,6 +40,21 @@ control = "127.0.0.1:8080"
 # Default: 30.
 # media_timeout_secs = 30
 
+# --- Clustering ---------------------------------------------------------------------------------
+#
+# siphon-rtp scales horizontally behind the SIP control layer: the SIP proxy (SIPhon / Kamailio) is
+# the media dispatcher, and each engine exposes its load + capabilities over the control protocol
+# (the `load`, `node_info`, `drain` and `undrain` commands).
+
+# Stable node identifier a dispatcher uses to tell engines apart, reported by `load` / `node_info`
+# (CLI: --node-id). Defaults to the host's HOSTNAME (else "siphon-rtp") when unset.
+# node_id = "rtp-ams-3"
+
+# Advertised maximum concurrent sessions for cluster load reporting; 0 = unlimited (CLI:
+# --max-sessions). Drives the normalized load score a dispatcher ranks nodes by. It does NOT cap
+# admission itself — the per-client quota and the datapath port pool do that.
+# max_sessions = 4000
+
 # Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting
 # (CLI: --shutdown-grace-secs). Default: 25.
 # shutdown_grace_secs = 25

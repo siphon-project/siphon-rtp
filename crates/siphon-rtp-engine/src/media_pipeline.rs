@@ -1109,6 +1109,17 @@ impl MediaRegistry {
             .is_some_and(|handle| !handle.relay_only)
     }
 
+    /// Count of live **transcoding** media calls (excludes promoted relay-only passthrough calls) —
+    /// the expensive, decode/re-encode subset the cluster `load` command reports so a dispatcher can
+    /// weight a node's real cost above its raw call count.
+    #[must_use]
+    pub fn transcode_call_count(&self) -> usize {
+        self.calls
+            .iter()
+            .filter(|entry| !entry.value().relay_only)
+            .count()
+    }
+
     /// Whether `call_id` is a promoted relay-only call (a passthrough leg taken to userspace for a
     /// SIPREC raw tee). Used to decide whether `unsubscribe` should demote it back to in-kernel
     /// `Forward` once its last subscription is gone.
