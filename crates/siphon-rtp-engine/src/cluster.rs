@@ -62,6 +62,13 @@ impl ClusterState {
         self.draining.load(Ordering::Relaxed)
     }
 
+    /// Advertised maximum concurrent sessions; `0` = unlimited. Read by the `/metrics` surface for the
+    /// `siphon_rtp_max_sessions` gauge and the load-score computation.
+    #[must_use]
+    pub fn max_sessions(&self) -> u64 {
+        self.max_sessions
+    }
+
     /// Enter (`true`) or leave (`false`) drain mode. Idempotent.
     pub fn set_draining(&self, draining: bool) {
         self.draining.store(draining, Ordering::Relaxed);

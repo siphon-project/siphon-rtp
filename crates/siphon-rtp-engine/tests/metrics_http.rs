@@ -103,10 +103,23 @@ async fn metrics_and_health_endpoint_over_tcp() {
     let gauge_engine = engine.clone();
     let live = move || {
         let conference = gauge_engine.conference();
+        let cluster = gauge_engine.cluster();
+        let sessions = gauge_engine.session_count() as u64;
+        let max_sessions = cluster.max_sessions();
+        let cpu_permille = cluster.cpu_permille();
         metrics::LiveGauges {
-            sessions: gauge_engine.session_count() as u64,
+            sessions,
             conference_rooms: conference.room_count() as u64,
             conference_participants: conference.participant_count() as u64,
+            max_sessions,
+            transcode_sessions: gauge_engine.transcode_session_count() as u64,
+            load_permille: siphon_rtp_engine::cluster::load_permille(
+                sessions,
+                max_sessions,
+                cpu_permille,
+            ),
+            cpu_permille,
+            draining: cluster.is_draining(),
         }
     };
     tokio::spawn(metrics::serve_metrics(listener, engine.metrics(), live));
@@ -149,8 +162,25 @@ async fn metrics_and_health_endpoint_over_tcp() {
         metrics_response.contains("siphon_rtp_jemalloc_allocated_bytes "),
         "jemalloc gauge present"
     );
+    // Cluster placement gauges: default node is unlimited (0), not draining, CPU unsampled (omitted).
+    assert!(
+        metrics_response.contains("siphon_rtp_max_sessions 0\n"),
+        "max_sessions gauge (0 = unlimited)"
+    );
+    assert!(
+        metrics_response.contains("siphon_rtp_load_permille 0\n"),
+        "load gauge present"
+    );
+    assert!(
+        metrics_response.contains("siphon_rtp_draining 0\n"),
+        "draining gauge reads 0 while serving"
+    );
+    assert!(
+        !metrics_response.contains("siphon_rtp_cpu_permille"),
+        "cpu gauge omitted until sampled"
+    );
 
-    // GET /healthz and /readyz — 200 OK liveness/readiness.
+    // GET /healthz and /readyz — 200 OK liveness/readiness while serving.
     let healthz = http_get(addr, "/healthz").await;
     assert!(healthz.starts_with("HTTP/1.1 200 OK\r\n"), "healthz 200");
     let readyz = http_get(addr, "/readyz").await;
@@ -161,5 +191,28 @@ async fn metrics_and_health_endpoint_over_tcp() {
     assert!(
         not_found.starts_with("HTTP/1.1 404 Not Found\r\n"),
         "unknown path 404"
+    );
+
+    // Drain the node: /readyz flips to 503 (so an orchestrator stops routing new calls) while
+    // /healthz stays 200 (the process is still alive), and the drain gauge reads 1.
+    engine.cluster().set_draining(true);
+    let readyz_draining = http_get(addr, "/readyz").await;
+    assert!(
+        readyz_draining.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+        "readyz 503 while draining"
+    );
+    assert!(
+        readyz_draining.contains("draining\n"),
+        "readyz body says draining"
+    );
+    let healthz_draining = http_get(addr, "/healthz").await;
+    assert!(
+        healthz_draining.starts_with("HTTP/1.1 200 OK\r\n"),
+        "healthz stays 200 while draining"
+    );
+    let metrics_draining = http_get(addr, "/metrics").await;
+    assert!(
+        metrics_draining.contains("siphon_rtp_draining 1\n"),
+        "drain gauge reads 1"
     );
 }
