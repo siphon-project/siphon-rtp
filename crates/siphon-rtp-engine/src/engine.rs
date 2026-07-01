@@ -571,6 +571,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if !codec_strip.is_empty() || !codec_add.is_empty() {
             rewritten.sdp = sdp::rewrite_codec_list(&rewritten.sdp, &codec_strip, &codec_add);
         }
+        // rtpengine `replace: [origin]`: rewrite the o= line to the engine's address (topology hiding).
+        if profile.replace.iter().any(|field| field == "origin") {
+            rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.rtp.ip());
+        }
 
         // WebSocket bridge (mod_audio_stream / voice-AI): a native siphon-rtp extension. When the
         // profile carries `ws_uri`, leg A (the offerer) is bridged to that WS server using A's
@@ -824,7 +828,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The answer to A advertises the near leg; on an SRTP bridge that side is plain (RTP/AVP), so
         // force AVP and strip crypto. A plain relay leaves transport/crypto untouched.
         let security = far_local_crypto.map(|_| SecurityAdvertisement::Plain);
-        let rewritten = match sdp::rewrite(sdp, engine, advert, security) {
+        let mut rewritten = match sdp::rewrite(sdp, engine, advert, security) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 return CmdResult::Error {
@@ -832,6 +836,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         };
+        // rtpengine `replace: [origin]`: rewrite the o= line to the engine's address (topology hiding).
+        if profile.replace.iter().any(|field| field == "origin") {
+            rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.rtp.ip());
+        }
 
         // WebSocket bridge: if this call is (or is now being) bridged to a WS media server, leg A's
         // audio is already (or now) pumped to the WS — the A↔B relay/transcode path is deliberately
@@ -2617,6 +2625,45 @@ mod tests {
         assert!(
             sdp.contains("a=rtpmap:9 G722/8000"),
             "G722 rtpmap added: {sdp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offer_replace_origin_rewrites_the_o_line_to_the_engine_address() {
+        // rtpengine `replace: [origin]`: the o= unicast-address is rewritten to the engine's (topology
+        // hiding). The offer's o= carries a distinct 10.0.0.7 so the loopback engine address differs.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let offer_sdp = format!(
+            "v=0\r\no=alice 1 1 IN IP4 10.0.0.7\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+            ip = addr.ip(),
+            port = addr.port()
+        );
+        let profile = ProfileFlags {
+            replace: vec!["origin".into()],
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ro".into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile,
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&offer);
+        let o_line = sdp.lines().find(|l| l.starts_with("o=")).expect("o= line");
+        assert!(
+            !o_line.contains("10.0.0.7"),
+            "the caller's origin IP is hidden: {o_line}"
+        );
+        assert!(
+            o_line.contains(&addr.ip().to_string()),
+            "o= now carries the engine's advertised (loopback) address: {o_line}"
         );
     }
 
