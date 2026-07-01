@@ -690,6 +690,43 @@ pub fn rewrite_codec_list(sdp: &str, strip: &[String], add: &[CodecSpec]) -> Str
     rewritten
 }
 
+/// Rewrite the session origin (`o=`) unicast-address to the engine's advertised `address`, honouring
+/// rtpengine's `replace: [origin]` so the far side never sees the originator's real IP (topology
+/// hiding). Replaces the `<addrtype> <unicast-address>` fields (matching `address`'s family) and
+/// keeps the username / session-id / session-version. Best-effort: returns the SDP unchanged if it
+/// has no well-formed 6-field `o=` line (RFC 4566 §5.2).
+#[must_use]
+pub fn rewrite_origin(sdp: &str, address: IpAddr) -> String {
+    let mut changed = false;
+    let lines: Vec<String> = sdp
+        .split('\n')
+        .map(|line| {
+            let stripped = line.trim_end_matches('\r');
+            if let Some(body) = stripped.strip_prefix("o=") {
+                let fields: Vec<&str> = body.split(' ').collect();
+                // o=<username> <sess-id> <sess-version> <nettype> <addrtype> <unicast-address>
+                if fields.len() == 6 {
+                    changed = true;
+                    return format!(
+                        "o={} {} {} IN {} {}",
+                        fields[0],
+                        fields[1],
+                        fields[2],
+                        addrtype(address),
+                        address
+                    );
+                }
+            }
+            stripped.to_string()
+        })
+        .collect();
+    if changed {
+        lines.join(CRLF)
+    } else {
+        sdp.to_string()
+    }
+}
+
 /// Replace the port (2nd field) of an `m=audio <port> <proto> <fmt...>` line and, when `transport`
 /// is `Some`, the transport profile (3rd field), preserving the media type and format list.
 fn rewrite_media_line(line: &str, port: u16, transport: Option<&str>) -> String {
@@ -1295,5 +1332,37 @@ mod tests {
             sdp,
             "stripping an absent codec → identity"
         );
+    }
+
+    #[test]
+    fn origin_is_rewritten_to_the_engine_address() {
+        let sdp = "v=0\r\no=alice 2890 2890 IN IP4 10.0.0.7\r\ns=-\r\n\
+                   c=IN IP4 10.0.0.7\r\nt=0 0\r\nm=audio 5004 RTP/AVP 0\r\n";
+        let engine_ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let out = rewrite_origin(sdp, engine_ip);
+        assert!(
+            out.contains("o=alice 2890 2890 IN IP4 203.0.113.5"),
+            "o= unicast-address rewritten (session-id/version kept): {out}"
+        );
+        assert!(
+            out.contains("c=IN IP4 10.0.0.7"),
+            "c= is left to rewrite() — rewrite_origin only touches o="
+        );
+    }
+
+    #[test]
+    fn origin_rewrite_switches_addrtype_for_an_ipv6_engine() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 10.0.0.7\r\ns=-\r\nt=0 0\r\n";
+        let out = rewrite_origin(sdp, "2001:db8::1".parse().unwrap());
+        assert!(
+            out.contains("o=- 1 1 IN IP6 2001:db8::1"),
+            "addrtype switched to IP6 for a v6 engine: {out}"
+        );
+    }
+
+    #[test]
+    fn origin_rewrite_is_a_noop_without_a_wellformed_o_line() {
+        let sdp = "v=0\r\ns=-\r\nt=0 0\r\n";
+        assert_eq!(rewrite_origin(sdp, "203.0.113.5".parse().unwrap()), sdp);
     }
 }
