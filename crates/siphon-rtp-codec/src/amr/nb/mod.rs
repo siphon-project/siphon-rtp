@@ -12,6 +12,8 @@ pub mod codebook;
 pub mod constants;
 pub mod dec_main;
 pub mod enc_lpc;
+pub mod enc_lsp;
+pub mod enc_main;
 pub mod enc_tables;
 pub mod filters;
 mod gain_tables;
