@@ -506,24 +506,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None
         };
 
-        // Two RTP endpoints, plus two companion RTCP endpoints unless the stream is muxed. Bind the
-        // engine endpoints in the address family of the offer's signalled `c=` line (RFC 4566 §5.7),
-        // so a `c=IN IP6` offer is relayed on v6 engine ports (and advertised back as `c=IN IP6`).
-        // A mixed-family call (A v4 ↔ B v6) is IPv4↔IPv6 interworking — a separate roadmap item; here
-        // both legs share the offer family, which covers the IPv6-only-network VoLTE case.
-        let family = AddressFamily::of(info.remote_rtp.ip());
-        let count = if info.rtcp_mux { 2 } else { 4 };
-        let endpoints = match self.alloc_endpoints(count, family).await {
+        // One RTP endpoint per leg, plus a companion RTCP endpoint unless the stream is muxed. The
+        // *near* leg binds the family of the offer's signalled `c=` line (RFC 4566 §5.7). The *far*
+        // leg binds the same family by default, or the `address family` flag's family for IPv4↔IPv6
+        // interworking (a v6 VoLTE access leg bridged to a v4 PSTN core) — the engine anchors media,
+        // so a v6 near socket and a v4 far socket relay/transcode through it, and each leg's SDP is
+        // rewritten in its own family (`rewrite` emits the endpoint's addrtype).
+        let near_family = AddressFamily::of(info.remote_rtp.ip());
+        let far_family = far_address_family(profile).unwrap_or(near_family);
+        let per_leg = if info.rtcp_mux { 1 } else { 2 };
+        let near_endpoints = match self.alloc_endpoints(per_leg, near_family).await {
             Ok(endpoints) => endpoints,
             Err(reason) => return CmdResult::Error { reason },
         };
-        let near_rtp = endpoints[0];
-        let far_rtp = endpoints[1];
+        let far_endpoints = match self.alloc_endpoints(per_leg, far_family).await {
+            Ok(endpoints) => endpoints,
+            Err(reason) => {
+                self.free(&near_endpoints).await;
+                return CmdResult::Error { reason };
+            }
+        };
+        let near_rtp = near_endpoints[0];
+        let far_rtp = far_endpoints[0];
         let (near_rtcp, far_rtcp) = if info.rtcp_mux {
             (None, None)
         } else {
-            (Some(endpoints[2]), Some(endpoints[3]))
+            (Some(near_endpoints[1]), Some(far_endpoints[1]))
         };
+        // Combined list for teardown on any later error path in this offer.
+        let endpoints: Vec<_> = near_endpoints
+            .iter()
+            .chain(far_endpoints.iter())
+            .copied()
+            .collect();
 
         // The rewritten offer is delivered to B, so it advertises the `far` leg.
         let engine = EngineMedia {
@@ -2244,6 +2259,16 @@ fn transcode_codec_spec(name: &str) -> Option<CodecSpec> {
     Some(CodecSpec::new(payload_type, &upper, clock_rate_hz, 1, 20))
 }
 
+/// The far-leg engine endpoint address family requested by the rtpengine `address family` flag
+/// (`IP4`/`IP6`), for IPv4↔IPv6 interworking. `None` when unset (the far leg follows the offer).
+fn far_address_family(profile: &ProfileFlags) -> Option<AddressFamily> {
+    match profile.address_family.as_deref()?.trim() {
+        family if family.eq_ignore_ascii_case("IP6") => Some(AddressFamily::V6),
+        family if family.eq_ignore_ascii_case("IP4") => Some(AddressFamily::V4),
+        _ => None,
+    }
+}
+
 /// Decide how a call's media is carried once answered: an SRTP bridge (secure far leg), the
 /// userspace media slow path (transcode requested or recording on), or the in-datapath plain relay.
 fn resolve_pipeline(
@@ -2664,6 +2689,56 @@ mod tests {
         assert!(
             o_line.contains(&addr.ip().to_string()),
             "o= now carries the engine's advertised (loopback) address: {o_line}"
+        );
+    }
+
+    #[test]
+    fn far_address_family_parses_the_flag() {
+        let with = |value: &str| ProfileFlags {
+            address_family: Some(value.into()),
+            ..Default::default()
+        };
+        assert_eq!(far_address_family(&with("IP6")), Some(AddressFamily::V6));
+        assert_eq!(far_address_family(&with("ip4")), Some(AddressFamily::V4));
+        assert_eq!(far_address_family(&with(" IP6 ")), Some(AddressFamily::V6));
+        assert_eq!(
+            far_address_family(&with("IP9")),
+            None,
+            "unknown family ignored"
+        );
+        assert_eq!(far_address_family(&ProfileFlags::default()), None);
+    }
+
+    #[tokio::test]
+    async fn offer_address_family_ip4_puts_the_far_leg_on_ipv4_for_a_v6_offer() {
+        // IPv4↔IPv6 interworking: a v6 (VoLTE) offer with `address family = IP4` (PSTN core) allocates
+        // the far leg on IPv4, advertised to B as `c=IN IP4`, while the near leg stays v6.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let offer_sdp = "v=0\r\no=- 1 1 IN IP6 ::1\r\ns=-\r\nc=IN IP6 ::1\r\nt=0 0\r\n\
+                         m=audio 6000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n";
+        let profile = ProfileFlags {
+            address_family: Some("IP4".into()),
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "xfam".into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp.into(),
+                    profile,
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&offer);
+        let c_line = sdp
+            .lines()
+            .find(|l| l.starts_with("c="))
+            .expect("c= line in the far-facing offer");
+        assert!(
+            c_line.contains("IN IP4 127.0.0.1"),
+            "the far (PSTN) leg is advertised on IPv4: {c_line}"
         );
     }
 

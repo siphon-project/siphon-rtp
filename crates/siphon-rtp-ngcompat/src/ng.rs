@@ -257,6 +257,9 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         ice: optional_str(request, "ICE"),
         dtls: optional_str(request, "DTLS"),
         replace: string_list(request, "replace"),
+        // rtpengine spells it `address family`; accept the hyphenated form too.
+        address_family: optional_str(request, "address family")
+            .or_else(|| optional_str(request, "address-family")),
         flags,
         direction: string_list(request, "direction"),
         record_call: is_yes(request, "record call") || is_yes(request, "record-call"),

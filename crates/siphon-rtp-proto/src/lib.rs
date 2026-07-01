@@ -255,6 +255,11 @@ pub struct ProfileFlags {
     /// SDP fields to rewrite (e.g. `["origin"]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replace: Vec<String>,
+    /// Address family for the **far** (outbound) leg's engine endpoints (`"IP4"` | `"IP6"`), for
+    /// IPv4↔IPv6 interworking — e.g. a v6 VoLTE access leg bridged to a v4 PSTN core. When unset the
+    /// far leg uses the offer's family (single-family relay). The near leg always follows the offerer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_family: Option<String>,
     /// Behavioral flags (e.g. `trust-address`, `symmetric`, `port-latching`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<String>,
