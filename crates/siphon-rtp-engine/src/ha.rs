@@ -9,7 +9,7 @@
 //! ICE-lite and SDES keying, and the installed forward rules (source-gate + latch + destination).
 //!
 //! It deliberately excludes:
-//! - **node-local handles** — sockets, task mailboxes, datapath [`EndpointId`]s (re-allocated on
+//! - **node-local handles** — sockets, task mailboxes, datapath `EndpointId`s (re-allocated on
 //!   restore; endpoints are referenced here by *role*, not id);
 //! - **ephemeral media state** — jitter buffers, codec/resampler state, the learned latch — which
 //!   restart fresh with at most a brief glitch;
@@ -146,7 +146,7 @@ pub struct CodecSnapshot {
 }
 
 /// Which of a call's four possible endpoints a rule refers to — the node-independent stand-in for a
-/// datapath [`EndpointId`], since the ids are re-allocated on restore.
+/// datapath `EndpointId`, since the ids are re-allocated on restore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointRole {
