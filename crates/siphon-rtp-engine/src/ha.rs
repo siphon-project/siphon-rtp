@@ -13,8 +13,9 @@
 //!   restore; endpoints are referenced here by *role*, not id);
 //! - **ephemeral media state** — jitter buffers, codec/resampler state, the learned latch — which
 //!   restart fresh with at most a brief glitch;
-//! - **SRTP rollover** for secure legs is a schema field ([`CallSnapshot::srtp_rollover`]) populated
-//!   by the SRTP bridge alongside `restore`'s seeding (both halves of that plumbing land together).
+//! - a secure (`Srtp`-pipeline) call additionally carries a [`SecureSnapshot`]
+//!   ([`CallSnapshot::secure`]) — the peer's SDES key, the leg's SRTP rollover, and the bridge flows —
+//!   so a standby can rebuild and re-key the [`SecureLeg`](siphon_rtp_srtp::leg::SecureLeg) bridge.
 //!
 //! The blob is **opaque to the SIP proxy**: it stores the JSON verbatim (keyed by `call_id`) and
 //! hands it back to `restore`. The engine owns the format; [`SNAPSHOT_VERSION`] guards against a
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 /// Snapshot wire-format version. Bumped on any breaking change to [`CallSnapshot`]; a standby rejects
 /// a blob whose version it does not understand.
-pub const SNAPSHOT_VERSION: u16 = 1;
+pub const SNAPSHOT_VERSION: u16 = 2;
 
 /// A portable snapshot of one live call's negotiated state (see the module docs). All fields are
 /// plain data (strings / integers / enums / `std::net` addresses), so the whole thing round-trips
@@ -68,10 +69,10 @@ pub struct CallSnapshot {
     /// whose media runs through a userspace actor (their flows are `Redirect`, rebuilt differently).
     #[serde(default)]
     pub flows: Vec<FlowSnapshot>,
-    /// Per-secure-leg SRTP rollover state (RFC 3711). Empty for a plain relay; populated for secure
-    /// legs by the SRTP bridge (lands with `restore`'s seeding — see the module docs).
-    #[serde(default)]
-    pub srtp_rollover: Vec<SrtpRolloverSnapshot>,
+    /// The secure (SDES-SRTP bridge) state — the peer's key, the leg's SRTP rollover, and the bridge
+    /// flow plans — present only for an `Srtp` pipeline. `None` for a plain relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure: Option<SecureSnapshot>,
 }
 
 /// One side of the call: the engine's local media sockets (the exact ports to re-bind on a standby)
@@ -202,32 +203,68 @@ pub enum LatchSnapshot {
     Symmetric,
 }
 
-/// A secure leg's SRTP rollover checkpoint (RFC 3711 §3.3.1 ROC + §3.4 SRTCP index) — the state that
-/// cannot be recovered from the SDES key. Mirrors `siphon_rtp_srtp::StreamRollover` plus the SRTCP
-/// index and a direction tag.
+/// The secure (SDES-SRTP bridge) state a standby needs to rebuild an `Srtp` call: the peer's SDES key
+/// (the engine's own is [`CallSnapshot::far_local_crypto`]), the leg's SRTP rollover, and the bridge
+/// flow plans. Present only for a secure call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecureSnapshot {
+    /// The peer's answered SDES key (keys the inbound/decrypt contexts on rebuild).
+    pub far_remote_crypto: CryptoSnapshot,
+    /// The secure leg's non-recoverable SRTP rollover (RFC 3711 §3.3.1 / §3.4).
+    pub rollover: SecureLegRolloverSnapshot,
+    /// The bridge flows (one per redirected endpoint) to reinstall on the standby.
+    pub bridge_flows: Vec<BridgeFlowSnapshot>,
+}
+
+/// Portable mirror of `siphon_rtp_srtp::leg::SecureLegRollover`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecureLegRolloverSnapshot {
+    /// Per-SSRC rollover of the inbound (from-peer) SRTP context.
+    #[serde(default)]
+    pub inbound_rtp: Vec<StreamRolloverSnapshot>,
+    /// Per-SSRC rollover of the outbound (to-peer) SRTP context.
+    #[serde(default)]
+    pub outbound_rtp: Vec<StreamRolloverSnapshot>,
+    /// The outbound SRTCP index to continue from.
+    pub outbound_rtcp_index: u32,
+}
+
+/// Portable mirror of `siphon_rtp_srtp::StreamRollover` (per-SSRC ROC + rollover anchor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SrtpRolloverSnapshot {
-    /// Which secure context this rollover belongs to.
-    pub direction: SrtpDirection,
+pub struct StreamRolloverSnapshot {
     /// The stream SSRC.
     pub ssrc: u32,
     /// The 32-bit SRTP rollover counter.
     pub roc: u32,
-    /// The highest RTP sequence seen (rollover anchor).
+    /// The highest RTP sequence seen (rollover anchor), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highest_seq: Option<u16>,
-    /// The outgoing SRTCP index for this context.
-    pub srtcp_send_index: u32,
 }
 
-/// Which SRTP context an [`SrtpRolloverSnapshot`] refers to on a secure leg.
+/// A secure bridge flow: which endpoint role handles ingress, the crypto op, the source-gate, and
+/// the peer-facing endpoint + destination. Mirror of the engine's `BridgeFlowPlan` with roles for ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeFlowSnapshot {
+    /// The redirected endpoint this flow crypts ingress for.
+    pub endpoint: EndpointRole,
+    /// Encrypt (plain→secure) or decrypt (secure→plain).
+    pub op: BridgeOpSnapshot,
+    /// The signalled-source gate (RTPBleed defence).
+    pub accepted_source: SourceFilterSnapshot,
+    /// The peer-facing endpoint the transformed datagram is transmitted from.
+    pub out: EndpointRole,
+    /// The peer's negotiated destination address.
+    pub out_dst: SocketAddr,
+}
+
+/// Mirror of the engine's `srtp_bridge::BridgeOp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SrtpDirection {
-    /// Decrypting the secure peer's ingress.
-    Ingress,
-    /// Encrypting egress toward the secure peer.
-    Egress,
+pub enum BridgeOpSnapshot {
+    /// Plain ingress → encrypt for the secure peer.
+    Encrypt,
+    /// Secure ingress → decrypt for the plain peer.
+    Decrypt,
 }
 
 impl CallSnapshot {
@@ -340,13 +377,36 @@ mod tests {
                 ))),
                 latch: LatchSnapshot::SignalledOnly,
             }],
-            srtp_rollover: vec![SrtpRolloverSnapshot {
-                direction: SrtpDirection::Ingress,
-                ssrc: 0xDEAD_BEEF,
-                roc: 3,
-                highest_seq: Some(42),
-                srtcp_send_index: 7,
-            }],
+            secure: Some(SecureSnapshot {
+                far_remote_crypto: CryptoSnapshot {
+                    tag: 1,
+                    suite: "AES_CM_128_HMAC_SHA1_80".into(),
+                    master_key_hex: to_hex(&[0x33; 16]),
+                    master_salt_hex: to_hex(&[0x44; 14]),
+                },
+                rollover: SecureLegRolloverSnapshot {
+                    inbound_rtp: vec![StreamRolloverSnapshot {
+                        ssrc: 0xDEAD_BEEF,
+                        roc: 3,
+                        highest_seq: Some(42),
+                    }],
+                    outbound_rtp: vec![StreamRolloverSnapshot {
+                        ssrc: 0x0A0A_0A0A,
+                        roc: 1,
+                        highest_seq: Some(7),
+                    }],
+                    outbound_rtcp_index: 9,
+                },
+                bridge_flows: vec![BridgeFlowSnapshot {
+                    endpoint: EndpointRole::NearRtp,
+                    op: BridgeOpSnapshot::Encrypt,
+                    accepted_source: SourceFilterSnapshot::Exact(IpAddr::V4(Ipv4Addr::new(
+                        198, 51, 100, 1,
+                    ))),
+                    out: EndpointRole::FarRtp,
+                    out_dst: "192.0.2.1:7000".parse().unwrap(),
+                }],
+            }),
         }
     }
 

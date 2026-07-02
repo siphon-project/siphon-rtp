@@ -30,8 +30,9 @@ use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, PlayMediaSource,
     ProfileFlags, SessionStats,
 };
-use siphon_rtp_srtp::leg::SecureLeg;
-use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
+use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
+use siphon_rtp_srtp::StreamRollover;
 
 use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
@@ -92,6 +93,10 @@ struct Call {
     /// advertised to B — kept to key the SRTP bridge once B's answer brings its key. `None` for a
     /// plain relay. (Scenario 1: AVP near ↔ SAVP far; the reverse, a secure near, is a follow-up.)
     far_local_crypto: Option<CryptoAttribute>,
+    /// The far (answerer) peer's SDES key from its `RTP/SAVP` answer — kept (alongside
+    /// `far_local_crypto`) so an HA checkpoint can re-key the SRTP bridge on a standby. `None` until a
+    /// secure answer lands (and `None` for a plain relay).
+    far_remote_crypto: Option<CryptoAttribute>,
     /// The near (offerer) leg's primary audio codec, captured at offer — paired with the answer's
     /// codec to decide whether the call transcodes (the media slow path).
     near_codec: Option<CodecSpec>,
@@ -125,10 +130,25 @@ impl Call {
         }
     }
 
+    /// This call's `(endpoint id, role)` pairs, in a fixed order — so the checkpoint handler can map
+    /// the SRTP bridge's flow ids back to roles and reach the shared secure leg.
+    fn endpoint_roles(&self) -> Vec<(EndpointId, crate::ha::EndpointRole)> {
+        use crate::ha::EndpointRole;
+        let mut roles = vec![(self.near.rtp.id, EndpointRole::NearRtp)];
+        if let Some(endpoint) = self.near.rtcp {
+            roles.push((endpoint.id, EndpointRole::NearRtcp));
+        }
+        roles.push((self.far.rtp.id, EndpointRole::FarRtp));
+        if let Some(endpoint) = self.far.rtcp {
+            roles.push((endpoint.id, EndpointRole::FarRtcp));
+        }
+        roles
+    }
+
     /// Capture this call's replicable negotiated state as a portable [`crate::ha::CallSnapshot`] for
-    /// HA failover. Node-local handles (sockets, ids) and ephemeral media state are excluded; the SRTP
-    /// rollover of a secure leg lives in the bridge and is filled in alongside `restore` (see
-    /// [`crate::ha`]).
+    /// HA failover. Node-local handles (sockets, ids) and ephemeral media state are excluded; a secure
+    /// call's live SRTP state (rollover + bridge flows) lives in the bridge, so the checkpoint handler
+    /// folds it in afterwards (this method only sees the `Call`).
     fn to_snapshot(&self) -> crate::ha::CallSnapshot {
         use crate::ha;
         let flows = self
@@ -158,22 +178,16 @@ impl Call {
                 ufrag: ice.ufrag.clone(),
                 pwd: ice.pwd.clone(),
             }),
-            far_local_crypto: self
-                .far_local_crypto
-                .as_ref()
-                .map(|crypto| ha::CryptoSnapshot {
-                    tag: crypto.tag,
-                    suite: crypto.suite.name().to_string(),
-                    master_key_hex: ha::to_hex(&crypto.key.master_key),
-                    master_salt_hex: ha::to_hex(&crypto.key.master_salt),
-                }),
+            far_local_crypto: self.far_local_crypto.as_ref().map(crypto_snapshot),
             near_codec: self.near_codec.as_ref().map(codec_snapshot),
             far_codec: self.far_codec.as_ref().map(codec_snapshot),
             near_telephone_event: self.near_telephone_event,
             near: leg_snapshot(&self.near),
             far: leg_snapshot(&self.far),
             flows,
-            srtp_rollover: Vec::new(),
+            // Populated by the checkpoint handler for a secure call (it has the SRTP bridge);
+            // `to_snapshot` only sees the `Call`, which does not hold the live crypto state.
+            secure: None,
         }
     }
 }
@@ -196,6 +210,30 @@ fn codec_snapshot(codec: &CodecSpec) -> crate::ha::CodecSnapshot {
         clock_rate_hz: codec.clock_rate_hz,
         channels: codec.channels,
         ptime_ms: codec.ptime_ms,
+    }
+}
+
+/// Map an SDES [`CryptoAttribute`] to its snapshot (suite name + hex key material).
+fn crypto_snapshot(crypto: &CryptoAttribute) -> crate::ha::CryptoSnapshot {
+    crate::ha::CryptoSnapshot {
+        tag: crypto.tag,
+        suite: crypto.suite.name().to_string(),
+        master_key_hex: crate::ha::to_hex(&crypto.key.master_key),
+        master_salt_hex: crate::ha::to_hex(&crypto.key.master_salt),
+    }
+}
+
+/// Map a [`SecureLegRollover`] (from the SRTP bridge) to its snapshot on checkpoint.
+fn secure_rollover_snapshot(rollover: &SecureLegRollover) -> crate::ha::SecureLegRolloverSnapshot {
+    let stream = |value: &StreamRollover| crate::ha::StreamRolloverSnapshot {
+        ssrc: value.ssrc,
+        roc: value.roc,
+        highest_seq: value.highest_seq,
+    };
+    crate::ha::SecureLegRolloverSnapshot {
+        inbound_rtp: rollover.inbound_rtp.iter().map(stream).collect(),
+        outbound_rtp: rollover.outbound_rtp.iter().map(stream).collect(),
+        outbound_rtcp_index: rollover.outbound_rtcp_index,
     }
 }
 
@@ -248,6 +286,41 @@ fn restore_latch(latch: crate::ha::LatchSnapshot) -> LatchPolicy {
         LatchSnapshot::Off => LatchPolicy::Off,
         LatchSnapshot::SignalledOnly => LatchPolicy::SignalledOnly,
         LatchSnapshot::Symmetric => LatchPolicy::Symmetric,
+    }
+}
+
+/// Reconstruct an SDES [`CryptoAttribute`] from its snapshot (hex-decoding the key/salt). Returns a
+/// human-readable error for an unknown suite or malformed key material.
+fn restore_crypto(snapshot: &crate::ha::CryptoSnapshot) -> Result<CryptoAttribute, String> {
+    let suite = CryptoSuite::from_name(&snapshot.suite)
+        .ok_or_else(|| format!("unknown crypto suite {}", snapshot.suite))?;
+    let master_key: [u8; 16] = crate::ha::from_hex(&snapshot.master_key_hex)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or("invalid master key hex (want 16 bytes)")?;
+    let master_salt: [u8; 14] = crate::ha::from_hex(&snapshot.master_salt_hex)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or("invalid master salt hex (want 14 bytes)")?;
+    Ok(CryptoAttribute {
+        tag: snapshot.tag,
+        suite,
+        key: SrtpKeyMaterial {
+            master_key,
+            master_salt,
+        },
+    })
+}
+
+/// Reconstruct a [`SecureLegRollover`] from its snapshot on restore.
+fn restore_rollover(snapshot: &crate::ha::SecureLegRolloverSnapshot) -> SecureLegRollover {
+    let stream = |value: &crate::ha::StreamRolloverSnapshot| StreamRollover {
+        ssrc: value.ssrc,
+        roc: value.roc,
+        highest_seq: value.highest_seq,
+    };
+    SecureLegRollover {
+        inbound_rtp: snapshot.inbound_rtp.iter().map(stream).collect(),
+        outbound_rtp: snapshot.outbound_rtp.iter().map(stream).collect(),
+        outbound_rtcp_index: snapshot.outbound_rtcp_index,
     }
 }
 
@@ -825,6 +898,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtcp: None,
                 },
                 far_local_crypto,
+                far_remote_crypto: None,
                 near_codec: near_codec.clone(),
                 far_codec: None,
                 near_telephone_event: info.telephone_event_payload_type(),
@@ -1401,6 +1475,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.far_codec = info.primary_codec();
             call.pipeline = pipeline;
             call.relay_flows = relay_flows;
+            // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
+            call.far_remote_crypto = info.crypto.first().copied();
         }
         ok_sdp(rewritten.sdp, Some(to_tag))
     }
@@ -1472,15 +1548,64 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// the SIP proxy stores and hands back to `restore` on a standby. Ownership-gated like `query`: a
     /// non-owner gets `unknown_call`, so it cannot even probe for a call's existence (A3 — docs §5).
     fn checkpoint(&self, client: ClientId, call_id: &str) -> CmdResult {
-        let Some(mut snapshot) = self.owned_call(client, call_id, Call::to_snapshot) else {
+        // `to_snapshot` only sees the `Call`; a secure call's live SRTP state lives in the bridge, so
+        // the closure also hands back what the bridge query needs (endpoint roles + the peer's key).
+        let Some((mut snapshot, secure_ctx)) = self.owned_call(client, call_id, |call| {
+            let snapshot = call.to_snapshot();
+            let secure_ctx = (call.pipeline == PipelineKind::Srtp)
+                .then(|| call.far_remote_crypto.as_ref().map(crypto_snapshot))
+                .flatten()
+                .map(|far_remote_crypto| (call.endpoint_roles(), far_remote_crypto));
+            (snapshot, secure_ctx)
+        }) else {
             return unknown_call(call_id);
         };
         // The registry key is the authoritative call-id (the snapshot builder left it blank).
         snapshot.call_id = call_id.to_string();
+        // For a secure call, fold in the bridge's live SRTP rollover + flow plans.
+        if let Some((roles, far_remote_crypto)) = secure_ctx {
+            snapshot.secure = self.build_secure_snapshot(&roles, far_remote_crypto);
+        }
         match snapshot.to_json() {
             Ok(blob) => CmdResult::Checkpoint { snapshot: blob },
             Err(error) => error_result("checkpoint serialize", &error),
         }
+    }
+
+    /// Build the [`crate::ha::SecureSnapshot`] for a secure (`Srtp`) call by querying the SRTP bridge
+    /// for the shared leg's rollover and the installed flow plans, mapping endpoint ids back to roles.
+    /// `None` if the bridge no longer holds the call (raced a teardown).
+    fn build_secure_snapshot(
+        &self,
+        roles: &[(EndpointId, crate::ha::EndpointRole)],
+        far_remote_crypto: crate::ha::CryptoSnapshot,
+    ) -> Option<crate::ha::SecureSnapshot> {
+        let first = roles.first()?.0;
+        let rollover = self.bridge.rollover_snapshot(first)?;
+        let role_of = |id: EndpointId| roles.iter().find(|(i, _)| *i == id).map(|(_, r)| *r);
+        let endpoint_ids: Vec<EndpointId> = roles.iter().map(|(id, _)| *id).collect();
+        let bridge_flows = self
+            .bridge
+            .flow_plans(&endpoint_ids)
+            .iter()
+            .filter_map(|plan| {
+                Some(crate::ha::BridgeFlowSnapshot {
+                    endpoint: role_of(plan.endpoint)?,
+                    op: match plan.op {
+                        BridgeOp::Encrypt => crate::ha::BridgeOpSnapshot::Encrypt,
+                        BridgeOp::Decrypt => crate::ha::BridgeOpSnapshot::Decrypt,
+                    },
+                    accepted_source: source_filter_snapshot(plan.accepted_source),
+                    out: role_of(plan.out_endpoint)?,
+                    out_dst: plan.out_dst,
+                })
+            })
+            .collect();
+        Some(crate::ha::SecureSnapshot {
+            far_remote_crypto,
+            rollover: secure_rollover_snapshot(&rollover),
+            bridge_flows,
+        })
     }
 
     /// Rebuild a call on this (standby) node from a [`Command::Checkpoint`] blob — the HA takeover.
@@ -1496,13 +1621,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(snapshot) => snapshot,
             Err(error) => return error_result("restore: parse snapshot", &error),
         };
-        if !matches!(snapshot.pipeline, PipelineSnapshot::Passthrough) {
-            return CmdResult::Error {
-                reason: format!(
-                    "restore of a {:?} call is not yet supported (plain relay only)",
-                    snapshot.pipeline
-                ),
-            };
+        // Supported today: a plain relay, and a secure SDES-SRTP bridge (`Srtp`) call. Transcode / WS
+        // pipelines additionally need their slow-path actor rebuilt — the remaining follow-up.
+        match snapshot.pipeline {
+            PipelineSnapshot::Passthrough => {}
+            PipelineSnapshot::Srtp if snapshot.secure.is_some() => {}
+            other => {
+                return CmdResult::Error {
+                    reason: format!("restore of a {other:?} call is not yet supported"),
+                };
+            }
         }
         if self.calls.contains_key(&snapshot.call_id) {
             return CmdResult::Error {
@@ -1510,60 +1638,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
         }
 
-        // Bind the four (or two, under rtcp-mux) endpoints at their exact ports, in role order.
-        let mut targets: Vec<(EndpointRole, std::net::SocketAddr)> =
-            vec![(EndpointRole::NearRtp, snapshot.near.rtp_local)];
-        if let Some(addr) = snapshot.near.rtcp_local {
-            targets.push((EndpointRole::NearRtcp, addr));
-        }
-        targets.push((EndpointRole::FarRtp, snapshot.far.rtp_local));
-        if let Some(addr) = snapshot.far.rtcp_local {
-            targets.push((EndpointRole::FarRtcp, addr));
-        }
-        let mut bound: Vec<(EndpointRole, Endpoint)> = Vec::new();
-        for (role, addr) in targets {
-            match self
-                .datapath
-                .alloc_endpoint_on_port(AddressFamily::of(addr.ip()), addr.port())
-                .await
-            {
-                Ok(endpoint) => bound.push((role, endpoint)),
-                Err(error) => {
-                    self.free_bound(&bound).await;
-                    return error_result("restore: bind endpoint at snapshot port", &error);
-                }
-            }
-        }
-        let role_endpoint = |role: EndpointRole| -> Option<Endpoint> {
-            bound.iter().find(|(r, _)| *r == role).map(|(_, e)| *e)
+        // Bind the endpoints at their exact ports (shared by both pipelines).
+        let bound = match self.bind_snapshot_endpoints(&snapshot).await {
+            Ok(bound) => bound,
+            Err(reason) => return reason,
         };
-
-        // Reinstall the forward rules, resolving each role to its freshly-bound endpoint id.
-        let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
-        for flow in &snapshot.flows {
-            let (Some(installed_on), Some(out)) =
-                (role_endpoint(flow.installed_on), role_endpoint(flow.out))
-            else {
-                self.free_bound(&bound).await;
-                return CmdResult::Error {
-                    reason: "restore: a snapshot flow references an unknown endpoint role"
-                        .to_string(),
-                };
-            };
-            let action = FlowAction::Forward(ForwardRule {
-                out_endpoint: out.id,
-                out_dst: flow.out_dst,
-                accepted_source: restore_source_filter(flow.accepted_source),
-                latch: restore_latch(flow.latch),
-            });
-            if let Err(error) = self.datapath.install_flow(installed_on.id, action) {
-                self.free_bound(&bound).await;
-                return error_result("restore: install forward flow", &error);
-            }
-            relay_flows.push((installed_on.id, action));
-        }
-
-        // Every plain relay has a near.rtp and a far.rtp; RTCP endpoints are optional (rtcp-mux).
+        let role_endpoint = |role: EndpointRole| -> Option<Endpoint> {
+            bound
+                .iter()
+                .find(|(role_, _)| *role_ == role)
+                .map(|(_, endpoint)| *endpoint)
+        };
+        // Every call has a near.rtp and a far.rtp; RTCP endpoints are optional (rtcp-mux).
         let (Some(near_rtp), Some(far_rtp)) = (
             role_endpoint(EndpointRole::NearRtp),
             role_endpoint(EndpointRole::FarRtp),
@@ -1586,6 +1672,108 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             remote_rtcp: snapshot.far.remote_rtcp,
         };
 
+        // Install the datapath flows and resolve the crypto per pipeline.
+        let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
+        let mut far_local_crypto: Option<CryptoAttribute> = None;
+        let mut far_remote_crypto: Option<CryptoAttribute> = None;
+        let pipeline;
+        match snapshot.pipeline {
+            PipelineSnapshot::Passthrough => {
+                pipeline = PipelineKind::Passthrough;
+                // Reinstall the forward rules, resolving each role to its freshly-bound id.
+                for flow in &snapshot.flows {
+                    let (Some(installed_on), Some(out)) =
+                        (role_endpoint(flow.installed_on), role_endpoint(flow.out))
+                    else {
+                        self.free_bound(&bound).await;
+                        return CmdResult::Error {
+                            reason: "restore: a snapshot flow references an unknown endpoint role"
+                                .to_string(),
+                        };
+                    };
+                    let action = FlowAction::Forward(ForwardRule {
+                        out_endpoint: out.id,
+                        out_dst: flow.out_dst,
+                        accepted_source: restore_source_filter(flow.accepted_source),
+                        latch: restore_latch(flow.latch),
+                    });
+                    if let Err(error) = self.datapath.install_flow(installed_on.id, action) {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: install forward flow", &error);
+                    }
+                    relay_flows.push((installed_on.id, action));
+                }
+            }
+            PipelineSnapshot::Srtp => {
+                pipeline = PipelineKind::Srtp;
+                let secure = snapshot.secure.as_ref().expect("Srtp ⇒ secure is present");
+                // Reconstruct the two SDES keys (the engine's own + the peer's).
+                let far_local = match snapshot.far_local_crypto.as_ref().map(restore_crypto) {
+                    Some(Ok(crypto)) => crypto,
+                    Some(Err(reason)) => {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: far_local key", &reason);
+                    }
+                    None => {
+                        self.free_bound(&bound).await;
+                        return CmdResult::Error {
+                            reason: "restore: secure call missing far_local_crypto".to_string(),
+                        };
+                    }
+                };
+                let far_remote = match restore_crypto(&secure.far_remote_crypto) {
+                    Ok(crypto) => crypto,
+                    Err(reason) => {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: far_remote key", &reason);
+                    }
+                };
+                // Rebuild the bridge flow plans (roles → freshly-bound ids).
+                let mut bridge_flows = Vec::with_capacity(secure.bridge_flows.len());
+                for plan in &secure.bridge_flows {
+                    let (Some(endpoint), Some(out)) =
+                        (role_endpoint(plan.endpoint), role_endpoint(plan.out))
+                    else {
+                        self.free_bound(&bound).await;
+                        return CmdResult::Error {
+                            reason: "restore: a secure bridge flow references an unknown role"
+                                .to_string(),
+                        };
+                    };
+                    bridge_flows.push(BridgeFlowPlan {
+                        endpoint: endpoint.id,
+                        op: match plan.op {
+                            ha::BridgeOpSnapshot::Encrypt => BridgeOp::Encrypt,
+                            ha::BridgeOpSnapshot::Decrypt => BridgeOp::Decrypt,
+                        },
+                        accepted_source: restore_source_filter(plan.accepted_source),
+                        out_endpoint: out.id,
+                        out_dst: plan.out_dst,
+                    });
+                }
+                // Redirect every endpoint to the bridge so it crypts both directions.
+                for (_, endpoint) in &bound {
+                    if let Err(error) = self
+                        .datapath
+                        .install_flow(endpoint.id, FlowAction::Redirect)
+                    {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: install SRTP bridge redirect", &error);
+                    }
+                }
+                // Rebuild the secure leg from the two keys and seed its rollover, then register.
+                let mut leg = SecureLeg::new(&far_local.key, &far_remote.key);
+                leg.seed_rollover(&restore_rollover(&secure.rollover));
+                self.bridge.register(BridgeCallPlan {
+                    leg,
+                    flows: bridge_flows,
+                });
+                far_local_crypto = Some(far_local);
+                far_remote_crypto = Some(far_remote);
+            }
+            _ => unreachable!("pipeline validated above"),
+        }
+
         // Register the reconstructed call under the requesting (standby) client.
         *self.client_calls.entry(client).or_insert(0) += 1;
         for (_, endpoint) in &bound {
@@ -1605,18 +1793,55 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 to_tag: snapshot.to_tag,
                 near,
                 far,
-                // A plain relay needs neither the SDES key nor codecs to forward; both are
-                // reconstructed with the secure/transcode-restore follow-up.
-                far_local_crypto: None,
+                far_local_crypto,
+                far_remote_crypto,
+                // Codecs are informational for these pipelines' relay/bridge path; reconstructed with
+                // the transcode-restore follow-up.
                 near_codec: None,
                 far_codec: None,
                 near_telephone_event: snapshot.near_telephone_event,
-                pipeline: PipelineKind::Passthrough,
+                pipeline,
                 relay_flows,
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
         ok_empty()
+    }
+
+    /// Bind a snapshot's endpoints at their exact ports (HA restore), in role order. On any bind
+    /// failure the endpoints already bound are freed and an error result is returned.
+    async fn bind_snapshot_endpoints(
+        &self,
+        snapshot: &crate::ha::CallSnapshot,
+    ) -> Result<Vec<(crate::ha::EndpointRole, Endpoint)>, CmdResult> {
+        use crate::ha::EndpointRole;
+        let mut targets: Vec<(EndpointRole, std::net::SocketAddr)> =
+            vec![(EndpointRole::NearRtp, snapshot.near.rtp_local)];
+        if let Some(addr) = snapshot.near.rtcp_local {
+            targets.push((EndpointRole::NearRtcp, addr));
+        }
+        targets.push((EndpointRole::FarRtp, snapshot.far.rtp_local));
+        if let Some(addr) = snapshot.far.rtcp_local {
+            targets.push((EndpointRole::FarRtcp, addr));
+        }
+        let mut bound: Vec<(EndpointRole, Endpoint)> = Vec::new();
+        for (role, addr) in targets {
+            match self
+                .datapath
+                .alloc_endpoint_on_port(AddressFamily::of(addr.ip()), addr.port())
+                .await
+            {
+                Ok(endpoint) => bound.push((role, endpoint)),
+                Err(error) => {
+                    self.free_bound(&bound).await;
+                    return Err(error_result(
+                        "restore: bind endpoint at snapshot port",
+                        &error,
+                    ));
+                }
+            }
+        }
+        Ok(bound)
     }
 
     /// Free the endpoints bound so far during a [`Self::restore`] that then failed (rollback).
@@ -3365,8 +3590,8 @@ mod tests {
             "near→far forward rule captured"
         );
         assert!(
-            snapshot.srtp_rollover.is_empty(),
-            "a plain relay has no SRTP state"
+            snapshot.secure.is_none(),
+            "a plain relay has no secure state"
         );
     }
 
@@ -3554,6 +3779,159 @@ mod tests {
                 .await,
             CmdResult::Error { .. }
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_resumes_a_secure_srtp_bridge_on_a_standby() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::SrtpContext;
+
+        // Secure warm-standby HA: an AVP↔SAVP bridge is set up on node A, checkpointed (capturing the
+        // peer's key + the leg rollover + the bridge flows), torn down, then restored on node B which
+        // re-binds the same ports and rebuilds the SRTP bridge — and secure media flows through B.
+        let (min, max) = (48_000u16, 48_060u16);
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        tokio::spawn(run_redirect_dispatcher(
+            engine_a.datapath().rx(),
+            engine_a.bridge(),
+            engine_a.media(),
+            engine_a.ws(),
+            engine_a.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await; // plain (AVP) caller A
+        let (phone_b, addr_b) = phone().await; // secure (SAVP) callee B
+
+        // A offers plaintext; the profile asks for a secure far leg. B answers RTP/SAVP with its key.
+        let offer = engine_a
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ha-savp".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        transport_protocol: Some("RTP/SAVP".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
+        let engine_far_key = *offer_reply.crypto.first().expect("engine a=crypto to B");
+        let engine_far = offer_reply.remote_rtp; // engine's B-facing port
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answer = engine_a
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ha-savp".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: savp_answer_sdp(addr_b, &b_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+
+        // Sanity: the bridge relays on A (A plaintext → B SRTP, decryptable with the engine's key).
+        let mut b_decrypt = SrtpContext::from_key_material(&engine_far_key.key);
+        let from_a = rtp_packet(100, 0x0A0A_0A0A);
+        phone_a.send_to(&from_a, engine_near).await.expect("a send");
+        let (srtp, _) = recv(&phone_b).await;
+        let mut recovered = Vec::new();
+        b_decrypt
+            .unprotect(&srtp, &mut recovered)
+            .expect("B decrypts on A");
+        assert_eq!(recovered, from_a);
+
+        // Checkpoint the secure call → the blob carries the secure section (peer key + bridge flows).
+        let CmdResult::Checkpoint { snapshot } = engine_a
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "ha-savp".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("expected a checkpoint result");
+        };
+        let parsed = crate::ha::CallSnapshot::from_json(&snapshot).expect("parse blob");
+        let secure = parsed
+            .secure
+            .expect("the snapshot carries the secure section");
+        assert_eq!(secure.far_remote_crypto.suite, "AES_CM_128_HMAC_SHA1_80");
+        assert!(
+            !secure.bridge_flows.is_empty(),
+            "bridge flow plans captured"
+        );
+
+        // Node A dies: delete frees its ports.
+        engine_a
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "ha-savp".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        drop(engine_a);
+
+        // Node B (same range) restores the secure call and rebuilds the SRTP bridge at the same ports.
+        let engine_b = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        tokio::spawn(run_redirect_dispatcher(
+            engine_b.datapath().rx(),
+            engine_b.bridge(),
+            engine_b.media(),
+            engine_b.ws(),
+            engine_b.conference(),
+            None,
+        ));
+        assert!(
+            matches!(
+                engine_b.handle(CLIENT, Command::Restore { snapshot }).await,
+                CmdResult::Ok { .. }
+            ),
+            "secure restore succeeds on the standby"
+        );
+
+        // Secure media resumes through B at the unchanged ports.
+        // A → engine_near → B receives SRTP (still decryptable with the engine's original key).
+        let from_a2 = rtp_packet(101, 0x0A0A_0A0A);
+        phone_a
+            .send_to(&from_a2, engine_near)
+            .await
+            .expect("a send 2");
+        let (srtp2, _) = recv(&phone_b).await;
+        let mut recovered2 = Vec::new();
+        b_decrypt
+            .unprotect(&srtp2, &mut recovered2)
+            .expect("B decrypts through the restored bridge");
+        assert_eq!(
+            recovered2, from_a2,
+            "A→B secure relay resumes on the standby"
+        );
+
+        // B → engine_far as SRTP (B's key) → bridge decrypts → A receives plaintext.
+        let from_b = rtp_packet(200, 0x0B0B_0B0B);
+        let mut b_encrypt = SrtpContext::from_key_material(&b_key.key);
+        let mut srtp_b = Vec::new();
+        b_encrypt.protect(&from_b, &mut srtp_b).expect("B encrypts");
+        phone_b.send_to(&srtp_b, engine_far).await.expect("b send");
+        let (recovered_a, _) = recv(&phone_a).await;
+        assert_eq!(
+            recovered_a, from_b,
+            "B→A secure relay resumes on the standby"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
