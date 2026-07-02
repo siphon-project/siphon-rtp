@@ -74,6 +74,16 @@ struct Args {
     #[arg(long)]
     relay_bind_ip: Option<IpAddr>,
 
+    /// Lowest media port the datapath may bind. Set together with `--port-max` to draw media ports
+    /// from a bounded, firewallable range (rtpengine `port-min` parity) instead of OS-ephemeral
+    /// ports — required for HA takeover (a standby re-binds the same port). Off unless both are set.
+    #[arg(long)]
+    port_min: Option<u16>,
+
+    /// Highest media port the datapath may bind. Set together with `--port-min`.
+    #[arg(long)]
+    port_max: Option<u16>,
+
     /// Prometheus metrics + health HTTP listen address. Off unless given. Exposes `GET /metrics`
     /// (OpenMetrics text), `GET /healthz` (liveness), and `GET /readyz` (readiness).
     #[arg(long)]
@@ -116,6 +126,8 @@ struct Resolved {
     control: SocketAddr,
     ng: Option<SocketAddr>,
     relay_bind_ip: Option<IpAddr>,
+    port_min: Option<u16>,
+    port_max: Option<u16>,
     metrics_addr: Option<SocketAddr>,
     max_control_rps: u64,
     media_timeout_secs: u64,
@@ -153,6 +165,8 @@ impl Resolved {
             ),
             ng: resolve_optional(args.ng, file.ng),
             relay_bind_ip: resolve_optional(args.relay_bind_ip, file.relay_bind_ip),
+            port_min: resolve_optional(args.port_min, file.port_min),
+            port_max: resolve_optional(args.port_max, file.port_max),
             metrics_addr: resolve_optional(args.metrics_addr, file.metrics_addr),
             max_control_rps: resolve_defaulted(
                 args.max_control_rps,
@@ -187,6 +201,25 @@ impl Resolved {
                 DEFAULT_MAX_SESSIONS,
             ),
         }
+    }
+}
+
+/// Validate the optional media-port range: both `--port-min` and `--port-max` must be set together
+/// and satisfy `min <= max`. Returns `Ok(None)` when neither is set (OS-ephemeral ports), `Ok(Some)`
+/// for a valid range, and a human-readable `Err` for a half-set or inverted range (fatal at startup).
+/// Pure and unit-tested.
+fn resolve_port_range(
+    port_min: Option<u16>,
+    port_max: Option<u16>,
+) -> Result<Option<(u16, u16)>, String> {
+    match (port_min, port_max) {
+        (None, None) => Ok(None),
+        (Some(min), Some(max)) if min <= max => Ok(Some((min, max))),
+        (Some(min), Some(max)) => Err(format!(
+            "invalid media port range: --port-min ({min}) must be <= --port-max ({max})"
+        )),
+        (Some(_), None) => Err("--port-min set without --port-max".to_string()),
+        (None, Some(_)) => Err("--port-max set without --port-min".to_string()),
     }
 }
 
@@ -253,13 +286,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
+    // Optional deterministic media-port range (`--port-min`/`--port-max`). Both-or-neither and
+    // min <= max; a half-set or inverted range is a fatal config error (fail loudly, before serving).
+    let port_range = match resolve_port_range(config.port_min, config.port_max) {
+        Ok(range) => range,
+        Err(error) => {
+            tracing::error!("{error}");
+            std::process::exit(1);
+        }
+    };
+
     // M1: the always-available NIC-free backend. XDP backend slots in behind the same trait. The
     // engine and the TURN server share one datapath (cloning shares the pool + logical clock).
     // Endpoints bind loopback by default; `--relay-bind-ip` binds a routable IP so the relay reaches
-    // real peers (docs/security-and-nat.md §11.1).
-    let datapath = match config.relay_bind_ip {
-        Some(ip) => UdpLoopbackDatapath::with_bind_ip(ip),
-        None => UdpLoopbackDatapath::new(),
+    // real peers (docs/security-and-nat.md §11.1). A configured port range draws media ports from a
+    // bounded, firewallable window (and enables same-port HA takeover) instead of OS-ephemeral ports.
+    let bind_ip = config
+        .relay_bind_ip
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let datapath = match port_range {
+        Some((min, max)) => UdpLoopbackDatapath::with_port_range(bind_ip, min, max),
+        None => match config.relay_bind_ip {
+            Some(ip) => UdpLoopbackDatapath::with_bind_ip(ip),
+            None => UdpLoopbackDatapath::new(),
+        },
     };
 
     // Cluster state for the `load` / `node_info` / `drain` control commands. The node id falls back
@@ -535,4 +585,42 @@ async fn spawn_turn(
         );
     }
     Ok((Some(turn), Some(relay_tx)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_port_range;
+
+    #[test]
+    fn port_range_neither_set_is_ephemeral() {
+        assert_eq!(resolve_port_range(None, None), Ok(None));
+    }
+
+    #[test]
+    fn port_range_valid_window_resolves() {
+        assert_eq!(
+            resolve_port_range(Some(30000), Some(40000)),
+            Ok(Some((30000, 40000)))
+        );
+        // A single-port range (min == max) is valid.
+        assert_eq!(
+            resolve_port_range(Some(50000), Some(50000)),
+            Ok(Some((50000, 50000)))
+        );
+    }
+
+    #[test]
+    fn port_range_half_set_is_an_error() {
+        assert!(resolve_port_range(Some(30000), None).is_err());
+        assert!(resolve_port_range(None, Some(40000)).is_err());
+    }
+
+    #[test]
+    fn port_range_inverted_is_an_error() {
+        let error = resolve_port_range(Some(40000), Some(30000)).expect_err("inverted range");
+        assert!(
+            error.contains("must be <="),
+            "message names the constraint: {error}"
+        );
+    }
 }

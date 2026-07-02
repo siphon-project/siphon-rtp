@@ -36,6 +36,14 @@ control = "127.0.0.1:8080"
 # turn_relay_ip to advertise the reachable address.
 # relay_bind_ip = "0.0.0.0"
 
+# Deterministic media port range (CLI: --port-min / --port-max). Set BOTH to draw media ports from a
+# bounded, firewallable window (rtpengine port-min/port-max parity) instead of OS-ephemeral ports;
+# also the prerequisite for HA takeover (a standby re-binds the same port behind a floating IP).
+# Size it for your concurrency: up to 4 ports per call (RTP+RTCP per leg), 2 with rtcp-mux. Unset =
+# OS-ephemeral ports. A half-set or inverted range is a fatal startup error.
+# port_min = 30000
+# port_max = 40000
+
 # Reap a call after this many seconds with no accepted media (CLI: --media-timeout-secs).
 # Default: 30.
 # media_timeout_secs = 30

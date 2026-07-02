@@ -63,6 +63,11 @@ pub struct FileConfig {
     pub ng: Option<SocketAddr>,
     /// Bind relay/media sockets to this IP instead of loopback (`--relay-bind-ip`).
     pub relay_bind_ip: Option<IpAddr>,
+    /// Lowest media port the datapath may bind (`--port-min`). Set together with `port_max` to draw
+    /// media ports from a bounded, firewallable range instead of OS-ephemeral ports.
+    pub port_min: Option<u16>,
+    /// Highest media port the datapath may bind (`--port-max`). Set together with `port_min`.
+    pub port_max: Option<u16>,
     /// Prometheus metrics + health HTTP listen address (`--metrics-addr`).
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap, requests/second; 0 disables (`--max-control-rps`).
@@ -158,6 +163,8 @@ mod tests {
             "control = \"0.0.0.0:8080\"\n",
             "ng = \"0.0.0.0:22222\"\n",
             "relay_bind_ip = \"203.0.113.7\"\n",
+            "port_min = 30000\n",
+            "port_max = 40000\n",
             "metrics_addr = \"127.0.0.1:9090\"\n",
             "max_control_rps = 500\n",
             "media_timeout_secs = 45\n",
@@ -187,6 +194,8 @@ mod tests {
             config.relay_bind_ip,
             Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
         );
+        assert_eq!(config.port_min, Some(30000));
+        assert_eq!(config.port_max, Some(40000));
         assert_eq!(
             config.metrics_addr,
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9090)))
