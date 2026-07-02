@@ -9,6 +9,7 @@
 pub mod cluster;
 pub mod conference;
 pub mod engine;
+pub mod ha;
 pub mod ice;
 pub mod media_pipeline;
 pub mod metrics;

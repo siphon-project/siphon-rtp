@@ -58,6 +58,14 @@ pub fn parse_command(request: &Value) -> Result<Command, NgError> {
         "node info" => Ok(Command::NodeInfo),
         "drain" => Ok(Command::Drain),
         "undrain" => Ok(Command::Undrain),
+        // HA warm-standby: snapshot a call's state / rebuild it on a standby.
+        "checkpoint" => Ok(Command::Checkpoint {
+            call_id: required_str(request, "call-id")?,
+            from_tag: required_str(request, "from-tag")?,
+        }),
+        "restore" => Ok(Command::Restore {
+            snapshot: required_str(request, "snapshot")?,
+        }),
         "offer" => Ok(Command::Offer {
             call_id: required_str(request, "call-id")?,
             from_tag: required_str(request, "from-tag")?,
@@ -233,6 +241,11 @@ pub fn serialize_result(result: &CmdResult) -> Value {
                 Value::Integer(i64::from(node.draining)),
             );
             dict.insert(b"node".to_vec(), Value::Dict(node_dict));
+        }
+        CmdResult::Checkpoint { snapshot } => {
+            // The opaque HA snapshot blob under a `snapshot` string, verbatim.
+            dict.insert(b"result".to_vec(), Value::string("ok"));
+            dict.insert(b"snapshot".to_vec(), Value::string(snapshot));
         }
         CmdResult::Error { reason } => {
             dict.insert(b"result".to_vec(), Value::string("error"));
@@ -788,6 +801,52 @@ mod tests {
             node.get(b"max-sessions".as_slice())
                 .and_then(Value::as_integer),
             Some(4000)
+        );
+    }
+
+    #[test]
+    fn checkpoint_and_restore_verbs_round_trip() {
+        // `checkpoint` carries the call keys; the result carries the opaque blob under `snapshot`.
+        let bytes = datagram(
+            "ck",
+            &[
+                ("command", Value::string("checkpoint")),
+                ("call-id", Value::string("call-x")),
+                ("from-tag", Value::string("ft")),
+            ],
+        );
+        let (_, command) = parse_datagram(&bytes);
+        assert_eq!(
+            command,
+            Command::Checkpoint {
+                call_id: "call-x".into(),
+                from_tag: "ft".into(),
+            }
+        );
+
+        let result = serialize_result(&CmdResult::Checkpoint {
+            snapshot: "{\"version\":1}".into(),
+        });
+        assert_eq!(result.get("result").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            result.get("snapshot").and_then(Value::as_str),
+            Some("{\"version\":1}")
+        );
+
+        // `restore` carries the blob back.
+        let restore = datagram(
+            "rs",
+            &[
+                ("command", Value::string("restore")),
+                ("snapshot", Value::string("{\"version\":1}")),
+            ],
+        );
+        let (_, command) = parse_datagram(&restore);
+        assert_eq!(
+            command,
+            Command::Restore {
+                snapshot: "{\"version\":1}".into(),
+            }
         );
     }
 

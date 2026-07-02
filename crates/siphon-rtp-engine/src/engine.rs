@@ -107,6 +107,130 @@ struct Call {
     relay_flows: Vec<(EndpointId, FlowAction)>,
 }
 
+impl Call {
+    /// The role of one of this call's four possible endpoints, or `None` if the id is not one of
+    /// them. Used to snapshot flows by role (the node-independent stand-in for a datapath id).
+    fn endpoint_role(&self, id: EndpointId) -> Option<crate::ha::EndpointRole> {
+        use crate::ha::EndpointRole;
+        if id == self.near.rtp.id {
+            Some(EndpointRole::NearRtp)
+        } else if self.near.rtcp.map(|endpoint| endpoint.id) == Some(id) {
+            Some(EndpointRole::NearRtcp)
+        } else if id == self.far.rtp.id {
+            Some(EndpointRole::FarRtp)
+        } else if self.far.rtcp.map(|endpoint| endpoint.id) == Some(id) {
+            Some(EndpointRole::FarRtcp)
+        } else {
+            None
+        }
+    }
+
+    /// Capture this call's replicable negotiated state as a portable [`crate::ha::CallSnapshot`] for
+    /// HA failover. Node-local handles (sockets, ids) and ephemeral media state are excluded; the SRTP
+    /// rollover of a secure leg lives in the bridge and is filled in alongside `restore` (see
+    /// [`crate::ha`]).
+    fn to_snapshot(&self) -> crate::ha::CallSnapshot {
+        use crate::ha;
+        let flows = self
+            .relay_flows
+            .iter()
+            .filter_map(|(endpoint, action)| {
+                // Only `Forward` rules are portable; `Redirect`/`Drop` carry no reconstructable state.
+                let FlowAction::Forward(rule) = action else {
+                    return None;
+                };
+                Some(ha::FlowSnapshot {
+                    installed_on: self.endpoint_role(*endpoint)?,
+                    out: self.endpoint_role(rule.out_endpoint)?,
+                    out_dst: rule.out_dst,
+                    accepted_source: source_filter_snapshot(rule.accepted_source),
+                    latch: latch_snapshot(rule.latch),
+                })
+            })
+            .collect();
+        ha::CallSnapshot {
+            version: ha::SNAPSHOT_VERSION,
+            call_id: String::new(), // filled by the caller, which holds the registry key
+            from_tag: self.from_tag.clone(),
+            to_tag: self.to_tag.clone(),
+            pipeline: pipeline_snapshot(self.pipeline),
+            ice: self.ice.as_ref().map(|ice| ha::IceSnapshot {
+                ufrag: ice.ufrag.clone(),
+                pwd: ice.pwd.clone(),
+            }),
+            far_local_crypto: self
+                .far_local_crypto
+                .as_ref()
+                .map(|crypto| ha::CryptoSnapshot {
+                    tag: crypto.tag,
+                    suite: crypto.suite.name().to_string(),
+                    master_key_hex: ha::to_hex(&crypto.key.master_key),
+                    master_salt_hex: ha::to_hex(&crypto.key.master_salt),
+                }),
+            near_codec: self.near_codec.as_ref().map(codec_snapshot),
+            far_codec: self.far_codec.as_ref().map(codec_snapshot),
+            near_telephone_event: self.near_telephone_event,
+            near: leg_snapshot(&self.near),
+            far: leg_snapshot(&self.far),
+            flows,
+            srtp_rollover: Vec::new(),
+        }
+    }
+}
+
+/// Map a [`Leg`] to its portable snapshot (local media ports + the peer's remote addresses).
+fn leg_snapshot(leg: &Leg) -> crate::ha::LegSnapshot {
+    crate::ha::LegSnapshot {
+        rtp_local: leg.rtp.local_addr,
+        rtcp_local: leg.rtcp.map(|endpoint| endpoint.local_addr),
+        remote_rtp: leg.remote_rtp,
+        remote_rtcp: leg.remote_rtcp,
+    }
+}
+
+/// Map a [`CodecSpec`] to its snapshot (the wire-relevant fields).
+fn codec_snapshot(codec: &CodecSpec) -> crate::ha::CodecSnapshot {
+    crate::ha::CodecSnapshot {
+        payload_type: codec.payload_type,
+        encoding_name: codec.encoding_name.clone(),
+        clock_rate_hz: codec.clock_rate_hz,
+        channels: codec.channels,
+        ptime_ms: codec.ptime_ms,
+    }
+}
+
+/// Map the engine [`PipelineKind`] to its snapshot mirror.
+fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSnapshot {
+    use crate::ha::PipelineSnapshot;
+    match pipeline {
+        PipelineKind::Passthrough => PipelineSnapshot::Passthrough,
+        PipelineKind::Srtp => PipelineSnapshot::Srtp,
+        PipelineKind::Media => PipelineSnapshot::Media,
+        PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
+        PipelineKind::Ws => PipelineSnapshot::Ws,
+    }
+}
+
+/// Map a datapath [`SourceFilter`] to its snapshot mirror.
+fn source_filter_snapshot(filter: SourceFilter) -> crate::ha::SourceFilterSnapshot {
+    use crate::ha::SourceFilterSnapshot;
+    match filter {
+        SourceFilter::Exact(ip) => SourceFilterSnapshot::Exact(ip),
+        SourceFilter::Subnet(ip, bits) => SourceFilterSnapshot::Subnet(ip, bits),
+        SourceFilter::Any => SourceFilterSnapshot::Any,
+    }
+}
+
+/// Map a datapath [`LatchPolicy`] to its snapshot mirror.
+fn latch_snapshot(latch: LatchPolicy) -> crate::ha::LatchSnapshot {
+    use crate::ha::LatchSnapshot;
+    match latch {
+        LatchPolicy::Off => LatchSnapshot::Off,
+        LatchPolicy::SignalledOnly => LatchSnapshot::SignalledOnly,
+        LatchPolicy::Symmetric => LatchSnapshot::Symmetric,
+    }
+}
+
 /// A SIPREC / monitor media subscription (RFC 7866): one or more source legs' **raw ingress RTP** is
 /// tee'd byte-for-byte toward a send-only subscriber (a Session Recording Server, SRS). Unlike a
 /// re-encode fork, the raw tee carries each leg's negotiated codec verbatim — so it works on a plain
@@ -361,6 +485,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.cluster.set_draining(false);
                 ok_empty()
             }
+            Command::Checkpoint { call_id, .. } => self.checkpoint(client, &call_id),
+            Command::Restore { .. } => CmdResult::Error {
+                reason: "restore is not yet supported on this build".to_string(),
+            },
             Command::Offer {
                 call_id,
                 from_tag,
@@ -1319,6 +1447,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             duration_ms: None,
             to_tag: None,
             stats: Some(stats),
+        }
+    }
+
+    /// Snapshot a call's replicable state for HA failover ([`Command::Checkpoint`]) — the opaque blob
+    /// the SIP proxy stores and hands back to `restore` on a standby. Ownership-gated like `query`: a
+    /// non-owner gets `unknown_call`, so it cannot even probe for a call's existence (A3 — docs §5).
+    fn checkpoint(&self, client: ClientId, call_id: &str) -> CmdResult {
+        let Some(mut snapshot) = self.owned_call(client, call_id, Call::to_snapshot) else {
+            return unknown_call(call_id);
+        };
+        // The registry key is the authoritative call-id (the snapshot builder left it blank).
+        snapshot.call_id = call_id.to_string();
+        match snapshot.to_json() {
+            Ok(blob) => CmdResult::Checkpoint { snapshot: blob },
+            Err(error) => error_result("checkpoint serialize", &error),
         }
     }
 
@@ -2500,6 +2643,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::NodeInfo => "node_info",
         Command::Drain => "drain",
         Command::Undrain => "undrain",
+        Command::Checkpoint { .. } => "checkpoint",
+        Command::Restore { .. } => "restore",
         Command::PlayMedia { .. } => "play_media",
         Command::StopMedia { .. } => "stop_media",
         Command::PlayDtmf { .. } => "play_dtmf",
@@ -2975,6 +3120,125 @@ mod tests {
             matches!(engine.handle(CLIENT, offer()).await, CmdResult::Ok { .. }),
             "offer admitted again after undrain"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_captures_a_plain_relay_snapshot() {
+        use crate::ha::{CallSnapshot, EndpointRole, PipelineSnapshot};
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        // A plain PCMU relay: offer + answer, no profile flags → Passthrough.
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ckpt-call".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let far_local = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ckpt-call".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+
+        // Checkpoint returns an opaque blob that deserializes to the negotiated state.
+        let CmdResult::Checkpoint { snapshot } = engine
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "ckpt-call".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("expected a checkpoint result");
+        };
+        let snapshot = CallSnapshot::from_json(&snapshot).expect("valid snapshot blob");
+        assert_eq!(snapshot.call_id, "ckpt-call");
+        assert_eq!(snapshot.from_tag, "tag-a");
+        assert_eq!(snapshot.to_tag.as_deref(), Some("tag-b"));
+        assert_eq!(snapshot.pipeline, PipelineSnapshot::Passthrough);
+        // rtcp-mux ⇒ no companion RTCP endpoint; the far leg advertises the engine port A dials.
+        assert!(
+            snapshot.near.rtcp_local.is_none(),
+            "rtcp-mux: no near RTCP port"
+        );
+        assert_eq!(
+            snapshot.far.rtp_local, far_local,
+            "far leg local port is captured"
+        );
+        assert_eq!(
+            snapshot.near.remote_rtp,
+            Some(addr_a),
+            "A's address captured"
+        );
+        assert_eq!(
+            snapshot.far.remote_rtp,
+            Some(addr_b),
+            "B's address captured"
+        );
+        // A plain relay installs Forward rules on both RTP endpoints (mux ⇒ two, not four).
+        assert!(
+            snapshot
+                .flows
+                .iter()
+                .any(|flow| flow.installed_on == EndpointRole::NearRtp
+                    && flow.out == EndpointRole::FarRtp),
+            "near→far forward rule captured"
+        );
+        assert!(
+            snapshot.srtp_rollover.is_empty(),
+            "a plain relay has no SRTP state"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_is_ownership_gated() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "owned".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        // A different client cannot checkpoint (nor even learn the call exists) — A3, docs §5.
+        let other = ClientId(999);
+        assert!(matches!(
+            engine
+                .handle(
+                    other,
+                    Command::Checkpoint {
+                        call_id: "owned".into(),
+                        from_tag: "tag-a".into(),
+                    },
+                )
+                .await,
+            CmdResult::Error { .. }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
