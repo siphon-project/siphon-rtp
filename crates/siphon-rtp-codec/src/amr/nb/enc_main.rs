@@ -7,10 +7,16 @@
 //! Speech path only: the comfort-noise / SID (`MRDTX`) frames are not emitted and DTX is disabled,
 //! matching the NODTX reference vectors (produced by `coder.c` without `-dtx`).
 
-use crate::amr::nb::constants::{AZ_SIZE, EHF_MASK, L_FRAME, L_NEXT, L_TOTAL, L_WINDOW, M};
+use crate::amr::nb::constants::{
+    AZ_SIZE, EHF_MASK, L_FRAME, L_NEXT, L_TOTAL, L_WINDOW, M, PIT_MAX,
+};
 use crate::amr::nb::enc_lpc::{lpc, LevinsonState, PreProcessState};
 use crate::amr::nb::enc_lsp::LspState;
+use crate::amr::nb::enc_pitch_ol::{weighted_speech_and_ol_pitch, PitchOlWghtState};
 use crate::amr::AmrNbMode;
+
+/// Length of the weighted-speech buffer (`cod_amrState.old_wsp[PIT_MAX + L_FRAME]`).
+const OLD_WSP_LEN: usize = PIT_MAX as usize + L_FRAME;
 
 /// AMR-NB encoder state (`cod_amrState` + the `Speech_Encode_FrameState` pre-processing memory),
 /// the analysis-side single-owner working set.
@@ -31,6 +37,21 @@ pub struct EncoderState {
     levinson: LevinsonState,
     /// LSP analysis + split-VQ predictor memory (`cod_amrState.lspSt`).
     lsp: LspState,
+    /// Weighted-speech buffer (`cod_amrState.old_wsp[PIT_MAX + L_FRAME]`). The reference pointer
+    /// layout is `wsp = old_wsp + PIT_MAX`, so `old_wsp[PIT_MAX ..]` receives the frame's `L_FRAME`
+    /// weighted-speech samples and `old_wsp[0 .. PIT_MAX]` carries the previous-frame history the
+    /// open-loop pitch search reads. Each frame shifts left by `L_FRAME`.
+    old_wsp: [i16; OLD_WSP_LEN],
+    /// Perceptual-weighting synthesis-filter memory (`cod_amrState.mem_w[M]`), carried across
+    /// subframes and frames by `pre_big`.
+    mem_w: [i16; M],
+    /// Open-loop weighted-pitch state (`cod_amrState.pitchOLWghtSt`), used only by MR102.
+    pitch_ol_wght: PitchOlWghtState,
+    /// History of old stored closed-loop lags (`cod_amrState.old_lags[5]`), reset to 40. Used by the
+    /// MR102 weighted open-loop pitch median; also updated from the closed-loop search (later tier).
+    old_lags: [i16; 5],
+    /// Open-loop gain flags (`cod_amrState.ol_gain_flg[2]`), maintained by the MR102 OL-pitch path.
+    ol_gain_flg: [i16; 2],
 }
 
 impl Default for EncoderState {
@@ -49,6 +70,12 @@ impl EncoderState {
             pre_process: PreProcessState::new(),
             levinson: LevinsonState::new(),
             lsp: LspState::new(),
+            old_wsp: [0i16; OLD_WSP_LEN],
+            mem_w: [0i16; M],
+            pitch_ol_wght: PitchOlWghtState::new(),
+            // cod_amr_reset seeds all 5 old_lags with 40.
+            old_lags: [40i16; 5],
+            ol_gain_flg: [0i16; 2],
         }
     }
 
@@ -66,6 +93,33 @@ impl EncoderState {
         mode: AmrNbMode,
         new_speech: &[i16],
         prm: &mut [i16],
+    ) -> usize {
+        let mut wsp = [0i16; L_FRAME];
+        let mut t_op = [0i16; 2];
+        self.analyze_frame(mode, new_speech, prm, &mut wsp, &mut t_op)
+    }
+
+    /// Front-end + LP analysis + LSF quantization + weighted speech + open-loop pitch for one 20 ms
+    /// frame (`cod_amr.c` through the open-loop pitch section, `~line 502`).
+    ///
+    /// On top of [`Self::encode_lsf_params`] this fills:
+    ///  * `wsp[0..L_FRAME]` — the perceptually-weighted speech for the whole frame (`pre_big`),
+    ///  * `t_op[0..2]` — the open-loop pitch lag(s) (`ol_ltp`); for MR475/MR515 `t_op[1] == t_op[0]`.
+    ///
+    /// The LSF quantization indices are written to `prm[0..nLSF]` (return value = `nLSF`). The
+    /// weighted-speech buffer, weighting-filter memory, and open-loop pitch state are advanced across
+    /// the frame boundary exactly as `cod_amr` does, so calling this once per frame keeps the encoder
+    /// state coherent for the excitation-loop tiers that follow.
+    ///
+    /// # Panics
+    /// Debug-asserts that `new_speech.len() == L_FRAME`.
+    pub fn analyze_frame(
+        &mut self,
+        mode: AmrNbMode,
+        new_speech: &[i16],
+        prm: &mut [i16],
+        wsp: &mut [i16; L_FRAME],
+        t_op: &mut [i16; 2],
     ) -> usize {
         debug_assert_eq!(new_speech.len(), L_FRAME, "new_speech must be one L_FRAME block");
 
@@ -107,11 +161,34 @@ impl EncoderState {
         }
 
         // From A(z) to LSP, LSP quantization + interpolation: lsp(lspSt, mode, A_t, Aq_t, lsp_new, &prm).
+        // On return `a_t` holds the unquantized interpolated LP filters used by the weighting filter.
         let mut a_q = [0i16; AZ_SIZE];
         let mut lsp_new = [0i16; M];
         let nlsf = self.lsp.lsp(mode, &mut a_t, &mut a_q, &mut lsp_new, prm);
 
-        // Update signal for the next frame: shift old_speech left by L_FRAME.
+        // Weighted speech (pre_big) + open-loop pitch (ol_ltp) for the whole frame.
+        // st->speech = old_speech + L_TOTAL - L_FRAME - L_NEXT (= +120); st->wsp = old_wsp + PIT_MAX.
+        let speech_base = L_TOTAL - L_FRAME - L_NEXT; // +120
+        weighted_speech_and_ol_pitch(
+            &mut self.pitch_ol_wght,
+            mode,
+            &a_t,
+            &self.old_speech,
+            speech_base,
+            &mut self.mem_w,
+            &mut self.old_wsp,
+            PIT_MAX as usize,
+            &mut self.old_lags,
+            &mut self.ol_gain_flg,
+            t_op,
+        );
+
+        // Expose the frame's weighted speech (old_wsp[PIT_MAX ..]) to the caller.
+        wsp.copy_from_slice(&self.old_wsp[PIT_MAX as usize..PIT_MAX as usize + L_FRAME]);
+
+        // Update signals for the next frame: shift old_wsp left by L_FRAME (Copy old_wsp+L_FRAME),
+        // then old_speech left by L_FRAME. Order mirrors cod_amr (wsp first, then speech).
+        self.old_wsp.copy_within(L_FRAME.., 0);
         self.old_speech.copy_within(L_FRAME.., 0);
 
         // Perform homing if a homing frame was detected at the encoder input (reset AFTER coding).
