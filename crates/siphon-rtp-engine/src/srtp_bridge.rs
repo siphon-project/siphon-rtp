@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
-use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 /// The crypto a bridge flow applies to ingress before forwarding it out the peer endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +106,35 @@ impl<D: Datapath> SrtpBridge<D> {
     #[must_use]
     pub fn owns(&self, endpoint: EndpointId) -> bool {
         self.flows.contains_key(&endpoint)
+    }
+
+    /// Export a call's shared secure-leg rollover for an HA checkpoint, reached via **any one** of its
+    /// endpoints (both directions share the leg). `None` if the endpoint is not bridged or the leg
+    /// mutex is poisoned. See [`SecureLeg::rollover_snapshot`].
+    #[must_use]
+    pub fn rollover_snapshot(&self, endpoint: EndpointId) -> Option<SecureLegRollover> {
+        let leg = self.flows.get(&endpoint)?.leg.clone();
+        let guard = leg.lock().ok()?;
+        Some(guard.rollover_snapshot())
+    }
+
+    /// Export the installed bridge flow plans for a call's `endpoints` (crypto op / source-gate /
+    /// destination), so an HA restore can reinstall them verbatim. Entries follow `endpoints`; an
+    /// endpoint the bridge does not own is skipped.
+    #[must_use]
+    pub fn flow_plans(&self, endpoints: &[EndpointId]) -> Vec<BridgeFlowPlan> {
+        endpoints
+            .iter()
+            .filter_map(|endpoint| {
+                self.flows.get(endpoint).map(|flow| BridgeFlowPlan {
+                    endpoint: *endpoint,
+                    op: flow.op,
+                    accepted_source: flow.accepted_source,
+                    out_endpoint: flow.out_endpoint,
+                    out_dst: flow.out_dst,
+                })
+            })
+            .collect()
     }
 
     /// Handle one redirected datagram: gate the source, apply the flow's crypto, and forward it.
