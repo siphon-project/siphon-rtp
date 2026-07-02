@@ -226,6 +226,13 @@ pub enum DatapathError {
         /// The configured maximum number of concurrent endpoints.
         limit: usize,
     },
+    /// A specific media port was requested (HA restore — re-binding the exact port a failed primary
+    /// used) but it is outside the configured range or already reserved on this node.
+    #[error("media port {port} is unavailable (out of range or already in use)")]
+    PortUnavailable {
+        /// The requested port that could not be reserved.
+        port: u16,
+    },
     /// Transmitting a datagram failed.
     #[error("send failed: {0}")]
     Send(#[source] std::io::Error),
