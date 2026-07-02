@@ -210,7 +210,20 @@ fn codec_snapshot(codec: &CodecSpec) -> crate::ha::CodecSnapshot {
         clock_rate_hz: codec.clock_rate_hz,
         channels: codec.channels,
         ptime_ms: codec.ptime_ms,
+        encode_mode: codec.encode_mode,
     }
+}
+
+/// Reconstruct a [`CodecSpec`] from its snapshot on restore (for a transcode call's directions).
+fn restore_codec(snapshot: &crate::ha::CodecSnapshot) -> CodecSpec {
+    CodecSpec::new(
+        snapshot.payload_type,
+        &snapshot.encoding_name,
+        snapshot.clock_rate_hz,
+        snapshot.channels,
+        snapshot.ptime_ms,
+    )
+    .with_encode_mode(snapshot.encode_mode)
 }
 
 /// Map an SDES [`CryptoAttribute`] to its snapshot (suite name + hex key material).
@@ -1621,11 +1634,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(snapshot) => snapshot,
             Err(error) => return error_result("restore: parse snapshot", &error),
         };
-        // Supported today: a plain relay, and a secure SDES-SRTP bridge (`Srtp`) call. Transcode / WS
-        // pipelines additionally need their slow-path actor rebuilt — the remaining follow-up.
+        // Supported: a plain relay, a secure SDES-SRTP bridge (`Srtp`), and a plaintext transcode
+        // (`Media`) call. `SrtpMedia` (secure transcode) and `Ws` keep their crypto/actor state inside
+        // the running actor and are the remaining follow-up.
         match snapshot.pipeline {
             PipelineSnapshot::Passthrough => {}
             PipelineSnapshot::Srtp if snapshot.secure.is_some() => {}
+            PipelineSnapshot::Media
+                if snapshot.near_codec.is_some() && snapshot.far_codec.is_some() => {}
             other => {
                 return CmdResult::Error {
                     reason: format!("restore of a {other:?} call is not yet supported"),
@@ -1676,6 +1692,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
         let mut far_local_crypto: Option<CryptoAttribute> = None;
         let mut far_remote_crypto: Option<CryptoAttribute> = None;
+        let mut near_codec_out: Option<CodecSpec> = None;
+        let mut far_codec_out: Option<CodecSpec> = None;
         let pipeline;
         match snapshot.pipeline {
             PipelineSnapshot::Passthrough => {
@@ -1771,6 +1789,84 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_local_crypto = Some(far_local);
                 far_remote_crypto = Some(far_remote);
             }
+            PipelineSnapshot::Media => {
+                pipeline = PipelineKind::Media;
+                // Both codecs were validated present above; the two remote addresses are required to
+                // target egress. Rebuild the transcoding actor — jitter/codec state restarts fresh
+                // (the cold-restore glitch); the egress SSRC/seq/ts also reset, so the far side re-syncs.
+                let (Some(near_codec_snap), Some(far_codec_snap)) =
+                    (snapshot.near_codec.as_ref(), snapshot.far_codec.as_ref())
+                else {
+                    self.free_bound(&bound).await;
+                    return CmdResult::Error {
+                        reason: "restore: media call missing a codec".to_string(),
+                    };
+                };
+                let (Some(a_rtp), Some(b_rtp)) = (near.remote_rtp, far.remote_rtp) else {
+                    self.free_bound(&bound).await;
+                    return CmdResult::Error {
+                        reason: "restore: media call missing a remote address".to_string(),
+                    };
+                };
+                let near_codec = restore_codec(near_codec_snap);
+                let far_codec = restore_codec(far_codec_snap);
+                let near_te = snapshot.near_telephone_event;
+                let a_to_b = match build_direction(
+                    near_rtp.id,
+                    SourceFilter::Exact(a_rtp.ip()),
+                    far_rtp.id,
+                    b_rtp,
+                    &near_codec,
+                    &far_codec,
+                    near_te,
+                    None,
+                    None,
+                ) {
+                    Ok(direction) => direction,
+                    Err(reason) => {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: media pipeline (A→B)", &reason);
+                    }
+                };
+                let b_to_a = match build_direction(
+                    far_rtp.id,
+                    SourceFilter::Exact(b_rtp.ip()),
+                    near_rtp.id,
+                    a_rtp,
+                    &far_codec,
+                    &near_codec,
+                    None,
+                    near_te,
+                    None,
+                ) {
+                    Ok(direction) => direction,
+                    Err(reason) => {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: media pipeline (B→A)", &reason);
+                    }
+                };
+                // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them).
+                for endpoint in [near_rtp.id, far_rtp.id] {
+                    if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: install media redirect", &error);
+                    }
+                }
+                let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
+                let media_call = MediaCall::new(
+                    snapshot.call_id.clone(),
+                    snapshot.from_tag.clone(),
+                    snapshot.to_tag.clone(),
+                    a_to_b,
+                    b_to_a,
+                    true, // relay latch (the `no-latch` flag is not carried in the snapshot)
+                    None, // recording restarts on the new node if the proxy re-issues it
+                );
+                self.media
+                    .register(media_call, self.datapath.clone(), owner_events);
+                near_codec_out = Some(near_codec);
+                far_codec_out = Some(far_codec);
+            }
             _ => unreachable!("pipeline validated above"),
         }
 
@@ -1795,10 +1891,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far,
                 far_local_crypto,
                 far_remote_crypto,
-                // Codecs are informational for these pipelines' relay/bridge path; reconstructed with
-                // the transcode-restore follow-up.
-                near_codec: None,
-                far_codec: None,
+                // Set for a transcode (`Media`) call; `None` for relay/bridge, which don't transcode.
+                near_codec: near_codec_out,
+                far_codec: far_codec_out,
                 near_telephone_event: snapshot.near_telephone_event,
                 pipeline,
                 relay_flows,
@@ -3931,6 +4026,134 @@ mod tests {
         assert_eq!(
             recovered_a, from_b,
             "B→A secure relay resumes on the standby"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_resumes_a_transcode_call_on_a_standby() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        // Transcode warm-standby HA: a PCMU↔PCMA transcoding call is set up on node A, checkpointed,
+        // torn down, then restored on node B which re-binds the same ports and rebuilds the
+        // transcoding actor — and media transcodes through B (fresh actor state, same ports).
+        let (min, max) = (49_000u16, 49_040u16);
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        tokio::spawn(run_redirect_dispatcher(
+            engine_a.datapath().rx(),
+            engine_a.bridge(),
+            engine_a.media(),
+            engine_a.ws(),
+            engine_a.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        // A offers PCMU; B answers PCMA → near=PCMU, far=PCMA → the transcoding media slow path.
+        let offer = engine_a
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ha-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_far = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+        let answer = engine_a
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ha-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        assert!(
+            engine_a.media().is_media_call("ha-xcode"),
+            "resolves to a transcode call"
+        );
+
+        // Checkpoint carries both codecs; then A dies (delete frees ports).
+        let CmdResult::Checkpoint { snapshot } = engine_a
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "ha-xcode".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("checkpoint");
+        };
+        let parsed = crate::ha::CallSnapshot::from_json(&snapshot).expect("parse blob");
+        assert_eq!(parsed.near_codec.expect("near codec").encoding_name, "PCMU");
+        assert_eq!(parsed.far_codec.expect("far codec").encoding_name, "PCMA");
+        engine_a
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "ha-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        drop(engine_a);
+
+        // Node B restores the transcode call and rebuilds the actor at the same ports.
+        let engine_b = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        tokio::spawn(run_redirect_dispatcher(
+            engine_b.datapath().rx(),
+            engine_b.bridge(),
+            engine_b.media(),
+            engine_b.ws(),
+            engine_b.conference(),
+            None,
+        ));
+        assert!(
+            matches!(
+                engine_b.handle(CLIENT, Command::Restore { snapshot }).await,
+                CmdResult::Ok { .. }
+            ),
+            "transcode restore succeeds on the standby"
+        );
+        assert!(
+            engine_b.media().is_media_call("ha-xcode"),
+            "the transcoding actor is rebuilt on the standby"
+        );
+
+        // A → engine_near → transcode → B receives A-law (PT 8), not the original µ-law.
+        let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
+        phone_a.send_to(&from_a, engine_near).await.expect("a send");
+        let (transcoded, _) = recv(&phone_b).await;
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&transcoded).expect("parse");
+        assert_eq!(
+            parsed.payload_type, 8,
+            "B receives A-law (PT 8) through the restored actor"
+        );
+
+        // B → engine_far → transcode → A receives µ-law (PT 0).
+        let from_b = g711_rtp(8, 200, 0x0B0B_0B0B, 0x55);
+        phone_b.send_to(&from_b, engine_far).await.expect("b send");
+        let (back, _) = recv(&phone_a).await;
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&back).expect("parse");
+        assert_eq!(
+            parsed.payload_type, 0,
+            "A receives µ-law (PT 0) through the restored actor"
         );
     }
 

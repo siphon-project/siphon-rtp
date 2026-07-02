@@ -144,6 +144,10 @@ pub struct CodecSnapshot {
     pub channels: u8,
     /// Packetization time (ms).
     pub ptime_ms: u8,
+    /// Egress encode mode for a variable-rate codec (AMR-WB `mode-set`), preserved so a restored
+    /// transcode call re-encodes at the same rate. `None` = the codec default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_mode: Option<u8>,
 }
 
 /// Which of a call's four possible endpoints a rule refers to — the node-independent stand-in for a
@@ -353,6 +357,7 @@ mod tests {
                 clock_rate_hz: 8000,
                 channels: 1,
                 ptime_ms: 20,
+                encode_mode: None,
             }),
             far_codec: None,
             near_telephone_event: Some(101),
