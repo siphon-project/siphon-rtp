@@ -231,6 +231,26 @@ fn latch_snapshot(latch: LatchPolicy) -> crate::ha::LatchSnapshot {
     }
 }
 
+/// Map a snapshot source-filter back to the datapath [`SourceFilter`] on restore.
+fn restore_source_filter(filter: crate::ha::SourceFilterSnapshot) -> SourceFilter {
+    use crate::ha::SourceFilterSnapshot;
+    match filter {
+        SourceFilterSnapshot::Exact(ip) => SourceFilter::Exact(ip),
+        SourceFilterSnapshot::Subnet(ip, bits) => SourceFilter::Subnet(ip, bits),
+        SourceFilterSnapshot::Any => SourceFilter::Any,
+    }
+}
+
+/// Map a snapshot latch policy back to the datapath [`LatchPolicy`] on restore.
+fn restore_latch(latch: crate::ha::LatchSnapshot) -> LatchPolicy {
+    use crate::ha::LatchSnapshot;
+    match latch {
+        LatchSnapshot::Off => LatchPolicy::Off,
+        LatchSnapshot::SignalledOnly => LatchPolicy::SignalledOnly,
+        LatchSnapshot::Symmetric => LatchPolicy::Symmetric,
+    }
+}
+
 /// A SIPREC / monitor media subscription (RFC 7866): one or more source legs' **raw ingress RTP** is
 /// tee'd byte-for-byte toward a send-only subscriber (a Session Recording Server, SRS). Unlike a
 /// re-encode fork, the raw tee carries each leg's negotiated codec verbatim — so it works on a plain
@@ -486,9 +506,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ok_empty()
             }
             Command::Checkpoint { call_id, .. } => self.checkpoint(client, &call_id),
-            Command::Restore { .. } => CmdResult::Error {
-                reason: "restore is not yet supported on this build".to_string(),
-            },
+            Command::Restore { snapshot } => self.restore(client, &snapshot).await,
             Command::Offer {
                 call_id,
                 from_tag,
@@ -1463,6 +1481,148 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(blob) => CmdResult::Checkpoint { snapshot: blob },
             Err(error) => error_result("checkpoint serialize", &error),
         }
+    }
+
+    /// Rebuild a call on this (standby) node from a [`Command::Checkpoint`] blob — the HA takeover.
+    /// Allocates endpoints at the snapshot's **exact ports** (so a floating-IP standby needs no SIP
+    /// re-INVITE), reinstalls the forward rules, and registers the call under the requesting client.
+    ///
+    /// Plain relay only for now: a secure / transcode / WS call additionally needs its SRTP keys and
+    /// slow-path actor rebuilt, which is a follow-up (the snapshot already carries the negotiated
+    /// state). Any endpoint bind or flow install that fails rolls back the endpoints already bound.
+    async fn restore(&self, client: ClientId, blob: &str) -> CmdResult {
+        use crate::ha::{self, EndpointRole, PipelineSnapshot};
+        let snapshot = match ha::CallSnapshot::from_json(blob) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_result("restore: parse snapshot", &error),
+        };
+        if !matches!(snapshot.pipeline, PipelineSnapshot::Passthrough) {
+            return CmdResult::Error {
+                reason: format!(
+                    "restore of a {:?} call is not yet supported (plain relay only)",
+                    snapshot.pipeline
+                ),
+            };
+        }
+        if self.calls.contains_key(&snapshot.call_id) {
+            return CmdResult::Error {
+                reason: format!("cannot restore: call {} already exists", snapshot.call_id),
+            };
+        }
+
+        // Bind the four (or two, under rtcp-mux) endpoints at their exact ports, in role order.
+        let mut targets: Vec<(EndpointRole, std::net::SocketAddr)> =
+            vec![(EndpointRole::NearRtp, snapshot.near.rtp_local)];
+        if let Some(addr) = snapshot.near.rtcp_local {
+            targets.push((EndpointRole::NearRtcp, addr));
+        }
+        targets.push((EndpointRole::FarRtp, snapshot.far.rtp_local));
+        if let Some(addr) = snapshot.far.rtcp_local {
+            targets.push((EndpointRole::FarRtcp, addr));
+        }
+        let mut bound: Vec<(EndpointRole, Endpoint)> = Vec::new();
+        for (role, addr) in targets {
+            match self
+                .datapath
+                .alloc_endpoint_on_port(AddressFamily::of(addr.ip()), addr.port())
+                .await
+            {
+                Ok(endpoint) => bound.push((role, endpoint)),
+                Err(error) => {
+                    self.free_bound(&bound).await;
+                    return error_result("restore: bind endpoint at snapshot port", &error);
+                }
+            }
+        }
+        let role_endpoint = |role: EndpointRole| -> Option<Endpoint> {
+            bound.iter().find(|(r, _)| *r == role).map(|(_, e)| *e)
+        };
+
+        // Reinstall the forward rules, resolving each role to its freshly-bound endpoint id.
+        let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
+        for flow in &snapshot.flows {
+            let (Some(installed_on), Some(out)) =
+                (role_endpoint(flow.installed_on), role_endpoint(flow.out))
+            else {
+                self.free_bound(&bound).await;
+                return CmdResult::Error {
+                    reason: "restore: a snapshot flow references an unknown endpoint role"
+                        .to_string(),
+                };
+            };
+            let action = FlowAction::Forward(ForwardRule {
+                out_endpoint: out.id,
+                out_dst: flow.out_dst,
+                accepted_source: restore_source_filter(flow.accepted_source),
+                latch: restore_latch(flow.latch),
+            });
+            if let Err(error) = self.datapath.install_flow(installed_on.id, action) {
+                self.free_bound(&bound).await;
+                return error_result("restore: install forward flow", &error);
+            }
+            relay_flows.push((installed_on.id, action));
+        }
+
+        // Every plain relay has a near.rtp and a far.rtp; RTCP endpoints are optional (rtcp-mux).
+        let (Some(near_rtp), Some(far_rtp)) = (
+            role_endpoint(EndpointRole::NearRtp),
+            role_endpoint(EndpointRole::FarRtp),
+        ) else {
+            self.free_bound(&bound).await;
+            return CmdResult::Error {
+                reason: "restore: snapshot is missing a required RTP endpoint".to_string(),
+            };
+        };
+        let near = Leg {
+            rtp: near_rtp,
+            rtcp: role_endpoint(EndpointRole::NearRtcp),
+            remote_rtp: snapshot.near.remote_rtp,
+            remote_rtcp: snapshot.near.remote_rtcp,
+        };
+        let far = Leg {
+            rtp: far_rtp,
+            rtcp: role_endpoint(EndpointRole::FarRtcp),
+            remote_rtp: snapshot.far.remote_rtp,
+            remote_rtcp: snapshot.far.remote_rtcp,
+        };
+
+        // Register the reconstructed call under the requesting (standby) client.
+        *self.client_calls.entry(client).or_insert(0) += 1;
+        for (_, endpoint) in &bound {
+            self.endpoint_calls
+                .insert(endpoint.id, snapshot.call_id.clone());
+        }
+        self.calls.insert(
+            snapshot.call_id.clone(),
+            Call {
+                owner: client,
+                created_tick: self.datapath.now_ticks(),
+                ice: snapshot.ice.map(|ice| IceCredentials {
+                    ufrag: ice.ufrag,
+                    pwd: ice.pwd,
+                }),
+                from_tag: snapshot.from_tag,
+                to_tag: snapshot.to_tag,
+                near,
+                far,
+                // A plain relay needs neither the SDES key nor codecs to forward; both are
+                // reconstructed with the secure/transcode-restore follow-up.
+                far_local_crypto: None,
+                near_codec: None,
+                far_codec: None,
+                near_telephone_event: snapshot.near_telephone_event,
+                pipeline: PipelineKind::Passthrough,
+                relay_flows,
+            },
+        );
+        tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
+        ok_empty()
+    }
+
+    /// Free the endpoints bound so far during a [`Self::restore`] that then failed (rollback).
+    async fn free_bound(&self, bound: &[(crate::ha::EndpointRole, Endpoint)]) {
+        let endpoints: Vec<Endpoint> = bound.iter().map(|(_, endpoint)| *endpoint).collect();
+        self.free(&endpoints).await;
     }
 
     /// Enumerate the live call-ids `client` owns ([`Command::List`]) — a read-only census of the
@@ -2817,7 +2977,7 @@ fn bridge_source_filter(profile: &ProfileFlags, addr: std::net::SocketAddr) -> S
 mod tests {
     use super::*;
     use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
@@ -3234,6 +3394,161 @@ mod tests {
                     Command::Checkpoint {
                         call_id: "owned".into(),
                         from_tag: "tag-a".into(),
+                    },
+                )
+                .await,
+            CmdResult::Error { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_resumes_a_plain_relay_on_a_standby_at_the_same_ports() {
+        // Warm-standby HA end to end: a plain relay is set up on "node A", checkpointed, torn down
+        // (A dies, freeing its ports), then restored on a fresh "node B" that re-binds the *same*
+        // media ports (as a floating-IP standby would) — and media relays through B with no
+        // re-negotiation. Both nodes use the same deterministic port range on loopback.
+        let (min, max) = (46_000u16, 46_040u16);
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        // A plain PCMU relay (offer + answer, rtcp-mux, no profile) on node A.
+        let offer = engine_a
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ha-relay".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        // The engine address B will send to (advertised in the offer sent onward to B).
+        let engine_far = sdp::parse(&ok_sdp_text(&offer)).expect("offer").remote_rtp;
+        let answer = engine_a
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ha-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        // The engine address A sends to (advertised back to A in the answer).
+        let engine_near = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer")
+            .remote_rtp;
+
+        // Checkpoint the live call, then delete it on A and drop A — freeing the media ports.
+        let CmdResult::Checkpoint { snapshot } = engine_a
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "ha-relay".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("expected a checkpoint result");
+        };
+        engine_a
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "ha-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        drop(engine_a);
+
+        // Node B (same port range + bind IP) restores from the blob, re-binding the same ports.
+        let engine_b = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        assert!(
+            matches!(
+                engine_b.handle(CLIENT, Command::Restore { snapshot }).await,
+                CmdResult::Ok { .. }
+            ),
+            "restore succeeds on the standby"
+        );
+
+        // Media now relays through B at the unchanged engine ports — no re-INVITE needed.
+        // A → engine_near → B receives at addr_b.
+        let a_to_b = g711_rtp(0, 1, 0x0A0A_0A0A, 0xA1);
+        phone_a.send_to(&a_to_b, engine_near).await.expect("a send");
+        let (got_b, _) = recv(&phone_b).await;
+        assert_eq!(got_b, a_to_b, "A→B relays through the restored node");
+
+        // B → engine_far → A receives at addr_a.
+        let b_to_a = g711_rtp(0, 2, 0x0B0B_0B0B, 0xB2);
+        phone_b.send_to(&b_to_a, engine_far).await.expect("b send");
+        let (got_a, _) = recv(&phone_a).await;
+        assert_eq!(got_a, b_to_a, "B→A relays through the restored node");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_stale_or_duplicate_call() {
+        // A blob for a call that is already live is refused (no clobbering a live call).
+        let engine = Engine::new(UdpLoopbackDatapath::with_port_range(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            47_000,
+            47_020,
+        ));
+        let (_phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dup".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dup".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let CmdResult::Checkpoint { snapshot } = engine
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "dup".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("checkpoint");
+        };
+        // The call is still live → restoring the same id is rejected.
+        assert!(matches!(
+            engine.handle(CLIENT, Command::Restore { snapshot }).await,
+            CmdResult::Error { .. }
+        ));
+        // A malformed blob is a clean error, never a panic.
+        assert!(matches!(
+            engine
+                .handle(
+                    CLIENT,
+                    Command::Restore {
+                        snapshot: "{not valid".into(),
                     },
                 )
                 .await,

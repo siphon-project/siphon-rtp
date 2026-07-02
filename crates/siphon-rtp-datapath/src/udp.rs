@@ -698,6 +698,14 @@ impl Datapath for UdpLoopbackDatapath {
         self.alloc_on(self.bind_ip_for(family)).await
     }
 
+    async fn alloc_endpoint_on_port(
+        &self,
+        family: AddressFamily,
+        port: u16,
+    ) -> Result<Endpoint, DatapathError> {
+        self.alloc_specific(family, port).await
+    }
+
     fn install_flow(&self, endpoint: EndpointId, action: FlowAction) -> Result<(), DatapathError> {
         if !self.inner.endpoints.contains_key(&endpoint) {
             return Err(DatapathError::UnknownEndpoint(endpoint));
