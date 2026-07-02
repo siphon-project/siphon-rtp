@@ -71,6 +71,20 @@ impl SrtcpContext {
         Self::new(&material.master_key, &material.master_salt)
     }
 
+    /// The current outgoing SRTCP index (RFC 3711 §3.4). Carried across an HA failover so a standby
+    /// does not re-use indices the primary already sent (a receiver rejects a re-used index as a
+    /// replay). See [`Self::set_send_index`].
+    #[must_use]
+    pub fn send_index(&self) -> u32 {
+        self.send_index
+    }
+
+    /// Seed the outgoing SRTCP index from an HA checkpoint, so egress SRTCP continues past the
+    /// primary's last-sent index instead of restarting at `0`.
+    pub fn set_send_index(&mut self, index: u32) {
+        self.send_index = index;
+    }
+
     /// Encrypt + authenticate a compound RTCP packet into `out`: `header(8) || AES-CM(rest) ||
     /// E|index || HMAC-SHA1-80`.
     pub fn protect(&mut self, rtcp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
@@ -179,6 +193,35 @@ mod tests {
             .unprotect(&srtcp, &mut recovered)
             .expect("unprotect");
         assert_eq!(recovered, plain);
+    }
+
+    #[test]
+    fn send_index_checkpoint_and_seed() {
+        // The SRTCP index is carried across an HA failover so the standby does not re-use indices the
+        // primary already sent (a receiver rejects a re-used index as a replay, RFC 3711 §3.4).
+        let mut primary = context();
+        let mut out = Vec::new();
+        assert_eq!(primary.send_index(), 0, "fresh index starts at 0");
+        primary
+            .protect(&rtcp(0x1111_2222, &[0; 20]), &mut out)
+            .expect("protect");
+        primary
+            .protect(&rtcp(0x1111_2222, &[0; 20]), &mut out)
+            .expect("protect");
+        assert_eq!(primary.send_index(), 2, "index advances per SRTCP packet");
+
+        // A standby seeded from the checkpoint continues past the primary's last-sent index.
+        let mut standby = context();
+        standby.set_send_index(primary.send_index());
+        assert_eq!(standby.send_index(), 2);
+        standby
+            .protect(&rtcp(0x1111_2222, &[0; 20]), &mut out)
+            .expect("protect");
+        assert_eq!(
+            standby.send_index(),
+            3,
+            "standby continues, never re-using an index"
+        );
     }
 
     #[test]
