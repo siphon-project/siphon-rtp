@@ -12,6 +12,7 @@ pub mod codebook;
 pub mod constants;
 pub mod dec_main;
 pub mod enc_cb;
+pub mod enc_gain;
 pub mod enc_lpc;
 pub mod enc_lsp;
 pub mod enc_main;
