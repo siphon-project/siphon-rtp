@@ -97,6 +97,16 @@ pub enum Command {
     Drain,
     /// Leave drain mode: resume admitting new sessions. Idempotent; answered with [`CmdResult::Ok`].
     Undrain,
+    /// Snapshot a live call's state for HA warm-standby failover — answered with
+    /// [`CmdResult::Checkpoint`]. The reply carries an **opaque** blob (the engine owns its format);
+    /// the SIP proxy stores it keyed by `call_id` and hands it back to [`Command::Restore`] on a
+    /// standby if this node dies. Ownership-gated like [`Command::Query`]: only the owning client may
+    /// checkpoint its call.
+    Checkpoint { call_id: String, from_tag: String },
+    /// Rebuild a call on this (standby) node from a blob produced by [`Command::Checkpoint`] —
+    /// answered with [`CmdResult::Ok`]. (Handler lands in the restore slice; the verb is defined here
+    /// so the contract is stable.)
+    Restore { snapshot: String },
     /// Inject an audio prompt into a leg.
     PlayMedia {
         call_id: String,
@@ -341,6 +351,9 @@ pub enum CmdResult {
     Load { load: NodeLoad },
     /// Answer to [`Command::NodeInfo`]: this engine's static identity and capabilities.
     NodeInfo { node: NodeInfo },
+    /// Answer to [`Command::Checkpoint`]: the opaque HA snapshot blob for the call. The engine owns
+    /// the format; the proxy stores it verbatim and returns it via [`Command::Restore`].
+    Checkpoint { snapshot: String },
     /// Failure with a human-readable reason.
     Error { reason: String },
 }
@@ -623,6 +636,13 @@ mod tests {
             Command::NodeInfo,
             Command::Drain,
             Command::Undrain,
+            Command::Checkpoint {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+            },
+            Command::Restore {
+                snapshot: "{\"version\":1}".into(),
+            },
             Command::PlayMedia {
                 call_id: "c".into(),
                 from_tag: "f".into(),
@@ -819,6 +839,12 @@ mod tests {
             },
         });
         roundtrip(&Response {
+            id: 11,
+            result: CmdResult::Checkpoint {
+                snapshot: "{\"version\":1,\"call_id\":\"c\"}".into(),
+            },
+        });
+        roundtrip(&Response {
             id: 4,
             result: CmdResult::Ok {
                 sdp: None,
@@ -970,6 +996,33 @@ mod tests {
         assert_eq!(info["result"], "node_info");
         assert_eq!(info["node"]["codecs"][1], "AMR-WB");
         assert_eq!(info["node"]["max_sessions"], 4000);
+    }
+
+    #[test]
+    fn checkpoint_wire_shape() {
+        // The command tags on "command":"checkpoint" and carries the call keys.
+        let command = serde_json::to_value(&Request {
+            id: 1,
+            command: Command::Checkpoint {
+                call_id: "call-x".into(),
+                from_tag: "ft".into(),
+            },
+        })
+        .expect("to_value");
+        assert_eq!(command["command"], "checkpoint");
+        assert_eq!(command["call_id"], "call-x");
+        assert_eq!(command["from_tag"], "ft");
+
+        // The result tags on "result":"checkpoint" and carries the opaque blob under "snapshot".
+        let result = serde_json::to_value(&Response {
+            id: 2,
+            result: CmdResult::Checkpoint {
+                snapshot: "{\"version\":1}".into(),
+            },
+        })
+        .expect("to_value");
+        assert_eq!(result["result"], "checkpoint");
+        assert_eq!(result["snapshot"], "{\"version\":1}");
     }
 
     #[test]

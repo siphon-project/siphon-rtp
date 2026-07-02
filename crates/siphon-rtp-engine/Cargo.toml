@@ -54,6 +54,8 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 # Optional TOML config file (`--config`) deserialized into a serde struct; CLI args take precedence.
 serde = { workspace = true }
+# Serialize the HA CallSnapshot to an opaque JSON blob for the checkpoint/restore control verbs.
+serde_json = { workspace = true }
 toml = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
