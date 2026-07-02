@@ -15,7 +15,7 @@
 
 use crate::sdes::SrtpKeyMaterial;
 use crate::srtcp::SrtcpContext;
-use crate::{SrtpContext, SrtpError};
+use crate::{SrtpContext, SrtpError, StreamRollover};
 
 /// Which media a packet carries, as resolved by [`is_rtcp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +41,24 @@ pub struct SecureLeg {
     outbound_rtp: SrtpContext,
     inbound_rtcp: SrtcpContext,
     outbound_rtcp: SrtcpContext,
+}
+
+/// The non-recoverable rollover state of a [`SecureLeg`], for an HA checkpoint. Everything else on a
+/// leg re-derives from the two SDES keys; only these SRTP rollover counters and the outbound SRTCP
+/// index are estimated from observed packets and so must move to a standby (RFC 3711 §3.3.1 / §3.4).
+///
+/// The **inbound** SRTP rollover keeps decryption of the peer's stream authenticating past a sequence
+/// wrap; the **outbound** SRTP rollover keeps our encryption continuous for the far side; the
+/// **outbound SRTCP index** stops the standby re-using an index (a replay). Inbound SRTCP needs no
+/// state — its index is explicit in each packet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecureLegRollover {
+    /// Per-SSRC rollover of the inbound (from-peer) SRTP context.
+    pub inbound_rtp: Vec<StreamRollover>,
+    /// Per-SSRC rollover of the outbound (to-peer) SRTP context.
+    pub outbound_rtp: Vec<StreamRollover>,
+    /// The outbound SRTCP index to continue from.
+    pub outbound_rtcp_index: u32,
 }
 
 impl SecureLeg {
@@ -80,6 +98,29 @@ impl SecureLeg {
             Ok(PacketKind::Rtp)
         }
     }
+
+    /// Export the leg's rollover state for an HA checkpoint. See [`SecureLegRollover`].
+    #[must_use]
+    pub fn rollover_snapshot(&self) -> SecureLegRollover {
+        SecureLegRollover {
+            inbound_rtp: self.inbound_rtp.rollover_state(),
+            outbound_rtp: self.outbound_rtp.rollover_state(),
+            outbound_rtcp_index: self.outbound_rtcp.send_index(),
+        }
+    }
+
+    /// Seed the leg's rollover state from an HA checkpoint (after rebuilding it from the two SDES
+    /// keys), so a standby continues both directions' SRTP index instead of resetting to `0`.
+    pub fn seed_rollover(&mut self, rollover: &SecureLegRollover) {
+        for stream in &rollover.inbound_rtp {
+            self.inbound_rtp.seed_stream(*stream);
+        }
+        for stream in &rollover.outbound_rtp {
+            self.outbound_rtp.seed_stream(*stream);
+        }
+        self.outbound_rtcp
+            .set_send_index(rollover.outbound_rtcp_index);
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +156,75 @@ mod tests {
         assert!(is_rtcp(&[0x80, 206]));
         assert!(!is_rtcp(&[0x80, 0x80 | 96]));
         assert!(!is_rtcp(&[0x80])); // too short → RTP
+    }
+
+    #[test]
+    fn rollover_snapshot_lets_a_standby_leg_continue_a_wrapped_stream() {
+        // HA-failover invariant at the leg level: after the outbound sequence wraps, a standby that
+        // rebuilds the leg from the two SDES keys alone (rollover reset) fails the far peer's auth;
+        // seeding it with the exported rollover keeps the peer decrypting.
+        let (local, remote) = (key(0xAA), key(0xBB));
+        let mut leg = SecureLeg::new(&local, &remote);
+        // The far peer decrypts our outbound with the *local* key (see the module note).
+        let mut peer = SrtpContext::from_key_material(&local);
+        let ssrc = 0x1234_5678;
+        let mut wire = Vec::new();
+        let mut plain = Vec::new();
+
+        // Drive the outbound RTP sequence past a wrap (…65534, 65535, 0); the peer follows the ROC.
+        for seq in [65534u16, 65535, 0] {
+            leg.protect(&rtp(seq, ssrc), &mut wire).expect("protect");
+            peer.unprotect(&wire, &mut plain)
+                .expect("peer decrypts pre-failover");
+        }
+        let snapshot = leg.rollover_snapshot();
+        assert_eq!(
+            snapshot
+                .outbound_rtp
+                .iter()
+                .find(|stream| stream.ssrc == ssrc)
+                .map(|stream| stream.roc),
+            Some(1),
+            "the outbound rollover reflects the wrap"
+        );
+
+        // Failover: a standby rebuilt from the same keys and seeded keeps the peer decrypting.
+        let mut standby = SecureLeg::new(&local, &remote);
+        standby.seed_rollover(&snapshot);
+        standby
+            .protect(&rtp(1, ssrc), &mut wire)
+            .expect("standby protect");
+        peer.unprotect(&wire, &mut plain)
+            .expect("seeded standby continues the stream");
+
+        // A cold rebuild (rollover reset to 0) fails the peer's auth after the wrap.
+        let mut cold = SecureLeg::new(&local, &remote);
+        cold.protect(&rtp(2, ssrc), &mut wire)
+            .expect("cold protect");
+        assert_eq!(
+            peer.unprotect(&wire, &mut plain),
+            Err(SrtpError::AuthFailed),
+            "a rollover reset breaks the peer's SRTP auth once the sequence has wrapped"
+        );
+    }
+
+    #[test]
+    fn seed_rollover_round_trips_the_outbound_srtcp_index() {
+        let (local, remote) = (key(0x11), key(0x22));
+        let mut leg = SecureLeg::new(&local, &remote);
+        let mut out = Vec::new();
+        leg.protect(&rtcp(0xABCD), &mut out).expect("srtcp protect");
+        leg.protect(&rtcp(0xABCD), &mut out).expect("srtcp protect");
+        let snapshot = leg.rollover_snapshot();
+        assert_eq!(snapshot.outbound_rtcp_index, 2);
+
+        let mut standby = SecureLeg::new(&local, &remote);
+        standby.seed_rollover(&snapshot);
+        // The standby's next SRTCP packet uses index 2, not a re-used 0.
+        standby
+            .protect(&rtcp(0xABCD), &mut out)
+            .expect("srtcp protect");
+        assert_eq!(standby.rollover_snapshot().outbound_rtcp_index, 3);
     }
 
     #[test]
