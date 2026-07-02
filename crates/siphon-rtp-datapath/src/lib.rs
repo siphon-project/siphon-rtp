@@ -276,6 +276,19 @@ pub trait Datapath: Send + Sync {
         self.alloc_endpoint()
     }
 
+    /// Allocate and bind an endpoint on a **specific** port — the HA-restore primitive: a standby
+    /// behind a floating IP re-binds the exact port a failed primary advertised, so media survives
+    /// without a SIP re-INVITE. The default errors with [`DatapathError::PortUnavailable`] (a backend
+    /// with no deterministic port allocator cannot honour a specific port); the loopback backend,
+    /// which has a port range, overrides this.
+    fn alloc_endpoint_on_port(
+        &self,
+        _family: AddressFamily,
+        port: u16,
+    ) -> impl std::future::Future<Output = Result<Endpoint, DatapathError>> + Send {
+        async move { Err(DatapathError::PortUnavailable { port }) }
+    }
+
     /// Install (or replace) the flow action for an endpoint.
     fn install_flow(&self, endpoint: EndpointId, action: FlowAction) -> Result<(), DatapathError>;
 
