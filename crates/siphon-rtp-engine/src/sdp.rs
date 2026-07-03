@@ -560,18 +560,71 @@ pub fn rewrite(
     })
 }
 
+/// Resolved rtpengine codec-manipulation policy for the SDP offered to the far side
+/// (`docs/ng_control_protocol.md`, the `codec` dictionary). Built from the `codec-<op>-<NAME>`
+/// profile flags by [`crate::engine`] and applied by [`apply_codec_policy`].
+///
+/// Note on `strip` vs `mask`/`consume`: rtpengine distinguishes them by whether the codec stays
+/// usable for transcoding on the *offering* side. This engine derives the offering (near) leg's
+/// codec from the offerer's own **unmodified** offer — independent of what is stripped/masked from
+/// the SDP sent onward — so the near side always keeps its codec regardless. The three therefore
+/// collapse to the same far-offer edit here (`mask`/`consume` on the near leg's own codec engage the
+/// transcoder automatically, because the near/far primaries then differ). Encoding names are stored
+/// uppercased for case-insensitive matching (SDP names are case-insensitive — RFC 4566 §6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodecPolicy {
+    /// Encoding names removed from the far offer — the union of `strip`, `mask` and `consume`.
+    pub remove: Vec<String>,
+    /// Remove every far-offer audio codec except the keep-list — `strip`/`mask` with the special
+    /// value `all` / `full`.
+    pub remove_all: bool,
+    /// Names never removed — the union of `except` and `accept` (the keep-list exception to
+    /// `remove` / `remove_all`).
+    pub keep: Vec<String>,
+    /// Explicit far-offer codec order (`offer`): a whitelist that also sets priority — only these
+    /// codecs (of those already offered) are kept, in this order. Empty ⇒ the offered order is kept.
+    pub order: Vec<String>,
+    /// Codecs appended to the far offer (`transcode` targets), so the far side may select one and
+    /// engage the transcoder.
+    pub add: Vec<CodecSpec>,
+}
+
+impl CodecPolicy {
+    /// Whether the policy edits the SDP at all (else the far offer is passed through untouched).
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        self.remove.is_empty() && !self.remove_all && self.order.is_empty() && self.add.is_empty()
+    }
+}
+
 /// Rewrite the audio `m=` codec list to honour rtpengine `codec-strip-X` / `codec-transcode-X`
 /// flags: drop every payload type whose encoding name is in `strip` (case-insensitive, matched via
-/// `a=rtpmap` or the RFC 3551 static table) — removing its `a=rtpmap`/`a=fmtp` lines too — and
-/// append each codec in `add` (its payload type on the `m=` line plus a fresh `a=rtpmap`).
+/// `a=rtpmap` or the RFC 3551 static table) and append each codec in `add`. Thin wrapper over
+/// [`apply_codec_policy`] retained for the simple strip/add call sites and their tests.
+#[must_use]
+pub fn rewrite_codec_list(sdp: &str, strip: &[String], add: &[CodecSpec]) -> String {
+    apply_codec_policy(
+        sdp,
+        &CodecPolicy {
+            remove: strip.iter().map(|s| s.to_ascii_uppercase()).collect(),
+            add: add.to_vec(),
+            ..CodecPolicy::default()
+        },
+    )
+}
+
+/// Apply a resolved [`CodecPolicy`] to the SDP offered to the far side (rtpengine
+/// `docs/ng_control_protocol.md` codec manipulation): remove/mask/whitelist/reorder the audio `m=`
+/// codec list — dropping each removed payload type's `a=rtpmap`/`a=fmtp` lines — and append the
+/// `add` (transcode) codecs (payload type on the `m=` line plus a fresh `a=rtpmap`).
 ///
 /// Best-effort and conservative: returns the SDP unchanged when it has no `m=audio` line; never
 /// removes the **last** remaining audio codec (an empty `m=` list is invalid, RFC 4566 §5.14); and
-/// skips an `add` codec whose payload type is already present. Telephone-event (DTMF) is preserved
-/// unless explicitly named in `strip`.
+/// skips an `add` codec whose payload type is already present. Telephone-event (RFC 4733 DTMF) is
+/// preserved unless explicitly named in `remove` (it is never swept by `remove_all` / `order`).
 #[must_use]
-pub fn rewrite_codec_list(sdp: &str, strip: &[String], add: &[CodecSpec]) -> String {
-    if strip.is_empty() && add.is_empty() {
+pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
+    if policy.is_noop() {
         return sdp.to_string();
     }
     let lines: Vec<&str> = sdp.split('\n').map(|l| l.trim_end_matches('\r')).collect();
@@ -616,30 +669,75 @@ pub fn rewrite_codec_list(sdp: &str, strip: &[String], add: &[CodecSpec]) -> Str
         CodecSpec::from_static_payload_type(payload_type, DEFAULT_PTIME_MS)
             .map(|spec| spec.encoding_name)
     };
-    let strip_upper: Vec<String> = strip.iter().map(|s| s.to_ascii_uppercase()).collect();
+    let is_telephone_event =
+        |name: &Option<String>| name.as_deref() == Some("TELEPHONE-EVENT");
 
-    // Payload types to remove: name in `strip`, but never empty the list.
+    // Decide which payload types to remove from the far offer.
     let mut removed: Vec<u8> = payload_types
         .iter()
         .copied()
-        .filter(|pt| name_of(*pt).is_some_and(|name| strip_upper.contains(&name)))
+        .filter(|&pt| {
+            let name = name_of(pt);
+            let explicitly_removed = name.as_ref().is_some_and(|n| policy.remove.contains(n));
+            // Telephone-event survives every sweep (remove_all / whitelist) unless named outright.
+            if is_telephone_event(&name) {
+                return explicitly_removed;
+            }
+            // The keep-list (`except` / `accept`) exempts a codec from any removal.
+            if name.as_ref().is_some_and(|n| policy.keep.contains(n)) {
+                return false;
+            }
+            if !policy.order.is_empty() {
+                // `offer` is a whitelist: remove anything not named in the explicit offer order.
+                return !name.as_ref().is_some_and(|n| policy.order.contains(n));
+            }
+            if policy.remove_all {
+                return true;
+            }
+            explicitly_removed
+        })
         .collect();
-    if removed.len() == payload_types.len() && !payload_types.is_empty() {
-        // Stripping everything would leave an invalid `m=` line — keep the first codec.
-        removed.retain(|pt| *pt != payload_types[0]);
+
+    // Never empty the audio codec list: if every audio codec would go, keep the first one.
+    let audio_types: Vec<u8> = payload_types
+        .iter()
+        .copied()
+        .filter(|&pt| !is_telephone_event(&name_of(pt)))
+        .collect();
+    if !audio_types.is_empty() && audio_types.iter().all(|pt| removed.contains(pt)) {
+        if let Some(&first) = audio_types.first() {
+            removed.retain(|pt| *pt != first);
+        }
     }
 
-    // Payload types to add (skip any already present after removal).
-    let present: Vec<u8> = payload_types
+    // Survivors, in the requested order (`offer`) or the original order otherwise.
+    let mut present: Vec<u8> = payload_types
         .iter()
         .copied()
         .filter(|pt| !removed.contains(pt))
         .collect();
-    let added: Vec<&CodecSpec> = add
+    if !policy.order.is_empty() {
+        // Stable sort by the offer order; telephone-event / unlisted survivors sort last, in place.
+        present.sort_by_key(|&pt| {
+            name_of(pt)
+                .and_then(|n| policy.order.iter().position(|o| *o == n))
+                .map_or(usize::MAX, |index| index)
+        });
+    }
+    let reordered = present
+        != payload_types
+            .iter()
+            .copied()
+            .filter(|pt| !removed.contains(pt))
+            .collect::<Vec<_>>();
+
+    // Codecs to append (skip any already present after removal).
+    let added: Vec<&CodecSpec> = policy
+        .add
         .iter()
         .filter(|spec| !present.contains(&spec.payload_type))
         .collect();
-    if removed.is_empty() && added.is_empty() {
+    if removed.is_empty() && added.is_empty() && !reordered {
         return sdp.to_string();
     }
 
@@ -1449,6 +1547,88 @@ mod tests {
             sdp,
             "stripping an absent codec → identity"
         );
+    }
+
+    #[test]
+    fn codec_policy_mask_removes_from_the_far_offer_like_strip() {
+        // m=audio 5004 RTP/AVP 0 8 96; masking PCMA drops PT 8 from the offer to B — the same SDP
+        // edit as strip (the two differ only in near-side transcodability, which this engine keeps).
+        let policy = CodecPolicy {
+            remove: vec!["PCMA".to_string()],
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        assert!(out.contains("m=audio 5004 RTP/AVP 0 96"), "{out}");
+        assert!(!out.contains("a=rtpmap:8 PCMA/8000"), "PCMA rtpmap removed");
+        assert_eq!(
+            out,
+            rewrite_codec_list(&offer("203.0.113.9", 5004), &["PCMA".to_string()], &[]),
+            "mask == strip at the SDP layer"
+        );
+    }
+
+    #[test]
+    fn codec_policy_except_keeps_a_codec_from_remove_all() {
+        // strip-all with an `except` keep-list: only PCMU (+ telephone-event) survive.
+        let policy = CodecPolicy {
+            remove_all: true,
+            keep: vec!["PCMU".to_string()],
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        assert!(
+            out.contains("m=audio 5004 RTP/AVP 0 96"),
+            "PCMU + telephone-event kept: {out}"
+        );
+        assert!(!out.contains("PCMA"), "PCMA swept by remove_all: {out}");
+        assert!(
+            out.contains("a=rtpmap:96 telephone-event/8000"),
+            "telephone-event survives remove_all"
+        );
+    }
+
+    #[test]
+    fn codec_policy_remove_all_keeps_the_first_audio_codec_without_a_keep_list() {
+        // strip-all and nothing excepted: the never-empty guard keeps the first audio codec.
+        let policy = CodecPolicy {
+            remove_all: true,
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        assert!(
+            out.contains("m=audio 5004 RTP/AVP 0 96"),
+            "first audio codec (PCMU) kept: {out}"
+        );
+    }
+
+    #[test]
+    fn codec_policy_offer_whitelists_and_reorders() {
+        // `offer` PCMA then PCMU: only those (PCMA preferred), telephone-event kept and last.
+        let policy = CodecPolicy {
+            order: vec!["PCMA".to_string(), "PCMU".to_string()],
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        let media = out
+            .lines()
+            .find(|line| line.starts_with("m=audio"))
+            .expect("m=audio");
+        assert_eq!(
+            media, "m=audio 5004 RTP/AVP 8 0 96",
+            "reordered to PCMA, PCMU with telephone-event last: {media}"
+        );
+    }
+
+    #[test]
+    fn codec_policy_offer_drops_a_codec_absent_from_the_whitelist() {
+        // `offer` PCMU only: PCMA is not whitelisted, so it is dropped from the far offer.
+        let policy = CodecPolicy {
+            order: vec!["PCMU".to_string()],
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        assert!(out.contains("m=audio 5004 RTP/AVP 0 96"), "{out}");
+        assert!(!out.contains("PCMA"), "non-whitelisted PCMA dropped: {out}");
     }
 
     /// A far-side answer SDP the engine has already transport-rewritten toward A, carrying B's

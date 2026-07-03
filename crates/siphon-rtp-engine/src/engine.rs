@@ -858,11 +858,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 };
             }
         };
-        // rtpengine codec manipulation on the SDP offered to the far side: `codec-strip-X` removes a
-        // codec, `codec-transcode-X` adds one (the far side may then select it, engaging transcode).
-        let (codec_strip, codec_add) = parse_codec_flags(&profile.flags);
-        if !codec_strip.is_empty() || !codec_add.is_empty() {
-            rewritten.sdp = sdp::rewrite_codec_list(&rewritten.sdp, &codec_strip, &codec_add);
+        // rtpengine codec manipulation on the SDP offered to the far side: strip/mask/consume remove a
+        // codec, transcode/offer add or reorder, except/accept keep it (see `parse_codec_flags`). The
+        // far side may then select a transcode/offer codec, engaging the transcoder at answer.
+        let codec_policy = parse_codec_flags(&profile.flags);
+        if !codec_policy.is_noop() {
+            rewritten.sdp = sdp::apply_codec_policy(&rewritten.sdp, &codec_policy);
         }
         // rtpengine `replace: [origin]`: rewrite the o= line to the engine's address (topology hiding).
         if profile.replace.iter().any(|field| field == "origin") {
@@ -2928,25 +2929,51 @@ fn ok_empty() -> CmdResult {
     }
 }
 
-/// Parse rtpengine codec-manipulation flags into SDP edits for [`sdp::rewrite_codec_list`]:
-/// `codec-strip-<NAME>` → an encoding name to drop from the SDP offered to the far side, and
-/// `codec-transcode-<NAME>` → a codec to add to that SDP. The engine's transcode pipeline then
-/// engages automatically when the far side selects a codec differing from the near leg's (no separate
-/// "force transcode" plumbing needed). Unknown / not-yet-encodable transcode targets are skipped so a
-/// forced codec never fails the call at answer. `codec-mask-X` (asymmetric hide) is a follow-up.
-fn parse_codec_flags(flags: &[String]) -> (Vec<String>, Vec<CodecSpec>) {
-    let mut strip = Vec::new();
-    let mut add = Vec::new();
+/// Parse rtpengine codec-manipulation flags into a [`sdp::CodecPolicy`] for the SDP offered to the
+/// far side. The NG/JSON front-ends flatten the `codec` dictionary
+/// (`docs/ng_control_protocol.md`) into `codec-<op>-<NAME>` flag strings, which map as:
+/// - `codec-strip-X` — remove X from the offer.
+/// - `codec-mask-X` / `codec-consume-X` — remove X from the offer but keep it usable near-side for
+///   transcoding. This engine derives the near leg's codec from the offerer's *own* offer,
+///   independent of the far-offer edit, so the near side keeps X regardless (and a masked near codec
+///   engages the transcoder because the near/far primaries then differ — see [`sdp::CodecPolicy`]).
+/// - `codec-transcode-X` — add X to the offer; the transcoder engages when the far side selects it.
+/// - `codec-except-X` / `codec-accept-X` — a keep-list: X is never stripped (the exception to
+///   `strip-all` / `mask-all`).
+/// - `codec-offer-X` — a whitelist that sets the far offer's codec order (only the listed codecs, in
+///   flag order; the first is preferred).
+/// - the special value `all` / `full` on strip/mask removes every codec except the keep-list.
+///
+/// Unknown / not-yet-encodable `transcode` targets are skipped so a forced codec never fails the call
+/// at answer. Names are matched case-insensitively (stored uppercased).
+fn parse_codec_flags(flags: &[String]) -> sdp::CodecPolicy {
+    let mut policy = sdp::CodecPolicy::default();
     for flag in flags {
-        if let Some(name) = flag.strip_prefix("codec-strip-") {
-            strip.push(name.to_string());
+        if let Some(name) = flag
+            .strip_prefix("codec-strip-")
+            .or_else(|| flag.strip_prefix("codec-mask-"))
+            .or_else(|| flag.strip_prefix("codec-consume-"))
+        {
+            // The special value `all` / `full` sweeps every codec (bar the keep-list).
+            if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("full") {
+                policy.remove_all = true;
+            } else {
+                policy.remove.push(name.to_ascii_uppercase());
+            }
+        } else if let Some(name) = flag
+            .strip_prefix("codec-except-")
+            .or_else(|| flag.strip_prefix("codec-accept-"))
+        {
+            policy.keep.push(name.to_ascii_uppercase());
+        } else if let Some(name) = flag.strip_prefix("codec-offer-") {
+            policy.order.push(name.to_ascii_uppercase());
         } else if let Some(name) = flag.strip_prefix("codec-transcode-") {
             if let Some(spec) = transcode_codec_spec(name) {
-                add.push(spec);
+                policy.add.push(spec);
             }
         }
     }
-    (strip, add)
+    policy
 }
 
 /// Map a `codec-transcode-<NAME>` target to a [`CodecSpec`] the engine can both advertise and
@@ -3412,6 +3439,90 @@ mod tests {
         assert!(
             sdp.contains("a=rtpmap:9 G722/8000"),
             "G722 rtpmap added: {sdp}"
+        );
+    }
+
+    #[test]
+    fn parse_codec_flags_maps_rtpengine_operations() {
+        // Each rtpengine codec op (docs/ng_control_protocol.md) resolves onto the CodecPolicy.
+        let policy = parse_codec_flags(&[
+            "codec-mask-PCMA".into(),
+            "codec-except-PCMU".into(),
+            "codec-accept-GSM".into(),
+            "codec-offer-G722".into(),
+            "codec-strip-all".into(),
+            "codec-transcode-PCMA".into(),
+        ]);
+        assert!(policy.remove_all, "strip-all → remove_all");
+        assert_eq!(policy.remove, vec!["PCMA".to_string()], "mask feeds the remove set");
+        assert!(policy.keep.contains(&"PCMU".to_string()), "except → keep-list");
+        assert!(policy.keep.contains(&"GSM".to_string()), "accept → keep-list");
+        assert_eq!(policy.order, vec!["G722".to_string()], "offer → far-offer order");
+        assert_eq!(policy.add.len(), 1, "transcode → one added codec");
+        assert_eq!(policy.add[0].encoding_name, "PCMA");
+        // Lowercase names are matched case-insensitively (stored uppercased).
+        let lower = parse_codec_flags(&["codec-mask-pcma".into()]);
+        assert_eq!(lower.remove, vec!["PCMA".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn offer_codec_mask_hides_the_codec_from_the_far_side() {
+        // rtpengine `codec-mask-PCMA` (asymmetric hide): PCMA is dropped from the offer to B (same
+        // far-offer edit as strip), while the near leg keeps it usable for transcoding.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let profile = ProfileFlags {
+            flags: vec!["codec-mask-PCMA".into()],
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mask".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile,
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&offer);
+        let m_line = sdp
+            .lines()
+            .find(|l| l.starts_with("m=audio"))
+            .expect("m=audio line");
+        assert!(m_line.ends_with(" 0"), "PCMA hidden from B, PCMU offered: {m_line}");
+        assert!(!m_line.contains(" 8"), "PCMA (PT 8) masked: {m_line}");
+    }
+
+    #[tokio::test]
+    async fn offer_codec_offer_reorders_the_far_offer() {
+        // rtpengine `codec-offer`: a whitelist that sets the offered order — PCMA before PCMU here.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let profile = ProfileFlags {
+            flags: vec!["codec-offer-PCMA".into(), "codec-offer-PCMU".into()],
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "reorder".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile,
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&offer);
+        let m_line = sdp
+            .lines()
+            .find(|l| l.starts_with("m=audio"))
+            .expect("m=audio line");
+        assert!(
+            m_line.ends_with("RTP/AVP 8 0"),
+            "PCMA (8) offered before PCMU (0): {m_line}"
         );
     }
 
