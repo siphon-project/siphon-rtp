@@ -66,6 +66,16 @@ pub trait Decoder: Send {
     fn rtp_clock_rate_hz(&self) -> u32 {
         self.params().sample_rate_hz
     }
+
+    /// The Codec Mode Request (CMR) carried by the most recently decoded payload, for a variable-rate
+    /// codec that signals one (RFC 4867 §4.3.1 AMR / AMR-WB): `Some(mode)` when the peer requested a
+    /// specific speech mode, `None` for "no request" (CMR = 15) or a codec with no CMR. Per RFC 4867
+    /// the request applies to the media sent back *towards* this decoder's peer, so the media path
+    /// feeds it to the **opposite** direction's [`Encoder::request_mode`]. Default `None` (fixed-rate
+    /// codecs carry no CMR).
+    fn last_mode_request(&self) -> Option<u8> {
+        None
+    }
 }
 
 /// Encodes linear 16-bit PCM into codec payloads.
@@ -98,6 +108,12 @@ pub trait Encoder: Send {
     fn is_stateless(&self) -> bool {
         false
     }
+
+    /// Request the egress speech mode for subsequent frames (RFC 4867 §4.3.1 Codec Mode Request).
+    /// A variable-rate codec (AMR / AMR-WB) switches to `mode`, clamped into the modes its SDP
+    /// `mode-set` permits so it never emits a disallowed mode; the request is sticky until the next
+    /// one. Default no-op — a fixed-rate codec has a single mode and ignores it.
+    fn request_mode(&mut self, _mode: u8) {}
 }
 
 /// Errors produced by codecs.

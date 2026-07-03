@@ -130,11 +130,15 @@ impl MediaInfo {
                 self.ptime_ms,
             );
             // Honour an AMR-WB `mode-set` (RFC 4867 §8.1) by clamping the egress encode mode into
-            // the allowed set, so the engine never sends the peer a mode it disallowed.
+            // the allowed set, so the engine never sends the peer a mode it disallowed. The full set
+            // is carried through so per-frame RFC 4867 CMR adaptation stays within it too.
             if spec.encoding_name == "AMR-WB" {
                 if let Some((_, modes)) = self.mode_sets.iter().find(|(pt, _)| *pt == payload_type)
                 {
-                    return Some(spec.with_encode_mode(choose_amr_wb_mode(modes)));
+                    return Some(
+                        spec.with_encode_mode(choose_amr_wb_mode(modes))
+                            .with_allowed_modes(modes.clone()),
+                    );
                 }
             }
             return Some(spec);
@@ -560,18 +564,71 @@ pub fn rewrite(
     })
 }
 
+/// Resolved rtpengine codec-manipulation policy for the SDP offered to the far side
+/// (`docs/ng_control_protocol.md`, the `codec` dictionary). Built from the `codec-<op>-<NAME>`
+/// profile flags by [`crate::engine`] and applied by [`apply_codec_policy`].
+///
+/// Note on `strip` vs `mask`/`consume`: rtpengine distinguishes them by whether the codec stays
+/// usable for transcoding on the *offering* side. This engine derives the offering (near) leg's
+/// codec from the offerer's own **unmodified** offer — independent of what is stripped/masked from
+/// the SDP sent onward — so the near side always keeps its codec regardless. The three therefore
+/// collapse to the same far-offer edit here (`mask`/`consume` on the near leg's own codec engage the
+/// transcoder automatically, because the near/far primaries then differ). Encoding names are stored
+/// uppercased for case-insensitive matching (SDP names are case-insensitive — RFC 4566 §6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodecPolicy {
+    /// Encoding names removed from the far offer — the union of `strip`, `mask` and `consume`.
+    pub remove: Vec<String>,
+    /// Remove every far-offer audio codec except the keep-list — `strip`/`mask` with the special
+    /// value `all` / `full`.
+    pub remove_all: bool,
+    /// Names never removed — the union of `except` and `accept` (the keep-list exception to
+    /// `remove` / `remove_all`).
+    pub keep: Vec<String>,
+    /// Explicit far-offer codec order (`offer`): a whitelist that also sets priority — only these
+    /// codecs (of those already offered) are kept, in this order. Empty ⇒ the offered order is kept.
+    pub order: Vec<String>,
+    /// Codecs appended to the far offer (`transcode` targets), so the far side may select one and
+    /// engage the transcoder.
+    pub add: Vec<CodecSpec>,
+}
+
+impl CodecPolicy {
+    /// Whether the policy edits the SDP at all (else the far offer is passed through untouched).
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        self.remove.is_empty() && !self.remove_all && self.order.is_empty() && self.add.is_empty()
+    }
+}
+
 /// Rewrite the audio `m=` codec list to honour rtpengine `codec-strip-X` / `codec-transcode-X`
 /// flags: drop every payload type whose encoding name is in `strip` (case-insensitive, matched via
-/// `a=rtpmap` or the RFC 3551 static table) — removing its `a=rtpmap`/`a=fmtp` lines too — and
-/// append each codec in `add` (its payload type on the `m=` line plus a fresh `a=rtpmap`).
+/// `a=rtpmap` or the RFC 3551 static table) and append each codec in `add`. Thin wrapper over
+/// [`apply_codec_policy`] retained for the simple strip/add call sites and their tests.
+#[must_use]
+pub fn rewrite_codec_list(sdp: &str, strip: &[String], add: &[CodecSpec]) -> String {
+    apply_codec_policy(
+        sdp,
+        &CodecPolicy {
+            remove: strip.iter().map(|s| s.to_ascii_uppercase()).collect(),
+            add: add.to_vec(),
+            ..CodecPolicy::default()
+        },
+    )
+}
+
+/// Apply a resolved [`CodecPolicy`] to the SDP offered to the far side (rtpengine
+/// `docs/ng_control_protocol.md` codec manipulation): remove/mask/whitelist/reorder the audio `m=`
+/// codec list — dropping each removed payload type's `a=rtpmap`/`a=fmtp` lines — and append the
+/// `add` (transcode) codecs (payload type on the `m=` line plus a fresh `a=rtpmap`).
 ///
 /// Best-effort and conservative: returns the SDP unchanged when it has no `m=audio` line; never
 /// removes the **last** remaining audio codec (an empty `m=` list is invalid, RFC 4566 §5.14); and
-/// skips an `add` codec whose payload type is already present. Telephone-event (DTMF) is preserved
-/// unless explicitly named in `strip`.
+/// skips an `add` codec whose payload type is already present. Telephone-event (RFC 4733 DTMF) is
+/// preserved unless explicitly named in `remove` (it is never swept by `remove_all` / `order`).
 #[must_use]
-pub fn rewrite_codec_list(sdp: &str, strip: &[String], add: &[CodecSpec]) -> String {
-    if strip.is_empty() && add.is_empty() {
+pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
+    if policy.is_noop() {
         return sdp.to_string();
     }
     let lines: Vec<&str> = sdp.split('\n').map(|l| l.trim_end_matches('\r')).collect();
@@ -616,30 +673,75 @@ pub fn rewrite_codec_list(sdp: &str, strip: &[String], add: &[CodecSpec]) -> Str
         CodecSpec::from_static_payload_type(payload_type, DEFAULT_PTIME_MS)
             .map(|spec| spec.encoding_name)
     };
-    let strip_upper: Vec<String> = strip.iter().map(|s| s.to_ascii_uppercase()).collect();
+    let is_telephone_event =
+        |name: &Option<String>| name.as_deref() == Some("TELEPHONE-EVENT");
 
-    // Payload types to remove: name in `strip`, but never empty the list.
+    // Decide which payload types to remove from the far offer.
     let mut removed: Vec<u8> = payload_types
         .iter()
         .copied()
-        .filter(|pt| name_of(*pt).is_some_and(|name| strip_upper.contains(&name)))
+        .filter(|&pt| {
+            let name = name_of(pt);
+            let explicitly_removed = name.as_ref().is_some_and(|n| policy.remove.contains(n));
+            // Telephone-event survives every sweep (remove_all / whitelist) unless named outright.
+            if is_telephone_event(&name) {
+                return explicitly_removed;
+            }
+            // The keep-list (`except` / `accept`) exempts a codec from any removal.
+            if name.as_ref().is_some_and(|n| policy.keep.contains(n)) {
+                return false;
+            }
+            if !policy.order.is_empty() {
+                // `offer` is a whitelist: remove anything not named in the explicit offer order.
+                return !name.as_ref().is_some_and(|n| policy.order.contains(n));
+            }
+            if policy.remove_all {
+                return true;
+            }
+            explicitly_removed
+        })
         .collect();
-    if removed.len() == payload_types.len() && !payload_types.is_empty() {
-        // Stripping everything would leave an invalid `m=` line — keep the first codec.
-        removed.retain(|pt| *pt != payload_types[0]);
+
+    // Never empty the audio codec list: if every audio codec would go, keep the first one.
+    let audio_types: Vec<u8> = payload_types
+        .iter()
+        .copied()
+        .filter(|&pt| !is_telephone_event(&name_of(pt)))
+        .collect();
+    if !audio_types.is_empty() && audio_types.iter().all(|pt| removed.contains(pt)) {
+        if let Some(&first) = audio_types.first() {
+            removed.retain(|pt| *pt != first);
+        }
     }
 
-    // Payload types to add (skip any already present after removal).
-    let present: Vec<u8> = payload_types
+    // Survivors, in the requested order (`offer`) or the original order otherwise.
+    let mut present: Vec<u8> = payload_types
         .iter()
         .copied()
         .filter(|pt| !removed.contains(pt))
         .collect();
-    let added: Vec<&CodecSpec> = add
+    if !policy.order.is_empty() {
+        // Stable sort by the offer order; telephone-event / unlisted survivors sort last, in place.
+        present.sort_by_key(|&pt| {
+            name_of(pt)
+                .and_then(|n| policy.order.iter().position(|o| *o == n))
+                .map_or(usize::MAX, |index| index)
+        });
+    }
+    let reordered = present
+        != payload_types
+            .iter()
+            .copied()
+            .filter(|pt| !removed.contains(pt))
+            .collect::<Vec<_>>();
+
+    // Codecs to append (skip any already present after removal).
+    let added: Vec<&CodecSpec> = policy
+        .add
         .iter()
         .filter(|spec| !present.contains(&spec.payload_type))
         .collect();
-    if removed.is_empty() && added.is_empty() {
+    if removed.is_empty() && added.is_empty() && !reordered {
         return sdp.to_string();
     }
 
@@ -677,6 +779,122 @@ pub fn rewrite_codec_list(sdp: &str, strip: &[String], add: &[CodecSpec]) -> Str
             if removed.contains(&pt) {
                 continue;
             }
+        }
+        // Preserve the trailing empty line if the input ended with CRLF.
+        if !(index == lines.len() - 1 && line.is_empty()) {
+            out.push((*line).to_string());
+        }
+    }
+    let mut rewritten = out.join(CRLF);
+    if sdp.ends_with('\n') {
+        rewritten.push_str(CRLF);
+    }
+    rewritten
+}
+
+/// The `a=rtpmap` line for a codec (`a=rtpmap:<pt> <name>/<clock>[/<channels>]`, RFC 4566 §6). The
+/// `/<channels>` suffix is emitted only for multi-channel audio — mono telephony omits it (matching
+/// [`rewrite_codec_list`]'s rtpmap emission).
+fn rtpmap_line(codec: &CodecSpec) -> String {
+    if codec.channels > 1 {
+        format!(
+            "a=rtpmap:{} {}/{}/{}",
+            codec.payload_type, codec.encoding_name, codec.clock_rate_hz, codec.channels
+        )
+    } else {
+        format!(
+            "a=rtpmap:{} {}/{}",
+            codec.payload_type, codec.encoding_name, codec.clock_rate_hz
+        )
+    }
+}
+
+/// The `a=fmtp` line describing the engine's egress framing for a variable-rate codec, or `None` for
+/// a codec that needs none. AMR-WB: the engine's encoder emits **octet-aligned** single-frame
+/// payloads (RFC 4867 §4.4 — see `siphon_rtp_codec::amr`), so the answer must advertise
+/// `octet-align=1`; when a `mode-set` was negotiated it also advertises the single mode the engine
+/// actually sends (RFC 4867 §8.1). (Bandwidth-efficient AMR-WB egress is a separate follow-up.)
+fn egress_fmtp_line(codec: &CodecSpec) -> Option<String> {
+    if codec.encoding_name != "AMR-WB" {
+        return None;
+    }
+    let mut params = String::from("octet-align=1");
+    if let Some(mode) = codec.encode_mode {
+        params.push_str(&format!(";mode-set={mode}"));
+    }
+    Some(format!("a=fmtp:{} {params}", codec.payload_type))
+}
+
+/// Force an answer SDP's audio codec presentation to `primary` (plus the negotiated `telephone_event`
+/// payload type, if any) — used on a **transcoding** call so the answer relayed back to a leg
+/// advertises *that leg's own* codec, never the far side's.
+///
+/// On a transcoded call the engine decodes the peer's codec and re-encodes into this leg's negotiated
+/// codec, so the codec this leg will actually receive is `primary` (its offer's primary codec), not
+/// whatever the peer answered. Relaying the peer's codec list would offer the recipient a codec it
+/// never offered (RFC 3264 §6 — an answer must contain only formats from the recipient's own offer).
+///
+/// Rewrites the audio `m=` format list to `[primary.payload_type]` (+ the telephone-event PT), drops
+/// every other codec's `a=rtpmap`/`a=fmtp`, and re-emits a fresh `a=rtpmap` for `primary` (plus, for
+/// AMR-WB, the egress `a=fmtp`) and a `telephone-event/8000` rtpmap. Best-effort and conservative:
+/// returns the SDP unchanged when it has no `m=audio` line.
+#[must_use]
+pub fn force_answer_codec(sdp: &str, primary: &CodecSpec, telephone_event: Option<u8>) -> String {
+    let lines: Vec<&str> = sdp.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    let Some(media_index) = lines
+        .iter()
+        .position(|l| l.starts_with("m=audio ") || *l == "m=audio")
+    else {
+        return sdp.to_string();
+    };
+    let media_fields: Vec<&str> = lines[media_index]
+        .strip_prefix("m=")
+        .unwrap_or(lines[media_index])
+        .split(' ')
+        .collect();
+    // m=audio <port> <proto> <pt...>
+    if media_fields.len() < 3 {
+        return sdp.to_string();
+    }
+
+    // The payload types the answer keeps, in order: the leg's own audio codec, then telephone-event.
+    let mut kept: Vec<u8> = vec![primary.payload_type];
+    if let Some(te) = telephone_event {
+        if te != primary.payload_type {
+            kept.push(te);
+        }
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
+    for (index, line) in lines.iter().enumerate() {
+        if index == media_index {
+            let formats: Vec<String> = kept.iter().map(u8::to_string).collect();
+            out.push(format!(
+                "m={} {} {} {}",
+                media_fields[0],
+                media_fields[1],
+                media_fields[2],
+                formats.join(" ")
+            ));
+            // Re-emit our own codec attributes right after the media line (RFC 4566 is order-free).
+            out.push(rtpmap_line(primary));
+            if let Some(fmtp) = egress_fmtp_line(primary) {
+                out.push(fmtp);
+            }
+            if let Some(te) = telephone_event {
+                out.push(format!("a=rtpmap:{te} telephone-event/8000"));
+            }
+            continue;
+        }
+        // Drop the far side's per-payload-type codec attributes; we re-emit our own above.
+        let is_codec_attr = line
+            .strip_prefix("a=rtpmap:")
+            .or_else(|| line.strip_prefix("a=fmtp:"))
+            .and_then(|body| body.split(|c: char| c.is_whitespace() || c == '/').next())
+            .and_then(|pt| pt.trim().parse::<u8>().ok())
+            .is_some();
+        if is_codec_attr {
+            continue;
         }
         // Preserve the trailing empty line if the input ended with CRLF.
         if !(index == lines.len() - 1 && line.is_empty()) {
@@ -1054,6 +1272,7 @@ mod tests {
                 rtcp: None,
             };
             let _ = rewrite(&text, engine, None, None);
+            let _ = force_answer_codec(&text, &CodecSpec::new(0, "PCMU", 8000, 1, 20), Some(96));
         }
     }
 
@@ -1332,6 +1551,155 @@ mod tests {
             sdp,
             "stripping an absent codec → identity"
         );
+    }
+
+    #[test]
+    fn codec_policy_mask_removes_from_the_far_offer_like_strip() {
+        // m=audio 5004 RTP/AVP 0 8 96; masking PCMA drops PT 8 from the offer to B — the same SDP
+        // edit as strip (the two differ only in near-side transcodability, which this engine keeps).
+        let policy = CodecPolicy {
+            remove: vec!["PCMA".to_string()],
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        assert!(out.contains("m=audio 5004 RTP/AVP 0 96"), "{out}");
+        assert!(!out.contains("a=rtpmap:8 PCMA/8000"), "PCMA rtpmap removed");
+        assert_eq!(
+            out,
+            rewrite_codec_list(&offer("203.0.113.9", 5004), &["PCMA".to_string()], &[]),
+            "mask == strip at the SDP layer"
+        );
+    }
+
+    #[test]
+    fn codec_policy_except_keeps_a_codec_from_remove_all() {
+        // strip-all with an `except` keep-list: only PCMU (+ telephone-event) survive.
+        let policy = CodecPolicy {
+            remove_all: true,
+            keep: vec!["PCMU".to_string()],
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        assert!(
+            out.contains("m=audio 5004 RTP/AVP 0 96"),
+            "PCMU + telephone-event kept: {out}"
+        );
+        assert!(!out.contains("PCMA"), "PCMA swept by remove_all: {out}");
+        assert!(
+            out.contains("a=rtpmap:96 telephone-event/8000"),
+            "telephone-event survives remove_all"
+        );
+    }
+
+    #[test]
+    fn codec_policy_remove_all_keeps_the_first_audio_codec_without_a_keep_list() {
+        // strip-all and nothing excepted: the never-empty guard keeps the first audio codec.
+        let policy = CodecPolicy {
+            remove_all: true,
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        assert!(
+            out.contains("m=audio 5004 RTP/AVP 0 96"),
+            "first audio codec (PCMU) kept: {out}"
+        );
+    }
+
+    #[test]
+    fn codec_policy_offer_whitelists_and_reorders() {
+        // `offer` PCMA then PCMU: only those (PCMA preferred), telephone-event kept and last.
+        let policy = CodecPolicy {
+            order: vec!["PCMA".to_string(), "PCMU".to_string()],
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        let media = out
+            .lines()
+            .find(|line| line.starts_with("m=audio"))
+            .expect("m=audio");
+        assert_eq!(
+            media, "m=audio 5004 RTP/AVP 8 0 96",
+            "reordered to PCMA, PCMU with telephone-event last: {media}"
+        );
+    }
+
+    #[test]
+    fn codec_policy_offer_drops_a_codec_absent_from_the_whitelist() {
+        // `offer` PCMU only: PCMA is not whitelisted, so it is dropped from the far offer.
+        let policy = CodecPolicy {
+            order: vec!["PCMU".to_string()],
+            ..CodecPolicy::default()
+        };
+        let out = apply_codec_policy(&offer("203.0.113.9", 5004), &policy);
+        assert!(out.contains("m=audio 5004 RTP/AVP 0 96"), "{out}");
+        assert!(!out.contains("PCMA"), "non-whitelisted PCMA dropped: {out}");
+    }
+
+    /// A far-side answer SDP the engine has already transport-rewritten toward A, carrying B's
+    /// codec (PCMA) plus telephone-event — what A would wrongly see relayed on a transcoded call.
+    fn far_answer(codecs: &str) -> String {
+        format!(
+            "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+             m=audio 40000 RTP/AVP {codecs}\r\na=rtpmap:8 PCMA/8000\r\n\
+             a=rtpmap:96 telephone-event/8000\r\na=fmtp:96 0-15\r\n"
+        )
+    }
+
+    #[test]
+    fn force_answer_codec_presents_the_legs_own_codec_not_the_far_sides() {
+        // A offered PCMU (PT 0); the engine transcodes PCMA↔PCMU. The answer to A must advertise
+        // PCMU + telephone-event, never B's PCMA.
+        let pcmu = CodecSpec::new(0, "PCMU", 8000, 1, 20);
+        let out = force_answer_codec(&far_answer("8 96"), &pcmu, Some(96));
+        assert!(
+            out.contains("m=audio 40000 RTP/AVP 0 96"),
+            "m= collapses to PCMU + telephone-event: {out}"
+        );
+        assert!(out.contains("a=rtpmap:0 PCMU/8000"), "PCMU rtpmap emitted");
+        assert!(
+            out.contains("a=rtpmap:96 telephone-event/8000"),
+            "telephone-event preserved"
+        );
+        assert!(!out.contains("PCMA"), "B's PCMA no longer leaked: {out}");
+        // The result reparses to the leg's own primary codec.
+        assert_eq!(
+            parse(&out).expect("reparse").primary_codec().expect("codec").encoding_name,
+            "PCMU"
+        );
+    }
+
+    #[test]
+    fn force_answer_codec_amr_wb_advertises_octet_align_and_mode_set() {
+        // The engine encodes octet-aligned AMR-WB at the mode-set-resolved mode; the answer must say so.
+        let amr = CodecSpec::new(96, "AMR-WB", 16000, 1, 20).with_encode_mode(Some(1));
+        let far = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                   m=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let out = force_answer_codec(far, &amr, None);
+        assert!(out.contains("m=audio 40000 RTP/AVP 96"), "{out}");
+        assert!(out.contains("a=rtpmap:96 AMR-WB/16000"));
+        assert!(
+            out.contains("a=fmtp:96 octet-align=1;mode-set=1"),
+            "octet-align + negotiated mode advertised: {out}"
+        );
+        assert!(!out.contains("PCMU"), "B's PCMU dropped: {out}");
+    }
+
+    #[test]
+    fn force_answer_codec_without_telephone_event_keeps_only_the_audio_codec() {
+        let pcmu = CodecSpec::new(0, "PCMU", 8000, 1, 20);
+        let out = force_answer_codec(&far_answer("8 96"), &pcmu, None);
+        assert!(out.contains("m=audio 40000 RTP/AVP 0"), "{out}");
+        assert!(
+            !out.contains("telephone-event"),
+            "no telephone-event when the leg negotiated none: {out}"
+        );
+    }
+
+    #[test]
+    fn force_answer_codec_is_identity_without_audio_media() {
+        let sdp = "v=0\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=video 5000 RTP/AVP 96\r\n";
+        let pcmu = CodecSpec::new(0, "PCMU", 8000, 1, 20);
+        assert_eq!(force_answer_codec(sdp, &pcmu, Some(96)), sdp);
     }
 
     #[test]
