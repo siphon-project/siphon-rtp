@@ -5,14 +5,17 @@
 //! authenticated span, so there is no separate ROC as in SRTP.
 //!
 //! SRTCP keys derive from the same master key/salt as SRTP but under labels 3/4/5 (RFC 3711 §4.3.2),
-//! so an SRTCP context is independent of the SRTP one on the same leg. Anti-replay (the explicit
-//! index makes it cheap) is a later hardening layer; this is the confidentiality+integrity core.
+//! so an SRTCP context is independent of the SRTP one on the same leg. Anti-replay (RFC 3711 §3.3.2)
+//! is applied on the receive side against the *explicit* 31-bit index — no rollover guessing needed —
+//! and, as in SRTP, the replay window is recorded only after a packet authenticates.
 
 use subtle::ConstantTimeEq;
 
 use crate::kdf::{self, MASTER_SALT_LEN};
 use crate::sdes::SrtpKeyMaterial;
-use crate::{apply_aes_cm, cipher_iv, hmac_sha1_80, SrtpError, AUTH_TAG_LEN, MASTER_KEY_LEN};
+use crate::{
+    apply_aes_cm, cipher_iv, hmac_sha1_80, ReplayWindow, SrtpError, AUTH_TAG_LEN, MASTER_KEY_LEN,
+};
 
 /// The `E|SRTCP-index` trailer length (RFC 3711 §3.4): 1 encrypt-flag bit + 31-bit index.
 const INDEX_TRAILER_LEN: usize = 4;
@@ -30,6 +33,9 @@ pub struct SrtcpContext {
     session_auth: [u8; 20],
     /// Our outgoing SRTCP index — starts at 0, used-then-incremented (RFC 3711 §3.4).
     send_index: u32,
+    /// Receive-side replay filter over the peer's explicit SRTCP index (RFC 3711 §3.3.2). Only used
+    /// on the inbound (unprotect) direction; unused on an outbound-only context.
+    recv_replay: ReplayWindow,
 }
 
 impl SrtcpContext {
@@ -62,6 +68,7 @@ impl SrtcpContext {
             session_salt,
             session_auth,
             send_index: 0,
+            recv_replay: ReplayWindow::default(),
         }
     }
 
@@ -109,7 +116,9 @@ impl SrtcpContext {
         Ok(())
     }
 
-    /// Verify the tag and decrypt an SRTCP packet into `out`, yielding the plain compound RTCP.
+    /// Reject replays, verify the tag, and decrypt an SRTCP packet into `out`, yielding the plain
+    /// compound RTCP. Returns [`SrtpError::Replayed`] for a duplicated/too-old SRTCP index (RFC 3711
+    /// §3.3.2) and [`SrtpError::AuthFailed`] for a forged/corrupt tag.
     pub fn unprotect(&mut self, srtcp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
         if srtcp.len() < CLEAR_HEADER_LEN + INDEX_TRAILER_LEN + AUTH_TAG_LEN {
             return Err(SrtpError::TooShort);
@@ -118,10 +127,6 @@ impl SrtcpContext {
             return Err(SrtpError::BadVersion);
         }
         let (authenticated, tag) = srtcp.split_at(srtcp.len() - AUTH_TAG_LEN);
-        let expected = hmac_sha1_80(&self.session_auth, authenticated);
-        if expected.ct_eq(tag).unwrap_u8() != 1 {
-            return Err(SrtpError::AuthFailed);
-        }
 
         let trailer_at = authenticated.len() - INDEX_TRAILER_LEN;
         let index_field = u32::from_be_bytes([
@@ -132,6 +137,19 @@ impl SrtcpContext {
         ]);
         let encrypted = index_field & ENCRYPT_FLAG != 0;
         let index = index_field & INDEX_MASK;
+
+        // The SRTCP index is explicit and in the clear, so a duplicated or too-old packet is discarded
+        // before the HMAC is spent (RFC 3711 §3.3.2). The window is recorded only after auth succeeds
+        // (below), so a forgery can never advance it.
+        if self.recv_replay.is_replay(u64::from(index)) {
+            return Err(SrtpError::Replayed);
+        }
+        let expected = hmac_sha1_80(&self.session_auth, authenticated);
+        if expected.ct_eq(tag).unwrap_u8() != 1 {
+            return Err(SrtpError::AuthFailed);
+        }
+        self.recv_replay.record(u64::from(index));
+
         let ssrc = u32::from_be_bytes([
             authenticated[4],
             authenticated[5],
@@ -340,5 +358,86 @@ mod tests {
         let mut bad = rtcp(1, &[0; 12]);
         bad[0] = 0x40; // version 1
         assert_eq!(context.protect(&bad, &mut out), Err(SrtpError::BadVersion));
+    }
+
+    /// Seal one compound RTCP with `sender` (its SRTCP index auto-increments) — a replay-test helper.
+    fn seal(sender: &mut SrtcpContext) -> Vec<u8> {
+        let mut wire = Vec::new();
+        sender
+            .protect(&rtcp(0x0101, &[0x5A; 20]), &mut wire)
+            .expect("protect");
+        wire
+    }
+
+    #[test]
+    fn replayed_srtcp_is_rejected() {
+        let mut sender = context();
+        let mut receiver = context();
+        let srtcp = seal(&mut sender); // index 0
+        let mut out = Vec::new();
+        receiver
+            .unprotect(&srtcp, &mut out)
+            .expect("first delivery accepted");
+        assert_eq!(
+            receiver.unprotect(&srtcp, &mut out),
+            Err(SrtpError::Replayed),
+            "the same SRTCP index re-delivered is a replay"
+        );
+    }
+
+    #[test]
+    fn srtcp_reordered_within_the_window_is_accepted_once() {
+        let mut sender = context();
+        let mut receiver = context();
+        let p0 = seal(&mut sender);
+        let p1 = seal(&mut sender);
+        let p2 = seal(&mut sender);
+
+        let mut out = Vec::new();
+        receiver.unprotect(&p0, &mut out).expect("index 0");
+        receiver.unprotect(&p2, &mut out).expect("index 2 ahead of 1");
+        receiver
+            .unprotect(&p1, &mut out)
+            .expect("the delayed index 1 is still inside the window");
+        assert_eq!(
+            receiver.unprotect(&p1, &mut out),
+            Err(SrtpError::Replayed),
+            "index 1 a second time is a replay"
+        );
+    }
+
+    #[test]
+    fn srtcp_index_older_than_the_window_is_rejected() {
+        let mut sender = context();
+        let mut receiver = context();
+        let old = seal(&mut sender); // index 0
+        let mut out = Vec::new();
+        for _ in 0..70 {
+            let wire = seal(&mut sender);
+            receiver.unprotect(&wire, &mut out).expect("in-order accepted");
+        }
+        assert_eq!(
+            receiver.unprotect(&old, &mut out),
+            Err(SrtpError::Replayed),
+            "index 0 is now more than a window behind the top"
+        );
+    }
+
+    #[test]
+    fn srtcp_forgery_does_not_poison_the_window() {
+        let mut sender = context();
+        let mut receiver = context();
+        let genuine = seal(&mut sender); // index 0
+        let mut forged = genuine.clone();
+        forged[10] ^= 0xFF; // corrupt an encrypted byte → auth fails
+        let mut out = Vec::new();
+        assert_eq!(
+            receiver.unprotect(&forged, &mut out),
+            Err(SrtpError::AuthFailed)
+        );
+        receiver
+            .unprotect(&genuine, &mut out)
+            .expect("the genuine packet is still accepted after the forgery");
+        assert_eq!(out, rtcp(0x0101, &[0x5A; 20]));
     }
 }
