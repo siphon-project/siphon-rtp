@@ -38,7 +38,7 @@ use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
 use crate::ice::{self, IceCredentials};
 use crate::media_pipeline::{
-    DirectionConfig, MediaCall, MediaControl, MediaRegistry, RawTee, RelayConfig,
+    DirectionConfig, MediaCall, MediaControl, MediaRegistry, RawTee, RelayConfig, RtcpRelay,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, SecurityAdvertisement};
@@ -1240,9 +1240,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else if pipeline == PipelineKind::SrtpMedia {
             // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
             // the media actor decrypts B's SRTP, transcodes, and encrypts toward B (and the reverse),
-            // sharing one SecureLeg across both directions. RTCP rides the muxed RTP endpoint and is
-            // (de)crypted there too. (rtcp-mux posture; a non-muxed secure-transcode RTCP companion
-            // is a follow-up — see docs/security-and-nat.md.)
+            // sharing one SecureLeg across both directions. Under rtcp-mux, RTCP rides the muxed RTP
+            // endpoint and is (de)crypted there too; when not muxed, the companion RTCP endpoints are
+            // redirected and SRTCP-(de)crypted through the same SecureLeg (see below +
+            // docs/security-and-nat.md).
             let far_local = far_local_crypto.expect("SrtpMedia ⇒ far_local_crypto is set");
             let Some(far_remote) = info.crypto.first().copied() else {
                 return error_result("SAVP answer", &"missing a=crypto in the answer");
@@ -1297,13 +1298,49 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (B→A)", &reason),
             };
-            // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them, (de)crypted in-actor).
+            // Redirect the RTP legs to the actor. Under rtcp-mux, RTCP rides the RTP endpoint and is
+            // (de)crypted inside the actor; when not muxed, the companion RTCP endpoints are redirected
+            // and SRTCP-(de)crypted through the same SecureLeg below.
             for endpoint in [near.rtp.id, far.rtp.id] {
                 if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
                     return error_result("install secure media redirect", &error);
                 }
             }
             let leg = Arc::new(Mutex::new(SecureLeg::new(&far_local.key, &far_remote.key)));
+
+            // Non-muxed companion RTCP: redirect both RTCP endpoints into the actor and relay them
+            // through the shared SecureLeg — A's RTCP encrypted toward secure B, B's SRTCP decrypted
+            // toward plaintext A — so a non-muxed secure-transcode leg keeps RTCP flowing (RFC 3711
+            // SRTCP; RFC 5761 keeps it on its own port). Muxed calls leave this empty.
+            let mut rtcp_relays = Vec::new();
+            if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp)) =
+                (near.rtcp, far.rtcp, near.remote_rtcp)
+            {
+                for endpoint in [near_rtcp.id, far_rtcp.id] {
+                    if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                        return error_result("install secure media RTCP redirect", &error);
+                    }
+                }
+                rtcp_relays.push(
+                    RtcpRelay::new(
+                        near_rtcp.id,
+                        bridge_source_filter(profile, a_rtcp),
+                        far_rtcp.id,
+                        info.remote_rtcp,
+                    )
+                    .with_secure_egress(leg.clone()),
+                );
+                rtcp_relays.push(
+                    RtcpRelay::new(
+                        far_rtcp.id,
+                        bridge_source_filter(profile, info.remote_rtcp),
+                        near_rtcp.id,
+                        a_rtcp,
+                    )
+                    .with_secure_ingress(leg.clone()),
+                );
+            }
+
             let latch = !profile.flags.iter().any(|flag| flag == "no-latch");
             let call = MediaCall::new(
                 call_id.to_string(),
@@ -1314,7 +1351,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 latch,
                 record_path,
             )
-            .with_far_secure_leg(leg);
+            .with_far_secure_leg(leg)
+            .with_rtcp_relays(rtcp_relays);
             self.media
                 .register(call, self.datapath.clone(), owner_events);
         } else if pipeline == PipelineKind::Media {
@@ -4474,6 +4512,124 @@ mod tests {
         let g711 = siphon_rtp_media::rtp::RtpPacket::parse(&plain_a).expect("parse plaintext");
         assert_eq!(g711.payload_type, 0, "A receives G.711 µ-law (PT 0)");
         assert_eq!(g711.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
+    }
+
+    /// A minimal RTCP sender-report-shaped datagram (version 2, PT 200) carrying `ssrc`.
+    fn rtcp_sr(ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0x80, 200, 0x00, 0x00];
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&[0x33; 16]);
+        packet
+    }
+
+    /// The BGCF/SBC secure transcode **without rtcp-mux**: the companion RTCP endpoints are redirected
+    /// into the media actor and SRTCP-(de)crypted through the shared SecureLeg (RFC 3711 / RFC 5761) —
+    /// B's SRTCP is decrypted and relayed plaintext to A's RTCP port, and A's plaintext RTCP is
+    /// encrypted toward B. Driven end to end through the control plane + redirect dispatcher.
+    #[cfg(feature = "amr")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn savp_transcode_relays_non_muxed_srtcp_both_ways() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::srtcp::SrtcpContext;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        // Dedicated RTP + RTCP sockets per party (non-mux ⇒ RTCP on its own port).
+        let (_phone_a, addr_a) = phone().await;
+        let (rtcp_a, rtcp_a_addr) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let (rtcp_b, rtcp_b_addr) = phone().await;
+
+        // A offers plaintext G.711, non-mux, advertising its RTCP socket; the profile secures the far leg.
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp:{rtcp}\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+            rtcp = rtcp_a_addr.port(),
+        );
+        let profile = ProfileFlags {
+            transport_protocol: Some("RTP/SAVP".into()),
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "savp-nonmux".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer_sdp,
+                    profile,
+                },
+            )
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
+        let engine_far_key = *offer_reply.crypto.first().expect("engine key to B");
+        let far_rtp = offer_reply.remote_rtp;
+        let far_rtcp = offer_reply.remote_rtcp;
+        assert_ne!(far_rtcp, far_rtp, "non-mux: distinct RTCP port advertised to B");
+
+        // B answers RTP/SAVP AMR-WB, non-mux, advertising its RTCP socket + key.
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/SAVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=rtcp:{rtcp}\r\na={crypto}\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+            rtcp = rtcp_b_addr.port(),
+            crypto = b_key.to_attribute_value(),
+        );
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "savp-nonmux".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let near_rtcp = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtcp;
+        assert!(
+            engine.media().is_media_call("savp-nonmux"),
+            "secure transcode resolves to the media slow path"
+        );
+
+        // B → A: B encrypts an RTCP SR with its key → engine far RTCP; A's RTCP socket gets plaintext.
+        let b_sr = rtcp_sr(0xB0B0_B0B0);
+        let mut b_srtcp = Vec::new();
+        SrtcpContext::from_key_material(&b_key.key)
+            .protect(&b_sr, &mut b_srtcp)
+            .expect("B encrypt SRTCP");
+        rtcp_b.send_to(&b_srtcp, far_rtcp).await.expect("b rtcp send");
+        let (relayed, from) = recv(&rtcp_a).await;
+        assert_eq!(from, near_rtcp, "RTCP relayed from the engine's near RTCP port");
+        assert_eq!(relayed, b_sr, "A receives B's decrypted plaintext RTCP");
+
+        // A → B: A's plaintext RTCP → engine near RTCP; B's RTCP socket gets SRTCP it can decrypt.
+        let a_sr = rtcp_sr(0xA0A0_A0A0);
+        rtcp_a.send_to(&a_sr, near_rtcp).await.expect("a rtcp send");
+        let (srtcp, from) = recv(&rtcp_b).await;
+        assert_eq!(from, far_rtcp, "engine transmits from its far RTCP port");
+        assert_ne!(srtcp, a_sr, "toward B it is encrypted (SRTCP)");
+        let mut recovered = Vec::new();
+        SrtcpContext::from_key_material(&engine_far_key.key)
+            .unprotect(&srtcp, &mut recovered)
+            .expect("B decrypt SRTCP");
+        assert_eq!(recovered, a_sr, "B recovers A's RTCP");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
