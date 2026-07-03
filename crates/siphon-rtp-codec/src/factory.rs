@@ -5,7 +5,7 @@
 //! leg's codec here once, at call setup, then runs the returned trait objects per frame.
 
 #[cfg(feature = "amr")]
-use crate::amr::{AmrNb, AmrWb};
+use crate::amr::{AmrNb, AmrNbMode, AmrWb};
 use crate::cn::Cn;
 use crate::g711::{Variant, G711};
 use crate::g722::G722;
@@ -142,10 +142,10 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         #[cfg(feature = "amr")]
         "AMR-WB" => Ok(Box::new(AmrWb::new())),
         // AMR-NB decode is bit-exact for all 8 speech modes (0..=7) against 3GPP TS 26.074, with the
-        // RFC 4867 RTP payload un-sorted to encoder order in `AmrNb::decode`. Encode is still WIP
-        // (see `encoder_for`), so AMR-NB is reachable as a decode-side codec — transcode *out* to
-        // another codec, conference ingress, recording, and voice-AI WS legs — but not yet as an
-        // egress encoder. Same `amr`-feature gate (patent-licensed — docs/codec-licensing.md).
+        // RFC 4867 RTP payload un-sorted to encoder order in `AmrNb::decode`. Encode is bit-exact for
+        // MR475 and MR122 (see `encoder_for`), so AMR-NB now works as both a decode-side codec and an
+        // egress encoder for those two modes (enabling AMR-NB↔G.711 transcode). Same `amr`-feature
+        // gate (patent-licensed — docs/codec-licensing.md).
         #[cfg(feature = "amr")]
         "AMR" => Ok(Box::new(AmrNb::new())),
         _ => Err(CodecError::Unsupported(unsupported_name(
@@ -177,6 +177,22 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
             }
             Ok(Box::new(encoder))
         }
+        // AMR-NB encode is bit-exact (3GPP TS 26.074) for MR475 (4.75k) and MR122 (12.2k, GSM-EFR);
+        // the other six modes' codebook/gain search is not yet ported, so a `mode-set` that resolves
+        // to one of them is declined here (a clean factory-time `Unsupported` rather than a per-frame
+        // error mid-call). No `mode-set` ⇒ the codec default (MR122). Same `amr`-feature gate.
+        #[cfg(feature = "amr")]
+        "AMR" => match spec.encode_mode {
+            None => Ok(Box::new(AmrNb::new())),
+            Some(m) => match AmrNbMode::from_frame_type(m) {
+                Some(mode @ (AmrNbMode::Mr475 | AmrNbMode::Mr1220)) => {
+                    Ok(Box::new(AmrNb::new().with_encode_mode(mode)))
+                }
+                _ => Err(CodecError::Unsupported(
+                    "AMR-NB encode is wired for MR475 and MR122 only; other modes not yet ported",
+                )),
+            },
+        },
         _ => Err(CodecError::Unsupported(unsupported_name(
             &spec.encoding_name,
         ))),
@@ -188,10 +204,11 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
 fn unsupported_name(encoding_name: &str) -> &'static str {
     match encoding_name {
         "CN" => "comfort-noise generation (DTX) is a media-path policy, not an audio encoder",
-        // With `amr` on, AMR-WB (decode + encode) and AMR-NB decode are wired, so they never reach
-        // here. AMR-NB *encode* is still WIP — `encoder_for("AMR")` falls through to this message.
+        // With `amr` on, AMR-WB (decode + encode) and AMR-NB decode + MR475/MR122 encode are wired, so
+        // supported specs never reach here. `encoder_for("AMR")` handles an unported-mode request with
+        // its own message; this fallback is only hit for a decode-side "AMR" spec that has no encoder.
         #[cfg(feature = "amr")]
-        "AMR" => "AMR-NB encode DSP not yet implemented (AMR-NB decode is supported)",
+        "AMR" => "AMR-NB encode is wired for MR475 and MR122 only; other modes not yet ported",
         #[cfg(not(feature = "amr"))]
         "AMR" | "AMR-WB" => {
             "AMR transcoding requires the `amr` build feature (patent-licensed — see \
@@ -376,10 +393,10 @@ mod tests {
 
     #[cfg(feature = "amr")]
     #[test]
-    fn amr_nb_decodes_but_encode_is_still_wip() {
-        // AMR-NB decode is bit-exact (3GPP TS 26.074) and now reachable from the factory, so AMR-NB
-        // is usable as a decode-side codec (transcode egress, conference ingress, recording, voice-AI
-        // WS). Encode DSP is still WIP, so `encoder_for` reports `Unsupported` rather than mis-encode.
+    fn amr_nb_decodes_and_encodes_the_wired_modes() {
+        // AMR-NB decode is bit-exact for all 8 modes (3GPP TS 26.074). Encode is bit-exact for MR475
+        // and MR122, enabling AMR-NB↔G.711 transcode; a `mode-set` resolving to an unported mode is
+        // declined at factory time rather than mis-encoding mid-call.
         let nb = CodecSpec::new(97, "AMR", 8000, 1, 20);
         let mut decoder = decoder_for(&nb).expect("AMR-NB decoder builds");
         // A minimal RFC 4867 octet-aligned mode-0 (MR475) frame: CMR=0xF, then ToC (F=0, FT=0, Q=1),
@@ -395,9 +412,23 @@ mod tests {
             160,
             "one 20 ms / 160-sample frame"
         );
+        // No mode-set ⇒ default MR122 encoder; MR475 (FT=0) and MR122 (FT=7) build; an unported mode
+        // (e.g. MR590 / FT=2) is declined with Unsupported.
+        assert!(encoder_for(&nb).is_ok(), "default AMR-NB encoder (MR122)");
         assert!(
-            matches!(encoder_for(&nb), Err(CodecError::Unsupported(_))),
-            "AMR-NB encode is still WIP"
+            encoder_for(&CodecSpec::new(97, "AMR", 8000, 1, 20).with_encode_mode(Some(0))).is_ok(),
+            "MR475 encoder builds"
+        );
+        assert!(
+            encoder_for(&CodecSpec::new(97, "AMR", 8000, 1, 20).with_encode_mode(Some(7))).is_ok(),
+            "MR122 encoder builds"
+        );
+        assert!(
+            matches!(
+                encoder_for(&CodecSpec::new(97, "AMR", 8000, 1, 20).with_encode_mode(Some(2))),
+                Err(CodecError::Unsupported(_))
+            ),
+            "MR590 (unported) is declined"
         );
     }
 

@@ -15,7 +15,7 @@ use siphon_rtp_codec::amr::wb::dec_main::{decode_frame, DecoderState};
 #[cfg(feature = "amr")]
 use siphon_rtp_codec::amr::wb::{codebook, constants, filters, lpc, pitch};
 #[cfg(feature = "amr")]
-use siphon_rtp_codec::amr::{AmrWb, AMRWB_SPEECH_BITS};
+use siphon_rtp_codec::amr::{AmrNb, AmrNbMode, AmrWb, AMRWB_SPEECH_BITS};
 use siphon_rtp_codec::cn::Cn;
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::g722::G722;
@@ -427,6 +427,58 @@ fn bench_amrwb_encode(criterion: &mut Criterion) {
     }
 }
 
+/// Full per-frame AMR-NB encode (µs/frame): the whole `cod_amr()` analysis-by-synthesis pipeline for
+/// the two wired modes — MR475 (2-pulse codebook + joint 2-subframe gain) and MR122 (10-pulse
+/// GSM-EFR codebook). Reads a real warmed-up speech frame from the 3GPP `T01.INP` input; skipped if
+/// the (gitignored) input is absent so CI without the vectors still builds.
+#[cfg(feature = "amr")]
+fn bench_amrnb_encode(criterion: &mut Criterion) {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("../../reference/amr-nb/testv/NODTX/T_INP/T01.INP");
+    let Ok(inp) = std::fs::read(&path) else {
+        return; // input vector not present in this checkout
+    };
+    let pcm: Vec<i16> = inp
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let n_frames = pcm.len() / FRAME;
+    // Frame 12 — real (non-silence, post-homing) speech energy, matching the decode bench.
+    let frame_index = 12usize;
+    if n_frames <= frame_index {
+        return;
+    }
+
+    for mode in [AmrNbMode::Mr475, AmrNbMode::Mr1220] {
+        let nb_bits = mode.bits() as usize;
+        let frame_pcm: Vec<i16> = pcm[frame_index * FRAME..(frame_index + 1) * FRAME].to_vec();
+
+        // Warm the encoder state through the preceding frames so the bench sees realistic memory.
+        let mut warm = AmrNb::new();
+        let mut out = vec![0i16; nb_bits];
+        for f in 0..frame_index {
+            let fp = &pcm[f * FRAME..(f + 1) * FRAME];
+            warm.encode_mode_bits(mode, fp, &mut out)
+                .expect("warm encode");
+        }
+
+        criterion.bench_function(
+            &format!("amrnb_encode_mode{}_frame", mode.frame_type()),
+            |bencher| {
+                // Clone the warmed state outside the timed section so only the encode is measured.
+                bencher.iter_batched(
+                    || warm.clone(),
+                    |mut st| {
+                        st.encode_mode_bits(mode, black_box(&frame_pcm), black_box(&mut out))
+                            .expect("encode")
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+}
+
 /// Full-frame [`siphon_rtp_codec::Encoder::encode`] (RTP payload = CMR | ToC | speech) with and
 /// without a per-frame RFC 4867 Codec Mode Request (`request_mode`), proving the `mode-set` clamp
 /// adds no measurable per-frame cost. Uses synthetic PCM so it runs without the reference vector.
@@ -480,6 +532,7 @@ criterion_group!(
     bench_amrwb_decode,
     bench_amrnb_decode,
     bench_amrwb_encode,
+    bench_amrnb_encode,
     bench_amrwb_encode_cmr
 );
 #[cfg(not(feature = "amr"))]

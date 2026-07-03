@@ -96,3 +96,40 @@ fn codec_construct_churn_does_not_leak() {
         after.saturating_sub(before)
     );
 }
+
+/// The AMR-NB encoder core (`encode_mode_bits`) writes into a caller-owned bit buffer and keeps all
+/// its analysis-by-synthesis scratch on the `EncoderState`, so a steady-state encode loop must not
+/// allocate. (The RFC 4867 `encode` wrapper additionally packs into a `Vec`, exactly like AMR-WB;
+/// the zero-allocation hot path is the bit-exact core gated here.) The input is a deterministic
+/// synthetic frame, so this runs without the (gitignored) reference vectors.
+#[cfg(feature = "amr")]
+#[test]
+fn amrnb_encode_allocates_nothing_per_frame() {
+    use siphon_rtp_codec::amr::{AmrNb, AmrNbMode};
+
+    let pcm: Vec<i16> = (0..160_i32)
+        .map(|i| (((i * 137) % 8000) - 4000) as i16)
+        .collect();
+    let mut nb = AmrNb::new();
+    let mut bits = [0i16; 244]; // max AMR-NB serial size (MR122)
+
+    // Prime jemalloc-ctl + warm the encoder state (steady-state, past homing).
+    let _prime = allocated_bytes();
+    for _ in 0..2_000 {
+        nb.encode_mode_bits(AmrNbMode::Mr1220, &pcm, &mut bits)
+            .expect("encode");
+    }
+
+    let before = allocated_bytes();
+    for _ in 0..50_000 {
+        nb.encode_mode_bits(AmrNbMode::Mr1220, &pcm, &mut bits)
+            .expect("encode");
+    }
+    let after = allocated_bytes();
+
+    assert!(
+        after.saturating_sub(before) < 4096,
+        "AMR-NB encode must not allocate on the hot path — grew {} bytes over 50k frames",
+        after.saturating_sub(before)
+    );
+}

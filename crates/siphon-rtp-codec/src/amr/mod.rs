@@ -230,6 +230,11 @@ pub fn parse_octet_aligned(payload: &[u8]) -> Result<OctetAlignedHeader, CodecEr
 pub struct AmrNb {
     params: CodecParams,
     decoder: Box<nb::dec_main::SpeechDecoder>,
+    encoder: Box<nb::enc_main::EncoderState>,
+    /// Target speech mode for [`Encoder::encode`]. Defaults to MR122 (12.2 kbit/s, GSM-EFR — the
+    /// highest-quality wired mode). Only MR122 and MR475 are wired; other modes return
+    /// [`CodecError::Unsupported`]. Set via [`AmrNb::with_encode_mode`].
+    encode_mode: AmrNbMode,
 }
 
 impl Default for AmrNb {
@@ -249,7 +254,42 @@ impl AmrNb {
                 ptime_ms: 20,
             },
             decoder: Box::new(nb::dec_main::SpeechDecoder::new()),
+            encoder: Box::new(nb::enc_main::EncoderState::new()),
+            encode_mode: AmrNbMode::Mr1220,
         }
+    }
+
+    /// Set the target speech mode for [`Encoder::encode`] (e.g. from the SDP `mode-set` / RFC 4867
+    /// CMR). Only MR122 and MR475 are wired; other modes make [`Encoder::encode`] return
+    /// [`CodecError::Unsupported`].
+    #[must_use]
+    pub fn with_encode_mode(mut self, mode: AmrNbMode) -> Self {
+        self.encode_mode = mode;
+        self
+    }
+
+    /// Encode one 20 ms frame (160 samples @ 8 kHz) at `mode` into its serial speech bits in
+    /// encoder/`Prm2bits` order (the `.COD` order, `0`/`1` per word), writing
+    /// [`AmrNbMode::bits`]`(mode)` words to `out_bits`. This is the bit-exact core used by the
+    /// vector tests; the RTP [`Encoder::encode`] path re-sorts these into RFC 4867 payload order.
+    /// The 13-bit input mask, pre-processing and encoder homing are applied internally.
+    pub fn encode_mode_bits(
+        &mut self,
+        mode: AmrNbMode,
+        pcm: &[i16],
+        out_bits: &mut [i16],
+    ) -> Result<usize, CodecError> {
+        if pcm.len() < nb::constants::L_FRAME {
+            return Err(CodecError::Malformed("AMR-NB input frame too small"));
+        }
+        let nb_bits = mode.bits() as usize;
+        if out_bits.len() < nb_bits {
+            return Err(CodecError::Malformed("AMR-NB output bit buffer too small"));
+        }
+        let mut prm = [0i16; nb::bitstream::MAX_PRM_SIZE];
+        let nprm = self.encoder.encode_frame(mode, pcm, &mut prm)?;
+        nb::bitstream::prm2bits(mode.frame_type() as usize, &prm[..nprm], &mut out_bits[..nb_bits]);
+        Ok(nb_bits)
     }
 
     /// Decode one speech frame of `mode` (0..=7) from its serial speech bits already in
@@ -332,10 +372,28 @@ impl Encoder for AmrNb {
     fn frame_samples(&self) -> usize {
         self.params.frame_samples()
     }
-    fn encode(&mut self, _pcm: &[i16], _out: &mut [u8]) -> Result<usize, CodecError> {
-        Err(CodecError::Unsupported(
-            "AMR-NB encode DSP not yet implemented",
-        ))
+    /// Encode one 20 ms frame (160 samples @ 8 kHz) into an RFC 4867 **octet-aligned** single-frame
+    /// AMR-NB payload at the configured [`AmrNb::with_encode_mode`] mode (default MR122 / 12.2 kbit/s):
+    /// the bit-exact core ([`AmrNb::encode_mode_bits`]) → RFC 4867 sort/pack → `CMR | ToC | speech`.
+    /// CMR = 15 (no mode request); ToC = `F=0, FT=mode, Q=1` (RFC 4867 §4.3.2 / §4.4).
+    fn encode(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, CodecError> {
+        let mode = self.encode_mode;
+        let nb_bits = mode.bits() as usize;
+        let mut bits = [0i16; 244]; // max AMR-NB serial size (MR122)
+        self.encode_mode_bits(mode, pcm, &mut bits[..nb_bits])?;
+        let speech = nb::bitstream::pack(&bits, mode.frame_type() as usize);
+        // Octet-aligned single-frame payload: CMR byte + ToC byte + speech bytes.
+        let total = 2 + speech.len();
+        if out.len() < total {
+            return Err(CodecError::OutputTooSmall {
+                needed: total,
+                have: out.len(),
+            });
+        }
+        out[0] = 0xF0; // CMR = 15 (no codec-mode request), low 4 bits reserved = 0
+        out[1] = (mode.frame_type() << 3) | 0x04; // F=0 (last frame), FT=mode, Q=1 (good)
+        out[2..total].copy_from_slice(&speech);
+        Ok(total)
     }
 }
 
@@ -825,7 +883,7 @@ mod tests {
 
     #[test]
     fn amr_codecs_report_params() {
-        // AMR-NB decode (all 8 modes) is wired; AMR-NB encode is still WIP.
+        // AMR-NB decode (all 8 modes) is wired; encode is wired for MR122 (default) + MR475.
         let mut nb = AmrNb::new();
         assert_eq!(nb.frame_samples(), 160);
         assert_eq!(nb.params().sample_rate_hz, 8000);
@@ -842,11 +900,14 @@ mod tests {
         ];
         nb_payload.extend(std::iter::repeat_n(0u8, AmrNbMode::Mr475.bytes()));
         assert!(matches!(nb.decode(&nb_payload, &mut [0i16; 160]), Ok(160)));
-        // Encode remains unimplemented.
-        assert!(matches!(
-            nb.encode(&[0i16; 160], &mut [0u8; 32]),
-            Err(CodecError::Unsupported(_))
-        ));
+        // Encode is wired (default MR122): a deterministic frame encodes to a well-formed
+        // octet-aligned payload (CMR + ToC + 31 speech bytes).
+        let pcm: Vec<i16> = (0..nb::constants::L_FRAME)
+            .map(|i| (((i as i32 * 137) % 8000) - 4000) as i16)
+            .collect();
+        let mut nb_out = [0u8; 64];
+        let n = nb.encode(&pcm, &mut nb_out).expect("AMR-NB encode");
+        assert_eq!(n, 2 + AmrNbMode::Mr1220.bytes());
 
         let mut wb = AmrWb::new();
         assert_eq!(wb.frame_samples(), 320);
@@ -1115,5 +1176,99 @@ mod tests {
                 "AMR-NB RTP decode frame {f} must equal the reference vector"
             );
         }
+    }
+
+    /// Encode the reference input PCM at `mode` (MR122 / MR475) frame-by-frame through the public
+    /// [`AmrNb::encode_mode_bits`] and compare every frame's serial speech bits against the official
+    /// 3GPP TS 26.074 `.COD` (250 words/frame: `[TXtype][244 bits][mode][4 unused]`). Returns
+    /// `(frames_checked, first_mismatch)`. Skip-when-absent (the vectors are gitignored).
+    #[allow(clippy::type_complexity)]
+    fn check_nb_encode_vector(mode: AmrNbMode, cod_rel: &str) -> (usize, Option<(usize, usize)>) {
+        let nb_bits = mode.bits() as usize;
+        let mut inp_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        inp_path.push("../../reference/amr-nb/testv/NODTX/T_INP/T01.INP");
+        let mut cod_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        cod_path.push(cod_rel);
+        let (Ok(inp), Ok(cod)) = (std::fs::read(&inp_path), std::fs::read(&cod_path)) else {
+            return (0, None);
+        };
+        let pcm: Vec<i16> = inp
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let cod_words: Vec<i16> = cod
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        const COD_FRAME_WORDS: usize = 250; // 1 + 244 + 1 + 4
+        let n_frames = cod_words.len() / COD_FRAME_WORDS;
+        let mut nb = AmrNb::new();
+        let mut bits = [0i16; 244];
+        for f in 0..n_frames {
+            let frame_pcm = &pcm[f * 160..(f + 1) * 160];
+            nb.encode_mode_bits(mode, frame_pcm, &mut bits[..nb_bits])
+                .expect("AMR-NB encode");
+            let base = f * COD_FRAME_WORDS + 1; // skip the TX-type word
+            for (b, (&got, &want)) in bits[..nb_bits]
+                .iter()
+                .zip(&cod_words[base..base + nb_bits])
+                .enumerate()
+            {
+                if got != want {
+                    return (n_frames, Some((f, b)));
+                }
+            }
+        }
+        (n_frames, None)
+    }
+
+    /// End-to-end public encode path (MR122): every serial speech bit matches `T01_122.COD`.
+    #[test]
+    fn encodes_amrnb_mr122_serial_bits_bit_exact() {
+        let (frames, mismatch) =
+            check_nb_encode_vector(AmrNbMode::Mr1220, "../../reference/amr-nb/testv/NODTX/T_122/T01_122.COD");
+        assert!(
+            mismatch.is_none(),
+            "MR122: {frames} frames, first mismatch {mismatch:?}"
+        );
+    }
+
+    /// End-to-end public encode path (MR475, joint gain): every serial speech bit matches `T01_475.COD`.
+    #[test]
+    fn encodes_amrnb_mr475_serial_bits_bit_exact() {
+        let (frames, mismatch) =
+            check_nb_encode_vector(AmrNbMode::Mr475, "../../reference/amr-nb/testv/NODTX/T_475/T01_475.COD");
+        assert!(
+            mismatch.is_none(),
+            "MR475: {frames} frames, first mismatch {mismatch:?}"
+        );
+    }
+
+    /// `AmrNb::encode` produces a well-formed RFC 4867 octet-aligned payload that round-trips through
+    /// the public RTP decode path (default mode MR122).
+    #[test]
+    fn amr_nb_encode_produces_a_decodable_octet_aligned_payload() {
+        let pcm: Vec<i16> = (0..nb::constants::L_FRAME)
+            .map(|i| (((i as i32 * 149) % 7000) - 3500) as i16)
+            .collect();
+        let mut encoder = AmrNb::new();
+        let mut payload = [0u8; 64];
+        let len = encoder.encode(&pcm, &mut payload).expect("AMR-NB encode");
+        // CMR(1) + ToC(1) + ceil(244/8)=31 speech bytes for MR122.
+        assert_eq!(len, 2 + AmrNbMode::Mr1220.bytes());
+        let parsed =
+            payload::AmrPayload::parse_amr_nb(&payload[..len], true).expect("parse octet-aligned");
+        assert_eq!(parsed.cmr, 15, "CMR = no codec-mode request");
+        assert_eq!(parsed.frames.len(), 1);
+        assert_eq!(parsed.frames[0].frame_type, 7, "MR122 / 12.2k");
+        assert!(parsed.frames[0].quality_ok, "Q bit set (good frame)");
+        let mut decoder = AmrNb::new();
+        let mut out = [0i16; nb::constants::L_FRAME];
+        assert_eq!(
+            decoder
+                .decode(&payload[..len], &mut out)
+                .expect("AMR-NB decode"),
+            nb::constants::L_FRAME
+        );
     }
 }
