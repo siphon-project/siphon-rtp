@@ -768,6 +768,11 @@ impl MediaCall {
                     .echo_into(&mut self.b_to_a, &packet.data, meta, out, events);
             } else {
                 self.a_to_b.handle(&packet.data, meta, out, events);
+                // RFC 4867 §4.3.1: A's Codec Mode Request steers the mode of the stream sent *back* to
+                // A (the b_to_a egress encoder). No-op for a fixed-rate codec / no request.
+                if let Some(mode) = self.a_to_b.decoder.last_mode_request() {
+                    self.b_to_a.encoder.request_mode(mode);
+                }
             }
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
             if !self.b_to_a.accepted_source.accepts(packet.source.ip()) {
@@ -782,6 +787,10 @@ impl MediaCall {
                     .echo_into(&mut self.a_to_b, &packet.data, meta, out, events);
             } else {
                 self.b_to_a.handle(&packet.data, meta, out, events);
+                // Symmetric: B's CMR steers the a_to_b egress encoder (the stream sent back to B).
+                if let Some(mode) = self.b_to_a.decoder.last_mode_request() {
+                    self.a_to_b.encoder.request_mode(mode);
+                }
             }
         }
     }
@@ -1452,6 +1461,68 @@ mod tests {
         assert!(
             packet.payload.iter().any(|&byte| byte != 0xD5),
             "transcoded G.711a carries non-silence audio"
+        );
+    }
+
+    /// RFC 4867 §4.3.1: a Codec Mode Request on the A→B stream steers the mode of the AMR-WB stream
+    /// the engine sends *back* to A (the b_to_a egress encoder), clamped to any `mode-set`. Proves the
+    /// cross-direction wiring in `process()`.
+    #[cfg(feature = "amr")]
+    #[test]
+    fn amr_wb_cmr_steers_the_reverse_direction_encoder() {
+        use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
+
+        let amr_dir = |ingress: u64, src: &str, egress: u64, dst: &str, ssrc: u32| DirectionConfig {
+            ingress_endpoint: endpoint(ingress),
+            accepted_source: SourceFilter::Exact(addr(src).ip()),
+            egress_endpoint: endpoint(egress),
+            egress_dst: addr(dst),
+            decoder: decoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("dec"),
+            encoder: encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc"),
+            egress_ssrc: ssrc,
+            egress_payload_type: 96,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+
+        // A payload at the default mode 2; flip its CMR nibble to request mode 0 for the B→A stream.
+        let mut encoder =
+            encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc");
+        let pcm: Vec<i16> = (0..320).map(|i| ((i as f32 * 0.2).sin() * 6000.0) as i16).collect();
+        let mut a_payload = vec![0u8; 256];
+        let len_a = encoder.encode(&pcm, &mut a_payload).expect("encode");
+        a_payload.truncate(len_a);
+        a_payload[0] = 0x00; // CMR = 0 (request mode 0)
+        // B's payload carries no request (CMR 15, as emitted).
+        let mut b_payload = vec![0u8; 256];
+        let len_b = encoder.encode(&pcm, &mut b_payload).expect("encode");
+        b_payload.truncate(len_b);
+
+        let mut call = MediaCall::new(
+            "cmr",
+            "tag-a",
+            Some("tag-b".into()),
+            amr_dir(1, A_ADDR, 2, B_ADDR, 0xB000_0060),
+            amr_dir(2, B_ADDR, 1, A_ADDR, 0xA000_0060),
+            true,
+            None,
+        );
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // A→B carries CMR 0 → the toward-A encoder switches to mode 0.
+        call.process(&rx(1, A_ADDR, amr_wb_rtp(1, &a_payload)), &mut out, &mut events);
+        out.clear();
+        // B→A: the reverse egress toward A is now encoded at the requested mode 0.
+        call.process(&rx(2, B_ADDR, amr_wb_rtp(1, &b_payload)), &mut out, &mut events);
+        assert_eq!(out.len(), 1, "one AMR-WB packet toward A");
+        let packet = RtpPacket::parse(&out[0].data).expect("parse");
+        assert_eq!(packet.payload_type, 96, "AMR-WB toward A");
+        assert_eq!(
+            (packet.payload[1] >> 3) & 0x0F,
+            0,
+            "toward-A egress adapted to the CMR-requested mode 0"
         );
     }
 
