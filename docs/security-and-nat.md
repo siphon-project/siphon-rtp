@@ -202,7 +202,8 @@ is wrong, and encryption defeats A2 eavesdrop.
 > wired for the `RTP/AVP` ↔ `RTP/SAVP` **bridge** topology (Scenario 1). The crypto core is the
 > isolated [`siphon-rtp-srtp`](../crates/siphon-rtp-srtp) crate: AES-CM + HMAC-SHA1 key derivation
 > validated bit-exact against the RFC 3711 §4.3.2 vectors, SRTP (§3.3) and SRTCP (§3.4)
-> protect/unprotect for `AES_CM_128_HMAC_SHA1_80`, and `SecureLeg` (the directional in/out contexts +
+> protect/unprotect for `AES_CM_128_HMAC_SHA1_80` with §3.3.2 anti-replay on the receive path, and
+> `SecureLeg` (the directional in/out contexts +
 > RFC 5761 RTP/RTCP demux). Pure-Rust RustCrypto (`aes`/`ctr`/`hmac`/`sha1`) — **not** ring, which has
 > no AES-CM; still zero-C. The engine generates its SDES key on a secure leg, parses the peer's, and
 > bridges plaintext ↔ SRTP via the userspace `Redirect` path (`engine/src/srtp_bridge.rs`).
@@ -216,8 +217,13 @@ is wrong, and encryption defeats A2 eavesdrop.
   `Exact`/`Subnet`/`Any` policy as `ingress_rule`) before any crypto — an off-path spray is dropped at
   the bridge, not decrypted. SRTP auth (HMAC-SHA1-80) is the second line: a forged packet from the
   gated address still fails authentication and is dropped (the rollover counter advances only after
-  auth succeeds). Anti-replay (the explicit SRTCP index / SRTP sliding window) is a later hardening
-  layer.
+  auth succeeds). **Anti-replay is the third line** (RFC 3711 §3.3.2, enforced in
+  `SrtpContext::unprotect` / `SrtcpContext::unprotect`): a per-SSRC 64-packet sliding window over the
+  SRTP packet index — and over the explicit SRTCP index — rejects a duplicated or too-old packet, so a
+  captured but still-valid packet re-injected by an on-path attacker is dropped as a replay rather than
+  re-forwarded. The window is recorded only *after* authentication, so a forged packet can never
+  advance or poison it; on an HA takeover the standby anchors the window at the checkpointed rollover
+  index and keeps rejecting the primary's last-seen packet.
 - **Key direction (the footgun `SecureLeg` pins down).** Outbound (engine→peer) encrypts with the
   engine's *own* offered key (the `a=crypto` it advertised); inbound (peer→engine) decrypts with the
   *peer's* answered key. The peer's `a=crypto` is always re-originated (dropped and replaced), like

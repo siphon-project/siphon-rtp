@@ -3,8 +3,9 @@
 //! [`SrtpContext`] holds the session keys derived from a master key/salt and protects/unprotects
 //! RTP packets: AES Counter-Mode encrypts the payload (header in the clear), HMAC-SHA1 truncated to
 //! 80 bits authenticates `header || ciphertext || ROC`. The 48-bit packet index (ROC·2¹⁶ + seq) is
-//! tracked per SSRC with the RFC 3711 §3.3.1 rollover estimation. Crypto is RustCrypto (pure Rust,
-//! zero C). Anti-replay is a later hardening layer; today this is the confidentiality+integrity core.
+//! tracked per SSRC with the RFC 3711 §3.3.1 rollover estimation, and a per-SSRC RFC 3711 §3.3.2
+//! sliding-window replay filter rejects a duplicated or too-old index — updated only *after* a packet
+//! authenticates, so a forgery can never poison it. Crypto is RustCrypto (pure Rust, zero C).
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
@@ -43,6 +44,70 @@ pub enum SrtpError {
     /// The authentication tag did not verify (forged/corrupt/wrong key).
     #[error("authentication failed")]
     AuthFailed,
+    /// The packet index was already received, or is too old to prove fresh — the RFC 3711 §3.3.2
+    /// replay filter discards it. The packet authenticated (or was rejected before auth as an obvious
+    /// replay); either way the caller drops it and never forwards it.
+    #[error("replayed packet")]
+    Replayed,
+}
+
+/// The RFC 3711 §3.3.2 replay-window width, in packets. The RFC mandates a receiver window of at
+/// least 64; we use exactly 64 so the window is a single `u64` bitmap, keeping the per-packet replay
+/// check a handful of branchless integer ops on the hot path.
+pub(crate) const REPLAY_WINDOW: u64 = 64;
+
+/// A sliding-window replay filter over a monotone packet index (RFC 3711 §3.3.2), shared by SRTP (the
+/// estimated 48-bit index) and SRTCP (the explicit 31-bit index). Bit `j` of `mask` records that the
+/// index `top - j` has been received — bit 0 is `top` itself. `seen` stays false until the first index
+/// is recorded, so a fresh stream never rejects its own opening packet.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayWindow {
+    top: u64,
+    mask: u64,
+    seen: bool,
+}
+
+impl ReplayWindow {
+    /// Would `index` be a replay — already recorded, or so old it has fallen out of the window and can
+    /// no longer be proven fresh? RFC 3711 §3.3.2 requires both cases to be discarded. Read-only: call
+    /// it *before* authenticating (a cheap early reject), then [`record`](Self::record) only *after*
+    /// the packet authenticates.
+    pub(crate) fn is_replay(&self, index: u64) -> bool {
+        if !self.seen || index > self.top {
+            return false; // first packet, or strictly newer than anything seen — not a replay
+        }
+        let delta = self.top - index;
+        // Below the window we cannot prove non-replay → discard; inside it, replay iff its bit is set.
+        delta >= REPLAY_WINDOW || (self.mask & (1u64 << delta)) != 0
+    }
+
+    /// Record `index` as received and slide the window up to it. RFC 3711 §3.3.2: MUST be called only
+    /// after the packet authenticates, so a forgery can never advance `top` or set a bit.
+    pub(crate) fn record(&mut self, index: u64) {
+        if !self.seen {
+            *self = Self { top: index, mask: 1, seen: true };
+            return;
+        }
+        if index > self.top {
+            let shift = index - self.top;
+            self.mask = if shift >= REPLAY_WINDOW {
+                1 // the window jumped clear of all prior history
+            } else {
+                (self.mask << shift) | 1
+            };
+            self.top = index;
+        } else {
+            // Older than `top` but inside the window (is_replay rejected anything below it): set its bit.
+            self.mask |= 1u64 << (self.top - index);
+        }
+    }
+
+    /// Anchor the window at `index` with only that index marked received. Used when an HA standby seeds
+    /// its replay state from the rollover anchor carried in a checkpoint (RFC 3711 §3.3.1): the
+    /// per-index history below the anchor is not carried across the failover, only its top.
+    pub(crate) fn anchor(&mut self, index: u64) {
+        *self = Self { top: index, mask: 1, seen: true };
+    }
 }
 
 /// Per-SSRC rollover state.
@@ -50,6 +115,8 @@ pub enum SrtpError {
 struct StreamState {
     roc: u32,
     highest_seq: Option<u16>,
+    /// RFC 3711 §3.3.2 replay filter over this stream's 48-bit packet index, committed post-auth.
+    replay: ReplayWindow,
 }
 
 /// A per-SSRC SRTP rollover checkpoint (RFC 3711 §3.3.1): the receiver/sender rollover state that is
@@ -164,13 +231,21 @@ impl SrtpContext {
     /// SRTP packet index instead of resetting to `0` — which would compute the wrong ROC (and fail
     /// authentication) once the sequence has wrapped. Overwrites any existing state for the SSRC.
     pub fn seed_stream(&mut self, rollover: StreamRollover) {
-        self.streams.insert(
-            rollover.ssrc,
-            StreamState {
-                roc: rollover.roc,
-                highest_seq: rollover.highest_seq,
-            },
-        );
+        let mut state = StreamState {
+            roc: rollover.roc,
+            highest_seq: rollover.highest_seq,
+            replay: ReplayWindow::default(),
+        };
+        // Anchor the replay filter at the carried index so the standby immediately rejects a replay of
+        // the primary's last-seen packet (RFC 3711 §3.3.2). Only the anchor's top is carried across the
+        // failover — the per-index bitmap below it is not — so at most a `REPLAY_WINDOW`-wide span may
+        // be re-accepted once after a takeover, which is bounded, receiver-local soft state.
+        if let Some(seq) = rollover.highest_seq {
+            state
+                .replay
+                .anchor((u64::from(rollover.roc) << 16) | u64::from(seq));
+        }
+        self.streams.insert(rollover.ssrc, state);
     }
 
     /// Encrypt + authenticate an RTP packet into `out` (cleared first): `header || AES-CM(payload) ||
@@ -189,7 +264,9 @@ impl SrtpContext {
         Ok(())
     }
 
-    /// Verify the tag and decrypt an SRTP packet into `out` (cleared first), yielding the plain RTP.
+    /// Reject replays, verify the tag, and decrypt an SRTP packet into `out` (cleared first), yielding
+    /// the plain RTP. Returns [`SrtpError::Replayed`] for a duplicated/too-old index (RFC 3711 §3.3.2)
+    /// and [`SrtpError::AuthFailed`] for a forged/corrupt tag; neither advances the stream state.
     pub fn unprotect(&mut self, srtp: &[u8], out: &mut Vec<u8>) -> Result<(), SrtpError> {
         if srtp.len() < 12 + AUTH_TAG_LEN {
             return Err(SrtpError::TooShort);
@@ -201,11 +278,19 @@ impl SrtpContext {
         let mut state = self.streams.get(&ssrc).copied().unwrap_or_default();
         let (index, roc) = state.index_for(seq);
 
+        // Replay filter before spending the HMAC: a duplicated or too-old index is discarded without
+        // authenticating it (RFC 3711 §3.3.2, in the receiver step order of §3.3). The window itself is
+        // recorded only *after* auth (below), so a forged packet can never advance or poison it.
+        if state.replay.is_replay(index) {
+            return Err(SrtpError::Replayed);
+        }
+
         let expected = auth_tag(&self.session_auth, authenticated, roc);
         if expected.ct_eq(tag).unwrap_u8() != 1 {
             return Err(SrtpError::AuthFailed);
         }
-        self.streams.insert(ssrc, state); // commit rollover only after auth succeeds
+        state.replay.record(index); // mark the index received — only now, post-authentication
+        self.streams.insert(ssrc, state); // commit rollover + replay window only after auth succeeds
 
         out.clear();
         out.extend_from_slice(authenticated);
@@ -457,5 +542,192 @@ mod tests {
         let mut bad = rtp(1, 1, 1);
         bad[0] = 0x40; // version 1
         assert_eq!(context.protect(&bad, &mut out), Err(SrtpError::BadVersion));
+    }
+
+    /// Seal one RTP packet with `sender` and return the SRTP bytes — a helper for the replay tests.
+    fn seal(sender: &mut SrtpContext, seq: u16, ssrc: u32) -> Vec<u8> {
+        let mut wire = Vec::new();
+        sender
+            .protect(&rtp(seq, ssrc, seq as u8), &mut wire)
+            .expect("protect");
+        wire
+    }
+
+    #[test]
+    fn replaying_a_captured_packet_is_rejected() {
+        // RFC 3711 §3.3.2: an attacker who re-injects a validly-authenticated packet must be dropped.
+        let mut sender = context();
+        let mut receiver = context();
+        let srtp = seal(&mut sender, 100, 0xFEED);
+
+        let mut out = Vec::new();
+        receiver
+            .unprotect(&srtp, &mut out)
+            .expect("first delivery accepted");
+        assert_eq!(
+            receiver.unprotect(&srtp, &mut out),
+            Err(SrtpError::Replayed),
+            "the identical, already-seen packet is a replay"
+        );
+    }
+
+    #[test]
+    fn reordered_packet_within_the_window_is_accepted_once_then_replayed() {
+        let mut sender = context();
+        let mut receiver = context();
+        let ssrc = 0x1357_9BDF;
+        let p1 = seal(&mut sender, 1, ssrc);
+        let p2 = seal(&mut sender, 2, ssrc);
+        let p3 = seal(&mut sender, 3, ssrc);
+
+        let mut out = Vec::new();
+        receiver.unprotect(&p1, &mut out).expect("1");
+        receiver.unprotect(&p3, &mut out).expect("3 ahead of 2");
+        receiver
+            .unprotect(&p2, &mut out)
+            .expect("the delayed 2 is still inside the window");
+        assert_eq!(
+            receiver.unprotect(&p2, &mut out),
+            Err(SrtpError::Replayed),
+            "but a second copy of 2 is a replay"
+        );
+    }
+
+    #[test]
+    fn a_packet_older_than_the_window_is_rejected() {
+        let mut sender = context();
+        let mut receiver = context();
+        let ssrc = 0x2468_ACE0;
+        let old = seal(&mut sender, 10, ssrc);
+
+        // Advance the receiver's window well past `old` (more than REPLAY_WINDOW ahead).
+        let mut out = Vec::new();
+        for seq in 11..=80 {
+            let wire = seal(&mut sender, seq, ssrc);
+            receiver.unprotect(&wire, &mut out).expect("in-order accepted");
+        }
+        // `old` (index 10) is now 70 behind the top (80) — below the window, so it cannot be proven
+        // fresh and MUST be discarded, even though it was never actually delivered.
+        assert_eq!(receiver.unprotect(&old, &mut out), Err(SrtpError::Replayed));
+    }
+
+    #[test]
+    fn a_forgery_does_not_poison_the_replay_window() {
+        // The window is recorded only after authentication, so a forged packet cannot pre-claim an
+        // index and lock out the genuine one.
+        let mut sender = context();
+        let mut receiver = context();
+        let ssrc = 0xF0F0_F0F0;
+        let genuine = seal(&mut sender, 50, ssrc);
+
+        let mut forged = genuine.clone();
+        forged[20] ^= 0xFF; // corrupt a ciphertext byte → auth fails
+        let mut out = Vec::new();
+        assert_eq!(
+            receiver.unprotect(&forged, &mut out),
+            Err(SrtpError::AuthFailed)
+        );
+        receiver
+            .unprotect(&genuine, &mut out)
+            .expect("the genuine packet is still accepted after the forgery");
+        assert_eq!(out, rtp(50, ssrc, 50));
+    }
+
+    #[test]
+    fn replay_state_is_independent_per_ssrc() {
+        let mut sender_a = context();
+        let mut sender_b = context();
+        let mut receiver = context();
+        let a = seal(&mut sender_a, 7, 0xAAAA_0000);
+        let b = seal(&mut sender_b, 7, 0xBBBB_0000);
+
+        let mut out = Vec::new();
+        receiver.unprotect(&a, &mut out).expect("ssrc A seq 7");
+        receiver
+            .unprotect(&b, &mut out)
+            .expect("ssrc B seq 7 is a distinct stream, not a replay");
+        assert_eq!(
+            receiver.unprotect(&a, &mut out),
+            Err(SrtpError::Replayed),
+            "but replaying A's seq 7 is still rejected"
+        );
+    }
+
+    #[test]
+    fn the_window_slides_forward_and_evicts_old_indices() {
+        let mut sender = context();
+        let mut receiver = context();
+        let ssrc = 0x9999_9999;
+        let first = seal(&mut sender, 1, ssrc);
+        let jump = seal(&mut sender, 1 + REPLAY_WINDOW as u16 + 5, ssrc);
+
+        let mut out = Vec::new();
+        receiver.unprotect(&first, &mut out).expect("seq 1");
+        receiver
+            .unprotect(&jump, &mut out)
+            .expect("a jump forward slides the window");
+        assert_eq!(
+            receiver.unprotect(&first, &mut out),
+            Err(SrtpError::Replayed),
+            "seq 1 is now evicted below the window"
+        );
+    }
+
+    #[test]
+    fn seeding_a_standby_anchors_the_replay_window() {
+        // HA takeover: a standby seeded from the primary's rollover rejects a replay of the primary's
+        // last-seen packet, yet accepts the next genuine one (RFC 3711 §3.3.1 / §3.3.2).
+        let ssrc = 0x0BAD_F00D;
+        let mut sender = context();
+        let last = seal(&mut sender, 500, ssrc);
+        let checkpoint = sender
+            .rollover_state()
+            .into_iter()
+            .find(|state| state.ssrc == ssrc)
+            .expect("rollover state for the ssrc");
+        assert_eq!(checkpoint.highest_seq, Some(500));
+
+        let mut standby = context();
+        standby.seed_stream(checkpoint);
+        let mut out = Vec::new();
+        assert_eq!(
+            standby.unprotect(&last, &mut out),
+            Err(SrtpError::Replayed),
+            "the primary's last packet, re-delivered to the standby, is a replay"
+        );
+        let next = seal(&mut sender, 501, ssrc);
+        standby
+            .unprotect(&next, &mut out)
+            .expect("the standby continues the live stream");
+        assert_eq!(out, rtp(501, ssrc, 501u16 as u8));
+    }
+
+    #[test]
+    fn replay_window_boundary_is_exactly_the_width() {
+        let mut window = ReplayWindow::default();
+        assert!(!window.is_replay(1000), "first index establishes the top");
+        window.record(1000);
+        assert!(window.is_replay(1000), "the top itself is now a replay");
+
+        // Exactly REPLAY_WINDOW-1 below the top is still inside the window (never seen → fresh)…
+        let edge = 1000 - (REPLAY_WINDOW - 1);
+        assert!(!window.is_replay(edge));
+        // …and one further back has fallen out of the window → too old.
+        assert!(window.is_replay(edge - 1));
+    }
+
+    #[test]
+    fn replay_window_records_slides_and_forgets() {
+        let mut window = ReplayWindow::default();
+        window.record(10);
+        window.record(11);
+        window.record(12);
+        // A jump clear of the window resets the mask to just the new top.
+        window.record(12 + REPLAY_WINDOW + 100);
+        assert!(window.is_replay(12), "12 is now far below the window");
+        assert!(
+            !window.is_replay(12 + REPLAY_WINDOW + 101),
+            "a newer index is fresh"
+        );
     }
 }

@@ -26,6 +26,15 @@ const MASTER_KEY: [u8; MASTER_KEY_LEN] = [0x11; MASTER_KEY_LEN];
 /// A test master salt (`0x22` repeated).
 const MASTER_SALT: [u8; MASTER_SALT_LEN] = [0x22; MASTER_SALT_LEN];
 
+/// Ring length for the unprotect benches. Anti-replay (RFC 3711 §3.3.2) rejects a re-delivered index,
+/// so an unprotect bench can't re-decrypt one sealed packet forever. Instead we seal a ring of
+/// consecutively-sequenced packets and unprotect them in order (a monotone index stream the replay
+/// window slides over — never a replay), resetting the receiver once per cycle so the ring repeats.
+/// 128 stays comfortably L1-resident (~23 KB) and puts the once-per-cycle key setup well under 1 % of
+/// the timed cost. NOTE: this restructure means the three unprotect benches must be re-baselined
+/// against their pre-anti-replay numbers.
+const RING_LEN: usize = 128;
+
 fn srtp_context() -> SrtpContext {
     SrtpContext::new(&MASTER_KEY, &MASTER_SALT)
 }
@@ -67,18 +76,29 @@ fn bench_srtp(criterion: &mut Criterion) {
     });
 
     criterion.bench_function("srtp_unprotect_160", |bencher| {
-        // One sealed packet, verified+decrypted each iteration. unprotect commits rollover only on
-        // success and the seq is constant, so the index is stable and the tag re-verifies.
+        // A monotone ring of sealed packets (see RING_LEN): the timed body is a single steady-state
+        // unprotect; the receiver is reset once per cycle so no index is ever replayed.
         let mut sender = srtp_context();
-        let mut srtp = Vec::with_capacity(256);
-        sender.protect(&plain, &mut srtp).expect("seed protect");
-
+        let ring: Vec<Vec<u8>> = (0..RING_LEN)
+            .map(|seq| {
+                let mut sealed = Vec::with_capacity(256);
+                sender
+                    .protect(&rtp_packet(seq as u16, 0x0102_0304), &mut sealed)
+                    .expect("seed protect");
+                sealed
+            })
+            .collect();
         let mut receiver = srtp_context();
         let mut out = Vec::with_capacity(256);
+        let mut index = 0usize;
         bencher.iter(|| {
+            if index == 0 {
+                receiver = srtp_context(); // fresh replay window so the ring repeats
+            }
             receiver
-                .unprotect(black_box(&srtp), &mut out)
+                .unprotect(black_box(&ring[index]), &mut out)
                 .expect("unprotect");
+            index = if index + 1 == RING_LEN { 0 } else { index + 1 };
             black_box(out.len())
         });
     });
@@ -99,16 +119,27 @@ fn bench_srtcp(criterion: &mut Criterion) {
     });
 
     criterion.bench_function("srtcp_unprotect", |bencher| {
+        // A monotone ring of sealed SRTCP packets (the sender's index auto-increments); the receiver
+        // is reset once per cycle so no explicit SRTCP index is ever replayed.
         let mut sender = srtcp_context();
-        let mut srtcp = Vec::with_capacity(256);
-        sender.protect(&plain, &mut srtcp).expect("seed protect");
-
+        let ring: Vec<Vec<u8>> = (0..RING_LEN)
+            .map(|_| {
+                let mut sealed = Vec::with_capacity(256);
+                sender.protect(&plain, &mut sealed).expect("seed protect");
+                sealed
+            })
+            .collect();
         let mut receiver = srtcp_context();
         let mut out = Vec::with_capacity(256);
+        let mut index = 0usize;
         bencher.iter(|| {
+            if index == 0 {
+                receiver = srtcp_context(); // fresh replay window so the ring repeats
+            }
             receiver
-                .unprotect(black_box(&srtcp), &mut out)
+                .unprotect(black_box(&ring[index]), &mut out)
                 .expect("unprotect");
+            index = if index + 1 == RING_LEN { 0 } else { index + 1 };
             black_box(out.len())
         });
     });
@@ -129,17 +160,28 @@ fn bench_secure_leg(criterion: &mut Criterion) {
     });
 
     criterion.bench_function("secure_leg_unprotect_rtp", |bencher| {
-        // The peer encrypts inbound media with the remote key; the leg decrypts it with the same.
+        // The peer encrypts inbound media with the remote key; the leg decrypts it with the same. Same
+        // replay-safe monotone ring as the SRTP bench, resetting the whole leg once per cycle.
         let mut peer = SrtpContext::from_key_material(&remote);
-        let mut srtp = Vec::with_capacity(256);
-        peer.protect(&plain, &mut srtp).expect("seed protect");
-
+        let ring: Vec<Vec<u8>> = (0..RING_LEN)
+            .map(|seq| {
+                let mut sealed = Vec::with_capacity(256);
+                peer.protect(&rtp_packet(seq as u16, 0x1111_1111), &mut sealed)
+                    .expect("seed protect");
+                sealed
+            })
+            .collect();
         let mut leg = SecureLeg::new(&local, &remote);
         let mut out = Vec::with_capacity(256);
+        let mut index = 0usize;
         bencher.iter(|| {
+            if index == 0 {
+                leg = SecureLeg::new(&local, &remote); // fresh replay window so the ring repeats
+            }
             let kind = leg
-                .unprotect(black_box(&srtp), &mut out)
+                .unprotect(black_box(&ring[index]), &mut out)
                 .expect("unprotect");
+            index = if index + 1 == RING_LEN { 0 } else { index + 1 };
             black_box(kind)
         });
     });

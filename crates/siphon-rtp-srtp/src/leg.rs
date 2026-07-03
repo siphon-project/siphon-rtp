@@ -304,4 +304,28 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(leg.unprotect(&srtp, &mut out), Err(SrtpError::AuthFailed));
     }
+
+    #[test]
+    fn a_replayed_inbound_packet_is_dropped_at_the_leg() {
+        // The RFC 3711 §3.3.2 replay filter surfaces through the leg's demux: a captured inbound SRTP
+        // packet re-injected by an attacker is rejected, so the bridge drops it instead of forwarding.
+        let (local, remote) = (key(0xAA), key(0xBB));
+        let mut leg = SecureLeg::new(&local, &remote);
+        let mut peer_encrypt = SrtpContext::from_key_material(&remote);
+        let mut srtp = Vec::new();
+        peer_encrypt
+            .protect(&rtp(9, 0x00AB_CDEF), &mut srtp)
+            .expect("peer protect");
+
+        let mut out = Vec::new();
+        assert_eq!(
+            leg.unprotect(&srtp, &mut out).expect("first delivery accepted"),
+            PacketKind::Rtp
+        );
+        assert_eq!(
+            leg.unprotect(&srtp, &mut out),
+            Err(SrtpError::Replayed),
+            "the replay is dropped at the leg"
+        );
+    }
 }
