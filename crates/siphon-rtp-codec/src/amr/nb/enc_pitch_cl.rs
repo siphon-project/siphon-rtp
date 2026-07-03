@@ -20,7 +20,7 @@ use crate::amr::basic_ops::{
     abs_s, add, div_s, extract_h, l_mac, l_mult, l_shl, norm_l, round_word, shl, shr, sub,
 };
 use crate::amr::nb::constants::{
-    GP_CLIP, L_INTER_SRCH, L_SUBFR, M, MP1, N_FRAME, PIT_MAX, PIT_MIN, PIT_MIN_MR122,
+    GP_CLIP, L_INTER_SRCH, L_SUBFR, M, MP1, N_FRAME, PIT_MAX, PIT_MIN, PIT_MIN_MR122, SHARPMAX,
 };
 use crate::amr::nb::enc_pitch_ol::{GAMMA1, GAMMA1_12K2, GAMMA2};
 use crate::amr::nb::filters::{residu, syn_filt, weight_ai};
@@ -945,6 +945,84 @@ pub fn cl_ltp(
         gain_pit,
         g_coeff,
         gp_limit,
+    }
+}
+
+// =============================================================================================
+//  Subframe post-processing (spstproc.c subframePostProc)
+// =============================================================================================
+
+/// `spstproc.c` `subframePostProc` — close the analysis-by-synthesis loop for one subframe.
+///
+/// Builds the total excitation `exc[i] = gain_pit*exc[i] + gain_code*code[i]` in place (the reference
+/// `L_mult`/`L_mac`/`L_shl(·, tempShift)`/`round` chain, Q0 result), runs the synthesis filter into
+/// `synth[i_subfr..]`, and updates the three filter memories the next subframe's `subframe_pre_proc`
+/// reads: `mem_syn` (via `syn_filt`'s `update`), `mem_err` (= `speech − synth` over the last M
+/// samples) and `mem_w0` (= `xn − (gain_pit·y1 + gain_code·y2)`). Also advances the pitch-sharpening
+/// value `sharp` (clamped to `SHARPMAX`).
+///
+/// Index bases mirror the reference pointers: `exc`/`exc_base` = `&st->exc[i_subfr]`,
+/// `speech`/`speech_base` = `&st->speech[i_subfr]`, `synth`/`synth_base` = `&synth[i_subfr]`. `a_q`
+/// is the current subframe's quantized LP filter (`Aq`, `MP1` words).
+#[allow(clippy::too_many_arguments)]
+pub fn subframe_post_proc(
+    speech: &[i16],
+    speech_base: usize,
+    mode: AmrNbMode,
+    gain_pit: i16,
+    gain_code: i16,
+    a_q: &[i16],
+    synth: &mut [i16],
+    synth_base: usize,
+    xn: &[i16],
+    code: &[i16],
+    y1: &[i16],
+    y2: &[i16],
+    mem_syn: &mut [i16],
+    mem_err: &mut [i16],
+    mem_w0: &mut [i16],
+    exc: &mut [i16],
+    exc_base: usize,
+    sharp: &mut i16,
+) {
+    // Q-domain shift constants differ for MR122 (spstproc.c §"tempShift/kShift/pitch_fac").
+    let (temp_shift, k_shift, pitch_fac) = if mode != AmrNbMode::Mr1220 {
+        (1i16, 2i16, gain_pit)
+    } else {
+        (2i16, 4i16, shr(gain_pit, 1))
+    };
+
+    // Update pitch sharpening "sharp" with the quantized gain_pit (clamped to SHARPMAX).
+    *sharp = gain_pit;
+    if sub(*sharp, SHARPMAX) > 0 {
+        *sharp = SHARPMAX;
+    }
+
+    // Total excitation: exc[i] = gain_pit*exc[i] + gain_code*code[i] (result Q0).
+    for i in 0..L_SUBFR {
+        let mut l_temp = l_mult(exc[exc_base + i], pitch_fac);
+        l_temp = l_mac(l_temp, code[i], gain_code);
+        l_temp = l_shl(l_temp, temp_shift);
+        exc[exc_base + i] = round_word(l_temp);
+    }
+
+    // Synthesis speech from exc[] (updates mem_syn in place).
+    syn_filt(
+        &a_q[..MP1],
+        &exc[exc_base..exc_base + L_SUBFR],
+        &mut synth[synth_base..synth_base + L_SUBFR],
+        L_SUBFR,
+        mem_syn,
+        true,
+    );
+
+    // Update mem_err (error signal) and mem_w0 (weighting filter) over the last M samples.
+    for (j, i) in (L_SUBFR - M..L_SUBFR).enumerate() {
+        mem_err[j] = sub(speech[speech_base + i], synth[synth_base + i]);
+
+        let temp = extract_h(l_shl(l_mult(y1[i], gain_pit), 1));
+        let k = extract_h(l_shl(l_mult(y2[i], gain_code), k_shift));
+        mem_w0[j] = sub(xn[i], add(temp, k));
     }
 }
 

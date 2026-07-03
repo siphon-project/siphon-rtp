@@ -94,6 +94,14 @@ impl LspState {
         }
     }
 
+    /// The previous frame's unquantized LSPs (`lspState.lsp_old`). After [`Self::lsp`] returns this
+    /// holds the *current* frame's LSPs (the reference updates `lsp_old` at the tail of `lsp()`), so
+    /// `cod_amr` reads it here to drive the tone-stabilizer resonance check (`check_lsp`).
+    #[must_use]
+    pub fn lsp_old(&self) -> &[i16; M] {
+        &self.lsp_old
+    }
+
     /// `lsp()` — from A(z) to LSP, LSP quantization and interpolation (`lsp.c` `lsp`, non-DTX path).
     ///
     /// `az` is the unquantized LP analysis (`A_t`, `AZ_SIZE` Q12, from [`crate::amr::nb::enc_lpc::lpc`]),
