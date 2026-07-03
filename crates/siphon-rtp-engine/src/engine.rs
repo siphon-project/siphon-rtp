@@ -1491,6 +1491,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
             call.far_remote_crypto = info.crypto.first().copied();
         }
+        // Answer-side codec presentation: on a transcoding call (Media / SrtpMedia) the engine sends
+        // A its *own* negotiated codec, so the answer relayed to A must advertise A's codec, never
+        // leak B's (RFC 3264 §6). A plain relay / SRTP bridge / WS leg shares one codec across both
+        // sides, so its answer already presents A's codec — leave those byte-for-byte untouched.
+        if matches!(pipeline, PipelineKind::Media | PipelineKind::SrtpMedia) {
+            if let Some(near_codec) = near_codec.as_ref() {
+                rewritten.sdp =
+                    sdp::force_answer_codec(&rewritten.sdp, near_codec, near_telephone_event);
+            }
+        }
         ok_sdp(rewritten.sdp, Some(to_tag))
     }
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_engine::{sdp, server, Engine};
-use siphon_rtp_proto::{frame, CmdResult, Command, Event, Request, Response};
+use siphon_rtp_proto::{frame, CmdResult, Command, Event, ProfileFlags, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -90,6 +90,35 @@ fn sdp_for(addr: SocketAddr) -> String {
         ip = addr.ip(),
         port = addr.port()
     )
+}
+
+/// An offer advertising PCMU only (so a `codec-transcode-PCMA` flag genuinely *adds* PCMA).
+fn pcmu_offer(addr: SocketAddr) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+        ip = addr.ip(),
+        port = addr.port()
+    )
+}
+
+/// A far-side answer selecting PCMA (PT 8) — the transcode target B picks.
+fn pcma_answer(addr: SocketAddr) -> String {
+    format!(
+        "v=0\r\no=- 2 2 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n",
+        ip = addr.ip(),
+        port = addr.port()
+    )
+}
+
+fn sdp_text(result: &CmdResult) -> String {
+    match result {
+        CmdResult::Ok {
+            sdp: Some(text), ..
+        } => text.clone(),
+        other => panic!("expected Ok with sdp, got {other:?}"),
+    }
 }
 
 fn engine_addr(result: &CmdResult) -> SocketAddr {
@@ -199,6 +228,119 @@ async fn offer_answer_relay_delete_over_tcp_control() {
         })
         .await;
     assert!(matches!(requery, CmdResult::Error { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transcoded_answer_advertises_the_offerers_own_codec() {
+    // A offers PCMU only; `codec-transcode-PCMA` adds PCMA to the offer to B; B answers PCMA. The
+    // engine then transcodes PCMA↔PCMU, so the answer relayed to A must advertise PCMU — A's own
+    // codec — and never leak B's PCMA (RFC 3264 §6). Regression guard for the answer-side codec bug.
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    tokio::spawn(async move {
+        let _ = server::serve(engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+
+    // Offer A (PCMU) with codec-transcode-PCMA → the rewritten offer to B carries PCMU + PCMA.
+    let offer = control
+        .request(Command::Offer {
+            call_id: "xcode".into(),
+            from_tag: "tag-a".into(),
+            sdp: pcmu_offer(addr_a),
+            profile: ProfileFlags {
+                flags: vec!["codec-transcode-PCMA".into()],
+                ..Default::default()
+            },
+        })
+        .await;
+    let offer_sdp = sdp_text(&offer);
+    let offer_media = offer_sdp
+        .lines()
+        .find(|line| line.starts_with("m=audio"))
+        .expect("offer m=audio");
+    assert!(
+        offer_media.split_whitespace().any(|field| field == "8"),
+        "PCMA added to the offer to B: {offer_media}"
+    );
+
+    // Answer B (PCMA) → transcode pipeline (PCMU↔PCMA).
+    let answer = control
+        .request(Command::Answer {
+            call_id: "xcode".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: pcma_answer(addr_b),
+            profile: Default::default(),
+        })
+        .await;
+    let answer_sdp = sdp_text(&answer);
+    let answer_media = answer_sdp
+        .lines()
+        .find(|line| line.starts_with("m=audio"))
+        .expect("answer m=audio");
+
+    // A sees its own PCMU, never B's PCMA.
+    assert!(
+        answer_media.split_whitespace().any(|field| field == "0"),
+        "PCMU presented to A: {answer_media}"
+    );
+    assert!(
+        !answer_media.split_whitespace().any(|field| field == "8"),
+        "B's PCMA not leaked to A: {answer_media}"
+    );
+    assert!(
+        answer_sdp.contains("a=rtpmap:0 PCMU/8000"),
+        "PCMU rtpmap advertised to A: {answer_sdp}"
+    );
+    assert!(!answer_sdp.contains("PCMA"), "no PCMA in A's answer: {answer_sdp}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_relay_answer_keeps_the_negotiated_codec_untouched() {
+    // Regression: a non-transcoded (same-codec) relay must NOT rewrite the answer's codec list —
+    // force_answer_codec only fires on the transcode pipelines.
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    tokio::spawn(async move {
+        let _ = server::serve(engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+
+    control
+        .request(Command::Offer {
+            call_id: "relay".into(),
+            from_tag: "tag-a".into(),
+            sdp: pcmu_offer(addr_a),
+            profile: Default::default(),
+        })
+        .await;
+    let answer = control
+        .request(Command::Answer {
+            call_id: "relay".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: pcmu_offer(addr_b),
+            profile: Default::default(),
+        })
+        .await;
+    let answer_sdp = sdp_text(&answer);
+    assert!(
+        answer_sdp.contains("a=rtpmap:0 PCMU/8000"),
+        "plain relay presents the shared PCMU: {answer_sdp}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
