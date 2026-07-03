@@ -196,6 +196,98 @@ pub struct RelayConfig {
     pub egress_dst: SocketAddr,
 }
 
+/// A companion **RTCP** relay for a *non-muxed* secure-transcode (`SrtpMedia`) leg. RTCP is never
+/// transcoded — on the secure side it is SRTCP-decrypted (ingress) / SRTCP-encrypted (egress) against
+/// the call's shared [`SecureLeg`] (RFC 3711), and on the plaintext side relayed verbatim; RFC 5761
+/// keeps it on its own port here (the muxed case rides the RTP endpoint and is handled inside
+/// `Direction::handle`). The `SecureLeg` is the *same* instance the RTP directions share — its SRTCP
+/// contexts are distinct from the SRTP ones, so the single-owner actor keeps all crypto state in one
+/// place. The RTPBleed source gate is enforced on the RTCP endpoint too.
+pub struct RtcpRelay {
+    ingress_endpoint: EndpointId,
+    accepted_source: SourceFilter,
+    egress_endpoint: EndpointId,
+    /// The peer's signalled RTCP address. (Dynamic RTCP-follows-RTP latching is a follow-up — RTCP is
+    /// gated to the signalled source and forwarded to the signalled address, matching the plain SRTP
+    /// bridge's RTCP flows.)
+    egress_dst: SocketAddr,
+    /// Decrypt SRTCP→RTCP when the ingress faces the secure peer.
+    secure_ingress: Option<Arc<Mutex<SecureLeg>>>,
+    /// Encrypt RTCP→SRTCP when the egress faces the secure peer.
+    secure_egress: Option<Arc<Mutex<SecureLeg>>>,
+}
+
+impl RtcpRelay {
+    /// A plaintext RTCP relay; layer on `with_secure_ingress` / `with_secure_egress` for the secure side.
+    #[must_use]
+    pub fn new(
+        ingress_endpoint: EndpointId,
+        accepted_source: SourceFilter,
+        egress_endpoint: EndpointId,
+        egress_dst: SocketAddr,
+    ) -> Self {
+        Self {
+            ingress_endpoint,
+            accepted_source,
+            egress_endpoint,
+            egress_dst,
+            secure_ingress: None,
+            secure_egress: None,
+        }
+    }
+
+    /// SRTCP-decrypt ingress datagrams against `leg` (the ingress faces the secure peer).
+    #[must_use]
+    pub fn with_secure_ingress(mut self, leg: Arc<Mutex<SecureLeg>>) -> Self {
+        self.secure_ingress = Some(leg);
+        self
+    }
+
+    /// SRTCP-encrypt egress datagrams against `leg` (the egress faces the secure peer).
+    #[must_use]
+    pub fn with_secure_egress(mut self, leg: Arc<Mutex<SecureLeg>>) -> Self {
+        self.secure_egress = Some(leg);
+        self
+    }
+
+    /// Relay one RTCP datagram: SRTCP-decrypt (if the ingress is secure) → SRTCP-encrypt (if the
+    /// egress is secure — [`SecureLeg`] auto-demuxes RTCP) → transmit toward the peer's RTCP address.
+    /// Drops on any (de)crypt failure — never forward garbage RTCP.
+    fn relay(&self, data: &[u8], out: &mut Vec<Outbound>) {
+        let decrypted;
+        let plaintext: &[u8] = if let Some(leg) = &self.secure_ingress {
+            let mut buffer = Vec::new();
+            let Ok(mut guard) = leg.lock() else { return };
+            if guard.unprotect(data, &mut buffer).is_err() {
+                return;
+            }
+            drop(guard);
+            decrypted = buffer;
+            &decrypted
+        } else {
+            data
+        };
+        let encrypted;
+        let payload: &[u8] = if let Some(leg) = &self.secure_egress {
+            let mut buffer = Vec::new();
+            let Ok(mut guard) = leg.lock() else { return };
+            if guard.protect(plaintext, &mut buffer).is_err() {
+                return;
+            }
+            drop(guard);
+            encrypted = buffer;
+            &encrypted
+        } else {
+            plaintext
+        };
+        out.push(Outbound {
+            endpoint: self.egress_endpoint,
+            dst: self.egress_dst,
+            data: Bytes::copy_from_slice(payload),
+        });
+    }
+}
+
 impl Direction {
     fn new(config: DirectionConfig) -> Self {
         let ingress_rate = config.decoder.params().sample_rate_hz;
@@ -668,6 +760,9 @@ pub struct MediaCall {
     echo: bool,
     /// Where to write the recorded WAV on teardown, when recording.
     record_path: Option<String>,
+    /// Companion (non-muxed) RTCP relays, for a secure-transcode leg whose RTCP rides its own port
+    /// (RFC 5761). Empty for a muxed call — muxed RTCP is (de)crypted/relayed inside [`Direction::handle`].
+    rtcp: Vec<RtcpRelay>,
 }
 
 impl MediaCall {
@@ -702,7 +797,25 @@ impl MediaCall {
             latch,
             echo: false,
             record_path,
+            rtcp: Vec::new(),
         }
+    }
+
+    /// Attach companion (non-muxed) RTCP relays for a secure-transcode leg — the RTCP endpoints whose
+    /// datagrams the actor SRTCP-(de)crypts and forwards without transcoding (RFC 5761 keeps RTCP on
+    /// its own port). Their ingress endpoints must be redirected to this actor and routed in the
+    /// [`MediaRegistry`] (see [`MediaCall::rtcp_endpoints`]).
+    #[must_use]
+    pub fn with_rtcp_relays(mut self, relays: Vec<RtcpRelay>) -> Self {
+        self.rtcp = relays;
+        self
+    }
+
+    /// The companion-RTCP endpoints this call routes (empty unless [`MediaCall::with_rtcp_relays`]),
+    /// so the registry can direct their redirected datagrams to this actor.
+    #[must_use]
+    pub fn rtcp_endpoints(&self) -> Vec<EndpointId> {
+        self.rtcp.iter().map(|relay| relay.ingress_endpoint).collect()
     }
 
     /// Build a **relay-only** call: both directions forward their ingress RTP verbatim to the peer
@@ -728,6 +841,7 @@ impl MediaCall {
             latch,
             echo: false,
             record_path: None,
+            rtcp: Vec::new(),
         }
     }
 
@@ -768,6 +882,11 @@ impl MediaCall {
                     .echo_into(&mut self.b_to_a, &packet.data, meta, out, events);
             } else {
                 self.a_to_b.handle(&packet.data, meta, out, events);
+                // RFC 4867 §4.3.1: A's Codec Mode Request steers the mode of the stream sent *back* to
+                // A (the b_to_a egress encoder). No-op for a fixed-rate codec / no request.
+                if let Some(mode) = self.a_to_b.decoder.last_mode_request() {
+                    self.b_to_a.encoder.request_mode(mode);
+                }
             }
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
             if !self.b_to_a.accepted_source.accepts(packet.source.ip()) {
@@ -782,7 +901,23 @@ impl MediaCall {
                     .echo_into(&mut self.a_to_b, &packet.data, meta, out, events);
             } else {
                 self.b_to_a.handle(&packet.data, meta, out, events);
+                // Symmetric: B's CMR steers the a_to_b egress encoder (the stream sent back to B).
+                if let Some(mode) = self.b_to_a.decoder.last_mode_request() {
+                    self.a_to_b.encoder.request_mode(mode);
+                }
             }
+        } else if let Some(relay) = self
+            .rtcp
+            .iter()
+            .find(|relay| relay.ingress_endpoint == packet.endpoint)
+        {
+            // Companion (non-muxed) RTCP on a secure-transcode leg: gate the source (RTPBleed) then
+            // SRTCP-(de)crypt and relay it untranscoded toward the peer's RTCP port.
+            if !relay.accepted_source.accepts(packet.source.ip()) {
+                tracing::debug!(source = %packet.source, "media-pipeline dropped RTCP from unsignalled source");
+                return;
+            }
+            relay.relay(&packet.data, out);
         }
     }
 
@@ -1033,6 +1168,8 @@ pub struct MediaRegistry {
 struct CallHandle {
     mailbox: flume::Sender<MediaInput>,
     endpoints: [EndpointId; 2],
+    /// Companion (non-muxed) RTCP endpoints routed to this actor, if any (secure-transcode leg).
+    rtcp_endpoints: Vec<EndpointId>,
     task: tokio::task::JoinHandle<()>,
     /// `true` for a promoted passthrough relay (no transcode) — distinguishes it from a transcoding
     /// call so the engine's silence/play/DTMF guards stay correct.
@@ -1064,9 +1201,10 @@ impl MediaRegistry {
     {
         let call_id = call.call_id.clone();
         let endpoints = call.endpoints();
+        let rtcp_endpoints = call.rtcp_endpoints();
         let relay_only = call.is_relay_only();
         let (mailbox, inbox) = flume::bounded(1024);
-        for endpoint in endpoints {
+        for endpoint in endpoints.iter().copied().chain(rtcp_endpoints.iter().copied()) {
             self.routes.insert(endpoint, mailbox.clone());
         }
         let task = tokio::spawn(run_media_call(call, inbox, datapath, events));
@@ -1075,6 +1213,7 @@ impl MediaRegistry {
             CallHandle {
                 mailbox,
                 endpoints,
+                rtcp_endpoints,
                 task,
                 relay_only,
             },
@@ -1109,6 +1248,17 @@ impl MediaRegistry {
             .is_some_and(|handle| !handle.relay_only)
     }
 
+    /// Count of live **transcoding** media calls (excludes promoted relay-only passthrough calls) —
+    /// the expensive, decode/re-encode subset the cluster `load` command reports so a dispatcher can
+    /// weight a node's real cost above its raw call count.
+    #[must_use]
+    pub fn transcode_call_count(&self) -> usize {
+        self.calls
+            .iter()
+            .filter(|entry| !entry.value().relay_only)
+            .count()
+    }
+
     /// Whether `call_id` is a promoted relay-only call (a passthrough leg taken to userspace for a
     /// SIPREC raw tee). Used to decide whether `unsubscribe` should demote it back to in-kernel
     /// `Forward` once its last subscription is gone.
@@ -1125,7 +1275,12 @@ impl MediaRegistry {
             let _ = handle
                 .mailbox
                 .try_send(MediaInput::Control(MediaControl::Stop));
-            for endpoint in handle.endpoints {
+            for endpoint in handle
+                .endpoints
+                .iter()
+                .copied()
+                .chain(handle.rtcp_endpoints.iter().copied())
+            {
                 self.routes.remove(&endpoint);
             }
             handle.task.abort();
@@ -1442,6 +1597,165 @@ mod tests {
             packet.payload.iter().any(|&byte| byte != 0xD5),
             "transcoded G.711a carries non-silence audio"
         );
+    }
+
+    /// RFC 4867 §4.3.1: a Codec Mode Request on the A→B stream steers the mode of the AMR-WB stream
+    /// the engine sends *back* to A (the b_to_a egress encoder), clamped to any `mode-set`. Proves the
+    /// cross-direction wiring in `process()`.
+    #[cfg(feature = "amr")]
+    #[test]
+    fn amr_wb_cmr_steers_the_reverse_direction_encoder() {
+        use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
+
+        let amr_dir = |ingress: u64, src: &str, egress: u64, dst: &str, ssrc: u32| DirectionConfig {
+            ingress_endpoint: endpoint(ingress),
+            accepted_source: SourceFilter::Exact(addr(src).ip()),
+            egress_endpoint: endpoint(egress),
+            egress_dst: addr(dst),
+            decoder: decoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("dec"),
+            encoder: encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc"),
+            egress_ssrc: ssrc,
+            egress_payload_type: 96,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+
+        // A payload at the default mode 2; flip its CMR nibble to request mode 0 for the B→A stream.
+        let mut encoder =
+            encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc");
+        let pcm: Vec<i16> = (0..320).map(|i| ((i as f32 * 0.2).sin() * 6000.0) as i16).collect();
+        let mut a_payload = vec![0u8; 256];
+        let len_a = encoder.encode(&pcm, &mut a_payload).expect("encode");
+        a_payload.truncate(len_a);
+        a_payload[0] = 0x00; // CMR = 0 (request mode 0)
+        // B's payload carries no request (CMR 15, as emitted).
+        let mut b_payload = vec![0u8; 256];
+        let len_b = encoder.encode(&pcm, &mut b_payload).expect("encode");
+        b_payload.truncate(len_b);
+
+        let mut call = MediaCall::new(
+            "cmr",
+            "tag-a",
+            Some("tag-b".into()),
+            amr_dir(1, A_ADDR, 2, B_ADDR, 0xB000_0060),
+            amr_dir(2, B_ADDR, 1, A_ADDR, 0xA000_0060),
+            true,
+            None,
+        );
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // A→B carries CMR 0 → the toward-A encoder switches to mode 0.
+        call.process(&rx(1, A_ADDR, amr_wb_rtp(1, &a_payload)), &mut out, &mut events);
+        out.clear();
+        // B→A: the reverse egress toward A is now encoded at the requested mode 0.
+        call.process(&rx(2, B_ADDR, amr_wb_rtp(1, &b_payload)), &mut out, &mut events);
+        assert_eq!(out.len(), 1, "one AMR-WB packet toward A");
+        let packet = RtpPacket::parse(&out[0].data).expect("parse");
+        assert_eq!(packet.payload_type, 96, "AMR-WB toward A");
+        assert_eq!(
+            (packet.payload[1] >> 3) & 0x0F,
+            0,
+            "toward-A egress adapted to the CMR-requested mode 0"
+        );
+    }
+
+    /// A minimal RTCP sender-report-shaped datagram (version 2, PT 200) carrying `ssrc` — the shape
+    /// [`is_rtcp`] classifies as RTCP and the SRTCP contexts (de)crypt.
+    fn rtcp_sr(ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0x80, 200, 0x00, 0x00];
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&[0x33; 16]);
+        packet
+    }
+
+    #[test]
+    fn non_muxed_srtcp_is_relayed_through_the_shared_secure_leg() {
+        use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
+
+        // The engine's leg (actor) and the far peer B's leg are key-inverses of one another.
+        let engine_key = SrtpKeyMaterial::from_inline_bytes(&[7u8; 30]).expect("engine key");
+        let b_key = SrtpKeyMaterial::from_inline_bytes(&[9u8; 30]).expect("b key");
+        let actor_leg = Arc::new(Mutex::new(SecureLeg::new(&engine_key, &b_key)));
+        let mut peer_leg = SecureLeg::new(&b_key, &engine_key); // stands in for the secure peer B
+
+        // Trivial RTP directions (unused by the RTCP path) on endpoints 1/2; RTCP on 3 (A) / 4 (B).
+        let g711 = |ingress: u64, src: &str, egress: u64, dst: &str| DirectionConfig {
+            ingress_endpoint: endpoint(ingress),
+            accepted_source: SourceFilter::Exact(addr(src).ip()),
+            egress_endpoint: endpoint(egress),
+            egress_dst: addr(dst),
+            decoder: Box::new(G711::ulaw()),
+            encoder: Box::new(G711::ulaw()),
+            egress_ssrc: 0x1111_1111,
+            egress_payload_type: 0,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+        let a_rtcp = "127.0.0.2:5001";
+        let b_rtcp = "127.0.0.3:6001";
+        let relays = vec![
+            // A's RTCP (plaintext) → encrypt toward secure B.
+            RtcpRelay::new(
+                endpoint(3),
+                SourceFilter::Exact(addr(a_rtcp).ip()),
+                endpoint(4),
+                addr(b_rtcp),
+            )
+            .with_secure_egress(actor_leg.clone()),
+            // B's SRTCP → decrypt toward plaintext A.
+            RtcpRelay::new(
+                endpoint(4),
+                SourceFilter::Exact(addr(b_rtcp).ip()),
+                endpoint(3),
+                addr(a_rtcp),
+            )
+            .with_secure_ingress(actor_leg.clone()),
+        ];
+        let mut call = MediaCall::new(
+            "srtcp",
+            "tag-a",
+            Some("tag-b".into()),
+            g711(1, A_ADDR, 2, B_ADDR),
+            g711(2, B_ADDR, 1, A_ADDR),
+            true,
+            None,
+        )
+        .with_far_secure_leg(actor_leg.clone())
+        .with_rtcp_relays(relays);
+        assert_eq!(call.rtcp_endpoints(), vec![endpoint(3), endpoint(4)]);
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // B → A: B encrypts an RTCP SR with its key; the actor decrypts and relays plaintext to A.
+        let b_rtcp_plain = rtcp_sr(0xB0B0_B0B0);
+        let mut b_srtcp = Vec::new();
+        peer_leg.protect(&b_rtcp_plain, &mut b_srtcp).expect("peer encrypt SRTCP");
+        call.process(&rx(4, b_rtcp, b_srtcp), &mut out, &mut events);
+        assert_eq!(out.len(), 1, "one RTCP toward A");
+        assert_eq!(out[0].endpoint, endpoint(3));
+        assert_eq!(out[0].dst, addr(a_rtcp));
+        assert_eq!(&out[0].data[..], &b_rtcp_plain[..], "decrypted plaintext RTCP toward A");
+
+        // A → B: A's plaintext RTCP is encrypted (SRTCP) toward B; the peer recovers it.
+        out.clear();
+        let a_rtcp_plain = rtcp_sr(0xA0A0_A0A0);
+        call.process(&rx(3, a_rtcp, a_rtcp_plain.clone()), &mut out, &mut events);
+        assert_eq!(out.len(), 1, "one SRTCP toward B");
+        assert_eq!(out[0].endpoint, endpoint(4));
+        assert_eq!(out[0].dst, addr(b_rtcp));
+        assert_ne!(&out[0].data[..], &a_rtcp_plain[..], "toward B it is encrypted (SRTCP)");
+        let mut recovered = Vec::new();
+        peer_leg.unprotect(&out[0].data, &mut recovered).expect("peer decrypt SRTCP");
+        assert_eq!(recovered, a_rtcp_plain, "B recovers A's RTCP");
+
+        // An off-source RTCP is dropped by the RTPBleed gate on the RTCP endpoint.
+        out.clear();
+        call.process(&rx(4, "127.0.0.9:7000", rtcp_sr(1)), &mut out, &mut events);
+        assert!(out.is_empty(), "unsignalled RTCP source dropped");
     }
 
     #[test]

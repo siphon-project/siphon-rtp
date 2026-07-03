@@ -30,13 +30,15 @@ use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, PlayMediaSource,
     ProfileFlags, SessionStats,
 };
-use siphon_rtp_srtp::leg::SecureLeg;
-use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
+use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
+use siphon_rtp_srtp::StreamRollover;
 
+use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
 use crate::ice::{self, IceCredentials};
 use crate::media_pipeline::{
-    DirectionConfig, MediaCall, MediaControl, MediaRegistry, RawTee, RelayConfig,
+    DirectionConfig, MediaCall, MediaControl, MediaRegistry, RawTee, RelayConfig, RtcpRelay,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, SecurityAdvertisement};
@@ -91,6 +93,10 @@ struct Call {
     /// advertised to B — kept to key the SRTP bridge once B's answer brings its key. `None` for a
     /// plain relay. (Scenario 1: AVP near ↔ SAVP far; the reverse, a secure near, is a follow-up.)
     far_local_crypto: Option<CryptoAttribute>,
+    /// The far (answerer) peer's SDES key from its `RTP/SAVP` answer — kept (alongside
+    /// `far_local_crypto`) so an HA checkpoint can re-key the SRTP bridge on a standby. `None` until a
+    /// secure answer lands (and `None` for a plain relay).
+    far_remote_crypto: Option<CryptoAttribute>,
     /// The near (offerer) leg's primary audio codec, captured at offer — paired with the answer's
     /// codec to decide whether the call transcodes (the media slow path).
     near_codec: Option<CodecSpec>,
@@ -104,6 +110,231 @@ struct Call {
     /// For a passthrough relay, the forward actions installed at answer — kept so `block`/`unblock`
     /// can flip the endpoints to `Drop` and restore them. Empty for media/SRTP calls.
     relay_flows: Vec<(EndpointId, FlowAction)>,
+}
+
+impl Call {
+    /// The role of one of this call's four possible endpoints, or `None` if the id is not one of
+    /// them. Used to snapshot flows by role (the node-independent stand-in for a datapath id).
+    fn endpoint_role(&self, id: EndpointId) -> Option<crate::ha::EndpointRole> {
+        use crate::ha::EndpointRole;
+        if id == self.near.rtp.id {
+            Some(EndpointRole::NearRtp)
+        } else if self.near.rtcp.map(|endpoint| endpoint.id) == Some(id) {
+            Some(EndpointRole::NearRtcp)
+        } else if id == self.far.rtp.id {
+            Some(EndpointRole::FarRtp)
+        } else if self.far.rtcp.map(|endpoint| endpoint.id) == Some(id) {
+            Some(EndpointRole::FarRtcp)
+        } else {
+            None
+        }
+    }
+
+    /// This call's `(endpoint id, role)` pairs, in a fixed order — so the checkpoint handler can map
+    /// the SRTP bridge's flow ids back to roles and reach the shared secure leg.
+    fn endpoint_roles(&self) -> Vec<(EndpointId, crate::ha::EndpointRole)> {
+        use crate::ha::EndpointRole;
+        let mut roles = vec![(self.near.rtp.id, EndpointRole::NearRtp)];
+        if let Some(endpoint) = self.near.rtcp {
+            roles.push((endpoint.id, EndpointRole::NearRtcp));
+        }
+        roles.push((self.far.rtp.id, EndpointRole::FarRtp));
+        if let Some(endpoint) = self.far.rtcp {
+            roles.push((endpoint.id, EndpointRole::FarRtcp));
+        }
+        roles
+    }
+
+    /// Capture this call's replicable negotiated state as a portable [`crate::ha::CallSnapshot`] for
+    /// HA failover. Node-local handles (sockets, ids) and ephemeral media state are excluded; a secure
+    /// call's live SRTP state (rollover + bridge flows) lives in the bridge, so the checkpoint handler
+    /// folds it in afterwards (this method only sees the `Call`).
+    fn to_snapshot(&self) -> crate::ha::CallSnapshot {
+        use crate::ha;
+        let flows = self
+            .relay_flows
+            .iter()
+            .filter_map(|(endpoint, action)| {
+                // Only `Forward` rules are portable; `Redirect`/`Drop` carry no reconstructable state.
+                let FlowAction::Forward(rule) = action else {
+                    return None;
+                };
+                Some(ha::FlowSnapshot {
+                    installed_on: self.endpoint_role(*endpoint)?,
+                    out: self.endpoint_role(rule.out_endpoint)?,
+                    out_dst: rule.out_dst,
+                    accepted_source: source_filter_snapshot(rule.accepted_source),
+                    latch: latch_snapshot(rule.latch),
+                })
+            })
+            .collect();
+        ha::CallSnapshot {
+            version: ha::SNAPSHOT_VERSION,
+            call_id: String::new(), // filled by the caller, which holds the registry key
+            from_tag: self.from_tag.clone(),
+            to_tag: self.to_tag.clone(),
+            pipeline: pipeline_snapshot(self.pipeline),
+            ice: self.ice.as_ref().map(|ice| ha::IceSnapshot {
+                ufrag: ice.ufrag.clone(),
+                pwd: ice.pwd.clone(),
+            }),
+            far_local_crypto: self.far_local_crypto.as_ref().map(crypto_snapshot),
+            near_codec: self.near_codec.as_ref().map(codec_snapshot),
+            far_codec: self.far_codec.as_ref().map(codec_snapshot),
+            near_telephone_event: self.near_telephone_event,
+            near: leg_snapshot(&self.near),
+            far: leg_snapshot(&self.far),
+            flows,
+            // Populated by the checkpoint handler for a secure call (it has the SRTP bridge);
+            // `to_snapshot` only sees the `Call`, which does not hold the live crypto state.
+            secure: None,
+        }
+    }
+}
+
+/// Map a [`Leg`] to its portable snapshot (local media ports + the peer's remote addresses).
+fn leg_snapshot(leg: &Leg) -> crate::ha::LegSnapshot {
+    crate::ha::LegSnapshot {
+        rtp_local: leg.rtp.local_addr,
+        rtcp_local: leg.rtcp.map(|endpoint| endpoint.local_addr),
+        remote_rtp: leg.remote_rtp,
+        remote_rtcp: leg.remote_rtcp,
+    }
+}
+
+/// Map a [`CodecSpec`] to its snapshot (the wire-relevant fields).
+fn codec_snapshot(codec: &CodecSpec) -> crate::ha::CodecSnapshot {
+    crate::ha::CodecSnapshot {
+        payload_type: codec.payload_type,
+        encoding_name: codec.encoding_name.clone(),
+        clock_rate_hz: codec.clock_rate_hz,
+        channels: codec.channels,
+        ptime_ms: codec.ptime_ms,
+        encode_mode: codec.encode_mode,
+    }
+}
+
+/// Reconstruct a [`CodecSpec`] from its snapshot on restore (for a transcode call's directions).
+fn restore_codec(snapshot: &crate::ha::CodecSnapshot) -> CodecSpec {
+    CodecSpec::new(
+        snapshot.payload_type,
+        &snapshot.encoding_name,
+        snapshot.clock_rate_hz,
+        snapshot.channels,
+        snapshot.ptime_ms,
+    )
+    .with_encode_mode(snapshot.encode_mode)
+}
+
+/// Map an SDES [`CryptoAttribute`] to its snapshot (suite name + hex key material).
+fn crypto_snapshot(crypto: &CryptoAttribute) -> crate::ha::CryptoSnapshot {
+    crate::ha::CryptoSnapshot {
+        tag: crypto.tag,
+        suite: crypto.suite.name().to_string(),
+        master_key_hex: crate::ha::to_hex(&crypto.key.master_key),
+        master_salt_hex: crate::ha::to_hex(&crypto.key.master_salt),
+    }
+}
+
+/// Map a [`SecureLegRollover`] (from the SRTP bridge) to its snapshot on checkpoint.
+fn secure_rollover_snapshot(rollover: &SecureLegRollover) -> crate::ha::SecureLegRolloverSnapshot {
+    let stream = |value: &StreamRollover| crate::ha::StreamRolloverSnapshot {
+        ssrc: value.ssrc,
+        roc: value.roc,
+        highest_seq: value.highest_seq,
+    };
+    crate::ha::SecureLegRolloverSnapshot {
+        inbound_rtp: rollover.inbound_rtp.iter().map(stream).collect(),
+        outbound_rtp: rollover.outbound_rtp.iter().map(stream).collect(),
+        outbound_rtcp_index: rollover.outbound_rtcp_index,
+    }
+}
+
+/// Map the engine [`PipelineKind`] to its snapshot mirror.
+fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSnapshot {
+    use crate::ha::PipelineSnapshot;
+    match pipeline {
+        PipelineKind::Passthrough => PipelineSnapshot::Passthrough,
+        PipelineKind::Srtp => PipelineSnapshot::Srtp,
+        PipelineKind::Media => PipelineSnapshot::Media,
+        PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
+        PipelineKind::Ws => PipelineSnapshot::Ws,
+    }
+}
+
+/// Map a datapath [`SourceFilter`] to its snapshot mirror.
+fn source_filter_snapshot(filter: SourceFilter) -> crate::ha::SourceFilterSnapshot {
+    use crate::ha::SourceFilterSnapshot;
+    match filter {
+        SourceFilter::Exact(ip) => SourceFilterSnapshot::Exact(ip),
+        SourceFilter::Subnet(ip, bits) => SourceFilterSnapshot::Subnet(ip, bits),
+        SourceFilter::Any => SourceFilterSnapshot::Any,
+    }
+}
+
+/// Map a datapath [`LatchPolicy`] to its snapshot mirror.
+fn latch_snapshot(latch: LatchPolicy) -> crate::ha::LatchSnapshot {
+    use crate::ha::LatchSnapshot;
+    match latch {
+        LatchPolicy::Off => LatchSnapshot::Off,
+        LatchPolicy::SignalledOnly => LatchSnapshot::SignalledOnly,
+        LatchPolicy::Symmetric => LatchSnapshot::Symmetric,
+    }
+}
+
+/// Map a snapshot source-filter back to the datapath [`SourceFilter`] on restore.
+fn restore_source_filter(filter: crate::ha::SourceFilterSnapshot) -> SourceFilter {
+    use crate::ha::SourceFilterSnapshot;
+    match filter {
+        SourceFilterSnapshot::Exact(ip) => SourceFilter::Exact(ip),
+        SourceFilterSnapshot::Subnet(ip, bits) => SourceFilter::Subnet(ip, bits),
+        SourceFilterSnapshot::Any => SourceFilter::Any,
+    }
+}
+
+/// Map a snapshot latch policy back to the datapath [`LatchPolicy`] on restore.
+fn restore_latch(latch: crate::ha::LatchSnapshot) -> LatchPolicy {
+    use crate::ha::LatchSnapshot;
+    match latch {
+        LatchSnapshot::Off => LatchPolicy::Off,
+        LatchSnapshot::SignalledOnly => LatchPolicy::SignalledOnly,
+        LatchSnapshot::Symmetric => LatchPolicy::Symmetric,
+    }
+}
+
+/// Reconstruct an SDES [`CryptoAttribute`] from its snapshot (hex-decoding the key/salt). Returns a
+/// human-readable error for an unknown suite or malformed key material.
+fn restore_crypto(snapshot: &crate::ha::CryptoSnapshot) -> Result<CryptoAttribute, String> {
+    let suite = CryptoSuite::from_name(&snapshot.suite)
+        .ok_or_else(|| format!("unknown crypto suite {}", snapshot.suite))?;
+    let master_key: [u8; 16] = crate::ha::from_hex(&snapshot.master_key_hex)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or("invalid master key hex (want 16 bytes)")?;
+    let master_salt: [u8; 14] = crate::ha::from_hex(&snapshot.master_salt_hex)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or("invalid master salt hex (want 14 bytes)")?;
+    Ok(CryptoAttribute {
+        tag: snapshot.tag,
+        suite,
+        key: SrtpKeyMaterial {
+            master_key,
+            master_salt,
+        },
+    })
+}
+
+/// Reconstruct a [`SecureLegRollover`] from its snapshot on restore.
+fn restore_rollover(snapshot: &crate::ha::SecureLegRolloverSnapshot) -> SecureLegRollover {
+    let stream = |value: &crate::ha::StreamRolloverSnapshot| StreamRollover {
+        ssrc: value.ssrc,
+        roc: value.roc,
+        highest_seq: value.highest_seq,
+    };
+    SecureLegRollover {
+        inbound_rtp: snapshot.inbound_rtp.iter().map(stream).collect(),
+        outbound_rtp: snapshot.outbound_rtp.iter().map(stream).collect(),
+        outbound_rtcp_index: snapshot.outbound_rtcp_index,
+    }
 }
 
 /// A SIPREC / monitor media subscription (RFC 7866): one or more source legs' **raw ingress RTP** is
@@ -184,6 +415,10 @@ pub struct Engine<D: Datapath> {
     /// Operational counters (offers/answers/deletes/errors), incremented on the control path and
     /// rendered by the `/metrics` HTTP endpoint. Shared so the metrics server reads the same surface.
     metrics: Arc<Metrics>,
+    /// Cluster identity, capacity, and drain flag — the state behind the `load` / `node_info` /
+    /// `drain` / `undrain` control commands (see [`crate::cluster`]). Shared so the CPU sampler and
+    /// the control path see one surface.
+    cluster: Arc<ClusterState>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -215,7 +450,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             conference: Arc::new(ConferenceRegistry::default()),
             subscriptions: DashMap::new(),
             metrics: Arc::new(Metrics::new()),
+            cluster: Arc::new(ClusterState::new("siphon-rtp".to_string(), 0, Vec::new())),
         }
+    }
+
+    /// Replace the default cluster identity/capacity with operator-configured state (`main.rs`
+    /// wiring). A builder-style consuming setter so the daemon can `Engine::new(dp).with_cluster(..)`
+    /// before it is wrapped in an `Arc`; tests keep the zero-config default.
+    #[must_use]
+    pub fn with_cluster(mut self, cluster: Arc<ClusterState>) -> Self {
+        self.cluster = cluster;
+        self
+    }
+
+    /// The shared cluster state (identity, capacity, drain flag) — handed to the CPU sampler so it
+    /// publishes host-load samples into the same surface the `load` command reads.
+    #[must_use]
+    pub fn cluster(&self) -> Arc<ClusterState> {
+        self.cluster.clone()
     }
 
     /// The shared operational metrics — handed to the `/metrics` HTTP endpoint so it renders the
@@ -311,10 +563,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// Dispatch one control command to its handler (the metric-free inner of [`Self::handle`]).
     async fn dispatch(&self, client: ClientId, command: Command) -> CmdResult {
+        // Drain gate: a draining node runs its live calls to completion but admits no new session, so
+        // it can be taken out of a rolling upgrade cleanly. Reject the two session-creating verbs;
+        // everything else — query/delete/media-control on existing calls, and the cluster/census
+        // verbs — still works. (Matching without binding does not move `command`.)
+        if self.cluster.is_draining()
+            && matches!(
+                command,
+                Command::Offer { .. } | Command::ConferenceJoin { .. }
+            )
+        {
+            return CmdResult::Error {
+                reason: "node is draining; not accepting new sessions".to_string(),
+            };
+        }
         match command {
             Command::Ping => CmdResult::Pong,
             Command::List => self.list(client),
             Command::Statistics => self.statistics(),
+            Command::Load => self.load_snapshot(),
+            Command::NodeInfo => self.node_info(),
+            Command::Drain => {
+                self.cluster.set_draining(true);
+                ok_empty()
+            }
+            Command::Undrain => {
+                self.cluster.set_draining(false);
+                ok_empty()
+            }
+            Command::Checkpoint { call_id, .. } => self.checkpoint(client, &call_id),
+            Command::Restore { snapshot } => self.restore(client, &snapshot).await,
             Command::Offer {
                 call_id,
                 from_tag,
@@ -580,11 +858,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 };
             }
         };
-        // rtpengine codec manipulation on the SDP offered to the far side: `codec-strip-X` removes a
-        // codec, `codec-transcode-X` adds one (the far side may then select it, engaging transcode).
-        let (codec_strip, codec_add) = parse_codec_flags(&profile.flags);
-        if !codec_strip.is_empty() || !codec_add.is_empty() {
-            rewritten.sdp = sdp::rewrite_codec_list(&rewritten.sdp, &codec_strip, &codec_add);
+        // rtpengine codec manipulation on the SDP offered to the far side: strip/mask/consume remove a
+        // codec, transcode/offer add or reorder, except/accept keep it (see `parse_codec_flags`). The
+        // far side may then select a transcode/offer codec, engaging the transcoder at answer.
+        let codec_policy = parse_codec_flags(&profile.flags);
+        if !codec_policy.is_noop() {
+            rewritten.sdp = sdp::apply_codec_policy(&rewritten.sdp, &codec_policy);
         }
         // rtpengine `replace: [origin]`: rewrite the o= line to the engine's address (topology hiding).
         if profile.replace.iter().any(|field| field == "origin") {
@@ -633,6 +912,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtcp: None,
                 },
                 far_local_crypto,
+                far_remote_crypto: None,
                 near_codec: near_codec.clone(),
                 far_codec: None,
                 near_telephone_event: info.telephone_event_payload_type(),
@@ -960,9 +1240,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else if pipeline == PipelineKind::SrtpMedia {
             // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
             // the media actor decrypts B's SRTP, transcodes, and encrypts toward B (and the reverse),
-            // sharing one SecureLeg across both directions. RTCP rides the muxed RTP endpoint and is
-            // (de)crypted there too. (rtcp-mux posture; a non-muxed secure-transcode RTCP companion
-            // is a follow-up — see docs/security-and-nat.md.)
+            // sharing one SecureLeg across both directions. Under rtcp-mux, RTCP rides the muxed RTP
+            // endpoint and is (de)crypted there too; when not muxed, the companion RTCP endpoints are
+            // redirected and SRTCP-(de)crypted through the same SecureLeg (see below +
+            // docs/security-and-nat.md).
             let far_local = far_local_crypto.expect("SrtpMedia ⇒ far_local_crypto is set");
             let Some(far_remote) = info.crypto.first().copied() else {
                 return error_result("SAVP answer", &"missing a=crypto in the answer");
@@ -1017,13 +1298,49 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (B→A)", &reason),
             };
-            // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them, (de)crypted in-actor).
+            // Redirect the RTP legs to the actor. Under rtcp-mux, RTCP rides the RTP endpoint and is
+            // (de)crypted inside the actor; when not muxed, the companion RTCP endpoints are redirected
+            // and SRTCP-(de)crypted through the same SecureLeg below.
             for endpoint in [near.rtp.id, far.rtp.id] {
                 if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
                     return error_result("install secure media redirect", &error);
                 }
             }
             let leg = Arc::new(Mutex::new(SecureLeg::new(&far_local.key, &far_remote.key)));
+
+            // Non-muxed companion RTCP: redirect both RTCP endpoints into the actor and relay them
+            // through the shared SecureLeg — A's RTCP encrypted toward secure B, B's SRTCP decrypted
+            // toward plaintext A — so a non-muxed secure-transcode leg keeps RTCP flowing (RFC 3711
+            // SRTCP; RFC 5761 keeps it on its own port). Muxed calls leave this empty.
+            let mut rtcp_relays = Vec::new();
+            if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp)) =
+                (near.rtcp, far.rtcp, near.remote_rtcp)
+            {
+                for endpoint in [near_rtcp.id, far_rtcp.id] {
+                    if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                        return error_result("install secure media RTCP redirect", &error);
+                    }
+                }
+                rtcp_relays.push(
+                    RtcpRelay::new(
+                        near_rtcp.id,
+                        bridge_source_filter(profile, a_rtcp),
+                        far_rtcp.id,
+                        info.remote_rtcp,
+                    )
+                    .with_secure_egress(leg.clone()),
+                );
+                rtcp_relays.push(
+                    RtcpRelay::new(
+                        far_rtcp.id,
+                        bridge_source_filter(profile, info.remote_rtcp),
+                        near_rtcp.id,
+                        a_rtcp,
+                    )
+                    .with_secure_ingress(leg.clone()),
+                );
+            }
+
             let latch = !profile.flags.iter().any(|flag| flag == "no-latch");
             let call = MediaCall::new(
                 call_id.to_string(),
@@ -1034,7 +1351,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 latch,
                 record_path,
             )
-            .with_far_secure_leg(leg);
+            .with_far_secure_leg(leg)
+            .with_rtcp_relays(rtcp_relays);
             self.media
                 .register(call, self.datapath.clone(), owner_events);
         } else if pipeline == PipelineKind::Media {
@@ -1209,6 +1527,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.far_codec = info.primary_codec();
             call.pipeline = pipeline;
             call.relay_flows = relay_flows;
+            // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
+            call.far_remote_crypto = info.crypto.first().copied();
+        }
+        // Answer-side codec presentation: on a transcoding call (Media / SrtpMedia) the engine sends
+        // A its *own* negotiated codec, so the answer relayed to A must advertise A's codec, never
+        // leak B's (RFC 3264 §6). A plain relay / SRTP bridge / WS leg shares one codec across both
+        // sides, so its answer already presents A's codec — leave those byte-for-byte untouched.
+        if matches!(pipeline, PipelineKind::Media | PipelineKind::SrtpMedia) {
+            if let Some(near_codec) = near_codec.as_ref() {
+                rewritten.sdp =
+                    sdp::force_answer_codec(&rewritten.sdp, near_codec, near_telephone_event);
+            }
         }
         ok_sdp(rewritten.sdp, Some(to_tag))
     }
@@ -1276,6 +1606,394 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Snapshot a call's replicable state for HA failover ([`Command::Checkpoint`]) — the opaque blob
+    /// the SIP proxy stores and hands back to `restore` on a standby. Ownership-gated like `query`: a
+    /// non-owner gets `unknown_call`, so it cannot even probe for a call's existence (A3 — docs §5).
+    fn checkpoint(&self, client: ClientId, call_id: &str) -> CmdResult {
+        // `to_snapshot` only sees the `Call`; a secure call's live SRTP state lives in the bridge, so
+        // the closure also hands back what the bridge query needs (endpoint roles + the peer's key).
+        let Some((mut snapshot, secure_ctx)) = self.owned_call(client, call_id, |call| {
+            let snapshot = call.to_snapshot();
+            let secure_ctx = (call.pipeline == PipelineKind::Srtp)
+                .then(|| call.far_remote_crypto.as_ref().map(crypto_snapshot))
+                .flatten()
+                .map(|far_remote_crypto| (call.endpoint_roles(), far_remote_crypto));
+            (snapshot, secure_ctx)
+        }) else {
+            return unknown_call(call_id);
+        };
+        // The registry key is the authoritative call-id (the snapshot builder left it blank).
+        snapshot.call_id = call_id.to_string();
+        // For a secure call, fold in the bridge's live SRTP rollover + flow plans.
+        if let Some((roles, far_remote_crypto)) = secure_ctx {
+            snapshot.secure = self.build_secure_snapshot(&roles, far_remote_crypto);
+        }
+        match snapshot.to_json() {
+            Ok(blob) => CmdResult::Checkpoint { snapshot: blob },
+            Err(error) => error_result("checkpoint serialize", &error),
+        }
+    }
+
+    /// Build the [`crate::ha::SecureSnapshot`] for a secure (`Srtp`) call by querying the SRTP bridge
+    /// for the shared leg's rollover and the installed flow plans, mapping endpoint ids back to roles.
+    /// `None` if the bridge no longer holds the call (raced a teardown).
+    fn build_secure_snapshot(
+        &self,
+        roles: &[(EndpointId, crate::ha::EndpointRole)],
+        far_remote_crypto: crate::ha::CryptoSnapshot,
+    ) -> Option<crate::ha::SecureSnapshot> {
+        let first = roles.first()?.0;
+        let rollover = self.bridge.rollover_snapshot(first)?;
+        let role_of = |id: EndpointId| roles.iter().find(|(i, _)| *i == id).map(|(_, r)| *r);
+        let endpoint_ids: Vec<EndpointId> = roles.iter().map(|(id, _)| *id).collect();
+        let bridge_flows = self
+            .bridge
+            .flow_plans(&endpoint_ids)
+            .iter()
+            .filter_map(|plan| {
+                Some(crate::ha::BridgeFlowSnapshot {
+                    endpoint: role_of(plan.endpoint)?,
+                    op: match plan.op {
+                        BridgeOp::Encrypt => crate::ha::BridgeOpSnapshot::Encrypt,
+                        BridgeOp::Decrypt => crate::ha::BridgeOpSnapshot::Decrypt,
+                    },
+                    accepted_source: source_filter_snapshot(plan.accepted_source),
+                    out: role_of(plan.out_endpoint)?,
+                    out_dst: plan.out_dst,
+                })
+            })
+            .collect();
+        Some(crate::ha::SecureSnapshot {
+            far_remote_crypto,
+            rollover: secure_rollover_snapshot(&rollover),
+            bridge_flows,
+        })
+    }
+
+    /// Rebuild a call on this (standby) node from a [`Command::Checkpoint`] blob — the HA takeover.
+    /// Allocates endpoints at the snapshot's **exact ports** (so a floating-IP standby needs no SIP
+    /// re-INVITE), reinstalls the forward rules, and registers the call under the requesting client.
+    ///
+    /// Plain relay only for now: a secure / transcode / WS call additionally needs its SRTP keys and
+    /// slow-path actor rebuilt, which is a follow-up (the snapshot already carries the negotiated
+    /// state). Any endpoint bind or flow install that fails rolls back the endpoints already bound.
+    async fn restore(&self, client: ClientId, blob: &str) -> CmdResult {
+        use crate::ha::{self, EndpointRole, PipelineSnapshot};
+        let snapshot = match ha::CallSnapshot::from_json(blob) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_result("restore: parse snapshot", &error),
+        };
+        // Supported: a plain relay, a secure SDES-SRTP bridge (`Srtp`), and a plaintext transcode
+        // (`Media`) call. `SrtpMedia` (secure transcode) and `Ws` keep their crypto/actor state inside
+        // the running actor and are the remaining follow-up.
+        match snapshot.pipeline {
+            PipelineSnapshot::Passthrough => {}
+            PipelineSnapshot::Srtp if snapshot.secure.is_some() => {}
+            PipelineSnapshot::Media
+                if snapshot.near_codec.is_some() && snapshot.far_codec.is_some() => {}
+            other => {
+                return CmdResult::Error {
+                    reason: format!("restore of a {other:?} call is not yet supported"),
+                };
+            }
+        }
+        if self.calls.contains_key(&snapshot.call_id) {
+            return CmdResult::Error {
+                reason: format!("cannot restore: call {} already exists", snapshot.call_id),
+            };
+        }
+
+        // Bind the endpoints at their exact ports (shared by both pipelines).
+        let bound = match self.bind_snapshot_endpoints(&snapshot).await {
+            Ok(bound) => bound,
+            Err(reason) => return reason,
+        };
+        let role_endpoint = |role: EndpointRole| -> Option<Endpoint> {
+            bound
+                .iter()
+                .find(|(role_, _)| *role_ == role)
+                .map(|(_, endpoint)| *endpoint)
+        };
+        // Every call has a near.rtp and a far.rtp; RTCP endpoints are optional (rtcp-mux).
+        let (Some(near_rtp), Some(far_rtp)) = (
+            role_endpoint(EndpointRole::NearRtp),
+            role_endpoint(EndpointRole::FarRtp),
+        ) else {
+            self.free_bound(&bound).await;
+            return CmdResult::Error {
+                reason: "restore: snapshot is missing a required RTP endpoint".to_string(),
+            };
+        };
+        let near = Leg {
+            rtp: near_rtp,
+            rtcp: role_endpoint(EndpointRole::NearRtcp),
+            remote_rtp: snapshot.near.remote_rtp,
+            remote_rtcp: snapshot.near.remote_rtcp,
+        };
+        let far = Leg {
+            rtp: far_rtp,
+            rtcp: role_endpoint(EndpointRole::FarRtcp),
+            remote_rtp: snapshot.far.remote_rtp,
+            remote_rtcp: snapshot.far.remote_rtcp,
+        };
+
+        // Install the datapath flows and resolve the crypto per pipeline.
+        let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
+        let mut far_local_crypto: Option<CryptoAttribute> = None;
+        let mut far_remote_crypto: Option<CryptoAttribute> = None;
+        let mut near_codec_out: Option<CodecSpec> = None;
+        let mut far_codec_out: Option<CodecSpec> = None;
+        let pipeline;
+        match snapshot.pipeline {
+            PipelineSnapshot::Passthrough => {
+                pipeline = PipelineKind::Passthrough;
+                // Reinstall the forward rules, resolving each role to its freshly-bound id.
+                for flow in &snapshot.flows {
+                    let (Some(installed_on), Some(out)) =
+                        (role_endpoint(flow.installed_on), role_endpoint(flow.out))
+                    else {
+                        self.free_bound(&bound).await;
+                        return CmdResult::Error {
+                            reason: "restore: a snapshot flow references an unknown endpoint role"
+                                .to_string(),
+                        };
+                    };
+                    let action = FlowAction::Forward(ForwardRule {
+                        out_endpoint: out.id,
+                        out_dst: flow.out_dst,
+                        accepted_source: restore_source_filter(flow.accepted_source),
+                        latch: restore_latch(flow.latch),
+                    });
+                    if let Err(error) = self.datapath.install_flow(installed_on.id, action) {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: install forward flow", &error);
+                    }
+                    relay_flows.push((installed_on.id, action));
+                }
+            }
+            PipelineSnapshot::Srtp => {
+                pipeline = PipelineKind::Srtp;
+                let secure = snapshot.secure.as_ref().expect("Srtp ⇒ secure is present");
+                // Reconstruct the two SDES keys (the engine's own + the peer's).
+                let far_local = match snapshot.far_local_crypto.as_ref().map(restore_crypto) {
+                    Some(Ok(crypto)) => crypto,
+                    Some(Err(reason)) => {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: far_local key", &reason);
+                    }
+                    None => {
+                        self.free_bound(&bound).await;
+                        return CmdResult::Error {
+                            reason: "restore: secure call missing far_local_crypto".to_string(),
+                        };
+                    }
+                };
+                let far_remote = match restore_crypto(&secure.far_remote_crypto) {
+                    Ok(crypto) => crypto,
+                    Err(reason) => {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: far_remote key", &reason);
+                    }
+                };
+                // Rebuild the bridge flow plans (roles → freshly-bound ids).
+                let mut bridge_flows = Vec::with_capacity(secure.bridge_flows.len());
+                for plan in &secure.bridge_flows {
+                    let (Some(endpoint), Some(out)) =
+                        (role_endpoint(plan.endpoint), role_endpoint(plan.out))
+                    else {
+                        self.free_bound(&bound).await;
+                        return CmdResult::Error {
+                            reason: "restore: a secure bridge flow references an unknown role"
+                                .to_string(),
+                        };
+                    };
+                    bridge_flows.push(BridgeFlowPlan {
+                        endpoint: endpoint.id,
+                        op: match plan.op {
+                            ha::BridgeOpSnapshot::Encrypt => BridgeOp::Encrypt,
+                            ha::BridgeOpSnapshot::Decrypt => BridgeOp::Decrypt,
+                        },
+                        accepted_source: restore_source_filter(plan.accepted_source),
+                        out_endpoint: out.id,
+                        out_dst: plan.out_dst,
+                    });
+                }
+                // Redirect every endpoint to the bridge so it crypts both directions.
+                for (_, endpoint) in &bound {
+                    if let Err(error) = self
+                        .datapath
+                        .install_flow(endpoint.id, FlowAction::Redirect)
+                    {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: install SRTP bridge redirect", &error);
+                    }
+                }
+                // Rebuild the secure leg from the two keys and seed its rollover, then register.
+                let mut leg = SecureLeg::new(&far_local.key, &far_remote.key);
+                leg.seed_rollover(&restore_rollover(&secure.rollover));
+                self.bridge.register(BridgeCallPlan {
+                    leg,
+                    flows: bridge_flows,
+                });
+                far_local_crypto = Some(far_local);
+                far_remote_crypto = Some(far_remote);
+            }
+            PipelineSnapshot::Media => {
+                pipeline = PipelineKind::Media;
+                // Both codecs were validated present above; the two remote addresses are required to
+                // target egress. Rebuild the transcoding actor — jitter/codec state restarts fresh
+                // (the cold-restore glitch); the egress SSRC/seq/ts also reset, so the far side re-syncs.
+                let (Some(near_codec_snap), Some(far_codec_snap)) =
+                    (snapshot.near_codec.as_ref(), snapshot.far_codec.as_ref())
+                else {
+                    self.free_bound(&bound).await;
+                    return CmdResult::Error {
+                        reason: "restore: media call missing a codec".to_string(),
+                    };
+                };
+                let (Some(a_rtp), Some(b_rtp)) = (near.remote_rtp, far.remote_rtp) else {
+                    self.free_bound(&bound).await;
+                    return CmdResult::Error {
+                        reason: "restore: media call missing a remote address".to_string(),
+                    };
+                };
+                let near_codec = restore_codec(near_codec_snap);
+                let far_codec = restore_codec(far_codec_snap);
+                let near_te = snapshot.near_telephone_event;
+                let a_to_b = match build_direction(
+                    near_rtp.id,
+                    SourceFilter::Exact(a_rtp.ip()),
+                    far_rtp.id,
+                    b_rtp,
+                    &near_codec,
+                    &far_codec,
+                    near_te,
+                    None,
+                    None,
+                ) {
+                    Ok(direction) => direction,
+                    Err(reason) => {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: media pipeline (A→B)", &reason);
+                    }
+                };
+                let b_to_a = match build_direction(
+                    far_rtp.id,
+                    SourceFilter::Exact(b_rtp.ip()),
+                    near_rtp.id,
+                    a_rtp,
+                    &far_codec,
+                    &near_codec,
+                    None,
+                    near_te,
+                    None,
+                ) {
+                    Ok(direction) => direction,
+                    Err(reason) => {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: media pipeline (B→A)", &reason);
+                    }
+                };
+                // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them).
+                for endpoint in [near_rtp.id, far_rtp.id] {
+                    if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                        self.free_bound(&bound).await;
+                        return error_result("restore: install media redirect", &error);
+                    }
+                }
+                let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
+                let media_call = MediaCall::new(
+                    snapshot.call_id.clone(),
+                    snapshot.from_tag.clone(),
+                    snapshot.to_tag.clone(),
+                    a_to_b,
+                    b_to_a,
+                    true, // relay latch (the `no-latch` flag is not carried in the snapshot)
+                    None, // recording restarts on the new node if the proxy re-issues it
+                );
+                self.media
+                    .register(media_call, self.datapath.clone(), owner_events);
+                near_codec_out = Some(near_codec);
+                far_codec_out = Some(far_codec);
+            }
+            _ => unreachable!("pipeline validated above"),
+        }
+
+        // Register the reconstructed call under the requesting (standby) client.
+        *self.client_calls.entry(client).or_insert(0) += 1;
+        for (_, endpoint) in &bound {
+            self.endpoint_calls
+                .insert(endpoint.id, snapshot.call_id.clone());
+        }
+        self.calls.insert(
+            snapshot.call_id.clone(),
+            Call {
+                owner: client,
+                created_tick: self.datapath.now_ticks(),
+                ice: snapshot.ice.map(|ice| IceCredentials {
+                    ufrag: ice.ufrag,
+                    pwd: ice.pwd,
+                }),
+                from_tag: snapshot.from_tag,
+                to_tag: snapshot.to_tag,
+                near,
+                far,
+                far_local_crypto,
+                far_remote_crypto,
+                // Set for a transcode (`Media`) call; `None` for relay/bridge, which don't transcode.
+                near_codec: near_codec_out,
+                far_codec: far_codec_out,
+                near_telephone_event: snapshot.near_telephone_event,
+                pipeline,
+                relay_flows,
+            },
+        );
+        tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
+        ok_empty()
+    }
+
+    /// Bind a snapshot's endpoints at their exact ports (HA restore), in role order. On any bind
+    /// failure the endpoints already bound are freed and an error result is returned.
+    async fn bind_snapshot_endpoints(
+        &self,
+        snapshot: &crate::ha::CallSnapshot,
+    ) -> Result<Vec<(crate::ha::EndpointRole, Endpoint)>, CmdResult> {
+        use crate::ha::EndpointRole;
+        let mut targets: Vec<(EndpointRole, std::net::SocketAddr)> =
+            vec![(EndpointRole::NearRtp, snapshot.near.rtp_local)];
+        if let Some(addr) = snapshot.near.rtcp_local {
+            targets.push((EndpointRole::NearRtcp, addr));
+        }
+        targets.push((EndpointRole::FarRtp, snapshot.far.rtp_local));
+        if let Some(addr) = snapshot.far.rtcp_local {
+            targets.push((EndpointRole::FarRtcp, addr));
+        }
+        let mut bound: Vec<(EndpointRole, Endpoint)> = Vec::new();
+        for (role, addr) in targets {
+            match self
+                .datapath
+                .alloc_endpoint_on_port(AddressFamily::of(addr.ip()), addr.port())
+                .await
+            {
+                Ok(endpoint) => bound.push((role, endpoint)),
+                Err(error) => {
+                    self.free_bound(&bound).await;
+                    return Err(error_result(
+                        "restore: bind endpoint at snapshot port",
+                        &error,
+                    ));
+                }
+            }
+        }
+        Ok(bound)
+    }
+
+    /// Free the endpoints bound so far during a [`Self::restore`] that then failed (rollback).
+    async fn free_bound(&self, bound: &[(crate::ha::EndpointRole, Endpoint)]) {
+        let endpoints: Vec<Endpoint> = bound.iter().map(|(_, endpoint)| *endpoint).collect();
+        self.free(&endpoints).await;
+    }
+
     /// Enumerate the live call-ids `client` owns ([`Command::List`]) — a read-only census of the
     /// session registry (rtpengine NG `list`). Scoped to the calling client: a call is invisible to
     /// clients that do not own it (A3 — docs §5), so the listing never leaks another client's
@@ -1306,6 +2024,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sessions: self.session_count() as u64,
             },
         }
+    }
+
+    /// Report this engine's live load ([`Command::Load`]) for cluster placement — the live session
+    /// gauges, the transcoding subset, jemalloc live bytes, host CPU (best effort), and drain state,
+    /// all via the shared [`ClusterState`]. Process-wide, not per-client, like `statistics`.
+    fn load_snapshot(&self) -> CmdResult {
+        CmdResult::Load {
+            load: self.cluster.load(
+                self.session_count() as u64,
+                self.transcode_session_count() as u64,
+                crate::metrics::jemalloc_allocated_bytes(),
+            ),
+        }
+    }
+
+    /// Describe this engine's static identity and capabilities ([`Command::NodeInfo`]) so a
+    /// dispatcher routes a call only to a node that can serve it (codecs, features, capacity).
+    fn node_info(&self) -> CmdResult {
+        CmdResult::NodeInfo {
+            node: self
+                .cluster
+                .info(engine_version(), supported_codecs(), supported_features()),
+        }
+    }
+
+    /// Live count of transcoding calls (the media slow path minus promoted relay-only passthroughs) —
+    /// the expensive subset the cluster `load` command reports.
+    #[must_use]
+    pub fn transcode_session_count(&self) -> usize {
+        self.media.transcode_call_count()
     }
 
     /// Drop (`block = true`) or resume (`block = false`) a call's media. A media-processing call
@@ -2219,25 +2967,51 @@ fn ok_empty() -> CmdResult {
     }
 }
 
-/// Parse rtpengine codec-manipulation flags into SDP edits for [`sdp::rewrite_codec_list`]:
-/// `codec-strip-<NAME>` → an encoding name to drop from the SDP offered to the far side, and
-/// `codec-transcode-<NAME>` → a codec to add to that SDP. The engine's transcode pipeline then
-/// engages automatically when the far side selects a codec differing from the near leg's (no separate
-/// "force transcode" plumbing needed). Unknown / not-yet-encodable transcode targets are skipped so a
-/// forced codec never fails the call at answer. `codec-mask-X` (asymmetric hide) is a follow-up.
-fn parse_codec_flags(flags: &[String]) -> (Vec<String>, Vec<CodecSpec>) {
-    let mut strip = Vec::new();
-    let mut add = Vec::new();
+/// Parse rtpengine codec-manipulation flags into a [`sdp::CodecPolicy`] for the SDP offered to the
+/// far side. The NG/JSON front-ends flatten the `codec` dictionary
+/// (`docs/ng_control_protocol.md`) into `codec-<op>-<NAME>` flag strings, which map as:
+/// - `codec-strip-X` — remove X from the offer.
+/// - `codec-mask-X` / `codec-consume-X` — remove X from the offer but keep it usable near-side for
+///   transcoding. This engine derives the near leg's codec from the offerer's *own* offer,
+///   independent of the far-offer edit, so the near side keeps X regardless (and a masked near codec
+///   engages the transcoder because the near/far primaries then differ — see [`sdp::CodecPolicy`]).
+/// - `codec-transcode-X` — add X to the offer; the transcoder engages when the far side selects it.
+/// - `codec-except-X` / `codec-accept-X` — a keep-list: X is never stripped (the exception to
+///   `strip-all` / `mask-all`).
+/// - `codec-offer-X` — a whitelist that sets the far offer's codec order (only the listed codecs, in
+///   flag order; the first is preferred).
+/// - the special value `all` / `full` on strip/mask removes every codec except the keep-list.
+///
+/// Unknown / not-yet-encodable `transcode` targets are skipped so a forced codec never fails the call
+/// at answer. Names are matched case-insensitively (stored uppercased).
+fn parse_codec_flags(flags: &[String]) -> sdp::CodecPolicy {
+    let mut policy = sdp::CodecPolicy::default();
     for flag in flags {
-        if let Some(name) = flag.strip_prefix("codec-strip-") {
-            strip.push(name.to_string());
+        if let Some(name) = flag
+            .strip_prefix("codec-strip-")
+            .or_else(|| flag.strip_prefix("codec-mask-"))
+            .or_else(|| flag.strip_prefix("codec-consume-"))
+        {
+            // The special value `all` / `full` sweeps every codec (bar the keep-list).
+            if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("full") {
+                policy.remove_all = true;
+            } else {
+                policy.remove.push(name.to_ascii_uppercase());
+            }
+        } else if let Some(name) = flag
+            .strip_prefix("codec-except-")
+            .or_else(|| flag.strip_prefix("codec-accept-"))
+        {
+            policy.keep.push(name.to_ascii_uppercase());
+        } else if let Some(name) = flag.strip_prefix("codec-offer-") {
+            policy.order.push(name.to_ascii_uppercase());
         } else if let Some(name) = flag.strip_prefix("codec-transcode-") {
             if let Some(spec) = transcode_codec_spec(name) {
-                add.push(spec);
+                policy.add.push(spec);
             }
         }
     }
-    (strip, add)
+    policy
 }
 
 /// Map a `codec-transcode-<NAME>` target to a [`CodecSpec`] the engine can both advertise and
@@ -2420,6 +3194,12 @@ fn command_name(command: &Command) -> &'static str {
         Command::Ping => "ping",
         Command::List => "list",
         Command::Statistics => "statistics",
+        Command::Load => "load",
+        Command::NodeInfo => "node_info",
+        Command::Drain => "drain",
+        Command::Undrain => "undrain",
+        Command::Checkpoint { .. } => "checkpoint",
+        Command::Restore { .. } => "restore",
         Command::PlayMedia { .. } => "play_media",
         Command::StopMedia { .. } => "stop_media",
         Command::PlayDtmf { .. } => "play_dtmf",
@@ -2437,6 +3217,53 @@ fn command_name(command: &Command) -> &'static str {
         Command::ConferenceBridge { .. } => "conference_bridge",
         Command::Authenticate { .. } => "authenticate",
     }
+}
+
+/// This engine's software version (the daemon crate version), advertised in `node_info`.
+fn engine_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// The codec payload names this build can relay or transcode, advertised in `node_info` so a
+/// dispatcher only routes a call to a node that can serve its codec. The always-available set (pure
+/// relay + the bit-exact pure-Rust codecs) plus the AMR family under the `amr` build feature — kept
+/// in step with `factory::encoder_for`.
+fn supported_codecs() -> Vec<String> {
+    let base = [
+        "PCMU",
+        "PCMA",
+        "G722",
+        "G726",
+        "GSM",
+        "CN",
+        "L16",
+        "telephone-event",
+    ];
+    // The AMR family is compiled in only under the `amr` build feature (docs/codec-licensing.md).
+    #[cfg(feature = "amr")]
+    let extra: &[&str] = &["AMR-WB", "AMR"];
+    #[cfg(not(feature = "amr"))]
+    let extra: &[&str] = &[];
+    base.iter()
+        .chain(extra.iter())
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// The capability flags this build ships, advertised in `node_info`.
+fn supported_features() -> Vec<String> {
+    vec![
+        "relay".to_string(),
+        "transcode".to_string(),
+        "srtp".to_string(),
+        "conference".to_string(),
+        "record".to_string(),
+        "websocket".to_string(),
+        "ng".to_string(),
+        "hep".to_string(),
+        "ice".to_string(),
+        "turn".to_string(),
+    ]
 }
 
 fn unknown_call(call_id: &str) -> CmdResult {
@@ -2545,7 +3372,7 @@ fn bridge_source_filter(profile: &ProfileFlags, addr: std::net::SocketAddr) -> S
 mod tests {
     use super::*;
     use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
     use tokio::net::UdpSocket;
     use tokio::time::timeout;
@@ -2650,6 +3477,90 @@ mod tests {
         assert!(
             sdp.contains("a=rtpmap:9 G722/8000"),
             "G722 rtpmap added: {sdp}"
+        );
+    }
+
+    #[test]
+    fn parse_codec_flags_maps_rtpengine_operations() {
+        // Each rtpengine codec op (docs/ng_control_protocol.md) resolves onto the CodecPolicy.
+        let policy = parse_codec_flags(&[
+            "codec-mask-PCMA".into(),
+            "codec-except-PCMU".into(),
+            "codec-accept-GSM".into(),
+            "codec-offer-G722".into(),
+            "codec-strip-all".into(),
+            "codec-transcode-PCMA".into(),
+        ]);
+        assert!(policy.remove_all, "strip-all → remove_all");
+        assert_eq!(policy.remove, vec!["PCMA".to_string()], "mask feeds the remove set");
+        assert!(policy.keep.contains(&"PCMU".to_string()), "except → keep-list");
+        assert!(policy.keep.contains(&"GSM".to_string()), "accept → keep-list");
+        assert_eq!(policy.order, vec!["G722".to_string()], "offer → far-offer order");
+        assert_eq!(policy.add.len(), 1, "transcode → one added codec");
+        assert_eq!(policy.add[0].encoding_name, "PCMA");
+        // Lowercase names are matched case-insensitively (stored uppercased).
+        let lower = parse_codec_flags(&["codec-mask-pcma".into()]);
+        assert_eq!(lower.remove, vec!["PCMA".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn offer_codec_mask_hides_the_codec_from_the_far_side() {
+        // rtpengine `codec-mask-PCMA` (asymmetric hide): PCMA is dropped from the offer to B (same
+        // far-offer edit as strip), while the near leg keeps it usable for transcoding.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let profile = ProfileFlags {
+            flags: vec!["codec-mask-PCMA".into()],
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mask".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile,
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&offer);
+        let m_line = sdp
+            .lines()
+            .find(|l| l.starts_with("m=audio"))
+            .expect("m=audio line");
+        assert!(m_line.ends_with(" 0"), "PCMA hidden from B, PCMU offered: {m_line}");
+        assert!(!m_line.contains(" 8"), "PCMA (PT 8) masked: {m_line}");
+    }
+
+    #[tokio::test]
+    async fn offer_codec_offer_reorders_the_far_offer() {
+        // rtpengine `codec-offer`: a whitelist that sets the offered order — PCMA before PCMU here.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let profile = ProfileFlags {
+            flags: vec!["codec-offer-PCMA".into(), "codec-offer-PCMU".into()],
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "reorder".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile,
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&offer);
+        let m_line = sdp
+            .lines()
+            .find(|l| l.starts_with("m=audio"))
+            .expect("m=audio line");
+        assert!(
+            m_line.ends_with("RTP/AVP 8 0"),
+            "PCMA (8) offered before PCMU (0): {m_line}"
         );
     }
 
@@ -2775,6 +3686,634 @@ mod tests {
     async fn ping_pongs() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         assert_eq!(engine.handle(CLIENT, Command::Ping).await, CmdResult::Pong);
+    }
+
+    #[tokio::test]
+    async fn load_reports_configured_capacity_and_gauges() {
+        let cluster = std::sync::Arc::new(crate::cluster::ClusterState::new(
+            "rtp-test-1".to_string(),
+            4000,
+            vec!["203.0.113.10".to_string()],
+        ));
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_cluster(cluster);
+        let CmdResult::Load { load } = engine.handle(CLIENT, Command::Load).await else {
+            panic!("expected load result");
+        };
+        assert_eq!(load.node_id, "rtp-test-1");
+        assert_eq!(load.max_sessions, 4000);
+        assert_eq!(load.sessions, 0, "no live calls yet");
+        assert_eq!(load.load_permille, 0, "empty node is 0 load");
+        assert_eq!(load.transcode_sessions, 0);
+        assert!(!load.draining);
+    }
+
+    #[tokio::test]
+    async fn node_info_reports_identity_and_capabilities() {
+        let cluster = std::sync::Arc::new(crate::cluster::ClusterState::new(
+            "rtp-test-2".to_string(),
+            1000,
+            vec!["203.0.113.11".to_string()],
+        ));
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_cluster(cluster);
+        let CmdResult::NodeInfo { node } = engine.handle(CLIENT, Command::NodeInfo).await else {
+            panic!("expected node_info result");
+        };
+        assert_eq!(node.node_id, "rtp-test-2");
+        assert_eq!(node.max_sessions, 1000);
+        assert_eq!(node.media_addresses, vec!["203.0.113.11".to_string()]);
+        assert!(
+            node.codecs.iter().any(|codec| codec == "PCMU"),
+            "advertises G.711"
+        );
+        assert!(node.features.iter().any(|feature| feature == "relay"));
+        assert_eq!(node.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn drain_refuses_new_offers_but_keeps_serving_control() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let offer = || Command::Offer {
+            call_id: "drain-call".to_string(),
+            from_tag: "ft".to_string(),
+            sdp: sdp_for(addr, true),
+            profile: ProfileFlags::default(),
+        };
+
+        // Enter drain mode: a new offer is refused with a "draining" reason...
+        assert_eq!(engine.handle(CLIENT, Command::Drain).await, ok_empty());
+        match engine.handle(CLIENT, offer()).await {
+            CmdResult::Error { reason } => assert!(reason.contains("draining"), "{reason}"),
+            other => panic!("expected drain rejection, got {other:?}"),
+        }
+        // ...but liveness and the cluster/census verbs still answer, and `load` shows draining.
+        assert_eq!(engine.handle(CLIENT, Command::Ping).await, CmdResult::Pong);
+        let CmdResult::Load { load } = engine.handle(CLIENT, Command::Load).await else {
+            panic!("load");
+        };
+        assert!(load.draining, "load snapshot reflects drain state");
+
+        // Undrain re-opens admission: the same offer now succeeds.
+        assert_eq!(engine.handle(CLIENT, Command::Undrain).await, ok_empty());
+        assert!(
+            matches!(engine.handle(CLIENT, offer()).await, CmdResult::Ok { .. }),
+            "offer admitted again after undrain"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_captures_a_plain_relay_snapshot() {
+        use crate::ha::{CallSnapshot, EndpointRole, PipelineSnapshot};
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        // A plain PCMU relay: offer + answer, no profile flags → Passthrough.
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ckpt-call".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let far_local = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ckpt-call".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+
+        // Checkpoint returns an opaque blob that deserializes to the negotiated state.
+        let CmdResult::Checkpoint { snapshot } = engine
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "ckpt-call".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("expected a checkpoint result");
+        };
+        let snapshot = CallSnapshot::from_json(&snapshot).expect("valid snapshot blob");
+        assert_eq!(snapshot.call_id, "ckpt-call");
+        assert_eq!(snapshot.from_tag, "tag-a");
+        assert_eq!(snapshot.to_tag.as_deref(), Some("tag-b"));
+        assert_eq!(snapshot.pipeline, PipelineSnapshot::Passthrough);
+        // rtcp-mux ⇒ no companion RTCP endpoint; the far leg advertises the engine port A dials.
+        assert!(
+            snapshot.near.rtcp_local.is_none(),
+            "rtcp-mux: no near RTCP port"
+        );
+        assert_eq!(
+            snapshot.far.rtp_local, far_local,
+            "far leg local port is captured"
+        );
+        assert_eq!(
+            snapshot.near.remote_rtp,
+            Some(addr_a),
+            "A's address captured"
+        );
+        assert_eq!(
+            snapshot.far.remote_rtp,
+            Some(addr_b),
+            "B's address captured"
+        );
+        // A plain relay installs Forward rules on both RTP endpoints (mux ⇒ two, not four).
+        assert!(
+            snapshot
+                .flows
+                .iter()
+                .any(|flow| flow.installed_on == EndpointRole::NearRtp
+                    && flow.out == EndpointRole::FarRtp),
+            "near→far forward rule captured"
+        );
+        assert!(
+            snapshot.secure.is_none(),
+            "a plain relay has no secure state"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_is_ownership_gated() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "owned".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        // A different client cannot checkpoint (nor even learn the call exists) — A3, docs §5.
+        let other = ClientId(999);
+        assert!(matches!(
+            engine
+                .handle(
+                    other,
+                    Command::Checkpoint {
+                        call_id: "owned".into(),
+                        from_tag: "tag-a".into(),
+                    },
+                )
+                .await,
+            CmdResult::Error { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_resumes_a_plain_relay_on_a_standby_at_the_same_ports() {
+        // Warm-standby HA end to end: a plain relay is set up on "node A", checkpointed, torn down
+        // (A dies, freeing its ports), then restored on a fresh "node B" that re-binds the *same*
+        // media ports (as a floating-IP standby would) — and media relays through B with no
+        // re-negotiation. Both nodes use the same deterministic port range on loopback.
+        let (min, max) = (46_000u16, 46_040u16);
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        // A plain PCMU relay (offer + answer, rtcp-mux, no profile) on node A.
+        let offer = engine_a
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ha-relay".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        // The engine address B will send to (advertised in the offer sent onward to B).
+        let engine_far = sdp::parse(&ok_sdp_text(&offer)).expect("offer").remote_rtp;
+        let answer = engine_a
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ha-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        // The engine address A sends to (advertised back to A in the answer).
+        let engine_near = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer")
+            .remote_rtp;
+
+        // Checkpoint the live call, then delete it on A and drop A — freeing the media ports.
+        let CmdResult::Checkpoint { snapshot } = engine_a
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "ha-relay".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("expected a checkpoint result");
+        };
+        engine_a
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "ha-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        drop(engine_a);
+
+        // Node B (same port range + bind IP) restores from the blob, re-binding the same ports.
+        let engine_b = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        assert!(
+            matches!(
+                engine_b.handle(CLIENT, Command::Restore { snapshot }).await,
+                CmdResult::Ok { .. }
+            ),
+            "restore succeeds on the standby"
+        );
+
+        // Media now relays through B at the unchanged engine ports — no re-INVITE needed.
+        // A → engine_near → B receives at addr_b.
+        let a_to_b = g711_rtp(0, 1, 0x0A0A_0A0A, 0xA1);
+        phone_a.send_to(&a_to_b, engine_near).await.expect("a send");
+        let (got_b, _) = recv(&phone_b).await;
+        assert_eq!(got_b, a_to_b, "A→B relays through the restored node");
+
+        // B → engine_far → A receives at addr_a.
+        let b_to_a = g711_rtp(0, 2, 0x0B0B_0B0B, 0xB2);
+        phone_b.send_to(&b_to_a, engine_far).await.expect("b send");
+        let (got_a, _) = recv(&phone_a).await;
+        assert_eq!(got_a, b_to_a, "B→A relays through the restored node");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_stale_or_duplicate_call() {
+        // A blob for a call that is already live is refused (no clobbering a live call).
+        let engine = Engine::new(UdpLoopbackDatapath::with_port_range(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            47_000,
+            47_020,
+        ));
+        let (_phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dup".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dup".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let CmdResult::Checkpoint { snapshot } = engine
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "dup".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("checkpoint");
+        };
+        // The call is still live → restoring the same id is rejected.
+        assert!(matches!(
+            engine.handle(CLIENT, Command::Restore { snapshot }).await,
+            CmdResult::Error { .. }
+        ));
+        // A malformed blob is a clean error, never a panic.
+        assert!(matches!(
+            engine
+                .handle(
+                    CLIENT,
+                    Command::Restore {
+                        snapshot: "{not valid".into(),
+                    },
+                )
+                .await,
+            CmdResult::Error { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_resumes_a_secure_srtp_bridge_on_a_standby() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::SrtpContext;
+
+        // Secure warm-standby HA: an AVP↔SAVP bridge is set up on node A, checkpointed (capturing the
+        // peer's key + the leg rollover + the bridge flows), torn down, then restored on node B which
+        // re-binds the same ports and rebuilds the SRTP bridge — and secure media flows through B.
+        let (min, max) = (48_000u16, 48_060u16);
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        tokio::spawn(run_redirect_dispatcher(
+            engine_a.datapath().rx(),
+            engine_a.bridge(),
+            engine_a.media(),
+            engine_a.ws(),
+            engine_a.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await; // plain (AVP) caller A
+        let (phone_b, addr_b) = phone().await; // secure (SAVP) callee B
+
+        // A offers plaintext; the profile asks for a secure far leg. B answers RTP/SAVP with its key.
+        let offer = engine_a
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ha-savp".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        transport_protocol: Some("RTP/SAVP".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
+        let engine_far_key = *offer_reply.crypto.first().expect("engine a=crypto to B");
+        let engine_far = offer_reply.remote_rtp; // engine's B-facing port
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answer = engine_a
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ha-savp".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: savp_answer_sdp(addr_b, &b_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+
+        // Sanity: the bridge relays on A (A plaintext → B SRTP, decryptable with the engine's key).
+        let mut b_decrypt = SrtpContext::from_key_material(&engine_far_key.key);
+        let from_a = rtp_packet(100, 0x0A0A_0A0A);
+        phone_a.send_to(&from_a, engine_near).await.expect("a send");
+        let (srtp, _) = recv(&phone_b).await;
+        let mut recovered = Vec::new();
+        b_decrypt
+            .unprotect(&srtp, &mut recovered)
+            .expect("B decrypts on A");
+        assert_eq!(recovered, from_a);
+
+        // Checkpoint the secure call → the blob carries the secure section (peer key + bridge flows).
+        let CmdResult::Checkpoint { snapshot } = engine_a
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "ha-savp".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("expected a checkpoint result");
+        };
+        let parsed = crate::ha::CallSnapshot::from_json(&snapshot).expect("parse blob");
+        let secure = parsed
+            .secure
+            .expect("the snapshot carries the secure section");
+        assert_eq!(secure.far_remote_crypto.suite, "AES_CM_128_HMAC_SHA1_80");
+        assert!(
+            !secure.bridge_flows.is_empty(),
+            "bridge flow plans captured"
+        );
+
+        // Node A dies: delete frees its ports.
+        engine_a
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "ha-savp".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        drop(engine_a);
+
+        // Node B (same range) restores the secure call and rebuilds the SRTP bridge at the same ports.
+        let engine_b = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        tokio::spawn(run_redirect_dispatcher(
+            engine_b.datapath().rx(),
+            engine_b.bridge(),
+            engine_b.media(),
+            engine_b.ws(),
+            engine_b.conference(),
+            None,
+        ));
+        assert!(
+            matches!(
+                engine_b.handle(CLIENT, Command::Restore { snapshot }).await,
+                CmdResult::Ok { .. }
+            ),
+            "secure restore succeeds on the standby"
+        );
+
+        // Secure media resumes through B at the unchanged ports.
+        // A → engine_near → B receives SRTP (still decryptable with the engine's original key).
+        let from_a2 = rtp_packet(101, 0x0A0A_0A0A);
+        phone_a
+            .send_to(&from_a2, engine_near)
+            .await
+            .expect("a send 2");
+        let (srtp2, _) = recv(&phone_b).await;
+        let mut recovered2 = Vec::new();
+        b_decrypt
+            .unprotect(&srtp2, &mut recovered2)
+            .expect("B decrypts through the restored bridge");
+        assert_eq!(
+            recovered2, from_a2,
+            "A→B secure relay resumes on the standby"
+        );
+
+        // B → engine_far as SRTP (B's key) → bridge decrypts → A receives plaintext.
+        let from_b = rtp_packet(200, 0x0B0B_0B0B);
+        let mut b_encrypt = SrtpContext::from_key_material(&b_key.key);
+        let mut srtp_b = Vec::new();
+        b_encrypt.protect(&from_b, &mut srtp_b).expect("B encrypts");
+        phone_b.send_to(&srtp_b, engine_far).await.expect("b send");
+        let (recovered_a, _) = recv(&phone_a).await;
+        assert_eq!(
+            recovered_a, from_b,
+            "B→A secure relay resumes on the standby"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_resumes_a_transcode_call_on_a_standby() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        // Transcode warm-standby HA: a PCMU↔PCMA transcoding call is set up on node A, checkpointed,
+        // torn down, then restored on node B which re-binds the same ports and rebuilds the
+        // transcoding actor — and media transcodes through B (fresh actor state, same ports).
+        let (min, max) = (49_000u16, 49_040u16);
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let engine_a = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        tokio::spawn(run_redirect_dispatcher(
+            engine_a.datapath().rx(),
+            engine_a.bridge(),
+            engine_a.media(),
+            engine_a.ws(),
+            engine_a.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        // A offers PCMU; B answers PCMA → near=PCMU, far=PCMA → the transcoding media slow path.
+        let offer = engine_a
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ha-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_far = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+        let answer = engine_a
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ha-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        assert!(
+            engine_a.media().is_media_call("ha-xcode"),
+            "resolves to a transcode call"
+        );
+
+        // Checkpoint carries both codecs; then A dies (delete frees ports).
+        let CmdResult::Checkpoint { snapshot } = engine_a
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "ha-xcode".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await
+        else {
+            panic!("checkpoint");
+        };
+        let parsed = crate::ha::CallSnapshot::from_json(&snapshot).expect("parse blob");
+        assert_eq!(parsed.near_codec.expect("near codec").encoding_name, "PCMU");
+        assert_eq!(parsed.far_codec.expect("far codec").encoding_name, "PCMA");
+        engine_a
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "ha-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        drop(engine_a);
+
+        // Node B restores the transcode call and rebuilds the actor at the same ports.
+        let engine_b = Engine::new(UdpLoopbackDatapath::with_port_range(bind, min, max));
+        tokio::spawn(run_redirect_dispatcher(
+            engine_b.datapath().rx(),
+            engine_b.bridge(),
+            engine_b.media(),
+            engine_b.ws(),
+            engine_b.conference(),
+            None,
+        ));
+        assert!(
+            matches!(
+                engine_b.handle(CLIENT, Command::Restore { snapshot }).await,
+                CmdResult::Ok { .. }
+            ),
+            "transcode restore succeeds on the standby"
+        );
+        assert!(
+            engine_b.media().is_media_call("ha-xcode"),
+            "the transcoding actor is rebuilt on the standby"
+        );
+
+        // A → engine_near → transcode → B receives A-law (PT 8), not the original µ-law.
+        let from_a = g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF);
+        phone_a.send_to(&from_a, engine_near).await.expect("a send");
+        let (transcoded, _) = recv(&phone_b).await;
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&transcoded).expect("parse");
+        assert_eq!(
+            parsed.payload_type, 8,
+            "B receives A-law (PT 8) through the restored actor"
+        );
+
+        // B → engine_far → transcode → A receives µ-law (PT 0).
+        let from_b = g711_rtp(8, 200, 0x0B0B_0B0B, 0x55);
+        phone_b.send_to(&from_b, engine_far).await.expect("b send");
+        let (back, _) = recv(&phone_a).await;
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&back).expect("parse");
+        assert_eq!(
+            parsed.payload_type, 0,
+            "A receives µ-law (PT 0) through the restored actor"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2973,6 +4512,124 @@ mod tests {
         let g711 = siphon_rtp_media::rtp::RtpPacket::parse(&plain_a).expect("parse plaintext");
         assert_eq!(g711.payload_type, 0, "A receives G.711 µ-law (PT 0)");
         assert_eq!(g711.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
+    }
+
+    /// A minimal RTCP sender-report-shaped datagram (version 2, PT 200) carrying `ssrc`.
+    fn rtcp_sr(ssrc: u32) -> Vec<u8> {
+        let mut packet = vec![0x80, 200, 0x00, 0x00];
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&[0x33; 16]);
+        packet
+    }
+
+    /// The BGCF/SBC secure transcode **without rtcp-mux**: the companion RTCP endpoints are redirected
+    /// into the media actor and SRTCP-(de)crypted through the shared SecureLeg (RFC 3711 / RFC 5761) —
+    /// B's SRTCP is decrypted and relayed plaintext to A's RTCP port, and A's plaintext RTCP is
+    /// encrypted toward B. Driven end to end through the control plane + redirect dispatcher.
+    #[cfg(feature = "amr")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn savp_transcode_relays_non_muxed_srtcp_both_ways() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::srtcp::SrtcpContext;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        // Dedicated RTP + RTCP sockets per party (non-mux ⇒ RTCP on its own port).
+        let (_phone_a, addr_a) = phone().await;
+        let (rtcp_a, rtcp_a_addr) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let (rtcp_b, rtcp_b_addr) = phone().await;
+
+        // A offers plaintext G.711, non-mux, advertising its RTCP socket; the profile secures the far leg.
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp:{rtcp}\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+            rtcp = rtcp_a_addr.port(),
+        );
+        let profile = ProfileFlags {
+            transport_protocol: Some("RTP/SAVP".into()),
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "savp-nonmux".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer_sdp,
+                    profile,
+                },
+            )
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
+        let engine_far_key = *offer_reply.crypto.first().expect("engine key to B");
+        let far_rtp = offer_reply.remote_rtp;
+        let far_rtcp = offer_reply.remote_rtcp;
+        assert_ne!(far_rtcp, far_rtp, "non-mux: distinct RTCP port advertised to B");
+
+        // B answers RTP/SAVP AMR-WB, non-mux, advertising its RTCP socket + key.
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/SAVP 96\r\na=rtpmap:96 AMR-WB/16000\r\na=rtcp:{rtcp}\r\na={crypto}\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+            rtcp = rtcp_b_addr.port(),
+            crypto = b_key.to_attribute_value(),
+        );
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "savp-nonmux".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let near_rtcp = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtcp;
+        assert!(
+            engine.media().is_media_call("savp-nonmux"),
+            "secure transcode resolves to the media slow path"
+        );
+
+        // B → A: B encrypts an RTCP SR with its key → engine far RTCP; A's RTCP socket gets plaintext.
+        let b_sr = rtcp_sr(0xB0B0_B0B0);
+        let mut b_srtcp = Vec::new();
+        SrtcpContext::from_key_material(&b_key.key)
+            .protect(&b_sr, &mut b_srtcp)
+            .expect("B encrypt SRTCP");
+        rtcp_b.send_to(&b_srtcp, far_rtcp).await.expect("b rtcp send");
+        let (relayed, from) = recv(&rtcp_a).await;
+        assert_eq!(from, near_rtcp, "RTCP relayed from the engine's near RTCP port");
+        assert_eq!(relayed, b_sr, "A receives B's decrypted plaintext RTCP");
+
+        // A → B: A's plaintext RTCP → engine near RTCP; B's RTCP socket gets SRTCP it can decrypt.
+        let a_sr = rtcp_sr(0xA0A0_A0A0);
+        rtcp_a.send_to(&a_sr, near_rtcp).await.expect("a rtcp send");
+        let (srtcp, from) = recv(&rtcp_b).await;
+        assert_eq!(from, far_rtcp, "engine transmits from its far RTCP port");
+        assert_ne!(srtcp, a_sr, "toward B it is encrypted (SRTCP)");
+        let mut recovered = Vec::new();
+        SrtcpContext::from_key_material(&engine_far_key.key)
+            .unprotect(&srtcp, &mut recovered)
+            .expect("B decrypt SRTCP");
+        assert_eq!(recovered, a_sr, "B recovers A's RTCP");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

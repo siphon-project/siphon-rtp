@@ -61,7 +61,9 @@ impl CryptoSuite {
         }
     }
 
-    fn from_name(name: &str) -> Option<Self> {
+    /// Parse an IANA crypto-suite name (the inverse of [`Self::name`]); `None` if unrecognised.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "AES_CM_128_HMAC_SHA1_80" => Some(CryptoSuite::AesCm128HmacSha1_80),
             "AES_CM_128_HMAC_SHA1_32" => Some(CryptoSuite::AesCm128HmacSha1_32),

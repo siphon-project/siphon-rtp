@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
@@ -57,6 +57,69 @@ struct EndpointEntry {
     task: JoinHandle<()>,
 }
 
+/// A deterministic media-port allocator over a closed `[min, max]` range.
+///
+/// Unlike OS `:0` ephemeral binding, a port handed out here is drawn from a bounded,
+/// operator-configured window — so the media plane can be firewalled to a known range (rtpengine
+/// `port-min`/`port-max` parity) and, crucially for HA takeover, a *specific* port can be re-bound
+/// on a standby (see [`UdpLoopbackDatapath::alloc_specific`]). Ports are reserved *before* the bind
+/// under a lock-free set, so a concurrent allocation never picks the same one; a port that happens
+/// to be held by another process on the host is skipped and released.
+struct PortAllocator {
+    min: u16,
+    max: u16,
+    /// Round-robin cursor across the range, so successive allocations spread out instead of always
+    /// retrying the low end.
+    cursor: AtomicUsize,
+    /// Ports currently reserved by this backend (reserved before the bind, released on removal).
+    reserved: DashSet<u16>,
+}
+
+impl PortAllocator {
+    fn new(min: u16, max: u16) -> Self {
+        Self {
+            min,
+            max,
+            cursor: AtomicUsize::new(0),
+            reserved: DashSet::new(),
+        }
+    }
+
+    /// Inclusive size of the range.
+    fn span(&self) -> usize {
+        (self.max - self.min) as usize + 1
+    }
+
+    /// Reserve the next free port in round-robin order, or `None` when every port in the range is
+    /// already reserved. The port is marked used immediately (before the bind) so a concurrent
+    /// allocation cannot also pick it.
+    fn reserve_next(&self) -> Option<u16> {
+        let span = self.span();
+        for _ in 0..span {
+            let offset = self.cursor.fetch_add(1, Ordering::Relaxed) % span;
+            let candidate = self.min + offset as u16;
+            if self.reserved.insert(candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Reserve a *specific* port (HA restore — re-bind the exact port the primary used). Returns
+    /// `false` when the port is outside `[min, max]` or already reserved.
+    fn reserve_exact(&self, port: u16) -> bool {
+        if port < self.min || port > self.max {
+            return false;
+        }
+        self.reserved.insert(port)
+    }
+
+    /// Return a port to the pool (endpoint removed, or a bind that raced a host process failed).
+    fn release(&self, port: u16) {
+        self.reserved.remove(&port);
+    }
+}
+
 /// What the relay has learned about an endpoint's peer source: where it sends from and the RTP
 /// SSRC it carries (for SSRC-consistent re-latch). See `docs/security-and-nat.md` §4 layer 3.
 #[derive(Clone, Copy)]
@@ -87,6 +150,10 @@ struct Inner {
     /// The local IP every endpoint socket binds. Loopback by default (the NIC-free CI posture); a
     /// routable IP in production so relay/media sockets are reachable by real peers.
     bind_ip: IpAddr,
+    /// Optional deterministic media-port range. `Some` binds each endpoint from the configured
+    /// `[min, max]` window (firewallable; re-bindable on a standby); `None` uses OS `:0` ephemeral
+    /// ports (the default / CI posture).
+    ports: Option<PortAllocator>,
     endpoints: DashMap<EndpointId, EndpointEntry>,
     flows: DashMap<EndpointId, FlowAction>,
     /// Per-endpoint latched peer source (address + RTP SSRC). A packet from a new source re-latches
@@ -282,7 +349,7 @@ impl UdpLoopbackDatapath {
     /// the port/FD-exhaustion guard (docs/security-and-nat.md §5). Sockets bind loopback.
     #[must_use]
     pub fn with_max_endpoints(max_endpoints: usize) -> Self {
-        Self::build(IpAddr::V4(Ipv4Addr::LOCALHOST), max_endpoints)
+        Self::build(IpAddr::V4(Ipv4Addr::LOCALHOST), max_endpoints, None)
     }
 
     /// Create a backend whose endpoint sockets bind `bind_ip` instead of loopback — the production
@@ -292,17 +359,28 @@ impl UdpLoopbackDatapath {
     /// separately (the TURN server's `--turn-relay-ip`). Unbounded pool.
     #[must_use]
     pub fn with_bind_ip(bind_ip: IpAddr) -> Self {
-        Self::build(bind_ip, usize::MAX)
+        Self::build(bind_ip, usize::MAX, None)
     }
 
     /// As [`with_bind_ip`](Self::with_bind_ip), also bounding the endpoint pool
     /// ([`with_max_endpoints`](Self::with_max_endpoints)).
     #[must_use]
     pub fn with_bind_ip_and_max_endpoints(bind_ip: IpAddr, max_endpoints: usize) -> Self {
-        Self::build(bind_ip, max_endpoints)
+        Self::build(bind_ip, max_endpoints, None)
     }
 
-    fn build(bind_ip: IpAddr, max_endpoints: usize) -> Self {
+    /// Create a backend that allocates media ports from a deterministic `[port_min, port_max]` range
+    /// on `bind_ip`, instead of OS-ephemeral `:0` ports. The range is firewallable (rtpengine
+    /// `port-min`/`port-max` parity) and — because a specific port can be re-bound via
+    /// [`alloc_specific`](Self::alloc_specific) — is the datapath prerequisite for HA takeover: a
+    /// standby behind a floating IP re-binds the exact port a failed primary advertised, so media
+    /// survives without a SIP re-INVITE. Unbounded endpoint pool (the range itself bounds ports).
+    #[must_use]
+    pub fn with_port_range(bind_ip: IpAddr, port_min: u16, port_max: u16) -> Self {
+        Self::build(bind_ip, usize::MAX, Some((port_min, port_max)))
+    }
+
+    fn build(bind_ip: IpAddr, max_endpoints: usize, port_range: Option<(u16, u16)>) -> Self {
         let (redirect_tx, redirect_rx) = flume::unbounded();
         let (observe_tx, observe_rx) = flume::bounded(256);
         Self {
@@ -312,6 +390,7 @@ impl UdpLoopbackDatapath {
                 live: AtomicUsize::new(0),
                 max_endpoints,
                 bind_ip,
+                ports: port_range.map(|(min, max)| PortAllocator::new(min, max)),
                 endpoints: DashMap::new(),
                 flows: DashMap::new(),
                 latched: DashMap::new(),
@@ -359,16 +438,93 @@ impl UdpLoopbackDatapath {
                 limit: self.inner.max_endpoints,
             });
         }
-        let bind = UdpSocket::bind((bind_ip, 0))
-            .await
-            .and_then(|socket| socket.local_addr().map(|addr| (socket, addr)));
-        let (socket, local_addr) = match bind {
-            Ok(bound) => bound,
+        // Bind from the configured port range, or an OS-ephemeral `:0` port when no range is set.
+        let bound = match &self.inner.ports {
+            Some(pool) => Self::bind_in_range(bind_ip, pool).await,
+            None => Self::bind_ephemeral(bind_ip, 0).await,
+        };
+        let (socket, local_addr) = match bound {
+            Ok(pair) => pair,
             Err(error) => {
                 self.inner.live.fetch_sub(1, Ordering::AcqRel);
-                return Err(DatapathError::Bind(error));
+                return Err(error);
             }
         };
+        Ok(self.register_socket(socket, local_addr))
+    }
+
+    /// Allocate an endpoint bound to a **specific** port — the HA-restore primitive: a standby
+    /// behind a floating IP re-binds the exact port a failed primary advertised, so media survives
+    /// without a SIP re-INVITE. With a port range configured the port must lie within it and be
+    /// free (else [`DatapathError::PortUnavailable`]); with no range, any bindable port is accepted.
+    /// `family` selects the bind IP the same way [`alloc_endpoint_for`](Datapath::alloc_endpoint_for)
+    /// does.
+    pub async fn alloc_specific(
+        &self,
+        family: AddressFamily,
+        port: u16,
+    ) -> Result<Endpoint, DatapathError> {
+        let bind_ip = self.bind_ip_for(family);
+        let reserved = self.inner.live.fetch_add(1, Ordering::AcqRel) + 1;
+        if reserved > self.inner.max_endpoints {
+            self.inner.live.fetch_sub(1, Ordering::AcqRel);
+            return Err(DatapathError::PoolExhausted {
+                limit: self.inner.max_endpoints,
+            });
+        }
+        // Reserve the exact port in the range (so a concurrent alloc can't take it) before binding.
+        if let Some(pool) = &self.inner.ports {
+            if !pool.reserve_exact(port) {
+                self.inner.live.fetch_sub(1, Ordering::AcqRel);
+                return Err(DatapathError::PortUnavailable { port });
+            }
+        }
+        match Self::bind_ephemeral(bind_ip, port).await {
+            Ok((socket, local_addr)) => Ok(self.register_socket(socket, local_addr)),
+            Err(error) => {
+                if let Some(pool) = &self.inner.ports {
+                    pool.release(port);
+                }
+                self.inner.live.fetch_sub(1, Ordering::AcqRel);
+                Err(error)
+            }
+        }
+    }
+
+    /// Bind a UDP socket on `bind_ip:port` (`port == 0` asks the OS for an ephemeral port) and read
+    /// back its local address.
+    async fn bind_ephemeral(
+        bind_ip: IpAddr,
+        port: u16,
+    ) -> Result<(UdpSocket, SocketAddr), DatapathError> {
+        let socket = UdpSocket::bind((bind_ip, port))
+            .await
+            .map_err(DatapathError::Bind)?;
+        let local_addr = socket.local_addr().map_err(DatapathError::Bind)?;
+        Ok((socket, local_addr))
+    }
+
+    /// Bind an endpoint on the next free port in the configured range. Tries each reservable port
+    /// once; a port reservable in our range but held by another process on the host is released and
+    /// skipped. `PoolExhausted` when the whole range is taken.
+    async fn bind_in_range(
+        bind_ip: IpAddr,
+        pool: &PortAllocator,
+    ) -> Result<(UdpSocket, SocketAddr), DatapathError> {
+        for _ in 0..pool.span() {
+            let Some(port) = pool.reserve_next() else {
+                return Err(DatapathError::PoolExhausted { limit: pool.span() });
+            };
+            match Self::bind_ephemeral(bind_ip, port).await {
+                Ok(bound) => return Ok(bound),
+                Err(_) => pool.release(port),
+            }
+        }
+        Err(DatapathError::PoolExhausted { limit: pool.span() })
+    }
+
+    /// Register a freshly bound socket: assign an id, start its receive loop, and record it.
+    fn register_socket(&self, socket: UdpSocket, local_addr: SocketAddr) -> Endpoint {
         let socket = Arc::new(socket);
         let id = EndpointId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let stats = Arc::new(StatsAtomic::default());
@@ -386,7 +542,7 @@ impl UdpLoopbackDatapath {
                 task,
             },
         );
-        Ok(Endpoint { id, local_addr })
+        Endpoint { id, local_addr }
     }
 }
 
@@ -542,6 +698,14 @@ impl Datapath for UdpLoopbackDatapath {
         self.alloc_on(self.bind_ip_for(family)).await
     }
 
+    async fn alloc_endpoint_on_port(
+        &self,
+        family: AddressFamily,
+        port: u16,
+    ) -> Result<Endpoint, DatapathError> {
+        self.alloc_specific(family, port).await
+    }
+
     fn install_flow(&self, endpoint: EndpointId, action: FlowAction) -> Result<(), DatapathError> {
         if !self.inner.endpoints.contains_key(&endpoint) {
             return Err(DatapathError::UnknownEndpoint(endpoint));
@@ -556,7 +720,20 @@ impl Datapath for UdpLoopbackDatapath {
 
     async fn remove_endpoint(&self, endpoint: EndpointId) {
         if let Some((_, entry)) = self.inner.endpoints.remove(&endpoint) {
-            entry.task.abort();
+            // Release the range port back to the pool (if a range is configured), reading the bound
+            // port off the socket before it is dropped, so the port can be re-allocated.
+            if let Some(pool) = &self.inner.ports {
+                if let Ok(local) = entry.socket.local_addr() {
+                    pool.release(local.port());
+                }
+            }
+            // Stop the receive task and wait for it to drop its socket clone, then drop ours, so the
+            // OS socket is fully closed before we return. A range port is then immediately
+            // re-bindable — needed for a same-port HA restore and for tight port-churn.
+            let EndpointEntry { socket, task, .. } = entry;
+            task.abort();
+            let _ = task.await;
+            drop(socket);
             // Release the pool slot only when an endpoint was actually removed (idempotent).
             self.inner.live.fetch_sub(1, Ordering::AcqRel);
         }
@@ -1098,6 +1275,98 @@ mod tests {
         datapath.remove_endpoint(leg_a.id).await;
         let leg_c = datapath.alloc_endpoint().await.expect("alloc after free");
         let _ = (leg_b, leg_c);
+    }
+
+    #[tokio::test]
+    async fn port_range_allocates_within_the_configured_window() {
+        // Every media port comes from the operator-configured [min, max] window (rtpengine
+        // port-min/port-max parity — firewallable), not an arbitrary OS-ephemeral port.
+        let (min, max) = (40_000u16, 40_009u16);
+        let datapath =
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), min, max);
+        for _ in 0..6 {
+            let endpoint = datapath.alloc_endpoint().await.expect("alloc in range");
+            let port = endpoint.local_addr.port();
+            assert!(
+                (min..=max).contains(&port),
+                "port {port} must be within [{min}, {max}]"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn port_range_exhaustion_is_clean() {
+        // A two-port range admits exactly two endpoints; the third fails cleanly (no host-FD spray).
+        let datapath =
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 41_000, 41_001);
+        let _a = datapath.alloc_endpoint().await.expect("alloc a");
+        let _b = datapath.alloc_endpoint().await.expect("alloc b");
+        assert!(matches!(
+            datapath.alloc_endpoint().await,
+            Err(DatapathError::PoolExhausted { limit: 2 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn port_range_releases_the_port_on_remove() {
+        // A single-port range: the port is reusable once the endpoint that held it is removed.
+        let datapath =
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 42_000, 42_000);
+        let first = datapath.alloc_endpoint().await.expect("first alloc");
+        assert_eq!(first.local_addr.port(), 42_000);
+        assert!(
+            matches!(
+                datapath.alloc_endpoint().await,
+                Err(DatapathError::PoolExhausted { limit: 1 })
+            ),
+            "the only port is taken"
+        );
+        datapath.remove_endpoint(first.id).await;
+        let reused = datapath.alloc_endpoint().await.expect("alloc after free");
+        assert_eq!(reused.local_addr.port(), 42_000, "the freed port is reused");
+    }
+
+    #[tokio::test]
+    async fn alloc_specific_binds_the_exact_port() {
+        // The HA-restore primitive: a standby re-binds the exact port a primary advertised.
+        let datapath =
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 43_000, 43_010);
+        let endpoint = datapath
+            .alloc_specific(AddressFamily::V4, 43_005)
+            .await
+            .expect("bind the exact port");
+        assert_eq!(endpoint.local_addr.port(), 43_005);
+        // The reserved port is now unavailable to the range allocator and to a second exact request.
+        assert!(matches!(
+            datapath.alloc_specific(AddressFamily::V4, 43_005).await,
+            Err(DatapathError::PortUnavailable { port: 43_005 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn alloc_specific_rejects_out_of_range_ports() {
+        let datapath =
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 44_000, 44_002);
+        assert!(matches!(
+            datapath.alloc_specific(AddressFamily::V4, 50_000).await,
+            Err(DatapathError::PortUnavailable { port: 50_000 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn alloc_specific_without_a_range_binds_the_requested_port() {
+        // No configured range: the exact port is bound directly (any free OS port is accepted).
+        let scratch = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("scratch bind");
+        let free_port = scratch.local_addr().expect("addr").port();
+        drop(scratch);
+        let datapath = UdpLoopbackDatapath::new();
+        let endpoint = datapath
+            .alloc_specific(AddressFamily::V4, free_port)
+            .await
+            .expect("bind the requested port without a range");
+        assert_eq!(endpoint.local_addr.port(), free_port);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

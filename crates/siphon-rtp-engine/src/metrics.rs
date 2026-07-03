@@ -28,6 +28,16 @@ pub struct LiveGauges {
     pub conference_rooms: u64,
     /// Live conference participants across all rooms.
     pub conference_participants: u64,
+    /// Advertised maximum concurrent sessions for cluster load reporting; `0` = unlimited.
+    pub max_sessions: u64,
+    /// The transcoding subset of live sessions (the expensive, decode/re-encode calls).
+    pub transcode_sessions: u64,
+    /// Normalized cluster load in per-mille (0..=1000): the higher of session utilization and CPU.
+    pub load_permille: u16,
+    /// Host CPU utilization in per-mille (best effort); `None` when no sample has been taken yet.
+    pub cpu_permille: Option<u16>,
+    /// Whether this node is draining (rejecting new sessions) — also drives `/readyz`.
+    pub draining: bool,
 }
 
 /// Process-wide operational counters and gauges, shared via `Arc`.
@@ -215,6 +225,47 @@ impl Metrics {
             "gauge",
             jemalloc_allocated_bytes,
         );
+        // Cluster placement gauges — the same surface the `load` control command reports, so an
+        // operator can alert on load / capacity / drain without polling the control plane.
+        metric(
+            &mut output,
+            "siphon_rtp_max_sessions",
+            "Advertised maximum concurrent sessions for cluster load reporting (0 = unlimited).",
+            "gauge",
+            live.max_sessions,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_transcode_sessions",
+            "Live transcoding calls (the expensive decode/re-encode subset of sessions).",
+            "gauge",
+            live.transcode_sessions,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_load_permille",
+            "Normalized node load in per-mille (0..=1000): max of session utilization and host CPU.",
+            "gauge",
+            u64::from(live.load_permille),
+        );
+        // CPU is best-effort: emit the series only once a sample exists (absent on a fresh start /
+        // a platform without /proc/stat), so the gauge never reports a misleading 0.
+        if let Some(cpu_permille) = live.cpu_permille {
+            metric(
+                &mut output,
+                "siphon_rtp_cpu_permille",
+                "Host CPU utilization in per-mille (0..=1000), sampled from /proc/stat.",
+                "gauge",
+                u64::from(cpu_permille),
+            );
+        }
+        metric(
+            &mut output,
+            "siphon_rtp_draining",
+            "Whether this node is draining (1) and refusing new sessions, or serving (0).",
+            "gauge",
+            u64::from(live.draining),
+        );
         output
     }
 }
@@ -275,6 +326,18 @@ pub fn route_request_line(request_line: &str) -> Route {
     }
 }
 
+/// Decide the `/readyz` response from the node's drain state: a draining node is **not ready**
+/// (`503`) so orchestration stops sending it new calls, while a serving node is `200`. Pure and
+/// unit-tested; the handler just formats the result.
+#[must_use]
+pub fn readyz_status(draining: bool) -> (&'static str, &'static str) {
+    if draining {
+        ("503 Service Unavailable", "draining\n")
+    } else {
+        ("200 OK", "ok\n")
+    }
+}
+
 /// Build a complete HTTP/1.1 response (status line, headers, body) for `status`/`body`.
 ///
 /// `Connection: close` is always sent — this server serves one request per connection (no
@@ -291,7 +354,7 @@ fn http_response(status_line: &str, content_type: &str, body: &str) -> String {
 /// Returns 0 if the allocator stats are unavailable (a non-jemalloc target / read failure) so the
 /// metrics endpoint never fails on a best-effort gauge.
 #[cfg(not(target_env = "msvc"))]
-fn jemalloc_allocated_bytes() -> u64 {
+pub(crate) fn jemalloc_allocated_bytes() -> u64 {
     if tikv_jemalloc_ctl::epoch::advance().is_err() {
         return 0;
     }
@@ -301,7 +364,7 @@ fn jemalloc_allocated_bytes() -> u64 {
 }
 
 #[cfg(target_env = "msvc")]
-fn jemalloc_allocated_bytes() -> u64 {
+pub(crate) fn jemalloc_allocated_bytes() -> u64 {
     0
 }
 
@@ -367,7 +430,13 @@ where
             http_response("200 OK", METRICS_CONTENT_TYPE, &body)
         }
         Route::Healthz => http_response("200 OK", "text/plain", "ok\n"),
-        Route::Readyz => http_response("200 OK", "text/plain", "ok\n"),
+        Route::Readyz => {
+            // Readiness reflects drain state: a draining node answers 503 so an orchestrator / load
+            // balancer stops routing new calls to it (the pod stays *live* — /healthz is still 200 —
+            // while existing calls finish). Liveness and readiness are deliberately distinct here.
+            let (status, body) = readyz_status(live().draining);
+            http_response(status, "text/plain", body)
+        }
         Route::NotFound => http_response("404 Not Found", "text/plain", "not found\n"),
     };
     stream.write_all(response.as_bytes()).await?;
@@ -452,6 +521,11 @@ mod tests {
                 sessions: 3,
                 conference_rooms: 5,
                 conference_participants: 9,
+                max_sessions: 4000,
+                transcode_sessions: 2,
+                load_permille: 203,
+                cpu_permille: Some(247),
+                draining: true,
             },
             4096,
         );
@@ -475,9 +549,53 @@ mod tests {
         assert!(body.contains(
             "# TYPE siphon_rtp_jemalloc_allocated_bytes gauge\nsiphon_rtp_jemalloc_allocated_bytes 4096\n"
         ));
-        // Every series carries a HELP line.
-        assert_eq!(body.matches("# HELP ").count(), 11);
-        assert_eq!(body.matches("# TYPE ").count(), 11);
+        // Cluster placement gauges.
+        assert!(
+            body.contains("# TYPE siphon_rtp_max_sessions gauge\nsiphon_rtp_max_sessions 4000\n")
+        );
+        assert!(body.contains("siphon_rtp_transcode_sessions 2\n"));
+        assert!(
+            body.contains("# TYPE siphon_rtp_load_permille gauge\nsiphon_rtp_load_permille 203\n")
+        );
+        assert!(body.contains("siphon_rtp_cpu_permille 247\n"));
+        assert!(body.contains("# TYPE siphon_rtp_draining gauge\nsiphon_rtp_draining 1\n"));
+        // Every series carries a HELP + TYPE line (16 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 16);
+        assert_eq!(body.matches("# TYPE ").count(), 16);
+    }
+
+    #[test]
+    fn render_omits_cpu_gauge_until_sampled() {
+        // No CPU sample yet → the cpu series is absent (never a misleading 0), and drain reads 0.
+        let body = Metrics::new().render(
+            LiveGauges {
+                max_sessions: 1000,
+                load_permille: 500,
+                cpu_permille: None,
+                draining: false,
+                ..LiveGauges::default()
+            },
+            0,
+        );
+        assert!(
+            !body.contains("siphon_rtp_cpu_permille"),
+            "cpu series omitted when unsampled"
+        );
+        assert!(body.contains("siphon_rtp_load_permille 500\n"));
+        assert!(body.contains("siphon_rtp_draining 0\n"));
+        // One fewer series than the CPU-present case (15 vs 16).
+        assert_eq!(body.matches("# TYPE ").count(), 15);
+    }
+
+    #[test]
+    fn readyz_reflects_drain_state() {
+        // A draining node is not ready (503) so orchestration stops routing new calls to it; a
+        // serving node is ready (200). Liveness (/healthz) is unaffected — that stays 200 either way.
+        assert_eq!(readyz_status(false), ("200 OK", "ok\n"));
+        assert_eq!(
+            readyz_status(true),
+            ("503 Service Unavailable", "draining\n")
+        );
     }
 
     #[test]

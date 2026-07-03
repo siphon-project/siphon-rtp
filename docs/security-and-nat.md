@@ -250,7 +250,13 @@ datapath's Forward-path layer-2 gate.
   to where its media actually originates — consistent with the Forward-path latch, but enforced in the
   actor because `Redirect` skips it.
 - **RTCP & unknown packets** are relayed verbatim (RFC 5761 demux on the payload-type byte); only audio
-  RTP is transcoded. Companion (non-mux) RTCP stays on the in-datapath Forward fast path.
+  RTP is transcoded. On the plaintext `Media` path, companion (non-mux) RTCP stays on the in-datapath
+  Forward fast path. On the **secure** transcode (`SrtpMedia`) path it cannot ride the datapath (it is
+  encrypted): non-mux RTCP endpoints are redirected into the same `MediaCall` actor and SRTCP-(de)crypted
+  through the call's shared `SecureLeg` — A's RTCP encrypted toward the secure B, B's SRTCP decrypted
+  toward plaintext A (RFC 3711) — with the RTPBleed source gate re-enforced on each RTCP endpoint.
+  (Muxed RTCP rides the RTP endpoint and is (de)crypted inline in `Direction::handle`.) RTCP is
+  forwarded to the peer's signalled RTCP address; dynamic RTCP-follows-RTP latching is a follow-up.
 - **Injected media** (PlayMedia prompts, PlayDtmf bursts) is emitted on the engine's *own* egress SSRC
   and sequence space, never echoing an attacker-supplied stream.
 

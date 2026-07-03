@@ -52,6 +52,20 @@ struct StreamState {
     highest_seq: Option<u16>,
 }
 
+/// A per-SSRC SRTP rollover checkpoint (RFC 3711 §3.3.1): the receiver/sender rollover state that is
+/// *estimated from observed packets*, not signalled, and so must be carried across an HA failover.
+/// Exported by [`SrtpContext::rollover_state`] and re-applied by [`SrtpContext::seed_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamRollover {
+    /// The stream's synchronization source (RFC 3550 §5.1).
+    pub ssrc: u32,
+    /// The 32-bit rollover counter — how many times the 16-bit RTP sequence has wrapped.
+    pub roc: u32,
+    /// The highest RTP sequence number processed so far (the rollover anchor), or `None` if no packet
+    /// has been seen for this SSRC yet.
+    pub highest_seq: Option<u16>,
+}
+
 impl StreamState {
     /// The 48-bit packet index for `seq` and the 32-bit ROC to authenticate with (RFC 3711 §3.3.1),
     /// advancing the rollover state for in-order/wrapping packets.
@@ -129,6 +143,34 @@ impl SrtpContext {
     #[must_use]
     pub fn from_key_material(material: &SrtpKeyMaterial) -> Self {
         Self::new(&material.master_key, &material.master_salt)
+    }
+
+    /// Export the per-SSRC rollover state for an HA checkpoint (order unspecified). This is the only
+    /// SRTP state that cannot be recovered by observing packets — everything else re-derives from the
+    /// SDES master key — so a warm standby must carry it (RFC 3711 §3.3.1). See [`Self::seed_stream`].
+    #[must_use]
+    pub fn rollover_state(&self) -> Vec<StreamRollover> {
+        self.streams
+            .iter()
+            .map(|(&ssrc, state)| StreamRollover {
+                ssrc,
+                roc: state.roc,
+                highest_seq: state.highest_seq,
+            })
+            .collect()
+    }
+
+    /// Seed a stream's rollover state from an HA checkpoint, so a standby continues a live stream's
+    /// SRTP packet index instead of resetting to `0` — which would compute the wrong ROC (and fail
+    /// authentication) once the sequence has wrapped. Overwrites any existing state for the SSRC.
+    pub fn seed_stream(&mut self, rollover: StreamRollover) {
+        self.streams.insert(
+            rollover.ssrc,
+            StreamState {
+                roc: rollover.roc,
+                highest_seq: rollover.highest_seq,
+            },
+        );
     }
 
     /// Encrypt + authenticate an RTP packet into `out` (cleared first): `header || AES-CM(payload) ||
@@ -280,6 +322,52 @@ mod tests {
             .unprotect(&srtp, &mut recovered)
             .expect("unprotect");
         assert_eq!(recovered, plain);
+    }
+
+    #[test]
+    fn rollover_state_carries_across_a_context_rebuild() {
+        // The HA-failover invariant: after the RTP sequence has wrapped, a standby that rebuilds the
+        // SRTP context from the SDES key alone (rollover reset to 0) computes the wrong ROC and fails
+        // authentication; seeding it with the exported rollover state keeps the stream decryptable.
+        let ssrc = 0xCAFE_1234;
+        let mut sender = context();
+        let mut scratch = Vec::new();
+        // Drive the sequence past a wrap (…65534, 65535, 0) so the rollover counter reaches 1.
+        for seq in [65534u16, 65535, 0] {
+            sender
+                .protect(&rtp(seq, ssrc, 0x11), &mut scratch)
+                .expect("protect");
+        }
+        let state = sender.rollover_state();
+        assert_eq!(state.len(), 1);
+        let checkpoint = state[0];
+        assert_eq!(checkpoint.ssrc, ssrc);
+        assert_eq!(checkpoint.roc, 1, "the sequence wrapped once");
+        assert_eq!(checkpoint.highest_seq, Some(0));
+
+        // The next packet the primary emits is protected at ROC = 1.
+        let mut wire = Vec::new();
+        sender
+            .protect(&rtp(1, ssrc, 0x11), &mut wire)
+            .expect("protect next");
+
+        // A standby seeded with the checkpoint continues the stream…
+        let mut seeded = context();
+        seeded.seed_stream(checkpoint);
+        let mut recovered = Vec::new();
+        seeded
+            .unprotect(&wire, &mut recovered)
+            .expect("seeded standby continues the stream");
+        assert_eq!(recovered, rtp(1, ssrc, 0x11));
+
+        // …while a cold rebuild (ROC reset to 0) breaks authentication after the wrap.
+        let mut cold = context();
+        let mut discard = Vec::new();
+        assert_eq!(
+            cold.unprotect(&wire, &mut discard),
+            Err(SrtpError::AuthFailed),
+            "resetting rollover state to zero fails SRTP auth once the sequence has wrapped"
+        );
     }
 
     #[test]

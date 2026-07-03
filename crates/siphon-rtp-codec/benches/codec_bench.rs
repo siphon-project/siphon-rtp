@@ -479,6 +479,44 @@ fn bench_amrnb_encode(criterion: &mut Criterion) {
     }
 }
 
+/// Full-frame [`siphon_rtp_codec::Encoder::encode`] (RTP payload = CMR | ToC | speech) with and
+/// without a per-frame RFC 4867 Codec Mode Request (`request_mode`), proving the `mode-set` clamp
+/// adds no measurable per-frame cost. Uses synthetic PCM so it runs without the reference vector.
+#[cfg(feature = "amr")]
+fn bench_amrwb_encode_cmr(criterion: &mut Criterion) {
+    use siphon_rtp_codec::Encoder;
+
+    // A deterministic 20 ms / 16 kHz frame (no reference input needed).
+    let frame_pcm: Vec<i16> = (0..constants::L_FRAME16K)
+        .map(|i| (((i as i32 * 137) % 8000) - 4000) as i16)
+        .collect();
+    let mut out = vec![0u8; 64];
+
+    // Plain full-frame encode at the default mode.
+    let warm = AmrWb::new();
+    criterion.bench_function("amrwb_encode_frame", |bencher| {
+        bencher.iter_batched(
+            || warm.clone(),
+            |mut st| st.encode(black_box(&frame_pcm), black_box(&mut out)).expect("encode"),
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Same, but a per-frame CMR is applied first (clamped to a mode-set). The bitmask clamp is a
+    // handful of bit ops with no allocation — this case must match `amrwb_encode_frame`.
+    let warm_cmr = AmrWb::new().with_allowed_modes(&[0, 1, 2]);
+    criterion.bench_function("amrwb_encode_frame_with_cmr", |bencher| {
+        bencher.iter_batched(
+            || warm_cmr.clone(),
+            |mut st| {
+                st.request_mode(black_box(2));
+                st.encode(black_box(&frame_pcm), black_box(&mut out)).expect("encode")
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 // AMR-WB/NB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
 #[cfg(feature = "amr")]
 criterion_group!(
@@ -494,7 +532,8 @@ criterion_group!(
     bench_amrwb_decode,
     bench_amrnb_decode,
     bench_amrwb_encode,
-    bench_amrnb_encode
+    bench_amrnb_encode,
+    bench_amrwb_encode_cmr
 );
 #[cfg(not(feature = "amr"))]
 criterion_group!(

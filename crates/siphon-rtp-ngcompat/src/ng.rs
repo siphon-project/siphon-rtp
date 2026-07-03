@@ -51,6 +51,21 @@ pub fn parse_command(request: &Value) -> Result<Command, NgError> {
         // Read-only census verbs: no keys beyond `command` (rtpengine NG `list` / `statistics`).
         "list" => Ok(Command::List),
         "statistics" => Ok(Command::Statistics),
+        // Cluster placement verbs (a siphon-rtp extension to the NG protocol): no keys beyond
+        // `command`. `load` / `node info` are read-only; `drain` / `undrain` toggle admission of new
+        // sessions for a zero-downtime rolling upgrade.
+        "load" => Ok(Command::Load),
+        "node info" => Ok(Command::NodeInfo),
+        "drain" => Ok(Command::Drain),
+        "undrain" => Ok(Command::Undrain),
+        // HA warm-standby: snapshot a call's state / rebuild it on a standby.
+        "checkpoint" => Ok(Command::Checkpoint {
+            call_id: required_str(request, "call-id")?,
+            from_tag: required_str(request, "from-tag")?,
+        }),
+        "restore" => Ok(Command::Restore {
+            snapshot: required_str(request, "snapshot")?,
+        }),
         "offer" => Ok(Command::Offer {
             call_id: required_str(request, "call-id")?,
             from_tag: required_str(request, "from-tag")?,
@@ -166,6 +181,71 @@ pub fn serialize_result(result: &CmdResult) -> Value {
                 Value::Integer(clamp_i64(statistics.sessions)),
             );
             dict.insert(b"statistics".to_vec(), Value::Dict(statistics_dict));
+        }
+        CmdResult::Load { load } => {
+            // The cluster `load` snapshot under a `load` sub-dict: integer per-mille figures + the
+            // live gauges, so a dispatcher polling over NG reads the same vocabulary the JSON
+            // front-end returns (hyphenated keys, the NG convention).
+            dict.insert(b"result".to_vec(), Value::string("ok"));
+            let mut load_dict = std::collections::BTreeMap::new();
+            load_dict.insert(b"node-id".to_vec(), Value::string(&load.node_id));
+            load_dict.insert(
+                b"sessions".to_vec(),
+                Value::Integer(clamp_i64(load.sessions)),
+            );
+            load_dict.insert(
+                b"max-sessions".to_vec(),
+                Value::Integer(clamp_i64(load.max_sessions)),
+            );
+            load_dict.insert(
+                b"load-permille".to_vec(),
+                Value::Integer(i64::from(load.load_permille)),
+            );
+            load_dict.insert(
+                b"transcode-sessions".to_vec(),
+                Value::Integer(clamp_i64(load.transcode_sessions)),
+            );
+            // Only present when a CPU sample has been taken (mirrors the JSON `skip_serializing_if`).
+            if let Some(cpu) = load.cpu_permille {
+                load_dict.insert(b"cpu-permille".to_vec(), Value::Integer(i64::from(cpu)));
+            }
+            load_dict.insert(
+                b"allocated-bytes".to_vec(),
+                Value::Integer(clamp_i64(load.jemalloc_allocated_bytes)),
+            );
+            // bencode has no boolean; draining is a 0/1 integer (the NG convention).
+            load_dict.insert(
+                b"draining".to_vec(),
+                Value::Integer(i64::from(load.draining)),
+            );
+            dict.insert(b"load".to_vec(), Value::Dict(load_dict));
+        }
+        CmdResult::NodeInfo { node } => {
+            // Static identity + capabilities under a `node` sub-dict.
+            dict.insert(b"result".to_vec(), Value::string("ok"));
+            let mut node_dict = std::collections::BTreeMap::new();
+            node_dict.insert(b"node-id".to_vec(), Value::string(&node.node_id));
+            node_dict.insert(b"version".to_vec(), Value::string(&node.version));
+            node_dict.insert(
+                b"media-addresses".to_vec(),
+                encode_string_list(&node.media_addresses),
+            );
+            node_dict.insert(b"codecs".to_vec(), encode_string_list(&node.codecs));
+            node_dict.insert(b"features".to_vec(), encode_string_list(&node.features));
+            node_dict.insert(
+                b"max-sessions".to_vec(),
+                Value::Integer(clamp_i64(node.max_sessions)),
+            );
+            node_dict.insert(
+                b"draining".to_vec(),
+                Value::Integer(i64::from(node.draining)),
+            );
+            dict.insert(b"node".to_vec(), Value::Dict(node_dict));
+        }
+        CmdResult::Checkpoint { snapshot } => {
+            // The opaque HA snapshot blob under a `snapshot` string, verbatim.
+            dict.insert(b"result".to_vec(), Value::string("ok"));
+            dict.insert(b"snapshot".to_vec(), Value::string(snapshot));
         }
         CmdResult::Error { reason } => {
             dict.insert(b"result".to_vec(), Value::string("error"));
@@ -326,6 +406,11 @@ fn is_yes(dict: &Value, key: &str) -> bool {
 /// saturates rather than wrapping a telemetry value negative.
 fn clamp_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Encode a `&[String]` as a bencode list of strings (`node_info` codecs / features / addresses).
+fn encode_string_list(items: &[String]) -> Value {
+    Value::List(items.iter().map(|item| Value::string(item)).collect())
 }
 
 #[cfg(test)]
@@ -607,6 +692,161 @@ mod tests {
                 .get(b"offers".as_slice())
                 .and_then(Value::as_integer),
             Some(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn cluster_verbs_need_no_call_id() {
+        // The cluster placement verbs carry only `command` (like list/statistics).
+        for (verb, expected) in [
+            ("load", Command::Load),
+            ("node info", Command::NodeInfo),
+            ("drain", Command::Drain),
+            ("undrain", Command::Undrain),
+        ] {
+            let bytes = datagram("c1", &[("command", Value::string(verb))]);
+            let (_, command) = parse_datagram(&bytes);
+            assert_eq!(command, expected, "verb {verb:?}");
+        }
+    }
+
+    #[test]
+    fn load_result_encodes_load_dict() {
+        let result = serialize_result(&CmdResult::Load {
+            load: siphon_rtp_proto::NodeLoad {
+                node_id: "rtp-ams-3".into(),
+                sessions: 812,
+                max_sessions: 4000,
+                load_permille: 203,
+                transcode_sessions: 140,
+                cpu_permille: Some(247),
+                jemalloc_allocated_bytes: 734_003_200,
+                draining: false,
+            },
+        });
+        assert_eq!(result.get("result").and_then(Value::as_str), Some("ok"));
+        let load = result
+            .get("load")
+            .and_then(Value::as_dict)
+            .expect("load dict");
+        let int = |key: &[u8]| load.get(key).and_then(Value::as_integer);
+        assert_eq!(
+            load.get(b"node-id".as_slice()).and_then(Value::as_str),
+            Some("rtp-ams-3")
+        );
+        assert_eq!(int(b"sessions"), Some(812));
+        assert_eq!(int(b"max-sessions"), Some(4000));
+        assert_eq!(int(b"load-permille"), Some(203));
+        assert_eq!(int(b"transcode-sessions"), Some(140));
+        assert_eq!(int(b"cpu-permille"), Some(247));
+        assert_eq!(int(b"allocated-bytes"), Some(734_003_200));
+        assert_eq!(int(b"draining"), Some(0));
+    }
+
+    #[test]
+    fn load_result_omits_cpu_when_unsampled() {
+        // No CPU sample → the `cpu-permille` key is absent (mirrors the JSON front-end).
+        let result = serialize_result(&CmdResult::Load {
+            load: siphon_rtp_proto::NodeLoad {
+                cpu_permille: None,
+                draining: true,
+                ..Default::default()
+            },
+        });
+        let load = result
+            .get("load")
+            .and_then(Value::as_dict)
+            .expect("load dict");
+        assert!(
+            load.get(b"cpu-permille".as_slice()).is_none(),
+            "cpu key omitted"
+        );
+        assert_eq!(
+            load.get(b"draining".as_slice()).and_then(Value::as_integer),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn node_info_result_encodes_capabilities() {
+        let result = serialize_result(&CmdResult::NodeInfo {
+            node: siphon_rtp_proto::NodeInfo {
+                node_id: "rtp-ams-3".into(),
+                version: "0.1.0".into(),
+                media_addresses: vec!["203.0.113.10".into()],
+                codecs: vec!["PCMU".into(), "AMR-WB".into()],
+                features: vec!["relay".into(), "srtp".into()],
+                max_sessions: 4000,
+                draining: false,
+            },
+        });
+        assert_eq!(result.get("result").and_then(Value::as_str), Some("ok"));
+        let node = result
+            .get("node")
+            .and_then(Value::as_dict)
+            .expect("node dict");
+        assert_eq!(
+            node.get(b"version".as_slice()).and_then(Value::as_str),
+            Some("0.1.0")
+        );
+        let codecs: Vec<&str> = node
+            .get(b"codecs".as_slice())
+            .and_then(Value::as_list)
+            .expect("codecs list")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(codecs, vec!["PCMU", "AMR-WB"]);
+        assert_eq!(
+            node.get(b"max-sessions".as_slice())
+                .and_then(Value::as_integer),
+            Some(4000)
+        );
+    }
+
+    #[test]
+    fn checkpoint_and_restore_verbs_round_trip() {
+        // `checkpoint` carries the call keys; the result carries the opaque blob under `snapshot`.
+        let bytes = datagram(
+            "ck",
+            &[
+                ("command", Value::string("checkpoint")),
+                ("call-id", Value::string("call-x")),
+                ("from-tag", Value::string("ft")),
+            ],
+        );
+        let (_, command) = parse_datagram(&bytes);
+        assert_eq!(
+            command,
+            Command::Checkpoint {
+                call_id: "call-x".into(),
+                from_tag: "ft".into(),
+            }
+        );
+
+        let result = serialize_result(&CmdResult::Checkpoint {
+            snapshot: "{\"version\":1}".into(),
+        });
+        assert_eq!(result.get("result").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            result.get("snapshot").and_then(Value::as_str),
+            Some("{\"version\":1}")
+        );
+
+        // `restore` carries the blob back.
+        let restore = datagram(
+            "rs",
+            &[
+                ("command", Value::string("restore")),
+                ("snapshot", Value::string("{\"version\":1}")),
+            ],
+        );
+        let (_, command) = parse_datagram(&restore);
+        assert_eq!(
+            command,
+            Command::Restore {
+                snapshot: "{\"version\":1}".into(),
+            }
         );
     }
 

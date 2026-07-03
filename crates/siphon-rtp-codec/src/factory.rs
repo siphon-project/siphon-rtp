@@ -45,6 +45,10 @@ pub struct CodecSpec {
     /// `a=fmtp` `mode-set` constrains it. `None` ⇒ the codec's own default (AMR-WB mode 2 / 12.65
     /// kbit/s). Honoured by [`encoder_for`]; ignored by decoders (the wire frame carries its own mode).
     pub encode_mode: Option<u8>,
+    /// The full set of AMR speech modes the peer's SDP `mode-set` permits (RFC 4867 §8.1), empty when
+    /// unconstrained. Passed to the AMR-WB encoder so a per-frame RFC 4867 CMR is clamped into it and
+    /// the engine never encodes a disallowed mode. Distinct from `encode_mode` (the *default* mode).
+    pub allowed_modes: Vec<u8>,
 }
 
 impl CodecSpec {
@@ -64,6 +68,7 @@ impl CodecSpec {
             channels: channels.max(1),
             ptime_ms: ptime_ms.max(1),
             encode_mode: None,
+            allowed_modes: Vec::new(),
         }
     }
 
@@ -71,6 +76,14 @@ impl CodecSpec {
     #[must_use]
     pub fn with_encode_mode(mut self, mode: Option<u8>) -> Self {
         self.encode_mode = mode;
+        self
+    }
+
+    /// Set the AMR `mode-set`-permitted speech modes for per-frame CMR clamping. Chainable on
+    /// [`CodecSpec::new`].
+    #[must_use]
+    pub fn with_allowed_modes(mut self, modes: Vec<u8>) -> Self {
+        self.allowed_modes = modes;
         self
     }
 
@@ -154,12 +167,16 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
         "L16" => Ok(Box::new(L16::new(spec.clock_rate_hz, spec.ptime_ms))),
         // AMR-WB encode is bit-exact (modes 0–7) against 3GPP TS 26.174 — same `amr`-feature gate as
         // decode (docs/codec-licensing.md). The egress mode is the SDP `mode-set`-resolved
-        // `spec.encode_mode` when present, else the codec default (mode 2 / 12.65 kbit/s).
+        // `spec.encode_mode` when present, else the codec default (mode 2 / 12.65 kbit/s). The full
+        // `mode-set` (`spec.allowed_modes`) bounds per-frame RFC 4867 CMR adaptation (`request_mode`).
         #[cfg(feature = "amr")]
-        "AMR-WB" => Ok(Box::new(match spec.encode_mode {
-            Some(mode) => AmrWb::new().with_encode_mode(mode),
-            None => AmrWb::new(),
-        })),
+        "AMR-WB" => {
+            let mut encoder = AmrWb::new().with_allowed_modes(&spec.allowed_modes);
+            if let Some(mode) = spec.encode_mode {
+                encoder = encoder.with_encode_mode(mode);
+            }
+            Ok(Box::new(encoder))
+        }
         // AMR-NB encode is bit-exact (3GPP TS 26.074) for MR475 (4.75k) and MR122 (12.2k, GSM-EFR);
         // the other six modes' codebook/gain search is not yet ported, so a `mode-set` that resolves
         // to one of them is declined here (a clean factory-time `Unsupported` rather than a per-frame

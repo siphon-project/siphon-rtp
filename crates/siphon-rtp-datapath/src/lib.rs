@@ -226,6 +226,13 @@ pub enum DatapathError {
         /// The configured maximum number of concurrent endpoints.
         limit: usize,
     },
+    /// A specific media port was requested (HA restore — re-binding the exact port a failed primary
+    /// used) but it is outside the configured range or already reserved on this node.
+    #[error("media port {port} is unavailable (out of range or already in use)")]
+    PortUnavailable {
+        /// The requested port that could not be reserved.
+        port: u16,
+    },
     /// Transmitting a datagram failed.
     #[error("send failed: {0}")]
     Send(#[source] std::io::Error),
@@ -267,6 +274,19 @@ pub trait Datapath: Send + Sync {
         _family: AddressFamily,
     ) -> impl std::future::Future<Output = Result<Endpoint, DatapathError>> + Send {
         self.alloc_endpoint()
+    }
+
+    /// Allocate and bind an endpoint on a **specific** port — the HA-restore primitive: a standby
+    /// behind a floating IP re-binds the exact port a failed primary advertised, so media survives
+    /// without a SIP re-INVITE. The default errors with [`DatapathError::PortUnavailable`] (a backend
+    /// with no deterministic port allocator cannot honour a specific port); the loopback backend,
+    /// which has a port range, overrides this.
+    fn alloc_endpoint_on_port(
+        &self,
+        _family: AddressFamily,
+        port: u16,
+    ) -> impl std::future::Future<Output = Result<Endpoint, DatapathError>> + Send {
+        async move { Err(DatapathError::PortUnavailable { port }) }
     }
 
     /// Install (or replace) the flow action for an endpoint.

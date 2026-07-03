@@ -1195,6 +1195,7 @@ dependencies = [
  "getrandom 0.3.4",
  "proptest",
  "serde",
+ "serde_json",
  "siphon-rtp-codec",
  "siphon-rtp-datapath",
  "siphon-rtp-dsp",

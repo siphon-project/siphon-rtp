@@ -63,6 +63,11 @@ pub struct FileConfig {
     pub ng: Option<SocketAddr>,
     /// Bind relay/media sockets to this IP instead of loopback (`--relay-bind-ip`).
     pub relay_bind_ip: Option<IpAddr>,
+    /// Lowest media port the datapath may bind (`--port-min`). Set together with `port_max` to draw
+    /// media ports from a bounded, firewallable range instead of OS-ephemeral ports.
+    pub port_min: Option<u16>,
+    /// Highest media port the datapath may bind (`--port-max`). Set together with `port_min`.
+    pub port_max: Option<u16>,
     /// Prometheus metrics + health HTTP listen address (`--metrics-addr`).
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap, requests/second; 0 disables (`--max-control-rps`).
@@ -86,6 +91,12 @@ pub struct FileConfig {
     /// `tracing` env-filter directive used when the process environment does not set one
     /// (`RUST_LOG` / the default-env filter always win over this).
     pub log_filter: Option<String>,
+    /// Stable cluster node identifier advertised by the `load` / `node_info` control commands
+    /// (`--node-id`). Defaults to the host's `HOSTNAME` (else `siphon-rtp`) when unset.
+    pub node_id: Option<String>,
+    /// Advertised maximum concurrent sessions for cluster load reporting; `0` = unlimited
+    /// (`--max-sessions`). Drives the normalized load score a dispatcher ranks nodes by.
+    pub max_sessions: Option<u64>,
 }
 
 impl FileConfig {
@@ -152,6 +163,8 @@ mod tests {
             "control = \"0.0.0.0:8080\"\n",
             "ng = \"0.0.0.0:22222\"\n",
             "relay_bind_ip = \"203.0.113.7\"\n",
+            "port_min = 30000\n",
+            "port_max = 40000\n",
             "metrics_addr = \"127.0.0.1:9090\"\n",
             "max_control_rps = 500\n",
             "media_timeout_secs = 45\n",
@@ -163,6 +176,8 @@ mod tests {
             "turn_tls_key = \"/etc/siphon-rtp/turn.key\"\n",
             "turn_relay_ip = \"203.0.113.7\"\n",
             "log_filter = \"info,siphon_rtp_engine=debug\"\n",
+            "node_id = \"rtp-ams-3\"\n",
+            "max_sessions = 4000\n",
         );
 
         let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
@@ -179,6 +194,8 @@ mod tests {
             config.relay_bind_ip,
             Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
         );
+        assert_eq!(config.port_min, Some(30000));
+        assert_eq!(config.port_max, Some(40000));
         assert_eq!(
             config.metrics_addr,
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9090)))
@@ -198,6 +215,8 @@ mod tests {
             config.log_filter.as_deref(),
             Some("info,siphon_rtp_engine=debug")
         );
+        assert_eq!(config.node_id.as_deref(), Some("rtp-ams-3"));
+        assert_eq!(config.max_sessions, Some(4000));
     }
 
     /// An empty file is valid and yields all-`None` (every key falls through to the CLI default).

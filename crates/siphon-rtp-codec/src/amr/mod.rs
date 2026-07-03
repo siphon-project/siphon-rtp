@@ -410,9 +410,18 @@ pub struct AmrWb {
     /// Last decoded speech mode (0..=8), used to size concealed frames after a loss.
     last_mode: u8,
     /// Target speech mode for [`Encoder::encode`] (0..=8). Defaults to 2 (12.65 kbit/s) — the common
-    /// VoLTE rate. Per-call selection (SDP `mode-set` / RFC 4867 CMR) is set via
-    /// [`AmrWb::with_encode_mode`]; per-frame CMR adaptation is a follow-up.
+    /// VoLTE rate. The SDP `mode-set`-resolved default is set via [`AmrWb::with_encode_mode`];
+    /// per-frame RFC 4867 CMR adaptation moves it via [`Encoder::request_mode`], clamped to
+    /// `allowed_mask`. Sticky until the next request.
     encode_mode: u8,
+    /// Bitmask of the modes the SDP `mode-set` permits (bit *i* ⇒ mode *i* allowed), for clamping a
+    /// per-frame CMR so the engine never encodes a disallowed mode (RFC 4867 §8.1). `0` ⇒ no `mode-set`
+    /// constraint (any mode 0..=8).
+    allowed_mask: u16,
+    /// The RFC 4867 §4.3.1 Codec Mode Request carried by the most recently decoded payload:
+    /// `Some(0..=8)` when the peer requested a mode, `None` for "no request" (CMR = 15). Surfaced via
+    /// [`Decoder::last_mode_request`] so the media path can steer the reverse-direction encoder.
+    last_cmr: Option<u8>,
 }
 
 impl Default for AmrWb {
@@ -435,6 +444,8 @@ impl AmrWb {
             encoder_state: Box::new(wb::enc_main::EncoderState::new()),
             last_mode: 0,
             encode_mode: 2,
+            allowed_mask: 0,
+            last_cmr: None,
         }
     }
 
@@ -444,6 +455,36 @@ impl AmrWb {
     pub fn with_encode_mode(mut self, mode: u8) -> Self {
         self.encode_mode = mode.min(8);
         self
+    }
+
+    /// Constrain per-frame CMR adaptation to the modes the SDP `mode-set` permits (RFC 4867 §8.1), so
+    /// a peer's Codec Mode Request can never make the engine encode a disallowed mode. An empty set
+    /// leaves the codec unconstrained (any mode 0..=8). Modes above 8 are ignored.
+    #[must_use]
+    pub fn with_allowed_modes(mut self, modes: &[u8]) -> Self {
+        self.allowed_mask = modes
+            .iter()
+            .filter(|&&mode| mode <= 8)
+            .fold(0u16, |mask, &mode| mask | (1 << mode));
+        self
+    }
+
+    /// Clamp a requested speech mode into the `allowed_mask`: the request itself when permitted, else
+    /// the highest allowed mode below it (never exceed what the peer asked for), else the lowest
+    /// allowed mode. Unconstrained (`allowed_mask == 0`) returns the request capped at mode 8.
+    fn clamp_to_allowed(&self, mode: u8) -> u8 {
+        let mode = mode.min(8);
+        if self.allowed_mask == 0 || self.allowed_mask & (1 << mode) != 0 {
+            return mode;
+        }
+        // Highest allowed mode strictly below the request.
+        if let Some(lower) = (0..mode).rev().find(|&m| self.allowed_mask & (1 << m) != 0) {
+            return lower;
+        }
+        // Else the lowest allowed mode above it (the mask is non-zero, so one exists).
+        (mode + 1..=8)
+            .find(|&m| self.allowed_mask & (1 << m) != 0)
+            .unwrap_or(mode)
     }
 
     /// Encode one 20 ms frame (320 samples @ 16 kHz) at `mode` (0..=8) into its speech bits in
@@ -553,6 +594,9 @@ impl Decoder for AmrWb {
         // bandwidth-efficient if that does not parse cleanly.
         let parsed = payload::AmrPayload::parse_amr_wb(payload, true)
             .or_else(|_| payload::AmrPayload::parse_amr_wb(payload, false))?;
+        // Record the RTP-header Codec Mode Request (RFC 4867 §4.3.1): 0..=8 request a speech mode; 15
+        // (0xF) is "no request". The media path feeds it to the reverse direction's encoder.
+        self.last_cmr = (parsed.cmr <= 8).then_some(parsed.cmr);
         let frame = parsed
             .frames
             .first()
@@ -585,6 +629,12 @@ impl Decoder for AmrWb {
             self.last_mode,
             out,
         ))
+    }
+
+    /// The Codec Mode Request from the most recently decoded payload (RFC 4867 §4.3.1): `Some(0..=8)`
+    /// for a mode request, `None` for "no request" (CMR = 15).
+    fn last_mode_request(&self) -> Option<u8> {
+        self.last_cmr
     }
 }
 
@@ -619,6 +669,14 @@ impl Encoder for AmrWb {
         out[1] = (mode << 3) | 0x04; // F=0 (last frame), FT=mode, Q=1 (good)
         out[2..total].copy_from_slice(&speech);
         Ok(total)
+    }
+
+    /// Adapt the egress speech mode to a peer's Codec Mode Request (RFC 4867 §4.3.1), clamped into the
+    /// SDP `mode-set` (`with_allowed_modes`) so a disallowed mode is never emitted. Sticky until the
+    /// next request. (The engine's own egress CMR stays 15/"no request" — it is a transcoder, not a
+    /// mode-requesting endpoint.)
+    fn request_mode(&mut self, mode: u8) {
+        self.encode_mode = self.clamp_to_allowed(mode);
     }
 }
 
@@ -670,6 +728,64 @@ mod tests {
                 .expect("AMR-WB decode"),
             wb::constants::L_FRAME16K
         );
+    }
+
+    /// The ToC frame-type (egress speech mode) of an octet-aligned single-frame AMR-WB payload.
+    fn toc_frame_type(payload: &[u8]) -> u8 {
+        (payload[1] >> 3) & 0x0F
+    }
+
+    #[test]
+    fn amr_wb_request_mode_switches_and_is_sticky() {
+        // A per-frame CMR (RFC 4867 §4.3.1) switches the egress speech mode; unconstrained, the exact
+        // request is honoured and stays in effect for later frames (sticky) with no new request.
+        let mut codec = AmrWb::new(); // default mode 2
+        let mut payload = [0u8; 64];
+        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
+        assert_eq!(toc_frame_type(&payload), 2, "starts at the default mode 2");
+
+        codec.request_mode(0);
+        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
+        assert_eq!(toc_frame_type(&payload), 0, "CMR 0 switches the egress mode");
+        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
+        assert_eq!(toc_frame_type(&payload), 0, "the request is sticky across frames");
+    }
+
+    #[test]
+    fn amr_wb_request_mode_never_exceeds_the_mode_set() {
+        let mut payload = [0u8; 64];
+        // mode-set {0,1,2}: a request for mode 8 clamps down to the highest allowed at or below it.
+        let mut codec = AmrWb::new().with_allowed_modes(&[0, 1, 2]);
+        codec.request_mode(8);
+        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
+        assert_eq!(toc_frame_type(&payload), 2, "clamped to the highest allowed mode");
+
+        // A request below the whole set clamps up to the lowest allowed mode.
+        let mut codec = AmrWb::new().with_allowed_modes(&[4, 5]);
+        codec.request_mode(0);
+        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
+        assert_eq!(toc_frame_type(&payload), 4, "clamped up to the lowest allowed mode");
+    }
+
+    #[test]
+    fn amr_wb_decode_surfaces_the_codec_mode_request() {
+        // The engine's own encoder emits CMR = 15 (no request); decoding it surfaces None.
+        let mut codec = AmrWb::new();
+        let mut payload = [0u8; 64];
+        let len = codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
+        let mut out = [0i16; wb::constants::L_FRAME16K];
+        codec.decode(&payload[..len], &mut out).expect("decode");
+        assert_eq!(codec.last_mode_request(), None, "CMR 15 (0xF0) ⇒ no request");
+
+        // A peer requesting mode 0 (CMR nibble in byte 0) is surfaced.
+        payload[0] = 0x00;
+        codec.decode(&payload[..len], &mut out).expect("decode");
+        assert_eq!(codec.last_mode_request(), Some(0), "CMR 0 surfaced");
+
+        // Back to "no request" leaves nothing to apply (the encoder stays sticky at its last mode).
+        payload[0] = 0xF0;
+        codec.decode(&payload[..len], &mut out).expect("decode");
+        assert_eq!(codec.last_mode_request(), None, "CMR 15 ⇒ no request again");
     }
 
     #[test]
