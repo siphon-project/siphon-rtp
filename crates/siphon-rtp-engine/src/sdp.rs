@@ -52,6 +52,14 @@ pub struct MediaInfo {
     pub secure: bool,
     /// The `a=crypto` lines offered (RFC 4568 SDES), in order — the peer's SRTP key candidates.
     pub crypto: Vec<CryptoAttribute>,
+    /// The peer's DTLS certificate fingerprint (`a=fingerprint`, RFC 8122), present on a DTLS-SRTP
+    /// (`UDP/TLS/RTP/SAVP[F]`) offer/answer — it binds the handshake identity to the SDP (RFC 5763 §5).
+    pub fingerprint: Option<Fingerprint>,
+    /// The peer's DTLS role (`a=setup`, RFC 4145 / RFC 5763) — who initiates the DTLS handshake.
+    pub setup: Option<Setup>,
+    /// Whether the `m=audio` transport is a DTLS-keyed profile (`UDP/TLS/RTP/SAVP[F]`, RFC 5764): SRTP
+    /// keyed by the DTLS handshake (`a=fingerprint`), not by SDES `a=crypto`. Implies [`Self::secure`].
+    pub dtls: bool,
     /// The peer's ICE username fragment (`a=ice-ufrag`), if it offered ICE (RFC 8445).
     pub ice_ufrag: Option<String>,
     /// The peer's ICE password (`a=ice-pwd`), if it offered ICE.
@@ -66,6 +74,87 @@ pub struct MediaInfo {
     pub mode_sets: Vec<(u8, Vec<u8>)>,
     /// The stream's `a=ptime` in milliseconds, if present (else the 20 ms telephony default).
     pub ptime_ms: u8,
+}
+
+/// A DTLS certificate fingerprint (RFC 8122), carried in `a=fingerprint`. In DTLS-SRTP the SDP does
+/// not carry keys (as SDES does); it carries the hash of the peer's self-signed certificate, and the
+/// handshake is only trusted if the presented certificate hashes to this value (RFC 5763 §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// The hash-function token, lowercased (RFC 8122 §5 registers `sha-256`, `sha-1`, …). Kept as a
+    /// string so an unknown-but-well-formed algorithm still round-trips through the rewriter.
+    pub hash_function: String,
+    /// The certificate-hash octets (the `:`-separated hex pairs, decoded).
+    pub bytes: Vec<u8>,
+}
+
+impl Fingerprint {
+    /// Parse an `a=fingerprint:<hash-func> <hex:hex:…>` attribute body (RFC 8122 §5). Returns `None`
+    /// for a missing prefix, a missing hash/value, or a non-hex octet.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let body = value.strip_prefix("fingerprint:")?;
+        let (hash_function, hex) = body.trim().split_once(char::is_whitespace)?;
+        let bytes = hex
+            .trim()
+            .split(':')
+            .map(|octet| u8::from_str_radix(octet.trim(), 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        if hash_function.is_empty() || bytes.is_empty() {
+            return None;
+        }
+        Some(Fingerprint {
+            hash_function: hash_function.to_ascii_lowercase(),
+            bytes,
+        })
+    }
+
+    /// The `fingerprint:<hash-func> <HEX:HEX:…>` attribute value (without the leading `a=`), uppercase
+    /// hex per RFC 8122 §5.
+    #[must_use]
+    pub fn to_attribute_value(&self) -> String {
+        let hex: Vec<String> = self.bytes.iter().map(|byte| format!("{byte:02X}")).collect();
+        format!("fingerprint:{} {}", self.hash_function, hex.join(":"))
+    }
+}
+
+/// The DTLS role from `a=setup` (RFC 4145 §4, applied to DTLS-SRTP by RFC 5763 §5): which endpoint
+/// initiates the DTLS handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setup {
+    /// `active` — this endpoint starts the handshake (the DTLS client).
+    Active,
+    /// `passive` — this endpoint waits for the handshake (the DTLS server).
+    Passive,
+    /// `actpass` — offer-only: willing to be either; the answerer chooses (RFC 5763 §5).
+    Actpass,
+    /// `holdconn` — the connection is on hold; do not establish it yet (RFC 4145 §4).
+    Holdconn,
+}
+
+impl Setup {
+    /// Parse an `a=setup:<role>` attribute body (RFC 4145 §4). Returns `None` for an unknown role.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.strip_prefix("setup:")?.trim() {
+            "active" => Some(Setup::Active),
+            "passive" => Some(Setup::Passive),
+            "actpass" => Some(Setup::Actpass),
+            "holdconn" => Some(Setup::Holdconn),
+            _ => None,
+        }
+    }
+
+    /// The `a=setup` role token.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Setup::Active => "active",
+            Setup::Passive => "passive",
+            Setup::Actpass => "actpass",
+            Setup::Holdconn => "holdconn",
+        }
+    }
 }
 
 /// One `a=rtpmap:<pt> <encoding>/<clock>[/<channels>]` entry (RFC 4566 §6).
@@ -186,6 +275,9 @@ struct AudioScan {
     ptime_ms: Option<u8>,
     /// Parsed `a=crypto` lines in the audio section, in order (RFC 4568).
     crypto: Vec<CryptoAttribute>,
+    /// The peer's DTLS fingerprint / setup role (`a=fingerprint` / `a=setup`), session- or media-level.
+    fingerprint: Option<Fingerprint>,
+    setup: Option<Setup>,
     /// Peer ICE credentials (`a=ice-ufrag` / `a=ice-pwd`), session- or media-level.
     ice_ufrag: Option<String>,
     ice_pwd: Option<String>,
@@ -299,6 +391,8 @@ fn scan(sdp: &str) -> AudioScan {
         fmtp_mode_sets: Vec::new(),
         ptime_ms: None,
         crypto: Vec::new(),
+        fingerprint: None,
+        setup: None,
         ice_ufrag: None,
         ice_pwd: None,
     };
@@ -348,6 +442,20 @@ fn scan(sdp: &str) -> AudioScan {
                 } else if let Some(pwd) = value.strip_prefix("ice-pwd:") {
                     if in_audio || scan.ice_pwd.is_none() {
                         scan.ice_pwd = Some(pwd.trim().to_string());
+                    }
+                } else if value.starts_with("fingerprint:") {
+                    // RFC 8122 `a=fingerprint` — session- or media-level; media-level wins (like ICE).
+                    if in_audio || scan.fingerprint.is_none() {
+                        if let Some(fingerprint) = Fingerprint::parse(value) {
+                            scan.fingerprint = Some(fingerprint);
+                        }
+                    }
+                } else if value.starts_with("setup:") {
+                    // RFC 4145 `a=setup` — session- or media-level; media-level wins.
+                    if in_audio || scan.setup.is_none() {
+                        if let Some(setup) = Setup::parse(value) {
+                            scan.setup = Some(setup);
+                        }
                     }
                 } else if in_audio {
                     if value == "rtcp-mux" {
@@ -399,12 +507,19 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         remote_rtp,
         remote_rtcp,
         rtcp_mux: scan.rtcp_mux,
-        // A secure profile is any `RTP/SAVP` variant (SDES today; DTLS-SRTP `UDP/TLS/...` later).
+        // A secure profile is any `RTP/SAVP` variant: SDES (`RTP/SAVP[F]`) or DTLS (`UDP/TLS/RTP/SAVP[F]`).
         secure: scan
             .transport
             .as_deref()
             .is_some_and(|transport| transport.contains("SAVP")),
         crypto: scan.crypto.clone(),
+        // DTLS-SRTP: the transport is `UDP/TLS/RTP/SAVP[F]` (RFC 5764), keyed by the handshake, not SDES.
+        dtls: scan
+            .transport
+            .as_deref()
+            .is_some_and(|transport| transport.contains("UDP/TLS")),
+        fingerprint: scan.fingerprint.clone(),
+        setup: scan.setup,
         ice_ufrag: scan.ice_ufrag.clone(),
         ice_pwd: scan.ice_pwd.clone(),
         payload_types: scan.payload_types.clone(),
@@ -1359,6 +1474,94 @@ mod tests {
         let plain = parse(&offer("203.0.113.7", 49170)).expect("parse");
         assert!(!plain.secure);
         assert!(plain.crypto.is_empty());
+    }
+
+    /// A WebRTC-style DTLS-SRTP (`UDP/TLS/RTP/SAVPF`) offer: fingerprint + setup + ICE, no `a=crypto`.
+    fn dtls_offer(addr: &str, port: u16) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {addr}\r\nt=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVPF 0 8\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=setup:actpass\r\n\
+             a=fingerprint:sha-256 \
+             AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89\r\n\
+             a=ice-ufrag:PEERUF\r\na=ice-pwd:peerpassword01234567\r\n"
+        )
+    }
+
+    #[test]
+    fn parse_detects_dtls_srtp_offer() {
+        let info = parse(&dtls_offer("203.0.113.7", 49170)).expect("parse");
+        assert!(info.dtls, "UDP/TLS/RTP/SAVPF is a DTLS-keyed profile");
+        assert!(info.secure, "and still a secure (SAVP) profile");
+        assert!(info.crypto.is_empty(), "DTLS-SRTP carries no SDES a=crypto");
+        assert_eq!(info.setup, Some(Setup::Actpass));
+        let fingerprint = info.fingerprint.expect("fingerprint present");
+        assert_eq!(fingerprint.hash_function, "sha-256");
+        assert_eq!(fingerprint.bytes.len(), 32, "SHA-256 is 32 bytes");
+        assert_eq!(fingerprint.bytes[0], 0xAB);
+    }
+
+    #[test]
+    fn sdes_and_plain_offers_carry_no_dtls_state() {
+        let sdes = parse(&savp_offer("203.0.113.7", 49170)).expect("parse");
+        assert!(!sdes.dtls, "RTP/SAVP is SDES-keyed, not DTLS");
+        assert!(sdes.fingerprint.is_none());
+        assert!(sdes.setup.is_none());
+        let plain = parse(&offer("203.0.113.7", 49170)).expect("parse");
+        assert!(!plain.dtls);
+        assert!(plain.fingerprint.is_none());
+    }
+
+    #[test]
+    fn fingerprint_round_trips_through_parse_and_format() {
+        let value = "fingerprint:sha-256 AB:CD:EF:01:23:45:67:89";
+        let parsed = Fingerprint::parse(value).expect("parse");
+        assert_eq!(parsed.hash_function, "sha-256");
+        assert_eq!(
+            parsed.bytes,
+            vec![0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89]
+        );
+        assert_eq!(parsed.to_attribute_value(), value);
+    }
+
+    #[test]
+    fn fingerprint_normalises_case() {
+        // A peer may send an uppercase algorithm token and lowercase hex; normalise for comparison.
+        let parsed = Fingerprint::parse("fingerprint:SHA-256 ab:cd:ef").expect("parse");
+        assert_eq!(parsed.hash_function, "sha-256");
+        assert_eq!(parsed.bytes, vec![0xAB, 0xCD, 0xEF]);
+        assert_eq!(parsed.to_attribute_value(), "fingerprint:sha-256 AB:CD:EF");
+    }
+
+    #[test]
+    fn fingerprint_rejects_malformed() {
+        assert!(Fingerprint::parse("fingerprint:sha-256 ").is_none(), "no value");
+        assert!(Fingerprint::parse("fingerprint:sha-256 GG:HH").is_none(), "non-hex octet");
+        assert!(Fingerprint::parse("fingerprint:sha-256").is_none(), "no value field");
+        assert!(Fingerprint::parse("crypto:1 whatever").is_none(), "wrong attribute");
+    }
+
+    #[test]
+    fn setup_parses_all_roles_and_rejects_unknown() {
+        assert_eq!(Setup::parse("setup:active"), Some(Setup::Active));
+        assert_eq!(Setup::parse("setup:passive"), Some(Setup::Passive));
+        assert_eq!(Setup::parse("setup:actpass"), Some(Setup::Actpass));
+        assert_eq!(Setup::parse("setup:holdconn"), Some(Setup::Holdconn));
+        assert_eq!(Setup::parse("setup:bogus"), None);
+        assert_eq!(Setup::parse("nonsense"), None);
+        assert_eq!(Setup::Active.token(), "active");
+        assert_eq!(Setup::Actpass.token(), "actpass");
+    }
+
+    #[test]
+    fn dtls_fingerprint_and_setup_may_be_session_level() {
+        // RFC 8122 / RFC 4145 permit session-level a=fingerprint / a=setup; the parser must catch them.
+        let sdp = "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n\
+             a=setup:passive\r\na=fingerprint:sha-1 01:02:03:04\r\n\
+             m=audio 49170 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let info = parse(sdp).expect("parse");
+        assert_eq!(info.setup, Some(Setup::Passive));
+        assert_eq!(info.fingerprint.expect("session fingerprint").hash_function, "sha-1");
     }
 
     #[test]
