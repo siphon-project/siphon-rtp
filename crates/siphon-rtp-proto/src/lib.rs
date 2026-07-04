@@ -157,6 +157,21 @@ pub enum Command {
         #[serde(default = "default_true")]
         enabled: bool,
     },
+    /// Begin recording an established call's media to a `.pcap` at runtime (rtpengine
+    /// `start recording`). Unlike the offer/answer `record_call` flag, this toggles recording on a
+    /// live call: a plain relay is promoted to the userspace media pipeline so its packets can be
+    /// tapped, and each accepted RTP/RTCP datagram is captured verbatim (raw wire bytes, any codec).
+    /// The pcap is written under `recording_dir` (the request's `recording-dir` flag). Rejected on a
+    /// secure (SRTP) or WebSocket-bridged call, whose on-the-wire bytes are not the clear media.
+    StartRecording {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recording_dir: Option<String>,
+    },
+    /// Stop a runtime recording started with [`Command::StartRecording`] (rtpengine `stop recording`):
+    /// finalize the `.pcap` and demote the relay back to the fast path if nothing else holds it.
+    StopRecording { call_id: String, from_tag: String },
     /// Create a media subscription (SIPREC / MPTY). `from_tags` may list multiple legs.
     SubscribeRequest {
         call_id: String,
