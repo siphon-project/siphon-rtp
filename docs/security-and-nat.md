@@ -120,7 +120,10 @@ Classify each datagram by its first byte and route it; **only RTP/RTCP may touch
 | else | unknown | drop, count |
 
 - **Spec:** RFC 7983 (multiplexing demux ranges), updating RFC 5764 §5.1.2.
-- **Enforcement:** datapath receive path, before any latch write.
+- **Enforcement:** one `siphon_rtp_datapath::classify` → `PacketClass` table backs the whole demux —
+  the datapath receive path (STUN answered in-datapath on an ICE endpoint, RTP/RTCP gated to the media
+  latch, everything else dropped on the `Forward` path before any latch write) *and* the userspace
+  split of a secure WebRTC leg's `Redirect` stream into its DTLS-handshake and SRTP-media sub-streams.
 - **Effect on A1:** garbage and STUN sprays can no longer poison the media latch.
 
 ### Layer 2 — Signalled-source gate

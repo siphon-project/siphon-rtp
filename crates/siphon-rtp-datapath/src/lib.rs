@@ -57,6 +57,40 @@ impl AddressFamily {
     }
 }
 
+/// The class of a datagram arriving on a muxed media socket, decided by its first byte alone per the
+/// RFC 7983 §7 demultiplexing table (the scheme RFC 5764 §5.1.2 defines for a DTLS-SRTP + STUN mux on
+/// one 5-tuple). The engine splits the redirected stream of a secure WebRTC leg into its STUN,
+/// DTLS-handshake, and SRTP-media sub-streams with this; the datapath uses the same table for its
+/// in-datapath ICE (STUN) demux and its RFC 7983 layer-1 media gate — one authoritative table, not
+/// three scattered byte-range checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketClass {
+    /// STUN — first byte `0..=3` (RFC 8489; ICE connectivity checks, RFC 8445).
+    Stun,
+    /// DTLS — first byte `20..=63` (the DTLS record layer, RFC 9147 / 6347; DTLS-SRTP keying, RFC 5764).
+    Dtls,
+    /// RTP or RTCP media — first byte `128..=191` (RFC 3550; RTP/RTCP muxed per RFC 5761). On a secure
+    /// leg these are SRTP/SRTCP (RFC 3711).
+    Media,
+    /// Any other first byte — ZRTP, TURN ChannelData (`64..=79`), or garbage. Not demuxed here: the
+    /// datapath drops it on the media path and the secure-leg consumer ignores it.
+    Other,
+}
+
+/// Classify a datagram by its first byte per the RFC 7983 §7 table. An empty datagram is
+/// [`PacketClass::Other`]. This is a pure first-byte test — it does not validate the rest of the
+/// datagram (a STUN magic cookie, a DTLS record length, an RTP version); that is each sub-stream
+/// parser's job. The four ranges are disjoint, so the classification is unambiguous.
+#[must_use]
+pub fn classify(datagram: &[u8]) -> PacketClass {
+    match datagram.first() {
+        Some(0..=3) => PacketClass::Stun,
+        Some(20..=63) => PacketClass::Dtls,
+        Some(128..=191) => PacketClass::Media,
+        _ => PacketClass::Other,
+    }
+}
+
 /// What the backend does with datagrams arriving at an endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowAction {
@@ -419,5 +453,36 @@ mod tests {
         let symmetric = ForwardRule::symmetric(endpoint, None);
         assert_eq!(symmetric.latch, LatchPolicy::Symmetric);
         assert_eq!(symmetric.accepted_source, SourceFilter::Any);
+    }
+
+    #[test]
+    fn classify_matches_the_rfc_7983_boundaries() {
+        // The exact edges of the RFC 7983 §7 table — STUN 0..=3, DTLS 20..=63, media 128..=191, and
+        // the gaps (which include TURN ChannelData 64..=79 and ZRTP) that are not demuxed here.
+        assert_eq!(classify(&[0]), PacketClass::Stun);
+        assert_eq!(classify(&[3]), PacketClass::Stun);
+        assert_eq!(classify(&[4]), PacketClass::Other);
+        assert_eq!(classify(&[19]), PacketClass::Other);
+        assert_eq!(classify(&[20]), PacketClass::Dtls);
+        assert_eq!(classify(&[63]), PacketClass::Dtls);
+        assert_eq!(classify(&[64]), PacketClass::Other);
+        assert_eq!(classify(&[127]), PacketClass::Other);
+        assert_eq!(classify(&[128]), PacketClass::Media);
+        assert_eq!(classify(&[191]), PacketClass::Media);
+        assert_eq!(classify(&[192]), PacketClass::Other);
+        assert_eq!(classify(&[255]), PacketClass::Other);
+    }
+
+    #[test]
+    fn classify_ignores_everything_after_the_first_byte() {
+        // The first byte alone decides; trailing bytes never change the class.
+        assert_eq!(classify(&[20, 0xFF, 0x00, 0x17]), PacketClass::Dtls);
+        assert_eq!(classify(&[128, 0x00]), PacketClass::Media);
+        assert_eq!(classify(&[0x00; 20]), PacketClass::Stun);
+    }
+
+    #[test]
+    fn classify_treats_an_empty_datagram_as_other() {
+        assert_eq!(classify(&[]), PacketClass::Other);
     }
 }
