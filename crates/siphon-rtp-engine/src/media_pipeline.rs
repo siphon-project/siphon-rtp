@@ -31,6 +31,7 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_media::dtmf::{DtmfDetector, DtmfGenerator};
 use siphon_rtp_media::fanout::MediaSink;
+use siphon_rtp_media::pcap::CapturedPacket;
 use siphon_rtp_media::player::PcmPlayer;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_media::wav::WavRecorder;
@@ -763,6 +764,24 @@ pub struct MediaCall {
     /// Companion (non-muxed) RTCP relays, for a secure-transcode leg whose RTCP rides its own port
     /// (RFC 5761). Empty for a muxed call — muxed RTCP is (de)crypted/relayed inside [`Direction::handle`].
     rtcp: Vec<RtcpRelay>,
+    /// An active raw-RTP pcap capture (`MediaControl::StartRecording`). Each accepted ingress datagram
+    /// on either RTP leg is copied byte-for-byte to the sink; the engine owns the drain task that
+    /// frames + streams it to disk. `None` unless recording — the actor's per-packet cost is one
+    /// bounded `try_send` per captured packet, and dropping under backpressure keeps recording from
+    /// ever stalling the media path.
+    capture: Option<PcapCapture>,
+}
+
+/// The sink + per-leg engine-local addresses for an active raw-RTP pcap capture. The local address
+/// is the synthetic destination stamped in the captured frame's 5-tuple (the engine socket the
+/// datagram arrived on), so the pcap dissects as `peer → engine`.
+pub struct PcapCapture {
+    /// The bounded channel the accepted ingress datagrams are streamed to (drained by the engine).
+    pub sender: flume::Sender<CapturedPacket>,
+    /// Engine-local address of leg A's ingress endpoint (capture destination for A's packets).
+    pub a_local: SocketAddr,
+    /// Engine-local address of leg B's ingress endpoint (capture destination for B's packets).
+    pub b_local: SocketAddr,
 }
 
 impl MediaCall {
@@ -798,6 +817,7 @@ impl MediaCall {
             echo: false,
             record_path,
             rtcp: Vec::new(),
+            capture: None,
         }
     }
 
@@ -842,6 +862,7 @@ impl MediaCall {
             echo: false,
             record_path: None,
             rtcp: Vec::new(),
+            capture: None,
         }
     }
 
@@ -873,6 +894,8 @@ impl MediaCall {
                 tracing::debug!(source = %packet.source, "media-pipeline dropped packet from unsignalled source");
                 return;
             }
+            // Raw-RTP pcap capture (accepted A→B ingress, post source-gate, before any transcode).
+            self.capture_ingress(true, packet.source, packet.arrival, &packet.data);
             if self.latch {
                 self.b_to_a.egress_dst = packet.source;
             }
@@ -893,6 +916,8 @@ impl MediaCall {
                 tracing::debug!(source = %packet.source, "media-pipeline dropped packet from unsignalled source");
                 return;
             }
+            // Raw-RTP pcap capture (accepted B→A ingress, post source-gate, before any transcode).
+            self.capture_ingress(false, packet.source, packet.arrival, &packet.data);
             if self.latch {
                 self.a_to_b.egress_dst = packet.source;
             }
@@ -937,6 +962,39 @@ impl MediaCall {
     pub fn set_blocked(&mut self, blocked: bool) {
         self.a_to_b.blocked = blocked;
         self.b_to_a.blocked = blocked;
+    }
+
+    /// Begin a raw-RTP pcap capture (`MediaControl::StartRecording`): every accepted ingress datagram
+    /// on either leg is copied byte-for-byte to the sink. Replacing an existing capture drops the old
+    /// sink, closing its channel so the engine's drain task finalizes that file.
+    pub fn start_recording(&mut self, capture: PcapCapture) {
+        self.capture = Some(capture);
+    }
+
+    /// Stop a raw-RTP pcap capture (`MediaControl::StopRecording`): drop the sink so the engine's
+    /// drain task sees the channel close and finalizes the file. A no-op if not recording.
+    pub fn stop_recording(&mut self) {
+        self.capture = None;
+    }
+
+    /// Whether a raw-RTP pcap capture is active (test/observability helper).
+    #[must_use]
+    pub fn is_recording(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Copy one accepted ingress datagram to the pcap sink, if recording. `leg_a` selects the capture
+    /// destination (leg A's or leg B's engine-local address). Bounded, drop-on-full: a recording is
+    /// best-effort and must never backpressure the media path.
+    fn capture_ingress(&self, leg_a: bool, source: SocketAddr, arrival: u64, data: &[u8]) {
+        let Some(capture) = &self.capture else {
+            return;
+        };
+        let destination = if leg_a { capture.a_local } else { capture.b_local };
+        let packet = CapturedPacket::new(source, destination, Bytes::copy_from_slice(data), arrival);
+        if capture.sender.try_send(packet).is_err() {
+            tracing::debug!("pcap capture dropped a packet (sink full or closed)");
+        }
     }
 
     /// The egress direction that plays toward party A (`toward_a = true`) or party B.
@@ -1141,6 +1199,12 @@ pub enum MediaControl {
         source_a: bool,
         subscriber_endpoint: EndpointId,
     },
+    /// Begin a raw-RTP pcap capture (`start recording`): every accepted ingress datagram on either
+    /// leg is copied to `capture.sender`. The engine owns the drain task that frames + streams it to
+    /// disk (so the actor never blocks on I/O).
+    StartRecording { capture: PcapCapture },
+    /// Stop the raw-RTP pcap capture (`stop recording`): drop the sink so the drain task finalizes.
+    StopRecording,
     /// Tear the call down: flush recordings and exit the actor loop.
     Stop,
 }
@@ -1344,6 +1408,10 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::RemoveRawTee { source_a, subscriber_endpoint }) => {
                         call.remove_raw_tee(source_a, subscriber_endpoint);
                     }
+                    MediaInput::Control(MediaControl::StartRecording { capture }) => {
+                        call.start_recording(capture);
+                    }
+                    MediaInput::Control(MediaControl::StopRecording) => call.stop_recording(),
                     MediaInput::Control(MediaControl::Stop) => break,
                 }
             }
@@ -2444,6 +2512,82 @@ mod tests {
         assert_eq!(out[0].endpoint, endpoint(2), "forwarded out B's socket");
         assert_eq!(out[0].dst, addr(B_ADDR));
         assert_eq!(&out[0].data[..], &original[..], "forwarded byte-for-byte");
+    }
+
+    /// Build a redirected datagram with an explicit arrival time (the capture timestamp).
+    fn rx_at(endpoint_id: u64, source: &str, arrival: u64, data: Vec<u8>) -> RxPacket {
+        RxPacket {
+            endpoint: endpoint(endpoint_id),
+            source: addr(source),
+            arrival,
+            data: Bytes::from(data),
+        }
+    }
+
+    #[test]
+    fn recording_captures_accepted_ingress_on_both_legs_with_the_5_tuple() {
+        let mut call = relay_call();
+        let (sender, sink) = flume::bounded(16);
+        call.start_recording(PcapCapture {
+            sender,
+            a_local: addr("127.0.0.1:10000"),
+            b_local: addr("127.0.0.1:10002"),
+        });
+        assert!(call.is_recording());
+
+        // A→B accepted packet: captured with A's observed source, leg A's engine-local destination,
+        // the verbatim RTP bytes, and the arrival timestamp.
+        let a_packet = ulaw_rtp(1, 0x40);
+        call.process(
+            &rx_at(1, A_ADDR, 123, a_packet.clone()),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let captured = sink.try_recv().expect("A→B datagram captured");
+        assert_eq!(captured.source, addr(A_ADDR), "captured source = A's observed addr");
+        assert_eq!(
+            captured.destination,
+            addr("127.0.0.1:10000"),
+            "captured destination = leg A's engine-local addr"
+        );
+        assert_eq!(&captured.payload[..], &a_packet[..], "RTP captured byte-for-byte");
+        assert_eq!(captured.timestamp_micros, 123, "arrival timestamp propagated");
+
+        // B→A accepted packet is captured with leg B's local address.
+        let b_packet = alaw_rtp(1, 0x55);
+        call.process(
+            &rx_at(2, B_ADDR, 456, b_packet.clone()),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let captured = sink.try_recv().expect("B→A datagram captured");
+        assert_eq!(
+            captured.destination,
+            addr("127.0.0.1:10002"),
+            "captured destination = leg B's engine-local addr"
+        );
+        assert_eq!(captured.timestamp_micros, 456);
+
+        // An off-source packet is gated out *before* capture — the recording never sees it.
+        call.process(
+            &rx_at(1, "127.0.0.99:5000", 789, ulaw_rtp(2, 0xFF)),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            sink.try_recv().is_err(),
+            "off-source packet is gated before capture"
+        );
+
+        // After stop_recording, nothing more is captured.
+        call.stop_recording();
+        assert!(!call.is_recording());
+        call.process(
+            &rx_at(1, A_ADDR, 1000, ulaw_rtp(3, 0x41)),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(sink.try_recv().is_err(), "no capture after stop_recording");
     }
 
     #[test]

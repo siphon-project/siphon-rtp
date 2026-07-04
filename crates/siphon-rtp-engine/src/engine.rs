@@ -15,6 +15,7 @@
 //! work; for plain relay the datapath's per-endpoint receive tasks are the data-plane workers.
 
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use siphon_rtp_codec::factory::{self, CodecSpec};
@@ -24,6 +25,7 @@ use siphon_rtp_datapath::{
 };
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::{protocol_type, Capture};
+use siphon_rtp_media::pcap::{self, CapturedPacket};
 use siphon_rtp_media::player::{PcmPlayer, WavSource};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
@@ -38,7 +40,8 @@ use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
 use crate::ice::{self, IceCredentials};
 use crate::media_pipeline::{
-    DirectionConfig, MediaCall, MediaControl, MediaRegistry, RawTee, RelayConfig, RtcpRelay,
+    DirectionConfig, MediaCall, MediaControl, MediaRegistry, PcapCapture, RawTee, RelayConfig,
+    RtcpRelay,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, SecurityAdvertisement};
@@ -110,6 +113,22 @@ struct Call {
     /// For a passthrough relay, the forward actions installed at answer — kept so `block`/`unblock`
     /// can flip the endpoints to `Drop` and restore them. Empty for media/SRTP calls.
     relay_flows: Vec<(EndpointId, FlowAction)>,
+    /// Runtime features that hold a *promoted* passthrough relay in the userspace media pipeline —
+    /// recording and DTMF-block (SIPREC subscriptions are the fourth reason, tracked by their own
+    /// `subscriptions` map). A plain relay is promoted off the in-kernel `Forward` fast path on the
+    /// first reason and demoted back only when the last one clears. Always empty for a call set up as
+    /// a transcoding/secure Media call — demotion is additionally gated on `is_relay_call`, so a
+    /// genuine media call is never demoted even if a reason is recorded here.
+    promotion_reasons: HashSet<PromotionReason>,
+}
+
+/// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off
+/// the in-kernel `Forward` fast path so a per-packet feature can attach). SIPREC subscriptions hold a
+/// relay up too, but are tracked by the `subscriptions` map; these are the reasons with no other home.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum PromotionReason {
+    /// A raw-RTP pcap recording is active (`start recording`).
+    Recording,
 }
 
 impl Call {
@@ -674,6 +693,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 enabled,
                 ..
             } => self.set_echo(client, &call_id, &from_tag, enabled),
+            Command::StartRecording {
+                call_id,
+                recording_dir,
+                ..
+            } => self.start_recording(client, &call_id, recording_dir).await,
+            Command::StopRecording { call_id, .. } => {
+                self.stop_recording(client, &call_id).await
+            }
             Command::ConferenceJoin {
                 conference_id,
                 from_tag,
@@ -918,6 +945,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event: info.telephone_event_payload_type(),
                 pipeline,
                 relay_flows: Vec::new(),
+                promotion_reasons: HashSet::new(),
             },
         );
 
@@ -1946,6 +1974,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event: snapshot.near_telephone_event,
                 pipeline,
                 relay_flows,
+                promotion_reasons: HashSet::new(),
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
@@ -2443,6 +2472,85 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Begin a runtime raw-RTP pcap recording of an established call ([`Command::StartRecording`] /
+    /// rtpengine `start recording`). A plain passthrough relay is promoted to the userspace media
+    /// pipeline (so its packets can be tapped) and each accepted RTP/RTCP datagram is captured
+    /// byte-for-byte — the source leg's negotiated codec, no decode — into `{recording_dir}/{call}.pcap`
+    /// wrapped in synthetic Ethernet/IP/UDP so it dissects as RTP. Rejected on a secure (SRTP) or
+    /// WebSocket-bridged call, whose on-the-wire bytes are ciphertext / off to a WS server rather than
+    /// the clear media (mirrors `subscribe_request`; SRTP decrypt-then-record is a follow-up).
+    async fn start_recording(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        recording_dir: Option<String>,
+    ) -> CmdResult {
+        // Snapshot the pipeline + each leg's engine-local RTP address under the ownership guard (A3).
+        let Some((pipeline, a_local, b_local)) = self.owned_call(client, call_id, |call| {
+            (call.pipeline, call.near.rtp.local_addr, call.far.rtp.local_addr)
+        }) else {
+            return unknown_call(call_id);
+        };
+        if matches!(
+            pipeline,
+            PipelineKind::Srtp | PipelineKind::SrtpMedia | PipelineKind::Ws
+        ) {
+            return error_result(
+                "start_recording",
+                &"recording a secure (SRTP) or WebSocket-bridged call is not supported yet",
+            );
+        }
+        let Some(directory) = recording_dir else {
+            return error_result("start_recording", &"no recording directory (set recording-dir)");
+        };
+        // Open the pcap up front so a bad path fails cleanly before we promote or spawn anything.
+        let path = format!("{directory}/{call_id}.pcap");
+        let file = match tokio::fs::File::create(&path).await {
+            Ok(file) => file,
+            Err(error) => return error_result("start_recording: open pcap", &error),
+        };
+        // Promote a plain relay to userspace (idempotent) and hold it for the duration of recording.
+        if let Err(reason) = self
+            .hold_in_userspace(call_id, PromotionReason::Recording)
+            .await
+        {
+            return error_result("start_recording: promote relay", &reason);
+        }
+        // Hand the actor the capture sink; the engine owns the drain task that frames + streams to disk.
+        let (sender, receiver) = flume::bounded::<CapturedPacket>(PCAP_CAPTURE_QUEUE);
+        let capture = PcapCapture {
+            sender,
+            a_local,
+            b_local,
+        };
+        if !self
+            .media
+            .control(call_id, MediaControl::StartRecording { capture })
+        {
+            // The actor vanished between promote and control — release the hold and report.
+            self.release_userspace_hold(call_id, PromotionReason::Recording)
+                .await;
+            return error_result("start_recording", &"media actor unavailable");
+        }
+        tokio::spawn(run_pcap_recorder(file, receiver, path));
+        ok_empty()
+    }
+
+    /// Stop a runtime recording started with [`Self::start_recording`] ([`Command::StopRecording`] /
+    /// rtpengine `stop recording`): tell the actor to drop its capture sink (the drain task then
+    /// finalizes the `.pcap`) and release the recording hold, demoting the relay back to the in-kernel
+    /// `Forward` fast path if no other hold (a SIPREC subscription) remains.
+    async fn stop_recording(&self, client: ClientId, call_id: &str) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        // No-op in the actor if not recording; ignored if the call has no actor (never promoted).
+        self.media.control(call_id, MediaControl::StopRecording);
+        self.release_userspace_hold(call_id, PromotionReason::Recording)
+            .await;
+        ok_empty()
+    }
+
     /// SIPREC / monitor `subscribe_request` (RFC 7866): the engine **offers** one or more source
     /// legs' media to a send-only subscriber (a Session Recording Server, SRS). It resolves the source
     /// legs from `from_tags` (an MPTY subscription taps every named leg), allocates one subscriber
@@ -2663,6 +2771,60 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Ensure `call_id` runs in the userspace media pipeline so a per-packet feature (pcap recording,
+    /// DTMF block) can attach to it: promote a plain passthrough relay off the in-kernel `Forward`
+    /// fast path if it is not already promoted, and record `reason` so the relay is not demoted while
+    /// the feature is active. A call set up as a transcoding/secure Media call already has an actor —
+    /// no promotion happens, but the reason is still recorded (harmlessly; demotion is gated on
+    /// `is_relay_call`, so a genuine media call is never demoted). Ownership must already be validated.
+    async fn hold_in_userspace(&self, call_id: &str, reason: PromotionReason) -> Result<(), String> {
+        let pipeline = self
+            .owned_call_internal(call_id, |call| call.pipeline)
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        // Mirror `subscribe_request`'s guard: promote only a plain relay not already in the pipeline.
+        // After promotion the call's pipeline is `Media`, so a second hold skips this and just records.
+        if pipeline == PipelineKind::Passthrough && !self.media.is_media_call(call_id) {
+            self.promote_passthrough(call_id).await?;
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.promotion_reasons.insert(reason);
+        }
+        Ok(())
+    }
+
+    /// Release a userspace hold taken by [`Self::hold_in_userspace`] and demote the relay back to the
+    /// `Forward` fast path if nothing else holds it up. Safe on a genuine Media call: demotion is
+    /// gated on `is_relay_call`, so only a promoted passthrough relay is ever demoted.
+    async fn release_userspace_hold(&self, call_id: &str, reason: PromotionReason) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.promotion_reasons.remove(&reason);
+        }
+        self.demote_if_idle(call_id).await;
+    }
+
+    /// Whether a promoted passthrough relay must stay in the userspace media pipeline — it has at
+    /// least one active hold: a SIPREC subscription, a recording, or a DTMF block.
+    fn call_has_userspace_hold(&self, call_id: &str) -> bool {
+        let has_subscription = self
+            .subscriptions
+            .get(call_id)
+            .is_some_and(|list| !list.is_empty());
+        let has_reason = self
+            .calls
+            .get(call_id)
+            .is_some_and(|call| !call.promotion_reasons.is_empty());
+        has_subscription || has_reason
+    }
+
+    /// Demote a promoted passthrough relay back to the in-kernel `Forward` fast path once no reason
+    /// (subscription, recording, DTMF block) holds it in userspace any more. A genuine
+    /// transcoding/secure call (`!is_relay_call`) is never demoted.
+    async fn demote_if_idle(&self, call_id: &str) {
+        if !self.call_has_userspace_hold(call_id) && self.media.is_relay_call(call_id) {
+            self.demote_to_passthrough(call_id).await;
+        }
+    }
+
     /// Run `f` against a call by id without an ownership check (an internal helper for promotion /
     /// demotion, which already validated ownership via the public verb). Returns `None` if unknown.
     fn owned_call_internal<T>(&self, call_id: &str, f: impl FnOnce(&Call) -> T) -> Option<T> {
@@ -2763,8 +2925,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
-        // Remove the named subscription from the call's list, noting whether the list is now empty.
-        let (removed, none_remain) = {
+        // Remove the named subscription from the call's list.
+        let removed = {
             let Some(mut subscriptions) = self.subscriptions.get_mut(call_id) else {
                 return error_result("unsubscribe", &"no subscription for this call");
             };
@@ -2774,18 +2936,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             else {
                 return error_result("unsubscribe", &format!("unknown subscription {to_tag}"));
             };
-            let removed = subscriptions.remove(position);
-            (removed, subscriptions.is_empty())
+            subscriptions.remove(position)
         };
         self.subscriptions
             .remove_if(call_id, |_, list| list.is_empty());
         self.detach_subscription(call_id, removed).await;
-        // Once no subscription remains on a relay we promoted for SIPREC, demote it back to the
-        // in-kernel Forward fast path (the relay leg keeps flowing throughout). `is_relay_call` keeps
-        // this scoped to promoted passthrough relays — a genuine transcoding call is never demoted.
-        if none_remain && self.media.is_relay_call(call_id) {
-            self.demote_to_passthrough(call_id).await;
-        }
+        // Once no subscription (or other hold — recording, DTMF block) remains on a relay we promoted,
+        // demote it back to the in-kernel Forward fast path (the relay leg keeps flowing throughout).
+        self.demote_if_idle(call_id).await;
         ok_empty()
     }
 
@@ -3185,6 +3343,38 @@ fn subscriber_offer_sdp(local_addr: std::net::SocketAddr, codec: &CodecSpec) -> 
     sdp
 }
 
+/// Bounded depth of a recording's capture channel. At telephony rates (~50 packets/s per leg) this
+/// buffers several seconds per leg before the actor drops packets under a stalled disk — a recording
+/// is best-effort and must never backpressure the media path.
+const PCAP_CAPTURE_QUEUE: usize = 1024;
+
+/// Drain task for a runtime pcap recording: write the libpcap global header, then one framed record
+/// per captured datagram, streaming to disk with async I/O (so the actor never blocks). Exits when
+/// the actor drops its capture sink (`stop recording` / teardown closes the channel), then flushes
+/// and closes the file.
+async fn run_pcap_recorder(
+    mut file: tokio::fs::File,
+    receiver: flume::Receiver<CapturedPacket>,
+    path: String,
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Err(error) = file.write_all(&pcap::global_header()).await {
+        tracing::warn!(%error, path, "pcap recorder: failed to write header");
+        return;
+    }
+    while let Ok(packet) = receiver.recv_async().await {
+        if let Err(error) = file.write_all(&pcap::frame(&packet)).await {
+            tracing::warn!(%error, path, "pcap recorder: write failed, stopping");
+            break;
+        }
+    }
+    if let Err(error) = file.flush().await {
+        tracing::warn!(%error, path, "pcap recorder: final flush failed");
+    } else {
+        tracing::info!(path, "pcap recording finalized");
+    }
+}
+
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Offer { .. } => "offer",
@@ -3208,6 +3398,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Echo { .. } => "echo",
         Command::BlockMedia { .. } => "block_media",
         Command::UnblockMedia { .. } => "unblock_media",
+        Command::StartRecording { .. } => "start_recording",
+        Command::StopRecording { .. } => "stop_recording",
         Command::SubscribeRequest { .. } => "subscribe_request",
         Command::SubscribeAnswer { .. } => "subscribe_answer",
         Command::Unsubscribe { .. } => "unsubscribe",
@@ -6416,6 +6608,227 @@ mod tests {
             engine.media().is_relay_call("fork-relay"),
             "the relay was promoted to userspace"
         );
+    }
+
+    /// Parse a libpcap byte stream into `(source, destination, udp_payload)` per record, unwrapping the
+    /// synthetic Ethernet(14) + IPv4(20) + UDP(8) framing. Test-only, IPv4-only.
+    fn pcap_records(bytes: &[u8]) -> Vec<(SocketAddr, SocketAddr, Vec<u8>)> {
+        use std::net::Ipv4Addr;
+        let mut records = Vec::new();
+        let mut offset = 24; // skip the global header
+        while offset + 16 <= bytes.len() {
+            let incl_len =
+                u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            offset += 16;
+            if offset + incl_len > bytes.len() || incl_len < 42 {
+                break;
+            }
+            let frame = &bytes[offset..offset + incl_len];
+            offset += incl_len;
+            let ip = &frame[14..];
+            let source_ip = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+            let dest_ip = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
+            let udp = &ip[20..];
+            let source_port = u16::from_be_bytes([udp[0], udp[1]]);
+            let dest_port = u16::from_be_bytes([udp[2], udp[3]]);
+            records.push((
+                SocketAddr::new(source_ip.into(), source_port),
+                SocketAddr::new(dest_ip.into(), dest_port),
+                udp[8..].to_vec(),
+            ));
+        }
+        records
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_recording_promotes_a_relay_and_captures_both_legs_to_pcap() {
+        // End-to-end: a plain PCMU relay is `start recording`'d → promoted to userspace → each leg's
+        // RTP is captured verbatim into a `.pcap` (synthetic IP/UDP framing) → `stop recording` demotes
+        // it back to the fast path. (docs/security-and-nat.md: the promoted relay re-enforces the gate.)
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        // Route redirected datagrams to the media actor (a promoted relay uses `Redirect`).
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "rec-e2e".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_rtp = sdp::parse(&ok_sdp_text(&offer)).expect("far").remote_rtp;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "rec-e2e".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_rtp = sdp::parse(&ok_sdp_text(&answer)).expect("near").remote_rtp;
+        assert!(
+            !engine.media().is_media_call("rec-e2e"),
+            "starts as a plain relay"
+        );
+
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "rec-e2e".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+        assert!(matches!(started, CmdResult::Ok { .. }), "recording started");
+        assert!(
+            engine.media().is_relay_call("rec-e2e"),
+            "the relay was promoted to userspace for recording"
+        );
+
+        // Feed one datagram each way; the promoted relay still forwards, so a receipt on the peer
+        // confirms the actor processed (and therefore captured) the packet.
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), near_rtp)
+            .await
+            .expect("a send");
+        let (data, _) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A), "A→B still relayed while recording");
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), far_rtp)
+            .await
+            .expect("b send");
+        let (data, _) = recv(&phone_a).await;
+        assert_eq!(data, rtp(0x0B0B_0B0B), "B→A still relayed while recording");
+
+        // Poll the pcap until the drain task has framed both captured datagrams.
+        let path = dir.path().join("rec-e2e.pcap");
+        let mut bytes = Vec::new();
+        for _ in 0..200 {
+            if let Ok(read) = std::fs::read(&path) {
+                if pcap_records(&read).len() >= 2 {
+                    bytes = read;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(&bytes[0..4], &[0xd4, 0xc3, 0xb2, 0xa1], "libpcap magic");
+        let records = pcap_records(&bytes);
+        assert_eq!(records.len(), 2, "both captured datagrams framed to the pcap");
+
+        // A's datagram: source = A's phone, destination = the engine's near RTP socket, payload verbatim.
+        let a_record = records
+            .iter()
+            .find(|(source, ..)| *source == addr_a)
+            .expect("A's captured datagram");
+        assert_eq!(a_record.1, near_rtp, "captured destination = engine near RTP");
+        assert_eq!(a_record.2, rtp(0x0A0A_0A0A), "A's RTP captured byte-for-byte");
+        let b_record = records
+            .iter()
+            .find(|(source, ..)| *source == addr_b)
+            .expect("B's captured datagram");
+        assert_eq!(b_record.1, far_rtp, "captured destination = engine far RTP");
+        assert_eq!(b_record.2, rtp(0x0B0B_0B0B), "B's RTP captured byte-for-byte");
+
+        // Stop recording: the relay is demoted back to the in-kernel Forward fast path.
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopRecording {
+                    call_id: "rec-e2e".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(matches!(stopped, CmdResult::Ok { .. }), "recording stopped");
+        assert!(
+            !engine.media().is_relay_call("rec-e2e") && !engine.media().is_media_call("rec-e2e"),
+            "the relay was demoted back to the fast path once recording stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_recording_rejects_a_secure_call_and_unknown_call() {
+        // A secure (SRTP-bridge) call's on-the-wire bytes are ciphertext, so a raw pcap of them is
+        // useless — `start recording` must reject it (mirrors `subscribe_request`). An unknown call errors.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "savp-rec".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        transport_protocol: Some("RTP/SAVP".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "savp-rec".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: savp_answer_sdp(addr_b, &b_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let secure = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "savp-rec".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some("/tmp".into()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(secure, CmdResult::Error { .. }),
+            "recording a secure call is rejected"
+        );
+
+        let unknown = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "nope".into(),
+                    from_tag: "f".into(),
+                    recording_dir: Some("/tmp".into()),
+                },
+            )
+            .await;
+        assert!(matches!(unknown, CmdResult::Error { .. }), "unknown call ⇒ error");
     }
 
     #[tokio::test]

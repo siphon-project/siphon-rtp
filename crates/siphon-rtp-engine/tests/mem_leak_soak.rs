@@ -156,6 +156,103 @@ async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usiz
     }
 }
 
+/// Churn one relay through `offer → answer → start recording → stop recording → delete`. Each cycle
+/// promotes the passthrough relay to a userspace media actor (spawning the pcap drain task), then
+/// demotes it back on stop and tears the whole call down on delete — so the promotion reason set, the
+/// capture channel, and the drain task must all drain to nothing.
+async fn record_start_stop(engine: &Engine<UdpLoopbackDatapath>, dir: &str, index: usize) {
+    let call_id = format!("soak-rec-{index}");
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for("198.51.100.1", 40_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&offer, "offer");
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for("203.0.113.1", 41_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&answer, "answer");
+    let start = engine
+        .handle(
+            CLIENT,
+            Command::StartRecording {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                recording_dir: Some(dir.to_string()),
+            },
+        )
+        .await;
+    assert_ok(&start, "start recording");
+    let stop = engine
+        .handle(
+            CLIENT,
+            Command::StopRecording {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+            },
+        )
+        .await;
+    assert_ok(&stop, "stop recording");
+    let delete = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id,
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert_ok(&delete, "delete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_start_stop_does_not_leak() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_string_lossy().into_owned();
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let _prime = allocated_bytes();
+
+    // Warm up: promote/demote paths, the drain task's blocking-pool threads, and jemalloc all settle.
+    for index in 0..100 {
+        record_start_stop(&engine, &path, index).await;
+    }
+    quiesce().await;
+    assert_eq!(engine.session_count(), 0, "registry empty after warmup");
+    let before = allocated_bytes();
+
+    // Each cycle promotes a relay (spawning a drain task) and demotes + deletes it. Across 500 cycles
+    // live bytes must not climb — no stranded promoted actor, capture channel, or drain task.
+    for index in 100..600 {
+        record_start_stop(&engine, &path, index).await;
+    }
+    quiesce().await;
+    let after = allocated_bytes();
+
+    assert_eq!(engine.session_count(), 0, "registry drained after soak");
+    let tolerance = 512 * 1024;
+    assert!(
+        after <= before + tolerance,
+        "recording leaked {} bytes over 500 churned record cycles (before={before}, after={after})",
+        after.saturating_sub(before)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conference_join_leave_does_not_leak() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
