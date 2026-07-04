@@ -109,6 +109,18 @@ pub fn parse_command(request: &Value) -> Result<Command, NgError> {
             call_id: required_str(request, "call-id")?,
             from_tag: required_str(request, "from-tag")?,
         }),
+        // Per-leg RFC 4733 telephone-event (DTMF) relay gate (rtpengine `block DTMF`). `from-tag` names
+        // the blocked source leg; `to-tag` (optional) disambiguates which dialog side is meant.
+        "block DTMF" => Ok(Command::BlockDtmf {
+            call_id: required_str(request, "call-id")?,
+            from_tag: required_str(request, "from-tag")?,
+            to_tag: optional_str(request, "to-tag"),
+        }),
+        "unblock DTMF" => Ok(Command::UnblockDtmf {
+            call_id: required_str(request, "call-id")?,
+            from_tag: required_str(request, "from-tag")?,
+            to_tag: optional_str(request, "to-tag"),
+        }),
         // Runtime recording toggle (rtpengine parity). Only `call-id` is required — from-tag is
         // optional, matching rtpengine (Kamailio's `rtpengine_start_recording()` sends call-id only).
         // The `recording-dir` flag names the output directory for the `.pcap`.
@@ -517,6 +529,50 @@ mod tests {
             Command::StopRecording {
                 call_id: "call-rec".into(),
                 from_tag: "ft".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_block_dtmf_with_optional_to_tag() {
+        let bytes = datagram(
+            "dtmf01",
+            &[
+                ("command", Value::string("block DTMF")),
+                ("call-id", Value::string("call-d")),
+                ("from-tag", Value::string("ft")),
+                ("to-tag", Value::string("tt")),
+            ],
+        );
+        let (_, command) = parse_datagram(&bytes);
+        assert_eq!(
+            command,
+            Command::BlockDtmf {
+                call_id: "call-d".into(),
+                from_tag: "ft".into(),
+                to_tag: Some("tt".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_unblock_dtmf_without_to_tag() {
+        // `to-tag` is optional on unblock DTMF (matches block media / delete).
+        let bytes = datagram(
+            "dtmf02",
+            &[
+                ("command", Value::string("unblock DTMF")),
+                ("call-id", Value::string("call-d")),
+                ("from-tag", Value::string("ft")),
+            ],
+        );
+        let (_, command) = parse_datagram(&bytes);
+        assert_eq!(
+            command,
+            Command::UnblockDtmf {
+                call_id: "call-d".into(),
+                from_tag: "ft".into(),
+                to_tag: None,
             }
         );
     }

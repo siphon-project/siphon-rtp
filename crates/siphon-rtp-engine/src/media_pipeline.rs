@@ -124,6 +124,11 @@ pub struct Direction {
     silenced: bool,
     /// Drop egress audio entirely (not even silence).
     blocked: bool,
+    /// Suppress relaying this leg's RFC 4733 telephone-event (DTMF) packets to the peer while still
+    /// detecting them (`block DTMF`). When set, an ingress telephone-event still fires the control
+    /// plane's `Event::Dtmf` (observability) but is not repacketized toward the peer — the digit is
+    /// seen by the controller but not heard by the far side. Independent of `blocked` (audio drop).
+    dtmf_blocked: bool,
     /// Egress codec native sample rate, for resampling injected prompt audio onto this stream.
     egress_sample_rate: u32,
     /// An active prompt / DTMF injection on this egress direction (PlayMedia / PlayDtmf). While set,
@@ -195,6 +200,10 @@ pub struct RelayConfig {
     pub accepted_source: SourceFilter,
     pub egress_endpoint: EndpointId,
     pub egress_dst: SocketAddr,
+    /// This leg's negotiated RFC 4733 telephone-event payload type, if known. Carried so `block DTMF`
+    /// can drop the verbatim relay of that PT even on a plain (untranscoded) relay. `None` when the
+    /// leg negotiated no telephone-event or its PT could not be resolved — DTMF cannot be gated then.
+    pub telephone_event: Option<u8>,
 }
 
 /// A companion **RTCP** relay for a *non-muxed* secure-transcode (`SrtpMedia`) leg. RTCP is never
@@ -335,6 +344,7 @@ impl Direction {
             forks: Vec::new(),
             silenced: false,
             blocked: false,
+            dtmf_blocked: false,
             egress_sample_rate: egress_rate,
             injection: None,
             secure_ingress: None,
@@ -363,13 +373,17 @@ impl Direction {
             egress_payload_type: 0,
             egress_frame_samples: 0,
             egress_timestamp_increment: 0,
-            telephone_event_in: None,
+            // Carry the leg's telephone-event PT so `block DTMF` can drop the verbatim relay of it even
+            // though this direction never transcodes. `telephone_event_out` stays `None` — a relay-only
+            // leg never repacketizes; it drops or forwards the packet whole.
+            telephone_event_in: config.telephone_event,
             telephone_event_out: None,
             dtmf: DtmfDetector::new(),
             recorder: None,
             forks: Vec::new(),
             silenced: false,
             blocked: false,
+            dtmf_blocked: false,
             egress_sample_rate: 0,
             injection: None,
             secure_ingress: None,
@@ -530,6 +544,32 @@ impl Direction {
         // `blocked`, so the SRS still records a held leg — RFC 7866 §6.) `blocked` suppresses the
         // peer-bound forward so block/unblock still works after promotion.
         if self.relay_only {
+            // `block DTMF` on a plain relay: drop the verbatim forward of this leg's RFC 4733
+            // telephone-event PT (still detect + emit the event for the controller), but keep RTCP
+            // and ordinary RTP flowing. Only the RTP demux applies (RTCP PT 64..=95 is not DTMF).
+            if self.dtmf_blocked {
+                let packet_type = data[1] & 0x7f; // RTP payload type = low 7 bits of byte 1
+                let is_rtcp = (64..=95).contains(&packet_type);
+                if !is_rtcp && Some(packet_type) == self.telephone_event_in {
+                    // Detect + emit the event so the controller still sees the digit (observability),
+                    // then drop the packet — the peer never hears the tone. A malformed telephone-event
+                    // still drops (never forward a blocked DTMF PT).
+                    if let Ok(parsed) = RtpPacket::parse(data) {
+                        if let Ok(Some(event)) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
+                            events.push(Event::Dtmf {
+                                call_id: dtmf_meta.call_id.to_string(),
+                                from_tag: dtmf_meta.from_tag.to_string(),
+                                to_tag: dtmf_meta.to_tag.map(str::to_string),
+                                digit: event.digit.to_string(),
+                                duration_ms: u32::from(event.duration) / 8,
+                                volume: -i32::from(event.volume),
+                                source: None,
+                            });
+                        }
+                    }
+                    return;
+                }
+            }
             if !self.blocked {
                 out.push(Outbound {
                     endpoint: self.egress_endpoint,
@@ -566,7 +606,11 @@ impl Direction {
                     source: None,
                 });
             }
-            self.relay_telephone_event(&parsed, out);
+            // `block DTMF`: still detect + emit the event above (the controller sees the digit), but
+            // do not relay it to the peer — the far side never hears the tone. v1 = drop mode.
+            if !self.dtmf_blocked {
+                self.relay_telephone_event(&parsed, out);
+            }
             return;
         }
 
@@ -964,6 +1008,14 @@ impl MediaCall {
         self.b_to_a.blocked = blocked;
     }
 
+    /// Block (`blocked = true`) or resume (`false`) relaying one leg's RFC 4733 telephone-events
+    /// (`Command::BlockDtmf`). `source_a` selects the blocked source leg: `true` ⇒ leg A. It is set on
+    /// the leg's **ingress** direction (leg A's telephone-events arrive on `a_to_b`), so A's DTMF is
+    /// dropped toward B while B's is unaffected. Detection still fires — the controller sees the digit.
+    pub fn set_dtmf_blocked(&mut self, source_a: bool, blocked: bool) {
+        self.ingress_direction(source_a).dtmf_blocked = blocked;
+    }
+
     /// Begin a raw-RTP pcap capture (`MediaControl::StartRecording`): every accepted ingress datagram
     /// on either leg is copied byte-for-byte to the sink. Replacing an existing capture drops the old
     /// sink, closing its channel so the engine's drain task finalizes that file.
@@ -1166,6 +1218,10 @@ pub enum MediaControl {
     Block(bool),
     /// Echo each party's ingress audio back to itself (`true`) or resume normal forwarding (`false`).
     Echo(bool),
+    /// Block (`blocked = true`) or resume (`false`) relaying one leg's RFC 4733 telephone-events
+    /// (`block DTMF`). `source_a` selects the blocked source leg (`true` ⇒ leg A). Detection still
+    /// fires while blocked, so the controller sees the digit — only the peer-bound relay is dropped.
+    BlockDtmf { source_a: bool, blocked: bool },
     /// Play a prompt toward a party (`toward_a`): the player owns its source-rate PCM.
     PlayAudio {
         toward_a: bool,
@@ -1389,6 +1445,9 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::Silence(on)) => call.set_silenced(on),
                     MediaInput::Control(MediaControl::Block(on)) => call.set_blocked(on),
                     MediaInput::Control(MediaControl::Echo(on)) => call.set_echo(on),
+                    MediaInput::Control(MediaControl::BlockDtmf { source_a, blocked }) => {
+                        call.set_dtmf_blocked(source_a, blocked);
+                    }
                     MediaInput::Control(MediaControl::PlayAudio { toward_a, player }) => {
                         call.start_play_audio(toward_a, *player);
                     }
@@ -2363,6 +2422,103 @@ mod tests {
         );
     }
 
+    /// A single RFC 4733 telephone-event RTP packet on PT 101 (digit 5, end bit set) — the fixture
+    /// the DTMF tests share. `marker` starts the event, `end` sets the RFC 4733 end bit. `timestamp`
+    /// keys the detector's event boundary — each distinct value is a fresh event (RFC 4733 §2.5.1.2).
+    fn telephone_event_rtp(sequence: u16, timestamp: u32, marker: bool, end: bool) -> Vec<u8> {
+        // event=5, E-bit per `end`, volume 10, duration 0x0320. RFC 4733 §2.3 payload layout.
+        let event_payload = [5u8, ((end as u8) << 7) | 10, 0x03, 0x20];
+        let header = RtpHeader {
+            marker,
+            payload_type: 101,
+            sequence,
+            timestamp,
+            ssrc: 0x1111_2222,
+        };
+        let mut buffer = vec![0u8; 16];
+        let len = write_packet(&header, &event_payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    #[test]
+    fn block_dtmf_drops_telephone_event_relay_but_still_emits_the_event() {
+        // On a transcoding call, a telephone-event from A with dtmf_blocked is NOT relayed to B
+        // (no egress telephone-event), but the control-plane Event::Dtmf still fires (observability).
+        // Clearing the block restores the relay.
+        let mut call = ulaw_alaw_call();
+        call.set_dtmf_blocked(true, true); // block A's DTMF toward B
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(
+            &rx(1, A_ADDR, telephone_event_rtp(1, 16000, true, true)),
+            &mut out,
+            &mut events,
+        );
+        assert_eq!(events.len(), 1, "DTMF still detected + emitted while blocked");
+        assert!(
+            matches!(&events[0], Event::Dtmf { digit, .. } if digit == "5"),
+            "the digit is surfaced to the controller"
+        );
+        assert!(
+            out.is_empty(),
+            "no telephone-event relayed to B while dtmf_blocked"
+        );
+
+        // Unblock: a fresh event (new RTP timestamp) now repacketizes toward B again.
+        call.set_dtmf_blocked(true, false);
+        out.clear();
+        events.clear();
+        call.process(
+            &rx(1, A_ADDR, telephone_event_rtp(2, 17600, true, true)),
+            &mut out,
+            &mut events,
+        );
+        assert_eq!(events.len(), 1, "still detected after unblock");
+        assert_eq!(out.len(), 1, "telephone-event relayed to B after unblock");
+        let relayed = RtpPacket::parse(&out[0].data).expect("parse");
+        assert_eq!(relayed.payload_type, 101, "egress telephone-event PT");
+    }
+
+    #[test]
+    fn block_dtmf_on_a_relay_drops_telephone_events_by_pt_but_forwards_ordinary_rtp() {
+        // A promoted plain relay with dtmf_blocked drops the verbatim forward of the leg's
+        // telephone-event PT (still emitting the event) but forwards ordinary RTP untouched.
+        let mut call = relay_call();
+        assert!(call.is_relay_only());
+        call.set_dtmf_blocked(true, true); // block A's DTMF toward B
+
+        // Ordinary audio RTP (PT 0) still relays byte-for-byte.
+        let audio = ulaw_rtp(1, 0xAB);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, audio.clone()), &mut out, &mut events);
+        assert_eq!(out.len(), 1, "ordinary RTP still forwarded verbatim");
+        assert_eq!(&out[0].data[..], &audio[..], "forwarded byte-for-byte");
+        assert!(events.is_empty(), "no DTMF event for ordinary audio");
+
+        // A telephone-event on PT 101 is dropped (not forwarded) but the event fires.
+        out.clear();
+        events.clear();
+        call.process(
+            &rx(1, A_ADDR, telephone_event_rtp(2, 16000, true, true)),
+            &mut out,
+            &mut events,
+        );
+        assert!(out.is_empty(), "telephone-event dropped on the blocked relay leg");
+        assert_eq!(events.len(), 1, "DTMF still detected + emitted on the relay path");
+
+        // Unblock: a fresh telephone-event (new RTP timestamp) is forwarded verbatim again.
+        call.set_dtmf_blocked(true, false);
+        out.clear();
+        events.clear();
+        let event = telephone_event_rtp(3, 17600, true, true);
+        call.process(&rx(1, A_ADDR, event.clone()), &mut out, &mut events);
+        assert_eq!(out.len(), 1, "telephone-event forwarded again after unblock");
+        assert_eq!(&out[0].data[..], &event[..], "forwarded byte-for-byte after unblock");
+    }
+
     #[test]
     fn a_fork_does_not_disturb_dtmf_extraction() {
         use siphon_rtp_media::fork::RtpForkSink;
@@ -2490,12 +2646,14 @@ mod tests {
             accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
             egress_endpoint: endpoint(2),
             egress_dst: addr(B_ADDR),
+            telephone_event: Some(101),
         };
         let b_to_a = RelayConfig {
             ingress_endpoint: endpoint(2),
             accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
             egress_endpoint: endpoint(1),
             egress_dst: addr(A_ADDR),
+            telephone_event: Some(101),
         };
         MediaCall::new_relay("relay", "tag-a", Some("tag-b".into()), a_to_b, b_to_a, true)
     }
