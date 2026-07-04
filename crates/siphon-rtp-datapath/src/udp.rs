@@ -18,8 +18,8 @@ use tokio::task::JoinHandle;
 use siphon_rtp_stun as stun;
 
 use crate::{
-    AddressFamily, Datapath, DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction,
-    IceConfig, LatchPolicy, ObservedRtcp, RxPacket,
+    classify, AddressFamily, Datapath, DatapathError, Endpoint, EndpointId, EndpointStats,
+    FlowAction, IceConfig, LatchPolicy, ObservedRtcp, PacketClass, RxPacket,
 };
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
@@ -546,11 +546,11 @@ impl UdpLoopbackDatapath {
     }
 }
 
-/// RFC 7983 first-byte demux on a media socket: only RTP/RTCP (128–191) may drive the relay or move
-/// the latch. STUN/DTLS/TURN/garbage are dropped in M-S1 (ICE/DTLS land in M-S3/M-S4).
-/// See `docs/security-and-nat.md` §4 layer 1.
+/// RFC 7983 first-byte demux on a media socket: only RTP/RTCP ([`PacketClass::Media`], 128–191) may
+/// drive the relay or move the latch. STUN/DTLS/TURN/garbage are dropped in M-S1 (ICE/DTLS land in
+/// M-S3/M-S4). See `docs/security-and-nat.md` §4 layer 1.
 fn is_rtp_or_rtcp(payload: &[u8]) -> bool {
-    matches!(payload.first(), Some(&byte0) if (128..=191).contains(&byte0))
+    classify(payload) == PacketClass::Media
 }
 
 /// Whether `payload` is specifically RTCP: in the RTP/RTCP demux range with an RTCP payload type —
@@ -663,7 +663,7 @@ async fn recv_loop(
         };
         // RFC 7983 demux for ICE: STUN (first byte 0..=3) drives connectivity checks on endpoints
         // that carry ICE credentials.
-        if matches!(buffer[..len].first(), Some(&first) if first <= 3) {
+        if classify(&buffer[..len]) == PacketClass::Stun {
             if let Some(ice) = inner.ice.get(&endpoint).map(|config| config.clone()) {
                 handle_stun(
                     &socket,
