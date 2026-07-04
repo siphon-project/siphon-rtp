@@ -371,6 +371,38 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         // The WS bridge is a native siphon-rtp (JSON control) extension; the NG/bencode front-end
         // never sets it.
         ws_uri: None,
+        // rtpengine spells it `received from`; accept the hyphenated form too.
+        received_from: parse_received_from(request),
+        // rtpengine `rtcp-mux` directive list; accept the dotted `rtcp.mux` spelling too.
+        rtcp_mux: {
+            let mut mux = string_list(request, "rtcp-mux");
+            if mux.is_empty() {
+                mux = string_list(request, "rtcp.mux");
+            }
+            mux
+        },
+    }
+}
+
+/// Parse rtpengine's `received-from` / `received from` — a bencode list `["IP4"|"IP6", "<address>"]`
+/// carrying the real post-NAT source address the SIP proxy saw the request come from. Only the IP is
+/// returned (the media port differs from the signalling port, so it is not gated). The family token
+/// is honoured: an `IP4` entry must carry an IPv4 literal (and `IP6` an IPv6 literal), else the entry
+/// is ignored rather than mis-typed.
+fn parse_received_from(request: &Value) -> Option<std::net::IpAddr> {
+    let list = string_list(request, "received-from");
+    let list = if list.is_empty() {
+        string_list(request, "received from")
+    } else {
+        list
+    };
+    let family = list.first()?;
+    let address = list.get(1)?;
+    let ip = address.parse::<std::net::IpAddr>().ok()?;
+    match family.as_str() {
+        "IP4" if ip.is_ipv4() => Some(ip),
+        "IP6" if ip.is_ipv6() => Some(ip),
+        _ => None,
     }
 }
 
@@ -623,6 +655,116 @@ mod tests {
             }
             other => panic!("expected offer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn offer_parses_received_from_into_the_source_gate_hint() {
+        // rtpengine `received-from` is a bencode list `["IP4"|"IP6", "<address>"]` — the real
+        // post-NAT source IP the proxy saw. It parses onto `ProfileFlags.received_from` (only the IP;
+        // the port is never gated).
+        let bytes = datagram(
+            "aa",
+            &[
+                ("command", Value::string("offer")),
+                ("call-id", Value::string("cid-rf")),
+                ("from-tag", Value::string("ftag")),
+                ("sdp", Value::string("v=0\r\nc=IN IP4 10.0.0.7\r\n")),
+                (
+                    "received-from",
+                    Value::List(vec![Value::string("IP4"), Value::string("198.51.100.7")]),
+                ),
+            ],
+        );
+        let (_, Command::Offer { profile, .. }) = parse_datagram(&bytes) else {
+            panic!("expected offer");
+        };
+        assert_eq!(
+            profile.received_from,
+            Some("198.51.100.7".parse().expect("ip"))
+        );
+
+        // The space-separated rtpengine spelling `received from` and IP6 are both honoured.
+        let bytes = datagram(
+            "bb",
+            &[
+                ("command", Value::string("offer")),
+                ("call-id", Value::string("cid-rf6")),
+                ("from-tag", Value::string("ftag")),
+                ("sdp", Value::string("v=0\r\nc=IN IP6 2001:db8::7\r\n")),
+                (
+                    "received from",
+                    Value::List(vec![Value::string("IP6"), Value::string("2001:db8::9")]),
+                ),
+            ],
+        );
+        let (_, Command::Offer { profile, .. }) = parse_datagram(&bytes) else {
+            panic!("expected offer");
+        };
+        assert_eq!(
+            profile.received_from,
+            Some("2001:db8::9".parse().expect("v6 ip"))
+        );
+    }
+
+    #[test]
+    fn received_from_family_mismatch_is_ignored() {
+        // A family token that disagrees with the literal (`IP4` carrying a v6 address) is not a usable
+        // source hint — dropped rather than mis-typed.
+        let bytes = datagram(
+            "cc",
+            &[
+                ("command", Value::string("offer")),
+                ("call-id", Value::string("cid-bad")),
+                ("from-tag", Value::string("ftag")),
+                ("sdp", Value::string("v=0\r\n")),
+                (
+                    "received-from",
+                    Value::List(vec![Value::string("IP4"), Value::string("2001:db8::9")]),
+                ),
+            ],
+        );
+        let (_, Command::Offer { profile, .. }) = parse_datagram(&bytes) else {
+            panic!("expected offer");
+        };
+        assert_eq!(profile.received_from, None);
+    }
+
+    #[test]
+    fn offer_parses_rtcp_mux_directive_list() {
+        // rtpengine `rtcp-mux` is a bencode list of directives; it parses onto `ProfileFlags.rtcp_mux`.
+        let bytes = datagram(
+            "dd",
+            &[
+                ("command", Value::string("offer")),
+                ("call-id", Value::string("cid-mux")),
+                ("from-tag", Value::string("ftag")),
+                ("sdp", Value::string("v=0\r\n")),
+                (
+                    "rtcp-mux",
+                    Value::List(vec![Value::string("offer"), Value::string("require")]),
+                ),
+            ],
+        );
+        let (_, Command::Offer { profile, .. }) = parse_datagram(&bytes) else {
+            panic!("expected offer");
+        };
+        assert_eq!(profile.rtcp_mux, vec!["offer", "require"]);
+
+        // The dotted `rtcp.mux` spelling is accepted too.
+        let bytes = datagram(
+            "ee",
+            &[
+                ("command", Value::string("offer")),
+                ("call-id", Value::string("cid-mux2")),
+                ("from-tag", Value::string("ftag")),
+                ("sdp", Value::string("v=0\r\n")),
+                ("rtcp.mux", Value::List(vec![Value::string("demux")])),
+            ],
+        );
+        let (_, Command::Offer { profile, .. }) = parse_datagram(&bytes) else {
+            panic!("expected offer");
+        };
+        assert_eq!(profile.rtcp_mux, vec!["demux"]);
     }
 
     #[test]

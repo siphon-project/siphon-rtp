@@ -132,13 +132,29 @@ Only **accept** (and only latch from) media whose source matches the address lea
 - Default policy `SignalledOnly`: source IP must equal the SDP `c=`/`m=` address (the engine already
   parses this into `remote_near` / `remote_far`). A `/24`-tolerant mode covers carriers that split
   RTP/RTCP across nearby addresses or re-NAT within a block.
+- **`received-from` (the NAT-aware signalled source, rtpengine parity).** When a UA sits behind NAT
+  it advertises its *private* `c=` address, which its media never actually comes from — the raw
+  `SignalledOnly` gate would then be `Exact(private-ip)`, which never matches the real (public) media
+  source, forcing the leg onto `Symmetric`/`Any` (a strictly weaker gate). The SIP proxy already knows
+  the real post-NAT source: the address it saw the request *arrive* from. It passes that to the engine
+  as rtpengine's `received-from` list (`["IP4"|"IP6", "<address>"]` → `ProfileFlags.received_from`).
+  When present, the engine **overrides the gated source IP** with it — the offer's `received-from`
+  tightens the near (A) leg, the answer's the far (B) leg — keeping the signalled media port and the
+  chosen gate *policy* (`Exact`/`Subnet`/`Any`) untouched. This is a **tightening**, not a relaxation:
+  a NATed UA is gated precisely to its NAT's public IP (`Exact(public-ip)`) instead of falling back to
+  an open latch. Only the IP is carried (the media port differs from the signalling port, so the port
+  is never gated — consistent with `SourceFilter` gating on IP only). Threaded into **every** gate
+  path — the datapath Forward relay, the redirect-dispatched media/transcode actor's `accepted_source`,
+  the SRTP bridge (`bridge_source_filter`), and the WS bridge — so no path silently keeps the private
+  address.
 - Relax to `Symmetric` (accept any source, latch the first) **only** when the control plane sets it —
   for UAs behind symmetric NAT where the signalled address is genuinely unusable. This is opt-in per
   leg, never a global default.
 - **Spec:** RFC 3264 (the offer/answer address *is* the contract); mirrors rtpengine
-  `trust-address` / `strict-source`.
+  `trust-address` / `strict-source` / `received-from`.
 - **Enforcement:** new accepted-source constraint on the forward rule (§4.7); engine fills it from
-  parsed SDP + `ProfileFlags.flags` (`trust-address`, `strict-source`, `port-latching`, `symmetric`).
+  parsed SDP + `ProfileFlags.received_from` + `ProfileFlags.flags` (`trust-address`, `strict-source`,
+  `port-latching`, `symmetric`).
 - **Effect on A1:** with `SignalledOnly`, a blind attacker must *also* spoof the signalled source IP
   to land a packet — collapses the off-path attack for non-NAT and full-cone-NAT peers.
 

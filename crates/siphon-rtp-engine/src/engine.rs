@@ -124,6 +124,12 @@ struct Call {
     /// a transcoding/secure Media call — demotion is additionally gated on `is_relay_call`, so a
     /// genuine media call is never demoted even if a reason is recorded here.
     promotion_reasons: HashSet<PromotionReason>,
+    /// The offer's rtpengine `received-from` — the real post-NAT source IP the proxy saw A's request
+    /// arrive from (`ProfileFlags.received_from`). Stored at offer so the **near** (A) leg's ingress
+    /// source gate can be tightened to A's public IP at answer time, when A's `c=` advertised an
+    /// unusable private address (docs/security-and-nat.md §4 layer 2). `None` when the offer carried
+    /// no `received-from`. (The answer's own `received-from` gates the far (B) leg directly.)
+    offer_received_from: Option<std::net::IpAddr>,
 }
 
 /// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off
@@ -842,12 +848,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // rewritten in its own family (`rewrite` emits the endpoint's addrtype).
         let near_family = AddressFamily::of(info.remote_rtp.ip());
         let far_family = far_address_family(profile).unwrap_or(near_family);
-        let per_leg = if info.rtcp_mux { 1 } else { 2 };
-        let near_endpoints = match self.alloc_endpoints(per_leg, near_family).await {
+        // RFC 5761 rtcp-mux: the controller's `rtcp-mux` directive can override the SDP-derived mux
+        // per side (force mux, demux, or reject). This drives the per-leg port count *and* the far
+        // SDP's `a=rtcp-mux` presentation — resolved once here so allocation and rewrite agree.
+        let (near_mux, far_mux) = resolve_rtcp_mux(info.rtcp_mux, &profile.rtcp_mux);
+        let near_per_leg = if near_mux { 1 } else { 2 };
+        let far_per_leg = if far_mux { 1 } else { 2 };
+        let near_endpoints = match self.alloc_endpoints(near_per_leg, near_family).await {
             Ok(endpoints) => endpoints,
             Err(reason) => return CmdResult::Error { reason },
         };
-        let far_endpoints = match self.alloc_endpoints(per_leg, far_family).await {
+        let far_endpoints = match self.alloc_endpoints(far_per_leg, far_family).await {
             Ok(endpoints) => endpoints,
             Err(reason) => {
                 self.free(&near_endpoints).await;
@@ -856,11 +867,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let near_rtp = near_endpoints[0];
         let far_rtp = far_endpoints[0];
-        let (near_rtcp, far_rtcp) = if info.rtcp_mux {
-            (None, None)
-        } else {
-            (Some(near_endpoints[1]), Some(far_endpoints[1]))
-        };
+        let near_rtcp = (!near_mux).then(|| near_endpoints[1]);
+        let far_rtcp = (!far_mux).then(|| far_endpoints[1]);
         // Combined list for teardown on any later error path in this offer.
         let endpoints: Vec<_> = near_endpoints
             .iter()
@@ -899,7 +907,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let security = far_local_crypto.map(SecurityAdvertisement::Secure);
 
-        let mut rewritten = match sdp::rewrite(sdp, engine, advert, security) {
+        // RFC 5761: when a `rtcp-mux` directive was given, present the resolved far-side mux to B
+        // explicitly (force `a=rtcp-mux` on, or strip it); otherwise mirror the offer (`None`).
+        let far_mux_override = (!profile.rtcp_mux.is_empty()).then_some(far_mux);
+        let mut rewritten = match sdp::rewrite(sdp, engine, advert, security, far_mux_override) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 self.free(&endpoints).await;
@@ -970,6 +981,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 pipeline,
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
+                offer_received_from: profile.received_from,
             },
         );
 
@@ -983,7 +995,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_rtp,
                     info.remote_rtp,
                     near_codec.as_ref(),
-                    bridge_source_filter(profile, info.remote_rtp),
+                    // Gate leg A's ingress to its `received-from` public IP when the offer supplied
+                    // one, else the signalled `c=` address (docs/security-and-nat.md §4 layer 2).
+                    bridge_source_filter(
+                        profile,
+                        apply_received_from(Some(info.remote_rtp), profile.received_from)
+                            .unwrap_or(info.remote_rtp),
+                    ),
                 )
                 .await
             {
@@ -1132,6 +1150,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_codec,
             near_telephone_event,
             offer_pipeline,
+            offer_received_from,
         ) = match self.calls.get(call_id) {
             Some(call) if call.owner == client => {
                 if call.from_tag != from_tag {
@@ -1147,6 +1166,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.near_codec.clone(),
                     call.near_telephone_event,
                     call.pipeline,
+                    call.offer_received_from,
                 )
             }
             _ => return unknown_call(call_id),
@@ -1163,6 +1183,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
 
+        // rtpengine `received-from`: the real post-NAT source the SIP proxy saw each request come
+        // from. The **offer's** hint (stored on the call) tightens the near (A) leg's ingress gate;
+        // the **answer's** hint tightens the far (B) leg's. Both keep the signalled port and only
+        // override the gated source IP — every gate path below uses these effective addresses so the
+        // source gate is uniform (docs/security-and-nat.md §4 layer 2). `None` ⇒ the signalled
+        // address is used unchanged.
+        let near_gate_rtp = apply_received_from(near.remote_rtp, offer_received_from);
+        let near_gate_rtcp = apply_received_from(near.remote_rtcp, offer_received_from);
+        let far_gate_rtp =
+            apply_received_from(Some(info.remote_rtp), profile.received_from).unwrap_or(info.remote_rtp);
+        let far_gate_rtcp = apply_received_from(Some(info.remote_rtcp), profile.received_from)
+            .unwrap_or(info.remote_rtcp);
+
         // The rewritten answer is delivered to A, so it advertises the `near` leg.
         let engine = EngineMedia {
             rtp: near.rtp.local_addr,
@@ -1175,7 +1208,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // The answer to A advertises the near leg; on an SRTP bridge that side is plain (RTP/AVP), so
         // force AVP and strip crypto. A plain relay leaves transport/crypto untouched.
         let security = far_local_crypto.map(|_| SecurityAdvertisement::Plain);
-        let mut rewritten = match sdp::rewrite(sdp, engine, advert, security) {
+        // RFC 5761: the near (A-facing) mux state was fixed at offer — the companion RTCP endpoint
+        // exists iff the near side is non-muxed. When a `rtcp-mux` directive drove that decision,
+        // present it to A explicitly so the answer SDP matches the ports the engine actually bound;
+        // otherwise mirror B's answer (`None`).
+        let near_mux = near.rtcp.is_none();
+        let near_mux_override = (!profile.rtcp_mux.is_empty()).then_some(near_mux);
+        let mut rewritten = match sdp::rewrite(sdp, engine, advert, security, near_mux_override) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 return CmdResult::Error {
@@ -1206,7 +1245,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             near.rtp,
                             a_rtp,
                             near_codec.as_ref(),
-                            bridge_source_filter(profile, a_rtp),
+                            // Gate leg A to its offer `received-from` public IP when supplied.
+                            bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                         )
                         .await
                     {
@@ -1252,11 +1292,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
             let mut flows = vec![
-                // A (plain) ingress → encrypt for B → out the far endpoint toward B.
+                // A (plain) ingress → encrypt for B → out the far endpoint toward B. Gated to A's
+                // effective source (its `received-from` public IP when the offer supplied one).
                 BridgeFlowPlan {
                     endpoint: near.rtp.id,
                     op: BridgeOp::Encrypt,
-                    accepted_source: bridge_source_filter(profile, a_rtp),
+                    accepted_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                     out_endpoint: far.rtp.id,
                     out_dst: info.remote_rtp,
                 },
@@ -1264,7 +1305,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 BridgeFlowPlan {
                     endpoint: far.rtp.id,
                     op: BridgeOp::Decrypt,
-                    accepted_source: bridge_source_filter(profile, info.remote_rtp),
+                    accepted_source: bridge_source_filter(profile, far_gate_rtp),
                     out_endpoint: near.rtp.id,
                     out_dst: a_rtp,
                 },
@@ -1273,14 +1314,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 flows.push(BridgeFlowPlan {
                     endpoint: near_rtcp.id,
                     op: BridgeOp::Encrypt,
-                    accepted_source: bridge_source_filter(profile, a_rtcp),
+                    accepted_source: bridge_source_filter(profile, near_gate_rtcp.unwrap_or(a_rtcp)),
                     out_endpoint: far_rtcp.id,
                     out_dst: info.remote_rtcp,
                 });
                 flows.push(BridgeFlowPlan {
                     endpoint: far_rtcp.id,
                     op: BridgeOp::Decrypt,
-                    accepted_source: bridge_source_filter(profile, info.remote_rtcp),
+                    accepted_source: bridge_source_filter(profile, far_gate_rtcp),
                     out_endpoint: near_rtcp.id,
                     out_dst: a_rtcp,
                 });
@@ -1324,7 +1365,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .flatten();
             let a_to_b = match build_direction(
                 near.rtp.id,
-                bridge_source_filter(profile, a_rtp),
+                bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                 far.rtp.id,
                 info.remote_rtp,
                 &near_codec,
@@ -1338,7 +1379,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
             let b_to_a = match build_direction(
                 far.rtp.id,
-                bridge_source_filter(profile, info.remote_rtp),
+                bridge_source_filter(profile, far_gate_rtp),
                 near.rtp.id,
                 a_rtp,
                 &far_codec,
@@ -1376,7 +1417,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 rtcp_relays.push(
                     RtcpRelay::new(
                         near_rtcp.id,
-                        bridge_source_filter(profile, a_rtcp),
+                        bridge_source_filter(profile, near_gate_rtcp.unwrap_or(a_rtcp)),
                         far_rtcp.id,
                         info.remote_rtcp,
                     )
@@ -1385,7 +1426,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 rtcp_relays.push(
                     RtcpRelay::new(
                         far_rtcp.id,
-                        bridge_source_filter(profile, info.remote_rtcp),
+                        bridge_source_filter(profile, far_gate_rtcp),
                         near_rtcp.id,
                         a_rtcp,
                     )
@@ -1425,10 +1466,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .then(|| profile.record_path.clone())
                 .flatten();
 
-            // Build the two transcode directions (decode ingress codec → encode peer's codec).
+            // Build the two transcode directions (decode ingress codec → encode peer's codec). Each
+            // direction gates ingress to the effective source (its `received-from` public IP when
+            // supplied), not the possibly-private signalled `c=` address.
             let a_to_b = match build_direction(
                 near.rtp.id,
-                bridge_source_filter(profile, a_rtp),
+                bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                 far.rtp.id,
                 info.remote_rtp,
                 &near_codec,
@@ -1442,7 +1485,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
             let b_to_a = match build_direction(
                 far.rtp.id,
-                bridge_source_filter(profile, info.remote_rtp),
+                bridge_source_filter(profile, far_gate_rtp),
                 near.rtp.id,
                 a_rtp,
                 &far_codec,
@@ -1461,14 +1504,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     return error_result("install media redirect", &error);
                 }
             }
-            // Relay companion RTCP in-datapath when not muxed (RTCP is never transcoded).
+            // Relay companion RTCP in-datapath when not muxed (RTCP is never transcoded). The gate
+            // keys on each side's effective source (`received-from` IP when supplied); the forward
+            // destination stays the real signalled address.
             if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
                 let _ = self.datapath.install_flow(
                     near_rtcp.id,
                     FlowAction::Forward(ingress_rule(
                         far_rtcp.id,
                         Some(info.remote_rtcp),
-                        near.remote_rtcp,
+                        near_gate_rtcp,
                         profile,
                         near_ice,
                     )),
@@ -1478,7 +1523,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     FlowAction::Forward(ingress_rule(
                         near_rtcp.id,
                         near.remote_rtcp,
-                        Some(info.remote_rtcp),
+                        Some(far_gate_rtcp),
                         profile,
                         far_ice,
                     )),
@@ -1499,13 +1544,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .register(call, self.datapath.clone(), owner_events);
         } else {
             // Plain relay: the in-datapath Forward fast path. Each endpoint's rule gates its ingress
-            // to the SDP-signalled peer and latches per policy (RTPBleed fix —
-            // docs/security-and-nat.md §4): `near` receives from A (`near.remote_rtp`); `far` from B
-            // (`info.remote_rtp`).
+            // to the peer's effective source and latches per policy (RTPBleed fix —
+            // docs/security-and-nat.md §4): `near` receives from A (`near_gate_rtp`, A's
+            // `received-from` public IP when supplied, else the signalled `near.remote_rtp`); `far`
+            // from B (`far_gate_rtp`). The forward destination is always the real signalled address.
             let near_action = FlowAction::Forward(ingress_rule(
                 far.rtp.id,
                 Some(info.remote_rtp),
-                near.remote_rtp,
+                near_gate_rtp,
                 profile,
                 near_ice,
             ));
@@ -1516,7 +1562,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let far_action = FlowAction::Forward(ingress_rule(
                 near.rtp.id,
                 near.remote_rtp,
-                Some(info.remote_rtp),
+                Some(far_gate_rtp),
                 profile,
                 far_ice,
             ));
@@ -1530,7 +1576,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 let near_rtcp_action = FlowAction::Forward(ingress_rule(
                     far_rtcp.id,
                     Some(info.remote_rtcp),
-                    near.remote_rtcp,
+                    near_gate_rtcp,
                     profile,
                     near_ice,
                 ));
@@ -1541,7 +1587,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 let far_rtcp_action = FlowAction::Forward(ingress_rule(
                     near_rtcp.id,
                     near.remote_rtcp,
-                    Some(info.remote_rtcp),
+                    Some(far_gate_rtcp),
                     profile,
                     far_ice,
                 ));
@@ -2007,6 +2053,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 pipeline,
                 relay_flows,
                 promotion_reasons: HashSet::new(),
+                // The source gate is reconstructed from the snapshot's per-flow `accepted_source`
+                // (which already folded in any `received-from` at the original answer), so the raw
+                // hint is not needed on the restored node.
+                offer_received_from: None,
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
@@ -2395,7 +2445,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             rtp: endpoint.local_addr,
             rtcp: None,
         };
-        match sdp::rewrite(sdp, engine, None, security) {
+        // A conference leg is always RTP/RTCP-muxed onto the one participant endpoint; the mux
+        // presentation mirrors the participant's offer (`None`) — the `rtcp-mux` directive is an
+        // offer/answer relay concern, not a conference one.
+        match sdp::rewrite(sdp, engine, None, security, None) {
             Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);
@@ -3622,6 +3675,29 @@ fn error_result(context: &str, error: &dyn std::fmt::Display) -> CmdResult {
     }
 }
 
+/// Resolve the rtpengine `rtcp-mux` directive list into the `(near_mux, far_mux)` decision for a
+/// call (RFC 5761). `offered` is whether the offer's SDP carried `a=rtcp-mux` (the near side's
+/// intent). The first recognised directive wins; an empty/unknown list mirrors the offer.
+///
+/// - `offer` / `require`: force mux on the generated (far) SDP → 1 far port. The near side follows
+///   the offer (mux iff it was offered).
+/// - `demux`: present separate RTCP to the far side (2 far ports, strip `a=rtcp-mux`) while the near
+///   side stays as offered — the engine bridges a muxed access leg to a non-muxed core.
+/// - `reject` / `remove`: no mux either side → 2 ports both sides, `a=rtcp-mux` stripped.
+/// - `accept` (or no directive): mirror the offer on both sides (the default behaviour).
+fn resolve_rtcp_mux(offered: bool, directives: &[String]) -> (bool, bool) {
+    for directive in directives {
+        match directive.as_str() {
+            "offer" | "require" => return (offered, true),
+            "demux" => return (offered, false),
+            "reject" | "remove" => return (false, false),
+            "accept" => return (offered, offered),
+            _ => continue,
+        }
+    }
+    (offered, offered)
+}
+
 /// Build the relay rule for one ingress endpoint: gate its incoming source to the SDP-signalled
 /// peer and latch `SignalledOnly` by default, or accept-any + `Symmetric` when the `symmetric`
 /// profile flag is set (or the peer address is not yet known). The RTPBleed-safe default —
@@ -3657,6 +3733,24 @@ fn ingress_rule(
         out_dst,
         accepted_source,
         latch: LatchPolicy::SignalledOnly,
+    }
+}
+
+/// Apply an rtpengine `received-from` source hint to a leg's SDP-signalled address: when `hint` is
+/// set (the real post-NAT source IP the SIP proxy saw the request come from), return the signalled
+/// **port** paired with the hint IP; otherwise the signalled address unchanged. Only the IP the
+/// source gate keys on is overridden — never the port (the media port differs from the signalling
+/// port), and never the gate *policy* (Exact/Subnet/Any is still chosen by `ingress_rule` /
+/// `bridge_source_filter` from the profile flags). This tightens the NAT case: a UA whose `c=`
+/// advertised a private (unusable) address is gated precisely to its NAT's public IP rather than
+/// forced onto a symmetric/any gate (docs/security-and-nat.md §4 layer 2, RFC 3264).
+fn apply_received_from(
+    signalled: Option<std::net::SocketAddr>,
+    hint: Option<std::net::IpAddr>,
+) -> Option<std::net::SocketAddr> {
+    match (signalled, hint) {
+        (Some(addr), Some(ip)) => Some(std::net::SocketAddr::new(ip, addr.port())),
+        (addr, _) => addr,
     }
 }
 
@@ -6608,6 +6702,142 @@ mod tests {
         assert_eq!(recv(&phone_a).await.0, b"\x80\xc8rtcp");
     }
 
+    /// An offer profile carrying an `rtcp-mux` directive list.
+    fn mux_profile(directive: &str) -> ProfileFlags {
+        ProfileFlags {
+            rtcp_mux: vec![directive.to_string()],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn rtcp_mux_offer_directive_forces_mux_and_allocates_one_far_port() {
+        // rtpengine `rtcp-mux: [offer]` forces the generated (far) SDP to advertise `a=rtcp-mux`
+        // (RFC 5761) and allocates a single far port — even though A's offer was NOT muxed.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mux-offer".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false), // A did NOT offer mux
+                    profile: mux_profile("offer"),
+                },
+            )
+            .await;
+        let far_sdp = ok_sdp_text(&offer);
+        assert!(
+            far_sdp.contains("a=rtcp-mux"),
+            "offer directive forces a=rtcp-mux on the far SDP: {far_sdp}"
+        );
+        assert!(
+            !far_sdp.contains("a=rtcp:"),
+            "no companion a=rtcp port under forced mux: {far_sdp}"
+        );
+        let far = sdp::parse(&far_sdp).expect("far");
+        assert!(far.rtcp_mux);
+        assert_eq!(far.remote_rtcp, far.remote_rtp, "RTCP rides the far RTP port");
+    }
+
+    #[tokio::test]
+    async fn rtcp_mux_demux_directive_keeps_near_muxed_but_splits_the_far_side() {
+        // rtpengine `rtcp-mux: [demux]`: A offered mux; the engine presents SEPARATE RTCP to the far
+        // side (2 far ports, `a=rtcp-mux` stripped from the far SDP) while the near side stays muxed.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mux-demux".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, true), // A offered mux
+                    profile: mux_profile("demux"),
+                },
+            )
+            .await;
+        let far_sdp = ok_sdp_text(&offer);
+        assert!(
+            !far_sdp.contains("a=rtcp-mux"),
+            "demux strips a=rtcp-mux from the far SDP: {far_sdp}"
+        );
+        let far = sdp::parse(&far_sdp).expect("far");
+        assert!(!far.rtcp_mux, "far side demuxed");
+        assert_ne!(
+            far.remote_rtcp, far.remote_rtp,
+            "far side has a distinct RTCP port"
+        );
+
+        // The near (A-facing) answer still advertises mux (the near side was left as offered).
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "mux-demux".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false), // B answers non-muxed on its own two ports
+                    profile: mux_profile("demux"),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
+        assert!(near.rtcp_mux, "near side stays muxed toward A");
+    }
+
+    #[tokio::test]
+    async fn rtcp_mux_reject_directive_forces_two_ports_both_sides() {
+        // rtpengine `rtcp-mux: [reject]`: no mux either side even though A offered it — 2 far ports,
+        // `a=rtcp-mux` stripped from the generated SDP.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mux-reject".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, true), // A offered mux
+                    profile: mux_profile("reject"),
+                },
+            )
+            .await;
+        let far_sdp = ok_sdp_text(&offer);
+        assert!(
+            !far_sdp.contains("a=rtcp-mux"),
+            "reject strips a=rtcp-mux: {far_sdp}"
+        );
+        let far = sdp::parse(&far_sdp).expect("far");
+        assert!(!far.rtcp_mux);
+        assert_ne!(far.remote_rtcp, far.remote_rtp, "far RTCP on its own port");
+
+        // The near side is demuxed too: the answer to A carries no a=rtcp-mux and a distinct port.
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "mux-reject".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: mux_profile("reject"),
+                },
+            )
+            .await;
+        let near_sdp = ok_sdp_text(&answer);
+        assert!(
+            !near_sdp.contains("a=rtcp-mux"),
+            "near side demuxed toward A: {near_sdp}"
+        );
+        let near = sdp::parse(&near_sdp).expect("near");
+        assert!(!near.rtcp_mux);
+        assert_ne!(near.remote_rtcp, near.remote_rtp);
+    }
+
     #[tokio::test]
     async fn answer_and_delete_unknown_call_error() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
@@ -7278,6 +7508,160 @@ mod tests {
             from, far.remote_rtp,
             "B sees media from the engine far-RTP port"
         );
+    }
+
+    /// A single-codec (PCMU) SDP whose `c=` connection address is `conn` but whose media port is
+    /// `port` — so the signalled source and the real socket can differ (the NAT case: a private `c=`
+    /// with media arriving from a public address). `codec_pt`/`codec_name` pick the audio codec.
+    fn sdp_with_conn(conn: IpAddr, port: u16, codec_pt: u8, codec_name: &str) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {conn}\r\ns=-\r\nc=IN IP4 {conn}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP {codec_pt}\r\na=rtpmap:{codec_pt} {codec_name}/8000\r\na=rtcp-mux\r\n",
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn received_from_tightens_the_near_leg_gate_to_the_public_source() {
+        // The NAT case: A advertises a *private/documentation* `c=` (203.0.113.2) that its media will
+        // never actually come from, but the SIP proxy tells us (`received-from`) the real public
+        // source is 127.0.0.2. The engine must gate the near leg to 127.0.0.2 — a TIGHTER RTPBleed
+        // gate than the unusable signalled address (docs/security-and-nat.md §4 layer 2), so A's real
+        // media flows while an off-path attacker is dropped.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
+
+        // A's offer advertises the documentation address 203.0.113.2 (unusable), real port = phone_a.
+        let offer_sdp =
+            sdp_with_conn(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), addr_a.port(), 0, "PCMU");
+        let profile = ProfileFlags {
+            received_from: Some(addr_a.ip()), // the proxy-observed public source
+            ..Default::default()
+        };
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "recvfrom".into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile,
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "recvfrom".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
+
+        // An attacker on 127.0.0.9 sprays A's port — gated out by the received-from-tightened gate.
+        attacker
+            .send_to(&rtp(0xAAAA_AAAA), near.remote_rtp)
+            .await
+            .expect("attacker send");
+        let mut scratch = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(150), phone_b.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "off-path source gated out even though it raced the port first"
+        );
+
+        // A's real media (from the received-from IP) flows to B.
+        phone_a
+            .send_to(&rtp(0x1234_5678), near.remote_rtp)
+            .await
+            .expect("peer send");
+        let (data, _from) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x1234_5678), "received-from source flows through");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn received_from_tightens_the_transcode_media_gate() {
+        // The same override must reach the media (transcode) slow path's `accepted_source`: A offers
+        // PCMU behind a documentation `c=`, B answers PCMA (⇒ transcode). The near direction gates on
+        // the received-from IP, so an off-path source is dropped by the media actor, not just the
+        // datapath Forward gate.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
+
+        // A advertises the documentation address 203.0.113.2 (unusable); its real media socket is
+        // phone_a, and the proxy-observed public source is passed as received-from.
+        let offer_sdp =
+            sdp_with_conn(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), addr_a.port(), 0, "PCMU");
+        let profile = ProfileFlags {
+            received_from: Some(addr_a.ip()),
+            ..Default::default()
+        };
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "recvfrom-media".into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile,
+                },
+            )
+            .await;
+        // B answers PCMA only → near=PCMU, far=PCMA → transcode media path.
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "recvfrom-media".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
+
+        // Off-path attacker → the media actor's accepted_source gate drops it (nothing reaches B).
+        attacker
+            .send_to(&g711_rtp(0, 1, 0xAAAA_AAAA, 0xFF), near.remote_rtp)
+            .await
+            .expect("attacker send");
+        let mut scratch = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(200), phone_b.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "off-path source gated out on the transcode media path too"
+        );
+
+        // A valid PCMU frame from the received-from source transcodes to PCMA and reaches B.
+        phone_a
+            .send_to(&g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF), near.remote_rtp)
+            .await
+            .expect("a send");
+        let (data, _from) = recv(&phone_b).await;
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&data).expect("parse");
+        assert_eq!(parsed.payload_type, 8, "B receives PCMA (transcoded)");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

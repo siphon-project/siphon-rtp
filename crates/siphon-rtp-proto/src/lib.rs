@@ -342,6 +342,20 @@ pub struct ProfileFlags {
     /// for v1 (`wss://` is a follow-up).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_uri: Option<String>,
+    /// The real post-NAT source IP the SIP proxy saw this request arrive from (rtpengine's
+    /// `received-from`). When a NATed UA advertises a private `c=` address, its media actually
+    /// originates from its NAT's *public* IP — this is that IP. The engine gates the leg's ingress to
+    /// it, a **tighter** RTPBleed source gate than the (unusable) signalled private address would
+    /// yield (docs/security-and-nat.md §4 layer 2). Only the IP is carried — the media port differs
+    /// from the signalling port, so the port is never gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_from: Option<std::net::IpAddr>,
+    /// rtpengine `rtcp-mux` directive list (`offer` | `require` | `demux` | `accept` | `reject` |
+    /// `remove`), letting the controller override the mux decision derived from the offered SDP
+    /// (RFC 5761). Empty ⇒ mirror the offer (the default). See [`crate`] callers / the engine's
+    /// `offer`/`answer` for the per-side resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rtcp_mux: Vec<String>,
 }
 
 fn is_false(value: &bool) -> bool {
