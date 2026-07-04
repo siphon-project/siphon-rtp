@@ -145,6 +145,26 @@ pub enum Command {
     BlockMedia { call_id: String, from_tag: String },
     /// Resume forwarding after [`Command::BlockMedia`].
     UnblockMedia { call_id: String, from_tag: String },
+    /// Stop relaying one leg's RFC 4733 telephone-event (DTMF) packets to the peer while still
+    /// detecting them (rtpengine `block DTMF`). `from_tag` names the blocked source leg; `to_tag`,
+    /// when present, disambiguates which dialog side is meant (it matches the call's to-tag ⇒ leg B).
+    /// The digit is still surfaced to the controller as an `Event::Dtmf` (observability) — only the
+    /// egress relay toward the peer is suppressed. v1 = drop mode (rtpengine's replace-with-tone/PCM
+    /// modes are a follow-up). Rejected on a secure (SRTP) or WebSocket-bridged call, whose DTMF is
+    /// not carried as clear telephone-events.
+    BlockDtmf {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+    },
+    /// Resume relaying a leg's telephone-events after [`Command::BlockDtmf`] (rtpengine `unblock DTMF`).
+    UnblockDtmf {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+    },
     /// Loop a leg's inbound audio straight back to itself (the classic echo test).
     /// `enabled` defaults to `true`; send `false` to stop echoing and resume normal
     /// forwarding. Requires a media-processing (transcoding) call, the same gate as
@@ -681,6 +701,16 @@ mod tests {
             Command::SilenceMedia {
                 call_id: "c".into(),
                 from_tag: "f".into(),
+            },
+            Command::BlockDtmf {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                to_tag: Some("t".into()),
+            },
+            Command::UnblockDtmf {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                to_tag: None,
             },
             Command::Echo {
                 call_id: "c".into(),

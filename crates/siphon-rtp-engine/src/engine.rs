@@ -108,6 +108,10 @@ struct Call {
     far_codec: Option<CodecSpec>,
     /// The near leg's negotiated RFC 4733 telephone-event payload type, if any.
     near_telephone_event: Option<u8>,
+    /// The far leg's negotiated RFC 4733 telephone-event payload type, captured at answer. Paired
+    /// with `near_telephone_event` so `block DTMF` can gate the telephone-event PT of either leg even
+    /// on a plain (untranscoded) relay. `None` until the call is answered / if the far leg has none.
+    far_telephone_event: Option<u8>,
     /// How this call's media is handled once answered (set in `answer`).
     pipeline: PipelineKind,
     /// For a passthrough relay, the forward actions installed at answer — kept so `block`/`unblock`
@@ -129,6 +133,9 @@ struct Call {
 enum PromotionReason {
     /// A raw-RTP pcap recording is active (`start recording`).
     Recording,
+    /// A per-leg RFC 4733 telephone-event (DTMF) relay block is active (`block DTMF`) — the relay is
+    /// held in userspace so the actor can gate the telephone-event PT per direction.
+    DtmfBlock,
 }
 
 impl Call {
@@ -632,6 +639,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Command::Query { call_id, .. } => self.query(client, &call_id),
             Command::BlockMedia { call_id, .. } => self.set_block(client, &call_id, true).await,
             Command::UnblockMedia { call_id, .. } => self.set_block(client, &call_id, false).await,
+            Command::BlockDtmf {
+                call_id,
+                from_tag,
+                to_tag,
+            } => {
+                self.block_dtmf(client, &call_id, &from_tag, to_tag.as_deref(), true)
+                    .await
+            }
+            Command::UnblockDtmf {
+                call_id,
+                from_tag,
+                to_tag,
+            } => {
+                self.block_dtmf(client, &call_id, &from_tag, to_tag.as_deref(), false)
+                    .await
+            }
             Command::SilenceMedia { call_id, .. } => self.set_silence(client, &call_id, true),
             Command::UnsilenceMedia { call_id, .. } => self.set_silence(client, &call_id, false),
             Command::PlayMedia {
@@ -943,6 +966,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_codec: near_codec.clone(),
                 far_codec: None,
                 near_telephone_event: info.telephone_event_payload_type(),
+                far_telephone_event: None,
                 pipeline,
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
@@ -1553,6 +1577,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.far.remote_rtp = Some(info.remote_rtp);
             call.far.remote_rtcp = Some(info.remote_rtcp);
             call.far_codec = info.primary_codec();
+            // The far leg's RFC 4733 telephone-event PT from its answer, so `block DTMF` can gate leg
+            // B's telephone-event even on a plain relay.
+            call.far_telephone_event = info.telephone_event_payload_type();
             call.pipeline = pipeline;
             call.relay_flows = relay_flows;
             // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
@@ -1972,6 +1999,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_codec: near_codec_out,
                 far_codec: far_codec_out,
                 near_telephone_event: snapshot.near_telephone_event,
+                // The far leg's telephone-event PT is not carried in the HA snapshot (a restored call
+                // is not DTMF-blocked — the reason set is cleared above too); resolved only on a fresh
+                // answer. `block DTMF` after a restore on a plain relay gates whichever side's PT is
+                // known (near), which is the documented relay-path limitation.
+                far_telephone_event: None,
                 pipeline,
                 relay_flows,
                 promotion_reasons: HashSet::new(),
@@ -2111,6 +2143,79 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
         ok_empty()
+    }
+
+    /// Block (`blocked = true`) or resume (`blocked = false`) relaying one leg's RFC 4733
+    /// telephone-events (DTMF) to the peer (`block DTMF` / `unblock DTMF`). The named leg's
+    /// telephone-events are still detected (the controller sees the digit as an `Event::Dtmf`) but not
+    /// forwarded — v1 = drop mode (rtpengine's replace-with-tone/PCM modes are a follow-up).
+    ///
+    /// A plain relay (`Passthrough`) is promoted to the userspace media pipeline so the actor can gate
+    /// the telephone-event PT per direction; a transcode / secure-transcode call already has an actor.
+    /// A plain SRTP bridge (`Srtp`) or WebSocket-bridged call (`Ws`) is rejected — its DTMF is not
+    /// carried as clear telephone-events (mirrors `subscribe_request` / recording). Only the owning
+    /// client may. `source_a` (which leg is blocked) is resolved from the tags the same way
+    /// `subscribe_request` does: `to_tag` matching the call's to-tag ⇒ leg B.
+    async fn block_dtmf(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        _from_tag: &str,
+        to_tag: Option<&str>,
+        blocked: bool,
+    ) -> CmdResult {
+        // Snapshot the pipeline + the call's to-tag under the ownership guard (A3 — docs §5).
+        let Some((pipeline, call_to)) =
+            self.owned_call(client, call_id, |call| (call.pipeline, call.to_tag.clone()))
+        else {
+            return unknown_call(call_id);
+        };
+        // A plain SRTP bridge / WS-bridge leg's DTMF is not clear telephone-events — reject clearly.
+        // (A secure *transcode* call — SrtpMedia — decrypts to clear RTP in the actor, so it is fine.)
+        if matches!(pipeline, PipelineKind::Srtp | PipelineKind::Ws) {
+            return error_result(
+                "block_dtmf",
+                &"blocking DTMF on a secure (SRTP) or WebSocket-bridged call is not supported",
+            );
+        }
+        // Resolve which leg is blocked: the call's to_tag ⇒ leg B (source_a = false); else leg A.
+        let source_a = !matches!((call_to.as_deref(), to_tag), (Some(to), Some(tag)) if to == tag);
+        // A plain relay is promoted to userspace (and held) so its actor can gate the telephone-event
+        // PT; a transcode / SrtpMedia call already has an actor. Holding on block, releasing on unblock.
+        if blocked {
+            if let Err(reason) = self
+                .hold_in_userspace(call_id, PromotionReason::DtmfBlock)
+                .await
+            {
+                return error_result("block_dtmf: promote relay", &reason);
+            }
+            if !self.media.control(
+                call_id,
+                MediaControl::BlockDtmf {
+                    source_a,
+                    blocked: true,
+                },
+            ) {
+                // The actor vanished between promote and control — release the hold and report.
+                self.release_userspace_hold(call_id, PromotionReason::DtmfBlock)
+                    .await;
+                return error_result("block_dtmf", &"media actor unavailable");
+            }
+            ok_empty()
+        } else {
+            // Unblock: clear the actor's gate first (no-op if no actor / never promoted), then release
+            // the hold, which demotes a plain relay back to the fast path if nothing else holds it.
+            self.media.control(
+                call_id,
+                MediaControl::BlockDtmf {
+                    source_a,
+                    blocked: false,
+                },
+            );
+            self.release_userspace_hold(call_id, PromotionReason::DtmfBlock)
+                .await;
+            ok_empty()
+        }
     }
 
     /// Replace a call's egress audio with comfort silence (`silence = true`) or resume it. Requires a
@@ -2686,13 +2791,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     async fn promote_passthrough(&self, call_id: &str) -> Result<(), String> {
         // Read the two RTP forward rules + leg identity out of the stored relay flows. `relay_flows`
         // for a passthrough call is [near.rtp, far.rtp, (near.rtcp, far.rtcp)] — we tee/relay only RTP.
-        let Some((from_tag, to_tag, relay_flows)) = self.owned_call_internal(call_id, |call| {
-            (
-                call.from_tag.clone(),
-                call.to_tag.clone(),
-                call.relay_flows.clone(),
-            )
-        }) else {
+        // Also carry each leg's negotiated telephone-event PT so a later `block DTMF` can gate it on
+        // this promoted (still untranscoded) relay: leg A's ingress uses `near_telephone_event`, leg
+        // B's uses `far_telephone_event`.
+        let Some((from_tag, to_tag, relay_flows, near_telephone_event, far_telephone_event)) = self
+            .owned_call_internal(call_id, |call| {
+                (
+                    call.from_tag.clone(),
+                    call.to_tag.clone(),
+                    call.relay_flows.clone(),
+                    call.near_telephone_event,
+                    call.far_telephone_event,
+                )
+            })
+        else {
             return Err("call no longer exists".to_string());
         };
 
@@ -2721,12 +2833,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             accepted_source: near_rule.accepted_source,
             egress_endpoint: near_rule.out_endpoint,
             egress_dst: b_dst,
+            telephone_event: near_telephone_event, // leg A's ingress
         };
         let b_to_a = RelayConfig {
             ingress_endpoint: far_endpoint,
             accepted_source: far_rule.accepted_source,
             egress_endpoint: far_rule.out_endpoint,
             egress_dst: a_dst,
+            telephone_event: far_telephone_event, // leg B's ingress
         };
         // Latch when either side's policy latches (the passthrough default is SignalledOnly/Symmetric).
         let latch = near_rule.latch != LatchPolicy::Off || far_rule.latch != LatchPolicy::Off;
@@ -3398,6 +3512,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Echo { .. } => "echo",
         Command::BlockMedia { .. } => "block_media",
         Command::UnblockMedia { .. } => "unblock_media",
+        Command::BlockDtmf { .. } => "block_dtmf",
+        Command::UnblockDtmf { .. } => "unblock_dtmf",
         Command::StartRecording { .. } => "start_recording",
         Command::StopRecording { .. } => "stop_recording",
         Command::SubscribeRequest { .. } => "subscribe_request",
@@ -6825,6 +6941,223 @@ mod tests {
                     call_id: "nope".into(),
                     from_tag: "f".into(),
                     recording_dir: Some("/tmp".into()),
+                },
+            )
+            .await;
+        assert!(matches!(unknown, CmdResult::Error { .. }), "unknown call ⇒ error");
+    }
+
+    /// Offer + answer a plain PCMU relay (both sides same codec ⇒ passthrough), with a live redirect
+    /// dispatcher so a promoted relay's Redirect datagrams reach its actor. Returns the engine.
+    async fn plain_relay_engine(
+        call_id: &str,
+        addr_a: SocketAddr,
+        addr_b: SocketAddr,
+    ) -> Engine<UdpLoopbackDatapath> {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_dtmf_promotes_a_relay_and_unblock_demotes_it_back() {
+        // `block DTMF` on a plain relay promotes it to userspace (so the actor can gate the
+        // telephone-event PT); `unblock DTMF` with no other hold demotes it back to the fast path.
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let engine = plain_relay_engine("bd-1", addr_a, addr_b).await;
+        assert!(
+            !engine.media().is_media_call("bd-1"),
+            "starts as a plain relay"
+        );
+
+        let blocked = engine
+            .handle(
+                CLIENT,
+                Command::BlockDtmf {
+                    call_id: "bd-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(blocked, CmdResult::Ok { .. }), "block DTMF ok");
+        assert!(
+            engine.media().is_relay_call("bd-1"),
+            "the relay was promoted to userspace for the DTMF block"
+        );
+
+        let unblocked = engine
+            .handle(
+                CLIENT,
+                Command::UnblockDtmf {
+                    call_id: "bd-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(unblocked, CmdResult::Ok { .. }), "unblock DTMF ok");
+        assert!(
+            !engine.media().is_relay_call("bd-1") && !engine.media().is_media_call("bd-1"),
+            "the relay was demoted back to the fast path once the DTMF block cleared"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recording_and_block_dtmf_reason_set_holds_the_relay_until_both_release() {
+        // The whole point of the promotion reason set: on one relay, start recording AND block DTMF;
+        // releasing only one keeps the call promoted; releasing both demotes it back to the fast path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let engine = plain_relay_engine("bd-2", addr_a, addr_b).await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "bd-2".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::BlockDtmf {
+                    call_id: "bd-2".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            engine.media().is_relay_call("bd-2"),
+            "promoted while both recording and DTMF-block hold it"
+        );
+
+        // Release only the DTMF block: still held up by the recording.
+        engine
+            .handle(
+                CLIENT,
+                Command::UnblockDtmf {
+                    call_id: "bd-2".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            engine.media().is_relay_call("bd-2"),
+            "still promoted — the recording hold remains"
+        );
+
+        // Release the recording too: now nothing holds it, so it demotes back.
+        engine
+            .handle(
+                CLIENT,
+                Command::StopRecording {
+                    call_id: "bd-2".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            !engine.media().is_relay_call("bd-2") && !engine.media().is_media_call("bd-2"),
+            "demoted once both the recording and the DTMF-block holds cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_dtmf_rejects_a_secure_call_and_unknown_call() {
+        // A plain SRTP-bridge call's DTMF is ciphertext on the wire, not clear telephone-events, so
+        // `block DTMF` must reject it (same guard as recording / subscribe_request). Unknown ⇒ error.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "bd-savp".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        transport_protocol: Some("RTP/SAVP".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "bd-savp".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: savp_answer_sdp(addr_b, &b_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let secure = engine
+            .handle(
+                CLIENT,
+                Command::BlockDtmf {
+                    call_id: "bd-savp".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(secure, CmdResult::Error { .. }),
+            "block DTMF on a secure (SRTP) call is rejected"
+        );
+
+        let unknown = engine
+            .handle(
+                CLIENT,
+                Command::BlockDtmf {
+                    call_id: "nope".into(),
+                    from_tag: "f".into(),
+                    to_tag: None,
                 },
             )
             .await;
