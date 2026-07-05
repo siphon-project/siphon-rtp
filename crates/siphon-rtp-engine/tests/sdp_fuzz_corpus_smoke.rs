@@ -36,7 +36,7 @@ fn engine() -> EngineMedia {
 
 fn drive(text: &str) {
     let _ = sdp::parse(text);
-    let _ = sdp::rewrite(text, engine(), None, None);
+    let _ = sdp::rewrite(text, engine(), None, None, None);
 }
 
 #[test]

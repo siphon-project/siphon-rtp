@@ -608,6 +608,12 @@ fn is_ice_attribute(line: &str) -> bool {
 /// line is rewritten or inserted for the engine RTCP port; for mux (`engine.rtcp = None`), any
 /// `a=rtcp:` line is dropped (RTCP rides the RTP port).
 ///
+/// `mux_override` controls the generated `a=rtcp-mux` attribute (RFC 5761): `Some(true)` forces the
+/// stream to advertise mux (an `a=rtcp-mux` line is emitted, any duplicate dropped); `Some(false)`
+/// strips `a=rtcp-mux` so the far side demuxes RTCP onto its own port; `None` mirrors the input
+/// (the default — the offered mux intent is passed through). This lets the controller's rtpengine
+/// `rtcp-mux` directive drive the far/near presentation independently of what the peer offered.
+///
 /// When `ice` is `Some`, the engine re-originates ICE as ICE-lite: the peer's ICE attributes are
 /// dropped and replaced with `a=ice-lite` plus the engine's own `a=ice-ufrag`/`a=ice-pwd` and a host
 /// `a=candidate` for the engine RTP address (RFC 8445).
@@ -616,6 +622,7 @@ pub fn rewrite(
     engine: EngineMedia,
     ice: Option<IceAdvertisement<'_>>,
     security: Option<SecurityAdvertisement>,
+    mux_override: Option<bool>,
 ) -> Result<Rewritten, SdpError> {
     let scan = scan(sdp);
     let media = media_info(&scan)?;
@@ -642,6 +649,12 @@ pub fn rewrite(
         {
             continue;
         }
+        // RFC 5761 rtcp-mux override: strip the peer's `a=rtcp-mux` when forcing demux
+        // (`Some(false)`) or when forcing mux (`Some(true)` — we re-emit exactly one after the media
+        // line, so drop any input copy to avoid a duplicate). `None` leaves the line untouched.
+        if line == "a=rtcp-mux" && matches!(mux_override, Some(false) | Some(true)) {
+            continue;
+        }
         if index == media_index {
             // `a=ice-lite` is session-level — emit it just before the media line (end of session).
             if ice.is_some() {
@@ -652,6 +665,11 @@ pub fn rewrite(
                 engine.rtp.port(),
                 security.as_ref().map(SecurityAdvertisement::transport),
             ));
+            // RFC 5761: force `a=rtcp-mux` when the controller directs it (`Some(true)`), regardless
+            // of whether the input offered it.
+            if mux_override == Some(true) {
+                lines.push("a=rtcp-mux".to_string());
+            }
             // Insert a fresh a=rtcp line only if there is no existing one to rewrite in place.
             if let Some(rtcp) = engine.rtcp {
                 if rtcp_index.is_none() {
@@ -1193,7 +1211,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine, None, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
             "203.0.113.7:49170".parse().unwrap()
@@ -1218,7 +1236,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine, None, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"));
         assert!(!result.sdp.contains("53000"));
         assert_eq!(
@@ -1237,12 +1255,94 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite");
         assert!(
             !result.sdp.contains("a=rtcp:"),
             "explicit a=rtcp dropped under mux"
         );
         assert!(result.sdp.contains("a=rtcp-mux"), "mux flag preserved");
+    }
+
+    #[test]
+    fn mux_override_true_forces_rtcp_mux_when_the_offer_had_none() {
+        // RFC 5761: `mux_override = Some(true)` emits `a=rtcp-mux` even though the offer carried none.
+        let sdp = offer("203.0.113.7", 49170); // no a=rtcp-mux
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let result = rewrite(&sdp, engine, None, None, Some(true)).expect("rewrite");
+        assert_eq!(
+            result.sdp.matches("a=rtcp-mux").count(),
+            1,
+            "exactly one a=rtcp-mux emitted: {}",
+            result.sdp
+        );
+        assert!(parse(&result.sdp).expect("reparse").rtcp_mux);
+    }
+
+    #[test]
+    fn mux_override_true_does_not_duplicate_an_existing_mux_line() {
+        // The offer already advertised mux; forcing mux must not produce a duplicate `a=rtcp-mux`.
+        let mut sdp = offer("203.0.113.7", 49170);
+        sdp.push_str("a=rtcp-mux\r\n");
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let result = rewrite(&sdp, engine, None, None, Some(true)).expect("rewrite");
+        assert_eq!(
+            result.sdp.matches("a=rtcp-mux").count(),
+            1,
+            "no duplicate a=rtcp-mux: {}",
+            result.sdp
+        );
+    }
+
+    #[test]
+    fn mux_override_false_strips_rtcp_mux_and_advertises_the_rtcp_port() {
+        // RFC 5761: `mux_override = Some(false)` demuxes — the offered `a=rtcp-mux` is dropped and the
+        // engine's separate RTCP port is advertised.
+        let mut sdp = offer("203.0.113.7", 49170);
+        sdp.push_str("a=rtcp-mux\r\n");
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: Some("127.0.0.1:40001".parse().unwrap()),
+        };
+        let result = rewrite(&sdp, engine, None, None, Some(false)).expect("rewrite");
+        assert!(
+            !result.sdp.contains("a=rtcp-mux"),
+            "a=rtcp-mux stripped under demux: {}",
+            result.sdp
+        );
+        assert!(result.sdp.contains("a=rtcp:40001"), "{}", result.sdp);
+        let reparsed = parse(&result.sdp).expect("reparse");
+        assert!(!reparsed.rtcp_mux);
+    }
+
+    #[test]
+    fn mux_override_none_mirrors_the_offer() {
+        // `None` is the default: the offer's `a=rtcp-mux` intent passes through untouched.
+        let mut muxed = offer("203.0.113.7", 49170);
+        muxed.push_str("a=rtcp-mux\r\n");
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        assert!(rewrite(&muxed, engine, None, None, None)
+            .expect("rewrite")
+            .sdp
+            .contains("a=rtcp-mux"));
+        // A non-muxed offer stays non-muxed under `None`.
+        let plain = offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: Some("127.0.0.1:40001".parse().unwrap()),
+        };
+        assert!(!rewrite(&plain, engine, None, None, None)
+            .expect("rewrite")
+            .sdp
+            .contains("a=rtcp-mux"));
     }
 
     #[test]
@@ -1252,7 +1352,7 @@ mod tests {
             rtp: "127.0.0.1:41000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(sdp, engine, None, None).expect("rewrite");
+        let result = rewrite(sdp, engine, None, None, None).expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
             "198.51.100.9:5000".parse().unwrap()
@@ -1314,7 +1414,7 @@ mod tests {
             rtp: "[::1]:40000".parse().unwrap(),
             rtcp: Some("[::1]:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine, None, None).expect("rewrite v6");
+        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite v6");
         assert_eq!(
             result.media.remote_rtp,
             "[2001:db8::1]:49170".parse().unwrap()
@@ -1354,7 +1454,7 @@ mod tests {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
         };
-        let result = rewrite(sdp, engine, Some(advert), None).expect("rewrite v6 ice");
+        let result = rewrite(sdp, engine, Some(advert), None, None).expect("rewrite v6 ice");
         assert!(result.sdp.contains("c=IN IP6 ::1"));
         assert!(
             result
@@ -1378,7 +1478,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None, None).expect("rewrite v4");
+        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite v4");
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(
             !result.sdp.contains("IP6"),
@@ -1410,7 +1510,7 @@ mod tests {
                 rtp: "192.0.2.1:10000".parse().expect("addr"),
                 rtcp: None,
             };
-            let _ = rewrite(&text, engine, None, None);
+            let _ = rewrite(&text, engine, None, None, None);
             let _ = force_answer_codec(&text, &CodecSpec::new(0, "PCMU", 8000, 1, 20), Some(96));
         }
     }
@@ -1450,7 +1550,7 @@ mod tests {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
         };
-        let result = rewrite(&sdp, engine, Some(advert), None).expect("rewrite");
+        let result = rewrite(&sdp, engine, Some(advert), None, None).expect("rewrite");
 
         // Our credentials and posture are advertised.
         assert!(result.sdp.contains("a=ice-lite"));
@@ -1474,7 +1574,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite");
         assert!(!result.sdp.contains("a=ice-lite"));
         assert!(!result.sdp.contains("a=ice-ufrag"));
     }
@@ -1648,6 +1748,7 @@ mod tests {
             engine,
             None,
             Some(SecurityAdvertisement::Secure(ours)),
+            None,
         )
         .expect("rewrite");
         assert!(
@@ -1669,7 +1770,7 @@ mod tests {
             rtcp: None,
         };
         let result =
-            rewrite(&sdp, engine, None, Some(SecurityAdvertisement::Plain)).expect("rewrite");
+            rewrite(&sdp, engine, None, Some(SecurityAdvertisement::Plain), None).expect("rewrite");
         assert!(
             result.sdp.contains("m=audio 40000 RTP/AVP 0 8"),
             "{}",

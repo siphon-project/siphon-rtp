@@ -18,6 +18,7 @@ fuzz_target!(|data: &[u8]| {
         rtp: "192.0.2.1:10000".parse().expect("static valid socket address"),
         rtcp: None,
     };
-    // Rewrite against arbitrary input with no ICE / security advertisement: must never panic.
-    let _ = sdp::rewrite(&text, engine, None, None);
+    // Rewrite against arbitrary input with no ICE / security advertisement / mux override: must
+    // never panic.
+    let _ = sdp::rewrite(&text, engine, None, None, None);
 });
