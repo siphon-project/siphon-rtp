@@ -907,7 +907,7 @@ impl Decoder for GsmFr {
     }
 
     fn decode(&mut self, payload: &[u8], out: &mut [i16]) -> Result<usize, CodecError> {
-        if payload.len() % FRAME_BYTES != 0 {
+        if !payload.len().is_multiple_of(FRAME_BYTES) {
             return Err(CodecError::Malformed(
                 "GSM payload not a multiple of 33 bytes",
             ));
@@ -947,7 +947,7 @@ impl Encoder for GsmFr {
     }
 
     fn encode(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, CodecError> {
-        if pcm.len() % FRAME_SAMPLES != 0 {
+        if !pcm.len().is_multiple_of(FRAME_SAMPLES) {
             return Err(CodecError::BadFrameSize {
                 expected: FRAME_SAMPLES,
                 got: pcm.len(),

@@ -132,7 +132,7 @@ fn next_frame(buffer: &[u8]) -> FramePeek {
         }
         let cookie = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
         let length = u16::from_be_bytes([buffer[2], buffer[3]]) as usize;
-        if cookie != stun::MAGIC_COOKIE || length % 4 != 0 {
+        if cookie != stun::MAGIC_COOKIE || !length.is_multiple_of(4) {
             return FramePeek::Invalid;
         }
         let total = 20 + length;

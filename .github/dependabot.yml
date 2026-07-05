@@ -32,7 +32,7 @@ updates:
       github-actions:
         patterns: ["*"]
     ignore:
-      # dtolnay/rust-toolchain's tag IS the Rust toolchain it installs (e.g. @1.86.0 = the MSRV pin),
+      # dtolnay/rust-toolchain's tag IS the Rust toolchain it installs (e.g. @1.88.0 = the MSRV pin),
       # not an action release. Dependabot "upgrading" it to a newer tag (it bumped @1.86.0 → @1.100.0,
       # a nonexistent rustc) silently breaks the msrv job. Pin this one manually.
       - dependency-name: "dtolnay/rust-toolchain"

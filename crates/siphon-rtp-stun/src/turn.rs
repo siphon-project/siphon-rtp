@@ -539,7 +539,7 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     if bytes.is_empty() {
         return Some(Vec::new());
     }
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
