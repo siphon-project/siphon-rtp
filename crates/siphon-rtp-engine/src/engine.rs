@@ -32,12 +32,14 @@ use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, PlayMediaSource,
     ProfileFlags, SessionStats,
 };
+use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
 use siphon_rtp_srtp::StreamRollover;
 
 use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
+use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
 use crate::ice::{self, IceCredentials};
 use crate::media_pipeline::{
     DirectionConfig, MediaCall, MediaControl, MediaRegistry, PcapCapture, RawTee, RelayConfig,
@@ -100,6 +102,10 @@ struct Call {
     /// `far_local_crypto`) so an HA checkpoint can re-key the SRTP bridge on a standby. `None` until a
     /// secure answer lands (and `None` for a plain relay).
     far_remote_crypto: Option<CryptoAttribute>,
+    /// Whether the far (answerer) leg is DTLS-SRTP (`UDP/TLS/RTP/SAVPF`, RFC 5764) — the engine offered
+    /// its `a=fingerprint`/`a=setup` and, on the answer, keys the leg from the DTLS handshake rather
+    /// than SDES. Mutually exclusive with `far_local_crypto`.
+    far_dtls: bool,
     /// The near (offerer) leg's primary audio codec, captured at offer — paired with the answer's
     /// codec to decide whether the call transcodes (the media slow path).
     near_codec: Option<CodecSpec>,
@@ -291,6 +297,7 @@ fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSnapshot {
         PipelineKind::Media => PipelineSnapshot::Media,
         PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
         PipelineKind::Ws => PipelineSnapshot::Ws,
+        PipelineKind::Dtls => PipelineSnapshot::Dtls,
     }
 }
 
@@ -410,6 +417,9 @@ enum PipelineKind {
     /// WebSocket bridge: leg A's audio is attached to an external WS media server (mod_audio_stream /
     /// voice-AI). The A↔B relay/transcode path is not wired — the WS server is A's far side.
     Ws,
+    /// Userspace DTLS-SRTP bridge (an `RTP/AVP` ↔ `UDP/TLS/RTP/SAVPF` secure leg, RFC 5764): like
+    /// [`PipelineKind::Srtp`] but the far leg is keyed by a DTLS handshake, not SDES.
+    Dtls,
 }
 
 /// The session engine, generic over a [`Datapath`] backend.
@@ -451,6 +461,10 @@ pub struct Engine<D: Datapath> {
     /// `drain` / `undrain` control commands (see [`crate::cluster`]). Shared so the CPU sampler and
     /// the control path see one surface.
     cluster: Arc<ClusterState>,
+    /// The engine's DTLS-SRTP certificate (self-signed; RFC 5763 §5), whose fingerprint is advertised
+    /// in `a=fingerprint` on a DTLS leg. Generated once at startup and reused for every leg; `None`
+    /// only if generation failed, in which case DTLS-SRTP offers are rejected.
+    dtls_certificate: Option<DtlsCertificate>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -469,6 +483,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         D: Clone,
     {
         let bridge = Arc::new(SrtpBridge::new(datapath.clone()));
+        // Mint the engine's DTLS-SRTP certificate once; its fingerprint is stable across all legs.
+        let dtls_certificate = match DtlsCertificate::generate() {
+            Ok(certificate) => Some(certificate),
+            Err(error) => {
+                tracing::error!(%error, "failed to generate DTLS certificate; DTLS-SRTP legs unavailable");
+                None
+            }
+        };
         Self {
             datapath,
             calls: DashMap::new(),
@@ -483,6 +505,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             subscriptions: DashMap::new(),
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(ClusterState::new("siphon-rtp".to_string(), 0, Vec::new())),
+            dtls_certificate,
         }
     }
 
@@ -518,6 +541,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// endpoints' datagrams here (see [`crate::srtp_bridge::run_redirect_dispatcher`]).
     pub fn bridge(&self) -> Arc<SrtpBridge<D>> {
         self.bridge.clone()
+    }
+
+    /// The shared DTLS-SRTP bridge (a sibling of the SRTP bridge, reached through it), for the control
+    /// path to register/deregister DTLS legs. The redirect dispatcher already routes DTLS endpoints via
+    /// [`Self::bridge`], so this is only for registration.
+    pub fn dtls_bridge(&self) -> Arc<DtlsBridge<D>> {
+        self.bridge.dtls()
     }
 
     /// The shared media registry — handed to the redirect dispatcher so it can route media-owned
@@ -886,15 +916,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             pwd: creds.pwd.as_str(),
         });
 
-        // SRTP bridge (Scenario 1): when the control profile asks for a secure far leg
-        // (transport-protocol RTP/SAVP), mint our own SDES key and advertise RTP/SAVP + a=crypto to
-        // B. B's answer brings its key and `answer` wires the bridge. The reverse (a secure near
-        // leg, i.e. A offered SAVP) is a follow-up — see Call::far_local_crypto.
-        let far_secure = profile
-            .transport_protocol
-            .as_deref()
-            .is_some_and(|protocol| protocol.contains("SAVP"));
-        let far_local_crypto = if far_secure {
+        // Secure far leg: when the control profile asks for a secure far leg, either DTLS-SRTP
+        // (`UDP/TLS/RTP/SAVP[F]`, RFC 5764) — advertise the engine's fingerprint + `a=setup:actpass`,
+        // keyed by the handshake at answer — or SDES (`RTP/SAVP[F]`, RFC 4568) — mint an `a=crypto` key.
+        // B's answer brings its keying and `answer` wires the bridge. (`UDP/TLS/...` also matches
+        // "SAVP", so DTLS is tested first.)
+        let far_transport = profile.transport_protocol.as_deref().unwrap_or_default();
+        let far_dtls = far_transport.contains("UDP/TLS");
+        let far_sdes = !far_dtls && far_transport.contains("SAVP");
+        let far_local_crypto = if far_sdes {
             match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
                 Ok(crypto) => Some(crypto),
                 Err(error) => {
@@ -905,7 +935,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             None
         };
-        let security = far_local_crypto.map(SecurityAdvertisement::Secure);
+        let security = if far_dtls {
+            let Some(certificate) = self.dtls_certificate.as_ref() else {
+                self.free(&endpoints).await;
+                return error_result("DTLS-SRTP offer", &"engine has no DTLS certificate");
+            };
+            let fingerprint = certificate.fingerprint();
+            Some(SecurityAdvertisement::Dtls {
+                fingerprint: sdp::Fingerprint {
+                    hash_function: fingerprint.hash_function,
+                    bytes: fingerprint.bytes,
+                },
+                // Offerer is `actpass`; the answerer (B) chooses active/passive (RFC 5763 §5).
+                setup: sdp::Setup::Actpass,
+            })
+        } else {
+            far_local_crypto.map(SecurityAdvertisement::Secure)
+        };
 
         // RFC 5761: when a `rtcp-mux` directive was given, present the resolved far-side mux to B
         // explicitly (force `a=rtcp-mux` on, or strip it); otherwise mirror the offer (`None`).
@@ -974,6 +1020,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 },
                 far_local_crypto,
                 far_remote_crypto: None,
+                far_dtls,
                 near_codec: near_codec.clone(),
                 far_codec: None,
                 near_telephone_event: info.telephone_event_payload_type(),
@@ -1147,6 +1194,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far,
             ice_creds,
             far_local_crypto,
+            far_dtls,
             near_codec,
             near_telephone_event,
             offer_pipeline,
@@ -1163,6 +1211,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.far,
                     call.ice.clone(),
                     call.far_local_crypto,
+                    call.far_dtls,
                     call.near_codec.clone(),
                     call.near_telephone_event,
                     call.pipeline,
@@ -1205,9 +1254,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ufrag: creds.ufrag.as_str(),
             pwd: creds.pwd.as_str(),
         });
-        // The answer to A advertises the near leg; on an SRTP bridge that side is plain (RTP/AVP), so
-        // force AVP and strip crypto. A plain relay leaves transport/crypto untouched.
-        let security = far_local_crypto.map(|_| SecurityAdvertisement::Plain);
+        // The answer to A advertises the near leg; on a secure (SDES or DTLS) far leg that side is
+        // plain (RTP/AVP), so force AVP and strip the peer's crypto/fingerprint. A plain relay leaves
+        // transport/crypto untouched.
+        let security =
+            (far_local_crypto.is_some() || far_dtls).then_some(SecurityAdvertisement::Plain);
         // RFC 5761: the near (A-facing) mux state was fixed at offer — the companion RTCP endpoint
         // exists iff the near side is non-muxed. When a `rtcp-mux` directive drove that decision,
         // present it to A explicitly so the answer SDP matches the ports the engine actually bound;
@@ -1270,7 +1321,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Resolve how this call's media is carried: an SRTP bridge (secure far leg), the userspace
         // media slow path (transcode / record), or the in-datapath plain relay.
-        let pipeline = resolve_pipeline(near_codec.as_ref(), &info, profile, far_local_crypto);
+        let pipeline = resolve_pipeline(near_codec.as_ref(), &info, profile, far_local_crypto, far_dtls);
         // For a passthrough relay, remember the installed forward actions so `block` can flip the
         // endpoints to `Drop` and `unblock` can restore them.
         let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
@@ -1329,6 +1380,47 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.bridge.register(BridgeCallPlan {
                 leg: SecureLeg::new(&far_local.key, &far_remote.key),
                 flows,
+            });
+        } else if pipeline == PipelineKind::Dtls {
+            // DTLS-SRTP far (B) leg → userspace DTLS bridge: the handshake keys the leg, then SRTP/SRTCP
+            // is terminated on B and plaintext relayed on A. B's answer must carry its certificate
+            // fingerprint (RFC 5763 §5) to authenticate the handshake; the engine takes the DTLS role
+            // opposite the peer's `a=setup`. (rtcp-mux is assumed, as WebRTC mandates — non-muxed DTLS
+            // RTCP is a follow-up.)
+            let Some(certificate) = self.dtls_certificate.clone() else {
+                return error_result("DTLS-SRTP answer", &"engine has no DTLS certificate");
+            };
+            let Some(peer_fingerprint) = info.fingerprint.clone() else {
+                return error_result("DTLS-SRTP answer", &"missing a=fingerprint in the answer");
+            };
+            let Some(a_rtp) = near.remote_rtp else {
+                return error_result("DTLS bridge", &"near leg has no signalled address");
+            };
+            // The answerer (B) picks the DTLS role; the engine takes the complement (RFC 5763 §5): a
+            // `passive` peer makes us the client, anything else (active/actpass) makes us the server.
+            let role = match info.setup {
+                Some(sdp::Setup::Passive) => DtlsRole::Client,
+                _ => DtlsRole::Server,
+            };
+            for endpoint in [near.rtp.id, far.rtp.id] {
+                if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                    return error_result("install DTLS bridge redirect", &error);
+                }
+            }
+            self.dtls_bridge().register(DtlsCallPlan {
+                plain_endpoint: near.rtp.id,
+                plain_source: bridge_source_filter(profile, a_rtp),
+                plain_dst: a_rtp,
+                secure_endpoint: far.rtp.id,
+                secure_source: bridge_source_filter(profile, info.remote_rtp),
+                secure_dst: info.remote_rtp,
+                secure_local: far.rtp.local_addr,
+                certificate,
+                role,
+                peer_fingerprint: DtlsFingerprint::new(
+                    peer_fingerprint.hash_function,
+                    peer_fingerprint.bytes,
+                ),
             });
         } else if pipeline == PipelineKind::SrtpMedia {
             // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
@@ -2041,6 +2133,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far,
                 far_local_crypto,
                 far_remote_crypto,
+                // A DTLS-SRTP call is never restored (rejected above), so it is always plaintext/SDES here.
+                far_dtls: false,
                 // Set for a transcode (`Media`) call; `None` for relay/bridge, which don't transcode.
                 near_codec: near_codec_out,
                 far_codec: far_codec_out,
@@ -3375,6 +3469,7 @@ fn resolve_pipeline(
     info: &sdp::MediaInfo,
     profile: &ProfileFlags,
     far_local_crypto: Option<CryptoAttribute>,
+    far_dtls: bool,
 ) -> PipelineKind {
     // Transcode when the two legs' primary codecs differ in encoding or clock rate.
     let transcode = match (near_codec, info.primary_codec()) {
@@ -3384,6 +3479,11 @@ fn resolve_pipeline(
         }
         _ => false,
     };
+    if far_dtls {
+        // DTLS-SRTP far leg → the userspace DTLS bridge (codec passthrough). Secure transcode over
+        // DTLS (the DTLS analogue of `SrtpMedia`) is a follow-up, so a codec mismatch still bridges.
+        return PipelineKind::Dtls;
+    }
     if far_local_crypto.is_some() {
         // Secure far leg: the plain SRTP bridge when both legs share a codec (crypto only), or the
         // secure transcoding media slow path when they differ — decrypt → transcode → encrypt
@@ -7446,6 +7546,159 @@ mod tests {
         packet.extend_from_slice(&ssrc.to_be_bytes());
         packet.extend_from_slice(b"audio");
         packet
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dtls_srtp_offer_answer_bridges_media_end_to_end() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use bytes::Bytes;
+        use siphon_rtp_dtls::{handshake, DtlsCertificate, DtlsRole, DtlsTransport};
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Full control-plane path: A offers plaintext + a DTLS far-leg profile, the engine advertises
+        // its fingerprint to B, B answers with its own fingerprint, the engine stands up the DTLS
+        // bridge, B completes the handshake, and B's SRTP is relayed to A as plaintext.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await; // plain caller A
+        let peer_b = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind b"),
+        );
+        let addr_b = peer_b.local_addr().expect("addr b");
+
+        // A offers plaintext; the profile requests a DTLS-SRTP far leg.
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dtls-e2e".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
+        assert!(offer_reply.dtls, "engine advertised UDP/TLS/RTP/SAVPF to B");
+        assert_eq!(offer_reply.setup, Some(sdp::Setup::Actpass));
+        let engine_fingerprint = offer_reply.fingerprint.clone().expect("engine a=fingerprint");
+        let engine_far = offer_reply.remote_rtp; // where B sends toward the engine
+
+        // B answers DTLS with its own fingerprint and `setup:active` (so the engine is DTLS server).
+        let peer_cert = DtlsCertificate::generate().expect("peer cert");
+        let peer_fingerprint = peer_cert.fingerprint();
+        let peer_hex = peer_fingerprint
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+             a=setup:active\r\na=fingerprint:{hash} {peer_hex}\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+            hash = peer_fingerprint.hash_function,
+        );
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dtls-e2e".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        assert!(matches!(answer, CmdResult::Ok { .. }), "answer ok: {answer:?}");
+
+        // B drives its side of the DTLS handshake (client) against the engine's far endpoint.
+        let (b_transport, b_channels) = DtlsTransport::new(addr_b, engine_far);
+        let reader = {
+            let socket = peer_b.clone();
+            let inbound = b_channels.inbound;
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 2048];
+                while let Ok((len, _)) = socket.recv_from(&mut buffer).await {
+                    if inbound
+                        .send_async(Bytes::copy_from_slice(&buffer[..len]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+        let writer = {
+            let socket = peer_b.clone();
+            let outbound = b_channels.outbound;
+            tokio::spawn(async move {
+                while let Ok(record) = outbound.recv_async().await {
+                    if socket.send_to(&record, engine_far).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let engine_fingerprint = siphon_rtp_dtls::Fingerprint::new(
+            engine_fingerprint.hash_function,
+            engine_fingerprint.bytes,
+        );
+        let mut peer_leg = timeout(
+            Duration::from_secs(5),
+            handshake(
+                Arc::new(b_transport),
+                &peer_cert,
+                DtlsRole::Client,
+                &engine_fingerprint,
+            ),
+        )
+        .await
+        .expect("handshake did not time out")
+        .expect("peer handshake");
+        reader.abort();
+        writer.abort();
+
+        // B → engine SRTP is decrypted and relayed to A as plaintext. Retry to absorb the tiny window
+        // between B finishing and the engine installing its leg.
+        let media = rtp(0x0B0B_0B0B);
+        let mut sealed = Vec::new();
+        let mut relayed = None;
+        for _ in 0..25 {
+            sealed.clear();
+            peer_leg.protect(&media, &mut sealed).expect("peer protect");
+            peer_b.send_to(&sealed, engine_far).await.expect("b send");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                relayed = Some(buffer[..len].to_vec());
+                break;
+            }
+        }
+        assert_eq!(
+            relayed.expect("phone A received the relayed media"),
+            media,
+            "B's DTLS-SRTP media is decrypted and relayed to A"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

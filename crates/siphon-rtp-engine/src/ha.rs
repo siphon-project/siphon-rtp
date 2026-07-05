@@ -106,6 +106,9 @@ pub enum PipelineSnapshot {
     SrtpMedia,
     /// WebSocket bridge (voice-AI).
     Ws,
+    /// Userspace DTLS-SRTP bridge — not HA-restorable (the handshake-derived keys cannot be recovered
+    /// from the snapshot), so `restore` rejects it and `checkpoint` refuses to produce one.
+    Dtls,
 }
 
 /// ICE-lite credentials (engine side).

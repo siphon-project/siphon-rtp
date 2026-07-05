@@ -19,6 +19,8 @@ use dashmap::DashMap;
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
+use crate::dtls_bridge::DtlsBridge;
+
 /// The crypto a bridge flow applies to ingress before forwarding it out the peer endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeOp {
@@ -62,19 +64,32 @@ struct Flow {
 
 /// The bridge registry: redirected endpoint → its `Flow`. Shared (`Arc`) between the control path
 /// (which registers/deregisters per call) and the redirect dispatcher (which calls [`Self::handle`]).
+///
+/// It also owns the sibling [`DtlsBridge`] (the DTLS-SRTP `Redirect` path). Both terminate a secure
+/// leg on the redirect stream, so the dispatcher routes through this one entry point: [`Self::owns`],
+/// [`Self::handle`], and [`Self::deregister`] cover DTLS endpoints too, keeping the dispatcher (and its
+/// many call sites) unchanged. Reach the DTLS bridge directly for registration via [`Self::dtls`].
 pub struct SrtpBridge<D: Datapath> {
     datapath: D,
     flows: DashMap<EndpointId, Flow>,
+    dtls: Arc<DtlsBridge<D>>,
 }
 
-impl<D: Datapath> SrtpBridge<D> {
+impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
     /// Create an empty bridge over `datapath` (a clone of the engine's datapath, used to transmit).
     #[must_use]
     pub fn new(datapath: D) -> Self {
         Self {
+            dtls: Arc::new(DtlsBridge::new(datapath.clone())),
             datapath,
             flows: DashMap::new(),
         }
+    }
+
+    /// The sibling DTLS-SRTP bridge, for the control path to register/query DTLS legs.
+    #[must_use]
+    pub fn dtls(&self) -> Arc<DtlsBridge<D>> {
+        self.dtls.clone()
     }
 
     /// Register a call's bridge flows, all sharing one [`SecureLeg`]. The caller installs
@@ -95,17 +110,20 @@ impl<D: Datapath> SrtpBridge<D> {
         }
     }
 
-    /// Drop the flows for `endpoints` (a call's endpoints) — the bridge half of call teardown.
+    /// Drop the flows for `endpoints` (a call's endpoints) — the bridge half of call teardown. Also
+    /// deregisters any DTLS-bridge flows for the same endpoints (aborting their handshake tasks).
     pub fn deregister(&self, endpoints: impl IntoIterator<Item = EndpointId>) {
-        for endpoint in endpoints {
-            self.flows.remove(&endpoint);
+        let endpoints: Vec<EndpointId> = endpoints.into_iter().collect();
+        for endpoint in &endpoints {
+            self.flows.remove(endpoint);
         }
+        self.dtls.deregister(endpoints);
     }
 
-    /// Whether this bridge owns `endpoint` — the dispatcher's routing predicate (bridge vs TURN).
+    /// Whether this (or the sibling DTLS) bridge owns `endpoint` — the dispatcher's routing predicate.
     #[must_use]
     pub fn owns(&self, endpoint: EndpointId) -> bool {
-        self.flows.contains_key(&endpoint)
+        self.flows.contains_key(&endpoint) || self.dtls.owns(endpoint)
     }
 
     /// Export a call's shared secure-leg rollover for an HA checkpoint, reached via **any one** of its
@@ -140,6 +158,11 @@ impl<D: Datapath> SrtpBridge<D> {
     /// Handle one redirected datagram: gate the source, apply the flow's crypto, and forward it.
     /// Anything that fails to gate or transform is dropped (never forwarded into the void).
     pub async fn handle(&self, packet: RxPacket) {
+        // A DTLS-bridge endpoint (handshake or DTLS-keyed SRTP) routes to the sibling bridge.
+        if self.dtls.owns(packet.endpoint) {
+            self.dtls.handle(packet).await;
+            return;
+        }
         // Snapshot the flow and release the map guard before any crypto or `.await`.
         let Some((op, accepted_source, out_endpoint, out_dst, leg)) =
             self.flows.get(&packet.endpoint).map(|flow| {
@@ -194,7 +217,7 @@ impl<D: Datapath> SrtpBridge<D> {
 /// is running). This is the single owner of `datapath.rx()` the datapath design calls for ("a single
 /// dispatcher should own it and route each RxPacket to the owning subsystem by EndpointId"). Routing
 /// order is bridge → media → ws → conference → turn. Runs until the redirect stream closes.
-pub async fn run_redirect_dispatcher<D: Datapath>(
+pub async fn run_redirect_dispatcher<D: Datapath + Clone + 'static>(
     redirect_rx: flume::Receiver<RxPacket>,
     bridge: Arc<SrtpBridge<D>>,
     media: Arc<crate::media_pipeline::MediaRegistry>,
