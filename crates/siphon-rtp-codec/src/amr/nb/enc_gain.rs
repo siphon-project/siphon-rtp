@@ -9,11 +9,11 @@
 //! emits the transmitted gain index/indices.
 //!
 //! Two paths are ported here (the modes the encoder brings up):
-//!   * **standard per-subframe** — MR122 goes through [`g_code`] + [`q_gain_code`]; the medium-rate
-//!     modes (MR59/MR515/MR67/MR74/MR102) go through [`qua_gain`]. One gain index per subframe.
+//!   * **standard per-subframe** — MR122 goes through [`g_code`] + `q_gain_code`; the medium-rate
+//!     modes (MR59/MR515/MR67/MR74/MR102) go through `qua_gain`. One gain index per subframe.
 //!   * **MR475 joint 2-subframe** — the even subframe *defers* (saving its `gc_pred`-predicted gain,
 //!     energy coefficients and target energy in [`GainQuantState`]); the odd subframe runs the joint
-//!     4-D quantizer [`mr475_gain_quant`] over **both** subframes, emitting a single joint index.
+//!     4-D quantizer `mr475_gain_quant` over **both** subframes, emitting a single joint index.
 //!
 //! MR795 (`MR795_gain_quant`) is out of scope; [`gain_quant`] returns
 //! [`CodecError::Unsupported`] for it and for the not-yet-brought-up modes.
@@ -517,12 +517,12 @@ pub struct GainQuantResult {
     pub sf0_gain_cod: i16,
     /// Transmitted gain index/indices for `ana` (in write order).
     pub params: [i16; 1],
-    /// Number of valid entries in [`params`] (0 for MR475 even subframe, else 1).
+    /// Number of valid entries in `params` (0 for MR475 even subframe, else 1).
     pub num_params: usize,
 }
 
 /// Full encoder gain quantizer (`gain_q.c` `gainQuant`) — dispatches the standard per-subframe path
-/// (MR122 → [`g_code`]+[`q_gain_code`]; medium rates → [`qua_gain`]) and the MR475 joint 2-subframe
+/// (MR122 → [`g_code`]+`q_gain_code`; medium rates → `qua_gain`) and the MR475 joint 2-subframe
 /// path. Threads and updates the MA gain predictor state in `st`.
 ///
 /// Inputs mirror the C `gainQuant(...)` call site:
@@ -535,7 +535,7 @@ pub struct GainQuantResult {
 ///   * `gain_pit` — closed-loop pitch gain (Q14), updated in place to the quantized value.
 ///
 /// Returns [`CodecError::Unsupported`] for MR795 and modes not yet brought up (this tier ships
-/// MR122 and MR475; the medium-rate [`qua_gain`] path is exercised in tests but gated off until its
+/// MR122 and MR475; the medium-rate `qua_gain` path is exercised in tests but gated off until its
 /// codebook search lands in tier 4).
 #[allow(clippy::too_many_arguments)]
 pub fn gain_quant(
