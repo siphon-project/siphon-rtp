@@ -1,9 +1,9 @@
 //! AMR-NB ENCODER algebraic (fixed) codebook search tier — 3GPP TS 26.073.
 //!
 //! Ports the per-mode fixed-codebook search dispatch [`cbsearch`] (`cbsearch.c`) and its shared
-//! helpers: [`cor_h_x`] (`cor_h.c` `cor_h_x`/`cor_h_x2` — the target×impulse-response correlation
-//! `dn[]`), [`cor_h`] (`cor_h.c` `cor_h` — the sign-folded impulse-response autocorrelation matrix
-//! `rr[][]`), [`set_sign`] / [`set_sign12k2`] (`set_sign.c` — the pulse sign vector + track maxima /
+//! helpers: `cor_h_x` (`cor_h.c` `cor_h_x`/`cor_h_x2` — the target×impulse-response correlation
+//! `dn[]`), `cor_h` (`cor_h.c` `cor_h` — the sign-folded impulse-response autocorrelation matrix
+//! `rr[][]`), `set_sign` / `set_sign12k2` (`set_sign.c` — the pulse sign vector + track maxima /
 //! starting positions), and the two per-mode searches ported for this tier:
 //!  * MR122 (12.2 kbit/s): `c1035pf.c` `code_10i40_35bits` — 10 pulses / 5 tracks, depth-first via
 //!    `s10_8pf.c` `search_10and8i40` (GSM-EFR flavour, `gsmefrFlag = 1`).
@@ -14,14 +14,14 @@
 //! [`cbsearch`]'s dispatch (the shared `cor_h_x`/`cor_h`/`set_sign` helpers already generalize).
 //!
 //! Everything is bit-exact against the fixed-point reference: all arithmetic goes through
-//! [`crate::amr::basic_ops`] / [`crate::amr::nb::math_nb`], never native integer arithmetic on the
+//! [`crate::amr::basic_ops`] / `crate::amr::nb::math_nb`, never native integer arithmetic on the
 //! DSP path.
 //!
 //! Pitch sharpening (the "pre/post CB" contribution the reference folds into `h1[]` and `code[]`)
 //! is mode-dependent and matches `cbsearch.c` exactly:
 //!  * MR122 sharpens with `gain_pit` (the closed-loop pitch gain), applied here in [`cbsearch`].
 //!  * MR475/MR515 sharpen with `pitch_sharp` (the encoder's `sharp` state, Q14), applied *inside*
-//!    [`code_2i40_9bits`] as the reference does.
+//!    `code_2i40_9bits` as the reference does.
 //!
 //! `pitch_sharp` is the persistent `st->sharp` (initialized to `SHARPMIN`, updated by tier 6's
 //! `subframePostProc` — NOT here). These functions carry no state of their own.
