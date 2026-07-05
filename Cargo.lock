@@ -1754,6 +1754,7 @@ dependencies = [
  "siphon-rtp-codec",
  "siphon-rtp-datapath",
  "siphon-rtp-dsp",
+ "siphon-rtp-dtls",
  "siphon-rtp-hep",
  "siphon-rtp-media",
  "siphon-rtp-ngcompat",
