@@ -6,15 +6,15 @@
 #   prod — host network + native/zero-copy XDP on the host NIC.
 #           docker compose --profile prod up --build
 #
-# XDP is opt-in until the eBPF crate lands: both profiles build the UDP-loopback binary today
-# (proving the caps/bpffs/veth wiring). Set CARGO_FEATURES=xdp under build.args to compile the aya
-# XDP datapath. With no caps at all the same image falls back to the UDP backend with a warning.
+# The XDP datapath is a separate workspace (crates/siphon-rtp-xdp), not a Cargo feature; both profiles
+# build the UDP-backend binary today (proving the caps/bpffs/veth wiring). The only Cargo feature is
+# CARGO_FEATURES=amr (AMR-NB/WB transcode, patent-gated — see docs/codec-licensing.md).
 #
 # The built-in TURN server (a coturn replacement) is enabled by SIPHON_RTP_TURN_REALM +
 # SIPHON_RTP_TURN_SECRET (coturn `static-auth-secret` REST profile) and serves turn:3478 (UDP+TCP)
-# below; turns:5349 (TLS) needs a mounted cert/key (see the commented block). NOTE: with the
-# UDP-loopback backend the relay leg binds loopback, so allocations + signalling work but media only
-# relays to loopback peers — real external relay needs the XDP/public datapath (CARGO_FEATURES=xdp).
+# below; turns:5349 (TLS) needs a mounted cert/key (see the commented block). NOTE: the UDP backend is
+# the production datapath. It defaults to loopback for NIC-free dev/CI; bind it to a routable address
+# with --relay-bind-ip so media reaches real external peers.
 
 services:
   siphon-rtp-dev:
@@ -23,7 +23,7 @@ services:
       context: .
       target: runtime-dev
       args:
-        CARGO_FEATURES: "" # set to "xdp" once crates/siphon-rtp-ebpf exists
+        CARGO_FEATURES: "" # set to "amr" for AMR-NB/WB transcode (patent-gated)
     cap_add:
       - NET_ADMIN # attach XDP, manage the veth
       - BPF # load programs / maps (kernels >= 5.8)
@@ -64,7 +64,7 @@ services:
       context: .
       target: runtime
       args:
-        CARGO_FEATURES: "" # set to "xdp" for the kernel-accelerated datapath
+        CARGO_FEATURES: "" # set to "amr" for AMR-NB/WB transcode (patent-gated)
     network_mode: host # AF_XDP on the host NIC
     cap_add:
       - NET_ADMIN

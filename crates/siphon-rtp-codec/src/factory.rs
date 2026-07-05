@@ -165,7 +165,7 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
         "G722" => Ok(Box::new(G722::new(spec.ptime_ms))),
         "GSM" => Ok(Box::new(GsmFr::new())),
         "L16" => Ok(Box::new(L16::new(spec.clock_rate_hz, spec.ptime_ms))),
-        // AMR-WB encode is bit-exact (modes 0–7) against 3GPP TS 26.174 — same `amr`-feature gate as
+        // AMR-WB encode is bit-exact (all 9 modes, 0..=8) against 3GPP TS 26.174 — same `amr`-feature gate as
         // decode (docs/codec-licensing.md). The egress mode is the SDP `mode-set`-resolved
         // `spec.encode_mode` when present, else the codec default (mode 2 / 12.65 kbit/s). The full
         // `mode-set` (`spec.allowed_modes`) bounds per-frame RFC 4867 CMR adaptation (`request_mode`).
