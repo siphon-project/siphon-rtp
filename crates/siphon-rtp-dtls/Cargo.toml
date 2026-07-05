@@ -1,0 +1,36 @@
+# siphon-rtp-dtls — pure-Rust DTLS-SRTP (RFC 5764) keying for secure WebRTC legs. The handshake runs
+# on webrtc-dtls (pure RustCrypto, zero C — no ring/aws-lc-rs/openssl), and the exported keying
+# material feeds the existing siphon-rtp-srtp SecureLeg, so DTLS-keyed and SDES-keyed legs share one
+# media path.
+[package]
+name = "siphon-rtp-dtls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "siphon-rtp pure-Rust DTLS-SRTP (RFC 5764) keying: webrtc-dtls handshake → SRTP SecureLeg, zero C deps"
+readme = "README.md"
+keywords = ["dtls", "srtp", "webrtc", "rtp", "voip"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+# DTLS handshake + SRTP key export — pure RustCrypto (p256/aes-gcm/x25519-dalek), no C, no ring.
+webrtc-dtls = "0.12"
+# The `Conn` transport trait + `KeyingMaterialExporter` the handshake drives over.
+webrtc-util = "0.11"
+# The SRTP secure leg the exported keying material is fed into (shared with the SDES path).
+siphon-rtp-srtp = { path = "../siphon-rtp-srtp" }
+# Certificate fingerprints (RFC 8122): SHA-256 default, SHA-384/512 + SHA-1 for interop.
+sha2 = "0.10"
+sha1 = "0.10"
+# The `Conn` trait is `#[async_trait]`.
+async-trait = "0.1"
+bytes = { workspace = true }
+flume = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# In-memory handshake driving in the loopback tests.
+tokio = { workspace = true }
