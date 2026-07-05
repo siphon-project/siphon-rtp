@@ -1709,6 +1709,7 @@ mod tests {
                 fingerprint,
                 setup: Setup::Passive,
             }),
+            None,
         )
         .expect("rewrite");
         assert!(
