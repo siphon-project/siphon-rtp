@@ -182,20 +182,27 @@ mod tests {
         )
         .await
         .expect("client handshake");
-        let mut server_leg = server.await.expect("server task").expect("server handshake");
+        let mut server_leg = server
+            .await
+            .expect("server task")
+            .expect("server handshake");
 
         // The role→key mapping is correct: what the server encrypts, the client decrypts, and back.
         let packet = rtp(1000, 0xDEAD_BEEF);
         let mut sealed = Vec::new();
         let mut recovered = Vec::new();
 
-        server_leg.protect(&packet, &mut sealed).expect("server protect");
+        server_leg
+            .protect(&packet, &mut sealed)
+            .expect("server protect");
         client_leg
             .unprotect(&sealed, &mut recovered)
             .expect("client unprotect");
         assert_eq!(recovered, packet, "server→client media decrypts");
 
-        client_leg.protect(&packet, &mut sealed).expect("client protect");
+        client_leg
+            .protect(&packet, &mut sealed)
+            .expect("client protect");
         server_leg
             .unprotect(&sealed, &mut recovered)
             .expect("server unprotect");

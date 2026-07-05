@@ -288,7 +288,11 @@ impl AmrNb {
         }
         let mut prm = [0i16; nb::bitstream::MAX_PRM_SIZE];
         let nprm = self.encoder.encode_frame(mode, pcm, &mut prm)?;
-        nb::bitstream::prm2bits(mode.frame_type() as usize, &prm[..nprm], &mut out_bits[..nb_bits]);
+        nb::bitstream::prm2bits(
+            mode.frame_type() as usize,
+            &prm[..nprm],
+            &mut out_bits[..nb_bits],
+        );
         Ok(nb_bits)
     }
 
@@ -741,14 +745,28 @@ mod tests {
         // request is honoured and stays in effect for later frames (sticky) with no new request.
         let mut codec = AmrWb::new(); // default mode 2
         let mut payload = [0u8; 64];
-        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
+        codec
+            .encode(&[0i16; wb::constants::L_FRAME16K], &mut payload)
+            .expect("encode");
         assert_eq!(toc_frame_type(&payload), 2, "starts at the default mode 2");
 
         codec.request_mode(0);
-        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
-        assert_eq!(toc_frame_type(&payload), 0, "CMR 0 switches the egress mode");
-        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
-        assert_eq!(toc_frame_type(&payload), 0, "the request is sticky across frames");
+        codec
+            .encode(&[0i16; wb::constants::L_FRAME16K], &mut payload)
+            .expect("encode");
+        assert_eq!(
+            toc_frame_type(&payload),
+            0,
+            "CMR 0 switches the egress mode"
+        );
+        codec
+            .encode(&[0i16; wb::constants::L_FRAME16K], &mut payload)
+            .expect("encode");
+        assert_eq!(
+            toc_frame_type(&payload),
+            0,
+            "the request is sticky across frames"
+        );
     }
 
     #[test]
@@ -757,14 +775,26 @@ mod tests {
         // mode-set {0,1,2}: a request for mode 8 clamps down to the highest allowed at or below it.
         let mut codec = AmrWb::new().with_allowed_modes(&[0, 1, 2]);
         codec.request_mode(8);
-        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
-        assert_eq!(toc_frame_type(&payload), 2, "clamped to the highest allowed mode");
+        codec
+            .encode(&[0i16; wb::constants::L_FRAME16K], &mut payload)
+            .expect("encode");
+        assert_eq!(
+            toc_frame_type(&payload),
+            2,
+            "clamped to the highest allowed mode"
+        );
 
         // A request below the whole set clamps up to the lowest allowed mode.
         let mut codec = AmrWb::new().with_allowed_modes(&[4, 5]);
         codec.request_mode(0);
-        codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
-        assert_eq!(toc_frame_type(&payload), 4, "clamped up to the lowest allowed mode");
+        codec
+            .encode(&[0i16; wb::constants::L_FRAME16K], &mut payload)
+            .expect("encode");
+        assert_eq!(
+            toc_frame_type(&payload),
+            4,
+            "clamped up to the lowest allowed mode"
+        );
     }
 
     #[test]
@@ -772,10 +802,16 @@ mod tests {
         // The engine's own encoder emits CMR = 15 (no request); decoding it surfaces None.
         let mut codec = AmrWb::new();
         let mut payload = [0u8; 64];
-        let len = codec.encode(&[0i16; wb::constants::L_FRAME16K], &mut payload).expect("encode");
+        let len = codec
+            .encode(&[0i16; wb::constants::L_FRAME16K], &mut payload)
+            .expect("encode");
         let mut out = [0i16; wb::constants::L_FRAME16K];
         codec.decode(&payload[..len], &mut out).expect("decode");
-        assert_eq!(codec.last_mode_request(), None, "CMR 15 (0xF0) ⇒ no request");
+        assert_eq!(
+            codec.last_mode_request(),
+            None,
+            "CMR 15 (0xF0) ⇒ no request"
+        );
 
         // A peer requesting mode 0 (CMR nibble in byte 0) is surfaced.
         payload[0] = 0x00;
@@ -1225,8 +1261,10 @@ mod tests {
     /// End-to-end public encode path (MR122): every serial speech bit matches `T01_122.COD`.
     #[test]
     fn encodes_amrnb_mr122_serial_bits_bit_exact() {
-        let (frames, mismatch) =
-            check_nb_encode_vector(AmrNbMode::Mr1220, "../../reference/amr-nb/testv/NODTX/T_122/T01_122.COD");
+        let (frames, mismatch) = check_nb_encode_vector(
+            AmrNbMode::Mr1220,
+            "../../reference/amr-nb/testv/NODTX/T_122/T01_122.COD",
+        );
         assert!(
             mismatch.is_none(),
             "MR122: {frames} frames, first mismatch {mismatch:?}"
@@ -1236,8 +1274,10 @@ mod tests {
     /// End-to-end public encode path (MR475, joint gain): every serial speech bit matches `T01_475.COD`.
     #[test]
     fn encodes_amrnb_mr475_serial_bits_bit_exact() {
-        let (frames, mismatch) =
-            check_nb_encode_vector(AmrNbMode::Mr475, "../../reference/amr-nb/testv/NODTX/T_475/T01_475.COD");
+        let (frames, mismatch) = check_nb_encode_vector(
+            AmrNbMode::Mr475,
+            "../../reference/amr-nb/testv/NODTX/T_475/T01_475.COD",
+        );
         assert!(
             mismatch.is_none(),
             "MR475: {frames} frames, first mismatch {mismatch:?}"

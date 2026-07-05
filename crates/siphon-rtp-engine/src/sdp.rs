@@ -113,7 +113,11 @@ impl Fingerprint {
     /// hex per RFC 8122 §5.
     #[must_use]
     pub fn to_attribute_value(&self) -> String {
-        let hex: Vec<String> = self.bytes.iter().map(|byte| format!("{byte:02X}")).collect();
+        let hex: Vec<String> = self
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
         format!("fingerprint:{} {}", self.hash_function, hex.join(":"))
     }
 }
@@ -830,8 +834,7 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
         CodecSpec::from_static_payload_type(payload_type, DEFAULT_PTIME_MS)
             .map(|spec| spec.encoding_name)
     };
-    let is_telephone_event =
-        |name: &Option<String>| name.as_deref() == Some("TELEPHONE-EVENT");
+    let is_telephone_event = |name: &Option<String>| name.as_deref() == Some("TELEPHONE-EVENT");
 
     // Decide which payload types to remove from the far offer.
     let mut removed: Vec<u8> = payload_types
@@ -1659,10 +1662,22 @@ mod tests {
 
     #[test]
     fn fingerprint_rejects_malformed() {
-        assert!(Fingerprint::parse("fingerprint:sha-256 ").is_none(), "no value");
-        assert!(Fingerprint::parse("fingerprint:sha-256 GG:HH").is_none(), "non-hex octet");
-        assert!(Fingerprint::parse("fingerprint:sha-256").is_none(), "no value field");
-        assert!(Fingerprint::parse("crypto:1 whatever").is_none(), "wrong attribute");
+        assert!(
+            Fingerprint::parse("fingerprint:sha-256 ").is_none(),
+            "no value"
+        );
+        assert!(
+            Fingerprint::parse("fingerprint:sha-256 GG:HH").is_none(),
+            "non-hex octet"
+        );
+        assert!(
+            Fingerprint::parse("fingerprint:sha-256").is_none(),
+            "no value field"
+        );
+        assert!(
+            Fingerprint::parse("crypto:1 whatever").is_none(),
+            "wrong attribute"
+        );
     }
 
     #[test]
@@ -1685,7 +1700,10 @@ mod tests {
              m=audio 49170 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n";
         let info = parse(sdp).expect("parse");
         assert_eq!(info.setup, Some(Setup::Passive));
-        assert_eq!(info.fingerprint.expect("session fingerprint").hash_function, "sha-1");
+        assert_eq!(
+            info.fingerprint.expect("session fingerprint").hash_function,
+            "sha-1"
+        );
     }
 
     #[test]
@@ -2037,7 +2055,11 @@ mod tests {
         assert!(!out.contains("PCMA"), "B's PCMA no longer leaked: {out}");
         // The result reparses to the leg's own primary codec.
         assert_eq!(
-            parse(&out).expect("reparse").primary_codec().expect("codec").encoding_name,
+            parse(&out)
+                .expect("reparse")
+                .primary_codec()
+                .expect("codec")
+                .encoding_name,
             "PCMU"
         );
     }

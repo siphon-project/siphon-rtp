@@ -395,7 +395,9 @@ mod tests {
 
         let mut out = Vec::new();
         receiver.unprotect(&p0, &mut out).expect("index 0");
-        receiver.unprotect(&p2, &mut out).expect("index 2 ahead of 1");
+        receiver
+            .unprotect(&p2, &mut out)
+            .expect("index 2 ahead of 1");
         receiver
             .unprotect(&p1, &mut out)
             .expect("the delayed index 1 is still inside the window");
@@ -414,7 +416,9 @@ mod tests {
         let mut out = Vec::new();
         for _ in 0..70 {
             let wire = seal(&mut sender);
-            receiver.unprotect(&wire, &mut out).expect("in-order accepted");
+            receiver
+                .unprotect(&wire, &mut out)
+                .expect("in-order accepted");
         }
         assert_eq!(
             receiver.unprotect(&old, &mut out),

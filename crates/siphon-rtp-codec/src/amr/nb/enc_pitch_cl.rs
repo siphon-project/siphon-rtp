@@ -206,7 +206,14 @@ pub fn subframe_pre_proc(
 
     // Syn_filt(Aq, ai_zero, h1, L_SUBFR, zero, 0) — zero memory (update=0), so a fresh zero vector.
     let mut zero_mem = [0i16; M];
-    syn_filt(&a_q[..MP1], &ai_zero[..L_SUBFR], h1, L_SUBFR, &mut zero_mem, false);
+    syn_filt(
+        &a_q[..MP1],
+        &ai_zero[..L_SUBFR],
+        h1,
+        L_SUBFR,
+        &mut zero_mem,
+        false,
+    );
     // Syn_filt(Ap2, h1, h1, L_SUBFR, zero, 0) — in place, disjoint copy of the input first.
     let mut h1_src = [0i16; L_SUBFR];
     h1_src.copy_from_slice(&h1[..L_SUBFR]);
@@ -221,7 +228,14 @@ pub fn subframe_pre_proc(
     // Syn_filt(Aq, exc, error, L_SUBFR, mem_err, 0) — read-only mem_err copy.
     let mut mem_err_local = [0i16; M];
     mem_err_local.copy_from_slice(&mem_err[..M]);
-    syn_filt(&a_q[..MP1], &exc[..L_SUBFR], error, L_SUBFR, &mut mem_err_local, false);
+    syn_filt(
+        &a_q[..MP1],
+        &exc[..L_SUBFR],
+        error,
+        L_SUBFR,
+        &mut mem_err_local,
+        false,
+    );
 
     // Residu(Ap1, error, xn, L_SUBFR) — error carries M history samples (mem_err) before error[0]?
     // No: in the reference `error = mem_err + M`, so Residu reads error[-j] = mem_err[M-j]. We
@@ -525,21 +539,101 @@ struct PitchFrParm {
 /// `pitch_fr.c` `mode_dep_parm[N_MODES]` (order = `enum Mode`).
 const MODE_DEP_PARM: [PitchFrParm; 8] = [
     // MR475
-    PitchFrParm { max_frac_lag: 84, flag3: 1, first_frac: -2, last_frac: 2, delta_int_low: 5, delta_int_range: 10, delta_frc_low: 5, delta_frc_range: 9, pit_min: PIT_MIN },
+    PitchFrParm {
+        max_frac_lag: 84,
+        flag3: 1,
+        first_frac: -2,
+        last_frac: 2,
+        delta_int_low: 5,
+        delta_int_range: 10,
+        delta_frc_low: 5,
+        delta_frc_range: 9,
+        pit_min: PIT_MIN,
+    },
     // MR515
-    PitchFrParm { max_frac_lag: 84, flag3: 1, first_frac: -2, last_frac: 2, delta_int_low: 5, delta_int_range: 10, delta_frc_low: 5, delta_frc_range: 9, pit_min: PIT_MIN },
+    PitchFrParm {
+        max_frac_lag: 84,
+        flag3: 1,
+        first_frac: -2,
+        last_frac: 2,
+        delta_int_low: 5,
+        delta_int_range: 10,
+        delta_frc_low: 5,
+        delta_frc_range: 9,
+        pit_min: PIT_MIN,
+    },
     // MR59
-    PitchFrParm { max_frac_lag: 84, flag3: 1, first_frac: -2, last_frac: 2, delta_int_low: 3, delta_int_range: 6, delta_frc_low: 5, delta_frc_range: 9, pit_min: PIT_MIN },
+    PitchFrParm {
+        max_frac_lag: 84,
+        flag3: 1,
+        first_frac: -2,
+        last_frac: 2,
+        delta_int_low: 3,
+        delta_int_range: 6,
+        delta_frc_low: 5,
+        delta_frc_range: 9,
+        pit_min: PIT_MIN,
+    },
     // MR67
-    PitchFrParm { max_frac_lag: 84, flag3: 1, first_frac: -2, last_frac: 2, delta_int_low: 3, delta_int_range: 6, delta_frc_low: 5, delta_frc_range: 9, pit_min: PIT_MIN },
+    PitchFrParm {
+        max_frac_lag: 84,
+        flag3: 1,
+        first_frac: -2,
+        last_frac: 2,
+        delta_int_low: 3,
+        delta_int_range: 6,
+        delta_frc_low: 5,
+        delta_frc_range: 9,
+        pit_min: PIT_MIN,
+    },
     // MR74
-    PitchFrParm { max_frac_lag: 84, flag3: 1, first_frac: -2, last_frac: 2, delta_int_low: 3, delta_int_range: 6, delta_frc_low: 5, delta_frc_range: 9, pit_min: PIT_MIN },
+    PitchFrParm {
+        max_frac_lag: 84,
+        flag3: 1,
+        first_frac: -2,
+        last_frac: 2,
+        delta_int_low: 3,
+        delta_int_range: 6,
+        delta_frc_low: 5,
+        delta_frc_range: 9,
+        pit_min: PIT_MIN,
+    },
     // MR795
-    PitchFrParm { max_frac_lag: 84, flag3: 1, first_frac: -2, last_frac: 2, delta_int_low: 3, delta_int_range: 6, delta_frc_low: 10, delta_frc_range: 19, pit_min: PIT_MIN },
+    PitchFrParm {
+        max_frac_lag: 84,
+        flag3: 1,
+        first_frac: -2,
+        last_frac: 2,
+        delta_int_low: 3,
+        delta_int_range: 6,
+        delta_frc_low: 10,
+        delta_frc_range: 19,
+        pit_min: PIT_MIN,
+    },
     // MR102
-    PitchFrParm { max_frac_lag: 84, flag3: 1, first_frac: -2, last_frac: 2, delta_int_low: 3, delta_int_range: 6, delta_frc_low: 5, delta_frc_range: 9, pit_min: PIT_MIN },
+    PitchFrParm {
+        max_frac_lag: 84,
+        flag3: 1,
+        first_frac: -2,
+        last_frac: 2,
+        delta_int_low: 3,
+        delta_int_range: 6,
+        delta_frc_low: 5,
+        delta_frc_range: 9,
+        pit_min: PIT_MIN,
+    },
     // MR122
-    PitchFrParm { max_frac_lag: 94, flag3: 0, first_frac: -3, last_frac: 3, delta_int_low: 3, delta_int_range: 6, delta_frc_low: 5, delta_frc_range: 9, pit_min: PIT_MIN_MR122 },
+    PitchFrParm {
+        max_frac_lag: 94,
+        flag3: 0,
+        first_frac: -3,
+        last_frac: 3,
+        delta_int_low: 3,
+        delta_int_range: 6,
+        delta_frc_low: 5,
+        delta_frc_range: 9,
+        pit_min: PIT_MIN_MR122,
+    },
 ];
 
 /// Closed-loop fractional pitch search state (`pitch_fr.h` `Pitch_frState`), owned by tier 6.
@@ -674,19 +768,47 @@ fn pitch_fr(
         }
 
         if sub(lag, tmp_lag) == 0 || sub(lag, sub(tmp_lag, 1)) == 0 {
-            search_frac(&mut lag, &mut frac, last_frac, &corr_v, corr_base, flag3 != 0);
+            search_frac(
+                &mut lag,
+                &mut frac,
+                last_frac,
+                &corr_v,
+                corr_base,
+                flag3 != 0,
+            );
         } else if sub(lag, sub(tmp_lag, 2)) == 0 {
             frac = 0;
-            search_frac(&mut lag, &mut frac, last_frac, &corr_v, corr_base, flag3 != 0);
+            search_frac(
+                &mut lag,
+                &mut frac,
+                last_frac,
+                &corr_v,
+                corr_base,
+                flag3 != 0,
+            );
         } else if sub(lag, add(tmp_lag, 1)) == 0 {
             last_frac = 0;
-            search_frac(&mut lag, &mut frac, last_frac, &corr_v, corr_base, flag3 != 0);
+            search_frac(
+                &mut lag,
+                &mut frac,
+                last_frac,
+                &corr_v,
+                corr_base,
+                flag3 != 0,
+            );
         } else {
             frac = 0;
         }
     } else {
         // Test the fractions around T0.
-        search_frac(&mut lag, &mut frac, last_frac, &corr_v, corr_base, flag3 != 0);
+        search_frac(
+            &mut lag,
+            &mut frac,
+            last_frac,
+            &corr_v,
+            corr_base,
+            flag3 != 0,
+        );
     }
 
     // Encode the pitch lag.
@@ -697,7 +819,15 @@ fn pitch_fr(
                 || mode == AmrNbMode::Mr590
                 || mode == AmrNbMode::Mr670,
         );
-        *ana_index = enc_lag3(lag, frac, st.t0_prev_subframe, t0_min, t0_max, delta_search, flag4);
+        *ana_index = enc_lag3(
+            lag,
+            frac,
+            st.t0_prev_subframe,
+            t0_min,
+            t0_max,
+            delta_search,
+            flag4,
+        );
     } else {
         *ana_index = enc_lag6(lag, frac, t0_min, delta_search);
     }
@@ -1118,7 +1248,11 @@ mod tests {
             for frac in -1..=1i16 {
                 let index = enc_lag3(t0, frac, 0, 0, 0, 0, 0);
                 let (dt0, dfrac) = dec_lag3(index, 0, 0, 0, 0, false);
-                assert_eq!((dt0, dfrac), (t0, frac), "roundtrip failed for T0={t0} frac={frac}");
+                assert_eq!(
+                    (dt0, dfrac),
+                    (t0, frac),
+                    "roundtrip failed for T0={t0} frac={frac}"
+                );
             }
         }
     }
@@ -1130,7 +1264,11 @@ mod tests {
             for frac in -2..=3i16 {
                 let index = enc_lag6(t0, frac, 0, 0);
                 let (dt0, dfrac) = dec_lag6(index, 18, 143, 0, 0);
-                assert_eq!((dt0, dfrac), (t0, frac), "roundtrip failed for T0={t0} frac={frac}");
+                assert_eq!(
+                    (dt0, dfrac),
+                    (t0, frac),
+                    "roundtrip failed for T0={t0} frac={frac}"
+                );
             }
         }
     }
@@ -1147,7 +1285,10 @@ mod tests {
         let y1 = [0i16; L_SUBFR];
         let mut g_coeff = [0i16; 4];
         // <y1,y1> = 1, <xn,y1> = 1 -> yy=xy=16384, gain = 0.5 Q15 = 16384 (1.0 Q14).
-        assert_eq!(g_pitch(AmrNbMode::Mr475, &xn, &y1, &mut g_coeff, L_SUBFR), 16384);
+        assert_eq!(
+            g_pitch(AmrNbMode::Mr475, &xn, &y1, &mut g_coeff, L_SUBFR),
+            16384
+        );
     }
 
     #[test]
@@ -1161,7 +1302,10 @@ mod tests {
         let mut g_coeff = [0i16; 4];
         let g = g_pitch(AmrNbMode::Mr475, &xn, &y1, &mut g_coeff, L_SUBFR);
         // Gain ~ 1.0 in Q14 (16384); allow the fixed-point rounding wobble.
-        assert!((16000..=16768).contains(&g), "expected ~16384 (1.0 Q14), got {g}");
+        assert!(
+            (16000..=16768).contains(&g),
+            "expected ~16384 (1.0 Q14), got {g}"
+        );
     }
 
     #[test]
@@ -1178,7 +1322,7 @@ mod tests {
         // With gp_limit below a high gain, the quantizer cannot pick large entries.
         let mut gain = 19661i16;
         let index = q_gain_pitch_mr122(GP_CLIP, &mut gain); // GP_CLIP = 15565 = entry 10
-        // Only entries <= 15565 are eligible; nearest to 19661 among them is index 10 (15565).
+                                                            // Only entries <= 15565 are eligible; nearest to 19661 among them is index 10 (15565).
         assert_eq!(index, 10);
     }
 
@@ -1420,7 +1564,10 @@ mod tests {
         );
 
         if result.t0 != rec.t0 {
-            return Err(format!("T0 {} != {} (i_subfr={})", result.t0, rec.t0, rec.i_subfr));
+            return Err(format!(
+                "T0 {} != {} (i_subfr={})",
+                result.t0, rec.t0, rec.i_subfr
+            ));
         }
         if result.t0_frac != rec.t0_frac {
             return Err(format!(
@@ -1580,7 +1727,11 @@ mod tests {
         assert_eq!(result.t0_frac, want_t0_frac, "{mode:?} T0_frac drift");
         assert_eq!(result.gain_pit, want_gain_pit, "{mode:?} gain_pit drift");
         assert_eq!(result.gp_limit, want_gp_limit, "{mode:?} gp_limit drift");
-        assert_eq!(&result.indices[..result.num_indices], want_prm, "{mode:?} prm drift");
+        assert_eq!(
+            &result.indices[..result.num_indices],
+            want_prm,
+            "{mode:?} prm drift"
+        );
         for &(i, want) in want_y1 {
             assert_eq!(y1[i], want, "{mode:?} y1[{i}] drift");
         }
@@ -1595,8 +1746,12 @@ mod tests {
     fn mr122_frame10_subfr0_matches_reference() {
         frame10_subfr0_regression(
             AmrNbMode::Mr1220,
-            &[4096, -1400, 1555, -1571, 1636, -1510, 1479, -1230, 1132, -818, 702],
-            &[4096, -1450, 1659, -1660, 1756, -1647, 1591, -1216, 1208, -945, 785],
+            &[
+                4096, -1400, 1555, -1571, 1636, -1510, 1479, -1230, 1132, -818, 702,
+            ],
+            &[
+                4096, -1450, 1659, -1660, 1756, -1647, 1591, -1216, 1208, -945, 785,
+            ],
             &[
                 -264, -113, 95, -532, 406, -797, 418, -713, -22, -228, -885, 446, -1967, 848,
                 -3023, -73, -4424, -12279, 12203, 11970, 811, 5112, 519, 2257, 881, 508, 1096,
@@ -1640,8 +1795,12 @@ mod tests {
     fn mr475_frame10_subfr0_matches_reference() {
         frame10_subfr0_regression(
             AmrNbMode::Mr475,
-            &[4096, -1558, 1991, -1842, 2115, -1793, 1896, -1437, 1416, -905, 839],
-            &[4096, -1301, 1471, -1386, 1599, -1367, 1454, -853, 800, -489, 684],
+            &[
+                4096, -1558, 1991, -1842, 2115, -1793, 1896, -1437, 1416, -905, 839,
+            ],
+            &[
+                4096, -1301, 1471, -1386, 1599, -1367, 1454, -853, 800, -489, 684,
+            ],
             &[
                 -264, -113, 95, -532, 406, -797, 418, -713, -22, -228, -885, 446, -1967, 848,
                 -3023, -73, -4424, -12279, 12203, 11970, 811, 5112, 519, 2257, 881, 508, 1096,

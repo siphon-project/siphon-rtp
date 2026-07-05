@@ -497,7 +497,10 @@ fn bench_amrwb_encode_cmr(criterion: &mut Criterion) {
     criterion.bench_function("amrwb_encode_frame", |bencher| {
         bencher.iter_batched(
             || warm.clone(),
-            |mut st| st.encode(black_box(&frame_pcm), black_box(&mut out)).expect("encode"),
+            |mut st| {
+                st.encode(black_box(&frame_pcm), black_box(&mut out))
+                    .expect("encode")
+            },
             BatchSize::SmallInput,
         );
     });
@@ -510,7 +513,8 @@ fn bench_amrwb_encode_cmr(criterion: &mut Criterion) {
             || warm_cmr.clone(),
             |mut st| {
                 st.request_mode(black_box(2));
-                st.encode(black_box(&frame_pcm), black_box(&mut out)).expect("encode")
+                st.encode(black_box(&frame_pcm), black_box(&mut out))
+                    .expect("encode")
             },
             BatchSize::SmallInput,
         );

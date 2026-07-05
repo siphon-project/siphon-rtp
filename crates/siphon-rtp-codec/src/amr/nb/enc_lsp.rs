@@ -191,7 +191,13 @@ fn lsf_wt(lsf: &[i16], wf: &mut [i16; M]) {
 /// `dico_size` half-stride) codevectors of 3 elements each. When `use_half` is set every second
 /// codevector is searched (stride 6) but the winner's flat index is still returned. `lsf_r1` is
 /// overwritten with the selected codevector.
-fn vq_subvec3(lsf_r1: &mut [i16], dico: &[i16], wf1: &[i16], dico_size: i16, use_half: bool) -> i16 {
+fn vq_subvec3(
+    lsf_r1: &mut [i16],
+    dico: &[i16],
+    wf1: &[i16],
+    dico_size: i16,
+    use_half: bool,
+) -> i16 {
     let mut dist_min = i32::MAX;
     let mut index: i16 = 0;
 
@@ -319,7 +325,13 @@ fn q_plsf_3(
     // Split-VQ of the prediction error.
     let is_475_515 = mode == AmrNbMode::Mr475 || mode == AmrNbMode::Mr515;
     if is_475_515 {
-        indice[0] = vq_subvec3(&mut lsf_r1[0..3], &DICO1_LSF_3, &wf1[0..3], DICO1_SIZE_3, false);
+        indice[0] = vq_subvec3(
+            &mut lsf_r1[0..3],
+            &DICO1_LSF_3,
+            &wf1[0..3],
+            DICO1_SIZE_3,
+            false,
+        );
         indice[1] = vq_subvec3(
             &mut lsf_r1[3..6],
             &DICO2_LSF_3,
@@ -329,13 +341,37 @@ fn q_plsf_3(
         );
         indice[2] = vq_subvec4(&mut lsf_r1[6..10], &MR515_3_LSF, &wf1[6..10], MR515_3_SIZE);
     } else if mode == AmrNbMode::Mr795 {
-        indice[0] = vq_subvec3(&mut lsf_r1[0..3], &MR795_1_LSF, &wf1[0..3], MR795_1_SIZE, false);
-        indice[1] = vq_subvec3(&mut lsf_r1[3..6], &DICO2_LSF_3, &wf1[3..6], DICO2_SIZE_3, false);
+        indice[0] = vq_subvec3(
+            &mut lsf_r1[0..3],
+            &MR795_1_LSF,
+            &wf1[0..3],
+            MR795_1_SIZE,
+            false,
+        );
+        indice[1] = vq_subvec3(
+            &mut lsf_r1[3..6],
+            &DICO2_LSF_3,
+            &wf1[3..6],
+            DICO2_SIZE_3,
+            false,
+        );
         indice[2] = vq_subvec4(&mut lsf_r1[6..10], &DICO3_LSF_3, &wf1[6..10], DICO3_SIZE_3);
     } else {
         // MR59, MR67, MR74, MR102.
-        indice[0] = vq_subvec3(&mut lsf_r1[0..3], &DICO1_LSF_3, &wf1[0..3], DICO1_SIZE_3, false);
-        indice[1] = vq_subvec3(&mut lsf_r1[3..6], &DICO2_LSF_3, &wf1[3..6], DICO2_SIZE_3, false);
+        indice[0] = vq_subvec3(
+            &mut lsf_r1[0..3],
+            &DICO1_LSF_3,
+            &wf1[0..3],
+            DICO1_SIZE_3,
+            false,
+        );
+        indice[1] = vq_subvec3(
+            &mut lsf_r1[3..6],
+            &DICO2_LSF_3,
+            &wf1[3..6],
+            DICO2_SIZE_3,
+            false,
+        );
         indice[2] = vq_subvec4(&mut lsf_r1[6..10], &DICO3_LSF_3, &wf1[6..10], DICO3_SIZE_3);
     }
 
@@ -519,20 +555,55 @@ fn q_plsf_5(
     {
         let (r1_lo, r1_hi) = lsf_r1.split_at_mut(2);
         let (r2_lo, r2_hi) = lsf_r2.split_at_mut(2);
-        indice[0] = vq_subvec(r1_lo, r2_lo, &DICO1_LSF_5, &wf1[0..2], &wf2[0..2], DICO1_SIZE_5);
+        indice[0] = vq_subvec(
+            r1_lo,
+            r2_lo,
+            &DICO1_LSF_5,
+            &wf1[0..2],
+            &wf2[0..2],
+            DICO1_SIZE_5,
+        );
 
         let (r1_2, r1_rest) = r1_hi.split_at_mut(2); // r1[2..4]
         let (r2_2, r2_rest) = r2_hi.split_at_mut(2); // r2[2..4]
-        indice[1] = vq_subvec(r1_2, r2_2, &DICO2_LSF_5, &wf1[2..4], &wf2[2..4], DICO2_SIZE_5);
+        indice[1] = vq_subvec(
+            r1_2,
+            r2_2,
+            &DICO2_LSF_5,
+            &wf1[2..4],
+            &wf2[2..4],
+            DICO2_SIZE_5,
+        );
 
         let (r1_4, r1_rest) = r1_rest.split_at_mut(2); // r1[4..6]
         let (r2_4, r2_rest) = r2_rest.split_at_mut(2); // r2[4..6]
-        indice[2] = vq_subvec_s(r1_4, r2_4, &DICO3_LSF_5, &wf1[4..6], &wf2[4..6], DICO3_SIZE_5);
+        indice[2] = vq_subvec_s(
+            r1_4,
+            r2_4,
+            &DICO3_LSF_5,
+            &wf1[4..6],
+            &wf2[4..6],
+            DICO3_SIZE_5,
+        );
 
         let (r1_6, r1_8) = r1_rest.split_at_mut(2); // r1[6..8], r1[8..10]
         let (r2_6, r2_8) = r2_rest.split_at_mut(2); // r2[6..8], r2[8..10]
-        indice[3] = vq_subvec(r1_6, r2_6, &DICO4_LSF_5, &wf1[6..8], &wf2[6..8], DICO4_SIZE_5);
-        indice[4] = vq_subvec(r1_8, r2_8, &DICO5_LSF_5, &wf1[8..10], &wf2[8..10], DICO5_SIZE_5);
+        indice[3] = vq_subvec(
+            r1_6,
+            r2_6,
+            &DICO4_LSF_5,
+            &wf1[6..8],
+            &wf2[6..8],
+            DICO4_SIZE_5,
+        );
+        indice[4] = vq_subvec(
+            r1_8,
+            r2_8,
+            &DICO5_LSF_5,
+            &wf1[8..10],
+            &wf2[8..10],
+            DICO5_SIZE_5,
+        );
     }
 
     // Compute quantized LSFs and update the past quantized residual (2nd vector).
@@ -612,7 +683,13 @@ mod tests {
         let mut st = QPlsfState::new();
         let mut lsp1_q = [0i16; M];
         let mut indice = [0i16; 3];
-        q_plsf_3(&mut st, AmrNbMode::Mr475, &LSP_INIT_DATA, &mut lsp1_q, &mut indice);
+        q_plsf_3(
+            &mut st,
+            AmrNbMode::Mr475,
+            &LSP_INIT_DATA,
+            &mut lsp1_q,
+            &mut indice,
+        );
         for i in 1..M {
             assert!(
                 lsp1_q[i] < lsp1_q[i - 1],

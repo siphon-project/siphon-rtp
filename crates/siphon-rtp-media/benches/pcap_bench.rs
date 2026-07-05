@@ -13,7 +13,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// A typical 172-byte µ-law RTP-over-UDP payload (12-byte RTP header + 160-byte frame).
 fn rtp_payload() -> Bytes {
-    let mut packet = vec![0x80, 0x00, 0x12, 0x34, 0x00, 0x00, 0x00, 0xA0, 0xDE, 0xAD, 0xBE, 0xEF];
+    let mut packet = vec![
+        0x80, 0x00, 0x12, 0x34, 0x00, 0x00, 0x00, 0xA0, 0xDE, 0xAD, 0xBE, 0xEF,
+    ];
     packet.extend_from_slice(&[0x7F; 160]);
     Bytes::from(packet)
 }
@@ -32,8 +34,14 @@ fn bench_pcap_frame_ipv4(criterion: &mut Criterion) {
 
 fn bench_pcap_frame_ipv6(criterion: &mut Criterion) {
     let packet = CapturedPacket::new(
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 40_000),
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)), 7_000),
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            40_000,
+        ),
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+            7_000,
+        ),
         rtp_payload(),
         1_234_567,
     );

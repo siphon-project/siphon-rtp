@@ -85,7 +85,11 @@ impl ReplayWindow {
     /// after the packet authenticates, so a forgery can never advance `top` or set a bit.
     pub(crate) fn record(&mut self, index: u64) {
         if !self.seen {
-            *self = Self { top: index, mask: 1, seen: true };
+            *self = Self {
+                top: index,
+                mask: 1,
+                seen: true,
+            };
             return;
         }
         if index > self.top {
@@ -106,7 +110,11 @@ impl ReplayWindow {
     /// its replay state from the rollover anchor carried in a checkpoint (RFC 3711 §3.3.1): the
     /// per-index history below the anchor is not carried across the failover, only its top.
     pub(crate) fn anchor(&mut self, index: u64) {
-        *self = Self { top: index, mask: 1, seen: true };
+        *self = Self {
+            top: index,
+            mask: 1,
+            seen: true,
+        };
     }
 }
 
@@ -604,7 +612,9 @@ mod tests {
         let mut out = Vec::new();
         for seq in 11..=80 {
             let wire = seal(&mut sender, seq, ssrc);
-            receiver.unprotect(&wire, &mut out).expect("in-order accepted");
+            receiver
+                .unprotect(&wire, &mut out)
+                .expect("in-order accepted");
         }
         // `old` (index 10) is now 70 behind the top (80) — below the window, so it cannot be proven
         // fresh and MUST be discarded, even though it was never actually delivered.
