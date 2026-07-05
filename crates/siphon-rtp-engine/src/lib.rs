@@ -8,6 +8,7 @@
 
 pub mod cluster;
 pub mod conference;
+pub mod dtls_bridge;
 pub mod engine;
 pub mod ha;
 pub mod ice;

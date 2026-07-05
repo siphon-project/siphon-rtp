@@ -544,22 +544,33 @@ pub struct IceAdvertisement<'a> {
     pub pwd: &'a str,
 }
 
-/// How to advertise the audio stream's security on rewrite (RFC 3264 transport + RFC 4568 SDES).
-#[derive(Debug, Clone, Copy)]
+/// How to advertise the audio stream's security on rewrite (RFC 3264 transport + RFC 4568 SDES /
+/// RFC 5764 DTLS-SRTP). Not `Copy` — the DTLS variant carries a variable-length fingerprint.
+#[derive(Debug, Clone)]
 pub enum SecurityAdvertisement {
-    /// Plaintext `RTP/AVP`: force the transport profile and strip any `a=crypto` lines.
+    /// Plaintext `RTP/AVP`: force the transport profile and strip any `a=crypto`/`a=fingerprint`.
     Plain,
-    /// Secure `RTP/SAVP`: force the transport, strip the peer's `a=crypto`, and advertise this one
-    /// (the engine's own offered SDES key for the leg).
+    /// SDES-secure `RTP/SAVP`: force the transport, strip the peer's keying, and advertise this
+    /// `a=crypto` (the engine's own offered SDES key for the leg, RFC 4568).
     Secure(CryptoAttribute),
+    /// DTLS-secure `UDP/TLS/RTP/SAVPF`: force the transport, strip the peer's keying, and advertise the
+    /// engine's certificate fingerprint and DTLS role (RFC 5764 / RFC 5763). The key is derived by the
+    /// DTLS handshake, not carried in SDP.
+    Dtls {
+        /// The engine certificate's fingerprint to advertise (`a=fingerprint`, RFC 8122).
+        fingerprint: Fingerprint,
+        /// The engine's DTLS role (`a=setup`): `Actpass` in an offer, `Passive`/`Active` in an answer.
+        setup: Setup,
+    },
 }
 
 impl SecurityAdvertisement {
     /// The `m=audio` transport profile to advertise.
-    fn transport(self) -> &'static str {
+    fn transport(&self) -> &'static str {
         match self {
             SecurityAdvertisement::Plain => "RTP/AVP",
             SecurityAdvertisement::Secure(_) => "RTP/SAVP",
+            SecurityAdvertisement::Dtls { .. } => "UDP/TLS/RTP/SAVPF",
         }
     }
 }
@@ -622,8 +633,13 @@ pub fn rewrite(
         if ice.is_some() && is_ice_attribute(line) {
             continue;
         }
-        // Re-originating SRTP keying: drop the peer's `a=crypto`; we advertise our own (or none).
-        if security.is_some() && line.starts_with("a=crypto:") {
+        // Re-originating secure keying: drop the peer's `a=crypto` (SDES) and `a=fingerprint`/`a=setup`
+        // (DTLS); we advertise our own below (or none, for a plaintext downgrade).
+        if security.is_some()
+            && (line.starts_with("a=crypto:")
+                || line.starts_with("a=fingerprint:")
+                || line.starts_with("a=setup:"))
+        {
             continue;
         }
         if index == media_index {
@@ -634,7 +650,7 @@ pub fn rewrite(
             lines.push(rewrite_media_line(
                 line,
                 engine.rtp.port(),
-                security.map(SecurityAdvertisement::transport),
+                security.as_ref().map(SecurityAdvertisement::transport),
             ));
             // Insert a fresh a=rtcp line only if there is no existing one to rewrite in place.
             if let Some(rtcp) = engine.rtcp {
@@ -642,9 +658,17 @@ pub fn rewrite(
                     lines.push(format!("a=rtcp:{}", rtcp.port()));
                 }
             }
-            // Advertise the engine's SDES key on a secure leg (RFC 4568).
-            if let Some(SecurityAdvertisement::Secure(crypto)) = security {
-                lines.push(format!("a={}", crypto.to_attribute_value()));
+            // Advertise the engine's own keying on a secure leg: the SDES `a=crypto` (RFC 4568) or the
+            // DTLS `a=fingerprint` + `a=setup` (RFC 5764 / RFC 5763).
+            match &security {
+                Some(SecurityAdvertisement::Secure(crypto)) => {
+                    lines.push(format!("a={}", crypto.to_attribute_value()));
+                }
+                Some(SecurityAdvertisement::Dtls { fingerprint, setup }) => {
+                    lines.push(format!("a={}", fingerprint.to_attribute_value()));
+                    lines.push(format!("a=setup:{}", setup.token()));
+                }
+                Some(SecurityAdvertisement::Plain) | None => {}
             }
             if let Some(ice) = ice {
                 lines.push(format!("a=ice-ufrag:{}", ice.ufrag));
@@ -1562,6 +1586,51 @@ mod tests {
         let info = parse(sdp).expect("parse");
         assert_eq!(info.setup, Some(Setup::Passive));
         assert_eq!(info.fingerprint.expect("session fingerprint").hash_function, "sha-1");
+    }
+
+    #[test]
+    fn rewrite_dtls_advertises_fingerprint_setup_and_savpf() {
+        // Answer a DTLS-SRTP leg: force `UDP/TLS/RTP/SAVPF`, advertise the engine's fingerprint + role,
+        // and re-originate (strip) the peer's `a=fingerprint`/`a=setup`.
+        let sdp = dtls_offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let fingerprint = Fingerprint {
+            hash_function: "sha-256".to_string(),
+            bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let result = rewrite(
+            &sdp,
+            engine,
+            None,
+            Some(SecurityAdvertisement::Dtls {
+                fingerprint,
+                setup: Setup::Passive,
+            }),
+        )
+        .expect("rewrite");
+        assert!(
+            result.sdp.contains("m=audio 40000 UDP/TLS/RTP/SAVPF"),
+            "{}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("a=fingerprint:sha-256 DE:AD:BE:EF"),
+            "{}",
+            result.sdp
+        );
+        assert!(result.sdp.contains("a=setup:passive"));
+        // The peer's own keying is re-originated, not forwarded.
+        assert!(
+            !result.sdp.contains("AB:CD:EF:01"),
+            "peer fingerprint must be stripped"
+        );
+        assert!(
+            !result.sdp.contains("a=setup:actpass"),
+            "peer setup must be stripped"
+        );
     }
 
     #[test]
