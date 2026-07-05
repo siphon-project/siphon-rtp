@@ -77,7 +77,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
 # TOML config-file parsing for the daemon's optional --config file (pure Rust: toml → toml_edit →
 # winnow, zero-C rule). `parse` only — no serialization needed.
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
 # Allocator (arena contention under the async runtime — see plan §perf)
 tikv-jemallocator = "0.6"
 # Dev / test
