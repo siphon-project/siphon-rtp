@@ -109,6 +109,18 @@ pub fn parse_command(request: &Value) -> Result<Command, NgError> {
             call_id: required_str(request, "call-id")?,
             from_tag: required_str(request, "from-tag")?,
         }),
+        // Runtime recording toggle (rtpengine parity). Only `call-id` is required — from-tag is
+        // optional, matching rtpengine (Kamailio's `rtpengine_start_recording()` sends call-id only).
+        // The `recording-dir` flag names the output directory for the `.pcap`.
+        "start recording" => Ok(Command::StartRecording {
+            call_id: required_str(request, "call-id")?,
+            from_tag: optional_str(request, "from-tag").unwrap_or_default(),
+            recording_dir: optional_str(request, "recording-dir"),
+        }),
+        "stop recording" => Ok(Command::StopRecording {
+            call_id: required_str(request, "call-id")?,
+            from_tag: optional_str(request, "from-tag").unwrap_or_default(),
+        }),
         "play media" => parse_play_media(request),
         "play DTMF" => parse_play_dtmf(request),
         "subscribe request" => Ok(Command::SubscribeRequest {
@@ -443,6 +455,70 @@ mod tests {
         let (cookie, command) = parse_datagram(&bytes);
         assert_eq!(cookie, b"a3f91c0d");
         assert_eq!(command, Command::Ping);
+    }
+
+    #[test]
+    fn parses_start_recording_with_recording_dir() {
+        let bytes = datagram(
+            "rec01",
+            &[
+                ("command", Value::string("start recording")),
+                ("call-id", Value::string("call-rec")),
+                ("from-tag", Value::string("ft")),
+                ("recording-dir", Value::string("/records")),
+            ],
+        );
+        let (_, command) = parse_datagram(&bytes);
+        assert_eq!(
+            command,
+            Command::StartRecording {
+                call_id: "call-rec".into(),
+                from_tag: "ft".into(),
+                recording_dir: Some("/records".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn start_recording_requires_only_call_id() {
+        // rtpengine parity: from-tag is optional (Kamailio's `rtpengine_start_recording()` sends
+        // call-id only), and no recording-dir yields `None`.
+        let bytes = datagram(
+            "rec02",
+            &[
+                ("command", Value::string("start recording")),
+                ("call-id", Value::string("c")),
+            ],
+        );
+        let (_, command) = parse_datagram(&bytes);
+        assert_eq!(
+            command,
+            Command::StartRecording {
+                call_id: "c".into(),
+                from_tag: String::new(),
+                recording_dir: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_stop_recording() {
+        let bytes = datagram(
+            "rec03",
+            &[
+                ("command", Value::string("stop recording")),
+                ("call-id", Value::string("call-rec")),
+                ("from-tag", Value::string("ft")),
+            ],
+        );
+        let (_, command) = parse_datagram(&bytes);
+        assert_eq!(
+            command,
+            Command::StopRecording {
+                call_id: "call-rec".into(),
+                from_tag: "ft".into(),
+            }
+        );
     }
 
     #[test]
