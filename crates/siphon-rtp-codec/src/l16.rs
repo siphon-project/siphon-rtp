@@ -47,7 +47,7 @@ impl Decoder for L16 {
     }
 
     fn decode(&mut self, payload: &[u8], out: &mut [i16]) -> Result<usize, CodecError> {
-        if payload.len() % 2 != 0 {
+        if !payload.len().is_multiple_of(2) {
             return Err(CodecError::Malformed("L16 payload length must be even"));
         }
         let samples = payload.len() / 2;

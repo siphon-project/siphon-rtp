@@ -53,19 +53,20 @@ jobs:
       - run: cargo test --workspace --all-features --locked
 
   msrv:
-    name: msrv (1.86)
+    name: msrv (1.88)
     runs-on: ubuntu-latest
     env:
       # rust-toolchain.toml pins `stable`; RUSTUP_TOOLCHAIN outranks that file, so cargo really
       # builds on the declared MSRV instead of silently falling back to stable.
-      RUSTUP_TOOLCHAIN: "1.86.0"
+      RUSTUP_TOOLCHAIN: "1.88.0"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
-      # rust-version = "1.86": the shippable crates must compile on it (tests/benches excluded).
-      # Floor set by transitive deps: clap_builder needs the 2024 edition (>=1.85) and the icu/idna
-      # stack (icu_* 2.2, idna_adapter) needs >=1.86.
+      # rust-version = "1.88": the shippable crates must compile on it (tests/benches excluded).
+      # Floor set by transitive deps: clap_builder needs the 2024 edition (>=1.85), the icu/idna stack
+      # (icu_* 2.2, idna_adapter) needs >=1.86, and `time` >=0.3.47 (the RUSTSEC-2026-0009 DoS fix,
+      # pulled in via siphon-rtp-dtls -> webrtc-dtls -> x509-parser) needs >=1.88.
       - run: cargo check --workspace --all-features --locked
 
   docs:

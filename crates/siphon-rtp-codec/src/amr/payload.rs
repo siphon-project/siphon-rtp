@@ -296,7 +296,7 @@ impl BitWriter {
     }
 
     fn write_bit(&mut self, bit: u8) {
-        if self.position % 8 == 0 {
+        if self.position.is_multiple_of(8) {
             self.bytes.push(0);
         }
         if bit != 0 {

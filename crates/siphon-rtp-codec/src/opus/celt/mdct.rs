@@ -148,7 +148,7 @@ fn kf_factor(n: usize) -> Result<Vec<(usize, usize)>, MdctError> {
     let nbak = n;
 
     loop {
-        while work % p != 0 {
+        while !work.is_multiple_of(p) {
             match p {
                 4 => p = 2,
                 2 => p = 3,
