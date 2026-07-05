@@ -1803,6 +1803,7 @@ name = "siphon-rtp-dsp"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "proptest",
  "siphon-rtp-simd",
  "thiserror 2.0.18",
 ]

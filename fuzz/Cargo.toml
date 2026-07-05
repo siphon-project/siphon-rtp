@@ -14,13 +14,14 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 # Every crate with a parser that eats untrusted bytes off the network gets a fuzz target. The codec
-# crate is deliberately excluded here (its AMR/Opus payload fuzzers are a separate follow-up — see
-# the README in this directory).
+# crate is included with the `amr` feature so the AMR-NB/WB RFC 4867 payload decoders (a hostile
+# codec bitstream off the wire) are fuzzed too. (Opus stays out until its decoder lands.)
 siphon-rtp-media = { path = "../crates/siphon-rtp-media" }
 siphon-rtp-engine = { package = "siphon-rtp", path = "../crates/siphon-rtp-engine" }
 siphon-rtp-ngcompat = { path = "../crates/siphon-rtp-ngcompat" }
 siphon-rtp-proto = { path = "../crates/siphon-rtp-proto" }
 siphon-rtp-stun = { path = "../crates/siphon-rtp-stun" }
+siphon-rtp-codec = { path = "../crates/siphon-rtp-codec", features = ["amr"] }
 
 # RFC 3550/3551/5761 — RTP header, compound RTCP, rtcp-mux classifier.
 [[bin]]
@@ -58,6 +59,22 @@ bench = false
 [[bin]]
 name = "stun_fuzz"
 path = "fuzz_targets/stun_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# 3GPP TS 26.171 / RFC 4867 — AMR-WB RTP payload parse + ACELP decode (hostile codec bitstream).
+[[bin]]
+name = "amr_wb_decode_fuzz"
+path = "fuzz_targets/amr_wb_decode_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# 3GPP TS 26.071 / RFC 4867 — AMR-NB RTP payload parse + ACELP decode (hostile codec bitstream).
+[[bin]]
+name = "amr_nb_decode_fuzz"
+path = "fuzz_targets/amr_nb_decode_fuzz.rs"
 test = false
 doc = false
 bench = false

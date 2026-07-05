@@ -127,11 +127,14 @@ jobs:
             sbom.spdx.json
             sbom.cdx.json
 
-  # ── Fuzz the media-plane parsers (nightly + cargo-fuzz) ──────────────────────────────────
-  # CLAUDE.md hard rule: the RTP/RTCP parser must never panic / read OOB / spin on a hostile
-  # datagram. 60 s is a smoke pass; deeper runs belong on a scheduled/OSS-Fuzz harness.
+  # ── Fuzz every untrusted-bytes parser + codec decoder (nightly + cargo-fuzz) ──────────────
+  # CLAUDE.md hard rule: a malformed/truncated/hostile datagram or codec bitstream must
+  # decode-or-error, never panic / read OOB / spin. Each target gets a 30 s smoke here (a fast
+  # regression net over the saved corpus + new mutation); deep runs belong on a scheduled/OSS-Fuzz
+  # harness. Covers the RTP/RTCP parser, the SDP + NG/bencode + native-JSON control parsers, the
+  # STUN/TURN framing, and the AMR-NB/WB RFC 4867 payload decoders.
   fuzz:
-    name: fuzz (RTP/RTCP parser, 60s)
+    name: fuzz (parsers + codec decoders, 30s each)
     runs-on: ubuntu-latest
     needs: test
     steps:
@@ -140,8 +143,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
-      - name: Fuzz rtp_parser_fuzz (60s)
-        run: cargo +nightly fuzz run rtp_parser_fuzz -- -max_total_time=60
+      - name: Fuzz each target (30s smoke each)
+        run: |
+          for target in \
+            rtp_parser_fuzz sdp_fuzz bencode_fuzz proto_frame_fuzz stun_fuzz \
+            amr_wb_decode_fuzz amr_nb_decode_fuzz; do
+            echo "::group::fuzz $target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
+            echo "::endgroup::"
+          done
 
   # ── Docker image builds (musl/distroless runtime target — no push, no privileged run) ────
   # GitHub runners can't grant the NET_ADMIN/BPF caps the compose profiles need, so we only prove
