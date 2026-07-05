@@ -246,3 +246,52 @@ mod tests {
         assert_eq!(buffer.pop(), JitterOutput::Packet(payload(1)));
     }
 }
+
+// Property test: under an arbitrary logical schedule of push/pop operations (arbitrary sequence
+// numbers, so arbitrary loss / reorder / duplication / 16-bit wrap, interleaved with playout ticks),
+// the buffer must never panic and must keep occupancy bounded by `max_depth`. The schedule *is* the
+// logical clock, so this is deterministic with no `Instant::now()` (CLAUDE.md).
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Push(u16),
+        Pop,
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![any::<u16>().prop_map(Op::Push), Just(Op::Pop)]
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_schedule_never_panics_and_stays_bounded(
+            target in 1usize..8,
+            extra in 0usize..16,
+            ops in prop::collection::vec(op(), 0..600),
+        ) {
+            let max_depth = target + extra;
+            let mut buffer = JitterBuffer::new(target, max_depth);
+            for step in ops {
+                match step {
+                    // The payload contents are irrelevant to the occupancy invariant under test.
+                    Op::Push(sequence) => {
+                        let _ = buffer.push(sequence, Bytes::from(vec![sequence as u8]));
+                    }
+                    Op::Pop => {
+                        let _ = buffer.pop();
+                    }
+                }
+                prop_assert!(
+                    buffer.buffered() <= max_depth,
+                    "occupancy {} exceeded max_depth {}",
+                    buffer.buffered(),
+                    max_depth,
+                );
+            }
+        }
+    }
+}

@@ -1257,4 +1257,25 @@ mod tests {
             assert_eq!(n, L_FRAME16K);
         }
     }
+
+    // Property: a burst of lost frames of arbitrary length, each claiming an arbitrary mode, is the
+    // PLC's worst case (a jitter buffer emits one `Conceal` per gap). Every concealed frame must be
+    // exactly one bounded 14-bit `L_FRAME16K` frame — never a panic, never unbounded growth. The loss
+    // run *is* the logical clock, so this is deterministic (CLAUDE.md: no `Instant::now()` in DSP).
+    proptest::proptest! {
+        #[test]
+        fn conceal_run_is_bounded_for_any_mode(modes in proptest::collection::vec(0u8..=8, 0..64)) {
+            let mut state = DecoderState::new();
+            state.reset_flag_old = false;
+            let mut synth = [0i16; L_FRAME16K];
+            for mode in modes {
+                let produced = conceal(&mut state, mode, &mut synth);
+                proptest::prop_assert_eq!(produced, L_FRAME16K);
+                // AMR-WB output is 14-bit (the low 2 bits are always cleared).
+                for &sample in synth.iter() {
+                    proptest::prop_assert_eq!(sample & 0x0003, 0);
+                }
+            }
+        }
+    }
 }

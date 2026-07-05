@@ -300,3 +300,70 @@ mod tests {
         ));
     }
 }
+
+// Property tests: the resampler fed an arbitrary logical sample-clock schedule (arbitrary rate pairs,
+// arbitrary chunk boundaries, full-range i16 input) must never panic and must produce a *bounded*
+// number of output samples. Deterministic by construction: the resampler has no wall clock, its whole
+// state is the input schedule (CLAUDE.md forbids Instant::now() in DSP tests).
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // Telephony/wideband rates the engine actually resamples between.
+    fn rate() -> impl Strategy<Value = u32> {
+        prop::sample::select(vec![8_000u32, 16_000, 32_000, 48_000])
+    }
+
+    // A single `process` emits, per input sample, every output whose source index has arrived, so the
+    // running count is at most ceil(inputs * out/in) plus a small filter transient. This constant slack
+    // covers the first-phase rounding on every rate pair below.
+    const SLACK: u64 = 64;
+
+    fn output_upper_bound(input_len: usize, in_rate: u32, out_rate: u32) -> u64 {
+        (input_len as u64 * out_rate as u64).div_ceil(in_rate as u64) + SLACK
+    }
+
+    proptest! {
+        #[test]
+        fn process_output_is_bounded_and_never_panics(
+            in_rate in rate(),
+            out_rate in rate(),
+            samples in prop::collection::vec(any::<i16>(), 0..4000),
+        ) {
+            let mut resampler = Resampler::new(in_rate, out_rate).expect("non-zero rates");
+            let mut output = Vec::new();
+            resampler.process(&samples, &mut output);
+            prop_assert!(
+                output.len() as u64 <= output_upper_bound(samples.len(), in_rate, out_rate),
+                "produced {} outputs for {} inputs at {}->{}",
+                output.len(), samples.len(), in_rate, out_rate,
+            );
+        }
+
+        #[test]
+        fn streaming_arbitrary_chunk_schedule_stays_bounded(
+            in_rate in rate(),
+            out_rate in rate(),
+            chunks in prop::collection::vec(prop::collection::vec(any::<i16>(), 0..400), 0..24),
+        ) {
+            // Feeding the same samples split at arbitrary boundaries must not blow the total output
+            // count past the single-block bound (the filter carries history across chunks).
+            let mut resampler = Resampler::new(in_rate, out_rate).expect("non-zero rates");
+            let mut total_in = 0usize;
+            let mut total_out = 0usize;
+            let mut output = Vec::new();
+            for chunk in &chunks {
+                output.clear();
+                resampler.process(chunk, &mut output);
+                total_in += chunk.len();
+                total_out += output.len();
+            }
+            prop_assert!(
+                total_out as u64 <= output_upper_bound(total_in, in_rate, out_rate),
+                "streamed {} outputs for {} inputs at {}->{}",
+                total_out, total_in, in_rate, out_rate,
+            );
+        }
+    }
+}
