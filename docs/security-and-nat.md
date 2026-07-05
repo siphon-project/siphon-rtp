@@ -1,10 +1,13 @@
-# siphon-rtp — Security & NAT Roadmap
+# siphon-rtp — Security & NAT design
 
-> Design + threat model for the media plane. Status: **design, pre-implementation.**
-> Crypto posture for the target deployments: **plaintext RTP, secured at the network layer**
-> (IPsec / SBC / private bearer). SRTP / DTLS-SRTP is designed-but-deferred — the control seam is
-> reserved, the work is not scheduled. Priority order therefore: **latch hardening → ICE → DoS/
-> control-plane hygiene → (deferred) SRTP/DTLS**.
+> Design + threat model for the media plane. Status: **implemented and wired.** The gated latch, the
+> source-consistency checks, symmetric-RTP NAT traversal, SDP address rewrite, ICE-lite + STUN, the
+> built-in TURN server, SRTP-SDES (RFC 3711 / 4568), and DTLS-SRTP (RFC 5764) all ship today. The main
+> remaining item is full ICE (state machine + consent freshness, RFC 8445 / 7675); ICE-lite is the
+> current server posture. Crypto posture: secure legs stay secure end to end, and a plaintext leg can
+> still run behind network-layer security (IPsec / SBC / private bearer) where a deployment prefers
+> that. Order as built: **latch hardening, then SRTP/DTLS keying, then ICE/TURN, then DoS /
+> control-plane hygiene.**
 >
 > This document is the source of truth for *why* the relay accepts, latches, and forwards a packet.
 > Every enforcement point below cites the spec it implements; any deviation must say so and why.
@@ -30,12 +33,12 @@ attacker). This document defines the one policy that satisfies both.
 
 > **Status — M-S1 (landed):** layers 2–3 below are implemented. The blind first-source `or_insert`
 > latch is gone; ingress is now **source-gated** and the latch is **SSRC-consistent** (`update_latch`
-> in [`udp.rs`](../crates/siphon-rtp-datapath/src/udp.rs); rules built by `ingress_rule` in
-> [`engine.rs`](../crates/siphon-rtp-engine/src/engine.rs) from the parsed SDP + `ProfileFlags`).
+> in [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs); rules built by `ingress_rule` in
+> [`engine.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-engine/src/engine.rs) from the parsed SDP + `ProfileFlags`).
 > Layer 1 (RFC 7983 demux) is in too; only layer 6 (media-timeout) remains — see §8. The original
 > hole, for the record:
 
-[`crates/siphon-rtp-datapath/src/udp.rs`](../crates/siphon-rtp-datapath/src/udp.rs), `recv_loop`:
+[`crates/siphon-rtp-datapath/src/udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs), `recv_loop`:
 
 ```rust
 inner.latched.entry(endpoint).or_insert(source);
@@ -114,7 +117,7 @@ Classify each datagram by its first byte and route it; **only RTP/RTCP may touch
 |---|---|---|
 | 0–3 | STUN | ICE / consent path (§4.4) |
 | 16–19 | ZRTP | drop (not supported) |
-| 20–63 | DTLS | DTLS-SRTP handshake (deferred, §5) |
+| 20–63 | DTLS | DTLS-SRTP handshake (§5) |
 | 64–79 | TURN channel | drop |
 | 128–191 | RTP / RTCP | media path (layers 2–3) |
 | else | unknown | drop, count |
@@ -219,7 +222,7 @@ is wrong, and encryption defeats A2 eavesdrop.
 
 > **Status (landed — SDES bridge):** SRTP over **SDES** (RFC 4568 `a=crypto`) is implemented and
 > wired for the `RTP/AVP` ↔ `RTP/SAVP` **bridge** topology (Scenario 1). The crypto core is the
-> isolated [`siphon-rtp-srtp`](../crates/siphon-rtp-srtp) crate: AES-CM + HMAC-SHA1 key derivation
+> isolated [`siphon-rtp-srtp`](https://github.com/siphon-project/siphon-rtp/tree/main/crates/siphon-rtp-srtp) crate: AES-CM + HMAC-SHA1 key derivation
 > validated bit-exact against the RFC 3711 §4.3.2 vectors, SRTP (§3.3) and SRTCP (§3.4)
 > protect/unprotect for `AES_CM_128_HMAC_SHA1_80` with §3.3.2 anti-replay on the receive path, and
 > `SecureLeg` (the directional in/out contexts +
@@ -227,8 +230,9 @@ is wrong, and encryption defeats A2 eavesdrop.
 > no AES-CM; still zero-C. The engine generates its SDES key on a secure leg, parses the peer's, and
 > bridges plaintext ↔ SRTP via the userspace `Redirect` path (`engine/src/srtp_bridge.rs`).
 >
-> **DTLS-SRTP remains deferred** (the WebRTC keying path, RFC 5764) — the seam is the same profile
-> flags below.
+> **DTLS-SRTP is implemented** (the WebRTC keying path, RFC 5764) via `siphon-rtp-dtls` +
+> `engine/src/dtls_bridge.rs`: the offer advertises `a=fingerprint` + `a=setup:actpass`, and the
+> handshake keys the same `SecureLeg` through the same profile flags below.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The
@@ -250,7 +254,7 @@ is wrong, and encryption defeats A2 eavesdrop.
 - **Seam (present):** `ProfileFlags.transport_protocol` (`RTP/SAVP[F]`, `UDP/TLS/RTP/SAVPF`) selects a
   secure leg; `ProfileFlags.dtls` (`passive`/`active`/`off`) reserved for DTLS-SRTP.
 - **Spec:** RFC 3711 (SRTP/SRTCP), RFC 4568 (SDES — keys in SDP, so the signalling path must be TLS),
-  RFC 5764 (DTLS-SRTP, deferred). Pure-Rust only, per the zero-C hard rule. **SDES key material must
+  RFC 5764 (DTLS-SRTP, implemented). Pure-Rust only, per the zero-C hard rule. **SDES key material must
   never transit a plaintext control channel** — keys in `a=crypto` are only as safe as the signalling.
 
 ### Layer 5b — The media (transcode / record / DTMF) Redirect path
@@ -346,7 +350,7 @@ A flow that has received no *accepted* packet for `T` ticks is torn down and rep
 
 Concrete, minimal, additive to the existing datapath seam:
 
-- **`ForwardRule`** ([datapath/src/lib.rs](../crates/siphon-rtp-datapath/src/lib.rs)) gains:
+- **`ForwardRule`** ([datapath/src/lib.rs](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/lib.rs)) gains:
   - `accepted_source: SourceFilter` — `Exact(IpAddr)` | `Subnet(IpAddr, prefix)` | `Any`.
   - `latch: LatchPolicy` — `Off` | `SignalledOnly` | `Symmetric`.
   (`out_dst` stays the send target; `allow_latch: bool` is subsumed by `latch`.)
@@ -354,7 +358,7 @@ Concrete, minimal, additive to the existing datapath seam:
   instead of a bare `SocketAddr`.
 - **`recv_loop`** gains the pipeline: demux byte0 → source-gate → SSRC-consistent latch/relatch →
   dispatch. The unconditional `or_insert` is removed.
-- **Engine** ([engine/src/engine.rs](../crates/siphon-rtp-engine/src/engine.rs)) fills
+- **Engine** ([engine/src/engine.rs](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-engine/src/engine.rs)) fills
   `accepted_source` / `latch` from the parsed SDP remote address and `ProfileFlags.flags` at
   `answer` time, and starts the timeout sweep.
 - **`siphon-rtp-media`** supplies the RTP header parse (version, PT, SSRC) the latch needs — already
@@ -397,7 +401,7 @@ out of bounds** — already a project hard rule; restated as part of this surfac
 
 - RTP/RTCP parser (`siphon-rtp-media`) — malformed/truncated packets.
 - Codec frame decoders (AMR NB/WB, Opus, IuUP framing) — hostile bitstreams.
-- SDP parser ([engine/src/sdp.rs](../crates/siphon-rtp-engine/src/sdp.rs)) and the JSON / (future)
+- SDP parser ([engine/src/sdp.rs](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-engine/src/sdp.rs)) and the JSON / (future)
   NG-bencode control parser.
 - **Method:** `cargo-fuzz` (libFuzzer) targets in CI + `proptest` structural invariants
   (`parse(serialize(x)) == x`, bounded output under arbitrary input). **Landed (proptest, on
@@ -455,8 +459,10 @@ Consent loss is handled via the media-timeout sweep (a valid check stamps activi
 full (non-lite) ICE where the engine must *send* checks — the strongest NAT + anti-hijack story for
 ICE-capable peers.
 
-**M-S4 — SRTP / DTLS-SRTP (deferred).** Layer 5, scheduled when an SRTP/DTLS deployment lands. Seam
-(`transport_protocol`, `dtls`) is already reserved; build with ring/rustls/webrtc-rs only.
+**M-S4 — SRTP / DTLS-SRTP (implemented).** Layer 5. SRTP-SDES ships in `siphon-rtp-srtp` +
+`engine/src/srtp_bridge.rs`; DTLS-SRTP (RFC 5764) ships in `siphon-rtp-dtls` +
+`engine/src/dtls_bridge.rs`. Both key the same `SecureLeg`; pure RustCrypto (no C), per the zero-C
+hard rule.
 
 **M-T — Built-in TURN server (RFC 5766), a coturn replacement.** §11. **Landed (M-T1–M-T7):** the
 `siphon-rtp-turn` crate — the allocation actor, the coturn REST credential + stateless nonce, the

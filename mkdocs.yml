@@ -1,0 +1,87 @@
+site_name: siphon-rtp
+site_description: Pure-Rust, kernel-accelerated media engine for SIPhon — RTP/SRTP relay, bit-exact VoLTE codecs, transcoding, conferencing, and RTP↔WebSocket for voice-AI
+site_url: https://rtp.siphon-sip.org/
+repo_url: https://github.com/siphon-project/siphon-rtp
+repo_name: siphon-project/siphon-rtp
+edit_uri: edit/main/docs/
+copyright: MIT-licensed. A media engine for SIPhon; interoperable with rtpengine control.
+
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Home: README.md
+  - Cookbook:
+      - Overview: cookbook/index.md
+      - Plain RTP relay (SBC media anchor): cookbook/relay.md
+      - Transcoding (AMR ↔ G.711, VoLTE): cookbook/transcoding.md
+      - Secure media (SRTP / SDES): cookbook/secure-srtp.md
+      - WebRTC legs (DTLS-SRTP / ICE / TURN): cookbook/webrtc.md
+      - Voice-AI (RTP ↔ WebSocket): cookbook/voice-ai.md
+      - Conferencing (MCU): cookbook/conferencing.md
+      - NAT traversal & latching: cookbook/nat.md
+      - Recording & forking (SIPREC): cookbook/recording.md
+      - Monitoring & QoS: cookbook/monitoring.md
+  - Control protocol:
+      - Native JSON-over-TCP: control/json.md
+      - rtpengine NG / bencode: control/ng.md
+  - Running in production:
+      - Deployment & operations: deployment.md
+      - Scaling, clustering & HA: scaling-and-ha.md
+      - Datapath (UDP today, XDP planned): datapath.md
+      - Supply chain & SBOM: supply-chain.md
+      - Migrating from rtpengine: migrating-from-rtpengine.md
+  - Reference:
+      - Codec support matrix: codecs.md
+      - Security & NAT design: security-and-nat.md
+      - Observability & call quality: observability.md
+      - Codec licensing & patents: codec-licensing.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search

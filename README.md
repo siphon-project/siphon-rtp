@@ -53,24 +53,33 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 
 | Capability | Standard | Status |
 |---|---|---|
-| **G.711 (µ-law / A-law)** | ITU-T G.711 | Implemented — encode/decode, all-256 round-trip tested |
+| **G.711 (µ-law / A-law)** | ITU-T G.711 | Implemented — bit-exact, all-256 round-trip tested |
+| **G.722** | ITU-T G.722 | Implemented — bit-exact vs the ITU reference |
+| **G.726 (16 / 24 / 32 / 40 kbit/s)** | ITU-T G.726 | Implemented — bit-exact vs the ITU reference |
+| **GSM Full Rate** | GSM 06.10 | Implemented — bit-exact vs the ETSI reference |
+| **Comfort noise** | RFC 3389 | Implemented — decode / generate |
 | **L16 / PCM** | RFC 3551 | Implemented — big-endian, round-trip tested |
-| **Fixed-point basic operators** | 3GPP/ITU `basicop2` | Implemented — saturation/rounding unit-tested |
-| **AMR-WB** | TS 26.171 / .190, RFC 4867 | Decode **bit-exact** vs 3GPP TS 26.174 vectors — all 9 modes (6.60–23.85 kbit/s); encode in progress |
-| **AMR-NB** | TS 26.071, RFC 4867 | Foundation: modes + framing tested; ACELP DSP in progress |
-| **Control protocol (JSON/TCP)** | — | Implemented — types + length-prefixed framing, round-trip tested |
-| **rtpengine NG/bencode front-end** | rtpengine NG | Planned (drop-in for Kamailio/OpenSIPS) |
-| **Datapath: UDP-loopback backend** | — | In progress (NIC-free, CI/dev) |
-| **Datapath: eBPF/XDP + AF_XDP** | — | Planned (`aya`, pure Rust) |
-| **RTP/RTCP + SRTP / DTLS / ICE** | RFC 3550 / 3711, webrtc-rs | Planned |
-| **Jitter buffer + PLC + resampler** | — | Planned |
-| **WebSocket bridge (raw PCM)** | — | Planned (M1 headline) |
+| **AMR-WB** | TS 26.171 / .190, RFC 4867 | Implemented (`amr` feature) — decode and encode bit-exact, all 9 modes (6.60–23.85 kbit/s) vs 3GPP TS 26.174 |
+| **AMR-NB** | TS 26.071 / .090, RFC 4867 | Implemented (`amr` feature) — decode bit-exact all 8 modes vs 3GPP TS 26.074; encode bit-exact MR475 + MR122 |
+| **Control: native JSON-over-TCP** | — | Implemented — length-prefixed JSON, async events, optional shared-secret auth |
+| **Control: rtpengine NG / bencode** | rtpengine NG | Implemented — drop-in for existing Kamailio / OpenSIPS |
+| **Datapath: UDP backend** | — | Implemented — the production datapath today (NIC-free, symmetric-RTP latching) |
+| **Datapath: eBPF/XDP + AF_XDP** | — | Planned — `aya`, pure Rust; control plane built, not yet wired into the daemon |
+| **RTP / RTCP (SR + RR)** | RFC 3550 / 3551 | Implemented — parse and construct |
+| **SRTP (SDES)** | RFC 3711 / 4568 | Implemented — AES-CM + HMAC-SHA1, RFC 3711 anti-replay |
+| **DTLS-SRTP** | RFC 5764 | Implemented — pure-RustCrypto handshake keying (webrtc-dtls) |
+| **ICE / STUN** | RFC 8445 / 5389 | Implemented — ICE-lite + STUN Binding (full ICE state machine planned) |
+| **TURN server** | RFC 5766 / 8656 | Implemented — `turn:` / `turns:` (UDP/TCP/TLS), coturn REST credentials |
+| **Jitter buffer + PLC + resampler** | RFC 3550 | Implemented (resampler AVX2, PLC drives decoder concealment) |
+| **VAD** | — | Implemented — energy VAD (noise suppression / echo cancellation planned) |
+| **WebSocket bridge (raw L16 PCM)** | — | Implemented — bidirectional, `ws://` |
 | **OpenAI Realtime / gRPC / WebRTC bridges** | — | Planned |
-| **VAD / noise suppression / echo cancellation** | — | Planned (all pure-Rust) |
 | **Forking (SIPREC raw-RTP tee)** | RFC 7866 | Implemented |
 | **Conferencing (MCU: mix-minus-self, active-speaker, whisper/monitor, room bridging)** | — | Implemented — N-party mixer, JSON control |
-| **Observability & QoS (Prometheus metrics, RTCP jitter/LSR/DLSR, G.107 MOS)** | RFC 3550 / ITU-T G.107 | Implemented — conference RR + `call_quality` events ([docs](docs/observability.md)) |
-| **Opus / G.722 / EVS** | RFC 6716 / G.722 | Planned (codec track) |
+| **Observability & QoS (Prometheus, RTCP jitter/loss, G.107 MOS, HEP/Homer)** | RFC 3550 / ITU-T G.107 / HEP3 | Implemented — RR + `call_quality` events ([docs](docs/observability.md)) |
+| **Recording (runtime raw-RTP pcap)** | — | Implemented |
+| **Clustering + warm-standby HA (checkpoint / restore)** | — | Implemented — plain / SDES-SRTP / transcode restore (secure-transcode + WS restore pending) |
+| **Opus / EVS** | RFC 6716 | Planned |
 
 ## Performance
 
@@ -212,9 +221,10 @@ Two front-ends onto one internal engine:
 1. **Native JSON-over-TCP** (`siphon-rtp-proto`, shared with SIPhon) — length-prefixed JSON,
    request/response correlated by id, async events pushed back. rtpengine offer/answer semantics,
    no bencode.
-2. **rtpengine NG/bencode** (optional, planned) — the actual rtpengine wire protocol, so existing
-   Kamailio / OpenSIPS / `mod_rtpengine` deployments point at siphon-rtp with no signaling changes.
-   Control-protocol parity only; the in-kernel path is our own XDP, **not** rtpengine's kernel module.
+2. **rtpengine NG/bencode** (optional, enabled with `--ng`) — the actual rtpengine wire protocol, so
+   existing Kamailio / OpenSIPS / `mod_rtpengine` deployments point at siphon-rtp with no signaling
+   changes. Control-protocol parity plus siphon-rtp extensions (cluster load, drain, HA
+   checkpoint/restore); the in-kernel path is our own XDP, **not** rtpengine's kernel module.
 
 ## Architecture
 
@@ -231,16 +241,25 @@ Two front-ends onto one internal engine:
                             resample → encode → packetize → SRTP → TX
 ```
 
+That XDP fast/slow split is the **target** datapath. Today the daemon runs the userspace slow path on
+the UDP backend (the XDP loader and classifier are built and unit-tested, not yet wired into the
+runtime); see the [datapath](https://rtp.siphon-sip.org/datapath/) page.
+
 Crates:
 
-- **`siphon-rtp-proto`** — JSON control contract (shared with SIPhon).
-- **`siphon-rtp-codec`** — pure-Rust codecs (G.711, L16, AMR-NB/WB, …).
-- **`siphon-rtp-simd`** — pure-Rust SIMD DSP primitives (runtime-detected AVX2 + scalar fallback)
+- **`siphon-rtp-proto`** — native JSON control contract (shared with SIPhon).
+- **`siphon-rtp-codec`** — pure-Rust codecs (G.711, G.722, G.726, GSM-FR, L16, comfort noise, AMR-NB/WB).
+- **`siphon-rtp-simd`** — pure-Rust SIMD DSP primitives (runtime-detected AVX2 + scalar fallback),
   shared by the codec and dsp hot paths.
-- `siphon-rtp-dsp` — resampler (done, SIMD); VAD / NS / AEC (VAD done, rest planned).
+- `siphon-rtp-dsp` — resampler (SIMD) and energy VAD (noise suppression / AEC planned).
 - `siphon-rtp-media` — RTP/RTCP, jitter/PLC, leg pipeline, fan-out/fork, the MCU mixer, stream bridges.
-- `siphon-rtp-datapath` — `Datapath` trait + UDP-loopback (CI) + XDP/AF_XDP backends (planned).
-- `siphon-rtp-ebpf*` — the aya XDP classifier (planned).
+- `siphon-rtp-srtp` — SRTP/SRTCP (SDES) with RFC 3711 anti-replay and the secure-leg demux.
+- `siphon-rtp-dtls` — DTLS-SRTP (RFC 5764) handshake keying, pure RustCrypto.
+- `siphon-rtp-stun` / `siphon-rtp-turn` — STUN plus the built-in TURN server (a coturn replacement).
+- `siphon-rtp-hep` — HEP3 / Homer export with G.107 MOS.
+- `siphon-rtp-ngcompat` — the rtpengine NG/bencode control front-end.
+- `siphon-rtp-datapath` — the `Datapath` trait and the UDP backend (the runtime datapath today).
+- `siphon-rtp-xdp` / `siphon-rtp-ebpf-common` — the aya XDP loader + classifier (built, not yet wired in).
 - **`siphon-rtp`** — the installable daemon binary (dir `crates/siphon-rtp-engine/`): control
   front-ends, session manager, actor runtime + aya loader.
 
@@ -258,9 +277,18 @@ paired perf + memory-leak check before every commit.
 
 ## Status
 
-Early development. The control protocol and the IMS-priority codecs (G.711 + the AMR foundation)
-land first; the XDP datapath, SRTP, and the WebSocket/AI bridges layer on top. See the milestone
-plan for the platform-track / codec-track structure.
+Pre-1.0, but the core is built and wired end-to-end. Shipping today: both control front-ends (native
+JSON-over-TCP and rtpengine NG/bencode), the userspace relay on the UDP datapath (with symmetric-RTP
+latching), the IMS-priority codecs (G.711, G.722, G.726, GSM-FR, comfort noise, and bit-exact
+AMR-NB/AMR-WB behind the `amr` feature), SRTP-SDES and DTLS-SRTP, a built-in TURN server, RTCP with
+G.107 MOS plus HEP/Homer export, the jitter buffer / PLC / resampler, SIPREC forking, the N-party
+conferencing MCU, the RTP↔WebSocket bridge, runtime pcap recording, and cluster load / drain with
+warm-standby checkpoint/restore.
+
+On the forward track: wiring the eBPF/XDP in-kernel fast path into the daemon (the loader and
+classifier are built and unit-tested but not yet selected at runtime), noise suppression / echo
+cancellation, the Opus codec, and the OpenAI-Realtime / gRPC / direct-WebRTC voice-AI adapters. See
+the [docs](https://rtp.siphon-sip.org/) for the full picture.
 
 ## License
 

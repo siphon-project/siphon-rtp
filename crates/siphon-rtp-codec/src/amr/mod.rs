@@ -1,9 +1,10 @@
-//! AMR-NB (3GPP TS 26.071, RTP RFC 4867) and AMR-WB (TS 26.171) — the VoLTE codecs.
+//! AMR-NB (3GPP TS 26.071 / .090, RTP RFC 4867) and AMR-WB (TS 26.171 / .190) — the VoLTE codecs.
 //!
-//! This module currently provides the **foundation**: the fixed-point [`basic_ops`], the mode
-//! tables (bit/byte sizes, frame-type mapping), and RFC 4867 payload framing. The ACELP
-//! encode/decode DSP is the multi-week bit-exact effort tracked separately; until it lands the
-//! [`AmrNb`]/[`AmrWb`] codecs return [`CodecError::Unsupported`] rather than panicking.
+//! Both codecs are implemented bit-exact against the 3GPP reference vectors. [`AmrWb`] decodes and
+//! encodes all nine modes (TS 26.174); [`AmrNb`] decodes all eight modes (TS 26.074) and
+//! encodes MR475 and MR122. Alongside the codecs the module carries the fixed-point [`basic_ops`],
+//! the mode tables (bit/byte sizes, frame-type mapping), and RFC 4867 payload framing. Modes that
+//! have no encoder yet, and SID/DTX, return [`CodecError::Unsupported`] rather than panicking.
 
 pub mod basic_ops;
 pub mod math_op;
