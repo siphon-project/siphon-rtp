@@ -32,7 +32,7 @@
 //! tier-6 wiring is mechanical.
 
 use crate::amr::basic_ops::{
-    add, extract_h, extract_l, l_abs, l_mac, l_mult, l_msu, l_shl, l_shr, mult, negate, norm_l,
+    add, extract_h, extract_l, l_abs, l_mac, l_msu, l_mult, l_shl, l_shr, mult, negate, norm_l,
     round_word, shl, shr, sub,
 };
 use crate::amr::nb::constants::{L_CODE, NB_TRACK, STEP};
@@ -846,7 +846,15 @@ fn code_10i40_35bits(
     let mut codvec = [0i16; NB_PULSE_MR122];
 
     cor_h_x(h, x, &mut dn, 2);
-    set_sign12k2(&mut dn, cn, &mut sign, &mut pos_max, NB_TRACK, &mut ipos, STEP);
+    set_sign12k2(
+        &mut dn,
+        cn,
+        &mut sign,
+        &mut pos_max,
+        NB_TRACK,
+        &mut ipos,
+        STEP,
+    );
     cor_h(h, &sign, &mut rr);
     search_10and8i40(&dn, &rr, &mut ipos, &pos_max, &mut codvec);
     build_code_10i40(&codvec, &sign, cod, h, y, indx);
@@ -910,7 +918,10 @@ pub fn cbsearch(
             let index = code_2i40_9bits(sub_nr, xn2, h1, t0, pitch_sharp, code, y2, &mut sign);
             params[0] = index; // position index
             params[1] = sign; //  sign index
-            Ok(CbSearchResult { params, num_params: 2 })
+            Ok(CbSearchResult {
+                params,
+                num_params: 2,
+            })
         }
         AmrNbMode::Mr1220 => {
             // Include the pitch contribution into the impulse response h1[] (MR122 uses gain_pit).
@@ -933,7 +944,10 @@ pub fn cbsearch(
                     code[i] = add(code[i], temp);
                 }
             }
-            Ok(CbSearchResult { params, num_params: NB_PULSE_MR122 })
+            Ok(CbSearchResult {
+                params,
+                num_params: NB_PULSE_MR122,
+            })
         }
         _ => Err(CodecError::Unsupported(
             "AMR-NB codebook search: mode not yet ported (MR122 and MR475/MR515 only)",
@@ -1075,8 +1089,19 @@ mod tests {
         let res2 = xn2;
         let mut code = [0i16; L_CODE];
         let mut y2 = [0i16; L_CODE];
-        let r = cbsearch(&xn2, &mut h, 40, 0, 8192, &res2, &mut code, &mut y2, AmrNbMode::Mr1220, 0)
-            .expect("MR122 cbsearch");
+        let r = cbsearch(
+            &xn2,
+            &mut h,
+            40,
+            0,
+            8192,
+            &res2,
+            &mut code,
+            &mut y2,
+            AmrNbMode::Mr1220,
+            0,
+        )
+        .expect("MR122 cbsearch");
         assert_eq!(r.num_params, 10);
     }
 
@@ -1090,8 +1115,19 @@ mod tests {
         let res2 = xn2;
         let mut code = [0i16; L_CODE];
         let mut y2 = [0i16; L_CODE];
-        let r = cbsearch(&xn2, &mut h, 40, 0, 8192, &res2, &mut code, &mut y2, AmrNbMode::Mr475, 0)
-            .expect("MR475 cbsearch");
+        let r = cbsearch(
+            &xn2,
+            &mut h,
+            40,
+            0,
+            8192,
+            &res2,
+            &mut code,
+            &mut y2,
+            AmrNbMode::Mr475,
+            0,
+        )
+        .expect("MR475 cbsearch");
         assert_eq!(r.num_params, 2);
     }
 
@@ -1230,10 +1266,16 @@ mod tests {
     fn run_cb_oracle_gate(dump_path: &str) -> Option<usize> {
         let text = std::fs::read_to_string(dump_path).ok()?;
         let records = parse_cb_dump(&text);
-        assert!(!records.is_empty(), "empty cbsearch oracle dump: {dump_path}");
+        assert!(
+            !records.is_empty(),
+            "empty cbsearch oracle dump: {dump_path}"
+        );
         for (n, rec) in records.iter().enumerate() {
             if let Err(reason) = replay_cb_subfr(rec) {
-                panic!("cbsearch oracle subframe #{n} (mode {:?}) FAILED: {reason}", rec.mode);
+                panic!(
+                    "cbsearch oracle subframe #{n} (mode {:?}) FAILED: {reason}",
+                    rec.mode
+                );
             }
         }
         Some(records.len())
@@ -1282,7 +1324,16 @@ mod tests {
         let mut code = [0i16; L_CODE];
         let mut y2 = [0i16; L_CODE];
         let result = cbsearch(
-            xn2, &mut h1_work, t0, sharp, gain_pit, res2, &mut code, &mut y2, mode, sub_nr,
+            xn2,
+            &mut h1_work,
+            t0,
+            sharp,
+            gain_pit,
+            res2,
+            &mut code,
+            &mut y2,
+            mode,
+            sub_nr,
         )
         .expect("cbsearch");
 
@@ -1293,7 +1344,11 @@ mod tests {
             )
         };
 
-        assert_eq!(&result.params[..result.num_params], want_param, "{mode:?} param drift");
+        assert_eq!(
+            &result.params[..result.num_params],
+            want_param,
+            "{mode:?} param drift"
+        );
         for &(i, want) in want_code {
             assert_eq!(code[i], want, "{mode:?} code[{i}] drift");
         }
@@ -1328,7 +1383,13 @@ mod tests {
                 -2824, 1000, -773, 648, -474, -1059, 611, -768, -120, 556, 576, -1596,
             ],
             &[12, 4, 4, 12, 15, 4, 4, 4, 5, 6],
-            &[(24, 4096), (25, -8192), (27, 8192), (33, -4096), (39, -4096)],
+            &[
+                (24, 4096),
+                (25, -8192),
+                (27, 8192),
+                (33, -4096),
+                (39, -4096),
+            ],
             (0, 268_435_456),
             &[(24, 1024), (25, -1788), (27, 2985), (39, -736)],
             (67, 18_514_537),
@@ -1349,8 +1410,9 @@ mod tests {
                 4079, 2200, -595, 578, 2574, 295, 1974, 212, 563, 670, 1496, 607,
             ],
             &[
-                4096, 769, -415, 180, -182, 232, -56, -151, 101, -110, -281, -128, 61, 7, 4, 8, -18,
-                51, 4, -2, 47, 17, 0, -12, -3, 1, -5, -2, -8, 1, -3, -7, 4, 0, 2, 1, 0, 2, -1, 1,
+                4096, 769, -415, 180, -182, 232, -56, -151, 101, -110, -281, -128, 61, 7, 4, 8,
+                -18, 51, 4, -2, 47, 17, 0, -12, -3, 1, -5, -2, -8, 1, -3, -7, 4, 0, 2, 1, 0, 2, -1,
+                1,
             ],
             &[
                 -116, 318, -708, 445, -558, 253, -189, -200, 279, -668, 585, -822, 457, -510, 95,

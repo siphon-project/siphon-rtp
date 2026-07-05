@@ -23,6 +23,7 @@ use siphon_rtp_datapath::{
     AddressFamily, Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy,
     ObservedRtcp, SourceFilter,
 };
+use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
@@ -32,7 +33,6 @@ use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, PlayMediaSource,
     ProfileFlags, SessionStats,
 };
-use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
 use siphon_rtp_srtp::StreamRollover;
@@ -757,9 +757,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 recording_dir,
                 ..
             } => self.start_recording(client, &call_id, recording_dir).await,
-            Command::StopRecording { call_id, .. } => {
-                self.stop_recording(client, &call_id).await
-            }
+            Command::StopRecording { call_id, .. } => self.stop_recording(client, &call_id).await,
             Command::ConferenceJoin {
                 conference_id,
                 from_tag,
@@ -1240,8 +1238,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // address is used unchanged.
         let near_gate_rtp = apply_received_from(near.remote_rtp, offer_received_from);
         let near_gate_rtcp = apply_received_from(near.remote_rtcp, offer_received_from);
-        let far_gate_rtp =
-            apply_received_from(Some(info.remote_rtp), profile.received_from).unwrap_or(info.remote_rtp);
+        let far_gate_rtp = apply_received_from(Some(info.remote_rtp), profile.received_from)
+            .unwrap_or(info.remote_rtp);
         let far_gate_rtcp = apply_received_from(Some(info.remote_rtcp), profile.received_from)
             .unwrap_or(info.remote_rtcp);
 
@@ -1321,7 +1319,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Resolve how this call's media is carried: an SRTP bridge (secure far leg), the userspace
         // media slow path (transcode / record), or the in-datapath plain relay.
-        let pipeline = resolve_pipeline(near_codec.as_ref(), &info, profile, far_local_crypto, far_dtls);
+        let pipeline = resolve_pipeline(
+            near_codec.as_ref(),
+            &info,
+            profile,
+            far_local_crypto,
+            far_dtls,
+        );
         // For a passthrough relay, remember the installed forward actions so `block` can flip the
         // endpoints to `Drop` and `unblock` can restore them.
         let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
@@ -1365,7 +1369,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 flows.push(BridgeFlowPlan {
                     endpoint: near_rtcp.id,
                     op: BridgeOp::Encrypt,
-                    accepted_source: bridge_source_filter(profile, near_gate_rtcp.unwrap_or(a_rtcp)),
+                    accepted_source: bridge_source_filter(
+                        profile,
+                        near_gate_rtcp.unwrap_or(a_rtcp),
+                    ),
                     out_endpoint: far_rtcp.id,
                     out_dst: info.remote_rtcp,
                 });
@@ -2739,7 +2746,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ) -> CmdResult {
         // Snapshot the pipeline + each leg's engine-local RTP address under the ownership guard (A3).
         let Some((pipeline, a_local, b_local)) = self.owned_call(client, call_id, |call| {
-            (call.pipeline, call.near.rtp.local_addr, call.far.rtp.local_addr)
+            (
+                call.pipeline,
+                call.near.rtp.local_addr,
+                call.far.rtp.local_addr,
+            )
         }) else {
             return unknown_call(call_id);
         };
@@ -2753,7 +2764,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         let Some(directory) = recording_dir else {
-            return error_result("start_recording", &"no recording directory (set recording-dir)");
+            return error_result(
+                "start_recording",
+                &"no recording directory (set recording-dir)",
+            );
         };
         // Open the pcap up front so a bad path fails cleanly before we promote or spawn anything.
         let path = format!("{directory}/{call_id}.pcap");
@@ -3038,7 +3052,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// the feature is active. A call set up as a transcoding/secure Media call already has an actor —
     /// no promotion happens, but the reason is still recorded (harmlessly; demotion is gated on
     /// `is_relay_call`, so a genuine media call is never demoted). Ownership must already be validated.
-    async fn hold_in_userspace(&self, call_id: &str, reason: PromotionReason) -> Result<(), String> {
+    async fn hold_in_userspace(
+        &self,
+        call_id: &str,
+        reason: PromotionReason,
+    ) -> Result<(), String> {
         let pipeline = self
             .owned_call_internal(call_id, |call| call.pipeline)
             .ok_or_else(|| "call no longer exists".to_string())?;
@@ -3994,10 +4012,24 @@ mod tests {
             "codec-transcode-PCMA".into(),
         ]);
         assert!(policy.remove_all, "strip-all → remove_all");
-        assert_eq!(policy.remove, vec!["PCMA".to_string()], "mask feeds the remove set");
-        assert!(policy.keep.contains(&"PCMU".to_string()), "except → keep-list");
-        assert!(policy.keep.contains(&"GSM".to_string()), "accept → keep-list");
-        assert_eq!(policy.order, vec!["G722".to_string()], "offer → far-offer order");
+        assert_eq!(
+            policy.remove,
+            vec!["PCMA".to_string()],
+            "mask feeds the remove set"
+        );
+        assert!(
+            policy.keep.contains(&"PCMU".to_string()),
+            "except → keep-list"
+        );
+        assert!(
+            policy.keep.contains(&"GSM".to_string()),
+            "accept → keep-list"
+        );
+        assert_eq!(
+            policy.order,
+            vec!["G722".to_string()],
+            "offer → far-offer order"
+        );
         assert_eq!(policy.add.len(), 1, "transcode → one added codec");
         assert_eq!(policy.add[0].encoding_name, "PCMA");
         // Lowercase names are matched case-insensitively (stored uppercased).
@@ -4031,7 +4063,10 @@ mod tests {
             .lines()
             .find(|l| l.starts_with("m=audio"))
             .expect("m=audio line");
-        assert!(m_line.ends_with(" 0"), "PCMA hidden from B, PCMU offered: {m_line}");
+        assert!(
+            m_line.ends_with(" 0"),
+            "PCMA hidden from B, PCMU offered: {m_line}"
+        );
         assert!(!m_line.contains(" 8"), "PCMA (PT 8) masked: {m_line}");
     }
 
@@ -5078,7 +5113,10 @@ mod tests {
         let engine_far_key = *offer_reply.crypto.first().expect("engine key to B");
         let far_rtp = offer_reply.remote_rtp;
         let far_rtcp = offer_reply.remote_rtcp;
-        assert_ne!(far_rtcp, far_rtp, "non-mux: distinct RTCP port advertised to B");
+        assert_ne!(
+            far_rtcp, far_rtp,
+            "non-mux: distinct RTCP port advertised to B"
+        );
 
         // B answers RTP/SAVP AMR-WB, non-mux, advertising its RTCP socket + key.
         let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
@@ -5116,9 +5154,15 @@ mod tests {
         SrtcpContext::from_key_material(&b_key.key)
             .protect(&b_sr, &mut b_srtcp)
             .expect("B encrypt SRTCP");
-        rtcp_b.send_to(&b_srtcp, far_rtcp).await.expect("b rtcp send");
+        rtcp_b
+            .send_to(&b_srtcp, far_rtcp)
+            .await
+            .expect("b rtcp send");
         let (relayed, from) = recv(&rtcp_a).await;
-        assert_eq!(from, near_rtcp, "RTCP relayed from the engine's near RTCP port");
+        assert_eq!(
+            from, near_rtcp,
+            "RTCP relayed from the engine's near RTCP port"
+        );
         assert_eq!(relayed, b_sr, "A receives B's decrypted plaintext RTCP");
 
         // A → B: A's plaintext RTCP → engine near RTCP; B's RTCP socket gets SRTCP it can decrypt.
@@ -6838,7 +6882,10 @@ mod tests {
         );
         let far = sdp::parse(&far_sdp).expect("far");
         assert!(far.rtcp_mux);
-        assert_eq!(far.remote_rtcp, far.remote_rtp, "RTCP rides the far RTP port");
+        assert_eq!(
+            far.remote_rtcp, far.remote_rtp,
+            "RTCP rides the far RTP port"
+        );
     }
 
     #[tokio::test]
@@ -7182,21 +7229,36 @@ mod tests {
         }
         assert_eq!(&bytes[0..4], &[0xd4, 0xc3, 0xb2, 0xa1], "libpcap magic");
         let records = pcap_records(&bytes);
-        assert_eq!(records.len(), 2, "both captured datagrams framed to the pcap");
+        assert_eq!(
+            records.len(),
+            2,
+            "both captured datagrams framed to the pcap"
+        );
 
         // A's datagram: source = A's phone, destination = the engine's near RTP socket, payload verbatim.
         let a_record = records
             .iter()
             .find(|(source, ..)| *source == addr_a)
             .expect("A's captured datagram");
-        assert_eq!(a_record.1, near_rtp, "captured destination = engine near RTP");
-        assert_eq!(a_record.2, rtp(0x0A0A_0A0A), "A's RTP captured byte-for-byte");
+        assert_eq!(
+            a_record.1, near_rtp,
+            "captured destination = engine near RTP"
+        );
+        assert_eq!(
+            a_record.2,
+            rtp(0x0A0A_0A0A),
+            "A's RTP captured byte-for-byte"
+        );
         let b_record = records
             .iter()
             .find(|(source, ..)| *source == addr_b)
             .expect("B's captured datagram");
         assert_eq!(b_record.1, far_rtp, "captured destination = engine far RTP");
-        assert_eq!(b_record.2, rtp(0x0B0B_0B0B), "B's RTP captured byte-for-byte");
+        assert_eq!(
+            b_record.2,
+            rtp(0x0B0B_0B0B),
+            "B's RTP captured byte-for-byte"
+        );
 
         // Stop recording: the relay is demoted back to the in-kernel Forward fast path.
         let stopped = engine
@@ -7274,7 +7336,10 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(unknown, CmdResult::Error { .. }), "unknown call ⇒ error");
+        assert!(
+            matches!(unknown, CmdResult::Error { .. }),
+            "unknown call ⇒ error"
+        );
     }
 
     /// Offer + answer a plain PCMU relay (both sides same codec ⇒ passthrough), with a live redirect
@@ -7491,7 +7556,10 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(unknown, CmdResult::Error { .. }), "unknown call ⇒ error");
+        assert!(
+            matches!(unknown, CmdResult::Error { .. }),
+            "unknown call ⇒ error"
+        );
     }
 
     #[tokio::test]
@@ -7595,7 +7663,10 @@ mod tests {
         let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
         assert!(offer_reply.dtls, "engine advertised UDP/TLS/RTP/SAVPF to B");
         assert_eq!(offer_reply.setup, Some(sdp::Setup::Actpass));
-        let engine_fingerprint = offer_reply.fingerprint.clone().expect("engine a=fingerprint");
+        let engine_fingerprint = offer_reply
+            .fingerprint
+            .clone()
+            .expect("engine a=fingerprint");
         let engine_far = offer_reply.remote_rtp; // where B sends toward the engine
 
         // B answers DTLS with its own fingerprint and `setup:active` (so the engine is DTLS server).
@@ -7627,7 +7698,10 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(answer, CmdResult::Ok { .. }), "answer ok: {answer:?}");
+        assert!(
+            matches!(answer, CmdResult::Ok { .. }),
+            "answer ok: {answer:?}"
+        );
 
         // B drives its side of the DTLS handshake (client) against the engine's far endpoint.
         let (b_transport, b_channels) = DtlsTransport::new(addr_b, engine_far);
@@ -7786,8 +7860,12 @@ mod tests {
         let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
 
         // A's offer advertises the documentation address 203.0.113.2 (unusable), real port = phone_a.
-        let offer_sdp =
-            sdp_with_conn(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), addr_a.port(), 0, "PCMU");
+        let offer_sdp = sdp_with_conn(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            addr_a.port(),
+            0,
+            "PCMU",
+        );
         let profile = ProfileFlags {
             received_from: Some(addr_a.ip()), // the proxy-observed public source
             ..Default::default()
@@ -7862,8 +7940,12 @@ mod tests {
 
         // A advertises the documentation address 203.0.113.2 (unusable); its real media socket is
         // phone_a, and the proxy-observed public source is passed as received-from.
-        let offer_sdp =
-            sdp_with_conn(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), addr_a.port(), 0, "PCMU");
+        let offer_sdp = sdp_with_conn(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            addr_a.port(),
+            0,
+            "PCMU",
+        );
         let profile = ProfileFlags {
             received_from: Some(addr_a.ip()),
             ..Default::default()

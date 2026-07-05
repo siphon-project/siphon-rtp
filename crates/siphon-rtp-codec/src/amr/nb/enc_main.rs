@@ -7,6 +7,7 @@
 //! Speech path only: the comfort-noise / SID (`MRDTX`) frames are not emitted and DTX is disabled,
 //! matching the NODTX reference vectors (produced by `coder.c` without `-dtx`).
 
+use crate::amr::basic_ops::sub;
 use crate::amr::nb::constants::{
     AZ_SIZE, EHF_MASK, L_FRAME, L_INTERPOL, L_NEXT, L_SUBFR, L_TOTAL, L_WINDOW, M, MP1, PIT_MAX,
     SHARPMIN,
@@ -16,11 +17,10 @@ use crate::amr::nb::enc_gain::{gain_quant, GainQuantState};
 use crate::amr::nb::enc_lpc::{lpc, LevinsonState, PreProcessState};
 use crate::amr::nb::enc_lsp::LspState;
 use crate::amr::nb::enc_pitch_cl::{
-    cl_ltp, subframe_pre_proc, subframe_post_proc, PitchFrState, TonStabState,
+    cl_ltp, subframe_post_proc, subframe_pre_proc, PitchFrState, TonStabState,
 };
 use crate::amr::nb::enc_pitch_ol::{weighted_speech_and_ol_pitch, PitchOlWghtState};
 use crate::amr::nb::pitch::pred_lt_3or6;
-use crate::amr::basic_ops::sub;
 use crate::amr::AmrNbMode;
 use crate::CodecError;
 
@@ -192,7 +192,11 @@ impl EncoderState {
         prm: &mut [i16],
         t_op: &mut [i16; 2],
     ) -> AnalyzeCore {
-        debug_assert_eq!(new_speech.len(), L_FRAME, "new_speech must be one L_FRAME block");
+        debug_assert_eq!(
+            new_speech.len(),
+            L_FRAME,
+            "new_speech must be one L_FRAME block"
+        );
 
         // Place the new frame at old_speech[new_speech ..] (= old_speech[L_TOTAL - L_FRAME ..]).
         let new_off = L_TOTAL - L_FRAME;
@@ -251,7 +255,12 @@ impl EncoderState {
             t_op,
         );
 
-        AnalyzeCore { nlsf, lsp_flag, a_t, a_q }
+        AnalyzeCore {
+            nlsf,
+            lsp_flag,
+            a_t,
+            a_q,
+        }
     }
 
     /// Next-frame buffer shifts (`cod_amr.c` `the_end`) + encoder-homing reset. `Copy` order mirrors
@@ -567,7 +576,14 @@ impl EncoderState {
 
                 // Re-build excitation for sf0 (with sf0's quantized pitch gain) + refilter y1.
                 let exc_base_sf0 = EXC_BASE + i_subfr_sf0;
-                pred_lt_3or6(&mut self.old_exc, exc_base_sf0, t0_sf0, t0_frac_sf0, L_SUBFR, true);
+                pred_lt_3or6(
+                    &mut self.old_exc,
+                    exc_base_sf0,
+                    t0_sf0,
+                    t0_frac_sf0,
+                    L_SUBFR,
+                    true,
+                );
                 convolve_frame(&self.old_exc, exc_base_sf0, &h1_sf0, &mut y1, L_SUBFR);
 
                 // Post-process sf0 with Aq of the *previous* subframe (Aq -= MP1). sharp_save is
@@ -763,8 +779,10 @@ mod tests {
     /// MR122 (12.2 kbit/s, GSM-EFR): 5-split MQ LSF quantization (`Q_plsf_5`), 5 LSF params.
     #[test]
     fn encodes_mr122_lsf_params_bit_exact() {
-        let (frames, mismatch) =
-            check_lsf_vector(AmrNbMode::Mr1220, "../../reference/amr-nb/testv/NODTX/T_122/T01_122.COD");
+        let (frames, mismatch) = check_lsf_vector(
+            AmrNbMode::Mr1220,
+            "../../reference/amr-nb/testv/NODTX/T_122/T01_122.COD",
+        );
         eprintln!("MR122 LSF gate: {frames} frames compared");
         assert!(
             mismatch.is_none(),
@@ -775,8 +793,10 @@ mod tests {
     /// MR475 (4.75 kbit/s): 3-split VQ LSF quantization (`Q_plsf_3`), 3 LSF params.
     #[test]
     fn encodes_mr475_lsf_params_bit_exact() {
-        let (frames, mismatch) =
-            check_lsf_vector(AmrNbMode::Mr475, "../../reference/amr-nb/testv/NODTX/T_475/T01_475.COD");
+        let (frames, mismatch) = check_lsf_vector(
+            AmrNbMode::Mr475,
+            "../../reference/amr-nb/testv/NODTX/T_475/T01_475.COD",
+        );
         eprintln!("MR475 LSF gate: {frames} frames compared");
         assert!(
             mismatch.is_none(),

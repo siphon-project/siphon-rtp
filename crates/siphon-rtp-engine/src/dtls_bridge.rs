@@ -155,7 +155,8 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 secure,
             },
         );
-        self.sessions.insert(plan.secure_endpoint, vec![drain, shake]);
+        self.sessions
+            .insert(plan.secure_endpoint, vec![drain, shake]);
     }
 
     /// Drop the flows for `endpoints` and abort their handshake/drain tasks — the bridge half of call
@@ -273,7 +274,11 @@ mod tests {
         let reader = tokio::spawn(async move {
             let mut buffer = [0u8; 2048];
             while let Ok((len, _)) = recv_socket.recv_from(&mut buffer).await {
-                if inbound.send_async(Bytes::copy_from_slice(&buffer[..len])).await.is_err() {
+                if inbound
+                    .send_async(Bytes::copy_from_slice(&buffer[..len]))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -302,9 +307,15 @@ mod tests {
             .expect("redirect secure");
 
         // Phone A (plain) and the WebRTC peer B (DTLS).
-        let phone_a = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).await.expect("bind a");
+        let phone_a = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a");
         let addr_a = phone_a.local_addr().expect("addr a");
-        let peer_b = Arc::new(UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0)).await.expect("bind b"));
+        let peer_b = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind b"),
+        );
         let addr_b = peer_b.local_addr().expect("addr b");
 
         let engine_cert = DtlsCertificate::generate().expect("engine cert");
@@ -361,7 +372,10 @@ mod tests {
         for _ in 0..25 {
             sealed.clear();
             peer_leg.protect(&media, &mut sealed).expect("peer protect");
-            peer_b.send_to(&sealed, secure.local_addr).await.expect("b send");
+            peer_b
+                .send_to(&sealed, secure.local_addr)
+                .await
+                .expect("b send");
             let mut buffer = [0u8; 2048];
             if let Ok(Ok((len, _))) =
                 timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
@@ -378,7 +392,10 @@ mod tests {
 
         // A → engine: plaintext RTP, encrypted and relayed to B as SRTP.
         let media_ab = rtp(2000, 0x0A0A_0A0A);
-        phone_a.send_to(&media_ab, plain.local_addr).await.expect("a send");
+        phone_a
+            .send_to(&media_ab, plain.local_addr)
+            .await
+            .expect("a send");
         let mut buffer = [0u8; 2048];
         let (len, _) = timeout(RECV_TIMEOUT, peer_b.recv_from(&mut buffer))
             .await
@@ -388,7 +405,10 @@ mod tests {
         peer_leg
             .unprotect(&buffer[..len], &mut recovered)
             .expect("peer unprotect");
-        assert_eq!(recovered, media_ab, "A's plaintext is encrypted and relayed to B as SRTP");
+        assert_eq!(
+            recovered, media_ab,
+            "A's plaintext is encrypted and relayed to B as SRTP"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -396,9 +416,13 @@ mod tests {
         let datapath = UdpLoopbackDatapath::new();
         let plain = datapath.alloc_endpoint().await.expect("alloc plain");
         let secure = datapath.alloc_endpoint().await.expect("alloc secure");
-        let phone_a = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).await.expect("bind a");
+        let phone_a = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("bind a");
         let addr_a = phone_a.local_addr().expect("addr a");
-        let peer_b = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0)).await.expect("bind b");
+        let peer_b = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+            .await
+            .expect("bind b");
         let addr_b = peer_b.local_addr().expect("addr b");
 
         let bridge = DtlsBridge::new(datapath.clone());

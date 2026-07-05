@@ -187,7 +187,12 @@ fn ipv6_datagram(packet: &CapturedPacket) -> Vec<u8> {
 }
 
 /// UDP (RFC 768) header + payload. `pseudo_header` is the IP pseudo-header prefix the checksum spans.
-fn udp_datagram(source_port: u16, destination_port: u16, payload: &[u8], pseudo_header: &[u8]) -> Vec<u8> {
+fn udp_datagram(
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+    pseudo_header: &[u8],
+) -> Vec<u8> {
     let length = (8 + payload.len()) as u16;
     let mut datagram = Vec::with_capacity(8 + payload.len());
     datagram.extend_from_slice(&source_port.to_be_bytes());
@@ -330,17 +335,29 @@ mod tests {
 
         let ip = &eth[14..];
         assert_eq!(ip[0], 0x45, "IPv4 version+IHL");
-        assert_eq!(read_u16_be(ip, 2), (20 + 8 + payload.len()) as u16, "IP total length");
+        assert_eq!(
+            read_u16_be(ip, 2),
+            (20 + 8 + payload.len()) as u16,
+            "IP total length"
+        );
         assert_eq!(ip[9], IP_PROTO_UDP, "protocol = UDP");
         assert_eq!(&ip[12..16], &[203, 0, 113, 5], "source IP");
         assert_eq!(&ip[16..20], &[198, 51, 100, 9], "destination IP");
         // The IPv4 header checksum must make the header sum to zero (RFC 1071).
-        assert_eq!(internet_checksum(&ip[0..20]), 0, "valid IPv4 header checksum");
+        assert_eq!(
+            internet_checksum(&ip[0..20]),
+            0,
+            "valid IPv4 header checksum"
+        );
 
         let udp = &ip[20..];
         assert_eq!(read_u16_be(udp, 0), 40_000, "UDP source port");
         assert_eq!(read_u16_be(udp, 2), 7_000, "UDP destination port");
-        assert_eq!(read_u16_be(udp, 4), (8 + payload.len()) as u16, "UDP length");
+        assert_eq!(
+            read_u16_be(udp, 4),
+            (8 + payload.len()) as u16,
+            "UDP length"
+        );
         assert_eq!(&udp[8..], &payload[..], "RTP payload byte-for-byte");
     }
 
@@ -359,7 +376,11 @@ mod tests {
         // Recompute the checksum over pseudo-header + UDP datagram; a correct one sums to zero.
         let mut buffer = pseudo_header_ipv4(&[10, 0, 0, 1], &[10, 0, 0, 2], &payload);
         buffer.extend_from_slice(udp);
-        assert_eq!(internet_checksum(&buffer), 0, "valid UDP checksum over pseudo-header");
+        assert_eq!(
+            internet_checksum(&buffer),
+            0,
+            "valid UDP checksum over pseudo-header"
+        );
     }
 
     #[test]
@@ -379,14 +400,22 @@ mod tests {
 
         let ip = &eth[14..];
         assert_eq!(ip[0] >> 4, 6, "IP version 6");
-        assert_eq!(read_u16_be(ip, 4), (8 + payload.len()) as u16, "IPv6 payload length");
+        assert_eq!(
+            read_u16_be(ip, 4),
+            (8 + payload.len()) as u16,
+            "IPv6 payload length"
+        );
         assert_eq!(ip[6], IP_PROTO_UDP, "next header = UDP");
         assert_eq!(&ip[8..24], &source.octets(), "source IPv6");
         assert_eq!(&ip[24..40], &destination.octets(), "destination IPv6");
 
         let udp = &ip[40..];
         assert_eq!(read_u16_be(udp, 0), 6_000, "UDP source port");
-        assert_ne!(read_u16_be(udp, 6), 0, "IPv6 UDP checksum is mandatory (non-zero)");
+        assert_ne!(
+            read_u16_be(udp, 6),
+            0,
+            "IPv6 UDP checksum is mandatory (non-zero)"
+        );
         assert_eq!(&udp[8..], &payload[..], "payload verbatim");
         // The checksum validates over the IPv6 pseudo-header.
         let mut buffer = pseudo_header_ipv6(&source.octets(), &destination.octets(), &payload);

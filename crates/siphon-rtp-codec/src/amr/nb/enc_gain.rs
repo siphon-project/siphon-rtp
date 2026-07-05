@@ -28,8 +28,8 @@ use crate::amr::basic_ops::{
 use crate::amr::math_op::{log2, pow2};
 use crate::amr::nb::constants::L_SUBFR;
 use crate::amr::nb::gain_tables::QUA_GAIN_CODE;
-use crate::amr::nb::gains::{gc_pred, gc_pred_update, GcPredState};
 use crate::amr::nb::gain_vq_tables::{TABLE_GAIN_HIGHRATES, TABLE_GAIN_LOWRATES, TABLE_GAIN_MR475};
+use crate::amr::nb::gains::{gc_pred, gc_pred_update, GcPredState};
 use crate::amr::oper_32b::{l_extract, mpy_32_16};
 use crate::amr::AmrNbMode;
 use crate::CodecError;
@@ -233,14 +233,23 @@ pub fn g_code(xn2: &[i16], y2: &[i16]) -> i16 {
 ///
 /// This tier only brings up MR122 in the dispatch; the MR795 arithmetic path is kept for parity.
 #[must_use]
-fn q_gain_code(mode: AmrNbMode, exp_gcode0: i16, frac_gcode0: i16, gain: &mut i16) -> (i16, i16, i16) {
+fn q_gain_code(
+    mode: AmrNbMode,
+    exp_gcode0: i16,
+    frac_gcode0: i16,
+    gain: &mut i16,
+) -> (i16, i16, i16) {
     let is_mr122 = mode == AmrNbMode::Mr1220;
 
     let g_q0 = if is_mr122 { shr(*gain, 1) } else { 0 };
 
     // predicted gain gc0 = Pow2(exp_gcode0 + frac_gcode0)
     let mut gcode0 = extract_l(pow2(exp_gcode0, frac_gcode0));
-    gcode0 = if is_mr122 { shl(gcode0, 4) } else { shl(gcode0, 5) };
+    gcode0 = if is_mr122 {
+        shl(gcode0, 4)
+    } else {
+        shl(gcode0, 5)
+    };
 
     // Search for the best quantizer.
     let mut index = 0usize;
@@ -635,7 +644,11 @@ pub fn gain_quant(
         ));
     } else if matches!(
         mode,
-        AmrNbMode::Mr590 | AmrNbMode::Mr515 | AmrNbMode::Mr670 | AmrNbMode::Mr740 | AmrNbMode::Mr1020
+        AmrNbMode::Mr590
+            | AmrNbMode::Mr515
+            | AmrNbMode::Mr670
+            | AmrNbMode::Mr740
+            | AmrNbMode::Mr1020
     ) {
         let energies = calc_filt_energies(mode, xn, xn2, y1, y2, g_coeff);
         let mut gain_cod = 0i16;
@@ -1163,7 +1176,10 @@ mod tests {
             if mode == AmrNbMode::Mr475 {
                 if rec.even != 0 {
                     // Even subframe defers: nothing transmitted (the reference reserves the slot).
-                    assert_eq!(out.num_params, 0, "MR475 even should defer at subframe #{n}");
+                    assert_eq!(
+                        out.num_params, 0,
+                        "MR475 even should defer at subframe #{n}"
+                    );
                 } else {
                     // Odd subframe emits the joint index (into the reserved slot) + both gains.
                     assert_eq!(out.num_params, 1, "MR475 odd should emit at subframe #{n}");
@@ -1182,7 +1198,10 @@ mod tests {
                 }
             } else {
                 // Standard path: exactly one index, matching the reference's ana slot.
-                assert_eq!(out.num_params, 1, "standard path emits 1 index at subframe #{n}");
+                assert_eq!(
+                    out.num_params, 1,
+                    "standard path emits 1 index at subframe #{n}"
+                );
                 assert_eq!(rec.nidx, 1, "reference wrote 1 index at subframe #{n}");
                 assert_eq!(
                     out.params[0], rec.idx[0],

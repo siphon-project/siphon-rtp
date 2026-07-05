@@ -319,7 +319,8 @@ mod tests {
 
         let mut out = Vec::new();
         assert_eq!(
-            leg.unprotect(&srtp, &mut out).expect("first delivery accepted"),
+            leg.unprotect(&srtp, &mut out)
+                .expect("first delivery accepted"),
             PacketKind::Rtp
         );
         assert_eq!(

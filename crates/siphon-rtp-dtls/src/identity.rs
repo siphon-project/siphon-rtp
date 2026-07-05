@@ -21,10 +21,9 @@ pub struct DtlsCertificate {
 impl DtlsCertificate {
     /// Generate a fresh self-signed certificate (ECDSA P-256, as `webrtc-dtls` mints and WebRTC uses).
     pub fn generate() -> Result<Self, DtlsError> {
-        let inner = webrtc_dtls::crypto::Certificate::generate_self_signed(vec![
-            "siphon-rtp".to_owned()
-        ])
-        .map_err(|error| DtlsError::Certificate(error.to_string()))?;
+        let inner =
+            webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["siphon-rtp".to_owned()])
+                .map_err(|error| DtlsError::Certificate(error.to_string()))?;
         let leaf_der = inner
             .certificate
             .first()

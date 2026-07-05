@@ -299,7 +299,10 @@ async fn transcoded_answer_advertises_the_offerers_own_codec() {
         answer_sdp.contains("a=rtpmap:0 PCMU/8000"),
         "PCMU rtpmap advertised to A: {answer_sdp}"
     );
-    assert!(!answer_sdp.contains("PCMA"), "no PCMA in A's answer: {answer_sdp}");
+    assert!(
+        !answer_sdp.contains("PCMA"),
+        "no PCMA in A's answer: {answer_sdp}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

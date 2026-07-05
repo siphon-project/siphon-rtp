@@ -123,8 +123,14 @@ mod tests {
     #[tokio::test]
     async fn inbound_datagrams_are_received_in_order() {
         let (transport, channels) = DtlsTransport::new(addr(5000), addr(6000));
-        channels.inbound.send(Bytes::from_static(&[0x16, 0x01])).unwrap();
-        channels.inbound.send(Bytes::from_static(&[0x16, 0x02])).unwrap();
+        channels
+            .inbound
+            .send(Bytes::from_static(&[0x16, 0x01]))
+            .unwrap();
+        channels
+            .inbound
+            .send(Bytes::from_static(&[0x16, 0x02]))
+            .unwrap();
 
         let mut buf = [0u8; 16];
         let n = transport.recv(&mut buf).await.unwrap();

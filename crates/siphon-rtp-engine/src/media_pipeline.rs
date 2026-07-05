@@ -555,7 +555,9 @@ impl Direction {
                     // then drop the packet — the peer never hears the tone. A malformed telephone-event
                     // still drops (never forward a blocked DTMF PT).
                     if let Ok(parsed) = RtpPacket::parse(data) {
-                        if let Ok(Some(event)) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
+                        if let Ok(Some(event)) =
+                            self.dtmf.on_packet(parsed.timestamp, parsed.payload)
+                        {
                             events.push(Event::Dtmf {
                                 call_id: dtmf_meta.call_id.to_string(),
                                 from_tag: dtmf_meta.from_tag.to_string(),
@@ -879,7 +881,10 @@ impl MediaCall {
     /// so the registry can direct their redirected datagrams to this actor.
     #[must_use]
     pub fn rtcp_endpoints(&self) -> Vec<EndpointId> {
-        self.rtcp.iter().map(|relay| relay.ingress_endpoint).collect()
+        self.rtcp
+            .iter()
+            .map(|relay| relay.ingress_endpoint)
+            .collect()
     }
 
     /// Build a **relay-only** call: both directions forward their ingress RTP verbatim to the peer
@@ -1042,8 +1047,13 @@ impl MediaCall {
         let Some(capture) = &self.capture else {
             return;
         };
-        let destination = if leg_a { capture.a_local } else { capture.b_local };
-        let packet = CapturedPacket::new(source, destination, Bytes::copy_from_slice(data), arrival);
+        let destination = if leg_a {
+            capture.a_local
+        } else {
+            capture.b_local
+        };
+        let packet =
+            CapturedPacket::new(source, destination, Bytes::copy_from_slice(data), arrival);
         if capture.sender.try_send(packet).is_err() {
             tracing::debug!("pcap capture dropped a packet (sink full or closed)");
         }
@@ -1324,7 +1334,11 @@ impl MediaRegistry {
         let rtcp_endpoints = call.rtcp_endpoints();
         let relay_only = call.is_relay_only();
         let (mailbox, inbox) = flume::bounded(1024);
-        for endpoint in endpoints.iter().copied().chain(rtcp_endpoints.iter().copied()) {
+        for endpoint in endpoints
+            .iter()
+            .copied()
+            .chain(rtcp_endpoints.iter().copied())
+        {
             self.routes.insert(endpoint, mailbox.clone());
         }
         let task = tokio::spawn(run_media_call(call, inbox, datapath, events));
@@ -1734,29 +1748,31 @@ mod tests {
     fn amr_wb_cmr_steers_the_reverse_direction_encoder() {
         use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
 
-        let amr_dir = |ingress: u64, src: &str, egress: u64, dst: &str, ssrc: u32| DirectionConfig {
-            ingress_endpoint: endpoint(ingress),
-            accepted_source: SourceFilter::Exact(addr(src).ip()),
-            egress_endpoint: endpoint(egress),
-            egress_dst: addr(dst),
-            decoder: decoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("dec"),
-            encoder: encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc"),
-            egress_ssrc: ssrc,
-            egress_payload_type: 96,
-            telephone_event_in: None,
-            telephone_event_out: None,
-            recorder: None,
-        };
+        let amr_dir =
+            |ingress: u64, src: &str, egress: u64, dst: &str, ssrc: u32| DirectionConfig {
+                ingress_endpoint: endpoint(ingress),
+                accepted_source: SourceFilter::Exact(addr(src).ip()),
+                egress_endpoint: endpoint(egress),
+                egress_dst: addr(dst),
+                decoder: decoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("dec"),
+                encoder: encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc"),
+                egress_ssrc: ssrc,
+                egress_payload_type: 96,
+                telephone_event_in: None,
+                telephone_event_out: None,
+                recorder: None,
+            };
 
         // A payload at the default mode 2; flip its CMR nibble to request mode 0 for the B→A stream.
-        let mut encoder =
-            encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc");
-        let pcm: Vec<i16> = (0..320).map(|i| ((i as f32 * 0.2).sin() * 6000.0) as i16).collect();
+        let mut encoder = encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("enc");
+        let pcm: Vec<i16> = (0..320)
+            .map(|i| ((i as f32 * 0.2).sin() * 6000.0) as i16)
+            .collect();
         let mut a_payload = vec![0u8; 256];
         let len_a = encoder.encode(&pcm, &mut a_payload).expect("encode");
         a_payload.truncate(len_a);
         a_payload[0] = 0x00; // CMR = 0 (request mode 0)
-        // B's payload carries no request (CMR 15, as emitted).
+                             // B's payload carries no request (CMR 15, as emitted).
         let mut b_payload = vec![0u8; 256];
         let len_b = encoder.encode(&pcm, &mut b_payload).expect("encode");
         b_payload.truncate(len_b);
@@ -1774,10 +1790,18 @@ mod tests {
         let mut events = Vec::new();
 
         // A→B carries CMR 0 → the toward-A encoder switches to mode 0.
-        call.process(&rx(1, A_ADDR, amr_wb_rtp(1, &a_payload)), &mut out, &mut events);
+        call.process(
+            &rx(1, A_ADDR, amr_wb_rtp(1, &a_payload)),
+            &mut out,
+            &mut events,
+        );
         out.clear();
         // B→A: the reverse egress toward A is now encoded at the requested mode 0.
-        call.process(&rx(2, B_ADDR, amr_wb_rtp(1, &b_payload)), &mut out, &mut events);
+        call.process(
+            &rx(2, B_ADDR, amr_wb_rtp(1, &b_payload)),
+            &mut out,
+            &mut events,
+        );
         assert_eq!(out.len(), 1, "one AMR-WB packet toward A");
         let packet = RtpPacket::parse(&out[0].data).expect("parse");
         assert_eq!(packet.payload_type, 96, "AMR-WB toward A");
@@ -1860,12 +1884,18 @@ mod tests {
         // B → A: B encrypts an RTCP SR with its key; the actor decrypts and relays plaintext to A.
         let b_rtcp_plain = rtcp_sr(0xB0B0_B0B0);
         let mut b_srtcp = Vec::new();
-        peer_leg.protect(&b_rtcp_plain, &mut b_srtcp).expect("peer encrypt SRTCP");
+        peer_leg
+            .protect(&b_rtcp_plain, &mut b_srtcp)
+            .expect("peer encrypt SRTCP");
         call.process(&rx(4, b_rtcp, b_srtcp), &mut out, &mut events);
         assert_eq!(out.len(), 1, "one RTCP toward A");
         assert_eq!(out[0].endpoint, endpoint(3));
         assert_eq!(out[0].dst, addr(a_rtcp));
-        assert_eq!(&out[0].data[..], &b_rtcp_plain[..], "decrypted plaintext RTCP toward A");
+        assert_eq!(
+            &out[0].data[..],
+            &b_rtcp_plain[..],
+            "decrypted plaintext RTCP toward A"
+        );
 
         // A → B: A's plaintext RTCP is encrypted (SRTCP) toward B; the peer recovers it.
         out.clear();
@@ -1874,9 +1904,15 @@ mod tests {
         assert_eq!(out.len(), 1, "one SRTCP toward B");
         assert_eq!(out[0].endpoint, endpoint(4));
         assert_eq!(out[0].dst, addr(b_rtcp));
-        assert_ne!(&out[0].data[..], &a_rtcp_plain[..], "toward B it is encrypted (SRTCP)");
+        assert_ne!(
+            &out[0].data[..],
+            &a_rtcp_plain[..],
+            "toward B it is encrypted (SRTCP)"
+        );
         let mut recovered = Vec::new();
-        peer_leg.unprotect(&out[0].data, &mut recovered).expect("peer decrypt SRTCP");
+        peer_leg
+            .unprotect(&out[0].data, &mut recovered)
+            .expect("peer decrypt SRTCP");
         assert_eq!(recovered, a_rtcp_plain, "B recovers A's RTCP");
 
         // An off-source RTCP is dropped by the RTPBleed gate on the RTCP endpoint.
@@ -2456,7 +2492,11 @@ mod tests {
             &mut out,
             &mut events,
         );
-        assert_eq!(events.len(), 1, "DTMF still detected + emitted while blocked");
+        assert_eq!(
+            events.len(),
+            1,
+            "DTMF still detected + emitted while blocked"
+        );
         assert!(
             matches!(&events[0], Event::Dtmf { digit, .. } if digit == "5"),
             "the digit is surfaced to the controller"
@@ -2506,8 +2546,15 @@ mod tests {
             &mut out,
             &mut events,
         );
-        assert!(out.is_empty(), "telephone-event dropped on the blocked relay leg");
-        assert_eq!(events.len(), 1, "DTMF still detected + emitted on the relay path");
+        assert!(
+            out.is_empty(),
+            "telephone-event dropped on the blocked relay leg"
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "DTMF still detected + emitted on the relay path"
+        );
 
         // Unblock: a fresh telephone-event (new RTP timestamp) is forwarded verbatim again.
         call.set_dtmf_blocked(true, false);
@@ -2515,8 +2562,16 @@ mod tests {
         events.clear();
         let event = telephone_event_rtp(3, 17600, true, true);
         call.process(&rx(1, A_ADDR, event.clone()), &mut out, &mut events);
-        assert_eq!(out.len(), 1, "telephone-event forwarded again after unblock");
-        assert_eq!(&out[0].data[..], &event[..], "forwarded byte-for-byte after unblock");
+        assert_eq!(
+            out.len(),
+            1,
+            "telephone-event forwarded again after unblock"
+        );
+        assert_eq!(
+            &out[0].data[..],
+            &event[..],
+            "forwarded byte-for-byte after unblock"
+        );
     }
 
     #[test]
@@ -2702,14 +2757,25 @@ mod tests {
             &mut Vec::new(),
         );
         let captured = sink.try_recv().expect("A→B datagram captured");
-        assert_eq!(captured.source, addr(A_ADDR), "captured source = A's observed addr");
+        assert_eq!(
+            captured.source,
+            addr(A_ADDR),
+            "captured source = A's observed addr"
+        );
         assert_eq!(
             captured.destination,
             addr("127.0.0.1:10000"),
             "captured destination = leg A's engine-local addr"
         );
-        assert_eq!(&captured.payload[..], &a_packet[..], "RTP captured byte-for-byte");
-        assert_eq!(captured.timestamp_micros, 123, "arrival timestamp propagated");
+        assert_eq!(
+            &captured.payload[..],
+            &a_packet[..],
+            "RTP captured byte-for-byte"
+        );
+        assert_eq!(
+            captured.timestamp_micros, 123,
+            "arrival timestamp propagated"
+        );
 
         // B→A accepted packet is captured with leg B's local address.
         let b_packet = alaw_rtp(1, 0x55);

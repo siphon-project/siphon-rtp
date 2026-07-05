@@ -35,9 +35,7 @@ pub(crate) const GAMMA1_12K2: [i16; M] = [
 
 /// `gamma2[M]` — spectral expansion factor 2 (`cod_amr.c`), the weighting filter denominator
 /// `A(z/gamma2)` for all modes.
-pub(crate) const GAMMA2: [i16; M] = [
-    19661, 11797, 7078, 4247, 2548, 1529, 917, 550, 330, 198,
-];
+pub(crate) const GAMMA2: [i16; M] = [19661, 11797, 7078, 4247, 2548, 1529, 917, 550, 330, 198];
 
 /// `corrweight[251]` (`corrwght.tab`) — the correlation-weighting window for `Pitch_ol_wgh`.
 const CORRWEIGHT: [i16; 251] = [
@@ -125,7 +123,14 @@ fn gmed_n(ind: &[i16], n: usize) -> i16 {
 /// (`calc_cor.c` `comp_corr`). `scal_sig` is a slice whose logical index 0 is `base`; the negative
 /// offsets `base - i` must be in range. `corr` is written at flat index `PIT_MAX - i` (mirroring the
 /// reference `corr[-i]` where `corr` points at `&corr[pit_max]`).
-fn comp_corr(scal_sig: &[i16], base: usize, l_frame: usize, lag_max: i16, lag_min: i16, corr: &mut [i32]) {
+fn comp_corr(
+    scal_sig: &[i16],
+    base: usize,
+    l_frame: usize,
+    lag_max: i16,
+    lag_min: i16,
+    corr: &mut [i32],
+) {
     let mut i = lag_max;
     while i >= lag_min {
         let mut t0 = 0i32;
@@ -533,7 +538,15 @@ pub fn weighted_speech_and_ol_pitch(
     #[allow(clippy::needless_range_loop)]
     for subfr_nr in 0..2 {
         let i_subfr = subfr_nr * L_FRAME_BY2;
-        pre_big(mode, a_t, i_subfr, speech, speech_base, mem_w, &mut wsp[wsp_base..]);
+        pre_big(
+            mode,
+            a_t,
+            i_subfr,
+            speech,
+            speech_base,
+            mem_w,
+            &mut wsp[wsp_base..],
+        );
 
         if mode != AmrNbMode::Mr475 && mode != AmrNbMode::Mr515 {
             t_op[subfr_nr] = ol_ltp(
@@ -551,16 +564,7 @@ pub fn weighted_speech_and_ol_pitch(
 
     if mode == AmrNbMode::Mr475 || mode == AmrNbMode::Mr515 {
         // One 160-sample search on the whole frame; idx = 1 in the reference.
-        t_op[0] = ol_ltp(
-            st,
-            mode,
-            wsp,
-            wsp_base,
-            old_lags,
-            ol_gain_flg,
-            1,
-            L_FRAME,
-        );
+        t_op[0] = ol_ltp(st, mode, wsp, wsp_base, old_lags, ol_gain_flg, 1, L_FRAME);
         t_op[1] = t_op[0];
     }
 }
@@ -600,9 +604,10 @@ mod tests {
         inp.push("../../reference/amr-nb/testv/NODTX/T_INP/T01.INP");
         let dump = std::path::PathBuf::from(dump_rel);
 
-        let (Some(pcm_bytes), Some(dump_text)) =
-            (std::fs::read(&inp).ok(), std::fs::read_to_string(&dump).ok())
-        else {
+        let (Some(pcm_bytes), Some(dump_text)) = (
+            std::fs::read(&inp).ok(),
+            std::fs::read_to_string(&dump).ok(),
+        ) else {
             eprintln!("oracle dump / input absent — skipping full gate for {mode:?}");
             return None;
         };
@@ -680,7 +685,10 @@ mod tests {
             .chunks_exact(2)
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
-        assert!(pcm.len() >= 11 * L_FRAME, "need at least 11 frames of input");
+        assert!(
+            pcm.len() >= 11 * L_FRAME,
+            "need at least 11 frames of input"
+        );
 
         let mut st = EncoderState::new();
         let mut prm = [0i16; 5];
@@ -711,7 +719,15 @@ mod tests {
         frame10_regression(
             AmrNbMode::Mr1220,
             [141, 141],
-            &[(0, -488), (10, 2081), (40, -493), (79, 59), (80, 166), (120, -264), (159, 283)],
+            &[
+                (0, -488),
+                (10, 2081),
+                (40, -493),
+                (79, 59),
+                (80, 166),
+                (120, -264),
+                (159, 283),
+            ],
             14512,
             888_515_028,
         );
@@ -722,7 +738,15 @@ mod tests {
         frame10_regression(
             AmrNbMode::Mr475,
             [141, 141],
-            &[(0, -338), (10, 2547), (40, -505), (79, 110), (80, 139), (120, -222), (159, -45)],
+            &[
+                (0, -338),
+                (10, 2547),
+                (40, -505),
+                (79, 110),
+                (80, 139),
+                (120, -222),
+                (159, -45),
+            ],
             13815,
             851_325_563,
         );
@@ -738,13 +762,23 @@ mod tests {
         let mut prm = [0i16; 5];
         let mut wsp = [1i16; L_FRAME];
         let mut t_op = [0i16; 2];
-        st.analyze_frame(AmrNbMode::Mr1220, &[0i16; L_FRAME], &mut prm, &mut wsp, &mut t_op);
-        assert!(wsp.iter().all(|&v| v == 0), "silence must yield zero weighted speech");
+        st.analyze_frame(
+            AmrNbMode::Mr1220,
+            &[0i16; L_FRAME],
+            &mut prm,
+            &mut wsp,
+            &mut t_op,
+        );
+        assert!(
+            wsp.iter().all(|&v| v == 0),
+            "silence must yield zero weighted speech"
+        );
     }
 
     #[test]
     fn oracle_gate_mr122_wsp_and_top_bit_exact() {
-        if let Some(n) = run_oracle_gate(AmrNbMode::Mr1220, "/tmp/amr-nb-oracle-t2/wsp_top_mr122.txt")
+        if let Some(n) =
+            run_oracle_gate(AmrNbMode::Mr1220, "/tmp/amr-nb-oracle-t2/wsp_top_mr122.txt")
         {
             eprintln!("MR122 oracle gate: {n} frames wsp+T_op bit-exact");
         }
@@ -752,7 +786,8 @@ mod tests {
 
     #[test]
     fn oracle_gate_mr475_wsp_and_top_bit_exact() {
-        if let Some(n) = run_oracle_gate(AmrNbMode::Mr475, "/tmp/amr-nb-oracle-t2/wsp_top_mr475.txt")
+        if let Some(n) =
+            run_oracle_gate(AmrNbMode::Mr475, "/tmp/amr-nb-oracle-t2/wsp_top_mr475.txt")
         {
             eprintln!("MR475 oracle gate: {n} frames wsp+T_op bit-exact");
         }
@@ -770,6 +805,10 @@ mod tests {
         }
         let lag = pitch_ol(&sig, HIST, PIT_MIN_VALUE, PIT_MAX, N, false);
         // The strongest normalized correlation for this train is at a multiple of 40 in range.
-        assert_eq!(lag % 40, 0, "expected a multiple of the true period, got {lag}");
+        assert_eq!(
+            lag % 40,
+            0,
+            "expected a multiple of the true period, got {lag}"
+        );
     }
 }
