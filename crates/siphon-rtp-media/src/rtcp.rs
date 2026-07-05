@@ -1,7 +1,7 @@
-//! RTCP compound-packet parsing (RFC 3550 §6) — enough to drive relay, statistics, and the
-//! later MOS estimation: Sender Reports, Receiver Reports, and their reception report blocks.
-//! SDES/BYE/APP are recognized and skipped. Construction of our own RR/SR comes with the
-//! statistics work; this slice is the read path.
+//! RTCP compound-packet parsing and construction (RFC 3550 §6), driving relay, statistics, and the
+//! G.107 MOS estimation. Parses Sender Reports, Receiver Reports, and their reception report blocks
+//! (SDES/BYE/APP are recognized and skipped), and builds our own minimal SR/RR for the per-leg
+//! reception reports the engine emits.
 
 /// Errors from RTCP parsing.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -22,6 +22,11 @@ per connection, never blocking the engine. Routes: `GET /metrics`, `GET /healthz
 | `siphon_rtp_conference_leaves_total` | counter | conference `leave` commands accepted |
 | `siphon_rtp_control_errors_total` | counter | control commands that returned an error |
 | `siphon_rtp_control_rate_limited_total` | counter | control commands rejected by the rate limiter |
+| `siphon_rtp_transcode_sessions` | gauge | live media-processing (transcode / bridge) sessions |
+| `siphon_rtp_max_sessions` | gauge | advertised session cap (`--max-sessions`, 0 = unlimited) |
+| `siphon_rtp_load_permille` | gauge | cluster load score, 0–1000 (the max of session utilisation and CPU) |
+| `siphon_rtp_cpu_permille` | gauge | sampled CPU utilisation, 0–1000 |
+| `siphon_rtp_draining` | gauge | 1 when the node is draining (rejecting new sessions), else 0 |
 | `siphon_rtp_jemalloc_allocated_bytes` | gauge | live heap (jemalloc `stats.allocated`) |
 
 Gauges are read on demand at scrape time from the live registries (`Metrics::render` takes a
@@ -61,7 +66,7 @@ JSON control channel — so the control plane sees live quality without parsing 
 - **loss_percent** — residual inbound loss the listener hears (jitter-buffer concealed/discarded
   slots over `expected = highest − base + 1`).
 - **mos** — MOS-CQE (1.0–4.5) from the **ITU-T G.107 E-model** in [`siphon-rtp-hep`'s `mos`
-  module](../crates/siphon-rtp-hep/src/mos.rs) — the one canonical estimator, shared with the HEP
+  module](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-hep/src/mos.rs) — the one canonical estimator, shared with the HEP
   export path:
 
   ```text
@@ -81,7 +86,9 @@ JSON control channel — so the control plane sees live quality without parsing 
 - **Wideband** codecs (G.722, AMR-WB) want the G.107.1 wideband extension; the narrowband model here
   is an approximation for them.
 - **2-party / transcoding-bridge** legs don't yet emit `call_quality` (conference-only today).
-- A **HEP3/Homer** export of RTCP + MOS is a candidate but lower priority where VoIPmonitor sniffs
-  the media passively.
+- **HEP3 / Homer** RTCP export ships (enabled by `SIPHON_RTP_HEP_COLLECTOR`, with
+  `SIPHON_RTP_HEP_AGENT_ID`), tapping relayed RTCP on the plain-relay path and sending it as HEP3
+  captures. The G.107 MOS still rides the `call_quality` control events, not HEP; wiring the
+  `siphon-rtp-hep` QoS report (HEP type 35) into the exporter is the remaining step.
 
 See also [`security-and-nat.md`](security-and-nat.md) for the relay's accept/latch/forward model.

@@ -5,7 +5,7 @@
 # cargo-chef layer-caches dependencies, mirroring siphon-sip's Dockerfile.
 #
 #   docker build -t siphon-rtp .                      # UDP-backend image (any kernel)
-#   docker build --build-arg CARGO_FEATURES=xdp .     # once the eBPF crate lands
+#   docker build --build-arg CARGO_FEATURES=amr .     # + AMR-NB/WB transcode (patent-gated)
 #
 # See docker-compose.yml for the dev (veth + SKB XDP) and prod (host-net + native XDP) profiles.
 
@@ -28,8 +28,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Builder: cook deps (cached until Cargo.lock changes), then build the engine ──────────
 FROM chef AS builder
-# Opt-in XDP datapath (aya XDP program via its own pinned-nightly toolchain). Empty by default so
-# the image builds anywhere without nightly — the binary then runs the UDP-loopback backend.
+# Opt-in Cargo features (only `amr` today: AMR-NB/WB transcode, patent-gated — see
+# docs/codec-licensing.md). Empty by default. The XDP datapath is a separate excluded workspace
+# (crates/siphon-rtp-xdp), not a Cargo feature; the default binary runs the UDP backend.
 ARG CARGO_FEATURES=""
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl \
