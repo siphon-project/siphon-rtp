@@ -23,7 +23,7 @@ webrtc-util = "0.11"
 # The SRTP secure leg the exported keying material is fed into (shared with the SDES path).
 siphon-rtp-srtp = { path = "../siphon-rtp-srtp" }
 # Certificate fingerprints (RFC 8122): SHA-256 default, SHA-384/512 + SHA-1 for interop.
-sha2 = "0.10"
+sha2 = "0.11"
 sha1 = "0.10"
 # The `Conn` trait is `#[async_trait]`.
 async-trait = "0.1"
