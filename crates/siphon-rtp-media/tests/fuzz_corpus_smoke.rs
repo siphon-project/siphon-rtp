@@ -4,7 +4,7 @@
 //! the compound RTCP parser (§6), and the rtcp-mux classifier (RFC 5761), asserting none panics,
 //! reads out of bounds, or spins.
 //!
-//! CLAUDE.md hard rule: a hostile datagram off the network must decode-or-error, never crash.
+//! House rule: a hostile datagram off the network must decode-or-error, never crash.
 //! (The crates' inline `parse_never_panics` proptests fuzz the same property structurally; this
 //! file additionally exercises the persisted seed corpus and a battery of hand-picked attacks.)
 

@@ -304,7 +304,7 @@ mod tests {
 // Property tests: the resampler fed an arbitrary logical sample-clock schedule (arbitrary rate pairs,
 // arbitrary chunk boundaries, full-range i16 input) must never panic and must produce a *bounded*
 // number of output samples. Deterministic by construction: the resampler has no wall clock, its whole
-// state is the input schedule (CLAUDE.md forbids Instant::now() in DSP tests).
+// state is the input schedule (no Instant::now() in DSP tests).
 #[cfg(test)]
 mod proptests {
     use super::*;

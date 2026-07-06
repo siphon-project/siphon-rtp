@@ -3,7 +3,7 @@
 //! crafted-malformed SDP bodies and the seed corpus through `sdp::parse` and `sdp::rewrite` against
 //! a fixed engine endpoint, asserting neither panics, reads out of bounds, or spins.
 //!
-//! CLAUDE.md hard rule: a malformed / hostile SDP off the signalling path must decode-or-error,
+//! House rule: a malformed / hostile SDP off the signalling path must decode-or-error,
 //! never crash. (The crate's inline `parsers_never_panic` proptest fuzzes the same property over
 //! arbitrary text; this file additionally exercises the persisted seed corpus and hand-picked
 //! attacks. All addresses are the 3GPP/documentation test range — never real subscriber endpoints.)

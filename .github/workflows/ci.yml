@@ -38,7 +38,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The house gate (CLAUDE.md): clippy must be clean across every target and feature.
+      # The house gate: clippy must be clean across every target and feature.
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -87,9 +87,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Keep the criterion perf gates compiling so they never bit-rot. The full
-      # ">10% regression fails CI" gate (CLAUDE.md) needs a stored baseline (critcmp /
-      # github-action-benchmark) — tracked as a follow-up; here we only prove they build.
+      # Keep the criterion (wall-clock) perf benches compiling so they never bit-rot. The
+      # actual ">10% regression fails CI" gate runs in the `perf-gate` job below, on the
+      # deterministic iai-callgrind instruction-count benches.
       - run: cargo bench --workspace --all-features --no-run --locked
 
   deny:
@@ -128,7 +128,7 @@ jobs:
             sbom.cdx.json
 
   # ── Fuzz every untrusted-bytes parser + codec decoder (nightly + cargo-fuzz) ──────────────
-  # CLAUDE.md hard rule: a malformed/truncated/hostile datagram or codec bitstream must
+  # House rule: a malformed/truncated/hostile datagram or codec bitstream must
   # decode-or-error, never panic / read OOB / spin. Each target gets a 30 s smoke here (a fast
   # regression net over the saved corpus + new mutation); deep runs belong on a scheduled/OSS-Fuzz
   # harness. Covers the RTP/RTCP parser, the SDP + NG/bencode + native-JSON control parsers, the
@@ -172,11 +172,58 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # ── Perf-regression gate (iai-callgrind, deterministic instruction counts) ───────────────
+  # House rule: a >10% regression vs the baseline fails CI. Callgrind counts *instructions
+  # executed*, which is deterministic run-to-run (unlike the wall-clock criterion benches, too noisy
+  # to gate on a shared runner). We build the baseline from the PR's base (main) in this same runner,
+  # so the two instruction counts are directly comparable, then re-run the PR against it; the bench's
+  # `soft_limits([(Ir, 10.0)])` makes iai-callgrind exit non-zero on a >10% regression. PR-only.
+  perf-gate:
+    name: perf regression (iai-callgrind)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends valgrind
+      - name: Install iai-callgrind-runner
+        run: cargo install iai-callgrind-runner --version 0.16.1 --locked
+      - name: Compare PR against the base baseline (fail on >10% instruction regression)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          BENCHES="--bench codec_iai --bench media_iai --bench srtp_iai"
+          # Baseline from the base commit (main) in this same runner, so instruction counts are
+          # directly comparable. If base predates these benches (the PR that introduces them), there is
+          # nothing to compare against yet, so just prove the PR benches build and run.
+          git checkout --quiet "$BASE_SHA"
+          if cargo bench $BENCHES --no-run >/dev/null 2>&1; then
+            cargo bench $BENCHES -- --save-baseline=main
+            HAVE_BASE=1
+          else
+            echo "base $BASE_SHA has no iai benches yet; skipping the comparison this once"
+            HAVE_BASE=0
+          fi
+          git checkout --quiet "$HEAD_SHA"
+          if [ "$HAVE_BASE" = 1 ]; then
+            cargo bench $BENCHES -- --baseline=main
+          else
+            cargo bench $BENCHES
+          fi
+
   # Single required status check for branch protection: green only if every job above is green.
+  # perf-gate is included: it runs on pull_request (success) and is skipped on the push-to-main build,
+  # and `if: always()` + the failure/cancelled check treats a skipped job as non-failing.
   ci:
     name: CI passed
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, benches, deny, sbom, fuzz, docker-build]
+    needs: [fmt, clippy, test, msrv, docs, benches, deny, sbom, fuzz, docker-build, perf-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job failed or was cancelled

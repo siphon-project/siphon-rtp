@@ -187,7 +187,7 @@ pub fn cpu_permille_between(prev: CpuTimes, now: CpuTimes) -> Option<u16> {
 /// Spawn a background task that samples host CPU from `/proc/stat` at `interval` and publishes each
 /// reading into `state`. Best effort: on a platform without `/proc/stat`, or on a read error, it
 /// publishes nothing and `cpu_permille` stays `None`. The `/proc` read (a pseudo-file, but still a
-/// blocking syscall) runs on `spawn_blocking`, never a reactor thread (CLAUDE.md: block never).
+/// blocking syscall) runs on `spawn_blocking`, never a reactor thread (the concurrency rule: block never).
 pub fn spawn_cpu_sampler(state: Arc<ClusterState>, interval: Duration) {
     tokio::spawn(async move {
         let mut previous: Option<CpuTimes> = None;

@@ -1,4 +1,4 @@
-//! Zero-per-frame-allocation gate for the AMR encode hot path (CLAUDE.md performance invariant).
+//! Zero-per-frame-allocation gate for the AMR encode hot path (a performance invariant).
 //!
 //! `cargo test -p siphon-rtp-codec --features amr --test amr_zero_alloc`
 //!

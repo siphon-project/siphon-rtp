@@ -391,7 +391,7 @@ impl Turn {
         tokio::spawn(manager.run(client_rx));
 
         // Drain redirected peer datagrams into the allocation actor. Drop-newest on a full mailbox —
-        // late media is worthless (docs/security-and-nat.md §11; CLAUDE.md concurrency rules).
+        // late media is worthless (docs/security-and-nat.md §11; the concurrency rules).
         let relay_tx = client_tx.clone();
         tokio::spawn(async move {
             while let Ok(packet) = relay_rx.recv_async().await {

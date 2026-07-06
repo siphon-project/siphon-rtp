@@ -28,9 +28,15 @@ flume = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+iai-callgrind = { workspace = true }
 
 [[bench]]
 name = "relay_bench"
+harness = false
+
+# Deterministic instruction-count gate (valgrind/callgrind) for the CI perf-regression gate.
+[[bench]]
+name = "media_iai"
 harness = false
 
 [[bench]]

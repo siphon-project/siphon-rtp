@@ -4,7 +4,7 @@
 //! TURN accessors and ChannelData framing, and MESSAGE-INTEGRITY verification, asserting none
 //! panics, reads out of bounds, or spins.
 //!
-//! CLAUDE.md hard rule: a hostile datagram on the media port must decode-or-error, never crash.
+//! House rule: a hostile datagram on the media port must decode-or-error, never crash.
 
 use std::path::PathBuf;
 

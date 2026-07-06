@@ -1,4 +1,4 @@
-//! The conference mix bus must do **zero per-frame heap allocation** on the hot path (CLAUDE.md
+//! The conference mix bus must do **zero per-frame heap allocation** on the hot path (a
 //! performance invariant): all scratch lives on the [`Mixer`], sized once at construction. A counting
 //! global allocator proves a tight `mix` loop allocates nothing after warm-up.
 

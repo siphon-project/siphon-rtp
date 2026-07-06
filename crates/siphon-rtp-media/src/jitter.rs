@@ -250,7 +250,7 @@ mod tests {
 // Property test: under an arbitrary logical schedule of push/pop operations (arbitrary sequence
 // numbers, so arbitrary loss / reorder / duplication / 16-bit wrap, interleaved with playout ticks),
 // the buffer must never panic and must keep occupancy bounded by `max_depth`. The schedule *is* the
-// logical clock, so this is deterministic with no `Instant::now()` (CLAUDE.md).
+// logical clock, so this is deterministic with no `Instant::now()` (house rule).
 #[cfg(test)]
 mod proptests {
     use super::*;

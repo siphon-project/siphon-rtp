@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz the SDP parser + rewriter, which eats the offer/answer SDP off the signalling path.
 //!
-//! CLAUDE.md hard rule: a malformed / hostile SDP body must decode-or-error — never panic, never
+//! House rule: a malformed / hostile SDP body must decode-or-error — never panic, never
 //! read out of bounds, never spin. The body arrives as text, so we feed `String::from_utf8_lossy`
 //! to both [`parse`](siphon_rtp_engine::sdp::parse) and
 //! [`rewrite`](siphon_rtp_engine::sdp::rewrite) against a fixed engine endpoint (RFC 4566 / 3264).

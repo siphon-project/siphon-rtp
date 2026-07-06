@@ -3,7 +3,7 @@
 //! crafted-malformed frames and the seed corpus through `frame::decode::<Request>` and asserts it
 //! never panics, reads out of bounds, or spins.
 //!
-//! CLAUDE.md hard rule: a corrupt length prefix or JSON body must decode-or-error, never crash;
+//! House rule: a corrupt length prefix or JSON body must decode-or-error, never crash;
 //! an oversized declared length must be rejected (MAX_FRAME_LEN), not used to slice past the buffer.
 
 use std::path::PathBuf;

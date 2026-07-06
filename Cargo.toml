@@ -83,6 +83,8 @@ tikv-jemallocator = "0.6"
 # Dev / test
 proptest = "1"
 criterion = "0.5"
+# Deterministic instruction-count benches (valgrind/callgrind) for the CI perf-regression gate.
+iai-callgrind = "0.16.1"
 tempfile = "3"
 tikv-jemalloc-ctl = { version = "0.6", features = [
     "stats",

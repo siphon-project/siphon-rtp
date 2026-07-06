@@ -455,7 +455,7 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
-        /// Arbitrary bytes off the network must decode-or-error, never panic (CLAUDE.md fuzz rule).
+        /// Arbitrary bytes off the network must decode-or-error, never panic (fuzz rule).
         #[test]
         fn parser_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
             let _ = AmrPayload::parse_amr_wb(&bytes, true);

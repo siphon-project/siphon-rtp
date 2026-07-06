@@ -95,7 +95,9 @@ impl SrtpKeyMaterial {
     pub fn generate() -> Result<Self, SdesError> {
         let mut bytes = [0u8; INLINE_KEY_LEN];
         getrandom::fill(&mut bytes).map_err(|_| SdesError::Random)?;
-        Ok(Self::from_inline_bytes(&bytes).expect("INLINE_KEY_LEN bytes"))
+        // `bytes` is exactly `INLINE_KEY_LEN`, so this split is infallible; propagate the `Result`
+        // rather than unwrap it (house rule: no `.expect()` in production).
+        Self::from_inline_bytes(&bytes)
     }
 
     /// Split the 30-byte inline value into master key (16) and salt (14).

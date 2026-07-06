@@ -391,7 +391,12 @@ impl XdpDatapath {
                 );
             })
             .map_err(|error| XdpError::Xsk(xsk::XskError::Socket(error)))?;
-        *inner.datapath_thread.lock().expect("datapath_thread lock") = Some(handle);
+        // A poisoned lock only means a prior holder panicked; the stored `JoinHandle` is still
+        // structurally valid, so recover the guard rather than panic (house rule: no `.expect()`).
+        *inner
+            .datapath_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 
         Ok(Self { inner })
     }
@@ -668,7 +673,13 @@ impl Datapath for XdpDatapath {
         // queue 0: single media RX queue for the first cut (the eBPF program redirects to the
         // socket bound on queue 0). Multi-queue spreads across redirect_queue per endpoint later.
         let kernel_action = to_kernel_action(action, &self.inner.endpoints, self.inner.local_ip, 0);
-        let mut loader = self.inner.loader.lock().expect("loader lock");
+        // Recover from a poisoned lock (a prior holder panicked); the loader is still usable, and
+        // `install_flow` returns a `Result`, so we must not panic here (house rule: no `.expect()`).
+        let mut loader = self
+            .inner
+            .loader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loader
             .set_flow(record.flow_key, kernel_action)
             .map_err(|error| DatapathError::Send(std::io::Error::other(error.to_string())))

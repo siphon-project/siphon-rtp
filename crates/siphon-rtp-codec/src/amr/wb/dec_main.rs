@@ -1261,7 +1261,7 @@ mod tests {
     // Property: a burst of lost frames of arbitrary length, each claiming an arbitrary mode, is the
     // PLC's worst case (a jitter buffer emits one `Conceal` per gap). Every concealed frame must be
     // exactly one bounded 14-bit `L_FRAME16K` frame — never a panic, never unbounded growth. The loss
-    // run *is* the logical clock, so this is deterministic (CLAUDE.md: no `Instant::now()` in DSP).
+    // run *is* the logical clock, so this is deterministic (no `Instant::now()` in DSP).
     proptest::proptest! {
         #[test]
         fn conceal_run_is_bounded_for_any_mode(modes in proptest::collection::vec(0u8..=8, 0..64)) {

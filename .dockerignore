@@ -15,7 +15,7 @@ fuzz/artifacts/
 .git
 .gitignore
 
-# Claude / AI artifacts — never ship into an image (house rule).
+# Local tooling / editor scratch — never ship into an image.
 CLAUDE.md
 .claude/
 *.plan
