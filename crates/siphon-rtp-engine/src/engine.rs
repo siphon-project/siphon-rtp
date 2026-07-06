@@ -1331,7 +1331,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
 
         if pipeline == PipelineKind::Srtp {
-            let far_local = far_local_crypto.expect("Srtp pipeline ⇒ far_local_crypto is set");
+            // `resolve_pipeline` only yields `Srtp` when `far_local_crypto` is set, so this is an
+            // internal invariant; answer gracefully rather than panic on the control path.
+            let Some(far_local) = far_local_crypto else {
+                return error_result("SRTP bridge", &"far leg has no local crypto (internal)");
+            };
             // Secure far (B) leg → userspace SRTP bridge: terminate SRTP/SRTCP on B and relay
             // plaintext on A. B's answer must carry its SDES key to key the inbound contexts.
             let Some(far_remote) = info.crypto.first().copied() else {
@@ -1436,7 +1440,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // endpoint and is (de)crypted there too; when not muxed, the companion RTCP endpoints are
             // redirected and SRTCP-(de)crypted through the same SecureLeg (see below +
             // docs/security-and-nat.md).
-            let far_local = far_local_crypto.expect("SrtpMedia ⇒ far_local_crypto is set");
+            // `resolve_pipeline` only yields `SrtpMedia` when `far_local_crypto` is set; treat a
+            // missing key as an internal error rather than panicking on the control path.
+            let Some(far_local) = far_local_crypto else {
+                return error_result("SRTP transcode", &"far leg has no local crypto (internal)");
+            };
             let Some(far_remote) = info.crypto.first().copied() else {
                 return error_result("SAVP answer", &"missing a=crypto in the answer");
             };
@@ -1874,9 +1882,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Allocates endpoints at the snapshot's **exact ports** (so a floating-IP standby needs no SIP
     /// re-INVITE), reinstalls the forward rules, and registers the call under the requesting client.
     ///
-    /// Plain relay only for now: a secure / transcode / WS call additionally needs its SRTP keys and
-    /// slow-path actor rebuilt, which is a follow-up (the snapshot already carries the negotiated
-    /// state). Any endpoint bind or flow install that fails rolls back the endpoints already bound.
+    /// Restores plain relay (`Passthrough`), the SDES-SRTP bridge (`Srtp`, keys and secure leg
+    /// rebuilt), and plaintext transcode (`Media`, transcode actor rebuilt). A secure transcode
+    /// (`SrtpMedia`), a WebSocket leg, or a DTLS leg is not yet restorable and is rejected up front.
+    /// Any endpoint bind or flow install that fails rolls back the endpoints already bound.
     async fn restore(&self, client: ClientId, blob: &str) -> CmdResult {
         use crate::ha::{self, EndpointRole, PipelineSnapshot};
         let snapshot = match ha::CallSnapshot::from_json(blob) {
@@ -1973,7 +1982,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             PipelineSnapshot::Srtp => {
                 pipeline = PipelineKind::Srtp;
-                let secure = snapshot.secure.as_ref().expect("Srtp ⇒ secure is present");
+                // The early validation admits `Srtp` only with `secure` present; if a hand-crafted
+                // snapshot violates that, free the ports and error rather than panic (mirrors the
+                // graceful returns just below for a missing/bad far_local key).
+                let Some(secure) = snapshot.secure.as_ref() else {
+                    self.free_bound(&bound).await;
+                    return CmdResult::Error {
+                        reason: "restore: secure call missing secure snapshot".to_string(),
+                    };
+                };
                 // Reconstruct the two SDES keys (the engine's own + the peer's).
                 let far_local = match snapshot.far_local_crypto.as_ref().map(restore_crypto) {
                     Some(Ok(crypto)) => crypto,
@@ -2458,7 +2475,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     "conference_join",
                     &format!(
                         "codec {} has no encoder, so the room mix cannot be sent to this participant \
-                         (AMR-WB needs the `amr` build feature; Opus/AMR-NB are not yet implemented)",
+                         (AMR-WB / AMR-NB need the `amr` build feature; Opus encode is not implemented)",
                         codec.encoding_name
                     ),
                 )

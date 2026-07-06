@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz the AMR-NB decode path with a hostile RTP payload (3GPP TS 26.071 / RFC 4867).
 //!
-//! CLAUDE.md hard rule: a hostile codec bitstream off the network must decode-or-error, never panic,
+//! House rule: a hostile codec bitstream off the network must decode-or-error, never panic,
 //! never read out of bounds, never spin. `Decoder::decode` runs the full RFC 4867 payload parse
 //! (ToC + frame un-sort) and the ACELP decode over arbitrary bytes.
 

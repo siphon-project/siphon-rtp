@@ -279,7 +279,7 @@ pub fn serialize_result(result: &CmdResult) -> Value {
             sdp,
             duration_ms,
             to_tag,
-            stats: _,
+            stats,
         } => {
             dict.insert(b"result".to_vec(), Value::string("ok"));
             if let Some(sdp) = sdp {
@@ -290,6 +290,33 @@ pub fn serialize_result(result: &CmdResult) -> Value {
             }
             if let Some(to_tag) = to_tag {
                 dict.insert(b"to-tag".to_vec(), Value::string(to_tag));
+            }
+            // `query` carries per-session counters. rtpengine's reply is a per-tag / per-SSRC
+            // breakdown; we return our flat per-session totals under `totals` so a passive collector
+            // still gets packet / byte / loss figures (previously these were dropped on the floor).
+            if let Some(stats) = stats {
+                let mut totals = std::collections::BTreeMap::new();
+                totals.insert(
+                    b"packets-in".to_vec(),
+                    Value::Integer(clamp_i64(stats.packets_in)),
+                );
+                totals.insert(
+                    b"packets-out".to_vec(),
+                    Value::Integer(clamp_i64(stats.packets_out)),
+                );
+                totals.insert(
+                    b"bytes-in".to_vec(),
+                    Value::Integer(clamp_i64(stats.bytes_in)),
+                );
+                totals.insert(
+                    b"bytes-out".to_vec(),
+                    Value::Integer(clamp_i64(stats.bytes_out)),
+                );
+                totals.insert(
+                    b"packets-lost".to_vec(),
+                    Value::Integer(clamp_i64(stats.packets_lost)),
+                );
+                dict.insert(b"totals".to_vec(), Value::Dict(totals));
             }
         }
     }
@@ -358,6 +385,9 @@ fn parse_profile(request: &Value) -> ProfileFlags {
     append_codec_flags(request, &mut flags);
     ProfileFlags {
         transport_protocol: optional_str(request, "transport-protocol"),
+        // `ICE` / `DTLS` are accepted for rtpengine wire compatibility but are not policy inputs: the
+        // engine derives ICE-lite credentials and DTLS-SRTP setup from the SDP itself (the `m=` line
+        // transport and the `a=fingerprint` / candidate attributes), not from these flags.
         ice: optional_str(request, "ICE"),
         dtls: optional_str(request, "DTLS"),
         replace: string_list(request, "replace"),
@@ -406,8 +436,10 @@ fn parse_received_from(request: &Value) -> Option<std::net::IpAddr> {
     }
 }
 
-/// Normalize the structured `codec` dict (stock-client form) into `codec-<op>-<NAME>` flag strings,
-/// plus a `ptime=<N>` flag — so the engine sees one codec representation regardless of wire form.
+/// Normalize the structured `codec` dict (stock-client form) into `codec-<op>-<NAME>` flag strings so
+/// the engine sees one codec representation regardless of wire form. A `ptime` is carried through as a
+/// `ptime=<N>` flag for rtpengine compatibility, but packetization is taken from the SDP `a=ptime`
+/// (RFC 3551), so the flag is informational today.
 fn append_codec_flags(request: &Value, flags: &mut Vec<String>) {
     if let Some(codec) = request.get("codec").and_then(Value::as_dict) {
         for (operation, names) in codec {
@@ -1166,6 +1198,42 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap()
             .contains("RTP/SAVP"));
+    }
+
+    #[test]
+    fn ok_with_session_stats_emits_totals_dict() {
+        // `query` returns per-session counters under `totals` (they used to be dropped entirely).
+        let ok = serialize_result(&CmdResult::Ok {
+            sdp: None,
+            duration_ms: None,
+            to_tag: None,
+            stats: Some(siphon_rtp_proto::SessionStats {
+                packets_in: 100,
+                packets_out: 98,
+                bytes_in: 16_000,
+                bytes_out: 15_680,
+                packets_lost: 2,
+            }),
+        });
+        let totals = ok.get("totals").and_then(Value::as_dict).expect("totals");
+        assert_eq!(
+            totals
+                .get(b"packets-in".as_slice())
+                .and_then(Value::as_integer),
+            Some(100)
+        );
+        assert_eq!(
+            totals
+                .get(b"packets-lost".as_slice())
+                .and_then(Value::as_integer),
+            Some(2)
+        );
+        assert_eq!(
+            totals
+                .get(b"bytes-out".as_slice())
+                .and_then(Value::as_integer),
+            Some(15_680)
+        );
     }
 
     #[test]

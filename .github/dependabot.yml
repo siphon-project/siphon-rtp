@@ -1,9 +1,9 @@
 # Dependabot — weekly, grouped to keep PR noise low.
 #
-# NOTE: cargo PRs must NOT be auto-merged. CLAUDE.md mandates the perf baseline + memory-leak soak
-# before every commit, and CI does not run the perf gate — a crate bump that is green in CI can
-# still regress throughput or leak. Treat each cargo PR as "green CI AND I ran the perf/mem
-# baseline". github-actions and docker bumps are safe to merge on green CI.
+# NOTE: cargo PRs are not auto-merged. A crate bump can regress throughput or leak memory without
+# tripping the obvious checks, so treat each cargo PR as "green CI" (which now includes the
+# instruction-count perf gate and the memory-leak soak). github-actions and docker bumps are safe to
+# merge on green CI.
 version: 2
 updates:
   # Rust crate dependencies — one grouped PR for all minor/patch bumps; major bumps arrive as

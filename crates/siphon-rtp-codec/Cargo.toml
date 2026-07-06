@@ -30,7 +30,14 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
+iai-callgrind = { workspace = true }
 
 [[bench]]
 name = "codec_bench"
+harness = false
+
+# Deterministic instruction-count gate (valgrind/callgrind). Unlike the criterion wall-clock benches,
+# these are stable enough on a shared CI runner to fail on a >N% regression. See ci.yml `perf-gate`.
+[[bench]]
+name = "codec_iai"
 harness = false

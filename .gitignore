@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target
+# The XDP loader is its own (excluded) workspace, so its target/ is not under /target.
+/crates/siphon-rtp-xdp/target
 **/*.rs.bk
 
 # cargo-fuzz: build output, generated corpora, and crash artifacts (the targets are tracked).
@@ -8,7 +10,7 @@
 /fuzz/artifacts
 /fuzz/coverage
 
-# Claude / AI artifacts — NEVER commit (house rule).
+# Local tooling / editor scratch — never commit.
 CLAUDE.md
 .claude/
 *.plan

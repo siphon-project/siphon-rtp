@@ -2,7 +2,7 @@
 //! Fuzz the STUN/TURN message decoder, which eats untrusted datagrams on the media socket (ICE
 //! connectivity checks and the built-in TURN server share the port via the layer-1 demux).
 //!
-//! CLAUDE.md hard rule: a hostile datagram on the media port must decode-or-error — never panic,
+//! House rule: a hostile datagram on the media port must decode-or-error — never panic,
 //! never read out of bounds, never spin. We exercise the STUN header + attribute TLV parser
 //! (RFC 5389 §6/§15), the accessors a parsed message feeds (XOR-MAPPED-ADDRESS, the TURN
 //! attributes), MESSAGE-INTEGRITY verification over arbitrary bytes, and the TURN ChannelData

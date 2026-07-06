@@ -3,7 +3,7 @@
 //! crafted-malformed datagrams and the seed corpus through the whole untrusted path (bencode decode
 //! → cookie split → NG command map) and asserts none of it panics, reads out of bounds, or spins.
 //!
-//! CLAUDE.md hard rule: a hostile control datagram must decode-or-error, never crash. The
+//! House rule: a hostile control datagram must decode-or-error, never crash. The
 //! deeply-nested case is the regression for the fixed recursive-descent stack-overflow DoS.
 
 use std::path::PathBuf;

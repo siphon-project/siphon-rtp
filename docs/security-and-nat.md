@@ -523,7 +523,7 @@ void, and bound the resources.
   public datapath).
 - **Single-owner actor.** All allocation state lives in one task (`AllocationManager`) reached only
   through a bounded `flume` mailbox — no shared lock over allocation state, no lock across an `.await`
-  (CLAUDE.md concurrency rules). Peer datagrams arrive on the relay endpoint via `FlowAction::Redirect`
+  (the concurrency rules). Peer datagrams arrive on the relay endpoint via `FlowAction::Redirect`
   and are routed to the actor by a single dispatcher that owns the shared `Datapath::rx()` stream.
 - **Datapath relaxation (cited at the enforcement point).** A relay endpoint must forward *whatever*
   the peer sends, including STUN/TURN-shaped bytes a media socket would drop at layer 1. So `recv_loop`
