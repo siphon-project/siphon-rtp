@@ -46,7 +46,7 @@ use crate::media_pipeline::{
     RtcpRelay,
 };
 use crate::metrics::Metrics;
-use crate::sdp::{self, EngineMedia, SecurityAdvertisement};
+use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement};
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
 use crate::ws_bridge::WsRegistry;
 
@@ -889,10 +889,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
 
-        // ICE-lite: if the peer offered ICE, mint our own short-term credentials — advertised in the
-        // rewritten SDP and installed on the endpoints so the responder can validate the peer's
-        // connectivity checks (docs/security-and-nat.md §4 layer 4).
-        let ice_creds = if info.is_ice() {
+        // ICE-lite posture (docs/security-and-nat.md §4 layer 4): mint our own short-term credentials
+        // when the leg uses ICE — advertised in the rewritten SDP and installed on the endpoints so
+        // the responder can validate the peer's connectivity checks. The control `profile.ice` field
+        // overrides the SDP-derived default (RFC 8445): `force`/`force-relay` mint them regardless of
+        // the offer, `remove` suppresses them, otherwise mirror whether the offer carried ICE.
+        let ice_directive = ice_directive(profile);
+        let want_ice = match ice_directive {
+            Some(IceDirective::Force) => true,
+            Some(IceDirective::Remove) => false,
+            None => info.is_ice(),
+        };
+        let ice_creds = if want_ice {
             ice::generate_credentials()
         } else {
             None
@@ -939,19 +947,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             rtp: far_rtp.local_addr,
             rtcp: far_rtcp.map(|endpoint| endpoint.local_addr),
         };
-        let advert = ice_creds.as_ref().map(|creds| sdp::IceAdvertisement {
-            ufrag: creds.ufrag.as_str(),
-            pwd: creds.pwd.as_str(),
-        });
+        // ICE rewrite mode (RFC 8839 §5): re-originate ICE-lite when we minted creds; on `ice: remove`
+        // with none minted, strip the peer's ICE without advertising our own; otherwise pass it
+        // through. `IceAdvertisement` borrows `ice_creds`, so it is built here and kept alive to rewrite.
+        let ice_rewrite = match (ice_creds.as_ref(), ice_directive) {
+            (Some(creds), _) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+                ufrag: creds.ufrag.as_str(),
+                pwd: creds.pwd.as_str(),
+            }),
+            (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
+            (None, _) => IceRewrite::Keep,
+        };
 
         // Secure far leg: when the control profile asks for a secure far leg, either DTLS-SRTP
-        // (`UDP/TLS/RTP/SAVP[F]`, RFC 5764) — advertise the engine's fingerprint + `a=setup:actpass`,
+        // (`UDP/TLS/RTP/SAVP[F]`, RFC 5764) — advertise the engine's fingerprint + `a=setup` role,
         // keyed by the handshake at answer — or SDES (`RTP/SAVP[F]`, RFC 4568) — mint an `a=crypto` key.
         // B's answer brings its keying and `answer` wires the bridge. (`UDP/TLS/...` also matches
-        // "SAVP", so DTLS is tested first.)
+        // "SAVP", so DTLS is tested first.) The control `profile.dtls` field refines the DTLS case:
+        // `off` downgrades the leg to plaintext, `passive`/`active`/`actpass` sets the offerer role.
         let far_transport = profile.transport_protocol.as_deref().unwrap_or_default();
-        let far_dtls = far_transport.contains("UDP/TLS");
-        let far_sdes = !far_dtls && far_transport.contains("SAVP");
+        let dtls_directive = dtls_directive(profile);
+        let dtls_transport = far_transport.contains("UDP/TLS");
+        // `dtls: off` (rtpengine DTLS=off) forces a plaintext far leg even on a UDP/TLS transport —
+        // no DTLS-SRTP and no SDES fallback (SDES applies only to a plain `RTP/SAVP[F]` transport).
+        let dtls_off = matches!(dtls_directive, Some(DtlsDirective::Off));
+        let far_dtls = dtls_transport && !dtls_off;
+        let far_sdes = !dtls_transport && far_transport.contains("SAVP");
         let far_local_crypto = if far_sdes {
             match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
                 Ok(crypto) => Some(crypto),
@@ -963,19 +984,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             None
         };
-        let security = if far_dtls {
+        let security = if dtls_transport && dtls_off {
+            // Downgrade a requested DTLS-SRTP far transport to plaintext RTP/AVP (RFC 3264): force AVP
+            // and strip the offer's DTLS keying (`a=fingerprint`/`a=setup`).
+            Some(SecurityAdvertisement::Plain)
+        } else if far_dtls {
             let Some(certificate) = self.dtls_certificate.as_ref() else {
                 self.free(&endpoints).await;
                 return error_result("DTLS-SRTP offer", &"engine has no DTLS certificate");
             };
             let fingerprint = certificate.fingerprint();
+            // RFC 5763 §5: the offerer defaults to `actpass` (the answerer picks active/passive); a
+            // control `dtls: passive|active|actpass` overrides that offerer role (RFC 4145 §4 a=setup).
+            let setup = match dtls_directive {
+                Some(DtlsDirective::Role(role)) => role,
+                _ => sdp::Setup::Actpass,
+            };
             Some(SecurityAdvertisement::Dtls {
                 fingerprint: sdp::Fingerprint {
                     hash_function: fingerprint.hash_function,
                     bytes: fingerprint.bytes,
                 },
-                // Offerer is `actpass`; the answerer (B) chooses active/passive (RFC 5763 §5).
-                setup: sdp::Setup::Actpass,
+                setup,
             })
         } else {
             far_local_crypto.map(SecurityAdvertisement::Secure)
@@ -984,7 +1014,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // RFC 5761: when a `rtcp-mux` directive was given, present the resolved far-side mux to B
         // explicitly (force `a=rtcp-mux` on, or strip it); otherwise mirror the offer (`None`).
         let far_mux_override = (!profile.rtcp_mux.is_empty()).then_some(far_mux);
-        let mut rewritten = match sdp::rewrite(sdp, engine, advert, security, far_mux_override) {
+        let mut rewritten = match sdp::rewrite(sdp, engine, ice_rewrite, security, far_mux_override)
+        {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 self.free(&endpoints).await;
@@ -1281,10 +1312,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             rtp: near.rtp.local_addr,
             rtcp: near.rtcp.map(|endpoint| endpoint.local_addr),
         };
-        let advert = ice_creds.as_ref().map(|creds| sdp::IceAdvertisement {
-            ufrag: creds.ufrag.as_str(),
-            pwd: creds.pwd.as_str(),
-        });
+        // The A-facing near leg re-originates ICE-lite iff the offer minted engine creds (the ICE
+        // posture was decided at offer); otherwise the peer's ICE (if any) passes through unchanged.
+        let ice_rewrite = match ice_creds.as_ref() {
+            Some(creds) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+                ufrag: creds.ufrag.as_str(),
+                pwd: creds.pwd.as_str(),
+            }),
+            None => IceRewrite::Keep,
+        };
         // The answer to A advertises the near leg; on a secure (SDES or DTLS) far leg that side is
         // plain (RTP/AVP), so force AVP and strip the peer's crypto/fingerprint. A plain relay leaves
         // transport/crypto untouched.
@@ -1296,14 +1332,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // otherwise mirror B's answer (`None`).
         let near_mux = near.rtcp.is_none();
         let near_mux_override = (!profile.rtcp_mux.is_empty()).then_some(near_mux);
-        let mut rewritten = match sdp::rewrite(sdp, engine, advert, security, near_mux_override) {
-            Ok(rewritten) => rewritten,
-            Err(error) => {
-                return CmdResult::Error {
-                    reason: format!("answer SDP rewrite failed: {error}"),
+        let mut rewritten =
+            match sdp::rewrite(sdp, engine, ice_rewrite, security, near_mux_override) {
+                Ok(rewritten) => rewritten,
+                Err(error) => {
+                    return CmdResult::Error {
+                        reason: format!("answer SDP rewrite failed: {error}"),
+                    }
                 }
-            }
-        };
+            };
         // rtpengine `replace: [origin]`: rewrite the o= line to the engine's address (topology hiding).
         if profile.replace.iter().any(|field| field == "origin") {
             rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.rtp.ip());
@@ -2599,7 +2636,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // A conference leg is always RTP/RTCP-muxed onto the one participant endpoint; the mux
         // presentation mirrors the participant's offer (`None`) — the `rtcp-mux` directive is an
         // offer/answer relay concern, not a conference one.
-        match sdp::rewrite(sdp, engine, None, security, None) {
+        match sdp::rewrite(sdp, engine, IceRewrite::Keep, security, None) {
             Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);
@@ -3526,6 +3563,58 @@ fn far_address_family(profile: &ProfileFlags) -> Option<AddressFamily> {
     match profile.address_family.as_deref()?.trim() {
         family if family.eq_ignore_ascii_case("IP6") => Some(AddressFamily::V6),
         family if family.eq_ignore_ascii_case("IP4") => Some(AddressFamily::V4),
+        _ => None,
+    }
+}
+
+/// The explicit ICE posture requested by the control `profile.ice` field (rtpengine `ICE=…`),
+/// overriding the SDP-derived default (mirror the offer). `None` ⇒ no directive, mirror the offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IceDirective {
+    /// `force` / `force-relay` — advertise engine ICE-lite regardless of whether the offer carried
+    /// ICE (RFC 8445). `force-relay` (relay-only candidates) degrades to `force`: the engine has no
+    /// TURN allocator, so only its host candidate is offered — documented in `docs/control/json.md`.
+    Force,
+    /// `remove` — strip the peer's ICE and advertise none (RFC 8839 §5).
+    Remove,
+}
+
+/// Parse `profile.ice` (case/space-insensitive). An unknown token yields `None` (no override), so a
+/// controller cannot silently disable ICE with a typo.
+fn ice_directive(profile: &ProfileFlags) -> Option<IceDirective> {
+    match profile.ice.as_deref()?.trim().to_ascii_lowercase().as_str() {
+        "force" | "force-relay" => Some(IceDirective::Force),
+        "remove" => Some(IceDirective::Remove),
+        _ => None,
+    }
+}
+
+/// The explicit DTLS-SRTP posture requested by the control `profile.dtls` field (rtpengine `DTLS=…`)
+/// for a secure (`UDP/TLS/RTP/SAVP[F]`) far leg, overriding the hardcoded offerer role. `None` ⇒ no
+/// directive (the RFC 5763 §5 default, `a=setup:actpass`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DtlsDirective {
+    /// `off` — no DTLS-SRTP; the far leg is advertised plaintext `RTP/AVP` (RFC 3264) even when a
+    /// UDP/TLS transport was requested.
+    Off,
+    /// `passive` / `active` / `actpass` — advertise DTLS with this `a=setup` role (RFC 4145 §4).
+    Role(sdp::Setup),
+}
+
+/// Parse `profile.dtls` (case/space-insensitive). An unknown token yields `None` (keep the default
+/// `actpass` offerer role).
+fn dtls_directive(profile: &ProfileFlags) -> Option<DtlsDirective> {
+    match profile
+        .dtls
+        .as_deref()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" => Some(DtlsDirective::Off),
+        "passive" => Some(DtlsDirective::Role(sdp::Setup::Passive)),
+        "active" => Some(DtlsDirective::Role(sdp::Setup::Active)),
+        "actpass" => Some(DtlsDirective::Role(sdp::Setup::Actpass)),
         _ => None,
     }
 }
@@ -7801,6 +7890,168 @@ mod tests {
         packet.extend_from_slice(&ssrc.to_be_bytes());
         packet.extend_from_slice(b"audio");
         packet
+    }
+
+    /// A plaintext `RTP/AVP` offer at a fixed RFC 5737 TEST-NET-3 address. The offer control path
+    /// never sends media, so no live socket is needed — only a parseable SDP body.
+    fn plain_offer_sdp() -> &'static str {
+        concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 203.0.113.7\r\n",
+            "s=-\r\n",
+            "c=IN IP4 203.0.113.7\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 RTP/AVP 0 8\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+        )
+    }
+
+    /// A plaintext offer that additionally carries ICE (`a=ice-ufrag`/`a=ice-pwd`/`a=candidate`),
+    /// used to prove `ice: remove` strips the peer's ICE.
+    fn plain_ice_offer_sdp() -> &'static str {
+        concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 203.0.113.7\r\n",
+            "s=-\r\n",
+            "c=IN IP4 203.0.113.7\r\n",
+            "t=0 0\r\n",
+            "a=ice-ufrag:PEERUF\r\n",
+            "a=ice-pwd:peerpassword01234567\r\n",
+            "m=audio 30000 RTP/AVP 0 8\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=candidate:1 1 UDP 2130706431 203.0.113.7 30000 typ host\r\n",
+        )
+    }
+
+    /// A DTLS-SRTP offer (`UDP/TLS/RTP/SAVPF`) carrying `a=setup`/`a=fingerprint`, used to prove
+    /// `dtls: off` downgrades the far leg to plaintext and strips the DTLS keying.
+    fn dtls_offer_sdp() -> &'static str {
+        concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 203.0.113.7\r\n",
+            "s=-\r\n",
+            "c=IN IP4 203.0.113.7\r\n",
+            "t=0 0\r\n",
+            "m=audio 30000 UDP/TLS/RTP/SAVPF 0 8\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=setup:actpass\r\n",
+            "a=fingerprint:sha-256 ",
+            "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89\r\n",
+        )
+    }
+
+    /// Drive an `offer` with `profile` and return the rewritten far-offer SDP text.
+    async fn offer_far_sdp(sdp: &str, profile: ProfileFlags) -> String {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ice-dtls-profile".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp.to_string(),
+                    profile,
+                },
+            )
+            .await;
+        ok_sdp_text(&offer)
+    }
+
+    #[tokio::test]
+    async fn offer_dtls_off_downgrades_far_leg_to_plaintext() {
+        // rtpengine DTLS=off (RFC 3264): a UDP/TLS far transport plus `dtls: off` yields plaintext
+        // RTP/AVP with the offer's DTLS keying stripped — no `a=fingerprint`/`a=setup`.
+        let far = offer_far_sdp(
+            dtls_offer_sdp(),
+            ProfileFlags {
+                transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                dtls: Some("off".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(far.contains("RTP/AVP"), "{far}");
+        assert!(!far.contains("UDP/TLS"), "{far}");
+        assert!(!far.contains("a=fingerprint"), "{far}");
+        assert!(!far.contains("a=setup"), "{far}");
+        let parsed = sdp::parse(&far).expect("parse far offer");
+        assert!(!parsed.dtls, "far leg is plaintext");
+        assert!(!parsed.secure, "far leg is not SAVP");
+    }
+
+    #[tokio::test]
+    async fn offer_dtls_passive_sets_setup_role() {
+        // RFC 4145 §4 / RFC 5763 §5: `dtls: passive` makes the engine the DTLS server (a=setup:passive)
+        // instead of the default offerer role `actpass`.
+        let far = offer_far_sdp(
+            plain_offer_sdp(),
+            ProfileFlags {
+                transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                dtls: Some("passive".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let parsed = sdp::parse(&far).expect("parse far offer");
+        assert!(parsed.dtls, "far leg advertises DTLS-SRTP");
+        assert_eq!(parsed.setup, Some(sdp::Setup::Passive), "{far}");
+        assert!(parsed.fingerprint.is_some(), "engine fingerprint present");
+    }
+
+    #[tokio::test]
+    async fn offer_dtls_active_sets_setup_role() {
+        // `dtls: active` makes the engine the DTLS client (a=setup:active).
+        let far = offer_far_sdp(
+            plain_offer_sdp(),
+            ProfileFlags {
+                transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                dtls: Some("active".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let parsed = sdp::parse(&far).expect("parse far offer");
+        assert_eq!(parsed.setup, Some(sdp::Setup::Active), "{far}");
+    }
+
+    #[tokio::test]
+    async fn offer_ice_force_advertises_ice_on_non_ice_offer() {
+        // rtpengine ICE=force (RFC 8445): the engine advertises ICE-lite even though the offer carried
+        // none — its own `a=ice-ufrag`/`a=ice-pwd` + host candidate, not the peer's.
+        let far = offer_far_sdp(
+            plain_offer_sdp(),
+            ProfileFlags {
+                ice: Some("force".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(far.contains("a=ice-lite"), "{far}");
+        assert!(far.contains("a=ice-ufrag:"), "{far}");
+        assert!(far.contains("a=ice-pwd:"), "{far}");
+        assert!(far.contains("typ host"), "engine host candidate: {far}");
+        let parsed = sdp::parse(&far).expect("parse far offer");
+        assert!(parsed.is_ice(), "far offer carries ICE");
+    }
+
+    #[tokio::test]
+    async fn offer_ice_remove_strips_peer_ice_without_re_originating() {
+        // rtpengine ICE=remove (RFC 8839 §5): strip the offerer's ICE and advertise none of our own.
+        let far = offer_far_sdp(
+            plain_ice_offer_sdp(),
+            ProfileFlags {
+                ice: Some("remove".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(!far.contains("a=ice-ufrag"), "{far}");
+        assert!(!far.contains("a=ice-pwd"), "{far}");
+        assert!(!far.contains("a=candidate"), "{far}");
+        assert!(!far.contains("PEERUF"), "peer ufrag stripped: {far}");
+        assert!(!far.contains("a=ice-lite"), "nothing re-originated: {far}");
+        let parsed = sdp::parse(&far).expect("parse far offer");
+        assert!(!parsed.is_ice(), "far offer carries no ICE");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
