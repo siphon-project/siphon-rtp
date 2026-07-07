@@ -233,6 +233,9 @@ jobs:
         working-directory: crates/siphon-rtp-xdp
     steps:
       - uses: actions/checkout@v7
+      # Puts rustup + cargo on PATH (stable, for the loader crate); the eBPF sub-crate pins its own
+      # nightly via ebpf/rust-toolchain.toml, installed in the next step.
+      - uses: dtolnay/rust-toolchain@stable
       - name: eBPF toolchain (pinned nightly + rust-src + bpf-linker)
         run: |
           rustup toolchain install nightly-2026-01-15 --component rust-src --profile minimal
