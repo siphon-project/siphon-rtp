@@ -207,6 +207,18 @@ fn quantize(d: i32, y: i32, table: &[i32], quantizer_states: i32) -> i16 {
     i as i16
 }
 
+/// Reinterpret `value` as a 15-bit two's-complement quantity — sign-extend from bit 14.
+///
+/// ITU-T G.726 §4.2.6: the signal estimate `SE` is a **15-bit** two's-complement number (the
+/// `SUBTA`/`ADDA` blocks form `D = SL - SE` and `SR = SE + DQ` in fixed point with `SE` at 15
+/// bits, its sign in bit 14). Whenever the adaptive predictor overloads and drives the running
+/// estimate past ±2¹⁴, the reference wraps it here; a wider integer would keep a spurious value
+/// and pick the wrong quantizer code (and the wrong reconstruction sign) on the overload path.
+#[inline]
+fn signal_estimate_15bit(value: i32) -> i32 {
+    (value << 17) >> 17
+}
+
 /// Reconstruct the quantized difference from a codeword (ITU-T G.726 `reconstruct`).
 fn reconstruct(sign: i32, dqln: i32, y: i32) -> i16 {
     let dql = dqln + (y >> 2); // ADDA
@@ -489,7 +501,8 @@ impl G726 {
     fn encode_sample(&mut self, sample: i16) -> u8 {
         let amp = i32::from(sample) >> 2; // linear-16 → 14-bit
         let sezi = i32::from(self.state.predictor_zero());
-        let se = (sezi + i32::from(self.state.predictor_pole())) >> 1;
+        // ITU-T G.726 §4.2.6 (SUBTA/ADDA): SE is a 15-bit two's-complement estimate.
+        let se = signal_estimate_15bit((sezi + i32::from(self.state.predictor_pole())) >> 1);
         let d = amp - se;
         let y = self.state.step_size();
         let code = quantize(d, y, self.rate.qtab(), self.rate.quantizer_states());
@@ -503,7 +516,11 @@ impl G726 {
         } else {
             se + dq
         }) as i16;
-        let dqsez = i32::from(sr) + (sezi >> 1) - se;
+        // ITU-T G.726 §4.2.6 (ADDC): PK0/SIGPK are the sign / zero-ness of DQSEZ = DQ + SEZ, formed
+        // in 16-bit two's complement. Wrap the running sum so an overload difference (DQ + SEZ past
+        // ±2¹⁵) carries the reference's bit-15 sign instead of a wider integer's, keeping the pole
+        // (a1/a2) adaptation bit-exact — otherwise the sign flips and the predictor drifts.
+        let dqsez = i32::from((i32::from(sr) + (sezi >> 1) - se) as i16);
         self.state.update(
             y,
             self.rate.witab()[code as usize],
@@ -535,13 +552,18 @@ impl G726 {
             self.rate.dqlntab()[code as usize],
             y,
         ));
-        let se = sei >> 1;
+        // ITU-T G.726 §4.2.6 (SUBTA/ADDA): SE is a 15-bit two's-complement estimate.
+        let se = signal_estimate_15bit(sei >> 1);
         let sr = (if dq < 0 {
             se - (dq & self.rate.reconstruct_mask())
         } else {
             se + dq
         }) as i16;
-        let dqsez = i32::from(sr) + (sezi >> 1) - se;
+        // ITU-T G.726 §4.2.6 (ADDC): PK0/SIGPK are the sign / zero-ness of DQSEZ = DQ + SEZ, formed
+        // in 16-bit two's complement. Wrap the running sum so an overload difference (DQ + SEZ past
+        // ±2¹⁵) carries the reference's bit-15 sign instead of a wider integer's, keeping the pole
+        // (a1/a2) adaptation bit-exact — otherwise the sign flips and the predictor drifts.
+        let dqsez = i32::from((i32::from(sr) + (sezi >> 1) - se) as i16);
         self.state.update(
             y,
             self.rate.witab()[code as usize],
@@ -824,6 +846,24 @@ mod tests {
         assert!(out.iter().all(|&s| s == 0));
     }
 
+    #[test]
+    fn signal_estimate_wraps_to_15_bit_twos_complement() {
+        // ITU-T G.726 §4.2.6: SE is 15-bit two's complement (sign in bit 14, range [-16384, 16383]).
+        assert_eq!(signal_estimate_15bit(0), 0);
+        // Largest positive / most negative in-range values are unchanged.
+        assert_eq!(signal_estimate_15bit(16383), 16383);
+        assert_eq!(signal_estimate_15bit(-16384), -16384);
+        // Overload: an estimate past +2^14 wraps to negative exactly as the reference SUBTA does.
+        // 16561 is the concrete R40 A-law/μ-law overload case (16561 - 32768 = -16207).
+        assert_eq!(signal_estimate_15bit(16561), -16207);
+        assert_eq!(signal_estimate_15bit(16384), -16384);
+        assert_eq!(signal_estimate_15bit(32767), -1);
+        // In-range estimates (the normal path, every non-overload sample) are left untouched.
+        for value in -16384..=16383 {
+            assert_eq!(signal_estimate_15bit(value), value);
+        }
+    }
+
     // ---- ITU-T G.726 Appendix II conformance (companded A-law / μ-law) -------------------------
 
     fn vector_path(name: &str) -> std::path::PathBuf {
@@ -995,33 +1035,20 @@ mod tests {
                             dec_bad.1.get_or_insert(k);
                         }
                     }
-                    // 40 kbit/s overload diverges from the STL vectors at the quantizer's outer
-                    // decision boundary — a spandsp-vs-STL lineage difference (this port faithfully
-                    // reproduces the spandsp reference, verified line-by-line; the decoder fed the
-                    // reference codes is near-exact, so only the encoder forward quantizer differs).
-                    // Every other rate/law/condition — including 32 kbit/s (the dominant VoIP rate)
-                    // at overload — is bit-exact. Report 40k-overload as a known residual, don't gate.
-                    let known_residual = rate == Rate::R40 && input == "ovr";
-                    if known_residual {
-                        eprintln!(
-                            "[known residual] {n}k {law} {input}: enc {}/{}, dec {}/{}",
-                            enc_bad.0,
-                            in_octets.len(),
-                            dec_bad.0,
-                            ref_codes.len()
-                        );
-                    } else {
-                        assert_eq!(
-                            enc_bad.0, 0,
-                            "{n}k {law} {input} encoder not bit-exact (first {:?})",
-                            enc_bad.1
-                        );
-                        assert_eq!(
-                            dec_bad.0, 0,
-                            "{n}k {law} {input} decoder not bit-exact (first {:?})",
-                            dec_bad.1
-                        );
-                    }
+                    // Bit-exact for every rate/law/condition, including 40 kbit/s on the overload
+                    // sequence: the SUBTA/ADDA signal estimate `SE` is carried as a 15-bit
+                    // two's-complement quantity (see `signal_estimate_15bit`), so the forward
+                    // path wraps identically to the STL reference when the predictor overloads.
+                    assert_eq!(
+                        enc_bad.0, 0,
+                        "{n}k {law} {input} encoder not bit-exact (first {:?})",
+                        enc_bad.1
+                    );
+                    assert_eq!(
+                        dec_bad.0, 0,
+                        "{n}k {law} {input} decoder not bit-exact (first {:?})",
+                        dec_bad.1
+                    );
                 }
             }
         }
