@@ -548,6 +548,22 @@ pub struct IceAdvertisement<'a> {
     pub pwd: &'a str,
 }
 
+/// How [`rewrite`] treats the audio stream's ICE attributes (RFC 8445 / RFC 8839 §5). Decouples the
+/// two ICE actions that used to be one `Option`: dropping the peer's ICE and re-originating our own.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum IceRewrite<'a> {
+    /// Leave the peer's ICE attributes untouched — a plain relay passes them through (the default).
+    #[default]
+    Keep,
+    /// Strip the peer's ICE attributes (`a=ice-ufrag`/`a=ice-pwd`/`a=candidate`/…) without advertising
+    /// our own — the rewritten SDP carries no ICE at all (rtpengine `ICE=remove`, RFC 8839 §5). The
+    /// leg then falls back to the signalled media address rather than ICE connectivity checks.
+    Strip,
+    /// Strip the peer's ICE and re-originate ICE-lite with the engine's own credentials plus a host
+    /// `a=candidate` (rtpengine `ICE=force`, or mirroring a peer's ICE offer; RFC 8445 §2.7 ICE-lite).
+    Reoriginate(IceAdvertisement<'a>),
+}
+
 /// How to advertise the audio stream's security on rewrite (RFC 3264 transport + RFC 4568 SDES /
 /// RFC 5764 DTLS-SRTP). Not `Copy` — the DTLS variant carries a variable-length fingerprint.
 #[derive(Debug, Clone)]
@@ -593,7 +609,8 @@ fn addrtype(ip: IpAddr) -> &'static str {
     }
 }
 
-/// Whether `line` is an ICE attribute we re-originate (so the peer's copy is dropped on rewrite).
+/// Whether `line` is an ICE attribute the engine drops on rewrite when stripping or re-originating
+/// (RFC 8839 §5) — the peer's copy is removed so it is not forwarded verbatim.
 fn is_ice_attribute(line: &str) -> bool {
     line == "a=ice-lite"
         || line.starts_with("a=ice-ufrag:")
@@ -618,13 +635,15 @@ fn is_ice_attribute(line: &str) -> bool {
 /// (the default — the offered mux intent is passed through). This lets the controller's rtpengine
 /// `rtcp-mux` directive drive the far/near presentation independently of what the peer offered.
 ///
-/// When `ice` is `Some`, the engine re-originates ICE as ICE-lite: the peer's ICE attributes are
-/// dropped and replaced with `a=ice-lite` plus the engine's own `a=ice-ufrag`/`a=ice-pwd` and a host
-/// `a=candidate` for the engine RTP address (RFC 8445).
+/// `ice` selects the ICE handling (RFC 8445 / RFC 8839 §5): [`IceRewrite::Keep`] passes the peer's
+/// ICE through; [`IceRewrite::Strip`] drops it without re-originating (rtpengine `ICE=remove`);
+/// [`IceRewrite::Reoriginate`] drops the peer's ICE and re-originates ICE-lite with `a=ice-lite`
+/// plus the engine's own `a=ice-ufrag`/`a=ice-pwd` and a host `a=candidate` for the engine RTP
+/// address (rtpengine `ICE=force` / mirroring a peer's ICE offer).
 pub fn rewrite(
     sdp: &str,
     engine: EngineMedia,
-    ice: Option<IceAdvertisement<'_>>,
+    ice: IceRewrite<'_>,
     security: Option<SecurityAdvertisement>,
     mux_override: Option<bool>,
 ) -> Result<Rewritten, SdpError> {
@@ -637,11 +656,14 @@ pub fn rewrite(
         .ok_or(SdpError::ConnectionAddress)?;
     let rtcp_index = scan.audio_rtcp.map(|(index, _)| index);
 
+    // Both `Strip` and `Reoriginate` drop the peer's ICE attributes; only `Reoriginate` re-adds ours.
+    let strip_peer_ice = matches!(ice, IceRewrite::Strip | IceRewrite::Reoriginate(_));
     let mut lines: Vec<String> = Vec::new();
     for (index, raw_line) in sdp.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        // Re-originating ICE: drop the peer's ICE attributes; we advertise our own below.
-        if ice.is_some() && is_ice_attribute(line) {
+        // Drop the peer's ICE attributes when stripping or re-originating (RFC 8839 §5); we advertise
+        // our own below only when re-originating.
+        if strip_peer_ice && is_ice_attribute(line) {
             continue;
         }
         // Re-originating secure keying: drop the peer's `a=crypto` (SDES) and `a=fingerprint`/`a=setup`
@@ -661,7 +683,7 @@ pub fn rewrite(
         }
         if index == media_index {
             // `a=ice-lite` is session-level — emit it just before the media line (end of session).
-            if ice.is_some() {
+            if matches!(ice, IceRewrite::Reoriginate(_)) {
                 lines.push("a=ice-lite".to_string());
             }
             lines.push(rewrite_media_line(
@@ -692,7 +714,7 @@ pub fn rewrite(
                 }
                 Some(SecurityAdvertisement::Plain) | None => {}
             }
-            if let Some(ice) = ice {
+            if let IceRewrite::Reoriginate(ice) = ice {
                 lines.push(format!("a=ice-ufrag:{}", ice.ufrag));
                 lines.push(format!("a=ice-pwd:{}", ice.pwd));
                 // RFC 8839 §5.1: the candidate's connection-address is a bare IP literal in either
@@ -1214,7 +1236,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
             "203.0.113.7:49170".parse().unwrap()
@@ -1239,7 +1261,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"));
         assert!(!result.sdp.contains("53000"));
         assert_eq!(
@@ -1258,7 +1280,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert!(
             !result.sdp.contains("a=rtcp:"),
             "explicit a=rtcp dropped under mux"
@@ -1274,7 +1296,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None, None, Some(true)).expect("rewrite");
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(true)).expect("rewrite");
         assert_eq!(
             result.sdp.matches("a=rtcp-mux").count(),
             1,
@@ -1293,7 +1315,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None, None, Some(true)).expect("rewrite");
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(true)).expect("rewrite");
         assert_eq!(
             result.sdp.matches("a=rtcp-mux").count(),
             1,
@@ -1312,7 +1334,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine, None, None, Some(false)).expect("rewrite");
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(false)).expect("rewrite");
         assert!(
             !result.sdp.contains("a=rtcp-mux"),
             "a=rtcp-mux stripped under demux: {}",
@@ -1332,7 +1354,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        assert!(rewrite(&muxed, engine, None, None, None)
+        assert!(rewrite(&muxed, engine, IceRewrite::Keep, None, None)
             .expect("rewrite")
             .sdp
             .contains("a=rtcp-mux"));
@@ -1342,7 +1364,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: Some("127.0.0.1:40001".parse().unwrap()),
         };
-        assert!(!rewrite(&plain, engine, None, None, None)
+        assert!(!rewrite(&plain, engine, IceRewrite::Keep, None, None)
             .expect("rewrite")
             .sdp
             .contains("a=rtcp-mux"));
@@ -1355,7 +1377,7 @@ mod tests {
             rtp: "127.0.0.1:41000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(sdp, engine, None, None, None).expect("rewrite");
+        let result = rewrite(sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
             "198.51.100.9:5000".parse().unwrap()
@@ -1417,7 +1439,7 @@ mod tests {
             rtp: "[::1]:40000".parse().unwrap(),
             rtcp: Some("[::1]:40001".parse().unwrap()),
         };
-        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite v6");
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite v6");
         assert_eq!(
             result.media.remote_rtp,
             "[2001:db8::1]:49170".parse().unwrap()
@@ -1457,7 +1479,8 @@ mod tests {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
         };
-        let result = rewrite(sdp, engine, Some(advert), None, None).expect("rewrite v6 ice");
+        let result = rewrite(sdp, engine, IceRewrite::Reoriginate(advert), None, None)
+            .expect("rewrite v6 ice");
         assert!(result.sdp.contains("c=IN IP6 ::1"));
         assert!(
             result
@@ -1481,7 +1504,7 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite v4");
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite v4");
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(
             !result.sdp.contains("IP6"),
@@ -1513,7 +1536,7 @@ mod tests {
                 rtp: "192.0.2.1:10000".parse().expect("addr"),
                 rtcp: None,
             };
-            let _ = rewrite(&text, engine, None, None, None);
+            let _ = rewrite(&text, engine, IceRewrite::Keep, None, None);
             let _ = force_answer_codec(&text, &CodecSpec::new(0, "PCMU", 8000, 1, 20), Some(96));
         }
     }
@@ -1553,7 +1576,8 @@ mod tests {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
         };
-        let result = rewrite(&sdp, engine, Some(advert), None, None).expect("rewrite");
+        let result =
+            rewrite(&sdp, engine, IceRewrite::Reoriginate(advert), None, None).expect("rewrite");
 
         // Our credentials and posture are advertised.
         assert!(result.sdp.contains("a=ice-lite"));
@@ -1577,9 +1601,49 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result = rewrite(&sdp, engine, None, None, None).expect("rewrite");
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert!(!result.sdp.contains("a=ice-lite"));
         assert!(!result.sdp.contains("a=ice-ufrag"));
+    }
+
+    #[test]
+    fn rewrite_keep_passes_peer_ice_through() {
+        // `IceRewrite::Keep` (a plain relay) forwards the peer's ICE attributes untouched — it is the
+        // decoupled counterpart of `Strip`, which removes them.
+        let sdp = ice_offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
+        assert!(result.sdp.contains("a=ice-ufrag:PEERUF"));
+        assert!(result.sdp.contains("a=ice-pwd:peerpassword01234567"));
+        assert!(result.sdp.contains("typ host"), "peer candidate preserved");
+        assert!(
+            !result.sdp.contains("a=ice-lite"),
+            "we add nothing of our own"
+        );
+    }
+
+    #[test]
+    fn rewrite_strip_removes_peer_ice_without_re_originating() {
+        // rtpengine `ICE=remove` (RFC 8839 §5): strip the offerer's ICE lines and advertise none of
+        // our own — the leg falls back to the signalled media address.
+        let sdp = ice_offer("203.0.113.7", 49170);
+        let engine = EngineMedia {
+            rtp: "127.0.0.1:40000".parse().unwrap(),
+            rtcp: None,
+        };
+        let result = rewrite(&sdp, engine, IceRewrite::Strip, None, None).expect("rewrite");
+        // The peer's ICE attributes are gone.
+        assert!(!result.sdp.contains("a=ice-ufrag"), "{}", result.sdp);
+        assert!(!result.sdp.contains("a=ice-pwd"), "{}", result.sdp);
+        assert!(!result.sdp.contains("a=candidate"), "{}", result.sdp);
+        assert!(!result.sdp.contains("PEERUF"));
+        // And, unlike `Reoriginate`, we add nothing of our own.
+        assert!(!result.sdp.contains("a=ice-lite"), "no ICE re-originated");
+        // The parsed media still records what the peer offered.
+        assert_eq!(result.media.ice_ufrag.as_deref(), Some("PEERUF"));
     }
 
     /// An `RTP/SAVP` (SDES) offer carrying one RFC 4568 `a=crypto` line.
@@ -1722,7 +1786,7 @@ mod tests {
         let result = rewrite(
             &sdp,
             engine,
-            None,
+            IceRewrite::Keep,
             Some(SecurityAdvertisement::Dtls {
                 fingerprint,
                 setup: Setup::Passive,
@@ -1765,7 +1829,7 @@ mod tests {
         let result = rewrite(
             &sdp,
             engine,
-            None,
+            IceRewrite::Keep,
             Some(SecurityAdvertisement::Secure(ours)),
             None,
         )
@@ -1788,8 +1852,14 @@ mod tests {
             rtp: "127.0.0.1:40000".parse().unwrap(),
             rtcp: None,
         };
-        let result =
-            rewrite(&sdp, engine, None, Some(SecurityAdvertisement::Plain), None).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            Some(SecurityAdvertisement::Plain),
+            None,
+        )
+        .expect("rewrite");
         assert!(
             result.sdp.contains("m=audio 40000 RTP/AVP 0 8"),
             "{}",
