@@ -22,6 +22,10 @@ plans/
 .vscode/
 *.swp
 
+# Python bytecode (the examples/ scripts)
+__pycache__/
+*.pyc
+
 # Bench / profiling output
 /criterion
 perf.data*

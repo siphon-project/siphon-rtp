@@ -53,7 +53,7 @@ Supported today, mapped one-to-one onto the engine:
 |---|---|
 | `ping` | Answers `pong`. |
 | `offer` / `answer` / `delete` | The core lifecycle, with SDP rewriting (RFC 3264). |
-| `query` | Accepted, but returns a minimal reply today (`result: ok`, no per-leg statistics dictionary). Use the native JSON `query` (full `SessionStats`) or Prometheus for numbers. |
+| `query` | Returns `result: ok` plus a `totals` dict of per-session counters (packets-in/out, bytes-in/out, packets-lost). rtpengine's fuller per-SSRC breakdown is not replicated; the native JSON `query` (full `SessionStats`) or Prometheus give richer numbers. |
 | `list` / `statistics` | Census: call-id list, global counters plus the live session gauge. |
 | `block media` / `unblock media` | Per-leg media gate. |
 | `silence media` / `unsilence media` | Replaces the call's egress audio with synthesized silence. Requires a media-processing (transcoding) call; rejected on a plain passthrough relay, which forwards opaque payloads it cannot synthesize into. |
