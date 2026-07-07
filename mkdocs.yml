@@ -51,6 +51,7 @@ nav:
       - NAT traversal & latching: cookbook/nat.md
       - Recording & forking (SIPREC): cookbook/recording.md
       - Monitoring & QoS: cookbook/monitoring.md
+  - Examples: examples/index.md
   - Control protocol:
       - Native JSON-over-TCP: control/json.md
       - rtpengine NG / bencode: control/ng.md

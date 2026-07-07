@@ -51,7 +51,7 @@ Stock rtpengine verbs, with the exact command strings the parser matches:
 | `offer` | `offer` | `call-id`, `from-tag`, `sdp` + the flag surface below. Returns the rewritten SDP. |
 | `answer` | `answer` | Adds `to-tag`. |
 | `delete` | `delete` | `to-tag` optional. |
-| `query` | `query` | Currently answers `result: ok` with no statistics payload (see parity notes). |
+| `query` | `query` | Answers `result: ok` with a `totals` dict of per-session counters (packets / bytes / loss); see parity notes. |
 | `list` | `list` | Returns the live call-ids under `calls`. |
 | `statistics` | `statistics` | Counters under a `statistics` sub-dict: `offers`, `answers`, `deletes`, `errors`, `sessions`. |
 | `play media` | `play_media` | Source from `file`, `blob`, or `db-id` (`db-id` parses but the engine rejects it: no media database). `repeat-times`, `start-pos`, `duration`, `to-tag`. |
@@ -128,9 +128,9 @@ Honest differences from stock rtpengine, and from siphon-rtp's own native protoc
   [JSON front-end](json.md).
 - **No asynchronous events.** NG is strictly request/response over UDP. DTMF detection,
   media-timeout, and call-quality events are pushed only on native JSON connections.
-- **`query` carries no statistics yet.** The engine computes per-session stats (the
-  native `query` returns them), but the NG serializer currently answers `result: ok`
-  without a stats payload.
+- **`query` returns a `totals` dict** of per-session counters (`packets-in`, `packets-out`,
+  `bytes-in`, `bytes-out`, `packets-lost`). rtpengine's fuller per-tag / per-SSRC breakdown is not
+  replicated; the native `query` (full `SessionStats`) or Prometheus give richer numbers.
 - **`block DTMF` is drop-mode only.** No tone/PCM replacement modes.
 - **`play media` has no `db-id` backend.** The key parses for compatibility; the engine
   answers with an error.

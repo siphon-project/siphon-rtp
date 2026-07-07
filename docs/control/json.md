@@ -74,18 +74,19 @@ Two more per-connection guards apply regardless of auth:
 | `delete` | `call_id`, `from_tag`, `to_tag?` | Tear down the session. |
 | `query` | `call_id`, `from_tag`, `to_tag?` | Session statistics: `packets_in/out`, `bytes_in/out`, `packets_lost`. |
 
-The `profile` object is the JSON twin of rtpengine's flag set. The fields the engine
-honours:
+The `profile` object is the JSON twin of rtpengine's flag set. Most fields change behaviour; a few
+(`ice`, `dtls`, `direction`) are accepted for rtpengine compatibility but are **not policy inputs
+yet**, noted below.
 
 | `profile` field | Type | Meaning |
 |---|---|---|
 | `transport_protocol` | string | Far-leg transport, e.g. `RTP/AVP`, `RTP/SAVP` (SDES-SRTP, RFC 4568), `UDP/TLS/RTP/SAVPF` (DTLS-SRTP, RFC 5764). |
-| `ice` | string | `remove` \| `force` \| `force-relay`. |
-| `dtls` | string | `passive` \| `active` \| `off`. |
+| `ice` | string | Parsed for compatibility, **currently no-op**. ICE-lite is driven from the SDP (an ICE offer), not this field. |
+| `dtls` | string | Parsed for compatibility, **currently no-op**. DTLS-SRTP is selected by `transport_protocol` (`UDP/TLS/RTP/SAVPF`) + the SDP `a=fingerprint` / `a=setup`, not this field. |
 | `replace` | string list | SDP fields to rewrite, e.g. `["origin"]`. |
 | `address_family` | string | `IP4` \| `IP6` for the far leg's engine endpoints (v4/v6 interworking). |
 | `flags` | string list | Behavioral flags plus the codec directives (`codec-transcode-X`, `codec-mask-X`, `codec-strip-X`, `codec-offer-X`, `codec-except-X`, `ptime=N`, ...). |
-| `direction` | string list | NAT leg designation pair, e.g. `["external", "internal"]`. |
+| `direction` | string list | Parsed for compatibility, **currently no-op** (multi-interface direction routing is planned). |
 | `record_call`, `record_path` | bool, string | Record this call from setup; output directory. |
 | `ws_uri` | string | Attach leg A to an external WebSocket media server (`ws://` only for v1). A native extension; not available over NG. |
 | `received_from` | IP string | The real post-NAT source IP the SIP proxy saw. Tightens the ingress source gate (anti-RTPBleed, see [Security and NAT](../security-and-nat.md)). |

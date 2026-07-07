@@ -183,8 +183,8 @@ addresses, is in [NAT traversal & latching](nat.md); the design and threat model
 engine forwarded, and `packets_lost` what it refused or could not use (source-gate rejections,
 late or malformed packets). `packets_in` climbing while `packets_lost` climbs with it and
 `packets_out` stays behind is the classic source-gate symptom; see
-[NAT traversal & latching](nat.md). Over NG, `query` is answered but the counters dict is
-currently native-JSON-only, so use the JSON control (or `/metrics`) for numbers.
+[NAT traversal & latching](nat.md). Over NG, `query` returns these counters under a `totals` dict
+(packets / bytes / loss); the native JSON `query` and `/metrics` carry the fuller numbers.
 
 **Engine-wide:** with `--metrics-addr` set, `GET /metrics` exposes `siphon_rtp_sessions` (live
 calls), `siphon_rtp_offers_total` / `siphon_rtp_answers_total` / `siphon_rtp_deletes_total`, and

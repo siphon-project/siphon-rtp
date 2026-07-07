@@ -53,9 +53,10 @@ Honest limits first:
   `AES_CM_128_HMAC_SHA1_80`) legs are supported. An offer with ICE or DTLS-SRTP (WebRTC) is
   rejected with an error; those conference legs are a follow-up.
 - The participant's codec must be both decodable and encodable by this build, because the engine
-  has to encode the mix back. AMR-WB egress needs the `amr` Cargo feature (off by default, see
-  [codec licensing](../codec-licensing.md)); without it an AMR-WB join is refused. Opus and
-  AMR-NB encode are not available for conference egress today.
+  has to encode the mix back. AMR-WB and AMR-NB egress need the `amr` Cargo feature (off by default,
+  see [codec licensing](../codec-licensing.md)); without it an AMR join is refused. With `amr`,
+  AMR-NB mixes are encoded at MR122 (the SDP `mode-set` is not applied to the mix egress). Opus has
+  no encoder, so an Opus participant is refused.
 - 64 participants per room, hard cap (the active-speaker set is a u64 bitmask).
 - A node in drain mode rejects `conference_join` like it rejects `offer`.
 
