@@ -37,10 +37,28 @@ bytes = "1.11"
 dashmap = "6"
 thiserror = "2"
 tracing = "0.1"
+# Next-hop MAC resolution (the `neighbor` module) talks to the kernel routing/neighbour/link tables
+# over rtnetlink. Chosen over `neli`: rtnetlink gives typed RTM_GETROUTE/GETNEIGH/GETLINK query
+# builders on an async Tokio socket and re-exports its `netlink-packet-route` message types, so the
+# same POD types the async worker receives are the ones the pure extractors + wire-fixture tests
+# parse — pure Rust, zero C deps. Pinned to rtnetlink 0.21's own netlink-packet-route (0.30) so there
+# is a single version of the message types across the crate.
+rtnetlink = "0.21"
+netlink-packet-route = "0.30"
+netlink-packet-core = "0.8"
+futures = "0.3"
 
 # No `[build-dependencies]`: build.rs invokes the eBPF build directly (rustup run <toolchain> cargo
 # build --target bpfel-unknown-none) instead of via aya-build, whose 0.1.x OUT_DIR embed copies the
 # artifact onto its own `--target-dir` path ("Is a directory"). See build.rs for the full rationale.
+
+[dev-dependencies]
+# Criterion for the TX-path next-hop-MAC cache-hit microbench (µs/frame gate).
+criterion = "0.5"
+
+[[bench]]
+name = "neighbor_bench"
+harness = false
 
 # A small workspace pairing the loader with the eBPF program crate (so build.rs's
 # `cargo build --package siphon-rtp-ebpf` resolves). Excluded from the parent stable workspace; the

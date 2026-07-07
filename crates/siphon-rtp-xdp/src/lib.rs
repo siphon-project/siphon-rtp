@@ -25,10 +25,17 @@
 //! backend only after [`xdp_supported`] and the AF_XDP bind both succeed, else it falls back to
 //! UDP-loopback.
 //!
+//! ## Next-hop MAC resolution (wired — Stage 1)
+//!
+//! `build_and_push` resolves the egress interface's source MAC and the next hop's destination MAC
+//! before it frames a TX packet (see [`neighbor`]): the kernel route to the destination gives the
+//! next hop (on-link → the destination itself, else the gateway — RFC 1122 §3.3.1) and egress
+//! interface, and the kernel neighbour table (ARP, RFC 826) gives its MAC. The busy-poll thread only
+//! reads a synchronous cache; on a miss it drops the packet and an off-thread rtnetlink worker
+//! resolves it, so no frame ever egresses with a zeroed MAC and the datapath never blocks on netlink.
+//!
 //! ## Remaining for a full hardware data plane (documented gaps, not yet wired)
 //!
-//! - **Next-hop MAC resolution** for TX: [`build_and_push`] emits a zeroed destination MAC; ARP /
-//!   `rtnetlink` neighbour-table lookup is the missing piece before TX frames egress a real NIC.
 //! - **In-kernel `XDP_TX` passthrough**: the eBPF side currently `XDP_REDIRECT`s every matched flow
 //!   to the AF_XDP RX ring (where SRTP/transcode/relay already live). The zero-copy `XDP_TX` rewrite
 //!   fast path (and the TURN channel fast path) lands with the eBPF L2/L3/L4 rewrite work.
@@ -64,7 +71,10 @@ use siphon_rtp_datapath::{
 use siphon_rtp_ebpf_common::{action, latch, source, FlowAction, FlowKey, FlowStats};
 
 pub mod headers;
+pub mod neighbor;
 pub mod xsk;
+
+use neighbor::{NeighborResolver, Resolution, ResolverConfig};
 
 /// `#[repr(transparent)]` POD wrappers so the shared ABI types can key/value aya maps.
 /// Safety: each wraps a `#[repr(C)]` all-integer POD, so every bit pattern is valid.
@@ -354,6 +364,10 @@ impl XdpDatapath {
         let (tx_commands, tx_rx) = flume::unbounded::<TxRequest>();
         let endpoints: Arc<DashMap<EndpointId, EndpointRecord>> = Arc::new(DashMap::new());
         let start = std::time::Instant::now();
+        // The next-hop MAC resolver spawns its own off-reactor rtnetlink worker; the busy-poll thread
+        // owns it and reads its resolved-MAC cache synchronously on the TX path. Owned solely by that
+        // thread, so it (and its worker) tear down when the datapath thread exits.
+        let resolver = NeighborResolver::new(ResolverConfig::default());
 
         let inner = Arc::new(Inner {
             loader: Mutex::new(loader),
@@ -378,6 +392,7 @@ impl XdpDatapath {
         let thread_redirect = redirect_tx;
         let thread_endpoints = endpoints;
         let local_ip_copy = local_ip;
+        let thread_resolver = resolver;
         let handle = std::thread::Builder::new()
             .name("siphon-xdp-datapath".to_string())
             .spawn(move || {
@@ -388,6 +403,7 @@ impl XdpDatapath {
                     thread_endpoints,
                     local_ip_copy,
                     start,
+                    thread_resolver,
                 );
             })
             .map_err(|error| XdpError::Xsk(xsk::XskError::Socket(error)))?;
@@ -526,8 +542,14 @@ fn datapath_loop(
     endpoints: Arc<DashMap<EndpointId, EndpointRecord>>,
     _local_ip: Ipv4Addr,
     start: std::time::Instant,
+    resolver: NeighborResolver,
 ) {
     loop {
+        // Stamp the resolver's freshness clock from the same monotonic origin the RX path uses
+        // (seconds granularity is ample for neighbour/route TTLs). Production path only — never a
+        // test-driven clock, so cache-expiry stays deterministic under test.
+        resolver.set_now(start.elapsed().as_secs());
+
         // Drain RX: parse each frame, map its destination transport to an endpoint, push the payload
         // onto the redirect stream. The in-kernel classifier already gated the source.
         let received = socket.rx_burst(64);
@@ -559,7 +581,7 @@ fn datapath_loop(
         // Serve any pending TX requests (build the frame, push, kick).
         let mut transmitted = false;
         while let Ok(request) = tx_rx.try_recv() {
-            let result = build_and_push(&mut socket, &request);
+            let result = build_and_push(&mut socket, &request, &resolver);
             transmitted = transmitted || result.as_ref().map(|n| *n > 0).unwrap_or(false);
             let _ = request.done.send(result);
         }
@@ -574,9 +596,11 @@ fn datapath_loop(
         // when idle (the RX side is still drained each wake; production would integrate a poll() on
         // the socket fd alongside this for RX wake-ups).
         if received.is_empty() && !transmitted {
+            // Idle: sweep stale next-hop MAC cache entries so the maps drain under churn-then-idle.
+            resolver.reap();
             match tx_rx.recv_timeout(std::time::Duration::from_millis(1)) {
                 Ok(request) => {
-                    let result = build_and_push(&mut socket, &request);
+                    let result = build_and_push(&mut socket, &request, &resolver);
                     let _ = request.done.send(result);
                     let _ = socket.tx_kick();
                 }
@@ -587,12 +611,15 @@ fn datapath_loop(
     }
 }
 
-/// Build an Ethernet+IPv4+UDP frame for one TX request and push it onto the ring. The next-hop MAC
-/// is not yet resolved here (ARP / `rtnetlink` neighbour lookup is the remaining piece), so this
-/// returns the frame length on a successful push and surfaces a clear error otherwise.
+/// Build an Ethernet+IPv4+UDP frame for one TX request and push it onto the ring. Resolves the egress
+/// source MAC and the next-hop destination MAC from the kernel via the [`NeighborResolver`] (a
+/// synchronous cache read); on an unresolved next hop it **drops** the packet (returns `WouldBlock`)
+/// and the resolver kicks off an off-thread lookup, so subsequent frames flow once ARP completes and
+/// no frame ever egresses with a zeroed destination MAC.
 fn build_and_push(
     socket: &mut xsk::XskSocket,
     request: &TxRequest,
+    resolver: &NeighborResolver,
 ) -> Result<usize, DatapathError> {
     let (SocketAddr::V4(src), SocketAddr::V4(dst)) = (request.source, request.destination) else {
         // IPv4-only datapath; a v6 transport cannot be framed by the current ABI.
@@ -601,11 +628,20 @@ fn build_and_push(
             "XDP datapath is IPv4-only",
         )));
     };
+    // Resolve source + next-hop MACs (RFC 1122 §3.3.1 next hop, RFC 826 ARP). A miss drops this
+    // packet — never forward into the void — while the resolver resolves it off-thread.
+    let (src_mac, dst_mac) = match resolver.resolve(*dst.ip()) {
+        Resolution::Resolved { src_mac, dst_mac } => (src_mac, dst_mac),
+        Resolution::Pending => {
+            return Err(DatapathError::Send(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "next-hop MAC unresolved; resolution requested",
+            )));
+        }
+    };
     let addrs = headers::FrameAddrs {
-        // The next-hop MAC must come from the kernel neighbour table; a zeroed MAC is a placeholder
-        // until ARP/rtnetlink resolution lands (the documented remaining gap).
-        src_mac: [0u8; 6],
-        dst_mac: [0u8; 6],
+        src_mac,
+        dst_mac,
         src_ip: *src.ip(),
         dst_ip: *dst.ip(),
         src_port: src.port(),
