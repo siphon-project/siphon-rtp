@@ -52,12 +52,21 @@ futures = "0.3"
 # build --target bpfel-unknown-none) instead of via aya-build, whose 0.1.x OUT_DIR embed copies the
 # artifact onto its own `--target-dir` path ("Is a directory"). See build.rs for the full rationale.
 
+# Dev-only: criterion for both hot-path microbenches; libc (also a normal dep) for the veth
+# XDP_TX smoke's raw AF_PACKET inject/capture.
 [dev-dependencies]
-# Criterion for the TX-path next-hop-MAC cache-hit microbench (µs/frame gate).
 criterion = "0.5"
+libc = "0.2"
 
+# The TX-path next-hop-MAC cache-hit microbench (µs/frame gate; the Stage-1 neighbour resolver).
 [[bench]]
 name = "neighbor_bench"
+harness = false
+
+# The in-kernel FORWARD relay's per-packet rewrite cost (RFC 1624 checksum fixups + the latch
+# decision) — benched as `siphon_rtp_ebpf_common::rewrite`, the exact math the eBPF program runs.
+[[bench]]
+name = "rewrite_bench"
 harness = false
 
 # A small workspace pairing the loader with the eBPF program crate (so build.rs's

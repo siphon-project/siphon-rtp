@@ -16,3 +16,8 @@ keywords = ["ebpf", "xdp", "networking", "rtp", "abi"]
 categories = ["network-programming"]
 
 [dependencies]
+
+# Dev-only: property-test the RFC 1624 incremental checksum fixup against an independent full RFC
+# 1071 recompute. Never compiled for downstream (the no_std kernel program pulls no dev-deps).
+[dev-dependencies]
+proptest = { workspace = true }

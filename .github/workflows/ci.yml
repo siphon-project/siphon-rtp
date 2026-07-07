@@ -244,6 +244,12 @@ jobs:
         run: cargo build --locked
       - name: Run the loader unit tests
         run: cargo test --locked
+      # Live veth XDP_TX relay smoke: attach the classifier in SKB mode, install a FORWARD flow,
+      # inject an RTP/UDP datagram and capture the frame the program relays — asserting the L2/L3/L4
+      # rewrite + both checksums. Self-skips (logs + passes) without CAP_NET_ADMIN / veth / generic
+      # XDP, so it never fails an unprivileged runner; `--nocapture` surfaces the skip/run message.
+      - name: veth XDP_TX relay smoke (self-skips without CAP_NET_ADMIN)
+        run: cargo test --locked --test xdp_tx_smoke -- --nocapture
 
   # Single required status check for branch protection: green only if every job above is green.
   # perf-gate is included: it runs on pull_request (success) and is skipped on the push-to-main build,

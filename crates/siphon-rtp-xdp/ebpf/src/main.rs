@@ -4,15 +4,21 @@
 //! looks it up in the `FLOWS` map, and:
 //! - **no flow** → `XDP_PASS` (not our media; the kernel stack keeps it),
 //! - **Drop** → `XDP_DROP`,
-//! - **Forward/Redirect** → enforce the **RTPBleed source-gate** (drop a source the SDP did not
-//!   signal) and then `XDP_REDIRECT` to the AF_XDP socket for the owning userspace actor.
+//! - **Redirect** → enforce the **RTPBleed source-gate** (drop a source the SDP did not signal) and
+//!   then `XDP_REDIRECT` to the AF_XDP socket for the owning userspace actor (SRTP / decode /
+//!   transcode / WS / TURN-control legs live there),
+//! - **Forward** → relay the datagram **entirely in the kernel** (the `XDP_TX` fast path): enforce
+//!   the source-gate + the SSRC-consistent symmetric-RTP latch (RTPBleed, RFC 3550 §8), rewrite
+//!   L3/L4 in place with an incremental checksum fixup (RFC 1624), resolve the next hop with
+//!   `bpf_fib_lookup`, rewrite L2, and `XDP_TX` / `bpf_redirect`. A plain `rtp_passthrough` relay
+//!   never touches userspace.
 //!
-//! The in-kernel `XDP_TX` passthrough fast-path (FIB/neighbour lookup + L2/L3/L4 rewrite +
-//! checksum fixup) is a later optimisation; until then every matched flow rides the AF_XDP slow
-//! path, which is where SRTP/decode/transcode/WS already live. The source-gate runs in-kernel
-//! regardless, so spoofed sources are dropped before they ever reach userspace.
+//! The correctness-critical arithmetic (the incremental checksum fixup and the latch state machine)
+//! lives in the host-testable [`siphon_rtp_ebpf_common::rewrite`] module — proptested against a
+//! from-scratch one's-complement recompute and unit-tested exhaustively — so this program only does
+//! the bounds-checked packet I/O and the FIB lookup around it.
 //!
-//! ## TURN channel-relay fast path (M-T8 — planned, gated on `XDP_TX`)
+//! ## TURN channel-relay fast path (M-T8 — planned, gated on this `XDP_TX` work)
 //!
 //! Once a TURN client binds a channel (RFC 5766 §11; docs/security-and-nat.md §11) the per-packet
 //! relay is a fixed rewrite the kernel can do without ever touching userspace. The userspace TURN
@@ -32,22 +38,32 @@
 //! - everything else (Allocate/Refresh/CreatePermission/ChannelBind, Send/Data indications,
 //!   non-channel data) falls through to `action::REDIRECT` and is handled in userspace.
 //!
-//! This shares the generic `XDP_TX` rewrite + checksum machinery, so it lands with that work — only
-//! the two map lookups and the 4-byte header adjust are TURN-specific. Permission gating is implicit:
-//! a route exists only while its channel is bound, and the userspace server enforces every permission
-//! on the control path before it ever programs a route.
+//! This shares the generic `XDP_TX` rewrite + checksum machinery landed here, so only the two map
+//! lookups and the 4-byte header adjust remain TURN-specific.
 #![no_std]
 #![no_main]
 
 use core::mem;
 
 use aya_ebpf::{
-    bindings::xdp_action,
+    bindings::{
+        bpf_fib_lookup as bpf_fib_lookup_params, xdp_action, BPF_FIB_LKUP_RET_SUCCESS,
+        BPF_FIB_LOOKUP_DIRECT,
+    },
+    helpers::{bpf_fib_lookup, bpf_redirect},
     macros::{map, xdp},
     maps::{HashMap, PerCpuArray, XskMap},
     programs::XdpContext,
+    EbpfContext,
 };
-use siphon_rtp_ebpf_common::{action, source, FlowAction, FlowKey, FlowStats};
+use siphon_rtp_ebpf_common::{
+    action, latch,
+    rewrite::{
+        ipv4_checksum_after_addr_rewrite, is_rtp_or_rtcp, latch_decision, rtp_media_ssrc,
+        udp_checksum_after_rewrite, LatchVerdict, Latched,
+    },
+    source, FlowAction, FlowKey, FlowStats,
+};
 
 /// Flow table: destination transport → relay rule. Keyed/valued by the shared ABI POD.
 #[map]
@@ -64,8 +80,11 @@ static STATS: PerCpuArray<FlowStats> = PerCpuArray::with_max_entries(1, 0);
 const ETH_HDR_LEN: usize = 14;
 const ETH_P_IP: u16 = 0x0800;
 const IPPROTO_UDP: u8 = 17;
+/// Address family for IPv4 (`AF_INET`; not exported by the aya bindings) — the `bpf_fib_lookup`
+/// family selector for an IPv4 route lookup.
+const AF_INET: u8 = 2;
 
-/// A bounds-checked pointer into the packet (the verifier requires every access be proven in-range).
+/// A bounds-checked const pointer into the packet (the verifier requires every access be in-range).
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     let start = ctx.data();
@@ -76,9 +95,42 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     Ok((start + offset) as *const T)
 }
 
+/// A bounds-checked mutable pointer into the packet (for the in-place L2/L3/L4 rewrite). XDP packet
+/// data is writable; the verifier still requires the range be proven in-bounds.
+#[inline(always)]
+fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    if start + offset + mem::size_of::<T>() > end {
+        return Err(());
+    }
+    Ok((start + offset) as *mut T)
+}
+
 #[inline(always)]
 fn load<T: Copy>(ctx: &XdpContext, offset: usize) -> Result<T, ()> {
     Ok(unsafe { *ptr_at::<T>(ctx, offset)? })
+}
+
+/// Store `value` at `offset` in the packet buffer (bounds-checked). Used with `[u8; N]` byte arrays
+/// so the byte order is explicit (`to_be_bytes` at the call site), never host-endian-dependent.
+#[inline(always)]
+fn store<T>(ctx: &XdpContext, offset: usize, value: T) -> Result<(), ()> {
+    unsafe { *ptr_at_mut::<T>(ctx, offset)? = value };
+    Ok(())
+}
+
+/// Read a network-order 32-bit field at `offset` as a host-order `u32` (`from_be_bytes`), so the
+/// checksum/latch math is byte-order-explicit and portable.
+#[inline(always)]
+fn load_be_u32(ctx: &XdpContext, offset: usize) -> Result<u32, ()> {
+    Ok(u32::from_be_bytes(load::<[u8; 4]>(ctx, offset)?))
+}
+
+/// Read a network-order 16-bit field at `offset` as a host-order `u16`.
+#[inline(always)]
+fn load_be_u16(ctx: &XdpContext, offset: usize) -> Result<u16, ()> {
+    Ok(u16::from_be_bytes(load::<[u8; 2]>(ctx, offset)?))
 }
 
 #[inline(always)]
@@ -89,7 +141,9 @@ fn bump(field: impl Fn(&mut FlowStats)) {
     }
 }
 
-/// Whether `source_ipv4` (network order) passes the flow's source gate.
+/// Whether `source_ipv4` (native-order read, as the classifier keys/gates on) passes the flow's
+/// source gate. Layer 2 of the media-plane design (docs/security-and-nat.md §4; RFC 3264): only the
+/// SDP-signalled peer may send here — the RTPBleed fix.
 #[inline(always)]
 fn source_allowed(rule: &FlowAction, source_ipv4: u32) -> bool {
     match rule.source_kind {
@@ -133,10 +187,11 @@ fn try_classify(ctx: &XdpContext) -> Result<u32, ()> {
     if protocol != IPPROTO_UDP {
         return Ok(xdp_action::XDP_PASS);
     }
-    let source_ipv4: u32 = load(ctx, ETH_HDR_LEN + 12)?; // network order
+    let source_ipv4: u32 = load(ctx, ETH_HDR_LEN + 12)?; // native-order read (classifier gate/key)
     let dest_ipv4: u32 = load(ctx, ETH_HDR_LEN + 16)?;
 
     // UDP: destination port keys the flow.
+    let ip_offset = ETH_HDR_LEN;
     let udp_offset = ETH_HDR_LEN + ihl;
     let dest_port: u16 = load(ctx, udp_offset + 2)?; // network order
 
@@ -145,10 +200,14 @@ fn try_classify(ctx: &XdpContext) -> Result<u32, ()> {
         local_port: dest_port,
         _pad: 0,
     };
-    let rule = match unsafe { FLOWS.get(&key) } {
+    // A mutable value pointer so the Forward fast path can write the learned latch state back.
+    let rule_ptr = match FLOWS.get_ptr_mut(&key) {
         Some(rule) => rule,
         None => return Ok(xdp_action::XDP_PASS),
     };
+    // A private copy for the read-only fields; the map value is only mutated through `rule_ptr` on
+    // a latch learn, so there is no aliasing between the copy and the write.
+    let rule = unsafe { *rule_ptr };
 
     bump(|s| s.packets_in += 1);
 
@@ -157,9 +216,19 @@ fn try_classify(ctx: &XdpContext) -> Result<u32, ()> {
             bump(|s| s.packets_dropped += 1);
             Ok(xdp_action::XDP_DROP)
         }
-        action::FORWARD | action::REDIRECT => {
+        action::FORWARD => {
+            Ok(
+                forward_in_kernel(ctx, &rule, rule_ptr, source_ipv4, ip_offset, udp_offset)
+                    .unwrap_or_else(|()| {
+                        // Truncated/malformed datagram: drop (do not XDP_PASS partial media).
+                        bump(|s| s.packets_dropped += 1);
+                        xdp_action::XDP_DROP
+                    }),
+            )
+        }
+        action::REDIRECT => {
             // RTPBleed gate: a source the SDP did not signal never reaches userspace.
-            if !source_allowed(rule, source_ipv4) {
+            if !source_allowed(&rule, source_ipv4) {
                 bump(|s| s.packets_dropped += 1);
                 return Ok(xdp_action::XDP_DROP);
             }
@@ -173,6 +242,198 @@ fn try_classify(ctx: &XdpContext) -> Result<u32, ()> {
             }
         }
         _ => Ok(xdp_action::XDP_PASS),
+    }
+}
+
+/// The in-kernel `XDP_TX` relay for an `action::FORWARD` flow (docs/security-and-nat.md §4).
+///
+/// Enforces the layered secure symmetric-RTP posture before it forwards a single byte:
+/// 1. **layer 1 — demux** (RFC 7983): only RTP/RTCP (first byte 128..=191) drives the relay or moves
+///    the latch; STUN/DTLS/garbage on a Forward leg is dropped;
+/// 2. **layer 2 — signalled-source gate** (RFC 3264): drop a source the SDP did not signal;
+/// 3. **layer 3 — SSRC-consistent latch** (RFC 3550 §8): learn the peer's real source, re-latch a
+///    new source only on a matching SSRC (a genuine NAT rebind), drop an SSRC-mismatched spray.
+///
+/// It then resolves the forward destination (the userspace-maintained `out_*`, rtpengine `dst_addr`
+/// parity — never a flow's *own* ingress latch, which would echo), rewrites L3/L4 with the RFC 1624
+/// incremental checksum fixup, resolves the next hop with `bpf_fib_lookup` (RFC 1122 §3.3), rewrites
+/// L2, and `XDP_TX`s (hairpin) or `bpf_redirect`s (different egress ifindex). A FIB miss / unresolved
+/// neighbour falls back to `action::REDIRECT` so userspace (netlink resolve + ARP kick) handles the
+/// cold case. Returns the XDP verdict; `Err(())` means a bounds check failed (the caller drops).
+#[inline(always)]
+fn forward_in_kernel(
+    ctx: &XdpContext,
+    rule: &FlowAction,
+    rule_ptr: *mut FlowAction,
+    source_ipv4: u32,
+    ip_offset: usize,
+    udp_offset: usize,
+) -> Result<u32, ()> {
+    let payload_offset = udp_offset + 8;
+
+    // --- Layer 1: RFC 7983 first-byte demux (only RTP/RTCP may drive a Forward relay). ----------
+    let first_byte: u8 = match load::<u8>(ctx, payload_offset) {
+        Ok(byte) => byte,
+        // No payload at all — not media on a media flow.
+        Err(()) => {
+            bump(|s| s.packets_dropped += 1);
+            return Ok(xdp_action::XDP_DROP);
+        }
+    };
+    if !is_rtp_or_rtcp(&[first_byte]) {
+        bump(|s| s.packets_dropped += 1);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // --- Layer 2: signalled-source gate (RTPBleed, RFC 3264). ----------------------------------
+    if !source_allowed(rule, source_ipv4) {
+        bump(|s| s.packets_dropped += 1);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // The datagram source in host order (used both for the latch and — as old_src — for the
+    // checksum fixup below). Kernel-private latch state uses this same representation throughout.
+    let src_ip_host = load_be_u32(ctx, ip_offset + 12)?;
+    let src_port_host = load_be_u16(ctx, udp_offset)?;
+
+    // --- Layer 3: SSRC-consistent latch (RFC 3550 §8). Only for a latching policy. --------------
+    if rule.latch_policy != latch::OFF {
+        // The RTP SSRC (bytes 8..12 of the payload), or None for RTCP / a too-short datagram.
+        let ssrc = match load::<[u8; 12]>(ctx, payload_offset) {
+            Ok(rtp_header) => rtp_media_ssrc(&rtp_header),
+            Err(()) => None,
+        };
+        let current = if rule.latch_valid != 0 {
+            Some(Latched {
+                ipv4: rule.latched_ipv4,
+                port: rule.latched_port,
+                ssrc: rule.latched_ssrc,
+            })
+        } else {
+            None
+        };
+        match latch_decision(current, src_ip_host, src_port_host, ssrc) {
+            LatchVerdict::Drop => {
+                // A hijack spray (new source, wrong/absent SSRC) — drop, keep the existing latch.
+                bump(|s| s.packets_dropped += 1);
+                return Ok(xdp_action::XDP_DROP);
+            }
+            LatchVerdict::Learn(learned) => {
+                // Learn / re-latch the peer's real source (symmetric RTP, RFC 4961). Written back
+                // through the map value pointer; last-writer-wins across CPUs is fine (it converges).
+                unsafe {
+                    (*rule_ptr).latched_ipv4 = learned.ipv4;
+                    (*rule_ptr).latched_port = learned.port;
+                    (*rule_ptr).latched_ssrc = learned.ssrc;
+                    (*rule_ptr).latch_valid = 1;
+                }
+            }
+            LatchVerdict::Forward => {}
+        }
+    }
+
+    // --- Resolve the forward destination. The kernel forwards to the userspace-maintained
+    //     destination (rtpengine `dst_addr` parity; the loopback backend's `.or(rule.out_dst)`
+    //     primary path). A flow's *own* ingress latch is the RTPBleed source anchor above, not a
+    //     destination — forwarding to it would echo. Never forward into the void: no destination →
+    //     drop (docs/security-and-nat.md §4; the datapath drops when nothing resolves). -----------
+    let new_dst_ip_host = rule.out_ipv4; // loader stores host-order (from_be_bytes)
+    let new_dst_port_host = u16::from_be(rule.out_port); // loader stores network-order (to_be)
+    if new_dst_ip_host == 0 || new_dst_port_host == 0 {
+        bump(|s| s.packets_dropped += 1);
+        return Ok(xdp_action::XDP_DROP);
+    }
+    let new_src_ip_host = rule.out_local_ipv4; // host-order
+    let new_src_port_host = u16::from_be(rule.out_src_port); // network-order -> host
+
+    // --- Next hop (RFC 1122 §3.3): a FIB lookup on the *rewritten* destination. -----------------
+    let ip_total_len_host = load_be_u16(ctx, ip_offset + 2)?;
+    let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
+    let mut params: bpf_fib_lookup_params = unsafe { mem::zeroed() };
+    params.family = AF_INET;
+    params.l4_protocol = IPPROTO_UDP;
+    params.sport = rule.out_src_port; // already network order (be16)
+    params.dport = rule.out_port; // already network order (be16)
+    params.ifindex = ingress_ifindex;
+    // Writing a union field is safe (only reads are unsafe); these select the IPv4 arms.
+    params.__bindgen_anon_1.tot_len = ip_total_len_host;
+    params.__bindgen_anon_3.ipv4_src = new_src_ip_host.to_be();
+    params.__bindgen_anon_4.ipv4_dst = new_dst_ip_host.to_be();
+    let fib_result = unsafe {
+        bpf_fib_lookup(
+            ctx.as_ptr(),
+            &mut params as *mut bpf_fib_lookup_params,
+            mem::size_of::<bpf_fib_lookup_params>() as i32,
+            BPF_FIB_LOOKUP_DIRECT,
+        )
+    };
+    if fib_result != BPF_FIB_LKUP_RET_SUCCESS as i64 {
+        // FIB miss / no neighbour / not forwardable (e.g. BPF_FIB_LKUP_RET_NO_NEIGH): the resolved
+        // fast path can't handle it — hand the *original* (un-rewritten) datagram to userspace,
+        // which has the netlink resolver + ARP kick (docs/security-and-nat.md; PR #84).
+        return match XSKS.redirect(rule.redirect_queue, 0) {
+            Ok(redirect) => Ok(redirect),
+            Err(_) => {
+                bump(|s| s.packets_dropped += 1);
+                Ok(xdp_action::XDP_DROP)
+            }
+        };
+    }
+
+    // --- FIB hit: commit the rewrite. Only now do we mutate the packet, so a fallback REDIRECT
+    //     above always forwards the original bytes. -----------------------------------------------
+
+    // L3/L4 (RFC 1624 incremental fixup): only the two addresses and two ports change; TTL is left
+    // untouched — a media relay is not an IP router, so it does not decrement TTL (RFC 1122 §3.3.1.1
+    // TTL decrement is a hop/router behaviour; a NAT/relay forwards the datagram, matching rtpengine
+    // and the userspace loopback backend, which rewrite addresses only).
+    let old_dst_ip_host = load_be_u32(ctx, ip_offset + 16)?;
+    let old_ip_checksum = load_be_u16(ctx, ip_offset + 10)?;
+    let old_dst_port_host = load_be_u16(ctx, udp_offset + 2)?;
+    let old_udp_checksum = load_be_u16(ctx, udp_offset + 6)?;
+
+    let new_ip_checksum = ipv4_checksum_after_addr_rewrite(
+        old_ip_checksum,
+        src_ip_host,
+        new_src_ip_host,
+        old_dst_ip_host,
+        new_dst_ip_host,
+    );
+    let new_udp_checksum = udp_checksum_after_rewrite(
+        old_udp_checksum,
+        src_ip_host,
+        new_src_ip_host,
+        old_dst_ip_host,
+        new_dst_ip_host,
+        src_port_host,
+        new_src_port_host,
+        old_dst_port_host,
+        new_dst_port_host,
+    );
+
+    store::<[u8; 4]>(ctx, ip_offset + 12, new_src_ip_host.to_be_bytes())?;
+    store::<[u8; 4]>(ctx, ip_offset + 16, new_dst_ip_host.to_be_bytes())?;
+    store::<[u8; 2]>(ctx, ip_offset + 10, new_ip_checksum.to_be_bytes())?;
+    store::<[u8; 2]>(ctx, udp_offset, new_src_port_host.to_be_bytes())?;
+    store::<[u8; 2]>(ctx, udp_offset + 2, new_dst_port_host.to_be_bytes())?;
+    store::<[u8; 2]>(ctx, udp_offset + 6, new_udp_checksum.to_be_bytes())?;
+
+    // L2: the FIB gave us the egress source MAC and the next-hop destination MAC.
+    store::<[u8; 6]>(ctx, 0, params.dmac)?;
+    store::<[u8; 6]>(ctx, 6, params.smac)?;
+
+    let frame_len = (ctx.data_end() - ctx.data()) as u64;
+    bump(|s| {
+        s.packets_out += 1;
+        s.bytes_out += frame_len;
+    });
+
+    if params.ifindex == ingress_ifindex {
+        // Same NIC — hairpin the frame straight back out.
+        Ok(xdp_action::XDP_TX)
+    } else {
+        // Different egress interface — redirect the (already L2-rewritten) frame to it.
+        Ok(unsafe { bpf_redirect(params.ifindex, 0) } as u32)
     }
 }
 

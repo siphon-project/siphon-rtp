@@ -12,6 +12,10 @@
 //! with the multi-interface / IPv4↔IPv6 work.
 #![cfg_attr(not(test), no_std)]
 
+/// Pure, `no_std` relay math (RFC 1624 incremental checksum fixup + RFC 3550 §8 SSRC-consistent
+/// latch state machine) shared by the in-kernel XDP_TX fast path and its host-side tests/benches.
+pub mod rewrite;
+
 /// Flow action discriminants ([`FlowAction::kind`]).
 pub mod action {
     /// Discard the datagram.

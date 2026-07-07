@@ -1912,6 +1912,9 @@ dependencies = [
 [[package]]
 name = "siphon-rtp-ebpf-common"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "siphon-rtp-hep"
