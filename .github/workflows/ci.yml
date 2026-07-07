@@ -219,9 +219,33 @@ jobs:
             cargo bench $BENCHES
           fi
 
+  # ── XDP / eBPF datapath (self-hosted, kernel-capable runner) ─────────────────────────────
+  # The eBPF loader is a separate, excluded workspace on a pinned nightly + bpf-linker, so the normal
+  # jobs never build it and it can bit-rot. This builds the eBPF program + the AF_XDP loader and runs
+  # its unit tests. push / manual only, never on a (possibly fork) PR: a self-hosted runner must not
+  # execute untrusted PR code. Kept out of the `CI passed` rollup while it is new.
+  xdp-integration:
+    name: xdp build + loader tests (self-hosted)
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    defaults:
+      run:
+        working-directory: crates/siphon-rtp-xdp
+    steps:
+      - uses: actions/checkout@v7
+      - name: eBPF toolchain (pinned nightly + rust-src + bpf-linker)
+        run: |
+          rustup toolchain install nightly-2026-01-15 --component rust-src --profile minimal
+          command -v bpf-linker >/dev/null 2>&1 || cargo install bpf-linker --locked
+      - name: Build the eBPF program + XDP/AF_XDP loader
+        run: cargo build --locked
+      - name: Run the loader unit tests
+        run: cargo test --locked
+
   # Single required status check for branch protection: green only if every job above is green.
   # perf-gate is included: it runs on pull_request (success) and is skipped on the push-to-main build,
-  # and `if: always()` + the failure/cancelled check treats a skipped job as non-failing.
+  # and `if: always()` + the failure/cancelled check treats a skipped job as non-failing. xdp-integration
+  # is deliberately excluded (push/manual-only, experimental toolchain) until it is proven stable.
   ci:
     name: CI passed
     if: always()
@@ -232,6 +256,7 @@ jobs:
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: exit 1
 
-# NOTE: crates/siphon-rtp-ebpf* carry their own pinned-nightly toolchain (bpf-linker) and are not
-# yet workspace members. Add a dedicated nightly job when they land. CD (release / container) is
-# intentionally omitted for now.
+# NOTE: the eBPF/XDP loader is an excluded workspace on its own pinned nightly + bpf-linker; the
+# `xdp-integration` job above builds and unit-tests it on the self-hosted runner (push/manual only).
+# A privileged veth + SKB-XDP attach smoke (the docker-compose `dev` profile) is a follow-up. CD
+# (release / container) is intentionally omitted for now.
