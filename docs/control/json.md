@@ -116,8 +116,8 @@ rtpengine compatibility but is **not a policy input yet**.
 | `checkpoint` | `call_id`, `from_tag` | `{"result": "checkpoint", "snapshot": "..."}`. An opaque blob; store it verbatim, keyed by call. Ownership-gated. |
 | `restore` | `snapshot` | Rebuilds the call on this (standby) node at the snapshot's exact ports, so a floating-IP failover needs no re-INVITE. |
 
-`restore` currently rebuilds three call shapes: a plain passthrough relay, an SDES-SRTP
-bridge, and a plaintext transcode call. A secure transcode call (`SrtpMedia`) or a
+`restore` currently rebuilds four call shapes: a plain passthrough relay, an SDES-SRTP
+bridge, a plaintext transcode call, and a secure transcode call (`SrtpMedia`). A
 WebSocket-bridged call keeps live state inside its running actor and is rejected with
 `restore of a ... call is not yet supported`. Restoring a `call_id` that already exists
 on the node is also rejected.

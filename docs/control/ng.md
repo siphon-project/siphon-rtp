@@ -74,7 +74,7 @@ behind the same dispatcher will reject these, so gate them on the node type:
 | `node info` | `node_info` | Static identity under `node` (`node-id`, `version`, `media-addresses`, `codecs`, `features`, `max-sessions`, `draining`). |
 | `drain` / `undrain` | `drain` / `undrain` | Stop/resume admitting new sessions for a rolling upgrade. |
 | `checkpoint` | `checkpoint` | HA snapshot; the opaque blob comes back under `snapshot`. |
-| `restore` | `restore` | Rebuild a checkpointed call on a standby. Same limits as native: passthrough, SDES-SRTP bridge, and plaintext transcode calls only. |
+| `restore` | `restore` | Rebuild a checkpointed call on a standby. Same limits as native: passthrough, SDES-SRTP bridge, plaintext transcode, and secure transcode calls (WebSocket-bridged restore still unsupported). |
 
 ## Codec directives
 

@@ -74,21 +74,24 @@ JSON control channel — so the control plane sees live quality without parsing 
   MOS = f(R)                      (G.107 Annex B)
   ```
 
-  `Id` is the delay impairment (jitter feeds in via the de-jitter buffer, ≈ 2× jitter), `Ie-eff` the
+  `Id` is the delay impairment (jitter feeds in via the de-jitter buffer, ≈ 2× jitter, and measured
+  one-way network delay now feeds `Id` too), `Ie-eff` the
   codec impairment (G.113 Appendix I `Ie`/`Bpl`) degraded by loss. The conference maps each leg's
   payload type to a `siphon_rtp_hep::mos::Codec` and feeds the measured loss + jitter in.
 
 ### Limitations / roadmap
 
-- **One-way network delay is not yet measured** (passed as `0`), so MOS reflects jitter + loss +
-  codec but not absolute latency. Deriving it needs RTT from inbound RRs (not yet consumed).
+- **One-way network delay is now measured** on the conference path: RTT is derived from inbound
+  reception reports (RRs) and folded into the G.107 MOS, so MOS now reflects jitter, loss, codec,
+  and measured one-way delay. The plain-relay path still uses delay `0` (only the conference path
+  measures RTT).
 - **Per-codec impairment** beyond the G.711 default is a small follow-up (the override hook exists).
 - **Wideband** codecs (G.722, AMR-WB) want the G.107.1 wideband extension; the narrowband model here
   is an approximation for them.
 - **2-party / transcoding-bridge** legs don't yet emit `call_quality` (conference-only today).
 - **HEP3 / Homer** RTCP export ships (enabled by `SIPHON_RTP_HEP_COLLECTOR`, with
   `SIPHON_RTP_HEP_AGENT_ID`), tapping relayed RTCP on the plain-relay path and sending it as HEP3
-  captures. The G.107 MOS still rides the `call_quality` control events, not HEP; wiring the
-  `siphon-rtp-hep` QoS report (HEP type 35) into the exporter is the remaining step.
+  captures. The G.107 MOS now rides BOTH the `call_quality` control events AND the exported HEP
+  type-35 QoS report (alongside the raw RTCP capture).
 
 See also [`security-and-nat.md`](security-and-nat.md) for the relay's accept/latch/forward model.
