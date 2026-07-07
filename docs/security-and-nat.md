@@ -184,6 +184,17 @@ Latch state machine, per direction:
 - **Spec:** RFC 3550 §8 (SSRC identity/collision), RFC 4961 (symmetric RTP/RTCP).
 - **Enforcement:** datapath latch state carries `ssrc`; needs the RTP header parse already in
   `siphon-rtp-media`.
+- **In-kernel enforcement (XDP_TX fast path).** For a plain `Forward` (`rtp_passthrough`) leg these
+  same three layers run **in the kernel** before the relay: the eBPF classifier demuxes (layer 1,
+  RFC 7983), re-checks the signalled-source gate (layer 2), and applies this SSRC-consistent latch —
+  learning the peer's real source into the flow's kernel latch state and re-latching a new source
+  only on a matching SSRC (RFC 3550 §8). It then rewrites L3/L4 with an RFC 1624 incremental checksum
+  fixup and `XDP_TX`s. The kernel latch is the **source anchor** (the RTPBleed / strict-source check,
+  rtpengine `expected_src`); the forward **destination** stays the userspace-maintained `out_dst`
+  (rtpengine `dst_addr`), never a flow's own ingress latch (which would echo). Consequently the
+  symmetric reply to an as-yet-unlearned peer — which the loopback backend resolves via the *peer*
+  leg's latch — stays on the userspace/`Redirect` path, since the per-flow kernel ABI carries no
+  cross-leg latch reference; a FIB miss / unresolved neighbour likewise falls back to `Redirect`.
 - **Effect on A1:** even inside the learning window, a hijack must reproduce the victim's live SSRC,
   which the blind attacker does not know.
 
