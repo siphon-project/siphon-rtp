@@ -33,6 +33,7 @@ use siphon_rtp_media::dtmf::{DtmfDetector, DtmfGenerator};
 use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::pcap::CapturedPacket;
 use siphon_rtp_media::player::PcmPlayer;
+use siphon_rtp_media::repacketize::Repacketizer;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::Event;
@@ -109,6 +110,15 @@ pub struct Direction {
     /// to `egress_frame_samples` for every codec whose RTP clock matches its sample rate, but not for
     /// G.722 (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2) — there it is half the sample count.
     egress_timestamp_increment: u32,
+    /// Re-frames the decoded/resampled ingress PCM to the egress `ptime` (rtpengine `ptime=<N>` override
+    /// or an ingress↔egress `a=ptime` mismatch). Accumulates egress-domain samples and drains exactly
+    /// `egress_frame_samples` per emitted packet, so one ingress frame can yield zero-or-many egress
+    /// packets. Sample-exact FIFO; preallocated (zero per-frame heap alloc on the hot path).
+    repacketizer: Repacketizer,
+    /// Pending RFC 3550 §5.1 marker: set when an ingress packet flags a talkspurt start (marker bit),
+    /// consumed by the next emitted egress packet — never a blind per-packet copy, since one ingress
+    /// packet maps to zero-or-many egress packets under repacketization.
+    pending_marker: bool,
     /// Ingress RFC 4733 telephone-event payload type, if negotiated.
     telephone_event_in: Option<u8>,
     /// Egress RFC 4733 telephone-event payload type (what the receiving party expects).
@@ -309,7 +319,15 @@ impl Direction {
         } else {
             Resampler::new(ingress_rate, egress_rate).ok()
         };
-        let egress_frame_samples = egress_params.frame_samples() as u32;
+        // The egress frame the encoder consumes (and the repacketizer drains) is the encoder's own
+        // `frame_samples` — sizing it here from the encoder guarantees the repacketizer always feeds
+        // the encoder exactly one frame's worth. A ptime override reaches this via the egress
+        // `CodecSpec.ptime_ms` the encoder was built with (sample-based codecs honour it; a frame-based
+        // codec such as AMR keeps its native 20 ms frame — the override is inert there by construction).
+        // Bound it to the scratch ceiling so an adversarial `a=ptime` can never overflow the fixed
+        // egress frame buffer; the timestamp step is recomputed from the same bounded count so drain
+        // and RTP clock stay in lock-step.
+        let egress_frame_samples = (egress_params.frame_samples() as u32).min(MAX_PCM as u32);
         // RFC 3551 §4.5.2: the synthesized-egress RTP timestamp advances at the codec's RTP clock,
         // which is not always the native sample rate — G.722 clocks RTP at 8 kHz while sampling
         // 16 kHz audio. So the per-packet step is native-samples × RTP-clock ÷ native-rate (= the
@@ -321,6 +339,10 @@ impl Direction {
             ((u64::from(egress_frame_samples) * u64::from(egress_rtp_clock))
                 / u64::from(egress_rate)) as u32
         };
+        // The repacketizer accumulates egress-domain PCM: one push is at most a decoded+resampled
+        // ingress frame (≤ `MAX_PCM`), and it holds < one egress frame of leftover, so `MAX_PCM` of
+        // push headroom never reallocates it.
+        let repacketizer = Repacketizer::new(egress_frame_samples as usize, MAX_PCM);
         Self {
             ingress_endpoint: config.ingress_endpoint,
             accepted_source: config.accepted_source,
@@ -337,6 +359,10 @@ impl Direction {
             egress_payload_type: config.egress_payload_type,
             egress_frame_samples,
             egress_timestamp_increment,
+            repacketizer,
+            // RFC 3550 §5.1: don't fabricate a talkspurt marker — propagate the sender's. The first
+            // egress packet carries the marker only if the ingress stream flagged one.
+            pending_marker: false,
             telephone_event_in: config.telephone_event_in,
             telephone_event_out: config.telephone_event_out,
             dtmf: DtmfDetector::new(),
@@ -373,6 +399,9 @@ impl Direction {
             egress_payload_type: 0,
             egress_frame_samples: 0,
             egress_timestamp_increment: 0,
+            // A relay-only direction forwards RTP verbatim; the repacketizer (frame size 0) never drains.
+            repacketizer: Repacketizer::new(0, 0),
+            pending_marker: false,
             // Carry the leg's telephone-event PT so `block DTMF` can drop the verbatim relay of it even
             // though this direction never transcodes. `telephone_event_out` stays `None` — a relay-only
             // leg never repacketizes; it drops or forwards the packet whole.
@@ -661,7 +690,39 @@ impl Direction {
             None => pre_resample,
         };
 
-        self.emit_pcm(egress_pcm, parsed.marker, out);
+        // Re-frame to the egress ptime: accumulate in the egress sample domain (post-resample) and
+        // emit one RTP packet per full egress frame. Resample **then** accumulate — the resampler is
+        // stateful (holds filter history across frames) so it must see the continuous per-ingress-frame
+        // stream, and accumulating in the egress domain makes the drain quantum exactly the encoder's
+        // frame size.
+        self.repacketize(egress_pcm, parsed.marker, out);
+    }
+
+    /// Re-frame decoded egress-domain PCM to this direction's egress `ptime` and emit one RTP packet
+    /// per full egress frame. The accumulator (preallocated) buffers a partial frame across ingress
+    /// packets, so a small ingress frame waits for a full egress frame and a large one emits several —
+    /// each with sequence +1 (RFC 3550 §5.1) and timestamp +`egress_timestamp_increment` (in the RTP
+    /// clock, RFC 3551 §4.5.2), advanced by [`Direction::emit_pcm`].
+    fn repacketize(&mut self, egress_pcm: &[i16], ingress_marker: bool, out: &mut Vec<Outbound>) {
+        // RFC 3550 §5.1: the marker flags the first packet of a talkspurt. Carry the sender's talkspurt
+        // boundary to the *first* egress packet that follows (repacketization means one ingress packet
+        // maps to zero-or-many egress packets), rather than stamping every egress packet with it.
+        if ingress_marker {
+            self.pending_marker = true;
+        }
+        // No egress framing (degenerate frame size 0): emit the chunk as one packet, unchanged.
+        if self.repacketizer.frame_samples() == 0 {
+            let marker = std::mem::take(&mut self.pending_marker);
+            self.emit_pcm(egress_pcm, marker, out);
+            return;
+        }
+        self.repacketizer.push(egress_pcm);
+        // `egress_frame_samples` is bounded to `MAX_PCM` in `Direction::new`, so one frame always fits.
+        let mut frame = [0i16; MAX_PCM];
+        while let Some(count) = self.repacketizer.next_frame(&mut frame) {
+            let marker = std::mem::take(&mut self.pending_marker);
+            self.emit_pcm(&frame[..count], marker, out);
+        }
     }
 
     /// Append one egress datagram toward this direction's peer, encrypting it (SRTP/SRTCP, auto-
@@ -1668,6 +1729,324 @@ mod tests {
         // µ-law 0xFF and A-law decode of that sample differ at the byte level → genuinely transcoded.
         assert_ne!(packet.payload, &[0xFFu8; 160][..]);
         assert!(events.is_empty());
+    }
+
+    /// Build a µ-law(A) → A-law(B) transcoding call whose **A→B egress** encoder packetizes at
+    /// `egress_ptime_ms`, so the repacketizer must re-frame A's 20 ms ingress to that egress ptime.
+    fn ulaw_to_alaw_egress_ptime(egress_ptime_ms: u8) -> MediaCall {
+        use siphon_rtp_codec::g711::Variant;
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            decoder: Box::new(G711::ulaw()),
+            encoder: Box::new(G711::new(Variant::Alaw, egress_ptime_ms)),
+            egress_ssrc: 0xB000_0001,
+            egress_payload_type: 8,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: Box::new(G711::alaw()),
+            encoder: Box::new(G711::ulaw()),
+            egress_ssrc: 0xA000_0001,
+            egress_payload_type: 0,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+        MediaCall::new(
+            "call-ptime",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        )
+    }
+
+    /// A µ-law RTP packet of `samples` bytes (one sample/byte at 8 kHz) with an explicit marker bit.
+    fn ulaw_rtp_frame(sequence: u16, payload_byte: u8, samples: usize, marker: bool) -> Vec<u8> {
+        let header = RtpHeader {
+            marker,
+            payload_type: 0,
+            sequence,
+            timestamp: u32::from(sequence) * samples as u32,
+            ssrc: 0x1234_5678,
+        };
+        let payload = vec![payload_byte; samples];
+        let mut buffer = vec![0u8; 12 + payload.len()];
+        let len = write_packet(&header, &payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    #[test]
+    fn repacketizes_two_20ms_ingress_frames_into_one_40ms_egress_packet() {
+        // A→B egress ptime overridden to 40 ms: two 20 ms µ-law frames in → one 40 ms A-law packet out.
+        let mut call = ulaw_to_alaw_egress_ptime(40);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // First 20 ms frame buffers — it is not yet a full 40 ms egress frame.
+        call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0xFF)), &mut out, &mut events);
+        assert!(
+            out.is_empty(),
+            "first 20 ms frame buffered, no egress packet yet"
+        );
+
+        // Second 20 ms frame completes a 40 ms egress frame → exactly one packet.
+        call.process(&rx(1, A_ADDR, ulaw_rtp(2, 0xFF)), &mut out, &mut events);
+        assert_eq!(
+            out.len(),
+            1,
+            "two 20 ms ingress frames → one 40 ms egress packet"
+        );
+        let packet = RtpPacket::parse(&out[0].data).expect("parse");
+        assert_eq!(packet.payload_type, 8, "re-encoded as A-law");
+        assert_eq!(
+            packet.payload.len(),
+            320,
+            "40 ms at 8 kHz = 320 samples (summed frame count)"
+        );
+        assert_eq!(packet.sequence, 0, "first egress sequence");
+        assert_eq!(packet.timestamp, 0, "first egress timestamp");
+
+        // Two more frames make the next 40 ms packet: sequence +1, timestamp +320 (RFC 3550 §5.1).
+        out.clear();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(3, 0xFF)), &mut out, &mut events);
+        assert!(out.is_empty());
+        call.process(&rx(1, A_ADDR, ulaw_rtp(4, 0xFF)), &mut out, &mut events);
+        assert_eq!(out.len(), 1);
+        let next = RtpPacket::parse(&out[0].data).expect("parse");
+        assert_eq!(
+            next.sequence, 1,
+            "sequence increments by 1 per egress packet"
+        );
+        assert_eq!(
+            next.timestamp, 320,
+            "timestamp advances by the 40 ms egress sample count (RFC 3550 §5.1)"
+        );
+    }
+
+    #[test]
+    fn repacketizes_one_20ms_ingress_frame_into_two_10ms_egress_packets() {
+        // A→B egress ptime overridden to 10 ms: one 20 ms µ-law frame in → two 10 ms A-law packets out.
+        let mut call = ulaw_to_alaw_egress_ptime(10);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0xFF)), &mut out, &mut events);
+        assert_eq!(
+            out.len(),
+            2,
+            "one 20 ms ingress frame → two 10 ms egress packets"
+        );
+        let first = RtpPacket::parse(&out[0].data).expect("parse");
+        let second = RtpPacket::parse(&out[1].data).expect("parse");
+        assert_eq!(first.payload.len(), 80, "10 ms at 8 kHz");
+        assert_eq!(second.payload.len(), 80);
+        assert_eq!(
+            second.sequence,
+            first.sequence.wrapping_add(1),
+            "two sequence numbers, +1"
+        );
+        assert_eq!(
+            second.timestamp.wrapping_sub(first.timestamp),
+            80,
+            "10 ms apart in the 8 kHz egress clock"
+        );
+    }
+
+    #[test]
+    fn fractional_30ms_ingress_to_20ms_egress_loses_no_samples_across_the_stream() {
+        // A→B egress ptime 20 ms (default), ingress 30 ms (240-sample µ-law): a fractional 3:2 ratio
+        // that buffers across packets. Over the stream the egress packet count and contiguous RTP
+        // timestamps prove no samples are lost or duplicated (byte-accounted).
+        let mut call = ulaw_to_alaw_egress_ptime(20);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let ingress_frames = 8u16;
+        for sequence in 1..=ingress_frames {
+            call.process(
+                &rx(1, A_ADDR, ulaw_rtp_frame(sequence, 0x40, 240, false)),
+                &mut out,
+                &mut events,
+            );
+        }
+        // 8 × 240 = 1920 egress samples ÷ 160 (20 ms) = exactly 12 egress packets, 0 leftover.
+        assert_eq!(
+            out.len(),
+            12,
+            "1920 egress samples re-framed into twelve 20 ms packets"
+        );
+        for (index, datagram) in out.iter().enumerate() {
+            let packet = RtpPacket::parse(&datagram.data).expect("parse");
+            assert_eq!(
+                packet.payload.len(),
+                160,
+                "each egress packet is a full 20 ms frame"
+            );
+            assert_eq!(packet.sequence, index as u16, "contiguous egress sequence");
+            assert_eq!(
+                packet.timestamp,
+                index as u32 * 160,
+                "contiguous egress timestamps — no samples dropped or duplicated"
+            );
+        }
+    }
+
+    /// Build a G.722 ↔ G.722 call whose A→B egress packetizes at `egress_ptime_ms`. G.722 samples
+    /// 16 kHz but clocks RTP at 8 kHz (RFC 3551 §4.5.2), so the egress timestamp steps by ptime × 8 kHz.
+    fn g722_call(egress_ptime_ms: u8) -> MediaCall {
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            decoder: Box::new(G722::new(20)),
+            encoder: Box::new(G722::new(egress_ptime_ms)),
+            egress_ssrc: 0xB000_0009,
+            egress_payload_type: 9,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: Box::new(G722::new(20)),
+            encoder: Box::new(G722::new(20)),
+            egress_ssrc: 0xA000_0009,
+            egress_payload_type: 9,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+        MediaCall::new(
+            "call-g722",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        )
+    }
+
+    #[test]
+    fn g722_egress_timestamp_uses_the_8khz_rtp_clock_not_the_16khz_sample_rate() {
+        // A→B egress ptime overridden to 40 ms: four 20 ms G.722 frames → two 40 ms egress packets.
+        let mut call = g722_call(40);
+        let mut out = Vec::new();
+        for sequence in 1..=4 {
+            call.process(
+                &rx(1, A_ADDR, g722_rtp(sequence)),
+                &mut out,
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(
+            out.len(),
+            2,
+            "four 20 ms G.722 frames → two 40 ms egress packets"
+        );
+        let first = RtpPacket::parse(&out[0].data).expect("parse");
+        let second = RtpPacket::parse(&out[1].data).expect("parse");
+        // 40 ms × 8000 Hz ÷ 1000 = 320 ts units — NOT 40 × 16000 ÷ 1000 = 640 (RFC 3551 §4.5.2).
+        assert_eq!(
+            second.timestamp.wrapping_sub(first.timestamp),
+            320,
+            "G.722 advances the 8 kHz RTP clock (ptime × 8000 ÷ 1000), not the 16 kHz sample rate"
+        );
+        assert_eq!(
+            first.payload.len(),
+            320,
+            "40 ms of G.722 codes (2 samples/byte at 16 kHz)"
+        );
+    }
+
+    #[test]
+    fn egress_marker_follows_the_ingress_talkspurt_not_a_blind_copy() {
+        // 1:1 20 ms transcode: the egress marker must track the sender's talkspurt boundary
+        // (RFC 3550 §5.1), never a blind per-packet copy.
+        let mut call = ulaw_to_alaw_egress_ptime(20);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // Mid-stream (no marker) → egress marker clear.
+        call.process(
+            &rx(1, A_ADDR, ulaw_rtp_frame(1, 0xFF, 160, false)),
+            &mut out,
+            &mut events,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(
+            !RtpPacket::parse(&out[0].data).expect("parse").marker,
+            "no talkspurt marker to copy"
+        );
+
+        // Talkspurt restart (marker set) → the next egress packet carries the marker.
+        out.clear();
+        call.process(
+            &rx(1, A_ADDR, ulaw_rtp_frame(2, 0xFF, 160, true)),
+            &mut out,
+            &mut events,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(
+            RtpPacket::parse(&out[0].data).expect("parse").marker,
+            "talkspurt start propagated"
+        );
+
+        // Continuation (no marker) → the marker is not sticky.
+        out.clear();
+        call.process(
+            &rx(1, A_ADDR, ulaw_rtp_frame(3, 0xFF, 160, false)),
+            &mut out,
+            &mut events,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(
+            !RtpPacket::parse(&out[0].data).expect("parse").marker,
+            "marker cleared after one packet"
+        );
+    }
+
+    #[test]
+    fn buffered_talkspurt_marker_rides_to_the_first_full_egress_frame() {
+        // A marked ingress frame that only buffers (20 ms into a 40 ms egress) must not lose its
+        // talkspurt marker — it rides to the first egress packet that carries the talkspurt start.
+        let mut call = ulaw_to_alaw_egress_ptime(40);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(
+            &rx(1, A_ADDR, ulaw_rtp_frame(1, 0xFF, 160, true)),
+            &mut out,
+            &mut events,
+        );
+        assert!(
+            out.is_empty(),
+            "marked frame buffered, no egress packet yet"
+        );
+        call.process(
+            &rx(1, A_ADDR, ulaw_rtp_frame(2, 0xFF, 160, false)),
+            &mut out,
+            &mut events,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(
+            RtpPacket::parse(&out[0].data).expect("parse").marker,
+            "the buffered talkspurt marker rides to the first full 40 ms egress packet"
+        );
     }
 
     /// An AMR-WB RTP packet (PT 96) carrying `payload`, with the 16 kHz RTP clock (320 ts units per

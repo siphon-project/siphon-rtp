@@ -438,8 +438,8 @@ fn parse_received_from(request: &Value) -> Option<std::net::IpAddr> {
 
 /// Normalize the structured `codec` dict (stock-client form) into `codec-<op>-<NAME>` flag strings so
 /// the engine sees one codec representation regardless of wire form. A `ptime` is carried through as a
-/// `ptime=<N>` flag for rtpengine compatibility, but packetization is taken from the SDP `a=ptime`
-/// (RFC 3551), so the flag is informational today.
+/// `ptime=<N>` flag for rtpengine compatibility; on a transcoding call the engine's repacketizer honours
+/// it and re-frames the synthesized egress to `<N>` ms (else the SDP `a=ptime` packetization stands).
 fn append_codec_flags(request: &Value, flags: &mut Vec<String>) {
     if let Some(codec) = request.get("codec").and_then(Value::as_dict) {
         for (operation, names) in codec {

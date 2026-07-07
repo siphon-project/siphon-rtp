@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name = "pcap_bench"
 harness = false
+
+[[bench]]
+name = "repacketize_bench"
+harness = false
