@@ -465,6 +465,12 @@ pub struct Engine<D: Datapath> {
     /// in `a=fingerprint` on a DTLS leg. Generated once at startup and reused for every leg; `None`
     /// only if generation failed, in which case DTLS-SRTP offers are rejected.
     dtls_certificate: Option<DtlsCertificate>,
+    /// TLS client configuration for `wss://` WebSocket-bridge dials (mod_audio_stream / voice-AI).
+    /// Built lazily once on the first bridge dial (the ring/rustls provider — the project's zero-C
+    /// TLS stack, never aws-lc-rs — with its trust store seeded from the webpki-roots Mozilla CA
+    /// bundle) and reused for every leg. A `ws://` dial ignores it. Tests may pre-seed it to trust a
+    /// self-signed server certificate.
+    ws_tls_config: std::sync::OnceLock<Arc<rustls::ClientConfig>>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -506,7 +512,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(ClusterState::new("siphon-rtp".to_string(), 0, Vec::new())),
             dtls_certificate,
+            ws_tls_config: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Build (once) and return the ring-backed rustls client configuration for `wss://` WebSocket
+    /// bridge dials. The trust store is seeded from the webpki-roots Mozilla CA bundle; the handshake
+    /// runs on the **ring** crypto provider — the project's pure-Rust, zero-C TLS stack (never
+    /// aws-lc-rs, whose default provider bundles C/asm). RFC 8446 / RFC 5246 over the RFC 6455 `wss`
+    /// upgrade. Cached in a `OnceLock`, so it is built at most once and shared across every leg.
+    fn ws_tls_client_config(&self) -> Arc<rustls::ClientConfig> {
+        self.ws_tls_config
+            .get_or_init(|| {
+                // Install the ring provider as the process default (idempotent — reuses the same
+                // sanctioned path the TURN TLS listener uses). rustls is built with
+                // `default-features = false, features = ["ring"]`, so aws-lc-rs is not compiled: ring
+                // is the only backend, and the config below is explicitly built on it.
+                siphon_rtp_turn::tls::install_crypto_provider();
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let config = rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                Arc::new(config)
+            })
+            .clone()
     }
 
     /// Replace the default cluster identity/capacity with operator-configured state (`main.rs`
@@ -1062,7 +1092,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// server as a client, build a [`BridgeSession`] on a [`MediaLeg`] in A's codec, and spawn the
     /// bridge + the rtp_out→datapath drain task, registering both in the [`WsRegistry`]. The bridge's
     /// `rtp_in` is fed by the redirect dispatcher (gated by `accepted_source` — RTPBleed defence,
-    /// `Redirect` skips the datapath gate). `ws://` only for v1 (`wss://` is a follow-up).
+    /// `Redirect` skips the datapath gate). Dials both `ws://` and `wss://` (TLS on ring/rustls).
     async fn setup_ws_bridge(
         &self,
         call_id: &str,
@@ -1085,11 +1115,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .install_flow(endpoint_a.id, FlowAction::Redirect)
             .map_err(|error| format!("install WS bridge redirect: {error}"))?;
 
-        // Dial the WS server as a client (ws:// for v1). connect_async returns the stream + the HTTP
-        // upgrade response; we keep only the stream.
-        let (socket, _response) = tokio_tungstenite::connect_async(ws_uri)
-            .await
-            .map_err(|error| format!("dial {ws_uri}: {error}"))?;
+        // Dial the WS server as a client. Supply a ring/rustls TLS connector so a `wss://` URI
+        // completes the RFC 8446 handshake before the RFC 6455 upgrade; a `ws://` URI ignores the
+        // connector (plain TCP). Returns the stream + the HTTP upgrade response; keep only the stream.
+        let connector = tokio_tungstenite::Connector::Rustls(self.ws_tls_client_config());
+        let (socket, _response) =
+            tokio_tungstenite::connect_async_tls_with_config(ws_uri, None, false, Some(connector))
+                .await
+                .map_err(|error| format!("dial {ws_uri}: {error}"))?;
 
         // A jitter buffer shallow enough for low-latency voice-AI (target 1, cap 16 — the bridge
         // pops one frame per ptime tick, the consumer's cadence being the sample-tick clock).
@@ -6425,6 +6458,143 @@ mod tests {
         assert!(
             !engine.ws().is_ws_call("ws-1"),
             "WS call deregistered on delete"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_attaches_leg_a_to_a_secure_websocket_server_over_wss() {
+        // The `wss://` counterpart of the plain-`ws://` bridge test: a control client sets a `wss://`
+        // `ws_uri`, and the engine dials it over TLS (RFC 8446 handshake on the ring/rustls provider,
+        // RFC 6455 upgrade) before streaming. Proves the ring-backed connector completes the TLS +
+        // WebSocket handshake end-to-end and the mod_audio_stream `start` frame flows over the tunnel.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use futures_util::StreamExt;
+        use siphon_rtp_media::bridge::protocol::ControlMessage;
+        use tokio_tungstenite::tungstenite::Message;
+
+        // Ring is the only crypto provider compiled (rustls `default-features = false, ["ring"]`);
+        // install it as the process default so the test-side rustls configs build on it too.
+        siphon_rtp_turn::tls::install_crypto_provider();
+
+        // A fresh self-signed certificate for the loopback IP the engine will dial (IP SAN so rustls
+        // validates the `ServerName::IpAddress` derived from `wss://127.0.0.1:...`).
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("gen cert");
+        let cert_der = rustls_pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key_der = rustls_pki_types::PrivateKeyDer::Pkcs8(
+            rustls_pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
+        );
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server tls config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        // A TLS WebSocket server: TLS-accept the connection, run the WS handshake over the tunnel, and
+        // relay every received frame out `ws_rx`.
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind wss");
+        let ws_addr = ws_listener.local_addr().expect("wss addr");
+        let (ws_tx, ws_rx) = flume::unbounded::<Message>();
+        tokio::spawn(async move {
+            let (stream, _) = ws_listener.accept().await.expect("accept tcp");
+            let tls_stream = acceptor.accept(stream).await.expect("tls handshake");
+            let socket = tokio_tungstenite::accept_async(tls_stream)
+                .await
+                .expect("wss handshake");
+            let (_sink, mut source) = socket.split();
+            while let Some(incoming) = source.next().await {
+                match incoming {
+                    Ok(message) => {
+                        if ws_tx.send(message).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        // Pre-seed the engine's `wss://` client trust store with the self-signed test certificate so
+        // the dial validates it (production seeds from the webpki-roots Mozilla CA bundle instead).
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).expect("add test root");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        engine
+            .ws_tls_config
+            .set(std::sync::Arc::new(client_config))
+            .expect("seed wss client config");
+
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (_phone_a, addr_a) = phone().await;
+
+        // A offers PCMU with a `wss://` `ws_uri` → the engine dials the TLS WS and bridges leg A.
+        let profile = ProfileFlags {
+            ws_uri: Some(format!("wss://127.0.0.1:{}/stream", ws_addr.port())),
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "wss-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile,
+                },
+            )
+            .await;
+        assert!(matches!(offer, CmdResult::Ok { .. }), "wss offer succeeds");
+        assert!(
+            engine.ws().is_ws_call("wss-1"),
+            "the call is a WS-bridge call"
+        );
+
+        // The TLS WebSocket server receives the `start` text frame first — proof the TLS handshake and
+        // the WS upgrade both completed over `wss://`.
+        let first = timeout(Duration::from_secs(3), ws_rx.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("a frame");
+        match first {
+            Message::Text(text) => assert!(
+                matches!(
+                    ControlMessage::from_json(text.as_str()),
+                    Ok(ControlMessage::Start(_))
+                ),
+                "first WSS frame is `start`"
+            ),
+            other => panic!("expected start text frame over wss, got {other:?}"),
+        }
+
+        // Teardown frees the secure WS bridge.
+        let deleted = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "wss-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+        assert!(
+            !engine.ws().is_ws_call("wss-1"),
+            "WSS call deregistered on delete"
         );
     }
 

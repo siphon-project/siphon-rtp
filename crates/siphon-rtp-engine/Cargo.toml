@@ -43,7 +43,14 @@ siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.1.0" }
 siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.1.0" }
 siphon-rtp-dsp = { path = "../siphon-rtp-dsp", version = "0.1.0" }
 tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
+# `rustls-tls-webpki-roots` gives the WebSocket bridge a `wss://` client (RFC 6455 over RFC 8446).
+# Pure Rust: it pulls tokio-rustls/rustls with `default-features = false`, so no aws-lc-rs — the
+# ring provider (installed explicitly, see engine.rs) is the only backend compiled.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+# Build the explicit ring-backed `wss://` client config (RootCertStore + no client auth).
+rustls = { workspace = true }
+# The Mozilla CA bundle seeded into that client config's trust store.
+webpki-roots = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
@@ -74,3 +81,8 @@ tikv-jemalloc-ctl = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }
+# `wss://` handshake test: a self-signed TLS WebSocket server (rcgen cert → tokio-rustls acceptor)
+# the engine dials, proving the ring/rustls connector completes the TLS + WS upgrade end-to-end.
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
