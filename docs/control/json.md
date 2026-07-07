@@ -88,7 +88,7 @@ yet**, noted below.
 | `flags` | string list | Behavioral flags plus the codec directives (`codec-transcode-X`, `codec-mask-X`, `codec-strip-X`, `codec-offer-X`, `codec-except-X`, `ptime=N`, ...). |
 | `direction` | string list | Parsed for compatibility, **currently no-op** (multi-interface direction routing is planned). |
 | `record_call`, `record_path` | bool, string | Record this call from setup; output directory. |
-| `ws_uri` | string | Attach leg A to an external WebSocket media server (`ws://` only for v1). A native extension; not available over NG. |
+| `ws_uri` | string | Attach leg A to an external WebSocket media server (`ws://` or `wss://`; `wss://` on ring/rustls with webpki-roots trust). A native extension; not available over NG. |
 | `received_from` | IP string | The real post-NAT source IP the SIP proxy saw. Tightens the ingress source gate (anti-RTPBleed, see [Security and NAT](../security-and-nat.md)). |
 | `rtcp_mux` | string list | rtpengine `rtcp-mux` directives (`offer`, `require`, `demux`, `accept`, `reject`, `remove`) overriding the RFC 5761 mux decision. |
 

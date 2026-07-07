@@ -11,8 +11,9 @@ Two things to be clear about up front:
 
 - This is a native siphon-rtp extension. The `ws_uri` field exists only on the JSON-over-TCP
   control channel; the rtpengine NG/bencode front-end never sets it.
-- v1 dials `ws://` only. `wss://` is a follow-up (the engine is built without WebSocket TLS
-  today, so a `wss://` URI fails at dial). Run the WS server on a trusted network segment.
+- Both `ws://` and `wss://` are dialled. `wss://` runs the TLS handshake on the pure-Rust
+  ring/rustls stack (no OpenSSL, no C), validating the server against the built-in webpki-roots
+  Mozilla CA bundle. Prefer `wss://` when the WS server is off the trusted segment.
 
 Adapters for OpenAI Realtime, gRPC media streaming, and a direct WebRTC leg are planned, not
 shipped. What ships today is the raw-PCM WebSocket wire described below.

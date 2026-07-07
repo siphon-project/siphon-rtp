@@ -338,8 +338,8 @@ pub struct ProfileFlags {
     /// mod_audio_stream / voice-AI integration). When set on `offer`/`answer`, the engine dials this
     /// URI as a WebSocket client and bridges leg A's RTP to it (decode → L16 uplink, L16 downlink →
     /// encode); the A↔B relay/transcode path is not wired in this mode (the WS server is A's far
-    /// side). A native siphon-rtp extension — the NG/bencode front-end does not set it. `ws://` only
-    /// for v1 (`wss://` is a follow-up).
+    /// side). A native siphon-rtp extension — the NG/bencode front-end does not set it. Both `ws://`
+    /// and `wss://` (TLS on ring/rustls, trust from the webpki-roots CA bundle) are dialled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_uri: Option<String>,
     /// The real post-NAT source IP the SIP proxy saw this request arrive from (rtpengine's
