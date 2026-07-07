@@ -37,16 +37,31 @@ bytes = "1.11"
 dashmap = "6"
 thiserror = "2"
 tracing = "0.1"
+# Next-hop MAC resolution (the `neighbor` module) talks to the kernel routing/neighbour/link tables
+# over rtnetlink. Chosen over `neli`: rtnetlink gives typed RTM_GETROUTE/GETNEIGH/GETLINK query
+# builders on an async Tokio socket and re-exports its `netlink-packet-route` message types, so the
+# same POD types the async worker receives are the ones the pure extractors + wire-fixture tests
+# parse — pure Rust, zero C deps. Pinned to rtnetlink 0.21's own netlink-packet-route (0.30) so there
+# is a single version of the message types across the crate.
+rtnetlink = "0.21"
+netlink-packet-route = "0.30"
+netlink-packet-core = "0.8"
+futures = "0.3"
 
 # No `[build-dependencies]`: build.rs invokes the eBPF build directly (rustup run <toolchain> cargo
 # build --target bpfel-unknown-none) instead of via aya-build, whose 0.1.x OUT_DIR embed copies the
 # artifact onto its own `--target-dir` path ("Is a directory"). See build.rs for the full rationale.
 
-# Dev-only: criterion for the in-kernel relay hot-path bench (the per-packet checksum/latch math);
-# libc (also a normal dep) for the veth XDP_TX smoke's raw AF_PACKET inject/capture.
+# Dev-only: criterion for both hot-path microbenches; libc (also a normal dep) for the veth
+# XDP_TX smoke's raw AF_PACKET inject/capture.
 [dev-dependencies]
 criterion = "0.5"
 libc = "0.2"
+
+# The TX-path next-hop-MAC cache-hit microbench (µs/frame gate; the Stage-1 neighbour resolver).
+[[bench]]
+name = "neighbor_bench"
+harness = false
 
 # The in-kernel FORWARD relay's per-packet rewrite cost (RFC 1624 checksum fixups + the latch
 # decision) — benched as `siphon_rtp_ebpf_common::rewrite`, the exact math the eBPF program runs.

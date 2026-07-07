@@ -80,7 +80,26 @@ pub struct MediaLeg {
     last_sr_ntp_middle: u32,
     /// Arrival (µs) of the most recent inbound SR, for the RR's DLSR field; `None` before any SR.
     last_sr_arrival_micros: Option<u64>,
+    /// Cumulative `expected` at the previous reception report, so `fraction_lost` describes just the
+    /// interval since (RFC 3550 §6.4.1 / Appendix A.3). `0` before the first report.
+    fraction_lost_expected_prior: u32,
+    /// Cumulative `lost` at the previous reception report (the counterpart snapshot to
+    /// `fraction_lost_expected_prior`). `0` before the first report.
+    fraction_lost_lost_prior: u32,
+    /// Fixed-size ring of the Sender Reports **this leg has sent**: each entry maps a report's NTP
+    /// middle-32 (the value a peer echoes back as LSR) to the logical send time (µs). Bounded — the
+    /// oldest entry is overwritten — so it never grows, and lookups are O(len) (RFC 3550 §6.4.1 RTT).
+    sent_reports: [Option<(u32, u64)>; SENT_SR_TABLE_LEN],
+    /// Next write slot in `sent_reports` (ring cursor).
+    sent_reports_next: usize,
+    /// The most recent round-trip time measured from an inbound reception report (µs), or `None`
+    /// until one is derived (RFC 3550 §6.4.1).
+    last_rtt_micros: Option<u64>,
 }
+
+/// Entries kept in the per-leg sent-Sender-Report ring (a few reporting intervals is ample — an RR
+/// echoes the LSR of the *last* SR its sender received, so recent history is all that is looked up).
+const SENT_SR_TABLE_LEN: usize = 8;
 
 impl MediaLeg {
     /// Build a leg from a decoder/encoder pair and a primed jitter buffer. `egress_ssrc` and
@@ -129,6 +148,11 @@ impl MediaLeg {
             ingress_jitter: 0.0,
             last_sr_ntp_middle: 0,
             last_sr_arrival_micros: None,
+            fraction_lost_expected_prior: 0,
+            fraction_lost_lost_prior: 0,
+            sent_reports: [None; SENT_SR_TABLE_LEN],
+            sent_reports_next: 0,
+            last_rtt_micros: None,
         }
     }
 
@@ -236,6 +260,95 @@ impl MediaLeg {
             }
             None => 0.0,
         }
+    }
+
+    /// The fraction of packets lost **since the previous call** as the RTCP reception report's 8-bit
+    /// fixed-point field (RFC 3550 §6.4.1 / Appendix A.3): `(lost_interval << 8) / expected_interval`,
+    /// saturating at 255. Snapshots the cumulative `(expected, lost)` on every call, so successive
+    /// reports each describe their own interval — the value resets per interval, it is **not**
+    /// cumulative. Returns `0` before the first inbound packet, or for an interval that expected no
+    /// packets. Deterministic: it reads only sequence / loss counters, never a clock. `expected` and
+    /// `lost` are the same signals [`MediaLeg::ingress_loss_percent`] divides.
+    #[must_use]
+    pub fn fraction_lost_since_last_report(&mut self) -> u8 {
+        let Some(base) = self.ingress_base_seq else {
+            return 0;
+        };
+        let expected = self
+            .ingress_extended_highest_seq()
+            .wrapping_sub(u32::from(base))
+            .wrapping_add(1);
+        let lost = self.jitter.stats().losses as u32;
+        let expected_interval = expected.wrapping_sub(self.fraction_lost_expected_prior);
+        let lost_interval = lost.wrapping_sub(self.fraction_lost_lost_prior);
+        self.fraction_lost_expected_prior = expected;
+        self.fraction_lost_lost_prior = lost;
+        // RFC 3550 A.3: no packets expected this interval, or no net loss ⇒ fraction 0. A "negative"
+        // interval (duplicates outran loss) wraps to a large `u32`, caught by `> expected_interval`.
+        if expected_interval == 0 || lost_interval == 0 || lost_interval > expected_interval {
+            return 0;
+        }
+        ((u64::from(lost_interval) << 8) / u64::from(expected_interval)).min(255) as u8
+    }
+
+    /// Record a Sender Report **this leg has sent**: map its NTP timestamp's middle 32 bits (the value
+    /// a peer echoes back as LSR, RFC 3550 §6.4.1) to `send_micros`, the logical send time, in a
+    /// fixed-size ring (oldest entry overwritten). A later inbound reception report looks this send
+    /// time up by its LSR to derive round-trip time. `send_micros` is a logical-clock reading (never
+    /// `Instant::now()`), so the RTT it feeds stays deterministic in tests.
+    pub fn record_sent_report(&mut self, ntp_timestamp: u64, send_micros: u64) {
+        let ntp_middle = ((ntp_timestamp >> 16) & 0xFFFF_FFFF) as u32;
+        self.sent_reports[self.sent_reports_next] = Some((ntp_middle, send_micros));
+        self.sent_reports_next = (self.sent_reports_next + 1) % SENT_SR_TABLE_LEN;
+    }
+
+    /// Consume an inbound reception report block that reports on **this leg's egress stream** and
+    /// derive the round-trip time (RFC 3550 §6.4.1): `rtt = arrival − DLSR − LSR`, where LSR selects
+    /// the Sender Report we sent (via [`MediaLeg::record_sent_report`]) and DLSR is the peer's
+    /// processing delay. Returns the RTT in microseconds (also stored for [`MediaLeg::ingress_rtt_ms`]),
+    /// or `None` when the block reports a different SSRC, carries no LSR, references an SR we do not
+    /// recognise, or the arithmetic underflows (a stale / clock-skewed report). `arrival_micros` is a
+    /// logical-clock reading, so the RTT is deterministic.
+    pub fn record_reception_report(
+        &mut self,
+        block: &crate::rtcp::ReportBlock,
+        arrival_micros: u64,
+    ) -> Option<u64> {
+        // The block must report on the stream we send (its SSRC field, RFC 3550 §6.4.1).
+        if block.ssrc != self.egress_ssrc {
+            return None;
+        }
+        let last_sender_report = block.last_sender_report;
+        if last_sender_report == 0 {
+            return None; // no SR echoed back ⇒ RTT not computable (RFC 3550 §6.4.1)
+        }
+        let send_micros = self
+            .sent_reports
+            .iter()
+            .flatten()
+            .find(|(ntp_middle, _)| *ntp_middle == last_sender_report)
+            .map(|(_, send_micros)| *send_micros)?;
+        // DLSR is in units of 1/65536 s; convert to microseconds.
+        let delay_micros = (u64::from(block.delay_since_last_sr) * 1_000_000) / 65_536;
+        let round_trip_micros = arrival_micros
+            .checked_sub(delay_micros)?
+            .checked_sub(send_micros)?;
+        self.last_rtt_micros = Some(round_trip_micros);
+        Some(round_trip_micros)
+    }
+
+    /// The most recent round-trip time measured from an inbound reception report (µs), or `None` until
+    /// one is derived (RFC 3550 §6.4.1).
+    #[must_use]
+    pub fn ingress_rtt_micros(&self) -> Option<u64> {
+        self.last_rtt_micros
+    }
+
+    /// The most recent measured round-trip time in **milliseconds** — the form the G.107 MOS estimator
+    /// halves into one-way mouth-to-ear delay. `None` until an RTT is measured.
+    #[must_use]
+    pub fn ingress_rtt_ms(&self) -> Option<f64> {
+        self.last_rtt_micros.map(|micros| micros as f64 / 1000.0)
     }
 
     /// Record an inbound Sender Report: its NTP timestamp's middle 32 bits become LSR, and
@@ -508,6 +621,78 @@ mod tests {
         leg.next_pcm(&mut pcm).expect("p2"); // decode seq 2
                                              // base seq 0, highest 2 ⇒ expected 3 packets; one concealed ⇒ 33.3 % loss.
         assert!((leg.ingress_loss_percent() - 100.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fraction_lost_is_the_per_interval_8bit_ratio() {
+        // RFC 3550 §6.4.1 / Appendix A.3: fraction = (lost_interval << 8) / expected_interval, over
+        // just the interval since the previous report — not cumulative.
+        let mut leg = ulaw_leg();
+        let mut pcm = [0i16; 160];
+
+        // Interval 1: base seq 0, highest 4 ⇒ expected 5; seq 1,2,3 concealed ⇒ 3 lost.
+        leg.ingest_rtp(&ulaw_packet(0, 0xFF)).expect("0");
+        leg.ingest_rtp(&ulaw_packet(4, 0xFF)).expect("4");
+        for _ in 0..5 {
+            leg.next_pcm(&mut pcm).expect("pop");
+        }
+        assert_eq!(leg.jitter_stats().losses, 3);
+        // (3 << 8) / 5 = 768 / 5 = 153.
+        assert_eq!(leg.fraction_lost_since_last_report(), 153);
+
+        // An immediate second report describes a zero-length interval ⇒ resets to 0 (not cumulative).
+        assert_eq!(leg.fraction_lost_since_last_report(), 0);
+
+        // Interval 2: highest advances to 7 ⇒ expected_interval 3; seq 6 concealed ⇒ lost_interval 1.
+        leg.ingest_rtp(&ulaw_packet(5, 0xFF)).expect("5");
+        leg.ingest_rtp(&ulaw_packet(7, 0xFF)).expect("7");
+        for _ in 0..3 {
+            leg.next_pcm(&mut pcm).expect("pop");
+        }
+        // (1 << 8) / 3 = 256 / 3 = 85 — a distinct per-interval value.
+        assert_eq!(leg.fraction_lost_since_last_report(), 85);
+    }
+
+    #[test]
+    fn rtt_from_reception_report_against_a_seeded_sent_sr_table() {
+        use crate::rtcp::ReportBlock;
+        let mut leg = ulaw_leg(); // egress SSRC 0xABCD_1234
+
+        // We sent an SR at logical time 1.0 s whose NTP middle-32 is 0xDEAD_BEEF.
+        leg.record_sent_report(0x0000_DEAD_BEEF_0000, 1_000_000);
+
+        // The peer's reception report on our egress SSRC echoes that LSR and reports DLSR = 0.5 s
+        // (0.5 × 65536 = 32768 units of 1/65536 s). It arrives at 2.0 s.
+        let block = ReportBlock {
+            ssrc: 0xABCD_1234,
+            fraction_lost: 0,
+            cumulative_lost: 0,
+            highest_sequence: 0,
+            jitter: 0,
+            last_sender_report: 0xDEAD_BEEF,
+            delay_since_last_sr: 32_768,
+        };
+        // rtt = arrival − DLSR − LSR-send = 2_000_000 − 500_000 − 1_000_000 = 500_000 µs.
+        assert_eq!(
+            leg.record_reception_report(&block, 2_000_000),
+            Some(500_000)
+        );
+        assert_eq!(leg.ingress_rtt_micros(), Some(500_000));
+        assert!((leg.ingress_rtt_ms().expect("rtt") - 500.0).abs() < 1e-9);
+
+        // A block echoing an LSR we never sent yields no RTT (rtt unknown).
+        let unknown = ReportBlock {
+            last_sender_report: 0x0BAD_0BAD,
+            ..block
+        };
+        assert_eq!(leg.record_reception_report(&unknown, 3_000_000), None);
+
+        // A block reporting on a different SSRC is not about our stream ⇒ no RTT.
+        let other_source = ReportBlock {
+            ssrc: 0x0000_0001,
+            ..block
+        };
+        assert_eq!(leg.record_reception_report(&other_source, 3_000_000), None);
     }
 
     #[test]

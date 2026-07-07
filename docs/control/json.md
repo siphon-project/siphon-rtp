@@ -74,21 +74,21 @@ Two more per-connection guards apply regardless of auth:
 | `delete` | `call_id`, `from_tag`, `to_tag?` | Tear down the session. |
 | `query` | `call_id`, `from_tag`, `to_tag?` | Session statistics: `packets_in/out`, `bytes_in/out`, `packets_lost`. |
 
-The `profile` object is the JSON twin of rtpengine's flag set. Most fields change behaviour; a few
-(`ice`, `dtls`, `direction`) are accepted for rtpengine compatibility but are **not policy inputs
-yet**, noted below.
+The `profile` object is the JSON twin of rtpengine's flag set. Most fields change behaviour; `ice`
+and `dtls` override the SDP-derived ICE/DTLS posture on `offer` (below); `direction` is accepted for
+rtpengine compatibility but is **not a policy input yet**.
 
 | `profile` field | Type | Meaning |
 |---|---|---|
 | `transport_protocol` | string | Far-leg transport, e.g. `RTP/AVP`, `RTP/SAVP` (SDES-SRTP, RFC 4568), `UDP/TLS/RTP/SAVPF` (DTLS-SRTP, RFC 5764). |
-| `ice` | string | Parsed for compatibility, **currently no-op**. ICE-lite is driven from the SDP (an ICE offer), not this field. |
-| `dtls` | string | Parsed for compatibility, **currently no-op**. DTLS-SRTP is selected by `transport_protocol` (`UDP/TLS/RTP/SAVPF`) + the SDP `a=fingerprint` / `a=setup`, not this field. |
+| `ice` | string | Override the SDP-derived ICE posture on the far offer (RFC 8445 / RFC 8839 §5). `force` (and `force-relay`) advertise engine ICE-lite even when the offer carried no ICE; `remove` strips the offerer's ICE and advertises none of ours. Unset ⇒ mirror the offer. `force-relay` degrades to `force` — the engine has no TURN allocator, so only its host candidate is offered. |
+| `dtls` | string | Override the DTLS-SRTP posture of a secure (`UDP/TLS/RTP/SAVP[F]`) far leg. `off` downgrades it to plaintext `RTP/AVP` (strips `a=fingerprint`/`a=setup`); `passive` / `active` / `actpass` set the offerer `a=setup` role (RFC 4145 §4 / RFC 5763 §5) instead of the default `actpass`. On a non-DTLS far leg the field is a no-op. |
 | `replace` | string list | SDP fields to rewrite, e.g. `["origin"]`. |
 | `address_family` | string | `IP4` \| `IP6` for the far leg's engine endpoints (v4/v6 interworking). |
 | `flags` | string list | Behavioral flags plus the codec directives (`codec-transcode-X`, `codec-mask-X`, `codec-strip-X`, `codec-offer-X`, `codec-except-X`, `ptime=N`, ...). |
 | `direction` | string list | Parsed for compatibility, **currently no-op** (multi-interface direction routing is planned). |
 | `record_call`, `record_path` | bool, string | Record this call from setup; output directory. |
-| `ws_uri` | string | Attach leg A to an external WebSocket media server (`ws://` only for v1). A native extension; not available over NG. |
+| `ws_uri` | string | Attach leg A to an external WebSocket media server (`ws://` or `wss://`; `wss://` on ring/rustls with webpki-roots trust). A native extension; not available over NG. |
 | `received_from` | IP string | The real post-NAT source IP the SIP proxy saw. Tightens the ingress source gate (anti-RTPBleed, see [Security and NAT](../security-and-nat.md)). |
 | `rtcp_mux` | string list | rtpengine `rtcp-mux` directives (`offer`, `require`, `demux`, `accept`, `reject`, `remove`) overriding the RFC 5761 mux decision. |
 

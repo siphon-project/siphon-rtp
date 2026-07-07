@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -46,7 +46,7 @@ jobs:
     # Deploy only from main; PRs just validate the build above.
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     permissions:
       pages: write
       id-token: write
