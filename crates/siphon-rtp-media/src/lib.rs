@@ -15,6 +15,7 @@ pub mod leg;
 pub mod mixer;
 pub mod pcap;
 pub mod player;
+pub mod repacketize;
 pub mod rtcp;
 pub mod rtp;
 pub mod wav;

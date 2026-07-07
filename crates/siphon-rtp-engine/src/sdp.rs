@@ -1044,6 +1044,15 @@ pub fn force_answer_codec(sdp: &str, primary: &CodecSpec, telephone_event: Optio
             if let Some(te) = telephone_event {
                 out.push(format!("a=rtpmap:{te} telephone-event/8000"));
             }
+            // Advertise the packetization the engine will actually send to this side (RFC 4566 §6):
+            // the leg's negotiated ptime or a `ptime=<N>` control override. The transcode datapath
+            // re-frames the egress to exactly this (the repacketizer), so the SDP must present our own
+            // ptime, never leak the far side's.
+            out.push(format!("a=ptime:{}", primary.ptime_ms));
+            continue;
+        }
+        // Drop the far side's `a=ptime` — we re-emit our own effective ptime above.
+        if line.starts_with("a=ptime:") {
             continue;
         }
         // Drop the far side's per-payload-type codec attributes; we re-emit our own above.
@@ -2078,6 +2087,29 @@ mod tests {
             "octet-align + negotiated mode advertised: {out}"
         );
         assert!(!out.contains("PCMU"), "B's PCMU dropped: {out}");
+    }
+
+    #[test]
+    fn force_answer_codec_advertises_the_legs_effective_ptime_not_the_far_sides() {
+        // B's answer carries a=ptime:20; the engine transcodes to A at a 40 ms override, so the answer
+        // to A must advertise a=ptime:40 (what A will receive), and B's a=ptime:20 must be dropped.
+        let far = "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                   m=audio 40000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=ptime:20\r\n";
+        let pcmu_40ms = CodecSpec::new(0, "PCMU", 8000, 1, 40);
+        let out = force_answer_codec(far, &pcmu_40ms, None);
+        assert!(
+            out.contains("a=ptime:40"),
+            "engine's effective 40 ms ptime advertised: {out}"
+        );
+        assert!(
+            !out.contains("a=ptime:20"),
+            "far side's 20 ms ptime dropped: {out}"
+        );
+        assert_eq!(
+            parse(&out).expect("reparse").ptime_ms,
+            40,
+            "the answer reparses to the overridden ptime"
+        );
     }
 
     #[test]

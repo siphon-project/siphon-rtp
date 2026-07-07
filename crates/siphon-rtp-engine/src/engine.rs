@@ -1378,6 +1378,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_local_crypto,
             far_dtls,
         );
+        // rtpengine `ptime=<N>` override: force the packetization of the synthesized (transcoded)
+        // egress toward both parties. Overriding the negotiated codec ptime here is the single source
+        // of truth — it flows to the egress encoder's frame size and the repacketizer (the RTP cadence,
+        // RFC 3550 §5.1), to the answer SDP `a=ptime` presented to A, and to the HA snapshot (so a
+        // restore rebuilds at the same ptime). Inert on a plain relay / bridge (which forward RTP
+        // verbatim and never re-encode); only a transcoding pipeline can re-frame.
+        let ptime_override = parse_ptime_override(&profile.flags);
+        let near_codec = near_codec.map(|codec| with_ptime_override(&codec, ptime_override));
         // For a passthrough relay, remember the installed forward actions so `block` can flip the
         // endpoints to `Drop` and `unblock` can restore them.
         let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
@@ -1512,7 +1520,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &"offer carried no usable audio codec",
                 );
             };
-            let Some(far_codec) = info.primary_codec() else {
+            let Some(far_codec) = info
+                .primary_codec()
+                .map(|codec| with_ptime_override(&codec, ptime_override))
+            else {
                 return error_result(
                     "secure media pipeline",
                     &"answer carried no usable audio codec",
@@ -1617,7 +1628,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let Some(near_codec) = near_codec.clone() else {
                 return error_result("media pipeline", &"offer carried no usable audio codec");
             };
-            let Some(far_codec) = info.primary_codec() else {
+            let Some(far_codec) = info
+                .primary_codec()
+                .map(|codec| with_ptime_override(&codec, ptime_override))
+            else {
                 return error_result("media pipeline", &"answer carried no usable audio codec");
             };
             let record_path = profile
@@ -1781,7 +1795,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.to_tag = Some(to_tag.clone());
             call.far.remote_rtp = Some(info.remote_rtp);
             call.far.remote_rtcp = Some(info.remote_rtcp);
-            call.far_codec = info.primary_codec();
+            // Store the *effective* (ptime-overridden) codecs so an HA checkpoint captures the override
+            // and a restore rebuilds the transcode at the same packetization (inert for a plain relay).
+            call.near_codec = near_codec.clone();
+            call.far_codec = info
+                .primary_codec()
+                .map(|codec| with_ptime_override(&codec, ptime_override));
             // The far leg's RFC 4733 telephone-event PT from its answer, so `block DTMF` can gate leg
             // B's telephone-event even on a plain relay.
             call.far_telephone_event = info.telephone_event_payload_type();
@@ -3727,6 +3746,39 @@ fn parse_codec_flags(flags: &[String]) -> sdp::CodecPolicy {
     policy
 }
 
+/// Upper bound on a control-`ptime` override, in milliseconds. A sane telephony ceiling (the common
+/// values are 10 / 20 / 30 / 40 ms); it also keeps the egress frame within the transcode scratch
+/// buffer at every codec rate the engine encodes, so an absurd value can never overflow it.
+const MAX_PTIME_OVERRIDE_MS: u8 = 40;
+
+/// Parse rtpengine's `ptime=<N>` flag into an egress packetization override in milliseconds, clamped
+/// to `1..=MAX_PTIME_OVERRIDE_MS`. `None` when the flag is absent or unparseable — the negotiated
+/// (SDP `a=ptime`) packetization then stands. The first well-formed `ptime=` flag wins.
+fn parse_ptime_override(flags: &[String]) -> Option<u8> {
+    flags.iter().find_map(|flag| {
+        flag.strip_prefix("ptime=")
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .filter(|&value| value >= 1)
+            .map(|value| (value.min(u16::from(MAX_PTIME_OVERRIDE_MS))) as u8)
+    })
+}
+
+/// Apply a `ptime` override to a codec: `Some(ms)` returns a clone repacketized to `ms`, `None`
+/// leaves the negotiated ptime. Sample-based codecs (G.711/G.722/G.726/L16/CN) honour any ptime;
+/// a frame-based codec (AMR) keeps its native 20 ms frame regardless (its encoder emits one fixed
+/// frame), so the override is inert there — building the encoder from the returned spec is what
+/// re-frames the codecs that honour it.
+fn with_ptime_override(codec: &CodecSpec, override_ms: Option<u8>) -> CodecSpec {
+    match override_ms {
+        Some(ptime_ms) => {
+            let mut overridden = codec.clone();
+            overridden.ptime_ms = ptime_ms.max(1);
+            overridden
+        }
+        None => codec.clone(),
+    }
+}
+
 /// Map a `codec-transcode-<NAME>` target to a [`CodecSpec`] the engine can both advertise and
 /// **encode** (so the forced transcode does not fail at answer). Static codecs use their RFC 3551
 /// payload type; dynamic ones use a conventional number. `None` for an unknown or not-yet-encodable
@@ -4276,6 +4328,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn answer_ptime_override_advertises_the_re_framed_egress_ptime() {
+        // A offers PCMU; B answers PCMA → the engine transcodes (Media pipeline). A `ptime=40` override
+        // on the answer must surface as `a=ptime:40` in the answer SDP presented to A (the packetization
+        // A will receive), never the far side's 20 ms — end-to-end from the control flag to the wire.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ptime-call".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        // B answers PCMA (PT 8) as its primary → codec mismatch → transcode, with a=ptime:20.
+        let b_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=rtcp-mux\r\na=ptime:20\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port()
+        );
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ptime-call".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: b_sdp,
+                    profile: ProfileFlags {
+                        flags: vec!["ptime=40".into()],
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&answer);
+        assert!(
+            sdp.contains("a=ptime:40"),
+            "answer to A advertises the 40 ms override: {sdp}"
+        );
+        assert!(
+            !sdp.contains("a=ptime:20"),
+            "B's 20 ms ptime is not leaked to A: {sdp}"
+        );
+        let parsed = sdp::parse(&sdp).expect("reparse");
+        assert_eq!(
+            parsed.ptime_ms, 40,
+            "the answer reparses to the overridden ptime"
+        );
+        assert_eq!(
+            parsed.primary_codec().expect("codec").encoding_name,
+            "PCMU",
+            "A is presented its own codec at the overridden ptime"
+        );
+    }
+
     #[test]
     fn parse_codec_flags_maps_rtpengine_operations() {
         // Each rtpengine codec op (docs/ng_control_protocol.md) resolves onto the CodecPolicy.
@@ -4311,6 +4425,58 @@ mod tests {
         // Lowercase names are matched case-insensitively (stored uppercased).
         let lower = parse_codec_flags(&["codec-mask-pcma".into()]);
         assert_eq!(lower.remove, vec!["PCMA".to_string()]);
+    }
+
+    #[test]
+    fn parse_ptime_override_reads_the_flag_and_clamps_it() {
+        assert_eq!(parse_ptime_override(&["ptime=40".into()]), Some(40));
+        assert_eq!(parse_ptime_override(&["ptime=10".into()]), Some(10));
+        assert_eq!(parse_ptime_override(&[]), None, "absent → no override");
+        assert_eq!(
+            parse_ptime_override(&["symmetric".into(), "ptime=30".into()]),
+            Some(30),
+            "found among other flags"
+        );
+        assert_eq!(
+            parse_ptime_override(&["ptime=500".into()]),
+            Some(MAX_PTIME_OVERRIDE_MS),
+            "an absurd ptime is clamped to the ceiling"
+        );
+        assert_eq!(
+            parse_ptime_override(&["ptime=0".into()]),
+            None,
+            "0 ms rejected"
+        );
+        assert_eq!(
+            parse_ptime_override(&["ptime=".into()]),
+            None,
+            "empty value rejected"
+        );
+        assert_eq!(
+            parse_ptime_override(&["ptime=abc".into()]),
+            None,
+            "non-numeric rejected"
+        );
+    }
+
+    #[test]
+    fn with_ptime_override_reframes_only_when_present() {
+        let g711 = CodecSpec::new(0, "PCMU", 8000, 1, 20);
+        assert_eq!(
+            with_ptime_override(&g711, Some(40)).ptime_ms,
+            40,
+            "override applied"
+        );
+        assert_eq!(
+            with_ptime_override(&g711, None).ptime_ms,
+            20,
+            "no override → negotiated ptime stands"
+        );
+        // Only ptime changes; the rest of the spec is untouched.
+        let overridden = with_ptime_override(&g711, Some(30));
+        assert_eq!(overridden.encoding_name, "PCMU");
+        assert_eq!(overridden.clock_rate_hz, 8000);
+        assert_eq!(overridden.payload_type, 0);
     }
 
     #[tokio::test]
