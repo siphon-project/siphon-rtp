@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
@@ -842,6 +842,16 @@ impl MediaCall {
         self
     }
 
+    /// The call's shared SDES-SRTP leg, when this is a secure-transcode (`SrtpMedia`) call — so the
+    /// registry can retain a handle to it after the actor takes ownership of the `MediaCall`, and read
+    /// the leg's SRTP rollover for an HA checkpoint (RFC 3711 §3.3.1). `None` for a plaintext transcode
+    /// / relay call (no secure leg). The `a_to_b` egress and `b_to_a` ingress share the one `Arc` (set
+    /// together by [`MediaCall::with_far_secure_leg`]), so returning the A→B egress handle is enough.
+    #[must_use]
+    pub fn far_secure_leg(&self) -> Option<Arc<Mutex<SecureLeg>>> {
+        self.a_to_b.secure_egress.clone()
+    }
+
     /// Build a call from its two directions and identity.
     #[must_use]
     pub fn new(
@@ -1304,6 +1314,10 @@ struct CallHandle {
     /// `true` for a promoted passthrough relay (no transcode) — distinguishes it from a transcoding
     /// call so the engine's silence/play/DTMF guards stay correct.
     relay_only: bool,
+    /// The call's shared SDES-SRTP leg for a secure-transcode (`SrtpMedia`) call — retained so an HA
+    /// checkpoint can read its live SRTP rollover (RFC 3711 §3.3.1), which the running actor otherwise
+    /// owns exclusively. `None` for a plaintext transcode / relay call.
+    secure_leg: Option<Arc<Mutex<SecureLeg>>>,
 }
 
 impl MediaRegistry {
@@ -1333,6 +1347,10 @@ impl MediaRegistry {
         let endpoints = call.endpoints();
         let rtcp_endpoints = call.rtcp_endpoints();
         let relay_only = call.is_relay_only();
+        // Clone out the shared secure leg (if any) before the actor takes ownership of the `MediaCall`,
+        // so an HA checkpoint can reach its SRTP rollover (RFC 3711 §3.3.1). The `Arc` is the same
+        // instance the actor holds — reads are a brief, uncontended lock.
+        let secure_leg = call.far_secure_leg();
         let (mailbox, inbox) = flume::bounded(1024);
         for endpoint in endpoints
             .iter()
@@ -1350,6 +1368,7 @@ impl MediaRegistry {
                 rtcp_endpoints,
                 task,
                 relay_only,
+                secure_leg,
             },
         );
     }
@@ -1370,6 +1389,19 @@ impl MediaRegistry {
     #[must_use]
     pub fn is_media_call(&self, call_id: &str) -> bool {
         self.calls.contains_key(call_id)
+    }
+
+    /// Snapshot the live SRTP rollover of a secure-transcode (`SrtpMedia`) call's shared [`SecureLeg`]
+    /// for an HA checkpoint — the per-SSRC ROC + outbound SRTCP index that are estimated from observed
+    /// packets and so cannot be re-derived from the SDES keys on a standby (RFC 3711 §3.3.1 / §3.4).
+    /// `None` if the call is unknown or is not a secure-transcode call. The lock is held only for the
+    /// snapshot copy (no `.await` under it), so it never blocks the actor's per-packet path materially.
+    #[must_use]
+    pub fn rollover_snapshot(&self, call_id: &str) -> Option<SecureLegRollover> {
+        let handle = self.calls.get(call_id)?;
+        let leg = handle.secure_leg.as_ref()?;
+        let guard = leg.lock().ok()?;
+        Some(guard.rollover_snapshot())
     }
 
     /// Whether `call_id` is a **transcoding** media call (decode/re-encode), i.e. registered and not
@@ -1919,6 +1951,63 @@ mod tests {
         out.clear();
         call.process(&rx(4, "127.0.0.9:7000", rtcp_sr(1)), &mut out, &mut events);
         assert!(out.is_empty(), "unsignalled RTCP source dropped");
+    }
+
+    #[test]
+    fn far_secure_leg_is_exposed_only_for_a_secure_call() {
+        use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
+
+        let g711 = |ingress: u64, src: &str, egress: u64, dst: &str| DirectionConfig {
+            ingress_endpoint: endpoint(ingress),
+            accepted_source: SourceFilter::Exact(addr(src).ip()),
+            egress_endpoint: endpoint(egress),
+            egress_dst: addr(dst),
+            decoder: Box::new(G711::ulaw()),
+            encoder: Box::new(G711::ulaw()),
+            egress_ssrc: 0x1111_1111,
+            egress_payload_type: 0,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+        };
+
+        // A plaintext transcode call exposes no secure leg — an HA checkpoint has no SRTP rollover to
+        // read (`rollover_snapshot` returns `None`, so `build_secure_media_snapshot` yields no secure
+        // section).
+        let plain = MediaCall::new(
+            "plain",
+            "tag-a",
+            Some("tag-b".into()),
+            g711(1, A_ADDR, 2, B_ADDR),
+            g711(2, B_ADDR, 1, A_ADDR),
+            true,
+            None,
+        );
+        assert!(
+            plain.far_secure_leg().is_none(),
+            "a plaintext call has no shared secure leg"
+        );
+
+        // A secure-transcode call exposes the *same* shared leg both directions crypt against, so the
+        // registry can retain it and checkpoint its rollover after the actor takes ownership.
+        let local = SrtpKeyMaterial::from_inline_bytes(&[3u8; 30]).expect("local key");
+        let remote = SrtpKeyMaterial::from_inline_bytes(&[4u8; 30]).expect("remote key");
+        let leg = Arc::new(Mutex::new(SecureLeg::new(&local, &remote)));
+        let secure = MediaCall::new(
+            "secure",
+            "tag-a",
+            Some("tag-b".into()),
+            g711(1, A_ADDR, 2, B_ADDR),
+            g711(2, B_ADDR, 1, A_ADDR),
+            true,
+            None,
+        )
+        .with_far_secure_leg(leg.clone());
+        let exposed = secure.far_secure_leg().expect("secure leg exposed");
+        assert!(
+            Arc::ptr_eq(&exposed, &leg),
+            "the exact shared leg instance is returned"
+        );
     }
 
     #[test]
