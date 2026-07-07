@@ -427,7 +427,9 @@ impl Conference {
         }
         // RFC 5761 demux: payload-type byte 64..=95 marks RTCP. We never mix it, but a Sender Report
         // carries the sender's NTP timestamp, which we echo back as LSR (+ DLSR) in our own reception
-        // report so the peer can compute round-trip time (RFC 3550 §6.4.1). Consume it, then drop.
+        // report so the peer can compute round-trip time; and any reception report block the peer sends
+        // *about our egress stream* lets us derive round-trip time from its LSR/DLSR against the SRs we
+        // sent (RFC 3550 §6.4.1). Consume both, then drop (RTCP is never mixed).
         let packet_type = data[1] & 0x7f;
         if (64..=95).contains(&packet_type) {
             // Sender Report (V=2, PT=200): the 64-bit NTP timestamp sits at offset 8 (after the
@@ -437,6 +439,22 @@ impl Conference {
                     participant
                         .leg
                         .record_sender_report(u64::from_be_bytes(ntp_bytes), packet.arrival);
+                }
+            }
+            // Feed every reception report block (in an SR or an RR) to the leg's RTT estimator; it
+            // ignores blocks that report a different SSRC or echo an SR we don't recognise.
+            if let Ok(packets) = rtcp::parse_compound(data) {
+                for rtcp_packet in &packets {
+                    let blocks = match rtcp_packet {
+                        rtcp::RtcpPacket::SenderReport(report) => report.reports.as_slice(),
+                        rtcp::RtcpPacket::ReceiverReport(report) => report.reports.as_slice(),
+                        rtcp::RtcpPacket::Other { .. } => &[],
+                    };
+                    for block in blocks {
+                        participant
+                            .leg
+                            .record_reception_report(block, packet.arrival);
+                    }
                 }
             }
             return true;
@@ -476,20 +494,26 @@ impl Conference {
     }
 
     /// Append a periodic [`Event::CallQuality`] (RFC 3550 jitter/loss + ITU-T G.107 MOS) for every
-    /// participant that has received audio. `network_delay_ms` is the best-known one-way network
-    /// delay — pass `0.0` when it is not measured (the score then reflects jitter + loss + codec; the
-    /// jitter buffer's own delay is always folded in).
+    /// participant that has received audio. `network_delay_ms` is a fallback one-way network delay used
+    /// only for a leg with no measured RTT yet — each leg prefers its own measured `rtt/2` when a
+    /// reception report has yielded one (RFC 3550 §6.4.1); pass `0.0` for no fallback. The jitter
+    /// buffer's own delay is always folded in.
     pub fn build_quality_events(&self, network_delay_ms: f64, out: &mut Vec<Event>) {
         for participant in &self.participants {
             if participant.leg.ingress_ssrc().is_none() {
                 continue; // no inbound stream measured yet
             }
+            // One-way mouth-to-ear delay = RTT/2 (ITU-T G.107 §7.4) when this leg has a measured RTT
+            // (from an inbound reception report), else the caller's fallback.
+            let one_way_delay_ms = participant
+                .leg
+                .ingress_rtt_ms()
+                .map_or(network_delay_ms, |rtt_ms| rtt_ms / 2.0);
             // MOS from the engine's canonical G.107 E-model (`siphon-rtp-hep`, shared with the HEP
-            // export path) — fed the leg's measured loss + jitter (one-way network delay unknown
-            // here, so 0; the jitter buffer's own delay is modelled inside the E-model).
+            // export path) — fed the leg's measured loss + jitter + one-way delay.
             let impairments = siphon_rtp_hep::mos::Impairments {
                 loss_percent: participant.leg.ingress_loss_percent(),
-                one_way_delay_ms: network_delay_ms,
+                one_way_delay_ms,
                 jitter_ms: participant.leg.ingress_jitter_ms(),
             };
             out.push(Event::CallQuality {
@@ -522,17 +546,26 @@ impl Conference {
                 continue;
             }
             let egress_endpoint = self.participants[index].egress_endpoint;
+            // `fraction_lost` advances a per-interval snapshot (RFC 3550 §6.4.1), so it needs `&mut`
+            // and is taken only when this leg has an inbound stream to report a block for.
+            let fraction_lost = if self.participants[index].leg.ingress_ssrc().is_some() {
+                self.participants[index]
+                    .leg
+                    .fraction_lost_since_last_report()
+            } else {
+                0
+            };
             let leg = &self.participants[index].leg;
             let block;
             let reports: &[rtcp::ReceptionReport] = if let Some(ssrc) = leg.ingress_ssrc() {
                 block = rtcp::ReceptionReport {
                     ssrc,
+                    fraction_lost,
                     cumulative_lost: leg.jitter_stats().losses as u32,
                     extended_highest_seq: leg.ingress_extended_highest_seq(),
                     jitter: leg.ingress_jitter(),
                     last_sr: leg.last_sr(),
                     delay_last_sr: leg.delay_since_last_sr(now_micros),
-                    ..rtcp::ReceptionReport::default()
                 };
                 std::slice::from_ref(&block)
             } else {
@@ -567,6 +600,11 @@ impl Conference {
                 dst,
                 data: Bytes::copy_from_slice(wire),
             });
+            // Record the SR we just sent (NTP middle-32 → logical send time) so a later reception
+            // report from this peer can derive round-trip time (RFC 3550 §6.4.1).
+            self.participants[index]
+                .leg
+                .record_sent_report(ntp_timestamp, now_micros);
         }
     }
 
@@ -2006,6 +2044,74 @@ mod tests {
             }
             other => panic!("expected CallQuality, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn measured_rtt_from_inbound_reception_report_lowers_mos() {
+        // End-to-end RTT (RFC 3550 §6.4.1): the engine sends an SR (recording its NTP↔send-time), the
+        // peer replies with a reception report on the engine's egress SSRC echoing that LSR + a DLSR,
+        // and the engine derives RTT — halved into the E-model one-way delay, which lowers the MOS.
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")));
+
+        // In-order audio so there is an inbound stream to report on (no loss).
+        let pcm = [3000i16; 160];
+        for sequence in 0..4u16 {
+            conference.ingest(&rx_at(
+                1,
+                "10.0.0.1:5000",
+                ulaw_rtp(0, sequence, &pcm),
+                u64::from(sequence) * 20_000,
+            ));
+        }
+
+        // Baseline: no reception report yet ⇒ no measured RTT ⇒ delay fallback 0.
+        let mut baseline = Vec::new();
+        conference.build_quality_events(0.0, &mut baseline);
+        let Event::CallQuality {
+            mos: baseline_mos, ..
+        } = baseline[0]
+        else {
+            panic!("expected CallQuality, got {:?}", baseline[0]);
+        };
+
+        // The engine sends its SR at t = 100 ms with NTP middle-32 = 0x1234_5678.
+        let engine_ntp = 0x0000_1234_5678_0000u64;
+        let mut out = Vec::new();
+        conference.build_sender_reports(engine_ntp, 100_000, &mut out);
+
+        // The peer replies (arriving at t = 1.0 s) with a reception report on the engine's egress SSRC
+        // (party-0 = 0xC000_0000), echoing that LSR and DLSR = 0.5 s (32768 units of 1/65536 s):
+        // rtt = 1_000_000 − 500_000 − 100_000 = 400 ms ⇒ one-way 200 ms (past the G.107 delay knee).
+        let block = rtcp::ReceptionReport {
+            ssrc: 0xC000_0000,
+            last_sr: 0x1234_5678,
+            delay_last_sr: 32_768,
+            ..rtcp::ReceptionReport::default()
+        };
+        let mut buffer = [0u8; rtcp::SENDER_REPORT_LEN + rtcp::RECEPTION_REPORT_LEN];
+        let len = rtcp::write_sender_report(0x1000_0000, 0, 0, 0, 0, &[block], &mut buffer)
+            .expect("peer SR with reception block");
+        conference.ingest(&rx_at(
+            1,
+            "10.0.0.1:5000",
+            buffer[..len].to_vec(),
+            1_000_000,
+        ));
+
+        // The measured RTT now feeds one-way delay into the MOS, scoring below the delay-free baseline.
+        let mut delayed = Vec::new();
+        conference.build_quality_events(0.0, &mut delayed);
+        let Event::CallQuality {
+            mos: delayed_mos, ..
+        } = delayed[0]
+        else {
+            panic!("expected CallQuality, got {:?}", delayed[0]);
+        };
+        assert!(
+            delayed_mos < baseline_mos,
+            "measured RTT (200 ms one-way) lowers MOS: {baseline_mos} -> {delayed_mos}"
+        );
     }
 
     #[test]

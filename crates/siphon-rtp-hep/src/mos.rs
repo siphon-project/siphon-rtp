@@ -227,6 +227,23 @@ mod tests {
     }
 
     #[test]
+    fn measured_round_trip_delay_lowers_mos() {
+        // The one-way delay the E-model penalises is RTT/2 (ITU-T G.107 §7.4). A reception report with
+        // a real, non-zero RTT must therefore score below the same report with RTT unknown (0) — the
+        // delay impairment Id is present only in the first case.
+        let clean = Impairments::from_rtcp(0, 0, 8000, 0.0);
+        let delayed = Impairments::from_rtcp(0, 0, 8000, 400.0); // RTT 400 ms ⇒ 200 ms one-way
+        assert!(delayed.one_way_delay_ms > clean.one_way_delay_ms);
+        let clean_mos = estimate_mos(Codec::G711, clean);
+        let delayed_mos = estimate_mos(Codec::G711, delayed);
+        assert!(
+            delayed_mos < clean_mos,
+            "measured RTT (one-way {} ms) lowers MOS: {clean_mos} -> {delayed_mos}",
+            delayed.one_way_delay_ms
+        );
+    }
+
+    #[test]
     fn impairments_from_rtcp_fields() {
         // fraction_lost 128/256 = 50%; jitter 160 units @ 8 kHz = 20 ms; RTT 100 ms → 50 ms one-way.
         let impairments = Impairments::from_rtcp(128, 160, 8000, 100.0);

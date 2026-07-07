@@ -25,6 +25,8 @@ use siphon_rtp_datapath::{
 };
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_hep::exporter::HepExporter;
+use siphon_rtp_hep::mos::Impairments;
+use siphon_rtp_hep::report::QosReport;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
 use siphon_rtp_media::player::{PcmPlayer, WavSource};
@@ -3606,10 +3608,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .map(|entry| entry.value().clone())
     }
 
-    /// Drain observed relayed RTCP and export each datagram as a HEP capture to `exporter` (a
-    /// VoIPmonitor / Homer collector), correlated by call-id. Runs until the datapath's observation
-    /// stream closes; fire-and-forget — export errors are logged, never propagated, so telemetry
-    /// never disturbs the media path.
+    /// Drain observed relayed RTCP and export it as HEP captures to `exporter` (a VoIPmonitor / Homer
+    /// collector), correlated by call-id. Each observed datagram ships **twice**: once as the raw RTCP
+    /// (`protocol_type` = RTCP) for a passive collector, and once — per reception report block it
+    /// carries — as a QoS/MOS report (`protocol_type` = REPORT_JSON, HEP3 type 35) built from the
+    /// block's loss/jitter through the G.107 E-model (RFC 3550 §6.4.1, ITU-T G.107). Runs until the
+    /// datapath's observation stream closes; fire-and-forget — export errors are logged, never
+    /// propagated, so telemetry never disturbs the media path.
+    ///
+    /// Note: `observe_rtcp` taps only the plain-relay (in-kernel `Forward`) path, where the engine
+    /// originates no Sender Report of its own, so the QoS report carries no measured RTT (one-way delay
+    /// 0). Transcode/conference legs measure RTT on their own path and surface it via `CallQuality`.
     pub async fn run_rtcp_export(self: Arc<Self>, exporter: HepExporter, capture_agent_id: u32) {
         let observations = self.datapath.observe_rtcp();
         while let Ok(observed) = observations.recv_async().await {
@@ -3617,18 +3626,101 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 continue;
             };
             let (timestamp_secs, timestamp_micros) = wall_clock_now();
-            let capture = rtcp_capture(
+            // Raw RTCP passthrough (unchanged) — a passive collector still gets the bytes verbatim.
+            let raw = rtcp_capture(
                 &observed,
-                call_id,
+                call_id.clone(),
                 capture_agent_id,
                 timestamp_secs,
                 timestamp_micros,
             );
-            if let Err(error) = exporter.export(&capture).await {
+            if let Err(error) = exporter.export(&raw).await {
                 tracing::debug!(%error, "HEP RTCP export failed");
+            }
+            // ...plus a QoS/MOS report per reception report block (HEP3 type 35).
+            let (codec, clock_rate_hz) = self.qos_codec_for_endpoint(observed.endpoint);
+            for report in qos_captures(
+                &observed,
+                &call_id,
+                capture_agent_id,
+                timestamp_secs,
+                timestamp_micros,
+                codec,
+                clock_rate_hz,
+            ) {
+                if let Err(error) = exporter.export(&report).await {
+                    tracing::debug!(%error, "HEP QoS export failed");
+                }
             }
         }
     }
+
+    /// The G.107 codec and RTP clock rate for QoS reports on `endpoint` — the negotiated codec of the
+    /// leg (near/far) the endpoint belongs to, via [`crate::conference::hep_codec_for_name`]. Falls
+    /// back to G.711 at 8 kHz when the call or its codec is not (yet) known.
+    fn qos_codec_for_endpoint(&self, endpoint: EndpointId) -> (siphon_rtp_hep::mos::Codec, u32) {
+        use crate::ha::EndpointRole;
+        let fallback = (siphon_rtp_hep::mos::Codec::G711, 8000);
+        let Some(call_id) = self.call_for_endpoint(endpoint) else {
+            return fallback;
+        };
+        let Some(call) = self.calls.get(&call_id) else {
+            return fallback;
+        };
+        let codec = match call.endpoint_role(endpoint) {
+            Some(EndpointRole::FarRtp | EndpointRole::FarRtcp) => call.far_codec.as_ref(),
+            _ => call.near_codec.as_ref(),
+        };
+        match codec {
+            Some(spec) => (
+                crate::conference::hep_codec_for_name(&spec.encoding_name),
+                spec.clock_rate_hz.max(1),
+            ),
+            None => fallback,
+        }
+    }
+}
+
+/// Build HEP QoS/MOS report captures (`protocol_type` = REPORT_JSON) from an observed RTCP datagram:
+/// one per reception report block (RFC 3550 §6.4.1) in any Sender/Receiver Report it carries. Each
+/// block's `fraction_lost` + `jitter` drive the G.107 E-model MOS (ITU-T G.107). `rtt` is 0 — the
+/// passive relay path measures none (see [`Engine::run_rtcp_export`]).
+fn qos_captures(
+    observed: &ObservedRtcp,
+    call_id: &str,
+    capture_agent_id: u32,
+    timestamp_secs: u32,
+    timestamp_micros: u32,
+    codec: siphon_rtp_hep::mos::Codec,
+    clock_rate_hz: u32,
+) -> Vec<Capture> {
+    let mut captures = Vec::new();
+    let Ok(packets) = siphon_rtp_media::rtcp::parse_compound(&observed.payload) else {
+        return captures;
+    };
+    for packet in &packets {
+        use siphon_rtp_media::rtcp::RtcpPacket;
+        let blocks = match packet {
+            RtcpPacket::SenderReport(report) => report.reports.as_slice(),
+            RtcpPacket::ReceiverReport(report) => report.reports.as_slice(),
+            RtcpPacket::Other { .. } => continue,
+        };
+        for block in blocks {
+            // No measured RTT on the passive relay path ⇒ one-way delay 0 (RFC 3550 §6.4.1).
+            let impairments =
+                Impairments::from_rtcp(block.fraction_lost, block.jitter, clock_rate_hz, 0.0);
+            let report = QosReport::new(call_id, block.ssrc, codec, impairments);
+            captures.push(Capture::from_qos_report(
+                observed.source,
+                observed.destination,
+                timestamp_secs,
+                timestamp_micros,
+                capture_agent_id,
+                &report,
+            ));
+        }
+    }
+    captures
 }
 
 /// Build a HEP RTCP capture from an observed relayed RTCP datagram (`protocol_type` = RTCP).
@@ -4182,6 +4274,61 @@ mod tests {
             .expect("bind");
         let addr = socket.local_addr().expect("addr");
         (socket, addr)
+    }
+
+    #[test]
+    fn qos_captures_emit_type35_reports_alongside_raw_rtcp() {
+        // A compound Receiver Report (RFC 3550 §6.4.2) with one reception block: fraction_lost 13/256,
+        // jitter 160 timestamp units. length = 7 words (32 bytes: 4 header + 4 reporter + 24 block).
+        let mut rtcp = vec![0x81, 201, 0x00, 0x07];
+        rtcp.extend_from_slice(&0xAAAA_0001u32.to_be_bytes()); // reporter ssrc
+        rtcp.extend_from_slice(&0x1111_2222u32.to_be_bytes()); // reported-on ssrc
+        rtcp.push(13); // fraction lost (13/256 ≈ 5.08 %)
+        rtcp.extend_from_slice(&[0x00, 0x00, 0x02]); // cumulative lost
+        rtcp.extend_from_slice(&0u32.to_be_bytes()); // extended highest seq
+        rtcp.extend_from_slice(&160u32.to_be_bytes()); // jitter (160 @ 8 kHz = 20 ms)
+        rtcp.extend_from_slice(&0u32.to_be_bytes()); // LSR
+        rtcp.extend_from_slice(&0u32.to_be_bytes()); // DLSR
+
+        let observed = ObservedRtcp {
+            endpoint: EndpointId(1),
+            source: "198.51.100.1:6000".parse().expect("src"),
+            destination: "203.0.113.1:6002".parse().expect("dst"),
+            payload: bytes::Bytes::from(rtcp.clone()),
+        };
+
+        // The raw RTCP passthrough is unchanged (protocol_type RTCP, bytes verbatim).
+        let raw = rtcp_capture(&observed, "call-42@host".into(), 7, 100, 0);
+        assert_eq!(raw.protocol_type, protocol_type::RTCP);
+        assert_eq!(raw.payload, rtcp);
+
+        // ...and one QoS/MOS report per reception block (protocol_type REPORT_JSON = HEP3 type 35).
+        let captures = qos_captures(
+            &observed,
+            "call-42@host",
+            7,
+            100,
+            0,
+            siphon_rtp_hep::mos::Codec::G711,
+            8000,
+        );
+        assert_eq!(captures.len(), 1, "one QoS report per reception block");
+        let capture = &captures[0];
+        assert_eq!(capture.protocol_type, protocol_type::REPORT_JSON);
+        assert_eq!(capture.correlation_id.as_deref(), Some("call-42@host"));
+        let json = std::str::from_utf8(&capture.payload).expect("utf8 payload");
+        // Reported-on SSRC 0x1111_2222 = 286335522.
+        assert!(json.contains(r#""ssrc":286335522"#), "{json}");
+        assert!(json.contains(r#""codec":"G711""#), "{json}");
+        assert!(
+            json.contains(r#""loss_percent":5.08"#),
+            "13/256 → 5.08 %: {json}"
+        );
+        assert!(
+            json.contains(r#""jitter_ms":20.00"#),
+            "160 @ 8 kHz → 20 ms: {json}"
+        );
+        assert!(json.contains(r#""mos":"#), "{json}");
     }
 
     /// A two-port SDP: RTP at `addr`, RTCP at `addr`+1 (default), optional `a=rtcp-mux`. The

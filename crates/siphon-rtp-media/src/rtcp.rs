@@ -125,10 +125,12 @@ pub const SENDER_REPORT_LEN: usize = 28;
 /// Length of one reception-report block, RFC 3550 §6.4.1.
 pub const RECEPTION_REPORT_LEN: usize = 24;
 
-/// A reception-report block (RFC 3550 §6.4.1) — the engine's view of one inbound stream. The
-/// conference reports cumulative loss and the extended highest sequence; `jitter` / `last_sr` /
-/// `delay_last_sr` are `0` (not estimated — the engine does not consume inbound RTCP or per-packet
-/// arrival timing), and `fraction_lost` is `0` for now (cumulative loss carries the real signal).
+/// A reception-report block (RFC 3550 §6.4.1) — the engine's view of one inbound stream, as it writes
+/// it into an outbound SR/RR. Every field is now measured per leg: `fraction_lost` (the per-interval
+/// 8-bit ratio, `MediaLeg::fraction_lost_since_last_report`), cumulative loss, the extended highest
+/// sequence, the interarrival `jitter` estimate, and `last_sr` / `delay_last_sr` (LSR/DLSR echoed from
+/// the peer's most recent Sender Report) — so the peer can compute reception quality and round-trip
+/// time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReceptionReport {
     /// SSRC of the source being reported on.
