@@ -34,15 +34,26 @@
 //! reads a synchronous cache; on a miss it drops the packet and an off-thread rtnetlink worker
 //! resolves it, so no frame ever egresses with a zeroed MAC and the datapath never blocks on netlink.
 //!
+//! ## Per-flow state feedback (wired — Stage 3a)
+//!
+//! The classifier feeds three per-flow facts back to userspace through the shared ABI:
+//! - **Per-endpoint stats**: a per-flow `FLOW_STATS` (`PerCpuHashMap<FlowKey, FlowStats>`), alongside
+//!   the program-wide `STATS` aggregate, lets [`XdpDatapath::stats`] report one endpoint's real
+//!   `packets_*` / `bytes_*` / `packets_dropped`, summed across CPUs. Bytes count the UDP payload, to
+//!   match the loopback backend's accounting.
+//! - **`last_activity`**: the kernel stamps `FlowStats::last_seen_ns` with `bpf_ktime_get_ns()`
+//!   (`CLOCK_MONOTONIC`) on every **accepted** packet — the in-kernel Forward relay *and* the Redirect
+//!   path — so [`XdpDatapath::last_activity`] returns a real value (via `kernel_ns_to_tick`, mapped to
+//!   the logical tick domain against the construction origin, the same clock domain as `start` /
+//!   `now_micros`) for the media-timeout / dead-path sweep (docs/security-and-nat.md §4 layer 6).
+//! - **Learned-latch readback**: [`XdpDatapath::learned_latch`] reads a flow's in-kernel-learned peer
+//!   source (`latched_*` in the `FLOWS` value) when the latch is valid. This is a datapath **read
+//!   primitive** only — the engine-side step that propagates a learned NAT source to the sibling leg's
+//!   `out_dst`, and the daemon datapath selection, are **deferred** and live in the engine, out of this
+//!   crate.
+//!
 //! ## Remaining for a full hardware data plane (documented gaps, not yet wired)
 //!
-//! - **In-kernel `XDP_TX` passthrough**: the eBPF side currently `XDP_REDIRECT`s every matched flow
-//!   to the AF_XDP RX ring (where SRTP/transcode/relay already live). The zero-copy `XDP_TX` rewrite
-//!   fast path (and the TURN channel fast path) lands with the eBPF L2/L3/L4 rewrite work.
-//! - **Per-endpoint stats**: the kernel `STATS` map is a single program-wide per-CPU counter, so
-//!   [`XdpDatapath::stats`] reports the aggregate. A per-flow stats value is a planned ABI widening.
-//! - **`last_activity`** is registry-stamped at `0`; the kernel does not yet feed back per-flow
-//!   activity ticks for the media-timeout sweep.
 //! - **RTCP observation** is wired for the userspace-redirected path only; the `XDP_TX` fast path
 //!   needs an explicit RTCP copy-to-userspace, tracked with the `XDP_TX` work.
 //!
@@ -53,12 +64,12 @@
 //! foreign trait on a foreign type, and keeping aya out of the shared crate keeps it off the
 //! workspace's dependency graph).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use aya::maps::{HashMap as AyaHashMap, MapData, PerCpuArray, XskMap};
+use aya::maps::{HashMap as AyaHashMap, MapData, MapError, PerCpuArray, PerCpuHashMap, XskMap};
 use aya::programs::{Xdp, XdpFlags};
 use aya::{Ebpf, Pod};
 use bytes::Bytes;
@@ -220,7 +231,9 @@ impl Loader {
             })
     }
 
-    /// Sum the per-CPU counters across all CPUs.
+    /// The program-wide aggregate: sum the per-CPU `STATS` counters across all CPUs (the totals over
+    /// every flow). Per-endpoint counters come from [`Loader::flow_stats`]; this stays the global
+    /// health metric.
     pub fn stats(&self) -> Result<FlowStats, XdpError> {
         let stats: PerCpuArray<_, PodStats> = PerCpuArray::try_from(
             self.ebpf.map("STATS").ok_or_else(|| XdpError::Map {
@@ -237,15 +250,54 @@ impl Loader {
             map: "STATS",
             detail: error.to_string(),
         })?;
-        let mut total = FlowStats::default();
-        for value in per_cpu.iter() {
-            total.packets_in += value.0.packets_in;
-            total.packets_out += value.0.packets_out;
-            total.bytes_in += value.0.bytes_in;
-            total.bytes_out += value.0.bytes_out;
-            total.packets_dropped += value.0.packets_dropped;
+        Ok(sum_flow_stats(per_cpu.iter().map(|value| value.0)))
+    }
+
+    /// Read one flow's per-CPU stats, summed across CPUs (counters) with `last_seen_ns` **maxed** (the
+    /// most recent accepted-packet time on any CPU). `Ok(None)` when the flow has no entry yet (no
+    /// packet has arrived on it), so an idle-but-existing endpoint reports zeros, never an error.
+    pub fn flow_stats(&self, key: FlowKey) -> Result<Option<FlowStats>, XdpError> {
+        let stats: PerCpuHashMap<_, PodKey, PodStats> =
+            PerCpuHashMap::try_from(self.ebpf.map("FLOW_STATS").ok_or_else(|| XdpError::Map {
+                map: "FLOW_STATS",
+                detail: "missing".to_string(),
+            })?)
+            .map_err(|error| XdpError::Map {
+                map: "FLOW_STATS",
+                detail: error.to_string(),
+            })?;
+        match stats.get(&PodKey(key), 0) {
+            Ok(per_cpu) => Ok(Some(sum_flow_stats(per_cpu.iter().map(|value| value.0)))),
+            // A flow with no traffic yet simply has no per-CPU entry — not an error.
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(XdpError::Map {
+                map: "FLOW_STATS",
+                detail: error.to_string(),
+            }),
         }
-        Ok(total)
+    }
+
+    /// Read a flow's current action value (the configured rule plus its in-kernel latch state), or
+    /// `Ok(None)` when no flow is installed for `key`. The read primitive behind
+    /// [`XdpDatapath::learned_latch`].
+    pub fn flow(&self, key: FlowKey) -> Result<Option<FlowAction>, XdpError> {
+        let flows: AyaHashMap<_, PodKey, PodAction> =
+            AyaHashMap::try_from(self.ebpf.map("FLOWS").ok_or_else(|| XdpError::Map {
+                map: "FLOWS",
+                detail: "missing".to_string(),
+            })?)
+            .map_err(|error| XdpError::Map {
+                map: "FLOWS",
+                detail: error.to_string(),
+            })?;
+        match flows.get(&PodKey(key), 0) {
+            Ok(action) => Ok(Some(action.0)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(XdpError::Map {
+                map: "FLOWS",
+                detail: error.to_string(),
+            }),
+        }
     }
 
     fn flows(&mut self) -> Result<AyaHashMap<&mut MapData, PodKey, PodAction>, XdpError> {
@@ -268,12 +320,14 @@ const MEDIA_PORT_BASE: u16 = 30000;
 const MEDIA_PORT_TOP: u16 = 40000;
 
 /// Per-endpoint record: the engine-local transport and the FLOWS key the kernel matches on.
+///
+/// It carries no `last_seen` tick: unlike the loopback backend, the XDP datapath's per-flow activity
+/// is fed back **from the kernel** (the classifier stamps `FlowStats::last_seen_ns` on every accepted
+/// packet), so [`XdpDatapath::last_activity`] reads the kernel map, not a userspace-stamped field.
 #[derive(Clone, Copy)]
 struct EndpointRecord {
     local_addr: SocketAddr,
     flow_key: FlowKey,
-    /// Logical-clock tick of the last accepted packet (mirrors the loopback backend's `last_seen`).
-    last_seen: u64,
 }
 
 /// A TX request sent to the datapath thread (the single owner of the AF_XDP socket): build an
@@ -305,6 +359,11 @@ struct Inner {
     /// wall-clock-rate elapsed time, shared with the datapath thread so a packet's arrival and a
     /// report's "now" read one clock. Production only — XDP runs on a real NIC, not in CI.
     start: std::time::Instant,
+    /// `CLOCK_MONOTONIC` ns reading captured at construction, in the **same** clock domain as the
+    /// kernel's `bpf_ktime_get_ns()` (and as `start` above). It is the origin the kernel's per-flow
+    /// `last_seen_ns` stamps are measured against, so [`XdpDatapath::last_activity`] can convert a
+    /// kernel ns stamp into the logical tick domain (`kernel_ns_to_tick`).
+    start_ktime_ns: u64,
     /// The engine-local relay IPv4 every endpoint advertises and the kernel keys flows on.
     local_ip: Ipv4Addr,
     /// Receiver end of the redirect stream; the sole sender lives on the datapath thread.
@@ -364,6 +423,9 @@ impl XdpDatapath {
         let (tx_commands, tx_rx) = flume::unbounded::<TxRequest>();
         let endpoints: Arc<DashMap<EndpointId, EndpointRecord>> = Arc::new(DashMap::new());
         let start = std::time::Instant::now();
+        // Same-instant CLOCK_MONOTONIC reading (the domain of the kernel's bpf_ktime_get_ns per-flow
+        // stamps) — the origin `last_activity` maps those stamps against.
+        let start_ktime_ns = monotonic_ns();
         // The next-hop MAC resolver spawns its own off-reactor rtnetlink worker; the busy-poll thread
         // owns it and reads its resolved-MAC cache synchronously on the TX path. Owned solely by that
         // thread, so it (and its worker) tear down when the datapath thread exits.
@@ -378,6 +440,7 @@ impl XdpDatapath {
             next_port: AtomicU64::new(0),
             clock: AtomicU64::new(0),
             start,
+            start_ktime_ns,
             local_ip,
             redirect_rx,
             observe_tx,
@@ -422,6 +485,24 @@ impl XdpDatapath {
         self.inner.clock.fetch_add(ticks, Ordering::Relaxed);
     }
 
+    /// Read back the peer source the kernel's in-kernel latch has learned for `endpoint` (symmetric
+    /// RTP, RFC 3550 §8), or `None` when the endpoint is unknown, has no flow installed, or has not
+    /// latched a source yet. Stage 3a **read primitive**: the engine will later use it to propagate a
+    /// learned NAT source to the sibling leg's `out_dst`, but that consumption is deferred and lives in
+    /// the engine (see the module-level "documented gaps" comment). Kept an inherent method, not a
+    /// [`Datapath`] trait method, so it stays inside the XDP backend.
+    #[must_use]
+    pub fn learned_latch(&self, endpoint: EndpointId) -> Option<LearnedLatch> {
+        let key = self.inner.endpoints.get(&endpoint)?.flow_key;
+        let loader = self
+            .inner
+            .loader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let action = loader.flow(key).ok()??;
+        learned_latch_from_action(&action)
+    }
+
     /// Assign the next free media port from the pool, or `None` when exhausted. Uses the `entry` API
     /// so a probe never clobbers a port already owned by another endpoint (check-and-claim is atomic
     /// per shard).
@@ -438,6 +519,88 @@ impl XdpDatapath {
         }
         None
     }
+}
+
+/// Nanoseconds per logical media tick: 20 ms — the RTP media frame period and the engine's sweep
+/// cadence (the same 20 ms/tick the [`Datapath::now_micros`] default uses).
+const NS_PER_TICK: u64 = 20_000_000;
+
+/// Read `CLOCK_MONOTONIC` in nanoseconds — the same clock domain the kernel's `bpf_ktime_get_ns()`
+/// stamps in and that `std::time::Instant` reads on Linux. Captured once at construction as the origin
+/// the kernel's per-flow `last_seen_ns` is measured against. Returns 0 on the (essentially impossible)
+/// syscall failure, which only means `last_activity` maps kernel stamps from tick 0.
+fn monotonic_ns() -> u64 {
+    let mut timespec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timespec` is a valid, writable `timespec`; CLOCK_MONOTONIC is always available on Linux.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timespec) } != 0 {
+        return 0;
+    }
+    (timespec.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(timespec.tv_nsec as u64)
+}
+
+/// Map an in-kernel `bpf_ktime_get_ns()` stamp (`CLOCK_MONOTONIC` ns since boot) into the datapath's
+/// logical tick domain, relative to the backend's monotonic origin captured at construction. Both the
+/// kernel helper and `start_ktime_ns` read `CLOCK_MONOTONIC` (the same clock `Instant` uses on Linux),
+/// so the subtraction is well-defined and suspend-consistent. A zero stamp (no packet accepted yet)
+/// maps to tick 0; a stamp before the origin saturates to 0. Pure — unit-tested with injected values
+/// and criterion-benched (the per-`last_activity`-query conversion cost).
+#[must_use]
+pub fn kernel_ns_to_tick(last_seen_ns: u64, start_ktime_ns: u64) -> u64 {
+    if last_seen_ns == 0 {
+        return 0;
+    }
+    last_seen_ns.saturating_sub(start_ktime_ns) / NS_PER_TICK
+}
+
+/// Reduce a flow value's per-CPU slices to one [`FlowStats`]: **sum** the counter fields and take the
+/// **max** of `last_seen_ns` (a monotonic timestamp, not a count — the most recent accepted packet on
+/// any CPU). Pure and allocation-free (accumulates into one stack [`FlowStats`]) — unit-tested with
+/// injected per-CPU vectors and criterion-benched (the per-endpoint stats-read reduction cost across
+/// CPUs), no map / NIC needed.
+#[must_use]
+pub fn sum_flow_stats(per_cpu: impl IntoIterator<Item = FlowStats>) -> FlowStats {
+    let mut total = FlowStats::default();
+    for value in per_cpu {
+        total.packets_in += value.packets_in;
+        total.packets_out += value.packets_out;
+        total.bytes_in += value.bytes_in;
+        total.bytes_out += value.bytes_out;
+        total.packets_dropped += value.packets_dropped;
+        total.last_seen_ns = total.last_seen_ns.max(value.last_seen_ns);
+    }
+    total
+}
+
+/// The peer source a Forward flow's in-kernel latch has learned (symmetric RTP, RFC 3550 §8),
+/// read back from the `FLOWS` map value. Stage 3a exposes this **read** primitive only; the engine's
+/// later step propagates a learned NAT source to the sibling leg's `out_dst` (deferred — see the
+/// module-level "documented gaps" comment).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LearnedLatch {
+    /// The learned peer transport (source IPv4 + port).
+    pub source: SocketAddrV4,
+    /// The RTP SSRC that pinned the latch (host order) — the re-latch consistency key.
+    pub ssrc: u32,
+}
+
+/// Extract the learned latch from a flow action, or `None` when the kernel has not latched a source
+/// (`latch_valid == 0`). The kernel stores `latched_ipv4` / `latched_port` in host order (a
+/// `from_be_bytes` of the wire bytes; see `siphon-rtp-ebpf::forward_in_kernel`), so `Ipv4Addr::from`
+/// and the raw port reconstruct the peer transport directly. Pure — unit-tested with a synthetic
+/// action, no map / NIC needed.
+fn learned_latch_from_action(action: &FlowAction) -> Option<LearnedLatch> {
+    if action.latch_valid == 0 {
+        return None;
+    }
+    Some(LearnedLatch {
+        source: SocketAddrV4::new(Ipv4Addr::from(action.latched_ipv4), action.latched_port),
+        ssrc: action.latched_ssrc,
+    })
 }
 
 /// Translate a userspace [`DpFlowAction`] into the kernel ABI [`FlowAction`], resolving the peer
@@ -564,8 +727,8 @@ fn datapath_loop(
             let Some(endpoint) = endpoint_for(&endpoints, dst) else {
                 continue;
             };
-            let payload = &packet.frame
-                [parsed.payload_offset..parsed.payload_offset + parsed.payload_len];
+            let payload =
+                &packet.frame[parsed.payload_offset..parsed.payload_offset + parsed.payload_len];
             let rx_packet = RxPacket {
                 endpoint,
                 source: SocketAddr::new(IpAddr::V4(parsed.src_ip), parsed.src_port),
@@ -681,9 +844,9 @@ fn endpoint_for(
 impl Datapath for XdpDatapath {
     async fn alloc_endpoint(&self) -> Result<Endpoint, DatapathError> {
         let id = EndpointId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let port = self
-            .alloc_port(id)
-            .ok_or(DatapathError::PoolExhausted { limit: (MEDIA_PORT_TOP - MEDIA_PORT_BASE) as usize })?;
+        let port = self.alloc_port(id).ok_or(DatapathError::PoolExhausted {
+            limit: (MEDIA_PORT_TOP - MEDIA_PORT_BASE) as usize,
+        })?;
         let local_addr = SocketAddr::new(IpAddr::V4(self.inner.local_ip), port);
         let flow_key = FlowKey {
             local_ipv4: u32::from_be_bytes(self.inner.local_ip.octets()),
@@ -695,13 +858,16 @@ impl Datapath for XdpDatapath {
             EndpointRecord {
                 local_addr,
                 flow_key,
-                last_seen: 0,
             },
         );
         Ok(Endpoint { id, local_addr })
     }
 
-    fn install_flow(&self, endpoint: EndpointId, action: DpFlowAction) -> Result<(), DatapathError> {
+    fn install_flow(
+        &self,
+        endpoint: EndpointId,
+        action: DpFlowAction,
+    ) -> Result<(), DatapathError> {
         let record = match self.inner.endpoints.get(&endpoint) {
             Some(record) => *record,
             None => return Err(DatapathError::UnknownEndpoint(endpoint)),
@@ -764,19 +930,22 @@ impl Datapath for XdpDatapath {
             .tx_commands
             .send(request)
             .map_err(|_| DatapathError::Send(std::io::Error::other("datapath thread stopped")))?;
-        done_rx
-            .await
-            .map_err(|_| DatapathError::Send(std::io::Error::other("datapath thread dropped reply")))?
+        done_rx.await.map_err(|_| {
+            DatapathError::Send(std::io::Error::other("datapath thread dropped reply"))
+        })?
     }
 
     fn stats(&self, endpoint: EndpointId) -> Option<EndpointStats> {
-        // The kernel STATS map is a single global per-CPU counter (not yet per-endpoint), so an
-        // endpoint that exists reports the program-wide totals. Per-endpoint counters are a planned
-        // ABI widening (a per-flow stats value); until then this is the program aggregate, scoped to
-        // "does this endpoint exist".
-        self.inner.endpoints.get(&endpoint)?;
-        let loader = self.inner.loader.lock().ok()?;
-        let totals = loader.stats().ok()?;
+        // Per-endpoint counters from the kernel's per-flow FLOW_STATS map (Stage 3a). The flow_key
+        // copies out before the loader lock so no DashMap guard is held across it. An endpoint with no
+        // traffic yet has no map entry → report zeros (it exists, just idle), never `None`.
+        let key = self.inner.endpoints.get(&endpoint)?.flow_key;
+        let loader = self
+            .inner
+            .loader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let totals = loader.flow_stats(key).ok()?.unwrap_or_default();
         Some(EndpointStats {
             packets_in: totals.packets_in,
             packets_out: totals.packets_out,
@@ -797,7 +966,24 @@ impl Datapath for XdpDatapath {
     }
 
     fn last_activity(&self, endpoint: EndpointId) -> Option<u64> {
-        self.inner.endpoints.get(&endpoint).map(|r| r.last_seen)
+        // Kernel-fed activity (Stage 3a): the classifier stamps FlowStats::last_seen_ns
+        // (bpf_ktime_get_ns) on every accepted packet — for the in-kernel Forward relay *and* the
+        // Redirect path, so this works even for flows userspace never sees. Map that CLOCK_MONOTONIC
+        // ns into the logical tick domain relative to the construction origin. Endpoint unknown →
+        // `None`; known but no packet yet → tick 0. `note_activity` stays the default no-op: the
+        // kernel is the single source of truth for XDP activity (no userspace double-stamp).
+        let key = self.inner.endpoints.get(&endpoint)?.flow_key;
+        let loader = self
+            .inner
+            .loader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last_seen_ns = loader
+            .flow_stats(key)
+            .ok()
+            .flatten()
+            .map_or(0, |stats| stats.last_seen_ns);
+        Some(kernel_ns_to_tick(last_seen_ns, self.inner.start_ktime_ns))
     }
 
     fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>) {
@@ -844,14 +1030,23 @@ mod tests {
 
     #[test]
     fn drop_action_maps_to_kernel_drop() {
-        let kernel = to_kernel_action(DpFlowAction::Drop, &empty_endpoints(), Ipv4Addr::LOCALHOST, 0);
+        let kernel = to_kernel_action(
+            DpFlowAction::Drop,
+            &empty_endpoints(),
+            Ipv4Addr::LOCALHOST,
+            0,
+        );
         assert_eq!(kernel.kind, action::DROP);
     }
 
     #[test]
     fn redirect_action_maps_to_kernel_redirect_with_queue() {
-        let kernel =
-            to_kernel_action(DpFlowAction::Redirect, &empty_endpoints(), Ipv4Addr::LOCALHOST, 3);
+        let kernel = to_kernel_action(
+            DpFlowAction::Redirect,
+            &empty_endpoints(),
+            Ipv4Addr::LOCALHOST,
+            3,
+        );
         assert_eq!(kernel.kind, action::REDIRECT);
         assert_eq!(kernel.redirect_queue, 3);
     }
@@ -909,7 +1104,6 @@ mod tests {
                     local_port: 0,
                     _pad: 0,
                 },
-                last_seen: 0,
             },
         );
         let rule = ForwardRule::symmetric(peer, Some("203.0.113.9:7000".parse().expect("addr")));
@@ -940,5 +1134,118 @@ mod tests {
             0,
         );
         assert_eq!(kernel.source_kind, source::ANY);
+    }
+
+    // --- Stage 3a pure helpers: NIC-free, deterministic (injected values, never `Instant::now()`). ---
+
+    #[test]
+    fn kernel_ns_to_tick_maps_relative_to_origin() {
+        let origin = 5_000_000_000; // 5 s since boot (CLOCK_MONOTONIC)
+                                    // 60 ms after the origin = 3 ticks of 20 ms.
+        assert_eq!(kernel_ns_to_tick(origin + 60_000_000, origin), 3);
+        // Exactly one tick.
+        assert_eq!(kernel_ns_to_tick(origin + NS_PER_TICK, origin), 1);
+        // Sub-tick rounds down (floor division): 19.999 ms is still tick 0.
+        assert_eq!(kernel_ns_to_tick(origin + NS_PER_TICK - 1, origin), 0);
+    }
+
+    #[test]
+    fn kernel_ns_to_tick_zero_stamp_is_tick_zero() {
+        // No packet accepted yet (never stamped) → tick 0, regardless of the origin.
+        assert_eq!(kernel_ns_to_tick(0, 12_345), 0);
+    }
+
+    #[test]
+    fn kernel_ns_to_tick_before_origin_saturates() {
+        // A stamp earlier than the origin (must not underflow) → tick 0.
+        assert_eq!(kernel_ns_to_tick(100, 5_000_000_000), 0);
+    }
+
+    fn flow_stats(
+        packets_in: u64,
+        packets_out: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+        packets_dropped: u64,
+        last_seen_ns: u64,
+    ) -> FlowStats {
+        FlowStats {
+            packets_in,
+            packets_out,
+            bytes_in,
+            bytes_out,
+            packets_dropped,
+            last_seen_ns,
+        }
+    }
+
+    #[test]
+    fn sum_flow_stats_sums_counters_and_maxes_last_seen() {
+        let per_cpu = [
+            flow_stats(3, 2, 300, 200, 1, 10),
+            flow_stats(4, 5, 400, 500, 0, 99),
+            flow_stats(0, 0, 0, 0, 2, 50),
+        ];
+        let total = sum_flow_stats(per_cpu);
+        assert_eq!(total.packets_in, 7);
+        assert_eq!(total.packets_out, 7);
+        assert_eq!(total.bytes_in, 700);
+        assert_eq!(total.bytes_out, 700);
+        assert_eq!(total.packets_dropped, 3);
+        // last_seen_ns is a timestamp → max across CPUs, not a sum.
+        assert_eq!(total.last_seen_ns, 99);
+    }
+
+    #[test]
+    fn sum_flow_stats_of_empty_is_zero() {
+        assert_eq!(sum_flow_stats(std::iter::empty()), FlowStats::default());
+    }
+
+    /// A `FORWARD` action carrying a latched peer (host-order fields, as the kernel writes them).
+    fn latched_action(latch_valid: u8) -> FlowAction {
+        FlowAction {
+            kind: action::FORWARD,
+            latch_policy: latch::SYMMETRIC,
+            source_kind: source::ANY,
+            source_prefix: 0,
+            source_ipv4: 0,
+            out_ipv4: 0,
+            out_local_ipv4: 0,
+            out_port: 0,
+            out_src_port: 0,
+            // Host order: from_be_bytes of the wire address/port (198.51.100.10:5000).
+            latched_ipv4: u32::from_be_bytes([198, 51, 100, 10]),
+            latched_ssrc: 0xDEAD_BEEF,
+            latched_port: 5000,
+            latch_valid,
+            _pad: 0,
+            redirect_queue: 0,
+        }
+    }
+
+    #[test]
+    fn learned_latch_extracts_host_order_transport_when_valid() {
+        let extracted = learned_latch_from_action(&latched_action(1)).expect("valid latch");
+        assert_eq!(
+            extracted.source,
+            "198.51.100.10:5000".parse::<SocketAddrV4>().expect("addr")
+        );
+        assert_eq!(extracted.ssrc, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn learned_latch_is_none_when_not_valid() {
+        // latch_valid == 0 means nothing learned yet, even with stale latched_* bytes present.
+        assert_eq!(learned_latch_from_action(&latched_action(0)), None);
+    }
+
+    #[test]
+    fn monotonic_ns_is_available_and_nondecreasing() {
+        // A sanity check of the CLOCK_MONOTONIC wrapper (not a timing-driven logic path): the clock is
+        // available (nonzero) and never runs backwards between two consecutive reads.
+        let first = monotonic_ns();
+        let second = monotonic_ns();
+        assert!(first > 0, "CLOCK_MONOTONIC should be available");
+        assert!(second >= first, "monotonic clock must not go backwards");
     }
 }

@@ -83,11 +83,12 @@ pub struct FlowAction {
     pub out_port: u16,
     /// Engine-local UDP port to transmit from (network byte order).
     pub out_src_port: u16,
-    /// Latched peer source IPv4 (network byte order); valid when `latch_valid != 0`.
+    /// Latched peer source IPv4 in **host** order (the kernel writes `from_be_bytes` of the wire
+    /// address; see `siphon-rtp-ebpf::forward_in_kernel`). Valid when `latch_valid != 0`.
     pub latched_ipv4: u32,
     /// Latched peer RTP SSRC (host order); the re-latch consistency key.
     pub latched_ssrc: u32,
-    /// Latched peer source port (network byte order).
+    /// Latched peer source port in **host** order (the kernel writes `from_be_bytes` of the wire port).
     pub latched_port: u16,
     /// Whether the latch fields hold a learned source.
     pub latch_valid: u8,
@@ -176,7 +177,14 @@ pub struct TurnPeerRoute {
     pub relay_port: u16,
 }
 
-/// Per-CPU counters in the `STATS` map (summed across CPUs by the loader).
+/// Per-CPU counters for a media flow. The same POD is the value of **two** maps:
+/// - the program-wide `STATS` `PerCpuArray<FlowStats>` (one entry) — the aggregate over every flow,
+///   summed across CPUs by the loader (`last_seen_ns` is not meaningful there and stays `0`);
+/// - the per-flow `FLOW_STATS` `PerCpuHashMap<FlowKey, FlowStats>` — one entry per media flow, so the
+///   loader reports a single endpoint's real counters instead of the program aggregate.
+///
+/// The counter fields are **summed** across CPUs by the loader; `last_seen_ns` is a monotonic-clock
+/// timestamp, so it is **maxed** across CPUs instead (the most recent accepted packet on any CPU).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct FlowStats {
@@ -190,6 +198,11 @@ pub struct FlowStats {
     pub bytes_out: u64,
     /// Datagrams dropped (gate, no destination, or `action::DROP`).
     pub packets_dropped: u64,
+    /// `bpf_ktime_get_ns()` (`CLOCK_MONOTONIC` nanoseconds) of the last **accepted** packet on this
+    /// flow, stamped in-kernel for the media-timeout / dead-path sweep (docs/security-and-nat.md §4
+    /// layer 6). `0` means no packet has been accepted yet. Per-CPU, so the loader takes the **max**
+    /// across CPUs; unused (left `0`) in the program-wide `STATS` aggregate.
+    pub last_seen_ns: u64,
 }
 
 #[cfg(test)]
@@ -226,9 +239,17 @@ mod tests {
 
     #[test]
     fn flow_stats_abi_is_stable() {
-        assert_eq!(size_of::<FlowStats>(), 40);
+        // Stage 3a widened the per-CPU value with `last_seen_ns` (the in-kernel activity stamp) for
+        // the per-flow `FLOW_STATS` map: size 40 -> 48, alignment unchanged (all `u64`), the five
+        // counters keep their offsets (0/8/16/24/32) and `last_seen_ns` is appended at offset 40.
+        assert_eq!(size_of::<FlowStats>(), 48);
         assert_eq!(align_of::<FlowStats>(), 8);
+        assert_eq!(offset_of!(FlowStats, packets_in), 0);
+        assert_eq!(offset_of!(FlowStats, packets_out), 8);
+        assert_eq!(offset_of!(FlowStats, bytes_in), 16);
+        assert_eq!(offset_of!(FlowStats, bytes_out), 24);
         assert_eq!(offset_of!(FlowStats, packets_dropped), 32);
+        assert_eq!(offset_of!(FlowStats, last_seen_ns), 40);
     }
 
     #[test]

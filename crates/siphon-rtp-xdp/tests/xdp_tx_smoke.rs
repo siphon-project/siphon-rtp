@@ -6,6 +6,11 @@
 //! at the receiver (RFC 1071 / RFC 768). This is the on-wire counterpart to the host proptest that
 //! pins the incremental checksum math.
 //!
+//! It also exercises the **Stage 3a per-flow feedback** on the wire: after the relay it reads back the
+//! per-flow `FLOW_STATS` (asserting `packets_in`/`packets_out`/`bytes_*` counted the datagram and the
+//! kernel stamped `last_seen_ns` for `last_activity`) and the learned latch in the `FLOWS` value
+//! (asserting the kernel wrote the peer's source back — the `symmetric` latch policy, RFC 3550 §8).
+//!
 //! It **self-skips** (logs + returns Ok) when it lacks `CAP_NET_ADMIN` / veth / generic-XDP support
 //! — creating the veth pair or attaching the program fails — so `cargo test` stays green on an
 //! unprivileged box. On the self-hosted CI runner (root, kernel-capable) it runs for real.
@@ -134,7 +139,10 @@ fn run_smoke() -> Result<SmokeOutcome, String> {
     };
     let flow = FlowAction {
         kind: action::FORWARD,
-        latch_policy: latch::OFF, // deterministic: forward straight to the configured destination
+        // Symmetric latch: the kernel learns the peer's real source (RFC 3550 §8) so we can assert the
+        // Stage 3a latch readback, while still forwarding to the configured destination below (the
+        // relay never forwards to a flow's own ingress latch) — so the rewrite assertions are unchanged.
+        latch_policy: latch::SYMMETRIC,
         source_kind: source::ANY,
         source_prefix: 0,
         source_ipv4: 0,
@@ -251,6 +259,69 @@ fn run_smoke() -> Result<SmokeOutcome, String> {
         assert!(
             udp_check == 0 || udp_check == 0xFFFF,
             "rewritten UDP checksum validates (got {udp_check:#06x})",
+        );
+
+        // --- Stage 3a: the kernel fed per-flow stats + activity + the learned latch back to us. ----
+        // Per-flow counters (summed across CPUs). We only reach here after capturing the relayed
+        // frame, so the XDP_TX path ran: at least one packet in and one out, nothing dropped.
+        let stats = loader
+            .flow_stats(key)
+            .map_err(|error| format!("flow_stats: {error}"))?
+            .ok_or("no per-flow FLOW_STATS entry after a forwarded packet")?;
+        assert!(
+            stats.packets_in >= 1,
+            "per-flow packets_in counted the ingress (got {})",
+            stats.packets_in
+        );
+        assert!(
+            stats.packets_out >= 1,
+            "per-flow packets_out counted the relay (got {})",
+            stats.packets_out
+        );
+        assert_eq!(
+            stats.packets_dropped, 0,
+            "the forwarded packet was not dropped"
+        );
+        // Bytes count the UDP payload (per packet), matching the loopback backend's accounting.
+        assert_eq!(
+            stats.bytes_in,
+            stats.packets_in * RTP_PAYLOAD.len() as u64,
+            "bytes_in counts the UDP payload per packet",
+        );
+        assert_eq!(
+            stats.bytes_out,
+            stats.packets_out * RTP_PAYLOAD.len() as u64,
+            "bytes_out counts the UDP payload per packet",
+        );
+        // last_activity feedback: the kernel stamped a monotonic bpf_ktime_get_ns() on the accepted
+        // packet (the value the loader maps into the tick domain).
+        assert!(
+            stats.last_seen_ns > 0,
+            "the kernel stamped last_seen_ns on the accepted packet",
+        );
+
+        // Learned-latch readback: the symmetric latch learned the peer's real source in-kernel and
+        // wrote it into the FLOWS value (host order — from_be_bytes of the wire fields).
+        let learned = loader
+            .flow(key)
+            .map_err(|error| format!("flow: {error}"))?
+            .ok_or("FLOWS entry disappeared")?;
+        assert_eq!(
+            learned.latch_valid, 1,
+            "the kernel learned the peer source (symmetric latch)",
+        );
+        assert_eq!(
+            learned.latched_ipv4,
+            u32::from_be_bytes(CALLER_IP.octets()),
+            "latched peer IPv4 (host order)",
+        );
+        assert_eq!(
+            learned.latched_port, CALLER_PORT,
+            "latched peer port (host order)",
+        );
+        assert_eq!(
+            learned.latched_ssrc, 0x1122_3344,
+            "latched peer SSRC (from the RTP header)",
         );
 
         return Ok(SmokeOutcome::Ran);

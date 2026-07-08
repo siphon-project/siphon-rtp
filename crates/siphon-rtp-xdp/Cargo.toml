@@ -69,6 +69,13 @@ harness = false
 name = "rewrite_bench"
 harness = false
 
+# The Stage 3a per-flow feedback read path: the loader-side per-CPU stats reduction (sum_flow_stats)
+# + the last_activity ns->tick conversion (kernel_ns_to_tick) — the host-benchable half of the new
+# per-flow bookkeeping cost.
+[[bench]]
+name = "stats_feedback_bench"
+harness = false
+
 # A small workspace pairing the loader with the eBPF program crate (so build.rs's
 # `cargo build --package siphon-rtp-ebpf` resolves). Excluded from the parent stable workspace; the
 # docker xdp build invokes it explicitly with nightly + bpf-linker on PATH.
