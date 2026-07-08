@@ -97,6 +97,13 @@ pub struct FileConfig {
     /// Advertised maximum concurrent sessions for cluster load reporting; `0` = unlimited
     /// (`--max-sessions`). Drives the normalized load score a dispatcher ranks nodes by.
     pub max_sessions: Option<u64>,
+    /// NIC to attach the XDP/AF_XDP kernel datapath to (`--xdp-interface`). Acted on **only** by the
+    /// separate `siphon-rtp-xdp-daemon` binary (the excluded XDP workspace); the default UDP-only
+    /// `siphon-rtp` engine ignores it. Kept here so both binaries share one TOML schema + parser.
+    pub xdp_interface: Option<String>,
+    /// NIC queue the XDP/AF_XDP socket binds (`--xdp-queue`), default 0. Read **only** by the
+    /// `siphon-rtp-xdp-daemon` binary; the default UDP engine ignores it (shared schema, see above).
+    pub xdp_queue: Option<u32>,
 }
 
 impl FileConfig {
@@ -178,6 +185,8 @@ mod tests {
             "log_filter = \"info,siphon_rtp_engine=debug\"\n",
             "node_id = \"rtp-ams-3\"\n",
             "max_sessions = 4000\n",
+            "xdp_interface = \"eth0\"\n",
+            "xdp_queue = 2\n",
         );
 
         let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
@@ -217,6 +226,8 @@ mod tests {
         );
         assert_eq!(config.node_id.as_deref(), Some("rtp-ams-3"));
         assert_eq!(config.max_sessions, Some(4000));
+        assert_eq!(config.xdp_interface.as_deref(), Some("eth0"));
+        assert_eq!(config.xdp_queue, Some(2));
     }
 
     /// An empty file is valid and yields all-`None` (every key falls through to the CLI default).
