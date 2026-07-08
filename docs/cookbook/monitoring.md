@@ -75,7 +75,8 @@ The engine pushes these asynchronously to the controlling client (no request id)
 - `call_quality`, every ~5 s per conference participant: RFC 3550 interarrival jitter in ms,
   residual loss percent, and a MOS estimate from the ITU-T G.107 E-model (R-factor mapped per
   Annex B, clamped to 1.0..4.5), with the codec's impairment factors per ITU-T G.113. One-way
-  network delay is not yet measured (fed as 0), so the score reflects jitter, loss, and codec.
+  network delay is now measured (from RTT on inbound RRs, conference path) and folded in, so the
+  score reflects jitter, loss, codec, and measured one-way delay.
   Two-party legs do not emit `call_quality` yet; it is conference-only today.
 
   ```json
@@ -102,14 +103,16 @@ siphon-rtp --control 127.0.0.1:8080 --relay-bind-ip 203.0.113.10
 
 Each capture carries the transport 5-tuple, a wall-clock timestamp, protocol type 5 (RTCP), the
 configured agent id, and the call-id as the HEP correlation id, so the collector groups both
-legs of a call. Export is fire-and-forget: observations are tapped off the relay fast path into
+legs of a call. A HEP type-35 QoS/MOS report now ships alongside the type-5 RTCP capture.
+Export is fire-and-forget: observations are tapped off the relay fast path into
 a bounded queue and dropped under backpressure, and a send failure is logged, never propagated.
 Telemetry cannot disturb media.
 
 Scope, honestly: the tap sits on the plain-relay forwarding path, so what reaches the collector
 is the endpoints' own relayed RTCP. Legs the engine terminates in userspace (conference, SRTP,
-transcode, WS) are not tapped, and the engine's G.107 MOS estimate travels on the control channel
-as `call_quality`, not in the HEP stream. If your collector is VoIPmonitor sniffing passively
+transcode, WS) are not tapped, and the engine's G.107 MOS estimate now travels BOTH on the control
+channel as `call_quality` AND in the HEP stream as a type-35 QoS report. If your collector is
+VoIPmonitor sniffing passively
 instead of ingesting HEP, note the relay preserves the streams it forwards, so correlation by
 SSRC keeps working across the relay.
 

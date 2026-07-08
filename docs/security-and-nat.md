@@ -222,8 +222,8 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 - **Consent freshness** (RFC 7675): periodic STUN keepalives; on consent loss, stop forwarding and
   tear down. This is also the anti-hijack *and* the dead-path detector.
 - **Spec:** RFC 8445 (ICE), RFC 8839 (SDP for ICE), RFC 8489 (STUN), RFC 7675 (consent).
-- **Enforcement:** `ProfileFlags.ice` (`remove` | `force` | `force-relay`) already reserved; STUN
-  served on the media socket via the layer-1 demux.
+- **Enforcement:** `profile.ice` (`force` / `remove`; `force-relay` degrades to `force`) now
+  overrides the SDP-derived ICE posture; STUN served on the media socket via the layer-1 demux.
 - **Note:** for non-ICE legacy VoLTE/PSTN UAs (the common case), layers 1–3 are the whole story; ICE
   applies to ICE-capable peers (RCS, WebRTC bridges, modern clients).
 
@@ -263,7 +263,8 @@ is wrong, and encryption defeats A2 eavesdrop.
   *peer's* answered key. The peer's `a=crypto` is always re-originated (dropped and replaced), like
   ICE — a secure leg's key never leaks onto the plaintext leg's rewritten SDP.
 - **Seam (present):** `ProfileFlags.transport_protocol` (`RTP/SAVP[F]`, `UDP/TLS/RTP/SAVPF`) selects a
-  secure leg; `ProfileFlags.dtls` (`passive`/`active`/`off`) reserved for DTLS-SRTP.
+  secure leg; `profile.dtls` (`off`/`passive`/`active`/`actpass`) is now honoured and overrides the
+SDP-derived DTLS posture.
 - **Spec:** RFC 3711 (SRTP/SRTCP), RFC 4568 (SDES — keys in SDP, so the signalling path must be TLS),
   RFC 5764 (DTLS-SRTP, implemented). Pure-Rust only, per the zero-C hard rule. **SDES key material must
   never transit a plaintext control channel** — keys in `a=crypto` are only as safe as the signalling.
@@ -330,8 +331,9 @@ so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the 
   so it cannot keep a dead path alive. The daemon sweep reaps participants idle past the media timeout
   and tears down a room once empty (the conference analogue of Layer 6).
 - **RTCP & telephone-events** are split off before the jitter buffer (RFC 5761 demux + RFC 4733 PT
-  match) so they cannot corrupt the decoder: inbound RTCP is dropped (we generate but do not consume
-  reception stats); a telephone-event is detected and surfaced as `Event::Dtmf` on the control channel.
+  match) so they cannot corrupt the decoder: the conference path now consumes inbound reception
+  reports (RRs) to derive RTT for MOS, and only non-report RTCP is dropped/not consumed; a
+  telephone-event is detected and surfaced as `Event::Dtmf` on the control channel.
   Each participant's mix is stamped with the engine's **own** per-leg egress SSRC, and a periodic RTCP
   Sender Report is emitted per participant (lip-sync + liveness) carrying a **reception report** on that
   participant's inbound stream (cumulative loss from its jitter buffer + extended highest sequence).

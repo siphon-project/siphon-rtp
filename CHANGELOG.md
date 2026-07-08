@@ -38,13 +38,13 @@ The initial public surface. This becomes `0.1.0` at the first tag.
 - **Conferencing MCU** — N-party mixer with mix-minus-self, active-speaker selection,
   whisper/monitor roles, and room bridging.
 - **SIPREC forking** (raw-RTP tee) and **runtime pcap recording**.
-- **RTP↔WebSocket bridge** (`ws://`, raw L16 PCM) for voice-AI.
+- **RTP↔WebSocket bridge** (`ws://` / `wss://`, raw L16 PCM) for voice-AI.
 
 ### Operations
 - **Prometheus `/metrics` + `/healthz` + `/readyz`**, **HEP/Homer export** with G.107
   MOS, cluster **load / node_info / drain** for rolling upgrades, and warm-standby
-  **checkpoint / restore** (plain relay, SDES-SRTP bridge, and plaintext transcode;
-  secure-transcode and WebSocket restore are not yet covered).
+  **checkpoint / restore** (plain relay, SDES-SRTP bridge, plaintext transcode, and
+  secure transcode; only WebSocket restore is not yet covered).
 
 ### Supply chain
 - Per-release **SBOM** (SPDX 2.3 + CycloneDX 1.4), a scheduled **cargo-deny** advisory

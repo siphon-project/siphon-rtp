@@ -72,13 +72,13 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **TURN server** | RFC 5766 / 8656 | Implemented — `turn:` / `turns:` (UDP/TCP/TLS), coturn REST credentials |
 | **Jitter buffer + PLC + resampler** | RFC 3550 | Implemented (resampler AVX2, PLC drives decoder concealment) |
 | **VAD** | — | Implemented — energy VAD (noise suppression / echo cancellation planned) |
-| **WebSocket bridge (raw L16 PCM)** | — | Implemented — bidirectional, `ws://` |
+| **WebSocket bridge (raw L16 PCM)** | — | Implemented — bidirectional, `ws://` and `wss://` (wss via ring/rustls + webpki-roots) |
 | **OpenAI Realtime / gRPC / WebRTC bridges** | — | Planned |
 | **Forking (SIPREC raw-RTP tee)** | RFC 7866 | Implemented |
 | **Conferencing (MCU: mix-minus-self, active-speaker, whisper/monitor, room bridging)** | — | Implemented — N-party mixer, JSON control |
 | **Observability & QoS (Prometheus, RTCP jitter/loss, G.107 MOS, HEP/Homer)** | RFC 3550 / ITU-T G.107 / HEP3 | Implemented — RR + `call_quality` events ([docs](docs/observability.md)) |
 | **Recording (runtime raw-RTP pcap)** | — | Implemented |
-| **Clustering + warm-standby HA (checkpoint / restore)** | — | Implemented — plain / SDES-SRTP / transcode restore (secure-transcode + WS restore pending) |
+| **Clustering + warm-standby HA (checkpoint / restore)** | — | Implemented — plain / SDES-SRTP / transcode / secure-transcode restore (WS restore pending) |
 | **Opus / EVS** | RFC 6716 | Planned |
 
 ## Performance

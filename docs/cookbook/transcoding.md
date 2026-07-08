@@ -154,9 +154,10 @@ disallowed. An AMR-NB `mode-set` is not yet resolved onto the egress mode; AMR-N
 MR122.
 
 **ptime.** Each leg's packetization follows its own SDP `a=ptime`, defaulting to 20 ms
-(RFC 3551); the transcoder builds each leg's codec at that leg's ptime. The NG `ptime` option is
-parsed and carried for rtpengine compatibility, but the SDP governs the packetization today; the
-directive does not force a different egress ptime.
+(RFC 3551); the transcoder builds each leg's codec at that leg's ptime. The NG `ptime=N` option
+now re-frames the egress via a repacketizer (decoupling ingress from egress framing) and forces
+the egress packetization, updating the answer `a=ptime`. AMR (frame-based) ignores the override
+by construction (fixed native frame).
 
 **DTMF.** RFC 4733 telephone-events are not decoded as audio: they are detected, surfaced as
 `dtmf` events on the control channel, and repacketized onto the egress stream using the far

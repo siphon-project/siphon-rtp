@@ -157,7 +157,7 @@ Those restart fresh on the standby, so expect at most a brief glitch at takeover
 | Plain relay (passthrough) | **Yes** | Forward rules, source gates and latch policies reinstalled; latch re-learns. |
 | SDES-SRTP bridge (RFC 3711/4568) | **Yes** | Bridge rebuilt and re-keyed from the snapshot; per-SSRC ROC and SRTCP index resume, so packets stay decryptable across the swing. |
 | Plaintext transcode | **Yes** | Transcode actor rebuilt from the codec snapshots; codec/jitter state starts fresh. |
-| Secure transcode (`SrtpMedia`) | **No** | The crypto and codec state live inside the running actor; `restore` rejects it (`restore of a ... call is not yet supported`). |
+| Secure transcode (`SrtpMedia`) | **Yes** | Now supported and integration-tested: restore rebuilds the SRTP keys + per-SSRC rollover and the transcode actor. |
 | WebSocket bridge (`Ws`) | **No** | Same reason; additionally the WS client connection cannot be resumed. |
 | DTLS-SRTP (RFC 5764) | **No** | Cannot even be checkpointed: the keys are derived from the DTLS handshake and cannot be exported into a snapshot. A restored leg would need a full re-handshake, which requires signalling. |
 | Conferences | **No** | `checkpoint` operates on calls; conference rooms and participants are not covered. |
@@ -184,8 +184,8 @@ standby is warm, not hot: it holds no state until `restore` hands it some.
   plane firewallable and keeps the HA option open.
 - Drain before you stop. It costs one control verb and turns an upgrade into a non-event.
 - Reserve warm-standby HA for the call types it actually covers today (relay, SDES-SRTP bridge,
-  plaintext transcode). For everything else, fast failover of *new* calls via the dispatcher is
-  the honest posture.
+  plaintext transcode, secure transcode). For everything else, fast failover of *new* calls via
+  the dispatcher is the honest posture.
 
 See also: [Deployment & operations](deployment.md) for the single-node runbook,
 [Native JSON-over-TCP](control/json.md) and [rtpengine NG / bencode](control/ng.md) for the verb

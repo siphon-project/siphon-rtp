@@ -39,5 +39,6 @@ frames.
   `cleared`.
 - **Close**: send `stop` (or close the socket); deleting the call also tears the bridge down.
 
-`ws://` only in v1 (`wss://` is a follow-up), so run the server on a trusted segment. Full protocol
-reference: [docs/cookbook/voice-ai.md](../../docs/cookbook/voice-ai.md).
+`wss://` now ships (ring/rustls, webpki-roots); prefer it when the server isn't on a trusted
+segment. The local `ws://` example URIs above stay as-is. Full protocol reference:
+[docs/cookbook/voice-ai.md](../../docs/cookbook/voice-ai.md).

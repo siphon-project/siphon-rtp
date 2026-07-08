@@ -165,7 +165,8 @@ half-working:
 already decrypting into the media actor. The same rejections apply to
 WebSocket-bridged calls. `checkpoint`/`restore` (HA warm standby) work for the
 plain SRTP bridge, including the key material and rollover state; restoring a
-secure-transcode call is rejected today.
+secure-transcode call now works too (keys, rollover, and the transcode actor are
+rebuilt).
 
 ## How to verify
 
