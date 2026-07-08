@@ -532,6 +532,18 @@ void, and bound the resources.
   address in XOR-RELAYED-ADDRESS when the bound IP differs (e.g. a `0.0.0.0` bind or a NAT'd host). A
   loopback bind relays only loopback peers, so a production relay needs a routable bind (or the XDP/
   public datapath).
+- **Two-binary datapath model (the same relay-bind posture, kernel-accelerated).** The kernel fast
+  path ships as a **separate binary**, not a Cargo feature. The default `siphon-rtp` binary is
+  **UDP-only** and never links the eBPF/aya toolchain (the stable workspace and `cargo test` stay
+  nightly-free); the `siphon-rtp-xdp-daemon` binary lives in the excluded `crates/siphon-rtp-xdp`
+  workspace, depends **up into** the engine, and hands an `XdpDatapath` to the *same*
+  `siphon_rtp_engine::run_with_datapath` runner. It attaches the kernel datapath only when
+  `--xdp-interface` names a NIC **and** `--relay-bind-ip` is a **routable IPv4** (the fast path is
+  IPv4-only and keys/advertises flows on that address — the reachability rule above); on any missing
+  capability or attach/bind failure it logs and falls back to the UDP-loopback datapath, never a hard
+  failure (the rtpengine posture). The relay-bind, source-gate, latch, and TURN rules in this document
+  are enforced identically over either datapath — selection is the only difference between the two
+  binaries.
 - **Single-owner actor.** All allocation state lives in one task (`AllocationManager`) reached only
   through a bounded `flume` mailbox — no shared lock over allocation state, no lock across an `.await`
   (the concurrency rules). Peer datagrams arrive on the relay endpoint via `FlowAction::Redirect`

@@ -29,6 +29,12 @@ publish = false
 # (the redirect/observe streams, pinned to the parent workspace's 0.12).
 siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }
 siphon-rtp-ebpf-common = { path = "../siphon-rtp-ebpf-common" }
+# The engine daemon library (package `siphon-rtp`, dir `siphon-rtp-engine`, lib `siphon_rtp_engine`)
+# — the `siphon-rtp-xdp-daemon` binary probes/attaches the kernel datapath and drives it through
+# `siphon_rtp_engine::run_with_datapath`. This is the INVERTED dependency edge the design mandates:
+# engine (UDP-only, stable) is depended UP INTO by the XDP workspace; the engine never depends on this
+# crate. No `version = ` (path-only): the engine is unpublished alongside this.
+siphon-rtp = { path = "../siphon-rtp-engine" }
 aya = "0.13"
 libc = "0.2"
 tokio = { version = "1.50", features = ["rt", "rt-multi-thread", "net", "sync", "macros"] }
@@ -37,6 +43,9 @@ bytes = "1.11"
 dashmap = "6"
 thiserror = "2"
 tracing = "0.1"
+# The daemon binary reuses the engine's `EngineArgs` (a flattenable `clap::Args`) and adds the two
+# `--xdp-*` knobs; pinned to clap 4 to match the engine's own clap so `#[command(flatten)]` unifies.
+clap = { version = "4", features = ["derive"] }
 # Next-hop MAC resolution (the `neighbor` module) talks to the kernel routing/neighbour/link tables
 # over rtnetlink. Chosen over `neli`: rtnetlink gives typed RTM_GETROUTE/GETNEIGH/GETLINK query
 # builders on an async Tokio socket and re-exports its `netlink-packet-route` message types, so the

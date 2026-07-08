@@ -242,7 +242,14 @@ jobs:
           command -v bpf-linker >/dev/null 2>&1 || cargo install bpf-linker --locked
       - name: Build the eBPF program + XDP/AF_XDP loader
         run: cargo build --locked
-      - name: Run the loader unit tests
+      # The XDP-enabled daemon binary: depends UP into the stable engine (`siphon-rtp`) + this crate,
+      # probes/attaches the kernel datapath, and drives `siphon_rtp_engine::run_with_datapath`. Built
+      # here (only where the eBPF toolchain exists); the default UDP `siphon-rtp` binary is unaffected
+      # and stays xdp-free in every normal job.
+      - name: Build the siphon-rtp-xdp-daemon binary
+        run: cargo build --locked --bin siphon-rtp-xdp-daemon
+      # Loader unit tests + the daemon's pure `choose_datapath` selection tests (NIC-free).
+      - name: Run the loader + daemon unit tests
         run: cargo test --locked
       # Live veth XDP_TX relay smoke: attach the classifier in SKB mode, install a FORWARD flow,
       # inject an RTP/UDP datagram and capture the frame the program relays — asserting the L2/L3/L4
