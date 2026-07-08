@@ -2157,6 +2157,7 @@ dependencies = [
  "siphon-rtp-datapath",
  "siphon-rtp-ebpf-common",
  "thiserror 2.0.18",
+ "tikv-jemallocator",
  "tokio",
  "tracing",
 ]

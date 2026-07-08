@@ -57,6 +57,12 @@ netlink-packet-route = "0.30"
 netlink-packet-core = "0.8"
 futures = "0.3"
 
+# Allocator parity with the engine binary: the `siphon-rtp-xdp-daemon` runs the same memory-leak-gated
+# runner (`run_with_datapath`), so it links jemalloc — the one accepted `-sys` dep, pure Rust over the
+# jemalloc the leak gate measures `stats.allocated` on. Same target gate + version the engine pins.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 # No `[build-dependencies]`: build.rs invokes the eBPF build directly (rustup run <toolchain> cargo
 # build --target bpfel-unknown-none) instead of via aya-build, whose 0.1.x OUT_DIR embed copies the
 # artifact onto its own `--target-dir` path ("Is a directory"). See build.rs for the full rationale.

@@ -26,6 +26,13 @@ use siphon_rtp_engine::daemon::{
 };
 use siphon_rtp_engine::{EngineArgs, RunConfig};
 
+// Allocator parity with the default `siphon-rtp-engine` binary: this daemon drives the same
+// memory-leak-gated runner, so it links jemalloc — the allocator the leak gate measures
+// `stats.allocated` on. The one accepted `-sys` dep; pure Rust over the already-linked jemalloc.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// siphon-rtp media engine daemon over the XDP/AF_XDP kernel datapath.
 #[derive(Parser, Debug)]
 #[command(name = "siphon-rtp-xdp-daemon", version, about)]
