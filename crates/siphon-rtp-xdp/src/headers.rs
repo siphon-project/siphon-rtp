@@ -100,9 +100,12 @@ pub fn build_udp_frame(addrs: &FrameAddrs, payload: &[u8], out: &mut [u8]) -> Op
     out[udp_start + UDP_HDR_LEN..total].copy_from_slice(payload);
 
     // UDP checksum spans the pseudo-header + UDP header + payload (RFC 768).
-    let udp_checksum =
-        udp_checksum(addrs.src_ip, addrs.dst_ip, &out[udp_start..total], udp_len);
-    let udp_checksum = if udp_checksum == 0 { 0xFFFF } else { udp_checksum };
+    let udp_checksum = udp_checksum(addrs.src_ip, addrs.dst_ip, &out[udp_start..total], udp_len);
+    let udp_checksum = if udp_checksum == 0 {
+        0xFFFF
+    } else {
+        udp_checksum
+    };
     out[udp_start + 6..udp_start + 8].copy_from_slice(&udp_checksum.to_be_bytes());
 
     Some(total)
@@ -295,7 +298,10 @@ mod tests {
         assert_eq!(out[ETH_HDR_LEN], 0x45);
         assert_eq!(out[ETH_HDR_LEN + 9], IPPROTO_UDP);
         let ip_total = u16::from_be_bytes([out[ETH_HDR_LEN + 2], out[ETH_HDR_LEN + 3]]);
-        assert_eq!(ip_total as usize, IPV4_HDR_LEN + UDP_HDR_LEN + payload.len());
+        assert_eq!(
+            ip_total as usize,
+            IPV4_HDR_LEN + UDP_HDR_LEN + payload.len()
+        );
         assert_eq!(&out[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16], &[198, 51, 100, 1]);
         assert_eq!(&out[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20], &[203, 0, 113, 5]);
 
@@ -366,7 +372,10 @@ mod tests {
         assert_eq!(parsed.dst_ip, Ipv4Addr::new(203, 0, 113, 5));
         assert_eq!(parsed.src_port, 5000);
         assert_eq!(parsed.dst_port, 6000);
-        assert_eq!(&out[parsed.payload_offset..parsed.payload_offset + parsed.payload_len], payload);
+        assert_eq!(
+            &out[parsed.payload_offset..parsed.payload_offset + parsed.payload_len],
+            payload
+        );
     }
 
     #[test]

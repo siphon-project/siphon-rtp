@@ -40,8 +40,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The house gate: clippy must be clean across every target and feature.
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The house gate: clippy clean across every target and non-eBPF feature. `--features amr` is
+      # every workspace feature except `xdp` — that one pulls the excluded aya/eBPF loader (needs the
+      # pinned nightly + bpf-linker, absent here), so the xdp-gated engine code is linted in the
+      # `xdp-integration` job instead. `amr` is the only other feature, so this loses no coverage.
+      - run: cargo clippy --all-targets --features amr -- -D warnings
 
   test:
     name: test (stable)
@@ -52,7 +55,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Default features = UDP-loopback datapath (NIC-free); integration tests are NOT #[ignore]d,
       # so they run here too. --locked keeps the build reproducible against the committed lockfile.
-      - run: cargo test --workspace --all-features --locked
+      # `--features amr` (not --all-features): the `xdp` feature needs the eBPF toolchain, exercised
+      # in the xdp-integration job — building it here would pull aya/bpf-linker into the stable job.
+      - run: cargo test --workspace --features amr --locked
 
   msrv:
     name: msrv (1.88)
@@ -69,7 +74,8 @@ jobs:
       # Floor set by transitive deps: clap_builder needs the 2024 edition (>=1.85), the icu/idna stack
       # (icu_* 2.2, idna_adapter) needs >=1.86, and `time` >=0.3.47 (the RUSTSEC-2026-0009 DoS fix,
       # pulled in via siphon-rtp-dtls -> webrtc-dtls -> x509-parser) needs >=1.88.
-      - run: cargo check --workspace --all-features --locked
+      # `--features amr`, not --all-features: `xdp` pulls the eBPF toolchain (see xdp-integration).
+      - run: cargo check --workspace --features amr --locked
 
   docs:
     name: doc
@@ -80,7 +86,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --workspace --no-deps --all-features --locked
+      # `--features amr`, not --all-features: `xdp` pulls the eBPF toolchain (see xdp-integration).
+      - run: cargo doc --workspace --no-deps --features amr --locked
 
   benches:
     name: bench compile
@@ -92,7 +99,8 @@ jobs:
       # Keep the criterion (wall-clock) perf benches compiling so they never bit-rot. The
       # actual ">10% regression fails CI" gate runs in the `perf-gate` job below, on the
       # deterministic iai-callgrind instruction-count benches.
-      - run: cargo bench --workspace --all-features --no-run --locked
+      # `--features amr`, not --all-features: `xdp` pulls the eBPF toolchain (see xdp-integration).
+      - run: cargo bench --workspace --features amr --no-run --locked
 
   deny:
     name: cargo-deny (no C deps)
@@ -233,9 +241,11 @@ jobs:
         working-directory: crates/siphon-rtp-xdp
     steps:
       - uses: actions/checkout@v7
-      # Puts rustup + cargo on PATH (stable, for the loader crate); the eBPF sub-crate pins its own
-      # nightly via ebpf/rust-toolchain.toml, installed in the next step.
+      # Puts rustup + cargo on PATH (stable, for the loader crate + the engine's xdp-feature clippy);
+      # the eBPF sub-crate pins its own nightly via ebpf/rust-toolchain.toml, installed in the next step.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: eBPF toolchain (pinned nightly + rust-src + bpf-linker)
         run: |
           rustup toolchain install nightly-2026-01-15 --component rust-src --profile minimal
@@ -250,13 +260,18 @@ jobs:
       # XDP, so it never fails an unprivileged runner; `--nocapture` surfaces the skip/run message.
       - name: veth XDP_TX relay smoke (self-skips without CAP_NET_ADMIN)
         run: cargo test --locked --test xdp_tx_smoke -- --nocapture
-      # Build the main-workspace engine daemon with the `xdp` feature: proves the capability-selected
-      # datapath wiring compiles the full aya/eBPF stack (the eBPF build.rs runs on the pinned nightly
-      # installed above). A plain `cargo build` on the normal jobs compiles none of it. Runs from the
-      # repo root (the main workspace), overriding this job's `crates/siphon-rtp-xdp` working-directory.
-      - name: Build the engine with the xdp datapath feature (repo root)
+      # This job owns the full `--all-features` gate for the engine (amr + xdp together — the shipping
+      # config), since it is the only one with bpf-linker. The normal jobs run `--features amr`
+      # (everything except xdp). `--all-features` here proves the capability-selected datapath wiring
+      # compiles the full aya/eBPF stack (the eBPF build.rs runs on the pinned nightly installed above)
+      # and keeps "clippy clean across every feature" true. Runs from the repo root (the main
+      # workspace), overriding this job's `crates/siphon-rtp-xdp` working-directory.
+      - name: Build the engine with all features incl. xdp (repo root)
         working-directory: .
-        run: cargo build --locked --features xdp -p siphon-rtp
+        run: cargo build --locked --all-features -p siphon-rtp
+      - name: Clippy the engine with all features incl. xdp (repo root)
+        working-directory: .
+        run: cargo clippy --locked --all-features -p siphon-rtp --all-targets -- -D warnings
 
   # Single required status check for branch protection: green only if every job above is green.
   # perf-gate is included: it runs on pull_request (success) and is skipped on the push-to-main build,

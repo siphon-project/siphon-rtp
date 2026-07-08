@@ -195,7 +195,11 @@ impl Loader {
 
     /// Register an AF_XDP socket fd into the `XSKS` map at `queue` so the classifier's
     /// `XDP_REDIRECT(queue)` lands packets on it. The socket must be bound to the same queue.
-    pub fn register_xsk(&mut self, queue: u32, socket_fd: std::os::fd::RawFd) -> Result<(), XdpError> {
+    pub fn register_xsk(
+        &mut self,
+        queue: u32,
+        socket_fd: std::os::fd::RawFd,
+    ) -> Result<(), XdpError> {
         let mut xsks: XskMap<&mut MapData> =
             XskMap::try_from(self.ebpf.map_mut("XSKS").ok_or_else(|| XdpError::Map {
                 map: "XSKS",
@@ -205,10 +209,11 @@ impl Loader {
                 map: "XSKS",
                 detail: error.to_string(),
             })?;
-        xsks.set(queue, socket_fd, 0).map_err(|error| XdpError::Map {
-            map: "XSKS",
-            detail: error.to_string(),
-        })
+        xsks.set(queue, socket_fd, 0)
+            .map_err(|error| XdpError::Map {
+                map: "XSKS",
+                detail: error.to_string(),
+            })
     }
 
     /// Install (or replace) the flow rule for `key`.
@@ -235,16 +240,15 @@ impl Loader {
     /// every flow). Per-endpoint counters come from [`Loader::flow_stats`]; this stays the global
     /// health metric.
     pub fn stats(&self) -> Result<FlowStats, XdpError> {
-        let stats: PerCpuArray<_, PodStats> = PerCpuArray::try_from(
-            self.ebpf.map("STATS").ok_or_else(|| XdpError::Map {
+        let stats: PerCpuArray<_, PodStats> =
+            PerCpuArray::try_from(self.ebpf.map("STATS").ok_or_else(|| XdpError::Map {
                 map: "STATS",
                 detail: "missing".to_string(),
-            })?,
-        )
-        .map_err(|error| XdpError::Map {
-            map: "STATS",
-            detail: error.to_string(),
-        })?;
+            })?)
+            .map_err(|error| XdpError::Map {
+                map: "STATS",
+                detail: error.to_string(),
+            })?;
 
         let per_cpu = stats.get(&0, 0).map_err(|error| XdpError::Map {
             map: "STATS",

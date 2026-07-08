@@ -404,12 +404,7 @@ impl XskSocket {
         reg.chunk_size = config.frame_size;
         reg.headroom = 0;
         reg.flags = 0;
-        set_sockopt(
-            fd.as_raw_fd(),
-            libc::XDP_UMEM_REG,
-            "XDP_UMEM_REG",
-            &reg,
-        )?;
+        set_sockopt(fd.as_raw_fd(), libc::XDP_UMEM_REG, "XDP_UMEM_REG", &reg)?;
 
         // Size the four rings (entry counts).
         set_sockopt(
@@ -450,9 +445,7 @@ impl XskSocket {
         let completion = Ring::<u64>::map(
             fd.as_raw_fd(),
             config.completion_size,
-            RingOption {
-                name: "completion",
-            },
+            RingOption { name: "completion" },
             libc::XDP_UMEM_PGOFF_COMPLETION_RING as libc::off_t,
             &offsets.cr,
         )?;
@@ -723,7 +716,10 @@ mod tests {
     #[test]
     fn ifindex_of_loopback_is_nonzero() {
         // `lo` exists on every Linux host (incl. the docker build container), index ≥ 1.
-        assert!(ifindex("lo") >= 1, "loopback must resolve to a real ifindex");
+        assert!(
+            ifindex("lo") >= 1,
+            "loopback must resolve to a real ifindex"
+        );
     }
 
     #[test]
