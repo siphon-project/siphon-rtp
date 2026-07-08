@@ -17,8 +17,8 @@
 //!
 //! ## What is wired vs. what needs a NIC
 //!
-//! The control plane (map programming, endpoint/flow registry, the port pool, the clock, the
-//! redirect/observe streams, the FlowKey/FlowAction encoding, header build/parse + checksums, and
+//! The control plane (map programming, endpoint/flow registry, the port pool, the real-time clock,
+//! the redirect/observe streams, the FlowKey/FlowAction encoding, header build/parse + checksums, and
 //! the UMEM frame book-keeping) is exercised NIC-free and unit-tested. Actually *binding* the AF_XDP
 //! socket and moving packets needs a real driver queue + `CAP_NET_RAW`: [`XdpDatapath::new`] binds
 //! the socket eagerly and returns [`XdpError::Xsk`] if that fails, so the engine selects this
@@ -44,8 +44,11 @@
 //! - **`last_activity`**: the kernel stamps `FlowStats::last_seen_ns` with `bpf_ktime_get_ns()`
 //!   (`CLOCK_MONOTONIC`) on every **accepted** packet — the in-kernel Forward relay *and* the Redirect
 //!   path — so [`XdpDatapath::last_activity`] returns a real value (via `kernel_ns_to_tick`, mapped to
-//!   the logical tick domain against the construction origin, the same clock domain as `start` /
-//!   `now_micros`) for the media-timeout / dead-path sweep (docs/security-and-nat.md §4 layer 6).
+//!   the elapsed-tick domain against the construction origin, the same real-time clock domain as
+//!   [`XdpDatapath::now_ticks`] / `now_micros`) for the media-timeout / dead-path sweep. `now_ticks`
+//!   is real-time too — `monotonic_ns()` against the same origin, NOT a logical sweep clock — so the
+//!   sweep's `now_ticks() - last_activity()` is a coherent elapsed-tick count and
+//!   `Datapath::advance_clock` is a no-op here (docs/security-and-nat.md §4 layer 6).
 //! - **Learned-latch readback**: [`XdpDatapath::learned_latch`] reads a flow's in-kernel-learned peer
 //!   source (`latched_*` in the `FLOWS` value) when the latch is valid. This is a datapath **read
 //!   primitive** only — the engine-side step that propagates a learned NAT source to the sibling leg's
@@ -352,17 +355,18 @@ struct Inner {
     ice: DashMap<EndpointId, IceConfig>,
     next_id: AtomicU64,
     next_port: AtomicU64,
-    /// Logical monotonic clock (ticks), advanced by the engine's sweep — never `Instant::now()`.
-    clock: AtomicU64,
     /// Real-time monotonic origin for **arrival** timestamps and `now_micros` (RTCP interarrival
-    /// jitter / DLSR, RFC 3550 §6.4.1). Distinct from the logical sweep `clock` above: this is
-    /// wall-clock-rate elapsed time, shared with the datapath thread so a packet's arrival and a
-    /// report's "now" read one clock. Production only — XDP runs on a real NIC, not in CI.
+    /// jitter / DLSR, RFC 3550 §6.4.1): wall-clock-rate elapsed time, shared with the datapath thread
+    /// so a packet's arrival and a report's "now" read one clock. XDP has **no** logical sweep clock —
+    /// it runs on a real NIC (not the deterministic CI loopback datapath), so `now_ticks` is real-time
+    /// too (`monotonic_ns` against `start_ktime_ns`), and `Datapath::advance_clock` is a no-op for it.
+    /// Production only — XDP runs on a real NIC, not in CI.
     start: std::time::Instant,
     /// `CLOCK_MONOTONIC` ns reading captured at construction, in the **same** clock domain as the
     /// kernel's `bpf_ktime_get_ns()` (and as `start` above). It is the origin the kernel's per-flow
-    /// `last_seen_ns` stamps are measured against, so [`XdpDatapath::last_activity`] can convert a
-    /// kernel ns stamp into the logical tick domain (`kernel_ns_to_tick`).
+    /// `last_seen_ns` stamps are measured against, so [`XdpDatapath::last_activity`] converts a kernel
+    /// ns stamp into the elapsed-tick domain (`kernel_ns_to_tick`) — and [`XdpDatapath::now_ticks`]
+    /// maps `monotonic_ns()` against this same origin, so both share one real-time tick domain.
     start_ktime_ns: u64,
     /// The engine-local relay IPv4 every endpoint advertises and the kernel keys flows on.
     local_ip: Ipv4Addr,
@@ -438,7 +442,6 @@ impl XdpDatapath {
             ice: DashMap::new(),
             next_id: AtomicU64::new(0),
             next_port: AtomicU64::new(0),
-            clock: AtomicU64::new(0),
             start,
             start_ktime_ns,
             local_ip,
@@ -478,11 +481,6 @@ impl XdpDatapath {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 
         Ok(Self { inner })
-    }
-
-    /// Advance the logical clock by `ticks` (mirrors the loopback backend; tests advance explicitly).
-    pub fn advance_clock(&self, ticks: u64) {
-        self.inner.clock.fetch_add(ticks, Ordering::Relaxed);
     }
 
     /// Read back the peer source the kernel's in-kernel latch has learned for `endpoint` (symmetric
@@ -956,7 +954,14 @@ impl Datapath for XdpDatapath {
     }
 
     fn now_ticks(&self) -> u64 {
-        self.inner.clock.load(Ordering::Relaxed)
+        // XDP runs on a real NIC (not the deterministic CI loopback datapath), so its clock is
+        // wall-clock elapsed, NOT the logical sweep clock. Reporting real-time ticks since the
+        // construction origin puts now_ticks() in the SAME domain as last_activity()
+        // (kernel_ns_to_tick against start_ktime_ns), so the media-timeout sweep's
+        // now_ticks() - last_activity() is a real elapsed-tick count (docs/security-and-nat.md §4
+        // layer 6). The `Datapath::advance_clock` default is a no-op for this backend — the sweep
+        // does not drive a real-time clock (RFC 3550 §6.4.1 monotonic clock).
+        kernel_ns_to_tick(monotonic_ns(), self.inner.start_ktime_ns)
     }
 
     fn now_micros(&self) -> u64 {
@@ -1247,5 +1252,32 @@ mod tests {
         let second = monotonic_ns();
         assert!(first > 0, "CLOCK_MONOTONIC should be available");
         assert!(second >= first, "monotonic clock must not go backwards");
+    }
+
+    #[test]
+    fn now_ticks_is_real_time_monotonic_and_coherent_with_last_activity() {
+        // `XdpDatapath::now_ticks` is `kernel_ns_to_tick(monotonic_ns(), start_ktime_ns)` and
+        // `last_activity` is `kernel_ns_to_tick(last_seen_ns, start_ktime_ns)` — both map a
+        // CLOCK_MONOTONIC ns reading through the SAME conversion against the SAME construction origin.
+        // This reproduces that exact arithmetic NIC-free (building an `XdpDatapath` needs an AF_XDP
+        // bind), asserting the two properties the media-timeout sweep relies on, WITHOUT a sleep:
+        //   1. now_ticks is monotonic non-decreasing across reads (CLOCK_MONOTONIC, RFC 3550 §6.4.1);
+        //   2. now_ticks never precedes a flow stamped "just now", so `now_ticks - last_activity`
+        //      (docs/security-and-nat.md §4 layer 6) is a real, non-underflowing elapsed-tick count.
+        let origin = monotonic_ns();
+        // A flow whose kernel `last_seen_ns` was stamped at (approximately) now.
+        let last_seen_ns = monotonic_ns();
+        let last_activity = kernel_ns_to_tick(last_seen_ns, origin);
+        // now_ticks() sampled after the stamp: same domain, same origin.
+        let now_first = kernel_ns_to_tick(monotonic_ns(), origin);
+        let now_second = kernel_ns_to_tick(monotonic_ns(), origin);
+        assert!(
+            now_second >= now_first,
+            "now_ticks must be monotonic non-decreasing"
+        );
+        assert!(
+            now_first >= last_activity,
+            "now_ticks must not precede a just-stamped last_activity (no sweep underflow)"
+        );
     }
 }
