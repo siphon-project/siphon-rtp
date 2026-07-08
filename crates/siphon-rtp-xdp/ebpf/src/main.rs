@@ -50,9 +50,9 @@ use aya_ebpf::{
         bpf_fib_lookup as bpf_fib_lookup_params, xdp_action, BPF_FIB_LKUP_RET_SUCCESS,
         BPF_FIB_LOOKUP_DIRECT,
     },
-    helpers::{bpf_fib_lookup, bpf_redirect},
+    helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect},
     macros::{map, xdp},
-    maps::{HashMap, PerCpuArray, XskMap},
+    maps::{HashMap, PerCpuArray, PerCpuHashMap, XskMap},
     programs::XdpContext,
     EbpfContext,
 };
@@ -73,9 +73,26 @@ static FLOWS: HashMap<FlowKey, FlowAction> = HashMap::with_max_entries(65_536, 0
 #[map]
 static XSKS: XskMap = XskMap::with_max_entries(64, 0);
 
-/// Per-CPU counters (summed by the loader).
+/// Program-wide per-CPU counters — the aggregate over every flow (summed by the loader).
 #[map]
 static STATS: PerCpuArray<FlowStats> = PerCpuArray::with_max_entries(1, 0);
+
+/// Per-flow per-CPU counters + last-accepted-packet timestamp, keyed by the same [`FlowKey`] as
+/// `FLOWS`, so the loader reports one endpoint's real counters and its `last_activity`
+/// (docs/security-and-nat.md §4 layer 6) instead of the program-wide aggregate. Sized to `FLOWS`.
+#[map]
+static FLOW_STATS: PerCpuHashMap<FlowKey, FlowStats> = PerCpuHashMap::with_max_entries(65_536, 0);
+
+/// A zeroed per-flow stats value for the first-packet insert. A `const` reference so the insert
+/// carries no on-stack copy (the eBPF stack budget is 512 bytes; the FIB-lookup params already use it).
+const EMPTY_FLOW_STATS: FlowStats = FlowStats {
+    packets_in: 0,
+    packets_out: 0,
+    bytes_in: 0,
+    bytes_out: 0,
+    packets_dropped: 0,
+    last_seen_ns: 0,
+};
 
 const ETH_HDR_LEN: usize = 14;
 const ETH_P_IP: u16 = 0x0800;
@@ -133,11 +150,39 @@ fn load_be_u16(ctx: &XdpContext, offset: usize) -> Result<u16, ()> {
     Ok(u16::from_be_bytes(load::<[u8; 2]>(ctx, offset)?))
 }
 
+/// This flow's per-CPU stats entry, creating a zeroed one on first sight. Returns `None` only if the
+/// `FLOW_STATS` map is full (65 536 concurrent flows) — then only the program-wide aggregate is
+/// bumped, never a panic. Per-CPU, so no cross-CPU race on the entry.
 #[inline(always)]
-fn bump(field: impl Fn(&mut FlowStats)) {
-    if let Some(stats) = STATS.get_ptr_mut(0) {
-        // Single-CPU view (per-CPU array), so a plain read-modify-write is race-free here.
-        unsafe { field(&mut *stats) };
+fn flow_stats_entry(key: &FlowKey) -> Option<*mut FlowStats> {
+    if let Some(entry) = FLOW_STATS.get_ptr_mut(key) {
+        return Some(entry);
+    }
+    // First packet for this flow on this CPU: insert a zeroed entry (BPF_ANY), then take the pointer.
+    let _ = FLOW_STATS.insert(key, &EMPTY_FLOW_STATS, 0);
+    FLOW_STATS.get_ptr_mut(key)
+}
+
+/// Apply `field` to **both** the program-wide aggregate (`STATS[0]`) and this flow's per-CPU entry,
+/// so one counter bump keeps the aggregate and the per-endpoint view in lockstep. Both are per-CPU,
+/// so a plain read-modify-write is race-free.
+#[inline(always)]
+fn account(entry: Option<*mut FlowStats>, field: impl Fn(&mut FlowStats)) {
+    if let Some(aggregate) = STATS.get_ptr_mut(0) {
+        unsafe { field(&mut *aggregate) };
+    }
+    if let Some(flow) = entry {
+        unsafe { field(&mut *flow) };
+    }
+}
+
+/// Stamp this flow's last-accepted-packet time (`last_seen_ns`, per-CPU) with a monotonic
+/// `bpf_ktime_get_ns()` reading. Only the per-flow entry carries it — the aggregate's `last_seen_ns`
+/// is meaningless. Drives the loader's `last_activity` (docs/security-and-nat.md §4 layer 6).
+#[inline(always)]
+fn stamp_last_seen(entry: Option<*mut FlowStats>, now_ns: u64) {
+    if let Some(flow) = entry {
+        unsafe { (*flow).last_seen_ns = now_ns };
     }
 }
 
@@ -195,6 +240,13 @@ fn try_classify(ctx: &XdpContext) -> Result<u32, ()> {
     let udp_offset = ETH_HDR_LEN + ihl;
     let dest_port: u16 = load(ctx, udp_offset + 2)?; // network order
 
+    // UDP payload bytes for stats = IP total length (RFC 791) minus the IP header (ihl) and the 8-byte
+    // UDP header (RFC 768). This matches the loopback backend's byte accounting (the recv_from /
+    // send_to payload length), so both datapaths report the same bytes for the same call. Saturating:
+    // a malformed short total-length counts 0 rather than underflowing.
+    let ip_total_len = load_be_u16(ctx, ip_offset + 2)? as usize;
+    let payload_len = ip_total_len.saturating_sub(ihl + 8) as u64;
+
     let key = FlowKey {
         local_ipv4: dest_ipv4,
         local_port: dest_port,
@@ -209,34 +261,48 @@ fn try_classify(ctx: &XdpContext) -> Result<u32, ()> {
     // a latch learn, so there is no aliasing between the copy and the write.
     let rule = unsafe { *rule_ptr };
 
-    bump(|s| s.packets_in += 1);
+    // This flow's per-CPU stats entry (created on first sight); threaded through every bump so the
+    // per-endpoint counters track the aggregate.
+    let stats_entry = flow_stats_entry(&key);
+    account(stats_entry, |s| {
+        s.packets_in += 1;
+        s.bytes_in += payload_len;
+    });
 
     match rule.kind {
         action::DROP => {
-            bump(|s| s.packets_dropped += 1);
+            account(stats_entry, |s| s.packets_dropped += 1);
             Ok(xdp_action::XDP_DROP)
         }
-        action::FORWARD => {
-            Ok(
-                forward_in_kernel(ctx, &rule, rule_ptr, source_ipv4, ip_offset, udp_offset)
-                    .unwrap_or_else(|()| {
-                        // Truncated/malformed datagram: drop (do not XDP_PASS partial media).
-                        bump(|s| s.packets_dropped += 1);
-                        xdp_action::XDP_DROP
-                    }),
-            )
-        }
+        action::FORWARD => Ok(forward_in_kernel(
+            ctx,
+            &rule,
+            rule_ptr,
+            stats_entry,
+            source_ipv4,
+            payload_len,
+            ip_offset,
+            udp_offset,
+        )
+        .unwrap_or_else(|()| {
+            // Truncated/malformed datagram: drop (do not XDP_PASS partial media).
+            account(stats_entry, |s| s.packets_dropped += 1);
+            xdp_action::XDP_DROP
+        })),
         action::REDIRECT => {
             // RTPBleed gate: a source the SDP did not signal never reaches userspace.
             if !source_allowed(&rule, source_ipv4) {
-                bump(|s| s.packets_dropped += 1);
+                account(stats_entry, |s| s.packets_dropped += 1);
                 return Ok(xdp_action::XDP_DROP);
             }
+            // Accepted media handed to userspace — stamp activity for the media-timeout sweep (mirrors
+            // the loopback backend, which stamps last_seen right after the gate, before the send).
+            stamp_last_seen(stats_entry, unsafe { bpf_ktime_get_ns() });
             // Hand to the owning AF_XDP socket (the userspace actor relays / transcodes).
             match XSKS.redirect(rule.redirect_queue, 0) {
                 Ok(redirect) => Ok(redirect),
                 Err(_) => {
-                    bump(|s| s.packets_dropped += 1);
+                    account(stats_entry, |s| s.packets_dropped += 1);
                     Ok(xdp_action::XDP_DROP)
                 }
             }
@@ -261,11 +327,14 @@ fn try_classify(ctx: &XdpContext) -> Result<u32, ()> {
 /// neighbour falls back to `action::REDIRECT` so userspace (netlink resolve + ARP kick) handles the
 /// cold case. Returns the XDP verdict; `Err(())` means a bounds check failed (the caller drops).
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn forward_in_kernel(
     ctx: &XdpContext,
     rule: &FlowAction,
     rule_ptr: *mut FlowAction,
+    stats_entry: Option<*mut FlowStats>,
     source_ipv4: u32,
+    payload_len: u64,
     ip_offset: usize,
     udp_offset: usize,
 ) -> Result<u32, ()> {
@@ -276,18 +345,18 @@ fn forward_in_kernel(
         Ok(byte) => byte,
         // No payload at all — not media on a media flow.
         Err(()) => {
-            bump(|s| s.packets_dropped += 1);
+            account(stats_entry, |s| s.packets_dropped += 1);
             return Ok(xdp_action::XDP_DROP);
         }
     };
     if !is_rtp_or_rtcp(&[first_byte]) {
-        bump(|s| s.packets_dropped += 1);
+        account(stats_entry, |s| s.packets_dropped += 1);
         return Ok(xdp_action::XDP_DROP);
     }
 
     // --- Layer 2: signalled-source gate (RTPBleed, RFC 3264). ----------------------------------
     if !source_allowed(rule, source_ipv4) {
-        bump(|s| s.packets_dropped += 1);
+        account(stats_entry, |s| s.packets_dropped += 1);
         return Ok(xdp_action::XDP_DROP);
     }
 
@@ -315,7 +384,7 @@ fn forward_in_kernel(
         match latch_decision(current, src_ip_host, src_port_host, ssrc) {
             LatchVerdict::Drop => {
                 // A hijack spray (new source, wrong/absent SSRC) — drop, keep the existing latch.
-                bump(|s| s.packets_dropped += 1);
+                account(stats_entry, |s| s.packets_dropped += 1);
                 return Ok(xdp_action::XDP_DROP);
             }
             LatchVerdict::Learn(learned) => {
@@ -332,6 +401,12 @@ fn forward_in_kernel(
         }
     }
 
+    // The datagram has passed layer 1 (demux) + layer 2 (source gate) + layer 3 (SSRC latch): it is
+    // accepted media. Stamp activity now — before the destination is resolved — so even a leg whose
+    // answer has not landed yet (no `out_dst`) records that the peer is alive, exactly what the
+    // media-timeout / dead-path sweep needs (docs/security-and-nat.md §4 layer 6).
+    stamp_last_seen(stats_entry, unsafe { bpf_ktime_get_ns() });
+
     // --- Resolve the forward destination. The kernel forwards to the userspace-maintained
     //     destination (rtpengine `dst_addr` parity; the loopback backend's `.or(rule.out_dst)`
     //     primary path). A flow's *own* ingress latch is the RTPBleed source anchor above, not a
@@ -340,7 +415,7 @@ fn forward_in_kernel(
     let new_dst_ip_host = rule.out_ipv4; // loader stores host-order (from_be_bytes)
     let new_dst_port_host = u16::from_be(rule.out_port); // loader stores network-order (to_be)
     if new_dst_ip_host == 0 || new_dst_port_host == 0 {
-        bump(|s| s.packets_dropped += 1);
+        account(stats_entry, |s| s.packets_dropped += 1);
         return Ok(xdp_action::XDP_DROP);
     }
     let new_src_ip_host = rule.out_local_ipv4; // host-order
@@ -374,7 +449,7 @@ fn forward_in_kernel(
         return match XSKS.redirect(rule.redirect_queue, 0) {
             Ok(redirect) => Ok(redirect),
             Err(_) => {
-                bump(|s| s.packets_dropped += 1);
+                account(stats_entry, |s| s.packets_dropped += 1);
                 Ok(xdp_action::XDP_DROP)
             }
         };
@@ -422,10 +497,11 @@ fn forward_in_kernel(
     store::<[u8; 6]>(ctx, 0, params.dmac)?;
     store::<[u8; 6]>(ctx, 6, params.smac)?;
 
-    let frame_len = (ctx.data_end() - ctx.data()) as u64;
-    bump(|s| {
+    // Count the UDP payload bytes (not the L2 frame) so bytes_out matches bytes_in and the loopback
+    // backend's send_to accounting; the payload is unchanged by the header-only rewrite above.
+    account(stats_entry, |s| {
         s.packets_out += 1;
-        s.bytes_out += frame_len;
+        s.bytes_out += payload_len;
     });
 
     if params.ifindex == ingress_ifindex {

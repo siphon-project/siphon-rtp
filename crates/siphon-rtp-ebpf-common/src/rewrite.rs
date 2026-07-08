@@ -131,14 +131,17 @@ pub fn udp_checksum_after_rewrite(
 // short datagrams (no readable SSRC) are gated + forwarded but never move the SSRC latch.
 // -------------------------------------------------------------------------------------------------
 
-/// The learned source of a flow's peer: address + port (network order) + the RTP SSRC (host order)
-/// it carries. The SSRC is the re-latch consistency key — a genuine NAT rebind keeps its SSRC, an
-/// off-path hijack spray does not (RFC 3550 §8).
+/// The learned source of a flow's peer: address + port + the RTP SSRC it carries, all in **host**
+/// byte order — the kernel reads the wire fields with `from_be_bytes` before comparing/storing, so the
+/// whole latch state machine is host-order throughout (equality is order-agnostic; the readback in
+/// `siphon-rtp-xdp` reconstructs the peer transport from these host-order values). The SSRC is the
+/// re-latch consistency key — a genuine NAT rebind keeps its SSRC, an off-path hijack spray does not
+/// (RFC 3550 §8).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Latched {
-    /// Peer source IPv4 (network byte order).
+    /// Peer source IPv4 (host byte order).
     pub ipv4: u32,
-    /// Peer source UDP port (network byte order).
+    /// Peer source UDP port (host byte order).
     pub port: u16,
     /// Peer RTP SSRC (host byte order).
     pub ssrc: u32,
@@ -192,8 +195,9 @@ pub fn is_rtp_or_rtcp(payload: &[u8]) -> bool {
 
 /// Apply the SSRC-consistent latch policy to one datagram that has already passed the RFC 7983 demux
 /// (layer 1) and the signalled-source gate (layer 2). `current` is the flow's latch state (`None`
-/// when not yet latched), `source_*` is the datagram's L3/L4 source (network order), and `ssrc` is
-/// [`rtp_media_ssrc`] of its payload. Returns the [`LatchVerdict`]. RFC 3550 §8; RFC 4961.
+/// when not yet latched), `source_*` is the datagram's L3/L4 source (host order — the kernel reads the
+/// wire fields with `from_be_bytes` before calling), and `ssrc` is [`rtp_media_ssrc`] of its payload.
+/// Returns the [`LatchVerdict`]. RFC 3550 §8; RFC 4961.
 ///
 /// This is a pure function of `(current, source, ssrc)` — no I/O — so it is exhaustively unit-tested
 /// on the host and reused verbatim by the kernel program.
