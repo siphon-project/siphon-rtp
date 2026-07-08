@@ -72,12 +72,14 @@ last SR so the peer can derive round-trip time. Secure legs get the same reports
 
 The engine pushes these asynchronously to the controlling client (no request id):
 
-- `call_quality`, every ~5 s per conference participant: RFC 3550 interarrival jitter in ms,
+- `call_quality`, every ~5 s per conference participant and per 2-party relay / transcode leg: RFC 3550 interarrival jitter in ms,
   residual loss percent, and a MOS estimate from the ITU-T G.107 E-model (R-factor mapped per
   Annex B, clamped to 1.0..4.5), with the codec's impairment factors per ITU-T G.113. One-way
   network delay is now measured (from RTT on inbound RRs, conference path) and folded in, so the
   score reflects jitter, loss, codec, and measured one-way delay.
-  Two-party legs do not emit `call_quality` yet; it is conference-only today.
+  Conference participants are keyed by `conference_id`; 2-party relay and transcode legs by `call_id`
+  (exactly one identifier is present). The transcode path reports on a ~5 s tick; the plain-relay path
+  derives it from each endpoint's RTCP reception reports.
 
   ```json
   { "event": "call_quality", "conference_id": "room-1", "from_tag": "alice",

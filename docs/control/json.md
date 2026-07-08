@@ -206,10 +206,11 @@ Events are pushed down the same TCP connection, tagged on `"event"`, with no `id
 | `dtmf` | `call_id`, `from_tag`, `to_tag?`, `digit`, `duration_ms`, `volume`, `source?` | An RFC 4733 telephone-event completed on a leg of a media-processing call or a conference participant. Fires even while that leg's DTMF relay is blocked. |
 | `media_timeout` | `call_id`, `from_tag` | The call went silent past `--media-timeout-secs` and the engine reaped it. Release your own per-call state. |
 | `active_speaker` | `conference_id`, `from_tag?` | The dominant speaker in a conference changed; `from_tag` absent means the floor went silent. |
-| `call_quality` | `conference_id`, `from_tag`, `jitter_ms`, `loss_percent`, `mos` | Periodic per-participant reception quality: RFC 3550 §6.4.1 interarrival jitter, residual loss, and an ITU-T G.107 E-model MOS estimate (1.0..=4.5). Emitted every few seconds per conference participant. |
+| `call_quality` | `conference_id?` xor `call_id?`, `from_tag`, `jitter_ms`, `loss_percent`, `mos` | Periodic reception quality: RFC 3550 §6.4.1 interarrival jitter, residual loss, and an ITU-T G.107 E-model MOS estimate (1.0..=4.5). Fires every few seconds per conference participant (keyed by `conference_id`) and per 2-party relay or transcode leg (keyed by `call_id`); exactly one identifier is present. |
 
-`active_speaker` and `call_quality` are conference-scoped today. For per-call quality on
-ordinary relayed calls, use [HEP/Homer export](../observability.md) instead.
+`active_speaker` is conference-scoped. `call_quality` now also fires for ordinary 2-party relay and
+transcode calls (keyed by `call_id`), so per-call quality is on the control channel as well as in the
+[HEP/Homer export](../observability.md).
 
 ## Worked examples
 
