@@ -516,10 +516,23 @@ pub enum Event {
         from_tag: Option<String>,
     },
     /// Periodic per-leg reception-quality estimate (RFC 3550 RTCP statistics + ITU-T G.107 MOS), so
-    /// SIPhon surfaces live call quality without parsing RTCP itself. Emitted every few seconds per
-    /// conference participant.
+    /// SIPhon surfaces live call quality without parsing RTCP itself. Emitted every few seconds for
+    /// every relayed leg — a conference participant, a 2-party plain-relay call, or a transcode call.
+    ///
+    /// The event carries **exactly one** stream identifier: `conference_id` for a conference
+    /// participant, or `call_id` for a 2-party (relay/transcode) call — never both, never neither.
+    /// Both are optional and `skip_serializing_if` the absent one, so a conference event's wire form
+    /// stays byte-identical to before this field split (a consumer that ignores the absent field is
+    /// unaffected — additive, backward-compatible).
     CallQuality {
-        conference_id: String,
+        /// The conference this participant belongs to, for a conference-leg quality report. `None`
+        /// on a 2-party (relay/transcode) call, where `call_id` identifies the stream instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
+        /// The call this leg belongs to, for a 2-party plain-relay or transcode quality report. `None`
+        /// on a conference participant, where `conference_id` identifies the stream instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
         from_tag: String,
         /// Interarrival jitter in milliseconds (RFC 3550 §6.4.1).
         jitter_ms: f64,
@@ -1108,7 +1121,8 @@ mod tests {
     #[test]
     fn call_quality_event_roundtrip() {
         let event = Event::CallQuality {
-            conference_id: "room".into(),
+            conference_id: Some("room".into()),
+            call_id: None,
             from_tag: "party-0".into(),
             jitter_ms: 1.125,
             loss_percent: 0.0,
@@ -1119,6 +1133,74 @@ mod tests {
         assert!(serde_json::to_string(&event)
             .expect("serialize")
             .contains("\"event\":\"call_quality\""));
+    }
+
+    #[test]
+    fn conference_call_quality_serializes_byte_identical_after_the_call_id_split() {
+        // Backward-compat regression: adding the optional `call_id` must not change a conference
+        // event's wire form. `conference_id` is `Some` (serializes as the bare string, as it did when
+        // it was a plain `String`), and the absent `call_id` is `skip_serializing_if`'d — so the JSON
+        // is exactly what a pre-split consumer expects (field order + contents unchanged).
+        let event = Event::CallQuality {
+            conference_id: Some("room".into()),
+            call_id: None,
+            from_tag: "party-0".into(),
+            jitter_ms: 1.125,
+            loss_percent: 0.0,
+            mos: 4.41,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"event":"call_quality","conference_id":"room","from_tag":"party-0","jitter_ms":1.125,"loss_percent":0.0,"mos":4.41}"#
+        );
+        // No `call_id` key leaks onto a conference event.
+        assert!(!json.contains("call_id"), "absent call_id must be omitted");
+    }
+
+    #[test]
+    fn call_id_call_quality_roundtrips_with_conference_id_absent() {
+        // A 2-party (relay/transcode) quality event carries `call_id` and omits `conference_id`.
+        let event = Event::CallQuality {
+            conference_id: None,
+            call_id: Some("call-42".into()),
+            from_tag: "caller".into(),
+            jitter_ms: 3.5,
+            loss_percent: 1.25,
+            mos: 4.2,
+        };
+        roundtrip(&event);
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(
+            json.contains(r#""call_id":"call-42""#),
+            "call_id present: {json}"
+        );
+        assert!(
+            !json.contains("conference_id"),
+            "absent conference_id must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn call_quality_deserializes_either_identifier_alone() {
+        // A consumer receiving only `conference_id` (old wire) or only `call_id` (new wire) decodes
+        // with the other identifier defaulting to `None` (forward/backward compatible).
+        let conference: Event = serde_json::from_str(
+            r#"{"event":"call_quality","conference_id":"room","from_tag":"p","jitter_ms":0.0,"loss_percent":0.0,"mos":4.4}"#,
+        )
+        .expect("deserialize conference quality");
+        assert!(matches!(
+            conference,
+            Event::CallQuality { conference_id: Some(ref id), call_id: None, .. } if id == "room"
+        ));
+        let call: Event = serde_json::from_str(
+            r#"{"event":"call_quality","call_id":"c1","from_tag":"p","jitter_ms":0.0,"loss_percent":0.0,"mos":4.4}"#,
+        )
+        .expect("deserialize call quality");
+        assert!(matches!(
+            call,
+            Event::CallQuality { conference_id: None, call_id: Some(ref id), .. } if id == "c1"
+        ));
     }
 
     #[test]

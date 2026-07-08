@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod dtmf;
 pub mod fanout;
 pub mod fork;
+pub mod ingress;
 pub mod jitter;
 pub mod leg;
 pub mod mixer;

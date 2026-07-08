@@ -517,7 +517,8 @@ impl Conference {
                 jitter_ms: participant.leg.ingress_jitter_ms(),
             };
             out.push(Event::CallQuality {
-                conference_id: self.conference_id().to_string(),
+                conference_id: Some(self.conference_id().to_string()),
+                call_id: None,
                 from_tag: participant.tag.clone(),
                 jitter_ms: impairments.jitter_ms,
                 loss_percent: impairments.loss_percent,
@@ -2028,12 +2029,14 @@ mod tests {
         match &events[0] {
             Event::CallQuality {
                 conference_id,
+                call_id,
                 from_tag,
                 jitter_ms,
                 loss_percent,
                 mos,
             } => {
-                assert_eq!(conference_id, "room");
+                assert_eq!(conference_id.as_deref(), Some("room"));
+                assert!(call_id.is_none(), "a conference event carries no call_id");
                 assert_eq!(from_tag, "party-0");
                 assert!(
                     *jitter_ms > 0.0,
