@@ -3708,7 +3708,34 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     tracing::debug!(%error, "HEP QoS export failed");
                 }
             }
+            // ...and the same per-block quality natively on the control channel (RFC 3550 §6.4.1 loss/
+            // jitter + G.107 MOS), so SIPhon sees this 2-party plain-relay call's quality the way it
+            // sees a conference participant's — the control-channel complement to the HEP QoS export.
+            if let Some((owner, from_tag)) = self.owner_and_tag_for_endpoint(observed.endpoint) {
+                for event in
+                    qos_quality_events(&observed, &call_id, &from_tag, codec, clock_rate_hz)
+                {
+                    self.push_event(owner, event);
+                }
+            }
         }
+    }
+
+    /// The owner client and leg tag for a call-quality event derived from RTCP observed on `endpoint`:
+    /// the client that created the call (the event's recipient) and the tag of the leg the RTCP
+    /// traversed — the far (answerer) leg's `to_tag` for a far endpoint, else the near (offerer) leg's
+    /// `from_tag`. `None` when the endpoint maps to no live call.
+    fn owner_and_tag_for_endpoint(&self, endpoint: EndpointId) -> Option<(ClientId, String)> {
+        use crate::ha::EndpointRole;
+        let call_id = self.call_for_endpoint(endpoint)?;
+        let call = self.calls.get(&call_id)?;
+        let from_tag = match call.endpoint_role(endpoint) {
+            Some(EndpointRole::FarRtp | EndpointRole::FarRtcp) => {
+                call.to_tag.clone().unwrap_or_else(|| call.from_tag.clone())
+            }
+            _ => call.from_tag.clone(),
+        };
+        Some((call.owner, from_tag))
     }
 
     /// The G.107 codec and RTP clock rate for QoS reports on `endpoint` — the negotiated codec of the
@@ -3737,6 +3764,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 }
 
+/// Invoke `handle` for each RFC 3550 §6.4.1 reception report block in an observed compound RTCP
+/// datagram — across every Sender Report and Receiver Report it carries. A malformed / unparseable
+/// datagram yields nothing (telemetry never disturbs the media path). The single parse both the HEP
+/// QoS export ([`qos_captures`]) and the control-channel quality events ([`qos_quality_events`]) share.
+fn for_each_reception_block(
+    observed: &ObservedRtcp,
+    mut handle: impl FnMut(&siphon_rtp_media::rtcp::ReportBlock),
+) {
+    use siphon_rtp_media::rtcp::RtcpPacket;
+    let Ok(packets) = siphon_rtp_media::rtcp::parse_compound(&observed.payload) else {
+        return;
+    };
+    for packet in &packets {
+        let blocks = match packet {
+            RtcpPacket::SenderReport(report) => report.reports.as_slice(),
+            RtcpPacket::ReceiverReport(report) => report.reports.as_slice(),
+            RtcpPacket::Other { .. } => continue,
+        };
+        for block in blocks {
+            handle(block);
+        }
+    }
+}
+
 /// Build HEP QoS/MOS report captures (`protocol_type` = REPORT_JSON) from an observed RTCP datagram:
 /// one per reception report block (RFC 3550 §6.4.1) in any Sender/Receiver Report it carries. Each
 /// block's `fraction_lost` + `jitter` drive the G.107 E-model MOS (ITU-T G.107). `rtt` is 0 — the
@@ -3751,32 +3802,51 @@ fn qos_captures(
     clock_rate_hz: u32,
 ) -> Vec<Capture> {
     let mut captures = Vec::new();
-    let Ok(packets) = siphon_rtp_media::rtcp::parse_compound(&observed.payload) else {
-        return captures;
-    };
-    for packet in &packets {
-        use siphon_rtp_media::rtcp::RtcpPacket;
-        let blocks = match packet {
-            RtcpPacket::SenderReport(report) => report.reports.as_slice(),
-            RtcpPacket::ReceiverReport(report) => report.reports.as_slice(),
-            RtcpPacket::Other { .. } => continue,
-        };
-        for block in blocks {
-            // No measured RTT on the passive relay path ⇒ one-way delay 0 (RFC 3550 §6.4.1).
-            let impairments =
-                Impairments::from_rtcp(block.fraction_lost, block.jitter, clock_rate_hz, 0.0);
-            let report = QosReport::new(call_id, block.ssrc, codec, impairments);
-            captures.push(Capture::from_qos_report(
-                observed.source,
-                observed.destination,
-                timestamp_secs,
-                timestamp_micros,
-                capture_agent_id,
-                &report,
-            ));
-        }
-    }
+    for_each_reception_block(observed, |block| {
+        // No measured RTT on the passive relay path ⇒ one-way delay 0 (RFC 3550 §6.4.1).
+        let impairments =
+            Impairments::from_rtcp(block.fraction_lost, block.jitter, clock_rate_hz, 0.0);
+        let report = QosReport::new(call_id, block.ssrc, codec, impairments);
+        captures.push(Capture::from_qos_report(
+            observed.source,
+            observed.destination,
+            timestamp_secs,
+            timestamp_micros,
+            capture_agent_id,
+            &report,
+        ));
+    });
     captures
+}
+
+/// Build per-leg [`Event::CallQuality`] control-channel events from an observed RTCP datagram — one
+/// per reception report block (RFC 3550 §6.4.1), from the **same** `fraction_lost` + `jitter` +
+/// G.107 MOS the HEP QoS export derives ([`qos_captures`]), but delivered natively on the control
+/// channel so SIPhon sees a 2-party plain-relay call's quality without parsing RTCP itself (the
+/// counterpart to what conference / transcode legs emit). `from_tag` names the leg the RTCP traversed
+/// (the reporting peer). `rtt` is 0 — the passive in-kernel relay originates no Sender Report, so it
+/// measures no round-trip time (matching the HEP QoS report's one-way delay of 0).
+fn qos_quality_events(
+    observed: &ObservedRtcp,
+    call_id: &str,
+    from_tag: &str,
+    codec: siphon_rtp_hep::mos::Codec,
+    clock_rate_hz: u32,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+    for_each_reception_block(observed, |block| {
+        let impairments =
+            Impairments::from_rtcp(block.fraction_lost, block.jitter, clock_rate_hz, 0.0);
+        events.push(Event::CallQuality {
+            conference_id: None,
+            call_id: Some(call_id.to_string()),
+            from_tag: from_tag.to_string(),
+            jitter_ms: impairments.jitter_ms,
+            loss_percent: impairments.loss_percent,
+            mos: siphon_rtp_hep::mos::estimate_mos(codec, impairments),
+        });
+    });
+    events
 }
 
 /// Build a HEP RTCP capture from an observed relayed RTCP datagram (`protocol_type` = RTCP).
@@ -4060,6 +4130,9 @@ fn build_direction(
         telephone_event_in,
         telephone_event_out,
         recorder,
+        // The G.107 codec class of the stream this direction decodes (the ingress codec), for the MOS
+        // in its periodic quality report — mapped the same way as the HEP QoS / conference paths.
+        ingress_mos_codec: crate::conference::hep_codec_for_name(&ingress_codec.encoding_name),
     })
 }
 
@@ -4470,6 +4543,66 @@ mod tests {
             "160 @ 8 kHz → 20 ms: {json}"
         );
         assert!(json.contains(r#""mos":"#), "{json}");
+
+        // ...and the SAME per-block loss/jitter/MOS natively on the control channel, keyed by
+        // `call_id` (not `conference_id`), for the 2-party plain-relay call.
+        let events = qos_quality_events(
+            &observed,
+            "call-42@host",
+            "caller",
+            siphon_rtp_hep::mos::Codec::G711,
+            8000,
+        );
+        assert_eq!(events.len(), 1, "one quality event per reception block");
+        match &events[0] {
+            Event::CallQuality {
+                conference_id,
+                call_id,
+                from_tag,
+                jitter_ms,
+                loss_percent,
+                mos,
+            } => {
+                assert!(
+                    conference_id.is_none(),
+                    "a 2-party relay carries no conference_id"
+                );
+                assert_eq!(call_id.as_deref(), Some("call-42@host"));
+                assert_eq!(from_tag, "caller");
+                // 13/256 → 5.078125 %, 160 @ 8 kHz → 20 ms — the exact figures the HEP report carries.
+                assert!(
+                    (*loss_percent - (13.0 / 256.0 * 100.0)).abs() < 1e-9,
+                    "13/256 → 5.08 %, got {loss_percent}"
+                );
+                assert!(
+                    (*jitter_ms - 20.0).abs() < 1e-9,
+                    "160 @ 8 kHz → 20 ms, got {jitter_ms}"
+                );
+                // The MOS is the G.107 estimate for that loss/jitter — a good-but-not-perfect call.
+                assert!(*mos > 1.0 && *mos < 4.5, "plausible MOS, got {mos}");
+            }
+            other => panic!("expected CallQuality, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qos_quality_events_ignores_rtcp_without_reception_blocks() {
+        // A minimal RR with reception-count 0 (no blocks) yields no quality event — nothing to report.
+        let rtcp = vec![0x80, 201, 0x00, 0x01, 0xAA, 0xAA, 0x00, 0x01];
+        let observed = ObservedRtcp {
+            endpoint: EndpointId(1),
+            source: "198.51.100.1:6000".parse().expect("src"),
+            destination: "203.0.113.1:6002".parse().expect("dst"),
+            payload: bytes::Bytes::from(rtcp),
+        };
+        let events = qos_quality_events(
+            &observed,
+            "call-x",
+            "caller",
+            siphon_rtp_hep::mos::Codec::G711,
+            8000,
+        );
+        assert!(events.is_empty(), "no reception block ⇒ no quality event");
     }
 
     /// A two-port SDP: RTP at `addr`, RTCP at `addr`+1 (default), optional `a=rtcp-mux`. The
@@ -9910,5 +10043,102 @@ mod tests {
             contains_bytes(packet, b"qos"),
             "HEP correlation id = call-id"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relayed_rtcp_reception_report_emits_call_quality_on_the_control_channel() {
+        // A 2-party plain-relay call: an inbound RTCP reception report (RFC 3550 §6.4.2) surfaces as
+        // an `Event::CallQuality` on the owner's control channel — keyed by `call_id`, carrying the
+        // same loss/jitter/MOS the HEP QoS export derives — alongside the unchanged raw-RTCP relay.
+        let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+        let events = engine.register_client(CLIENT);
+
+        // Bring up the RTCP export tap (which also pushes the control-channel quality events).
+        let collector = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind collector");
+        let exporter = HepExporter::connect(collector.local_addr().expect("addr"))
+            .await
+            .expect("connect");
+        tokio::spawn(engine.clone().run_rtcp_export(exporter, 7));
+        tokio::task::yield_now().await;
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "quality".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "quality".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("near");
+
+        // A compound Receiver Report with one reception block: fraction_lost 13/256, jitter 160 @
+        // 8 kHz (= 20 ms). RC=1, PT=201, length 7 words.
+        let mut report = vec![0x81u8, 201, 0x00, 0x07];
+        report.extend_from_slice(&0xAAAA_0001u32.to_be_bytes()); // reporter ssrc
+        report.extend_from_slice(&0x1111_2222u32.to_be_bytes()); // reported-on ssrc
+        report.push(13); // fraction lost (13/256 ≈ 5.08 %)
+        report.extend_from_slice(&[0x00, 0x00, 0x02]); // cumulative lost
+        report.extend_from_slice(&0u32.to_be_bytes()); // extended highest seq
+        report.extend_from_slice(&160u32.to_be_bytes()); // jitter
+        report.extend_from_slice(&0u32.to_be_bytes()); // LSR
+        report.extend_from_slice(&0u32.to_be_bytes()); // DLSR
+        phone_a
+            .send_to(&report, near.remote_rtp)
+            .await
+            .expect("send rtcp");
+        // The raw RTCP still relays verbatim to B (unchanged passthrough).
+        assert_eq!(recv(&phone_b).await.0, report, "RTCP relays to B");
+
+        // ...and the owner receives a CallQuality event derived from the reception block.
+        let event = timeout(Duration::from_secs(2), events.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("event");
+        match event {
+            Event::CallQuality {
+                conference_id,
+                call_id,
+                from_tag,
+                jitter_ms,
+                loss_percent,
+                mos,
+            } => {
+                assert!(
+                    conference_id.is_none(),
+                    "a plain relay carries no conference_id"
+                );
+                assert_eq!(call_id.as_deref(), Some("quality"), "keyed by call_id");
+                assert_eq!(from_tag, "a", "tagged by the reporting (near) leg");
+                assert!(
+                    (loss_percent - (13.0 / 256.0 * 100.0)).abs() < 1e-9,
+                    "13/256 → 5.08 %, got {loss_percent}"
+                );
+                assert!(
+                    (jitter_ms - 20.0).abs() < 1e-9,
+                    "160 @ 8 kHz → 20 ms, got {jitter_ms}"
+                );
+                assert!(mos > 1.0 && mos < 4.5, "plausible MOS, got {mos}");
+            }
+            other => panic!("expected CallQuality, got {other:?}"),
+        }
     }
 }

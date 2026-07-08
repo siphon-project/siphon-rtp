@@ -8,6 +8,7 @@
 use bytes::Bytes;
 use siphon_rtp_codec::{CodecError, Decoder, Encoder};
 
+use crate::ingress::IngressStats;
 use crate::jitter::{JitterBuffer, JitterOutput, PushResult};
 use crate::rtp::{write_packet, RtpError, RtpHeader, RtpPacket};
 
@@ -54,27 +55,12 @@ pub struct MediaLeg {
     egress_packets: u32,
     /// Total payload octets emitted (RTCP SR sender octet count — excludes RTP header/padding).
     egress_octets: u32,
-    /// SSRC of the inbound stream (first packet seen), for the RTCP reception report (RFC 3550 §6.4.1).
-    ingress_ssrc: Option<u32>,
-    /// Highest inbound RTP sequence seen + the wrap count, for the extended-highest-seq RR field
-    /// (RFC 3550 Appendix A.1).
-    ingress_max_seq: u16,
-    ingress_cycles: u16,
-    /// First inbound sequence number seen, the base for `expected = highest − base + 1` in the loss
-    /// fraction the MOS estimate uses (RFC 3550 Appendix A.3); `None` before the first packet.
-    ingress_base_seq: Option<u16>,
-    /// Ingress RTP clock rate (Hz) — the rate inbound RTP timestamps advance, the unit the
-    /// interarrival-jitter estimate is measured in (RFC 3550 §6.4.1). From the decoder's codec.
-    ingress_clock_rate_hz: u32,
-    /// RTP timestamp of the most recent inbound packet, captured in `ingest_rtp` so `observe_arrival`
-    /// forms the transit time without re-parsing.
-    last_ingress_timestamp: u32,
-    /// Previous packet's transit (arrival − RTP timestamp, in RTP-clock units); `None` until the
-    /// second packet — the running input to the interarrival-jitter recurrence (RFC 3550 §A.8).
-    last_transit: Option<i32>,
-    /// Smoothed interarrival jitter, in RTP-clock units (RFC 3550 §6.4.1 / §A.8: the
-    /// `J += (|D| − J)/16` recurrence in floating point, reported truncated to a `u32`).
-    ingress_jitter: f64,
+    /// Receiver-side reception statistics for this leg's inbound stream (RFC 3550 §6.4.1): SSRC latch,
+    /// extended sequence, interarrival jitter, and RTT-from-reception-report. Shared with the
+    /// transcode/relay directions ([`crate::ingress::IngressStats`]) so the jitter/RTT logic lives in
+    /// one place; the leg overlays its own **jitter-buffer-derived** loss (see
+    /// [`MediaLeg::ingress_loss_percent`] / [`MediaLeg::fraction_lost_since_last_report`]).
+    ingress: IngressStats,
     /// Middle 32 bits of the NTP timestamp from the most recent inbound Sender Report (the RR's LSR
     /// field, RFC 3550 §6.4.1), or `0` before any SR is seen.
     last_sr_ntp_middle: u32,
@@ -86,20 +72,7 @@ pub struct MediaLeg {
     /// Cumulative `lost` at the previous reception report (the counterpart snapshot to
     /// `fraction_lost_expected_prior`). `0` before the first report.
     fraction_lost_lost_prior: u32,
-    /// Fixed-size ring of the Sender Reports **this leg has sent**: each entry maps a report's NTP
-    /// middle-32 (the value a peer echoes back as LSR) to the logical send time (µs). Bounded — the
-    /// oldest entry is overwritten — so it never grows, and lookups are O(len) (RFC 3550 §6.4.1 RTT).
-    sent_reports: [Option<(u32, u64)>; SENT_SR_TABLE_LEN],
-    /// Next write slot in `sent_reports` (ring cursor).
-    sent_reports_next: usize,
-    /// The most recent round-trip time measured from an inbound reception report (µs), or `None`
-    /// until one is derived (RFC 3550 §6.4.1).
-    last_rtt_micros: Option<u64>,
 }
-
-/// Entries kept in the per-leg sent-Sender-Report ring (a few reporting intervals is ample — an RR
-/// echoes the LSR of the *last* SR its sender received, so recent history is all that is looked up).
-const SENT_SR_TABLE_LEN: usize = 8;
 
 impl MediaLeg {
     /// Build a leg from a decoder/encoder pair and a primed jitter buffer. `egress_ssrc` and
@@ -138,21 +111,11 @@ impl MediaLeg {
             egress_timestamp_increment,
             egress_packets: 0,
             egress_octets: 0,
-            ingress_ssrc: None,
-            ingress_max_seq: 0,
-            ingress_cycles: 0,
-            ingress_base_seq: None,
-            ingress_clock_rate_hz,
-            last_ingress_timestamp: 0,
-            last_transit: None,
-            ingress_jitter: 0.0,
+            ingress: IngressStats::new(ingress_clock_rate_hz),
             last_sr_ntp_middle: 0,
             last_sr_arrival_micros: None,
             fraction_lost_expected_prior: 0,
             fraction_lost_lost_prior: 0,
-            sent_reports: [None; SENT_SR_TABLE_LEN],
-            sent_reports_next: 0,
-            last_rtt_micros: None,
         }
     }
 
@@ -165,22 +128,10 @@ impl MediaLeg {
     /// Depacketize an inbound RTP packet and buffer its payload for playout.
     pub fn ingest_rtp(&mut self, packet: &[u8]) -> Result<PushResult, LegError> {
         let parsed = RtpPacket::parse(packet)?;
-        // Remember the timestamp so `observe_arrival` can form the transit time (RFC 3550 §6.4.1)
-        // without re-parsing the header.
-        self.last_ingress_timestamp = parsed.timestamp;
-        // Track the inbound SSRC + highest sequence (with wrap) for the RTCP reception report.
-        if self.ingress_ssrc.is_none() {
-            self.ingress_ssrc = Some(parsed.ssrc);
-            self.ingress_max_seq = parsed.sequence;
-            self.ingress_base_seq = Some(parsed.sequence);
-        } else if parsed.sequence.wrapping_sub(self.ingress_max_seq) < 0x8000 {
-            // `parsed.sequence` is ahead of the current max (RFC 1982 serial order); bump the wrap
-            // count when it rolled over.
-            if parsed.sequence < self.ingress_max_seq {
-                self.ingress_cycles = self.ingress_cycles.wrapping_add(1);
-            }
-            self.ingress_max_seq = parsed.sequence;
-        }
+        // Fold the packet into the receiver statistics (SSRC latch, extended sequence, received
+        // count, and the RTP timestamp `observe_arrival` needs) — RFC 3550 §6.4.1 / Appendix A.
+        self.ingress
+            .on_rtp(parsed.ssrc, parsed.sequence, parsed.timestamp);
         Ok(self
             .jitter
             .push(parsed.sequence, Bytes::copy_from_slice(parsed.payload)))
@@ -190,42 +141,29 @@ impl MediaLeg {
     /// source the RTCP reception report describes.
     #[must_use]
     pub fn ingress_ssrc(&self) -> Option<u32> {
-        self.ingress_ssrc
+        self.ingress.ssrc()
     }
 
     /// Extended highest inbound sequence received: `cycles << 16 | highest_seq` (RFC 3550 Appendix
     /// A.1) — the RTCP reception report's "extended highest sequence number" field.
     #[must_use]
     pub fn ingress_extended_highest_seq(&self) -> u32 {
-        (u32::from(self.ingress_cycles) << 16) | u32::from(self.ingress_max_seq)
+        self.ingress.extended_highest_sequence()
     }
 
     /// Fold one inbound packet's arrival into the interarrival-jitter estimate (RFC 3550 §6.4.1 /
     /// §A.8). Call once per accepted ingress packet, right after [`MediaLeg::ingest_rtp`] (which
     /// records the packet's RTP timestamp). `arrival_micros` is the receive-time clock reading the
     /// datapath stamped on the datagram — *not* an actor-ingest time, so it reflects network timing.
-    ///
-    /// `transit = arrival (sampled at the ingress RTP clock) − the packet's RTP timestamp`; the
-    /// jitter is the smoothed mean deviation of consecutive transits. All wrapping `u32`/`i32`
-    /// arithmetic per §A.8, so the 32-bit RTP-timestamp rollover is handled implicitly.
     pub fn observe_arrival(&mut self, arrival_micros: u64) {
-        // Arrival sampled at the RTP clock rate as a wrapping u32 (§A.8 `arrival`). The u128
-        // intermediate keeps the rate multiply from overflowing on long-running streams.
-        let arrival_rtp = ((u128::from(arrival_micros) * u128::from(self.ingress_clock_rate_hz))
-            / 1_000_000) as u32;
-        let transit = arrival_rtp.wrapping_sub(self.last_ingress_timestamp) as i32;
-        if let Some(previous) = self.last_transit {
-            let delta = (i64::from(transit) - i64::from(previous)).unsigned_abs() as f64;
-            self.ingress_jitter += (delta - self.ingress_jitter) / 16.0;
-        }
-        self.last_transit = Some(transit);
+        self.ingress.observe_arrival(arrival_micros);
     }
 
     /// The current interarrival-jitter estimate in RTP-clock units (RFC 3550 §6.4.1), truncated to
     /// the `u32` the reception report carries.
     #[must_use]
     pub fn ingress_jitter(&self) -> u32 {
-        self.ingress_jitter as u32
+        self.ingress.jitter_rtp_units()
     }
 
     /// The interarrival-jitter estimate in **milliseconds** — the form the G.107 MOS estimator
@@ -233,32 +171,23 @@ impl MediaLeg {
     /// codec's clock rate.
     #[must_use]
     pub fn ingress_jitter_ms(&self) -> f64 {
-        if self.ingress_clock_rate_hz == 0 {
-            return 0.0;
-        }
-        // Derive from the same value the reception report carries, so jitter-in-ms and the RR agree.
-        f64::from(self.ingress_jitter()) * 1000.0 / f64::from(self.ingress_clock_rate_hz)
+        self.ingress.jitter_ms()
     }
 
     /// Residual inbound packet loss as a percentage — the jitter buffer's lost/concealed slots over
     /// the packets expected so far (`expected = highest − base + 1`, RFC 3550 Appendix A.3). The
     /// loss a listener actually hears, and the loss input to the MOS estimate. `0` before any packet.
+    ///
+    /// This is the **jitter-buffer-derived** loss (concealment count), distinct from the sequence-gap
+    /// loss [`crate::ingress::IngressStats::loss_percent`] reports — a buffered leg measures the loss
+    /// its playout actually concealed, so the leg overlays this on the shared receiver statistics.
     #[must_use]
     pub fn ingress_loss_percent(&self) -> f64 {
-        match self.ingress_base_seq {
-            Some(base) => {
-                let expected = self
-                    .ingress_extended_highest_seq()
-                    .wrapping_sub(u32::from(base))
-                    .wrapping_add(1);
-                if expected == 0 {
-                    0.0
-                } else {
-                    (self.jitter.stats().losses as f64 / f64::from(expected) * 100.0)
-                        .clamp(0.0, 100.0)
-                }
-            }
-            None => 0.0,
+        let expected = self.ingress.expected();
+        if expected == 0 {
+            0.0
+        } else {
+            (self.jitter.stats().losses as f64 / f64::from(expected) * 100.0).clamp(0.0, 100.0)
         }
     }
 
@@ -268,16 +197,13 @@ impl MediaLeg {
     /// reports each describe their own interval — the value resets per interval, it is **not**
     /// cumulative. Returns `0` before the first inbound packet, or for an interval that expected no
     /// packets. Deterministic: it reads only sequence / loss counters, never a clock. `expected` and
-    /// `lost` are the same signals [`MediaLeg::ingress_loss_percent`] divides.
+    /// `lost` are the same signals [`MediaLeg::ingress_loss_percent`] divides (jitter-buffer loss).
     #[must_use]
     pub fn fraction_lost_since_last_report(&mut self) -> u8 {
-        let Some(base) = self.ingress_base_seq else {
+        if self.ingress.ssrc().is_none() {
             return 0;
-        };
-        let expected = self
-            .ingress_extended_highest_seq()
-            .wrapping_sub(u32::from(base))
-            .wrapping_add(1);
+        }
+        let expected = self.ingress.expected();
         let lost = self.jitter.stats().losses as u32;
         let expected_interval = expected.wrapping_sub(self.fraction_lost_expected_prior);
         let lost_interval = lost.wrapping_sub(self.fraction_lost_lost_prior);
@@ -297,9 +223,7 @@ impl MediaLeg {
     /// time up by its LSR to derive round-trip time. `send_micros` is a logical-clock reading (never
     /// `Instant::now()`), so the RTT it feeds stays deterministic in tests.
     pub fn record_sent_report(&mut self, ntp_timestamp: u64, send_micros: u64) {
-        let ntp_middle = ((ntp_timestamp >> 16) & 0xFFFF_FFFF) as u32;
-        self.sent_reports[self.sent_reports_next] = Some((ntp_middle, send_micros));
-        self.sent_reports_next = (self.sent_reports_next + 1) % SENT_SR_TABLE_LEN;
+        self.ingress.record_sent_report(ntp_timestamp, send_micros);
     }
 
     /// Consume an inbound reception report block that reports on **this leg's egress stream** and
@@ -314,41 +238,22 @@ impl MediaLeg {
         block: &crate::rtcp::ReportBlock,
         arrival_micros: u64,
     ) -> Option<u64> {
-        // The block must report on the stream we send (its SSRC field, RFC 3550 §6.4.1).
-        if block.ssrc != self.egress_ssrc {
-            return None;
-        }
-        let last_sender_report = block.last_sender_report;
-        if last_sender_report == 0 {
-            return None; // no SR echoed back ⇒ RTT not computable (RFC 3550 §6.4.1)
-        }
-        let send_micros = self
-            .sent_reports
-            .iter()
-            .flatten()
-            .find(|(ntp_middle, _)| *ntp_middle == last_sender_report)
-            .map(|(_, send_micros)| *send_micros)?;
-        // DLSR is in units of 1/65536 s; convert to microseconds.
-        let delay_micros = (u64::from(block.delay_since_last_sr) * 1_000_000) / 65_536;
-        let round_trip_micros = arrival_micros
-            .checked_sub(delay_micros)?
-            .checked_sub(send_micros)?;
-        self.last_rtt_micros = Some(round_trip_micros);
-        Some(round_trip_micros)
+        self.ingress
+            .record_reception_report(self.egress_ssrc, block, arrival_micros)
     }
 
     /// The most recent round-trip time measured from an inbound reception report (µs), or `None` until
     /// one is derived (RFC 3550 §6.4.1).
     #[must_use]
     pub fn ingress_rtt_micros(&self) -> Option<u64> {
-        self.last_rtt_micros
+        self.ingress.rtt_micros()
     }
 
     /// The most recent measured round-trip time in **milliseconds** — the form the G.107 MOS estimator
     /// halves into one-way mouth-to-ear delay. `None` until an RTT is measured.
     #[must_use]
     pub fn ingress_rtt_ms(&self) -> Option<f64> {
-        self.last_rtt_micros.map(|micros| micros as f64 / 1000.0)
+        self.ingress.rtt_ms()
     }
 
     /// Record an inbound Sender Report: its NTP timestamp's middle 32 bits become LSR, and

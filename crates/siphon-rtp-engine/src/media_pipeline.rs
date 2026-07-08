@@ -31,6 +31,7 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_media::dtmf::{DtmfDetector, DtmfGenerator};
 use siphon_rtp_media::fanout::MediaSink;
+use siphon_rtp_media::ingress::IngressStats;
 use siphon_rtp_media::pcap::CapturedPacket;
 use siphon_rtp_media::player::PcmPlayer;
 use siphon_rtp_media::repacketize::Repacketizer;
@@ -41,6 +42,10 @@ use siphon_rtp_proto::Event;
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
 /// 20 ms, the telephony default ptime (RFC 3551).
 pub const INJECT_TICK: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How many [`INJECT_TICK`]s between periodic per-leg [`Event::CallQuality`] reports — 250 × 20 ms ≈
+/// 5 s, the same reporting cadence the conference actor uses for its quality events / RTCP SRs.
+const QUALITY_INTERVAL_TICKS: u64 = 250;
 
 /// Largest RTP packet the egress scratch buffers accommodate.
 const MAX_RTP: usize = 1500;
@@ -152,6 +157,16 @@ pub struct Direction {
     /// on a plaintext leg — the existing transcode path is unchanged.
     secure_ingress: Option<Arc<Mutex<SecureLeg>>>,
     secure_egress: Option<Arc<Mutex<SecureLeg>>>,
+    /// Receiver-side reception statistics for this direction's inbound stream (RFC 3550 §6.4.1): the
+    /// loss / jitter (and RTT, when measured) feeding the periodic [`Event::CallQuality`] a 2-party
+    /// transcode call reports on the control channel — the transcode counterpart to the conference
+    /// per-participant quality report. Fed once per accepted ingress RTP packet in
+    /// [`Direction::handle`]; loss is the sequence-gap model (this direction has no playout jitter
+    /// buffer — the receiving endpoint owns that). Left inert on a relay-only direction (never fed).
+    ingress: IngressStats,
+    /// The G.107 codec class (ITU-T G.107) of this direction's **ingress** stream, for the MOS in its
+    /// quality report — the codec the sending party used (what this direction decodes).
+    ingress_mos_codec: siphon_rtp_hep::mos::Codec,
 }
 
 /// One playout tick's egress action, computed while the injection is borrowed and applied after.
@@ -201,6 +216,9 @@ pub struct DirectionConfig {
     pub telephone_event_out: Option<u8>,
     /// `Some(WavRecorder)` to record this direction's decoded audio.
     pub recorder: Option<WavRecorder>,
+    /// The G.107 codec class of the **ingress** stream (what this direction decodes), for the MOS in
+    /// the periodic [`Event::CallQuality`] this direction reports.
+    pub ingress_mos_codec: siphon_rtp_hep::mos::Codec,
 }
 
 /// Per-direction parameters for a **relay-only** direction (a promoted passthrough leg): just the
@@ -311,6 +329,10 @@ impl RtcpRelay {
 impl Direction {
     fn new(config: DirectionConfig) -> Self {
         let ingress_rate = config.decoder.params().sample_rate_hz;
+        // The RTP clock the ingress interarrival jitter is measured in (RFC 3550 §6.4.1) — not always
+        // the sample rate (G.722 clocks RTP at 8 kHz while sampling 16 kHz; RFC 3551 §4.5.2). Read it
+        // before the decoder is moved into the struct.
+        let ingress_rtp_clock_rate_hz = config.decoder.rtp_clock_rate_hz();
         let egress_params = config.encoder.params();
         let egress_rate = egress_params.sample_rate_hz;
         // Build a resampler only when the codecs run at different rates (e.g. AMR-WB 16 k → G.711 8 k).
@@ -375,6 +397,10 @@ impl Direction {
             injection: None,
             secure_ingress: None,
             secure_egress: None,
+            // The ingress interarrival jitter is measured at the ingress codec's RTP clock (RFC 3550
+            // §6.4.1), which the decoder exposes — 8 kHz for G.711, 16 kHz for AMR-WB, etc.
+            ingress: IngressStats::new(ingress_rtp_clock_rate_hz),
+            ingress_mos_codec: config.ingress_mos_codec,
         }
     }
 
@@ -417,6 +443,11 @@ impl Direction {
             injection: None,
             secure_ingress: None,
             secure_egress: None,
+            // A relay-only direction never builds a quality report (a promoted passthrough is spawned
+            // with no control-event sink, and its quality is reported off the in-kernel relay's RTCP
+            // via `Engine::run_rtcp_export`), so its reception estimator stays inert — never fed.
+            ingress: IngressStats::new(8000),
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         }
     }
 
@@ -535,11 +566,41 @@ impl Direction {
         }
     }
 
+    /// Build this direction's periodic call-quality event (RFC 3550 §6.4.1 loss/jitter + ITU-T G.107
+    /// MOS) from the accumulated ingress statistics, or `None` before any inbound packet (nothing to
+    /// report) or on a relay-only direction (its quality is reported off the in-kernel relay's RTCP,
+    /// not here). `from_tag` names the leg the quality is measured on; `call_id` correlates it. The
+    /// one-way mouth-to-ear delay is `RTT/2` (ITU-T G.107 §7.4) when a reception report has yielded an
+    /// RTT, else 0 — the transcode path does not originate its own Sender Reports, so RTT is usually
+    /// absent, matching the passive plain-relay QoS export.
+    fn quality_event(&self, call_id: &str, from_tag: &str) -> Option<Event> {
+        if self.relay_only || self.ingress.ssrc().is_none() {
+            return None;
+        }
+        let one_way_delay_ms = self.ingress.rtt_ms().map_or(0.0, |rtt_ms| rtt_ms / 2.0);
+        let impairments = siphon_rtp_hep::mos::Impairments {
+            loss_percent: self.ingress.loss_percent(),
+            one_way_delay_ms,
+            jitter_ms: self.ingress.jitter_ms(),
+        };
+        Some(Event::CallQuality {
+            conference_id: None,
+            call_id: Some(call_id.to_string()),
+            from_tag: from_tag.to_string(),
+            jitter_ms: impairments.jitter_ms,
+            loss_percent: impairments.loss_percent,
+            mos: siphon_rtp_hep::mos::estimate_mos(self.ingress_mos_codec, impairments),
+        })
+    }
+
     /// Transform one accepted datagram for this direction, appending any outbound datagrams and DTMF
     /// events. `source`-gating and latching are the caller's responsibility (it owns both directions).
+    /// `arrival_micros` is the datapath's receive-time stamp on the datagram, folded into the ingress
+    /// interarrival-jitter estimate (RFC 3550 §6.4.1) that feeds this direction's quality report.
     fn handle(
         &mut self,
         data: &[u8],
+        arrival_micros: u64,
         dtmf_meta: DtmfMeta<'_>,
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
@@ -622,6 +683,14 @@ impl Direction {
         let Ok(parsed) = RtpPacket::parse(data) else {
             return; // malformed RTP — drop (never forward garbage)
         };
+
+        // Fold this RTP packet into the per-direction reception statistics (RFC 3550 §6.4.1): SSRC +
+        // sequence for the sequence-gap loss, RTP timestamp + arrival for interarrival jitter. Counts
+        // audio *and* RFC 4733 telephone-events (they share the audio SSRC + sequence space). O(1),
+        // zero-alloc — the ~5 s quality tick reads the accumulated estimate, never the per-packet path.
+        self.ingress
+            .on_rtp(parsed.ssrc, parsed.sequence, parsed.timestamp);
+        self.ingress.observe_arrival(arrival_micros);
 
         // RFC 4733 telephone-event: extract a DTMF event and repacketize onto the egress stream.
         if Some(parsed.payload_type) == self.telephone_event_in {
@@ -1024,7 +1093,8 @@ impl MediaCall {
                 self.a_to_b
                     .echo_into(&mut self.b_to_a, &packet.data, meta, out, events);
             } else {
-                self.a_to_b.handle(&packet.data, meta, out, events);
+                self.a_to_b
+                    .handle(&packet.data, packet.arrival, meta, out, events);
                 // RFC 4867 §4.3.1: A's Codec Mode Request steers the mode of the stream sent *back* to
                 // A (the b_to_a egress encoder). No-op for a fixed-rate codec / no request.
                 if let Some(mode) = self.a_to_b.decoder.last_mode_request() {
@@ -1045,7 +1115,8 @@ impl MediaCall {
                 self.b_to_a
                     .echo_into(&mut self.a_to_b, &packet.data, meta, out, events);
             } else {
-                self.b_to_a.handle(&packet.data, meta, out, events);
+                self.b_to_a
+                    .handle(&packet.data, packet.arrival, meta, out, events);
                 // Symmetric: B's CMR steers the a_to_b egress encoder (the stream sent back to B).
                 if let Some(mode) = self.b_to_a.decoder.last_mode_request() {
                     self.a_to_b.encoder.request_mode(mode);
@@ -1256,6 +1327,24 @@ impl MediaCall {
     pub fn tick(&mut self, out: &mut Vec<Outbound>) {
         self.a_to_b.tick_injection(out);
         self.b_to_a.tick_injection(out);
+    }
+
+    /// Append this call's periodic per-leg [`Event::CallQuality`] reports (RFC 3550 §6.4.1 loss/jitter
+    /// with an ITU-T G.107 MOS) — the 2-party transcode counterpart to the conference per-participant
+    /// quality report. One event per direction that has received audio: the `a_to_b` ingress measures
+    /// what party A (the offerer, `from_tag`) sent, the `b_to_a` ingress what party B (`to_tag`) sent.
+    /// A direction with no inbound stream yet, or a leg whose tag is unknown, contributes nothing.
+    /// Reads the accumulated estimates only — no per-packet or per-frame work, so it is safe on the
+    /// ~5 s cadence the actor drives it at.
+    pub fn build_quality_events(&self, out: &mut Vec<Event>) {
+        if let Some(event) = self.a_to_b.quality_event(&self.call_id, &self.from_tag) {
+            out.push(event);
+        }
+        if let Some(to_tag) = self.to_tag.as_deref() {
+            if let Some(event) = self.b_to_a.quality_event(&self.call_id, to_tag) {
+                out.push(event);
+            }
+        }
     }
 
     /// Whether either direction has an active injection (the actor only needs the ticker while so).
@@ -1531,6 +1620,10 @@ async fn run_media_call<D>(
     // a no-op unless an injection is active; `Skip` keeps it from bursting after a stall.
     let mut ticker = tokio::time::interval(INJECT_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Periodic per-leg call-quality reporting rides the same ticker (every `QUALITY_INTERVAL_TICKS`),
+    // so a 2-party transcode call surfaces RFC 3550 loss/jitter + G.107 MOS on the control channel the
+    // way a conference participant does — without any per-packet work.
+    let mut ticks_since_quality = 0u64;
     loop {
         tokio::select! {
             input = inbox.recv_async() => {
@@ -1586,6 +1679,24 @@ async fn run_media_call<D>(
                     outbound.clear();
                     call.tick(&mut outbound);
                     send_all(&datapath, &mut outbound).await;
+                }
+                // Periodic per-leg quality estimate (jitter/loss/MOS) on the control channel, so SIPhon
+                // sees live 2-party (relay/transcode) call quality without parsing RTCP itself — the
+                // control-channel complement to the HEP QoS export.
+                ticks_since_quality += 1;
+                if ticks_since_quality >= QUALITY_INTERVAL_TICKS {
+                    ticks_since_quality = 0;
+                    if let Some(sink) = &events {
+                        emitted.clear();
+                        call.build_quality_events(&mut emitted);
+                        for event in emitted.drain(..) {
+                            if sink.try_send(event).is_err() {
+                                tracing::debug!(
+                                    "media-pipeline quality event dropped (sink full or closed)"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1646,6 +1757,7 @@ mod tests {
             telephone_event_in: Some(101),
             telephone_event_out: Some(101),
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
             ingress_endpoint: endpoint(2),
@@ -1659,6 +1771,7 @@ mod tests {
             telephone_event_in: Some(101),
             telephone_event_out: Some(101),
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new(
             "call-1",
@@ -1731,6 +1844,113 @@ mod tests {
         assert!(events.is_empty());
     }
 
+    #[test]
+    fn transcode_call_reports_call_quality_with_loss_and_jitter() {
+        // A 2-party transcode call reports RFC 3550 loss/jitter + G.107 MOS on the control channel,
+        // keyed by `call_id` (not `conference_id`) — the transcode counterpart to a conference
+        // participant's quality report.
+        let mut call = ulaw_alaw_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        // A→B ingress (endpoint 1): sequence 0,1,3,4 — packet 2 is lost (expected 5, received 4 ⇒
+        // 20%). Arrivals drift off the 20 ms RTP pacing so a positive interarrival jitter accrues.
+        for (sequence, arrival) in [(0u16, 0u64), (1, 20_000), (3, 75_000), (4, 85_000)] {
+            call.process(
+                &rx_at(1, A_ADDR, arrival, ulaw_rtp(sequence, 0x40)),
+                &mut out,
+                &mut events,
+            );
+        }
+        // No DTMF/control events on the packet path; quality is a separate periodic emit.
+        assert!(events.is_empty(), "no per-packet events for ordinary audio");
+
+        let mut quality = Vec::new();
+        call.build_quality_events(&mut quality);
+        assert_eq!(
+            quality.len(),
+            1,
+            "only A→B has an inbound stream ⇒ one quality event"
+        );
+        match &quality[0] {
+            Event::CallQuality {
+                conference_id,
+                call_id,
+                from_tag,
+                jitter_ms,
+                loss_percent,
+                mos,
+            } => {
+                assert!(
+                    conference_id.is_none(),
+                    "a 2-party call carries no conference_id"
+                );
+                assert_eq!(call_id.as_deref(), Some("call-1"), "keyed by call_id");
+                assert_eq!(from_tag, "tag-a", "measured on A's ingress (a_to_b)");
+                // expected = 5 (seq 0..=4), received = 4 ⇒ 1 lost ⇒ 20%.
+                assert!(
+                    (*loss_percent - 20.0).abs() < 1e-9,
+                    "1 of 5 packets lost ⇒ 20%, got {loss_percent}"
+                );
+                assert!(
+                    *jitter_ms > 0.0,
+                    "drifting arrivals ⇒ jitter, got {jitter_ms}"
+                );
+                // 20% loss on G.711 collapses the MOS well below a clean call (~2.6 on the E-model).
+                assert!(
+                    *mos > 1.0 && *mos < 3.5,
+                    "20% loss ⇒ degraded MOS in (1, 3.5), got {mos}"
+                );
+            }
+            other => panic!("expected CallQuality, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transcode_call_quality_names_each_leg_by_its_tag() {
+        // Clean audio on both legs ⇒ one quality event per direction, each keyed by `call_id` and
+        // named by the sending leg's tag (A = `from_tag`, B = `to_tag`), both with a high MOS.
+        let mut call = ulaw_alaw_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for sequence in 0..4u16 {
+            let arrival = u64::from(sequence) * 20_000;
+            call.process(
+                &rx_at(1, A_ADDR, arrival, ulaw_rtp(sequence, 0x40)),
+                &mut out,
+                &mut events,
+            );
+            call.process(
+                &rx_at(2, B_ADDR, arrival, ulaw_rtp(sequence, 0x40)),
+                &mut out,
+                &mut events,
+            );
+        }
+        let mut quality = Vec::new();
+        call.build_quality_events(&mut quality);
+        assert_eq!(quality.len(), 2, "one quality event per direction");
+        let mut tags: Vec<&str> = Vec::new();
+        for event in &quality {
+            let Event::CallQuality {
+                conference_id,
+                call_id,
+                from_tag,
+                loss_percent,
+                mos,
+                ..
+            } = event
+            else {
+                panic!("expected CallQuality, got {event:?}");
+            };
+            assert!(conference_id.is_none());
+            assert_eq!(call_id.as_deref(), Some("call-1"));
+            assert_eq!(*loss_percent, 0.0, "in-order ⇒ no loss");
+            assert!(*mos > 4.0, "clean call ⇒ good MOS, got {mos}");
+            tags.push(from_tag);
+        }
+        tags.sort_unstable();
+        assert_eq!(tags, ["tag-a", "tag-b"], "each leg named by its own tag");
+    }
+
     /// Build a µ-law(A) → A-law(B) transcoding call whose **A→B egress** encoder packetizes at
     /// `egress_ptime_ms`, so the repacketizer must re-frame A's 20 ms ingress to that egress ptime.
     fn ulaw_to_alaw_egress_ptime(egress_ptime_ms: u8) -> MediaCall {
@@ -1747,6 +1967,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
             ingress_endpoint: endpoint(2),
@@ -1760,6 +1981,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new(
             "call-ptime",
@@ -1917,6 +2139,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
             ingress_endpoint: endpoint(2),
@@ -1930,6 +2153,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new(
             "call-g722",
@@ -2102,6 +2326,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
             ingress_endpoint: endpoint(2),
@@ -2116,6 +2341,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new(
             "amr-call",
@@ -2172,6 +2398,7 @@ mod tests {
                 telephone_event_in: None,
                 telephone_event_out: None,
                 recorder: None,
+                ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
 
         // A payload at the default mode 2; flip its CMR nibble to request mode 0 for the B→A stream.
@@ -2255,6 +2482,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let a_rtcp = "127.0.0.2:5001";
         let b_rtcp = "127.0.0.3:6001";
@@ -2348,6 +2576,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
 
         // A plaintext transcode call exposes no secure leg — an HA checkpoint has no SRTP rollover to
@@ -2413,6 +2642,7 @@ mod tests {
                 telephone_event_in: Some(101),
                 telephone_event_out: Some(101),
                 recorder: None,
+                ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
         let mut call = MediaCall::new(
             "te",
@@ -2496,6 +2726,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
             ingress_endpoint: endpoint(2),
@@ -2509,6 +2740,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new(
             "g722",
@@ -2833,6 +3065,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
             ingress_endpoint: endpoint(2),
@@ -2846,6 +3079,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new("c", "a", None, a_to_b, b_to_a, true, None);
         assert!(
@@ -3368,6 +3602,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: Some(WavRecorder::new(8000, 1)),
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
             ingress_endpoint: endpoint(2),
@@ -3381,6 +3616,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new(
             "rec-call",
