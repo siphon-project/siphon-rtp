@@ -346,8 +346,24 @@ pub trait Datapath: Send + Sync {
 
     /// The backend's current logical clock (monotonic ticks). Drives the engine's media-timeout
     /// sweep; the loopback backend's clock is advanced explicitly
-    /// ([`udp::UdpLoopbackDatapath::advance_clock`]) so timeout tests stay deterministic.
+    /// ([`advance_clock`](Self::advance_clock)) so timeout tests stay deterministic.
     fn now_ticks(&self) -> u64;
+
+    /// Advance the backend's **logical** clock by `ticks`. The daemon's media-timeout sweeper drives
+    /// this ~one tick per wall-second so [`now_ticks`](Self::now_ticks) /
+    /// [`last_activity`](Self::last_activity) comparisons stay deterministic under test (never
+    /// `Instant::now()`).
+    ///
+    /// Default: **no-op**. Only a backend whose clock is purely *logical* (the UDP-loopback backend)
+    /// overrides this to advance it; a real-time backend (the XDP/AF_XDP fast path) derives its clock
+    /// from a monotonic kernel source, so the sweep must not drive it. Keeping the method **additive
+    /// and defaulted** means every existing backend keeps compiling, and — crucially — lets the
+    /// generic engine runner ([`siphon_rtp_engine::run_with_datapath`]) advance the clock through this
+    /// trait rather than an external shim trait, which would hit the orphan rule when implemented for
+    /// the out-of-crate `XdpDatapath`.
+    ///
+    /// [`siphon_rtp_engine::run_with_datapath`]: https://docs.rs/siphon-rtp
+    fn advance_clock(&self, _ticks: u64) {}
 
     /// The backend's current clock in **microseconds** — the finer-grained companion to
     /// [`now_ticks`](Self::now_ticks), used for RTCP interarrival jitter / DLSR (RFC 3550 §6.4.1).

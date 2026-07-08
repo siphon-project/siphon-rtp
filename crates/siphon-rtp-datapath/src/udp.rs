@@ -772,6 +772,13 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.clock.load(Ordering::Relaxed)
     }
 
+    /// The loopback backend's clock is purely logical, so the media-timeout sweep drives it through
+    /// the trait. Delegates to the inherent [`Self::advance_clock`] (which concrete call sites still
+    /// resolve to directly, inherent-over-trait), keeping the advance logic in one place.
+    fn advance_clock(&self, ticks: u64) {
+        UdpLoopbackDatapath::advance_clock(self, ticks);
+    }
+
     fn last_activity(&self, endpoint: EndpointId) -> Option<u64> {
         self.inner
             .endpoints
@@ -1469,6 +1476,73 @@ mod tests {
         );
         datapath.advance_clock(5);
         assert_eq!(datapath.now_ticks(), 5);
+    }
+
+    #[test]
+    fn trait_advance_clock_drives_the_logical_clock() {
+        // The generic engine runner (`run_with_datapath<D: Datapath>`) advances the sweep clock
+        // through the `Datapath` trait method, not the inherent one — prove the trait method moves
+        // the loopback backend's logical clock so the media-timeout sweep stays deterministic.
+        fn tick_via_trait<D: Datapath>(datapath: &D, ticks: u64) {
+            datapath.advance_clock(ticks);
+        }
+        let datapath = UdpLoopbackDatapath::new();
+        assert_eq!(datapath.now_ticks(), 0);
+        tick_via_trait(&datapath, 3);
+        tick_via_trait(&datapath, 4);
+        assert_eq!(datapath.now_ticks(), 7);
+    }
+
+    #[test]
+    fn default_trait_advance_clock_is_a_noop() {
+        // A backend that does not override `advance_clock` (the real-time XDP posture) gets the
+        // additive default no-op: the generic sweep call compiles and does nothing to its clock.
+        struct RealtimeStub;
+        impl Datapath for RealtimeStub {
+            async fn alloc_endpoint(&self) -> Result<Endpoint, DatapathError> {
+                Err(DatapathError::PortUnavailable { port: 0 })
+            }
+            fn install_flow(
+                &self,
+                _endpoint: EndpointId,
+                _action: FlowAction,
+            ) -> Result<(), DatapathError> {
+                Ok(())
+            }
+            fn remove_flow(&self, _endpoint: EndpointId) {}
+            async fn remove_endpoint(&self, _endpoint: EndpointId) {}
+            async fn send(
+                &self,
+                _endpoint: EndpointId,
+                _dst: std::net::SocketAddr,
+                _data: &[u8],
+            ) -> Result<usize, DatapathError> {
+                Ok(0)
+            }
+            fn stats(&self, _endpoint: EndpointId) -> Option<EndpointStats> {
+                None
+            }
+            fn now_ticks(&self) -> u64 {
+                42
+            }
+            fn last_activity(&self, _endpoint: EndpointId) -> Option<u64> {
+                None
+            }
+            fn set_ice(&self, _endpoint: EndpointId, _config: Option<IceConfig>) {}
+            fn rx(&self) -> flume::Receiver<RxPacket> {
+                flume::unbounded().1
+            }
+            fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp> {
+                flume::unbounded().1
+            }
+        }
+        let stub = RealtimeStub;
+        stub.advance_clock(1000);
+        assert_eq!(
+            stub.now_ticks(),
+            42,
+            "default no-op must not touch the clock"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

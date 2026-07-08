@@ -100,3 +100,17 @@ control = "127.0.0.1:8080"
 # Public IP to advertise in XOR-RELAYED-ADDRESS when the relay socket's bound IP is not the
 # reachable one, e.g. a NAT'd host (CLI: --turn-relay-ip). Defaults to the datapath-assigned address.
 # turn_relay_ip = "203.0.113.7"
+
+# --- XDP / AF_XDP kernel datapath ---------------------------------------------------------------
+#
+# These two keys are acted on ONLY by the separate `siphon-rtp-xdp-daemon` binary (the kernel fast
+# path lives in the excluded crates/siphon-rtp-xdp workspace, not a Cargo feature). The default
+# UDP-only `siphon-rtp` binary parses them (shared schema) but ignores them. The XDP daemon attaches
+# the kernel datapath only when xdp_interface names a NIC AND relay_bind_ip is a routable IPv4 (the
+# fast path is IPv4-only); otherwise, or on any attach failure, it falls back to UDP-loopback.
+
+# NIC to attach the XDP/AF_XDP datapath to (CLI: --xdp-interface). Off unless set.
+# xdp_interface = "eth0"
+
+# NIC queue the AF_XDP socket binds, RX/TX (CLI: --xdp-queue). Default: 0.
+# xdp_queue = 0
