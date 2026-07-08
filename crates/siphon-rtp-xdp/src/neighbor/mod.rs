@@ -517,6 +517,18 @@ mod live_tests {
             eprintln!("skip: resolver did not converge for {}", candidate.ip);
             return;
         };
+        // A neighbour reachable only via an L3 / point-to-point egress (tun, WireGuard, loopback) has
+        // no egress hardware address — RTM_GETLINK returns a zero IFLA_ADDRESS. That is a valid kernel
+        // state, just not an AF_XDP TX target (which requires an Ethernet egress), so skip rather than
+        // fail: the runner's default route can land on such an interface. The dst-MAC assertion still
+        // validates the neighbour-table lookup whenever a real Ethernet egress is present.
+        if src_mac == [0u8; 6] {
+            eprintln!(
+                "skip: egress interface for {} has no hardware MAC (L3/tun/loopback)",
+                candidate.ip
+            );
+            return;
+        }
         assert_eq!(
             dst_mac, candidate.mac,
             "resolved dst MAC matches the kernel neighbour table"
