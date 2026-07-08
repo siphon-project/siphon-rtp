@@ -532,6 +532,14 @@ void, and bound the resources.
   address in XOR-RELAYED-ADDRESS when the bound IP differs (e.g. a `0.0.0.0` bind or a NAT'd host). A
   loopback bind relays only loopback peers, so a production relay needs a routable bind (or the XDP/
   public datapath).
+- **XDP datapath selection follows the same posture.** The engine attaches the XDP/AF_XDP kernel fast
+  path only in a build with the `xdp` feature AND when `--xdp-interface` names a NIC AND `--relay-bind-ip`
+  is a **routable IPv4** address — the fast path is IPv4-only and keys/advertises every flow on that
+  engine-local relay IPv4, which is meaningless on loopback, a `0.0.0.0` wildcard, or IPv6. Anything
+  else, or any capability-probe / attach / AF_XDP-bind failure, selects the always-available
+  UDP-loopback backend instead: a clean degrade, never a hard failure (the rtpengine posture — use the
+  kernel fast path when the box supports it, fall back otherwise). This is a startup-time *selection*
+  only; the in-kernel latch/source-gate the fast path enforces is unchanged (§4).
 - **Single-owner actor.** All allocation state lives in one task (`AllocationManager`) reached only
   through a bounded `flume` mailbox — no shared lock over allocation state, no lock across an `.await`
   (the concurrency rules). Peer datagrams arrive on the relay endpoint via `FlowAction::Redirect`

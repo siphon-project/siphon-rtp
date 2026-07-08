@@ -1,14 +1,20 @@
 //! siphon-rtp-engine binary: start the control server (and the built-in TURN server) over the
 //! capability-selected datapath.
 //!
-//! M1 binds the UDP-loopback backend unconditionally; XDP/AF_XDP selection by capability
-//! detection (NET_ADMIN/BPF probe → graceful fallback) lands with the XDP backend. The TURN server
-//! (`turn:`/`turns:`, a coturn replacement) shares that one datapath, so its relay ports come from
-//! the same bounded pool and its allocations expire on the same logical clock.
+//! The always-available UDP-loopback backend is the default; the XDP/AF_XDP kernel fast path is
+//! selected at startup when the `xdp` feature is compiled in AND `--xdp-interface` names a NIC AND a
+//! routable IPv4 `--relay-bind-ip` is configured (the XDP fast path is IPv4-only and keys flows on
+//! the engine's relay address). Selection is a capability probe with graceful fallback: on any
+//! failure — no capability, attach/bind fails, not IPv4 — the daemon logs and uses UDP-loopback,
+//! never a hard failure (the rtpengine posture: use the kernel fast path when the box supports it,
+//! degrade cleanly otherwise). [`run_with_datapath`] is generic over the selected backend, so every
+//! subsystem (control server, TURN, redirect dispatcher, sweeper, metrics, NG) runs identically over
+//! either. The TURN server (`turn:`/`turns:`, a coturn replacement) shares that one datapath, so its
+//! relay ports come from the same bounded pool and its allocations expire on the same logical clock.
 
 mod config;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -115,6 +121,19 @@ struct Args {
     /// per-client quota and the datapath port pool do that).
     #[arg(long, default_value_t = DEFAULT_MAX_SESSIONS)]
     max_sessions: u64,
+
+    /// Attach the XDP/AF_XDP kernel datapath to this NIC (e.g. `eth0`) — the kernel media fast path.
+    /// Requires a build with the `xdp` feature AND a routable IPv4 `--relay-bind-ip` (the XDP path is
+    /// IPv4-only and keys flows on the engine's relay address). Unset, a build without the feature, or
+    /// any probe/attach failure falls back cleanly to the always-available UDP-loopback datapath — the
+    /// daemon never hard-fails on the XDP path (docs/security-and-nat.md §11.1).
+    #[arg(long, value_name = "NAME")]
+    xdp_interface: Option<String>,
+
+    /// NIC queue the XDP/AF_XDP socket binds (RX/TX). Only used when `--xdp-interface` selects the XDP
+    /// datapath; the first cut drives a single media queue (0).
+    #[arg(long, default_value_t = DEFAULT_XDP_QUEUE)]
+    xdp_queue: u32,
 }
 
 /// The daemon's runtime configuration after merging the CLI with the optional `--config` file.
@@ -145,6 +164,13 @@ struct Resolved {
     node_id: Option<String>,
     /// Advertised maximum concurrent sessions for cluster load reporting (`0` = unlimited).
     max_sessions: u64,
+    /// XDP/AF_XDP attach interface (`--xdp-interface`); `None` = UDP-loopback. Consulted by the
+    /// datapath selection ([`choose_datapath`]); only acted on in a build with the `xdp` feature.
+    xdp_interface: Option<String>,
+    /// XDP/AF_XDP NIC queue (`--xdp-queue`, default 0). Only read when the `xdp` feature builds the
+    /// backend in; kept unconditionally so the config surface is identical across builds.
+    #[cfg_attr(not(feature = "xdp"), allow(dead_code))]
+    xdp_queue: u32,
 }
 
 impl Resolved {
@@ -200,6 +226,13 @@ impl Resolved {
                 file.max_sessions,
                 DEFAULT_MAX_SESSIONS,
             ),
+            xdp_interface: resolve_optional(args.xdp_interface, file.xdp_interface),
+            xdp_queue: resolve_defaulted(
+                args.xdp_queue,
+                explicit("xdp_queue"),
+                file.xdp_queue,
+                DEFAULT_XDP_QUEUE,
+            ),
         }
     }
 }
@@ -223,6 +256,51 @@ fn resolve_port_range(
     }
 }
 
+/// The datapath the daemon selects at startup, decided purely from config (no I/O). This is only the
+/// *candidacy* decision — whether XDP is even worth probing; the actual attach can still fail and
+/// fall back to UDP at runtime (see the `xdp`-gated `try_build_xdp_datapath`). Pure and unit-tested so
+/// the policy is checked without a NIC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatapathChoice {
+    /// Use the always-available UDP-loopback backend.
+    Udp,
+    /// XDP is a candidate — probe + attach it, falling back to UDP on any failure.
+    TryXdp,
+}
+
+/// Decide the startup datapath from config alone. XDP is a candidate only when **all** hold:
+/// - the `xdp` feature is compiled in (`feature_on`), so the backend exists to select;
+/// - `--xdp-interface` names a non-empty NIC to attach to;
+/// - `--relay-bind-ip` is a **routable IPv4** address ([`is_routable_relay_v4`]) — the XDP fast path
+///   is IPv4-only and keys/advertises flows on the engine's relay address, which is meaningless on
+///   loopback / a `0.0.0.0` wildcard / IPv6 (docs/security-and-nat.md §11.1: advertise a reachable
+///   address, never the private/loopback one).
+///
+/// Anything else selects UDP-loopback. This does no I/O: a `TryXdp` result must still clear the
+/// capability probe and the AF_XDP bind before it is actually used, else the daemon degrades to UDP.
+fn choose_datapath(
+    feature_on: bool,
+    xdp_interface: Option<&str>,
+    relay_bind_ip: Option<IpAddr>,
+) -> DatapathChoice {
+    match (feature_on, xdp_interface, relay_bind_ip) {
+        (true, Some(interface), Some(IpAddr::V4(ip)))
+            if !interface.is_empty() && is_routable_relay_v4(ip) =>
+        {
+            DatapathChoice::TryXdp
+        }
+        _ => DatapathChoice::Udp,
+    }
+}
+
+/// Whether `ip` is a usable relay address to advertise to real peers and key XDP flows on: a specific
+/// unicast IPv4 — not loopback, unspecified (`0.0.0.0`), multicast, or broadcast. The XDP backend
+/// needs exactly this: a concrete engine-local IPv4 as its `local_ip` (docs/security-and-nat.md
+/// §11.1). Used only to gate XDP selection; the UDP-loopback path imposes no such constraint.
+fn is_routable_relay_v4(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast()
+}
+
 /// Built-in default for `--control` (kept in one place so the CLI default and the precedence
 /// fallback can never drift). Parsing a compile-time-constant literal that is always valid.
 fn default_control() -> SocketAddr {
@@ -232,6 +310,10 @@ fn default_control() -> SocketAddr {
 /// Built-in default for `--max-sessions` (mirrors the clap `default_value_t`). `0` = unlimited: the
 /// node advertises no session cap and its load score is driven by CPU alone until one is configured.
 const DEFAULT_MAX_SESSIONS: u64 = 0;
+
+/// Built-in default NIC queue for `--xdp-queue` (mirrors the clap `default_value_t`): a single media
+/// RX/TX queue (the first-cut XDP posture; multi-queue spreading is a later step).
+const DEFAULT_XDP_QUEUE: u32 = 0;
 
 /// Default cluster node id when neither `--node-id` nor the config file set one: the host's
 /// `HOSTNAME` environment variable if present and non-empty, otherwise the literal `siphon-rtp`.
@@ -296,22 +378,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // M1: the always-available NIC-free backend. XDP backend slots in behind the same trait. The
-    // engine and the TURN server share one datapath (cloning shares the pool + logical clock).
-    // Endpoints bind loopback by default; `--relay-bind-ip` binds a routable IP so the relay reaches
-    // real peers (docs/security-and-nat.md §11.1). A configured port range draws media ports from a
-    // bounded, firewallable window (and enables same-port HA takeover) instead of OS-ephemeral ports.
+    // Select the datapath from config (pure decision; see `choose_datapath`) and hand the chosen
+    // backend to the generic `run_with_datapath`. The always-available UDP-loopback backend is the
+    // default; the XDP/AF_XDP kernel fast path is chosen only under the `xdp` feature with a NIC + a
+    // routable IPv4 relay address, and only after its capability probe + AF_XDP bind succeed. On any
+    // XDP failure the daemon logs and falls back to UDP-loopback — never a hard failure. Endpoints bind
+    // loopback by default; `--relay-bind-ip` binds a routable IP so the relay reaches real peers
+    // (docs/security-and-nat.md §11.1). A configured port range draws media ports from a bounded,
+    // firewallable window (and enables same-port HA takeover) instead of OS-ephemeral ports.
     let bind_ip = config
         .relay_bind_ip
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    let datapath = match port_range {
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    match choose_datapath(
+        cfg!(feature = "xdp"),
+        config.xdp_interface.as_deref(),
+        config.relay_bind_ip,
+    ) {
+        // XDP is a candidate: probe + attach the kernel fast path and run over it on success. On any
+        // failure `try_build_xdp_datapath` logs the reason and returns `None`, so we fall through to
+        // the UDP-loopback backend (the rtpengine posture: use the kernel fast path when the box
+        // supports it, degrade cleanly otherwise). The arm is `xdp`-gated — feature-off can never
+        // yield `TryXdp`, so the default build only ever matches the `_` fall-through to UDP-loopback.
+        #[cfg(feature = "xdp")]
+        DatapathChoice::TryXdp => {
+            if let Some(xdp) = try_build_xdp_datapath(&config) {
+                return run_with_datapath(xdp, config).await;
+            }
+        }
+        _ => {}
+    }
+    let datapath = build_udp_datapath(&config, port_range, bind_ip);
+    run_with_datapath(datapath, config).await
+}
+
+/// Build the always-available UDP-loopback datapath from the resolved config: a `--port-min`/
+/// `--port-max` range draws media ports from a bounded, firewallable window (and enables same-port HA
+/// takeover); otherwise a `--relay-bind-ip` binds a routable IP instead of loopback; neither set falls
+/// back to OS-ephemeral loopback ports (the NIC-free default). `bind_ip` is `relay_bind_ip` or loopback.
+fn build_udp_datapath(
+    config: &Resolved,
+    port_range: Option<(u16, u16)>,
+    bind_ip: IpAddr,
+) -> UdpLoopbackDatapath {
+    match port_range {
         Some((min, max)) => UdpLoopbackDatapath::with_port_range(bind_ip, min, max),
         None => match config.relay_bind_ip {
             Some(ip) => UdpLoopbackDatapath::with_bind_ip(ip),
             None => UdpLoopbackDatapath::new(),
         },
-    };
+    }
+}
 
+/// Advance a datapath backend's **logical** clock. The daemon's media-timeout sweeper drives this one
+/// tick per wall second; both backends derive `now_ticks` from this logical clock (never
+/// `Instant::now()`), so the sweep stays deterministic under test. `advance_clock` is an *inherent*
+/// method on each concrete backend rather than a [`Datapath`] trait method; this local shim lets the
+/// generic [`run_with_datapath`] drive it without widening the shared datapath seam. Inherent methods
+/// win over trait methods, so concrete call sites (the engine's own tests) are unaffected.
+trait AdvanceClock {
+    /// Advance the backend's logical clock by `ticks`.
+    fn advance_clock(&self, ticks: u64);
+}
+
+impl AdvanceClock for UdpLoopbackDatapath {
+    fn advance_clock(&self, ticks: u64) {
+        UdpLoopbackDatapath::advance_clock(self, ticks);
+    }
+}
+
+#[cfg(feature = "xdp")]
+impl AdvanceClock for siphon_rtp_xdp::XdpDatapath {
+    fn advance_clock(&self, ticks: u64) {
+        siphon_rtp_xdp::XdpDatapath::advance_clock(self, ticks);
+    }
+}
+
+/// Run every post-datapath subsystem over the selected `datapath`: the cluster/engine, control server,
+/// built-in TURN server, the single redirect dispatcher, the media-timeout + TURN sweeper, the
+/// optional metrics/HEP/NG front-ends, and the graceful-shutdown drain. Generic over the datapath
+/// backend `D`, so the UDP-loopback and XDP/AF_XDP paths run through identical wiring — the selection
+/// in `main` is the only place the two differ. Behaviour-preserving for the UDP path (the engine
+/// integration tests exercise it unchanged).
+async fn run_with_datapath<D>(
+    datapath: D,
+    config: Resolved,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    D: Datapath + AdvanceClock + Clone + Send + Sync + 'static,
+{
     // Cluster state for the `load` / `node_info` / `drain` control commands. The node id falls back
     // to the host's `HOSTNAME` (else `siphon-rtp`); the advertised media address is the routable
     // relay bind IP (skipping a `0.0.0.0` wildcard, which is not a reachable address to hand a peer).
@@ -524,10 +678,14 @@ where
 
 /// Build and start the TURN server when `SIPHON_RTP_TURN_REALM` + `SIPHON_RTP_TURN_SECRET` are set,
 /// spawning whichever of the UDP/TCP/TLS listeners are configured. Returns `None` when TURN is off.
-async fn spawn_turn(
-    datapath: Arc<UdpLoopbackDatapath>,
+/// Generic over the datapath backend so TURN shares whichever one the daemon selected.
+async fn spawn_turn<D>(
+    datapath: Arc<D>,
     settings: &Resolved,
-) -> Result<(Option<Turn>, Option<flume::Sender<RxPacket>>), Box<dyn std::error::Error>> {
+) -> Result<(Option<Turn>, Option<flume::Sender<RxPacket>>), Box<dyn std::error::Error>>
+where
+    D: Datapath + 'static,
+{
     let (Some(realm), Some(secret)) = (
         std::env::var("SIPHON_RTP_TURN_REALM").ok(),
         std::env::var("SIPHON_RTP_TURN_SECRET").ok(),
@@ -587,9 +745,94 @@ async fn spawn_turn(
     Ok((Some(turn), Some(relay_tx)))
 }
 
+/// Probe for and construct the XDP/AF_XDP datapath from config, or return `None` to fall back to
+/// UDP-loopback. Only compiled under the `xdp` feature, and only reached after [`choose_datapath`]
+/// returns [`DatapathChoice::TryXdp`] (feature on + interface + routable IPv4 relay). Never a hard
+/// failure: no capability, a non-IPv4 relay address, or an attach/bind failure logs and returns `None`
+/// so the daemon degrades cleanly to UDP-loopback (the rtpengine posture).
+///
+/// Attach preference: native/driver XDP first (lowest overhead), then generic SKB mode (any kernel
+/// ≥ 5.10, incl. veth). `local_ip` is the routable IPv4 `--relay-bind-ip` — the address the XDP backend
+/// advertises and keys flows on (docs/security-and-nat.md §11.1). This is startup-path code, not a
+/// per-packet hot path, so no criterion bench is required.
+#[cfg(feature = "xdp")]
+fn try_build_xdp_datapath(config: &Resolved) -> Option<siphon_rtp_xdp::XdpDatapath> {
+    use siphon_rtp_xdp::{xsk, AttachMode, Loader, XdpDatapath};
+
+    // `choose_datapath` already established these invariants; re-derive the concrete values, and
+    // decline (logging) if the relay address is somehow not a routable IPv4 so we never attach the
+    // IPv4-only fast path without an engine-local relay IPv4 to key flows on.
+    let interface = config.xdp_interface.as_deref()?;
+    let local_ip = match config.relay_bind_ip {
+        Some(IpAddr::V4(ip)) if is_routable_relay_v4(ip) => ip,
+        _ => {
+            tracing::warn!(
+                "XDP requested but --relay-bind-ip is not a routable IPv4 relay address; \
+                 using UDP-loopback"
+            );
+            return None;
+        }
+    };
+
+    // Capability probe: can this host load + attach XDP at all (load + SKB-attach to `lo`)? A clean
+    // "not supported" signal, distinct from the per-interface attach failures handled below.
+    if !siphon_rtp_xdp::xdp_supported() {
+        tracing::warn!(
+            interface,
+            "XDP not supported on this host (load/attach probe failed); using UDP-loopback"
+        );
+        return None;
+    }
+
+    // Try native/driver XDP first, then generic SKB mode. A failed attempt drops its loader (which
+    // detaches the program), so the next mode starts clean; total failure falls back to UDP-loopback.
+    for mode in [AttachMode::Native, AttachMode::Skb] {
+        let loader = match Loader::load(interface, mode) {
+            Ok(loader) => loader,
+            Err(error) => {
+                tracing::debug!(interface, ?mode, %error, "XDP attach failed; trying next mode");
+                continue;
+            }
+        };
+        match XdpDatapath::new(
+            loader,
+            interface,
+            config.xdp_queue,
+            local_ip,
+            xsk::XskConfig::default(),
+        ) {
+            Ok(datapath) => {
+                tracing::info!(
+                    interface,
+                    queue = config.xdp_queue,
+                    local_ip = %local_ip,
+                    ?mode,
+                    "XDP/AF_XDP datapath selected (kernel fast path)"
+                );
+                return Some(datapath);
+            }
+            Err(error) => {
+                tracing::debug!(interface, ?mode, %error, "AF_XDP bind failed; trying next mode");
+            }
+        }
+    }
+
+    tracing::warn!(
+        interface,
+        "XDP unavailable after native + SKB attempts; using UDP-loopback"
+    );
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_port_range;
+    use super::{choose_datapath, is_routable_relay_v4, resolve_port_range, DatapathChoice};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// Build an IPv4 [`IpAddr`] from octets (test helper — keeps the selection cases terse).
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
 
     #[test]
     fn port_range_neither_set_is_ephemeral() {
@@ -622,5 +865,78 @@ mod tests {
             error.contains("must be <="),
             "message names the constraint: {error}"
         );
+    }
+
+    // ── Datapath selection policy (pure; no NIC) ────────────────────────────────────────────────
+
+    #[test]
+    fn datapath_choice_feature_off_is_always_udp() {
+        // A build without the `xdp` feature never selects XDP, even with a perfect interface + relay.
+        assert_eq!(
+            choose_datapath(false, Some("eth0"), Some(v4(203, 0, 113, 7))),
+            DatapathChoice::Udp
+        );
+    }
+
+    #[test]
+    fn datapath_choice_without_interface_is_udp() {
+        // Feature on but no interface named → UDP.
+        assert_eq!(
+            choose_datapath(true, None, Some(v4(203, 0, 113, 7))),
+            DatapathChoice::Udp
+        );
+        // An empty interface name counts as unset.
+        assert_eq!(
+            choose_datapath(true, Some(""), Some(v4(203, 0, 113, 7))),
+            DatapathChoice::Udp
+        );
+    }
+
+    #[test]
+    fn datapath_choice_requires_a_routable_v4_relay_ip() {
+        // No relay address at all: nothing for the IPv4-only fast path to key/advertise on.
+        assert_eq!(
+            choose_datapath(true, Some("eth0"), None),
+            DatapathChoice::Udp
+        );
+        // Loopback and the 0.0.0.0 wildcard are not routable relay addresses.
+        assert_eq!(
+            choose_datapath(true, Some("eth0"), Some(v4(127, 0, 0, 1))),
+            DatapathChoice::Udp
+        );
+        assert_eq!(
+            choose_datapath(true, Some("eth0"), Some(v4(0, 0, 0, 0))),
+            DatapathChoice::Udp
+        );
+        // An IPv6 relay address: the XDP fast path is IPv4-only.
+        assert_eq!(
+            choose_datapath(
+                true,
+                Some("eth0"),
+                Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+            ),
+            DatapathChoice::Udp
+        );
+    }
+
+    #[test]
+    fn datapath_choice_full_config_tries_xdp() {
+        // Feature on + a named interface + a routable IPv4 relay address → probe XDP.
+        assert_eq!(
+            choose_datapath(true, Some("eth0"), Some(v4(203, 0, 113, 7))),
+            DatapathChoice::TryXdp
+        );
+    }
+
+    #[test]
+    fn routable_relay_v4_accepts_unicast_rejects_special() {
+        // Documentation-range unicast addresses are routable relay addresses.
+        assert!(is_routable_relay_v4(Ipv4Addr::new(203, 0, 113, 7)));
+        assert!(is_routable_relay_v4(Ipv4Addr::new(198, 51, 100, 1)));
+        // Loopback / unspecified / broadcast / multicast are not.
+        assert!(!is_routable_relay_v4(Ipv4Addr::LOCALHOST));
+        assert!(!is_routable_relay_v4(Ipv4Addr::UNSPECIFIED));
+        assert!(!is_routable_relay_v4(Ipv4Addr::BROADCAST));
+        assert!(!is_routable_relay_v4(Ipv4Addr::new(224, 0, 0, 1)));
     }
 }

@@ -20,6 +20,10 @@ default = []
 # Build the patent-encumbered AMR-NB/AMR-WB codecs into the engine (transcode + conference egress).
 # Off by default; passthrough/relay of AMR is always available. See docs/codec-licensing.md.
 amr = ["siphon-rtp-codec/amr"]
+# Wire the XDP/AF_XDP kernel datapath backend into the daemon's capability-selected datapath. Off by
+# default: the loader crate is an excluded standalone workspace whose build.rs compiles the eBPF
+# program on a pinned nightly + bpf-linker, so only the xdp-integration / docker build enables it.
+xdp = ["dep:siphon-rtp-xdp"]
 
 [[bin]]
 name = "siphon-rtp"
@@ -42,6 +46,9 @@ siphon-rtp-ngcompat = { path = "../siphon-rtp-ngcompat", version = "0.1.0" }
 siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.1.0" }
 siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.1.0" }
 siphon-rtp-dsp = { path = "../siphon-rtp-dsp", version = "0.1.0" }
+# Optional: the XDP/AF_XDP datapath backend (excluded standalone workspace). Only pulled in under the
+# `xdp` feature — a plain `cargo build` never resolves aya/eBPF. See the `xdp` feature above.
+siphon-rtp-xdp = { path = "../siphon-rtp-xdp", version = "0.1.0", optional = true }
 tokio = { workspace = true }
 # `rustls-tls-webpki-roots` gives the WebSocket bridge a `wss://` client (RFC 6455 over RFC 8446).
 # Pure Rust: it pulls tokio-rustls/rustls with `default-features = false`, so no aws-lc-rs — the

@@ -48,6 +48,21 @@ control = "127.0.0.1:8080"
 # Default: 30.
 # media_timeout_secs = 30
 
+# --- XDP / AF_XDP kernel datapath ---------------------------------------------------------------
+#
+# Optional kernel media fast path. Only effective in a build with the `xdp` feature (the eBPF loader
+# is a separate toolchain, so stock `cargo install` builds do NOT include it); a build without it
+# ignores these keys and always uses the UDP-loopback datapath. The XDP path is selected only when
+# xdp_interface names a NIC AND relay_bind_ip is a routable IPv4 address (the fast path is IPv4-only
+# and keys/advertises flows on that relay IP). On any capability-probe or attach failure the daemon
+# logs and falls back to UDP-loopback — never a hard failure.
+
+# NIC to attach the XDP/AF_XDP classifier to, e.g. "eth0" (CLI: --xdp-interface). Unset = UDP-loopback.
+# xdp_interface = "eth0"
+
+# NIC queue the AF_XDP socket binds, RX/TX (CLI: --xdp-queue). Default: 0 (single media queue).
+# xdp_queue = 0
+
 # --- Clustering ---------------------------------------------------------------------------------
 #
 # siphon-rtp scales horizontally behind the SIP control layer: the SIP proxy (SIPhon / Kamailio) is

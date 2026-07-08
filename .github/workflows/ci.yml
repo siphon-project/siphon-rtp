@@ -250,6 +250,13 @@ jobs:
       # XDP, so it never fails an unprivileged runner; `--nocapture` surfaces the skip/run message.
       - name: veth XDP_TX relay smoke (self-skips without CAP_NET_ADMIN)
         run: cargo test --locked --test xdp_tx_smoke -- --nocapture
+      # Build the main-workspace engine daemon with the `xdp` feature: proves the capability-selected
+      # datapath wiring compiles the full aya/eBPF stack (the eBPF build.rs runs on the pinned nightly
+      # installed above). A plain `cargo build` on the normal jobs compiles none of it. Runs from the
+      # repo root (the main workspace), overriding this job's `crates/siphon-rtp-xdp` working-directory.
+      - name: Build the engine with the xdp datapath feature (repo root)
+        working-directory: .
+        run: cargo build --locked --features xdp -p siphon-rtp
 
   # Single required status check for branch protection: green only if every job above is green.
   # perf-gate is included: it runs on pull_request (success) and is skipped on the push-to-main build,
