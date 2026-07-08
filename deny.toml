@@ -25,6 +25,12 @@ ignore = [
     # through `webrtc-dtls`/`webrtc-util` (the DTLS-SRTP leg in siphon-rtp-dtls). We don't own that edge
     # and there is no safe upgrade path yet; drop this ignore once webrtc-* moves off bincode 1.x.
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.x unmaintained (final release, not a vuln); transitive via webrtc-dtls, no upgrade" },
+    # RUSTSEC-2026-0173: `proc-macro-error2` is unmaintained (the author confirmed it, and the upstream
+    # `proc-macro-error` it forked is likewise abandoned; not a vulnerability). It is a compile-time-only
+    # proc-macro reached transitively through `iai-callgrind-macros` / `iai-callgrind`, which we use
+    # *only* as a dev-dependency for the instruction-count perf-regression gate. We don't own that edge
+    # and there is no safe upgrade; drop this ignore once iai-callgrind moves off proc-macro-error2.
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; compile-time-only, dev-dep via iai-callgrind, no upgrade" },
 ]
 
 [bans]
