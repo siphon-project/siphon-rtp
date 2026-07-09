@@ -293,9 +293,12 @@ impl EncoderState {
         new_speech: &[i16],
         prm: &mut [i16],
     ) -> Result<usize, CodecError> {
-        if mode != AmrNbMode::Mr1220 && mode != AmrNbMode::Mr475 {
+        if !matches!(
+            mode,
+            AmrNbMode::Mr1220 | AmrNbMode::Mr475 | AmrNbMode::Mr515 | AmrNbMode::Mr590
+        ) {
             return Err(CodecError::Unsupported(
-                "AMR-NB encoder: only MR122 and MR475 are wired (cbsearch / gain modes ported)",
+                "AMR-NB encoder: only MR122, MR475, MR515 and MR59 are wired (cbsearch / gain modes ported)",
             ));
         }
 
@@ -916,6 +919,68 @@ mod tests {
         assert!(
             mismatch.is_none(),
             "MR475 T01: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR515 full-encoder gate on T01 (19 params/frame; same 9-bit 2-pulse codebook as MR475 but the
+    /// per-subframe `qua_gain` VQ instead of the joint 2-subframe gain — so this is the first mode to
+    /// prove the standard per-subframe path end-to-end byte-exact).
+    #[test]
+    fn encodes_mr515_full_params_bit_exact_t01() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr515,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T01.INP",
+            "../../reference/amr-nb/testv/NODTX/T_515/T01_515.COD",
+        );
+        eprintln!("MR515 full-encode gate (T01): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR515 T01: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR515 full-encoder gate on a second vector (T02) for extra confidence.
+    #[test]
+    fn encodes_mr515_full_params_bit_exact_t02() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr515,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T02.INP",
+            "../../reference/amr-nb/testv/NODTX/T_515/T02_515.COD",
+        );
+        eprintln!("MR515 full-encode gate (T02): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR515 T02: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR59 full-encoder gate on T01 (19 params/frame; the 11-bit 2-pulse codebook `c2_11pf`).
+    #[test]
+    fn encodes_mr59_full_params_bit_exact_t01() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr590,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T01.INP",
+            "../../reference/amr-nb/testv/NODTX/T_59/T01_59.COD",
+        );
+        eprintln!("MR59 full-encode gate (T01): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR59 T01: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR59 full-encoder gate on a second vector (T02) for extra confidence.
+    #[test]
+    fn encodes_mr59_full_params_bit_exact_t02() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr590,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T02.INP",
+            "../../reference/amr-nb/testv/NODTX/T_59/T02_59.COD",
+        );
+        eprintln!("MR59 full-encode gate (T02): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR59 T02: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
         );
     }
 }
