@@ -6,13 +6,16 @@
 //!     `siphon_rtp_simd::sum_sq_i16`).
 //!   - `ns_8k_20ms` / `ns_16k_20ms` — one 20 ms noise-suppression frame (√Hann WOLA STFT + a real
 //!     FFT/IFFT hop + the decision-directed Wiener gain over `N/2+1` bins), reported as µs/frame.
+//!   - `aec_8k_20ms` / `aec_16k_20ms` — one NLMS echo-cancel frame (L=256): per sample a SIMD
+//!     estimate dot (`siphon_rtp_simd::fir_dot_f32`) + a scalar NLMS weight update.
 //!
 //! No per-frame heap on the steady-state path: the resampler reuses its history/branches and the
 //! caller-owned output vector; the VAD reduces in place; the noise suppressor's FFT/WOLA/PSD scratch
-//! is all preallocated (a counting-allocator test asserts zero per-frame allocation).
+//! and the canceller's weights/ring are all preallocated (a counting-allocator test asserts zero
+//! per-frame allocation).
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use siphon_rtp_dsp::{EnergyVad, NoiseSuppressor, Resampler};
+use siphon_rtp_dsp::{EchoCanceller, EnergyVad, NoiseSuppressor, Resampler};
 
 fn bench_resampler(criterion: &mut Criterion) {
     // 8 kHz → 16 kHz, one 20 ms frame (160 samples) → ~320 out: the WS/voice-AI bridge upsample.
@@ -77,10 +80,50 @@ fn bench_noise_suppression(criterion: &mut Criterion) {
     });
 }
 
+fn bench_aec(criterion: &mut Criterion) {
+    const TAIL: usize = 256;
+
+    // A far-end (reference) and a near-end microphone frame; near carries an echo-like copy of far.
+    let far_8k: Vec<i16> = (0..160)
+        .map(|n| ((n as f32 * 0.13).sin() * 8_000.0) as i16)
+        .collect();
+    let near_8k: Vec<i16> = (0..160)
+        .map(|n| ((n as f32 * 0.13).sin() * 2_000.0 + (n as f32 * 0.05).sin() * 3_000.0) as i16)
+        .collect();
+
+    criterion.bench_function("aec_8k_20ms", |bencher| {
+        let mut canceller = EchoCanceller::new(8_000, TAIL).expect("build");
+        let mut near = near_8k.clone();
+        bencher.iter(|| {
+            near.copy_from_slice(&near_8k);
+            canceller.cancel(black_box(&mut near), black_box(&far_8k));
+            black_box(near[0])
+        });
+    });
+
+    let far_16k: Vec<i16> = (0..320)
+        .map(|n| ((n as f32 * 0.09).sin() * 8_000.0) as i16)
+        .collect();
+    let near_16k: Vec<i16> = (0..320)
+        .map(|n| ((n as f32 * 0.09).sin() * 2_000.0 + (n as f32 * 0.04).sin() * 3_000.0) as i16)
+        .collect();
+
+    criterion.bench_function("aec_16k_20ms", |bencher| {
+        let mut canceller = EchoCanceller::new(16_000, TAIL).expect("build");
+        let mut near = near_16k.clone();
+        bencher.iter(|| {
+            near.copy_from_slice(&near_16k);
+            canceller.cancel(black_box(&mut near), black_box(&far_16k));
+            black_box(near[0])
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_resampler,
     bench_vad_energy,
-    bench_noise_suppression
+    bench_noise_suppression,
+    bench_aec
 );
 criterion_main!(benches);
