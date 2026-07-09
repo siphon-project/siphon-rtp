@@ -5,8 +5,10 @@
 //! sample-clock, never `Instant::now()`), so every unit golden-tests without audio hardware.
 #![forbid(unsafe_code)]
 
+pub mod aec;
 pub mod resample;
 pub mod vad;
 
+pub use aec::{AecError, EchoCanceller};
 pub use resample::{ResampleError, Resampler};
 pub use vad::EnergyVad;
