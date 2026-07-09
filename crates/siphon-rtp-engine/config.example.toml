@@ -33,7 +33,7 @@ control = "127.0.0.1:8080"
 
 # Bind relay/media sockets to this IP instead of loopback (CLI: --relay-bind-ip) — the production
 # posture so the relay is reachable by real peers. With a 0.0.0.0 bind or a NAT'd host, pair with
-# turn_relay_ip to advertise the reachable address.
+# advertise_ip (below) to advertise the reachable SDP address (and turn_relay_ip for the TURN server).
 # relay_bind_ip = "0.0.0.0"
 
 # Deterministic media port range (CLI: --port-min / --port-max). Set BOTH to draw media ports from a
@@ -47,6 +47,42 @@ control = "127.0.0.1:8080"
 # Reap a call after this many seconds with no accepted media (CLI: --media-timeout-secs).
 # Default: 30.
 # media_timeout_secs = 30
+
+# --- Advertised address & named interfaces (rtpengine-style) ------------------------------------
+#
+# The engine separates the IP it BINDS media sockets to (relay_bind_ip / an interface `address`) from
+# the IP it ADVERTISES in rewritten SDP. The advertised IP is presentation-only — it never gates or
+# latches media (not an RTPbleed vector, see docs/security-and-nat.md §12).
+
+# Single-interface case (1:1 NAT, e.g. an AWS Elastic IP): bind a private/wildcard address but
+# advertise a routable public IP in the SDP c=/o=/ICE-candidate lines (CLI: --advertise-ip). Same
+# port; the socket still binds relay_bind_ip. Pair with relay_bind_ip = "0.0.0.0" or the private IP.
+# Emit-only (does not affect bind, the source gate, the symmetric-RTP latch, or TURN). Ignored when
+# [[interface]] entries are set below.
+# advertise_ip = "203.0.113.5"
+
+# Multi-network case: named interfaces. Each [[interface]] has a bind `address` and an optional
+# `advertised` (public) IP; the control `direction` pair then selects which interface the caller-facing
+# (A) leg and the callee-facing (B) leg land on — e.g. direction = ["external", "internal"] puts the
+# A leg on `external` and the B leg on `internal`. Repeat a name with a v4 and a v6 `address` to serve
+# both families on one interface. `default_interface` is used when a call carries no direction (or an
+# unknown one); it defaults to the first interface defined.
+#
+# default_interface = "external"
+#
+# [[interface]]
+# name = "internal"
+# address = "10.0.0.1"          # bind + advertise 10.0.0.1 (directly reachable on the core side)
+#
+# [[interface]]
+# name = "external"
+# address = "0.0.0.0"           # bind the wildcard on the access side
+# advertised = "203.0.113.5"    # advertise the public IP to peers
+#
+# [[interface]]
+# name = "external"             # same name → the v6 address of the `external` interface
+# address = "::"
+# advertised = "2001:db8::5"
 
 # --- Clustering ---------------------------------------------------------------------------------
 #

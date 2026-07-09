@@ -55,7 +55,7 @@ Supported today, mapped one-to-one onto the engine:
 | `offer` / `answer` / `delete` | The core lifecycle, with SDP rewriting (RFC 3264). |
 | `query` | Returns `result: ok` plus a `totals` dict of per-session counters (packets-in/out, bytes-in/out, packets-lost). rtpengine's fuller per-SSRC breakdown is not replicated; the native JSON `query` (full `SessionStats`) or Prometheus give richer numbers. |
 | `list` / `statistics` | Census: call-id list, global counters plus the live session gauge. |
-| `block media` / `unblock media` | Per-leg media gate. |
+| `block media` / `unblock media` | Whole-call media gate (the leg `from-tag` is accepted but not acted on — block applies to the whole call, both directions). |
 | `silence media` / `unsilence media` | Replaces the call's egress audio with synthesized silence. Requires a media-processing (transcoding) call; rejected on a plain passthrough relay, which forwards opaque payloads it cannot synthesize into. |
 | `block DTMF` / `unblock DTMF` | Drop-mode only; see the differences below. |
 | `play media` / `stop media` | `file` and `blob` sources; `db-id` parses but is rejected by the engine (there is no media database). |
@@ -92,7 +92,13 @@ vocabulary you already send:
 
 - `call-id`, `from-tag`, `to-tag`, `sdp`
 - `transport-protocol` (e.g. `RTP/AVP`, `RTP/SAVP` for the SDES-SRTP bridge, RFC 4568)
-- `ICE`, `DTLS`, `replace`, `direction`
+- `ICE`, `DTLS`, `replace`
+- `direction` — the two interface names select the local media interface per leg (caller-facing then
+  callee-facing), exactly as rtpengine's `interface=…` + `direction` do. Define the interfaces (bind
+  IP + advertised public IP) as `[[interface]]` entries in the config file; with none configured the
+  pair falls back to the single default interface. A single-homed host behind 1:1 NAT usually wants
+  just `--advertise-ip` (advertise a public IP, keep binding private) — see
+  [Deployment](deployment.md).
 - `address family` (both the spaced and `address-family` spellings)
 - `received-from` / `received from` (`["IP4"|"IP6", "<address>"]`), used as the RTPBleed
   source-gate hint
@@ -108,14 +114,18 @@ just may not all do something yet. When in doubt, test the specific flag.
 
 ## The differences that matter
 
-**The in-kernel path is XDP, not a kernel module, and today it is userspace.** rtpengine
+**The in-kernel path is XDP, not a kernel module, and it ships as a separate daemon.** rtpengine
 accelerates forwarding with its out-of-tree `xt_RTPENGINE` kernel module. siphon-rtp's equivalent
-is a planned eBPF/XDP fast path (pure Rust via aya, no out-of-tree module to build per kernel),
-and it is **not wired in yet**: all media currently flows through the userspace UDP datapath. That
-is less dramatic than it sounds, the userspace rewrite costs ~8 ns/packet, but read
-[Datapath](datapath.md) before assuming rtpengine-kernel-module throughput figures carry over.
-There is consequently also no `/proc/rtpengine` interface; stats come from `query`/`statistics`
-and [Prometheus](observability.md).
+is a pure-Rust eBPF/XDP datapath (via aya, no out-of-tree module to build per kernel) that relays
+plain-RTP flows entirely in-kernel (`XDP_TX`) behind the same source gate, redirecting anything that
+needs byte access (SRTP, transcode, TURN) to the userspace slow path. It ships as a **separate
+opt-in binary, `siphon-rtp-xdp-daemon`**, that shares the engine's CLI/config, probes the NIC,
+attaches the classifier (native, else generic/SKB), and falls back cleanly to the userspace UDP
+datapath when the host cannot support it. The **default `siphon-rtp` binary is userspace-UDP-only**
+and never links the XDP toolchain — and even that userspace rewrite costs only ~8 ns/packet, so read
+[Datapath](datapath.md) before assuming rtpengine-kernel-module throughput figures carry over either
+way. There is no `/proc/rtpengine` interface (siphon-rtp is not a kernel module); stats come from
+`query`/`statistics` and [Prometheus](observability.md).
 
 **NG is UDP-only and unauthenticated.** Like rtpengine, the NG protocol has no authentication;
 unlike recent rtpengine, siphon-rtp listens for NG on UDP only (no NG-over-TCP). Keep `--ng` on a

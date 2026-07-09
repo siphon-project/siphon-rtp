@@ -79,7 +79,9 @@ pub struct CallSnapshot {
 /// and the peer's negotiated remote addresses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegSnapshot {
-    /// Local RTP socket address — the port a standby must re-bind for transparent takeover.
+    /// Local RTP socket address — the port (and named-interface source IP) a standby must re-bind for
+    /// transparent takeover. The standby re-binds this exact `ip:port`, so a call pinned to a named
+    /// interface resumes on the same source IP.
     pub rtp_local: SocketAddr,
     /// Local RTCP socket address, absent under rtcp-mux.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +92,12 @@ pub struct LegSnapshot {
     /// The peer's RTCP address from its SDP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_rtcp: Option<SocketAddr>,
+    /// The IP this leg advertised in SDP (the named interface's advertised/public address), so a
+    /// post-restore re-offer re-advertises the same public IP. Absent in a pre-interface snapshot ⇒
+    /// fall back to the bound `rtp_local.ip()` (the old behaviour). Presentation-only — it never feeds
+    /// the source gate or latch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_ip: Option<IpAddr>,
 }
 
 /// Mirror of the engine's pipeline kind (kept in step with `engine::PipelineKind`).
@@ -369,12 +377,14 @@ mod tests {
                 rtcp_local: Some("203.0.113.10:30001".parse().unwrap()),
                 remote_rtp: Some("198.51.100.1:5000".parse().unwrap()),
                 remote_rtcp: Some("198.51.100.1:5001".parse().unwrap()),
+                advertised_ip: None,
             },
             far: LegSnapshot {
                 rtp_local: "203.0.113.10:30002".parse().unwrap(),
                 rtcp_local: None,
                 remote_rtp: Some("192.0.2.1:7000".parse().unwrap()),
                 remote_rtcp: None,
+                advertised_ip: None,
             },
             flows: vec![FlowSnapshot {
                 installed_on: EndpointRole::NearRtp,
@@ -424,6 +434,30 @@ mod tests {
         let blob = snapshot.to_json().expect("serialize");
         let back = CallSnapshot::from_json(&blob).expect("deserialize");
         assert_eq!(snapshot, back);
+    }
+
+    #[test]
+    fn leg_snapshot_advertised_ip_round_trips_and_defaults_to_none() {
+        // A named-interface call records its advertised IP; the field round-trips through JSON.
+        let mut snapshot = sample();
+        snapshot.near.advertised_ip = Some("203.0.113.99".parse().unwrap());
+        let back =
+            CallSnapshot::from_json(&snapshot.to_json().expect("serialize")).expect("deserialize");
+        assert_eq!(
+            back.near.advertised_ip,
+            Some("203.0.113.99".parse().unwrap())
+        );
+        assert_eq!(
+            back.far.advertised_ip, None,
+            "unset far advertised stays None"
+        );
+
+        // A pre-interface blob (no `advertised_ip` key on the leg) deserializes to `None` (serde
+        // default), so an older primary's checkpoint restores on a new standby.
+        let blob = snapshot.to_json().expect("serialize");
+        let stripped = blob.replace(",\"advertised_ip\":\"203.0.113.99\"", "");
+        let back = CallSnapshot::from_json(&stripped).expect("legacy blob deserializes");
+        assert_eq!(back.near.advertised_ip, None);
     }
 
     #[test]

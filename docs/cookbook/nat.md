@@ -82,6 +82,43 @@ what the other signalled. Two things must be true for that to work:
 - Add `replace: ["origin"]` (`"replace": ["origin"]` in JSON) if you also want the `o=` line
   rewritten to the engine's address for topology hiding; the media path does not need it.
 
+## The engine itself is behind NAT (advertise a public IP)
+
+On a cloud host whose only local address is private and whose public address is an Elastic IP (1:1
+NAT via the gateway), binding the public IP is not an option — it is not a local address, and the
+XDP fast path requires `--relay-bind-ip` to be a routable *local* IPv4. Decouple the advertised
+address from the bound one:
+
+```
+siphon-rtp --relay-bind-ip 10.0.0.7 --advertise-ip 203.0.113.9 ...
+```
+
+The sockets bind and receive on the private `10.0.0.7`; the rewritten SDP hands peers
+`c=IN IP4 203.0.113.9` on the **same port** (1:1 NAT preserves it). It is emit-only: the source
+gate and the symmetric-RTP latch still key on the real remote/bound addresses, so this does not
+touch the anti-RTPbleed posture, and XDP attach/bind are unaffected. `--advertise-ip` only
+substitutes when its family matches the leg's, so a v4 EIP never lands on a `c=IN IP6` leg.
+
+For a host that fronts **two** networks (a private core side and a public access side), define
+named interfaces in the config file and let the control `direction` pair pick the interface per leg:
+
+```toml
+default_interface = "external"
+
+[[interface]]
+name = "internal"
+address = "10.0.0.7"
+
+[[interface]]
+name = "external"
+address = "10.0.0.7"          # bind the private/local IP
+advertised = "203.0.113.9"    # advertise the public IP
+```
+
+`direction = ["external", "internal"]` then anchors the caller-facing leg on `external` (advertising
+the EIP) and the callee-facing leg on `internal`. The single `--advertise-ip` is the one-interface
+shorthand for this. Full design: [Security & NAT §12](../security-and-nat.md).
+
 ## Hairpinning
 
 Two parties behind the same NAT (or two NATed legs of any shape) relay *through* the engine,
@@ -103,8 +140,9 @@ plain-RTP legs, which in VoLTE/PSTN work is most of them. See
 Work through these in order; each one names its check.
 
 1. **Is the engine reachable at what it advertised?** Look at the rewritten SDP's `c=` line. If
-   it says `127.0.0.1`, you forgot `--relay-bind-ip`. If it names an IP the peer cannot route,
-   fix the bind or the network, not the latch.
+   it says `127.0.0.1`, you forgot `--relay-bind-ip`. If it names a private IP the peer cannot
+   route and the host is behind 1:1 NAT (a cloud host with an Elastic IP), set `--advertise-ip` to
+   the public address. Otherwise fix the bind or the network, not the latch.
 2. **Is the gate dropping the sender?** `query` the call while the party sends. `packets_in`
    rising together with `packets_lost`, while `packets_out` lags, means packets reach the engine
    and the source gate rejects them. Compare the arriving source IP (tcpdump) against the leg's

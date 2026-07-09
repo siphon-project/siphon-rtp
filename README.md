@@ -70,6 +70,7 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **DTLS-SRTP** | RFC 5764 | Implemented — pure-RustCrypto handshake keying (webrtc-dtls) |
 | **ICE / STUN** | RFC 8445 / 5389 | Implemented — ICE-lite + STUN Binding (full ICE state machine planned) |
 | **TURN server** | RFC 5766 / 8656 | Implemented — `turn:` / `turns:` (UDP/TCP/TLS), coturn REST credentials |
+| **NAT traversal (symmetric RTP, advertised IP, named interfaces)** | RFC 3550 §8 | Implemented — RTPbleed-gated symmetric latch, `--advertise-ip` for a 1:1-NAT / Elastic-IP host, and rtpengine-style `[[interface]]` + `direction` per-leg selection ([docs](docs/security-and-nat.md)) |
 | **Jitter buffer + PLC + resampler** | RFC 3550 | Implemented (resampler AVX2, PLC drives decoder concealment) |
 | **VAD** | — | Implemented — energy VAD (noise suppression / echo cancellation planned) |
 | **WebSocket bridge (raw L16 PCM)** | — | Implemented — bidirectional, `ws://` and `wss://` (wss via ring/rustls + webpki-roots) |

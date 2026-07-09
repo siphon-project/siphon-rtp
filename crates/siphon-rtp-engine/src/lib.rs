@@ -22,6 +22,7 @@ pub mod dtls_bridge;
 pub mod engine;
 pub mod ha;
 pub mod ice;
+pub mod interface;
 pub mod media_pipeline;
 pub mod metrics;
 pub mod sdp;
@@ -32,4 +33,5 @@ pub mod ws_bridge;
 
 pub use daemon::{run_with_datapath, EngineArgs, RunConfig};
 pub use engine::{ClientId, Engine};
+pub use interface::{Interface, InterfaceAddress, InterfaceEntry, InterfaceTable};
 pub use metrics::Metrics;

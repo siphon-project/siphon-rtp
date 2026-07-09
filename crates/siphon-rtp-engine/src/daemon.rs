@@ -28,7 +28,8 @@ use siphon_rtp_turn::{tls, NoFastPath, SystemUnixClock, Turn, TurnConfig};
 use tokio::net::{TcpListener, UdpSocket};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{resolve_defaulted, resolve_optional, FileConfig};
+use crate::config::{resolve_defaulted, resolve_optional, FileConfig, InterfaceConfig};
+use crate::interface::{InterfaceEntry, InterfaceTable};
 use crate::srtp_bridge::run_redirect_dispatcher;
 use crate::{cluster, metrics, server, shutdown, ClientId, Engine};
 
@@ -77,9 +78,18 @@ pub struct EngineArgs {
 
     /// Bind relay/media sockets to this IP instead of loopback — the production posture so the relay
     /// is reachable by real peers (docs/security-and-nat.md §11.1). With a `0.0.0.0` bind or a NAT'd
-    /// host, pair with `--turn-relay-ip` to advertise the reachable address.
+    /// host, pair with `--advertise-ip` to advertise the reachable address in SDP.
     #[arg(long)]
     pub relay_bind_ip: Option<IpAddr>,
+
+    /// Public IP advertised in offer/answer SDP `c=`/`m=`/`o=` (and ICE candidate) when the relay is
+    /// bound to a private/NAT'd address — the single-interface 1:1-NAT case (e.g. an AWS Elastic IP).
+    /// Same port; the socket still binds `--relay-bind-ip`. Emit-only: it does not affect the socket
+    /// bind, the source gate, the in-kernel symmetric-RTP latch, or TURN (use `--turn-relay-ip` for
+    /// that). For a multi-network internal/external split use `[[interface]]` + the control
+    /// `direction` instead.
+    #[arg(long)]
+    pub advertise_ip: Option<IpAddr>,
 
     /// Lowest media port the datapath may bind. Set together with `--port-max` to draw media ports
     /// from a bounded, firewallable range (rtpengine `port-min` parity) instead of OS-ephemeral
@@ -139,6 +149,14 @@ pub struct RunConfig {
     pub ng: Option<SocketAddr>,
     /// Bind relay/media sockets to this IP instead of loopback; `None` = loopback.
     pub relay_bind_ip: Option<IpAddr>,
+    /// Public IP advertised in rewritten SDP instead of the bind IP; `None` = advertise the bind IP.
+    /// Sugar for a lone `default` interface; ignored when [`Self::interfaces`] is non-empty.
+    pub advertise_ip: Option<IpAddr>,
+    /// Named media interfaces (config-file only). Empty ⇒ a single `default` interface synthesised
+    /// from [`Self::relay_bind_ip`] + [`Self::advertise_ip`].
+    pub interfaces: Vec<InterfaceConfig>,
+    /// Interface used when a call carries no `direction`; `None` ⇒ the first defined interface.
+    pub default_interface: Option<String>,
     /// Lowest media port the datapath may bind (paired with [`Self::port_max`]).
     pub port_min: Option<u16>,
     /// Highest media port the datapath may bind (paired with [`Self::port_min`]).
@@ -190,6 +208,9 @@ impl RunConfig {
             ),
             ng: resolve_optional(args.ng, file.ng),
             relay_bind_ip: resolve_optional(args.relay_bind_ip, file.relay_bind_ip),
+            advertise_ip: resolve_optional(args.advertise_ip, file.advertise_ip),
+            interfaces: file.interface,
+            default_interface: file.default_interface,
             port_min: resolve_optional(args.port_min, file.port_min),
             port_max: resolve_optional(args.port_max, file.port_max),
             metrics_addr: resolve_optional(args.metrics_addr, file.metrics_addr),
@@ -226,6 +247,37 @@ impl RunConfig {
                 DEFAULT_MAX_SESSIONS,
             ),
         }
+    }
+
+    /// Build the engine's [`InterfaceTable`] from the resolved config. When `[[interface]]` entries are
+    /// present they define the named interfaces (and `advertise_ip` is ignored — a warning is logged
+    /// if it was also set); otherwise a single `default` interface is synthesised from `relay_bind_ip`
+    /// (loopback when unset) + `advertise_ip`. Both datapath binaries call this once at startup.
+    ///
+    /// # Errors
+    /// Propagates [`InterfaceTable::from_entries`] validation failures (empty table, duplicate family
+    /// on one name, unknown `default_interface`) as a human-readable startup error.
+    pub fn interface_table(&self) -> Result<InterfaceTable, String> {
+        if self.interfaces.is_empty() {
+            let bind = self
+                .relay_bind_ip
+                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            return Ok(InterfaceTable::single(bind, self.advertise_ip));
+        }
+        if self.advertise_ip.is_some() {
+            tracing::warn!(
+                "--advertise-ip is ignored when [[interface]] entries are configured; \
+                 set `advertised` on the interface instead"
+            );
+        }
+        let entries = self
+            .interfaces
+            .iter()
+            .map(|iface: &InterfaceConfig| {
+                InterfaceEntry::new(iface.name.clone(), iface.address, iface.advertised)
+            })
+            .collect();
+        InterfaceTable::from_entries(entries, self.default_interface.as_deref())
     }
 }
 
@@ -326,15 +378,16 @@ pub async fn run_with_datapath<D>(
 where
     D: Datapath + Clone + Send + Sync + 'static,
 {
-    // Cluster state for the `load` / `node_info` / `drain` control commands. The node id falls back
-    // to the host's `HOSTNAME` (else `siphon-rtp`); the advertised media address is the routable
-    // relay bind IP (skipping a `0.0.0.0` wildcard, which is not a reachable address to hand a peer).
+    // Named-interface table (rtpengine-style): the advertised/bind-IP policy the engine applies at
+    // SDP-rewrite time. Built once here so both datapath binaries inherit it; a malformed table is a
+    // fatal startup error (never a silent fallback).
+    let interfaces = config.interface_table()?;
+
+    // Cluster state for the `load` / `node_info` / `drain` control commands. The node id falls back to
+    // the host's `HOSTNAME` (else `siphon-rtp`); the advertised media addresses are the interfaces'
+    // advertised IPs (skipping a `0.0.0.0` wildcard, which is not a reachable address to hand a peer).
     let node_id = config.node_id.clone().unwrap_or_else(default_node_id);
-    let media_addresses = config
-        .relay_bind_ip
-        .filter(|ip| !ip.is_unspecified())
-        .map(|ip| vec![ip.to_string()])
-        .unwrap_or_default();
+    let media_addresses = interfaces.advertised_media_addresses();
     let cluster = Arc::new(cluster::ClusterState::new(
         node_id.clone(),
         config.max_sessions,
@@ -345,7 +398,11 @@ where
         max_sessions = config.max_sessions,
         "cluster node identity registered"
     );
-    let engine = Arc::new(Engine::new(datapath.clone()).with_cluster(cluster.clone()));
+    let engine = Arc::new(
+        Engine::new(datapath.clone())
+            .with_cluster(cluster.clone())
+            .with_interfaces(interfaces),
+    );
 
     // Best-effort host-CPU sampler feeding the `load` command's load score (~1 Hz, off-reactor).
     cluster::spawn_cpu_sampler(cluster, cluster::DEFAULT_CPU_SAMPLE_INTERVAL);
@@ -612,7 +669,119 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_port_range;
+    use super::{resolve_port_range, RunConfig};
+    use crate::config::InterfaceConfig;
+    use siphon_rtp_datapath::AddressFamily;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// A `RunConfig` with everything at its off/default value, so a test overrides only the fields it
+    /// cares about (the interface-table inputs).
+    fn bare_run_config() -> RunConfig {
+        RunConfig {
+            control: "127.0.0.1:8080".parse().unwrap(),
+            ng: None,
+            relay_bind_ip: None,
+            advertise_ip: None,
+            interfaces: Vec::new(),
+            default_interface: None,
+            port_min: None,
+            port_max: None,
+            metrics_addr: None,
+            max_control_rps: 0,
+            media_timeout_secs: 30,
+            shutdown_grace_secs: 25,
+            turn_udp: None,
+            turn_tcp: None,
+            turn_tls: None,
+            turn_tls_cert: None,
+            turn_tls_key: None,
+            turn_relay_ip: None,
+            log_filter: None,
+            node_id: None,
+            max_sessions: 0,
+        }
+    }
+
+    #[test]
+    fn interface_table_synthesises_default_from_bind_and_advertise_ip() {
+        // No `[[interface]]`: a single `default` interface from relay_bind_ip + advertise_ip (sugar).
+        let config = RunConfig {
+            relay_bind_ip: Some(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
+            advertise_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
+            ..bare_run_config()
+        };
+        let table = config.interface_table().expect("single interface");
+        let address = table
+            .default_interface()
+            .exact_address_for(AddressFamily::V4)
+            .expect("v4");
+        assert_eq!(address.bind, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert_eq!(
+            address.advertised,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
+        );
+    }
+
+    #[test]
+    fn interface_table_with_no_config_is_loopback() {
+        let table = bare_run_config()
+            .interface_table()
+            .expect("loopback default");
+        let address = table
+            .default_interface()
+            .exact_address_for(AddressFamily::V4)
+            .expect("v4");
+        assert_eq!(address.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(address.advertised, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn interface_table_builds_named_interfaces_from_config() {
+        let config = RunConfig {
+            interfaces: vec![
+                InterfaceConfig {
+                    name: "internal".into(),
+                    address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                    advertised: None,
+                },
+                InterfaceConfig {
+                    name: "external".into(),
+                    address: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                    advertised: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
+                },
+            ],
+            default_interface: Some("external".into()),
+            ..bare_run_config()
+        };
+        let table = config.interface_table().expect("named interfaces");
+        assert_eq!(table.default_interface().name, "external");
+        let (near, far) =
+            table.resolve_direction(&["external".to_string(), "internal".to_string()]);
+        assert_eq!(
+            near.exact_address_for(AddressFamily::V4)
+                .unwrap()
+                .advertised,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
+        );
+        assert_eq!(
+            far.exact_address_for(AddressFamily::V4).unwrap().bind,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn interface_table_rejects_an_unknown_default() {
+        let config = RunConfig {
+            interfaces: vec![InterfaceConfig {
+                name: "a".into(),
+                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                advertised: None,
+            }],
+            default_interface: Some("missing".into()),
+            ..bare_run_config()
+        };
+        assert!(config.interface_table().is_err());
+    }
 
     #[test]
     fn port_range_neither_set_is_ephemeral() {

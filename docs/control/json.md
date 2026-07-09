@@ -75,8 +75,8 @@ Two more per-connection guards apply regardless of auth:
 | `query` | `call_id`, `from_tag`, `to_tag?` | Session statistics: `packets_in/out`, `bytes_in/out`, `packets_lost`. |
 
 The `profile` object is the JSON twin of rtpengine's flag set. Most fields change behaviour; `ice`
-and `dtls` override the SDP-derived ICE/DTLS posture on `offer` (below); `direction` is accepted for
-rtpengine compatibility but is **not a policy input yet**.
+and `dtls` override the SDP-derived ICE/DTLS posture on `offer` (below); `direction` selects the
+per-leg media interface (below).
 
 | `profile` field | Type | Meaning |
 |---|---|---|
@@ -86,7 +86,7 @@ rtpengine compatibility but is **not a policy input yet**.
 | `replace` | string list | SDP fields to rewrite, e.g. `["origin"]`. |
 | `address_family` | string | `IP4` \| `IP6` for the far leg's engine endpoints (v4/v6 interworking). |
 | `flags` | string list | Behavioral flags plus the codec directives (`codec-transcode-X`, `codec-mask-X`, `codec-strip-X`, `codec-offer-X`, `codec-except-X`, `ptime=N`, ...). |
-| `direction` | string list | Parsed for compatibility, **currently no-op** (multi-interface direction routing is planned). |
+| `direction` | string list | Named-interface selection (rtpengine-style). Two interface names: the first for the caller-facing (A / near) leg, the second for the callee-facing (B / far) leg — so an inbound leg lands on `internal` and the outbound leg on `external`. Each interface has a bind IP and an advertised (public) IP (see the daemon `[[interface]]` config). An absent or unknown name falls back to the default interface (logged). With no `[[interface]]` configured, both legs use the single synthesised `default` interface. |
 | `record_call`, `record_path` | bool, string | Record this call from setup; output directory. |
 | `ws_uri` | string | Attach leg A to an external WebSocket media server (`ws://` or `wss://`; `wss://` on ring/rustls with webpki-roots trust). A native extension; not available over NG. |
 | `received_from` | IP string | The real post-NAT source IP the SIP proxy saw. Tightens the ingress source gate (anti-RTPBleed, see [Security and NAT](../security-and-nat.md)). |

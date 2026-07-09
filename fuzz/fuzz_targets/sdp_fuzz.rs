@@ -13,11 +13,14 @@ fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
     let _ = sdp::parse(&text);
 
-    let engine = EngineMedia {
-        // 3GPP test range / documentation address — never a real subscriber endpoint.
-        rtp: "192.0.2.1:10000".parse().expect("static valid socket address"),
-        rtcp: None,
-    };
+    // 3GPP test range / documentation address — never a real subscriber endpoint. No advertised-IP
+    // override here (advertise the bound address), so the rewriter exercises its default path.
+    let engine = EngineMedia::new(
+        "192.0.2.1:10000"
+            .parse()
+            .expect("static valid socket address"),
+        None,
+    );
     // Rewrite against arbitrary input passing the peer's ICE through (no re-origination) with no
     // security advertisement / mux override: must never panic.
     let _ = sdp::rewrite(&text, engine, IceRewrite::Keep, None, None);

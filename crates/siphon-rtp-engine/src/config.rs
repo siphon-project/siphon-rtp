@@ -48,6 +48,22 @@ pub enum ConfigError {
     },
 }
 
+/// One `[[interface]]` table in the config file — a named media interface (rtpengine-style). Repeat
+/// the same `name` with a v4 and a v6 `address` to give one interface both families. `advertised`
+/// (optional) is the public IP put into rewritten SDP when it differs from the bind `address` (behind
+/// 1:1 NAT); omit it for a directly reachable interface.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterfaceConfig {
+    /// Interface name, matched against the control `direction` pair (e.g. `internal` / `external`).
+    pub name: String,
+    /// Local IP the datapath binds and transmits media from.
+    pub address: IpAddr,
+    /// Public IP advertised in rewritten SDP; omit to advertise the bind `address`.
+    #[serde(default)]
+    pub advertised: Option<IpAddr>,
+}
+
 /// The on-disk TOML schema for the daemon. Every field is optional: a config file only sets the keys
 /// it overrides, and the rest fall through to the CLI default. Field names mirror the CLI long flags
 /// (`--relay-bind-ip` → `relay_bind_ip`, …). Unknown keys are rejected so a typo'd key is a loud
@@ -63,6 +79,22 @@ pub struct FileConfig {
     pub ng: Option<SocketAddr>,
     /// Bind relay/media sockets to this IP instead of loopback (`--relay-bind-ip`).
     pub relay_bind_ip: Option<IpAddr>,
+    /// Public IP to advertise in rewritten SDP (`c=`/`o=`/ICE candidate) instead of the bind IP
+    /// (`--advertise-ip`). The single-interface 1:1-NAT case (e.g. an AWS Elastic IP): bind a
+    /// private/wildcard address, advertise the routable one — same port, family-matched. For a
+    /// multi-network split use `[[interface]]` + the control `direction` instead; this is sugar for a
+    /// lone `default` interface. The advertised IP never feeds the source gate or latch (not an
+    /// RTPbleed vector — see `docs/security-and-nat.md`).
+    pub advertise_ip: Option<IpAddr>,
+    /// Named media interfaces (rtpengine-style). Each `[[interface]]` names a local bind address and
+    /// an optional advertised public IP; the control `direction` pair then selects which interface the
+    /// caller-facing (A) and callee-facing (B) legs land on. When empty, a single `default` interface
+    /// is synthesised from `relay_bind_ip` + `advertise_ip`.
+    #[serde(default)]
+    pub interface: Vec<InterfaceConfig>,
+    /// Which named interface to use when a call carries no `direction` (or names an unknown one).
+    /// Defaults to the first `[[interface]]` defined.
+    pub default_interface: Option<String>,
     /// Lowest media port the datapath may bind (`--port-min`). Set together with `port_max` to draw
     /// media ports from a bounded, firewallable range instead of OS-ephemeral ports.
     pub port_min: Option<u16>,
@@ -228,6 +260,65 @@ mod tests {
         assert_eq!(config.max_sessions, Some(4000));
         assert_eq!(config.xdp_interface.as_deref(), Some("eth0"));
         assert_eq!(config.xdp_queue, Some(2));
+    }
+
+    /// The single-interface advertise-IP override deserializes (the 1:1-NAT / Elastic-IP case).
+    #[test]
+    fn deserializes_advertise_ip() {
+        let config = FileConfig::parse_str("advertise_ip = \"203.0.113.5\"\n").expect("valid");
+        assert_eq!(
+            config.advertise_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)))
+        );
+        assert!(config.interface.is_empty());
+    }
+
+    /// The `[[interface]]` array of tables deserializes: a name, a bind `address`, an optional
+    /// `advertised`, and a `default_interface`. A repeated name (v4 + v6) is preserved as two entries
+    /// (the table merges them). This is the rtpengine named-interface model.
+    #[test]
+    fn deserializes_interface_array() {
+        let toml = concat!(
+            "default_interface = \"external\"\n",
+            "[[interface]]\n",
+            "name = \"internal\"\n",
+            "address = \"10.0.0.1\"\n",
+            "[[interface]]\n",
+            "name = \"external\"\n",
+            "address = \"0.0.0.0\"\n",
+            "advertised = \"203.0.113.5\"\n",
+            "[[interface]]\n",
+            "name = \"external\"\n",
+            "address = \"::\"\n",
+            "advertised = \"2001:db8::5\"\n",
+        );
+        let config = FileConfig::parse_str(toml).expect("valid interface array");
+        assert_eq!(config.default_interface.as_deref(), Some("external"));
+        assert_eq!(config.interface.len(), 3);
+        assert_eq!(config.interface[0].name, "internal");
+        assert_eq!(
+            config.interface[0].address,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+        assert_eq!(config.interface[0].advertised, None);
+        assert_eq!(config.interface[1].name, "external");
+        assert_eq!(
+            config.interface[1].advertised,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)))
+        );
+        assert!(config.interface[2].address.is_ipv6());
+    }
+
+    /// A mistyped key inside an `[[interface]]` table is rejected (`deny_unknown_fields`).
+    #[test]
+    fn unknown_interface_key_is_rejected() {
+        let toml = concat!(
+            "[[interface]]\n",
+            "name = \"x\"\n",
+            "address = \"10.0.0.1\"\n",
+            "advertize = \"203.0.113.5\"\n", // typo of `advertised`
+        );
+        assert!(FileConfig::parse_str(toml).is_err());
     }
 
     /// An empty file is valid and yields all-`None` (every key falls through to the CLI default).

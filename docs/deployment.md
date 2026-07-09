@@ -72,6 +72,7 @@ there is **no `--xdp` flag** today, the daemon always runs the UDP datapath
 | `--control <ADDR>` | `127.0.0.1:8080` | Native JSON-over-TCP control listener (length-prefixed JSON, async events). |
 | `--ng <ADDR>` | off | rtpengine NG/bencode control listener (UDP). Off unless given; rtpengine's conventional port is 22222. |
 | `--relay-bind-ip <IP>` | loopback | Bind relay/media sockets to this IP. The production posture; without it media only reaches loopback peers. |
+| `--advertise-ip <IP>` | bound IP | Public IP advertised in offer/answer SDP (`c=`/`m=`/`o=`/ICE candidate) instead of the bound IP, for a single-homed host behind 1:1 NAT (e.g. an Elastic IP): bind private with `--relay-bind-ip`, advertise the public IP here, same port. Emit-only (does not affect the bind, the source gate, the latch, or TURN). For a multi-network split use `[[interface]]` + the control `direction` instead. |
 | `--port-min <PORT>` / `--port-max <PORT>` | OS-ephemeral | Bounded media port range (rtpengine `port-min`/`port-max` parity). Both-or-neither; a half-set or inverted range is a fatal startup error. Required for HA takeover. |
 | `--metrics-addr <ADDR>` | off | Prometheus + health HTTP: `GET /metrics`, `GET /healthz`, `GET /readyz`. |
 | `--max-control-rps <N>` | `200` | Per-connection control request cap (requests/second). `0` disables the limit. |
@@ -143,6 +144,14 @@ Why each of these:
 - **`--relay-bind-ip`** is the switch from lab to production. Media endpoints bind this IP and the
   rewritten SDP advertises it (RFC 3264 offer/answer), so real peers can reach the relay. Leave it
   unset and everything still works, but only against loopback peers.
+- **`--advertise-ip`** covers the host whose reachable address is not a local one — a cloud host
+  behind 1:1 NAT (e.g. an AWS Elastic IP). Bind the private/routable local IP with `--relay-bind-ip`
+  (the XDP fast path needs a real local IPv4), and advertise the public IP here; the rewritten SDP
+  hands peers the public address while the socket keeps binding private, same port. It is emit-only:
+  the source gate and the symmetric-RTP latch still key on the real remote/bound addresses. For a
+  host that fronts two networks (a private core side and a public access side), define named
+  `[[interface]]` entries in the config file instead and let the control `direction` pair pick the
+  interface per leg — the single `--advertise-ip` is the one-interface shorthand.
 - **`--port-min` / `--port-max`** pins media to a firewallable UDP window. Size it for your
   concurrency: up to 4 ports per call (RTP + RTCP on each leg), 2 with rtcp-mux (RFC 5761). A pool
   of 30000-40000 comfortably covers ~2,500 calls at the worst case. A deterministic range is also

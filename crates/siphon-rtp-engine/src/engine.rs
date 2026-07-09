@@ -43,6 +43,7 @@ use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
 use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
 use crate::ice::{self, IceCredentials};
+use crate::interface::{Interface, InterfaceTable};
 use crate::media_pipeline::{
     DirectionConfig, MediaCall, MediaControl, MediaRegistry, PcapCapture, RawTee, RelayConfig,
     RtcpRelay,
@@ -73,6 +74,12 @@ struct Leg {
     rtcp: Option<Endpoint>,
     remote_rtp: Option<std::net::SocketAddr>,
     remote_rtcp: Option<std::net::SocketAddr>,
+    /// The IP advertised for this leg in rewritten SDP (`c=`/`o=`/ICE candidate) — the named
+    /// interface's advertised address, or the bound `rtp.local_addr.ip()` when no interface overrides
+    /// it. Presentation-only: it never feeds the source gate or latch (not an RTPbleed vector). Kept
+    /// so `answer()` (which re-advertises the stored near leg, no re-allocation) uses the same IP the
+    /// offer did, and so an HA checkpoint can carry it forward.
+    advertised_ip: std::net::IpAddr,
 }
 
 impl Leg {
@@ -232,13 +239,17 @@ impl Call {
     }
 }
 
-/// Map a [`Leg`] to its portable snapshot (local media ports + the peer's remote addresses).
+/// Map a [`Leg`] to its portable snapshot (local media ports + the peer's remote addresses). The
+/// advertised IP is recorded only when it differs from the bound IP (a named-interface override), so a
+/// plain-relay snapshot stays byte-compatible with a pre-interface standby.
 fn leg_snapshot(leg: &Leg) -> crate::ha::LegSnapshot {
+    let advertised_ip = (leg.advertised_ip != leg.rtp.local_addr.ip()).then_some(leg.advertised_ip);
     crate::ha::LegSnapshot {
         rtp_local: leg.rtp.local_addr,
         rtcp_local: leg.rtcp.map(|endpoint| endpoint.local_addr),
         remote_rtp: leg.remote_rtp,
         remote_rtcp: leg.remote_rtcp,
+        advertised_ip,
     }
 }
 
@@ -492,6 +503,11 @@ pub struct Engine<D: Datapath> {
     /// bundle) and reused for every leg. A `ws://` dial ignores it. Tests may pre-seed it to trust a
     /// self-signed server certificate.
     ws_tls_config: std::sync::OnceLock<Arc<rustls::ClientConfig>>,
+    /// Named-interface policy (rtpengine-style): maps the control `direction` pair to each leg's bind
+    /// and advertised address at SDP-rewrite time. The zero-config default is a single loopback
+    /// interface (advertise whatever the datapath bound), so existing tests are behaviour-preserving;
+    /// the daemon replaces it via [`Self::with_interfaces`] from config. Shared read-only (`Arc`).
+    interfaces: Arc<InterfaceTable>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -534,6 +550,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             cluster: Arc::new(ClusterState::new("siphon-rtp".to_string(), 0, Vec::new())),
             dtls_certificate,
             ws_tls_config: std::sync::OnceLock::new(),
+            // Zero-config default: one loopback interface with no advertised override, so a leg
+            // advertises exactly the address the datapath bound (behaviour-preserving for tests).
+            interfaces: Arc::new(InterfaceTable::single(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                None,
+            )),
         }
     }
 
@@ -566,6 +588,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     #[must_use]
     pub fn with_cluster(mut self, cluster: Arc<ClusterState>) -> Self {
         self.cluster = cluster;
+        self
+    }
+
+    /// Replace the default single-loopback interface table with the operator-configured named
+    /// interfaces (`main.rs` / the XDP daemon wiring). Builder-style consuming setter, mirroring
+    /// [`Self::with_cluster`]; tests keep the zero-config default.
+    #[must_use]
+    pub fn with_interfaces(mut self, interfaces: InterfaceTable) -> Self {
+        self.interfaces = Arc::new(interfaces);
         self
     }
 
@@ -842,14 +873,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Allocate `count` endpoints of `family`, rolling back all of them if any allocation fails. The
     /// family is the address family of the call's signalled `c=` line (RFC 4566 §5.7), so a
     /// `c=IN IP6` call gets v6 engine endpoints and a `c=IN IP4` call gets v4.
+    ///
+    /// `bind` selects the local source IP (named-interface selection): `Some(ip)` binds/emits from that
+    /// exact IP via [`Datapath::alloc_endpoint_on`]; `None` uses the datapath's family default
+    /// ([`Datapath::alloc_endpoint_for`]). The caller resolves `bind` from the interface table so a
+    /// v6 leg on a v4-only interface still binds the datapath's v6 default rather than a wrong-family IP.
     async fn alloc_endpoints(
         &self,
         count: usize,
         family: AddressFamily,
+        bind: Option<std::net::IpAddr>,
     ) -> Result<Vec<Endpoint>, String> {
         let mut endpoints = Vec::with_capacity(count);
         for _ in 0..count {
-            match self.datapath.alloc_endpoint_for(family).await {
+            let allocated = match bind {
+                Some(ip) => self.datapath.alloc_endpoint_on(ip).await,
+                None => self.datapath.alloc_endpoint_for(family).await,
+            };
+            match allocated {
                 Ok(endpoint) => endpoints.push(endpoint),
                 Err(error) => {
                     for allocated in &endpoints {
@@ -860,6 +901,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
         Ok(endpoints)
+    }
+
+    /// Resolve a leg's `(bind, advertised)` addresses for the chosen interface + family. `bind =
+    /// Some(ip)` asks the datapath to source the leg from that exact IP (a same-family interface
+    /// address); `None` means "use the datapath's family default". `advertised = Some(ip)` overrides
+    /// the SDP address; `None` means "advertise whatever the datapath bound". Both are `None` when the
+    /// interface serves no address of the leg's family, preserving the pre-interface behaviour.
+    fn leg_binding(
+        interface: &Interface,
+        family: AddressFamily,
+    ) -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
+        match interface.exact_address_for(family) {
+            Some(address) => (Some(address.bind), Some(address.advertised)),
+            None => (None, None),
+        }
     }
 
     async fn free(&self, endpoints: &[Endpoint]) {
@@ -941,11 +997,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (near_mux, far_mux) = resolve_rtcp_mux(info.rtcp_mux, &profile.rtcp_mux);
         let near_per_leg = if near_mux { 1 } else { 2 };
         let far_per_leg = if far_mux { 1 } else { 2 };
-        let near_endpoints = match self.alloc_endpoints(near_per_leg, near_family).await {
+        // Named-interface selection (rtpengine `direction`): `direction[0]` picks the near (A) leg's
+        // interface and `direction[1]` the far (B) leg's. Each resolves to a bind IP the datapath
+        // sources the leg from and an advertised IP put into that leg's rewritten SDP
+        // (docs/security-and-nat.md §12.2). Absent/unknown slots fall back to the default interface.
+        let (near_interface, far_interface) = self.interfaces.resolve_direction(&profile.direction);
+        let (near_bind, near_advertised_override) = Self::leg_binding(near_interface, near_family);
+        let (far_bind, far_advertised_override) = Self::leg_binding(far_interface, far_family);
+        let near_endpoints = match self
+            .alloc_endpoints(near_per_leg, near_family, near_bind)
+            .await
+        {
             Ok(endpoints) => endpoints,
             Err(reason) => return CmdResult::Error { reason },
         };
-        let far_endpoints = match self.alloc_endpoints(far_per_leg, far_family).await {
+        let far_endpoints = match self
+            .alloc_endpoints(far_per_leg, far_family, far_bind)
+            .await
+        {
             Ok(endpoints) => endpoints,
             Err(reason) => {
                 self.free(&near_endpoints).await;
@@ -956,6 +1025,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let far_rtp = far_endpoints[0];
         let near_rtcp = (!near_mux).then(|| near_endpoints[1]);
         let far_rtcp = (!far_mux).then(|| far_endpoints[1]);
+        // Each leg's advertised IP: the interface override, else the address the datapath actually
+        // bound (the pre-interface behaviour). The advertised IP is presentation-only — it never feeds
+        // the source gate or latch, so it is not an RTPbleed vector (docs/security-and-nat.md §12.1).
+        let near_advertised = near_advertised_override.unwrap_or_else(|| near_rtp.local_addr.ip());
+        let far_advertised = far_advertised_override.unwrap_or_else(|| far_rtp.local_addr.ip());
         // Combined list for teardown on any later error path in this offer.
         let endpoints: Vec<_> = near_endpoints
             .iter()
@@ -967,6 +1041,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let engine = EngineMedia {
             rtp: far_rtp.local_addr,
             rtcp: far_rtcp.map(|endpoint| endpoint.local_addr),
+            advertised_ip: far_advertised,
         };
         // ICE rewrite mode (RFC 8839 §5): re-originate ICE-lite when we minted creds; on `ice: remove`
         // with none minted, strip the peer's ICE without advertising our own; otherwise pass it
@@ -1052,9 +1127,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if !codec_policy.is_noop() {
             rewritten.sdp = sdp::apply_codec_policy(&rewritten.sdp, &codec_policy);
         }
-        // rtpengine `replace: [origin]`: rewrite the o= line to the engine's address (topology hiding).
+        // rtpengine `replace: [origin]`: rewrite the o= line to the engine's advertised address
+        // (topology hiding) — the interface's advertised IP, not the bound one.
         if profile.replace.iter().any(|field| field == "origin") {
-            rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.rtp.ip());
+            rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.advertised_ip);
         }
 
         // WebSocket bridge (mod_audio_stream / voice-AI): a native siphon-rtp extension. When the
@@ -1091,12 +1167,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     rtcp: near_rtcp,
                     remote_rtp: Some(info.remote_rtp),
                     remote_rtcp: Some(info.remote_rtcp),
+                    advertised_ip: near_advertised,
                 },
                 far: Leg {
                     rtp: far_rtp,
                     rtcp: far_rtcp,
                     remote_rtp: None,
                     remote_rtcp: None,
+                    advertised_ip: far_advertised,
                 },
                 far_local_crypto,
                 far_remote_crypto: None,
@@ -1328,10 +1406,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let far_gate_rtcp = apply_received_from(Some(info.remote_rtcp), profile.received_from)
             .unwrap_or(info.remote_rtcp);
 
-        // The rewritten answer is delivered to A, so it advertises the `near` leg.
+        // The rewritten answer is delivered to A, so it advertises the `near` leg — with the same
+        // advertised IP the offer picked for it (the near interface's advertised address), stored on
+        // the leg since the answer path does no re-allocation.
         let engine = EngineMedia {
             rtp: near.rtp.local_addr,
             rtcp: near.rtcp.map(|endpoint| endpoint.local_addr),
+            advertised_ip: near.advertised_ip,
         };
         // The A-facing near leg re-originates ICE-lite iff the offer minted engine creds (the ICE
         // posture was decided at offer); otherwise the peer's ICE (if any) passes through unchanged.
@@ -1362,9 +1443,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     }
                 }
             };
-        // rtpengine `replace: [origin]`: rewrite the o= line to the engine's address (topology hiding).
+        // rtpengine `replace: [origin]`: rewrite the o= line to the engine's advertised address
+        // (topology hiding) — the interface's advertised IP, not the bound one.
         if profile.replace.iter().any(|field| field == "origin") {
-            rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.rtp.ip());
+            rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.advertised_ip);
         }
 
         // WebSocket bridge: if this call is (or is now being) bridged to a WS media server, leg A's
@@ -2091,12 +2173,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             rtcp: role_endpoint(EndpointRole::NearRtcp),
             remote_rtp: snapshot.near.remote_rtp,
             remote_rtcp: snapshot.near.remote_rtcp,
+            // Restore the advertised IP the primary used; a pre-interface snapshot has none, so fall
+            // back to the bound IP (the old behaviour).
+            advertised_ip: snapshot
+                .near
+                .advertised_ip
+                .unwrap_or_else(|| near_rtp.local_addr.ip()),
         };
         let far = Leg {
             rtp: far_rtp,
             rtcp: role_endpoint(EndpointRole::FarRtcp),
             remote_rtp: snapshot.far.remote_rtp,
             remote_rtcp: snapshot.far.remote_rtcp,
+            advertised_ip: snapshot
+                .far
+                .advertised_ip
+                .unwrap_or_else(|| far_rtp.local_addr.ip()),
         };
 
         // Install the datapath flows and resolve the crypto per pipeline.
@@ -2516,9 +2608,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         let mut bound: Vec<(EndpointRole, Endpoint)> = Vec::new();
         for (role, addr) in targets {
+            // Re-bind the exact source IP *and* port the primary used, so a call pinned to a named
+            // interface resumes on the same source address (not just the datapath's default bind IP).
             match self
                 .datapath
-                .alloc_endpoint_on_port(AddressFamily::of(addr.ip()), addr.port())
+                .alloc_endpoint_on_port_at(addr.ip(), addr.port())
                 .await
             {
                 Ok(endpoint) => bound.push((role, endpoint)),
@@ -2798,12 +2892,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 )
             }
         };
-        // One engine endpoint in the offer's address family, redirected to the conference actor.
+        // One engine endpoint in the offer's address family, redirected to the conference actor. A
+        // participant is a single leg, so it uses the near (`direction[0]`) interface — its bind IP and
+        // advertised (public) address — defaulting when the join carries no `direction`.
         let family = AddressFamily::of(info.remote_rtp.ip());
-        let endpoint = match self.alloc_endpoints(1, family).await {
+        let (participant_interface, _) = self.interfaces.resolve_direction(&profile.direction);
+        let (bind, advertised_override) = Self::leg_binding(participant_interface, family);
+        let endpoint = match self.alloc_endpoints(1, family, bind).await {
             Ok(mut endpoints) => endpoints.remove(0),
             Err(reason) => return error_result("conference_join", &reason),
         };
+        let advertised = advertised_override.unwrap_or_else(|| endpoint.local_addr.ip());
         if let Err(error) = self
             .datapath
             .install_flow(endpoint.id, FlowAction::Redirect)
@@ -2874,11 +2973,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.endpoint_calls
             .insert(endpoint.id, conference_id.to_string());
 
-        // Answer: advertise the engine endpoint, keep the participant's codec, sendrecv, and (for a
-        // secure leg) RTP/SAVP + the engine's a=crypto.
+        // Answer: advertise the engine endpoint (the interface's advertised IP), keep the participant's
+        // codec, sendrecv, and (for a secure leg) RTP/SAVP + the engine's a=crypto.
         let engine = EngineMedia {
             rtp: endpoint.local_addr,
             rtcp: None,
+            advertised_ip: advertised,
         };
         // A conference leg is always RTP/RTCP-muxed onto the one participant endpoint; the mux
         // presentation mirrors the participant's offer (`None`) — the `rtcp-mux` directive is an
@@ -3248,15 +3348,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        // Allocate the single send-only subscriber endpoint in the call's address family.
-        let subscriber_endpoint = match self.alloc_endpoints(1, family).await {
+        // Allocate the single send-only subscriber endpoint in the call's address family. SIPREC has
+        // no per-leg `direction`, so the leg uses the default interface — its bind IP and its
+        // advertised (public) address, which the SRS must be able to reach.
+        let (bind, advertised_override) =
+            Self::leg_binding(self.interfaces.default_interface(), family);
+        let subscriber_endpoint = match self.alloc_endpoints(1, family, bind).await {
             Ok(mut endpoints) => endpoints.remove(0),
             Err(reason) => return error_result("subscribe_request", &reason),
         };
+        let advertised = advertised_override.unwrap_or_else(|| subscriber_endpoint.local_addr.ip());
 
         // The subscription id (returned as the UAS to-tag) names this subscription for answer/teardown.
         let subscription_id = subscription_tag();
-        let offer = subscriber_offer_sdp(subscriber_endpoint.local_addr, &codec);
+        let offer = subscriber_offer_sdp(subscriber_endpoint.local_addr, advertised, &codec);
 
         self.subscriptions
             .entry(call_id.to_string())
@@ -4234,15 +4339,20 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// advertising the engine's subscriber endpoint + the fork codec (RFC 4566 §5 line order
 /// `v= o= s= c= t= m=`; RFC 3264 §5.1 `a=sendonly` — the engine only transmits to the SRS, which is
 /// the RTPBleed-safe posture: no inbound media is accepted on this endpoint).
-fn subscriber_offer_sdp(local_addr: std::net::SocketAddr, codec: &CodecSpec) -> String {
+fn subscriber_offer_sdp(
+    local_addr: std::net::SocketAddr,
+    advertised: std::net::IpAddr,
+    codec: &CodecSpec,
+) -> String {
     let payload_type = codec.payload_type;
     let mut sdp = String::new();
     use std::fmt::Write as _;
     // RFC 4566 §5: mandatory lines in order. o= uses a fixed session id/version (one offer per
     // subscription); s=- is the standard "no name"; t=0 0 is an unbounded session.
-    // RFC 4566 §5.7: the addrtype (`IP4`/`IP6`) follows the subscriber endpoint's own family, so a
-    // v6 SIPREC tee is offered to the SRS as `c=IN IP6`.
-    let addrtype = if local_addr.is_ipv6() { "IP6" } else { "IP4" };
+    // RFC 4566 §5.7: the addrtype (`IP4`/`IP6`) follows the advertised address' family (which matches
+    // the bound endpoint's), so a v6 SIPREC tee is offered to the SRS as `c=IN IP6`. The advertised
+    // (public) IP is emitted so the SRS can reach the engine; the port is the bound one.
+    let addrtype = if advertised.is_ipv6() { "IP6" } else { "IP4" };
     let _ = write!(
         sdp,
         "v=0\r\n\
@@ -4253,7 +4363,7 @@ fn subscriber_offer_sdp(local_addr: std::net::SocketAddr, codec: &CodecSpec) -> 
          m=audio {port} RTP/AVP {payload_type}\r\n\
          a=rtpmap:{payload_type} {name}/{clock}{channels}\r\n\
          a=sendonly\r\n",
-        ip = local_addr.ip(),
+        ip = advertised,
         port = local_addr.port(),
         name = codec.encoding_name,
         clock = codec.clock_rate_hz,
@@ -8244,6 +8354,208 @@ mod tests {
             )
             .await;
         assert!(matches!(delete, CmdResult::Ok { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_answer_honours_direction_bind_and_advertised_ips() {
+        // Two named interfaces on loopback (127/8 is all loopback on Linux, so distinct 127.0.0.x
+        // addresses exercise per-leg source-IP selection + advertised-IP override NIC-free):
+        //   internal → bind 127.0.0.1 (advertise the same),
+        //   external → bind 127.0.0.2 but advertise a *distinct* public IP 127.0.0.3.
+        // direction=[external, internal] puts the A-facing (near) leg on external and the B-facing
+        // (far) leg on internal — rtpengine semantics.
+        let table = InterfaceTable::from_entries(
+            vec![
+                crate::interface::InterfaceEntry::new(
+                    "internal",
+                    "127.0.0.1".parse().unwrap(),
+                    None,
+                ),
+                crate::interface::InterfaceEntry::new(
+                    "external",
+                    "127.0.0.2".parse().unwrap(),
+                    Some("127.0.0.3".parse().unwrap()),
+                ),
+            ],
+            None,
+        )
+        .expect("interface table");
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_interfaces(table);
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        let profile = ProfileFlags {
+            direction: vec!["external".into(), "internal".into()],
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "call-dir".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: profile.clone(),
+                },
+            )
+            .await;
+        let offer_sdp = ok_sdp_text(&offer);
+        // The offer goes to B, advertising the far (internal) leg: bound and advertised are both
+        // 127.0.0.1.
+        assert!(
+            offer_sdp.contains("c=IN IP4 127.0.0.1"),
+            "far leg advertises the internal interface: {offer_sdp}"
+        );
+        let far = sdp::parse(&offer_sdp).expect("parse far").remote_rtp;
+        assert_eq!(far.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "call-dir".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile,
+                },
+            )
+            .await;
+        let answer_sdp = ok_sdp_text(&answer);
+        // The answer goes to A, advertising the near (external) leg's *advertised public* IP
+        // 127.0.0.3 — decoupled from the bound socket, which is on 127.0.0.2.
+        assert!(
+            answer_sdp.contains("c=IN IP4 127.0.0.3"),
+            "near leg advertises the external public IP, not the bind IP: {answer_sdp}"
+        );
+        let near_advertised = sdp::parse(&answer_sdp).expect("parse near").remote_rtp;
+        assert_eq!(
+            near_advertised.ip(),
+            "127.0.0.3".parse::<std::net::IpAddr>().unwrap()
+        );
+
+        // Media actually flows on the *bound* near IP (127.0.0.2), not the advertised 127.0.0.3
+        // (a stand-in public IP nothing is bound on). A sends to the bound near address; the packet
+        // relays out of the far (internal, 127.0.0.1) leg to B.
+        let near_bound = SocketAddr::new("127.0.0.2".parse().unwrap(), near_advertised.port());
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), near_bound)
+            .await
+            .expect("send a");
+        let (data, from) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A));
+        assert_eq!(
+            from, far,
+            "B receives the relayed packet from the far (internal) bound leg on 127.0.0.1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_answer_advertises_the_public_ip_while_binding_private() {
+        // The single-homed 1:1-NAT / AWS Elastic-IP case (`--advertise-ip`): bind a private address
+        // (127.0.0.2 stands in for the VPC IP), advertise a public one (127.0.0.3 = the EIP), no
+        // `direction` — exactly the one synthesised `default` interface the daemon builds from
+        // relay_bind_ip + advertise_ip.
+        let table = InterfaceTable::single(
+            "127.0.0.2".parse().unwrap(),
+            Some("127.0.0.3".parse().unwrap()),
+        );
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_interfaces(table);
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "adv".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let offer_sdp = ok_sdp_text(&offer);
+        assert!(
+            offer_sdp.contains("c=IN IP4 127.0.0.3"),
+            "offer advertises the public EIP: {offer_sdp}"
+        );
+        assert!(
+            !offer_sdp.contains("127.0.0.2"),
+            "the private bind IP never appears in SDP: {offer_sdp}"
+        );
+        let far_advertised = sdp::parse(&offer_sdp).expect("parse far").remote_rtp;
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "adv".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer_sdp = ok_sdp_text(&answer);
+        assert!(
+            answer_sdp.contains("c=IN IP4 127.0.0.3"),
+            "answer advertises the public EIP: {answer_sdp}"
+        );
+        let near_advertised = sdp::parse(&answer_sdp).expect("parse near").remote_rtp;
+
+        // Media flows on the *private* bound IP (127.0.0.2), not the advertised public one; the port
+        // is identical (1:1 NAT preserves it).
+        let near_bound = SocketAddr::new("127.0.0.2".parse().unwrap(), near_advertised.port());
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), near_bound)
+            .await
+            .expect("send a");
+        let (data, from) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A));
+        assert_eq!(
+            from.ip(),
+            "127.0.0.2".parse::<std::net::IpAddr>().unwrap(),
+            "B receives from the far leg's bound *private* IP, not the advertised public one"
+        );
+        assert_eq!(
+            from.port(),
+            far_advertised.port(),
+            "same port on both sides (1:1 NAT)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advertise_ip_v4_does_not_land_on_a_v6_leg() {
+        // Family guard: a v4 advertise-ip must never appear in a `c=IN IP6` line (invalid SDP). A v6
+        // offer's engine leg advertises its bound v6 address, not the v4 public IP.
+        let table = InterfaceTable::single(
+            "127.0.0.2".parse().unwrap(),
+            Some("127.0.0.3".parse().unwrap()),
+        );
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_interfaces(table);
+        let (_phone_a, addr_a) = phone_v6().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "v6".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let offer_sdp = ok_sdp_text(&offer);
+        assert!(
+            offer_sdp.contains("c=IN IP6 ::1"),
+            "the v6 leg advertises its bound v6 address: {offer_sdp}"
+        );
+        assert!(
+            !offer_sdp.contains("127.0.0.3"),
+            "the v4 advertise-ip must not land on a v6 leg: {offer_sdp}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
