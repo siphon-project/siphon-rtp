@@ -301,9 +301,10 @@ impl EncoderState {
                 | AmrNbMode::Mr590
                 | AmrNbMode::Mr670
                 | AmrNbMode::Mr740
+                | AmrNbMode::Mr1020
         ) {
             return Err(CodecError::Unsupported(
-                "AMR-NB encoder: only MR122, MR475, MR515, MR59, MR67 and MR74 are wired (cbsearch / gain modes ported)",
+                "AMR-NB encoder: only MR122, MR102, MR475, MR515, MR59, MR67 and MR74 are wired (cbsearch / gain modes ported)",
             ));
         }
 
@@ -1048,6 +1049,38 @@ mod tests {
         assert!(
             mismatch.is_none(),
             "MR74 T02: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR102 full-encoder gate on T01 (analysis-by-synthesis with the 31-bit 8-pulse codebook
+    /// `c8_31pf` — 8 pulses / 4 tracks via the generalized `search_10and8i40`, and `compress_code`
+    /// packing to 4 signs + 3 position indices). This is the definitive byte-exact acceptance test.
+    #[test]
+    fn encodes_mr102_full_params_bit_exact_t01() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr1020,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T01.INP",
+            "../../reference/amr-nb/testv/NODTX/T_102/T01_102.COD",
+        );
+        eprintln!("MR102 full-encode gate (T01): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR102 T01: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR102 full-encoder gate on a second vector (T02) for extra confidence.
+    #[test]
+    fn encodes_mr102_full_params_bit_exact_t02() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr1020,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T02.INP",
+            "../../reference/amr-nb/testv/NODTX/T_102/T02_102.COD",
+        );
+        eprintln!("MR102 full-encode gate (T02): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR102 T02: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
         );
     }
 }
