@@ -66,7 +66,7 @@ getrandom = "0.3"
 # trust store is the Mozilla CA bundle; version-matched to what tokio-tungstenite's
 # `rustls-tls-webpki-roots` feature pulls, so only one copy is compiled.
 tokio-tungstenite = "0.29"
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 futures-util = "0.3"
 # Control protocol (JSON over TCP) + serde
 serde = { version = "1", features = ["derive"] }
