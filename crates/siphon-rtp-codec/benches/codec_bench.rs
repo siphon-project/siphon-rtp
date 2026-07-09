@@ -428,10 +428,10 @@ fn bench_amrwb_encode(criterion: &mut Criterion) {
 }
 
 /// Full per-frame AMR-NB encode (µs/frame): the whole `cod_amr()` analysis-by-synthesis pipeline for
-/// the wired modes — MR475 (2-pulse codebook + joint 2-subframe gain), the 2/3/4-pulse medium rates,
-/// MR102 (8-pulse 31-bit codebook) and MR122 (10-pulse GSM-EFR codebook). Reads a real warmed-up
-/// speech frame from the 3GPP `T01.INP` input; skipped if the (gitignored) input is absent so CI
-/// without the vectors still builds.
+/// all eight speech modes — MR475 (2-pulse codebook + joint 2-subframe gain), the 2/3/4-pulse medium
+/// rates, MR795 (4-pulse codebook + adaptive two-index gain), MR102 (8-pulse 31-bit codebook) and
+/// MR122 (10-pulse GSM-EFR codebook). Reads a real warmed-up speech frame from the 3GPP `T01.INP`
+/// input; skipped if the (gitignored) input is absent so CI without the vectors still builds.
 #[cfg(feature = "amr")]
 fn bench_amrnb_encode(criterion: &mut Criterion) {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -456,6 +456,7 @@ fn bench_amrnb_encode(criterion: &mut Criterion) {
         AmrNbMode::Mr590,
         AmrNbMode::Mr670,
         AmrNbMode::Mr740,
+        AmrNbMode::Mr795,
         AmrNbMode::Mr1020,
         AmrNbMode::Mr1220,
     ] {

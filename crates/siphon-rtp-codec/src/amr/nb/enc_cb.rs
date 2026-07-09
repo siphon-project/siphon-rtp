@@ -12,13 +12,14 @@
 //!    grid). Shares the two-pulse inner search kernel with the 9-bit codebook.
 //!  * MR67 (6.70 kbit/s): `c3_14pf.c` `code_3i40_14bits` — 3 pulses / 14-bit index. First user of the
 //!    `set_sign` `dn2` per-track pruning (`n = 6`).
-//!  * MR74 (7.40 kbit/s): `c4_17pf.c` `code_4i40_17bits` — 4 pulses / 17-bit index, Gray-coded
-//!    positions (`n = 4`). The same codebook backs MR795 (its extra gain param lands with the MR795
-//!    gain quantizer).
+//!  * MR74 & MR795 (7.40 / 7.95 kbit/s): `c4_17pf.c` `code_4i40_17bits` — 4 pulses / 17-bit index,
+//!    Gray-coded positions (`n = 4`). The two modes share the codebook and differ only in the gain
+//!    quantizer (MR795's adaptive two-index gain lives in `enc_gain`).
+//!  * MR102 (10.2 kbit/s): `c8_31pf.c` `code_8i40_31bits` — 8 pulses / 4 tracks, via the generalized
+//!    `search_10and8i40` `(nb_pulse, step, nb_tracks)` (the `gsmefr` gate skips the trailing pulse
+//!    pair) and `cor_h_x2` `(nb_track, step)`, then `compress_code` packs the 7 indices.
 //!
-//! The remaining modes' searches (`c8_31pf` MR102, and MR795's gain) are OUT OF SCOPE for this tier —
-//! a later extension wires them into [`cbsearch`]'s dispatch (the shared `cor_h_x`/`cor_h`/`set_sign`
-//! helpers already generalize).
+//! All eight speech modes are now wired into [`cbsearch`]'s dispatch.
 //!
 //! Everything is bit-exact against the fixed-point reference: all arithmetic goes through
 //! [`crate::amr::basic_ops`] / `crate::amr::nb::math_nb`, never native integer arithmetic on the
@@ -1785,9 +1786,9 @@ pub struct CbSearchResult {
 ///  * Outputs: `code` (innovation, Q13), `y2` (filtered code, Q12), and the returned
 ///    [`CbSearchResult`] carrying the `ana` params.
 ///
-/// Only MR122, MR475/MR515, MR59, MR67 and MR74 are implemented so far; other modes return
-/// [`CodecError::Unsupported`] (they are gated out of the encoder until their search files are
-/// ported). The frame loop only ever calls the live modes.
+/// All eight AMR-NB speech modes are dispatched here (MR795 reuses MR74's `c4_17pf`; MR102 uses
+/// `c8_31pf`; MR122 uses `c1035pf`). The `Result` shape is retained for the caller's `?`, but every
+/// arm succeeds — there is no unsupported speech mode left.
 #[allow(clippy::too_many_arguments)]
 pub fn cbsearch(
     xn2: &[i16],
@@ -1834,7 +1835,9 @@ pub fn cbsearch(
                 num_params: 2,
             })
         }
-        AmrNbMode::Mr740 => {
+        AmrNbMode::Mr740 | AmrNbMode::Mr795 => {
+            // MR74 and MR795 share the 17-bit 4-pulse codebook (`c4_17pf`); they differ only in the
+            // gain quantizer (MR795 emits two gain params — handled in the gain tier).
             let mut sign = 0i16;
             let index = code_4i40_17bits(xn2, h1, t0, pitch_sharp, code, y2, &mut sign);
             params[0] = index; // position index
@@ -1898,9 +1901,6 @@ pub fn cbsearch(
                 num_params: 7,
             })
         }
-        _ => Err(CodecError::Unsupported(
-            "AMR-NB codebook search: mode not yet ported (MR795 gain quantizer pending)",
-        )),
     }
 }
 
@@ -2138,6 +2138,36 @@ mod tests {
         )
         .expect("MR102 cbsearch");
         assert_eq!(r.num_params, 7);
+    }
+
+    #[test]
+    fn cbsearch_mr795_emits_two_params() {
+        // MR795 shares MR74's 17-bit 4-pulse codebook; cbsearch returns the 2 codebook params (the
+        // extra gain params are emitted by the MR795 gain tier, not here).
+        let mut h = [0i16; L_CODE];
+        h[0] = 4096;
+        let mut xn2 = [0i16; L_CODE];
+        xn2[0] = 5000;
+        xn2[1] = -4000;
+        xn2[2] = 3000;
+        xn2[3] = -2000;
+        let res2 = xn2;
+        let mut code = [0i16; L_CODE];
+        let mut y2 = [0i16; L_CODE];
+        let r = cbsearch(
+            &xn2,
+            &mut h,
+            40,
+            0,
+            8192,
+            &res2,
+            &mut code,
+            &mut y2,
+            AmrNbMode::Mr795,
+            0,
+        )
+        .expect("MR795 cbsearch");
+        assert_eq!(r.num_params, 2);
     }
 
     #[test]
@@ -2508,6 +2538,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oracle_gate_mr795_all_subframes_bit_exact() {
+        if let Some(n) = run_cb_oracle_gate("/tmp/amr-nb-oracle-t4/dump_mr795.txt") {
+            eprintln!("MR795 cbsearch oracle gate: {n} subframes bit-exact");
+        } else {
+            eprintln!("MR795 cbsearch oracle dump absent — skipping full gate");
+        }
+    }
+
     /// Committed self-contained regression: feed the oracle-captured *inputs* of frame 10, subframe
     /// 0 (real pitch energy, non-zero `sharp` so the pitch-sharpening path is exercised) into
     /// [`cbsearch`] and pin the transmitted codebook params + `code`/`y2` (spot samples + sum/sumsq
@@ -2807,6 +2846,41 @@ mod tests {
             (-16382, 670_924_810),
             &[(3, 4096), (7, -5682), (9, -6841), (10, 979)],
             (-8282, 149_812_120),
+        );
+    }
+
+    #[test]
+    fn mr795_frame10_subfr0_cbsearch_matches_reference() {
+        // MR795 reaches the same 17-bit 4-pulse codebook (`c4_17pf`) as MR74, but through the MR795
+        // dispatch arm and driven by the MR795 analysis-by-synthesis state (its own adaptive gain
+        // quantizer diverges the excitation, so the frame-10 inputs differ from MR74's). Pinned to the
+        // byte-exact encoder output (validated frame-for-frame against the official T01_795.COD).
+        frame10_subfr0_cb_regression(
+            AmrNbMode::Mr795,
+            0,
+            141,
+            8192,
+            17180,
+            &[
+                53, -184, -1272, 820, -1341, 906, 1704, -2680, -1189, 1332, 2648, -201, -280, 621,
+                -1034, -162, -1419, 1292, 1162, -456, 650, -454, 425, 247, 321, -170, -289, -19,
+                -352, 564, -426, 197, -77, -527, -450, -211, 374, -762, 215, -159,
+            ],
+            &[
+                4096, 1082, -688, 200, -6, 47, -161, -50, -54, -202, -165, -255, 78, 84, -60, 64,
+                6, 55, 25, 13, 58, -3, 21, -29, -17, 15, -30, 3, -12, -7, 4, -13, 10, -1, 6, 5, -4,
+                10, -3, 2,
+            ],
+            &[
+                476, -519, -1013, 938, -1714, 1580, 922, -2557, -513, 1096, 2275, -623, 288, 131,
+                -922, 53, -1481, 1729, 256, 75, 716, -535, 545, -43, 522, -534, 32, -164, -140,
+                649, -706, 590, -425, -219, -492, -113, 314, -882, 529, -507,
+            ],
+            &[1611, 11],
+            &[(6, 8191), (7, -8192), (9, 8191), (10, 8191)],
+            (16381, 268_386_307),
+            &[(6, 4096), (7, -3014), (9, 4984), (10, 4972)],
+            (8219, 79_975_249),
         );
     }
 }

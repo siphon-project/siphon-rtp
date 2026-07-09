@@ -27,7 +27,7 @@ codec is free, running it is not. See [Codec licensing](codec-licensing.md).
 | GSM Full-Rate | `GSM` (3) | yes | yes | ETSI/3GPP TS 06.10 sequences, coder and decoder | none |
 | Comfort noise | `CN` (13) | generate only | no | RFC 3389 (a generator, not a codec) | none |
 | AMR-WB | `AMR-WB` (dynamic) | all 9 modes | all 9 modes | 3GPP TS 26.174 vectors, per mode | `amr` |
-| AMR-NB | `AMR` (dynamic) | all 8 modes | MR475, MR515, MR59, MR67, MR74, MR102, MR122 | 3GPP TS 26.074 vectors | `amr` |
+| AMR-NB | `AMR` (dynamic) | all 8 modes | all 8 modes | 3GPP TS 26.074 vectors | `amr` |
 | Opus | `OPUS` | in progress | in progress | RFC 6716 test vectors (targeted) | not wired |
 | EVS | | no | no | | absent |
 
@@ -65,13 +65,13 @@ tier included. The egress mode defaults to mode 2 (12.65 kbit/s), honours the SD
 `a=fmtp` `mode-set` (RFC 4867 §8.1), and adapts per frame to the peer's CMR clamped
 into that mode-set. This is the VoLTE codec; it is what the `amr` feature exists for.
 
-**AMR-NB** (behind `amr`). Decode covers all 8 modes (4.75 through 12.2 kbit/s),
-bit-exact against 3GPP TS 26.074. Encode is wired for MR475 (4.75 kbit/s), MR515
-(5.15 kbit/s), MR59 (5.90 kbit/s), MR67 (6.70 kbit/s), MR74 (7.40 kbit/s), MR102
-(10.2 kbit/s) and MR122 (12.2 kbit/s, the GSM-EFR-equivalent mode); a `mode-set` that
-forces the one remaining mode (MR795) is declined cleanly at call setup rather than
-mis-encoding mid-call. That is enough for AMR-NB to G.711 transcoding in both directions;
-the last encoder mode is in progress.
+**AMR-NB** (behind `amr`). Decode and encode both cover all 8 speech modes (4.75 through
+12.2 kbit/s), bit-exact against 3GPP TS 26.074: MR475, MR515, MR59, MR67, MR74, MR795
+(7.95 kbit/s), MR102 (10.2 kbit/s) and MR122 (12.2 kbit/s, the GSM-EFR-equivalent mode).
+MR795 carries an adaptive gain quantizer (a pre-quantizer over three pitch-gain candidates,
+a gain adaptor, then a modified codebook-gain search) and is the only mode that sends two
+gain indices per subframe. This is a full AMR-NB encoder for G.711 transcoding in both
+directions; only DTX/SID (comfort-noise generation) is out of scope.
 
 **Opus.** An implementation is under way with RFC 6716 conformance gating, but it is
 **not wired into the codec factory**: a call that requires Opus transcoding fails at
