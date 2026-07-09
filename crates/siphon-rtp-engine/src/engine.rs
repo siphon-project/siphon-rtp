@@ -9272,7 +9272,9 @@ mod tests {
                 },
             )
             .await;
-        let engine_near = sdp::parse(&ok_sdp_text(&answer)).expect("engine near SDP").remote_rtp;
+        let engine_near = sdp::parse(&ok_sdp_text(&answer))
+            .expect("engine near SDP")
+            .remote_rtp;
         assert!(
             !engine.media().is_media_call("echo-1"),
             "starts as a plain in-kernel relay"
@@ -9315,7 +9317,10 @@ mod tests {
             }
         }
         let (packet, from) = echoed.expect("phone A hears its own audio echoed back");
-        assert_eq!(from, engine_near, "echo comes from the engine's A-facing port");
+        assert_eq!(
+            from, engine_near,
+            "echo comes from the engine's A-facing port"
+        );
         let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&packet).expect("parse echoed rtp");
         assert_eq!(
             parsed.payload_type, 0,
