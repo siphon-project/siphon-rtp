@@ -1223,6 +1223,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         apply_received_from(Some(info.remote_rtp), profile.received_from)
                             .unwrap_or(info.remote_rtp),
                     ),
+                    profile.noise_suppression,
                 )
                 .await
             {
@@ -1247,6 +1248,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         a_rtp: std::net::SocketAddr,
         codec: Option<&CodecSpec>,
         accepted_source: SourceFilter,
+        noise_suppression: bool,
     ) -> Result<(), String> {
         let Some(codec) = codec else {
             return Err("offer carried no usable audio codec for the WS bridge".to_string());
@@ -1299,7 +1301,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call_id.to_string(),
             WsDirection::Duplex,
             8, // playout cap (drop-oldest): late audio is worthless
-        );
+        )
+        // Clean leg A's uplink audio toward the voice-AI server when requested (rate-gated inside).
+        .with_noise_suppression(noise_suppression);
 
         let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
         let (rtp_out_tx, rtp_out_rx) = flume::bounded::<bytes::Bytes>(1024);
@@ -1485,6 +1489,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             near_codec.as_ref(),
                             // Gate leg A to its offer `received-from` public IP when supplied.
                             bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
+                            profile.noise_suppression,
                         )
                         .await
                     {
