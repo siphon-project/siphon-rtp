@@ -337,6 +337,14 @@ pub struct ProfileFlags {
     /// Recording output directory/path, when recording.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_path: Option<String>,
+    /// Apply single-channel noise suppression to this call's decoded ingress audio before it is
+    /// transcoded/relayed toward the peer (and captured by recording/forks). Engaged only where the
+    /// leg is transcoded through userspace and the ingress codec's native rate is 8 or 16 kHz (the
+    /// rates the suppressor supports) — inert on an in-kernel passthrough or a 48 kHz codec. Setting
+    /// it forces the call out of the in-kernel fast path onto the media slow path, exactly as
+    /// `record_call` does. A native siphon-rtp extension — the NG/bencode front-end does not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub noise_suppression: bool,
     /// Attach this call's offerer (leg A) audio to an external WebSocket media server (the
     /// mod_audio_stream / voice-AI integration). When set on `offer`/`answer`, the engine dials this
     /// URI as a WebSocket client and bridges leg A's RTP to it (decode → L16 uplink, L16 downlink →
