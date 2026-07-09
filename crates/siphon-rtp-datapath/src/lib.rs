@@ -285,6 +285,24 @@ pub struct IceConfig {
     pub local_pwd: String,
 }
 
+/// A raw STUN datagram the datapath forwarded to the engine's ICE agent on a **full-agent**
+/// endpoint (see [`Datapath::set_ice_agent`]). The ice-lite responder answers inbound checks in the
+/// datapath as before; a full-agent endpoint *additionally* forwards every STUN datagram it sees —
+/// crucially the Binding **responses** the responder path drops — so the engine's consent checker
+/// (RFC 7675) can correlate its own outbound checks. The agent owns all STUN semantics for these.
+#[derive(Clone, Debug)]
+pub struct IceDatapathEvent {
+    /// The endpoint the datagram arrived on (maps back to a call leg / consent state).
+    pub endpoint: EndpointId,
+    /// The transport source it arrived from.
+    pub source: SocketAddr,
+    /// The datapath logical tick at arrival (drives consent correlation on the same clock as the
+    /// media-timeout sweep — never `Instant::now()`).
+    pub arrival_tick: u64,
+    /// The raw STUN datagram bytes.
+    pub datagram: Bytes,
+}
+
 /// A media datapath: allocates endpoints, installs per-endpoint flows, moves packets, reports stats.
 ///
 /// Methods that touch sockets are `async`; the flow-table and stats operations are synchronous
@@ -388,6 +406,25 @@ pub trait Datapath: Send + Sync {
     /// Install (or clear with `None`) ICE-lite credentials for an endpoint, enabling the datapath to
     /// answer STUN connectivity checks on it and adopt the validated source (RFC 8445, layer 4).
     fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>);
+
+    /// Enable **full-agent** ICE on an endpoint: keep answering inbound checks (the ice-lite
+    /// responder, exactly as [`set_ice`](Self::set_ice)) **and** forward every STUN datagram seen on
+    /// it — including the Binding *responses* the responder drops — to `events`, so the engine's
+    /// consent checker (RFC 7675) can correlate its own outbound checks and detect a dead peer.
+    ///
+    /// Additive to `set_ice`; clear via `set_ice(endpoint, None)` or [`remove_endpoint`](Self::remove_endpoint).
+    /// The **default** installs the responder only (no forwarding) via `set_ice`, so a backend without
+    /// the seam (the XDP fast path) keeps compiling and answering checks — full-agent consent is a
+    /// UDP-datapath capability the loopback backend overrides to provide.
+    fn set_ice_agent(
+        &self,
+        endpoint: EndpointId,
+        config: IceConfig,
+        events: flume::Sender<IceDatapathEvent>,
+    ) {
+        let _ = events;
+        self.set_ice(endpoint, Some(config));
+    }
 
     /// A receiver for datagrams delivered by [`FlowAction::Redirect`] flows — the userspace slow path
     /// (SRTP/transcode/WS, and the built-in TURN relay, docs/security-and-nat.md §11). Clone-per-

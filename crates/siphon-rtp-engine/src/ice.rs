@@ -5,6 +5,12 @@
 //! the datapath endpoints (`Datapath::set_ice`) so the connectivity-check responder can validate
 //! and answer incoming checks. The full ICE state machine + consent (RFC 7675) build on this.
 //! See `docs/security-and-nat.md` §4 layer 4.
+//!
+//! The [`consent`] submodule adds the RFC 7675 consent-freshness checker — the initiator side that
+//! actively probes an established peer and detects a dead/withdrawn one — built on the STUN client
+//! in `siphon-rtp-stun`. Pure, tick-driven logic; the daemon sweeper drives it (wired in a follow-up).
+
+pub mod consent;
 
 /// The engine's short-term ICE credentials for one call (its own identity as the ICE-lite server).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -34,6 +34,7 @@ path = "src/lib.rs"
 [dependencies]
 siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.1.0" }
 siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
+siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }
 siphon-rtp-srtp = { path = "../siphon-rtp-srtp", version = "0.1.0" }
 siphon-rtp-dtls = { path = "../siphon-rtp-dtls", version = "0.1.0" }
 siphon-rtp-turn = { path = "../siphon-rtp-turn", version = "0.1.0" }
@@ -80,7 +81,6 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
-siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }
 # `wss://` handshake test: a self-signed TLS WebSocket server (rcgen cert → tokio-rustls acceptor)
 # the engine dials, proving the ring/rustls connector completes the TLS + WS upgrade end-to-end.
 rcgen = { workspace = true }

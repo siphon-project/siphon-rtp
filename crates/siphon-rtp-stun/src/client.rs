@@ -5,7 +5,7 @@
 //! Pure codec + logic, **zero I/O**: the owning leg task sends the bytes and feeds arrival ticks
 //! back in. Retransmission is expressed in the datapath's **logical ticks** and driven by
 //! [`Transaction::poll`] — never a timer thread, never `Instant::now()` — so the whole state machine
-//! is deterministic under test. Builds on the base [`MessageBuilder`](super::MessageBuilder) /
+//! is deterministic under test. Builds on the base [`MessageBuilder`] /
 //! HMAC-SHA1 / CRC-32 in [`crate`], adding no new crypto dependency; the only new dependency is
 //! `getrandom`, for the 96-bit transaction id (the mirror of `siphon-rtp-engine`'s credential RNG).
 //!
@@ -297,7 +297,10 @@ pub fn binding_error_response(
     integrity_key: Option<&[u8]>,
 ) -> Vec<u8> {
     MessageBuilder::new(BINDING_ERROR, transaction_id)
-        .attribute(ATTR_ERROR_CODE, &crate::turn::error_code_value(code, reason))
+        .attribute(
+            ATTR_ERROR_CODE,
+            &crate::turn::error_code_value(code, reason),
+        )
         .finish(integrity_key, true)
 }
 
@@ -306,7 +309,11 @@ pub fn binding_error_response(
 /// The PRIORITY value a check advertises (RFC 8445 §7.1.1), if present and well-formed.
 #[must_use]
 pub fn priority(message: &StunMessage) -> Option<u32> {
-    let bytes: [u8; 4] = message.attribute(ATTR_PRIORITY)?.get(0..4)?.try_into().ok()?;
+    let bytes: [u8; 4] = message
+        .attribute(ATTR_PRIORITY)?
+        .get(0..4)?
+        .try_into()
+        .ok()?;
     Some(u32::from_be_bytes(bytes))
 }
 
@@ -428,8 +435,11 @@ mod tests {
 
     #[test]
     fn transaction_succeeds_only_on_a_matching_response_id() {
-        let mut transaction =
-            Transaction::start(TransactionId::from([7u8; 12]), RetransmitSchedule::new(1), 0);
+        let mut transaction = Transaction::start(
+            TransactionId::from([7u8; 12]),
+            RetransmitSchedule::new(1),
+            0,
+        );
         assert!(!transaction.on_response(&[1u8; 12])); // wrong id ignored
         assert!(transaction.is_pending());
         assert!(transaction.on_response(&[7u8; 12])); // correct id
