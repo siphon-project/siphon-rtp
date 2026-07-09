@@ -2,7 +2,7 @@
 //!
 //! This crate is the kernel-acceleration counterpart of `siphon-rtp-datapath`'s UDP-loopback
 //! backend, kept separate so the always-available backend never depends on aya/eBPF. It loads the
-//! embedded XDP classifier ([`siphon-rtp-ebpf`]), attaches it to an interface, drives the `FLOWS` /
+//! embedded XDP classifier (the `siphon-rtp-ebpf` crate), attaches it to an interface, drives the `FLOWS` /
 //! `STATS` / `XSKS` maps with the shared [`siphon_rtp_ebpf_common`] ABI, and binds an in-house
 //! AF_XDP socket ([`xsk`]) that the classifier `XDP_REDIRECT`s media onto.
 //!
@@ -50,10 +50,11 @@
 //!   sweep's `now_ticks() - last_activity()` is a coherent elapsed-tick count and
 //!   `Datapath::advance_clock` is a no-op here (docs/security-and-nat.md §4 layer 6).
 //! - **Learned-latch readback**: [`XdpDatapath::learned_latch`] reads a flow's in-kernel-learned peer
-//!   source (`latched_*` in the `FLOWS` value) when the latch is valid. This is a datapath **read
-//!   primitive** only — the engine-side step that propagates a learned NAT source to the sibling leg's
-//!   `out_dst`, and the daemon datapath selection, are **deferred** and live in the engine, out of this
-//!   crate.
+//!   source (`latched_*` in the `FLOWS` value) when the latch is valid, and [`XdpDatapath::learned_source`]
+//!   (the [`Datapath`] trait override) exposes it as a [`SocketAddr`]. The engine consumes it on its
+//!   1 Hz sweep (`Engine::refresh_latched_destinations`): it propagates a learned NAT source to the
+//!   **sibling** leg's `out_dst`, so a NATed peer's real post-latch source drives the in-kernel relay
+//!   (the in-kernel symmetric-RTP loop is now closed; docs/security-and-nat.md §4 layer 3).
 //!
 //! ## Remaining for a full hardware data plane (documented gaps, not yet wired)
 //!
@@ -485,10 +486,11 @@ impl XdpDatapath {
 
     /// Read back the peer source the kernel's in-kernel latch has learned for `endpoint` (symmetric
     /// RTP, RFC 3550 §8), or `None` when the endpoint is unknown, has no flow installed, or has not
-    /// latched a source yet. Stage 3a **read primitive**: the engine will later use it to propagate a
-    /// learned NAT source to the sibling leg's `out_dst`, but that consumption is deferred and lives in
-    /// the engine (see the module-level "documented gaps" comment). Kept an inherent method, not a
-    /// [`Datapath`] trait method, so it stays inside the XDP backend.
+    /// latched a source yet. The [`Datapath::learned_source`] override exposes this over the trait, and
+    /// the engine consumes it on its 1 Hz sweep (`Engine::refresh_latched_destinations`) to propagate a
+    /// learned NAT source to the sibling leg's `out_dst` — the in-kernel symmetric-RTP loop is now
+    /// closed (docs/security-and-nat.md §4 layer 3). Kept an inherent method (with the trait override
+    /// delegating to it) so the SSRC-bearing [`LearnedLatch`] detail stays inside the XDP backend.
     #[must_use]
     pub fn learned_latch(&self, endpoint: EndpointId) -> Option<LearnedLatch> {
         let key = self.inner.endpoints.get(&endpoint)?.flow_key;
@@ -575,9 +577,9 @@ pub fn sum_flow_stats(per_cpu: impl IntoIterator<Item = FlowStats>) -> FlowStats
 }
 
 /// The peer source a Forward flow's in-kernel latch has learned (symmetric RTP, RFC 3550 §8),
-/// read back from the `FLOWS` map value. Stage 3a exposes this **read** primitive only; the engine's
-/// later step propagates a learned NAT source to the sibling leg's `out_dst` (deferred — see the
-/// module-level "documented gaps" comment).
+/// read back from the `FLOWS` map value. Exposed over the trait as [`Datapath::learned_source`]
+/// (dropping the SSRC) and consumed by the engine's 1 Hz sweep, which propagates the learned NAT
+/// source to the sibling leg's `out_dst` (docs/security-and-nat.md §4 layer 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LearnedLatch {
     /// The learned peer transport (source IPv4 + port).
@@ -991,6 +993,15 @@ impl Datapath for XdpDatapath {
         Some(kernel_ns_to_tick(last_seen_ns, self.inner.start_ktime_ns))
     }
 
+    fn learned_source(&self, endpoint: EndpointId) -> Option<std::net::SocketAddr> {
+        // Mirror the kernel's own validated latch (symmetric RTP, RFC 3550 §8) into the trait so the
+        // engine can propagate it to the sibling leg's `out_dst` (docs/security-and-nat.md §4 layer 3).
+        // Only a source the kernel already latched (source-gate + SSRC re-latch passed) is exposed, so
+        // no unvalidated source ever reaches the engine — the RTPBleed invariant holds.
+        self.learned_latch(endpoint)
+            .map(|latch| std::net::SocketAddr::V4(latch.source))
+    }
+
     fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>) {
         match config {
             Some(config) => {
@@ -1242,6 +1253,22 @@ mod tests {
     fn learned_latch_is_none_when_not_valid() {
         // latch_valid == 0 means nothing learned yet, even with stale latched_* bytes present.
         assert_eq!(learned_latch_from_action(&latched_action(0)), None);
+    }
+
+    #[test]
+    fn learned_source_maps_a_valid_latch_to_a_socket_addr_v4() {
+        // `Datapath::learned_source` is `learned_latch(..).map(|l| SocketAddr::V4(l.source))`. A real
+        // `XdpDatapath` needs a NIC + kernel, so exercise that exact mapping over the shared fixture:
+        // a valid latch maps to the V4 socket address; an invalid one maps to `None`.
+        let mapped = learned_latch_from_action(&latched_action(1)).map(|l| SocketAddr::V4(l.source));
+        assert_eq!(
+            mapped,
+            Some("198.51.100.10:5000".parse::<SocketAddr>().expect("addr"))
+        );
+        assert_eq!(
+            learned_latch_from_action(&latched_action(0)).map(|l| SocketAddr::V4(l.source)),
+            None
+        );
     }
 
     #[test]

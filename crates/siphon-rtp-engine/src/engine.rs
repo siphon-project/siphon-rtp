@@ -3640,6 +3640,63 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         reaped
     }
 
+    /// Propagate each in-kernel-learned peer source into the sibling leg's forward destination — the
+    /// engine half of the in-kernel symmetric-RTP loop (RFC 3550 §8, docs/security-and-nat.md §4 layer
+    /// 3). A split userspace/kernel backend (XDP) forwards a `Forward` flow to the static `out_dst`
+    /// from the negotiated SDP but *learns* the peer's real source in its own ingress latch; unlike the
+    /// loopback backend (which owns both legs and resolves the sibling latch inline when forwarding),
+    /// the per-flow kernel model cannot cross-reference siblings. So a NATed peer whose real source
+    /// differs from the signalled address never drives the in-kernel fast path until userspace
+    /// reprograms the sibling leg's rule (rtpengine's "userspace learns → reprograms the kernel rule"
+    /// model). For every installed `Forward` flow: read the learned source of the endpoint the flow
+    /// forwards **to** (its ingress latch is where this flow should now send); if the backend has
+    /// learned one and it differs from the flow's current `out_dst`, reinstall the flow with
+    /// `out_dst = learned` and write the updated action back into `relay_flows` (so `block`/`unblock`,
+    /// which restore endpoints from `relay_flows`, keep the learned destination).
+    ///
+    /// RTPBleed-safe: only a source the kernel already validated (its own source-gate + SSRC re-latch)
+    /// is ever exposed by [`Datapath::learned_source`], so this mirrors the kernel's validated latch —
+    /// it never adopts an unvalidated source. An `install_flow` failure is logged and skipped, never
+    /// fatal. A no-op on the loopback backend (its `learned_source` default is `None`; it resolves the
+    /// latch inline when forwarding). Driven once per daemon sweep tick — NAT rebinds are rare. Purely
+    /// synchronous work (`install_flow` is sync), so no map guard is ever held across an `.await`.
+    pub async fn refresh_latched_destinations(&self) {
+        for mut entry in self.calls.iter_mut() {
+            let call = entry.value_mut();
+            // Media/SRTP/transcode calls take the Redirect+userspace path (which latches in userspace
+            // already), so their `relay_flows` is empty and they are naturally skipped.
+            for (installed_on, action) in call.relay_flows.iter_mut() {
+                // Only in-kernel `Forward` flows carry an `out_dst` to reprogram; skip Redirect/Drop.
+                let FlowAction::Forward(rule) = *action else {
+                    continue;
+                };
+                let installed_on = *installed_on;
+                // The endpoint THIS flow forwards TO — its learned ingress source is where THIS flow
+                // should send (the sibling's real post-NAT source, symmetric RTP RFC 3550 §8).
+                let Some(learned) = self.datapath.learned_source(rule.out_endpoint) else {
+                    continue;
+                };
+                if rule.out_dst == Some(learned) {
+                    continue; // Already pointed at the learned source — idempotent, nothing to do.
+                }
+                let mut updated = rule;
+                updated.out_dst = Some(learned);
+                let updated_action = FlowAction::Forward(updated);
+                if let Err(error) = self.datapath.install_flow(installed_on, updated_action) {
+                    tracing::warn!(
+                        endpoint = ?installed_on,
+                        out_endpoint = ?updated.out_endpoint,
+                        %learned,
+                        %error,
+                        "failed to reprogram sibling forward destination from kernel-learned latch"
+                    );
+                    continue;
+                }
+                *action = updated_action;
+            }
+        }
+    }
+
     /// Reap conference participants whose media has been idle for at least `idle_ticks`, freeing their
     /// endpoints and tearing down any room left empty (the conference analogue of [`Engine::reap_idle`]
     /// — abandoned legs / a control client that disconnected without leaving never leak a room). Driven
@@ -4633,6 +4690,314 @@ mod tests {
             CmdResult::Ok { sdp: Some(sdp), .. } => sdp.clone(),
             other => panic!("expected Ok with sdp, got {other:?}"),
         }
+    }
+
+    /// A [`Datapath`] test double: it wraps the real loopback backend (so offer/answer sets up genuine
+    /// relay flows) but overrides [`Datapath::learned_source`] from an injected per-endpoint map — the
+    /// split userspace/kernel behaviour the XDP backend has and that `refresh_latched_destinations`
+    /// consumes. It also records every `install_flow` call so a test can assert exactly which flow the
+    /// sweep reprogrammed.
+    // The `learned` map and `installs` log are behind `Arc` so every clone (the engine holds one)
+    // shares one view — a deep-cloned `DashMap` would hide a test's injected latch from the engine.
+    #[derive(Clone)]
+    struct LatchLearningDatapath {
+        inner: UdpLoopbackDatapath,
+        /// Injected per-endpoint learned sources — what `learned_source` returns (the kernel latch).
+        learned: Arc<DashMap<EndpointId, SocketAddr>>,
+        /// An ordered log of every `(endpoint, action)` installed, for assertions.
+        installs: Arc<Mutex<Vec<(EndpointId, FlowAction)>>>,
+    }
+
+    impl LatchLearningDatapath {
+        fn new() -> Self {
+            Self {
+                inner: UdpLoopbackDatapath::new(),
+                learned: Arc::new(DashMap::new()),
+                installs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Record that `endpoint`'s in-kernel ingress latch has learned `source`.
+        fn set_learned(&self, endpoint: EndpointId, source: SocketAddr) {
+            self.learned.insert(endpoint, source);
+        }
+
+        /// Drain the captured install log, so a test measures only the installs since the last drain.
+        fn take_installs(&self) -> Vec<(EndpointId, FlowAction)> {
+            std::mem::take(&mut self.installs.lock().expect("install log lock"))
+        }
+    }
+
+    impl Datapath for LatchLearningDatapath {
+        fn alloc_endpoint(
+            &self,
+        ) -> impl std::future::Future<Output = Result<Endpoint, siphon_rtp_datapath::DatapathError>> + Send
+        {
+            self.inner.alloc_endpoint()
+        }
+
+        fn alloc_endpoint_for(
+            &self,
+            family: AddressFamily,
+        ) -> impl std::future::Future<Output = Result<Endpoint, siphon_rtp_datapath::DatapathError>> + Send
+        {
+            self.inner.alloc_endpoint_for(family)
+        }
+
+        fn alloc_endpoint_on_port(
+            &self,
+            family: AddressFamily,
+            port: u16,
+        ) -> impl std::future::Future<Output = Result<Endpoint, siphon_rtp_datapath::DatapathError>> + Send
+        {
+            self.inner.alloc_endpoint_on_port(family, port)
+        }
+
+        fn install_flow(
+            &self,
+            endpoint: EndpointId,
+            action: FlowAction,
+        ) -> Result<(), siphon_rtp_datapath::DatapathError> {
+            self.installs
+                .lock()
+                .expect("install log lock")
+                .push((endpoint, action));
+            self.inner.install_flow(endpoint, action)
+        }
+
+        fn remove_flow(&self, endpoint: EndpointId) {
+            self.inner.remove_flow(endpoint);
+        }
+
+        fn remove_endpoint(
+            &self,
+            endpoint: EndpointId,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            self.inner.remove_endpoint(endpoint)
+        }
+
+        fn send(
+            &self,
+            endpoint: EndpointId,
+            dst: SocketAddr,
+            data: &[u8],
+        ) -> impl std::future::Future<Output = Result<usize, siphon_rtp_datapath::DatapathError>> + Send
+        {
+            self.inner.send(endpoint, dst, data)
+        }
+
+        fn stats(&self, endpoint: EndpointId) -> Option<siphon_rtp_datapath::EndpointStats> {
+            self.inner.stats(endpoint)
+        }
+
+        fn now_ticks(&self) -> u64 {
+            self.inner.now_ticks()
+        }
+
+        fn advance_clock(&self, ticks: u64) {
+            self.inner.advance_clock(ticks);
+        }
+
+        fn now_micros(&self) -> u64 {
+            self.inner.now_micros()
+        }
+
+        fn last_activity(&self, endpoint: EndpointId) -> Option<u64> {
+            self.inner.last_activity(endpoint)
+        }
+
+        fn note_activity(&self, endpoint: EndpointId) {
+            self.inner.note_activity(endpoint);
+        }
+
+        // The override under test: expose the injected kernel-learned source.
+        fn learned_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+            self.learned.get(&endpoint).map(|entry| *entry.value())
+        }
+
+        fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>) {
+            self.inner.set_ice(endpoint, config);
+        }
+
+        fn rx(&self) -> flume::Receiver<siphon_rtp_datapath::RxPacket> {
+            self.inner.rx()
+        }
+
+        fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp> {
+            self.inner.observe_rtcp()
+        }
+    }
+
+    /// The `out_dst` of the `Forward` flow installed on `endpoint`, read out of the call's `relay_flows`.
+    fn relay_out_dst<D: Datapath>(
+        engine: &Engine<D>,
+        call_id: &str,
+        endpoint: EndpointId,
+    ) -> Option<SocketAddr> {
+        let call = engine.calls.get(call_id).expect("call present");
+        call.relay_flows
+            .iter()
+            .find_map(|(installed, action)| match action {
+                FlowAction::Forward(rule) if *installed == endpoint => Some(rule.out_dst),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn refresh_latched_destinations_reprograms_the_sibling_out_dst_from_the_kernel_latch() {
+        // A NATed peer whose real source differs from the signalled address: the kernel latches it on
+        // the far leg's ingress, and the engine sweep must propagate that learned source into the
+        // *near→far* flow's `out_dst` (docs/security-and-nat.md §4 layer 3, RFC 3550 §8).
+        let datapath = LatchLearningDatapath::new();
+        let engine = Engine::new(datapath.clone());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        // A plain PCMU relay (no profile flags) → Passthrough with in-kernel `Forward` flows.
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "nat-call".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "nat-call".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+
+        let (near_rtp, far_rtp) = {
+            let call = engine.calls.get("nat-call").expect("call present");
+            (call.near.rtp.id, call.far.rtp.id)
+        };
+        // Before the sweep: near→far forwards to B's signalled address; far→near to A's.
+        assert_eq!(
+            relay_out_dst(&engine, "nat-call", near_rtp),
+            Some(addr_b),
+            "near→far initially forwards to B's signalled address"
+        );
+        let far_out_dst_before = relay_out_dst(&engine, "nat-call", far_rtp);
+
+        // The kernel learned B's REAL post-NAT source on the far leg's ingress (a symmetric-NAT rebind),
+        // differing from the signalled address. 203.0.113.0/24 is the RFC 5737 documentation range.
+        let learned_b: SocketAddr = "203.0.113.7:40004".parse().expect("addr");
+        assert_ne!(
+            learned_b, addr_b,
+            "the learned source must differ to exercise the propagation"
+        );
+        datapath.set_learned(far_rtp, learned_b);
+        // The near leg has NOT learned anything: the far→near flow must stay untouched.
+
+        let _ = datapath.take_installs(); // Drop the offer/answer installs; measure only the sweep.
+        engine.refresh_latched_destinations().await;
+
+        // (a) Exactly one flow was reinstalled — the near→far flow, now aimed at B's learned source.
+        let installs = datapath.take_installs();
+        assert_eq!(
+            installs.len(),
+            1,
+            "only the near→far flow is reprogrammed, got {installs:?}"
+        );
+        let (reinstalled_on, reinstalled_action) = installs[0];
+        assert_eq!(
+            reinstalled_on, near_rtp,
+            "reprogrammed the near endpoint (forwards toward B)"
+        );
+        match reinstalled_action {
+            FlowAction::Forward(rule) => {
+                assert_eq!(
+                    rule.out_dst,
+                    Some(learned_b),
+                    "out_dst set to the kernel-learned source"
+                );
+                assert_eq!(rule.out_endpoint, far_rtp, "still the near→far direction");
+            }
+            other => panic!("expected a Forward action, got {other:?}"),
+        }
+
+        // (b) relay_flows now carries the updated action (so block/unblock restores the learned dst)...
+        assert_eq!(
+            relay_out_dst(&engine, "nat-call", near_rtp),
+            Some(learned_b),
+            "relay_flows holds the learned destination after the sweep"
+        );
+        // ...and the far→near flow (near never learned) is untouched.
+        assert_eq!(
+            relay_out_dst(&engine, "nat-call", far_rtp),
+            far_out_dst_before,
+            "far→near untouched: near never learned a source"
+        );
+
+        // Idempotence: a second sweep with the same learned source reinstalls nothing new.
+        engine.refresh_latched_destinations().await;
+        assert!(
+            datapath.take_installs().is_empty(),
+            "idempotent: no reinstall once out_dst already equals the learned source"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_latched_destinations_is_a_noop_on_the_loopback_backend() {
+        // The loopback backend's `learned_source` defaults to `None` (it resolves the latch inline when
+        // forwarding, owning both legs), so the sweep reprograms nothing — relay_flows are unchanged.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "loop-call".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "loop-call".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+
+        let before = engine
+            .calls
+            .get("loop-call")
+            .expect("call present")
+            .relay_flows
+            .clone();
+        assert!(!before.is_empty(), "a plain relay installs Forward flows");
+        engine.refresh_latched_destinations().await;
+        let after = engine
+            .calls
+            .get("loop-call")
+            .expect("call present")
+            .relay_flows
+            .clone();
+        assert_eq!(
+            before, after,
+            "loopback learned_source is None → the sweep reprograms nothing"
+        );
     }
 
     #[tokio::test]

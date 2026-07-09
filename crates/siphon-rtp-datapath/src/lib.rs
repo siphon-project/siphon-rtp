@@ -385,6 +385,15 @@ pub trait Datapath: Send + Sync {
     /// do not track activity.
     fn note_activity(&self, _endpoint: EndpointId) {}
 
+    /// The peer source a backend has learned in-kernel for `endpoint` via symmetric-RTP latching
+    /// (RFC 3550 §8), if any. The engine propagates it to the sibling leg's forward destination so a
+    /// NATed peer's real source drives the in-kernel relay (docs/security-and-nat.md §4 layer 3).
+    /// Default `None`: the loopback backend resolves the latched source inline when forwarding (it owns
+    /// both legs), so only a split userspace/kernel backend (XDP) overrides this.
+    fn learned_source(&self, _endpoint: EndpointId) -> Option<SocketAddr> {
+        None
+    }
+
     /// Install (or clear with `None`) ICE-lite credentials for an endpoint, enabling the datapath to
     /// answer STUN connectivity checks on it and adopt the validated source (RFC 8445, layer 4).
     fn set_ice(&self, endpoint: EndpointId, config: Option<IceConfig>);
