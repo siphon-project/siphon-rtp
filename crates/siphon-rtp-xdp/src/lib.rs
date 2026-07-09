@@ -2,7 +2,7 @@
 //!
 //! This crate is the kernel-acceleration counterpart of `siphon-rtp-datapath`'s UDP-loopback
 //! backend, kept separate so the always-available backend never depends on aya/eBPF. It loads the
-//! embedded XDP classifier ([`siphon-rtp-ebpf`]), attaches it to an interface, drives the `FLOWS` /
+//! embedded XDP classifier (the `siphon-rtp-ebpf` crate), attaches it to an interface, drives the `FLOWS` /
 //! `STATS` / `XSKS` maps with the shared [`siphon_rtp_ebpf_common`] ABI, and binds an in-house
 //! AF_XDP socket ([`xsk`]) that the classifier `XDP_REDIRECT`s media onto.
 //!
