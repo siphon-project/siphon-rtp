@@ -167,8 +167,11 @@ pub enum Command {
     },
     /// Loop a leg's inbound audio straight back to itself (the classic echo test).
     /// `enabled` defaults to `true`; send `false` to stop echoing and resume normal
-    /// forwarding. Requires a media-processing (transcoding) call, the same gate as
-    /// [`Command::PlayMedia`]. DTMF detection and media-timeout still fire while echoing.
+    /// forwarding. A single-leg IVR/echo call is a plain relay; enabling echo promotes it
+    /// into the userspace media pipeline (decode → re-encode) so its audio can be looped —
+    /// the same way [`Command::StartRecording`] promotes a relay so it can be tapped — then
+    /// demotes it back to the fast path when disabled. DTMF detection and media-timeout
+    /// still fire while echoing.
     Echo {
         call_id: String,
         from_tag: String,

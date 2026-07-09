@@ -157,6 +157,22 @@ enum PromotionReason {
     /// A per-leg RFC 4733 telephone-event (DTMF) relay block is active (`block DTMF`) — the relay is
     /// held in userspace so the actor can gate the telephone-event PT per direction.
     DtmfBlock,
+    /// Echo-test mode is on (`Command::Echo`) — the relay is held in a **processing** MediaCall so the
+    /// actor can decode each party's ingress and re-emit it back to the sender (a relay-only promotion
+    /// forwards opaque payloads to the peer and cannot loop them home).
+    Echo,
+}
+
+/// How [`Engine::hold_in_userspace`] promotes a plain passthrough relay into the userspace media
+/// pipeline. A relay-only promotion forwards RTP verbatim to the peer (enough for recording / a raw
+/// SIPREC tee / gating a telephone-event PT); a processing promotion decodes and re-encodes, which
+/// echo needs to reflect audio back to the sender.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PromoteMode {
+    /// Forward ingress RTP verbatim to the peer (recording / DTMF-block / SIPREC tee).
+    RelayOnly,
+    /// Decode ingress → re-encode (echo reflects each party's audio back to itself).
+    Processing,
 }
 
 impl Call {
@@ -833,7 +849,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag,
                 enabled,
                 ..
-            } => self.set_echo(client, &call_id, &from_tag, enabled),
+            } => self.set_echo(client, &call_id, &from_tag, enabled).await,
             Command::StartRecording {
                 call_id,
                 recording_dir,
@@ -2763,7 +2779,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // PT; a transcode / SrtpMedia call already has an actor. Holding on block, releasing on unblock.
         if blocked {
             if let Err(reason) = self
-                .hold_in_userspace(call_id, PromotionReason::DtmfBlock)
+                .hold_in_userspace(call_id, PromotionReason::DtmfBlock, PromoteMode::RelayOnly)
                 .await
             {
                 return error_result("block_dtmf: promote relay", &reason);
@@ -2819,10 +2835,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Enable or disable echo-test mode on a call ([`Command::Echo`]): each party's ingress audio is
-    /// reflected straight back to itself. Like silence, this requires a media-processing (transcode)
-    /// call — a plain relay forwards opaque payloads and cannot loop them. Only the owning client may
-    /// control the call. `from_tag` is accepted for protocol symmetry; echo applies to the whole call.
-    fn set_echo(
+    /// decoded and re-emitted straight back to itself. A single-leg IVR/echo call is a plain
+    /// passthrough relay, so — like `block_dtmf` / `start_recording` — echo promotes it into the
+    /// userspace media pipeline first, but into a **processing** (decode → re-encode) `MediaCall`, not a
+    /// relay-only one (a relay forwards opaque payloads to the peer and cannot loop them home). An
+    /// already-transcoding call is used as-is. On disable the hold is released, demoting a promoted
+    /// relay back to the `Forward` fast path once nothing else holds it. Only the owning client may
+    /// control the call; `from_tag` is accepted for protocol symmetry (echo applies to the whole call).
+    async fn set_echo(
         &self,
         client: ClientId,
         call_id: &str,
@@ -2832,15 +2852,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
-        if self.media.is_transcoding_call(call_id)
-            && self.media.control(call_id, MediaControl::Echo(enabled))
-        {
+        if enabled {
+            // Promote a plain relay into a processing MediaCall (idempotent on an already-promoted /
+            // transcoding call) and hold it, then turn echo on.
+            if let Err(reason) = self
+                .hold_in_userspace(call_id, PromotionReason::Echo, PromoteMode::Processing)
+                .await
+            {
+                return error_result("echo: promote relay", &reason);
+            }
+            if !self.media.control(call_id, MediaControl::Echo(true)) {
+                // The actor vanished between promote and control — release the hold and report.
+                self.release_userspace_hold(call_id, PromotionReason::Echo)
+                    .await;
+                return error_result("echo", &"media actor unavailable");
+            }
             ok_empty()
         } else {
-            error_result(
-                "echo",
-                &"call is not a media-processing call (transcode/record/stream required)",
-            )
+            // Disable: clear the actor's echo flag (a no-op if never promoted), then release the hold,
+            // which demotes a promoted relay back to the fast path if nothing else holds it.
+            self.media.control(call_id, MediaControl::Echo(false));
+            self.release_userspace_hold(call_id, PromotionReason::Echo)
+                .await;
+            ok_empty()
         }
     }
 
@@ -3211,7 +3245,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         // Promote a plain relay to userspace (idempotent) and hold it for the duration of recording.
         if let Err(reason) = self
-            .hold_in_userspace(call_id, PromotionReason::Recording)
+            .hold_in_userspace(call_id, PromotionReason::Recording, PromoteMode::RelayOnly)
             .await
         {
             return error_result("start_recording: promote relay", &reason);
@@ -3408,51 +3442,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return Err("call no longer exists".to_string());
         };
 
-        // The first two entries are the RTP rules (near, then far) — see `answer`'s passthrough arm.
-        let rtp_flows: Vec<(EndpointId, ForwardRule)> = relay_flows
-            .iter()
-            .filter_map(|(endpoint, action)| match action {
-                FlowAction::Forward(rule) => Some((*endpoint, *rule)),
-                _ => None,
-            })
-            .collect();
-        let [(near_endpoint, near_rule), (far_endpoint, far_rule)] = rtp_flows.as_slice()[..2]
-            .try_into()
-            .map_err(|_| "passthrough call has no installed RTP relay flows".to_string())?;
-
+        // Reconstruct the per-direction wiring from the stored `Forward` rules (near then far).
         // `near_rule` is installed on near.rtp: it gates A's source and forwards toward far/out_dst (B).
         // Build the relay-only directions: A→B forwards out far's endpoint to B; B→A out near's to A.
-        let Some(b_dst) = near_rule.out_dst else {
-            return Err("passthrough relay has no destination toward B".to_string());
-        };
-        let Some(a_dst) = far_rule.out_dst else {
-            return Err("passthrough relay has no destination toward A".to_string());
-        };
+        let layout = relay_layout_from_flows(&relay_flows)?;
         let a_to_b = RelayConfig {
-            ingress_endpoint: near_endpoint,
-            accepted_source: near_rule.accepted_source,
-            egress_endpoint: near_rule.out_endpoint,
-            egress_dst: b_dst,
+            ingress_endpoint: layout.near_endpoint,
+            accepted_source: layout.near_rule.accepted_source,
+            egress_endpoint: layout.near_rule.out_endpoint,
+            egress_dst: layout.b_dst,
             telephone_event: near_telephone_event, // leg A's ingress
         };
         let b_to_a = RelayConfig {
-            ingress_endpoint: far_endpoint,
-            accepted_source: far_rule.accepted_source,
-            egress_endpoint: far_rule.out_endpoint,
-            egress_dst: a_dst,
+            ingress_endpoint: layout.far_endpoint,
+            accepted_source: layout.far_rule.accepted_source,
+            egress_endpoint: layout.far_rule.out_endpoint,
+            egress_dst: layout.a_dst,
             telephone_event: far_telephone_event, // leg B's ingress
         };
-        // Latch when either side's policy latches (the passthrough default is SignalledOnly/Symmetric).
-        let latch = near_rule.latch != LatchPolicy::Off || far_rule.latch != LatchPolicy::Off;
 
         // Switch both RTP endpoints to Redirect so the dispatcher routes them to the media actor.
-        for endpoint in [near_endpoint, far_endpoint] {
+        for endpoint in [layout.near_endpoint, layout.far_endpoint] {
             self.datapath
                 .install_flow(endpoint, FlowAction::Redirect)
                 .map_err(|error| format!("install relay redirect: {error}"))?;
         }
-        let call =
-            MediaCall::new_relay(call_id.to_string(), from_tag, to_tag, a_to_b, b_to_a, latch);
+        let call = MediaCall::new_relay(
+            call_id.to_string(),
+            from_tag,
+            to_tag,
+            a_to_b,
+            b_to_a,
+            layout.latch,
+        );
         self.media.register(call, self.datapath.clone(), None);
 
         // Record the promotion on the Call so demotion can restore the in-kernel Forward rules.
@@ -3462,8 +3484,97 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(())
     }
 
-    /// Demote a promoted passthrough relay back to the in-kernel `FlowAction::Forward` fast path once
-    /// its last SIPREC subscription is gone: deregister the relay-only [`MediaCall`] actor and
+    /// Promote a plain passthrough relay (the in-kernel `Forward` fast path) to a userspace
+    /// **processing** [`MediaCall`] (decode → re-encode), so echo has a real reflect path: a relay-only
+    /// promotion forwards opaque payloads to the peer and cannot loop a party's audio back to itself.
+    /// Builds the two transcode directions from the call's negotiated codecs over the same endpoints /
+    /// source gates / egress targets the stored `Forward` rules used — so the RTPBleed defence is
+    /// unchanged (`Redirect` bypasses the datapath gate, so the directions re-enforce the exact same
+    /// per-leg source filter, docs/security-and-nat.md §4). A passthrough relay always shares one codec
+    /// across both legs (a codec *mismatch* answers as a transcode call, not a relay), so the near/far
+    /// codecs are the same here; errors only if that codec has no encoder (e.g. AMR-WB without the
+    /// `amr` build feature). The owner's event sink is wired so DTMF still surfaces (the SBC ends the
+    /// echo test on `#`).
+    async fn promote_to_processing(&self, call_id: &str) -> Result<(), String> {
+        let Some((owner, from_tag, to_tag, relay_flows, near_codec, far_codec, near_te, far_te)) =
+            self.owned_call_internal(call_id, |call| {
+                (
+                    call.owner,
+                    call.from_tag.clone(),
+                    call.to_tag.clone(),
+                    call.relay_flows.clone(),
+                    call.near_codec.clone(),
+                    call.far_codec.clone(),
+                    call.near_telephone_event,
+                    call.far_telephone_event,
+                )
+            })
+        else {
+            return Err("call no longer exists".to_string());
+        };
+        let (Some(near_codec), Some(far_codec)) = (near_codec, far_codec) else {
+            return Err(
+                "call has no negotiated codec to echo (offer/answer not complete)".to_string(),
+            );
+        };
+        let layout = relay_layout_from_flows(&relay_flows)?;
+
+        // Cross the codecs the way `answer`'s Media arm does: A→B decodes A's codec / encodes B's,
+        // B→A decodes B's / encodes A's — so each party's echo (decode on its ingress, re-encode on the
+        // reverse egress that faces it) round-trips in that party's own codec. `build_direction` gives
+        // each egress a fresh random SSRC + real timestamp increment (RFC 3550 §5.1 / §8), so the
+        // reflected stream is well-formed — which a relay-only direction's zeroed egress params are not.
+        let a_to_b = build_direction(
+            layout.near_endpoint,
+            layout.near_rule.accepted_source,
+            layout.near_rule.out_endpoint,
+            layout.b_dst,
+            &near_codec,
+            &far_codec,
+            near_te,
+            far_te,
+            None,
+        )?;
+        let b_to_a = build_direction(
+            layout.far_endpoint,
+            layout.far_rule.accepted_source,
+            layout.far_rule.out_endpoint,
+            layout.a_dst,
+            &far_codec,
+            &near_codec,
+            far_te,
+            near_te,
+            None,
+        )?;
+
+        // Switch both RTP endpoints to Redirect so the dispatcher routes them to the media actor.
+        for endpoint in [layout.near_endpoint, layout.far_endpoint] {
+            self.datapath
+                .install_flow(endpoint, FlowAction::Redirect)
+                .map_err(|error| format!("install processing redirect: {error}"))?;
+        }
+        let owner_events = self.events.get(&owner).map(|sink| sink.value().clone());
+        let call = MediaCall::new(
+            call_id.to_string(),
+            from_tag,
+            to_tag,
+            a_to_b,
+            b_to_a,
+            layout.latch,
+            None,
+        );
+        self.media
+            .register(call, self.datapath.clone(), owner_events);
+
+        // Record the promotion on the Call so demotion can restore the in-kernel Forward rules.
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.pipeline = PipelineKind::Media;
+        }
+        Ok(())
+    }
+
+    /// Demote a *promoted passthrough* relay back to the in-kernel `FlowAction::Forward` fast path once
+    /// nothing holds it in userspace: deregister the [`MediaCall`] actor (relay-only or processing) and
     /// reinstall the stored `Forward` rules (the same ones promotion redirected away from). Best-effort
     /// — on any install error the call is left redirected (still relaying through the actor), which is
     /// correct if slower, and logged.
@@ -3486,15 +3597,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Ensure `call_id` runs in the userspace media pipeline so a per-packet feature (pcap recording,
-    /// DTMF block) can attach to it: promote a plain passthrough relay off the in-kernel `Forward`
+    /// DTMF block, echo) can attach to it: promote a plain passthrough relay off the in-kernel `Forward`
     /// fast path if it is not already promoted, and record `reason` so the relay is not demoted while
-    /// the feature is active. A call set up as a transcoding/secure Media call already has an actor —
-    /// no promotion happens, but the reason is still recorded (harmlessly; demotion is gated on
-    /// `is_relay_call`, so a genuine media call is never demoted). Ownership must already be validated.
+    /// the feature is active. `mode` selects the promotion — [`PromoteMode::RelayOnly`] (verbatim
+    /// forward, for recording / DTMF-block) or [`PromoteMode::Processing`] (decode → re-encode, for
+    /// echo). A call set up as a transcoding/secure Media call already has an actor — no promotion
+    /// happens, but the reason is still recorded (harmlessly; demotion is gated on the presence of
+    /// stored `relay_flows`, so a genuine media call is never demoted). Ownership must already be
+    /// validated.
     async fn hold_in_userspace(
         &self,
         call_id: &str,
         reason: PromotionReason,
+        mode: PromoteMode,
     ) -> Result<(), String> {
         let pipeline = self
             .owned_call_internal(call_id, |call| call.pipeline)
@@ -3502,7 +3617,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Mirror `subscribe_request`'s guard: promote only a plain relay not already in the pipeline.
         // After promotion the call's pipeline is `Media`, so a second hold skips this and just records.
         if pipeline == PipelineKind::Passthrough && !self.media.is_media_call(call_id) {
-            self.promote_passthrough(call_id).await?;
+            match mode {
+                PromoteMode::RelayOnly => self.promote_passthrough(call_id).await?,
+                PromoteMode::Processing => self.promote_to_processing(call_id).await?,
+            }
+        } else if mode == PromoteMode::Processing && self.media.is_relay_call(call_id) {
+            // A relay-only promotion (recording / DTMF-block on a plain relay) is already up, but echo
+            // needs a decode → re-encode path a relay-only actor cannot provide. Reject clearly rather
+            // than silently apply an Echo control that would forward opaque payloads to the peer.
+            return Err(
+                "echo is unsupported while a plain relay is held in userspace for recording or a \
+                 DTMF block; stop those first"
+                    .to_string(),
+            );
         }
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.promotion_reasons.insert(reason);
@@ -3511,8 +3638,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Release a userspace hold taken by [`Self::hold_in_userspace`] and demote the relay back to the
-    /// `Forward` fast path if nothing else holds it up. Safe on a genuine Media call: demotion is
-    /// gated on `is_relay_call`, so only a promoted passthrough relay is ever demoted.
+    /// `Forward` fast path if nothing else holds it up. Safe on a genuine Media call: demotion is gated
+    /// on the presence of stored `relay_flows`, so only a promoted passthrough relay is ever demoted.
     async fn release_userspace_hold(&self, call_id: &str, reason: PromotionReason) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.promotion_reasons.remove(&reason);
@@ -3534,11 +3661,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         has_subscription || has_reason
     }
 
-    /// Demote a promoted passthrough relay back to the in-kernel `Forward` fast path once no reason
-    /// (subscription, recording, DTMF block) holds it in userspace any more. A genuine
-    /// transcoding/secure call (`!is_relay_call`) is never demoted.
+    /// Demote a *promoted passthrough* relay back to the in-kernel `Forward` fast path once no reason
+    /// (subscription, recording, DTMF block, echo) holds it in userspace any more. A promoted relay is
+    /// identified by its stored `relay_flows` (non-empty only for a passthrough; empty for a genuine
+    /// transcoding/secure `Media` call, which must never be demoted) — not by `is_relay_call`, because
+    /// echo promotes to a **processing** (non-relay-only) actor that must still demote when it clears.
     async fn demote_if_idle(&self, call_id: &str) {
-        if !self.call_has_userspace_hold(call_id) && self.media.is_relay_call(call_id) {
+        if self.call_has_userspace_hold(call_id) {
+            return;
+        }
+        let promoted_from_passthrough = self.media.is_media_call(call_id)
+            && self
+                .owned_call_internal(call_id, |call| !call.relay_flows.is_empty())
+                .unwrap_or(false);
+        if promoted_from_passthrough {
             self.demote_to_passthrough(call_id).await;
         }
     }
@@ -4258,6 +4394,62 @@ fn resolve_pipeline(
     } else {
         PipelineKind::Passthrough
     }
+}
+
+/// The per-direction endpoints, source gates, egress targets and latch reconstructed from a promoted
+/// passthrough relay's stored `Forward` rules (`Call::relay_flows`). Shared by the relay-only promote
+/// ([`Engine::promote_passthrough`]) and the processing promote ([`Engine::promote_to_processing`]) so
+/// both derive the datapath wiring from the exact same rules the in-kernel fast path installed.
+struct PassthroughRelayLayout {
+    /// The A-facing (near) RTP endpoint and its `Forward` rule (gates A's source, forwards toward B).
+    near_endpoint: EndpointId,
+    near_rule: ForwardRule,
+    /// The B-facing (far) RTP endpoint and its `Forward` rule (gates B's source, forwards toward A).
+    far_endpoint: EndpointId,
+    far_rule: ForwardRule,
+    /// Egress destination toward B (`near_rule.out_dst`) and toward A (`far_rule.out_dst`).
+    b_dst: std::net::SocketAddr,
+    a_dst: std::net::SocketAddr,
+    /// Whether either side's rule latches (the passthrough default is SignalledOnly/Symmetric).
+    latch: bool,
+}
+
+/// Reconstruct a promoted passthrough relay's [`PassthroughRelayLayout`] from its stored `relay_flows`
+/// (the two installed RTP `Forward` rules — near then far, per `answer`'s passthrough arm; any
+/// companion RTCP rules are ignored, RTCP is not transcoded/relayed on the promote path). Errors — never
+/// panics — if the two RTP rules or their egress destinations are missing.
+fn relay_layout_from_flows(
+    relay_flows: &[(EndpointId, FlowAction)],
+) -> Result<PassthroughRelayLayout, String> {
+    let rtp_flows: Vec<(EndpointId, ForwardRule)> = relay_flows
+        .iter()
+        .filter_map(|(endpoint, action)| match action {
+            FlowAction::Forward(rule) => Some((*endpoint, *rule)),
+            _ => None,
+        })
+        .collect();
+    let (Some((near_endpoint, near_rule)), Some((far_endpoint, far_rule))) =
+        (rtp_flows.first().copied(), rtp_flows.get(1).copied())
+    else {
+        return Err("passthrough call has no installed RTP relay flows".to_string());
+    };
+    let Some(b_dst) = near_rule.out_dst else {
+        return Err("passthrough relay has no destination toward B".to_string());
+    };
+    let Some(a_dst) = far_rule.out_dst else {
+        return Err("passthrough relay has no destination toward A".to_string());
+    };
+    // Latch when either side's policy latches (the passthrough default is SignalledOnly/Symmetric).
+    let latch = near_rule.latch != LatchPolicy::Off || far_rule.latch != LatchPolicy::Off;
+    Ok(PassthroughRelayLayout {
+        near_endpoint,
+        near_rule,
+        far_endpoint,
+        far_rule,
+        b_dst,
+        a_dst,
+        latch,
+    })
 }
 
 /// Build one transcode direction's config: decode the ingress codec, encode the egress codec, and
@@ -9347,6 +9539,230 @@ mod tests {
         assert!(
             !engine.media().is_relay_call("bd-1") && !engine.media().is_media_call("bd-1"),
             "the relay was demoted back to the fast path once the DTMF block cleared"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn echo_promotes_a_passthrough_reflects_audio_then_disable_demotes() {
+        // A single-leg IVR/echo call is a plain passthrough relay. `echo enabled=true` must promote it
+        // into a *processing* MediaCall (decode → re-encode) and loop the caller's audio straight back;
+        // `echo enabled=false` releases the hold and demotes it to the in-kernel Forward fast path.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "echo-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        // The engine's A-facing endpoint is advertised in the answer's returned SDP — A sends there.
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "echo-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&answer))
+            .expect("engine near SDP")
+            .remote_rtp;
+        assert!(
+            !engine.media().is_media_call("echo-1"),
+            "starts as a plain in-kernel relay"
+        );
+
+        let enabled = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(
+            matches!(enabled, CmdResult::Ok { .. }),
+            "echo enabled ok, got {enabled:?}"
+        );
+        assert!(
+            engine.media().is_transcoding_call("echo-1"),
+            "the relay was promoted to a processing MediaCall (not relay-only)"
+        );
+
+        // A speaks µ-law toward the engine; with echo on it must come straight back to A. Retry to
+        // absorb the tiny window between the control being applied and the first packet routing in.
+        let mut echoed = None;
+        for sequence in 0..25u16 {
+            phone_a
+                .send_to(&ulaw_rtp_packet(sequence, 0x1111_2222, 0xFF), engine_near)
+                .await
+                .expect("a send");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                echoed = Some((buffer[..len].to_vec(), from));
+                break;
+            }
+        }
+        let (packet, from) = echoed.expect("phone A hears its own audio echoed back");
+        assert_eq!(
+            from, engine_near,
+            "echo comes from the engine's A-facing port"
+        );
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&packet).expect("parse echoed rtp");
+        assert_eq!(
+            parsed.payload_type, 0,
+            "re-encoded in A's own codec (µ-law PT 0)"
+        );
+        // µ-law decode+encode is idempotent, so A hears exactly the bytes it sent.
+        assert_eq!(
+            parsed.payload,
+            &[0xFFu8; 160][..],
+            "ingress audio reflected back verbatim"
+        );
+
+        let disabled = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                    enabled: false,
+                },
+            )
+            .await;
+        assert!(
+            matches!(disabled, CmdResult::Ok { .. }),
+            "echo disabled ok, got {disabled:?}"
+        );
+        assert!(
+            !engine.media().is_media_call("echo-1"),
+            "demoted back to the in-kernel Forward fast path once echo cleared"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn echo_on_a_transcoding_call_works_and_does_not_demote_it() {
+        // A genuine transcode call (PCMU ↔ PCMA) already has a processing actor; echo must engage on it
+        // as-is (no double-promote) and, when disabled, must NOT demote it — a transcode call has no
+        // in-kernel Forward rules to fall back to (`relay_flows` is empty), so it stays in userspace.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "echo-tc".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true), // PCMU primary
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "echo-tc".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_with_conn(addr_b.ip(), addr_b.port(), 8, "PCMA"), // PCMA ⇒ transcode
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            engine.media().is_transcoding_call("echo-tc"),
+            "PCMU↔PCMA answered as a transcode call"
+        );
+
+        let enabled = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-tc".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(matches!(enabled, CmdResult::Ok { .. }), "echo enabled ok");
+        assert!(
+            engine.media().is_transcoding_call("echo-tc"),
+            "still the same transcode call — not double-promoted"
+        );
+
+        let disabled = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-tc".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                    enabled: false,
+                },
+            )
+            .await;
+        assert!(matches!(disabled, CmdResult::Ok { .. }), "echo disabled ok");
+        assert!(
+            engine.media().is_transcoding_call("echo-tc"),
+            "a genuine transcode call is never demoted when echo clears"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn echo_from_a_non_owner_is_rejected_and_leaves_the_call_untouched() {
+        // Only the owning client may control a call (docs §5). A non-owner gets `unknown call` and the
+        // relay is left on the fast path — echo never promotes a call for a client that does not own it.
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let engine = plain_relay_engine("echo-own", addr_a, addr_b).await;
+
+        let rejected = engine
+            .handle(
+                ClientId(2), // not the owner (CLIENT == ClientId(1))
+                Command::Echo {
+                    call_id: "echo-own".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(
+            matches!(rejected, CmdResult::Error { reason } if reason.contains("unknown call")),
+            "a non-owning client gets unknown_call"
+        );
+        assert!(
+            !engine.media().is_media_call("echo-own"),
+            "the call was not promoted for a non-owner"
         );
     }
 
