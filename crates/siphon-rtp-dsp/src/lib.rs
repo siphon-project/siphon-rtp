@@ -11,11 +11,13 @@
 #![forbid(unsafe_code)]
 
 pub mod fft;
+pub mod ns;
 pub mod resample;
 pub mod vad;
 pub mod window;
 
 pub use fft::{Complex, RealFft};
+pub use ns::NoiseSuppressor;
 pub use resample::{ResampleError, Resampler};
 pub use vad::EnergyVad;
 pub use window::WolaProcessor;
