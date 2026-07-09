@@ -88,7 +88,9 @@ JSON control channel — so the control plane sees live quality without parsing 
 - **Per-codec impairment** beyond the G.711 default is a small follow-up (the override hook exists).
 - **Wideband** codecs (G.722, AMR-WB) want the G.107.1 wideband extension; the narrowband model here
   is an approximation for them.
-- **2-party / transcoding-bridge** legs don't yet emit `call_quality` (conference-only today).
+- **2-party relay and transcode** legs now emit `call_quality` too, keyed by `call_id` (conferences
+  by `conference_id`): the transcode path on a ~5 s tick, the plain-relay path from each endpoint's
+  RTCP reception reports.
 - **HEP3 / Homer** RTCP export ships (enabled by `SIPHON_RTP_HEP_COLLECTOR`, with
   `SIPHON_RTP_HEP_AGENT_ID`), tapping relayed RTCP on the plain-relay path and sending it as HEP3
   captures. The G.107 MOS now rides BOTH the `call_quality` control events AND the exported HEP
