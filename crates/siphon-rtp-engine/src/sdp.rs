@@ -243,11 +243,32 @@ impl MediaInfo {
 /// The engine endpoints to advertise in a rewritten SDP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineMedia {
-    /// The engine's RTP endpoint (advertised in `c=`/`m=audio`).
+    /// The engine's RTP endpoint (its bound `local_addr`). The **port** is advertised in `m=audio`;
+    /// the IP is *not* — [`Self::advertised_ip`] is (they differ behind 1:1 NAT / a named interface).
     pub rtp: SocketAddr,
     /// The engine's RTCP endpoint, when not multiplexed (advertised as `a=rtcp:`). `None` ⇒
-    /// rtcp-mux (any `a=rtcp:` line is dropped; RTCP rides the RTP port).
+    /// rtcp-mux (any `a=rtcp:` line is dropped; RTCP rides the RTP port). Only its port is advertised.
     pub rtcp: Option<SocketAddr>,
+    /// The IP advertised in `c=`/`o=`/ICE-candidate lines — the named interface's advertised (public)
+    /// address, which equals `rtp.ip()` when no interface overrides it. Decoupling the advertised IP
+    /// from the bound IP is what lets the engine bind a private/wildcard address yet hand peers a
+    /// routable one; it is presentation-only and never feeds the source gate or latch.
+    pub advertised_ip: IpAddr,
+}
+
+impl EngineMedia {
+    /// Advertise the engine's *bound* address — `advertised_ip` = the RTP endpoint's own IP. The
+    /// common case with no named-interface / advertised-IP override; the engine sets `advertised_ip`
+    /// explicitly (via the struct literal) when an interface decouples the advertised IP from the bound
+    /// one. Its family always matches `rtp`, so `c=`/`a=candidate` stay well-formed.
+    #[must_use]
+    pub fn new(rtp: SocketAddr, rtcp: Option<SocketAddr>) -> Self {
+        Self {
+            rtp,
+            rtcp,
+            advertised_ip: rtp.ip(),
+        }
+    }
 }
 
 /// A rewritten SDP plus the remote media info parsed from the input.
@@ -719,17 +740,19 @@ pub fn rewrite(
                 lines.push(format!("a=ice-pwd:{}", ice.pwd));
                 // RFC 8839 §5.1: the candidate's connection-address is a bare IP literal in either
                 // family — `IpAddr`'s Display emits a v6 literal without brackets, exactly as the
-                // `a=candidate` grammar requires (brackets are an `m=`/`c=`-line concern only).
+                // `a=candidate` grammar requires (brackets are an `m=`/`c=`-line concern only). The
+                // advertised (public) IP is emitted, the bound port; they share a family by construction.
                 lines.push(format!(
                     "a=candidate:1 1 UDP {HOST_CANDIDATE_PRIORITY} {} {} typ host",
-                    engine.rtp.ip(),
+                    engine.advertised_ip,
                     engine.rtp.port()
                 ));
             }
         } else if index == conn_index {
             // RFC 4566 §5.7: emit the addrtype of the engine endpoint's own family (`IP4`/`IP6`),
-            // so a v6 engine endpoint is advertised as `c=IN IP6` and a v4 one as `c=IN IP4`.
-            let ip = engine.rtp.ip();
+            // so a v6 engine endpoint is advertised as `c=IN IP6` and a v4 one as `c=IN IP4`. The IP
+            // is the interface's advertised (public) address, not the bound one — same family.
+            let ip = engine.advertised_ip;
             lines.push(format!("c=IN {} {}", addrtype(ip), ip));
         } else if Some(index) == rtcp_index {
             match engine.rtcp {
@@ -1241,10 +1264,7 @@ mod tests {
     #[test]
     fn rewrites_rtp_and_inserts_rtcp_for_non_mux() {
         let sdp = offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: Some("127.0.0.1:40001".parse().unwrap()),
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), Some("127.0.0.1:40001".parse().unwrap()));
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
@@ -1266,10 +1286,7 @@ mod tests {
     fn rewrites_existing_rtcp_attribute_in_place() {
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp:53000\r\n");
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: Some("127.0.0.1:40001".parse().unwrap()),
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), Some("127.0.0.1:40001".parse().unwrap()));
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"));
         assert!(!result.sdp.contains("53000"));
@@ -1285,10 +1302,7 @@ mod tests {
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp:53000\r\n");
         sdp.push_str("a=rtcp-mux\r\n");
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert!(
             !result.sdp.contains("a=rtcp:"),
@@ -1301,10 +1315,7 @@ mod tests {
     fn mux_override_true_forces_rtcp_mux_when_the_offer_had_none() {
         // RFC 5761: `mux_override = Some(true)` emits `a=rtcp-mux` even though the offer carried none.
         let sdp = offer("203.0.113.7", 49170); // no a=rtcp-mux
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(true)).expect("rewrite");
         assert_eq!(
             result.sdp.matches("a=rtcp-mux").count(),
@@ -1320,10 +1331,7 @@ mod tests {
         // The offer already advertised mux; forcing mux must not produce a duplicate `a=rtcp-mux`.
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp-mux\r\n");
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(true)).expect("rewrite");
         assert_eq!(
             result.sdp.matches("a=rtcp-mux").count(),
@@ -1339,10 +1347,7 @@ mod tests {
         // engine's separate RTCP port is advertised.
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp-mux\r\n");
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: Some("127.0.0.1:40001".parse().unwrap()),
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), Some("127.0.0.1:40001".parse().unwrap()));
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(false)).expect("rewrite");
         assert!(
             !result.sdp.contains("a=rtcp-mux"),
@@ -1359,20 +1364,14 @@ mod tests {
         // `None` is the default: the offer's `a=rtcp-mux` intent passes through untouched.
         let mut muxed = offer("203.0.113.7", 49170);
         muxed.push_str("a=rtcp-mux\r\n");
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         assert!(rewrite(&muxed, engine, IceRewrite::Keep, None, None)
             .expect("rewrite")
             .sdp
             .contains("a=rtcp-mux"));
         // A non-muxed offer stays non-muxed under `None`.
         let plain = offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: Some("127.0.0.1:40001".parse().unwrap()),
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), Some("127.0.0.1:40001".parse().unwrap()));
         assert!(!rewrite(&plain, engine, IceRewrite::Keep, None, None)
             .expect("rewrite")
             .sdp
@@ -1382,10 +1381,7 @@ mod tests {
     #[test]
     fn media_level_connection_overrides_session_level() {
         let sdp = "v=0\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\nc=IN IP4 198.51.100.9\r\n";
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:41000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:41000".parse().unwrap(), None);
         let result = rewrite(sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
@@ -1444,10 +1440,7 @@ mod tests {
         // RFC 4566 §5.7: rewriting to a v6 engine endpoint must emit `c=IN IP6` (addrtype follows the
         // engine endpoint's family), the engine's v6 address, and the engine ports.
         let sdp = offer_v6("2001:db8::1", 49170);
-        let engine = EngineMedia {
-            rtp: "[::1]:40000".parse().unwrap(),
-            rtcp: Some("[::1]:40001".parse().unwrap()),
-        };
+        let engine = EngineMedia::new("[::1]:40000".parse().unwrap(), Some("[::1]:40001".parse().unwrap()));
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite v6");
         assert_eq!(
             result.media.remote_rtp,
@@ -1480,10 +1473,7 @@ mod tests {
         let sdp = "v=0\r\no=- 1 1 IN IP6 host.invalid\r\ns=-\r\nc=IN IP6 2001:db8::7\r\nt=0 0\r\n\
              a=ice-ufrag:PEERUF\r\na=ice-pwd:peerpassword01234567\r\n\
              m=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
-        let engine = EngineMedia {
-            rtp: "[::1]:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("[::1]:40000".parse().unwrap(), None);
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
@@ -1509,10 +1499,7 @@ mod tests {
         // Regression: a v4 engine endpoint must still emit `c=IN IP4` (addrtype follows the family),
         // proving the addrtype is picked from the endpoint, not hardcoded either way.
         let sdp = offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite v4");
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(
@@ -1541,10 +1528,7 @@ mod tests {
         #[test]
         fn parsers_never_panic(text in "(?s).{0,400}") {
             let _ = parse(&text);
-            let engine = EngineMedia {
-                rtp: "192.0.2.1:10000".parse().expect("addr"),
-                rtcp: None,
-            };
+            let engine = EngineMedia::new("192.0.2.1:10000".parse().expect("addr"), None);
             let _ = rewrite(&text, engine, IceRewrite::Keep, None, None);
             let _ = force_answer_codec(&text, &CodecSpec::new(0, "PCMU", 8000, 1, 20), Some(96));
         }
@@ -1577,10 +1561,7 @@ mod tests {
     #[test]
     fn rewrite_re_originates_ice_as_ice_lite() {
         let sdp = ice_offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
@@ -1606,10 +1587,7 @@ mod tests {
     #[test]
     fn rewrite_without_ice_leaves_no_ice_lines() {
         let sdp = offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert!(!result.sdp.contains("a=ice-lite"));
         assert!(!result.sdp.contains("a=ice-ufrag"));
@@ -1620,10 +1598,7 @@ mod tests {
         // `IceRewrite::Keep` (a plain relay) forwards the peer's ICE attributes untouched — it is the
         // decoupled counterpart of `Strip`, which removes them.
         let sdp = ice_offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert!(result.sdp.contains("a=ice-ufrag:PEERUF"));
         assert!(result.sdp.contains("a=ice-pwd:peerpassword01234567"));
@@ -1639,10 +1614,7 @@ mod tests {
         // rtpengine `ICE=remove` (RFC 8839 §5): strip the offerer's ICE lines and advertise none of
         // our own — the leg falls back to the signalled media address.
         let sdp = ice_offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let result = rewrite(&sdp, engine, IceRewrite::Strip, None, None).expect("rewrite");
         // The peer's ICE attributes are gone.
         assert!(!result.sdp.contains("a=ice-ufrag"), "{}", result.sdp);
@@ -1784,10 +1756,7 @@ mod tests {
         // Answer a DTLS-SRTP leg: force `UDP/TLS/RTP/SAVPF`, advertise the engine's fingerprint + role,
         // and re-originate (strip) the peer's `a=fingerprint`/`a=setup`.
         let sdp = dtls_offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let fingerprint = Fingerprint {
             hash_function: "sha-256".to_string(),
             bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -1830,10 +1799,7 @@ mod tests {
         use siphon_rtp_srtp::sdes::CryptoSuite;
         // Bridge an AVP offer up to SAVP: force the transport and advertise the engine's key.
         let sdp = offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
         let result = rewrite(
             &sdp,
@@ -1857,10 +1823,7 @@ mod tests {
     fn rewrite_plain_forces_avp_and_strips_crypto() {
         // Bridge a SAVP answer down to AVP: force the transport and drop the peer's a=crypto.
         let sdp = savp_offer("203.0.113.7", 49170);
-        let engine = EngineMedia {
-            rtp: "127.0.0.1:40000".parse().unwrap(),
-            rtcp: None,
-        };
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
         let result = rewrite(
             &sdp,
             engine,

@@ -323,6 +323,39 @@ pub trait Datapath: Send + Sync {
         async move { Err(DatapathError::PortUnavailable { port }) }
     }
 
+    /// Allocate and bind a new media endpoint on a **specific local IP** — the named-interface
+    /// primitive. rtpengine-style per-leg interface selection resolves the control `direction` pair to
+    /// a bind address (an `internal` 10.x for one leg, an `external` public/private address for the
+    /// other) and asks the datapath to source that leg from it. The IP carries its own family, so this
+    /// also lets a v6 leg bind the interface's real v6 address rather than a loopback fallback.
+    ///
+    /// The default derives the family from `bind_ip` and delegates to
+    /// [`alloc_endpoint_for`](Self::alloc_endpoint_for), i.e. it honours the family but ignores the
+    /// specific IP — keeping every existing backend compiling. Backends that can bind an arbitrary
+    /// local IP (the loopback backend; the XDP fast path for source IPs on its attached NIC) override
+    /// this to bind `bind_ip` exactly.
+    fn alloc_endpoint_on(
+        &self,
+        bind_ip: IpAddr,
+    ) -> impl std::future::Future<Output = Result<Endpoint, DatapathError>> + Send {
+        self.alloc_endpoint_for(AddressFamily::of(bind_ip))
+    }
+
+    /// Allocate and bind an endpoint on a **specific local IP and port** — the interface-aware
+    /// HA-restore primitive. A standby behind a floating IP re-binds the exact `(local_ip, port)` a
+    /// failed primary advertised (the snapshot records the full bound `SocketAddr`), so a call that was
+    /// pinned to a named interface resumes on the same source IP. The default ignores `bind_ip` and
+    /// delegates to [`alloc_endpoint_on_port`](Self::alloc_endpoint_on_port) (so a backend without a
+    /// deterministic port allocator still errors [`DatapathError::PortUnavailable`]); the loopback
+    /// backend overrides it to bind the given IP.
+    fn alloc_endpoint_on_port_at(
+        &self,
+        bind_ip: IpAddr,
+        port: u16,
+    ) -> impl std::future::Future<Output = Result<Endpoint, DatapathError>> + Send {
+        self.alloc_endpoint_on_port(AddressFamily::of(bind_ip), port)
+    }
+
     /// Install (or replace) the flow action for an endpoint.
     fn install_flow(&self, endpoint: EndpointId, action: FlowAction) -> Result<(), DatapathError>;
 

@@ -79,7 +79,7 @@ fn corpus_seeds_never_panic() {
 fn deeply_nested_datagram_errors_instead_of_overflowing_the_stack() {
     // The fixed bug: a datagram of nothing but `l`/`d` openers recursed once per byte and aborted
     // the process via stack overflow. Driven on a small stack so the depth cap is what saves it.
-    for opener in [b'l', b'd'] {
+    for opener in *b"ld" {
         let payload: Vec<u8> = std::iter::repeat_n(opener, 500_000).collect();
         let result = std::thread::Builder::new()
             .stack_size(128 * 1024)

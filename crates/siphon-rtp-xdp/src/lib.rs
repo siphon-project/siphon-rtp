@@ -519,6 +519,31 @@ impl XdpDatapath {
         }
         None
     }
+
+    /// Allocate an endpoint that binds/emits from a **specific** local IPv4 — the shared core of
+    /// [`Datapath::alloc_endpoint`] (which uses the configured `local_ip`) and
+    /// [`Datapath::alloc_endpoint_on`] (a named-interface source IP). The per-flow source is carried
+    /// end-to-end without any eBPF change: the kernel `FlowAction.out_local_ipv4` is filled from the
+    /// egress peer's `local_addr` (`apply_forward_target`) and the userspace TX frame builder sources
+    /// from `record.local_addr`, so a different `bind_ip` here means a different egress source IP.
+    /// Valid only for a source IP on the one attached NIC (the same-NIC scope; a second NIC needs a
+    /// second AF_XDP socket).
+    fn alloc_endpoint_on_ipv4(&self, bind_ip: Ipv4Addr) -> Result<Endpoint, DatapathError> {
+        let id = EndpointId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
+        let port = self.alloc_port(id).ok_or(DatapathError::PoolExhausted {
+            limit: (MEDIA_PORT_TOP - MEDIA_PORT_BASE) as usize,
+        })?;
+        let local_addr = SocketAddr::new(IpAddr::V4(bind_ip), port);
+        let flow_key = FlowKey {
+            local_ipv4: u32::from_be_bytes(bind_ip.octets()),
+            local_port: port.to_be(),
+            _pad: 0,
+        };
+        self.inner
+            .endpoints
+            .insert(id, EndpointRecord { local_addr, flow_key });
+        Ok(Endpoint { id, local_addr })
+    }
 }
 
 /// Nanoseconds per logical media tick: 20 ms — the RTP media frame period and the engine's sweep
@@ -843,24 +868,17 @@ fn endpoint_for(
 
 impl Datapath for XdpDatapath {
     async fn alloc_endpoint(&self) -> Result<Endpoint, DatapathError> {
-        let id = EndpointId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let port = self.alloc_port(id).ok_or(DatapathError::PoolExhausted {
-            limit: (MEDIA_PORT_TOP - MEDIA_PORT_BASE) as usize,
-        })?;
-        let local_addr = SocketAddr::new(IpAddr::V4(self.inner.local_ip), port);
-        let flow_key = FlowKey {
-            local_ipv4: u32::from_be_bytes(self.inner.local_ip.octets()),
-            local_port: port.to_be(),
-            _pad: 0,
-        };
-        self.inner.endpoints.insert(
-            id,
-            EndpointRecord {
-                local_addr,
-                flow_key,
-            },
-        );
-        Ok(Endpoint { id, local_addr })
+        self.alloc_endpoint_on_ipv4(self.inner.local_ip)
+    }
+
+    async fn alloc_endpoint_on(&self, bind_ip: IpAddr) -> Result<Endpoint, DatapathError> {
+        match bind_ip {
+            // A named-interface source IP on the attached NIC: bind/emit the leg from it.
+            IpAddr::V4(ipv4) => self.alloc_endpoint_on_ipv4(ipv4),
+            // The XDP fast path is IPv4-only (one attached NIC); a v6 interface address cannot be
+            // sourced here, so fall back to the configured default rather than the wrong family.
+            IpAddr::V6(_) => self.alloc_endpoint_on_ipv4(self.inner.local_ip),
+        }
     }
 
     fn install_flow(
@@ -1133,6 +1151,45 @@ mod tests {
         assert_eq!(kernel.out_local_ipv4, u32::from_be_bytes([198, 51, 100, 1]));
         assert_eq!(kernel.out_src_port, 31000u16.to_be());
         assert_eq!(kernel.latch_policy, latch::SYMMETRIC);
+    }
+
+    #[test]
+    fn forward_tx_source_is_the_peer_per_leg_bind_ip_not_the_datapath_default() {
+        // Named-interface per-leg source IP: the egress peer was allocated (via `alloc_endpoint_on`)
+        // on the `external` interface IP 203.0.113.5, which differs from the datapath's default
+        // `local_ip` 198.51.100.1. The kernel `FlowAction` must transmit from the peer's *per-leg*
+        // source IP, so a two-interface XDP relay sources each leg from its own interface address —
+        // with no eBPF change (the field was already carried; only the bound IP became per-leg).
+        let endpoints = empty_endpoints();
+        let peer = EndpointId(7);
+        endpoints.insert(
+            peer,
+            EndpointRecord {
+                local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), 30500),
+                flow_key: FlowKey {
+                    local_ipv4: u32::from_be_bytes([203, 0, 113, 5]),
+                    local_port: 30500u16.to_be(),
+                    _pad: 0,
+                },
+            },
+        );
+        let rule = ForwardRule::signalled(
+            peer,
+            Some("198.51.100.9:8000".parse().expect("addr")),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        );
+        let kernel = to_kernel_action(
+            DpFlowAction::Forward(rule),
+            &endpoints,
+            Ipv4Addr::new(198, 51, 100, 1), // datapath default — must NOT be used for this leg
+            0,
+        );
+        assert_eq!(
+            kernel.out_local_ipv4,
+            u32::from_be_bytes([203, 0, 113, 5]),
+            "TX sources from the peer's per-leg interface IP, not the datapath default"
+        );
+        assert_eq!(kernel.out_src_port, 30500u16.to_be());
     }
 
     #[test]

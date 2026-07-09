@@ -464,7 +464,18 @@ impl UdpLoopbackDatapath {
         family: AddressFamily,
         port: u16,
     ) -> Result<Endpoint, DatapathError> {
-        let bind_ip = self.bind_ip_for(family);
+        self.alloc_specific_on(self.bind_ip_for(family), port).await
+    }
+
+    /// Allocate an endpoint bound to a **specific local IP and port** — the interface-aware
+    /// HA-restore primitive. Like [`alloc_specific`](Self::alloc_specific) but the caller supplies the
+    /// exact bind IP (the snapshot's recorded `local_addr.ip()`) rather than selecting it by family, so
+    /// a call pinned to a named interface resumes on the same source IP.
+    pub async fn alloc_specific_on(
+        &self,
+        bind_ip: IpAddr,
+        port: u16,
+    ) -> Result<Endpoint, DatapathError> {
         let reserved = self.inner.live.fetch_add(1, Ordering::AcqRel) + 1;
         if reserved > self.inner.max_endpoints {
             self.inner.live.fetch_sub(1, Ordering::AcqRel);
@@ -704,6 +715,18 @@ impl Datapath for UdpLoopbackDatapath {
         port: u16,
     ) -> Result<Endpoint, DatapathError> {
         self.alloc_specific(family, port).await
+    }
+
+    async fn alloc_endpoint_on(&self, bind_ip: IpAddr) -> Result<Endpoint, DatapathError> {
+        self.alloc_on(bind_ip).await
+    }
+
+    async fn alloc_endpoint_on_port_at(
+        &self,
+        bind_ip: IpAddr,
+        port: u16,
+    ) -> Result<Endpoint, DatapathError> {
+        self.alloc_specific_on(bind_ip, port).await
     }
 
     fn install_flow(&self, endpoint: EndpointId, action: FlowAction) -> Result<(), DatapathError> {
@@ -1405,6 +1428,80 @@ mod tests {
             .expect("packet");
         assert_eq!(packet.source, peer_addr);
         assert_eq!(&packet.data[..], b"peer-media");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alloc_endpoint_on_binds_a_per_leg_source_ip_and_emits_from_it() {
+        // Named-interface posture: two legs on the *same* datapath bind two *different* source IPs
+        // (an `internal` and an `external` address), independent of the datapath's default bind IP.
+        // 127.0.0.0/8 is entirely loopback on Linux, so distinct 127.0.0.x addresses exercise per-leg
+        // source-IP selection NIC-free.
+        let datapath = UdpLoopbackDatapath::new(); // default bind IP = 127.0.0.1
+        let internal = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let external = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+        let near = datapath
+            .alloc_endpoint_on(internal)
+            .await
+            .expect("alloc internal");
+        let far = datapath
+            .alloc_endpoint_on(external)
+            .await
+            .expect("alloc external");
+        assert_eq!(
+            near.local_addr.ip(),
+            internal,
+            "near leg binds the internal source IP, not the default loopback"
+        );
+        assert_eq!(
+            far.local_addr.ip(),
+            external,
+            "far leg binds the external source IP"
+        );
+
+        // A -> engine(near) -> phone_b, forwarded out via the `far` endpoint: phone_b must see the
+        // datagram arrive *from the external source IP*, proving the far leg emits from its bind IP.
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
+        datapath
+            .install_flow(
+                near.id,
+                FlowAction::Forward(ForwardRule {
+                    out_endpoint: far.id,
+                    out_dst: Some(addr_b),
+                    accepted_source: SourceFilter::Exact(addr_a.ip()),
+                    latch: LatchPolicy::SignalledOnly,
+                }),
+            )
+            .expect("flow");
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A, 1), near.local_addr)
+            .await
+            .expect("send a");
+        let (data, from) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A, 1));
+        assert_eq!(
+            from, far.local_addr,
+            "the relayed datagram leaves from the far leg's external source IP"
+        );
+    }
+
+    #[tokio::test]
+    async fn alloc_endpoint_on_port_at_rebinds_a_specific_source_ip_and_port() {
+        // Interface-aware HA restore: a standby re-binds the exact (source IP, port) the snapshot
+        // recorded, so a call pinned to a named interface resumes on the same source IP.
+        let bind_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let scratch = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .expect("scratch bind");
+        let free_port = scratch.local_addr().expect("addr").port();
+        drop(scratch);
+        let datapath = UdpLoopbackDatapath::new();
+        let endpoint = datapath
+            .alloc_endpoint_on_port_at(bind_ip, free_port)
+            .await
+            .expect("rebind the exact source IP and port");
+        assert_eq!(endpoint.local_addr.ip(), bind_ip);
+        assert_eq!(endpoint.local_addr.port(), free_port);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

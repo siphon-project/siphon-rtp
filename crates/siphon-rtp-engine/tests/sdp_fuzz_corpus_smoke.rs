@@ -26,12 +26,12 @@ fn corpus_seeds() -> Vec<Vec<u8>> {
 }
 
 fn engine() -> EngineMedia {
-    EngineMedia {
-        rtp: "192.0.2.1:10000"
+    EngineMedia::new(
+        "192.0.2.1:10000"
             .parse()
             .expect("static valid socket address"),
-        rtcp: None,
-    }
+        None,
+    )
 }
 
 fn drive(text: &str) {

@@ -586,3 +586,54 @@ void, and bound the resources.
   loopback datapath: the full Allocate → CreatePermission → ChannelBind → relay round-trip both ways,
   plus 401 / 437 / 438 / 403, relay-without-permission drop, idempotent retransmit, and Refresh(0)
   teardown — the §7-style adversarial validation, applied to the relay.
+
+---
+
+## 12. Media interfaces and advertised address (egress topology)
+
+A real carrier/SBC deploy separates two IPs the bare bind address conflates: the IP the engine's socket
+**binds** (and sources media from) and the IP it **advertises** in the rewritten SDP. It also fronts more
+than one network — a private `internal` side toward the core and a public `external` side toward the
+access network. Both are policy the engine applies at SDP-rewrite time; neither weakens the ingress
+posture of §4.
+
+### 12.1 Advertised address ≠ bound address
+The rewritten SDP (`c=`, `o=` on `replace: [origin]`, the ICE host `a=candidate`) advertises the
+interface's **advertised** IP, while the socket binds the interface's **bind** IP and the advertised
+**port** is always the bound one. This is what lets the engine bind a private or wildcard address yet
+hand peers a routable one (1:1 NAT / a floating public IP), the SDP-layer analogue of the TURN
+`--turn-relay-ip` split (§11). The single-homed case is `--advertise-ip <public>` (an AWS Elastic IP:
+bind the private VPC address, advertise the EIP — same port, family-matched); the XDP fast path keeps
+binding the private routable IP, so it is unaffected. With no override the advertised IP equals the
+bound IP, so the default posture is unchanged.
+
+- **Security invariant (no RTPbleed regression):** the advertised IP is **presentation-only**. It never
+  feeds the layer-2 signalled-source gate, the layer-3 latch, or the forward/relay path — those key on
+  the peer's *real* source (the SDP `c=`/`received-from`, §4.2) and on the engine's *bound* socket. An
+  attacker learning the advertised IP from the SDP gains nothing the `c=` line did not already give
+  them; the gate still requires the real signalled source. Enforcement: the advertised IP is carried as
+  `EngineMedia.advertised_ip` / `Leg.advertised_ip` (presentation), entirely disjoint from
+  `accepted_source` / `SourceFilter` (gate) and the bound `Endpoint.local_addr` (relay).
+
+### 12.2 Named interfaces + `direction` (per-leg interface selection)
+Operators define named interfaces (config `[[interface]] name / address / advertised`, repeating a name
+for a second family). The control `direction` pair selects them per call: `direction[0]` → the near
+(caller-facing / A) leg, `direction[1]` → the far (callee-facing / B) leg — so an inbound leg lands on
+`internal` and the outbound leg on `external`, mirroring rtpengine. An absent or unknown name falls back
+to the default interface (logged, never fatal — a stale `direction` from the proxy keeps the call
+flowing). The single-interface advertised-IP override (§12.1) is the degenerate case: one synthesised
+`default` interface from `relay_bind_ip` + `advertise_ip` (the `--advertise-ip` single-homed
+Elastic-IP case: bind private, advertise the public IP, same port, family-matched).
+
+- **Enforcement:** `siphon_rtp_engine::interface::InterfaceTable` (pure policy) resolves the pair to each
+  leg's bind + advertised address; `Engine::leg_binding` maps it to a datapath bind IP and an advertised
+  IP; the leg allocates via `Datapath::alloc_endpoint_on(bind_ip)`. A leg whose interface serves no
+  address of the call's family falls back to the datapath's family default (never a cross-family bind —
+  a v4 address in a `c=IN IP6` line is invalid SDP).
+- **Datapath reach:** the UDP backend binds any source IP directly. The XDP fast path carries a per-flow
+  source IP end-to-end already (`FlowAction.out_local_ipv4`, no eBPF change), so per-leg source IPs work
+  for addresses on its **one attached NIC**; a second source IP on a *different* NIC needs a second
+  AF_XDP socket and is a follow-up (the advertised-IP override still works there).
+- **HA:** the checkpoint records each leg's advertised IP and its full bound `ip:port`, and restore
+  re-binds the exact source IP (`Datapath::alloc_endpoint_on_port_at`), so a call pinned to a named
+  interface resumes on the same source and re-advertises the same public IP on a standby.
