@@ -19,6 +19,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+pub mod client;
 pub mod turn;
 
 /// The STUN magic cookie (RFC 5389 §6).
@@ -564,6 +565,108 @@ mod tests {
         let parsed = parse(&msg).expect("parse request");
         assert!(parsed.is_binding_request());
         assert_eq!(parsed.username(), Some("evtj:h6vY"));
+    }
+
+    // --- RFC 5769 sample vectors -----------------------------------------------------------------
+    // The reference short-term-credential test vectors (RFC 5769 §2.1-§2.3). Validating our
+    // HMAC-SHA1 MESSAGE-INTEGRITY, CRC-32 FINGERPRINT, and XOR-MAPPED-ADDRESS codecs against these
+    // exact bytes is the conformance anchor the round-trip tests above cannot provide (a shared
+    // encode/decode bug passes a round-trip). §2.4 (long-term credential) needs SASLprep of a
+    // Unicode password and is intentionally out of scope. The USERNAME/SOFTWARE padding in these
+    // vectors is spaces (0x20), not our encoder's zero pad — so these are stored, not rebuilt.
+    //
+    // Common short-term credential (RFC 5769 §2.1): username "evtj:h6vY", password below.
+    const RFC5769_PASSWORD: &[u8] = b"VOkJxbRl1RmTxUk/WvJxBt";
+
+    /// Recompute the trailing FINGERPRINT (RFC 5389 §15.5) over a stored vector and confirm it
+    /// matches the on-the-wire value — a CRC-32 known-answer over real RFC bytes.
+    fn fingerprint_matches(message: &[u8]) -> bool {
+        let value_offset = message.len() - 4;
+        let expected = crc32(&message[..value_offset - 4]) ^ FINGERPRINT_XOR;
+        message[value_offset..] == expected.to_be_bytes()
+    }
+
+    #[test]
+    fn rfc5769_sample_request_vector() {
+        // RFC 5769 §2.1 — Sample Request.
+        let vector: [u8; 108] = [
+            0x00, 0x01, 0x00, 0x58, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34,
+            0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x10, 0x53, 0x54, 0x55, 0x4e,
+            0x20, 0x74, 0x65, 0x73, 0x74, 0x20, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x00, 0x24,
+            0x00, 0x04, 0x6e, 0x00, 0x01, 0xff, 0x80, 0x29, 0x00, 0x08, 0x93, 0x2f, 0xf9, 0xb1,
+            0x51, 0x26, 0x3b, 0x36, 0x00, 0x06, 0x00, 0x09, 0x65, 0x76, 0x74, 0x6a, 0x3a, 0x68,
+            0x36, 0x76, 0x59, 0x20, 0x20, 0x20, 0x00, 0x08, 0x00, 0x14, 0x9a, 0xea, 0xa7, 0x0c,
+            0xbf, 0xd8, 0xcb, 0x56, 0x78, 0x1e, 0xf2, 0xb5, 0xb2, 0xd3, 0xf2, 0x49, 0xc1, 0xb5,
+            0x71, 0xa2, 0x80, 0x28, 0x00, 0x04, 0xe5, 0x7a, 0x3b, 0xcf,
+        ];
+        let message = parse(&vector).expect("parse the RFC 5769 sample request");
+        assert!(message.is_binding_request());
+        assert_eq!(
+            message.transaction_id,
+            [0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae]
+        );
+        assert_eq!(message.username(), Some("evtj:h6vY"));
+        // The new ICE attribute codecs read the documented PRIORITY / ICE-CONTROLLED values.
+        assert_eq!(client::priority(&message), Some(0x6e00_01ff));
+        assert_eq!(
+            client::ice_controlled(&message),
+            Some(0x932f_f9b1_5126_3b36)
+        );
+        assert_eq!(client::ice_controlling(&message), None);
+        // MESSAGE-INTEGRITY verifies with the reference password (our HMAC-SHA1 == the RFC's), and
+        // a single-bit corruption fails it.
+        assert!(verify_message_integrity(&vector, RFC5769_PASSWORD));
+        let mut corrupted = vector;
+        corrupted[24] ^= 0x01;
+        assert!(!verify_message_integrity(&corrupted, RFC5769_PASSWORD));
+        assert!(fingerprint_matches(&vector));
+    }
+
+    #[test]
+    fn rfc5769_sample_ipv4_response_vector() {
+        // RFC 5769 §2.2 — Sample IPv4 Response.
+        let vector: [u8; 80] = [
+            0x01, 0x01, 0x00, 0x3c, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34,
+            0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x0b, 0x74, 0x65, 0x73, 0x74,
+            0x20, 0x76, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x20, 0x00, 0x20, 0x00, 0x08, 0x00, 0x01,
+            0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43, 0x00, 0x08, 0x00, 0x14, 0x2b, 0x91, 0xf5, 0x99,
+            0xfd, 0x9e, 0x90, 0xc3, 0x8c, 0x74, 0x89, 0xf9, 0x2a, 0xf9, 0xba, 0x53, 0xf0, 0x6b,
+            0xe7, 0xd7, 0x80, 0x28, 0x00, 0x04, 0xc0, 0x7d, 0x4c, 0x96,
+        ];
+        let message = parse(&vector).expect("parse the RFC 5769 sample IPv4 response");
+        assert_eq!(message.message_type, BINDING_SUCCESS);
+        assert_eq!(
+            message.xor_mapped_address(),
+            Some("192.0.2.1:32853".parse().expect("addr"))
+        );
+        assert!(verify_message_integrity(&vector, RFC5769_PASSWORD));
+        assert!(fingerprint_matches(&vector));
+    }
+
+    #[test]
+    fn rfc5769_sample_ipv6_response_vector() {
+        // RFC 5769 §2.3 — Sample IPv6 Response.
+        let vector: [u8; 92] = [
+            0x01, 0x01, 0x00, 0x48, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34,
+            0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x0b, 0x74, 0x65, 0x73, 0x74,
+            0x20, 0x76, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x20, 0x00, 0x20, 0x00, 0x14, 0x00, 0x02,
+            0xa1, 0x47, 0x01, 0x13, 0xa9, 0xfa, 0xa5, 0xd3, 0xf1, 0x79, 0xbc, 0x25, 0xf4, 0xb5,
+            0xbe, 0xd2, 0xb9, 0xd9, 0x00, 0x08, 0x00, 0x14, 0xa3, 0x82, 0x95, 0x4e, 0x4b, 0xe6,
+            0x7b, 0xf1, 0x17, 0x84, 0xc9, 0x7c, 0x82, 0x92, 0xc2, 0x75, 0xbf, 0xe3, 0xed, 0x41,
+            0x80, 0x28, 0x00, 0x04, 0xc8, 0xfb, 0x0b, 0x4c,
+        ];
+        let message = parse(&vector).expect("parse the RFC 5769 sample IPv6 response");
+        assert_eq!(message.message_type, BINDING_SUCCESS);
+        assert_eq!(
+            message.xor_mapped_address(),
+            Some(
+                "[2001:db8:1234:5678:11:2233:4455:6677]:32853"
+                    .parse()
+                    .expect("addr")
+            )
+        );
+        assert!(verify_message_integrity(&vector, RFC5769_PASSWORD));
+        assert!(fingerprint_matches(&vector));
     }
 
     use proptest::prelude::*;

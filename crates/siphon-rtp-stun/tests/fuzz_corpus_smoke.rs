@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use siphon_rtp_stun::{self as stun, turn};
+use siphon_rtp_stun::{self as stun, client, turn};
 
 fn corpus_seeds() -> Vec<Vec<u8>> {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -28,6 +28,10 @@ fn drive(bytes: &[u8]) {
         let _ = message.is_binding_request();
         let _ = message.username();
         let _ = message.xor_mapped_address();
+        let _ = client::priority(&message);
+        let _ = client::ice_controlling(&message);
+        let _ = client::ice_controlled(&message);
+        let _ = client::has_use_candidate(&message);
         let _ = turn::requested_transport(&message);
         let _ = turn::lifetime(&message);
         let _ = turn::channel_number(&message);
