@@ -1004,11 +1004,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (near_interface, far_interface) = self.interfaces.resolve_direction(&profile.direction);
         let (near_bind, near_advertised_override) = Self::leg_binding(near_interface, near_family);
         let (far_bind, far_advertised_override) = Self::leg_binding(far_interface, far_family);
-        let near_endpoints = match self.alloc_endpoints(near_per_leg, near_family, near_bind).await {
+        let near_endpoints = match self
+            .alloc_endpoints(near_per_leg, near_family, near_bind)
+            .await
+        {
             Ok(endpoints) => endpoints,
             Err(reason) => return CmdResult::Error { reason },
         };
-        let far_endpoints = match self.alloc_endpoints(far_per_leg, far_family, far_bind).await {
+        let far_endpoints = match self
+            .alloc_endpoints(far_per_leg, far_family, far_bind)
+            .await
+        {
             Ok(endpoints) => endpoints,
             Err(reason) => {
                 self.free(&near_endpoints).await;
@@ -3351,8 +3357,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(mut endpoints) => endpoints.remove(0),
             Err(reason) => return error_result("subscribe_request", &reason),
         };
-        let advertised =
-            advertised_override.unwrap_or_else(|| subscriber_endpoint.local_addr.ip());
+        let advertised = advertised_override.unwrap_or_else(|| subscriber_endpoint.local_addr.ip());
 
         // The subscription id (returned as the UAS to-tag) names this subscription for answer/teardown.
         let subscription_id = subscription_tag();
@@ -8432,8 +8437,7 @@ mod tests {
         // Media actually flows on the *bound* near IP (127.0.0.2), not the advertised 127.0.0.3
         // (a stand-in public IP nothing is bound on). A sends to the bound near address; the packet
         // relays out of the far (internal, 127.0.0.1) leg to B.
-        let near_bound =
-            SocketAddr::new("127.0.0.2".parse().unwrap(), near_advertised.port());
+        let near_bound = SocketAddr::new("127.0.0.2".parse().unwrap(), near_advertised.port());
         phone_a
             .send_to(&rtp(0x0A0A_0A0A), near_bound)
             .await
@@ -8503,8 +8507,7 @@ mod tests {
 
         // Media flows on the *private* bound IP (127.0.0.2), not the advertised public one; the port
         // is identical (1:1 NAT preserves it).
-        let near_bound =
-            SocketAddr::new("127.0.0.2".parse().unwrap(), near_advertised.port());
+        let near_bound = SocketAddr::new("127.0.0.2".parse().unwrap(), near_advertised.port());
         phone_a
             .send_to(&rtp(0x0A0A_0A0A), near_bound)
             .await
@@ -8516,7 +8519,11 @@ mod tests {
             "127.0.0.2".parse::<std::net::IpAddr>().unwrap(),
             "B receives from the far leg's bound *private* IP, not the advertised public one"
         );
-        assert_eq!(from.port(), far_advertised.port(), "same port on both sides (1:1 NAT)");
+        assert_eq!(
+            from.port(),
+            far_advertised.port(),
+            "same port on both sides (1:1 NAT)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

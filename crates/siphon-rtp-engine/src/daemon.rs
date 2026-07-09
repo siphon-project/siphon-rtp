@@ -716,12 +716,17 @@ mod tests {
             .exact_address_for(AddressFamily::V4)
             .expect("v4");
         assert_eq!(address.bind, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
-        assert_eq!(address.advertised, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+        assert_eq!(
+            address.advertised,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
+        );
     }
 
     #[test]
     fn interface_table_with_no_config_is_loopback() {
-        let table = bare_run_config().interface_table().expect("loopback default");
+        let table = bare_run_config()
+            .interface_table()
+            .expect("loopback default");
         let address = table
             .default_interface()
             .exact_address_for(AddressFamily::V4)
@@ -753,7 +758,9 @@ mod tests {
         let (near, far) =
             table.resolve_direction(&["external".to_string(), "internal".to_string()]);
         assert_eq!(
-            near.exact_address_for(AddressFamily::V4).unwrap().advertised,
+            near.exact_address_for(AddressFamily::V4)
+                .unwrap()
+                .advertised,
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
         );
         assert_eq!(

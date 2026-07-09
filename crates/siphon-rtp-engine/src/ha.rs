@@ -441,13 +441,16 @@ mod tests {
         // A named-interface call records its advertised IP; the field round-trips through JSON.
         let mut snapshot = sample();
         snapshot.near.advertised_ip = Some("203.0.113.99".parse().unwrap());
-        let back = CallSnapshot::from_json(&snapshot.to_json().expect("serialize"))
-            .expect("deserialize");
+        let back =
+            CallSnapshot::from_json(&snapshot.to_json().expect("serialize")).expect("deserialize");
         assert_eq!(
             back.near.advertised_ip,
             Some("203.0.113.99".parse().unwrap())
         );
-        assert_eq!(back.far.advertised_ip, None, "unset far advertised stays None");
+        assert_eq!(
+            back.far.advertised_ip, None,
+            "unset far advertised stays None"
+        );
 
         // A pre-interface blob (no `advertised_ip` key on the leg) deserializes to `None` (serde
         // default), so an older primary's checkpoint restores on a new standby.

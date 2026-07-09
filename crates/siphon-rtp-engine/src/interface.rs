@@ -144,7 +144,9 @@ impl InterfaceTable {
             Some(name) => interfaces
                 .iter()
                 .position(|iface| iface.name == name)
-                .ok_or_else(|| format!("default_interface `{name}` is not a configured interface"))?,
+                .ok_or_else(|| {
+                    format!("default_interface `{name}` is not a configured interface")
+                })?,
             None => 0,
         };
         Ok(Self {
@@ -245,7 +247,9 @@ mod tests {
     fn single_defaults_advertised_to_bind() {
         let table = InterfaceTable::single(v4(10, 0, 0, 1), None);
         let iface = table.default_interface();
-        let address = iface.exact_address_for(AddressFamily::V4).expect("v4 address");
+        let address = iface
+            .exact_address_for(AddressFamily::V4)
+            .expect("v4 address");
         assert_eq!(address.bind, v4(10, 0, 0, 1));
         assert_eq!(address.advertised, v4(10, 0, 0, 1));
     }
@@ -298,8 +302,7 @@ mod tests {
             Some("external"),
         )
         .expect("table");
-        let (near, far) =
-            table.resolve_direction(&["does-not-exist".to_string(), String::new()]);
+        let (near, far) = table.resolve_direction(&["does-not-exist".to_string(), String::new()]);
         assert_eq!(near.name, "external", "unknown slot falls back to default");
         assert_eq!(far.name, "external", "empty slot falls back to default");
     }

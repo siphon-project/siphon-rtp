@@ -296,7 +296,10 @@ mod tests {
         assert_eq!(config.default_interface.as_deref(), Some("external"));
         assert_eq!(config.interface.len(), 3);
         assert_eq!(config.interface[0].name, "internal");
-        assert_eq!(config.interface[0].address, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(
+            config.interface[0].address,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
         assert_eq!(config.interface[0].advertised, None);
         assert_eq!(config.interface[1].name, "external");
         assert_eq!(

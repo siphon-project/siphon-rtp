@@ -1264,7 +1264,10 @@ mod tests {
     #[test]
     fn rewrites_rtp_and_inserts_rtcp_for_non_mux() {
         let sdp = offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), Some("127.0.0.1:40001".parse().unwrap()));
+        let engine = EngineMedia::new(
+            "127.0.0.1:40000".parse().unwrap(),
+            Some("127.0.0.1:40001".parse().unwrap()),
+        );
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
@@ -1286,7 +1289,10 @@ mod tests {
     fn rewrites_existing_rtcp_attribute_in_place() {
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp:53000\r\n");
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), Some("127.0.0.1:40001".parse().unwrap()));
+        let engine = EngineMedia::new(
+            "127.0.0.1:40000".parse().unwrap(),
+            Some("127.0.0.1:40001".parse().unwrap()),
+        );
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"));
         assert!(!result.sdp.contains("53000"));
@@ -1347,7 +1353,10 @@ mod tests {
         // engine's separate RTCP port is advertised.
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp-mux\r\n");
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), Some("127.0.0.1:40001".parse().unwrap()));
+        let engine = EngineMedia::new(
+            "127.0.0.1:40000".parse().unwrap(),
+            Some("127.0.0.1:40001".parse().unwrap()),
+        );
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(false)).expect("rewrite");
         assert!(
             !result.sdp.contains("a=rtcp-mux"),
@@ -1371,7 +1380,10 @@ mod tests {
             .contains("a=rtcp-mux"));
         // A non-muxed offer stays non-muxed under `None`.
         let plain = offer("203.0.113.7", 49170);
-        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), Some("127.0.0.1:40001".parse().unwrap()));
+        let engine = EngineMedia::new(
+            "127.0.0.1:40000".parse().unwrap(),
+            Some("127.0.0.1:40001".parse().unwrap()),
+        );
         assert!(!rewrite(&plain, engine, IceRewrite::Keep, None, None)
             .expect("rewrite")
             .sdp
@@ -1440,7 +1452,10 @@ mod tests {
         // RFC 4566 §5.7: rewriting to a v6 engine endpoint must emit `c=IN IP6` (addrtype follows the
         // engine endpoint's family), the engine's v6 address, and the engine ports.
         let sdp = offer_v6("2001:db8::1", 49170);
-        let engine = EngineMedia::new("[::1]:40000".parse().unwrap(), Some("[::1]:40001".parse().unwrap()));
+        let engine = EngineMedia::new(
+            "[::1]:40000".parse().unwrap(),
+            Some("[::1]:40001".parse().unwrap()),
+        );
         let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite v6");
         assert_eq!(
             result.media.remote_rtp,
