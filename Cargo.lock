@@ -1936,6 +1936,7 @@ dependencies = [
  "serde",
  "serde_json",
  "siphon-rtp-codec",
+ "siphon-rtp-dsp",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",

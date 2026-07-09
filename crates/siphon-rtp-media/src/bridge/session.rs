@@ -10,6 +10,8 @@
 
 use std::collections::VecDeque;
 
+use siphon_rtp_dsp::NoiseSuppressor;
+
 use crate::bridge::protocol::{
     ControlMessage, Direction, ErrorData, MarkData, MediaFormat, PlaySource, StartData,
 };
@@ -39,6 +41,13 @@ pub struct BridgeSession {
     playout: VecDeque<Vec<i16>>,
     playout_cap: usize,
     stopped: bool,
+    /// Optional single-channel noise suppressor for the **uplink** (call → server) PCM. Built at the
+    /// leg's native decode rate (8/16 kHz) and applied in place per tick to the decoded frame before
+    /// it is framed as L16, so the voice-AI server hears a de-noised stream. `None` when the leg was
+    /// stood up without the `noise_suppression` profile flag (or its codec rate is unsupported), in
+    /// which case the uplink is byte-for-byte the decoded audio (unchanged behaviour). Preallocated —
+    /// its per-frame `process` does zero heap allocation.
+    noise_suppressor: Option<NoiseSuppressor>,
 }
 
 impl BridgeSession {
@@ -61,7 +70,19 @@ impl BridgeSession {
             playout: VecDeque::new(),
             playout_cap: playout_cap.max(1),
             stopped: false,
+            noise_suppressor: None,
         }
+    }
+
+    /// Attach a noise suppressor to the uplink (call → server) audio (the `noise_suppression` profile
+    /// flag). Each tick's decoded PCM frame is cleaned in place before it is framed as L16, so the
+    /// voice-AI server receives a de-noised stream. `None` leaves the uplink unchanged. The suppressor
+    /// must be built for the leg's native decode rate so its frame length matches the per-tick frame
+    /// (no per-frame reallocation).
+    #[must_use]
+    pub fn with_noise_suppressor(mut self, noise_suppressor: Option<NoiseSuppressor>) -> Self {
+        self.noise_suppressor = noise_suppressor;
+        self
     }
 
     /// The `start` message to send as the first text frame.
@@ -150,6 +171,12 @@ impl BridgeSession {
         if let Ok(PcmFrame::Decoded(written) | PcmFrame::Concealed(written)) =
             self.leg.next_pcm(&mut pcm[..frame_samples])
         {
+            // Post-decode noise suppression on the uplink toward the voice-AI server: clean the
+            // decoded near-end PCM in place at the leg's native rate before it is framed as L16. The
+            // suppressor is preallocated for this exact frame length, so `process` allocates nothing.
+            if let Some(noise_suppressor) = self.noise_suppressor.as_mut() {
+                noise_suppressor.process(&mut pcm[..written]);
+            }
             result.uplink_bytes = pcm_to_l16_le(&pcm[..written], uplink_out);
         }
 
@@ -172,6 +199,7 @@ mod tests {
     use crate::jitter::JitterBuffer;
     use crate::rtp::{write_packet, RtpHeader, RtpPacket};
     use siphon_rtp_codec::g711::G711;
+    use siphon_rtp_codec::Encoder;
 
     fn ulaw_session() -> BridgeSession {
         let leg = MediaLeg::new(
@@ -291,5 +319,100 @@ mod tests {
             reason: "call_ended".into(),
         }));
         assert!(session.is_stopped());
+    }
+
+    /// A µ-law session with the uplink noise suppressor attached at the leg's 8 kHz native rate.
+    fn ulaw_session_with_noise_suppression() -> BridgeSession {
+        let leg = MediaLeg::new(
+            Box::new(G711::ulaw()),
+            Box::new(G711::ulaw()),
+            JitterBuffer::new(1, 16),
+            0x5555_6666,
+            0,
+        );
+        BridgeSession::new(
+            leg,
+            MediaFormat::telephony_default(),
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        )
+        .with_noise_suppressor(Some(
+            siphon_rtp_dsp::NoiseSuppressor::new(8_000).expect("build 8k suppressor"),
+        ))
+    }
+
+    /// Deterministic LCG (fixed seed) — reproducible white noise, never `rand` / the wall clock.
+    struct Lcg(u32);
+    impl Lcg {
+        fn next_bipolar(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (self.0 >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+        }
+    }
+
+    /// One 20 ms µ-law RTP packet of deterministic white noise at `sequence`.
+    fn noisy_ulaw_packet(sequence: u16, rng: &mut Lcg) -> Vec<u8> {
+        let mut pcm = [0i16; 160];
+        for sample in pcm.iter_mut() {
+            *sample = (2000.0 * rng.next_bipolar()) as i16;
+        }
+        let mut payload = [0u8; 160];
+        G711::ulaw().encode(&pcm, &mut payload).expect("encode");
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 0,
+            sequence,
+            timestamp: u32::from(sequence) * 160,
+            ssrc: 1,
+        };
+        let mut buffer = vec![0u8; 172];
+        let len = write_packet(&header, &payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    /// Mean per-sample energy of the converged uplink L16 tail produced by ticking `session` over a
+    /// stream of identically-seeded noisy µ-law packets — the datapath-observable uplink signal.
+    fn converged_uplink_energy(session: &mut BridgeSession) -> f64 {
+        let mut rng = Lcg(0x51A9_2E17);
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        let mut energy = 0.0f64;
+        let mut samples = 0u64;
+        // ~120 frames: a lead-in for the minimum-statistics tracker to converge, scoring only the tail.
+        for sequence in 0..120u16 {
+            session.on_rtp(&noisy_ulaw_packet(sequence, &mut rng));
+            let result = session.tick(&mut uplink, &mut downlink);
+            if sequence < 60 {
+                continue; // skip the convergence lead-in
+            }
+            for chunk in uplink[..result.uplink_bytes].chunks_exact(2) {
+                let value = f64::from(i16::from_le_bytes([chunk[0], chunk[1]]));
+                energy += value * value;
+                samples += 1;
+            }
+        }
+        if samples == 0 {
+            0.0
+        } else {
+            energy / samples as f64
+        }
+    }
+
+    #[test]
+    fn noise_suppressor_cleans_the_uplink_on_the_datapath() {
+        // The suppressor must actually run on the uplink: an identical noisy µ-law stream comes out
+        // measurably quieter through a session with the suppressor attached than through a plain one.
+        let plain_energy = converged_uplink_energy(&mut ulaw_session());
+        let suppressed_energy = converged_uplink_energy(&mut ulaw_session_with_noise_suppression());
+
+        assert!(plain_energy > 0.0, "plain uplink must carry the noise");
+        assert!(
+            suppressed_energy < 0.5 * plain_energy,
+            "uplink noise not suppressed: {suppressed_energy:.1} vs plain {plain_energy:.1} \
+             (suppressor did not run on the datapath)"
+        );
     }
 }
