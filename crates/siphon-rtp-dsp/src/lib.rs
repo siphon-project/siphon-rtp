@@ -10,12 +10,14 @@
 //! direct DFT.
 #![forbid(unsafe_code)]
 
+pub mod aec;
 pub mod fft;
 pub mod ns;
 pub mod resample;
 pub mod vad;
 pub mod window;
 
+pub use aec::{AecError, EchoCanceller};
 pub use fft::{Complex, RealFft};
 pub use ns::NoiseSuppressor;
 pub use resample::{ResampleError, Resampler};
