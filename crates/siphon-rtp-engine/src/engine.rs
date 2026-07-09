@@ -1129,6 +1129,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         apply_received_from(Some(info.remote_rtp), profile.received_from)
                             .unwrap_or(info.remote_rtp),
                     ),
+                    profile.noise_suppression,
                 )
                 .await
             {
@@ -1145,6 +1146,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// bridge + the rtp_out→datapath drain task, registering both in the [`WsRegistry`]. The bridge's
     /// `rtp_in` is fed by the redirect dispatcher (gated by `accepted_source` — RTPBleed defence,
     /// `Redirect` skips the datapath gate). Dials both `ws://` and `wss://` (TLS on ring/rustls).
+    #[allow(clippy::too_many_arguments)]
     async fn setup_ws_bridge(
         &self,
         call_id: &str,
@@ -1153,6 +1155,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         a_rtp: std::net::SocketAddr,
         codec: Option<&CodecSpec>,
         accepted_source: SourceFilter,
+        noise_suppression: bool,
     ) -> Result<(), String> {
         let Some(codec) = codec else {
             return Err("offer carried no usable audio codec for the WS bridge".to_string());
@@ -1198,6 +1201,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             endianness: siphon_rtp_media::bridge::protocol::Endianness::Little,
             ptime: codec.ptime_ms.max(1),
         };
+        // Uplink noise suppression toward the voice-AI server (the `noise_suppression` profile flag).
+        // Built at the leg's native PCM rate so its per-tick frame length matches the uplink frame;
+        // only narrowband/wideband telephony (8/16 kHz) is supported — a codec at another rate keeps
+        // the uplink unsuppressed rather than failing the bridge.
+        let noise_suppressor = if noise_suppression {
+            match siphon_rtp_dsp::NoiseSuppressor::new(bridge_pcm_rate) {
+                Ok(suppressor) => Some(suppressor),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        bridge_pcm_rate,
+                        "noise suppression requested but unsupported at the WS bridge codec rate; \
+                         uplink left unsuppressed"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let session = BridgeSession::new(
             leg,
             format,
@@ -1205,7 +1228,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call_id.to_string(),
             WsDirection::Duplex,
             8, // playout cap (drop-oldest): late audio is worthless
-        );
+        )
+        .with_noise_suppressor(noise_suppressor);
 
         let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
         let (rtp_out_tx, rtp_out_rx) = flume::bounded::<bytes::Bytes>(1024);
@@ -1387,6 +1411,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             near_codec.as_ref(),
                             // Gate leg A to its offer `received-from` public IP when supplied.
                             bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
+                            profile.noise_suppression,
                         )
                         .await
                     {
@@ -1582,6 +1607,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event,
                 info.telephone_event_payload_type(),
                 record_path.as_deref(),
+                profile.noise_suppression,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (A→B)", &reason),
@@ -1596,6 +1622,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.telephone_event_payload_type(),
                 near_telephone_event,
                 record_path.as_deref(),
+                profile.noise_suppression,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (B→A)", &reason),
@@ -1691,6 +1718,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event,
                 info.telephone_event_payload_type(),
                 record_path.as_deref(),
+                profile.noise_suppression,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("media pipeline (A→B)", &reason),
@@ -1705,6 +1733,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.telephone_event_payload_type(),
                 near_telephone_event,
                 record_path.as_deref(),
+                profile.noise_suppression,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("media pipeline (B→A)", &reason),
@@ -2240,6 +2269,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     None,
                     None,
+                    // The HA checkpoint snapshot does not carry the noise-suppression flag; a
+                    // restored call re-arms it when the controller re-issues the profile on failover,
+                    // exactly as recording restarts on restore.
+                    false,
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -2257,6 +2290,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     near_te,
                     None,
+                    // The HA checkpoint snapshot does not carry the noise-suppression flag; a
+                    // restored call re-arms it when the controller re-issues the profile on failover,
+                    // exactly as recording restarts on restore.
+                    false,
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -2356,6 +2393,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     None,
                     None,
+                    // The HA checkpoint snapshot does not carry the noise-suppression flag; a
+                    // restored call re-arms it when the controller re-issues the profile on failover,
+                    // exactly as recording restarts on restore.
+                    false,
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -2373,6 +2414,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     near_te,
                     None,
+                    // The HA checkpoint snapshot does not carry the noise-suppression flag; a
+                    // restored call re-arms it when the controller re-issues the profile on failover,
+                    // exactly as recording restarts on restore.
+                    false,
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -4148,7 +4193,12 @@ fn resolve_pipeline(
             PipelineKind::Srtp
         };
     }
-    if profile.record_call || transcode {
+    // Noise suppression needs decode → clean → re-encode, so it promotes a plaintext call to the
+    // userspace media slow path exactly as recording does — otherwise an in-kernel `Passthrough`
+    // relay (same codec both sides, no recording) would silently ignore the flag. On a secure
+    // same-codec call the crypto-only `Srtp` bridge still stands (NS-on-secure follows the transcode
+    // path, `SrtpMedia`), matching how recording is only wired on the media pipeline.
+    if profile.record_call || profile.noise_suppression || transcode {
         PipelineKind::Media
     } else {
         PipelineKind::Passthrough
@@ -4168,6 +4218,7 @@ fn build_direction(
     telephone_event_in: Option<u8>,
     telephone_event_out: Option<u8>,
     record_path: Option<&str>,
+    noise_suppression: bool,
 ) -> Result<DirectionConfig, String> {
     let decoder = factory::decoder_for(ingress_codec).map_err(|error| error.to_string())?;
     let encoder = factory::encoder_for(egress_codec).map_err(|error| error.to_string())?;
@@ -4190,6 +4241,7 @@ fn build_direction(
         // The G.107 codec class of the stream this direction decodes (the ingress codec), for the MOS
         // in its periodic quality report — mapped the same way as the HEP QoS / conference paths.
         ingress_mos_codec: crate::conference::hep_codec_for_name(&ingress_codec.encoding_name),
+        noise_suppression,
     })
 }
 
@@ -9614,6 +9666,73 @@ mod tests {
             "v=0\r\no=- 1 1 IN IP4 {conn}\r\ns=-\r\nc=IN IP4 {conn}\r\nt=0 0\r\n\
              m=audio {port} RTP/AVP {codec_pt}\r\na=rtpmap:{codec_pt} {codec_name}/8000\r\na=rtcp-mux\r\n",
         )
+    }
+
+    /// Offer + answer a plaintext PCMU↔PCMU call on `engine`, optionally requesting noise suppression.
+    /// The flag is set on both messages' profiles (as a controller would): the media pipeline is built
+    /// at answer, so `resolve_pipeline` / `build_direction` read it from the answer profile — exactly
+    /// how `record_call` is honoured.
+    async fn offer_answer_ns(
+        engine: &Engine<UdpLoopbackDatapath>,
+        call_id: &str,
+        addr_a: SocketAddr,
+        addr_b: SocketAddr,
+        noise_suppression: bool,
+    ) {
+        let profile = || ProfileFlags {
+            noise_suppression,
+            ..Default::default()
+        };
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: profile(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: profile(),
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn noise_suppression_promotes_a_same_codec_call_to_the_media_pipeline() {
+        // A same-codec (PCMU↔PCMU) call would relay in-kernel (`Passthrough`); the `noise_suppression`
+        // flag must promote it to the userspace media slow path (decode → clean → re-encode), exactly
+        // as `record_call` does — otherwise the flag would be silently dropped on a non-transcoding
+        // call (a config knob wired to nothing).
+        let (_phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (_phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+
+        // Control: no flag ⇒ the same-codec call stays an in-kernel passthrough (not a media call).
+        let plain = Engine::new(UdpLoopbackDatapath::new());
+        offer_answer_ns(&plain, "ns-off", addr_a, addr_b, false).await;
+        assert!(
+            !plain.media().is_media_call("ns-off"),
+            "same-codec call without the flag must stay an in-kernel passthrough"
+        );
+
+        // With the flag ⇒ promoted to the userspace media pipeline (a transcoding media call), where
+        // `Direction::handle` runs the suppressor on the decoded ingress.
+        let suppressed = Engine::new(UdpLoopbackDatapath::new());
+        offer_answer_ns(&suppressed, "ns-on", addr_a, addr_b, true).await;
+        assert!(
+            suppressed.media().is_transcoding_call("ns-on"),
+            "the noise_suppression flag must promote the call to the media slow path where NS runs"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
