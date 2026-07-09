@@ -398,6 +398,9 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         direction: string_list(request, "direction"),
         record_call: is_yes(request, "record call") || is_yes(request, "record-call"),
         record_path: optional_str(request, "recording-dir"),
+        // Noise suppression is a native siphon-rtp (JSON control) extension; the NG/bencode front-end
+        // never requests it.
+        noise_suppression: false,
         // The WS bridge is a native siphon-rtp (JSON control) extension; the NG/bencode front-end
         // never sets it.
         ws_uri: None,

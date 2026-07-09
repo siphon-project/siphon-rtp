@@ -29,6 +29,7 @@ use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
+use siphon_rtp_dsp::NoiseSuppressor;
 use siphon_rtp_media::dtmf::{DtmfDetector, DtmfGenerator};
 use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::ingress::IngressStats;
@@ -105,6 +106,11 @@ pub struct Direction {
     encoder: Box<dyn Encoder>,
     /// Sample-rate converter when the ingress codec rate differs from the egress codec rate.
     resampler: Option<Resampler>,
+    /// Single-channel noise suppression on this direction's decoded ingress audio, applied in place
+    /// before record/fork/silence/resample/encode so every downstream consumer sees the cleaned
+    /// signal. `Some` only when the control requested it *and* the ingress rate is 8/16 kHz (built and
+    /// rate-gated in `Direction::new`); introduces the suppressor's WOLA latency on this leg.
+    noise_suppressor: Option<NoiseSuppressor>,
     egress_sequence: u16,
     egress_timestamp: u32,
     egress_ssrc: u32,
@@ -216,6 +222,9 @@ pub struct DirectionConfig {
     pub telephone_event_out: Option<u8>,
     /// `Some(WavRecorder)` to record this direction's decoded audio.
     pub recorder: Option<WavRecorder>,
+    /// Request noise suppression on this direction's decoded ingress audio. Built and rate-gated (to
+    /// 8/16 kHz) in `Direction::new`; inert on an unsupported ingress rate.
+    pub noise_suppression: bool,
     /// The G.107 codec class of the **ingress** stream (what this direction decodes), for the MOS in
     /// the periodic [`Event::CallQuality`] this direction reports.
     pub ingress_mos_codec: siphon_rtp_hep::mos::Codec,
@@ -341,6 +350,13 @@ impl Direction {
         } else {
             Resampler::new(ingress_rate, egress_rate).ok()
         };
+        // Noise suppression runs on the decoded ingress PCM at the ingress codec's native rate; the
+        // suppressor only supports 8/16 kHz, so an unsupported rate (e.g. 48 kHz Opus) leaves it off.
+        let noise_suppressor = if config.noise_suppression {
+            NoiseSuppressor::new(ingress_rate).ok()
+        } else {
+            None
+        };
         // The egress frame the encoder consumes (and the repacketizer drains) is the encoder's own
         // `frame_samples` — sizing it here from the encoder guarantees the repacketizer always feeds
         // the encoder exactly one frame's worth. A ptime override reaches this via the egress
@@ -375,6 +391,7 @@ impl Direction {
             decoder: config.decoder,
             encoder: config.encoder,
             resampler,
+            noise_suppressor,
             egress_sequence: 0,
             egress_timestamp: 0,
             egress_ssrc: config.egress_ssrc,
@@ -419,6 +436,8 @@ impl Direction {
             decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             encoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             resampler: None,
+            // A relay-only leg forwards verbatim (never decodes), so there is nothing to suppress.
+            noise_suppressor: None,
             egress_sequence: 0,
             egress_timestamp: 0,
             egress_ssrc: 0,
@@ -723,11 +742,16 @@ impl Direction {
             return;
         }
 
-        // Decode → record → (silence) → resample → encode → transmit.
+        // Decode → (noise suppression) → record → (silence) → resample → encode → transmit.
         let mut decoded = [0i16; MAX_PCM];
         let Ok(samples) = self.decoder.decode(parsed.payload, &mut decoded) else {
             return;
         };
+        // Suppress noise in place first, so the recorder, SIPREC forks, and the peer all receive the
+        // cleaned audio. Streaming/WOLA — one ingress frame in, the same count out (delayed).
+        if let Some(suppressor) = self.noise_suppressor.as_mut() {
+            suppressor.process(&mut decoded[..samples]);
+        }
         let decoded = &decoded[..samples];
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.write_pcm(decoded);
@@ -1757,6 +1781,7 @@ mod tests {
             telephone_event_in: Some(101),
             telephone_event_out: Some(101),
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -1771,6 +1796,7 @@ mod tests {
             telephone_event_in: Some(101),
             telephone_event_out: Some(101),
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new(
@@ -1967,6 +1993,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -1981,6 +2008,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new(
@@ -2139,6 +2167,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -2153,6 +2182,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new(
@@ -2326,6 +2356,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -2341,6 +2372,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new(
@@ -2398,6 +2430,7 @@ mod tests {
                 telephone_event_in: None,
                 telephone_event_out: None,
                 recorder: None,
+                noise_suppression: false,
                 ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
 
@@ -2482,6 +2515,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let a_rtcp = "127.0.0.2:5001";
@@ -2576,6 +2610,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
 
@@ -2642,6 +2677,7 @@ mod tests {
                 telephone_event_in: Some(101),
                 telephone_event_out: Some(101),
                 recorder: None,
+                noise_suppression: false,
                 ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
         let mut call = MediaCall::new(
@@ -2726,6 +2762,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -2740,6 +2777,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new(
@@ -3065,6 +3103,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -3079,6 +3118,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new("c", "a", None, a_to_b, b_to_a, true, None);
@@ -3602,6 +3642,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: Some(WavRecorder::new(8000, 1)),
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -3616,6 +3657,7 @@ mod tests {
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
+            noise_suppression: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new(
@@ -3634,5 +3676,113 @@ mod tests {
         assert_eq!(files.len(), 1, "one direction recorded");
         assert!(files[0].0.ends_with("rec-call-a.wav"));
         assert!(files[0].1.starts_with(b"RIFF"), "valid WAV header");
+    }
+
+    /// An L16↔L16 (lossless) 8 kHz call with noise suppression on the A→B direction only, so an
+    /// NS-off run is an exact passthrough and the egress energy comparison isolates the suppressor.
+    fn ns_l16_call(noise_suppression: bool) -> MediaCall {
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            decoder: Box::new(L16::new(8000, 20)),
+            encoder: Box::new(L16::new(8000, 20)),
+            egress_ssrc: 0xB000_0002,
+            egress_payload_type: 11,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: Box::new(L16::new(8000, 20)),
+            encoder: Box::new(L16::new(8000, 20)),
+            egress_ssrc: 0xA000_0002,
+            egress_payload_type: 11,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+        };
+        MediaCall::new("ns-call", "a", None, a_to_b, b_to_a, false, None)
+    }
+
+    /// An L16 RTP packet (PT 11) carrying one 20 ms PCM frame.
+    fn l16_rtp(sequence: u16, pcm: &[i16]) -> Vec<u8> {
+        use siphon_rtp_codec::Encoder as _;
+        let mut encoder = L16::new(8000, 20);
+        let mut payload = [0u8; MAX_RTP];
+        let payload_len = encoder.encode(pcm, &mut payload).expect("encode L16");
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 11,
+            sequence,
+            timestamp: u32::from(sequence) * 160,
+            ssrc: 0x1234_5678,
+        };
+        let mut buffer = vec![0u8; 12 + payload_len];
+        let written = write_packet(&header, &payload[..payload_len], &mut buffer).expect("write");
+        buffer.truncate(written);
+        buffer
+    }
+
+    #[test]
+    fn noise_suppression_attenuates_noise_through_the_media_path() {
+        use siphon_rtp_codec::Decoder as _;
+
+        // Deterministic white-noise PCM frames (160 samples @ 8 kHz), identical for both runs.
+        let mut state = 0x1234_5678u32;
+        let mut noise_sample = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((state >> 8) as f32 / (1u32 << 24) as f32) - 0.5) * 2.0 * 2000.0
+        };
+        let frame_count = 200usize;
+        let frames: Vec<Vec<i16>> = (0..frame_count)
+            .map(|_| (0..160).map(|_| noise_sample() as i16).collect())
+            .collect();
+
+        // Total decoded egress energy toward B over the converged region (past the WOLA startup).
+        let egress_energy = |noise_suppression: bool| -> f64 {
+            let mut call = ns_l16_call(noise_suppression);
+            let mut decoder = L16::new(8000, 20);
+            let mut energy = 0.0f64;
+            for (index, frame) in frames.iter().enumerate() {
+                let mut out = Vec::new();
+                let mut events = Vec::new();
+                call.process(&rx(1, A_ADDR, l16_rtp(index as u16, frame)), &mut out, &mut events);
+                if index < 30 {
+                    continue; // let the suppressor's noise floor and WOLA converge first
+                }
+                for datagram in &out {
+                    if datagram.endpoint != endpoint(2) {
+                        continue;
+                    }
+                    let packet = RtpPacket::parse(&datagram.data).expect("parse egress");
+                    let mut pcm = [0i16; MAX_PCM];
+                    let count = decoder.decode(packet.payload, &mut pcm).expect("decode egress");
+                    energy += pcm[..count]
+                        .iter()
+                        .map(|&sample| f64::from(sample) * f64::from(sample))
+                        .sum::<f64>();
+                }
+            }
+            energy
+        };
+
+        let off = egress_energy(false);
+        let on = egress_energy(true);
+        assert!(off > 0.0, "sanity: NS-off passes the noise through");
+        // The suppressor removes the bulk of stationary noise on the converged region.
+        assert!(
+            on < 0.7 * off,
+            "noise suppression must attenuate through the pipeline: on {on:.3e} vs off {off:.3e}"
+        );
     }
 }
