@@ -24,7 +24,9 @@ siphon-rtp \
 ```
 
 `--relay-bind-ip` matters: the default bind is loopback (fine for CI, useless for real peers).
-The address you bind is the address the rewritten SDP advertises.
+The address you bind is the address the rewritten SDP advertises — unless the host sits behind 1:1
+NAT (a cloud host with an Elastic IP), in which case add `--advertise-ip <public>` to advertise the
+reachable address while the socket keeps binding the private one (see [NAT](nat.md)).
 
 ## The offer / answer exchange
 

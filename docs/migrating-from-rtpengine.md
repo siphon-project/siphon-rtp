@@ -92,7 +92,13 @@ vocabulary you already send:
 
 - `call-id`, `from-tag`, `to-tag`, `sdp`
 - `transport-protocol` (e.g. `RTP/AVP`, `RTP/SAVP` for the SDES-SRTP bridge, RFC 4568)
-- `ICE`, `DTLS`, `replace`, `direction`
+- `ICE`, `DTLS`, `replace`
+- `direction` — the two interface names select the local media interface per leg (caller-facing then
+  callee-facing), exactly as rtpengine's `interface=…` + `direction` do. Define the interfaces (bind
+  IP + advertised public IP) as `[[interface]]` entries in the config file; with none configured the
+  pair falls back to the single default interface. A single-homed host behind 1:1 NAT usually wants
+  just `--advertise-ip` (advertise a public IP, keep binding private) — see
+  [Deployment](deployment.md).
 - `address family` (both the spaced and `address-family` spellings)
 - `received-from` / `received from` (`["IP4"|"IP6", "<address>"]`), used as the RTPBleed
   source-gate hint

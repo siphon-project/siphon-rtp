@@ -39,6 +39,13 @@ The initial public surface. This becomes `0.1.0` at the first tag.
   whisper/monitor roles, and room bridging.
 - **SIPREC forking** (raw-RTP tee) and **runtime pcap recording**.
 - **RTP↔WebSocket bridge** (`ws://` / `wss://`, raw L16 PCM) for voice-AI.
+- **Advertised media address + named interfaces** — advertise a public IP in SDP
+  decoupled from the bound socket (`--advertise-ip`, for a single-homed host behind
+  1:1 NAT such as an Elastic IP: bind private, advertise public, same port), and
+  rtpengine-style named interfaces (`[[interface]]` + `default_interface`) selected
+  per leg by the control `direction` pair (caller-facing vs callee-facing network).
+  Emit-only: the advertised IP never affects the socket bind, the source gate, the
+  symmetric-RTP latch, or TURN.
 
 ### Operations
 - **Prometheus `/metrics` + `/healthz` + `/readyz`**, **HEP/Homer export** with G.107
