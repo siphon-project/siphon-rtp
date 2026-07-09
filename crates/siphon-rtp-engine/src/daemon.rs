@@ -391,6 +391,10 @@ where
         loop {
             ticker.tick().await;
             sweeper.datapath().advance_clock(1);
+            // Propagate any kernel-learned peer source into the sibling leg's forward destination,
+            // closing the in-kernel symmetric-RTP loop (docs/security-and-nat.md §4 layer 3); a no-op
+            // on the loopback backend (which resolves the latch inline when forwarding).
+            sweeper.refresh_latched_destinations().await;
             for call_id in sweeper.reap_idle(timeout_ticks).await {
                 tracing::warn!(%call_id, "media timeout — call reaped");
             }

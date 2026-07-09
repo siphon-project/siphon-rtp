@@ -191,10 +191,15 @@ Latch state machine, per direction:
   only on a matching SSRC (RFC 3550 §8). It then rewrites L3/L4 with an RFC 1624 incremental checksum
   fixup and `XDP_TX`s. The kernel latch is the **source anchor** (the RTPBleed / strict-source check,
   rtpengine `expected_src`); the forward **destination** stays the userspace-maintained `out_dst`
-  (rtpengine `dst_addr`), never a flow's own ingress latch (which would echo). Consequently the
-  symmetric reply to an as-yet-unlearned peer — which the loopback backend resolves via the *peer*
-  leg's latch — stays on the userspace/`Redirect` path, since the per-flow kernel ABI carries no
-  cross-leg latch reference; a FIB miss / unresolved neighbour likewise falls back to `Redirect`.
+  (rtpengine `dst_addr`), never a flow's *own* ingress latch (which would echo). To reach a NATed peer
+  whose real source differs from the signalled `out_dst`, userspace closes the loop out-of-band: the
+  kernel exposes each flow's learned source over the trait (`Datapath::learned_source`), and on its
+  1 Hz sweep the engine (`Engine::refresh_latched_destinations`) reads the *peer* leg's kernel latch
+  and, when it has learned a new source, reprograms the **sibling** flow's `out_dst` to it (rtpengine's
+  "userspace learns → reprograms the kernel rule" model) — so the in-kernel fast path then relays to
+  the peer's real post-latch source with no cross-leg reference in the per-flow kernel ABI. The engine
+  mirrors **only** a source the kernel *already* validated (its own source-gate + SSRC re-latch), so no
+  new trust is introduced. A FIB miss / unresolved neighbour still falls back to `Redirect`.
 - **Effect on A1:** even inside the learning window, a hijack must reproduce the victim's live SSRC,
   which the blind attacker does not know.
 
