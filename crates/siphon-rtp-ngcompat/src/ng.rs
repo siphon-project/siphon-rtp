@@ -401,6 +401,9 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         // The WS bridge is a native siphon-rtp (JSON control) extension; the NG/bencode front-end
         // never sets it.
         ws_uri: None,
+        // Noise suppression is likewise a native siphon-rtp (JSON control) extension; the NG/bencode
+        // front-end never sets it.
+        noise_suppression: false,
         // rtpengine spells it `received from`; accept the hyphenated form too.
         received_from: parse_received_from(request),
         // rtpengine `rtcp-mux` directive list; accept the dotted `rtcp.mux` spelling too.

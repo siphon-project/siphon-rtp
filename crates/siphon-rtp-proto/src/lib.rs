@@ -334,6 +334,15 @@ pub struct ProfileFlags {
     /// Recording output directory/path, when recording.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_path: Option<String>,
+    /// Apply single-channel noise suppression (decision-directed Wiener, `siphon-rtp-dsp`) to this
+    /// leg's decoded near-end audio. On a transcoding call it cleans the decoded ingress PCM before
+    /// resample/re-encode; on a WebSocket voice-AI bridge it cleans the uplink PCM sent toward the AI
+    /// (where it matters most — the model hears a de-noised stream). The suppressor runs at the
+    /// codec's native rate — narrowband 8 kHz or wideband 16 kHz (G.711, AMR-WB, G.722) — so a codec
+    /// at another rate passes through unsuppressed. A native siphon-rtp extension — the NG/bencode
+    /// front-end does not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub noise_suppression: bool,
     /// Attach this call's offerer (leg A) audio to an external WebSocket media server (the
     /// mod_audio_stream / voice-AI integration). When set on `offer`/`answer`, the engine dials this
     /// URI as a WebSocket client and bridges leg A's RTP to it (decode → L16 uplink, L16 downlink →
