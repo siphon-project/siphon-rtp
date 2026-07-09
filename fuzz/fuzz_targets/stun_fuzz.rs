@@ -9,7 +9,7 @@
 //! framing (RFC 5766 §11) — every path that touches bytes straight off the wire.
 
 use libfuzzer_sys::fuzz_target;
-use siphon_rtp_stun::{self as stun, turn};
+use siphon_rtp_stun::{self as stun, client, turn};
 
 fuzz_target!(|data: &[u8]| {
     // STUN header + attribute parse, then every accessor that walks the parsed attributes.
@@ -17,6 +17,11 @@ fuzz_target!(|data: &[u8]| {
         let _ = message.is_binding_request();
         let _ = message.username();
         let _ = message.xor_mapped_address();
+        // ICE client attribute accessors (a check / response an ICE agent parses off the wire).
+        let _ = client::priority(&message);
+        let _ = client::ice_controlling(&message);
+        let _ = client::ice_controlled(&message);
+        let _ = client::has_use_candidate(&message);
         // TURN attribute accessors over the same parsed message.
         let _ = turn::requested_transport(&message);
         let _ = turn::lifetime(&message);
