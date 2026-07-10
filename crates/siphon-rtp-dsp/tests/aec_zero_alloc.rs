@@ -174,3 +174,91 @@ fn cancel_with_delay_estimation_makes_no_heap_allocation() {
         after - before
     );
 }
+
+/// The MDF / partitioned-block frequency-domain backend is also zero per-frame heap: the `K` partition
+/// weight spectra, the reference-spectrum delay line, the per-bin delay-line power, all FFT scratch, and
+/// the block-assembly / output rings are preallocated in `with_mdf`, and the real FFT/IFFT are
+/// allocation-free — so even the frames on which one or two overlap-save blocks fire (each running the
+/// filter FFT + `K` per-partition gradient-constraint IFFT/FFT pairs) allocate nothing. Runs the
+/// two-path variant so the per-block NCC path is measured too.
+#[test]
+fn cancel_mdf_makes_no_heap_allocation() {
+    const TAIL: usize = 1024; // 8 partitions of 128 @ 8 kHz
+    const FRAME: usize = 160; // 8 kHz / 20 ms
+
+    let mut canceller = EchoCanceller::with_mdf(8_000, TAIL)
+        .expect("build")
+        .with_two_path_dtd();
+    let reference: Vec<i16> = (0..FRAME)
+        .map(|index| ((index as i16).wrapping_mul(211)).wrapping_sub(3_000))
+        .collect();
+    let echo_only: Vec<i16> = reference.iter().map(|&sample| sample / 4).collect();
+    let mut near = echo_only.clone();
+
+    // Warm up enough frames that the block/output rings and the two-path bootstrap have settled and any
+    // one-time init is paid before we sample.
+    for _ in 0..32 {
+        near.copy_from_slice(&echo_only);
+        canceller.cancel(&mut near, &reference);
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..2_000 {
+        near.copy_from_slice(&echo_only);
+        canceller.cancel(&mut near, &reference);
+        std::hint::black_box(near[0]);
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(
+        after,
+        before,
+        "MDF cancel allocated {} times across 2000 frames (must be zero)",
+        after - before
+    );
+}
+
+/// The MDF + GCC-PHAT delay-estimation path is zero per-frame heap too: on top of the MDF state, the
+/// estimation block/spectra/correlation are preallocated in `with_mdf_delay_estimation`, so the frames
+/// on which a GCC block fires (and a committed re-align re-slices the alignment ring) still allocate
+/// nothing.
+#[test]
+fn cancel_mdf_with_delay_estimation_makes_no_heap_allocation() {
+    const TAIL: usize = 512;
+    const FRAME: usize = 160;
+    const SEARCH_RANGE: usize = 512;
+
+    let mut canceller =
+        EchoCanceller::with_mdf_delay_estimation(8_000, TAIL, SEARCH_RANGE).expect("build");
+    let reference: Vec<i16> = (0..FRAME)
+        .map(|index| ((index as i16).wrapping_mul(211)).wrapping_sub(3_000))
+        .collect();
+    let source: Vec<i16> = (0..FRAME)
+        .map(|index| ((index as i16).wrapping_mul(97)).wrapping_add(500))
+        .collect();
+    let mut near = source.clone();
+
+    for _ in 0..64 {
+        near.copy_from_slice(&source);
+        canceller.cancel(&mut near, &reference);
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..2_000 {
+        near.copy_from_slice(&source);
+        canceller.cancel(&mut near, &reference);
+        std::hint::black_box(near[0]);
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(
+        after,
+        before,
+        "MDF cancel-with-estimation allocated {} times across 2000 frames (must be zero)",
+        after - before
+    );
+}
