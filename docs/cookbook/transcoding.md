@@ -34,12 +34,12 @@ What each codec actually does, precisely:
 | GSM-FR (GSM 06.10) | always | yes | yes | bit-exact, ETSI vectors |
 | Comfort noise (RFC 3389) | always | yes (generator) | no (DTX is a media-path policy) | RFC 3389 |
 | AMR-WB (TS 26.171/.190) | `amr` | all 9 modes, 6.60 to 23.85 kbit/s | all 9 modes | bit-exact, 3GPP TS 26.174 vectors |
-| AMR-NB (TS 26.071/.090) | `amr` | all 8 modes | **MR475, MR515, MR59, MR122** | bit-exact, 3GPP TS 26.074 vectors |
+| AMR-NB (TS 26.071/.090) | `amr` | all 8 modes | **MR475, MR515, MR59, MR67, MR122** | bit-exact, 3GPP TS 26.074 vectors |
 
-Be precise about AMR-NB: the decoder covers every mode, the encoder covers four (MR475, MR515,
-MR59, MR122). The engine's default AMR-NB egress mode is MR122 (12.2 kbit/s, the GSM-EFR-compatible
-mode); the lower-rate modes are implemented and bit-exact but the SDP layer does not currently
-select them. AMR-WB egress defaults
+Be precise about AMR-NB: the decoder covers every mode, the encoder covers five (MR475, MR515,
+MR59, MR67, MR122). The engine's default AMR-NB egress mode is MR122 (12.2 kbit/s, the
+GSM-EFR-compatible mode); the lower-rate modes are implemented and bit-exact but the SDP layer does
+not currently select them. AMR-WB egress defaults
 to mode 2 (12.65 kbit/s) and is clamped by the peer's `mode-set` (below). Opus is in progress and
 not usable yet; EVS is absent. Both still *relay* fine.
 

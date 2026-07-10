@@ -27,7 +27,7 @@ codec is free, running it is not. See [Codec licensing](codec-licensing.md).
 | GSM Full-Rate | `GSM` (3) | yes | yes | ETSI/3GPP TS 06.10 sequences, coder and decoder | none |
 | Comfort noise | `CN` (13) | generate only | no | RFC 3389 (a generator, not a codec) | none |
 | AMR-WB | `AMR-WB` (dynamic) | all 9 modes | all 9 modes | 3GPP TS 26.174 vectors, per mode | `amr` |
-| AMR-NB | `AMR` (dynamic) | all 8 modes | MR475, MR515, MR59, MR122 | 3GPP TS 26.074 vectors | `amr` |
+| AMR-NB | `AMR` (dynamic) | all 8 modes | MR475, MR515, MR59, MR67, MR122 | 3GPP TS 26.074 vectors | `amr` |
 | Opus | `OPUS` | in progress | in progress | RFC 6716 test vectors (targeted) | not wired |
 | EVS | | no | no | | absent |
 
@@ -67,10 +67,11 @@ into that mode-set. This is the VoLTE codec; it is what the `amr` feature exists
 
 **AMR-NB** (behind `amr`). Decode covers all 8 modes (4.75 through 12.2 kbit/s),
 bit-exact against 3GPP TS 26.074. Encode is wired for MR475 (4.75 kbit/s), MR515
-(5.15 kbit/s), MR59 (5.90 kbit/s) and MR122 (12.2 kbit/s, the GSM-EFR-equivalent
-mode); a `mode-set` that forces one of the remaining four modes is declined cleanly at
-call setup rather than mis-encoding mid-call. That is enough for AMR-NB to G.711
-transcoding in both directions; the remaining encoder modes are in progress.
+(5.15 kbit/s), MR59 (5.90 kbit/s), MR67 (6.70 kbit/s) and MR122 (12.2 kbit/s, the
+GSM-EFR-equivalent mode); a `mode-set` that forces one of the remaining three modes is
+declined cleanly at call setup rather than mis-encoding mid-call. That is enough for
+AMR-NB to G.711 transcoding in both directions; the remaining encoder modes are in
+progress.
 
 **Opus.** An implementation is under way with RFC 6716 conformance gating, but it is
 **not wired into the codec factory**: a call that requires Opus transcoding fails at

@@ -295,10 +295,14 @@ impl EncoderState {
     ) -> Result<usize, CodecError> {
         if !matches!(
             mode,
-            AmrNbMode::Mr1220 | AmrNbMode::Mr475 | AmrNbMode::Mr515 | AmrNbMode::Mr590
+            AmrNbMode::Mr1220
+                | AmrNbMode::Mr475
+                | AmrNbMode::Mr515
+                | AmrNbMode::Mr590
+                | AmrNbMode::Mr670
         ) {
             return Err(CodecError::Unsupported(
-                "AMR-NB encoder: only MR122, MR475, MR515 and MR59 are wired (cbsearch / gain modes ported)",
+                "AMR-NB encoder: only MR122, MR475, MR515, MR59 and MR67 are wired (cbsearch / gain modes ported)",
             ));
         }
 
@@ -981,6 +985,37 @@ mod tests {
         assert!(
             mismatch.is_none(),
             "MR59 T02: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR67 full-encoder gate on T01 (19 params/frame; the 14-bit 3-pulse codebook `c3_14pf`, the
+    /// first mode to exercise the `set_sign` `dn2` per-track pruning path — `n = 6`).
+    #[test]
+    fn encodes_mr67_full_params_bit_exact_t01() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr670,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T01.INP",
+            "../../reference/amr-nb/testv/NODTX/T_67/T01_67.COD",
+        );
+        eprintln!("MR67 full-encode gate (T01): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR67 T01: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR67 full-encoder gate on a second vector (T02) for extra confidence.
+    #[test]
+    fn encodes_mr67_full_params_bit_exact_t02() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr670,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T02.INP",
+            "../../reference/amr-nb/testv/NODTX/T_67/T02_67.COD",
+        );
+        eprintln!("MR67 full-encode gate (T02): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR67 T02: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
         );
     }
 }
