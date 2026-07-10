@@ -19,7 +19,7 @@ use siphon_rtp_stun as stun;
 
 use crate::{
     classify, AddressFamily, Datapath, DatapathError, Endpoint, EndpointId, EndpointStats,
-    FlowAction, IceConfig, LatchPolicy, ObservedRtcp, PacketClass, RxPacket,
+    FlowAction, IceConfig, IceDatapathEvent, LatchPolicy, ObservedRtcp, PacketClass, RxPacket,
 };
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
@@ -162,6 +162,12 @@ struct Inner {
     /// Per-endpoint ICE-lite credentials; when present, STUN checks are answered and the validated
     /// source is adopted as the media path (RFC 8445).
     ice: DashMap<EndpointId, IceConfig>,
+    /// Per-endpoint **full-agent** STUN forwarding sink. Present only for endpoints promoted via
+    /// [`Datapath::set_ice_agent`]; a STUN datagram on such an endpoint is forwarded here (in
+    /// addition to the responder answering inbound checks) so the engine's consent checker can
+    /// correlate Binding responses — which the responder path drops. Bounded per-sink; a full sink
+    /// drops the event (a lost consent response only delays the refresh, never blocks the reactor).
+    ice_events: DashMap<EndpointId, flume::Sender<IceDatapathEvent>>,
     redirect_tx: flume::Sender<RxPacket>,
     redirect_rx: flume::Receiver<RxPacket>,
     /// Telemetry tap: when enabled, relayed RTCP is copied here (bounded, dropped on backpressure).
@@ -395,6 +401,7 @@ impl UdpLoopbackDatapath {
                 flows: DashMap::new(),
                 latched: DashMap::new(),
                 ice: DashMap::new(),
+                ice_events: DashMap::new(),
                 redirect_tx,
                 redirect_rx,
                 observe_enabled: AtomicBool::new(false),
@@ -675,6 +682,17 @@ async fn recv_loop(
         // RFC 7983 demux for ICE: STUN (first byte 0..=3) drives connectivity checks on endpoints
         // that carry ICE credentials.
         if classify(&buffer[..len]) == PacketClass::Stun {
+            // Full-agent seam (RFC 7675 consent): forward the raw STUN to the engine's checker so it
+            // can correlate its own Binding responses — which the responder below otherwise drops.
+            // Bounded sink, drop-on-full; forwarded for requests too (the checker ignores those).
+            if let Some(sender) = inner.ice_events.get(&endpoint).map(|entry| entry.clone()) {
+                let _ = sender.try_send(IceDatapathEvent {
+                    endpoint,
+                    source,
+                    arrival_tick: inner.clock.load(Ordering::Relaxed),
+                    datagram: Bytes::copy_from_slice(&buffer[..len]),
+                });
+            }
             if let Some(ice) = inner.ice.get(&endpoint).map(|config| config.clone()) {
                 handle_stun(
                     &socket,
@@ -763,6 +781,7 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.flows.remove(&endpoint);
         self.inner.latched.remove(&endpoint);
         self.inner.ice.remove(&endpoint);
+        self.inner.ice_events.remove(&endpoint);
     }
 
     async fn send(
@@ -825,8 +844,21 @@ impl Datapath for UdpLoopbackDatapath {
             }
             None => {
                 self.inner.ice.remove(&endpoint);
+                self.inner.ice_events.remove(&endpoint);
             }
         }
+    }
+
+    fn set_ice_agent(
+        &self,
+        endpoint: EndpointId,
+        config: IceConfig,
+        events: flume::Sender<IceDatapathEvent>,
+    ) {
+        // Keep the responder (so inbound checks are still answered) and add the forwarding sink so
+        // Binding responses reach the engine's consent checker (RFC 7675).
+        self.inner.ice.insert(endpoint, config);
+        self.inner.ice_events.insert(endpoint, events);
     }
 
     fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp> {
@@ -1740,6 +1772,104 @@ mod tests {
             datapath.last_activity(leg.id),
             Some(7),
             "a valid consent check stamps activity at the current tick"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_agent_forwards_a_stun_response_the_responder_would_drop() {
+        // The full-agent seam (RFC 7675 consent) delivers Binding *responses* — which the ice-lite
+        // responder drops (they are not requests) — to the engine's checker via the events sink.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (events_tx, events_rx) = flume::bounded(16);
+        datapath.set_ice_agent(
+            leg.id,
+            IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            },
+            events_tx,
+        );
+        datapath.advance_clock(5);
+
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let response = stun::binding_success_response(&[7u8; 12], peer_addr, Some(b"engpass"));
+        peer.send_to(&response, leg.local_addr)
+            .await
+            .expect("send response");
+
+        let event = timeout(SHORT, events_rx.recv_async())
+            .await
+            .expect("an event is delivered")
+            .expect("the channel stays open");
+        assert_eq!(event.endpoint, leg.id);
+        assert_eq!(event.source, peer_addr);
+        assert_eq!(event.arrival_tick, 5, "stamped at the current logical tick");
+        assert_eq!(event.datagram.as_ref(), response.as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_agent_still_answers_inbound_checks_and_forwards_them() {
+        // A full-agent endpoint keeps the ice-lite responder: an inbound check is still answered,
+        // and the request is also forwarded to the checker (visibility for later milestones).
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (events_tx, events_rx) = flume::bounded(16);
+        datapath.set_ice_agent(
+            leg.id,
+            IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            },
+            events_tx,
+        );
+
+        let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        peer.send_to(&check, leg.local_addr)
+            .await
+            .expect("send check");
+
+        let (response, _) = recv(&peer).await;
+        assert_eq!(
+            stun::parse(&response).expect("parse").message_type,
+            stun::BINDING_SUCCESS,
+            "the responder still answers inbound checks"
+        );
+        let event = timeout(SHORT, events_rx.recv_async())
+            .await
+            .expect("event")
+            .expect("open");
+        assert_eq!(event.datagram.as_ref(), check.as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_ice_removes_the_full_agent_forwarding_sink() {
+        // `set_ice(_, None)` tears down both the responder creds and the full-agent sink.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (events_tx, events_rx) = flume::bounded(16);
+        // Keep a sender alive so the channel stays *connected* after the map drops its clone — else
+        // `recv_async` would resolve to `Disconnected` and mask "nothing was forwarded".
+        let _keepalive = events_tx.clone();
+        datapath.set_ice_agent(
+            leg.id,
+            IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            },
+            events_tx,
+        );
+        datapath.set_ice(leg.id, None);
+
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let response = stun::binding_success_response(&[7u8; 12], peer_addr, Some(b"engpass"));
+        peer.send_to(&response, leg.local_addr)
+            .await
+            .expect("send response");
+        assert!(
+            timeout(NEGATIVE, events_rx.recv_async()).await.is_err(),
+            "a cleared full-agent sink forwards nothing"
         );
     }
 
