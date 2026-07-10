@@ -1990,6 +1990,8 @@ dependencies = [
 name = "siphon-rtp-stun"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "getrandom 0.3.4",
  "proptest",
  "thiserror 2.0.18",
 ]

@@ -15,7 +15,15 @@ keywords = ["stun", "ice", "webrtc", "voip", "nat"]
 categories = ["network-programming"]
 
 [dependencies]
+# `getrandom` (tiny, pure) draws the 96-bit STUN transaction id for the ICE client; the base codec
+# stays free of the media plane's heavier tree.
+getrandom = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 proptest = { workspace = true }
+
+[[bench]]
+name = "stun_client"
+harness = false
