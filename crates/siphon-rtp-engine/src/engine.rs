@@ -1223,6 +1223,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         apply_received_from(Some(info.remote_rtp), profile.received_from)
                             .unwrap_or(info.remote_rtp),
                     ),
+                    profile.noise_suppression,
                 )
                 .await
             {
@@ -1247,6 +1248,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         a_rtp: std::net::SocketAddr,
         codec: Option<&CodecSpec>,
         accepted_source: SourceFilter,
+        noise_suppression: bool,
     ) -> Result<(), String> {
         let Some(codec) = codec else {
             return Err("offer carried no usable audio codec for the WS bridge".to_string());
@@ -1299,7 +1301,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call_id.to_string(),
             WsDirection::Duplex,
             8, // playout cap (drop-oldest): late audio is worthless
-        );
+        )
+        // Clean leg A's uplink audio toward the voice-AI server when requested (rate-gated inside).
+        .with_noise_suppression(noise_suppression);
 
         let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
         let (rtp_out_tx, rtp_out_rx) = flume::bounded::<bytes::Bytes>(1024);
@@ -1485,6 +1489,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             near_codec.as_ref(),
                             // Gate leg A to its offer `received-from` public IP when supplied.
                             bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
+                            profile.noise_suppression,
                         )
                         .await
                     {
@@ -1680,6 +1685,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event,
                 info.telephone_event_payload_type(),
                 record_path.as_deref(),
+                profile.noise_suppression,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (A→B)", &reason),
@@ -1694,6 +1700,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.telephone_event_payload_type(),
                 near_telephone_event,
                 record_path.as_deref(),
+                profile.noise_suppression,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (B→A)", &reason),
@@ -1789,6 +1796,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event,
                 info.telephone_event_payload_type(),
                 record_path.as_deref(),
+                profile.noise_suppression,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("media pipeline (A→B)", &reason),
@@ -1803,6 +1811,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.telephone_event_payload_type(),
                 near_telephone_event,
                 record_path.as_deref(),
+                profile.noise_suppression,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("media pipeline (B→A)", &reason),
@@ -2348,6 +2357,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     None,
                     None,
+                    // Noise suppression is not carried in the checkpoint snapshot, so a cold restore
+                    // resumes without it — matching how recording (`record_path`) is not restored.
+                    false,
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -2365,6 +2377,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     near_te,
                     None,
+                    false,
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -2464,6 +2477,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     None,
                     None,
+                    false,
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -2481,6 +2495,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     near_te,
                     None,
+                    false,
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -3534,6 +3549,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_te,
             far_te,
             None,
+            // Echo promotion is a runtime control action, not an offer/answer profile; no NS here.
+            false,
         )?;
         let b_to_a = build_direction(
             layout.far_endpoint,
@@ -3545,6 +3562,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_te,
             near_te,
             None,
+            false,
         )?;
 
         // Switch both RTP endpoints to Redirect so the dispatcher routes them to the media actor.
@@ -4389,7 +4407,9 @@ fn resolve_pipeline(
             PipelineKind::Srtp
         };
     }
-    if profile.record_call || transcode {
+    if profile.record_call || profile.noise_suppression || transcode {
+        // Recording, noise suppression, or a codec mismatch all need the decoded audio, so force the
+        // userspace media slow path instead of the in-kernel passthrough.
         PipelineKind::Media
     } else {
         PipelineKind::Passthrough
@@ -4465,6 +4485,7 @@ fn build_direction(
     telephone_event_in: Option<u8>,
     telephone_event_out: Option<u8>,
     record_path: Option<&str>,
+    noise_suppression: bool,
 ) -> Result<DirectionConfig, String> {
     let decoder = factory::decoder_for(ingress_codec).map_err(|error| error.to_string())?;
     let encoder = factory::encoder_for(egress_codec).map_err(|error| error.to_string())?;
@@ -4484,6 +4505,9 @@ fn build_direction(
         telephone_event_in,
         telephone_event_out,
         recorder,
+        // The suppressor is built (and rate-gated) inside `Direction::new` from the decoder's native
+        // rate; carry only the request here. Inert unless the ingress rate is 8/16 kHz.
+        noise_suppression,
         // The G.107 codec class of the stream this direction decodes (the ingress codec), for the MOS
         // in its periodic quality report — mapped the same way as the HEP QoS / conference paths.
         ingress_mos_codec: crate::conference::hep_codec_for_name(&ingress_codec.encoding_name),

@@ -15,6 +15,7 @@ use crate::bridge::protocol::{
 };
 use crate::bridge::{l16_le_to_pcm, pcm_to_l16_le};
 use crate::leg::{MediaLeg, PcmFrame};
+use siphon_rtp_dsp::NoiseSuppressor;
 
 /// Largest frame the scratch PCM buffer holds (48 kHz × 20 ms).
 const MAX_FRAME_SAMPLES: usize = 960;
@@ -39,6 +40,10 @@ pub struct BridgeSession {
     playout: VecDeque<Vec<i16>>,
     playout_cap: usize,
     stopped: bool,
+    /// Single-channel noise suppression on the uplink (call → server) audio, so the voice-AI receives
+    /// cleaned speech. `Some` only when requested *and* the uplink rate is 8/16 kHz (see
+    /// [`BridgeSession::with_noise_suppression`]); introduces the suppressor's WOLA latency on uplink.
+    noise_suppressor: Option<NoiseSuppressor>,
 }
 
 impl BridgeSession {
@@ -61,7 +66,19 @@ impl BridgeSession {
             playout: VecDeque::new(),
             playout_cap: playout_cap.max(1),
             stopped: false,
+            noise_suppressor: None,
         }
+    }
+
+    /// Enable single-channel noise suppression on the uplink audio (call → voice-AI server). Built
+    /// from the advertised uplink sample rate; a no-op unless `enabled` is set *and* that rate is
+    /// 8 or 16 kHz (the suppressor's supported rates — e.g. a 48 kHz Opus leg leaves it off).
+    #[must_use]
+    pub fn with_noise_suppression(mut self, enabled: bool) -> Self {
+        self.noise_suppressor = enabled
+            .then(|| NoiseSuppressor::new(self.format.sample_rate).ok())
+            .flatten();
+        self
     }
 
     /// The `start` message to send as the first text frame.
@@ -150,6 +167,10 @@ impl BridgeSession {
         if let Ok(PcmFrame::Decoded(written) | PcmFrame::Concealed(written)) =
             self.leg.next_pcm(&mut pcm[..frame_samples])
         {
+            // Clean the uplink audio in place before framing it toward the server, when enabled.
+            if let Some(suppressor) = self.noise_suppressor.as_mut() {
+                suppressor.process(&mut pcm[..written]);
+            }
             result.uplink_bytes = pcm_to_l16_le(&pcm[..written], uplink_out);
         }
 
@@ -229,6 +250,83 @@ mod tests {
         assert_eq!(result.uplink_bytes, 320, "8k/20ms L16 = 320 bytes");
         // Decoded silence → all-zero L16.
         assert!(uplink[..320].iter().all(|&byte| byte == 0));
+    }
+
+    fn ulaw_packet_pcm(sequence: u16, pcm: &[i16]) -> Vec<u8> {
+        use siphon_rtp_codec::Encoder as _;
+        let mut encoder = G711::ulaw();
+        let mut payload = [0u8; 160];
+        let len = encoder.encode(pcm, &mut payload).expect("encode");
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 0,
+            sequence,
+            timestamp: u32::from(sequence) * 160,
+            ssrc: 1,
+        };
+        let mut buffer = vec![0u8; 12 + len];
+        let written = write_packet(&header, &payload[..len], &mut buffer).expect("write");
+        buffer.truncate(written);
+        buffer
+    }
+
+    #[test]
+    fn noise_suppression_attenuates_uplink_audio() {
+        // Deterministic white-noise PCM frames, identical for both runs.
+        let mut state = 0x2247_9BEFu32;
+        let mut noise_sample = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((state >> 8) as f32 / (1u32 << 24) as f32) - 0.5) * 2.0 * 2000.0
+        };
+        let frames: Vec<Vec<i16>> = (0..160)
+            .map(|_| (0..160).map(|_| noise_sample() as i16).collect())
+            .collect();
+
+        // Total L16-uplink energy over the converged region (past the suppressor's WOLA startup).
+        let uplink_energy = |noise_suppression: bool| -> f64 {
+            let leg = MediaLeg::new(
+                Box::new(G711::ulaw()),
+                Box::new(G711::ulaw()),
+                JitterBuffer::new(1, 16),
+                0x5555_6666,
+                0,
+            );
+            let mut session = BridgeSession::new(
+                leg,
+                MediaFormat::telephony_default(),
+                "str_1",
+                "call_1",
+                Direction::Duplex,
+                8,
+            )
+            .with_noise_suppression(noise_suppression);
+
+            let mut uplink = [0u8; 1024];
+            let mut downlink = [0u8; 1024];
+            let mut energy = 0.0f64;
+            for (index, frame) in frames.iter().enumerate() {
+                session.on_rtp(&ulaw_packet_pcm(index as u16, frame));
+                let result = session.tick(&mut uplink, &mut downlink);
+                if index < 30 || result.uplink_bytes == 0 {
+                    continue;
+                }
+                let mut pcm = vec![0i16; result.uplink_bytes / 2];
+                let count = l16_le_to_pcm(&uplink[..result.uplink_bytes], &mut pcm);
+                energy += pcm[..count]
+                    .iter()
+                    .map(|&sample| f64::from(sample) * f64::from(sample))
+                    .sum::<f64>();
+            }
+            energy
+        };
+
+        let off = uplink_energy(false);
+        let on = uplink_energy(true);
+        assert!(off > 0.0, "sanity: the uplink carries the noise through");
+        assert!(
+            on < 0.7 * off,
+            "noise suppression must attenuate the uplink: on {on:.3e} vs off {off:.3e}"
+        );
     }
 
     #[test]
