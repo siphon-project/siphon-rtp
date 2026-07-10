@@ -449,7 +449,12 @@ fn bench_amrnb_encode(criterion: &mut Criterion) {
         return;
     }
 
-    for mode in [AmrNbMode::Mr475, AmrNbMode::Mr1220] {
+    for mode in [
+        AmrNbMode::Mr475,
+        AmrNbMode::Mr515,
+        AmrNbMode::Mr590,
+        AmrNbMode::Mr1220,
+    ] {
         let nb_bits = mode.bits() as usize;
         let frame_pcm: Vec<i16> = pcm[frame_index * FRAME..(frame_index + 1) * FRAME].to_vec();
 

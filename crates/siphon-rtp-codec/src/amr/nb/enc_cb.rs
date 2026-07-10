@@ -4,14 +4,16 @@
 //! helpers: `cor_h_x` (`cor_h.c` `cor_h_x`/`cor_h_x2` — the target×impulse-response correlation
 //! `dn[]`), `cor_h` (`cor_h.c` `cor_h` — the sign-folded impulse-response autocorrelation matrix
 //! `rr[][]`), `set_sign` / `set_sign12k2` (`set_sign.c` — the pulse sign vector + track maxima /
-//! starting positions), and the two per-mode searches ported for this tier:
+//! starting positions), and the per-mode searches ported so far:
 //!  * MR122 (12.2 kbit/s): `c1035pf.c` `code_10i40_35bits` — 10 pulses / 5 tracks, depth-first via
 //!    `s10_8pf.c` `search_10and8i40` (GSM-EFR flavour, `gsmefrFlag = 1`).
-//!  * MR475 & MR515 (4.75 / 5.15 kbit/s): `c2_9pf.c` `code_2i40_9bits` — 2 pulses / 2 tracks.
+//!  * MR475 & MR515 (4.75 / 5.15 kbit/s): `c2_9pf.c` `code_2i40_9bits` — 2 pulses / 9-bit index.
+//!  * MR59 (5.90 kbit/s): `c2_11pf.c` `code_2i40_11bits` — 2 pulses / 11-bit index (fixed 2×4 track
+//!    grid). Shares the two-pulse inner search kernel with the 9-bit codebook.
 //!
-//! The remaining modes' searches (`c2_11pf` MR59, `c3_14pf` MR67, `c4_17pf` MR74, `c8_31pf`
-//! MR102/MR795) are OUT OF SCOPE for this tier — a later extension wires them into
-//! [`cbsearch`]'s dispatch (the shared `cor_h_x`/`cor_h`/`set_sign` helpers already generalize).
+//! The remaining modes' searches (`c3_14pf` MR67, `c4_17pf` MR74, `c8_31pf` MR102/MR795) are OUT OF
+//! SCOPE for this tier — a later extension wires them into [`cbsearch`]'s dispatch (the shared
+//! `cor_h_x`/`cor_h`/`set_sign` helpers already generalize).
 //!
 //! Everything is bit-exact against the fixed-point reference: all arithmetic goes through
 //! [`crate::amr::basic_ops`] / `crate::amr::nb::math_nb`, never native integer arithmetic on the
@@ -289,10 +291,69 @@ fn cor_h(h: &[i16], sign: &[i16], rr: &mut [i16]) {
 //  MR475 / MR515 : 2-pulse 9-bit search (c2_9pf.c)
 // =============================================================================================
 
-/// `c2_9pf.c` `search_2i40` — find the 2 pulse positions.
-fn search_2i40(sub_nr: i16, dn: &[i16], rr: &[i16], codvec: &mut [i16; NB_PULSE_2I40]) {
+/// Shared inner search body for the two-pulse codebooks (`c2_9pf.c` / `c2_11pf.c` `search_2i40`):
+/// given one track start pair `(ipos0, ipos1)`, scan pulse `i0` over its track and pulse `i1` over its
+/// track (both stepping by [`STEP`]) and update the running best `(psk, alpk, codvec)` with the
+/// division-free cross-multiply metric `L_msu(L_mult(alp, sq1), sq, alp_16) > 0` (strict `>0`,
+/// first-found-wins). The two reference files share this body verbatim (same `_1_4`/`_1_2` weights);
+/// only the set of `(ipos0, ipos1)` track pairs differs — MR475/MR515 (9-bit, subframe-dependent) vs
+/// MR59 (11-bit, fixed 2×4 grid).
+fn search_2i40_track_pair(
+    ipos0: i16,
+    ipos1: i16,
+    dn: &[i16],
+    rr: &[i16],
+    psk: &mut i16,
+    alpk: &mut i16,
+    codvec: &mut [i16; NB_PULSE_2I40],
+) {
     let rr = |i: usize, j: usize| -> i16 { rr[i * L_CODE + j] };
 
+    // i0 loop: 8 positions.
+    let mut i0 = ipos0;
+    while (i0 as usize) < L_CODE {
+        let ps0 = dn[i0 as usize];
+        let alp0 = l_mult(rr(i0 as usize, i0 as usize), Q15_1_4);
+
+        // i1 loop: 8 positions.
+        let mut sq: i16 = -1;
+        let mut alp: i16 = 1;
+        let mut ix = ipos1;
+
+        let mut i1 = ipos1;
+        while (i1 as usize) < L_CODE {
+            let ps1 = add(ps0, dn[i1 as usize]);
+            // alp1 = alp0 + ¼·rr[i1][i1] + ½·rr[i0][i1].
+            let mut alp1 = l_mac(alp0, rr(i1 as usize, i1 as usize), Q15_1_4);
+            alp1 = l_mac(alp1, rr(i0 as usize, i1 as usize), Q15_1_2);
+
+            let sq1 = mult(ps1, ps1);
+            let alp_16 = round_word(alp1);
+
+            let s = l_msu(l_mult(alp, sq1), sq, alp_16);
+            if s > 0 {
+                sq = sq1;
+                alp = alp_16;
+                ix = i1;
+            }
+            i1 += STEP as i16;
+        }
+
+        // Memorise the codevector if this one is better.
+        let s = l_msu(l_mult(*alpk, sq), *psk, alp);
+        if s > 0 {
+            *psk = sq;
+            *alpk = alp;
+            codvec[0] = i0;
+            codvec[1] = ix;
+        }
+        i0 += STEP as i16;
+    }
+}
+
+/// `c2_9pf.c` `search_2i40` — MR475/MR515 (9-bit) 2-pulse search: 2 track pairs seeded from the
+/// subframe-dependent `startPos[]` table.
+fn search_2i40(sub_nr: i16, dn: &[i16], rr: &[i16], codvec: &mut [i16; NB_PULSE_2I40]) {
     let mut psk: i16 = -1;
     let mut alpk: i16 = 1;
     for (i, c) in codvec.iter_mut().enumerate() {
@@ -302,46 +363,27 @@ fn search_2i40(sub_nr: i16, dn: &[i16], rr: &[i16], codvec: &mut [i16; NB_PULSE_
     for track1 in 0i16..2 {
         let ipos0 = START_POS[(sub_nr * 2 + 8 * track1) as usize];
         let ipos1 = START_POS[(sub_nr * 2 + 1 + 8 * track1) as usize];
+        search_2i40_track_pair(ipos0, ipos1, dn, rr, &mut psk, &mut alpk, codvec);
+    }
+}
 
-        // i0 loop: 8 positions.
-        let mut i0 = ipos0;
-        while (i0 as usize) < L_CODE {
-            let ps0 = dn[i0 as usize];
-            let alp0 = l_mult(rr(i0 as usize, i0 as usize), Q15_1_4);
+/// `c2_11pf.c` `search_2i40` — MR59 (11-bit) 2-pulse search: a fixed 2×4 grid of track pairs
+/// (`c2_11pf.tab` `startPos1[2]` × `startPos2[4]`), not subframe-dependent. `i0` ranges over 2×8
+/// positions (tracks starting at 1, 3), `i1` over 4×8 (tracks starting at 0, 1, 2, 4).
+fn search_2i40_11bits(dn: &[i16], rr: &[i16], codvec: &mut [i16; NB_PULSE_2I40]) {
+    // c2_11pf.tab: startPos1[2] = {1, 3}; startPos2[4] = {0, 1, 2, 4}.
+    const START_POS1: [i16; 2] = [1, 3];
+    const START_POS2: [i16; 4] = [0, 1, 2, 4];
 
-            // i1 loop: 8 positions.
-            let mut sq: i16 = -1;
-            let mut alp: i16 = 1;
-            let mut ix = ipos1;
+    let mut psk: i16 = -1;
+    let mut alpk: i16 = 1;
+    for (i, c) in codvec.iter_mut().enumerate() {
+        *c = i as i16;
+    }
 
-            let mut i1 = ipos1;
-            while (i1 as usize) < L_CODE {
-                let ps1 = add(ps0, dn[i1 as usize]);
-                // alp1 = alp0 + ¼·rr[i1][i1] + ½·rr[i0][i1].
-                let mut alp1 = l_mac(alp0, rr(i1 as usize, i1 as usize), Q15_1_4);
-                alp1 = l_mac(alp1, rr(i0 as usize, i1 as usize), Q15_1_2);
-
-                let sq1 = mult(ps1, ps1);
-                let alp_16 = round_word(alp1);
-
-                let s = l_msu(l_mult(alp, sq1), sq, alp_16);
-                if s > 0 {
-                    sq = sq1;
-                    alp = alp_16;
-                    ix = i1;
-                }
-                i1 += STEP as i16;
-            }
-
-            // Memorise the codevector if this one is better.
-            let s = l_msu(l_mult(alpk, sq), psk, alp);
-            if s > 0 {
-                psk = sq;
-                alpk = alp;
-                codvec[0] = i0;
-                codvec[1] = ix;
-            }
-            i0 += STEP as i16;
+    for &ipos0 in &START_POS1 {
+        for &ipos1 in &START_POS2 {
+            search_2i40_track_pair(ipos0, ipos1, dn, rr, &mut psk, &mut alpk, codvec);
         }
     }
 }
@@ -462,6 +504,134 @@ fn code_2i40_9bits(
     cor_h(h, &dn_sign, &mut rr);
     search_2i40(sub_nr, &dn, &rr, &mut codvec);
     let index = build_code_2i40(sub_nr, &codvec, &dn_sign, code, h, y, sign);
+
+    // Post-CB pitch sharpening folded into code[].
+    if sub(t0, L_CODE as i16) < 0 {
+        for i in (t0 as usize)..L_CODE {
+            code[i] = add(code[i], mult(code[i - t0 as usize], sharp));
+        }
+    }
+
+    index
+}
+
+// =============================================================================================
+//  MR59 : 2-pulse 11-bit search (c2_11pf.c)
+// =============================================================================================
+
+/// `c2_11pf.c` `build_code` — build the innovation `cod[]`, filtered code `y[]`, the 2-pulse sign word
+/// (`*sign`) and the 9-bit position index (returned) for the 11-bit codebook. The index bit-packing
+/// differs from the 9-bit codebook: pulse i0 (tracks 1, 3) occupies bits 0-3, pulse i1 (tracks 0, 1,
+/// 2, 4) occupies bits 4-8 — see `d2_11pf.c` for the inverse.
+fn build_code_2i40_11bits(
+    codvec: &[i16; NB_PULSE_2I40],
+    dn_sign: &[i16],
+    cod: &mut [i16],
+    h: &[i16],
+    y: &mut [i16],
+    sign: &mut i16,
+) -> i16 {
+    for c in cod.iter_mut().take(L_CODE) {
+        *c = 0;
+    }
+
+    let mut sign_pulses = [0i16; NB_PULSE_2I40];
+    let mut indx: i16 = 0;
+    let mut rsign: i16 = 0;
+    for k in 0..NB_PULSE_2I40 {
+        let i = codvec[k];
+        let j = dn_sign[i as usize];
+
+        let mut index = mult(i, 6554); // index = pos/5
+        let track = sub(i, extract_l(l_shr(l_mult(index, 5), 1))); // track = pos%5
+
+        // Remap the raw track (pos%5) to the transmitted sign-track and finalize the position bits.
+        let track = if track == 0 {
+            index = shl(index, 6);
+            1i16
+        } else if track == 1 {
+            if k == 0 {
+                index = shl(index, 1);
+                0i16
+            } else {
+                index = add(shl(index, 6), 16);
+                1i16
+            }
+        } else if track == 2 {
+            index = add(shl(index, 6), 32);
+            1i16
+        } else if track == 3 {
+            index = add(shl(index, 1), 1);
+            0i16
+        } else {
+            // track == 4
+            index = add(shl(index, 6), 48);
+            1i16
+        };
+
+        if j > 0 {
+            cod[i as usize] = 8191;
+            sign_pulses[k] = 32767;
+            rsign = add(rsign, shl(1, track));
+        } else {
+            cod[i as usize] = -8192;
+            sign_pulses[k] = -32768; // (Word16)-32768
+        }
+        indx = add(indx, index);
+    }
+    *sign = rsign;
+
+    // y[i] = round( Σ_k h[i - codvec[k]] · sign_pulses[k] ), reading h[n<0] as 0.
+    let p0 = codvec[0];
+    let p1 = codvec[1];
+    for (i, yi) in y.iter_mut().enumerate().take(L_CODE) {
+        let mut s: i32 = 0;
+        let n0 = i as isize - p0 as isize;
+        if n0 >= 0 {
+            s = l_mac(s, h[n0 as usize], sign_pulses[0]);
+        }
+        let n1 = i as isize - p1 as isize;
+        if n1 >= 0 {
+            s = l_mac(s, h[n1 as usize], sign_pulses[1]);
+        }
+        *yi = round_word(s);
+    }
+
+    indx
+}
+
+/// `c2_11pf.c` `code_2i40_11bits` — MR59 fixed-codebook search over a 40-sample subframe with 2
+/// pulses (11-bit index). `h` is modified in place with the pitch-sharpening contribution (as the
+/// reference does), so the caller must pass a writable copy. Returns the position index and writes
+/// the sign word to `sign`. Unlike the 9-bit search this takes no subframe number.
+fn code_2i40_11bits(
+    x: &[i16],
+    h: &mut [i16],
+    t0: i16,
+    pitch_sharp: i16,
+    code: &mut [i16],
+    y: &mut [i16],
+    sign: &mut i16,
+) -> i16 {
+    let sharp = shl(pitch_sharp, 1);
+    // Pre-CB pitch sharpening folded into h[] (as the reference does, before the search).
+    if sub(t0, L_CODE as i16) < 0 {
+        for i in (t0 as usize)..L_CODE {
+            h[i] = add(h[i], mult(h[i - t0 as usize], sharp));
+        }
+    }
+
+    let mut dn = [0i16; L_CODE];
+    let mut dn2 = [0i16; L_CODE];
+    let mut dn_sign = [0i16; L_CODE];
+    let mut rr = [0i16; L_CODE * L_CODE];
+    let mut codvec = [0i16; NB_PULSE_2I40];
+
+    cor_h_x(h, x, &mut dn, 1);
+    set_sign(&mut dn, &mut dn_sign, &mut dn2, 8); // dn2[] unused in this search (n = 8)
+    cor_h(h, &dn_sign, &mut rr);
+    search_2i40_11bits(&dn, &rr, &mut codvec);
+    let index = build_code_2i40_11bits(&codvec, &dn_sign, code, h, y, sign);
 
     // Post-CB pitch sharpening folded into code[].
     if sub(t0, L_CODE as i16) < 0 {
@@ -871,12 +1041,13 @@ fn code_10i40_35bits(
 /// reference writes them via `*(*anap)++`), plus the mode's parameter count.
 ///
 /// * MR122 (`code_10i40_35bits`): 10 params — the 10 packed pulse indices (`indx[0..10]`).
-/// * MR475/MR515 (`code_2i40_9bits`): 2 params — the position index, then the sign index.
+/// * MR475/MR515 (`code_2i40_9bits`) and MR59 (`code_2i40_11bits`): 2 params — the position index,
+///   then the sign index.
 #[derive(Debug, Clone)]
 pub struct CbSearchResult {
     /// Codebook parameters, written in `*anap++` order. Only the first [`Self::num_params`] valid.
     pub params: [i16; 10],
-    /// Number of valid entries in [`Self::params`] (2 for MR475/MR515, 10 for MR122).
+    /// Number of valid entries in [`Self::params`] (2 for MR475/MR515/MR59, 10 for MR122).
     pub num_params: usize,
 }
 
@@ -894,9 +1065,9 @@ pub struct CbSearchResult {
 ///  * Outputs: `code` (innovation, Q13), `y2` (filtered code, Q12), and the returned
 ///    [`CbSearchResult`] carrying the `ana` params.
 ///
-/// Only MR122 and MR475/MR515 are implemented in this tier; other modes return
+/// Only MR122, MR475/MR515 and MR59 are implemented so far; other modes return
 /// [`CodecError::Unsupported`] (they are gated out of the encoder until their search files are
-/// ported). Tier 6 only ever calls the two live modes.
+/// ported). The frame loop only ever calls the live modes.
 #[allow(clippy::too_many_arguments)]
 pub fn cbsearch(
     xn2: &[i16],
@@ -916,6 +1087,16 @@ pub fn cbsearch(
         AmrNbMode::Mr475 | AmrNbMode::Mr515 => {
             let mut sign = 0i16;
             let index = code_2i40_9bits(sub_nr, xn2, h1, t0, pitch_sharp, code, y2, &mut sign);
+            params[0] = index; // position index
+            params[1] = sign; //  sign index
+            Ok(CbSearchResult {
+                params,
+                num_params: 2,
+            })
+        }
+        AmrNbMode::Mr590 => {
+            let mut sign = 0i16;
+            let index = code_2i40_11bits(xn2, h1, t0, pitch_sharp, code, y2, &mut sign);
             params[0] = index; // position index
             params[1] = sign; //  sign index
             Ok(CbSearchResult {
@@ -1055,6 +1236,58 @@ mod tests {
         let mut cod_dec = [0i16; L_CODE];
         decode_2i40_9bits(0, sign, index, &mut cod_dec);
         assert_eq!(code, cod_dec, "encoder/decoder codeword mismatch");
+    }
+
+    #[test]
+    fn code_2i40_11bits_places_two_pulses_and_signs_roundtrip() {
+        // MR59 11-bit codebook: build a code and confirm the 11-bit decoder twin reconstructs the
+        // same two ±8191/-8192 pulses from the returned position/sign indices.
+        use crate::amr::nb::codebook::decode_2i40_11bits;
+        let mut h = [0i16; L_CODE];
+        h[0] = 4096; // unit-ish impulse response
+        let mut x = [0i16; L_CODE];
+        x[1] = 8000; // peak on an i0 track (pos%5 == 1)
+        x[5] = -6000; // peak on an i1 track (pos%5 == 0)
+        let mut code = [0i16; L_CODE];
+        let mut y = [0i16; L_CODE];
+        let mut sign = 0i16;
+        let index = code_2i40_11bits(&x, &mut h, 40, 0, &mut code, &mut y, &mut sign);
+
+        // exactly two nonzero pulses at ±8191/-8192
+        let nz: Vec<_> = code.iter().enumerate().filter(|(_, &v)| v != 0).collect();
+        assert_eq!(nz.len(), 2);
+        assert!(nz.iter().all(|&(_, &v)| v == 8191 || v == -8192));
+
+        // decoder reconstructs the same pulse positions/signs
+        let mut cod_dec = [0i16; L_CODE];
+        decode_2i40_11bits(sign, index, &mut cod_dec);
+        assert_eq!(code, cod_dec, "MR59 encoder/decoder codeword mismatch");
+    }
+
+    #[test]
+    fn cbsearch_mr590_emits_two_params() {
+        let mut h = [0i16; L_CODE];
+        h[0] = 4096;
+        let mut xn2 = [0i16; L_CODE];
+        xn2[1] = 5000;
+        xn2[5] = -4000;
+        let res2 = xn2;
+        let mut code = [0i16; L_CODE];
+        let mut y2 = [0i16; L_CODE];
+        let r = cbsearch(
+            &xn2,
+            &mut h,
+            40,
+            0,
+            8192,
+            &res2,
+            &mut code,
+            &mut y2,
+            AmrNbMode::Mr590,
+            0,
+        )
+        .expect("MR59 cbsearch");
+        assert_eq!(r.num_params, 2);
     }
 
     #[test]
@@ -1299,6 +1532,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oracle_gate_mr515_all_subframes_bit_exact() {
+        if let Some(n) = run_cb_oracle_gate("/tmp/amr-nb-oracle-t4/dump_mr515.txt") {
+            eprintln!("MR515 cbsearch oracle gate: {n} subframes bit-exact");
+        } else {
+            eprintln!("MR515 cbsearch oracle dump absent — skipping full gate");
+        }
+    }
+
+    #[test]
+    fn oracle_gate_mr59_all_subframes_bit_exact() {
+        if let Some(n) = run_cb_oracle_gate("/tmp/amr-nb-oracle-t4/dump_mr59.txt") {
+            eprintln!("MR59 cbsearch oracle gate: {n} subframes bit-exact");
+        } else {
+            eprintln!("MR59 cbsearch oracle dump absent — skipping full gate");
+        }
+    }
+
     /// Committed self-contained regression: feed the oracle-captured *inputs* of frame 10, subframe
     /// 0 (real pitch energy, non-zero `sharp` so the pitch-sharpening path is exercised) into
     /// [`cbsearch`] and pin the transmitted codebook params + `code`/`y2` (spot samples + sum/sumsq
@@ -1424,6 +1675,75 @@ mod tests {
             (-1, 134_201_345),
             &[(25, -4096), (27, 4511), (39, 57)],
             (-11, 38_595_193),
+        );
+    }
+
+    #[test]
+    fn mr515_frame10_subfr0_cbsearch_matches_reference() {
+        // Same 9-bit 2-pulse codebook as MR475, but reached via the MR515 dispatch arm and driven by
+        // the MR515 per-subframe input (real pitch energy, non-zero `sharp`). Pins the transmitted
+        // params + code/y2 to the byte-exact encoder output (validated frame-for-frame against the
+        // official T01_515.COD).
+        frame10_subfr0_cb_regression(
+            AmrNbMode::Mr515,
+            0,
+            141,
+            3932,
+            13926,
+            &[
+                526, 593, -538, 1644, -2163, 1326, -2233, -7380, 4207, 6381, 1059, -2645, 331,
+                2494, 595, 2513, 336, 890, 981, 1335, 1619, -369, 988, -143, 601, 245, -276, 197,
+                -973, 365, -361, -145, 144, -330, -425, -783, -223, -687, -149, -531,
+            ],
+            &[
+                4096, 771, -305, 183, -195, 151, -165, -179, 91, -36, -228, -112, 63, -12, 23, 17,
+                -5, 64, -5, -8, 30, 12, 2, -14, -2, -4, -5, -3, -9, 6, -1, -4, 3, 0, 4, 0, 0, 2,
+                -1, 1,
+            ],
+            &[
+                725, 328, -468, 1700, -2509, 1975, -2878, -6438, 4904, 5371, 501, -2800, 1152,
+                1733, 228, 2946, -100, 505, 795, 2080, 1239, -475, 1196, -293, 961, 90, 14, 112,
+                -818, 594, -521, 116, -12, -219, -472, -699, -124, -765, -11, -636,
+            ],
+            &[11, 1],
+            &[(7, -8192), (15, 8191)],
+            (-1, 134_201_345),
+            &[(7, -4096), (15, 4005)],
+            (17, 34_658_561),
+        );
+    }
+
+    #[test]
+    fn mr59_frame10_subfr0_cbsearch_matches_reference() {
+        // MR59 11-bit 2-pulse codebook (`c2_11pf`). Pins the transmitted params + code/y2 of frame 10
+        // subframe 0 (real pitch energy, non-zero `sharp` so the pitch-sharpening path runs) to the
+        // byte-exact encoder output (validated frame-for-frame against the official T01_59.COD).
+        frame10_subfr0_cb_regression(
+            AmrNbMode::Mr590,
+            0,
+            141,
+            10813,
+            17191,
+            &[
+                -189, 315, 159, 1477, -3159, 2755, 1768, -6804, -1298, 1180, 1352, 963, 1655, 769,
+                503, 2317, -1419, 520, 597, -94, 548, -563, 1025, -543, 214, -409, -863, 303, -161,
+                668, -651, -40, -425, -788, -239, -467, 319, -389, 150, -285,
+            ],
+            &[
+                4096, 1112, -632, 230, -18, -2, -201, -40, 15, -103, -87, -242, 52, 76, -63, 59, 4,
+                45, 7, -11, 42, -7, 26, -21, -15, 19, -26, 6, -7, -3, 7, -12, 8, -4, 3, 4, -6, 8,
+                -3, 1,
+            ],
+            &[
+                210, 37, 264, 1338, -3530, 3924, -2, -5943, 7, 334, 1462, 718, 1811, -73, 829,
+                1893, -1629, 1190, -500, 578, 379, -374, 1206, -858, 814, -854, -303, 46, -68, 767,
+                -975, 401, -838, -365, -355, -387, 361, -612, 455, -598,
+            ],
+            &[102, 0],
+            &[(7, -8192), (16, -8192)],
+            (-16384, 134_217_728),
+            &[(7, -4096), (8, -1112), (16, -3993)],
+            (-8651, 36_462_871),
         );
     }
 }
