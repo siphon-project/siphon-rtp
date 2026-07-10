@@ -195,6 +195,25 @@ fn bench_aec(criterion: &mut Criterion) {
             black_box(near[0])
         });
     });
+
+    // The residual-echo suppressor chained after the time-domain NLMS: on top of the linear cancel it
+    // pays, per 20 ms frame, a √Hann WOLA STFT over the residual (one or two 256-point forward+inverse
+    // FFT hops + the per-bin decision-directed Wiener gain) and an analysis-only forward FFT of the
+    // frame-synchronous echo estimate. The extra per-frame cost the residual post-filter adds — the
+    // number that informs whether the engine runs it inline or on a DSP worker (that wiring is a later
+    // PR). Loud far-end + quiet echo-like near-end so the Geigel screen never freezes the linear filter.
+    criterion.bench_function("aec_res_8k_20ms", |bencher| {
+        let mut canceller = EchoCanceller::new(8_000, TAIL)
+            .expect("build")
+            .with_residual_suppression()
+            .expect("res");
+        let mut near = near_quiet_8k.clone();
+        bencher.iter(|| {
+            near.copy_from_slice(&near_quiet_8k);
+            canceller.cancel(black_box(&mut near), black_box(&far_loud_8k));
+            black_box(near[0])
+        });
+    });
 }
 
 criterion_group!(

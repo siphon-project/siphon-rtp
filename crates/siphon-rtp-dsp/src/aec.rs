@@ -68,6 +68,8 @@
 //! search range, so a re-align only shifts a read offset — never a heap allocation.
 
 use crate::fft::{Complex, RealFft};
+use crate::res::ResidualEchoSuppressor;
+use crate::DspError;
 use siphon_rtp_simd::fir_dot_f32;
 
 /// i16 full-scale. Samples are processed in normalized `f32` in `[-1, 1)` so the NLMS step size,
@@ -208,6 +210,13 @@ pub enum AecError {
         got: usize,
         /// The maximum supported search range.
         max: usize,
+    },
+    /// The residual-echo suppressor only supports the 8 kHz / 16 kHz media-plane rates (its √Hann WOLA
+    /// sizes), so it cannot be chained onto a canceller at any other rate.
+    #[error("residual-echo suppression supports only 8000 and 16000 Hz (got {rate} Hz)")]
+    ResidualSuppressionUnavailable {
+        /// The canceller's sample rate, unsupported by the residual-echo suppressor.
+        rate: u32,
     },
 }
 
@@ -699,6 +708,21 @@ struct MdfFilter {
     out_res: Vec<f32>,
     /// Valid samples in [`Self::out_res`].
     out_len: usize,
+    /// Whether to capture the block echo estimate frame-synchronously with the residual (only when a
+    /// residual-echo suppressor is chained on — see [`EchoCanceller::with_residual_suppression`]). When
+    /// false the echo buffers below are left untouched, so the residual path stays byte-for-byte and
+    /// perf-for-perf identical to the RES-off MDF.
+    capture_echo: bool,
+    /// Per-block echo-estimate scratch `ŷ = last B samples of IFFT(Y)` (`B` reals), the parallel of
+    /// [`Self::block_error`]; only filled when [`Self::capture_echo`].
+    block_echo: Vec<f32>,
+    /// Echo-estimate output ring, drained in lock-step with [`Self::out_res`] so the echo frame the
+    /// RES receives is aligned sample-for-sample with the residual frame (both delayed by the block
+    /// latency). Same length and `out_len` bookkeeping as [`Self::out_res`].
+    out_echo: Vec<f32>,
+    /// The most recent frame's drained echo estimate (`frame_capacity` reals, normalized), handed to
+    /// the residual-echo suppressor after [`Self::push_frame`].
+    last_echo_frame: Vec<f32>,
     /// The [`FarEndReference`] (tail 1) that applies the bulk delay to the raw reference.
     reference: FarEndReference,
     /// Frequency-domain NLMS step `μ`.
@@ -770,6 +794,10 @@ impl MdfFilter {
             // Preload the block latency; capacity holds the latency + up to two blocks of production.
             out_res: vec![0.0; block_size + frame_capacity + 2 * block_size],
             out_len: block_size,
+            capture_echo: false,
+            block_echo: vec![0.0; block_size],
+            out_echo: vec![0.0; block_size + frame_capacity + 2 * block_size],
+            last_echo_frame: vec![0.0; frame_capacity],
             reference: FarEndReference::with_max_delay(1, 0, max_bulk_delay, frame_capacity),
             step_size: MDF_STEP_SIZE,
             regularization: MDF_REGULARIZATION,
@@ -785,6 +813,19 @@ impl MdfFilter {
     #[inline]
     fn bulk_delay(&self) -> usize {
         self.reference.bulk_delay
+    }
+
+    /// Turn on frame-synchronous echo-estimate capture (paid only when a residual-echo suppressor is
+    /// chained on); idempotent.
+    fn enable_echo_capture(&mut self) {
+        self.capture_echo = true;
+    }
+
+    /// The most recent [`Self::push_frame`]'s drained echo estimate (`n` normalized samples, aligned
+    /// sample-for-sample with the drained residual). Only populated when [`Self::capture_echo`] is on.
+    #[inline]
+    fn echo_frame(&self, n: usize) -> &[f32] {
+        &self.last_echo_frame[..n.min(self.last_echo_frame.len())]
     }
 
     /// Re-align the reference to a new bulk delay and reset the weights (they were tuned to the old
@@ -851,6 +892,18 @@ impl MdfFilter {
         for (sample, &residual) in near_end.iter_mut().take(n).zip(self.out_res.iter()) {
             *sample = denormalize(residual);
         }
+        if self.capture_echo {
+            // Drain the frame-aligned echo estimate for the RES before the ring shifts down.
+            for (slot, &echo) in self
+                .last_echo_frame
+                .iter_mut()
+                .take(n)
+                .zip(self.out_echo.iter())
+            {
+                *slot = echo;
+            }
+            self.out_echo.copy_within(n..self.out_len, 0);
+        }
         self.out_res.copy_within(n..self.out_len, 0);
         self.out_len -= n;
     }
@@ -904,6 +957,9 @@ impl MdfFilter {
             let echo = self.y_time[block + i];
             let residual = mic - echo;
             self.block_error[i] = residual;
+            if self.capture_echo {
+                self.block_echo[i] = echo;
+            }
             let mic64 = f64::from(mic);
             let echo64 = f64::from(echo);
             sum_mic_sq += mic64 * mic64;
@@ -912,9 +968,13 @@ impl MdfFilter {
             let reference = f64::from(self.in_ref[i]);
             far_energy += reference * reference;
         }
-        // Emit the residual (append to the output ring).
+        // Emit the residual (append to the output ring), plus the frame-aligned echo estimate when a
+        // residual-echo suppressor is chained on.
         let out_base = self.out_len;
         self.out_res[out_base..out_base + block].copy_from_slice(&self.block_error);
+        if self.capture_echo {
+            self.out_echo[out_base..out_base + block].copy_from_slice(&self.block_echo);
+        }
         self.out_len += block;
 
         // --- decide adaptation for this block (Geigel frame gate, or the per-block two-path NCC) ---
@@ -997,6 +1057,9 @@ impl MdfFilter {
         self.overlap_ref.iter_mut().for_each(|s| *s = 0.0);
         self.in_len = 0;
         self.out_res.iter_mut().for_each(|s| *s = 0.0);
+        self.out_echo.iter_mut().for_each(|s| *s = 0.0);
+        self.block_echo.iter_mut().for_each(|s| *s = 0.0);
+        self.last_echo_frame.iter_mut().for_each(|s| *s = 0.0);
         self.out_len = self.block_size;
         self.reference.reset();
         self.reference.set_bulk_delay(0);
@@ -1081,6 +1144,19 @@ pub struct EchoCanceller {
     /// time-domain `weights`/`foreground` are then inert. `None` selects the default time-domain
     /// backend, keeping every existing constructor byte-for-byte identical.
     mdf: Option<MdfFilter>,
+    /// Optional residual-echo suppressor (spectral post-filter). When present it runs **after** the
+    /// linear backend on the emitted residual, using the frame-synchronous echo estimate to knock down
+    /// the nonlinear / under-modelled echo the linear filter leaves behind. `None` (the default) keeps
+    /// the linear residual byte-for-byte, so every existing constructor is unaffected. See
+    /// [`EchoCanceller::with_residual_suppression`].
+    res: Option<ResidualEchoSuppressor>,
+    /// Preallocated snapshot of the near-end frame (normalized) taken **before** the time-domain
+    /// backend overwrites it, so the residual-echo suppressor can form `y_echo = near − residual`
+    /// (the MDF backend captures its own frame-aligned echo estimate instead). Length `frame_samples`.
+    res_near_snapshot: Vec<f32>,
+    /// Preallocated scratch for the frame-synchronous echo-estimate frame handed to the residual-echo
+    /// suppressor (normalized). Length `frame_samples`.
+    res_echo_frame: Vec<f32>,
 }
 
 impl EchoCanceller {
@@ -1141,6 +1217,9 @@ impl EchoCanceller {
             doubletalk_active: false,
             delay_estimator: None,
             mdf: None,
+            res: None,
+            res_near_snapshot: vec![0.0; frame_samples],
+            res_echo_frame: vec![0.0; frame_samples],
         })
     }
 
@@ -1196,6 +1275,9 @@ impl EchoCanceller {
             doubletalk_active: false,
             delay_estimator: Some(delay_estimator),
             mdf: None,
+            res: None,
+            res_near_snapshot: vec![0.0; frame_samples],
+            res_echo_frame: vec![0.0; frame_samples],
         })
     }
 
@@ -1272,6 +1354,9 @@ impl EchoCanceller {
             doubletalk_active: false,
             delay_estimator,
             mdf: Some(mdf),
+            res: None,
+            res_near_snapshot: vec![0.0; frame_samples],
+            res_echo_frame: vec![0.0; frame_samples],
         })
     }
 
@@ -1291,6 +1376,46 @@ impl EchoCanceller {
             mdf.dtd = MdfDtd::TwoPath;
         }
         self
+    }
+
+    /// Chain a **residual-echo suppressor** (spectral post-filter) after the linear backend
+    /// (chainable with every constructor and with [`EchoCanceller::with_two_path_dtd`], e.g.
+    /// `EchoCanceller::with_mdf(8_000, 1024)?.with_two_path_dtd().with_residual_suppression()?`).
+    ///
+    /// The linear NLMS/MDF filter removes only the echo that is a *linear* function of the far-end
+    /// within its tail; loudspeaker nonlinearity and under-modelled tail energy survive as a residual
+    /// echo in the emitted signal. The suppressor runs the residual through a √Hann WOLA STFT and
+    /// applies a per-bin decision-directed Wiener gain whose interference PSD is an adaptive
+    /// leakage-scaled estimate of the residual-echo power (from the frame-synchronous echo estimate),
+    /// **gated by this canceller's double-talk detector** so it never chews the near-end talker (see
+    /// [`ResidualEchoSuppressor`]). It is off unless this is called, so the committed linear residual
+    /// stays byte-for-byte identical without it.
+    ///
+    /// The suppressor adds a fixed `N`-sample (~32 ms) WOLA algorithmic delay on top of the backend's
+    /// own latency — see [`EchoCanceller::residual_suppression_latency_samples`]. With the MDF backend
+    /// this also turns on the (otherwise skipped) frame-synchronous echo-estimate capture. All state is
+    /// preallocated, so the hot path stays zero-per-frame-heap.
+    ///
+    /// # Errors
+    /// [`AecError::ResidualSuppressionUnavailable`] if the sample rate is not 8000 or 16000 Hz (the
+    /// suppressor's supported WOLA sizes).
+    pub fn with_residual_suppression(mut self) -> Result<Self, AecError> {
+        let suppressor =
+            ResidualEchoSuppressor::new(self.sample_rate_hz).map_err(|error| match error {
+                DspError::InvalidSampleRate { rate } => {
+                    AecError::ResidualSuppressionUnavailable { rate }
+                }
+                // The only failure `ResidualEchoSuppressor::new` returns for a validated rate is the rate
+                // itself; map anything else to the same surface rather than panicking.
+                _ => AecError::ResidualSuppressionUnavailable {
+                    rate: self.sample_rate_hz,
+                },
+            })?;
+        if let Some(mdf) = self.mdf.as_mut() {
+            mdf.enable_echo_capture();
+        }
+        self.res = Some(suppressor);
+        Ok(self)
     }
 
     /// Whether the adaptive filter backend is the MDF / partitioned-block frequency-domain filter
@@ -1397,6 +1522,23 @@ impl EchoCanceller {
         self.doubletalk_active
     }
 
+    /// Whether a residual-echo suppressor is chained on (see
+    /// [`EchoCanceller::with_residual_suppression`]).
+    #[must_use]
+    pub fn residual_suppression_enabled(&self) -> bool {
+        self.res.is_some()
+    }
+
+    /// The extra algorithmic delay in samples the residual-echo suppressor adds on top of the linear
+    /// backend's latency (one WOLA window `N` — 256 @ 8 kHz, 512 @ 16 kHz), or `None` when it is not
+    /// enabled.
+    #[must_use]
+    pub fn residual_suppression_latency_samples(&self) -> Option<usize> {
+        self.res
+            .as_ref()
+            .map(ResidualEchoSuppressor::latency_samples)
+    }
+
     /// Cancel the echo in one frame **in place**: subtract the estimated echo (the adaptive filter
     /// applied to the aligned far-end `reference`) from `near_end`, then adapt the filter by NLMS on
     /// the residual — frozen while a near-end talker is present so the filter never learns *him*.
@@ -1456,17 +1598,71 @@ impl EchoCanceller {
         let far_active = far_peak > self.far_peak_floor;
         let geigel_tripped = far_active && near_peak >= self.geigel_threshold * far_peak;
 
-        if self.mdf.is_some() {
-            self.cancel_mdf(n, near_end, reference, geigel_tripped);
-            return;
-        }
-
-        match self.dtd_mode {
-            DtdMode::Geigel => self.cancel_geigel(n, near_end, reference, geigel_tripped),
-            DtdMode::TwoPath => {
-                self.cancel_two_path(n, near_end, reference, geigel_tripped, far_active);
+        // Snapshot the near-end before a time-domain backend overwrites it in place, so the residual-
+        // echo suppressor can form `y_echo = near − residual`. The MDF backend captures its own
+        // frame-aligned echo estimate instead, so it needs no snapshot.
+        if self.res.is_some() && self.mdf.is_none() {
+            for (slot, &sample) in self.res_near_snapshot[..n].iter_mut().zip(near_end.iter()) {
+                *slot = f32::from(sample) / SAMPLE_SCALE;
             }
         }
+
+        if self.mdf.is_some() {
+            self.cancel_mdf(n, near_end, reference, geigel_tripped);
+        } else {
+            match self.dtd_mode {
+                DtdMode::Geigel => self.cancel_geigel(n, near_end, reference, geigel_tripped),
+                DtdMode::TwoPath => {
+                    self.cancel_two_path(n, near_end, reference, geigel_tripped, far_active);
+                }
+            }
+        }
+
+        // Residual-echo post-filter (off unless chained on): suppress the nonlinear / under-modelled
+        // echo the linear backend left behind, gated by the double-talk decision just computed.
+        if self.res.is_some() {
+            self.run_residual_suppression(near_end, n);
+        }
+    }
+
+    /// Run the chained residual-echo suppressor on the just-emitted residual frame. Stages the
+    /// frame-synchronous echo estimate (`near − residual` for the time-domain backends, the MDF's own
+    /// block-aligned capture for the MDF) and applies the spectral post-filter in place, gated by the
+    /// frame's double-talk decision. A no-op unless [`EchoCanceller::with_residual_suppression`] was
+    /// called (the caller checks `self.res.is_some()`).
+    fn run_residual_suppression(&mut self, near_end: &mut [i16], n: usize) {
+        let Self {
+            res,
+            mdf,
+            res_near_snapshot,
+            res_echo_frame,
+            doubletalk_active,
+            ..
+        } = self;
+        let Some(res) = res.as_mut() else {
+            return;
+        };
+        let double_talk = *doubletalk_active;
+        match mdf.as_ref() {
+            // MDF: the block-aligned echo estimate is delayed with the residual, so both drained frames
+            // line up sample-for-sample.
+            Some(mdf) => {
+                let echo = mdf.echo_frame(n);
+                let take = echo.len().min(n);
+                res_echo_frame[..take].copy_from_slice(&echo[..take]);
+                res_echo_frame[take..n].iter_mut().for_each(|s| *s = 0.0);
+            }
+            // Time-domain: `y_echo = near_before − residual`, frame-synchronous (no backend latency).
+            None => {
+                for (echo, (&near_before, &residual)) in res_echo_frame[..n]
+                    .iter_mut()
+                    .zip(res_near_snapshot[..n].iter().zip(near_end.iter()))
+                {
+                    *echo = near_before - f32::from(residual) / SAMPLE_SCALE;
+                }
+            }
+        }
+        res.process(near_end, &res_echo_frame[..n], double_talk);
     }
 
     /// The MDF / partitioned-block frequency-domain cancel path. It composes the shared pieces: the
@@ -1745,6 +1941,9 @@ impl EchoCanceller {
         }
         if let Some(mdf) = self.mdf.as_mut() {
             mdf.reset();
+        }
+        if let Some(res) = self.res.as_mut() {
+            res.reset();
         }
         self.doubletalk_hold_frames = 0;
         self.doubletalk_active = false;
@@ -3338,5 +3537,395 @@ mod tests {
             recovered >= 20.0,
             "composed MDF + delay-est + two-path recovered ERLE only {recovered:.1} dB"
         );
+    }
+
+    // ---- residual-echo suppressor (spectral post-filter) ----
+
+    /// A room impulse response with a reflection placed **beyond** a 256-tap tail (at tap 400), so a
+    /// short time-domain NLMS leaves it as an uncancellable *linear* residual echo — the
+    /// "under-modelled tail" the residual-echo suppressor knocks down. Its residual power tracks the
+    /// far-end (and hence the linear echo estimate) per bin, exactly the leakage model the RES assumes.
+    fn build_rir_with_late_reflection() -> Vec<f32> {
+        let mut rir = build_rir(420);
+        rir[400] = 0.045;
+        rir
+    }
+
+    /// Run one single-talk (echo-only) pass of `canceller` over a fixed far-end/echo and report the
+    /// steady-state ERLE over the last `tail_frames` frames (latency-invariant power ratio).
+    fn run_echo_only_erle(
+        canceller: &mut EchoCanceller,
+        far: &[i16],
+        echo: &[i16],
+        frame: usize,
+        tail_frames: usize,
+    ) -> f64 {
+        let frames = far.len() / frame;
+        let mut residual_stream = vec![0i16; frames * frame];
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            residual_stream[range].copy_from_slice(&mic);
+        }
+        steady_erle(echo, &residual_stream, frame, tail_frames)
+    }
+
+    #[test]
+    fn residual_suppression_off_by_default() {
+        let canceller = EchoCanceller::new(8_000, 256).expect("build");
+        assert!(!canceller.residual_suppression_enabled());
+        assert_eq!(canceller.residual_suppression_latency_samples(), None);
+
+        let with_res = EchoCanceller::new(8_000, 256)
+            .expect("build")
+            .with_residual_suppression()
+            .expect("res");
+        assert!(with_res.residual_suppression_enabled());
+        assert_eq!(with_res.residual_suppression_latency_samples(), Some(256));
+        let wideband = EchoCanceller::new(16_000, 256)
+            .expect("build")
+            .with_residual_suppression()
+            .expect("res");
+        assert_eq!(wideband.residual_suppression_latency_samples(), Some(512));
+    }
+
+    #[test]
+    fn residual_suppression_rejects_unsupported_rate() {
+        // The canceller supports any rate ≥ 8 kHz that is a multiple of 50; the RES supports only the
+        // 8/16 kHz WOLA sizes, so chaining it at 32 kHz is a clean typed error, not a panic.
+        let result = EchoCanceller::new(32_000, 256)
+            .expect("build")
+            .with_residual_suppression();
+        assert!(matches!(
+            result,
+            Err(AecError::ResidualSuppressionUnavailable { rate: 32_000 })
+        ));
+    }
+
+    /// **Total ERLE improvement.** On an echo path whose late reflection sits beyond the linear tail
+    /// (a measurable linear residual the NLMS cannot reach), the RES post-filter adds a quantified
+    /// extra suppression on top of the linear ERLE, measured on echo-only segments.
+    #[test]
+    fn residual_suppression_adds_erle_on_under_modelled_tail() {
+        let frame = 160;
+        let tail = 256;
+        let frames = 260;
+        let rir = build_rir_with_late_reflection();
+        let mut prng = SplitMix64::new(0x08E5_C0DE);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+
+        let mut linear = EchoCanceller::new(8_000, tail).expect("build");
+        let linear_erle = run_echo_only_erle(&mut linear, &far, &echo, frame, 60);
+
+        let mut suppressed = EchoCanceller::new(8_000, tail)
+            .expect("build")
+            .with_residual_suppression()
+            .expect("res");
+        let suppressed_erle = run_echo_only_erle(&mut suppressed, &far, &echo, frame, 60);
+
+        let extra = suppressed_erle - linear_erle;
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "under-modelled tail ERLE: linear {linear_erle:.1} dB, +RES {suppressed_erle:.1} dB, extra {extra:.1} dB"
+            );
+        }
+        assert!(
+            extra >= 6.0,
+            "RES added only {extra:.1} dB of residual-echo attenuation (want ≥ 6 dB); linear {linear_erle:.1} → +RES {suppressed_erle:.1}"
+        );
+    }
+
+    /// **Total ERLE improvement under a loudspeaker nonlinearity.** A memoryless cubic on the far-end
+    /// before the (linear) room convolution leaves a nonlinear residual the adaptive filter cannot
+    /// model; the RES still adds a quantified extra attenuation on echo-only segments.
+    #[test]
+    fn residual_suppression_adds_erle_on_nonlinear_echo() {
+        let frame = 160;
+        let tail = 256;
+        let frames = 260;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x0000_1E5D_1234);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        // Loudspeaker nonlinearity: y = x + 0.3·x³ (normalized), then the linear room convolution.
+        let far_normalized = normalize(&far);
+        let driven: Vec<f32> = far_normalized
+            .iter()
+            .map(|&x| x + 0.3 * x * x * x)
+            .collect();
+        let echo = synthesize_echo(&driven, &rir, 0);
+
+        let mut linear = EchoCanceller::new(8_000, tail).expect("build");
+        let linear_erle = run_echo_only_erle(&mut linear, &far, &echo, frame, 60);
+        let mut suppressed = EchoCanceller::new(8_000, tail)
+            .expect("build")
+            .with_residual_suppression()
+            .expect("res");
+        let suppressed_erle = run_echo_only_erle(&mut suppressed, &far, &echo, frame, 60);
+
+        let extra = suppressed_erle - linear_erle;
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "nonlinear echo ERLE: linear {linear_erle:.1} dB, +RES {suppressed_erle:.1} dB, extra {extra:.1} dB"
+            );
+        }
+        assert!(
+            extra >= 6.0,
+            "RES added only {extra:.1} dB on nonlinear echo (want ≥ 6 dB); linear {linear_erle:.1} → +RES {suppressed_erle:.1}"
+        );
+    }
+
+    /// **Near-end preservation (near-end only).** With the far-end silent (no echo), the near-end
+    /// talker must pass through the RES essentially untouched — it must not mistake speech for echo.
+    #[test]
+    fn residual_suppression_preserves_near_end_only() {
+        let frame = 160;
+        let tail = 256;
+        let converge_frames = 120;
+        let near_frames = 80;
+        let rir = build_rir_with_late_reflection();
+        let mut prng = SplitMix64::new(0x0EA5_1DE0);
+        let mut canceller = EchoCanceller::new(8_000, tail)
+            .expect("build")
+            .with_residual_suppression()
+            .expect("res");
+
+        // Converge on echo-only.
+        let far = far_stream(&mut prng, 0.6, converge_frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+        for index in 0..converge_frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+        }
+
+        // Near-end only, far-end silent: measure output/near power over the segment interior.
+        let silent_far = vec![0i16; near_frames * frame];
+        let near: Vec<i16> = (0..near_frames * frame)
+            .map(|_| super::denormalize(prng.next_noise(0.3)))
+            .collect();
+        let mut output = vec![0i16; near_frames * frame];
+        for index in 0..near_frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = near[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &silent_far[range.clone()]);
+            output[range].copy_from_slice(&mic);
+        }
+        // Skip the WOLA-latency transient at both ends.
+        let interior = 4 * frame..(near_frames - 2) * frame;
+        let near_power = power_i16(&near[interior.clone()]);
+        let output_power = power_i16(&output[interior]);
+        let attenuation_db = 10.0 * (output_power / near_power.max(1.0)).log10();
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!("near-end-only attenuation {attenuation_db:.2} dB");
+        }
+        assert!(
+            attenuation_db.abs() <= 1.5,
+            "near-end-only attenuated {attenuation_db:.2} dB (want |·| ≤ 1.5 dB)"
+        );
+    }
+
+    /// **Near-end preservation (double-talk).** With the DTD flagging near-end presence on top of the
+    /// echo, the RES backs off (leakage frozen, gain floored up) so the near-end talker passes with a
+    /// bounded attenuation instead of being chewed.
+    #[test]
+    fn residual_suppression_preserves_near_end_double_talk() {
+        let frame = 160;
+        let tail = 256;
+        let converge_frames = 120;
+        let double_talk_frames = 60;
+        let rir = build_rir_with_late_reflection();
+        let mut prng = SplitMix64::new(0xD0B1_E7A1);
+        let mut canceller = EchoCanceller::new(8_000, tail)
+            .expect("build")
+            .with_two_path_dtd()
+            .with_residual_suppression()
+            .expect("res");
+        let total = converge_frames + double_talk_frames;
+        let far = far_stream(&mut prng, 0.6, total * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+        let near_talk: Vec<i16> = (0..total * frame)
+            .map(|t| {
+                super::denormalize(
+                    0.5 * (2.0 * std::f32::consts::PI * 400.0 * t as f32 / 8_000.0).sin(),
+                )
+            })
+            .collect();
+
+        for index in 0..converge_frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+        }
+
+        let mut double_talk_seen = false;
+        let mut output = vec![0i16; double_talk_frames * frame];
+        for offset in 0..double_talk_frames {
+            let index = converge_frames + offset;
+            let range = index * frame..(index + 1) * frame;
+            let mut mic: Vec<i16> = echo[range.clone()]
+                .iter()
+                .zip(&near_talk[range.clone()])
+                .map(|(&e, &s)| e.saturating_add(s))
+                .collect();
+            canceller.cancel(&mut mic, &far[range]);
+            double_talk_seen |= canceller.double_talk_active();
+            let local = offset * frame..(offset + 1) * frame;
+            output[local].copy_from_slice(&mic);
+        }
+        assert!(double_talk_seen, "DTD must flag the double-talk");
+        // Output power (near-end + suppressed residual echo) vs the near-end talker power, over the
+        // segment interior: the near-end must be preserved (not cancelled) — bounded on the low side.
+        let interior = 6 * frame..(double_talk_frames - 2) * frame;
+        let talk_power = power_i16(
+            &near_talk[(converge_frames * frame + 6 * frame)
+                ..(converge_frames * frame + (double_talk_frames - 2) * frame)],
+        );
+        let output_power = power_i16(&output[interior]);
+        let ratio_db = 10.0 * (output_power / talk_power.max(1.0)).log10();
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!("double-talk output/near-talk power {ratio_db:.1} dB");
+        }
+        assert!(
+            ratio_db >= -3.0,
+            "near-end over-suppressed during double-talk: {ratio_db:.1} dB (want ≥ -3 dB)"
+        );
+    }
+
+    /// **No musical noise.** On an echo-only tail after the RES, the per-frame residual energy has a
+    /// bounded coefficient of variation (musical noise would flicker isolated tones → high variance).
+    #[test]
+    fn residual_suppression_no_musical_noise() {
+        let frame = 160;
+        let tail = 256;
+        let frames = 200;
+        let rir = build_rir_with_late_reflection();
+        let mut prng = SplitMix64::new(0xBADF_00D5);
+        let mut canceller = EchoCanceller::new(8_000, tail)
+            .expect("build")
+            .with_residual_suppression()
+            .expect("res");
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+        let mut energies = Vec::new();
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+            if index >= frames / 2 {
+                energies.push(power_i16(&mic) as f32);
+            }
+        }
+        let mean = energies.iter().sum::<f32>() / energies.len() as f32;
+        let variance = energies
+            .iter()
+            .map(|&e| (e - mean) * (e - mean))
+            .sum::<f32>()
+            / energies.len() as f32;
+        let coefficient_of_variation = variance.sqrt() / mean.max(1e-6);
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!("RES echo-only tail energy CoV {coefficient_of_variation:.3}");
+        }
+        assert!(
+            coefficient_of_variation < 0.6,
+            "RES residual energy CoV {coefficient_of_variation:.3} too high (musical noise)"
+        );
+    }
+
+    /// **Composition with the MDF backend.** The RES chains onto the frequency-domain backend too
+    /// (which captures its own frame-aligned echo estimate), adding extra ERLE on a nonlinear echo.
+    #[test]
+    fn residual_suppression_composes_with_mdf() {
+        let frame = 160;
+        let tail = 1024;
+        let frames = 300;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x3DF0_9E51);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let driven: Vec<f32> = normalize(&far)
+            .iter()
+            .map(|&x| x + 0.3 * x * x * x)
+            .collect();
+        let echo = synthesize_echo(&driven, &rir, 0);
+
+        let mut linear = EchoCanceller::with_mdf(8_000, tail).expect("build");
+        let linear_erle = run_echo_only_erle(&mut linear, &far, &echo, frame, 60);
+        let mut suppressed = EchoCanceller::with_mdf(8_000, tail)
+            .expect("build")
+            .with_residual_suppression()
+            .expect("res");
+        let suppressed_erle = run_echo_only_erle(&mut suppressed, &far, &echo, frame, 60);
+        let extra = suppressed_erle - linear_erle;
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "MDF + RES ERLE: linear {linear_erle:.1} dB, +RES {suppressed_erle:.1} dB, extra {extra:.1} dB"
+            );
+        }
+        assert!(
+            extra >= 6.0,
+            "RES added only {extra:.1} dB on the MDF backend (want ≥ 6 dB); linear {linear_erle:.1} → +RES {suppressed_erle:.1}"
+        );
+    }
+
+    /// The RES-on cancel path is a pure function of its inputs (logical clock, fixed-seed PRNG): two
+    /// identical runs produce identical residual streams.
+    #[test]
+    fn residual_suppression_is_deterministic() {
+        let run = || {
+            let frame = 160;
+            let rir = build_rir_with_late_reflection();
+            let mut prng = SplitMix64::new(0xD37E_9E51);
+            let mut canceller = EchoCanceller::new(8_000, 256)
+                .expect("build")
+                .with_residual_suppression()
+                .expect("res");
+            let far = far_stream(&mut prng, 0.6, 80 * frame);
+            let echo = synthesize_echo(&normalize(&far), &rir, 0);
+            let mut residual_stream = vec![0i16; 80 * frame];
+            for index in 0..80 {
+                let range = index * frame..(index + 1) * frame;
+                let mut mic = echo[range.clone()].to_vec();
+                canceller.cancel(&mut mic, &far[range.clone()]);
+                residual_stream[range].copy_from_slice(&mic);
+            }
+            residual_stream
+        };
+        assert_eq!(run(), run());
+    }
+
+    /// `reset` clears the RES state along with the canceller's: after churning frames and resetting,
+    /// a silent input stays silent (no residual leakage from the pre-reset state).
+    #[test]
+    fn residual_suppression_reset_clears_state() {
+        let frame = 160;
+        let rir = build_rir_with_late_reflection();
+        let mut prng = SplitMix64::new(0x5E70_9E51);
+        let mut canceller = EchoCanceller::new(8_000, 256)
+            .expect("build")
+            .with_residual_suppression()
+            .expect("res");
+        let far = far_stream(&mut prng, 0.6, 60 * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+        for index in 0..60 {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+        }
+        canceller.reset();
+        assert!(
+            canceller.residual_suppression_enabled(),
+            "reset preserves the mode"
+        );
+        // After reset, a silent far-end and silent near-end stay silent through the RES too.
+        let silent = vec![0i16; frame];
+        for _ in 0..10 {
+            let mut mic = silent.clone();
+            canceller.cancel(&mut mic, &silent);
+            assert!(
+                mic.iter().all(|&s| s == 0),
+                "post-reset silence must stay silent"
+            );
+        }
     }
 }

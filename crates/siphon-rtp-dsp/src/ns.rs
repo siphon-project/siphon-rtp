@@ -30,6 +30,7 @@
 //! suppressor into the engine's media pipeline.
 
 use crate::fft::Complex;
+use crate::spectral::DecisionDirectedWiener;
 use crate::window::WolaProcessor;
 use crate::DspError;
 
@@ -177,9 +178,8 @@ struct SpectralState {
     // --- fixed coefficients (documented at construction) ---
     power_smoothing: f32,
     noise_bias: f32,
-    decision_directed: f32,
-    gain_floor: f32,
-    a_priori_floor: f32,
+    /// The shared decision-directed Wiener gain (interference = the tracked noise PSD).
+    gain: DecisionDirectedWiener,
 }
 
 impl SpectralState {
@@ -200,14 +200,16 @@ impl SpectralState {
             // fixed 3.0 brings the estimate up to the mean, which both suppresses residual noise
             // fully and stops isolated bins flickering through (musical noise).
             noise_bias: 3.0,
-            // Decision-directed a priori SNR smoothing (Ephraim–Malah). The canonical 0.98..0.99
-            // range; 0.99 maximises the temporal smoothing that suppresses musical noise.
-            decision_directed: 0.99,
-            // Spectral floor ≈ −16 dB amplitude (10^(-16/20)); output never fully gates, and the
-            // constant floor bed masks any residual isolated survivors (musical noise).
-            gain_floor: 0.158_489_32,
-            // Small a priori SNR floor so ξ stays positive before the gain floor applies.
-            a_priori_floor: 0.003,
+            gain: DecisionDirectedWiener {
+                // Decision-directed a priori SNR smoothing (Ephraim–Malah). The canonical 0.98..0.99
+                // range; 0.99 maximises the temporal smoothing that suppresses musical noise.
+                decision_directed: 0.99,
+                // Small a priori SNR floor so ξ stays positive before the gain floor applies.
+                a_priori_floor: 0.003,
+                // Spectral floor ≈ −16 dB amplitude (10^(-16/20)); output never fully gates, and the
+                // constant floor bed masks any residual isolated survivors (musical noise).
+                gain_floor: 0.158_489_32,
+            },
         }
     }
 
@@ -237,17 +239,9 @@ impl SpectralState {
             self.noise_psd[index] = (self.noise_bias * windowed_min).max(EPSILON);
 
             let noise = self.noise_psd[index];
-            let posterior_snr = power / noise;
-            let decision_directed = self.previous_clean_power[index] / noise;
-            let maximum_likelihood = (posterior_snr - 1.0).max(0.0);
-            let a_priori_snr = (self.decision_directed * decision_directed
-                + (1.0 - self.decision_directed) * maximum_likelihood)
-                .max(self.a_priori_floor);
-
-            let mut gain = a_priori_snr / (1.0 + a_priori_snr);
-            if gain < self.gain_floor {
-                gain = self.gain_floor;
-            }
+            let gain = self
+                .gain
+                .gain(power, noise, self.previous_clean_power[index]);
 
             bin.re *= gain;
             bin.im *= gain;

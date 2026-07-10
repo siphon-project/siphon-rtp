@@ -262,3 +262,50 @@ fn cancel_mdf_with_delay_estimation_makes_no_heap_allocation() {
         after - before
     );
 }
+
+/// The chained residual-echo suppressor is zero per-frame heap too: both WOLA rings, the FFT scratch,
+/// the per-bin leakage / smoothing / gain state, the per-hop echo-power queue, and the near-snapshot /
+/// echo-estimate scratch on the canceller are all preallocated in `with_residual_suppression` /
+/// `new`, and the real FFT/IFFT hops the post-filter runs are allocation-free — so a tight cancel loop
+/// with the RES on allocates nothing after warm-up. Driven with an echo-like near-end so the RES's
+/// suppression path (leakage update + per-bin gain) is exercised inside the measured window.
+#[test]
+fn cancel_with_residual_suppression_makes_no_heap_allocation() {
+    const TAIL: usize = 256;
+    const FRAME: usize = 160; // 8 kHz / 20 ms
+
+    let mut canceller = EchoCanceller::new(8_000, TAIL)
+        .expect("build")
+        .with_residual_suppression()
+        .expect("res");
+    let reference: Vec<i16> = (0..FRAME)
+        .map(|index| ((index as i16).wrapping_mul(211)).wrapping_sub(3_000))
+        .collect();
+    // An echo-like near-end (a scaled copy of the reference) so the residual carries residual echo the
+    // RES suppresses — driving the leakage-update and gain branches under measurement.
+    let echo_like: Vec<i16> = reference.iter().map(|&sample| sample / 4).collect();
+    let mut near = echo_like.clone();
+
+    // Warm up so the RES seeds its state and any one-time lazy init is paid before we sample.
+    for _ in 0..16 {
+        near.copy_from_slice(&echo_like);
+        canceller.cancel(&mut near, &reference);
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..2_000 {
+        near.copy_from_slice(&echo_like);
+        canceller.cancel(&mut near, &reference);
+        std::hint::black_box(near[0]);
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(
+        after,
+        before,
+        "cancel-with-residual-suppression allocated {} times across 2000 frames (must be zero)",
+        after - before
+    );
+}

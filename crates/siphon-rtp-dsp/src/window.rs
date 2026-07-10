@@ -272,6 +272,112 @@ impl WolaProcessor {
     }
 }
 
+/// Streaming √Hann **analysis-only** framing over the same real FFT and hop clock as
+/// [`WolaProcessor`], with no synthesis / overlap-add.
+///
+/// The AEC residual-echo suppressor ([`crate::res`]) needs the far-end **echo-estimate** spectrum
+/// frame-synchronous with the residual it reconstructs: for every internal STFT hop the residual
+/// [`WolaProcessor`] takes, it needs the echo estimate's spectrum for that same hop. Running the echo
+/// estimate through this analyzer — same `N`, same hop, fed the same-length frames — keeps the two in
+/// exact lock-step (both drain `⌊pending / hop⌋` hops per call from an identically-filled input ring),
+/// so the k-th [`WolaAnalyzer`] spectrum covers the identical sample interval as the k-th
+/// [`WolaProcessor`] analysis window. It skips the IFFT / synthesis-window / overlap-add the
+/// residual path pays, so the echo side costs one forward FFT per hop and nothing else.
+#[derive(Clone, Debug)]
+pub struct WolaAnalyzer {
+    n: usize,
+    hop: usize,
+    analysis_window: Vec<f32>,
+    /// Sliding analysis window: the most recent `N` input samples (oldest first).
+    frame: Vec<f32>,
+    /// Scratch for the windowed time frame (length `N`).
+    scratch: Vec<f32>,
+    /// Scratch spectrum (length `N/2 + 1`).
+    spectrum: Vec<Complex>,
+    fft: RealFft,
+    input_pending: SampleRing,
+}
+
+impl WolaAnalyzer {
+    /// Build an analysis framing with FFT size `n_fft` and pipeline frame length `frame_len`. The
+    /// `√Hann` analysis window and hop match [`WolaProcessor::new`] exactly.
+    ///
+    /// # Errors
+    /// - [`DspError::InvalidFrameLength`] if `frame_len` is 0.
+    /// - [`DspError::InvalidFftSize`] if `n_fft` is not a power of two `>= 4`.
+    pub fn new(n_fft: usize, frame_len: usize) -> Result<Self, DspError> {
+        if frame_len == 0 {
+            return Err(DspError::InvalidFrameLength { length: frame_len });
+        }
+        let fft = RealFft::new(n_fft)?;
+        let n = n_fft;
+        let hop = n / 2;
+        Ok(Self {
+            n,
+            hop,
+            analysis_window: sqrt_hann(n),
+            frame: vec![0.0; n],
+            scratch: vec![0.0; n],
+            spectrum: vec![Complex::default(); n / 2 + 1],
+            fft,
+            input_pending: SampleRing::with_capacity(2 * n + frame_len),
+        })
+    }
+
+    /// FFT size `N`.
+    #[inline]
+    #[must_use]
+    pub fn fft_size(&self) -> usize {
+        self.n
+    }
+
+    /// Hop size `H = N/2`.
+    #[inline]
+    #[must_use]
+    pub fn hop(&self) -> usize {
+        self.hop
+    }
+
+    /// Feed one pipeline frame (float domain) and invoke `spectrum_op` once per internal STFT hop with
+    /// that hop's `N/2 + 1` complex analysis bins (read-only). Produces no output stream.
+    pub fn analyze_frame<F>(&mut self, input: &[f32], mut spectrum_op: F)
+    where
+        F: FnMut(&[Complex]),
+    {
+        for &sample in input {
+            self.input_pending.push_back(sample);
+        }
+        while self.input_pending.len() >= self.hop {
+            // Slide the analysis frame left by one hop (N - hop == hop) and append the new hop —
+            // byte-for-byte the same frame management as `WolaProcessor::step`.
+            self.frame.copy_within(self.hop.., 0);
+            for slot in self.frame[self.hop..].iter_mut() {
+                match self.input_pending.pop_front() {
+                    Some(sample) => *slot = sample,
+                    None => break, // unreachable: guarded by len() >= hop
+                }
+            }
+            for ((windowed, &sample), &weight) in self
+                .scratch
+                .iter_mut()
+                .zip(self.frame.iter())
+                .zip(self.analysis_window.iter())
+            {
+                *windowed = sample * weight;
+            }
+            self.fft.forward(&self.scratch, &mut self.spectrum);
+            spectrum_op(&self.spectrum);
+        }
+    }
+
+    /// Reset the framing state (e.g. on a stream discontinuity).
+    pub fn reset(&mut self) {
+        self.frame.iter_mut().for_each(|s| *s = 0.0);
+        self.scratch.iter_mut().for_each(|s| *s = 0.0);
+        self.input_pending.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +494,43 @@ mod tests {
             output.iter().take(128).all(|&s| s == 0.0),
             "post-reset prefill should be zeros"
         );
+    }
+
+    #[test]
+    fn analyzer_hops_are_bit_identical_to_the_processor() {
+        // The residual-echo suppressor relies on the analysis-only `WolaAnalyzer` producing exactly
+        // the same per-hop spectra, in the same order, as the full `WolaProcessor` — that lock-step is
+        // what makes the echo-estimate spectrum frame-synchronous with the residual. Feed both the
+        // same variable-length frames and require every hop's spectrum bit-for-bit identical.
+        for &(n, frame_len) in &[(256usize, 160usize), (512, 320)] {
+            let mut processor = WolaProcessor::new(n, frame_len).expect("build");
+            let mut analyzer = WolaAnalyzer::new(n, frame_len).expect("build");
+            let mut rng = Lcg(0x0C0F_FEE0 ^ n as u32);
+
+            let mut processor_hops: Vec<Vec<Complex>> = Vec::new();
+            let mut analyzer_hops: Vec<Vec<Complex>> = Vec::new();
+            let mut output = vec![0.0f32; frame_len];
+            for _ in 0..30 {
+                let frame: Vec<f32> = (0..frame_len).map(|_| rng.next_unit() * 1000.0).collect();
+                processor.process_frame(&frame, &mut output, |spectrum| {
+                    processor_hops.push(spectrum.to_vec());
+                });
+                analyzer.analyze_frame(&frame, |spectrum| {
+                    analyzer_hops.push(spectrum.to_vec());
+                });
+            }
+
+            assert_eq!(
+                processor_hops.len(),
+                analyzer_hops.len(),
+                "n={n}: hop counts differ ({} vs {})",
+                processor_hops.len(),
+                analyzer_hops.len()
+            );
+            assert!(!processor_hops.is_empty(), "n={n}: no hops produced");
+            for (hop, (a, b)) in processor_hops.iter().zip(analyzer_hops.iter()).enumerate() {
+                assert_eq!(a, b, "n={n} hop={hop}: analyzer spectrum diverged");
+            }
+        }
     }
 }
