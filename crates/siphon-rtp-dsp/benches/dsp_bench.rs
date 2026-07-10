@@ -8,6 +8,9 @@
 //!     FFT/IFFT hop + the decision-directed Wiener gain over `N/2+1` bins), reported as µs/frame.
 //!   - `aec_8k_20ms` / `aec_16k_20ms` — one NLMS echo-cancel frame (L=256): per sample a SIMD
 //!     estimate dot (`siphon_rtp_simd::fir_dot_f32`) + a scalar NLMS weight update.
+//!   - `aec_twopath_8k_20ms` — one two-path/NCC echo-cancel frame (L=256): two SIMD estimate dots per
+//!     sample (foreground + background) + the background NLMS update + the per-frame NCC accumulators,
+//!     i.e. the extra per-frame cost the double-talk-robust path pays over the single-filter one.
 //!
 //! No per-frame heap on the steady-state path: the resampler reuses its history/branches and the
 //! caller-owned output vector; the VAD reduces in place; the noise suppressor's FFT/WOLA/PSD scratch
@@ -114,6 +117,20 @@ fn bench_aec(criterion: &mut Criterion) {
         bencher.iter(|| {
             near.copy_from_slice(&near_16k);
             canceller.cancel(black_box(&mut near), black_box(&far_16k));
+            black_box(near[0])
+        });
+    });
+
+    // The two-path/NCC double-talk detector: a second (foreground) estimate dot per sample plus the
+    // per-frame NCC accumulators, on top of the single-filter cost above (~2× the per-sample MAC).
+    criterion.bench_function("aec_twopath_8k_20ms", |bencher| {
+        let mut canceller = EchoCanceller::new(8_000, TAIL)
+            .expect("build")
+            .with_two_path_dtd();
+        let mut near = near_8k.clone();
+        bencher.iter(|| {
+            near.copy_from_slice(&near_8k);
+            canceller.cancel(black_box(&mut near), black_box(&far_8k));
             black_box(near[0])
         });
     });

@@ -78,6 +78,57 @@ fn cancel_frame_makes_no_heap_allocation() {
     );
 }
 
+/// The two-path (foreground/background) + NCC path is also zero per-frame heap: the second (foreground)
+/// filter and the copy are `copy_from_slice` into a buffer preallocated in `new`, and the NCC
+/// accumulators are stack scalars — no allocation anywhere on the hot path, on either a single-talk
+/// (copy-firing) or a double-talk (frozen) frame. This drives both regimes inside the measured window.
+#[test]
+fn cancel_two_path_makes_no_heap_allocation() {
+    const TAIL: usize = 256;
+    const FRAME: usize = 160; // 8 kHz / 20 ms
+
+    let mut canceller = EchoCanceller::new(8_000, TAIL)
+        .expect("build")
+        .with_two_path_dtd();
+    // An echo-like reference (single-talk → copies fire) and a loud near-end (double-talk → frozen).
+    let reference: Vec<i16> = (0..FRAME)
+        .map(|index| ((index as i16).wrapping_mul(211)).wrapping_sub(3_000))
+        .collect();
+    let echo_only: Vec<i16> = reference.iter().map(|&sample| sample / 4).collect();
+    let near_end_talk: Vec<i16> = (0..FRAME)
+        .map(|index| ((index as i16).wrapping_mul(157)).wrapping_add(9_000))
+        .collect();
+    let mut near = echo_only.clone();
+
+    // Warm up (lets the foreground copy in, so both the copy and no-copy branches run under measurement).
+    for _ in 0..8 {
+        near.copy_from_slice(&echo_only);
+        canceller.cancel(&mut near, &reference);
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for cycle in 0..2_000 {
+        // Alternate single-talk and double-talk frames so both decision branches are measured.
+        if cycle % 2 == 0 {
+            near.copy_from_slice(&echo_only);
+        } else {
+            near.copy_from_slice(&near_end_talk);
+        }
+        canceller.cancel(&mut near, &reference);
+        std::hint::black_box(near[0]);
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(
+        after,
+        before,
+        "two-path cancel allocated {} times across 2000 frames (must be zero)",
+        after - before
+    );
+}
+
 /// The GCC-PHAT delay-estimation path is also zero per-frame heap: the estimation block, spectra,
 /// cross-power, correlation, and accumulator are all preallocated in `with_delay_estimation`, and the
 /// real FFT/IFFT are allocation-free — so even the frames on which a full GCC block fires allocate

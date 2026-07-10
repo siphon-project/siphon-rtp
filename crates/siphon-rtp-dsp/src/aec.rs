@@ -26,6 +26,19 @@
 //! double-talk detector (cheap `max|far|` vs `|near|`) sees near-end speech, so the filter never
 //! learns the near-end talker (which would make it cancel *him*, not the echo).
 //!
+//! ## Two-path double-talk protection (optional — [`EchoCanceller::with_two_path_dtd`])
+//! The single-filter Geigel screen above is the default. Enabling the **two-path** detector runs *two*
+//! adaptive filters — a *background* filter that keeps adapting through safe (single-talk) intervals
+//! and a *foreground* filter that actually produces the emitted residual. The foreground is only ever
+//! advanced by **copying** the converged background into it, and only when a **normalized
+//! cross-correlation** (NCC) decision statistic (Benesty *et al.*, *A New Class of Doubletalk
+//! Detectors Based on Cross-Correlation*, IEEE TSAP 2000) confirms echo-only **and** the background
+//! residual is smaller than the foreground's. During double-talk no copy happens, so the foreground
+//! stays frozen on its pre-double-talk estimate and never learns the near-end talker — the failure
+//! mode a Geigel-only screen suffers when the near-end is too quiet to trip `max|near| ≥ ½·max|far|`
+//! yet still dominates the (echo-return-loss-attenuated) echo. The exact statistic, thresholds, and
+//! hangover are documented on [`EchoCanceller::cancel`] and the `NCC_*` constants.
+//!
 //! ## Determinism & allocation
 //! No wall clock, no randomness: identical input frames yield identical output, so it golden-tests
 //! without audio hardware on a purely logical sample-clock. Every buffer (the filter weights and the
@@ -82,6 +95,33 @@ const DEFAULT_FAR_PEAK_FLOOR: f32 = 1.0e-3;
 /// Frames adaptation stays frozen after the last double-talk trigger (~60 ms at a 20 ms frame), so a
 /// brief near-end gap mid-word doesn't let the filter resume learning the near-end talker.
 const DEFAULT_DOUBLETALK_HANGOVER_FRAMES: usize = 3;
+
+// --- Two-path (foreground/background) + normalized-cross-correlation (Benesty) DTD ---
+/// Normalized cross-correlation `ρ = <mic, echo_hat> / (‖mic‖·‖echo_hat‖)` below which the frame is
+/// declared **double-talk** (near-end present) and adaptation/copy freeze. During single-talk the
+/// microphone *is* the echo estimate (bar the residual) so `ρ → 1`; an uncorrelated near-end talker
+/// lifts `‖mic‖` without lifting `<mic, echo_hat>`, so `ρ = ‖echo‖/‖echo+near‖` drops. 0.85 sits well
+/// below the single-talk value yet comfortably above `ρ` for any near-end at or above the echo level
+/// (e.g. equal-power double-talk gives `ρ ≈ 0.71`).
+const NCC_DOUBLETALK_THRESHOLD: f32 = 0.85;
+/// Normalized cross-correlation at or above which the frame is confidently **echo-only**, permitting a
+/// background→foreground copy (with the residual-margin gate below). Kept above
+/// [`NCC_DOUBLETALK_THRESHOLD`] so the `[0.85, 0.90)` band is a no-copy / no-freeze hysteresis zone.
+const NCC_COPY_THRESHOLD: f32 = 0.90;
+/// A background→foreground copy also requires the background residual energy to be at most this
+/// fraction of the foreground's — i.e. the background is at least ~0.46 dB better. This both
+/// bootstraps the first copy (foreground starts at zero, so its residual is the full echo) and stops
+/// copy thrash once the two filters have converged to the same estimate.
+const COPY_RESIDUAL_MARGIN: f64 = 0.90;
+/// When the background residual energy grows past this multiple of the foreground's, the background is
+/// deemed to have diverged (e.g. it adapted into a near-end onset the frame before the NCC caught it),
+/// so it is reset to the protected foreground — the two-path safety net that keeps a transiently
+/// mis-adapted background from lingering.
+const DIVERGE_RESIDUAL_MARGIN: f64 = 2.0;
+/// Below this per-frame normalized energy the microphone or echo estimate carries no usable signal, so
+/// the NCC is undefined and the frame drives neither a freeze nor a copy (avoids a 0/0 that would look
+/// like permanent double-talk and deadlock the very first adaptation).
+const NCC_ENERGY_FLOOR: f64 = 1.0e-7;
 
 // --- GCC-PHAT delay estimation ---
 /// Largest bulk delay (and therefore search range) automatic estimation supports, in samples
@@ -510,8 +550,18 @@ impl DelayEstimator {
     }
 }
 
-/// A time-domain NLMS acoustic echo canceller with a Geigel double-talk detector and an optional
-/// GCC-PHAT bulk-delay estimator.
+/// The double-talk detector wired into [`EchoCanceller::cancel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DtdMode {
+    /// Single adaptive filter frozen by the cheap per-frame [`Geigel`](https://ieeexplore.ieee.org/document/1163130)
+    /// screen (the default; the original PR-#116/#117 behaviour, byte-for-byte).
+    Geigel,
+    /// Two adaptive filters (foreground/background) with a normalized-cross-correlation copy criterion.
+    TwoPath,
+}
+
+/// A time-domain NLMS acoustic echo canceller with a Geigel or two-path/NCC double-talk detector and
+/// an optional GCC-PHAT bulk-delay estimator.
 #[derive(Debug, Clone)]
 pub struct EchoCanceller {
     sample_rate_hz: u32,
@@ -520,8 +570,21 @@ pub struct EchoCanceller {
     /// Adaptive filter length `L` (the *tail*).
     tail_samples: usize,
     /// Adaptive FIR weights, length `tail_samples`, aligned to the ascending regressor window (so
-    /// `residual = near − fir_dot_f32(weights, window)`).
+    /// `residual = near − fir_dot_f32(weights, window)`). In [`DtdMode::Geigel`] this is the single
+    /// filter that both adapts and produces the output; in [`DtdMode::TwoPath`] it is the *background*
+    /// filter (the always-learning candidate).
     weights: Vec<f32>,
+    /// The *foreground* filter (two-path mode only): it produces the emitted residual and is advanced
+    /// **only** by copying [`Self::weights`] into it under the NCC copy criterion, so it never adapts
+    /// on the near-end talker. Length `tail_samples`, preallocated (all-zero, unused in Geigel mode).
+    foreground: Vec<f32>,
+    /// Which double-talk detector [`EchoCanceller::cancel`] runs.
+    dtd_mode: DtdMode,
+    /// The most recent frame's NCC statistic `ρ` (two-path mode), or `None` before the first valid
+    /// (non-silent) frame — a status surface the engine can meter.
+    last_correlation: Option<f32>,
+    /// Count of background→foreground copies since construction/reset (a convergence-health metric).
+    copies: u64,
     reference: FarEndReference,
     // --- adaptation (all wired; no dead knobs) ---
     step_size: f32,
@@ -587,6 +650,10 @@ impl EchoCanceller {
             frame_samples,
             tail_samples,
             weights: vec![0.0; tail_samples],
+            foreground: vec![0.0; tail_samples],
+            dtd_mode: DtdMode::Geigel,
+            last_correlation: None,
+            copies: 0,
             reference: FarEndReference::new(tail_samples, bulk_delay_samples, frame_samples),
             step_size: DEFAULT_STEP_SIZE,
             regularization: DEFAULT_REGULARIZATION,
@@ -632,6 +699,10 @@ impl EchoCanceller {
             frame_samples,
             tail_samples,
             weights: vec![0.0; tail_samples],
+            foreground: vec![0.0; tail_samples],
+            dtd_mode: DtdMode::Geigel,
+            last_correlation: None,
+            copies: 0,
             reference: FarEndReference::with_max_delay(
                 tail_samples,
                 0,
@@ -647,6 +718,43 @@ impl EchoCanceller {
             doubletalk_active: false,
             delay_estimator: Some(delay_estimator),
         })
+    }
+
+    /// Enable the **two-path** double-talk detector on top of any of the constructors above
+    /// (chainable, e.g. `EchoCanceller::with_bulk_delay(8_000, 256, 80)?.with_two_path_dtd()`).
+    ///
+    /// A background filter keeps adapting through single-talk while a protected foreground filter — the
+    /// one that produces the emitted residual — is advanced only by copying the background in under the
+    /// normalized-cross-correlation copy criterion (see [`EchoCanceller::cancel`]). Both filters and
+    /// all NCC scratch are already preallocated, so this only flips a mode flag: no allocation, and the
+    /// hot path stays zero-per-frame-heap. The default (without this call) is the single-filter Geigel
+    /// screen, kept for byte-for-byte backward compatibility with the delay-estimation PR.
+    #[must_use]
+    pub fn with_two_path_dtd(mut self) -> Self {
+        self.dtd_mode = DtdMode::TwoPath;
+        self
+    }
+
+    /// Whether the two-path/NCC double-talk detector is enabled (else the Geigel screen).
+    #[must_use]
+    pub fn two_path_enabled(&self) -> bool {
+        self.dtd_mode == DtdMode::TwoPath
+    }
+
+    /// The most recent frame's normalized cross-correlation `ρ ∈ [-1, 1]` between the microphone and
+    /// the estimated echo (two-path mode), or `None` before the first valid (non-silent) frame or when
+    /// two-path is disabled. `ρ → 1` is echo-only; a drop signals near-end/double-talk.
+    #[must_use]
+    pub fn double_talk_correlation(&self) -> Option<f32> {
+        self.last_correlation
+    }
+
+    /// Number of background→foreground copies since construction or the last [`EchoCanceller::reset`]
+    /// (two-path mode) — a convergence-health metric (it climbs during single-talk, holds during
+    /// double-talk).
+    #[must_use]
+    pub fn foreground_copies(&self) -> u64 {
+        self.copies
     }
 
     /// The sample rate this canceller was built for.
@@ -707,7 +815,39 @@ impl EchoCanceller {
 
     /// Cancel the echo in one frame **in place**: subtract the estimated echo (the adaptive filter
     /// applied to the aligned far-end `reference`) from `near_end`, then adapt the filter by NLMS on
-    /// the residual — frozen for any sample the Geigel detector flags as double-talk.
+    /// the residual — frozen while a near-end talker is present so the filter never learns *him*.
+    ///
+    /// The double-talk gate is either the cheap per-frame [`Geigel`](https://ieeexplore.ieee.org/document/1163130)
+    /// screen (`max|near| ≥ ½·max|far|`, the default) or, with [`EchoCanceller::with_two_path_dtd`],
+    /// the two-path/NCC detector described below.
+    ///
+    /// ## Two-path / normalized-cross-correlation decision
+    /// Two adaptive filters run in lock-step. The *background* filter adapts by NLMS whenever the frame
+    /// is safe (far-end active, not double-talk); the *foreground* filter produces the emitted residual
+    /// and is **only** advanced by copying the background into it. After the sample loop the frame's
+    /// **normalized cross-correlation** between the microphone `d` and the background echo estimate
+    /// `ŷ` is formed:
+    ///
+    /// ```text
+    ///   ρ = Σ d[n]·ŷ[n] / sqrt( (Σ d[n]²)·(Σ ŷ[n]²) )
+    /// ```
+    ///
+    /// (Benesty *et al.* 2000, the two-path/cross-correlation DTD class.) During single-talk the
+    /// microphone *is* the echo (bar the residual) so `ρ → 1`; an uncorrelated near-end talker lifts
+    /// `‖d‖` without lifting `Σ d·ŷ`, so `ρ = ‖echo‖/‖echo+near‖` drops. The frame is:
+    /// - **double-talk** (freeze background, no copy, re-arm the hangover) when the Geigel screen trips
+    ///   *or* `ρ < NCC_DOUBLETALK_THRESHOLD` (0.85);
+    /// - **echo-only, copy-eligible** when `ρ ≥ NCC_COPY_THRESHOLD` (0.90) — the `[0.85, 0.90)` band is
+    ///   a no-copy/no-freeze hysteresis zone.
+    ///
+    /// A background→foreground copy fires on a copy-eligible frame **and** only if the background
+    /// residual energy is at most `COPY_RESIDUAL_MARGIN` (0.90) of the foreground's (the background is
+    /// genuinely better — this also bootstraps the first copy from the all-zero foreground and stops
+    /// copy-thrash at convergence). If instead the background residual grows past
+    /// `DIVERGE_RESIDUAL_MARGIN` (2×) of the foreground's, the background is reset to the protected
+    /// foreground (it adapted into a near-end onset the NCC caught only a frame later). A hangover of
+    /// `DEFAULT_DOUBLETALK_HANGOVER_FRAMES` frames (~60 ms) holds the freeze across brief near-end
+    /// gaps.
     ///
     /// `near_end` and `reference` are a frame-synchronous pair (same time interval). This processes
     /// `min(near_end.len(), reference.len(), frame_samples())` samples — for a correct 20 ms caller
@@ -720,15 +860,37 @@ impl EchoCanceller {
             return;
         }
 
-        // --- Geigel double-talk decision for the whole frame (cheap block max|far| vs max|near|) ---
+        // --- Geigel screen for the whole frame (cheap block max|far| vs max|near|) ---
         // A block (per-frame) decision is stable and O(n): the far-end level is slowly varying, so
         // one comparison per 20 ms frame gates adaptation without the intra-frame jitter a per-sample
         // leaky peak-hold suffers. `max|near|` uses the *raw* microphone (echo + any near-end talker):
         // during single-talk it is the attenuated echo (below the threshold); a near-end talker lifts
-        // it above `threshold·max|far|` and freezes the update so the filter never learns the talker.
+        // it above `threshold·max|far|`. In two-path mode this is a cheap fast pre-screen alongside the
+        // NCC; in Geigel mode it is the sole detector.
         let far_peak = normalized_peak(&reference[..n]);
         let near_peak = normalized_peak(&near_end[..n]);
-        if far_peak > self.far_peak_floor && near_peak >= self.geigel_threshold * far_peak {
+        let far_active = far_peak > self.far_peak_floor;
+        let geigel_tripped = far_active && near_peak >= self.geigel_threshold * far_peak;
+
+        match self.dtd_mode {
+            DtdMode::Geigel => self.cancel_geigel(n, near_end, reference, geigel_tripped),
+            DtdMode::TwoPath => {
+                self.cancel_two_path(n, near_end, reference, geigel_tripped, far_active);
+            }
+        }
+    }
+
+    /// The single-filter, Geigel-gated cancel path (the default). Kept byte-for-byte identical to the
+    /// pre-two-path implementation so the committed golden residual and the delay-estimation tests do
+    /// not move.
+    fn cancel_geigel(
+        &mut self,
+        n: usize,
+        near_end: &mut [i16],
+        reference: &[i16],
+        geigel_tripped: bool,
+    ) {
+        if geigel_tripped {
             self.doubletalk_hold_frames = self.doubletalk_hangover_frames;
         }
         let adapt = self.doubletalk_hold_frames == 0;
@@ -796,11 +958,143 @@ impl EchoCanceller {
         self.reference.compact(n);
     }
 
+    /// The two-path cancel path: a continuously-adapting background filter, a protected foreground
+    /// filter that produces the output, and the NCC copy criterion (see [`EchoCanceller::cancel`]).
+    fn cancel_two_path(
+        &mut self,
+        n: usize,
+        near_end: &mut [i16],
+        reference: &[i16],
+        geigel_tripped: bool,
+        far_active: bool,
+    ) {
+        // Background adaptation this frame: the far-end must excite it and no double-talk-freeze
+        // hangover from a prior frame's decision may be active. The NCC for this frame is only known
+        // *after* the sample loop, so it gates the copy and the *next* frame's adaptation via the
+        // hangover — the foreground is protected regardless. While *bootstrapping* (before the first
+        // copy has ever populated the foreground) the background always adapts on an excited frame, so
+        // an NCC freeze can never latch the filter at its uninitialized state. Note the Geigel screen
+        // is deliberately NOT used to gate adaptation: its fixed `½·far` threshold false-trips on a
+        // loud (low-ERL) echo, which would stall convergence — the NCC (a scale-independent ratio) is
+        // the primary detector and does not.
+        let bootstrapping = self.copies == 0;
+        let background_adapt = far_active && (bootstrapping || self.doubletalk_hold_frames == 0);
+
+        // --- GCC-PHAT bulk-delay estimation on the *raw* near-end (before it is overwritten) ---
+        // A newly committed alignment invalidates *both* filters (they were tuned to the old offset),
+        // so reset them and the copy state; the filters re-converge over the following frames.
+        let realign = self.delay_estimator.as_mut().and_then(|estimator| {
+            estimator.observe(&near_end[..n], &reference[..n], background_adapt)
+        });
+        if let Some(new_delay) = realign {
+            if new_delay != self.reference.bulk_delay {
+                self.reference.set_bulk_delay(new_delay);
+                self.weights.iter_mut().for_each(|weight| *weight = 0.0);
+                self.foreground.iter_mut().for_each(|weight| *weight = 0.0);
+            }
+        }
+
+        let written = self.reference.write_frame(&reference[..n]);
+        debug_assert_eq!(written, n, "far-end ring must absorb the whole frame");
+
+        let mut energy = {
+            let window = self.reference.window(0);
+            fir_dot_f32(window, window)
+        };
+
+        // Frame energy accumulators for the NCC decision (f64 headroom over the summed products).
+        let mut sum_mic_sq = 0.0f64; // Σ d²
+        let mut sum_echo_sq = 0.0f64; // Σ ŷ² (background echo estimate)
+        let mut sum_mic_echo = 0.0f64; // Σ d·ŷ
+        let mut sum_background_residual_sq = 0.0f64; // Σ (d − ŷ_background)²
+        let mut sum_foreground_residual_sq = 0.0f64; // Σ (d − ŷ_foreground)²  ← the output
+
+        for (i, near_sample) in near_end.iter_mut().enumerate().take(n) {
+            let window = self.reference.window(i);
+            let background_estimate = fir_dot_f32(&self.weights, window);
+            let foreground_estimate = fir_dot_f32(&self.foreground, window);
+            let mic = f32::from(*near_sample) / SAMPLE_SCALE;
+            let background_residual = mic - background_estimate;
+            let foreground_residual = mic - foreground_estimate;
+
+            // NLMS adapts the *background* only, only on a safe frame — the foreground is never touched
+            // here, so it cannot learn the near-end talker.
+            if background_adapt {
+                let normalized_step =
+                    self.step_size * background_residual / (energy + self.regularization);
+                for (weight, &sample) in self.weights.iter_mut().zip(window) {
+                    *weight += normalized_step * sample;
+                }
+            }
+
+            // Emit the *foreground* residual — the protected, converged estimate.
+            *near_sample = denormalize(foreground_residual);
+
+            let mic64 = f64::from(mic);
+            let echo64 = f64::from(background_estimate);
+            sum_mic_sq += mic64 * mic64;
+            sum_echo_sq += echo64 * echo64;
+            sum_mic_echo += mic64 * echo64;
+            sum_background_residual_sq += f64::from(background_residual * background_residual);
+            sum_foreground_residual_sq += f64::from(foreground_residual * foreground_residual);
+
+            if i + 1 < n {
+                let leaving = self.reference.window_sample(i);
+                let entering = self.reference.window_sample(i + self.tail_samples);
+                energy += entering * entering - leaving * leaving;
+                if energy < 0.0 {
+                    energy = 0.0;
+                }
+            }
+        }
+
+        self.reference.compact(n);
+
+        // --- Normalized cross-correlation ρ (Benesty two-path/NCC) ---
+        let correlation =
+            if far_active && sum_mic_sq > NCC_ENERGY_FLOOR && sum_echo_sq > NCC_ENERGY_FLOOR {
+                Some((sum_mic_echo / (sum_mic_sq * sum_echo_sq).sqrt()) as f32)
+            } else {
+                None
+            };
+        self.last_correlation = correlation;
+
+        // The NCC is the primary detector. `confident_echo_only` (ρ ≥ copy threshold) both permits a
+        // copy and vetoes the Geigel pre-screen, so a loud single-talk echo — which trips Geigel — does
+        // not freeze adaptation. The Geigel screen only adds a freeze when the NCC is *not* confident it
+        // is echo-only (a cheap fast reaction to a near-end onset).
+        let ncc_double_talk = correlation.is_some_and(|rho| rho < NCC_DOUBLETALK_THRESHOLD);
+        let confident_echo_only = correlation.is_some_and(|rho| rho >= NCC_COPY_THRESHOLD);
+        let freeze = ncc_double_talk || (geigel_tripped && !confident_echo_only);
+        // Reported status: either detector seeing near-end (a metering surface for the engine).
+        self.doubletalk_active = ncc_double_talk || geigel_tripped;
+        if freeze {
+            self.doubletalk_hold_frames = self.doubletalk_hangover_frames;
+        } else if self.doubletalk_hold_frames > 0 {
+            self.doubletalk_hold_frames -= 1;
+        }
+
+        // --- Copy / divergence logic (foreground stays protected) ---
+        if confident_echo_only
+            && sum_background_residual_sq <= COPY_RESIDUAL_MARGIN * sum_foreground_residual_sq
+        {
+            // Background is confidently echo-only and genuinely better → promote it to the foreground.
+            self.foreground.copy_from_slice(&self.weights);
+            self.copies = self.copies.saturating_add(1);
+        } else if far_active
+            && sum_background_residual_sq >= DIVERGE_RESIDUAL_MARGIN * sum_foreground_residual_sq
+        {
+            // Background diverged well past the protected foreground → snap it back to the good copy.
+            self.weights.copy_from_slice(&self.foreground);
+        }
+    }
+
     /// Reset the adaptive filter, far-end ring, and detector state (e.g. on a stream discontinuity).
     /// With automatic delay estimation this also clears the estimator and returns the ring to
     /// unaligned (bulk delay 0); a fixed-delay canceller keeps its configured bulk delay.
     pub fn reset(&mut self) {
         self.weights.iter_mut().for_each(|weight| *weight = 0.0);
+        self.foreground.iter_mut().for_each(|weight| *weight = 0.0);
         self.reference.reset();
         if self.delay_estimator.is_some() {
             if let Some(estimator) = self.delay_estimator.as_mut() {
@@ -810,12 +1104,22 @@ impl EchoCanceller {
         }
         self.doubletalk_hold_frames = 0;
         self.doubletalk_active = false;
+        self.last_correlation = None;
+        self.copies = 0;
     }
 
-    /// The adaptive filter weights (tests assert convergence/freezing on these).
+    /// The adaptive filter weights (tests assert convergence/freezing on these). In two-path mode this
+    /// is the *background* filter.
     #[cfg(test)]
     fn weights(&self) -> &[f32] {
         &self.weights
+    }
+
+    /// The two-path *foreground* filter (the one producing the output; tests assert it is frozen
+    /// during double-talk and improves during single-talk).
+    #[cfg(test)]
+    fn foreground_weights(&self) -> &[f32] {
+        &self.foreground
     }
 }
 
@@ -1511,6 +1815,421 @@ mod tests {
         assert_eq!(canceller.estimated_bulk_delay(), None);
         assert_eq!(canceller.bulk_delay_samples(), 0);
         assert!(canceller.weights().iter().all(|&weight| weight == 0.0));
+    }
+
+    // ---- two-path (foreground/background) + normalized-cross-correlation DTD ----
+
+    /// Single-talk convergence in two-path mode: the foreground (which produces the output) reaches the
+    /// ≥ 20 dB ERLE target within a bounded frame count via background→foreground copies.
+    #[test]
+    fn two_path_converges_to_high_erle_on_synthetic_echo() {
+        let tail = 256;
+        let frame = 160;
+        let frames = 200;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x7000_2026);
+        let mut canceller = EchoCanceller::new(8_000, tail)
+            .expect("build")
+            .with_two_path_dtd();
+        assert!(canceller.two_path_enabled());
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+
+        let mut converged_frame: Option<usize> = None;
+        let mut steady_erle = f64::NAN;
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            let erle = erle_db(&echo[range], &mic);
+            if converged_frame.is_none() && erle >= 20.0 {
+                converged_frame = Some(index);
+            }
+            steady_erle = erle;
+        }
+        // One frame slower than the single filter (frame 0 emits the un-cancelled echo while the first
+        // copy is still forming) — still well inside 20 frames on this box (frame 4).
+        let converged = converged_frame.expect("two-path must reach 20 dB ERLE");
+        assert!(
+            converged <= 20,
+            "two-path converged only after {converged} frames (>20)"
+        );
+        assert!(
+            steady_erle >= 20.0,
+            "two-path steady ERLE {steady_erle:.1} dB < 20 dB"
+        );
+        assert!(
+            canceller.foreground_copies() > 0,
+            "single-talk must copy background→foreground"
+        );
+        assert!(
+            !canceller.double_talk_active(),
+            "single-talk is not double-talk"
+        );
+    }
+
+    /// **Two-path beats Geigel on a hard case.** On a loud (low-ERL) echo the Geigel screen's fixed
+    /// `½·max|far|` threshold false-trips on the single-talk echo *every* frame and freezes adaptation,
+    /// so the single filter never converges (ERLE ≈ 0). The two-path NCC is a scale-independent ratio
+    /// (`ρ → 1` on echo-only regardless of loudness), so it vetoes the false Geigel trip and converges
+    /// to > 20 dB. This is the canonical fixed-threshold Geigel weakness. (The near-end *divergence*
+    /// failure the spec also names does not occur on this synthetic path: NLMS is inherently robust to
+    /// an *uncorrelated* near-end at this step size — its mean-zero updates average out and the
+    /// per-frame peak Geigel actually freezes on the echo+talker peak — so the loud-echo false-trip is
+    /// the honest hard case here. The two-path *mechanism* that would also hold under divergence is
+    /// proven by the foreground-frozen assertion in `two_path_protects_foreground_through_double_talk`.)
+    #[test]
+    fn two_path_beats_geigel_on_loud_echo_false_trip() {
+        let tail = 256;
+        let frame = 160;
+        let frames = 200;
+        // 3× the reference RIR → Σ|coef| ≈ 0.95, so the single-talk echo peak clears ½·max|far| on
+        // essentially every frame and the Geigel screen freezes; ρ (scale-independent) stays ≈ 1.
+        let loud: Vec<f32> = build_rir(128)
+            .iter()
+            .map(|coefficient| coefficient * 3.0)
+            .collect();
+        let mut prng = SplitMix64::new(0x1357_2468);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &loud, 0);
+
+        let mut geigel = EchoCanceller::new(8_000, tail).expect("build");
+        let mut two_path = EchoCanceller::new(8_000, tail)
+            .expect("build")
+            .with_two_path_dtd();
+        let mut geigel_erle = f64::NAN;
+        let mut two_path_erle = f64::NAN;
+        let mut geigel_frozen_frames = 0usize;
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut geigel_mic = echo[range.clone()].to_vec();
+            let mut two_path_mic = echo[range.clone()].to_vec();
+            geigel.cancel(&mut geigel_mic, &far[range.clone()]);
+            two_path.cancel(&mut two_path_mic, &far[range.clone()]);
+            geigel_erle = erle_db(&echo[range.clone()], &geigel_mic);
+            two_path_erle = erle_db(&echo[range], &two_path_mic);
+            if geigel.double_talk_active() {
+                geigel_frozen_frames += 1;
+            }
+        }
+        // Geigel false-freezes on the loud echo on nearly every frame and never cancels it.
+        assert!(
+            geigel_frozen_frames * 10 >= frames * 9,
+            "expected Geigel to false-trip on ~every loud-echo frame, got {geigel_frozen_frames}/{frames}"
+        );
+        assert!(
+            geigel_erle < 6.0,
+            "Geigel-only unexpectedly cancelled the loud echo ({geigel_erle:.1} dB)"
+        );
+        // The two-path NCC ignores the false trip and converges — a > 20 dB improvement.
+        assert!(
+            two_path_erle >= 20.0,
+            "two-path only reached {two_path_erle:.1} dB on the loud echo"
+        );
+        assert!(
+            two_path_erle - geigel_erle >= 20.0,
+            "two-path improvement over Geigel only {:.1} dB",
+            two_path_erle - geigel_erle
+        );
+        assert!(two_path.foreground_copies() > 0);
+    }
+
+    /// Double-talk protection: a well-converged two-path canceller must (a) flag double-talk, (b) keep
+    /// the **foreground frozen bit-for-bit** through it (a copy is the only thing that can move the
+    /// foreground and the NCC blocks it), (c) pass the near-end through with bounded leakage, and (d)
+    /// recover ERLE the instant the near-end stops — because the foreground never degraded.
+    #[test]
+    fn two_path_protects_foreground_through_double_talk() {
+        let tail = 256;
+        let frame = 160;
+        let converge_frames = 120;
+        let double_talk_frames = 30;
+        let recover_frames = 40;
+        let total = converge_frames + double_talk_frames + recover_frames;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x00DD_BA11);
+        let mut canceller = EchoCanceller::new(8_000, tail)
+            .expect("build")
+            .with_two_path_dtd();
+        let far = far_stream(&mut prng, 0.6, total * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+        let near_talk: Vec<i16> = (0..total * frame)
+            .map(|t| {
+                super::denormalize(
+                    0.6 * (2.0 * std::f32::consts::PI * 400.0 * t as f32 / 8_000.0).sin(),
+                )
+            })
+            .collect();
+        let frame_range = |index: usize| index * frame..(index + 1) * frame;
+
+        // 1) Converge on pure echo.
+        for index in 0..converge_frames {
+            let range = frame_range(index);
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+        }
+        let foreground_before: Vec<f32> = canceller.foreground_weights().to_vec();
+        let copies_before = canceller.foreground_copies();
+        assert!(
+            foreground_before.iter().any(|&weight| weight != 0.0),
+            "foreground must have converged before the double-talk"
+        );
+
+        // 2) Inject the near-end talker on top of the echo → double-talk.
+        let mut near_leakage = 0.0f64;
+        let mut near_power = 0.0f64;
+        let mut double_talk_seen = false;
+        for index in converge_frames..converge_frames + double_talk_frames {
+            let range = frame_range(index);
+            let talk = &near_talk[range.clone()];
+            let mut mic: Vec<i16> = echo[range.clone()]
+                .iter()
+                .zip(talk)
+                .map(|(&echo_sample, &near_sample)| echo_sample.saturating_add(near_sample))
+                .collect();
+            canceller.cancel(&mut mic, &far[range]);
+            double_talk_seen |= canceller.double_talk_active();
+            for (&residual, &near_sample) in mic.iter().zip(talk) {
+                let difference = f64::from(residual) - f64::from(near_sample);
+                near_leakage += difference * difference;
+                near_power += f64::from(near_sample) * f64::from(near_sample);
+            }
+        }
+        assert!(double_talk_seen, "two-path must flag the double-talk");
+        // The foreground filter is untouched through the whole double-talk segment.
+        assert_eq!(
+            foreground_before.as_slice(),
+            canceller.foreground_weights(),
+            "foreground must not adapt during double-talk"
+        );
+        assert_eq!(
+            copies_before,
+            canceller.foreground_copies(),
+            "no background→foreground copy may happen during double-talk"
+        );
+        // Near-end passes through: leakage ≥ ~12 dB below the near-end talker.
+        let leakage_db = 10.0 * (near_leakage / near_power.max(1.0)).log10();
+        assert!(
+            leakage_db <= -12.0,
+            "near-end leakage {leakage_db:.1} dB (want ≤ -12 dB)"
+        );
+
+        // 3) Near-end stops: ERLE recovers (the protected foreground never degraded).
+        let mut recovered = f64::NAN;
+        for index in converge_frames + double_talk_frames..total {
+            let range = frame_range(index);
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            recovered = erle_db(&echo[range], &mic);
+        }
+        assert!(
+            recovered >= 20.0,
+            "ERLE recovered to only {recovered:.1} dB after double-talk"
+        );
+    }
+
+    /// Copy-logic correctness: during clean single-talk the background converges and is copied into the
+    /// foreground (foreground improves from all-zero, copies climb); during double-talk no copy happens
+    /// (foreground frozen bit-for-bit, copy count held).
+    #[test]
+    fn two_path_copies_during_single_talk_and_freezes_during_double_talk() {
+        let tail = 128;
+        let frame = 160;
+        let rir = build_rir(64);
+        let mut prng = SplitMix64::new(0xC0DE_0FF1);
+        let mut canceller = EchoCanceller::new(8_000, tail)
+            .expect("build")
+            .with_two_path_dtd();
+        let far = far_stream(&mut prng, 0.6, 200 * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+        let frame_range = |index: usize| index * frame..(index + 1) * frame;
+
+        assert_eq!(canceller.foreground_copies(), 0);
+        // A few single-talk frames: the foreground must lift off zero via copies.
+        let mut early_erle = f64::NAN;
+        for index in 0..4 {
+            let range = frame_range(index);
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            early_erle = erle_db(&echo[range], &mic);
+        }
+        let copies_early = canceller.foreground_copies();
+        let foreground_energy_early: f32 = canceller
+            .foreground_weights()
+            .iter()
+            .map(|weight| weight * weight)
+            .sum();
+        assert!(copies_early > 0, "single-talk must trigger copies");
+        assert!(
+            foreground_energy_early > 0.0,
+            "foreground must improve from zero during single-talk"
+        );
+
+        // Keep converging: more copies, better foreground ERLE.
+        let mut late_erle = f64::NAN;
+        for index in 4..60 {
+            let range = frame_range(index);
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            late_erle = erle_db(&echo[range], &mic);
+        }
+        assert!(
+            canceller.foreground_copies() > copies_early,
+            "copies must keep firing while single-talk continues"
+        );
+        assert!(
+            late_erle > early_erle,
+            "foreground ERLE must improve as copies accumulate ({early_erle:.1} → {late_erle:.1} dB)"
+        );
+
+        // Double-talk: the copy must stop and the foreground must freeze.
+        let foreground_before: Vec<f32> = canceller.foreground_weights().to_vec();
+        let copies_before = canceller.foreground_copies();
+        for index in 60..85 {
+            let range = frame_range(index);
+            let talk: Vec<i16> = (0..frame)
+                .map(|t| super::denormalize(0.7 * ((index * frame + t) as f32 * 0.37).sin()))
+                .collect();
+            let mut mic: Vec<i16> = echo[range.clone()]
+                .iter()
+                .zip(&talk)
+                .map(|(&echo_sample, &near_sample)| echo_sample.saturating_add(near_sample))
+                .collect();
+            canceller.cancel(&mut mic, &far[range]);
+        }
+        assert_eq!(
+            foreground_before.as_slice(),
+            canceller.foreground_weights(),
+            "foreground must be frozen during double-talk"
+        );
+        assert_eq!(
+            copies_before,
+            canceller.foreground_copies(),
+            "no copy may happen during double-talk"
+        );
+    }
+
+    /// The two-path toggle is additive and composes with every constructor; its status accessors report
+    /// the mode, the last NCC, and the copy count. The Geigel default reports no two-path state.
+    #[test]
+    fn two_path_toggle_and_accessors() {
+        let geigel = EchoCanceller::new(8_000, 128).expect("build");
+        assert!(!geigel.two_path_enabled());
+        assert_eq!(geigel.double_talk_correlation(), None);
+        assert_eq!(geigel.foreground_copies(), 0);
+
+        let two_path = EchoCanceller::with_bulk_delay(8_000, 128, 40)
+            .expect("build")
+            .with_two_path_dtd();
+        assert!(two_path.two_path_enabled());
+        assert_eq!(two_path.double_talk_correlation(), None); // no frame processed yet
+        assert_eq!(two_path.foreground_copies(), 0);
+        assert_eq!(two_path.bulk_delay_samples(), 40); // toggle preserves the constructor config
+
+        // After a frame with far-end energy the NCC becomes observable.
+        let mut prng = SplitMix64::new(0x0B5E_2FED);
+        let mut canceller = EchoCanceller::new(8_000, 64)
+            .expect("build")
+            .with_two_path_dtd();
+        let far = far_stream(&mut prng, 0.6, 160);
+        let rir = build_rir(64);
+        let mut mic = synthesize_echo(&normalize(&far), &rir, 0);
+        canceller.cancel(&mut mic, &far);
+        assert!(
+            canceller.double_talk_correlation().is_some(),
+            "NCC must be observable after an excited frame"
+        );
+    }
+
+    /// `reset` clears both filters, the copy count, and the NCC, but preserves the two-path mode.
+    #[test]
+    fn two_path_reset_clears_state() {
+        let frame = 160;
+        let rir = build_rir(64);
+        let mut prng = SplitMix64::new(0x1234_ABCD);
+        let mut canceller = EchoCanceller::new(8_000, 128)
+            .expect("build")
+            .with_two_path_dtd();
+        let far = far_stream(&mut prng, 0.6, 40 * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+        for index in 0..40 {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+        }
+        assert!(canceller.foreground_copies() > 0);
+        assert!(canceller
+            .foreground_weights()
+            .iter()
+            .any(|&weight| weight != 0.0));
+        canceller.reset();
+        assert_eq!(canceller.foreground_copies(), 0);
+        assert_eq!(canceller.double_talk_correlation(), None);
+        assert!(canceller
+            .foreground_weights()
+            .iter()
+            .all(|&weight| weight == 0.0));
+        assert!(canceller.weights().iter().all(|&weight| weight == 0.0));
+        assert!(canceller.two_path_enabled(), "reset must preserve the mode");
+        assert!(!canceller.double_talk_active());
+    }
+
+    /// Determinism: the two-path path is a pure function of the input (logical clock, fixed-seed PRNG),
+    /// so two identical runs yield identical foreground weights and copy counts.
+    #[test]
+    fn two_path_is_deterministic() {
+        let run = || {
+            let frame = 160;
+            let rir = build_rir(128);
+            let mut prng = SplitMix64::new(0xD37E_2222);
+            let mut canceller = EchoCanceller::new(8_000, 160)
+                .expect("build")
+                .with_two_path_dtd();
+            let far = far_stream(&mut prng, 0.6, 80 * frame);
+            let echo = synthesize_echo(&normalize(&far), &rir, 0);
+            for index in 0..80 {
+                let range = index * frame..(index + 1) * frame;
+                let mut mic = echo[range.clone()].to_vec();
+                canceller.cancel(&mut mic, &far[range]);
+            }
+            (
+                canceller.foreground_weights().to_vec(),
+                canceller.foreground_copies(),
+            )
+        };
+        assert_eq!(run(), run());
+    }
+
+    /// The two-path toggle composes with automatic GCC-PHAT delay estimation: an unknown bulk delay is
+    /// aligned and the protected foreground still reaches the ≥ 20 dB ERLE target.
+    #[test]
+    fn two_path_with_delay_estimation_converges() {
+        let frame = 160;
+        let search_range = 512;
+        let unknown_delay = 256;
+        let frames = 300;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0xE51E_7777);
+        let mut canceller = EchoCanceller::with_delay_estimation(8_000, 192, search_range)
+            .expect("build")
+            .with_two_path_dtd();
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, unknown_delay);
+        let mut steady_erle = f64::NAN;
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            steady_erle = erle_db(&echo[range], &mic);
+        }
+        assert!(
+            canceller.estimated_bulk_delay().is_some(),
+            "GCC-PHAT must lock the delay in two-path mode"
+        );
+        assert!(
+            steady_erle >= 20.0,
+            "two-path + delay-estimation steady ERLE {steady_erle:.1} dB < 20 dB"
+        );
     }
 
     /// The block size is a power of two, at least twice the search range, clamped to the FFT bounds.
