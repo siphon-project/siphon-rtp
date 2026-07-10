@@ -34,12 +34,12 @@ What each codec actually does, precisely:
 | GSM-FR (GSM 06.10) | always | yes | yes | bit-exact, ETSI vectors |
 | Comfort noise (RFC 3389) | always | yes (generator) | no (DTX is a media-path policy) | RFC 3389 |
 | AMR-WB (TS 26.171/.190) | `amr` | all 9 modes, 6.60 to 23.85 kbit/s | all 9 modes | bit-exact, 3GPP TS 26.174 vectors |
-| AMR-NB (TS 26.071/.090) | `amr` | all 8 modes | **MR475, MR515, MR59, MR67, MR74, MR122** | bit-exact, 3GPP TS 26.074 vectors |
+| AMR-NB (TS 26.071/.090) | `amr` | all 8 modes | **MR475, MR515, MR59, MR67, MR74, MR102, MR122** | bit-exact, 3GPP TS 26.074 vectors |
 
-Be precise about AMR-NB: the decoder covers every mode, the encoder covers six (MR475, MR515,
-MR59, MR67, MR74, MR122). The engine's default AMR-NB egress mode is MR122 (12.2 kbit/s, the
-GSM-EFR-compatible mode); the lower-rate modes are implemented and bit-exact but the SDP layer does
-not currently select them. AMR-WB egress defaults
+Be precise about AMR-NB: the decoder covers every mode, the encoder covers seven (MR475, MR515,
+MR59, MR67, MR74, MR102, MR122 — only MR795 remains). The engine's default AMR-NB egress mode is
+MR122 (12.2 kbit/s, the GSM-EFR-compatible mode); the other modes are implemented and bit-exact but
+the SDP layer does not currently select them. AMR-WB egress defaults
 to mode 2 (12.65 kbit/s) and is clamped by the peer's `mode-set` (below). Opus is in progress and
 not usable yet; EVS is absent. Both still *relay* fine.
 
@@ -121,8 +121,9 @@ the AMR-NB leg encodes MR122.
 
 One asymmetry to know: `codec-transcode-AMR` is **not** an accepted directive target. The engine
 only injects codecs it can unconditionally encode into a far offer, and the AMR-NB encoder covers
-two modes, so AMR-NB cannot be forced into an offer that never contained it (the directive is
-skipped, the call proceeds without it). `codec-transcode-AMR-WB` *is* accepted on `amr` builds.
+seven of the eight modes, so AMR-NB cannot be forced into an offer that never contained it (the
+directive is skipped, the call proceeds without it). `codec-transcode-AMR-WB` *is* accepted on `amr`
+builds.
 In practice this costs nothing: the AMR leg is the access leg that offered AMR itself.
 
 ## The codec directives
