@@ -12,10 +12,13 @@
 //!    grid). Shares the two-pulse inner search kernel with the 9-bit codebook.
 //!  * MR67 (6.70 kbit/s): `c3_14pf.c` `code_3i40_14bits` — 3 pulses / 14-bit index. First user of the
 //!    [`set_sign`] `dn2` per-track pruning (`n = 6`).
+//!  * MR74 (7.40 kbit/s): `c4_17pf.c` `code_4i40_17bits` — 4 pulses / 17-bit index, Gray-coded
+//!    positions (`n = 4`). The same codebook backs MR795 (its extra gain param lands with the MR795
+//!    gain quantizer).
 //!
-//! The remaining modes' searches (`c4_17pf` MR74/MR795, `c8_31pf` MR102) are OUT OF SCOPE for this
-//! tier — a later extension wires them into [`cbsearch`]'s dispatch (the shared
-//! `cor_h_x`/`cor_h`/`set_sign` helpers already generalize).
+//! The remaining modes' searches (`c8_31pf` MR102, and MR795's gain) are OUT OF SCOPE for this tier —
+//! a later extension wires them into [`cbsearch`]'s dispatch (the shared `cor_h_x`/`cor_h`/`set_sign`
+//! helpers already generalize).
 //!
 //! Everything is bit-exact against the fixed-point reference: all arithmetic goes through
 //! [`crate::amr::basic_ops`] / `crate::amr::nb::math_nb`, never native integer arithmetic on the
@@ -36,8 +39,8 @@
 //! tier-6 wiring is mechanical.
 
 use crate::amr::basic_ops::{
-    add, extract_h, extract_l, l_abs, l_mac, l_msu, l_mult, l_shl, l_shr, mult, negate, norm_l,
-    round_word, shl, shr, sub,
+    add, extract_h, extract_l, l_abs, l_deposit_h, l_mac, l_msu, l_mult, l_shl, l_shr, mult,
+    negate, norm_l, round_word, shl, shr, sub,
 };
 use crate::amr::nb::constants::{L_CODE, NB_TRACK, STEP};
 use crate::amr::nb::math_nb::inv_sqrt;
@@ -50,6 +53,8 @@ const NB_PULSE_MR122: usize = 10;
 const NB_PULSE_2I40: usize = 2;
 /// Number of pulses in the MR67 (3-pulse) search (`c3_14pf.c` `NB_PULSE`).
 const NB_PULSE_3I40: usize = 3;
+/// Number of pulses in the MR74/MR795 (4-pulse) search (`c4_17pf.c` `NB_PULSE`).
+const NB_PULSE_4I40: usize = 4;
 
 /// `1/2` in Q15 (`(Word16)(32768/2)` = 16384). All these fractions fit a positive `Word16`.
 const Q15_1_2: i16 = 16384;
@@ -875,6 +880,264 @@ fn code_3i40_14bits(
 }
 
 // =============================================================================================
+//  MR74 / MR795 : 4-pulse 17-bit search (c4_17pf.c)
+// =============================================================================================
+
+/// `c4_17pf.c` `search_4i40` — MR74/MR795 (17-bit) 4-pulse search: pulses i0/i1/i2 on tracks 0/1/2
+/// (positions 0,5,…; 1,6,…; 2,7,…), i3 on tracks {3,4}, over a 2-way grid of the i3 start track with
+/// a 4-way cyclic permutation of the pulse-start positions. `dn2` carries the per-track pruning from
+/// [`set_sign`] (called with `n = 4`): only i0 positions whose `dn2[i0] >= 0` (the 4 largest of each
+/// track's 8) are searched. The i3 accumulator seeds from `L_deposit_h(alp)` (not `¼·alp` as i2 does).
+fn search_4i40(dn: &[i16], dn2: &[i16], rr: &[i16], codvec: &mut [i16; NB_PULSE_4I40]) {
+    let step = STEP as i16;
+    let rr = |i: usize, j: usize| -> i16 { rr[i * L_CODE + j] };
+
+    let mut psk: i16 = -1;
+    let mut alpk: i16 = 1;
+    for (i, c) in codvec.iter_mut().enumerate() {
+        *c = i as i16;
+    }
+
+    let mut track = 3i16;
+    while track < 5 {
+        let mut ipos = [0i16, 1, 2, track];
+
+        // Try the 4 cyclic rotations of (ipos[0], ipos[1], ipos[2], ipos[3]).
+        for _ in 0..NB_PULSE_4I40 {
+            let mut i0 = ipos[0];
+            while (i0 as usize) < L_CODE {
+                if dn2[i0 as usize] >= 0 {
+                    let ps0 = dn[i0 as usize];
+                    let alp0 = l_mult(rr(i0 as usize, i0 as usize), Q15_1_4);
+
+                    // i1 loop: 8 positions.
+                    let mut sq: i16 = -1;
+                    let mut alp: i16 = 1;
+                    let mut ps: i16 = 0;
+                    let mut ix = ipos[1];
+                    let mut i1 = ipos[1];
+                    while (i1 as usize) < L_CODE {
+                        let ps1 = add(ps0, dn[i1 as usize]);
+                        let mut alp1 = l_mac(alp0, rr(i1 as usize, i1 as usize), Q15_1_4);
+                        alp1 = l_mac(alp1, rr(i0 as usize, i1 as usize), Q15_1_2);
+                        let sq1 = mult(ps1, ps1);
+                        let alp_16 = round_word(alp1);
+                        let s = l_msu(l_mult(alp, sq1), sq, alp_16);
+                        if s > 0 {
+                            sq = sq1;
+                            ps = ps1;
+                            alp = alp_16;
+                            ix = i1;
+                        }
+                        i1 += step;
+                    }
+                    let i1 = ix;
+
+                    // i2 loop: 8 positions.
+                    let ps0 = ps;
+                    let alp0 = l_mult(alp, Q15_1_4);
+                    let mut sq: i16 = -1;
+                    let mut alp: i16 = 1;
+                    let mut ps: i16 = 0;
+                    let mut ix = ipos[2];
+                    let mut i2 = ipos[2];
+                    while (i2 as usize) < L_CODE {
+                        let ps1 = add(ps0, dn[i2 as usize]);
+                        let mut alp1 = l_mac(alp0, rr(i2 as usize, i2 as usize), Q15_1_16);
+                        alp1 = l_mac(alp1, rr(i1 as usize, i2 as usize), Q15_1_8);
+                        alp1 = l_mac(alp1, rr(i0 as usize, i2 as usize), Q15_1_8);
+                        let sq1 = mult(ps1, ps1);
+                        let alp_16 = round_word(alp1);
+                        let s = l_msu(l_mult(alp, sq1), sq, alp_16);
+                        if s > 0 {
+                            sq = sq1;
+                            ps = ps1;
+                            alp = alp_16;
+                            ix = i2;
+                        }
+                        i2 += step;
+                    }
+                    let i2 = ix;
+
+                    // i3 loop: 8 positions.
+                    let ps0 = ps;
+                    let alp0 = l_deposit_h(alp);
+                    let mut sq: i16 = -1;
+                    let mut alp: i16 = 1;
+                    let mut ix = ipos[3];
+                    let mut i3 = ipos[3];
+                    while (i3 as usize) < L_CODE {
+                        let ps1 = add(ps0, dn[i3 as usize]);
+                        let mut alp1 = l_mac(alp0, rr(i3 as usize, i3 as usize), Q15_1_16);
+                        alp1 = l_mac(alp1, rr(i2 as usize, i3 as usize), Q15_1_8);
+                        alp1 = l_mac(alp1, rr(i1 as usize, i3 as usize), Q15_1_8);
+                        alp1 = l_mac(alp1, rr(i0 as usize, i3 as usize), Q15_1_8);
+                        let sq1 = mult(ps1, ps1);
+                        let alp_16 = round_word(alp1);
+                        let s = l_msu(l_mult(alp, sq1), sq, alp_16);
+                        if s > 0 {
+                            sq = sq1;
+                            alp = alp_16;
+                            ix = i3;
+                        }
+                        i3 += step;
+                    }
+
+                    // Memorise the codevector if this one is better.
+                    let s = l_msu(l_mult(alpk, sq), psk, alp);
+                    if s > 0 {
+                        psk = sq;
+                        alpk = alp;
+                        codvec[0] = i0;
+                        codvec[1] = i1;
+                        codvec[2] = i2;
+                        codvec[3] = ix;
+                    }
+                }
+                i0 += step;
+            }
+
+            // Cyclic permutation of the 4 pulse-start positions.
+            let pos = ipos[3];
+            ipos[3] = ipos[2];
+            ipos[2] = ipos[1];
+            ipos[1] = ipos[0];
+            ipos[0] = pos;
+        }
+        track += 1;
+    }
+}
+
+/// `c4_17pf.c` `build_code` — build the innovation `cod[]`, filtered code `y[]`, the 4-pulse sign word
+/// (`*sign`) and the 13-bit position index (returned) for the 17-bit codebook. Each pulse position is
+/// Gray-encoded ([`GRAY`]); i0 (track 0) → bits 0-2, i1 → 3-5, i2 → 6-8, i3 (tracks 3/4) → bits 9-12
+/// (see `d4_17pf.c` for the inverse).
+fn build_code_4i40_17bits(
+    codvec: &[i16; NB_PULSE_4I40],
+    dn_sign: &[i16],
+    cod: &mut [i16],
+    h: &[i16],
+    y: &mut [i16],
+    sign: &mut i16,
+) -> i16 {
+    for c in cod.iter_mut().take(L_CODE) {
+        *c = 0;
+    }
+
+    let mut sign_pulses = [0i16; NB_PULSE_4I40];
+    let mut indx: i16 = 0;
+    let mut rsign: i16 = 0;
+    for k in 0..NB_PULSE_4I40 {
+        let i = codvec[k];
+        let j = dn_sign[i as usize];
+
+        let pos_over5 = mult(i, 6554); // index = pos/5
+        let track = sub(i, extract_l(l_shr(l_mult(pos_over5, 5), 1))); // track = pos%5
+        let mut index = GRAY[pos_over5 as usize]; // Gray-encode the in-track position
+
+        // Remap the raw track (pos%5) to the transmitted sign-track and finalize the position bits.
+        let track = if track == 1 {
+            index = shl(index, 3);
+            1i16
+        } else if track == 2 {
+            index = shl(index, 6);
+            2i16
+        } else if track == 3 {
+            index = shl(index, 10);
+            3i16
+        } else if track == 4 {
+            index = add(shl(index, 10), 512);
+            3i16
+        } else {
+            // track == 0: the Gray-encoded position stays in bits 0-2, sign-track 0.
+            0i16
+        };
+
+        if j > 0 {
+            cod[i as usize] = 8191;
+            sign_pulses[k] = 32767;
+            rsign = add(rsign, shl(1, track));
+        } else {
+            cod[i as usize] = -8192;
+            sign_pulses[k] = -32768; // (Word16)-32768
+        }
+        indx = add(indx, index);
+    }
+    *sign = rsign;
+
+    // y[i] = round( Σ_k h[i - codvec[k]] · sign_pulses[k] ), reading h[n<0] as 0.
+    let p0 = codvec[0];
+    let p1 = codvec[1];
+    let p2 = codvec[2];
+    let p3 = codvec[3];
+    for (i, yi) in y.iter_mut().enumerate().take(L_CODE) {
+        let mut s: i32 = 0;
+        let n0 = i as isize - p0 as isize;
+        if n0 >= 0 {
+            s = l_mac(s, h[n0 as usize], sign_pulses[0]);
+        }
+        let n1 = i as isize - p1 as isize;
+        if n1 >= 0 {
+            s = l_mac(s, h[n1 as usize], sign_pulses[1]);
+        }
+        let n2 = i as isize - p2 as isize;
+        if n2 >= 0 {
+            s = l_mac(s, h[n2 as usize], sign_pulses[2]);
+        }
+        let n3 = i as isize - p3 as isize;
+        if n3 >= 0 {
+            s = l_mac(s, h[n3 as usize], sign_pulses[3]);
+        }
+        *yi = round_word(s);
+    }
+
+    indx
+}
+
+/// `c4_17pf.c` `code_4i40_17bits` — MR74/MR795 fixed-codebook search over a 40-sample subframe with 4
+/// pulses (17-bit index). `h` is modified in place with the pitch-sharpening contribution (as the
+/// reference does), so the caller must pass a writable copy. Returns the position index and writes
+/// the sign word to `sign`.
+fn code_4i40_17bits(
+    x: &[i16],
+    h: &mut [i16],
+    t0: i16,
+    pitch_sharp: i16,
+    code: &mut [i16],
+    y: &mut [i16],
+    sign: &mut i16,
+) -> i16 {
+    let sharp = shl(pitch_sharp, 1);
+    // Pre-CB pitch sharpening folded into h[] (as the reference does, before the search).
+    if sub(t0, L_CODE as i16) < 0 {
+        for i in (t0 as usize)..L_CODE {
+            h[i] = add(h[i], mult(h[i - t0 as usize], sharp));
+        }
+    }
+
+    let mut dn = [0i16; L_CODE];
+    let mut dn2 = [0i16; L_CODE];
+    let mut dn_sign = [0i16; L_CODE];
+    let mut rr = [0i16; L_CODE * L_CODE];
+    let mut codvec = [0i16; NB_PULSE_4I40];
+
+    cor_h_x(h, x, &mut dn, 1);
+    set_sign(&mut dn, &mut dn_sign, &mut dn2, 4); // n = 4 → keep 4 maxima per track in dn2[]
+    cor_h(h, &dn_sign, &mut rr);
+    search_4i40(&dn, &dn2, &rr, &mut codvec);
+    let index = build_code_4i40_17bits(&codvec, &dn_sign, code, h, y, sign);
+
+    // Post-CB pitch sharpening folded into code[].
+    if sub(t0, L_CODE as i16) < 0 {
+        for i in (t0 as usize)..L_CODE {
+            code[i] = add(code[i], mult(code[i - t0 as usize], sharp));
+        }
+    }
+
+    index
+}
+
+// =============================================================================================
 //  MR122 : 10-pulse 35-bit search (c1035pf.c + s10_8pf.c)
 // =============================================================================================
 
@@ -1272,13 +1535,13 @@ fn code_10i40_35bits(
 /// reference writes them via `*(*anap)++`), plus the mode's parameter count.
 ///
 /// * MR122 (`code_10i40_35bits`): 10 params — the 10 packed pulse indices (`indx[0..10]`).
-/// * MR475/MR515 (`code_2i40_9bits`), MR59 (`code_2i40_11bits`) and MR67 (`code_3i40_14bits`): 2
-///   params — the position index, then the sign index.
+/// * MR475/MR515 (`code_2i40_9bits`), MR59 (`code_2i40_11bits`), MR67 (`code_3i40_14bits`) and MR74
+///   (`code_4i40_17bits`): 2 params — the position index, then the sign index.
 #[derive(Debug, Clone)]
 pub struct CbSearchResult {
     /// Codebook parameters, written in `*anap++` order. Only the first [`Self::num_params`] valid.
     pub params: [i16; 10],
-    /// Number of valid entries in [`Self::params`] (2 for MR475/MR515/MR59/MR67, 10 for MR122).
+    /// Number of valid entries in [`Self::params`] (2 for MR475/MR515/MR59/MR67/MR74, 10 for MR122).
     pub num_params: usize,
 }
 
@@ -1296,7 +1559,7 @@ pub struct CbSearchResult {
 ///  * Outputs: `code` (innovation, Q13), `y2` (filtered code, Q12), and the returned
 ///    [`CbSearchResult`] carrying the `ana` params.
 ///
-/// Only MR122, MR475/MR515, MR59 and MR67 are implemented so far; other modes return
+/// Only MR122, MR475/MR515, MR59, MR67 and MR74 are implemented so far; other modes return
 /// [`CodecError::Unsupported`] (they are gated out of the encoder until their search files are
 /// ported). The frame loop only ever calls the live modes.
 #[allow(clippy::too_many_arguments)]
@@ -1338,6 +1601,16 @@ pub fn cbsearch(
         AmrNbMode::Mr670 => {
             let mut sign = 0i16;
             let index = code_3i40_14bits(xn2, h1, t0, pitch_sharp, code, y2, &mut sign);
+            params[0] = index; // position index
+            params[1] = sign; //  sign index
+            Ok(CbSearchResult {
+                params,
+                num_params: 2,
+            })
+        }
+        AmrNbMode::Mr740 => {
+            let mut sign = 0i16;
+            let index = code_4i40_17bits(xn2, h1, t0, pitch_sharp, code, y2, &mut sign);
             params[0] = index; // position index
             params[1] = sign; //  sign index
             Ok(CbSearchResult {
@@ -1530,6 +1803,62 @@ mod tests {
         let mut cod_dec = [0i16; L_CODE];
         decode_3i40_14bits(sign, index, &mut cod_dec);
         assert_eq!(code, cod_dec, "MR67 encoder/decoder codeword mismatch");
+    }
+
+    #[test]
+    fn code_4i40_17bits_places_four_pulses_and_signs_roundtrip() {
+        // MR74 17-bit codebook: build a code and confirm the 17-bit decoder twin reconstructs the
+        // same four ±8191/-8192 pulses from the returned position/sign indices.
+        use crate::amr::nb::codebook::decode_4i40_17bits;
+        let mut h = [0i16; L_CODE];
+        h[0] = 4096; // unit-ish impulse response
+        let mut x = [0i16; L_CODE];
+        x[0] = 8000; // peak on i0 track (pos%5 == 0)
+        x[1] = -6000; // peak on i1 track (pos%5 == 1)
+        x[2] = 5000; // peak on i2 track (pos%5 == 2)
+        x[3] = -4000; // peak on an i3 track (pos%5 == 3)
+        let mut code = [0i16; L_CODE];
+        let mut y = [0i16; L_CODE];
+        let mut sign = 0i16;
+        let index = code_4i40_17bits(&x, &mut h, 40, 0, &mut code, &mut y, &mut sign);
+
+        // exactly four nonzero pulses at ±8191/-8192
+        let nz: Vec<_> = code.iter().enumerate().filter(|(_, &v)| v != 0).collect();
+        assert_eq!(nz.len(), 4);
+        assert!(nz.iter().all(|&(_, &v)| v == 8191 || v == -8192));
+
+        // decoder reconstructs the same pulse positions/signs
+        let mut cod_dec = [0i16; L_CODE];
+        decode_4i40_17bits(sign, index, &mut cod_dec);
+        assert_eq!(code, cod_dec, "MR74 encoder/decoder codeword mismatch");
+    }
+
+    #[test]
+    fn cbsearch_mr740_emits_two_params() {
+        let mut h = [0i16; L_CODE];
+        h[0] = 4096;
+        let mut xn2 = [0i16; L_CODE];
+        xn2[0] = 5000;
+        xn2[1] = -4000;
+        xn2[2] = 3000;
+        xn2[3] = -2000;
+        let res2 = xn2;
+        let mut code = [0i16; L_CODE];
+        let mut y2 = [0i16; L_CODE];
+        let r = cbsearch(
+            &xn2,
+            &mut h,
+            40,
+            0,
+            8192,
+            &res2,
+            &mut code,
+            &mut y2,
+            AmrNbMode::Mr740,
+            0,
+        )
+        .expect("MR74 cbsearch");
+        assert_eq!(r.num_params, 2);
     }
 
     #[test]
@@ -1854,6 +2183,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oracle_gate_mr74_all_subframes_bit_exact() {
+        if let Some(n) = run_cb_oracle_gate("/tmp/amr-nb-oracle-t4/dump_mr74.txt") {
+            eprintln!("MR74 cbsearch oracle gate: {n} subframes bit-exact");
+        } else {
+            eprintln!("MR74 cbsearch oracle dump absent — skipping full gate");
+        }
+    }
+
     /// Committed self-contained regression: feed the oracle-captured *inputs* of frame 10, subframe
     /// 0 (real pitch energy, non-zero `sharp` so the pitch-sharpening path is exercised) into
     /// [`cbsearch`] and pin the transmitted codebook params + `code`/`y2` (spot samples + sum/sumsq
@@ -2083,6 +2421,40 @@ mod tests {
             (8190, 201_293_826),
             &[(5, 4096), (7, -4728), (11, 3913)],
             (4313, 58_464_855),
+        );
+    }
+
+    #[test]
+    fn mr74_frame10_subfr0_cbsearch_matches_reference() {
+        // MR74 17-bit 4-pulse codebook (`c4_17pf`) — Gray-coded positions, `set_sign` pruning (n=4),
+        // and the `L_deposit_h` i3 accumulator. Frame 10 subframe 0 (non-zero `sharp`) pinned to the
+        // byte-exact encoder output (validated frame-for-frame against the official T01_74.COD).
+        frame10_subfr0_cb_regression(
+            AmrNbMode::Mr740,
+            0,
+            141,
+            10300,
+            18355,
+            &[
+                -102, 206, -816, 643, -1748, 789, -206, -1974, 894, -2322, 438, -52, -881, 845,
+                -861, 988, -601, -657, -484, 148, 452, -693, 595, -386, 695, 421, -386, 257, -567,
+                640, 151, 505, 302, -90, 12, 63, 716, -134, 181, -420,
+            ],
+            &[
+                4096, 1112, -632, 230, -18, -2, -201, -40, 15, -103, -87, -242, 52, 76, -63, 59, 4,
+                45, 7, -11, 42, -7, 26, -21, -15, 19, -26, 6, -7, -3, 7, -12, 8, -4, 3, 4, -6, 8,
+                -3, 1,
+            ],
+            &[
+                297, -54, -725, 786, -2043, 1536, -1015, -1332, 952, -2629, 1264, -846, -292, 526,
+                -896, 1093, -1006, -193, -877, 576, -65, -417, 652, -757, 1158, -155, -19, 69,
+                -608, 862, -196, 810, -84, 145, -100, 157, 705, -344, 439, -660,
+            ],
+            &[1627, 1],
+            &[(7, -8192), (9, -8192), (10, 8191), (11, -8192)],
+            (-16385, 268_419_073),
+            &[(7, -4096), (9, -3464), (10, 2754), (11, -2334)],
+            (-8635, 48_602_933),
         );
     }
 }

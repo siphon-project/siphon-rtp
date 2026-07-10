@@ -178,10 +178,10 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
             Ok(Box::new(encoder))
         }
         // AMR-NB encode is bit-exact (3GPP TS 26.074) for MR475 (4.75k), MR515 (5.15k), MR59 (5.90k),
-        // MR67 (6.70k) and MR122 (12.2k, GSM-EFR); the remaining modes' codebook/gain search is not yet
-        // ported, so a `mode-set` that resolves to one of them is declined here (a clean factory-time
-        // `Unsupported` rather than a per-frame error mid-call). No `mode-set` ⇒ the codec default
-        // (MR122). Same `amr`-feature gate.
+        // MR67 (6.70k), MR74 (7.40k) and MR122 (12.2k, GSM-EFR); the remaining modes' codebook/gain
+        // search is not yet ported, so a `mode-set` that resolves to one of them is declined here (a
+        // clean factory-time `Unsupported` rather than a per-frame error mid-call). No `mode-set` ⇒ the
+        // codec default (MR122). Same `amr`-feature gate.
         #[cfg(feature = "amr")]
         "AMR" => match spec.encode_mode {
             None => Ok(Box::new(AmrNb::new())),
@@ -191,10 +191,11 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
                     | AmrNbMode::Mr515
                     | AmrNbMode::Mr590
                     | AmrNbMode::Mr670
+                    | AmrNbMode::Mr740
                     | AmrNbMode::Mr1220),
                 ) => Ok(Box::new(AmrNb::new().with_encode_mode(mode))),
                 _ => Err(CodecError::Unsupported(
-                    "AMR-NB encode is wired for MR475, MR515, MR59, MR67 and MR122 only; other modes not yet ported",
+                    "AMR-NB encode is wired for MR475, MR515, MR59, MR67, MR74 and MR122 only; other modes not yet ported",
                 )),
             },
         },
@@ -209,12 +210,12 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
 fn unsupported_name(encoding_name: &str) -> &'static str {
     match encoding_name {
         "CN" => "comfort-noise generation (DTX) is a media-path policy, not an audio encoder",
-        // With `amr` on, AMR-WB (decode + encode) and AMR-NB decode + MR475/MR515/MR59/MR122 encode are
-        // wired, so supported specs never reach here. `encoder_for("AMR")` handles an unported-mode
-        // request with its own message; this fallback is only hit for a decode-side "AMR" spec that has
-        // no encoder.
+        // With `amr` on, AMR-WB (decode + encode) and AMR-NB decode + MR475/MR515/MR59/MR67/MR74/MR122
+        // encode are wired, so supported specs never reach here. `encoder_for("AMR")` handles an
+        // unported-mode request with its own message; this fallback is only hit for a decode-side "AMR"
+        // spec that has no encoder.
         #[cfg(feature = "amr")]
-        "AMR" => "AMR-NB encode is wired for MR475, MR515, MR59 and MR122 only; other modes not yet ported",
+        "AMR" => "AMR-NB encode is wired for MR475, MR515, MR59, MR67, MR74 and MR122 only; other modes not yet ported",
         #[cfg(not(feature = "amr"))]
         "AMR" | "AMR-WB" => {
             "AMR transcoding requires the `amr` build feature (patent-licensed — see \
@@ -401,8 +402,8 @@ mod tests {
     #[test]
     fn amr_nb_decodes_and_encodes_the_wired_modes() {
         // AMR-NB decode is bit-exact for all 8 modes (3GPP TS 26.074). Encode is bit-exact for MR475,
-        // MR515, MR59, MR67 and MR122, enabling AMR-NB↔G.711 transcode; a `mode-set` resolving to an
-        // unported mode is declined at factory time rather than mis-encoding mid-call.
+        // MR515, MR59, MR67, MR74 and MR122, enabling AMR-NB↔G.711 transcode; a `mode-set` resolving to
+        // an unported mode is declined at factory time rather than mis-encoding mid-call.
         let nb = CodecSpec::new(97, "AMR", 8000, 1, 20);
         let mut decoder = decoder_for(&nb).expect("AMR-NB decoder builds");
         // A minimal RFC 4867 octet-aligned mode-0 (MR475) frame: CMR=0xF, then ToC (F=0, FT=0, Q=1),
@@ -418,14 +419,15 @@ mod tests {
             160,
             "one 20 ms / 160-sample frame"
         );
-        // No mode-set ⇒ default MR122 encoder; MR475 (FT=0), MR515 (FT=1), MR59 (FT=2), MR67 (FT=3)
-        // and MR122 (FT=7) build; an unported mode (e.g. MR74 / FT=4) is declined with Unsupported.
+        // No mode-set ⇒ default MR122 encoder; MR475 (FT=0), MR515 (FT=1), MR59 (FT=2), MR67 (FT=3),
+        // MR74 (FT=4) and MR122 (FT=7) build; an unported mode (e.g. MR795 / FT=5) is declined.
         assert!(encoder_for(&nb).is_ok(), "default AMR-NB encoder (MR122)");
         for (frame_type, name) in [
             (0u8, "MR475"),
             (1, "MR515"),
             (2, "MR59"),
             (3, "MR67"),
+            (4, "MR74"),
             (7, "MR122"),
         ] {
             assert!(
@@ -438,10 +440,10 @@ mod tests {
         }
         assert!(
             matches!(
-                encoder_for(&CodecSpec::new(97, "AMR", 8000, 1, 20).with_encode_mode(Some(4))),
+                encoder_for(&CodecSpec::new(97, "AMR", 8000, 1, 20).with_encode_mode(Some(5))),
                 Err(CodecError::Unsupported(_))
             ),
-            "MR74 (unported) is declined"
+            "MR795 (unported) is declined"
         );
     }
 

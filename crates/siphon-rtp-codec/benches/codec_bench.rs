@@ -454,6 +454,7 @@ fn bench_amrnb_encode(criterion: &mut Criterion) {
         AmrNbMode::Mr515,
         AmrNbMode::Mr590,
         AmrNbMode::Mr670,
+        AmrNbMode::Mr740,
         AmrNbMode::Mr1220,
     ] {
         let nb_bits = mode.bits() as usize;
