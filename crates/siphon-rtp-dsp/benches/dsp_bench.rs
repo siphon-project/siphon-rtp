@@ -117,6 +117,20 @@ fn bench_aec(criterion: &mut Criterion) {
             black_box(near[0])
         });
     });
+
+    // The amortized per-frame cost with GCC-PHAT delay estimation on: every frame buffers the raw
+    // near/far into the estimation block and, once per `block_size` samples, pays two forward real
+    // FFTs + a phase-transformed cross-power + an inverse FFT. Search range 512 → 1024-point blocks
+    // (one GCC block every ~6.4 frames at 8 kHz).
+    criterion.bench_function("aec_delayest_8k_20ms", |bencher| {
+        let mut canceller = EchoCanceller::with_delay_estimation(8_000, TAIL, 512).expect("build");
+        let mut near = near_8k.clone();
+        bencher.iter(|| {
+            near.copy_from_slice(&near_8k);
+            canceller.cancel(black_box(&mut near), black_box(&far_8k));
+            black_box(near[0])
+        });
+    });
 }
 
 criterion_group!(

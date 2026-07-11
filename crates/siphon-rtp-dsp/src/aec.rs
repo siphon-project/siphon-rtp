@@ -32,12 +32,29 @@
 //! far-end delay ring) is preallocated in [`EchoCanceller::new`]; the near-end is filtered in place,
 //! so [`EchoCanceller::cancel`] does **zero per-frame heap allocation**.
 //!
-//! ## Fixed bulk delay (this slice) vs. delay estimation (later)
-//! The loudspeaker→microphone acoustic + buffering delay `τ` is a **configuration parameter** here
-//! ([`EchoCanceller::with_bulk_delay`]); the adaptive filter only has to cover the impulse-response
-//! *spread*, not the bulk transport delay, which keeps the tail short. Automatic delay estimation
-//! (GCC-PHAT) is a later PR — see the crate roadmap.
+//! ## Fixed bulk delay vs. automatic delay estimation
+//! The loudspeaker→microphone acoustic + buffering delay `τ` can be supplied as a **configuration
+//! parameter** ([`EchoCanceller::with_bulk_delay`]) or **estimated automatically** at run time from
+//! the signals themselves ([`EchoCanceller::with_delay_estimation`]). Either way the adaptive filter
+//! only has to cover the impulse-response *spread*, not the bulk transport delay, which keeps the
+//! tail short.
+//!
+//! ## Automatic delay estimation (GCC-PHAT)
+//! [`with_delay_estimation`](EchoCanceller::with_delay_estimation) drives the far-end alignment ring
+//! from a **generalized cross-correlation with phase transform** (GCC-PHAT) estimate of the bulk
+//! delay between the far-end reference and the near-end echo (Knapp & Carter, *The Generalized
+//! Correlation Method for Estimation of Time Delay*, IEEE TASSP 1976). Over a preallocated power-of-two
+//! block, an internal `DelayEstimator` runs the near-end and reference blocks through the real
+//! [`crate::fft`],
+//! forms the cross-power spectrum `Near·conj(Far)`, applies the phase transform (each bin normalized
+//! by its magnitude, so only the phase — the delay information — survives), inverse-transforms to the
+//! generalized cross-correlation, and picks the peak lag over the search range. The correlation
+//! surface is smoothed across several blocks and a re-align hangover keeps a stable delay from
+//! thrashing the alignment. When the committed estimate changes, the adaptive weights are reset (they
+//! were tuned to the previous alignment); the far-end history ring is preallocated for the whole
+//! search range, so a re-align only shifts a read offset — never a heap allocation.
 
+use crate::fft::{Complex, RealFft};
 use siphon_rtp_simd::fir_dot_f32;
 
 /// i16 full-scale. Samples are processed in normalized `f32` in `[-1, 1)` so the NLMS step size,
@@ -66,6 +83,36 @@ const DEFAULT_FAR_PEAK_FLOOR: f32 = 1.0e-3;
 /// brief near-end gap mid-word doesn't let the filter resume learning the near-end talker.
 const DEFAULT_DOUBLETALK_HANGOVER_FRAMES: usize = 3;
 
+// --- GCC-PHAT delay estimation ---
+/// Largest bulk delay (and therefore search range) automatic estimation supports, in samples
+/// (~0.5 s @ 8 kHz / ~0.25 s @ 16 kHz) — far beyond any realistic loudspeaker→microphone path,
+/// and it bounds the estimation FFT to [`DELAY_BLOCK_MAX`].
+const MAX_SEARCH_RANGE_SAMPLES: usize = 4_096;
+/// Smallest GCC-PHAT block (a power of two). The block must be several times the search range so the
+/// circular cross-correlation approximates the linear one over the whole search span.
+const DELAY_BLOCK_MIN: usize = 512;
+/// Largest GCC-PHAT block (a power of two) — the FFT size at the maximum search range.
+const DELAY_BLOCK_MAX: usize = 8_192;
+/// Phase-transform regularization: each cross-power bin is divided by `magnitude + ε`, so a
+/// near-silent bin contributes ~0 phase instead of blowing up (RFC-free classical GCC-PHAT).
+const PHAT_EPSILON: f32 = 1.0e-6;
+/// Leaky-integrator weight for the smoothed cross-correlation surface (`acc = λ·acc + gcc`), giving
+/// an effective memory of ~1/(1−λ) ≈ 3 blocks. Smoothing averages out the finite-block noise floor so
+/// the peak pick is stable, while still tracking a genuinely changed delay within a few blocks.
+const GCC_SMOOTHING: f32 = 0.7;
+/// Blocks that must be accumulated before the first delay lock, so the initial estimate rests on a
+/// smoothed surface rather than a single noisy block.
+const MIN_BLOCKS_BEFORE_LOCK: usize = 3;
+/// A new peak this many samples or less from the committed delay is treated as the *same* delay (no
+/// re-align) — it absorbs the ±1-sample GCC jitter a stable path shows block to block.
+const REALIGN_TOLERANCE_SAMPLES: usize = 8;
+/// A genuinely different peak must persist for this many consecutive decision blocks before the
+/// alignment is moved — the hangover that stops a transient from thrashing the ring/weights.
+const REALIGN_HANGOVER_BLOCKS: usize = 5;
+/// Mean per-sample far-end block energy (normalized) below which a block carries no usable echo, so
+/// it is skipped for estimation (a silent far-end produces only a noise correlation).
+const DELAY_FAR_ENERGY_FLOOR: f32 = 1.0e-6;
+
 /// Errors constructing an [`EchoCanceller`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AecError {
@@ -91,46 +138,92 @@ pub enum AecError {
         /// The maximum supported bulk delay.
         max: usize,
     },
+    /// The delay-estimation search range is zero or exceeds the supported maximum.
+    #[error("delay-estimation search range must be in 1..={max} samples (got {got})")]
+    InvalidSearchRange {
+        /// The requested search range in samples.
+        got: usize,
+        /// The maximum supported search range.
+        max: usize,
+    },
 }
 
-/// A preallocated far-end delay line — the fixed-bulk-delay FIFO feeding the adaptive filter.
+/// A preallocated far-end delay line — the bulk-delay FIFO feeding the adaptive filter.
 ///
-/// One contiguous `line` of `carry + frame_capacity` normalized samples. The first
-/// `carry = bulk_delay + tail − 1` slots hold the delay-line history carried over from the previous
-/// frame; the frame region `[carry, carry + n)` receives the current frame's far-end samples. The
-/// bulk delay is baked into `carry`, so the length-`tail` regressor the filter convolves for
-/// near-end sample `i` is exactly the contiguous slice `line[i .. i + tail]` — a single
-/// `fir_dot_f32`, no gather. After a frame, [`FarEndReference::compact`] slides the trailing `carry`
-/// samples to the front for the next call. Fully preallocated: no per-frame heap.
+/// One contiguous `line` of `capacity_carry + frame_capacity` normalized samples. The leading
+/// `capacity_carry = max_bulk_delay + tail − 1` slots hold the delay-line history carried over from
+/// the previous frame; the frame region `[capacity_carry, capacity_carry + n)` receives the current
+/// frame's far-end samples. The **current** bulk delay is applied as a read offset rather than baked
+/// into the layout: the length-`tail` regressor for near-end sample `i` is the contiguous slice
+/// `line[read_base + i .. read_base + i + tail]` where `read_base = max_bulk_delay − bulk_delay` —
+/// still a single `fir_dot_f32`, no gather. Preallocating the carry for `max_bulk_delay` lets
+/// [`FarEndReference::set_bulk_delay`] retune the alignment (for GCC-PHAT estimation) by moving that
+/// offset, with **no reallocation** — the raw far-end history in `line` is simply re-sliced. For the
+/// fixed-delay constructors `max_bulk_delay == bulk_delay`, so `read_base == 0` and the layout /
+/// numeric path is byte-identical to a delay baked into `carry`. After a frame,
+/// [`FarEndReference::compact`] slides the trailing `capacity_carry` samples to the front.
 #[derive(Debug, Clone)]
 struct FarEndReference {
     tail: usize,
+    /// The current bulk delay applied (`0 ..= max_bulk_delay`).
     bulk_delay: usize,
-    /// `bulk_delay + tail − 1` — the history that must precede the frame region.
-    carry: usize,
+    /// `max_bulk_delay + tail − 1` — the preallocated history preceding the frame region.
+    capacity_carry: usize,
     /// Largest frame this ring can absorb without reallocating (the 20 ms frame for the rate).
     frame_capacity: usize,
-    /// `carry + frame_capacity` normalized samples, oldest-first.
+    /// `capacity_carry + frame_capacity` normalized samples, oldest-first.
     line: Vec<f32>,
 }
 
 impl FarEndReference {
+    /// A fixed-delay ring: the carry is sized exactly to `bulk_delay`, so the delay cannot change
+    /// and `read_base` is always 0 (the original single-delay layout).
     fn new(tail: usize, bulk_delay: usize, frame_capacity: usize) -> Self {
-        let carry = bulk_delay + tail - 1;
+        Self::with_max_delay(tail, bulk_delay, bulk_delay, frame_capacity)
+    }
+
+    /// A ring preallocated for a delay anywhere in `0 ..= max_bulk_delay`, starting at `bulk_delay`.
+    /// [`FarEndReference::set_bulk_delay`] can then retune the alignment with no reallocation.
+    fn with_max_delay(
+        tail: usize,
+        bulk_delay: usize,
+        max_bulk_delay: usize,
+        frame_capacity: usize,
+    ) -> Self {
+        let capacity_carry = max_bulk_delay + tail - 1;
         Self {
             tail,
             bulk_delay,
-            carry,
+            capacity_carry,
             frame_capacity,
-            line: vec![0.0; carry + frame_capacity],
+            line: vec![0.0; capacity_carry + frame_capacity],
         }
+    }
+
+    /// The largest bulk delay this ring was preallocated for.
+    #[inline]
+    fn max_bulk_delay(&self) -> usize {
+        self.capacity_carry + 1 - self.tail
+    }
+
+    /// Offset of the oldest tap of near-sample 0's window into `line`
+    /// (`max_bulk_delay − bulk_delay`); 0 for the fixed-delay layout.
+    #[inline]
+    fn read_base(&self) -> usize {
+        self.capacity_carry + 1 - self.tail - self.bulk_delay
+    }
+
+    /// Retune the alignment to a new bulk delay (`0 ..= max_bulk_delay`), clamped to the cap. Only the
+    /// read offset moves; the raw far-end history is preserved and re-sliced.
+    fn set_bulk_delay(&mut self, bulk_delay: usize) {
+        self.bulk_delay = bulk_delay.min(self.max_bulk_delay());
     }
 
     /// Write up to `frame_capacity` normalized far-end samples into the frame region, returning the
     /// count written (`min(reference.len(), frame_capacity)`).
     fn write_frame(&mut self, reference: &[i16]) -> usize {
         let count = reference.len().min(self.frame_capacity);
-        let base = self.carry;
+        let base = self.capacity_carry;
         for (slot, &sample) in self.line[base..base + count].iter_mut().zip(reference) {
             *slot = f32::from(sample) / SAMPLE_SCALE;
         }
@@ -140,20 +233,23 @@ impl FarEndReference {
     /// The length-`tail` regressor window for near-end sample `i` (`0 ≤ i < n`).
     #[inline]
     fn window(&self, i: usize) -> &[f32] {
-        &self.line[i..i + self.tail]
+        let base = self.read_base() + i;
+        &self.line[base..base + self.tail]
     }
 
-    /// The single normalized sample at absolute `line` index `index` (for the sliding-energy update:
-    /// `line[i]` leaves and `line[i + tail]` enters the window when advancing from `i` to `i + 1`).
+    /// The single normalized sample `offset` positions into the aligned window stream (for the
+    /// sliding-energy update: `window_sample(i)` leaves and `window_sample(i + tail)` enters the
+    /// window when advancing from `i` to `i + 1`).
     #[inline]
-    fn at(&self, index: usize) -> f32 {
-        self.line[index]
+    fn window_sample(&self, offset: usize) -> f32 {
+        self.line[self.read_base() + offset]
     }
 
-    /// Carry the trailing `carry` samples of the just-processed `n`-sample frame to the front so the
-    /// next frame's windows see continuous history.
+    /// Carry the trailing `capacity_carry` samples of the just-processed `n`-sample frame to the
+    /// front so the next frame's windows see continuous history.
     fn compact(&mut self, frame_len: usize) {
-        self.line.copy_within(frame_len..frame_len + self.carry, 0);
+        self.line
+            .copy_within(frame_len..frame_len + self.capacity_carry, 0);
     }
 
     fn reset(&mut self) {
@@ -161,7 +257,261 @@ impl FarEndReference {
     }
 }
 
-/// A fixed-delay time-domain NLMS acoustic echo canceller with a Geigel double-talk detector.
+/// The GCC-PHAT block size for a search range: the smallest power of two that is at least twice the
+/// range (so the circular cross-correlation approximates the linear one across the whole search
+/// span), clamped to `[DELAY_BLOCK_MIN, DELAY_BLOCK_MAX]`.
+fn choose_block_size(search_range: usize) -> usize {
+    (2 * search_range)
+        .next_power_of_two()
+        .clamp(DELAY_BLOCK_MIN, DELAY_BLOCK_MAX)
+}
+
+/// A **GCC-PHAT** bulk-delay estimator (Knapp & Carter 1976).
+///
+/// It buffers time-contiguous near-end and far-end samples into a preallocated power-of-two block,
+/// and on each full block computes the phase-transformed cross-correlation:
+///
+/// ```text
+///   Near = FFT(near_block),  Far = FFT(far_block)          (real FFT, N/2+1 bins)
+///   G[k] = Near[k]·conj(Far[k])                            (cross-power spectrum)
+///   G_phat[k] = G[k] / (|G[k]| + ε)                        (phase transform: keep only phase)
+///   gcc[τ] = IFFT(G_phat)[τ] = Σ_n near[n]·far[n − τ]      (generalized cross-correlation, real)
+/// ```
+///
+/// The peak lag `τ*` over `0 ..= search_range` is the delay by which the near-end echo lags the
+/// reference (`near[n] ≈ Σ_k h[k]·far[n − τ]` puts the correlation peak at `τ = delay`). Because both
+/// blocks are real, `G` and `G_phat` are Hermitian, so the correlation is real and the whole thing
+/// runs on the `N/2+1`-bin half-spectrum through [`RealFft`].
+///
+/// The phase transform whitens both spectra, so `G_phat = H/|H|` (the echo path's phase-only impulse
+/// response) — its peak sits at the path's dominant tap, i.e. the bulk delay, independent of the
+/// reference spectrum's colour. That is what makes GCC-PHAT sharp and speech-robust.
+///
+/// ## Smoothing & hangover (no thrash)
+/// The correlation surface is accumulated with a leaky integrator ([`GCC_SMOOTHING`]) across blocks,
+/// so the peak pick rests on several blocks of evidence rather than one noisy block. A committed
+/// delay only moves when a *different* peak (more than [`REALIGN_TOLERANCE_SAMPLES`] away) persists
+/// for [`REALIGN_HANGOVER_BLOCKS`] consecutive decisions; a stable path therefore locks once and
+/// holds. Silent far-end blocks (no echo) and, optionally, double-talk blocks are skipped.
+///
+/// ## Allocation
+/// Every buffer (block assembly, spectra, cross-power, correlation, accumulator) is sized once in
+/// [`DelayEstimator::new`]; [`DelayEstimator::observe`] is allocation-free.
+#[derive(Clone, Debug)]
+struct DelayEstimator {
+    /// GCC-PHAT block length `N` (a power of two).
+    block_size: usize,
+    /// Largest lag searched (`τ ∈ 0..=search_range`).
+    search_range: usize,
+    /// The real FFT/IFFT for `block_size`.
+    fft: RealFft,
+    /// Assembled near-end block (normalized `f32`), `block_size` samples.
+    near_block: Vec<f32>,
+    /// Assembled far-end block (normalized `f32`), `block_size` samples.
+    far_block: Vec<f32>,
+    /// `Near` spectrum, `N/2+1` bins.
+    near_spectrum: Vec<Complex>,
+    /// `Far` spectrum, `N/2+1` bins.
+    far_spectrum: Vec<Complex>,
+    /// Phase-transformed cross-power `G_phat`, `N/2+1` bins.
+    cross: Vec<Complex>,
+    /// Generalized cross-correlation `gcc`, `block_size` real samples.
+    gcc: Vec<f32>,
+    /// Leaky-integrated correlation surface over `0..=search_range`.
+    accumulator: Vec<f32>,
+    /// Samples currently buffered in the block-assembly buffers.
+    fill: usize,
+    /// Whether every frame contributing to the current block was usable (no double-talk); a block
+    /// with any unusable frame is dropped from accumulation.
+    block_usable: bool,
+    /// Accumulated blocks toward a decision (gates the first lock).
+    blocks_seen: usize,
+    /// Whether a delay has been locked at least once.
+    locked: bool,
+    /// The currently committed delay estimate (valid once `locked`).
+    committed_delay: usize,
+    /// A pending different-delay candidate awaiting hangover confirmation.
+    candidate_delay: usize,
+    /// Consecutive decisions the candidate has held.
+    candidate_count: usize,
+}
+
+impl DelayEstimator {
+    fn new(search_range: usize) -> Result<Self, AecError> {
+        if search_range == 0 || search_range > MAX_SEARCH_RANGE_SAMPLES {
+            return Err(AecError::InvalidSearchRange {
+                got: search_range,
+                max: MAX_SEARCH_RANGE_SAMPLES,
+            });
+        }
+        let block_size = choose_block_size(search_range);
+        // `block_size` is a power of two in `[512, 8192]` by construction, so this cannot fail; map
+        // any future contract change to the search-range error rather than panicking.
+        let fft = RealFft::new(block_size).map_err(|_| AecError::InvalidSearchRange {
+            got: search_range,
+            max: MAX_SEARCH_RANGE_SAMPLES,
+        })?;
+        let bins = fft.bins();
+        Ok(Self {
+            block_size,
+            search_range,
+            fft,
+            near_block: vec![0.0; block_size],
+            far_block: vec![0.0; block_size],
+            near_spectrum: vec![Complex::default(); bins],
+            far_spectrum: vec![Complex::default(); bins],
+            cross: vec![Complex::default(); bins],
+            gcc: vec![0.0; block_size],
+            accumulator: vec![0.0; search_range + 1],
+            fill: 0,
+            block_usable: true,
+            blocks_seen: 0,
+            locked: false,
+            committed_delay: 0,
+            candidate_delay: 0,
+            candidate_count: 0,
+        })
+    }
+
+    /// The committed delay estimate once locked, else `None`.
+    #[inline]
+    fn locked_delay(&self) -> Option<usize> {
+        self.locked.then_some(self.committed_delay)
+    }
+
+    /// Buffer one time-contiguous frame of raw near-end and far-end samples. `usable` is false for a
+    /// double-talk frame (its block is dropped from accumulation). Returns `Some(delay)` when a new
+    /// alignment is committed (an initial lock or a hangover-confirmed re-align), else `None`.
+    fn observe(&mut self, near: &[i16], far: &[i16], usable: bool) -> Option<usize> {
+        let count = near.len().min(far.len());
+        let mut decision = None;
+        let mut offset = 0;
+        while offset < count {
+            let take = (self.block_size - self.fill).min(count - offset);
+            for step in 0..take {
+                self.near_block[self.fill + step] = f32::from(near[offset + step]) / SAMPLE_SCALE;
+                self.far_block[self.fill + step] = f32::from(far[offset + step]) / SAMPLE_SCALE;
+            }
+            self.block_usable &= usable;
+            self.fill += take;
+            offset += take;
+            if self.fill == self.block_size {
+                if let Some(delay) = self.process_block() {
+                    decision = Some(delay);
+                }
+                self.fill = 0;
+                self.block_usable = true;
+            }
+        }
+        decision
+    }
+
+    /// Run GCC-PHAT over the just-assembled block, fold it into the smoothed surface, and decide
+    /// whether to (re-)commit a delay.
+    fn process_block(&mut self) -> Option<usize> {
+        if !self.block_usable {
+            return None;
+        }
+        // Skip a silent far-end block — no echo to correlate, only a noise surface.
+        let far_energy: f32 =
+            self.far_block.iter().map(|&s| s * s).sum::<f32>() / self.block_size as f32;
+        if far_energy < DELAY_FAR_ENERGY_FLOOR {
+            return None;
+        }
+
+        self.fft.forward(&self.near_block, &mut self.near_spectrum);
+        self.fft.forward(&self.far_block, &mut self.far_spectrum);
+
+        // Cross-power `Near·conj(Far)`, phase-transformed to unit magnitude per bin.
+        for ((slot, &near), &far) in self
+            .cross
+            .iter_mut()
+            .zip(self.near_spectrum.iter())
+            .zip(self.far_spectrum.iter())
+        {
+            let real = near.re * far.re + near.im * far.im;
+            let imag = near.im * far.re - near.re * far.im;
+            let inverse_magnitude = 1.0 / ((real * real + imag * imag).sqrt() + PHAT_EPSILON);
+            *slot = Complex::new(real * inverse_magnitude, imag * inverse_magnitude);
+        }
+
+        self.fft.inverse(&self.cross, &mut self.gcc);
+
+        for (slot, &value) in self
+            .accumulator
+            .iter_mut()
+            .zip(self.gcc.iter().take(self.search_range + 1))
+        {
+            *slot = GCC_SMOOTHING * *slot + value;
+        }
+
+        self.blocks_seen += 1;
+        if self.blocks_seen < MIN_BLOCKS_BEFORE_LOCK {
+            return None;
+        }
+        let peak = self.peak_lag();
+        self.decide(peak)
+    }
+
+    /// Index of the largest accumulated correlation over `0 ..= search_range`.
+    fn peak_lag(&self) -> usize {
+        let mut best_lag = 0;
+        let mut best_value = self.accumulator[0];
+        for (lag, &value) in self.accumulator.iter().enumerate() {
+            if value > best_value {
+                best_value = value;
+                best_lag = lag;
+            }
+        }
+        best_lag
+    }
+
+    /// Lock/hangover decision for a freshly picked peak.
+    fn decide(&mut self, peak: usize) -> Option<usize> {
+        if !self.locked {
+            self.locked = true;
+            self.committed_delay = peak;
+            self.candidate_delay = peak;
+            self.candidate_count = 0;
+            return Some(peak);
+        }
+        if peak.abs_diff(self.committed_delay) <= REALIGN_TOLERANCE_SAMPLES {
+            // Still the committed delay (within the stable band): clear any pending candidate.
+            self.candidate_delay = self.committed_delay;
+            self.candidate_count = 0;
+            return None;
+        }
+        if peak.abs_diff(self.candidate_delay) <= REALIGN_TOLERANCE_SAMPLES {
+            self.candidate_count += 1;
+            if self.candidate_count >= REALIGN_HANGOVER_BLOCKS {
+                self.committed_delay = self.candidate_delay;
+                self.candidate_count = 0;
+                return Some(self.committed_delay);
+            }
+            None
+        } else {
+            self.candidate_delay = peak;
+            self.candidate_count = 1;
+            None
+        }
+    }
+
+    fn reset(&mut self) {
+        self.near_block.iter_mut().for_each(|sample| *sample = 0.0);
+        self.far_block.iter_mut().for_each(|sample| *sample = 0.0);
+        self.accumulator.iter_mut().for_each(|slot| *slot = 0.0);
+        self.fill = 0;
+        self.block_usable = true;
+        self.blocks_seen = 0;
+        self.locked = false;
+        self.committed_delay = 0;
+        self.candidate_delay = 0;
+        self.candidate_count = 0;
+    }
+}
+
+/// A time-domain NLMS acoustic echo canceller with a Geigel double-talk detector and an optional
+/// GCC-PHAT bulk-delay estimator.
 #[derive(Debug, Clone)]
 pub struct EchoCanceller {
     sample_rate_hz: u32,
@@ -187,6 +537,10 @@ pub struct EchoCanceller {
     /// Whether the most recent [`EchoCanceller::cancel`] frame had adaptation frozen for double-talk
     /// (a status surface the engine can meter/log).
     doubletalk_active: bool,
+    /// Optional GCC-PHAT bulk-delay estimator. When present, each [`EchoCanceller::cancel`] feeds the
+    /// raw near-end/reference to it and re-aligns the far-end ring (resetting the weights) whenever a
+    /// new bulk delay is committed. `None` for the fixed-delay constructors.
+    delay_estimator: Option<DelayEstimator>,
 }
 
 impl EchoCanceller {
@@ -241,6 +595,57 @@ impl EchoCanceller {
             doubletalk_hold_frames: 0,
             doubletalk_hangover_frames: DEFAULT_DOUBLETALK_HANGOVER_FRAMES,
             doubletalk_active: false,
+            delay_estimator: None,
+        })
+    }
+
+    /// A canceller that **estimates the bulk delay automatically** with GCC-PHAT over
+    /// `search_range_samples` and drives the far-end alignment ring from the estimate — so the
+    /// adaptive `tail_samples` filter only has to span the residual impulse-response spread, not the
+    /// transport delay. The far-end history ring is preallocated for the whole search range, so a
+    /// re-align only shifts a read offset (never a heap allocation). Until the first lock the ring is
+    /// unaligned (bulk delay 0). Preallocates all state, including the estimation FFT.
+    ///
+    /// # Errors
+    /// As [`EchoCanceller::new`], plus [`AecError::InvalidSearchRange`] if `search_range_samples` is 0
+    /// or exceeds the supported maximum.
+    pub fn with_delay_estimation(
+        sample_rate_hz: u32,
+        tail_samples: usize,
+        search_range_samples: usize,
+    ) -> Result<Self, AecError> {
+        if sample_rate_hz < 8_000 || !sample_rate_hz.is_multiple_of(50) {
+            return Err(AecError::InvalidSampleRate(sample_rate_hz));
+        }
+        if tail_samples == 0 || tail_samples > MAX_TAIL_SAMPLES {
+            return Err(AecError::InvalidTail {
+                got: tail_samples,
+                max: MAX_TAIL_SAMPLES,
+            });
+        }
+        // Builds the estimator first so an invalid search range is reported before any allocation of
+        // the (larger) alignment ring.
+        let delay_estimator = DelayEstimator::new(search_range_samples)?;
+        let frame_samples = (sample_rate_hz / 50) as usize;
+        Ok(Self {
+            sample_rate_hz,
+            frame_samples,
+            tail_samples,
+            weights: vec![0.0; tail_samples],
+            reference: FarEndReference::with_max_delay(
+                tail_samples,
+                0,
+                search_range_samples,
+                frame_samples,
+            ),
+            step_size: DEFAULT_STEP_SIZE,
+            regularization: DEFAULT_REGULARIZATION,
+            geigel_threshold: DEFAULT_GEIGEL_THRESHOLD,
+            far_peak_floor: DEFAULT_FAR_PEAK_FLOOR,
+            doubletalk_hold_frames: 0,
+            doubletalk_hangover_frames: DEFAULT_DOUBLETALK_HANGOVER_FRAMES,
+            doubletalk_active: false,
+            delay_estimator: Some(delay_estimator),
         })
     }
 
@@ -262,10 +667,35 @@ impl EchoCanceller {
         self.tail_samples
     }
 
-    /// The configured fixed bulk delay in samples.
+    /// The bulk delay currently applied to the far-end alignment ring, in samples. For a fixed-delay
+    /// canceller this is the configured value; with automatic estimation it is the current estimate
+    /// (0 until the first lock).
     #[must_use]
     pub fn bulk_delay_samples(&self) -> usize {
         self.reference.bulk_delay
+    }
+
+    /// Whether this canceller estimates the bulk delay automatically (GCC-PHAT).
+    #[must_use]
+    pub fn delay_estimation_enabled(&self) -> bool {
+        self.delay_estimator.is_some()
+    }
+
+    /// The automatically estimated bulk delay in samples once GCC-PHAT has locked, else `None`
+    /// (before the first lock, or when automatic estimation is not enabled).
+    #[must_use]
+    pub fn estimated_bulk_delay(&self) -> Option<usize> {
+        self.delay_estimator
+            .as_ref()
+            .and_then(DelayEstimator::locked_delay)
+    }
+
+    /// The GCC-PHAT search range in samples, or `None` when automatic estimation is not enabled.
+    #[must_use]
+    pub fn delay_search_range(&self) -> Option<usize> {
+        self.delay_estimator
+            .as_ref()
+            .map(|estimator| estimator.search_range)
     }
 
     /// Whether the most recently cancelled frame contained double-talk (near-end speech that froze
@@ -307,6 +737,22 @@ impl EchoCanceller {
             self.doubletalk_hold_frames -= 1;
         }
 
+        // --- GCC-PHAT bulk-delay estimation on the *raw* near-end (before it is overwritten) ---
+        // Feed the time-contiguous raw pair to the estimator; a double-talk frame is marked unusable
+        // so it does not corrupt the correlation. On a newly committed (re-)alignment, retune the ring
+        // and reset the weights — they were tuned to the previous alignment and are meaningless now;
+        // the filter re-converges over the following frames.
+        let realign = self
+            .delay_estimator
+            .as_mut()
+            .and_then(|estimator| estimator.observe(&near_end[..n], &reference[..n], adapt));
+        if let Some(new_delay) = realign {
+            if new_delay != self.reference.bulk_delay {
+                self.reference.set_bulk_delay(new_delay);
+                self.weights.iter_mut().for_each(|weight| *weight = 0.0);
+            }
+        }
+
         // Load the far-end frame into the delay ring (normalized f32).
         let written = self.reference.write_frame(&reference[..n]);
         debug_assert_eq!(written, n, "far-end ring must absorb the whole frame");
@@ -338,8 +784,8 @@ impl EchoCanceller {
             // Slide the window energy to i+1 (line[i] leaves, line[i+tail] enters); skip after the
             // last sample. Reseeded every frame above, so f32 drift can't accumulate across frames.
             if i + 1 < n {
-                let leaving = self.reference.at(i);
-                let entering = self.reference.at(i + self.tail_samples);
+                let leaving = self.reference.window_sample(i);
+                let entering = self.reference.window_sample(i + self.tail_samples);
                 energy += entering * entering - leaving * leaving;
                 if energy < 0.0 {
                     energy = 0.0; // guard f32 round-off below zero
@@ -351,9 +797,17 @@ impl EchoCanceller {
     }
 
     /// Reset the adaptive filter, far-end ring, and detector state (e.g. on a stream discontinuity).
+    /// With automatic delay estimation this also clears the estimator and returns the ring to
+    /// unaligned (bulk delay 0); a fixed-delay canceller keeps its configured bulk delay.
     pub fn reset(&mut self) {
         self.weights.iter_mut().for_each(|weight| *weight = 0.0);
         self.reference.reset();
+        if self.delay_estimator.is_some() {
+            if let Some(estimator) = self.delay_estimator.as_mut() {
+                estimator.reset();
+            }
+            self.reference.set_bulk_delay(0);
+        }
         self.doubletalk_hold_frames = 0;
         self.doubletalk_active = false;
     }
@@ -841,5 +1295,239 @@ mod tests {
         let reference = vec![2000i16; 40];
         canceller.cancel(&mut near, &reference);
         // No panic, no allocation blow-up; output is well-formed i16 (nothing to assert beyond that).
+    }
+
+    // ---- GCC-PHAT delay estimation ----
+
+    /// The sample-accuracy the estimator is held to across the delay sweep. GCC-PHAT with the phase
+    /// transform peaks at the echo path's dominant (direct) tap, so the recovered delay lands on the
+    /// injected value within the stable band (well inside "±1 hop").
+    const DELAY_RECOVERY_TOLERANCE: usize = REALIGN_TOLERANCE_SAMPLES;
+
+    fn run_delay_estimation(
+        search_range: usize,
+        tail: usize,
+        injected_delay: usize,
+        frames: usize,
+        seed: u64,
+    ) -> (EchoCanceller, f64) {
+        let frame = 160;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(seed);
+        let mut canceller =
+            EchoCanceller::with_delay_estimation(8_000, tail, search_range).expect("build");
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, injected_delay);
+        let mut erle = f64::NAN;
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            erle = erle_db(&echo[range], &mic);
+        }
+        (canceller, erle)
+    }
+
+    /// Delay recovery: sweep several known bulk delays across the search range and assert GCC-PHAT
+    /// locks onto each within the tolerance. Pure single-talk echo, so the correlation is clean.
+    #[test]
+    fn gcc_phat_recovers_swept_bulk_delays() {
+        let search_range = 512;
+        for &delay in &[40usize, 128, 256, 400] {
+            let (canceller, _erle) =
+                run_delay_estimation(search_range, 160, delay, 160, 0xDE1A_0000 ^ delay as u64);
+            let estimated = canceller
+                .estimated_bulk_delay()
+                .expect("GCC-PHAT must lock a delay");
+            let error = estimated.abs_diff(delay);
+            if std::env::var_os("DUMP_GOLDEN").is_some() {
+                eprintln!("delay {delay} -> estimated {estimated} (error {error})");
+            }
+            assert!(
+                error <= DELAY_RECOVERY_TOLERANCE,
+                "delay {delay}: estimated {estimated} (error {error} > {DELAY_RECOVERY_TOLERANCE})"
+            );
+        }
+    }
+
+    /// ERLE with estimation on: the reference is misaligned by an unknown bulk delay; automatic
+    /// estimation aligns the ring and the canceller still reaches the ≥ 20 dB ERLE target within a
+    /// bounded frame count, holding high steady-state — matching the fixed-delay path in #116.
+    #[test]
+    fn converges_with_delay_estimation_on_unknown_delay() {
+        let search_range = 512;
+        let unknown_delay = 256;
+        // Tail spans the RIR spread (max tap 110) plus margin for any few-sample estimation error.
+        let (canceller, steady) =
+            run_delay_estimation(search_range, 192, unknown_delay, 300, 0xE51E_0001);
+        let estimated = canceller
+            .estimated_bulk_delay()
+            .expect("GCC-PHAT must lock the delay");
+        assert!(
+            estimated.abs_diff(unknown_delay) <= DELAY_RECOVERY_TOLERANCE,
+            "estimated {estimated} for injected {unknown_delay}"
+        );
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!("estimation ERLE: estimated {estimated}, steady {steady:.1} dB");
+        }
+        assert!(
+            steady >= 20.0,
+            "steady-state ERLE with estimation {steady:.1} dB < 20 dB"
+        );
+    }
+
+    /// Convergence-time with estimation on: track the first frame that reaches 20 dB ERLE and bound
+    /// it. The estimator must lock, re-align (resetting the weights), and the filter re-converge — all
+    /// inside the bound.
+    #[test]
+    fn delay_estimation_converges_within_bounded_frames() {
+        let frame = 160;
+        let search_range = 512;
+        let unknown_delay = 256;
+        let frames = 300;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0xC0FF_EE01);
+        let mut canceller =
+            EchoCanceller::with_delay_estimation(8_000, 192, search_range).expect("build");
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, unknown_delay);
+        let mut converged_frame: Option<usize> = None;
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            let erle = erle_db(&echo[range], &mic);
+            // First *sustained* crossing after the lock: require the previous frame to also be high so
+            // a transient block-boundary spike is not mistaken for convergence.
+            if converged_frame.is_none()
+                && erle >= 20.0
+                && canceller.estimated_bulk_delay().is_some()
+            {
+                converged_frame = Some(index);
+            }
+        }
+        let converged = converged_frame.expect("must reach 20 dB ERLE with estimation");
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "estimation convergence: frame {converged}, locked delay {:?}",
+                canceller.estimated_bulk_delay()
+            );
+        }
+        assert!(
+            converged <= 120,
+            "converged only after {converged} frames (>120) with estimation"
+        );
+    }
+
+    /// No-thrash: a stable delay locks once and the committed estimate holds — it does not oscillate
+    /// frame to frame (which would repeatedly reset the adaptive weights and wreck ERLE).
+    #[test]
+    fn stable_delay_estimate_does_not_thrash() {
+        let frame = 160;
+        let search_range = 512;
+        let delay = 200;
+        let frames = 400;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x57AB_1E00);
+        let mut canceller =
+            EchoCanceller::with_delay_estimation(8_000, 160, search_range).expect("build");
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, delay);
+        let mut estimates: Vec<usize> = Vec::new();
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+            if let Some(estimate) = canceller.estimated_bulk_delay() {
+                estimates.push(estimate);
+            }
+        }
+        assert!(!estimates.is_empty(), "estimator must lock a stable delay");
+        let unique: std::collections::BTreeSet<usize> = estimates.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            1,
+            "stable delay thrashed the estimate across {unique:?}"
+        );
+        let locked = estimates[0];
+        assert!(
+            locked.abs_diff(delay) <= DELAY_RECOVERY_TOLERANCE,
+            "locked {locked} for stable delay {delay}"
+        );
+    }
+
+    /// Determinism: the estimate is a pure function of the input (logical clock, no wall clock, no
+    /// randomness) — two identical runs lock the identical delay.
+    #[test]
+    fn delay_estimate_is_deterministic() {
+        let (first, _) = run_delay_estimation(512, 160, 300, 120, 0xD37E_0001);
+        let (second, _) = run_delay_estimation(512, 160, 300, 120, 0xD37E_0001);
+        assert_eq!(first.estimated_bulk_delay(), second.estimated_bulk_delay());
+        assert!(first.estimated_bulk_delay().is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_search_range() {
+        assert!(matches!(
+            EchoCanceller::with_delay_estimation(8_000, 256, 0),
+            Err(AecError::InvalidSearchRange { got: 0, .. })
+        ));
+        assert!(matches!(
+            EchoCanceller::with_delay_estimation(8_000, 256, MAX_SEARCH_RANGE_SAMPLES + 1),
+            Err(AecError::InvalidSearchRange { .. })
+        ));
+        // Sample-rate and tail are still validated on the estimation constructor.
+        assert!(matches!(
+            EchoCanceller::with_delay_estimation(7_000, 256, 256),
+            Err(AecError::InvalidSampleRate(7_000))
+        ));
+        assert!(matches!(
+            EchoCanceller::with_delay_estimation(8_000, 0, 256),
+            Err(AecError::InvalidTail { got: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn delay_estimation_accessors_report_state() {
+        let fixed = EchoCanceller::new(8_000, 256).expect("build");
+        assert!(!fixed.delay_estimation_enabled());
+        assert_eq!(fixed.estimated_bulk_delay(), None);
+        assert_eq!(fixed.delay_search_range(), None);
+
+        let estimating = EchoCanceller::with_delay_estimation(8_000, 160, 512).expect("build");
+        assert!(estimating.delay_estimation_enabled());
+        assert_eq!(estimating.estimated_bulk_delay(), None); // not locked yet
+        assert_eq!(estimating.delay_search_range(), Some(512));
+        assert_eq!(estimating.bulk_delay_samples(), 0);
+    }
+
+    /// `reset` clears the estimator and returns the ring to unaligned (bulk delay 0).
+    #[test]
+    fn reset_clears_delay_estimate() {
+        let (mut canceller, _) = run_delay_estimation(512, 160, 256, 120, 0x8E5E_7001);
+        assert!(canceller.estimated_bulk_delay().is_some());
+        assert!(canceller.bulk_delay_samples() > 0);
+        canceller.reset();
+        assert_eq!(canceller.estimated_bulk_delay(), None);
+        assert_eq!(canceller.bulk_delay_samples(), 0);
+        assert!(canceller.weights().iter().all(|&weight| weight == 0.0));
+    }
+
+    /// The block size is a power of two, at least twice the search range, clamped to the FFT bounds.
+    #[test]
+    fn block_size_covers_the_search_range() {
+        assert_eq!(choose_block_size(1), DELAY_BLOCK_MIN);
+        assert_eq!(choose_block_size(100), DELAY_BLOCK_MIN);
+        assert_eq!(choose_block_size(256), DELAY_BLOCK_MIN);
+        assert_eq!(choose_block_size(512), 1024);
+        assert_eq!(choose_block_size(MAX_SEARCH_RANGE_SAMPLES), DELAY_BLOCK_MAX);
+        for &range in &[1usize, 100, 256, 512, 1024, MAX_SEARCH_RANGE_SAMPLES] {
+            let block = choose_block_size(range);
+            assert!(block.is_power_of_two(), "block {block} not power of two");
+            assert!(
+                block > range,
+                "block {block} must exceed search range {range}"
+            );
+        }
     }
 }

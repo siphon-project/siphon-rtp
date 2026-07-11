@@ -77,3 +77,49 @@ fn cancel_frame_makes_no_heap_allocation() {
         after - before
     );
 }
+
+/// The GCC-PHAT delay-estimation path is also zero per-frame heap: the estimation block, spectra,
+/// cross-power, correlation, and accumulator are all preallocated in `with_delay_estimation`, and the
+/// real FFT/IFFT are allocation-free — so even the frames on which a full GCC block fires allocate
+/// nothing. The measured window spans many blocks so the FFT path is exercised inside it.
+#[test]
+fn cancel_with_delay_estimation_makes_no_heap_allocation() {
+    const TAIL: usize = 160;
+    const FRAME: usize = 160; // 8 kHz / 20 ms
+    const SEARCH_RANGE: usize = 512; // → 1024-point GCC blocks, one every ~6.4 frames
+
+    let mut canceller =
+        siphon_rtp_dsp::EchoCanceller::with_delay_estimation(8_000, TAIL, SEARCH_RANGE)
+            .expect("build");
+    let reference: Vec<i16> = (0..FRAME)
+        .map(|index| ((index as i16).wrapping_mul(211)).wrapping_sub(3_000))
+        .collect();
+    let source: Vec<i16> = (0..FRAME)
+        .map(|index| ((index as i16).wrapping_mul(97)).wrapping_add(500))
+        .collect();
+    let mut near = source.clone();
+
+    // Warm up enough frames to fill and process several estimation blocks (so the estimator has
+    // locked and any one-time init is paid) before we sample.
+    for _ in 0..64 {
+        near.copy_from_slice(&source);
+        canceller.cancel(&mut near, &reference);
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..2_000 {
+        near.copy_from_slice(&source);
+        canceller.cancel(&mut near, &reference);
+        std::hint::black_box(near[0]);
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(
+        after,
+        before,
+        "cancel-with-estimation allocated {} times across 2000 frames (must be zero)",
+        after - before
+    );
+}
