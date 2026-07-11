@@ -153,6 +153,29 @@ const REALIGN_HANGOVER_BLOCKS: usize = 5;
 /// it is skipped for estimation (a silent far-end produces only a noise correlation).
 const DELAY_FAR_ENERGY_FLOOR: f32 = 1.0e-6;
 
+// --- MDF / partitioned-block frequency-domain adaptive filter (Soo & Pang 1990) ---
+/// Frequency-domain NLMS step size `μ` for the MDF weight update (0 < μ < 2 for stability). At each
+/// bin the `K` partition weights form a `K`-tap NLMS driven by the delay-line regressor
+/// `[X_m, X_{m-1}, …, X_{m-K+1}]`, normalized by that regressor's *total* per-bin energy
+/// `Σ_k |X_{m-k}[b]|²` (see [`MdfFilter::process_block`]) — so the effective per-bin step is exactly
+/// `μ`, independent of the partition count `K`. 0.5 gives fast convergence with a wide stability margin.
+const MDF_STEP_SIZE: f32 = 0.5;
+/// Per-bin power regularization `δ` (normalized units) added to the delay-line energy before the
+/// division, so a near-silent bin yields a ~0 step instead of a blow-up (the frequency-domain analogue
+/// of the NLMS `δ`).
+const MDF_REGULARIZATION: f32 = 1.0e-4;
+/// Largest partition count the MDF preallocates for — 64 blocks of the (rate-dependent) block size,
+/// i.e. up to ~2048 taps (256 ms) @ 8 kHz / ~4096 taps (256 ms) @ 16 kHz. Bounds a pathological tail.
+const MDF_MAX_PARTITIONS: usize = 64;
+/// Below this per-frame normalized energy on either the microphone or the block echo estimate the MDF
+/// two-path NCC is undefined (a 0/0), so the frame drives neither a freeze nor an unfreeze — the
+/// bootstrap guard that lets the very first (all-zero-filter) blocks adapt.
+const MDF_NCC_ENERGY_FLOOR: f64 = 1.0e-7;
+/// Blocks the MDF two-path adaptation stays frozen after the last NCC double-talk trigger (~48 ms at a
+/// 128-sample block / 8 kHz), so a brief mid-word near-end gap does not let a partition resume learning
+/// the near-end talker.
+const MDF_DOUBLETALK_HANGOVER_BLOCKS: usize = 3;
+
 /// Errors constructing an [`EchoCanceller`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AecError {
@@ -550,6 +573,455 @@ impl DelayEstimator {
     }
 }
 
+/// The largest power of two `<= n` (the MDF block size for a 20 ms frame: 160 → 128, 320 → 256), so
+/// the overlap-save FFT length `N = 2·block` stays a power of two the [`RealFft`] supports.
+fn floor_power_of_two(n: usize) -> usize {
+    debug_assert!(n >= 2);
+    if n.is_power_of_two() {
+        n
+    } else {
+        n.next_power_of_two() >> 1
+    }
+}
+
+/// Which double-talk gate the MDF adaptation runs (mirrors [`DtdMode`] for the frequency-domain path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MdfDtd {
+    /// The frame-level Geigel gate decided by [`EchoCanceller::cancel`] drives adaptation (default).
+    Geigel,
+    /// A per-block normalized cross-correlation (NCC) between the microphone and the block echo
+    /// estimate freezes the per-partition weight update during double-talk (the two-path posture).
+    TwoPath,
+}
+
+/// A **multi-delay block frequency-domain adaptive filter** (MDF / PBFDAF, Soo & Pang, *Multidelay
+/// block frequency domain adaptive filter*, IEEE TASSP 1990) — a partitioned-block frequency-domain
+/// LMS that covers a long echo tail (128–256 ms) at O(N log N) instead of the O(L) per sample a
+/// time-domain NLMS pays.
+///
+/// ## Structure (overlap-save, 50 % overlap)
+/// The length-`tail` impulse response is split into `K` partitions of `block_size` (`B`) taps. Each
+/// block of `B` new samples is processed with an `N = 2·B`-point real FFT ([`RealFft`], the same plan
+/// the noise suppressor uses):
+///
+/// ```text
+///   Xₘ = FFT( [ xₘ₋₁ | xₘ ] )                     (overlap-save frame: previous B ++ current B)
+///   Y  = Σ_{k=0}^{K-1} W_k ⊙ X_{m-k}              (partitioned filter over the spectrum delay line)
+///   y  = last B samples of IFFT(Y)                (overlap-save discards the first B — the aliasing)
+///   e  = d − y                                    (the residual we emit, B samples)
+///   E  = FFT( [ 0…0 (B) | e ] )
+/// ```
+///
+/// ## Per-bin power-normalized frequency LMS (with the gradient constraint)
+/// Each partition adapts by the standard NLMS-in-frequency (Shynk, *Frequency-domain and multirate
+/// adaptive filtering*, IEEE SP Mag 1992), normalized by a smoothed per-bin reference PSD and made a
+/// proper overlap-save gradient by the time-domain constraint (zeroing the wrap-around half):
+///
+/// ```text
+///   P[b]  = λ·P[b] + (1−λ)·|Xₘ[b]|²               (per-bin reference power)
+///   G_k   = μ · conj(X_{m-k}) ⊙ E / (P + δ)       (power-normalized cross-correlation gradient)
+///   g_k   = IFFT(G_k);  g_k[B..2B] = 0;  Ĝ_k = FFT(g_k)   (gradient constraint → linear correlation)
+///   W_k  += Ĝ_k
+/// ```
+///
+/// The constraint is the canonical Soo–Pang MDF (it makes the block update identical to time-domain
+/// block-LMS); it costs one IFFT + one FFT per partition per block, which is why the MDF is the heavy
+/// AEC path (see the bench note). An *unconstrained* variant (skip `g_k[B..]=0` and the round-trip) is
+/// a documented future perf lever.
+///
+/// ## Double-talk freeze (composition with the two-path DTD)
+/// In [`MdfDtd::TwoPath`] a per-block NCC `ρ = Σ d·ŷ / √(Σ d²·Σ ŷ²)` between the microphone `d` and the
+/// block echo estimate `ŷ` freezes the per-partition update when `ρ < NCC_DOUBLETALK_THRESHOLD`
+/// (Benesty *et al.* 2000), with a short block hangover — so a near-end talker never leaks into the
+/// weights. In [`MdfDtd::Geigel`] the frame-level Geigel gate the canceller already computes drives the
+/// freeze instead. Either way the frozen weights are protected bit-for-bit through the double-talk.
+///
+/// ## Bulk-delay alignment
+/// A [`FarEndReference`] delay line (tail 1) applies the GCC-PHAT bulk delay as a read offset, so the
+/// aligned reference the block assembly buffers already has the transport delay removed and the `K`
+/// partitions only span the residual dispersion. [`MdfFilter::set_bulk_delay`] re-aligns (and resets
+/// the weights, tuned to the old offset) with no allocation.
+///
+/// ## Allocation & latency
+/// Every buffer — the `K` weight spectra, the `K`-deep reference-spectrum delay line, the per-bin PSD,
+/// all FFT scratch, and the block-assembly / output rings — is sized once in [`MdfFilter::new`];
+/// [`MdfFilter::push_frame`] is allocation-free. Block processing adds a fixed `block_size`-sample
+/// (~16 ms) algorithmic latency (the overlap-save block delay), documented like the NS WOLA delay.
+#[derive(Clone, Debug)]
+struct MdfFilter {
+    /// Partition / hop length `B` (a power of two).
+    block_size: usize,
+    /// Overlap-save FFT length `N = 2·B`.
+    fft_size: usize,
+    /// Half-spectrum bin count `N/2 + 1`.
+    bins: usize,
+    /// Partition count `K` (`tail = K·B` taps covered).
+    partitions: usize,
+    /// Effective covered tail in samples (`K·B`).
+    tail: usize,
+    /// The real FFT/IFFT for `N` (shared plan type with the noise suppressor).
+    fft: RealFft,
+    /// Per-partition frequency-domain weights, `K·bins` complex (partition-major).
+    weights: Vec<Complex>,
+    /// Reference-spectrum delay line, `K·bins` complex (a ring of the last `K` input-block spectra).
+    x_spectra: Vec<Complex>,
+    /// Ring index of the newest stored reference spectrum in [`Self::x_spectra`].
+    x_head: usize,
+    /// Per-bin **delay-line** reference energy `Σ_{k} |X_{m-k}[b]|²`, `bins` reals — the NLMS-in-
+    /// frequency normalizer for the `K`-tap-per-bin partition filter. Recomputed every block from the
+    /// spectrum delay line (a sum over `K` blocks, so inherently low-variance), never smoothed.
+    delay_power: Vec<f32>,
+    /// Overlap-save frame scratch (`N` reals): `[previous block | current block]` and, reused, the
+    /// zero-padded error frame and the per-partition gradient time signal.
+    frame_time: Vec<f32>,
+    /// Newest input-block spectrum scratch, `bins` complex.
+    x_new: Vec<Complex>,
+    /// Filter output spectrum `Y`, `bins` complex.
+    y_spectrum: Vec<Complex>,
+    /// Filter output time signal (`N` reals); the last `B` samples are the block echo estimate.
+    y_time: Vec<f32>,
+    /// Error spectrum `E`, `bins` complex.
+    error_spectrum: Vec<Complex>,
+    /// Per-partition gradient spectrum scratch, `bins` complex.
+    grad_spectrum: Vec<Complex>,
+    /// The current block's residual (`B` reals), also the error fed into `E`.
+    block_error: Vec<f32>,
+    /// Previous block's `B` reference samples (the overlap-save carry).
+    overlap_ref: Vec<f32>,
+    /// Aligned-reference block-assembly buffer, `B + frame_capacity` reals.
+    in_ref: Vec<f32>,
+    /// Near-end block-assembly buffer, `B + frame_capacity` reals.
+    in_near: Vec<f32>,
+    /// Samples currently buffered in [`Self::in_ref`] / [`Self::in_near`].
+    in_len: usize,
+    /// Residual output ring (holds emitted-but-not-yet-drained samples), preloaded with `B` zeros for
+    /// the block latency so a full 20 ms frame always drains without underflow.
+    out_res: Vec<f32>,
+    /// Valid samples in [`Self::out_res`].
+    out_len: usize,
+    /// The [`FarEndReference`] (tail 1) that applies the bulk delay to the raw reference.
+    reference: FarEndReference,
+    /// Frequency-domain NLMS step `μ`.
+    step_size: f32,
+    /// Per-bin power regularization `δ`.
+    regularization: f32,
+    /// The double-talk gate driving the per-partition freeze.
+    dtd: MdfDtd,
+    /// The most recent block's NCC `ρ` (two-path mode), or `None` before the first valid block.
+    last_correlation: Option<f32>,
+    /// Whether the most recent block was frozen for (NCC) double-talk.
+    doubletalk_active: bool,
+    /// Remaining blocks the two-path adaptation stays frozen after the last NCC trigger.
+    dt_hold_blocks: usize,
+    /// Two-path bootstrap guard: until the NCC has confirmed echo-only (`ρ ≥ NCC_COPY_THRESHOLD`) at
+    /// least once, adaptation ignores the NCC freeze — otherwise a mid-convergence `ρ` sitting in the
+    /// double-talk band would freeze the filter before it ever converged (the copies-`> 0` bootstrap the
+    /// time-domain two-path uses, adapted to the single-filter MDF).
+    converged_once: bool,
+}
+
+impl MdfFilter {
+    /// Build an MDF for `frame_capacity` (the 20 ms frame), a `tail_samples` echo tail, and a
+    /// `max_bulk_delay` reference-alignment range (0 for the fixed / no-estimation constructor).
+    fn new(
+        frame_capacity: usize,
+        tail_samples: usize,
+        max_bulk_delay: usize,
+    ) -> Result<Self, AecError> {
+        if tail_samples == 0 || tail_samples > MAX_TAIL_SAMPLES {
+            return Err(AecError::InvalidTail {
+                got: tail_samples,
+                max: MAX_TAIL_SAMPLES,
+            });
+        }
+        let block_size = floor_power_of_two(frame_capacity);
+        let fft_size = block_size * 2;
+        let partitions = tail_samples.div_ceil(block_size).min(MDF_MAX_PARTITIONS);
+        // `fft_size` is a power of two `>= 4` (block_size >= 2), so this cannot fail; map any future
+        // contract change to the tail error rather than panicking.
+        let fft = RealFft::new(fft_size).map_err(|_| AecError::InvalidTail {
+            got: tail_samples,
+            max: MAX_TAIL_SAMPLES,
+        })?;
+        let bins = fft.bins();
+        let tail = partitions * block_size;
+        Ok(Self {
+            block_size,
+            fft_size,
+            bins,
+            partitions,
+            tail,
+            fft,
+            weights: vec![Complex::default(); partitions * bins],
+            x_spectra: vec![Complex::default(); partitions * bins],
+            x_head: 0,
+            delay_power: vec![0.0; bins],
+            frame_time: vec![0.0; fft_size],
+            x_new: vec![Complex::default(); bins],
+            y_spectrum: vec![Complex::default(); bins],
+            y_time: vec![0.0; fft_size],
+            error_spectrum: vec![Complex::default(); bins],
+            grad_spectrum: vec![Complex::default(); bins],
+            block_error: vec![0.0; block_size],
+            overlap_ref: vec![0.0; block_size],
+            in_ref: vec![0.0; block_size + frame_capacity],
+            in_near: vec![0.0; block_size + frame_capacity],
+            in_len: 0,
+            // Preload the block latency; capacity holds the latency + up to two blocks of production.
+            out_res: vec![0.0; block_size + frame_capacity + 2 * block_size],
+            out_len: block_size,
+            reference: FarEndReference::with_max_delay(1, 0, max_bulk_delay, frame_capacity),
+            step_size: MDF_STEP_SIZE,
+            regularization: MDF_REGULARIZATION,
+            dtd: MdfDtd::Geigel,
+            last_correlation: None,
+            doubletalk_active: false,
+            dt_hold_blocks: 0,
+            converged_once: false,
+        })
+    }
+
+    /// The bulk delay currently applied to the reference alignment.
+    #[inline]
+    fn bulk_delay(&self) -> usize {
+        self.reference.bulk_delay
+    }
+
+    /// Re-align the reference to a new bulk delay and reset the weights (they were tuned to the old
+    /// alignment). Only the alignment read offset moves — no allocation. The two-path bootstrap/DTD
+    /// state is reset too: the zeroed filter is unconverged again, so the NCC must re-bootstrap
+    /// (otherwise a stale `converged_once` would freeze the just-reset filter into a permanent
+    /// double-talk deadlock on the poor early echo estimate).
+    fn set_bulk_delay(&mut self, bulk_delay: usize) {
+        self.reference.set_bulk_delay(bulk_delay);
+        self.weights
+            .iter_mut()
+            .for_each(|w| *w = Complex::default());
+        self.converged_once = false;
+        self.dt_hold_blocks = 0;
+        self.doubletalk_active = false;
+        self.last_correlation = None;
+    }
+
+    /// Ring slot of the reference spectrum `k` blocks older than the newest.
+    #[inline]
+    fn partition_slot(&self, k: usize) -> usize {
+        (self.x_head + self.partitions - k) % self.partitions
+    }
+
+    /// Push one frame-synchronous `(near_end, reference)` pair: buffer the bulk-delay-aligned reference
+    /// and the near-end, run every complete block through the FDAF, and drain the same number of
+    /// echo-subtracted residual samples back into `near_end` (delayed by the fixed block latency).
+    ///
+    /// `base_adapt` is the frame-level adaptation gate for [`MdfDtd::Geigel`] (the canceller's Geigel
+    /// screen + hangover); in [`MdfDtd::TwoPath`] the per-block NCC decides the freeze and `base_adapt`
+    /// is ignored (the far-end-active check is made per block from the aligned reference energy).
+    fn push_frame(&mut self, near_end: &mut [i16], reference: &[i16], base_adapt: bool) {
+        let n = near_end
+            .len()
+            .min(reference.len())
+            .min(self.reference.frame_capacity);
+        if n == 0 {
+            return;
+        }
+
+        // 1. Buffer the bulk-delay-aligned reference and the near-end into the block-assembly buffers.
+        let written = self.reference.write_frame(&reference[..n]);
+        debug_assert_eq!(written, n, "MDF reference ring must absorb the whole frame");
+        let base = self.in_len;
+        for (i, &near_sample) in near_end.iter().take(n).enumerate() {
+            self.in_ref[base + i] = self.reference.window_sample(i);
+            self.in_near[base + i] = f32::from(near_sample) / SAMPLE_SCALE;
+        }
+        self.reference.compact(n);
+        self.in_len += n;
+
+        // 2. Process every complete block, appending its residual to the output ring.
+        while self.in_len >= self.block_size {
+            self.process_block(base_adapt);
+            let remaining = self.in_len - self.block_size;
+            self.in_ref.copy_within(self.block_size..self.in_len, 0);
+            self.in_near.copy_within(self.block_size..self.in_len, 0);
+            self.in_len = remaining;
+        }
+
+        // 3. Drain n residual samples back into near_end in place (the block latency guarantees the
+        //    output ring holds at least n after warm-up; before that the preloaded zeros cover it).
+        debug_assert!(self.out_len >= n, "MDF output ring underflow");
+        for (sample, &residual) in near_end.iter_mut().take(n).zip(self.out_res.iter()) {
+            *sample = denormalize(residual);
+        }
+        self.out_res.copy_within(n..self.out_len, 0);
+        self.out_len -= n;
+    }
+
+    /// Run one `block_size`-sample block through the partitioned-block frequency-domain LMS.
+    fn process_block(&mut self, base_adapt: bool) {
+        let block = self.block_size;
+        let fft_size = self.fft_size;
+        let bins = self.bins;
+
+        // --- overlap-save input frame [ previous B | current B ] → newest spectrum Xₘ ---
+        self.frame_time[..block].copy_from_slice(&self.overlap_ref);
+        self.frame_time[block..fft_size].copy_from_slice(&self.in_ref[..block]);
+        self.fft.forward(&self.frame_time, &mut self.x_new);
+
+        // Store Xₘ as the newest ring slot.
+        self.x_head = (self.x_head + 1) % self.partitions;
+        let head_base = self.x_head * bins;
+        self.x_spectra[head_base..head_base + bins].copy_from_slice(&self.x_new);
+
+        // --- filter Y = Σ_k W_k ⊙ X_{m-k}, and the per-bin delay-line energy Σ_k |X_{m-k}|² ---
+        // The delay-line energy is the NLMS normalizer: at each bin the K partition weights are a K-tap
+        // NLMS whose regressor is the K-block delay line, so its energy — not one block's power — is the
+        // correct per-bin step normalizer (otherwise the effective step scales with K and diverges).
+        for slot in self.y_spectrum.iter_mut() {
+            *slot = Complex::default();
+        }
+        for power in self.delay_power.iter_mut() {
+            *power = 0.0;
+        }
+        for k in 0..self.partitions {
+            let weight_base = k * bins;
+            let x_base = self.partition_slot(k) * bins;
+            for bin in 0..bins {
+                let w = self.weights[weight_base + bin];
+                let x = self.x_spectra[x_base + bin];
+                self.y_spectrum[bin].re += w.re * x.re - w.im * x.im;
+                self.y_spectrum[bin].im += w.re * x.im + w.im * x.re;
+                self.delay_power[bin] += x.norm_squared();
+            }
+        }
+        self.fft.inverse(&self.y_spectrum, &mut self.y_time);
+
+        // --- residual e = d − ŷ over the block (ŷ = last B samples of IFFT(Y)) + NCC accumulators ---
+        let mut sum_mic_sq = 0.0f64;
+        let mut sum_echo_sq = 0.0f64;
+        let mut sum_mic_echo = 0.0f64;
+        let mut far_energy = 0.0f64;
+        for i in 0..block {
+            let mic = self.in_near[i];
+            let echo = self.y_time[block + i];
+            let residual = mic - echo;
+            self.block_error[i] = residual;
+            let mic64 = f64::from(mic);
+            let echo64 = f64::from(echo);
+            sum_mic_sq += mic64 * mic64;
+            sum_echo_sq += echo64 * echo64;
+            sum_mic_echo += mic64 * echo64;
+            let reference = f64::from(self.in_ref[i]);
+            far_energy += reference * reference;
+        }
+        // Emit the residual (append to the output ring).
+        let out_base = self.out_len;
+        self.out_res[out_base..out_base + block].copy_from_slice(&self.block_error);
+        self.out_len += block;
+
+        // --- decide adaptation for this block (Geigel frame gate, or the per-block two-path NCC) ---
+        let far_active = far_energy / block as f64 > f64::from(DELAY_FAR_ENERGY_FLOOR);
+        let adapt = match self.dtd {
+            MdfDtd::Geigel => base_adapt,
+            MdfDtd::TwoPath => {
+                let correlation = if far_active
+                    && sum_mic_sq > MDF_NCC_ENERGY_FLOOR
+                    && sum_echo_sq > MDF_NCC_ENERGY_FLOOR
+                {
+                    Some((sum_mic_echo / (sum_mic_sq * sum_echo_sq).sqrt()) as f32)
+                } else {
+                    None
+                };
+                self.last_correlation = correlation;
+                if correlation.is_some_and(|rho| rho >= NCC_COPY_THRESHOLD) {
+                    self.converged_once = true;
+                }
+                let double_talk = correlation.is_some_and(|rho| rho < NCC_DOUBLETALK_THRESHOLD);
+                self.doubletalk_active = double_talk;
+                if double_talk {
+                    self.dt_hold_blocks = MDF_DOUBLETALK_HANGOVER_BLOCKS;
+                } else if self.dt_hold_blocks > 0 {
+                    self.dt_hold_blocks -= 1;
+                }
+                // Until the filter has confidently converged once, adapt on every excited block so the
+                // NCC can never latch it at its uninitialized state; afterwards the freeze is trusted.
+                far_active && (!self.converged_once || self.dt_hold_blocks == 0)
+            }
+        };
+
+        // --- adapt each partition: G_k = μ·conj(X_{m-k})⊙E/(P+δ), constrain, W_k += Ĝ_k ---
+        if adapt {
+            // Error frame E = FFT( [ 0…0 (B) | e ] ).
+            self.frame_time[..block].iter_mut().for_each(|s| *s = 0.0);
+            self.frame_time[block..fft_size].copy_from_slice(&self.block_error);
+            self.fft.forward(&self.frame_time, &mut self.error_spectrum);
+
+            for k in 0..self.partitions {
+                let x_base = self.partition_slot(k) * bins;
+                for bin in 0..bins {
+                    let x = self.x_spectra[x_base + bin];
+                    let e = self.error_spectrum[bin];
+                    // conj(X)·E = (xr − i·xi)(er + i·ei).
+                    let real = x.re * e.re + x.im * e.im;
+                    let imag = x.re * e.im - x.im * e.re;
+                    let scale = self.step_size / (self.delay_power[bin] + self.regularization);
+                    self.grad_spectrum[bin] = Complex::new(real * scale, imag * scale);
+                }
+                // Gradient constraint: g = IFFT(G); zero the wrap-around half; Ĝ = FFT(g).
+                self.fft.inverse(&self.grad_spectrum, &mut self.frame_time);
+                self.frame_time[block..fft_size]
+                    .iter_mut()
+                    .for_each(|s| *s = 0.0);
+                self.fft.forward(&self.frame_time, &mut self.grad_spectrum);
+                let weight_base = k * bins;
+                for bin in 0..bins {
+                    self.weights[weight_base + bin].re += self.grad_spectrum[bin].re;
+                    self.weights[weight_base + bin].im += self.grad_spectrum[bin].im;
+                }
+            }
+        }
+
+        // Current block's reference becomes the next block's overlap carry.
+        self.overlap_ref.copy_from_slice(&self.in_ref[..block]);
+    }
+
+    /// Reset all adaptive state (weights, spectrum delay line, PSD, block/output rings, DTD) and the
+    /// reference alignment.
+    fn reset(&mut self) {
+        self.weights
+            .iter_mut()
+            .for_each(|w| *w = Complex::default());
+        self.x_spectra
+            .iter_mut()
+            .for_each(|x| *x = Complex::default());
+        self.x_head = 0;
+        self.delay_power.iter_mut().for_each(|p| *p = 0.0);
+        self.overlap_ref.iter_mut().for_each(|s| *s = 0.0);
+        self.in_len = 0;
+        self.out_res.iter_mut().for_each(|s| *s = 0.0);
+        self.out_len = self.block_size;
+        self.reference.reset();
+        self.reference.set_bulk_delay(0);
+        self.last_correlation = None;
+        self.doubletalk_active = false;
+        self.dt_hold_blocks = 0;
+        self.converged_once = false;
+    }
+
+    /// Total energy of the weight spectra (a convergence probe for tests).
+    #[cfg(test)]
+    fn weight_energy(&self) -> f64 {
+        self.weights
+            .iter()
+            .map(|w| f64::from(w.norm_squared()))
+            .sum()
+    }
+
+    /// A snapshot of the weight spectra (tests assert bit-for-bit freeze during double-talk).
+    #[cfg(test)]
+    fn weights_snapshot(&self) -> Vec<Complex> {
+        self.weights.clone()
+    }
+}
+
 /// The double-talk detector wired into [`EchoCanceller::cancel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DtdMode {
@@ -604,6 +1076,11 @@ pub struct EchoCanceller {
     /// raw near-end/reference to it and re-aligns the far-end ring (resetting the weights) whenever a
     /// new bulk delay is committed. `None` for the fixed-delay constructors.
     delay_estimator: Option<DelayEstimator>,
+    /// Optional MDF / partitioned-block frequency-domain adaptive filter backend. When present it
+    /// **replaces** the time-domain NLMS on the hot path (covering a long tail at O(N log N)); the
+    /// time-domain `weights`/`foreground` are then inert. `None` selects the default time-domain
+    /// backend, keeping every existing constructor byte-for-byte identical.
+    mdf: Option<MdfFilter>,
 }
 
 impl EchoCanceller {
@@ -663,6 +1140,7 @@ impl EchoCanceller {
             doubletalk_hangover_frames: DEFAULT_DOUBLETALK_HANGOVER_FRAMES,
             doubletalk_active: false,
             delay_estimator: None,
+            mdf: None,
         })
     }
 
@@ -717,6 +1195,83 @@ impl EchoCanceller {
             doubletalk_hangover_frames: DEFAULT_DOUBLETALK_HANGOVER_FRAMES,
             doubletalk_active: false,
             delay_estimator: Some(delay_estimator),
+            mdf: None,
+        })
+    }
+
+    /// A canceller whose adaptive filter is the **MDF / partitioned-block frequency-domain** backend
+    /// (Soo & Pang 1990) covering a long echo tail (`tail_samples`, 128–256 ms) at O(N log N) instead
+    /// of the time-domain NLMS's O(L) per sample — the right backend when the impulse-response spread
+    /// is long. No bulk delay is applied (the echo is assumed to start within the tail); pair it with
+    /// [`EchoCanceller::with_mdf_delay_estimation`] to recover an unknown transport delay first.
+    ///
+    /// Chainable with [`EchoCanceller::with_two_path_dtd`] (which then drives a per-block NCC freeze).
+    /// The block backend adds a fixed `block_size`-sample (~16 ms) algorithmic latency (the overlap-save
+    /// block delay). Preallocates all state (the `K` partition spectra, the reference-spectrum delay
+    /// line, the per-bin delay-line power, and all FFT scratch).
+    ///
+    /// # Errors
+    /// As [`EchoCanceller::new`] for the sample rate and tail.
+    pub fn with_mdf(sample_rate_hz: u32, tail_samples: usize) -> Result<Self, AecError> {
+        Self::build_mdf(sample_rate_hz, tail_samples, 0, None)
+    }
+
+    /// The MDF backend **plus automatic GCC-PHAT bulk-delay estimation** over `search_range_samples`:
+    /// the estimator removes the transport delay and the `K` MDF partitions cover the residual
+    /// dispersion. Chainable with [`EchoCanceller::with_two_path_dtd`]. Preallocates all state
+    /// (including the estimation FFT and the MDF reference-alignment ring for the whole search range).
+    ///
+    /// # Errors
+    /// As [`EchoCanceller::new`], plus [`AecError::InvalidSearchRange`] if `search_range_samples` is 0
+    /// or exceeds the supported maximum.
+    pub fn with_mdf_delay_estimation(
+        sample_rate_hz: u32,
+        tail_samples: usize,
+        search_range_samples: usize,
+    ) -> Result<Self, AecError> {
+        let delay_estimator = DelayEstimator::new(search_range_samples)?;
+        Self::build_mdf(
+            sample_rate_hz,
+            tail_samples,
+            search_range_samples,
+            Some(delay_estimator),
+        )
+    }
+
+    /// Shared MDF constructor: validates the rate, builds the MDF (sized for `max_bulk_delay`), and
+    /// wires the optional delay estimator. The time-domain `weights`/`foreground` are allocated inert
+    /// so the struct shape (and `reset`) is uniform across backends.
+    fn build_mdf(
+        sample_rate_hz: u32,
+        tail_samples: usize,
+        max_bulk_delay: usize,
+        delay_estimator: Option<DelayEstimator>,
+    ) -> Result<Self, AecError> {
+        if sample_rate_hz < 8_000 || !sample_rate_hz.is_multiple_of(50) {
+            return Err(AecError::InvalidSampleRate(sample_rate_hz));
+        }
+        let frame_samples = (sample_rate_hz / 50) as usize;
+        let mdf = MdfFilter::new(frame_samples, tail_samples, max_bulk_delay)?;
+        let tail = mdf.tail;
+        Ok(Self {
+            sample_rate_hz,
+            frame_samples,
+            tail_samples: tail,
+            weights: vec![0.0; tail],
+            foreground: vec![0.0; tail],
+            dtd_mode: DtdMode::Geigel,
+            last_correlation: None,
+            copies: 0,
+            reference: FarEndReference::new(1, 0, frame_samples),
+            step_size: DEFAULT_STEP_SIZE,
+            regularization: DEFAULT_REGULARIZATION,
+            geigel_threshold: DEFAULT_GEIGEL_THRESHOLD,
+            far_peak_floor: DEFAULT_FAR_PEAK_FLOOR,
+            doubletalk_hold_frames: 0,
+            doubletalk_hangover_frames: DEFAULT_DOUBLETALK_HANGOVER_FRAMES,
+            doubletalk_active: false,
+            delay_estimator,
+            mdf: Some(mdf),
         })
     }
 
@@ -732,7 +1287,30 @@ impl EchoCanceller {
     #[must_use]
     pub fn with_two_path_dtd(mut self) -> Self {
         self.dtd_mode = DtdMode::TwoPath;
+        if let Some(mdf) = self.mdf.as_mut() {
+            mdf.dtd = MdfDtd::TwoPath;
+        }
         self
+    }
+
+    /// Whether the adaptive filter backend is the MDF / partitioned-block frequency-domain filter
+    /// (else the default time-domain NLMS).
+    #[must_use]
+    pub fn mdf_enabled(&self) -> bool {
+        self.mdf.is_some()
+    }
+
+    /// The MDF block size (partition length) in samples, or `None` when the time-domain backend is
+    /// active. The block backend adds this many samples of algorithmic latency (~16 ms).
+    #[must_use]
+    pub fn mdf_block_size(&self) -> Option<usize> {
+        self.mdf.as_ref().map(|mdf| mdf.block_size)
+    }
+
+    /// The MDF partition count `K` (`tail = K·block_size`), or `None` for the time-domain backend.
+    #[must_use]
+    pub fn mdf_partitions(&self) -> Option<usize> {
+        self.mdf.as_ref().map(|mdf| mdf.partitions)
     }
 
     /// Whether the two-path/NCC double-talk detector is enabled (else the Geigel screen).
@@ -746,7 +1324,10 @@ impl EchoCanceller {
     /// two-path is disabled. `ρ → 1` is echo-only; a drop signals near-end/double-talk.
     #[must_use]
     pub fn double_talk_correlation(&self) -> Option<f32> {
-        self.last_correlation
+        match self.mdf.as_ref() {
+            Some(mdf) => mdf.last_correlation,
+            None => self.last_correlation,
+        }
     }
 
     /// Number of background→foreground copies since construction or the last [`EchoCanceller::reset`]
@@ -780,7 +1361,10 @@ impl EchoCanceller {
     /// (0 until the first lock).
     #[must_use]
     pub fn bulk_delay_samples(&self) -> usize {
-        self.reference.bulk_delay
+        match self.mdf.as_ref() {
+            Some(mdf) => mdf.bulk_delay(),
+            None => self.reference.bulk_delay,
+        }
     }
 
     /// Whether this canceller estimates the bulk delay automatically (GCC-PHAT).
@@ -872,11 +1456,68 @@ impl EchoCanceller {
         let far_active = far_peak > self.far_peak_floor;
         let geigel_tripped = far_active && near_peak >= self.geigel_threshold * far_peak;
 
+        if self.mdf.is_some() {
+            self.cancel_mdf(n, near_end, reference, geigel_tripped);
+            return;
+        }
+
         match self.dtd_mode {
             DtdMode::Geigel => self.cancel_geigel(n, near_end, reference, geigel_tripped),
             DtdMode::TwoPath => {
                 self.cancel_two_path(n, near_end, reference, geigel_tripped, far_active);
             }
+        }
+    }
+
+    /// The MDF / partitioned-block frequency-domain cancel path. It composes the shared pieces: the
+    /// GCC-PHAT estimator (when present) removes the bulk delay and re-aligns the MDF (resetting its
+    /// weights on a committed change), the Geigel screen gates adaptation in [`DtdMode::Geigel`], and
+    /// the MDF's own per-block NCC gates it in [`DtdMode::TwoPath`]. The near-end is echo-subtracted in
+    /// place (delayed by the fixed block latency).
+    fn cancel_mdf(
+        &mut self,
+        n: usize,
+        near_end: &mut [i16],
+        reference: &[i16],
+        geigel_tripped: bool,
+    ) {
+        // Geigel frame gate (the default DTD): freeze adaptation on a trip, with the same hangover the
+        // time-domain path uses. In two-path mode the MDF ignores this and runs its per-block NCC, so
+        // `base_adapt` is only consulted there for the `doubletalk_active` status surface.
+        if geigel_tripped {
+            self.doubletalk_hold_frames = self.doubletalk_hangover_frames;
+        }
+        let base_adapt = self.doubletalk_hold_frames == 0;
+        if self.doubletalk_hold_frames > 0 {
+            self.doubletalk_hold_frames -= 1;
+        }
+
+        // GCC-PHAT bulk-delay estimation on the raw pair (before near_end is overwritten). A committed
+        // (re-)alignment retunes the MDF reference and resets its weights (tuned to the old offset).
+        let realign = self
+            .delay_estimator
+            .as_mut()
+            .and_then(|estimator| estimator.observe(&near_end[..n], &reference[..n], base_adapt));
+        if let Some(new_delay) = realign {
+            if let Some(mdf) = self.mdf.as_mut() {
+                if new_delay != mdf.bulk_delay() {
+                    mdf.set_bulk_delay(new_delay);
+                }
+            }
+        }
+
+        let two_path = self.dtd_mode == DtdMode::TwoPath;
+        // SAFETY-of-logic: `mdf` is `Some` on this path (checked by the caller).
+        if let Some(mdf) = self.mdf.as_mut() {
+            mdf.push_frame(near_end, reference, base_adapt);
+            // Surface the DTD status for the accessors: the block-level NCC in two-path mode, or the
+            // Geigel frame decision in the default mode.
+            self.doubletalk_active = if two_path {
+                mdf.doubletalk_active
+            } else {
+                !base_adapt
+            };
+            self.last_correlation = mdf.last_correlation;
         }
     }
 
@@ -1102,6 +1743,9 @@ impl EchoCanceller {
             }
             self.reference.set_bulk_delay(0);
         }
+        if let Some(mdf) = self.mdf.as_mut() {
+            mdf.reset();
+        }
         self.doubletalk_hold_frames = 0;
         self.doubletalk_active = false;
         self.last_correlation = None;
@@ -1120,6 +1764,19 @@ impl EchoCanceller {
     #[cfg(test)]
     fn foreground_weights(&self) -> &[f32] {
         &self.foreground
+    }
+
+    /// Total energy of the MDF weight spectra (a convergence probe; `None` for the time-domain
+    /// backend).
+    #[cfg(test)]
+    fn mdf_weight_energy(&self) -> Option<f64> {
+        self.mdf.as_ref().map(MdfFilter::weight_energy)
+    }
+
+    /// A snapshot of the MDF weight spectra (tests assert bit-for-bit freeze during double-talk).
+    #[cfg(test)]
+    fn mdf_weights_snapshot(&self) -> Option<Vec<Complex>> {
+        self.mdf.as_ref().map(MdfFilter::weights_snapshot)
     }
 }
 
@@ -2248,5 +2905,438 @@ mod tests {
                 "block {block} must exceed search range {range}"
             );
         }
+    }
+
+    // ---- MDF / partitioned-block frequency-domain adaptive filter ----
+
+    /// A long, sparse-plus-dispersive room impulse response (up to `len` taps @ 8 kHz): a decaying
+    /// early cluster plus late reflections placed **well beyond a 256-tab NLMS tail** (at ~800 / 1200 /
+    /// 1600 taps). A short time-domain NLMS cannot reach those late taps; the MDF long tail can.
+    const LONG_ROOM_IMPULSE_RESPONSE: &[(usize, f32)] = &[
+        (5, 0.100),
+        (11, -0.075),
+        (23, 0.055),
+        (47, -0.040),
+        (95, 0.030),
+        (190, -0.022),
+        (380, 0.016),
+        (800, -0.045),
+        (1200, 0.030),
+        (1600, -0.020),
+    ];
+
+    fn build_long_rir(len: usize) -> Vec<f32> {
+        let mut rir = vec![0.0f32; len];
+        for &(tap, amplitude) in LONG_ROOM_IMPULSE_RESPONSE {
+            if tap < len {
+                rir[tap] = amplitude;
+            }
+        }
+        rir
+    }
+
+    /// Steady-state ERLE (dB) over the last `tail_frames` frames of a run: the block latency is a
+    /// constant shift that averages out over the window, so the echo/residual power ratio is a clean
+    /// steady-state measure regardless of the MDF's algorithmic delay.
+    fn steady_erle(echo: &[i16], residual: &[i16], frame: usize, tail_frames: usize) -> f64 {
+        let start = echo.len().saturating_sub(tail_frames * frame);
+        erle_db(&echo[start..], &residual[start..])
+    }
+
+    #[test]
+    fn mdf_accessors_report_configuration() {
+        let canceller = EchoCanceller::with_mdf(8_000, 1024).expect("build");
+        assert!(canceller.mdf_enabled());
+        assert_eq!(canceller.sample_rate_hz(), 8_000);
+        assert_eq!(canceller.frame_samples(), 160);
+        assert_eq!(canceller.mdf_block_size(), Some(128)); // floor_pow2(160)
+        assert_eq!(canceller.mdf_partitions(), Some(8)); // ceil(1024/128)
+        assert_eq!(canceller.tail_samples(), 1024); // K·B == 8·128
+        assert_eq!(canceller.bulk_delay_samples(), 0);
+        assert!(!canceller.double_talk_active());
+
+        let wideband = EchoCanceller::with_mdf(16_000, 2048).expect("build");
+        assert_eq!(wideband.mdf_block_size(), Some(256)); // floor_pow2(320)
+        assert_eq!(wideband.mdf_partitions(), Some(8)); // ceil(2048/256)
+
+        // The time-domain backend reports no MDF state.
+        let time_domain = EchoCanceller::new(8_000, 256).expect("build");
+        assert!(!time_domain.mdf_enabled());
+        assert_eq!(time_domain.mdf_block_size(), None);
+        assert_eq!(time_domain.mdf_partitions(), None);
+    }
+
+    #[test]
+    fn mdf_rejects_invalid_config() {
+        assert!(matches!(
+            EchoCanceller::with_mdf(7_000, 1024),
+            Err(AecError::InvalidSampleRate(7_000))
+        ));
+        assert!(matches!(
+            EchoCanceller::with_mdf(8_000, 0),
+            Err(AecError::InvalidTail { got: 0, .. })
+        ));
+        assert!(matches!(
+            EchoCanceller::with_mdf(8_000, MAX_TAIL_SAMPLES + 1),
+            Err(AecError::InvalidTail { .. })
+        ));
+        assert!(matches!(
+            EchoCanceller::with_mdf_delay_estimation(8_000, 1024, 0),
+            Err(AecError::InvalidSearchRange { got: 0, .. })
+        ));
+    }
+
+    /// Golden ERLE for the MDF: on a committed synthetic echo it cancels by ≥ 20 dB in steady state,
+    /// reaching it within a bounded frame count — the same acceptance bar as the short-tail NLMS.
+    #[test]
+    fn mdf_converges_to_high_erle_on_synthetic_echo() {
+        let tail = 1024;
+        let frame = 160;
+        let frames = 240;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x3DF0_2026);
+        let mut canceller = EchoCanceller::with_mdf(8_000, tail).expect("build");
+
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+
+        let mut residual_stream = vec![0i16; frames * frame];
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            residual_stream[range].copy_from_slice(&mic);
+        }
+        let steady = steady_erle(&echo, &residual_stream, frame, 40);
+        assert!(
+            steady >= 20.0,
+            "MDF steady-state ERLE {steady:.1} dB < 20 dB"
+        );
+    }
+
+    /// **MDF beats the time-domain NLMS on a long echo tail.** The RIR has significant energy at ~800,
+    /// 1200 and 1600 taps — far outside a 256-tap NLMS window, so the NLMS (the inline-budget default)
+    /// leaves that echo energy uncancelled and its ERLE is capped. The MDF long tail (1792 taps, 14
+    /// partitions) covers the whole response and reaches a high ERLE. Asserts a large, quantified gap.
+    #[test]
+    fn mdf_beats_nlms_on_long_tail() {
+        let frame = 160;
+        let frames = 300;
+        let long_tail = 1792; // 14 partitions of 128 → spans past the 1600-tap reflection
+        let nlms_tail = 256; // the inline-budget time-domain default
+        let rir = build_long_rir(1700);
+        let mut prng = SplitMix64::new(0x104C_7A11);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+
+        let run = |canceller: &mut EchoCanceller| -> f64 {
+            let mut residual_stream = vec![0i16; frames * frame];
+            for index in 0..frames {
+                let range = index * frame..(index + 1) * frame;
+                let mut mic = echo[range.clone()].to_vec();
+                canceller.cancel(&mut mic, &far[range.clone()]);
+                residual_stream[range].copy_from_slice(&mic);
+            }
+            steady_erle(&echo, &residual_stream, frame, 40)
+        };
+
+        let mut nlms = EchoCanceller::new(8_000, nlms_tail).expect("build");
+        let nlms_erle = run(&mut nlms);
+        let mut mdf = EchoCanceller::with_mdf(8_000, long_tail).expect("build");
+        let mdf_erle = run(&mut mdf);
+
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!("long-tail ERLE: NLMS(256) {nlms_erle:.1} dB, MDF(1792) {mdf_erle:.1} dB");
+        }
+        // The short NLMS cannot reach the late taps → its ERLE is capped well below the MDF's.
+        assert!(
+            nlms_erle < 15.0,
+            "short NLMS unexpectedly cancelled the long tail ({nlms_erle:.1} dB)"
+        );
+        assert!(
+            mdf_erle >= 20.0,
+            "MDF long tail only reached {mdf_erle:.1} dB (want ≥ 20 dB)"
+        );
+        assert!(
+            mdf_erle - nlms_erle >= 10.0,
+            "MDF long-tail advantage only {:.1} dB (NLMS {nlms_erle:.1} → MDF {mdf_erle:.1})",
+            mdf_erle - nlms_erle
+        );
+    }
+
+    /// Determinism: the MDF path is a pure function of the input (logical clock, fixed-seed PRNG), so
+    /// two identical runs yield identical residual streams and weight energies.
+    #[test]
+    fn mdf_is_deterministic() {
+        let run = || {
+            let frame = 160;
+            let rir = build_rir(128);
+            let mut prng = SplitMix64::new(0xD37E_3333);
+            let mut canceller = EchoCanceller::with_mdf(8_000, 1024).expect("build");
+            let far = far_stream(&mut prng, 0.6, 80 * frame);
+            let echo = synthesize_echo(&normalize(&far), &rir, 0);
+            let mut residual_stream = vec![0i16; 80 * frame];
+            for index in 0..80 {
+                let range = index * frame..(index + 1) * frame;
+                let mut mic = echo[range.clone()].to_vec();
+                canceller.cancel(&mut mic, &far[range.clone()]);
+                residual_stream[range].copy_from_slice(&mic);
+            }
+            (residual_stream, canceller.mdf_weight_energy())
+        };
+        let (first_residual, first_energy) = run();
+        let (second_residual, second_energy) = run();
+        assert_eq!(first_residual, second_residual);
+        assert_eq!(first_energy, second_energy);
+    }
+
+    #[test]
+    fn mdf_reset_clears_state() {
+        let frame = 160;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x4E5E_7001);
+        let mut canceller = EchoCanceller::with_mdf(8_000, 1024).expect("build");
+        let far = far_stream(&mut prng, 0.6, 60 * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+        for index in 0..60 {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+        }
+        assert!(
+            canceller.mdf_weight_energy().expect("mdf") > 0.0,
+            "MDF must have adapted before reset"
+        );
+        canceller.reset();
+        assert_eq!(canceller.mdf_weight_energy(), Some(0.0));
+        assert_eq!(canceller.bulk_delay_samples(), 0);
+        assert!(!canceller.double_talk_active());
+    }
+
+    /// Composition — MDF + **GCC-PHAT**: an unknown bulk delay misaligns the reference; automatic
+    /// estimation recovers it (the MDF partitions then cover only the residual dispersion) and the
+    /// long-tail filter still reaches the ≥ 20 dB ERLE target.
+    #[test]
+    fn mdf_with_delay_estimation_recovers_unknown_delay() {
+        let frame = 160;
+        let search_range = 512;
+        let unknown_delay = 256;
+        let frames = 320;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0xE51E_3DF0);
+        let mut canceller =
+            EchoCanceller::with_mdf_delay_estimation(8_000, 512, search_range).expect("build");
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, unknown_delay);
+
+        let mut residual_stream = vec![0i16; frames * frame];
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            residual_stream[range].copy_from_slice(&mic);
+        }
+        let estimated = canceller
+            .estimated_bulk_delay()
+            .expect("GCC-PHAT must lock the delay under the MDF backend");
+        assert!(
+            estimated.abs_diff(unknown_delay) <= DELAY_RECOVERY_TOLERANCE,
+            "estimated {estimated} for injected {unknown_delay}"
+        );
+        assert_eq!(canceller.bulk_delay_samples(), estimated);
+        let steady = steady_erle(&echo, &residual_stream, frame, 40);
+        assert!(
+            steady >= 20.0,
+            "MDF + delay-estimation steady ERLE {steady:.1} dB < 20 dB"
+        );
+    }
+
+    /// Composition — MDF + **two-path NCC double-talk freeze**: converge the foreground long-tail
+    /// filter, then inject a near-end talker. The per-block NCC must (a) flag double-talk, (b) hold the
+    /// MDF weight spectra **frozen bit-for-bit** through it, (c) pass the near-end through with bounded
+    /// leakage, and (d) recover ERLE the instant the near-end stops (the protected weights never
+    /// degraded).
+    #[test]
+    fn mdf_two_path_freezes_through_double_talk() {
+        let tail = 1024;
+        let frame = 160;
+        let converge_frames = 140;
+        let settle_frames = 4; // let the NCC + hangover engage across the boundary blocks
+        let double_talk_frames = 30;
+        let recover_frames = 50;
+        let total = converge_frames + double_talk_frames + recover_frames;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x0DDB_A11F);
+        let mut canceller = EchoCanceller::with_mdf(8_000, tail)
+            .expect("build")
+            .with_two_path_dtd();
+        let far = far_stream(&mut prng, 0.6, total * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 0);
+        let near_talk: Vec<i16> = (0..total * frame)
+            .map(|t| {
+                super::denormalize(
+                    0.6 * (2.0 * std::f32::consts::PI * 400.0 * t as f32 / 8_000.0).sin(),
+                )
+            })
+            .collect();
+        let frame_range = |index: usize| index * frame..(index + 1) * frame;
+
+        // 1) Converge on pure echo.
+        for index in 0..converge_frames {
+            let range = frame_range(index);
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+        }
+
+        // 2) Double-talk. Snapshot the weights a few frames in (once the NCC + hangover have engaged
+        //    across the block boundary) and require them frozen bit-for-bit for the rest of the segment.
+        //    Near-end preservation is measured as a power ratio (latency-invariant, unlike a sample-wise
+        //    difference the MDF's block delay would corrupt): with the filter frozen at its
+        //    echo-cancelling state the residual is `≈ near-talk`, so its power tracks the talker's.
+        let mut double_talk_seen = false;
+        let mut residual_power_sum = 0.0f64;
+        let mut talk_power_sum = 0.0f64;
+        let mut frozen_snapshot: Option<Vec<Complex>> = None;
+        for offset in 0..double_talk_frames {
+            let index = converge_frames + offset;
+            let range = frame_range(index);
+            let talk = &near_talk[range.clone()];
+            let mut mic: Vec<i16> = echo[range.clone()]
+                .iter()
+                .zip(talk)
+                .map(|(&echo_sample, &near_sample)| echo_sample.saturating_add(near_sample))
+                .collect();
+            canceller.cancel(&mut mic, &far[range]);
+            double_talk_seen |= canceller.double_talk_active();
+            if offset == settle_frames {
+                frozen_snapshot = canceller.mdf_weights_snapshot();
+            }
+            if offset >= settle_frames {
+                assert_eq!(
+                    frozen_snapshot.as_deref(),
+                    canceller.mdf_weights_snapshot().as_deref(),
+                    "MDF weights must be frozen bit-for-bit during double-talk (frame offset {offset})"
+                );
+                residual_power_sum += power_i16(&mic) * frame as f64;
+                talk_power_sum += power_i16(talk) * frame as f64;
+            }
+        }
+        assert!(double_talk_seen, "MDF two-path must flag the double-talk");
+        // The near-end passes through neither cancelled nor amplified: residual power within ±3 dB of
+        // the near-talk power.
+        let preservation_db = 10.0 * (residual_power_sum / talk_power_sum.max(1.0)).log10();
+        assert!(
+            preservation_db.abs() <= 3.0,
+            "near-end not preserved: residual/near-talk power {preservation_db:.1} dB (want |·| ≤ 3 dB)"
+        );
+
+        // 3) Near-end stops: ERLE recovers (the protected weights never degraded). Measured over the
+        //    steady window, skipping the first few frames while the output ring drains the block-latency
+        //    tail of double-talk residual.
+        let skip = 5;
+        let mut residual_stream = vec![0i16; recover_frames * frame];
+        for offset in 0..recover_frames {
+            let index = converge_frames + double_talk_frames + offset;
+            let range = frame_range(index);
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            let local = offset * frame..(offset + 1) * frame;
+            residual_stream[local].copy_from_slice(&mic);
+        }
+        let recovered_echo_start = (converge_frames + double_talk_frames + skip) * frame;
+        let recovered = erle_db(
+            &echo[recovered_echo_start..],
+            &residual_stream[skip * frame..],
+        );
+        assert!(
+            recovered >= 20.0,
+            "ERLE recovered to only {recovered:.1} dB after double-talk"
+        );
+    }
+
+    /// Composition — **all three together**: MDF long-tail backend + GCC-PHAT (unknown delay) +
+    /// two-path NCC. The delay is recovered, the ERLE target met, and the near-end preserved through a
+    /// scripted double-talk (the weights survive it), proving the three pieces compose.
+    #[test]
+    fn mdf_composition_delay_estimation_and_two_path() {
+        let tail = 512;
+        let frame = 160;
+        let search_range = 512;
+        let unknown_delay = 200;
+        let converge_frames = 180;
+        let double_talk_frames = 25;
+        let recover_frames = 60;
+        let total = converge_frames + double_talk_frames + recover_frames;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0xC0FF_EE3D);
+        let mut canceller = EchoCanceller::with_mdf_delay_estimation(8_000, tail, search_range)
+            .expect("build")
+            .with_two_path_dtd();
+        let far = far_stream(&mut prng, 0.6, total * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, unknown_delay);
+        let near_talk: Vec<i16> = (0..total * frame)
+            .map(|t| {
+                super::denormalize(
+                    0.6 * (2.0 * std::f32::consts::PI * 350.0 * t as f32 / 8_000.0).sin(),
+                )
+            })
+            .collect();
+        let frame_range = |index: usize| index * frame..(index + 1) * frame;
+
+        for index in 0..converge_frames {
+            let range = frame_range(index);
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+        }
+        assert!(
+            canceller
+                .estimated_bulk_delay()
+                .is_some_and(|delay| delay.abs_diff(unknown_delay) <= DELAY_RECOVERY_TOLERANCE),
+            "GCC-PHAT must lock ~{unknown_delay} under MDF + two-path (got {:?})",
+            canceller.estimated_bulk_delay()
+        );
+        let weights_before = canceller.mdf_weight_energy().expect("mdf");
+
+        let mut double_talk_seen = false;
+        for offset in 0..double_talk_frames {
+            let index = converge_frames + offset;
+            let range = frame_range(index);
+            let talk = &near_talk[range.clone()];
+            let mut mic: Vec<i16> = echo[range.clone()]
+                .iter()
+                .zip(talk)
+                .map(|(&echo_sample, &near_sample)| echo_sample.saturating_add(near_sample))
+                .collect();
+            canceller.cancel(&mut mic, &far[range]);
+            double_talk_seen |= canceller.double_talk_active();
+        }
+        assert!(double_talk_seen, "double-talk must be flagged");
+        // The weights must not have run off learning the near-end talker.
+        let weights_after = canceller.mdf_weight_energy().expect("mdf");
+        assert!(
+            weights_after <= weights_before * 2.0,
+            "MDF weights diverged during double-talk: {weights_before:.3} -> {weights_after:.3}"
+        );
+
+        let skip = 5;
+        let mut residual_stream = vec![0i16; recover_frames * frame];
+        for offset in 0..recover_frames {
+            let index = converge_frames + double_talk_frames + offset;
+            let range = frame_range(index);
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            let local = offset * frame..(offset + 1) * frame;
+            residual_stream[local].copy_from_slice(&mic);
+        }
+        // Skip the block-latency transition (output ring draining the double-talk tail).
+        let recovered_echo_start = (converge_frames + double_talk_frames + skip) * frame;
+        let recovered = erle_db(
+            &echo[recovered_echo_start..],
+            &residual_stream[skip * frame..],
+        );
+        assert!(
+            recovered >= 20.0,
+            "composed MDF + delay-est + two-path recovered ERLE only {recovered:.1} dB"
+        );
     }
 }

@@ -11,6 +11,10 @@
 //!   - `aec_twopath_8k_20ms` — one two-path/NCC echo-cancel frame (L=256): two SIMD estimate dots per
 //!     sample (foreground + background) + the background NLMS update + the per-frame NCC accumulators,
 //!     i.e. the extra per-frame cost the double-talk-robust path pays over the single-filter one.
+//!   - `aec_mdf_8k_20ms` / `aec_mdf_16k_20ms` — one 20 ms frame through the MDF / partitioned-block
+//!     frequency-domain backend over a 256 ms tail (16 partitions): the overlap-save block FFTs plus the
+//!     per-partition gradient-constraint IFFT/FFT pairs. The heaviest AEC path; the µs/frame informs the
+//!     inline-vs-DSP-worker decision for the (later) engine integration.
 //!
 //! No per-frame heap on the steady-state path: the resampler reuses its history/branches and the
 //! caller-owned output vector; the VAD reduces in place; the noise suppressor's FFT/WOLA/PSD scratch
@@ -145,6 +149,49 @@ fn bench_aec(criterion: &mut Criterion) {
         bencher.iter(|| {
             near.copy_from_slice(&near_8k);
             canceller.cancel(black_box(&mut near), black_box(&far_8k));
+            black_box(near[0])
+        });
+    });
+
+    // The MDF / partitioned-block frequency-domain backend covering a 256 ms tail (2048 taps @ 8 kHz,
+    // 16 partitions of 128; 4096 taps @ 16 kHz, 16 partitions of 256). Per 20 ms frame it processes one
+    // or two 256-/512-point overlap-save blocks; each block is the filter FFT (an inverse), the error
+    // FFT (a forward), and — per partition — the gradient-constraint IFFT/FFT pair (the canonical MDF
+    // cost). This is the heaviest AEC path; the µs/frame here informs whether the engine runs it inline
+    // or on a bounded DSP worker (that wiring is a later PR).
+    // Loud far-end + a quiet echo-like near-end so the Geigel screen never trips and the *adapting*
+    // MDF path (the per-partition gradient-constraint IFFT/FFT pairs — the dominant cost) is measured
+    // every frame, not the cheap frozen-filter path.
+    let far_loud_8k: Vec<i16> = (0..160)
+        .map(|n| ((n as f32 * 0.13).sin() * 24_000.0) as i16)
+        .collect();
+    let near_quiet_8k: Vec<i16> = (0..160)
+        .map(|n| ((n as f32 * 0.13).sin() * 1_500.0) as i16)
+        .collect();
+    const MDF_TAIL_8K: usize = 2048;
+    criterion.bench_function("aec_mdf_8k_20ms", |bencher| {
+        let mut canceller = EchoCanceller::with_mdf(8_000, MDF_TAIL_8K).expect("build");
+        let mut near = near_quiet_8k.clone();
+        bencher.iter(|| {
+            near.copy_from_slice(&near_quiet_8k);
+            canceller.cancel(black_box(&mut near), black_box(&far_loud_8k));
+            black_box(near[0])
+        });
+    });
+
+    let far_loud_16k: Vec<i16> = (0..320)
+        .map(|n| ((n as f32 * 0.09).sin() * 24_000.0) as i16)
+        .collect();
+    let near_quiet_16k: Vec<i16> = (0..320)
+        .map(|n| ((n as f32 * 0.09).sin() * 1_500.0) as i16)
+        .collect();
+    const MDF_TAIL_16K: usize = 4096;
+    criterion.bench_function("aec_mdf_16k_20ms", |bencher| {
+        let mut canceller = EchoCanceller::with_mdf(16_000, MDF_TAIL_16K).expect("build");
+        let mut near = near_quiet_16k.clone();
+        bencher.iter(|| {
+            near.copy_from_slice(&near_quiet_16k);
+            canceller.cancel(black_box(&mut near), black_box(&far_loud_16k));
             black_box(near[0])
         });
     });
