@@ -274,8 +274,8 @@ SDP-derived DTLS posture.
   RFC 5764 (DTLS-SRTP, implemented). Pure-Rust only, per the zero-C hard rule. **SDES key material must
   never transit a plaintext control channel** — keys in `a=crypto` are only as safe as the signalling.
 
-### Layer 5b — The media (transcode / record / DTMF) Redirect path
-The transcode/record/DTMF-extraction slow path (`engine/src/media_pipeline.rs`) shares the SRTP
+### Layer 5b — The media (transcode / record / DTMF / echo) Redirect path
+The transcode/record/DTMF-extraction/echo slow path (`engine/src/media_pipeline.rs`) shares the SRTP
 bridge's posture because it runs on the **same `FlowAction::Redirect`** seam, which bypasses the
 datapath's Forward-path layer-2 gate.
 
@@ -305,6 +305,19 @@ datapath's Forward-path layer-2 gate.
   forwarded to the peer's signalled RTCP address; dynamic RTCP-follows-RTP latching is a follow-up.
 - **Injected media** (PlayMedia prompts, PlayDtmf bursts) is emitted on the engine's *own* egress SSRC
   and sequence space, never echoing an attacker-supplied stream.
+- **Echo reflect (self-test).** `echo enabled=true` promotes a plain relay into a **processing**
+  `MediaCall` that decodes each party's ingress and re-encodes it back to the sender (on the engine's
+  own egress SSRC/sequence, RFC 3550 §5.1 — never the sender's). A **single-leg** echo — an offer-only
+  UAS IVR with no answered B leg — reflects on the one caller-facing endpoint the offer's rewritten SDP
+  advertised (the socket the UAS put in its 200 OK), gating ingress to the caller's signalled /
+  `received-from` source (RTPBleed, layer 2) and looping back to it; the never-advertised sibling socket
+  stays idle. Disabling echo demotes the relay — a single-leg promotion returns its lone endpoint to the
+  inbound-drop state it had before (an offer-only endpoint has no negotiated peer).
+- **Idle reap.** A gated-in packet stamps the endpoint's activity (`Datapath::note_activity` — the
+  `Redirect` arm does not stamp `last_seen` itself, so the `MediaCall` actor stamps it on each accepted
+  packet, exactly as the conference actor does); a spoofed source that fails the gate does **not**, so
+  it cannot keep a dead path alive. The daemon sweep (Layer 6) then reaps a media call idle past the
+  media timeout — an actively-transcoding/echoing call is kept alive, a silent one is torn down.
 
 ### Layer 5c — The conference (MCU) Redirect path
 The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,

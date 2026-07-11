@@ -1094,8 +1094,15 @@ impl MediaCall {
     }
 
     /// Process one redirected datagram, gating its source and latching the reverse direction's
-    /// destination, then transcoding/relaying it.
-    pub fn process(&mut self, packet: &RxPacket, out: &mut Vec<Outbound>, events: &mut Vec<Event>) {
+    /// destination, then transcoding/relaying it. Returns `true` when the packet passed its source gate
+    /// and was acted on — the caller stamps media-activity for the timeout sweep only on that (a spoofed
+    /// spray dropped by the gate must never keep an idle path alive, mirroring the conference actor).
+    pub fn process(
+        &mut self,
+        packet: &RxPacket,
+        out: &mut Vec<Outbound>,
+        events: &mut Vec<Event>,
+    ) -> bool {
         let meta = DtmfMeta {
             call_id: &self.call_id,
             from_tag: &self.from_tag,
@@ -1105,7 +1112,7 @@ impl MediaCall {
             // Party A's media: gate A's source; the B→A direction now knows where to reply to A.
             if !self.a_to_b.accepted_source.accepts(packet.source.ip()) {
                 tracing::debug!(source = %packet.source, "media-pipeline dropped packet from unsignalled source");
-                return;
+                return false;
             }
             // Raw-RTP pcap capture (accepted A→B ingress, post source-gate, before any transcode).
             self.capture_ingress(true, packet.source, packet.arrival, &packet.data);
@@ -1125,10 +1132,11 @@ impl MediaCall {
                     self.b_to_a.encoder.request_mode(mode);
                 }
             }
+            true
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
             if !self.b_to_a.accepted_source.accepts(packet.source.ip()) {
                 tracing::debug!(source = %packet.source, "media-pipeline dropped packet from unsignalled source");
-                return;
+                return false;
             }
             // Raw-RTP pcap capture (accepted B→A ingress, post source-gate, before any transcode).
             self.capture_ingress(false, packet.source, packet.arrival, &packet.data);
@@ -1146,6 +1154,7 @@ impl MediaCall {
                     self.a_to_b.encoder.request_mode(mode);
                 }
             }
+            true
         } else if let Some(relay) = self
             .rtcp
             .iter()
@@ -1155,9 +1164,12 @@ impl MediaCall {
             // SRTCP-(de)crypt and relay it untranscoded toward the peer's RTCP port.
             if !relay.accepted_source.accepts(packet.source.ip()) {
                 tracing::debug!(source = %packet.source, "media-pipeline dropped RTCP from unsignalled source");
-                return;
+                return false;
             }
             relay.relay(&packet.data, out);
+            true
+        } else {
+            false
         }
     }
 
@@ -1501,6 +1513,14 @@ impl MediaRegistry {
         self.routes.contains_key(&endpoint)
     }
 
+    /// Test-only: the two ingress endpoints a registered call routes. They are **equal** for an
+    /// offer-only single-leg self-echo call (both directions face the caller on one endpoint) and
+    /// **distinct** for a 2-leg call — the structural difference the echo tests assert on.
+    #[cfg(test)]
+    pub(crate) fn call_endpoints(&self, call_id: &str) -> Option<[EndpointId; 2]> {
+        self.calls.get(call_id).map(|handle| handle.endpoints)
+    }
+
     /// Route a redirected datagram to its owning call actor (drop on a full or closed mailbox —
     /// late media is worthless).
     pub fn dispatch(&self, packet: RxPacket) {
@@ -1656,7 +1676,15 @@ async fn run_media_call<D>(
                     MediaInput::Packet(packet) => {
                         outbound.clear();
                         emitted.clear();
-                        call.process(&packet, &mut outbound, &mut emitted);
+                        // Stamp media activity for the timeout sweep only when the packet passes the
+                        // source gate (a spoofed spray must not keep an idle path alive). A redirected
+                        // media leg's ingress otherwise never touches the datapath's `last_seen` (the
+                        // Redirect arm doesn't, unlike the in-kernel Forward relay), so without this an
+                        // actively-transcoding/echoing call would be reaped mid-call — same fix the
+                        // conference actor already applies.
+                        if call.process(&packet, &mut outbound, &mut emitted) {
+                            datapath.note_activity(packet.endpoint);
+                        }
                         send_all(&datapath, &mut outbound).await;
                         for event in emitted.drain(..) {
                             if let Some(sink) = &events {
