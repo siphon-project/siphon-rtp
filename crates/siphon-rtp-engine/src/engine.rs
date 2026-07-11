@@ -1224,6 +1224,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             .unwrap_or(info.remote_rtp),
                     ),
                     profile.noise_suppression,
+                    WsVadConfig::from_profile(profile),
                 )
                 .await
             {
@@ -1249,6 +1250,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         codec: Option<&CodecSpec>,
         accepted_source: SourceFilter,
         noise_suppression: bool,
+        vad_config: Option<WsVadConfig>,
     ) -> Result<(), String> {
         let Some(codec) = codec else {
             return Err("offer carried no usable audio codec for the WS bridge".to_string());
@@ -1294,7 +1296,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             endianness: siphon_rtp_media::bridge::protocol::Endianness::Little,
             ptime: codec.ptime_ms.max(1),
         };
-        let session = BridgeSession::new(
+        let mut session = BridgeSession::new(
             leg,
             format,
             format!("ws-{call_id}"),
@@ -1304,6 +1306,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         )
         // Clean leg A's uplink audio toward the voice-AI server when requested (rate-gated inside).
         .with_noise_suppression(noise_suppression);
+        // Local energy-VAD turn-taking (speech_started/stopped + optional barge-in) when requested.
+        // The hangover is carried in ms and converted to ptime frames now that the codec ptime known.
+        if let Some(vad) = vad_config {
+            let hangover_frames = (vad.hangover_ms / u32::from(codec.ptime_ms.max(1))).max(1);
+            session = session.with_vad(vad.threshold, hangover_frames, vad.barge_in);
+        }
 
         let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
         let (rtp_out_tx, rtp_out_rx) = flume::bounded::<bytes::Bytes>(1024);
@@ -1490,6 +1498,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             // Gate leg A to its offer `received-from` public IP when supplied.
                             bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                             profile.noise_suppression,
+                            WsVadConfig::from_profile(profile),
                         )
                         .await
                     {
@@ -4618,6 +4627,35 @@ fn build_direction(
 /// (party B) plays toward B; otherwise toward A (the offerer) — the default.
 fn resolve_toward_a(from_tag: &str, _call_from: &str, call_to: Option<&str>) -> bool {
     !matches!(call_to, Some(to_tag) if to_tag == from_tag)
+}
+
+/// Default mean-square energy threshold for the WS uplink VAD (8/16 kHz L16) when the profile does
+/// not override it — the 8 kHz/20 ms starting point suggested by `EnergyVad`.
+const DEFAULT_WS_VAD_THRESHOLD: i64 = 1_000_000;
+/// Default trailing hangover for the WS uplink VAD (~200 ms) when the profile does not override it.
+const DEFAULT_WS_VAD_HANGOVER_MS: u32 = 200;
+
+/// Local-VAD turn-taking config for a WS voice-AI leg, resolved from [`ProfileFlags`] at offer time.
+#[derive(Debug, Clone, Copy)]
+struct WsVadConfig {
+    /// Mean-square energy at/above which an uplink frame is speech.
+    threshold: i64,
+    /// Trailing hangover in milliseconds (converted to ptime frames once the codec ptime is known).
+    hangover_ms: u32,
+    /// Flush the downlink playout locally on a speech-start edge (barge-in).
+    barge_in: bool,
+}
+
+impl WsVadConfig {
+    /// Resolve the turn-taking config from a profile, or `None` when neither VAD nor barge-in was
+    /// requested. Barge-in implies VAD, so either flag turns the detector on.
+    fn from_profile(profile: &ProfileFlags) -> Option<Self> {
+        (profile.ws_vad || profile.ws_barge_in).then(|| Self {
+            threshold: profile.ws_vad_threshold.unwrap_or(DEFAULT_WS_VAD_THRESHOLD),
+            hangover_ms: profile.ws_vad_hangover_ms.unwrap_or(DEFAULT_WS_VAD_HANGOVER_MS),
+            barge_in: profile.ws_barge_in,
+        })
+    }
 }
 
 /// A fresh SSRC for a synthesized (transcoded) egress stream, from the OS CSPRNG (RFC 3550 §8 wants
