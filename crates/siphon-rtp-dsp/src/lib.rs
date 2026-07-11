@@ -13,16 +13,19 @@
 pub mod aec;
 pub mod fft;
 pub mod ns;
+pub mod res;
 pub mod resample;
+mod spectral;
 pub mod vad;
 pub mod window;
 
 pub use aec::{AecError, EchoCanceller};
 pub use fft::{Complex, RealFft};
 pub use ns::NoiseSuppressor;
+pub use res::ResidualEchoSuppressor;
 pub use resample::{ResampleError, Resampler};
 pub use vad::EnergyVad;
-pub use window::WolaProcessor;
+pub use window::{WolaAnalyzer, WolaProcessor};
 
 /// Errors constructing a DSP block (noise suppressor, WOLA framing, FFT).
 ///
