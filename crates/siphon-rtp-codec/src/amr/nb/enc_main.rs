@@ -301,10 +301,11 @@ impl EncoderState {
                 | AmrNbMode::Mr590
                 | AmrNbMode::Mr670
                 | AmrNbMode::Mr740
+                | AmrNbMode::Mr795
                 | AmrNbMode::Mr1020
         ) {
             return Err(CodecError::Unsupported(
-                "AMR-NB encoder: only MR122, MR102, MR475, MR515, MR59, MR67 and MR74 are wired (cbsearch / gain modes ported)",
+                "AMR-NB encoder: only MR122, MR102, MR475, MR515, MR59, MR67, MR74 and MR795 are wired (cbsearch / gain modes ported)",
             ));
         }
 
@@ -1081,6 +1082,38 @@ mod tests {
         assert!(
             mismatch.is_none(),
             "MR102 T02: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR795 full-encoder gate on T01 (7.95 kbit/s): the 17-bit 4-pulse codebook `c4_17pf` (shared
+    /// with MR74) plus the adaptive MR795 gain quantizer emitting TWO gain indices (pitch then code).
+    /// This is the definitive byte-exact acceptance test — the last of the eight AMR-NB modes.
+    #[test]
+    fn encodes_mr795_full_params_bit_exact_t01() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr795,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T01.INP",
+            "../../reference/amr-nb/testv/NODTX/T_795/T01_795.COD",
+        );
+        eprintln!("MR795 full-encode gate (T01): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR795 T01: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
+        );
+    }
+
+    /// MR795 full-encoder gate on a second vector (T02) for extra confidence.
+    #[test]
+    fn encodes_mr795_full_params_bit_exact_t02() {
+        let (frames, mismatch) = check_encode_vector(
+            AmrNbMode::Mr795,
+            "../../reference/amr-nb/testv/NODTX/T_INP/T02.INP",
+            "../../reference/amr-nb/testv/NODTX/T_795/T02_795.COD",
+        );
+        eprintln!("MR795 full-encode gate (T02): {frames} frames compared");
+        assert!(
+            mismatch.is_none(),
+            "MR795 T02: {frames} frames, first mismatch (frame, param, got, want) = {mismatch:?}"
         );
     }
 }
