@@ -82,6 +82,11 @@ where
             },
             _ = ticker.tick() => {
                 let result = session.tick(&mut uplink, &mut downlink);
+                // Turn signals (speech_started/stopped) go out first, so the server reacts to a
+                // barge-in or turn endpoint without waiting behind this tick's audio frame.
+                while let Some(control) = session.next_control() {
+                    sink.send(Message::text(control.to_json()?)).await?;
+                }
                 if result.uplink_bytes > 0 {
                     sink.send(Message::binary(uplink[..result.uplink_bytes].to_vec())).await?;
                 }
@@ -221,5 +226,99 @@ mod tests {
             outcome.expect("task").is_ok(),
             "bridge exits cleanly on stop"
         );
+    }
+
+    fn session_fixture_vad() -> BridgeSession {
+        let leg = MediaLeg::new(
+            Box::new(G711::ulaw()),
+            Box::new(G711::ulaw()),
+            JitterBuffer::new(1, 16),
+            0x5555_6666,
+            0,
+        );
+        BridgeSession::new(
+            leg,
+            MediaFormat::telephony_default(),
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        )
+        .with_vad(1_000_000, 3, true)
+    }
+
+    fn ulaw_packet_pcm(sequence: u16, pcm: &[i16]) -> Vec<u8> {
+        use siphon_rtp_codec::Encoder as _;
+        let mut encoder = G711::ulaw();
+        let mut payload = [0u8; 160];
+        let len = encoder.encode(pcm, &mut payload).expect("encode");
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 0,
+            sequence,
+            timestamp: u32::from(sequence) * 160,
+            ssrc: 1,
+        };
+        let mut buffer = vec![0u8; 12 + len];
+        let written = write_packet(&header, &payload[..len], &mut buffer).expect("write");
+        buffer.truncate(written);
+        buffer
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_emits_speech_started_over_websocket_on_uplink_speech() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+
+        let (rtp_in_tx, rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (rtp_out_tx, _rtp_out_rx) = flume::unbounded::<Bytes>();
+        let bridge = tokio::spawn(run_bridge(
+            server_ws,
+            session_fixture_vad(),
+            rtp_in_rx,
+            rtp_out_tx,
+            Duration::from_millis(10),
+        ));
+
+        let (_client_tx, mut client_rx) = client_ws.split();
+
+        // Drain the leading `start` text frame.
+        let first = timeout(Duration::from_secs(2), client_rx.next())
+            .await
+            .expect("no timeout")
+            .expect("some")
+            .expect("ok");
+        assert!(matches!(first, Message::Text(_)), "first frame is start");
+
+        // The caller starts talking: several loud uplink frames.
+        for sequence in 0..4 {
+            rtp_in_tx
+                .send(Bytes::from(ulaw_packet_pcm(sequence, &[4000i16; 160])))
+                .expect("feed rtp");
+        }
+
+        // A `speech_started` text frame must surface among the WS frames the server receives.
+        let mut got_speech_started = false;
+        for _ in 0..30 {
+            let frame = timeout(Duration::from_secs(1), client_rx.next())
+                .await
+                .expect("no timeout")
+                .expect("some")
+                .expect("ok");
+            if let Message::Text(text) = frame {
+                if matches!(
+                    ControlMessage::from_json(text.as_str()),
+                    Ok(ControlMessage::SpeechStarted(_))
+                ) {
+                    got_speech_started = true;
+                    break;
+                }
+            }
+        }
+        assert!(got_speech_started, "expected a speech_started text frame");
+
+        drop(rtp_in_tx); // ends the bridge (RTP source gone)
+        let _ = timeout(Duration::from_secs(2), bridge).await;
     }
 }

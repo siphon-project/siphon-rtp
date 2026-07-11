@@ -211,6 +211,18 @@ pub struct DtmfData {
     pub duration_ms: u32,
 }
 
+/// `speech_started` / `speech_stopped` — engine → server, a local-VAD turn boundary on the caller's
+/// uplink. `speech_started` marks the start of caller speech (turn start / barge-in — the server
+/// should stop generating); `speech_stopped` marks the end past the VAD hangover (the turn
+/// **endpoint** — the server may commit ASR and run the agent). A native siphon-rtp extension; a
+/// server that ignores these still works (the audio stream is unchanged).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechData {
+    /// Stream id.
+    pub stream_id: String,
+}
+
 /// `stop` — graceful close.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -265,6 +277,10 @@ pub enum ControlMessage {
     Mark(MarkData),
     /// Detected DTMF digit.
     Dtmf(DtmfData),
+    /// Local VAD detected the start of caller speech (turn start / barge-in).
+    SpeechStarted(SpeechData),
+    /// Local VAD detected the end of caller speech past hangover (the turn endpoint).
+    SpeechStopped(SpeechData),
     /// Graceful close.
     Stop(StopData),
     /// Failure report.
@@ -355,6 +371,12 @@ mod tests {
             track: "inbound".into(),
             duration_ms: 160,
         }));
+        roundtrip(&ControlMessage::SpeechStarted(SpeechData {
+            stream_id: "s".into(),
+        }));
+        roundtrip(&ControlMessage::SpeechStopped(SpeechData {
+            stream_id: "s".into(),
+        }));
         roundtrip(&ControlMessage::Stop(StopData {
             stream_id: "s".into(),
             reason: "call_ended".into(),
@@ -384,6 +406,22 @@ mod tests {
             }
             other => panic!("expected play_start, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn speech_events_wire_shape() {
+        let started = ControlMessage::SpeechStarted(SpeechData {
+            stream_id: "str_a1b2c3".into(),
+        });
+        let value: serde_json::Value = serde_json::to_value(&started).expect("value");
+        assert_eq!(value["type"], "speech_started");
+        assert_eq!(value["data"]["streamId"], "str_a1b2c3");
+
+        let stopped = ControlMessage::SpeechStopped(SpeechData {
+            stream_id: "str_a1b2c3".into(),
+        });
+        let value: serde_json::Value = serde_json::to_value(&stopped).expect("value");
+        assert_eq!(value["type"], "speech_stopped");
     }
 
     #[test]

@@ -353,6 +353,27 @@ pub struct ProfileFlags {
     /// and `wss://` (TLS on ring/rustls, trust from the webpki-roots CA bundle) are dialled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_uri: Option<String>,
+    /// Run a local energy-VAD on the WS voice-AI uplink (`ws_uri`): the bridge emits
+    /// `speech_started` / `speech_stopped` control frames on the caller's speech edges, so the
+    /// inference server gets turn boundaries (and the turn **endpoint**) without running its own VAD —
+    /// lower turn latency. Inert without `ws_uri`. A native siphon-rtp extension; the NG/bencode
+    /// front-end does not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ws_vad: bool,
+    /// Local barge-in on the WS voice-AI leg: when the caller starts speaking, the bridge flushes the
+    /// queued downlink playout in the same tick (no server round-trip) and notifies the server via
+    /// `speech_started`. Implies `ws_vad`. Inert without `ws_uri`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ws_barge_in: bool,
+    /// Mean-square energy threshold for the WS uplink VAD. `None` uses a sensible 8/16 kHz L16 default
+    /// (~1_000_000); higher is less sensitive. Only meaningful with `ws_vad` / `ws_barge_in`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_vad_threshold: Option<i64>,
+    /// Trailing hangover for the WS uplink VAD, in milliseconds — how long speech is held after energy
+    /// drops before `speech_stopped` (the turn endpoint) fires. `None` uses ~200 ms. Only meaningful
+    /// with `ws_vad` / `ws_barge_in`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_vad_hangover_ms: Option<u32>,
     /// The real post-NAT source IP the SIP proxy saw this request arrive from (rtpengine's
     /// `received-from`). When a NATed UA advertises a private `c=` address, its media actually
     /// originates from its NAT's *public* IP — this is that IP. The engine gates the leg's ingress to
@@ -680,6 +701,38 @@ mod tests {
             serialized.get("ws_uri").is_none(),
             "ws_uri omitted when unset"
         );
+        // The voice-AI turn-taking knobs are all off/omitted by default, so an existing ws_uri user
+        // (or the NG front-end) is unaffected.
+        for field in ["ws_vad", "ws_barge_in", "ws_vad_threshold", "ws_vad_hangover_ms"] {
+            assert!(
+                serialized.get(field).is_none(),
+                "{field} omitted when unset"
+            );
+        }
+        let profile = ProfileFlags::default();
+        assert!(!profile.ws_vad);
+        assert!(!profile.ws_barge_in);
+        assert_eq!(profile.ws_vad_threshold, None);
+        assert_eq!(profile.ws_vad_hangover_ms, None);
+    }
+
+    #[test]
+    fn ws_vad_flags_parse_when_set() {
+        let json = concat!(
+            r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n",""#,
+            r#"profile":{"ws_uri":"ws://h/s","ws_vad":true,"ws_barge_in":true,"#,
+            r#""ws_vad_threshold":2000000,"ws_vad_hangover_ms":300}}"#
+        );
+        let command: Command = serde_json::from_str(json).expect("deserialize");
+        match command {
+            Command::Offer { profile, .. } => {
+                assert!(profile.ws_vad);
+                assert!(profile.ws_barge_in);
+                assert_eq!(profile.ws_vad_threshold, Some(2_000_000));
+                assert_eq!(profile.ws_vad_hangover_ms, Some(300));
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
     }
 
     #[test]
