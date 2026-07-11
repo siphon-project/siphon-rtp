@@ -3502,91 +3502,191 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Promote a plain passthrough relay (the in-kernel `Forward` fast path) to a userspace
     /// **processing** [`MediaCall`] (decode → re-encode), so echo has a real reflect path: a relay-only
     /// promotion forwards opaque payloads to the peer and cannot loop a party's audio back to itself.
-    /// Builds the two transcode directions from the call's negotiated codecs over the same endpoints /
-    /// source gates / egress targets the stored `Forward` rules used — so the RTPBleed defence is
-    /// unchanged (`Redirect` bypasses the datapath gate, so the directions re-enforce the exact same
-    /// per-leg source filter, docs/security-and-nat.md §4). A passthrough relay always shares one codec
-    /// across both legs (a codec *mismatch* answers as a transcode call, not a relay), so the near/far
-    /// codecs are the same here; errors only if that codec has no encoder (e.g. AMR-WB without the
-    /// `amr` build feature). The owner's event sink is wired so DTMF still surfaces (the SBC ends the
-    /// echo test on `#`).
+    /// The reflect path takes one of two shapes, decided by whether the call was answered:
+    ///
+    /// * **offer + answer** (both codecs known) → a **2-leg** echo: build A→B and B→A over the same
+    ///   endpoints / source gates / egress targets the stored `Forward` rules used, so each party hears
+    ///   itself. A passthrough relay always shares one codec across both legs (a codec *mismatch*
+    ///   answers as a transcode call, not a relay), so the near/far codecs are the same here.
+    /// * **offer only** (no `answer` — a UAS IVR/echo that never dials a B leg, so `far_codec` is
+    ///   `None`) → a **single-leg** self-echo: decode the caller's ingress (`near_codec`) and re-encode
+    ///   it back out the *same* endpoint the caller reaches (`near_codec` on both sides). The caller
+    ///   sends to the engine's far socket — the offer's rewritten SDP advertises the far leg and the UAS
+    ///   put that SDP in its 200 OK — so the reflect runs on that socket; the never-advertised near
+    ///   socket stays idle. No `Forward` rule was ever installed on it (an offer-only endpoint drops
+    ///   inbound media, having no negotiated peer), so a `Drop` restore is recorded in `relay_flows` for
+    ///   demotion to return it to that state.
+    ///
+    /// Either way the RTPBleed defence is unchanged (`Redirect` bypasses the datapath gate, so the
+    /// directions re-enforce the exact same per-leg source filter, docs/security-and-nat.md §4);
+    /// building errors only if a codec has no encoder (e.g. AMR-WB without the `amr` build feature). The
+    /// owner's event sink is wired so DTMF still surfaces (the SBC ends the echo test on `#`).
     async fn promote_to_processing(&self, call_id: &str) -> Result<(), String> {
-        let Some((owner, from_tag, to_tag, relay_flows, near_codec, far_codec, near_te, far_te)) =
-            self.owned_call_internal(call_id, |call| {
-                (
-                    call.owner,
-                    call.from_tag.clone(),
-                    call.to_tag.clone(),
-                    call.relay_flows.clone(),
-                    call.near_codec.clone(),
-                    call.far_codec.clone(),
-                    call.near_telephone_event,
-                    call.far_telephone_event,
-                )
-            })
-        else {
+        let Some((
+            owner,
+            from_tag,
+            to_tag,
+            relay_flows,
+            near_codec,
+            far_codec,
+            near_te,
+            far_te,
+            caller_facing_endpoint,
+            caller_signalled_rtp,
+            offer_received_from,
+        )) = self.owned_call_internal(call_id, |call| {
+            (
+                call.owner,
+                call.from_tag.clone(),
+                call.to_tag.clone(),
+                call.relay_flows.clone(),
+                call.near_codec.clone(),
+                call.far_codec.clone(),
+                call.near_telephone_event,
+                call.far_telephone_event,
+                // The engine socket the caller reaches for a single-leg (offer-only) echo: the offer's
+                // rewritten SDP advertises the *far* leg (it is normally forwarded to B; see the offer
+                // path — "the rewritten offer is delivered to B, so it advertises the `far` leg"), and a
+                // UAS IVR puts that SDP in its 200 OK, so the caller sends here. Unused by the 2-leg arm.
+                call.far.rtp.id,
+                // The caller's own signalled RTP address (the near/offerer leg's remote) — what the
+                // single-leg source gate keys on and reflects back toward.
+                call.near.remote_rtp,
+                call.offer_received_from,
+            )
+        }) else {
             return Err("call no longer exists".to_string());
         };
-        let (Some(near_codec), Some(far_codec)) = (near_codec, far_codec) else {
+        let Some(near_codec) = near_codec else {
             return Err(
                 "call has no negotiated codec to echo (offer/answer not complete)".to_string(),
             );
         };
-        let layout = relay_layout_from_flows(&relay_flows)?;
 
-        // Cross the codecs the way `answer`'s Media arm does: A→B decodes A's codec / encodes B's,
-        // B→A decodes B's / encodes A's — so each party's echo (decode on its ingress, re-encode on the
-        // reverse egress that faces it) round-trips in that party's own codec. `build_direction` gives
-        // each egress a fresh random SSRC + real timestamp increment (RFC 3550 §5.1 / §8), so the
-        // reflected stream is well-formed — which a relay-only direction's zeroed egress params are not.
-        let a_to_b = build_direction(
-            layout.near_endpoint,
-            layout.near_rule.accepted_source,
-            layout.near_rule.out_endpoint,
-            layout.b_dst,
-            &near_codec,
-            &far_codec,
-            near_te,
-            far_te,
-            None,
-            // Echo promotion is a runtime control action, not an offer/answer profile; no NS here.
-            false,
-        )?;
-        let b_to_a = build_direction(
-            layout.far_endpoint,
-            layout.far_rule.accepted_source,
-            layout.far_rule.out_endpoint,
-            layout.a_dst,
-            &far_codec,
-            &near_codec,
-            far_te,
-            near_te,
-            None,
-            false,
-        )?;
+        // Two echo shapes, chosen by whether the call was answered (see the doc comment): a 2-leg echo
+        // (far codec known) or an offer-only single-leg self-echo. Each builds its directions, the RTP
+        // endpoints it must `Redirect`, the latch flag, and — for the single-leg case only — a `Drop`
+        // restore recorded in `relay_flows` (the offer-only caller-facing endpoint had no `Forward`
+        // rule, so it dropped inbound media; demotion returns it there, and a non-empty `relay_flows` is
+        // what makes `demote_if_idle` tear the single-leg actor down when `echo enabled=false`).
+        let (a_to_b, b_to_a, redirect_endpoints, latch, offer_only_restore) = match far_codec {
+            Some(far_codec) => {
+                // 2-leg echo: reconstruct the wiring from the answer-installed `Forward` rules and cross
+                // the codecs the way `answer`'s Media arm does — A→B decodes A's codec / encodes B's,
+                // B→A decodes B's / encodes A's — so each party's echo (decode on its ingress, re-encode
+                // on the reverse egress that faces it) round-trips in that party's own codec.
+                // `build_direction` gives each egress a fresh random SSRC + real timestamp increment
+                // (RFC 3550 §5.1 / §8), so the reflected stream is well-formed — which a relay-only
+                // direction's zeroed egress params are not.
+                let layout = relay_layout_from_flows(&relay_flows)?;
+                let a_to_b = build_direction(
+                    layout.near_endpoint,
+                    layout.near_rule.accepted_source,
+                    layout.near_rule.out_endpoint,
+                    layout.b_dst,
+                    &near_codec,
+                    &far_codec,
+                    near_te,
+                    far_te,
+                    None,
+                    // Echo promotion is a runtime control action, not an offer/answer profile; no NS here.
+                    false,
+                )?;
+                let b_to_a = build_direction(
+                    layout.far_endpoint,
+                    layout.far_rule.accepted_source,
+                    layout.far_rule.out_endpoint,
+                    layout.a_dst,
+                    &far_codec,
+                    &near_codec,
+                    far_te,
+                    near_te,
+                    None,
+                    false,
+                )?;
+                (
+                    a_to_b,
+                    b_to_a,
+                    vec![layout.near_endpoint, layout.far_endpoint],
+                    layout.latch,
+                    None,
+                )
+            }
+            None => {
+                // Single-leg self-echo (offer only, no B): reflect the caller's audio back out the very
+                // endpoint it reaches — the caller-facing (far) socket the offer's rewritten SDP
+                // advertised, which the UAS put in its 200 OK. Both directions face the caller on that
+                // one endpoint — `a_to_b` decodes the caller's ingress, `b_to_a` re-encodes it home
+                // (`MediaCall::process` routes the packet through `a_to_b.echo_into(b_to_a)`; the shared
+                // ingress means the `b_to_a` arm is shadowed and never processes a packet twice). There
+                // is no B leg — the near (A-facing) socket the offer never advertised stays unused.
+                //
+                // Gate ingress to the caller's real source IP (RTPBleed defence, docs §4 layer 2): the
+                // offer's `received-from` public IP when the SIP proxy supplied one, else the signalled
+                // `c=` address. The initial egress destination is that same address; the `SignalledOnly`
+                // latch (default on, below) then refines it to the caller's observed source (symmetric
+                // RTP), so the loop follows a NATed caller.
+                let Some(caller) = apply_received_from(caller_signalled_rtp, offer_received_from)
+                else {
+                    return Err(
+                        "echo: offer-only call has no signalled caller address to reflect to"
+                            .to_string(),
+                    );
+                };
+                let accepted_source = SourceFilter::Exact(caller.ip());
+                let a_to_b = build_direction(
+                    caller_facing_endpoint,
+                    accepted_source,
+                    caller_facing_endpoint,
+                    caller,
+                    &near_codec,
+                    &near_codec,
+                    near_te,
+                    near_te,
+                    None,
+                    false,
+                )?;
+                let b_to_a = build_direction(
+                    caller_facing_endpoint,
+                    accepted_source,
+                    caller_facing_endpoint,
+                    caller,
+                    &near_codec,
+                    &near_codec,
+                    near_te,
+                    near_te,
+                    None,
+                    false,
+                )?;
+                (
+                    a_to_b,
+                    b_to_a,
+                    vec![caller_facing_endpoint],
+                    true,
+                    Some(vec![(caller_facing_endpoint, FlowAction::Drop)]),
+                )
+            }
+        };
 
-        // Switch both RTP endpoints to Redirect so the dispatcher routes them to the media actor.
-        for endpoint in [layout.near_endpoint, layout.far_endpoint] {
+        // Switch the RTP endpoint(s) to Redirect so the dispatcher routes them to the media actor.
+        for endpoint in &redirect_endpoints {
             self.datapath
-                .install_flow(endpoint, FlowAction::Redirect)
+                .install_flow(*endpoint, FlowAction::Redirect)
                 .map_err(|error| format!("install processing redirect: {error}"))?;
         }
         let owner_events = self.events.get(&owner).map(|sink| sink.value().clone());
-        let call = MediaCall::new(
-            call_id.to_string(),
-            from_tag,
-            to_tag,
-            a_to_b,
-            b_to_a,
-            layout.latch,
-            None,
-        );
+        let call = MediaCall::new(call_id.to_string(), from_tag, to_tag, a_to_b, b_to_a, latch, None);
         self.media
             .register(call, self.datapath.clone(), owner_events);
 
-        // Record the promotion on the Call so demotion can restore the in-kernel Forward rules.
+        // Record the promotion on the Call so demotion can restore the pre-promote datapath state: the
+        // 2-leg case keeps its answer-installed `Forward` rules (already in `relay_flows`); the
+        // single-leg case records a `Drop` restore for its lone caller-facing endpoint.
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.pipeline = PipelineKind::Media;
+            if let Some(restore) = offer_only_restore {
+                call.relay_flows = restore;
+            }
         }
         Ok(())
     }
@@ -9635,6 +9735,14 @@ mod tests {
             engine.media().is_transcoding_call("echo-1"),
             "the relay was promoted to a processing MediaCall (not relay-only)"
         );
+        let endpoints = engine
+            .media()
+            .call_endpoints("echo-1")
+            .expect("registered media call");
+        assert_ne!(
+            endpoints[0], endpoints[1],
+            "a 2-leg (answered) echo builds both directions on distinct near/far endpoints"
+        );
 
         // A speaks µ-law toward the engine; with echo on it must come straight back to A. Retry to
         // absorb the tiny window between the control being applied and the first packet routing in.
@@ -9687,6 +9795,265 @@ mod tests {
         assert!(
             !engine.media().is_media_call("echo-1"),
             "demoted back to the in-kernel Forward fast path once echo cleared"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn echo_promotes_an_offer_only_call_reflects_audio_then_disable_tears_down() {
+        // A UAS IVR/echo answers the caller itself and never dials a B leg — so the call is `offer`ed
+        // but never `answer`ed (`far_codec` is None). `echo enabled=true` must still promote it to a
+        // *single-leg* processing MediaCall that decodes the caller's ingress and re-encodes it back out
+        // the same near endpoint (no far direction); `echo enabled=false` tears the actor down.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+
+        // Offer only — the SBC never answers (there is no far leg). The engine's A-facing endpoint is
+        // advertised in the *offer's* returned SDP, so A sends there.
+        let offered = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "echo-solo".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&offered))
+            .expect("engine near SDP")
+            .remote_rtp;
+        assert!(
+            !engine.media().is_media_call("echo-solo"),
+            "an offer-only call starts as a plain in-kernel relay (no media actor)"
+        );
+
+        let enabled = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-solo".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(
+            matches!(enabled, CmdResult::Ok { .. }),
+            "echo enabled ok on an offer-only call, got {enabled:?}"
+        );
+        assert!(
+            engine.media().is_transcoding_call("echo-solo"),
+            "the offer-only relay was promoted to a processing MediaCall"
+        );
+        // Single-leg: both directions face the caller on the *one* near endpoint (no far direction).
+        let endpoints = engine
+            .media()
+            .call_endpoints("echo-solo")
+            .expect("registered media call");
+        assert_eq!(
+            endpoints[0], endpoints[1],
+            "a single-leg echo builds one direction on the near endpoint — no far direction"
+        );
+
+        // A speaks µ-law toward the engine; with echo on it must come straight back out the same port.
+        // Retry to absorb the window between the control landing and the first packet routing in.
+        let mut echoed = None;
+        for sequence in 0..25u16 {
+            phone_a
+                .send_to(&ulaw_rtp_packet(sequence, 0x3333_4444, 0xAB), engine_near)
+                .await
+                .expect("a send");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                echoed = Some((buffer[..len].to_vec(), from));
+                break;
+            }
+        }
+        let (packet, from) = echoed.expect("phone A hears its own audio echoed back");
+        assert_eq!(
+            from, engine_near,
+            "echo comes back from the engine's A-facing port"
+        );
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&packet).expect("parse echoed rtp");
+        assert_eq!(
+            parsed.payload_type, 0,
+            "re-encoded in the caller's own codec (µ-law PT 0)"
+        );
+        // µ-law decode+encode is idempotent, so A hears exactly the bytes it sent.
+        assert_eq!(
+            parsed.payload,
+            &[0xABu8; 160][..],
+            "ingress audio reflected back verbatim"
+        );
+
+        let disabled = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-solo".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                    enabled: false,
+                },
+            )
+            .await;
+        assert!(
+            matches!(disabled, CmdResult::Ok { .. }),
+            "echo disabled ok, got {disabled:?}"
+        );
+        assert!(
+            !engine.media().is_media_call("echo-solo"),
+            "the single-leg processing actor is torn down once echo clears"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn echo_single_leg_active_call_survives_timeout_but_silent_is_reaped() {
+        // A single-leg echo runs on a *redirected* endpoint, whose ingress does not touch the datapath's
+        // `last_seen` the way the in-kernel Forward relay does. The media actor must therefore stamp
+        // activity on each gated-in packet, so an actively-echoing caller is not reaped mid-call — while
+        // a caller that falls silent still times out (the acceptance criterion: `#`/hangup ends it, a
+        // silent call is reaped).
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+
+        let offered = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "echo-idle".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&offered))
+            .expect("engine near SDP")
+            .remote_rtp;
+        let enabled = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-idle".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(matches!(enabled, CmdResult::Ok { .. }), "echo enabled ok");
+
+        // Advance the logical clock to tick 10, then speak: the actor stamps activity at tick 10 when it
+        // gates the packet in (proven by hearing the echo, which the same accepted packet produces).
+        engine.datapath().advance_clock(10);
+        let mut heard = false;
+        for sequence in 0..25u16 {
+            phone_a
+                .send_to(&ulaw_rtp_packet(sequence, 0x5566_7788, 0x7F), engine_near)
+                .await
+                .expect("a send");
+            let mut buffer = [0u8; 2048];
+            if timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer))
+                .await
+                .is_ok_and(|result| result.is_ok())
+            {
+                heard = true;
+                break;
+            }
+        }
+        assert!(heard, "the active caller hears its echo (packet was gated in)");
+
+        // Tick 14: only 4 ticks since the stamp (< 5) → recent media keeps the active call alive.
+        engine.datapath().advance_clock(4);
+        assert!(
+            engine.reap_idle(5).await.is_empty(),
+            "an actively-echoing call is not reaped"
+        );
+        assert!(
+            engine.media().is_media_call("echo-idle"),
+            "the single-leg echo actor is still up"
+        );
+
+        // Tick 20: 10 ticks of silence (>= 5) → the now-silent call times out and is reaped.
+        engine.datapath().advance_clock(6);
+        assert_eq!(
+            engine.reap_idle(5).await,
+            vec!["echo-idle".to_string()],
+            "a silent single-leg echo call is reaped"
+        );
+        assert!(!engine.media().is_media_call("echo-idle"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn echo_on_an_offer_only_call_with_no_codec_errors() {
+        // An `offer` that carried no usable audio codec leaves `near_codec` None, so there is nothing to
+        // decode/re-encode — echo must error clearly rather than promote a codec-less reflect path.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        // An offer whose m= line advertises only a codec the engine has no decoder/encoder for. Use a
+        // dynamic payload type with no rtpmap so no primary codec is resolved.
+        let sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 99\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port()
+        );
+        let offered = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "echo-nocodec".into(),
+                    from_tag: "tag-a".into(),
+                    sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(offered, CmdResult::Ok { .. }),
+            "offer accepted, got {offered:?}"
+        );
+        let rejected = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-nocodec".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(
+            matches!(&rejected, CmdResult::Error { reason } if reason.contains("no negotiated codec")),
+            "echo on a codec-less offer errors, got {rejected:?}"
+        );
+        assert!(
+            !engine.media().is_media_call("echo-nocodec"),
+            "a codec-less call is never promoted"
         );
     }
 
