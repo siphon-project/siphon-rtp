@@ -1544,6 +1544,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let near_ice = ice_creds.is_some();
         let far_ice = ice_creds.is_some() && info.is_ice();
 
+        // Enable the ICE connectivity-check responder on the endpoints facing an ICE peer *before*
+        // any relay flow is installed, so an ICE leg is STUN-gated from its first packet — the
+        // datapath's layer-4 gate then forwards media only from a validated source and a Forward flow
+        // is never live with a blind-latch window (docs/security-and-nat.md §4 layer 4; RFC 8445).
+        if let Some(creds) = &ice_creds {
+            let config = IceConfig {
+                local_ufrag: creds.ufrag.clone(),
+                local_pwd: creds.pwd.clone(),
+            };
+            // `near` faces A (which offered ICE); enable the responder on its RTP and, under
+            // non-mux, its companion RTCP endpoint.
+            for endpoint in near.endpoint_ids() {
+                self.datapath.set_ice(endpoint, Some(config.clone()));
+            }
+            // `far` faces B; enable only when B also offered ICE.
+            if info.is_ice() {
+                for endpoint in far.endpoint_ids() {
+                    self.datapath.set_ice(endpoint, Some(config.clone()));
+                }
+            }
+        }
+
         // Resolve how this call's media is carried: an SRTP bridge (secure far leg), the userspace
         // media slow path (transcode / record), or the in-datapath plain relay.
         let pipeline = resolve_pipeline(
@@ -1951,26 +1973,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     return error_result("install far->near RTCP flow", &error);
                 }
                 relay_flows.push((far_rtcp.id, far_rtcp_action));
-            }
-        }
-
-        // Enable the ICE connectivity-check responder on the RTP endpoints facing an ICE peer; the
-        // datapath then answers checks and adopts the validated source (RFC 8445).
-        if let Some(creds) = &ice_creds {
-            let config = IceConfig {
-                local_ufrag: creds.ufrag.clone(),
-                local_pwd: creds.pwd.clone(),
-            };
-            // `near` faces A (which offered ICE); enable the responder on its RTP and, under
-            // non-mux, its companion RTCP endpoint.
-            for endpoint in near.endpoint_ids() {
-                self.datapath.set_ice(endpoint, Some(config.clone()));
-            }
-            // `far` faces B; enable only when B also offered ICE.
-            if info.is_ice() {
-                for endpoint in far.endpoint_ids() {
-                    self.datapath.set_ice(endpoint, Some(config.clone()));
-                }
             }
         }
 
@@ -5062,9 +5064,18 @@ fn ingress_rule(
     ice: bool,
 ) -> ForwardRule {
     if ice {
-        // ICE validates the source via STUN connectivity checks (the datapath responder adopts the
-        // validated candidate), so accept any source and latch it.
-        return ForwardRule::symmetric(out_endpoint, out_dst);
+        // ICE (RFC 8445) validates the source via STUN connectivity checks — the datapath's STUN
+        // responder adopts the validated candidate as the media path and is the *only* thing that
+        // latches an ICE endpoint. So media must never blind-latch here (the B1 hole): accept any
+        // source at the rule level, but never move the latch from media (`LatchPolicy::Off`). The
+        // datapath's layer-4 ICE-media gate then forwards only STUN-validated media and drops
+        // everything else — docs/security-and-nat.md §4 layer 4.
+        return ForwardRule {
+            out_endpoint,
+            out_dst,
+            accepted_source: SourceFilter::Any,
+            latch: LatchPolicy::Off,
+        };
     }
     let symmetric = profile.flags.iter().any(|flag| flag == "symmetric");
     let Some(addr) = expected_source.filter(|_| !symmetric) else {

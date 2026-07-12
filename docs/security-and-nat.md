@@ -184,7 +184,11 @@ Latch state machine, per direction:
 - **Spec:** RFC 3550 §8 (SSRC identity/collision), RFC 4961 (symmetric RTP/RTCP).
 - **Enforcement:** datapath latch state carries `ssrc`; needs the RTP header parse already in
   `siphon-rtp-media`.
-- **In-kernel enforcement (XDP_TX fast path).** For a plain `Forward` (`rtp_passthrough`) leg these
+- **In-kernel enforcement (XDP_TX fast path) — specified + built, not yet wired.** This kernel
+  datapath is **not the shipped relay path today**: the daemon runs the userspace UDP datapath, which
+  enforces layers 1–3 in [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs). The XDP program and its map ABI are built but the in-kernel
+  rewrite + `XDP_TX` is not yet wired — [`docs/datapath.md`](datapath.md) is the authority on what is
+  built vs. wired. The design, once attached: for a plain `Forward` (`rtp_passthrough`) leg these
   same three layers run **in the kernel** before the relay: the eBPF classifier demuxes (layer 1,
   RFC 7983), re-checks the signalled-source gate (layer 2), and applies this SSRC-consistent latch —
   learning the peer's real source into the flow's kernel latch state and re-latching a new source
@@ -224,6 +228,16 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
   never saw. The validated candidate pair, not "first packet wins", becomes the path.
+- **No blind pre-check latch on a plaintext-RTP + ICE relay leg.** On the `Forward` fast path an ICE
+  endpoint's media is gated to the STUN-validated latch: the connectivity-check responder
+  (`handle_stun`) is the **only** writer of an ICE endpoint's latch, so media arriving *before* any
+  valid check is dropped, media from a source other than the adopted one is dropped, and media never
+  itself creates or moves the latch (a genuine rebind comes via a fresh validated check, not a media
+  spray). The engine builds the ICE `Forward` rule with `SourceFilter::Any` + `LatchPolicy::Off` (no
+  rule-level latch) and calls `set_ice` **before** installing the flow, so an ICE leg is check-gated
+  from its first packet — no first-source race. Secure ICE (DTLS-SRTP / SDES) legs run on the
+  `Redirect` path and are unaffected. Enforcement: `Inner::dispatch` (the Forward-path ICE branch) in
+  [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs); the rule + `set_ice` ordering in `engine::answer`.
 - **Consent freshness** (RFC 7675): periodic STUN keepalives; on consent loss, stop forwarding and
   tear down. This is also the anti-hijack *and* the dead-path detector.
 - **Spec:** RFC 8445 (ICE), RFC 8839 (SDP for ICE), RFC 8489 (STUN), RFC 7675 (consent).
@@ -291,10 +305,15 @@ datapath's Forward-path layer-2 gate.
   gate (`MediaCall::process` checks `SourceFilter::accepts` before any decode, using the same
   `Exact`/`Subnet`/`Any` policy as the relay and the SRTP bridge). An off-path spray is dropped before
   it can be transcoded or latched.
-- **Symmetric latch.** When a party's gated packet is accepted, the reverse direction's egress
-  destination is latched to that observed source (RFC 3550 symmetric RTP), so a NATed peer is replied
-  to where its media actually originates — consistent with the Forward-path latch, but enforced in the
-  actor because `Redirect` skips it.
+- **Symmetric, SSRC-consistent latch (after auth).** When a party's gated packet is accepted, the
+  reverse direction's egress destination is latched to that observed source (RFC 3550 symmetric RTP),
+  so a NATed peer is replied to where its media actually originates. This mirrors the Forward-path
+  latch (the same SSRC gate, `SymmetricLatch`): the reply follows a genuine NAT rebind (a new source
+  keeping the stream's SSRC, RFC 3550 §8) but a spray from a new source with a *different* SSRC cannot
+  steal it. Crucially the re-latch runs **only after** the SRTP `unprotect` succeeds on a secure leg —
+  a forged, auth-failing packet from the gated address is dropped before it can move the reply
+  direction (it never reaches the latch). Enforced in the actor because `Redirect` skips the datapath
+  latch (`MediaCall::process` → `Direction::source_latch`).
 - **RTCP & unknown packets** are relayed verbatim (RFC 5761 demux on the payload-type byte); only audio
   RTP is transcoded. On the plaintext `Media` path, companion (non-mux) RTCP stays on the in-datapath
   Forward fast path. On the **secure** transcode (`SrtpMedia`) path it cannot ride the datapath (it is
@@ -334,8 +353,12 @@ so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the 
   `SourceFilter::accepts` for the participant's endpoint **before** the packet enters the jitter buffer
   (same `Exact`/`Subnet`/`Any` policy). A spoofed source never reaches the mix — proven by
   `unsignalled_source_is_dropped_from_the_mix`.
-- **Constrained latch.** An accepted participant's egress destination is latched to its observed
-  source (symmetric RTP), so a NATed leg is replied to where its media originates.
+- **Constrained, SSRC-consistent latch (after auth).** An accepted participant's egress destination
+  is latched to its observed source (symmetric RTP), so a NATed leg is replied to where its media
+  originates — but only for an authenticated, SSRC-consistent stream: the re-latch runs **after** the
+  SRTP `unprotect` and only when the source is SSRC-consistent (`SymmetricLatch`, RFC 3550 §8), so a
+  forged/auth-failing or wrong-SSRC packet from the gated address never moves the reply
+  (`Conference::ingest` → the participant's `reverse_latch`).
 - **SDES-SRTP secure legs.** A participant offering `RTP/SAVP` + `a=crypto` gets a per-participant
   `SecureLeg` (the same primitive Layer 5a uses): `conference_join` mints the engine's key, answers
   `RTP/SAVP` + its own `a=crypto`, and the room **decrypts each inbound packet before it enters the

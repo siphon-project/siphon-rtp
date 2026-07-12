@@ -38,7 +38,7 @@ use siphon_rtp_media::rtp::RtpPacket;
 use siphon_rtp_proto::Event;
 use siphon_rtp_srtp::leg::SecureLeg;
 
-use crate::media_pipeline::Outbound;
+use crate::media_pipeline::{Outbound, SymmetricLatch};
 
 /// The wideband room rate. A room runs at this rate whenever any participant is wideband (>8 kHz) or
 /// the room is bridged; an all-narrowband, unbridged room drops to `NARROWBAND_RATE_HZ` so it pays
@@ -134,6 +134,11 @@ struct Participant {
     egress_dst: SocketAddr,
     accepted_source: SourceFilter,
     latch: bool,
+    /// The SSRC-consistent symmetric latch for this participant's ingress stream. An accepted
+    /// (authenticated + source-gated) RTP packet re-points `egress_dst` only when it is
+    /// SSRC-consistent — a forged/auth-failing or wrong-SSRC packet never moves the reply
+    /// (docs/security-and-nat.md §4 layer 3; RFC 3550 §8).
+    reverse_latch: SymmetricLatch,
     /// This participant's codec sample rate, kept so its resamplers can be rebuilt if the room rate
     /// flips (e.g. a wideband leg joins an all-narrowband room).
     native_rate: u32,
@@ -336,6 +341,7 @@ impl Conference {
             egress_dst: config.egress_dst,
             accepted_source: config.accepted_source,
             latch: config.latch,
+            reverse_latch: SymmetricLatch::default(),
             native_rate,
             native_frame,
             egress_payload_type,
@@ -383,11 +389,12 @@ impl Conference {
         }
     }
 
-    /// Ingress one datagram for a participant endpoint: gate its source, latch its reply address,
-    /// drop RTCP / telephone-event, and buffer the audio for the next room tick. Never mixes a packet
-    /// from an unsignalled source (RTPBleed defence). Returns `true` if the packet passed the
-    /// signalled-source gate (so the caller can stamp media activity for the timeout sweep) — RTCP and
-    /// telephone-events count as activity even though they are not mixed.
+    /// Ingress one datagram for a participant endpoint: gate its source, decrypt (secure legs), then
+    /// SSRC-latch its reply address, drop RTCP / telephone-event, and buffer the audio for the next
+    /// room tick. Never mixes a packet from an unsignalled source (RTPBleed defence), and only an
+    /// authenticated, SSRC-consistent stream can move the reply address (§4 layer 3). Returns `true`
+    /// if the packet passed the signalled-source gate (so the caller can stamp media activity for the
+    /// timeout sweep) — RTCP and telephone-events count as activity even though they are not mixed.
     pub fn ingest(&mut self, packet: &RxPacket) -> bool {
         let conference_id = &self.conference_id;
         let Some(participant) = self
@@ -406,10 +413,6 @@ impl Conference {
                 "conference dropped packet from unsignalled source"
             );
             return false;
-        }
-        // Layer 3 — constrained latch: learn the reply address from the gated source.
-        if participant.latch {
-            participant.egress_dst = packet.source;
         }
         // SRTP: decrypt a secure participant's packet first (the auth tag also proves authenticity —
         // a forged/replayed packet fails here and is dropped). Plain legs pass through untouched.
@@ -462,6 +465,18 @@ impl Conference {
         let Ok(parsed) = RtpPacket::parse(data) else {
             return true;
         };
+        // Layer 3 — constrained, SSRC-consistent latch (docs/security-and-nat.md §4 layer 3; RFC 3550
+        // §8): learn the reply address from an accepted stream only *after* SRTP unprotect above (a
+        // forged packet was already dropped) and only when the source is SSRC-consistent — a new
+        // source carrying a different SSRC (a hijack spray) never re-points the reply.
+        if participant.latch {
+            if let Some(dst) = participant
+                .reverse_latch
+                .observe(packet.source, parsed.ssrc)
+            {
+                participant.egress_dst = dst;
+            }
+        }
         // RFC 4733 telephone-event: never feed DTMF to the audio decoder (it would mangle the mix);
         // detect the key press and surface it on the control channel instead.
         if Some(parsed.payload_type) == participant.telephone_event_in {
@@ -2245,6 +2260,49 @@ mod tests {
         assert!(
             frame_energy(&decode_ulaw(&clear)) > VAD_THRESHOLD,
             "the secure leg hears the room after decrypt"
+        );
+    }
+
+    #[test]
+    fn forged_srtp_packet_does_not_move_a_participant_reply() {
+        // B2: a secure participant's reply address is re-latched only *after* SRTP unprotect and only
+        // for an SSRC-consistent stream. A forged, auth-failing packet from the gated IP must not move
+        // it (the latch previously ran before the decrypt, so a forgery could steal the reply).
+        use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+        use siphon_rtp_srtp::SrtpContext;
+
+        let local =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("local key");
+        let remote =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("remote key");
+
+        let mut conference = Conference::new("room".into(), 0);
+        let mut secure = ulaw_config(0, "10.0.0.1", "10.0.0.1:4000");
+        secure.secure = Some(SecureLeg::new(&local.key, &remote.key));
+        secure.latch = true; // symmetric-RTP: follow the participant to its real source
+        conference.add_participant(secure);
+
+        // An authentic packet (encrypted by the peer) from a fresh source port latches the reply.
+        let mut peer_encrypt = SrtpContext::from_key_material(&remote.key);
+        let loud = [6000i16; 160];
+        let mut srtp = Vec::new();
+        peer_encrypt
+            .protect(&ulaw_rtp(0, 1, &loud), &mut srtp)
+            .expect("peer protect");
+        conference.ingest(&rx(1, "10.0.0.1:7000", srtp));
+        assert_eq!(
+            conference.participants[0].egress_dst,
+            addr("10.0.0.1:7000"),
+            "an authentic packet latches the reply toward the participant's real source"
+        );
+
+        // A forged packet from the same gated IP (different port), never SRTP-protected, fails auth
+        // and must not move the reply.
+        conference.ingest(&rx(1, "10.0.0.1:9999", ulaw_rtp(0, 2, &loud)));
+        assert_eq!(
+            conference.participants[0].egress_dst,
+            addr("10.0.0.1:7000"),
+            "a forged, auth-failing packet must not steal the reply direction (B2)"
         );
     }
 

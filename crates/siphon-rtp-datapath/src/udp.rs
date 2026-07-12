@@ -200,22 +200,42 @@ impl Inner {
                     in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                // Layer 2 — signalled-source gate: only the SDP-signalled peer may send here. This
-                // is the RTPBleed fix; an off-path source on another address is dropped before it
-                // can latch or be forwarded. (docs/security-and-nat.md §4 layer 2; RFC 3264.)
-                if !rule.accepted_source.accepts(source.ip()) {
-                    in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                // Layer 3 — SSRC-consistent latch: a new source re-latches only when it carries the
-                // same RTP SSRC (a genuine NAT rebind), never a hijack spray.
-                // (docs/security-and-nat.md §4 layer 3; RFC 3550 §8.)
-                if rule.latch != LatchPolicy::Off
-                    && self.update_latch(endpoint, source, rtp_ssrc(payload))
-                        == LatchOutcome::Reject
-                {
-                    in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                    return;
+                if self.ice.contains_key(&endpoint) {
+                    // Layer 4 — ICE supersedes blind latching (docs/security-and-nat.md §4 layer 4;
+                    // RFC 8445 §7). On an ICE endpoint the STUN connectivity-check responder
+                    // (`handle_stun`) is the *only* thing that adopts a media source: media is
+                    // forwarded **only** from the STUN-validated latch, and media never creates or
+                    // moves that latch. So drop media that arrives before any check has validated a
+                    // source, and drop media whose source is not the adopted one — the leg never
+                    // blind-latches the first RTP sender. The signalled-source gate (layer 2) and the
+                    // SSRC re-latch (layer 3) are subsumed by the authenticated connectivity check.
+                    let validated = self
+                        .latched
+                        .get(&endpoint)
+                        .is_some_and(|state| state.addr == source);
+                    if !validated {
+                        in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                } else {
+                    // Layer 2 — signalled-source gate: only the SDP-signalled peer may send here.
+                    // This is the RTPBleed fix; an off-path source on another address is dropped
+                    // before it can latch or be forwarded. (docs/security-and-nat.md §4 layer 2; RFC
+                    // 3264.)
+                    if !rule.accepted_source.accepts(source.ip()) {
+                        in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Layer 3 — SSRC-consistent latch: a new source re-latches only when it carries
+                    // the same RTP SSRC (a genuine NAT rebind), never a hijack spray.
+                    // (docs/security-and-nat.md §4 layer 3; RFC 3550 §8.)
+                    if rule.latch != LatchPolicy::Off
+                        && self.update_latch(endpoint, source, rtp_ssrc(payload))
+                            == LatchOutcome::Reject
+                    {
+                        in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                 }
 
                 // The packet is accepted — stamp activity for the media-timeout sweep (§4 layer 6).
@@ -1715,6 +1735,82 @@ mod tests {
             .expect("send rtp");
         let (data, _) = recv(&callee).await;
         assert_eq!(data, rtp(0x1234_5678, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_forward_leg_forwards_media_only_from_a_stun_validated_source() {
+        // B1 regression: a plaintext-RTP + ICE relay leg must never blind-latch the first RTP
+        // sender. Media is forwarded only from a source a STUN connectivity check has validated —
+        // never a pre-check spray, and never a different source after adoption (the connectivity
+        // check, not "first packet wins", is the path). docs/security-and-nat.md §4 layer 4; RFC 8445.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        datapath.set_ice(
+            leg_a.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        let (callee, callee_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+        // The engine installs an ICE leg with an open rule (`Any`/`Off`); the datapath's ICE gate —
+        // not the rule — decides, so an un-validated source is dropped regardless of the rule.
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule {
+                    out_endpoint: leg_b.id,
+                    out_dst: Some(callee_addr),
+                    accepted_source: SourceFilter::Any,
+                    latch: LatchPolicy::Off,
+                }),
+            )
+            .expect("flow");
+
+        // Pre-check spray: an attacker's RTP arrives before any connectivity check. It must be
+        // dropped — never blind-latched, never forwarded to the callee.
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        attacker
+            .send_to(&rtp(0xAAAA_AAAA, 1), leg_a.local_addr)
+            .await
+            .expect("attacker send");
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, callee.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "media before any STUN validation must be dropped, not blind-latched (B1)"
+        );
+
+        // A valid connectivity check from the real peer adopts its source.
+        let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        peer.send_to(&check, leg_a.local_addr)
+            .await
+            .expect("send check");
+        let _ = recv(&peer).await; // await the success response so the adoption has completed
+
+        // The validated peer's media now flows to the callee.
+        peer.send_to(&rtp(0x1234_5678, 1), leg_a.local_addr)
+            .await
+            .expect("peer rtp");
+        let (data, from) = recv(&callee).await;
+        assert_eq!(data, rtp(0x1234_5678, 1));
+        assert_eq!(from, leg_b.local_addr);
+
+        // A different source spraying after adoption is rejected — an ICE path only ever follows a
+        // fresh validated check, so a later different-source spray cannot steal it via media.
+        attacker
+            .send_to(&rtp(0xBBBB_BBBB, 2), leg_a.local_addr)
+            .await
+            .expect("attacker rtp");
+        assert!(
+            timeout(NEGATIVE, callee.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "a different source after adoption must not be forwarded (no media re-latch on ICE)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

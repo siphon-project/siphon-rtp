@@ -26,8 +26,9 @@
 //!
 //! follow-up: this slice ships the DD-Wiener gain with a fixed-bias windowed minimum-statistics
 //! tracker. The MMSE-LSA gain (Ephraim & Malah 1985), Martin's optimal *adaptive* bias/smoothing, and
-//! a full IMCRA / MCRA soft-decision noise estimator are deferred to a later PR, as is wiring the
-//! suppressor into the engine's media pipeline.
+//! a full IMCRA / MCRA soft-decision noise estimator are deferred to a later PR. The suppressor is
+//! wired into the engine media pipeline: the `noise_suppression` profile flag gates it per leg on the
+//! transcode path and the WS voice-AI bridge (rate-gated to 8/16 kHz at build time).
 
 use crate::fft::Complex;
 use crate::spectral::DecisionDirectedWiener;
