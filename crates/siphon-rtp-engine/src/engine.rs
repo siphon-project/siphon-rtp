@@ -1247,6 +1247,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             .unwrap_or(info.remote_rtp),
                     ),
                     profile.noise_suppression,
+                    profile.echo_cancellation,
                     WsVadConfig::from_profile(profile),
                 )
                 .await
@@ -1273,6 +1274,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         codec: Option<&CodecSpec>,
         accepted_source: SourceFilter,
         noise_suppression: bool,
+        echo_cancellation: bool,
         vad_config: Option<WsVadConfig>,
     ) -> Result<(), String> {
         let Some(codec) = codec else {
@@ -1328,7 +1330,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             8, // playout cap (drop-oldest): late audio is worthless
         )
         // Clean leg A's uplink audio toward the voice-AI server when requested (rate-gated inside).
-        .with_noise_suppression(noise_suppression);
+        .with_noise_suppression(noise_suppression)
+        // Cancel leg A's uplink echo toward the voice-AI server, referenced against the downlink the
+        // bridge plays toward the call — so the model does not hear its own speech reflected by the
+        // phone. Single-sourced from the same `build_echo_canceller` the transcode path uses (an
+        // unsupported rate keeps the uplink uncancelled rather than failing the bridge).
+        .with_echo_canceller(if echo_cancellation {
+            crate::media_pipeline::build_echo_canceller(bridge_pcm_rate)
+        } else {
+            None
+        });
         // Local energy-VAD turn-taking (speech_started/stopped + optional barge-in) when requested.
         // The hangover is carried in ms and converted to ptime frames now that the codec ptime known.
         if let Some(vad) = vad_config {
@@ -1521,6 +1532,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             // Gate leg A to its offer `received-from` public IP when supplied.
                             bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                             profile.noise_suppression,
+                            profile.echo_cancellation,
                             WsVadConfig::from_profile(profile),
                         )
                         .await
@@ -1718,6 +1730,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.telephone_event_payload_type(),
                 record_path.as_deref(),
                 profile.noise_suppression,
+                profile.echo_cancellation,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (A→B)", &reason),
@@ -1733,6 +1746,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event,
                 record_path.as_deref(),
                 profile.noise_suppression,
+                profile.echo_cancellation,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (B→A)", &reason),
@@ -1829,6 +1843,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.telephone_event_payload_type(),
                 record_path.as_deref(),
                 profile.noise_suppression,
+                profile.echo_cancellation,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("media pipeline (A→B)", &reason),
@@ -1844,6 +1859,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event,
                 record_path.as_deref(),
                 profile.noise_suppression,
+                profile.echo_cancellation,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("media pipeline (B→A)", &reason),
@@ -2391,7 +2407,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     // Noise suppression is not carried in the checkpoint snapshot, so a cold restore
                     // resumes without it — matching how recording (`record_path`) is not restored.
-                    false,
+                    false, // noise_suppression
+                    false, // echo_cancellation (re-armed when the controller re-issues the profile)
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -2409,7 +2426,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     near_te,
                     None,
-                    false,
+                    false, // noise_suppression
+                    false, // echo_cancellation (re-armed when the controller re-issues the profile)
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -2509,7 +2527,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     None,
                     None,
-                    false,
+                    false, // noise_suppression
+                    false, // echo_cancellation (re-armed when the controller re-issues the profile)
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -2527,7 +2546,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     near_te,
                     None,
-                    false,
+                    false, // noise_suppression
+                    false, // echo_cancellation (re-armed when the controller re-issues the profile)
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -3698,7 +3718,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 call.near.remote_rtp,
                 call.offer_received_from,
             )
-        }) else {
+        })
+        else {
             return Err("call no longer exists".to_string());
         };
         let Some(near_codec) = near_codec else {
@@ -3734,7 +3755,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     far_te,
                     None,
                     // Echo promotion is a runtime control action, not an offer/answer profile; no NS here.
-                    false,
+                    false, // noise_suppression
+                    false, // echo_cancellation (a reflect/echo path wants the echo)
                 )?;
                 let b_to_a = build_direction(
                     layout.far_endpoint,
@@ -3746,7 +3768,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     far_te,
                     near_te,
                     None,
-                    false,
+                    false, // noise_suppression
+                    false, // echo_cancellation (a reflect/echo path wants the echo)
                 )?;
                 (
                     a_to_b,
@@ -3788,7 +3811,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     near_te,
                     None,
-                    false,
+                    false, // noise_suppression
+                    false, // echo_cancellation (a reflect/echo path wants the echo)
                 )?;
                 let b_to_a = build_direction(
                     caller_facing_endpoint,
@@ -3800,7 +3824,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     near_te,
                     None,
-                    false,
+                    false, // noise_suppression
+                    false, // echo_cancellation (a reflect/echo path wants the echo)
                 )?;
                 (
                     a_to_b,
@@ -3819,7 +3844,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .map_err(|error| format!("install processing redirect: {error}"))?;
         }
         let owner_events = self.events.get(&owner).map(|sink| sink.value().clone());
-        let call = MediaCall::new(call_id.to_string(), from_tag, to_tag, a_to_b, b_to_a, latch, None);
+        let call = MediaCall::new(
+            call_id.to_string(),
+            from_tag,
+            to_tag,
+            a_to_b,
+            b_to_a,
+            latch,
+            None,
+        );
         self.media
             .register(call, self.datapath.clone(), owner_events);
 
@@ -4651,9 +4684,9 @@ fn resolve_pipeline(
             PipelineKind::Srtp
         };
     }
-    if profile.record_call || profile.noise_suppression || transcode {
-        // Recording, noise suppression, or a codec mismatch all need the decoded audio, so force the
-        // userspace media slow path instead of the in-kernel passthrough.
+    if profile.record_call || profile.noise_suppression || profile.echo_cancellation || transcode {
+        // Recording, noise suppression, echo cancellation, or a codec mismatch all need the decoded
+        // audio, so force the userspace media slow path instead of the in-kernel passthrough.
         PipelineKind::Media
     } else {
         PipelineKind::Passthrough
@@ -4730,6 +4763,7 @@ fn build_direction(
     telephone_event_out: Option<u8>,
     record_path: Option<&str>,
     noise_suppression: bool,
+    echo_cancellation: bool,
 ) -> Result<DirectionConfig, String> {
     let decoder = factory::decoder_for(ingress_codec).map_err(|error| error.to_string())?;
     let encoder = factory::encoder_for(egress_codec).map_err(|error| error.to_string())?;
@@ -4752,6 +4786,12 @@ fn build_direction(
         // The suppressor is built (and rate-gated) inside `Direction::new` from the decoder's native
         // rate; carry only the request here. Inert unless the ingress rate is 8/16 kHz.
         noise_suppression,
+        echo_cancellation,
+        // A 2-party leg's echo cancellation is symmetric: both directions cancel, so each must also
+        // produce the far-end reference the other reads (the audio it sends toward its party). Hence
+        // `produce_echo_reference == echo_cancellation` here — the two are only ever set apart for a
+        // (future) single-leg asymmetric AEC or in the integration tests.
+        produce_echo_reference: echo_cancellation,
         // The G.107 codec class of the stream this direction decodes (the ingress codec), for the MOS
         // in its periodic quality report — mapped the same way as the HEP QoS / conference paths.
         ingress_mos_codec: crate::conference::hep_codec_for_name(&ingress_codec.encoding_name),
@@ -4787,7 +4827,9 @@ impl WsVadConfig {
     fn from_profile(profile: &ProfileFlags) -> Option<Self> {
         (profile.ws_vad || profile.ws_barge_in).then(|| Self {
             threshold: profile.ws_vad_threshold.unwrap_or(DEFAULT_WS_VAD_THRESHOLD),
-            hangover_ms: profile.ws_vad_hangover_ms.unwrap_or(DEFAULT_WS_VAD_HANGOVER_MS),
+            hangover_ms: profile
+                .ws_vad_hangover_ms
+                .unwrap_or(DEFAULT_WS_VAD_HANGOVER_MS),
             barge_in: profile.ws_barge_in,
         })
     }
@@ -10290,7 +10332,10 @@ mod tests {
                 break;
             }
         }
-        assert!(heard, "the active caller hears its echo (packet was gated in)");
+        assert!(
+            heard,
+            "the active caller hears its echo (packet was gated in)"
+        );
 
         // Tick 14: only 4 ticks since the stamp (< 5) → recent media keeps the active call alive.
         engine.datapath().advance_clock(4);
@@ -11930,5 +11975,72 @@ mod tests {
             }
             other => panic!("expected CallQuality, got {other:?}"),
         }
+    }
+
+    /// Offer + answer a plaintext PCMU↔PCMU call on `engine`, optionally requesting echo cancellation.
+    /// The flag is set on both messages' profiles (as a controller would); the media pipeline is built
+    /// at answer, so `resolve_pipeline` / `build_direction` read it from the answer profile — exactly
+    /// how `noise_suppression` and `record_call` are honoured.
+    async fn offer_answer_aec(
+        engine: &Engine<UdpLoopbackDatapath>,
+        call_id: &str,
+        addr_a: SocketAddr,
+        addr_b: SocketAddr,
+        echo_cancellation: bool,
+    ) {
+        let profile = || ProfileFlags {
+            echo_cancellation,
+            ..Default::default()
+        };
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: profile(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: profile(),
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn echo_cancellation_promotes_a_same_codec_call_to_the_media_pipeline() {
+        // A same-codec (PCMU↔PCMU) call would relay in-kernel (`Passthrough`); the `echo_cancellation`
+        // flag must promote it to the userspace media slow path (decode → cancel → re-encode), exactly
+        // as `noise_suppression` / `record_call` do — otherwise the flag would be silently dropped on a
+        // non-transcoding call (a config knob wired to nothing).
+        let (_phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (_phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+
+        // Control: no flag ⇒ the same-codec call stays an in-kernel passthrough (not a media call).
+        let plain = Engine::new(UdpLoopbackDatapath::new());
+        offer_answer_aec(&plain, "aec-off", addr_a, addr_b, false).await;
+        assert!(
+            !plain.media().is_media_call("aec-off"),
+            "same-codec call without the flag must stay an in-kernel passthrough"
+        );
+
+        // With the flag ⇒ promoted to the userspace media pipeline (a transcoding media call), where
+        // `Direction::handle` runs the echo canceller on the decoded ingress.
+        let cancelled = Engine::new(UdpLoopbackDatapath::new());
+        offer_answer_aec(&cancelled, "aec-on", addr_a, addr_b, true).await;
+        assert!(
+            cancelled.media().is_transcoding_call("aec-on"),
+            "the echo_cancellation flag must promote the call to the media slow path where AEC runs"
+        );
     }
 }

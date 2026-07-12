@@ -143,7 +143,6 @@ impl BridgeSession {
         }
     }
 
-
     /// The `start` message to send as the first text frame.
     pub fn start_message(&self) -> ControlMessage {
         ControlMessage::Start(StartData {

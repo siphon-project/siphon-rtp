@@ -723,7 +723,12 @@ mod tests {
         );
         // The voice-AI turn-taking knobs are all off/omitted by default, so an existing ws_uri user
         // (or the NG front-end) is unaffected.
-        for field in ["ws_vad", "ws_barge_in", "ws_vad_threshold", "ws_vad_hangover_ms"] {
+        for field in [
+            "ws_vad",
+            "ws_barge_in",
+            "ws_vad_threshold",
+            "ws_vad_hangover_ms",
+        ] {
             assert!(
                 serialized.get(field).is_none(),
                 "{field} omitted when unset"
