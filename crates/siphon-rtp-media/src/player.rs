@@ -235,6 +235,24 @@ impl PcmPlayer {
         self.repeat_times.max(1)
     }
 
+    /// Total playout duration in milliseconds for the whole prompt, measured from the current
+    /// position — what a blocking `play_media` reports as `duration_ms` when it drains. Each pass
+    /// rewinds to the seek point (`loop_start`), so the remaining time is the tail of the current
+    /// pass plus every full pass still to come. Zero for an empty body or an unknown rate.
+    #[must_use]
+    pub fn duration_ms(&self) -> u64 {
+        if self.mono.is_empty() || self.sample_rate_hz == 0 {
+            return 0;
+        }
+        let total_plays = u64::from(self.total_plays());
+        let played = u64::from(self.plays_done).min(total_plays);
+        let tail_of_pass = self.mono.len().saturating_sub(self.position) as u64;
+        let full_passes_left = total_plays.saturating_sub(played + 1);
+        let per_pass = self.mono.len().saturating_sub(self.loop_start) as u64;
+        let samples = tail_of_pass + full_passes_left * per_pass;
+        samples * 1000 / u64::from(self.sample_rate_hz)
+    }
+
     /// Whether the player has produced its last frame and will only yield `None` from now on.
     #[must_use]
     pub fn is_exhausted(&self) -> bool {
@@ -550,6 +568,34 @@ mod tests {
         assert_eq!(player.next_frame(&mut out), Some(2));
         assert_eq!(out, [3, 4]); // loop rewound to the seek point, not to 0
         assert_eq!(player.next_frame(&mut out), None);
+    }
+
+    #[test]
+    fn duration_ms_covers_seek_and_repeat() {
+        // 8000 samples @ 8 kHz = exactly 1000 ms for one pass.
+        let mut recorder = WavRecorder::new(8000, 1);
+        recorder.write_pcm(&vec![0i16; 8000]);
+        let source = WavSource::parse(&recorder.into_wav()).expect("parse");
+
+        // One pass = 1000 ms.
+        assert_eq!(PcmPlayer::new(&source, 1, 0).duration_ms(), 1000);
+        // Three passes = 3000 ms.
+        assert_eq!(PcmPlayer::new(&source, 3, 0).duration_ms(), 3000);
+        // Seek 250 ms in → 750 ms for the pass; twice = 1500 ms (each loop rewinds to the seek).
+        assert_eq!(PcmPlayer::new(&source, 2, 250).duration_ms(), 1500);
+
+        // The estimate shrinks as frames are pulled: after consuming 2000 samples (250 ms) of a
+        // single 1000 ms pass, 750 ms remain.
+        let mut player = PcmPlayer::new(&source, 1, 0);
+        let mut out = [0i16; 2000];
+        assert_eq!(player.next_frame(&mut out), Some(2000));
+        assert_eq!(player.duration_ms(), 750);
+
+        // An empty body has no duration.
+        let mut empty = WavRecorder::new(8000, 1);
+        empty.write_pcm(&[]);
+        let empty = WavSource::parse(&empty.into_wav()).expect("parse");
+        assert_eq!(PcmPlayer::new(&empty, 4, 0).duration_ms(), 0);
     }
 
     #[test]

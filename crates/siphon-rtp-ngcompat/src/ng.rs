@@ -356,6 +356,9 @@ fn parse_play_media(request: &Value) -> Result<Command, NgError> {
         start_pos_ms: optional_u64(request, "start-pos"),
         duration_ms: optional_u64(request, "duration"),
         to_tag: optional_str(request, "to-tag"),
+        // rtpengine `play media` is fire-and-forget — it returns on accept, never blocking until the
+        // prompt drains (the blocking `wait` mode is a native-front-end feature).
+        wait: false,
     })
 }
 

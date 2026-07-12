@@ -39,6 +39,7 @@ use siphon_rtp_media::repacketize::Repacketizer;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::Event;
+use tokio::sync::oneshot;
 
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
 /// 20 ms, the telephony default ptime (RFC 3551).
@@ -198,6 +199,11 @@ enum Injection {
     Audio {
         player: PcmPlayer,
         resampler: Option<Resampler>,
+        /// Completion waiter for a **blocking** `play_media` (`wait = true`): fired once when the
+        /// prompt drains (or is stopped / superseded), so the engine can defer the control response
+        /// until playout finishes. `None` for fire-and-forget playback. Dropping it (actor teardown)
+        /// closes the channel, which the waiter treats as "the play ended".
+        done: Option<oneshot::Sender<()>>,
     },
     /// An RFC 4733 DTMF burst from `PlayDtmf`, sharing the egress stream's SSRC + a frozen timestamp.
     Dtmf {
@@ -500,7 +506,9 @@ impl Direction {
         // Produce this tick's egress step while holding the injection borrow, then act on it after
         // the borrow ends (the encode/packetize path needs `&mut self` again).
         let step = match self.injection.as_mut() {
-            Some(Injection::Audio { player, resampler }) => {
+            Some(Injection::Audio {
+                player, resampler, ..
+            }) => {
                 let source_rate = player.sample_rate_hz() as usize;
                 let source_frame = (source_rate * ptime / 1000).clamp(1, MAX_PCM);
                 let mut source = [0i16; MAX_PCM];
@@ -556,7 +564,16 @@ impl Direction {
                     self.egress_sequence = self.egress_sequence.wrapping_add(1);
                 }
             }
-            InjectStep::Exhausted => self.injection = None,
+            InjectStep::Exhausted => {
+                // The prompt / DTMF burst drained. Clear it and, for a blocking audio play, fire the
+                // completion waiter so the engine can send the deferred control response now.
+                if let Some(Injection::Audio {
+                    done: Some(done), ..
+                }) = self.injection.take()
+                {
+                    let _ = done.send(());
+                }
+            }
             InjectStep::Idle => {}
         }
     }
@@ -1247,15 +1264,34 @@ impl MediaCall {
     }
 
     /// Start a prompt / announcement toward a party (`Command::PlayMedia`). The player carries the
-    /// source-rate PCM; a resampler is built when it differs from the egress codec rate.
-    pub fn start_play_audio(&mut self, toward_a: bool, player: PcmPlayer) {
+    /// source-rate PCM; a resampler is built when it differs from the egress codec rate. `done` is a
+    /// blocking-play completion waiter, fired when this prompt drains. If a prior prompt on this
+    /// direction still holds a waiter, it is released now — the new prompt supersedes it, so a
+    /// blocking `play_media` on the old one never hangs.
+    pub fn start_play_audio(
+        &mut self,
+        toward_a: bool,
+        player: PcmPlayer,
+        done: Option<oneshot::Sender<()>>,
+    ) {
         let direction = self.direction_toward(toward_a);
+        if let Some(Injection::Audio {
+            done: Some(previous),
+            ..
+        }) = direction.injection.take()
+        {
+            let _ = previous.send(());
+        }
         let resampler = if player.sample_rate_hz() == direction.egress_sample_rate {
             None
         } else {
             Resampler::new(player.sample_rate_hz(), direction.egress_sample_rate).ok()
         };
-        direction.injection = Some(Injection::Audio { player, resampler });
+        direction.injection = Some(Injection::Audio {
+            player,
+            resampler,
+            done,
+        });
     }
 
     /// Start a DTMF burst toward a party (`Command::PlayDtmf`). Returns `false` if the party has no
@@ -1286,10 +1322,18 @@ impl MediaCall {
         true
     }
 
-    /// Stop any prompt / DTMF injection on both directions (`Command::StopMedia`).
+    /// Stop any prompt / DTMF injection on both directions (`Command::StopMedia`). A blocking play's
+    /// completion waiter is fired — an explicit stop is a valid end of the playout, so a script
+    /// `await`ing the prompt resumes rather than hanging.
     pub fn stop_play(&mut self) {
-        self.a_to_b.injection = None;
-        self.b_to_a.injection = None;
+        for direction in [&mut self.a_to_b, &mut self.b_to_a] {
+            if let Some(Injection::Audio {
+                done: Some(done), ..
+            }) = direction.injection.take()
+            {
+                let _ = done.send(());
+            }
+        }
     }
 
     /// The direction whose **ingress** decodes a leg's audio: leg A's RTP is decoded by `a_to_b`
@@ -1428,10 +1472,13 @@ pub enum MediaControl {
     /// (`block DTMF`). `source_a` selects the blocked source leg (`true` ⇒ leg A). Detection still
     /// fires while blocked, so the controller sees the digit — only the peer-bound relay is dropped.
     BlockDtmf { source_a: bool, blocked: bool },
-    /// Play a prompt toward a party (`toward_a`): the player owns its source-rate PCM.
+    /// Play a prompt toward a party (`toward_a`): the player owns its source-rate PCM. `done` is a
+    /// completion waiter for a blocking `play_media` (`Some` ⇒ fired when the prompt drains / is
+    /// stopped / superseded; `None` ⇒ fire-and-forget).
     PlayAudio {
         toward_a: bool,
         player: Box<PcmPlayer>,
+        done: Option<oneshot::Sender<()>>,
     },
     /// Play a DTMF burst toward a party; the reply channel reports whether it could start.
     PlayDtmf {
@@ -1700,8 +1747,8 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::BlockDtmf { source_a, blocked }) => {
                         call.set_dtmf_blocked(source_a, blocked);
                     }
-                    MediaInput::Control(MediaControl::PlayAudio { toward_a, player }) => {
-                        call.start_play_audio(toward_a, *player);
+                    MediaInput::Control(MediaControl::PlayAudio { toward_a, player, done }) => {
+                        call.start_play_audio(toward_a, *player, done);
                     }
                     MediaInput::Control(MediaControl::PlayDtmf { toward_a, digit, duration_ms, volume }) => {
                         call.start_play_dtmf(toward_a, digit, duration_ms, volume);
@@ -3064,7 +3111,7 @@ mod tests {
         let source = WavSource::parse(&wav).expect("parse wav");
         let player = PcmPlayer::new(&source, 1, 0);
 
-        call.start_play_audio(true, player); // toward A (the b_to_a egress, µ-law PT 0)
+        call.start_play_audio(true, player, None); // toward A (the b_to_a egress, µ-law PT 0)
         assert!(call.has_injection());
 
         let mut out = Vec::new();
@@ -3094,6 +3141,91 @@ mod tests {
         assert!(
             !call.has_injection(),
             "injection cleared when the prompt ends"
+        );
+    }
+
+    /// Build an 8 kHz mono prompt of `frames` × 20 ms (160 samples/frame) as a fresh `PcmPlayer`.
+    fn prompt_player(frames: usize) -> PcmPlayer {
+        use siphon_rtp_media::player::WavSource;
+        let mut recorder = WavRecorder::new(8000, 1);
+        recorder.write_pcm(&vec![2000i16; 160 * frames.max(1)]);
+        let wav = recorder.into_wav();
+        let source = WavSource::parse(&wav).expect("parse wav");
+        PcmPlayer::new(&source, 1, 0)
+    }
+
+    #[test]
+    fn blocking_play_fires_completion_waiter_on_drain() {
+        let mut call = ulaw_alaw_call();
+        let (done_tx, mut done_rx) = oneshot::channel();
+        // A 2-frame (40 ms) prompt toward A, with a blocking-play completion waiter.
+        call.start_play_audio(true, prompt_player(2), Some(done_tx));
+
+        let mut out = Vec::new();
+        // Two ticks emit the two frames; the waiter has not fired yet (prompt still playing).
+        call.tick(&mut out);
+        call.tick(&mut out);
+        assert!(
+            done_rx.try_recv().is_err(),
+            "waiter must not fire while the prompt is still playing"
+        );
+        // The third tick finds the prompt exhausted, clears the injection, and fires the waiter.
+        out.clear();
+        call.tick(&mut out);
+        assert!(!call.has_injection(), "injection cleared at end of prompt");
+        assert_eq!(
+            done_rx.try_recv(),
+            Ok(()),
+            "waiter fires when the prompt drains"
+        );
+    }
+
+    #[test]
+    fn stop_play_fires_pending_completion_waiter() {
+        let mut call = ulaw_alaw_call();
+        let (done_tx, mut done_rx) = oneshot::channel();
+        call.start_play_audio(true, prompt_player(50), Some(done_tx)); // a long prompt
+        let mut out = Vec::new();
+        call.tick(&mut out); // one frame played, prompt far from drained
+        assert!(done_rx.try_recv().is_err(), "still playing");
+        call.stop_play();
+        assert!(!call.has_injection(), "stop clears the injection");
+        assert_eq!(
+            done_rx.try_recv(),
+            Ok(()),
+            "an explicit stop resolves the blocking play"
+        );
+    }
+
+    #[test]
+    fn superseding_a_prompt_releases_the_old_waiter() {
+        let mut call = ulaw_alaw_call();
+        let (first_tx, mut first_rx) = oneshot::channel();
+        call.start_play_audio(true, prompt_player(50), Some(first_tx));
+        // A second play on the same direction replaces the first — its waiter must be released so a
+        // script awaiting the first prompt does not hang forever.
+        let (second_tx, mut second_rx) = oneshot::channel();
+        call.start_play_audio(true, prompt_player(2), Some(second_tx));
+        assert_eq!(
+            first_rx.try_recv(),
+            Ok(()),
+            "the superseded prompt's waiter is released"
+        );
+        assert!(
+            second_rx.try_recv().is_err(),
+            "the new prompt's waiter is still pending"
+        );
+    }
+
+    #[test]
+    fn dropping_the_call_closes_the_completion_waiter() {
+        let mut call = ulaw_alaw_call();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        call.start_play_audio(true, prompt_player(50), Some(done_tx));
+        drop(call); // actor teardown drops the Direction → the sender → the channel closes
+        assert!(
+            done_rx.blocking_recv().is_err(),
+            "a torn-down call closes the waiter so the engine can respond"
         );
     }
 
