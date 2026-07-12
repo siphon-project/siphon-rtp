@@ -145,15 +145,23 @@ pub enum Command {
     },
     /// Stop prompt playback on a leg.
     StopMedia { call_id: String, from_tag: String },
-    /// Inject DTMF (RFC 4733) toward a leg.
+    /// Inject DTMF (RFC 4733 telephone-events) toward a leg. `code` is played in full as a sequence,
+    /// one telephone-event per digit (`0`-`9`, `*`, `#`, `A`-`D`), each `duration_ms` long at
+    /// `volume_dbm0`, separated by `pause_ms` of inter-digit silence (each digit is a distinct event
+    /// with its own start timestamp, RFC 4733 §2.5.1.2). The target leg is the one named by `from_tag`
+    /// or `to_tag` (the call's to-tag ⇒ leg B). A non-DTMF character in `code` is rejected.
     PlayDtmf {
         call_id: String,
         from_tag: String,
+        /// The digit string to play, e.g. `"1234#"` — every character is played, not just the first.
         code: String,
+        /// Per-digit event length in milliseconds (default 250).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// Playout level as a (negative) dBm0 power; the generator uses its magnitude (0..=63).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         volume_dbm0: Option<i64>,
+        /// Inter-digit silence in milliseconds between consecutive events (default 40).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pause_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -30,7 +30,7 @@ use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_dsp::{EchoCanceller, NoiseSuppressor};
-use siphon_rtp_media::dtmf::{DtmfDetector, DtmfGenerator};
+use siphon_rtp_media::dtmf::{DtmfDetector, DtmfSequence, DtmfStep};
 use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::ingress::IngressStats;
 use siphon_rtp_media::pcap::CapturedPacket;
@@ -375,6 +375,9 @@ enum InjectStep {
         payload_type: u8,
         timestamp: u32,
     },
+    /// Inter-digit silence in a multi-digit DTMF sequence — emit nothing this tick, but keep the
+    /// injection active (the next digit is still to come; RFC 4733 gap between events).
+    DtmfSilence,
     /// The injection finished — clear it and resume transcode.
     Exhausted,
     /// No injection active.
@@ -403,12 +406,15 @@ enum Injection {
         /// Milliseconds played so far (one ptime per emitted frame), reported as `played_ms`.
         played_ms: u64,
     },
-    /// An RFC 4733 DTMF burst from `PlayDtmf`, sharing the egress stream's SSRC + a frozen timestamp.
+    /// An RFC 4733 DTMF sequence from `PlayDtmf` (`code`, one event per digit), sharing the egress
+    /// stream's SSRC. Each digit event carries its own start timestamp (`base_timestamp` plus the
+    /// sequence step's offset), holding it constant across that event's packets (RFC 4733 §2.5.1.2).
     Dtmf {
-        generator: DtmfGenerator,
+        sequence: DtmfSequence,
         payload_type: u8,
-        /// The RTP timestamp held constant across the event (RFC 4733 §2.5.1.2).
-        timestamp: u32,
+        /// The RTP timestamp of the sequence's first event; later digit events start at this plus the
+        /// step's `timestamp_offset` so the peer resolves each press separately (RFC 4733 §2.5.1.2).
+        base_timestamp: u32,
     },
 }
 
@@ -770,17 +776,22 @@ impl Direction {
                 }
             }
             Some(Injection::Dtmf {
-                generator,
+                sequence,
                 payload_type,
-                timestamp,
-            }) => match generator.next_payload() {
-                Some(payload) => InjectStep::Dtmf {
+                base_timestamp,
+            }) => match sequence.next_step() {
+                DtmfStep::Event {
+                    payload,
+                    timestamp_offset,
+                } => InjectStep::Dtmf {
                     bytes: payload.bytes,
                     marker: payload.is_first,
                     payload_type: *payload_type,
-                    timestamp: *timestamp,
+                    // Each digit is its own event, offset from the sequence base (RFC 4733 §2.5.1.2).
+                    timestamp: base_timestamp.wrapping_add(timestamp_offset),
                 },
-                None => InjectStep::Exhausted,
+                DtmfStep::Silence => InjectStep::DtmfSilence,
+                DtmfStep::Done => InjectStep::Exhausted,
             },
             None => InjectStep::Idle,
         };
@@ -810,6 +821,8 @@ impl Direction {
                 }
                 None
             }
+            // Inter-digit gap: emit nothing and keep the injection so the next digit still plays.
+            InjectStep::DtmfSilence => None,
             InjectStep::Exhausted => {
                 // The prompt / DTMF burst drained naturally. Clear it and, for a `play_media` prompt,
                 // report it as `Completed` so the actor emits the matching `Event::PlayFinished`.
@@ -1634,14 +1647,17 @@ impl MediaCall {
         }
     }
 
-    /// Start a DTMF burst toward a party (`Command::PlayDtmf`). Returns `false` if the party has no
-    /// negotiated telephone-event payload type to carry it.
+    /// Start a DTMF sequence toward a party (`Command::PlayDtmf`): `digits` is played as one RFC 4733
+    /// event per digit, each `duration_ms` long, separated by `pause_ms` of silence. Returns `false`
+    /// if the party has no negotiated telephone-event payload type to carry it, or `digits` is empty /
+    /// carries a non-DTMF character (the engine validates the code, so this is a defensive guard).
     pub fn start_play_dtmf(
         &mut self,
         toward_a: bool,
-        digit: char,
+        digits: &str,
         duration_ms: u32,
         volume: u8,
+        pause_ms: u32,
     ) -> bool {
         let direction = self.direction_toward(toward_a);
         let Some(payload_type) = direction.telephone_event_out else {
@@ -1649,15 +1665,16 @@ impl MediaCall {
         };
         let clock_rate = direction.egress_sample_rate;
         let ptime = direction.egress_ptime_ms() as u8;
-        let Some(generator) = DtmfGenerator::new(digit, duration_ms, volume, clock_rate, ptime)
+        let Some(sequence) =
+            DtmfSequence::new(digits, duration_ms, volume, clock_rate, ptime, pause_ms)
         else {
             return false;
         };
-        let timestamp = direction.egress_timestamp;
+        let base_timestamp = direction.egress_timestamp;
         direction.injection = Some(Injection::Dtmf {
-            generator,
+            sequence,
             payload_type,
-            timestamp,
+            base_timestamp,
         });
         true
     }
@@ -1870,12 +1887,14 @@ pub enum MediaControl {
         player: Box<PcmPlayer>,
         play_id: u64,
     },
-    /// Play a DTMF burst toward a party; the reply channel reports whether it could start.
+    /// Play a DTMF sequence toward a party: `digits` is the (validated) multi-digit code, each digit
+    /// played `duration_ms` long with `pause_ms` of inter-digit silence (RFC 4733 telephone-events).
     PlayDtmf {
         toward_a: bool,
-        digit: char,
+        digits: String,
         duration_ms: u32,
         volume: u8,
+        pause_ms: u32,
     },
     /// Stop any prompt / DTMF injection on both directions.
     StopPlay,
@@ -2138,8 +2157,8 @@ async fn run_media_call<D>(
                         call.start_play_audio(toward_a, *player, play_id, &mut emitted);
                         emit_events(&mut emitted, &events);
                     }
-                    MediaInput::Control(MediaControl::PlayDtmf { toward_a, digit, duration_ms, volume }) => {
-                        call.start_play_dtmf(toward_a, digit, duration_ms, volume);
+                    MediaInput::Control(MediaControl::PlayDtmf { toward_a, digits, duration_ms, volume, pause_ms }) => {
+                        call.start_play_dtmf(toward_a, &digits, duration_ms, volume, pause_ms);
                     }
                     MediaInput::Control(MediaControl::StopPlay) => {
                         // An explicit stop ends any prompt with `PlayFinished{Stopped}`.
@@ -3859,7 +3878,7 @@ mod tests {
     fn play_dtmf_injects_telephone_events_toward_the_target() {
         let mut call = ulaw_alaw_call();
         assert!(
-            call.start_play_dtmf(true, '5', 100, 10),
+            call.start_play_dtmf(true, "5", 100, 10, 40),
             "A negotiated telephone-event"
         );
         let mut out = Vec::new();
@@ -3871,6 +3890,60 @@ mod tests {
         assert!(
             packet.marker,
             "first packet of the event carries the marker"
+        );
+    }
+
+    #[test]
+    fn play_dtmf_plays_a_multi_digit_code_as_distinct_events() {
+        // A multi-digit code "12" injects one RFC 4733 event per digit: event code 1 then 2, each
+        // opening with the marker, the second event's timestamp advanced past the first, and an
+        // inter-digit gap (no telephone-event) between them. The injection clears when the code drains.
+        let mut call = ulaw_alaw_call();
+        assert!(call.start_play_dtmf(true, "12", 100, 10, 40));
+
+        let mut first_event_timestamp = None;
+        let mut second_event_timestamp = None;
+        let mut saw_gap_after_first = false;
+        // Tick well past the whole sequence (2×(5 update + 3 End) + 2 gap ticks = 18) and drain it.
+        for _ in 0..40 {
+            let mut out = Vec::new();
+            call.tick(&mut out, &mut Vec::new());
+            for outbound in &out {
+                let packet = RtpPacket::parse(&outbound.data).expect("parse");
+                assert_eq!(packet.payload_type, 101, "egress telephone-event PT");
+                match packet.payload[0] {
+                    1 => {
+                        if packet.marker {
+                            first_event_timestamp = Some(packet.timestamp);
+                        }
+                    }
+                    2 => {
+                        if packet.marker {
+                            second_event_timestamp = Some(packet.timestamp);
+                        }
+                    }
+                    other => panic!("unexpected DTMF event code {other}"),
+                }
+            }
+            // Once the first digit's marker was seen, a later tick that emits nothing is the gap.
+            if first_event_timestamp.is_some() && second_event_timestamp.is_none() && out.is_empty()
+            {
+                saw_gap_after_first = true;
+            }
+        }
+        let first = first_event_timestamp.expect("digit 1 played");
+        let second = second_event_timestamp.expect("digit 2 played");
+        assert!(
+            second.wrapping_sub(first) > 0,
+            "the second digit event starts at a later RTP timestamp"
+        );
+        assert!(
+            saw_gap_after_first,
+            "an inter-digit silence gap separated the events"
+        );
+        assert!(
+            !call.has_injection(),
+            "the sequence cleared when the code drained"
         );
     }
 
@@ -3913,7 +3986,7 @@ mod tests {
         };
         let mut call = MediaCall::new("c", "a", None, a_to_b, b_to_a, true, None);
         assert!(
-            !call.start_play_dtmf(true, '5', 100, 10),
+            !call.start_play_dtmf(true, "5", 100, 10, 40),
             "no telephone-event ⇒ cannot inject"
         );
     }
