@@ -1589,7 +1589,10 @@ impl MediaCall {
     /// Take a direction's in-flight injection (stopping it), reporting it as a [`FinishedPlay`] for
     /// `reason` only when it was a `play_media` prompt (a DTMF burst carries no `play_id`, an empty
     /// direction nothing).
-    fn take_finished_play(direction: &mut Direction, reason: PlayEndReason) -> Option<FinishedPlay> {
+    fn take_finished_play(
+        direction: &mut Direction,
+        reason: PlayEndReason,
+    ) -> Option<FinishedPlay> {
         match direction.injection.take() {
             Some(Injection::Audio {
                 play_id, played_ms, ..
@@ -3552,8 +3555,8 @@ mod tests {
         call.start_play_audio(true, prompt_player(50), 1, &mut Vec::new());
         let mut out = Vec::new();
         call.tick(&mut out, &mut Vec::new()); // 20 ms of the first prompt played
-        // A second play on the same direction replaces the first — the old play_id is reported as
-        // Superseded so a controller awaiting it resolves rather than hanging forever.
+                                              // A second play on the same direction replaces the first — the old play_id is reported as
+                                              // Superseded so a controller awaiting it resolves rather than hanging forever.
         let mut events = Vec::new();
         call.start_play_audio(true, prompt_player(2), 2, &mut events);
         assert_eq!(
@@ -3570,8 +3573,8 @@ mod tests {
         call.start_play_audio(true, prompt_player(50), 9, &mut Vec::new());
         let mut out = Vec::new();
         call.tick(&mut out, &mut Vec::new()); // 20 ms played, prompt far from drained
-        // The leg is torn down mid-play: the actor reports the in-flight prompt as Error so the engine
-        // (and siphon-sip) can release a controller awaiting it.
+                                              // The leg is torn down mid-play: the actor reports the in-flight prompt as Error so the engine
+                                              // (and siphon-sip) can release a controller awaiting it.
         let mut events = Vec::new();
         call.finish_pending_plays(&mut events);
         assert!(!call.has_injection(), "teardown clears the injection");
