@@ -698,6 +698,23 @@ mod tests {
         assert_eq!(AmrNbMode::Mr1220.frame_type(), 7);
     }
 
+    // Regression (N2): a hostile in-range AMR-NB frame can dequantize an LSF whose top byte would
+    // index past `LSF_LSP_TABLE` in `lsf_lsp`. Drive the live decode core (`decode_mode_bits`, which
+    // `AmrNb::decode` calls after RFC 4867 un-sorting) with arbitrary serial bits for every speech
+    // mode — it must decode-or-error, never panic. Bits are the logical input, so this is
+    // deterministic (no `Instant::now()`).
+    proptest::proptest! {
+        #[test]
+        fn amr_nb_decode_mode_bits_never_panics(
+            mode in 0usize..=7,
+            bits in proptest::collection::vec(0i16..=1, 244),
+        ) {
+            let mut codec = AmrNb::new();
+            let mut out = [0i16; nb::constants::L_FRAME];
+            let _ = codec.decode_mode_bits(mode, &bits, &mut out);
+        }
+    }
+
     #[test]
     fn amrwb_mode_sizes() {
         assert_eq!(AmrWbMode::Mr660.bits(), 132);

@@ -283,12 +283,15 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
             .copy_from_slice(&new_speech_buf[..L_FRAME]);
         state.mem_decim = mem;
 
-        // last L_FILT samples for autocorr window: code = mem_decim(2*L_FILT16k); error[0..L_FILT16k]=0
-        let mut code = [0i16; 30 + 16]; // holds 2*L_FILT16k (=30) decim memory then output
-        code[..30].copy_from_slice(&state.mem_decim[..30]);
+        // last L_FILT samples for autocorr window: seed a scratch copy of the 2*L_FILT16k (=30)-word
+        // decimation-filter memory from mem_decim; error[0..L_FILT16k] = 0. A fixed [i16; 30] matches
+        // `decim_12k8`'s `&mut [i16; 2 * NB_COEF_DOWN]` argument directly — no fallible slice→array
+        // conversion (house rule: no `.unwrap()` in production).
+        let mut decim_mem = [0i16; 30];
+        decim_mem.copy_from_slice(&state.mem_decim[..30]);
         let error = [0i16; 15];
         let mut tail = [0i16; L_FILT + 4];
-        decim_12k8(&error, 15, &mut tail, &mut code[..30].try_into().unwrap());
+        decim_12k8(&error, 15, &mut tail, &mut decim_mem);
         // new_speech[L_FRAME..L_FRAME+L_FILT]
         for i in 0..L_FILT {
             old_speech[new_speech_off + L_FRAME + i] = tail[i];
@@ -796,18 +799,10 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
                 h1[i] = v;
                 error2[i + M] = v;
             }
-            if std::env::var("AMRWB_DBG").is_ok() && i_subfr == 64 {
-                eprintln!("RDBG H1RAW={h1:?}");
-                eprintln!("RDBG AQ={:?}", &aq[p_aq..p_aq + M + 1]);
-            }
             let mut t = 0i16;
             deemph2(&mut h1, TILT_FAC, &mut t);
             h2.copy_from_slice(&h1);
             scale_sig(&mut h2, L_SUBFR, -2);
-            if std::env::var("AMRWB_DBG").is_ok() && i_subfr == 64 {
-                eprintln!("RDBG H1DE={h1:?}");
-                eprintln!("RDBG H2SC={h2:?}");
-            }
         }
 
         // scale xn and h1
@@ -983,12 +978,6 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
         scale_sig(&mut cn, L_SUBFR, shift);
 
         // include fixed-gain pitch contribution into h2[]
-        if std::env::var("AMRWB_DBG").is_ok() {
-            eprintln!(
-                "RDBG PRE sf={i_subfr} tilt={} T0={t0} T0f={t0_frac} xn2={xn2:?}",
-                state.tilt_code
-            );
-        }
         {
             let mut t = 0i16;
             preemph(&mut h2, state.tilt_code, L_SUBFR, &mut t);
@@ -1008,11 +997,6 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
             parm_serial(indice_cb[0], 12, prms, &mut pos);
         } else {
             let nbbits = acelp_nbbits(ser_size);
-            if std::env::var("AMRWB_DBG").is_ok() {
-                eprintln!("RDBG ACELPIN sf={i_subfr} dn={:?}", &dn[..]);
-                eprintln!("RDBG ACELPIN sf={i_subfr} h2={:?}", &h2[..]);
-                eprintln!("RDBG ACELPIN sf={i_subfr} cn={:?}", &cn[..]);
-            }
             acelp_4t64_search(
                 &mut dn,
                 &cn,
@@ -1023,12 +1007,6 @@ pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [
                 ser_size,
                 &mut indice_cb,
             );
-            if std::env::var("AMRWB_DBG").is_ok() {
-                eprintln!(
-                    "RDBG ACELPIDX sf={i_subfr}: {} {} {} {}",
-                    indice_cb[0], indice_cb[1], indice_cb[2], indice_cb[3]
-                );
-            }
             emit_acelp_indices(nbbits, ser_size, &indice_cb, prms, &mut pos);
         }
 

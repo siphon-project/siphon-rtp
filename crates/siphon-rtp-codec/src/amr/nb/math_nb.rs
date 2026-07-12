@@ -19,7 +19,6 @@ static INV_SQRT_TABLE: [i16; 49] = [
 ];
 
 /// `sqrt` look-up (`sqrt_l.tab` `table[49]`).
-#[allow(dead_code)] // used by the decoder-main tier (excitation-energy estimate), landed next
 #[rustfmt::skip]
 static SQRT_L_TABLE: [i16; 49] = [
     16384, 16888, 17378, 17854, 18318, 18770, 19212, 19644, 20066, 20480,
@@ -60,7 +59,6 @@ pub fn inv_sqrt(l_x: i32) -> i32 {
 
 /// `sqrt(L_x)` with an output exponent (`sqrt_l.c` `sqrt_l_exp`). Returns the Q31 mantissa; the
 /// caller denormalizes with `*exp` (the value is `mantissa * 2^(-exp/2)`). Non-positive input → 0.
-#[allow(dead_code)] // used by the decoder-main tier (excitation-energy estimate), landed next
 #[must_use]
 pub fn sqrt_l_exp(l_x: i32, exp: &mut i16) -> i32 {
     if l_x <= 0 {

@@ -1,15 +1,11 @@
-// AMR-WB encoder — WORK IN PROGRESS: not yet wired into the codec factory or validated
-// bit-exact. Ported from the 3GPP fixed-point C reference (index loops / manual slice
-// copies mirror the C, plus not-yet-used WIP code); these style + dead-code lints are
-// quieted module-wide until the encoder is complete and validated, then revisited.
+// AMR-WB encoder ACELP tier. Ported bit-exact from the 3GPP fixed-point C reference; the index loops
+// and manual slice copies deliberately mirror the C (`pitch_f4.c`, `c2t64fx.c` / `c4t64fx.c`,
+// `q_pulse.c`, `q_gain2.c`, `voicefac.c`) line-for-line so the port can be audited against the spec
+// source, so the matching idiom-style lints are quieted module-wide.
 #![allow(
     clippy::needless_range_loop,
     clippy::manual_memcpy,
-    clippy::explicit_counter_loop,
-    clippy::manual_div_ceil,
-    clippy::unnecessary_to_owned,
-    dead_code,
-    unused
+    clippy::explicit_counter_loop
 )]
 
 //! AMR-WB encoder per-subframe ACELP tier (3GPP TS 26.173), ported bit-exact.
@@ -24,9 +20,9 @@
 //! the voicing factor ([`voice_factor`], `voicefac.c`).
 
 use crate::amr::basic_ops::{
-    abs_s, add, div_s, extract_h, extract_l, l_abs, l_add, l_deposit_h, l_deposit_l, l_mac, l_msu,
-    l_mult, l_negate, l_shl, l_shr, l_sub, mult, mult_r, negate, norm_l, norm_s, round_word, shl,
-    shr, shr_r, sub,
+    add, div_s, extract_h, extract_l, l_abs, l_add, l_deposit_h, l_deposit_l, l_mac, l_msu, l_mult,
+    l_negate, l_shl, l_shr, l_sub, mult, mult_r, negate, norm_l, norm_s, round_word, shl, shr,
+    shr_r, sub,
 };
 use crate::amr::math_op::{dot_product12, isqrt_n};
 use crate::amr::oper_32b::{l_extract, mpy_32_16};
@@ -1186,7 +1182,7 @@ const NB_POS_4T: usize = 16;
 const MSIZE_4T: usize = 256;
 const NB_MAX_4T: usize = 8;
 const NB_PULSE_MAX: usize = 24;
-const NPMAXPT: usize = (NB_PULSE_MAX + NB_TRACK_4T - 1) / NB_TRACK_4T; // 6
+const NPMAXPT: usize = NB_PULSE_MAX.div_ceil(NB_TRACK_4T); // 6
 
 /// Starting-track table (`c4t64fx.c` `tipos`), 36 entries (9 iterations × 4).
 #[rustfmt::skip]
@@ -1531,10 +1527,10 @@ pub fn acelp_4t64_search(
         // emulate a flat pointer p0 over rows 0..4
         let mut row = 0usize;
         let mut col = 0usize;
-        let mut advance = |flat: &mut [[i16; MSIZE_4T]; NB_TRACK_4T],
-                           v: i16,
-                           row: &mut usize,
-                           col: &mut usize| {
+        let advance = |flat: &mut [[i16; MSIZE_4T]; NB_TRACK_4T],
+                       v: i16,
+                       row: &mut usize,
+                       col: &mut usize| {
             flat[*row][*col] = mult(flat[*row][*col], v);
             *col += 1;
             if *col == MSIZE_4T {

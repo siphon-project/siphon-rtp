@@ -525,6 +525,10 @@ fn opus_fft_impl(st: &FftState, fout: &mut [Complex], base: usize) {
             4 => kf_bfly4(fout, base, fstride[i], &st.twiddles, m, fstride[i], m2),
             3 => kf_bfly3(fout, base, fstride[i], &st.twiddles, m, fstride[i], m2),
             5 => kf_bfly5(fout, base, fstride[i], &st.twiddles, m, fstride[i], m2),
+            // infallible: `kf_factor` (the only producer of `st.factors`) returns
+            // `MdctError::Unfactorable` for any radix > 5, and the FFT sizes are fixed by the CELT
+            // mode/config at construction — never bitstream-controlled — so `radix` is always one of
+            // 2/3/4/5 here.
             _ => unreachable!("kf_factor only yields radices 2/3/4/5"),
         }
         m = m2;
