@@ -88,7 +88,11 @@ per-leg media interface (below).
 | `flags` | string list | Behavioral flags plus the codec directives (`codec-transcode-X`, `codec-mask-X`, `codec-strip-X`, `codec-offer-X`, `codec-except-X`, `ptime=N`, ...). |
 | `direction` | string list | Named-interface selection (rtpengine-style). Two interface names: the first for the caller-facing (A / near) leg, the second for the callee-facing (B / far) leg — so an inbound leg lands on `internal` and the outbound leg on `external`. Each interface has a bind IP and an advertised (public) IP (see the daemon `[[interface]]` config). An absent or unknown name falls back to the default interface (logged). With no `[[interface]]` configured, both legs use the single synthesised `default` interface. |
 | `record_call`, `record_path` | bool, string | Record this call from setup; output directory. |
+| `noise_suppression` | bool | Single-channel noise suppression on this leg's decoded ingress before it is transcoded/relayed (and captured by recording/forks). Engaged only on a userspace-transcoded leg whose codec is 8 or 16 kHz; inert on an in-kernel passthrough or a 48 kHz codec. Setting it forces a same-codec call off the in-kernel fast path onto the media slow path (like `record_call`). Native extension; not set over NG. |
+| `echo_cancellation` | bool | Acoustic/line echo cancellation on this leg's send path, using the audio played *toward* that party as the far-end reference (on a WebSocket voice-AI bridge, the AI downlink cancels the phone's echo of the AI). Runs at the codec's native 8 or 16 kHz; a codec at another rate passes through uncancelled. Wired on transcode and WebSocket-bridge legs, **not** on SRTP/DTLS-secured legs. Setting it promotes a same-codec plaintext call to the userspace pipeline. Native extension; not set over NG. |
 | `ws_uri` | string | Attach leg A to an external WebSocket media server (`ws://` or `wss://`; `wss://` on ring/rustls with webpki-roots trust). A native extension; not available over NG. |
+| `ws_vad`, `ws_barge_in` | bool | Voice-AI turn-taking on the `ws_uri` bridge. `ws_vad` runs a local energy-VAD on the uplink and emits `speech_started` / `speech_stopped` WS control frames on the caller's speech edges (turn boundaries without a server-side VAD). `ws_barge_in` additionally flushes the queued downlink playout in the same tick when the caller starts speaking (no server round-trip); it implies `ws_vad`. Both inert without `ws_uri`. |
+| `ws_vad_threshold`, `ws_vad_hangover_ms` | int, int | Tune the WS uplink VAD: mean-square energy threshold (`None` ≈ 1_000_000; higher is less sensitive) and trailing hangover in ms before `speech_stopped` fires (`None` ≈ 200 ms). Only meaningful with `ws_vad` / `ws_barge_in`. |
 | `received_from` | IP string | The real post-NAT source IP the SIP proxy saw. Tightens the ingress source gate (anti-RTPBleed, see [Security and NAT](../security-and-nat.md)). |
 | `rtcp_mux` | string list | rtpengine `rtcp-mux` directives (`offer`, `require`, `demux`, `accept`, `reject`, `remove`) overriding the RFC 5761 mux decision. |
 
@@ -126,7 +130,7 @@ on the node is also rejected.
 
 | Verb | Fields | Purpose |
 |---|---|---|
-| `play_media` | `call_id`, `from_tag`, `source`, `repeat_times?`, `start_pos_ms?`, `duration_ms?`, `to_tag?` | Inject a WAV prompt toward a leg. `source` is tagged: `{"source": "file", "path": "..."}` or `{"source": "blob", "data": [...]}`. |
+| `play_media` | `call_id`, `from_tag`, `source`, `repeat_times?`, `start_pos_ms?`, `duration_ms?`, `to_tag?` | Inject a WAV prompt toward a leg. `source` is tagged: `{"source": "file", "path": "..."}` or `{"source": "blob", "data": [...]}`. Accepts immediately (accept-on-start) with a `play_id`; the prompt's end is reported later by a matching `play_finished` event carrying the same `play_id`, so a controller correlates the completion without a late response racing the request timeout. |
 | `stop_media` | `call_id`, `from_tag` | Stop prompt/DTMF playback. |
 | `play_dtmf` | `call_id`, `from_tag`, `code`, `duration_ms?`, `volume_dbm0?`, `pause_ms?`, `to_tag?` | Inject RFC 4733 telephone-events toward a leg. |
 | `silence_media` / `unsilence_media` | `call_id`, `from_tag` | Replace egress audio with comfort silence / resume. |
@@ -188,7 +192,7 @@ Every response is one of:
 
 | `result` | Payload |
 |---|---|
-| `ok` | Optional `sdp` (offer/answer/subscribe), `duration_ms` (play_media), `to_tag` (subscribe_request), `stats` (query). |
+| `ok` | Optional `sdp` (offer/answer/subscribe), `play_id` + `duration_ms` (play_media accept), `to_tag` (subscribe_request), `stats` (query). |
 | `pong` | none |
 | `list` | `call_ids` |
 | `statistics` | `statistics` counter object |
@@ -205,6 +209,7 @@ Events are pushed down the same TCP connection, tagged on `"event"`, with no `id
 |---|---|---|
 | `dtmf` | `call_id`, `from_tag`, `to_tag?`, `digit`, `duration_ms`, `volume`, `source?` | An RFC 4733 telephone-event completed on a leg of a media-processing call or a conference participant. Fires even while that leg's DTMF relay is blocked. |
 | `media_timeout` | `call_id`, `from_tag` | The call went silent past `--media-timeout-secs` and the engine reaped it. Release your own per-call state. |
+| `play_finished` | `call_id`, `from_tag`, `to_tag?`, `play_id`, `reason`, `played_ms?` | A `play_media` prompt ended. `play_id` matches the accept; `reason` is `completed` (drained in full, all repeats / the `duration_ms` cap), `stopped` (`stop_media`), `superseded` (a newer `play_media` on the same leg), or `error` (decode/source error or the leg was torn down mid-play). Only `completed` means the prompt finished on its own. |
 | `active_speaker` | `conference_id`, `from_tag?` | The dominant speaker in a conference changed; `from_tag` absent means the floor went silent. |
 | `call_quality` | `conference_id?` xor `call_id?`, `from_tag`, `jitter_ms`, `loss_percent`, `mos` | Periodic reception quality: RFC 3550 §6.4.1 interarrival jitter, residual loss, and an ITU-T G.107 E-model MOS estimate (1.0..=4.5). Fires every few seconds per conference participant (keyed by `conference_id`) and per 2-party relay or transcode leg (keyed by `call_id`); exactly one identifier is present. |
 

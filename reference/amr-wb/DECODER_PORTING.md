@@ -52,14 +52,14 @@ the bits straight in.
 12. **dec_main**: `dec_main.c` `decoder()` — the per-frame orchestration + `synthesis()`; the
     `Decoder_State` struct; Init/Reset. → `wb/dec_main.rs`; wire into `AmrWb::decode`.
 
-## Decoder_State fields (frame-to-frame) — see subagent map / dec_main.h
+## Decoder_State fields (frame-to-frame) — see the porting notes / dec_main.h
 ispold[M], isfold[M], isf_buf[3*M], past_isfq[M]; old_exc[PIT_MAX+L_INTERPOL]; old_T0, old_T0_frac,
 lag_hist[5]; dec_gain[23] (gain-predictor mem incl. CNG seed); mem_syn_hi[M], mem_syn_lo[M],
 mem_syn_hf[M16k]; mem_deemph, mem_sig_out[6], mem_hp400[6], mem_oversamp[2*L_FILT], mem_hf*[…];
 Q_old, Qsubfr[4], L_gc_thres, tilt_code; seed/seed2/seed3, prev_bfi, state (BFI machine);
 dtx_decSt, vad_hist; first_frame.
 
-## Per-frame pipeline (dec_main `decoder()`), see subagent map for the full step list
+## Per-frame pipeline (dec_main `decoder()`), see the porting notes for the full step list
 DTX handler → ISF dequant (36b ≤7k / 46b >7k) → Isf_isp → Int_isp → per-subframe ×4 { pitch lag
 decode, Pred_lt4, [LP filter select], algebraic codebook decode, Preemph+Pit_shrp, D_gain2, excitation
 scaling (Q_new), voice_factor/tilt, build exc = code·gcode + adapt·gpit, Phase_dispersion, noise/pitch

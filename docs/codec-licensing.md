@@ -41,18 +41,20 @@ patent licence(s) for that codec in your jurisdiction.** Build with e.g. `--feat
 
 ## Per-codec patent posture
 
-**License-free — always on (transcode + passthrough), no flag:**
+**License-free by patents — no feature flag needed to run them.** The patent column is
+the posture; whether the engine can *transcode* one today is the separate implementation
+status on the right (passthrough of every codec is always available, per the rule above).
 
-| Codec | Basis |
-|---|---|
-| G.711 µ-law / A-law, L16 | patents long expired; trivial |
-| G.722 | ITU-T, patents expired (1988) |
-| G.726 (16/24/32/40k) | ITU-T, patents expired |
-| GSM 06.10 Full-Rate | patents expired; ETSI |
-| CN (RFC 3389) | free |
-| iLBC | **explicit royalty-free** — Google open-sourced it (BSD) via WebRTC |
-| Speex | **explicit royalty-free** — Xiph, patent-free by design (BSD) |
-| Opus | **explicit royalty-free** — IETF RF by design (RFC 6716) |
+| Codec | Patent basis | Transcode status |
+|---|---|---|
+| G.711 µ-law / A-law, L16 | patents long expired; trivial | implemented, bit-exact |
+| G.722 | ITU-T, patents expired (1988) | implemented, bit-exact |
+| G.726 (16/24/32/40k) | ITU-T, patents expired | implemented, bit-exact |
+| GSM 06.10 Full-Rate | patents expired; ETSI | implemented, bit-exact |
+| CN (RFC 3389) | free | generate/decode only |
+| iLBC | royalty-free (Google/WebRTC, BSD) | not implemented (passthrough only) |
+| Speex | royalty-free (Xiph, patent-free by design, BSD) | not implemented (passthrough only) |
+| Opus | royalty-free (IETF RF by design, RFC 6716) | in progress, not yet factory-wired (passthrough only) |
 
 **Patent-encumbered — transcoding gated behind an opt-in feature:**
 
@@ -67,3 +69,30 @@ patent licence(s) for that codec in your jurisdiction.** Build with e.g. `--feat
 Nothing is *technically* excluded — the `evs`/`g729` features mean even the heavily-encumbered
 codecs can be compiled in by a licensed operator. The line we hold is: **the default build ships
 only license-free codecs**, and **passthrough of everything is always available**.
+
+## Provenance
+
+Patent posture (above) is one axis; **copyright provenance** is a separate one. Several codecs are
+pure-Rust *ports* of a reference implementation — a from-scratch translation, but one that follows
+a specific upstream's algorithm, block decomposition, and (in places) ROM tables, as the source
+headers document function by function. Who each was ported from, and under what terms:
+
+| Codec | Ported from | Upstream terms |
+|---|---|---|
+| GSM 06.10 Full-Rate | libgsm (Degener/Bormann, TU Berlin) | permissive, attribution-preserving (not public domain, despite the in-tree header) |
+| G.726 | spandsp G.726 (Steve Underwood) | LGPL-2.1 |
+| AMR-NB (encode + decode) | 3GPP TS 26.073 fixed-point reference C (ANSI-C: TS 26.104) | 3GPP Organizational Partners' reference-software terms + AMR patent pool |
+| AMR-WB (encode + decode) | 3GPP TS 26.173 / TS 26.190 reference C (ANSI-C: TS 26.204) | 3GPP Organizational Partners' reference-software terms + AMR patent pool |
+| G.722 | ITU-T G.722 reference | ITU-T reference-software terms |
+| Opus (in progress, not factory-wired) | libopus float build (Xiph.Org) | BSD-3-Clause |
+
+G.711 is a clean-room implementation of the companding law (not a port), validated against the
+ITU-T G.191 STL vectors. The full copyright/licence notices for every upstream above are
+reproduced in
+[`THIRD-PARTY-NOTICES.md`](https://github.com/siphon-project/siphon-rtp/blob/main/THIRD-PARTY-NOTICES.md)
+at the repository root.
+
+> **This records lineage; it does not resolve licence compatibility.** Whether a bit-exact Rust
+> port of an LGPL-2.1 (spandsp), 3GPP, or ITU-T reference may itself be distributed under
+> siphon-rtp's MIT licence is an **open legal-counsel question** owned by the maintainer, not
+> settled by the attribution above.

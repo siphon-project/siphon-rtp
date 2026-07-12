@@ -101,6 +101,49 @@ for compatibility with the mod_audio_stream family. In v1 the engine honours `cl
 and rejects an inline (base64) `play_start` with an `error` message; downlink audio needs no
 `play_start` at all, binary frames are enough.
 
+## Turn-taking, barge-in, and echo control
+
+Three optional profile flags move the turn-taking work into the engine so your inference server
+does not have to run its own VAD or fight the phone's echo of the AI. All are native-JSON-only and
+inert without `ws_uri`.
+
+- **`ws_vad`** runs a local energy-VAD on the uplink and emits two text control frames on the
+  caller's speech edges: `speech_started` when the caller starts talking and `speech_stopped` (the
+  turn endpoint) after the trailing hangover. The server gets clean turn boundaries with no VAD of
+  its own, which cuts turn latency.
+- **`ws_barge_in`** adds engine-side barge-in: the moment the caller starts speaking, the bridge
+  flushes the queued downlink playout in the same tick (no server round-trip) and sends
+  `speech_started`. It implies `ws_vad`. This is the counterpart to the server-initiated `clear`
+  above: `clear` is the server flushing on its own decision, `ws_barge_in` is the engine flushing
+  the instant the caller talks over the AI.
+- **`ws_vad_threshold`** (mean-square energy, higher is less sensitive, default ≈ 1_000_000) and
+  **`ws_vad_hangover_ms`** (how long speech is held after energy drops before `speech_stopped`
+  fires, default ≈ 200 ms) tune the local VAD. Both only matter with `ws_vad` / `ws_barge_in`.
+
+- **`echo_cancellation`** cancels the phone's echo of the AI on the uplink toward the server: the
+  bridge runs `siphon-rtp-dsp`'s echo canceller on the caller's uplink using the AI downlink (what
+  the engine last sent toward the caller) as the far-end reference, at the codec's native 8 or
+  16 kHz. This stops the AI hearing itself looped back through the caller's handset, which otherwise
+  triggers false barge-ins and derails the model. A codec at another rate passes through
+  uncancelled.
+
+```json
+{
+  "id": 1,
+  "command": "offer",
+  "call_id": "call-7@198.51.100.2",
+  "from_tag": "caller",
+  "sdp": "...",
+  "profile": {
+    "ws_uri": "ws://127.0.0.1:9001/stream",
+    "ws_vad": true,
+    "ws_barge_in": true,
+    "ws_vad_hangover_ms": 300,
+    "echo_cancellation": true
+  }
+}
+```
+
 ## A minimal server
 
 An echo agent in Python (`pip install websockets`), enough to prove the path end to end:

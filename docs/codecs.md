@@ -46,10 +46,11 @@ concealment is planned.
 historical quirk; the engine gets this right in both SDP and timestamps. Mode 1
 (64 kbit/s) only, which is what SIP deployments use.
 
-**G.726.** All four rates encode and decode. One known residual: on the ITU overload
-test sequence the 40 kbit/s *encoder* diverges from the STL vectors at the quantizer's
-outermost decision boundary (the port faithfully reproduces the spandsp lineage there).
-Every other rate/law/condition, including 32 kbit/s at overload, is bit-exact.
+**G.726.** All four rates encode and decode, bit-exact against the ITU-T STL test
+sequences for every rate and both companding laws, including the 40 kbit/s overload
+condition. The fixed-point arithmetic follows the spandsp reference lineage; that
+provenance (and its licensing question) is tracked in
+[Codec licensing](codec-licensing.md#provenance).
 
 **GSM-FR.** GSM 06.10 full-rate, 13 kbit/s, the 33-byte RTP frame of RFC 3551 §4.5.8.
 Both directions validated frame-by-frame against the ETSI sequences with zero tolerance.

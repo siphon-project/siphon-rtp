@@ -60,7 +60,7 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **Comfort noise** | RFC 3389 | Implemented — decode / generate |
 | **L16 / PCM** | RFC 3551 | Implemented — big-endian, round-trip tested |
 | **AMR-WB** | TS 26.171 / .190, RFC 4867 | Implemented (`amr` feature) — decode and encode bit-exact, all 9 modes (6.60–23.85 kbit/s) vs 3GPP TS 26.174 |
-| **AMR-NB** | TS 26.071 / .090, RFC 4867 | Implemented (`amr` feature) — decode bit-exact all 8 modes vs 3GPP TS 26.074; encode bit-exact MR475 + MR122 |
+| **AMR-NB** | TS 26.071 / .090, RFC 4867 | Implemented (`amr` feature) — decode and encode bit-exact, all 8 modes (4.75–12.2 kbit/s) vs 3GPP TS 26.074; DTX/SID out of scope |
 | **Control: native JSON-over-TCP** | — | Implemented — length-prefixed JSON, async events, optional shared-secret auth |
 | **Control: rtpengine NG / bencode** | rtpengine NG | Implemented — drop-in for existing Kamailio / OpenSIPS |
 | **Datapath: UDP backend** | — | Implemented — the production datapath today (NIC-free, symmetric-RTP latching) |
@@ -72,7 +72,7 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **TURN server** | RFC 5766 / 8656 | Implemented — `turn:` / `turns:` (UDP/TCP/TLS), coturn REST credentials |
 | **NAT traversal (symmetric RTP, advertised IP, named interfaces)** | RFC 3550 §8 | Implemented — RTPbleed-gated symmetric latch, `--advertise-ip` for a 1:1-NAT / Elastic-IP host, and rtpengine-style `[[interface]]` + `direction` per-leg selection ([docs](docs/security-and-nat.md)) |
 | **Jitter buffer + PLC + resampler** | RFC 3550 | Implemented (resampler AVX2, PLC drives decoder concealment) |
-| **VAD** | — | Implemented — energy VAD (noise suppression / echo cancellation planned) |
+| **VAD / noise suppression / echo cancellation** | — | Implemented — energy VAD, single-channel noise suppression, and echo cancellation (AEC wired on the transcode and WebSocket-bridge paths, not on SRTP/DTLS legs) |
 | **WebSocket bridge (raw L16 PCM)** | — | Implemented — bidirectional, `ws://` and `wss://` (wss via ring/rustls + webpki-roots) |
 | **OpenAI Realtime / gRPC / WebRTC bridges** | — | Planned |
 | **Forking (SIPREC raw-RTP tee)** | RFC 7866 | Implemented |
@@ -252,7 +252,7 @@ Crates:
 - **`siphon-rtp-codec`** — pure-Rust codecs (G.711, G.722, G.726, GSM-FR, L16, comfort noise, AMR-NB/WB).
 - **`siphon-rtp-simd`** — pure-Rust SIMD DSP primitives (runtime-detected AVX2 + scalar fallback),
   shared by the codec and dsp hot paths.
-- `siphon-rtp-dsp` — resampler (SIMD) and energy VAD (noise suppression / AEC planned).
+- `siphon-rtp-dsp` — resampler (SIMD), energy VAD, single-channel noise suppression, and echo cancellation.
 - `siphon-rtp-media` — RTP/RTCP, jitter/PLC, leg pipeline, fan-out/fork, the MCU mixer, stream bridges.
 - `siphon-rtp-srtp` — SRTP/SRTCP (SDES) with RFC 3711 anti-replay and the secure-leg demux.
 - `siphon-rtp-dtls` — DTLS-SRTP (RFC 5764) handshake keying, pure RustCrypto.
@@ -282,14 +282,15 @@ Pre-1.0, but the core is built and wired end-to-end. Shipping today: both contro
 JSON-over-TCP and rtpengine NG/bencode), the userspace relay on the UDP datapath (with symmetric-RTP
 latching), the IMS-priority codecs (G.711, G.722, G.726, GSM-FR, comfort noise, and bit-exact
 AMR-NB/AMR-WB behind the `amr` feature), SRTP-SDES and DTLS-SRTP, a built-in TURN server, RTCP with
-G.107 MOS plus HEP/Homer export, the jitter buffer / PLC / resampler, SIPREC forking, the N-party
-conferencing MCU, the RTP↔WebSocket bridge, runtime pcap recording, and cluster load / drain with
-warm-standby checkpoint/restore.
+G.107 MOS plus HEP/Homer export, the jitter buffer / PLC / resampler, energy VAD, single-channel
+noise suppression and echo cancellation (on the transcode and WebSocket-bridge paths), SIPREC
+forking, the N-party conferencing MCU, the RTP↔WebSocket bridge, runtime pcap recording, and
+cluster load / drain with warm-standby checkpoint/restore.
 
 On the forward track: wiring the eBPF/XDP in-kernel fast path into the daemon (the loader and
-classifier are built and unit-tested but not yet selected at runtime), noise suppression / echo
-cancellation, the Opus codec, and the OpenAI-Realtime / gRPC / direct-WebRTC voice-AI adapters. See
-the [docs](https://rtp.siphon-sip.org/) for the full picture.
+classifier are built and unit-tested but not yet selected at runtime), the full ICE state machine
+(the agent is foundations-only today), the Opus codec, and the OpenAI-Realtime / gRPC /
+direct-WebRTC voice-AI adapters. See the [docs](https://rtp.siphon-sip.org/) for the full picture.
 
 ## License
 

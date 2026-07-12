@@ -80,9 +80,11 @@ document to a project via the API or UI; it re-evaluates the component list agai
 over time, no re-scan of the binary needed.
 
 License compliance: feed the SPDX document to your compliance tooling, or a plain `jq` over the
-license fields. Everything resolves to OSI-permissive licenses (siphon-rtp itself is MIT). Codec
-*patent* posture is a separate question from copyright licensing and has its own page:
-[Codec licensing & patents](codec-licensing.md).
+license fields. Everything resolves to permissive, MIT-compatible terms (siphon-rtp itself is MIT).
+The one non-OSI item is `webpki-roots`, under `CDLA-Permissive-2.0` (a permissive *data* licence
+covering the bundled Mozilla CA set, not a code licence); it is allow-listed in `deny.toml` with
+that note. Codec *patent* posture is a separate question from copyright licensing and has its own
+page: [Codec licensing & patents](codec-licensing.md).
 
 ## Generating an SBOM yourself
 
@@ -113,9 +115,10 @@ a RustSec advisory filed a week later without a line of code changing. siphon-rt
   on unchanged code, but still surfaces within a week.
 - **Yanked crates fail the audit** (`yanked = "deny"`).
 - **Ignores are explicit and justified in `deny.toml`**, each with the reason and the exit
-  condition recorded (currently two unmaintained-crate notices reached transitively:
-  `paste` via the jemalloc stats dev-dependency, `bincode` 1.x via `webrtc-dtls`; neither is a
-  vulnerability and neither has an upstream fix yet).
+  condition recorded (currently three unmaintained-crate notices reached transitively:
+  `paste` via the jemalloc stats dev-dependency, `bincode` 1.x via `webrtc-dtls`, and
+  `proc-macro-error2` via the `iai-callgrind` perf-gate dev-dependency; none is a
+  vulnerability and none has an upstream fix yet; see `deny.toml`).
 
 Run the same checks on your own checkout:
 

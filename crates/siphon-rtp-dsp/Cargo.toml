@@ -1,5 +1,5 @@
-# siphon-rtp-dsp — pure-Rust audio DSP: resampler now; VAD / NS / AEC to follow. NIC-free, sync,
-# deterministic (logical sample-clock, never Instant::now()).
+# siphon-rtp-dsp — pure-Rust audio DSP: resampler, energy VAD, noise suppression, echo cancellation.
+# NIC-free, sync, deterministic (logical sample-clock, never Instant::now()).
 [package]
 name = "siphon-rtp-dsp"
 version.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "siphon-rtp pure-Rust audio DSP: resampler (VAD/NS/AEC to follow) — deterministic, zero C deps"
+description = "siphon-rtp pure-Rust audio DSP: resampler + energy VAD + noise suppression + echo cancellation, deterministic, zero C deps"
 readme = "README.md"
 keywords = ["dsp", "audio", "resampler", "voip", "media"]
 categories = ["multimedia::audio"]
