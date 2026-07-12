@@ -55,6 +55,36 @@ impl Control {
         }
     }
 
+    /// Send a command without awaiting its response (for pipelining two requests to prove the
+    /// control loop keeps serving while one is deferred). Returns the request id.
+    async fn send(&mut self, command: Command) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let bytes = frame::encode(&Request { id, command }).expect("encode request");
+        self.stream.write_all(&bytes).await.expect("write request");
+        id
+    }
+
+    /// Read the next correlated [`Response`] off the wire (in arrival order, which may differ from
+    /// send order when a response is deferred).
+    async fn next_response(&mut self) -> Response {
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some((response, consumed)) =
+                frame::decode::<Response>(&self.buffer).expect("decode response")
+            {
+                self.buffer.drain(..consumed);
+                return response;
+            }
+            let read = timeout(Duration::from_secs(3), self.stream.read(&mut chunk))
+                .await
+                .expect("response not timed out")
+                .expect("read response");
+            assert_ne!(read, 0, "control connection closed unexpectedly");
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
     /// Read the next frame as a server-initiated [`Event`] (no request correlation).
     async fn recv_event(&mut self) -> Event {
         let mut chunk = [0u8; 4096];
@@ -146,6 +176,104 @@ fn rtp(ssrc: u32) -> Vec<u8> {
     packet.extend_from_slice(&ssrc.to_be_bytes());
     packet.extend_from_slice(b"voice");
     packet
+}
+
+/// A minimal 8 kHz mono 16-bit PCM RIFF/WAVE with `sample_count` samples — a prompt blob for
+/// `play_media`. `sample_count / 160` is the number of 20 ms playout frames (~duration).
+fn wav_blob(sample_count: usize) -> Vec<u8> {
+    let data_len = (sample_count * 2) as u32;
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(b"RIFF");
+    buffer.extend_from_slice(&(36 + data_len).to_le_bytes());
+    buffer.extend_from_slice(b"WAVE");
+    buffer.extend_from_slice(b"fmt ");
+    buffer.extend_from_slice(&16u32.to_le_bytes());
+    buffer.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buffer.extend_from_slice(&1u16.to_le_bytes()); // mono
+    buffer.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
+    buffer.extend_from_slice(&16000u32.to_le_bytes()); // byte rate
+    buffer.extend_from_slice(&2u16.to_le_bytes()); // block align
+    buffer.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    buffer.extend_from_slice(b"data");
+    buffer.extend_from_slice(&data_len.to_le_bytes());
+    for index in 0..sample_count {
+        buffer.extend_from_slice(&((index as i16).wrapping_mul(7)).to_le_bytes());
+    }
+    buffer
+}
+
+/// Blocking `play_media` (`wait = true`) defers its response until the prompt drains, and the
+/// control loop keeps serving other requests on the same connection meanwhile — the spec's
+/// non-blocking invariant. A `Ping` sent right after a blocking play is answered *first*, while the
+/// play's own response arrives later (once the prompt finishes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_play_defers_its_response_and_does_not_stall_other_requests() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    tokio::spawn(async move {
+        let _ = server::serve(engine, listener).await;
+    });
+
+    let mut control = Control::connect(control_addr).await;
+    let (_phone_a, addr_a) = phone().await;
+
+    // A UAS IVR: offer, never answer — an offer-only single-leg call `play_media` must promote.
+    let offer = control
+        .request(Command::Offer {
+            call_id: "ivr".into(),
+            from_tag: "tag-a".into(),
+            sdp: sdp_for(addr_a),
+            profile: Default::default(),
+        })
+        .await;
+    assert!(matches!(offer, CmdResult::Ok { .. }));
+
+    // Pipeline: a blocking play (a ~100 ms prompt) immediately followed by a Ping — without awaiting
+    // the play's response. If the control loop blocked on the play, the Ping would be answered only
+    // after the prompt drained; instead the Pong must come back first.
+    let play_id = control
+        .send(Command::PlayMedia {
+            call_id: "ivr".into(),
+            from_tag: "tag-a".into(),
+            source: siphon_rtp_proto::PlayMediaSource::Blob {
+                data: wav_blob(800), // 5 frames ≈ 100 ms
+            },
+            repeat_times: None,
+            start_pos_ms: None,
+            duration_ms: None,
+            to_tag: None,
+            wait: true,
+        })
+        .await;
+    let ping_id = control.send(Command::Ping).await;
+
+    let first = control.next_response().await;
+    assert_eq!(
+        first.id, ping_id,
+        "the Ping is answered while the blocking play is still pending (non-blocking invariant)"
+    );
+    assert_eq!(first.result, CmdResult::Pong);
+
+    // The play's own response arrives later, once the prompt has drained, reporting the duration.
+    let second = control.next_response().await;
+    assert_eq!(
+        second.id, play_id,
+        "the deferred play response follows, by id"
+    );
+    assert!(
+        matches!(
+            second.result,
+            CmdResult::Ok {
+                duration_ms: Some(100),
+                ..
+            }
+        ),
+        "the blocking play resolves with the played duration, got {:?}",
+        second.result
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

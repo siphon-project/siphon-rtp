@@ -107,7 +107,11 @@ pub enum Command {
     /// answered with [`CmdResult::Ok`]. (Handler lands in the restore slice; the verb is defined here
     /// so the contract is stable.)
     Restore { snapshot: String },
-    /// Inject an audio prompt into a leg.
+    /// Inject an audio prompt into a leg. `wait` (default `true`) makes the response block until the
+    /// prompt drains — a script can then `await play_media()` and sequence a following action (e.g.
+    /// echo) after the prompt finishes, with no overlap. `wait: false` returns on accept for
+    /// fire-and-forget playback (music-on-hold / background). The rtpengine NG front-end is always
+    /// fire-and-forget (it never honours `wait`).
     PlayMedia {
         call_id: String,
         from_tag: String,
@@ -120,6 +124,9 @@ pub enum Command {
         duration_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
+        /// Block the response until the prompt has fully played out (default `true`).
+        #[serde(default = "default_true")]
+        wait: bool,
     },
     /// Stop prompt playback on a leg.
     StopMedia { call_id: String, from_tag: String },
@@ -779,6 +786,7 @@ mod tests {
                 start_pos_ms: None,
                 duration_ms: Some(5000),
                 to_tag: None,
+                wait: false,
             },
             Command::PlayDtmf {
                 call_id: "c".into(),
@@ -878,9 +886,27 @@ mod tests {
                 start_pos_ms: None,
                 duration_ms: None,
                 to_tag: None,
+                wait: true,
             },
         };
         roundtrip(&request);
+    }
+
+    #[test]
+    fn play_media_wait_defaults_to_true() {
+        // A minimal play frame (no `wait`) must default to blocking so `await play_media()` sequences
+        // a prompt before the next action; `wait: false` is the explicit fire-and-forget opt-out.
+        let json = r#"{"command":"play_media","call_id":"c","from_tag":"f","source":{"source":"file","path":"/p.wav"}}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::PlayMedia { wait, .. } => assert!(wait, "wait must default to true"),
+            other => panic!("expected play_media, got {other:?}"),
+        }
+
+        let explicit = r#"{"command":"play_media","call_id":"c","from_tag":"f","source":{"source":"file","path":"/p.wav"},"wait":false}"#;
+        match serde_json::from_str::<Command>(explicit).expect("deserialize") {
+            Command::PlayMedia { wait, .. } => assert!(!wait, "explicit wait:false honoured"),
+            other => panic!("expected play_media, got {other:?}"),
+        }
     }
 
     #[test]

@@ -161,6 +161,12 @@ enum PromotionReason {
     /// actor can decode each party's ingress and re-emit it back to the sender (a relay-only promotion
     /// forwards opaque payloads to the peer and cannot loop them home).
     Echo,
+    /// A userspace media op (`play_media`) needs a **processing** MediaCall to synthesize egress
+    /// audio on an offer-only single-leg IVR call (or a plain relay). Unlike `Echo`, this hold is
+    /// never released on its own — once a prompt has played, the call is a media-processing call for
+    /// the rest of its dialog and is torn down by `delete` (an IVR call does not fall back to a
+    /// kernel relay). Harmless on an already-transcoding call (demotion is gated on `relay_flows`).
+    MediaOp,
 }
 
 /// How [`Engine::hold_in_userspace`] promotes a plain passthrough relay into the userspace media
@@ -173,6 +179,23 @@ enum PromoteMode {
     RelayOnly,
     /// Decode ingress → re-encode (echo reflects each party's audio back to itself).
     Processing,
+}
+
+/// The outcome of dispatching one control command through the deferral-aware entry
+/// ([`Engine::play_media_deferred`]) the native control server uses. Almost every command answers
+/// immediately ([`Dispatched::Now`]); a **blocking** `play_media` (`wait = true`) instead defers its
+/// response until the prompt drains ([`Dispatched::Deferred`]) so the control loop can keep serving
+/// other requests on the shared connection while the prompt plays (the spec's non-blocking
+/// invariant). The server writes `on_done` when `done` fires, or an error if it is dropped
+/// (the call was torn down before the prompt finished).
+pub enum Dispatched {
+    /// Respond now with this result (the common path — every command except a blocking play).
+    Now(CmdResult),
+    /// Defer the response: send `on_done` once `done` resolves (the prompt drained / was stopped).
+    Deferred {
+        done: tokio::sync::oneshot::Receiver<()>,
+        on_done: CmdResult,
+    },
 }
 
 impl Call {
@@ -3117,8 +3140,90 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         (call.owner == client).then(|| f(&call))
     }
 
-    /// Inject a prompt / announcement toward a leg ([`Command::PlayMedia`]). Requires a
-    /// media-processing call (the actor owns the egress codec). The source is a WAV file/blob.
+    /// Shared `play_media` setup: validate ownership, promote an offer-only single-leg IVR call (or a
+    /// plain relay) to a **processing** MediaCall so it owns an egress codec, read + parse the WAV,
+    /// build the player, resolve the target direction, and start the injection. Returns the prompt's
+    /// total playout `duration_ms` on success, or a `CmdResult::Error` describing the failure. `done`
+    /// is the blocking-play completion waiter handed to the actor (`Some` for `wait = true`).
+    ///
+    /// Promotion mirrors `set_echo`: an already-transcoding call is used as-is; an offer-only
+    /// single-leg call is promoted via [`Self::promote_to_processing`] (the `a47c657` self-echo build)
+    /// and held with [`PromotionReason::MediaOp`] for the dialog. That build puts both directions on
+    /// the one caller-facing endpoint, and [`MediaCall::process`] always runs the `a_to_b` branch for
+    /// that shared endpoint, so the prompt must inject on `a_to_b` (`toward_a = false`) for its
+    /// injection to suppress the self-echo and reach the caller — hence the `call_to.is_none()`
+    /// override of `resolve_toward_a` (which otherwise returns `true` for an unanswered call).
+    async fn start_play(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+        source: PlayMediaSource,
+        repeat_times: Option<u64>,
+        start_pos_ms: Option<u64>,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<u64, CmdResult> {
+        let Some((call_from, call_to)) = self.owned_call(client, call_id, |call| {
+            (call.from_tag.clone(), call.to_tag.clone())
+        }) else {
+            return Err(unknown_call(call_id));
+        };
+        // Promote an offer-only single-leg IVR call (or a plain relay) to a processing MediaCall so a
+        // prompt can play with no B leg — the same promote `set_echo` uses. Idempotent on an
+        // already-transcoding call. Rejected only when a relay is held for recording / a DTMF block
+        // (a relay-only actor cannot synthesize decoded audio — same guard as echo).
+        if !self.media.is_transcoding_call(call_id) {
+            if let Err(reason) = self
+                .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
+                .await
+            {
+                return Err(error_result("play_media: promote call", &reason));
+            }
+        }
+        let bytes = match source {
+            PlayMediaSource::Blob { data } => data,
+            PlayMediaSource::File { path } => match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(error_result("play_media: read file", &error)),
+            },
+            PlayMediaSource::DbId { .. } => {
+                return Err(error_result(
+                    "play_media",
+                    &"db-id media source is not supported",
+                ))
+            }
+        };
+        let wav = match WavSource::parse(&bytes) {
+            Ok(wav) => wav,
+            Err(error) => return Err(error_result("play_media: parse WAV", &error)),
+        };
+        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
+        let repeat = repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        let start = start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        let player = PcmPlayer::new(&wav, repeat, start);
+        let duration_ms = player.duration_ms();
+        // Offer-only single-leg call: both directions face the caller on one endpoint and `process`
+        // always runs the `a_to_b` branch, so inject on `a_to_b` (toward_a = false) — see the doc
+        // comment. A normal 2-leg call resolves the target leg from `from_tag` as usual.
+        let toward_a = if call_to.is_none() {
+            false
+        } else {
+            resolve_toward_a(from_tag, &call_from, call_to.as_deref())
+        };
+        self.media.control(
+            call_id,
+            MediaControl::PlayAudio {
+                toward_a,
+                player: Box::new(player),
+                done,
+            },
+        );
+        Ok(duration_ms)
+    }
+
+    /// Inject a prompt / announcement toward a leg ([`Command::PlayMedia`]) — the fire-and-forget
+    /// (`wait = false`) path, and the entry the NG front-end always takes. Returns on accept; a
+    /// blocking (`wait = true`) native play goes through [`Self::play_media_deferred`] instead.
     async fn play_media(
         &self,
         client: ClientId,
@@ -3128,44 +3233,74 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         repeat_times: Option<u64>,
         start_pos_ms: Option<u64>,
     ) -> CmdResult {
-        let Some((call_from, call_to)) = self.owned_call(client, call_id, |call| {
-            (call.from_tag.clone(), call.to_tag.clone())
-        }) else {
-            return unknown_call(call_id);
-        };
-        if !self.media.is_transcoding_call(call_id) {
-            return error_result(
-                "play_media",
-                &"requires a media-processing call (transcode/record/stream)",
-            );
+        match self
+            .start_play(
+                client,
+                call_id,
+                from_tag,
+                source,
+                repeat_times,
+                start_pos_ms,
+                None,
+            )
+            .await
+        {
+            Ok(duration_ms) => CmdResult::Ok {
+                sdp: None,
+                duration_ms: Some(duration_ms),
+                to_tag: None,
+                stats: None,
+            },
+            Err(error) => error,
         }
-        let bytes = match source {
-            PlayMediaSource::Blob { data } => data,
-            PlayMediaSource::File { path } => match tokio::fs::read(&path).await {
-                Ok(bytes) => bytes,
-                Err(error) => return error_result("play_media: read file", &error),
-            },
-            PlayMediaSource::DbId { .. } => {
-                return error_result("play_media", &"db-id media source is not supported")
-            }
-        };
-        let wav = match WavSource::parse(&bytes) {
-            Ok(wav) => wav,
-            Err(error) => return error_result("play_media: parse WAV", &error),
-        };
-        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
-        let repeat = repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
-        let start = start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
-        let player = PcmPlayer::new(&wav, repeat, start);
-        let toward_a = resolve_toward_a(from_tag, &call_from, call_to.as_deref());
-        self.media.control(
+    }
+
+    /// The **blocking** `play_media` (`wait = true`): start the prompt with a completion waiter and
+    /// return [`Dispatched::Deferred`] so the control server answers the request only once the prompt
+    /// has drained — without stalling its per-connection request loop while the prompt plays. An early
+    /// failure (unknown call, promote rejected, bad WAV) answers immediately with [`Dispatched::Now`].
+    /// Takes the whole [`Command::PlayMedia`] so the server can hand off the blocking case wholesale.
+    pub async fn play_media_deferred(&self, client: ClientId, command: Command) -> Dispatched {
+        let Command::PlayMedia {
             call_id,
-            MediaControl::PlayAudio {
-                toward_a,
-                player: Box::new(player),
+            from_tag,
+            source,
+            repeat_times,
+            start_pos_ms,
+            ..
+        } = command
+        else {
+            // Only ever called with a PlayMedia command; be defensive rather than panic.
+            return Dispatched::Now(error_result("play_media", &"expected a play_media command"));
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        match self
+            .start_play(
+                client,
+                &call_id,
+                &from_tag,
+                source,
+                repeat_times,
+                start_pos_ms,
+                Some(done_tx),
+            )
+            .await
+        {
+            Ok(duration_ms) => Dispatched::Deferred {
+                done: done_rx,
+                on_done: CmdResult::Ok {
+                    sdp: None,
+                    duration_ms: Some(duration_ms),
+                    to_tag: None,
+                    stats: None,
+                },
             },
-        );
-        ok_empty()
+            Err(error) => {
+                // Parity with `handle`: count a rejected control command.
+                self.metrics.record_control_error();
+                Dispatched::Now(error)
+            }
+        }
     }
 
     /// Stop any prompt / DTMF playback on a call ([`Command::StopMedia`]).
@@ -9955,6 +10090,139 @@ mod tests {
         assert!(
             !engine.media().is_media_call("echo-solo"),
             "the single-leg processing actor is torn down once echo clears"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_media_promotes_an_offer_only_call_and_plays_the_prompt() {
+        // A UAS IVR offers but never answers (single-leg). A prompt must play on it *before* any echo,
+        // so `play_media` promotes the offer-only relay into a processing MediaCall (the same promote
+        // `echo` uses) and injects the prompt toward the caller. A blocking (`wait = true`) play
+        // returns `Dispatched::Deferred`, its response held until the prompt drains.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+
+        let offered = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "play-solo".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&offered))
+            .expect("engine near SDP")
+            .remote_rtp;
+        assert!(
+            !engine.media().is_media_call("play-solo"),
+            "an offer-only call starts as a plain in-kernel relay (no media actor)"
+        );
+
+        // An 8 kHz mono prompt: 320 samples = 40 ms → 2 frames at 20 ms ptime.
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[1000i16; 320]);
+        let wav = recorder.into_wav();
+
+        let dispatched = engine
+            .play_media_deferred(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "play-solo".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Blob { data: wav },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    to_tag: None,
+                    wait: true,
+                },
+            )
+            .await;
+        let done = match dispatched {
+            Dispatched::Deferred { done, on_done } => {
+                assert!(
+                    matches!(
+                        on_done,
+                        CmdResult::Ok {
+                            duration_ms: Some(40),
+                            ..
+                        }
+                    ),
+                    "blocking play reports the 40 ms prompt duration, got {on_done:?}"
+                );
+                done
+            }
+            Dispatched::Now(result) => panic!("blocking play must defer, got {result:?}"),
+        };
+        assert!(
+            engine.media().is_transcoding_call("play-solo"),
+            "the offer-only relay was promoted to a processing MediaCall by play_media"
+        );
+
+        // The prompt is injected toward the caller's signalled address, so A hears it out the engine's
+        // A-facing port — no ingress needed (the playout clock drives it).
+        let mut prompt = None;
+        for _ in 0..25u16 {
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                prompt = Some((buffer[..len].to_vec(), from));
+                break;
+            }
+        }
+        let (packet, from) = prompt.expect("phone A hears the injected prompt");
+        assert_eq!(
+            from, engine_near,
+            "prompt comes from the engine's A-facing port"
+        );
+        let parsed = siphon_rtp_media::rtp::RtpPacket::parse(&packet).expect("parse prompt rtp");
+        assert_eq!(
+            parsed.payload_type, 0,
+            "prompt encoded in A's own codec (µ-law PT 0)"
+        );
+
+        // The blocking play resolves once the prompt drains (a couple of ticks after the last frame).
+        timeout(Duration::from_secs(2), done)
+            .await
+            .expect("blocking play resolves within the prompt duration")
+            .expect("the completion waiter fired (prompt drained), not dropped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_play_on_an_unknown_call_answers_immediately_with_an_error() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let dispatched = engine
+            .play_media_deferred(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "no-such-call".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Blob { data: vec![0u8; 4] },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    to_tag: None,
+                    wait: true,
+                },
+            )
+            .await;
+        assert!(
+            matches!(dispatched, Dispatched::Now(CmdResult::Error { .. })),
+            "an unknown call fails now, not deferred"
         );
     }
 
