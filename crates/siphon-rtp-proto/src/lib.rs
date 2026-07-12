@@ -107,11 +107,13 @@ pub enum Command {
     /// answered with [`CmdResult::Ok`]. (Handler lands in the restore slice; the verb is defined here
     /// so the contract is stable.)
     Restore { snapshot: String },
-    /// Inject an audio prompt into a leg. `wait` (default `true`) makes the response block until the
-    /// prompt drains — a script can then `await play_media()` and sequence a following action (e.g.
-    /// echo) after the prompt finishes, with no overlap. `wait: false` returns on accept for
-    /// fire-and-forget playback (music-on-hold / background). The rtpengine NG front-end is always
-    /// fire-and-forget (it never honours `wait`).
+    /// Inject an audio prompt into a leg. Answers immediately (accept-on-start) with a
+    /// [`CmdResult::Ok`] carrying a `play_id`; the eventual [`Event::PlayFinished`] carries the same
+    /// `play_id` when the prompt ends (drained / stopped / superseded / aborted). A controller that
+    /// wants to sequence a following action (e.g. echo) after the prompt awaits that event's
+    /// `Completed` reason — the accept alone means "started", not "finished". The rtpengine NG
+    /// front-end never consumes the event (fire-and-forget). Whether to await the completion is a
+    /// controller-side concern; there is no on-the-wire "wait" flag.
     PlayMedia {
         call_id: String,
         from_tag: String,
@@ -124,9 +126,6 @@ pub enum Command {
         duration_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
-        /// Block the response until the prompt has fully played out (default `true`).
-        #[serde(default = "default_true")]
-        wait: bool,
     },
     /// Stop prompt playback on a leg.
     StopMedia { call_id: String, from_tag: String },
@@ -434,6 +433,11 @@ pub enum CmdResult {
         /// Duration of injected media (play_media).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// The accepted playback's identifier (play_media). Unique per active playback on a
+        /// `(call_id, from_tag)` leg; the matching [`Event::PlayFinished`] carries the same value so a
+        /// controller correlates the completion with the accept it awaited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        play_id: Option<u64>,
         /// UAS To-tag (subscribe_request / siprec).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
@@ -537,6 +541,22 @@ pub struct SessionStats {
     pub packets_lost: u64,
 }
 
+/// How a [`Command::PlayMedia`] playback ended, carried by [`Event::PlayFinished`]. Only
+/// [`PlayEndReason::Completed`] means the prompt played out in full; the others resolve a controller's
+/// await as *not* completed (the prompt did not finish on its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayEndReason {
+    /// The prompt drained naturally — all repeats done, or the `duration_ms` cap was hit.
+    Completed,
+    /// Ended by [`Command::StopMedia`].
+    Stopped,
+    /// A newer [`Command::PlayMedia`] replaced this one on the same leg.
+    Superseded,
+    /// Playback aborted — a decode / source error, or the leg was torn down mid-play.
+    Error,
+}
+
 /// An asynchronous event pushed from the engine to SIPhon (no request correlation).
 /// `#[serde(other)]` keeps forward-compatibility: SIPhon tolerates new event kinds.
 ///
@@ -560,6 +580,24 @@ pub enum Event {
     /// A call's media went silent past the timeout and the engine tore it down (dead-path
     /// detection). Lets SIPhon release its own per-call state.
     MediaTimeout { call_id: String, from_tag: String },
+    /// A [`Command::PlayMedia`] playback ended. Carries the `play_id` the play's accept returned, so a
+    /// controller awaiting a specific prompt matches the completion to the accept it holds — the
+    /// load-bearing correlation, since a leg may play several prompts in sequence. `reason` says *how*
+    /// it ended: only [`PlayEndReason::Completed`] means the prompt played out in full (all repeats /
+    /// the `duration_ms` cap); `Stopped` / `Superseded` / `Error` resolve the await as not-completed so
+    /// a script does not run its next step on a prompt that never finished.
+    PlayFinished {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+        /// Correlates with the `play_id` returned by the [`Command::PlayMedia`] accept.
+        play_id: u64,
+        reason: PlayEndReason,
+        /// Actual played duration in milliseconds, for observability / CDR. `None` when not tracked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        played_ms: Option<u64>,
+    },
     /// The active (dominant) speaker in a conference changed. `from_tag` is the new speaker's leg
     /// tag, or `None` when the floor went silent (no one speaking). Drives floor control / UI.
     ActiveSpeaker {
@@ -804,7 +842,10 @@ mod tests {
                 start_pos_ms: None,
                 duration_ms: Some(5000),
                 to_tag: None,
-                wait: false,
+            },
+            Command::StopMedia {
+                call_id: "c".into(),
+                from_tag: "f".into(),
             },
             Command::PlayDtmf {
                 call_id: "c".into(),
@@ -904,27 +945,55 @@ mod tests {
                 start_pos_ms: None,
                 duration_ms: None,
                 to_tag: None,
-                wait: true,
             },
         };
         roundtrip(&request);
     }
 
     #[test]
-    fn play_media_wait_defaults_to_true() {
-        // A minimal play frame (no `wait`) must default to blocking so `await play_media()` sequences
-        // a prompt before the next action; `wait: false` is the explicit fire-and-forget opt-out.
-        let json = r#"{"command":"play_media","call_id":"c","from_tag":"f","source":{"source":"file","path":"/p.wav"}}"#;
+    fn play_media_tolerates_the_removed_wait_field() {
+        // `wait` was an early on-the-wire field; it is now purely a controller-side concept (await the
+        // completion event, or don't). An older frame that still carries `wait` must deserialize fine —
+        // serde ignores the now-unknown key, so a mixed-version deployment never fails to parse a play.
+        let json = r#"{"command":"play_media","call_id":"c","from_tag":"f","source":{"source":"file","path":"/p.wav"},"wait":true}"#;
         match serde_json::from_str::<Command>(json).expect("deserialize") {
-            Command::PlayMedia { wait, .. } => assert!(wait, "wait must default to true"),
+            Command::PlayMedia { call_id, .. } => assert_eq!(call_id, "c"),
             other => panic!("expected play_media, got {other:?}"),
         }
+    }
 
-        let explicit = r#"{"command":"play_media","call_id":"c","from_tag":"f","source":{"source":"file","path":"/p.wav"},"wait":false}"#;
-        match serde_json::from_str::<Command>(explicit).expect("deserialize") {
-            Command::PlayMedia { wait, .. } => assert!(!wait, "explicit wait:false honoured"),
-            other => panic!("expected play_media, got {other:?}"),
-        }
+    #[test]
+    fn play_media_accept_carries_a_play_id() {
+        // The accept answers immediately (accept-on-start) with the playback's `play_id` and the total
+        // duration; the matching PlayFinished later carries the same `play_id`.
+        let response = Response {
+            id: 3,
+            result: CmdResult::Ok {
+                sdp: None,
+                duration_ms: Some(4000),
+                play_id: Some(7),
+                to_tag: None,
+                stats: None,
+            },
+        };
+        roundtrip(&response);
+        let value = serde_json::to_value(&response).expect("to_value");
+        assert_eq!(value["result"], "ok");
+        assert_eq!(value["play_id"], 7);
+        assert_eq!(value["duration_ms"], 4000);
+        // An `ok` with no play (offer/answer) omits `play_id` on the wire.
+        let no_play = serde_json::to_value(CmdResult::Ok {
+            sdp: Some("v=0".into()),
+            duration_ms: None,
+            play_id: None,
+            to_tag: None,
+            stats: None,
+        })
+        .expect("to_value");
+        assert!(
+            no_play.get("play_id").is_none(),
+            "play_id omitted when absent"
+        );
     }
 
     #[test]
@@ -934,6 +1003,7 @@ mod tests {
             result: CmdResult::Ok {
                 sdp: Some("v=0".into()),
                 duration_ms: None,
+                play_id: None,
                 to_tag: None,
                 stats: None,
             },
@@ -1029,6 +1099,7 @@ mod tests {
             result: CmdResult::Ok {
                 sdp: None,
                 duration_ms: None,
+                play_id: None,
                 to_tag: None,
                 stats: Some(SessionStats {
                     packets_in: 100,
@@ -1224,6 +1295,42 @@ mod tests {
             call_id: "c".into(),
             from_tag: "f".into(),
         });
+    }
+
+    #[test]
+    fn play_finished_event_roundtrip_for_each_reason() {
+        for reason in [
+            PlayEndReason::Completed,
+            PlayEndReason::Stopped,
+            PlayEndReason::Superseded,
+            PlayEndReason::Error,
+        ] {
+            roundtrip(&Event::PlayFinished {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                to_tag: Some("t".into()),
+                play_id: 42,
+                reason,
+                played_ms: Some(1234),
+            });
+        }
+        // The wire tag is snake_case (SIPhon dispatches on "play_finished"), the reason is snake_case,
+        // and an absent `to_tag` / `played_ms` are omitted.
+        let event = Event::PlayFinished {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            to_tag: None,
+            play_id: 9,
+            reason: PlayEndReason::Superseded,
+            played_ms: None,
+        };
+        roundtrip(&event);
+        let value = serde_json::to_value(&event).expect("to_value");
+        assert_eq!(value["event"], "play_finished");
+        assert_eq!(value["play_id"], 9);
+        assert_eq!(value["reason"], "superseded");
+        assert!(value.get("to_tag").is_none(), "absent to_tag omitted");
+        assert!(value.get("played_ms").is_none(), "absent played_ms omitted");
     }
 
     #[test]

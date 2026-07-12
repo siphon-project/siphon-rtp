@@ -38,8 +38,7 @@ use siphon_rtp_media::player::PcmPlayer;
 use siphon_rtp_media::repacketize::Repacketizer;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_media::wav::WavRecorder;
-use siphon_rtp_proto::Event;
-use tokio::sync::oneshot;
+use siphon_rtp_proto::{Event, PlayEndReason};
 
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
 /// 20 ms, the telephony default ptime (RFC 3551).
@@ -320,17 +319,27 @@ enum InjectStep {
     Idle,
 }
 
+/// A `play_media` prompt that just ended, reported by the injection paths so the actor can emit the
+/// matching [`Event::PlayFinished`]. Carries the accept's `play_id` (the load-bearing correlator),
+/// how it ended, and the milliseconds actually played (for observability / CDR).
+struct FinishedPlay {
+    play_id: u64,
+    reason: PlayEndReason,
+    played_ms: u64,
+}
+
 /// Media injected onto an egress direction by a control verb.
 enum Injection {
     /// A prompt / announcement from [`super::engine`]'s `PlayMedia`, resampled to the egress rate.
     Audio {
         player: PcmPlayer,
         resampler: Option<Resampler>,
-        /// Completion waiter for a **blocking** `play_media` (`wait = true`): fired once when the
-        /// prompt drains (or is stopped / superseded), so the engine can defer the control response
-        /// until playout finishes. `None` for fire-and-forget playback. Dropping it (actor teardown)
-        /// closes the channel, which the waiter treats as "the play ended".
-        done: Option<oneshot::Sender<()>>,
+        /// The accept's playback id; the [`Event::PlayFinished`] emitted when this prompt ends
+        /// (drains / is stopped / superseded / aborted) carries it so a controller correlates the
+        /// completion with the accept it holds.
+        play_id: u64,
+        /// Milliseconds played so far (one ptime per emitted frame), reported as `played_ms`.
+        played_ms: u64,
     },
     /// An RFC 4733 DTMF burst from `PlayDtmf`, sharing the egress stream's SSRC + a frozen timestamp.
     Dtmf {
@@ -662,20 +671,27 @@ impl Direction {
     }
 
     /// Advance an active injection by one tick, emitting at most one egress packet. Clears the
-    /// injection when the prompt / DTMF burst is exhausted.
-    fn tick_injection(&mut self, out: &mut Vec<Outbound>) {
+    /// injection when the prompt / DTMF burst is exhausted, returning [`FinishedPlay`] when a
+    /// `play_media` prompt drained naturally (all repeats / the duration cap) so the caller emits the
+    /// [`Event::PlayFinished`]. A drained DTMF burst reports nothing (it carries no `play_id`).
+    fn tick_injection(&mut self, out: &mut Vec<Outbound>) -> Option<FinishedPlay> {
         let ptime = self.egress_ptime_ms() as usize;
         // Produce this tick's egress step while holding the injection borrow, then act on it after
         // the borrow ends (the encode/packetize path needs `&mut self` again).
         let step = match self.injection.as_mut() {
             Some(Injection::Audio {
-                player, resampler, ..
+                player,
+                resampler,
+                played_ms,
+                ..
             }) => {
                 let source_rate = player.sample_rate_hz() as usize;
                 let source_frame = (source_rate * ptime / 1000).clamp(1, MAX_PCM);
                 let mut source = [0i16; MAX_PCM];
                 match player.next_frame(&mut source[..source_frame]) {
                     Some(written) => {
+                        // Count this frame's ptime toward the played duration reported on completion.
+                        *played_ms += ptime as u64;
                         let frame = match resampler.as_mut() {
                             Some(resampler) => {
                                 let mut buffer = Vec::new();
@@ -706,7 +722,10 @@ impl Direction {
         };
 
         match step {
-            InjectStep::Audio(frame) => self.emit_encoded(&frame, out),
+            InjectStep::Audio(frame) => {
+                self.emit_encoded(&frame, out);
+                None
+            }
             InjectStep::Dtmf {
                 bytes,
                 marker,
@@ -725,18 +744,23 @@ impl Direction {
                     self.push_egress(&buffer[..total], out);
                     self.egress_sequence = self.egress_sequence.wrapping_add(1);
                 }
+                None
             }
             InjectStep::Exhausted => {
-                // The prompt / DTMF burst drained. Clear it and, for a blocking audio play, fire the
-                // completion waiter so the engine can send the deferred control response now.
-                if let Some(Injection::Audio {
-                    done: Some(done), ..
-                }) = self.injection.take()
-                {
-                    let _ = done.send(());
+                // The prompt / DTMF burst drained naturally. Clear it and, for a `play_media` prompt,
+                // report it as `Completed` so the actor emits the matching `Event::PlayFinished`.
+                match self.injection.take() {
+                    Some(Injection::Audio {
+                        play_id, played_ms, ..
+                    }) => Some(FinishedPlay {
+                        play_id,
+                        reason: PlayEndReason::Completed,
+                        played_ms,
+                    }),
+                    _ => None,
                 }
             }
-            InjectStep::Idle => {}
+            InjectStep::Idle => None,
         }
     }
 
@@ -1471,34 +1495,39 @@ impl MediaCall {
     }
 
     /// Start a prompt / announcement toward a party (`Command::PlayMedia`). The player carries the
-    /// source-rate PCM; a resampler is built when it differs from the egress codec rate. `done` is a
-    /// blocking-play completion waiter, fired when this prompt drains. If a prior prompt on this
-    /// direction still holds a waiter, it is released now — the new prompt supersedes it, so a
-    /// blocking `play_media` on the old one never hangs.
+    /// source-rate PCM; a resampler is built when it differs from the egress codec rate. `play_id` is
+    /// the accept's playback id, carried on the eventual [`Event::PlayFinished`]. If a prior prompt is
+    /// still playing on this direction it is superseded now — a `PlayFinished{Superseded}` for its
+    /// `play_id` is pushed onto `events`, so a controller awaiting the old prompt resolves (not
+    /// completed) rather than hanging.
     pub fn start_play_audio(
         &mut self,
         toward_a: bool,
         player: PcmPlayer,
-        done: Option<oneshot::Sender<()>>,
+        play_id: u64,
+        events: &mut Vec<Event>,
     ) {
-        let direction = self.direction_toward(toward_a);
-        if let Some(Injection::Audio {
-            done: Some(previous),
-            ..
-        }) = direction.injection.take()
-        {
-            let _ = previous.send(());
-        }
-        let resampler = if player.sample_rate_hz() == direction.egress_sample_rate {
-            None
-        } else {
-            Resampler::new(player.sample_rate_hz(), direction.egress_sample_rate).ok()
+        let superseded = {
+            let direction = self.direction_toward(toward_a);
+            // Taking the prior injection stops any in-flight prompt / DTMF on this direction; only a
+            // prompt (with a `play_id`) is reported, as `Superseded`.
+            let superseded = Self::take_finished_play(direction, PlayEndReason::Superseded);
+            let resampler = if player.sample_rate_hz() == direction.egress_sample_rate {
+                None
+            } else {
+                Resampler::new(player.sample_rate_hz(), direction.egress_sample_rate).ok()
+            };
+            direction.injection = Some(Injection::Audio {
+                player,
+                resampler,
+                play_id,
+                played_ms: 0,
+            });
+            superseded
         };
-        direction.injection = Some(Injection::Audio {
-            player,
-            resampler,
-            done,
-        });
+        if let Some(finished) = superseded {
+            events.push(self.play_finished_event(finished));
+        }
     }
 
     /// Start a DTMF burst toward a party (`Command::PlayDtmf`). Returns `false` if the party has no
@@ -1529,17 +1558,60 @@ impl MediaCall {
         true
     }
 
-    /// Stop any prompt / DTMF injection on both directions (`Command::StopMedia`). A blocking play's
-    /// completion waiter is fired — an explicit stop is a valid end of the playout, so a script
-    /// `await`ing the prompt resumes rather than hanging.
-    pub fn stop_play(&mut self) {
-        for direction in [&mut self.a_to_b, &mut self.b_to_a] {
-            if let Some(Injection::Audio {
-                done: Some(done), ..
-            }) = direction.injection.take()
-            {
-                let _ = done.send(());
-            }
+    /// Stop any prompt / DTMF injection on both directions (`Command::StopMedia`). A `play_media`
+    /// prompt in flight is reported as `PlayFinished{Stopped}` on `events` — an explicit stop is a
+    /// valid end of the playout, so a controller awaiting the prompt resolves (not completed) rather
+    /// than hanging.
+    pub fn stop_play(&mut self, events: &mut Vec<Event>) {
+        self.end_all_plays(PlayEndReason::Stopped, events);
+    }
+
+    /// Report every in-flight `play_media` prompt as ended by the leg's teardown
+    /// (`PlayFinished{Error}`), draining the injections. Called when the actor exits (leg torn down /
+    /// mailbox closed) so a controller awaiting a prompt that will never finish is released.
+    pub fn finish_pending_plays(&mut self, events: &mut Vec<Event>) {
+        self.end_all_plays(PlayEndReason::Error, events);
+    }
+
+    /// Take (stop) any injection on both directions, emitting a `PlayFinished{reason}` for each that
+    /// was a `play_media` prompt. Shared by [`Self::stop_play`] and [`Self::finish_pending_plays`].
+    fn end_all_plays(&mut self, reason: PlayEndReason, events: &mut Vec<Event>) {
+        let a = Self::take_finished_play(&mut self.a_to_b, reason);
+        let b = Self::take_finished_play(&mut self.b_to_a, reason);
+        if let Some(finished) = a {
+            events.push(self.play_finished_event(finished));
+        }
+        if let Some(finished) = b {
+            events.push(self.play_finished_event(finished));
+        }
+    }
+
+    /// Take a direction's in-flight injection (stopping it), reporting it as a [`FinishedPlay`] for
+    /// `reason` only when it was a `play_media` prompt (a DTMF burst carries no `play_id`, an empty
+    /// direction nothing).
+    fn take_finished_play(direction: &mut Direction, reason: PlayEndReason) -> Option<FinishedPlay> {
+        match direction.injection.take() {
+            Some(Injection::Audio {
+                play_id, played_ms, ..
+            }) => Some(FinishedPlay {
+                play_id,
+                reason,
+                played_ms,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Build the [`Event::PlayFinished`] for a just-ended prompt, keyed by this call's identifiers
+    /// (the same `call_id` / `from_tag` / `to_tag` triple as [`Event::Dtmf`]).
+    fn play_finished_event(&self, finished: FinishedPlay) -> Event {
+        Event::PlayFinished {
+            call_id: self.call_id.clone(),
+            from_tag: self.from_tag.clone(),
+            to_tag: self.to_tag.clone(),
+            play_id: finished.play_id,
+            reason: finished.reason,
+            played_ms: Some(finished.played_ms),
         }
     }
 
@@ -1610,10 +1682,15 @@ impl MediaCall {
         }
     }
 
-    /// Advance any active injections by one playout tick, emitting their egress packets.
-    pub fn tick(&mut self, out: &mut Vec<Outbound>) {
-        self.a_to_b.tick_injection(out);
-        self.b_to_a.tick_injection(out);
+    /// Advance any active injections by one playout tick, emitting their egress packets. A prompt that
+    /// drains this tick appends its [`Event::PlayFinished`] (reason `Completed`) to `events`.
+    pub fn tick(&mut self, out: &mut Vec<Outbound>, events: &mut Vec<Event>) {
+        if let Some(finished) = self.a_to_b.tick_injection(out) {
+            events.push(self.play_finished_event(finished));
+        }
+        if let Some(finished) = self.b_to_a.tick_injection(out) {
+            events.push(self.play_finished_event(finished));
+        }
     }
 
     /// Append this call's periodic per-leg [`Event::CallQuality`] reports (RFC 3550 §6.4.1 loss/jitter
@@ -1679,13 +1756,12 @@ pub enum MediaControl {
     /// (`block DTMF`). `source_a` selects the blocked source leg (`true` ⇒ leg A). Detection still
     /// fires while blocked, so the controller sees the digit — only the peer-bound relay is dropped.
     BlockDtmf { source_a: bool, blocked: bool },
-    /// Play a prompt toward a party (`toward_a`): the player owns its source-rate PCM. `done` is a
-    /// completion waiter for a blocking `play_media` (`Some` ⇒ fired when the prompt drains / is
-    /// stopped / superseded; `None` ⇒ fire-and-forget).
+    /// Play a prompt toward a party (`toward_a`): the player owns its source-rate PCM. `play_id` is
+    /// the accept's playback id, carried on the [`Event::PlayFinished`] emitted when the prompt ends.
     PlayAudio {
         toward_a: bool,
         player: Box<PcmPlayer>,
-        done: Option<oneshot::Sender<()>>,
+        play_id: u64,
     },
     /// Play a DTMF burst toward a party; the reply channel reports whether it could start.
     PlayDtmf {
@@ -1940,13 +2016,7 @@ async fn run_media_call<D>(
                             datapath.note_activity(packet.endpoint);
                         }
                         send_all(&datapath, &mut outbound).await;
-                        for event in emitted.drain(..) {
-                            if let Some(sink) = &events {
-                                if sink.try_send(event).is_err() {
-                                    tracing::debug!("media-pipeline event dropped (sink full or closed)");
-                                }
-                            }
-                        }
+                        emit_events(&mut emitted, &events);
                     }
                     MediaInput::Control(MediaControl::Silence(on)) => call.set_silenced(on),
                     MediaInput::Control(MediaControl::Block(on)) => call.set_blocked(on),
@@ -1954,13 +2024,22 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::BlockDtmf { source_a, blocked }) => {
                         call.set_dtmf_blocked(source_a, blocked);
                     }
-                    MediaInput::Control(MediaControl::PlayAudio { toward_a, player, done }) => {
-                        call.start_play_audio(toward_a, *player, done);
+                    MediaInput::Control(MediaControl::PlayAudio { toward_a, player, play_id }) => {
+                        // Starting a prompt supersedes any prior one on the direction, which emits a
+                        // `PlayFinished{Superseded}` for the old play_id.
+                        emitted.clear();
+                        call.start_play_audio(toward_a, *player, play_id, &mut emitted);
+                        emit_events(&mut emitted, &events);
                     }
                     MediaInput::Control(MediaControl::PlayDtmf { toward_a, digit, duration_ms, volume }) => {
                         call.start_play_dtmf(toward_a, digit, duration_ms, volume);
                     }
-                    MediaInput::Control(MediaControl::StopPlay) => call.stop_play(),
+                    MediaInput::Control(MediaControl::StopPlay) => {
+                        // An explicit stop ends any prompt with `PlayFinished{Stopped}`.
+                        emitted.clear();
+                        call.stop_play(&mut emitted);
+                        emit_events(&mut emitted, &events);
+                    }
                     MediaInput::Control(MediaControl::AddFork { source_a, sink }) => {
                         call.add_fork(source_a, sink);
                     }
@@ -1983,8 +2062,11 @@ async fn run_media_call<D>(
             _ = ticker.tick() => {
                 if call.has_injection() {
                     outbound.clear();
-                    call.tick(&mut outbound);
+                    emitted.clear();
+                    // A prompt that drains this tick appends its `PlayFinished{Completed}`.
+                    call.tick(&mut outbound, &mut emitted);
                     send_all(&datapath, &mut outbound).await;
+                    emit_events(&mut emitted, &events);
                 }
                 // Periodic per-leg quality estimate (jitter/loss/MOS) on the control channel, so SIPhon
                 // sees live 2-party (relay/transcode) call quality without parsing RTCP itself — the
@@ -1992,27 +2074,38 @@ async fn run_media_call<D>(
                 ticks_since_quality += 1;
                 if ticks_since_quality >= QUALITY_INTERVAL_TICKS {
                     ticks_since_quality = 0;
-                    if let Some(sink) = &events {
-                        emitted.clear();
-                        call.build_quality_events(&mut emitted);
-                        for event in emitted.drain(..) {
-                            if sink.try_send(event).is_err() {
-                                tracing::debug!(
-                                    "media-pipeline quality event dropped (sink full or closed)"
-                                );
-                            }
-                        }
-                    }
+                    emitted.clear();
+                    call.build_quality_events(&mut emitted);
+                    emit_events(&mut emitted, &events);
                 }
             }
         }
     }
+    // Any prompt still in flight when the actor exits ended with the leg — report it as
+    // `PlayFinished{Error}` (best-effort) so a controller awaiting it is released. siphon-sip carries
+    // its own fallback timeout, since a hard task-abort may pre-empt this teardown.
+    emitted.clear();
+    call.finish_pending_plays(&mut emitted);
+    emit_events(&mut emitted, &events);
     // Flush recordings on teardown (one-shot; tokio::fs keeps the runtime non-blocking).
     for (path, bytes) in call.take_recordings() {
         if let Err(error) = tokio::fs::write(&path, &bytes).await {
             tracing::warn!(%error, path, "media-pipeline failed to write recording");
         } else {
             tracing::info!(path, "media-pipeline wrote recording");
+        }
+    }
+}
+
+/// Push every queued control event to the owner's per-client sink, draining the buffer. A full or
+/// closed sink drops the event (best-effort, never blocks the actor) — the same posture the per-packet
+/// path takes for `Event::Dtmf`.
+fn emit_events(emitted: &mut Vec<Event>, sink: &Option<flume::Sender<Event>>) {
+    for event in emitted.drain(..) {
+        if let Some(sink) = sink {
+            if sink.try_send(event).is_err() {
+                tracing::debug!("media-pipeline event dropped (sink full or closed)");
+            }
         }
     }
 }
@@ -3346,11 +3439,11 @@ mod tests {
         let source = WavSource::parse(&wav).expect("parse wav");
         let player = PcmPlayer::new(&source, 1, 0);
 
-        call.start_play_audio(true, player, None); // toward A (the b_to_a egress, µ-law PT 0)
+        call.start_play_audio(true, player, 1, &mut Vec::new()); // toward A (b_to_a egress, µ-law PT 0)
         assert!(call.has_injection());
 
         let mut out = Vec::new();
-        call.tick(&mut out);
+        call.tick(&mut out, &mut Vec::new());
         assert_eq!(out.len(), 1, "one prompt packet per playout tick");
         let packet = RtpPacket::parse(&out[0].data).expect("parse");
         assert_eq!(out[0].endpoint, endpoint(1), "prompt goes out A's socket");
@@ -3369,13 +3462,20 @@ mod tests {
 
         // Second tick drains the rest; a third finds the prompt exhausted and clears the injection.
         out.clear();
-        call.tick(&mut out);
+        call.tick(&mut out, &mut Vec::new());
         assert_eq!(out.len(), 1);
         out.clear();
-        call.tick(&mut out);
+        let mut events = Vec::new();
+        call.tick(&mut out, &mut events);
         assert!(
             !call.has_injection(),
             "injection cleared when the prompt ends"
+        );
+        // The prompt drained on its own → a single PlayFinished{Completed} for play_id 1.
+        assert_eq!(
+            expect_one_play_finished(&events),
+            (1, PlayEndReason::Completed, Some(40)),
+            "40 ms prompt (2 frames × 20 ms) completes with its played duration"
         );
     }
 
@@ -3389,78 +3489,125 @@ mod tests {
         PcmPlayer::new(&source, 1, 0)
     }
 
+    /// Assert exactly one [`Event::PlayFinished`] was emitted, returning `(play_id, reason,
+    /// played_ms)`.
+    fn expect_one_play_finished(events: &[Event]) -> (u64, PlayEndReason, Option<u64>) {
+        match events {
+            [Event::PlayFinished {
+                play_id,
+                reason,
+                played_ms,
+                ..
+            }] => (*play_id, *reason, *played_ms),
+            other => panic!("expected exactly one PlayFinished, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn blocking_play_fires_completion_waiter_on_drain() {
+    fn play_emits_play_finished_completed_on_drain() {
         let mut call = ulaw_alaw_call();
-        let (done_tx, mut done_rx) = oneshot::channel();
-        // A 2-frame (40 ms) prompt toward A, with a blocking-play completion waiter.
-        call.start_play_audio(true, prompt_player(2), Some(done_tx));
+        // A 2-frame (40 ms) prompt toward A.
+        call.start_play_audio(true, prompt_player(2), 7, &mut Vec::new());
 
         let mut out = Vec::new();
-        // Two ticks emit the two frames; the waiter has not fired yet (prompt still playing).
-        call.tick(&mut out);
-        call.tick(&mut out);
+        let mut events = Vec::new();
+        // Two ticks emit the two frames; no completion event yet (prompt still playing).
+        call.tick(&mut out, &mut events);
+        call.tick(&mut out, &mut events);
         assert!(
-            done_rx.try_recv().is_err(),
-            "waiter must not fire while the prompt is still playing"
+            events.is_empty(),
+            "no PlayFinished while the prompt is still playing"
         );
-        // The third tick finds the prompt exhausted, clears the injection, and fires the waiter.
+        // The third tick finds the prompt exhausted, clears the injection, and emits Completed.
         out.clear();
-        call.tick(&mut out);
+        call.tick(&mut out, &mut events);
         assert!(!call.has_injection(), "injection cleared at end of prompt");
         assert_eq!(
-            done_rx.try_recv(),
-            Ok(()),
-            "waiter fires when the prompt drains"
+            expect_one_play_finished(&events),
+            (7, PlayEndReason::Completed, Some(40)),
+            "the prompt drains → PlayFinished{{Completed}} with its play_id and played_ms"
         );
     }
 
     #[test]
-    fn stop_play_fires_pending_completion_waiter() {
+    fn stop_play_emits_play_finished_stopped() {
         let mut call = ulaw_alaw_call();
-        let (done_tx, mut done_rx) = oneshot::channel();
-        call.start_play_audio(true, prompt_player(50), Some(done_tx)); // a long prompt
+        call.start_play_audio(true, prompt_player(50), 3, &mut Vec::new()); // a long prompt
         let mut out = Vec::new();
-        call.tick(&mut out); // one frame played, prompt far from drained
-        assert!(done_rx.try_recv().is_err(), "still playing");
-        call.stop_play();
+        let mut events = Vec::new();
+        call.tick(&mut out, &mut events); // one frame (20 ms) played, prompt far from drained
+        assert!(events.is_empty(), "still playing, no completion yet");
+        call.stop_play(&mut events);
         assert!(!call.has_injection(), "stop clears the injection");
         assert_eq!(
-            done_rx.try_recv(),
-            Ok(()),
-            "an explicit stop resolves the blocking play"
+            expect_one_play_finished(&events),
+            (3, PlayEndReason::Stopped, Some(20)),
+            "an explicit stop ends the play as Stopped, reporting the 20 ms played so far"
         );
     }
 
     #[test]
-    fn superseding_a_prompt_releases_the_old_waiter() {
+    fn superseding_a_prompt_emits_play_finished_superseded() {
         let mut call = ulaw_alaw_call();
-        let (first_tx, mut first_rx) = oneshot::channel();
-        call.start_play_audio(true, prompt_player(50), Some(first_tx));
-        // A second play on the same direction replaces the first — its waiter must be released so a
-        // script awaiting the first prompt does not hang forever.
-        let (second_tx, mut second_rx) = oneshot::channel();
-        call.start_play_audio(true, prompt_player(2), Some(second_tx));
+        call.start_play_audio(true, prompt_player(50), 1, &mut Vec::new());
+        let mut out = Vec::new();
+        call.tick(&mut out, &mut Vec::new()); // 20 ms of the first prompt played
+        // A second play on the same direction replaces the first — the old play_id is reported as
+        // Superseded so a controller awaiting it resolves rather than hanging forever.
+        let mut events = Vec::new();
+        call.start_play_audio(true, prompt_player(2), 2, &mut events);
         assert_eq!(
-            first_rx.try_recv(),
-            Ok(()),
-            "the superseded prompt's waiter is released"
+            expect_one_play_finished(&events),
+            (1, PlayEndReason::Superseded, Some(20)),
+            "the superseded prompt is reported for its own play_id, not the new one"
         );
-        assert!(
-            second_rx.try_recv().is_err(),
-            "the new prompt's waiter is still pending"
+        assert!(call.has_injection(), "the new prompt is now playing");
+    }
+
+    #[test]
+    fn teardown_emits_play_finished_error_for_an_in_flight_prompt() {
+        let mut call = ulaw_alaw_call();
+        call.start_play_audio(true, prompt_player(50), 9, &mut Vec::new());
+        let mut out = Vec::new();
+        call.tick(&mut out, &mut Vec::new()); // 20 ms played, prompt far from drained
+        // The leg is torn down mid-play: the actor reports the in-flight prompt as Error so the engine
+        // (and siphon-sip) can release a controller awaiting it.
+        let mut events = Vec::new();
+        call.finish_pending_plays(&mut events);
+        assert!(!call.has_injection(), "teardown clears the injection");
+        assert_eq!(
+            expect_one_play_finished(&events),
+            (9, PlayEndReason::Error, Some(20)),
+            "a torn-down leg ends its prompt as Error"
         );
     }
 
     #[test]
-    fn dropping_the_call_closes_the_completion_waiter() {
+    fn a_repeated_prompt_emits_play_finished_once_at_the_very_end() {
+        use siphon_rtp_media::player::WavSource;
         let mut call = ulaw_alaw_call();
-        let (done_tx, done_rx) = oneshot::channel::<()>();
-        call.start_play_audio(true, prompt_player(50), Some(done_tx));
-        drop(call); // actor teardown drops the Direction → the sender → the channel closes
+        // A 1-frame (160-sample) body played twice (repeat_times = 2) → 2 frames, then exhausted.
+        let mut recorder = WavRecorder::new(8000, 1);
+        recorder.write_pcm(&vec![2000i16; 160]);
+        let source = WavSource::parse(&recorder.into_wav()).expect("parse");
+        let player = PcmPlayer::new(&source, 2, 0);
+        call.start_play_audio(true, player, 5, &mut Vec::new());
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        // The body plays through twice; no completion until every repeat is done.
+        call.tick(&mut out, &mut events);
+        call.tick(&mut out, &mut events);
         assert!(
-            done_rx.blocking_recv().is_err(),
-            "a torn-down call closes the waiter so the engine can respond"
+            events.is_empty(),
+            "no PlayFinished until every repeat has played"
+        );
+        // The exhaustion tick fires Completed exactly once, reporting both passes (40 ms).
+        call.tick(&mut out, &mut events);
+        assert_eq!(
+            expect_one_play_finished(&events),
+            (5, PlayEndReason::Completed, Some(40)),
+            "a repeated prompt reports one Completed at the very end"
         );
     }
 
@@ -3472,7 +3619,7 @@ mod tests {
             "A negotiated telephone-event"
         );
         let mut out = Vec::new();
-        call.tick(&mut out);
+        call.tick(&mut out, &mut Vec::new());
         assert_eq!(out.len(), 1);
         let packet = RtpPacket::parse(&out[0].data).expect("parse");
         assert_eq!(packet.payload_type, 101, "egress telephone-event PT");

@@ -12,19 +12,13 @@ use siphon_rtp_proto::{frame, CmdResult, Command, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::engine::{ClientId, Dispatched, Engine};
+use crate::engine::{ClientId, Engine};
 use crate::metrics::RateLimiter;
 use crate::shutdown::Shutdown;
 
 /// Default per-connection control request cap (requests/second) when none is configured. Generous
 /// for a legitimate SIPhon controller; a hostile flood that exceeds it is rejected, not processed.
 pub const DEFAULT_MAX_CONTROL_RPS: u64 = 200;
-
-/// Per-connection queue for deferred control responses (a blocking `play_media` that answers when
-/// its prompt drains). Each pending play holds one detached waiter task that pushes a single
-/// `Response` here on completion; the one socket-writing task (the connection loop) drains it. A
-/// generous bound — a full queue only makes a completing waiter await, never the request loop.
-const DEFERRED_RESPONSE_QUEUE: usize = 256;
 
 /// Accept loop with no control-plane authentication — suitable only for a trusted, private control
 /// network. Use [`serve_with_auth`] to require a shared secret.
@@ -134,11 +128,6 @@ where
     // Split so the inbound-read future and the event/response writes borrow disjoint halves.
     let (mut read_half, mut write_half) = stream.into_split();
 
-    // Deferred control responses (a blocking `play_media` answered when its prompt drains) arrive
-    // here from detached waiter tasks and are written by this one connection task — so a slow play
-    // never head-of-line-blocks other requests on the shared connection (the non-blocking invariant).
-    let (responses_tx, responses_rx) = flume::bounded::<Response>(DEFERRED_RESPONSE_QUEUE);
-
     // With no configured secret the connection starts authenticated; otherwise it must authenticate
     // before any other command is honoured.
     let mut authenticated = secret.is_none();
@@ -156,72 +145,44 @@ where
                     buffer.drain(..consumed);
                     // Spend a rate-limit token first: a breach is rejected before any work (and
                     // before the auth check) so a flood cannot drive engine work or probe auth.
-                    let dispatched = if !rate_limiter.try_acquire() {
+                    // Every command answers immediately — `play_media` accepts on start and reports
+                    // its end asynchronously via `Event::PlayFinished`, so nothing defers the response.
+                    let result = if !rate_limiter.try_acquire() {
                         metrics.record_rate_limited();
-                        Dispatched::Now(CmdResult::Error {
+                        CmdResult::Error {
                             reason: "rate limit exceeded".to_string(),
-                        })
+                        }
                     } else {
                         match request.command {
-                            Command::Authenticate { token } => {
-                                Dispatched::Now(match secret.as_deref() {
-                                    None => auth_ok(),
-                                    Some(secret)
-                                        if tokens_match(token.as_bytes(), secret.as_bytes()) =>
-                                    {
-                                        authenticated = true;
-                                        auth_ok()
-                                    }
-                                    Some(_) => CmdResult::Error {
-                                        reason: "authentication failed".to_string(),
-                                    },
-                                })
-                            }
+                            Command::Authenticate { token } => match secret.as_deref() {
+                                None => auth_ok(),
+                                Some(secret)
+                                    if tokens_match(token.as_bytes(), secret.as_bytes()) =>
+                                {
+                                    authenticated = true;
+                                    auth_ok()
+                                }
+                                Some(_) => CmdResult::Error {
+                                    reason: "authentication failed".to_string(),
+                                },
+                            },
                             command if !authenticated => {
                                 let _ = command;
-                                Dispatched::Now(CmdResult::Error {
+                                CmdResult::Error {
                                     reason: "authentication required".to_string(),
-                                })
-                            }
-                            // A blocking `play_media` defers its response until the prompt drains;
-                            // the request loop keeps reading/dispatching meanwhile so a 22 s prompt
-                            // never stalls other calls' commands on this connection.
-                            command @ Command::PlayMedia { wait: true, .. } => {
-                                engine.play_media_deferred(client, command).await
-                            }
-                            command => Dispatched::Now(engine.handle(client, command).await),
-                        }
-                    };
-                    match dispatched {
-                        Dispatched::Now(result) => {
-                            let response = Response {
-                                id: request.id,
-                                result,
-                            };
-                            match frame::encode(&response) {
-                                Ok(bytes) => write_half.write_all(&bytes).await?,
-                                Err(error) => {
-                                    tracing::error!(%error, "failed to encode control response");
                                 }
                             }
+                            command => engine.handle(client, command).await,
                         }
-                        // The prompt is still playing: answer later, out of order by id, via the
-                        // per-connection response channel (drained by the select loop below). A
-                        // detached waiter awaits the drain so the request loop is not blocked. A
-                        // dropped waiter (the call was torn down mid-play) answers with an error so
-                        // the client never hangs.
-                        Dispatched::Deferred { done, on_done } => {
-                            let responses = responses_tx.clone();
-                            let id = request.id;
-                            tokio::spawn(async move {
-                                let result = match done.await {
-                                    Ok(()) => on_done,
-                                    Err(_) => CmdResult::Error {
-                                        reason: "play interrupted before completion".to_string(),
-                                    },
-                                };
-                                let _ = responses.send_async(Response { id, result }).await;
-                            });
+                    };
+                    let response = Response {
+                        id: request.id,
+                        result,
+                    };
+                    match frame::encode(&response) {
+                        Ok(bytes) => write_half.write_all(&bytes).await?,
+                        Err(error) => {
+                            tracing::error!(%error, "failed to encode control response");
                         }
                     }
                 }
@@ -252,17 +213,6 @@ where
                     }
                 }
             }
-            // A deferred control response (a blocking play whose prompt drained) resolved on a
-            // waiter task; this connection task is the sole socket writer, so writing it here never
-            // races the inline responses above.
-            response = responses_rx.recv_async() => {
-                if let Ok(response) = response {
-                    match frame::encode(&response) {
-                        Ok(bytes) => write_half.write_all(&bytes).await?,
-                        Err(error) => tracing::error!(%error, "failed to encode deferred control response"),
-                    }
-                }
-            }
             _ = refill.tick() => {
                 rate_limiter.refill(1);
             }
@@ -287,6 +237,7 @@ fn auth_ok() -> CmdResult {
     CmdResult::Ok {
         sdp: None,
         duration_ms: None,
+        play_id: None,
         to_tag: None,
         stats: None,
     }

@@ -280,6 +280,9 @@ pub fn serialize_result(result: &CmdResult) -> Value {
             duration_ms,
             to_tag,
             stats,
+            // `play_id` correlates the native async `PlayFinished` event; NG `play media` is
+            // fire-and-forget and has no event rail, so it is not rendered into the bencode reply.
+            play_id: _,
         } => {
             dict.insert(b"result".to_vec(), Value::string("ok"));
             if let Some(sdp) = sdp {
@@ -356,9 +359,6 @@ fn parse_play_media(request: &Value) -> Result<Command, NgError> {
         start_pos_ms: optional_u64(request, "start-pos"),
         duration_ms: optional_u64(request, "duration"),
         to_tag: optional_str(request, "to-tag"),
-        // rtpengine `play media` is fire-and-forget — it returns on accept, never blocking until the
-        // prompt drains (the blocking `wait` mode is a native-front-end feature).
-        wait: false,
     })
 }
 
@@ -1202,6 +1202,7 @@ mod tests {
         let ok = serialize_result(&CmdResult::Ok {
             sdp: Some("v=0\r\nm=audio 30000 RTP/SAVP 96\r\n".into()),
             duration_ms: None,
+            play_id: None,
             to_tag: None,
             stats: None,
         });
@@ -1219,6 +1220,7 @@ mod tests {
         let ok = serialize_result(&CmdResult::Ok {
             sdp: None,
             duration_ms: None,
+            play_id: None,
             to_tag: None,
             stats: Some(siphon_rtp_proto::SessionStats {
                 packets_in: 100,

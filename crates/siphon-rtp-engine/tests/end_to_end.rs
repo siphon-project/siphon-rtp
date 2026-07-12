@@ -55,36 +55,6 @@ impl Control {
         }
     }
 
-    /// Send a command without awaiting its response (for pipelining two requests to prove the
-    /// control loop keeps serving while one is deferred). Returns the request id.
-    async fn send(&mut self, command: Command) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        let bytes = frame::encode(&Request { id, command }).expect("encode request");
-        self.stream.write_all(&bytes).await.expect("write request");
-        id
-    }
-
-    /// Read the next correlated [`Response`] off the wire (in arrival order, which may differ from
-    /// send order when a response is deferred).
-    async fn next_response(&mut self) -> Response {
-        let mut chunk = [0u8; 4096];
-        loop {
-            if let Some((response, consumed)) =
-                frame::decode::<Response>(&self.buffer).expect("decode response")
-            {
-                self.buffer.drain(..consumed);
-                return response;
-            }
-            let read = timeout(Duration::from_secs(3), self.stream.read(&mut chunk))
-                .await
-                .expect("response not timed out")
-                .expect("read response");
-            assert_ne!(read, 0, "control connection closed unexpectedly");
-            self.buffer.extend_from_slice(&chunk[..read]);
-        }
-    }
-
     /// Read the next frame as a server-initiated [`Event`] (no request correlation).
     async fn recv_event(&mut self) -> Event {
         let mut chunk = [0u8; 4096];
@@ -202,12 +172,8 @@ fn wav_blob(sample_count: usize) -> Vec<u8> {
     buffer
 }
 
-/// Blocking `play_media` (`wait = true`) defers its response until the prompt drains, and the
-/// control loop keeps serving other requests on the same connection meanwhile — the spec's
-/// non-blocking invariant. A `Ping` sent right after a blocking play is answered *first*, while the
-/// play's own response arrives later (once the prompt finishes).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blocking_play_defers_its_response_and_does_not_stall_other_requests() {
+/// Spawn an engine + control server on an ephemeral loopback port, returning its control address.
+async fn spawn_control_server() -> SocketAddr {
     let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -216,64 +182,138 @@ async fn blocking_play_defers_its_response_and_does_not_stall_other_requests() {
     tokio::spawn(async move {
         let _ = server::serve(engine, listener).await;
     });
+    control_addr
+}
 
-    let mut control = Control::connect(control_addr).await;
-    let (_phone_a, addr_a) = phone().await;
-
-    // A UAS IVR: offer, never answer — an offer-only single-leg call `play_media` must promote.
+/// Offer an offer-only single-leg IVR call named `call_id` on `control` (a UAS that never answers) —
+/// `play_media` promotes it into the userspace media pipeline. Returns the phone socket that hears
+/// the prompt (kept alive by the caller).
+async fn offer_ivr(control: &mut Control, call_id: &str) -> UdpSocket {
+    let (phone_a, addr_a) = phone().await;
     let offer = control
         .request(Command::Offer {
-            call_id: "ivr".into(),
+            call_id: call_id.into(),
             from_tag: "tag-a".into(),
             sdp: sdp_for(addr_a),
             profile: Default::default(),
         })
         .await;
-    assert!(matches!(offer, CmdResult::Ok { .. }));
+    assert!(matches!(offer, CmdResult::Ok { .. }), "IVR offer accepted");
+    phone_a
+}
 
-    // Pipeline: a blocking play (a ~100 ms prompt) immediately followed by a Ping — without awaiting
-    // the play's response. If the control loop blocked on the play, the Ping would be answered only
-    // after the prompt drained; instead the Pong must come back first.
-    let play_id = control
-        .send(Command::PlayMedia {
-            call_id: "ivr".into(),
+/// Await the next [`Event::PlayFinished`] on `control`, skipping any unrelated event. Returns
+/// `(play_id, reason, played_ms)`.
+async fn next_play_finished(
+    control: &mut Control,
+) -> (u64, siphon_rtp_proto::PlayEndReason, Option<u64>) {
+    for _ in 0..20 {
+        if let Event::PlayFinished {
+            play_id,
+            reason,
+            played_ms,
+            ..
+        } = control.recv_event().await
+        {
+            return (play_id, reason, played_ms);
+        }
+    }
+    panic!("no PlayFinished event arrived");
+}
+
+/// Send a `play_media` and assert it accepts immediately with a `play_id`, returning `(play_id,
+/// duration_ms)`.
+async fn play_blob(control: &mut Control, call_id: &str, samples: usize) -> (u64, Option<u64>) {
+    let result = control
+        .request(Command::PlayMedia {
+            call_id: call_id.into(),
             from_tag: "tag-a".into(),
             source: siphon_rtp_proto::PlayMediaSource::Blob {
-                data: wav_blob(800), // 5 frames ≈ 100 ms
+                data: wav_blob(samples),
             },
             repeat_times: None,
             start_pos_ms: None,
             duration_ms: None,
             to_tag: None,
-            wait: true,
         })
         .await;
-    let ping_id = control.send(Command::Ping).await;
+    match result {
+        CmdResult::Ok {
+            play_id: Some(play_id),
+            duration_ms,
+            ..
+        } => (play_id, duration_ms),
+        other => panic!("play_media must accept with a play_id, got {other:?}"),
+    }
+}
 
-    let first = control.next_response().await;
-    assert_eq!(
-        first.id, ping_id,
-        "the Ping is answered while the blocking play is still pending (non-blocking invariant)"
-    );
-    assert_eq!(first.result, CmdResult::Pong);
+/// `play_media` accepts immediately with a `play_id`, and a `PlayFinished{Completed}` carrying the
+/// same `play_id` (and the played duration) arrives on the async event rail when the prompt drains —
+/// the completion signal that replaced the deferred response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn play_media_emits_play_finished_completed_on_drain() {
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let _phone_a = offer_ivr(&mut control, "ivr").await;
 
-    // The play's own response arrives later, once the prompt has drained, reporting the duration.
-    let second = control.next_response().await;
+    // A ~100 ms prompt (5 frames × 20 ms) accepts on start with its play_id and duration.
+    let (play_id, duration_ms) = play_blob(&mut control, "ivr", 800).await;
+    assert_eq!(duration_ms, Some(100), "the accept reports the prompt duration");
+
+    // The completion arrives asynchronously once the prompt drains.
+    let (finished_id, reason, played_ms) = next_play_finished(&mut control).await;
+    assert_eq!(finished_id, play_id, "PlayFinished carries the accept's play_id");
+    assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
+    assert_eq!(played_ms, Some(100), "the whole 100 ms prompt played");
+}
+
+/// `StopMedia` mid-play ends the prompt as `PlayFinished{Stopped}` (not `Completed`), so a controller
+/// awaiting it resolves as not-completed rather than hanging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_media_emits_play_finished_stopped() {
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let _phone_a = offer_ivr(&mut control, "ivr").await;
+
+    // A long prompt (~2 s) so the stop lands well before it would drain on its own.
+    let (play_id, _) = play_blob(&mut control, "ivr", 160 * 100).await;
+    let stopped = control
+        .request(Command::StopMedia {
+            call_id: "ivr".into(),
+            from_tag: "tag-a".into(),
+        })
+        .await;
+    assert!(matches!(stopped, CmdResult::Ok { .. }), "stop accepted");
+
+    let (finished_id, reason, _played_ms) = next_play_finished(&mut control).await;
+    assert_eq!(finished_id, play_id, "the stopped prompt's play_id");
+    assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Stopped);
+}
+
+/// A second `play_media` on the same leg supersedes the first: the first play's id is reported as
+/// `PlayFinished{Superseded}`, then the second drains to `PlayFinished{Completed}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_play_supersedes_the_first_then_completes() {
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let _phone_a = offer_ivr(&mut control, "ivr").await;
+
+    // A long first prompt, then a short second one that replaces it immediately.
+    let (first_id, _) = play_blob(&mut control, "ivr", 160 * 100).await;
+    let (second_id, _) = play_blob(&mut control, "ivr", 160 * 2).await;
+    assert_ne!(first_id, second_id, "each play draws its own id");
+
+    // The superseded first play is reported first (for its own id), then the second completes.
+    let (superseded_id, superseded_reason, _) = next_play_finished(&mut control).await;
+    assert_eq!(superseded_id, first_id, "the first play is the one superseded");
     assert_eq!(
-        second.id, play_id,
-        "the deferred play response follows, by id"
+        superseded_reason,
+        siphon_rtp_proto::PlayEndReason::Superseded
     );
-    assert!(
-        matches!(
-            second.result,
-            CmdResult::Ok {
-                duration_ms: Some(100),
-                ..
-            }
-        ),
-        "the blocking play resolves with the played duration, got {:?}",
-        second.result
-    );
+
+    let (completed_id, completed_reason, _) = next_play_finished(&mut control).await;
+    assert_eq!(completed_id, second_id, "the second play then completes");
+    assert_eq!(completed_reason, siphon_rtp_proto::PlayEndReason::Completed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

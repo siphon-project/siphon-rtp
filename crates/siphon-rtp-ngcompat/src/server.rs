@@ -79,6 +79,7 @@ mod tests {
             Command::Offer { sdp, .. } => CmdResult::Ok {
                 sdp: Some(sdp.replace("RTP/SAVP", "RTP/AVP")),
                 duration_ms: None,
+                play_id: None,
                 to_tag: None,
                 stats: None,
             },

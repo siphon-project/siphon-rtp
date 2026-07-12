@@ -181,23 +181,6 @@ enum PromoteMode {
     Processing,
 }
 
-/// The outcome of dispatching one control command through the deferral-aware entry
-/// ([`Engine::play_media_deferred`]) the native control server uses. Almost every command answers
-/// immediately ([`Dispatched::Now`]); a **blocking** `play_media` (`wait = true`) instead defers its
-/// response until the prompt drains ([`Dispatched::Deferred`]) so the control loop can keep serving
-/// other requests on the shared connection while the prompt plays (the spec's non-blocking
-/// invariant). The server writes `on_done` when `done` fires, or an error if it is dropped
-/// (the call was torn down before the prompt finished).
-pub enum Dispatched {
-    /// Respond now with this result (the common path — every command except a blocking play).
-    Now(CmdResult),
-    /// Defer the response: send `on_done` once `done` resolves (the prompt drained / was stopped).
-    Deferred {
-        done: tokio::sync::oneshot::Receiver<()>,
-        on_done: CmdResult,
-    },
-}
-
 impl Call {
     /// The role of one of this call's four possible endpoints, or `None` if the id is not one of
     /// them. Used to snapshot flows by role (the node-independent stand-in for a datapath id).
@@ -547,6 +530,10 @@ pub struct Engine<D: Datapath> {
     /// interface (advertise whatever the datapath bound), so existing tests are behaviour-preserving;
     /// the daemon replaces it via [`Self::with_interfaces`] from config. Shared read-only (`Arc`).
     interfaces: Arc<InterfaceTable>,
+    /// Monotonic source of `play_media` playback ids. Each accepted play draws the next value, echoed
+    /// in the accept's `play_id` and in the matching [`Event::PlayFinished`], so a controller
+    /// correlates a completion with the specific prompt it started (a leg may play several in sequence).
+    play_id_counter: std::sync::atomic::AtomicU64,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -595,6 +582,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 None,
             )),
+            // Start at 1 so a `play_id` of 0 never appears (a controller can treat 0 as "no play").
+            play_id_counter: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -2046,6 +2035,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 CmdResult::Ok {
                     sdp: None,
                     duration_ms: None,
+                    play_id: None,
                     to_tag: None,
                     stats: None,
                 }
@@ -2074,6 +2064,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         CmdResult::Ok {
             sdp: None,
             duration_ms: None,
+            play_id: None,
             to_tag: None,
             stats: Some(stats),
         }
@@ -3160,11 +3151,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         (call.owner == client).then(|| f(&call))
     }
 
+    /// Draw the next monotonic `play_media` playback id.
+    fn next_play_id(&self) -> u64 {
+        self.play_id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Shared `play_media` setup: validate ownership, promote an offer-only single-leg IVR call (or a
     /// plain relay) to a **processing** MediaCall so it owns an egress codec, read + parse the WAV,
-    /// build the player, resolve the target direction, and start the injection. Returns the prompt's
-    /// total playout `duration_ms` on success, or a `CmdResult::Error` describing the failure. `done`
-    /// is the blocking-play completion waiter handed to the actor (`Some` for `wait = true`).
+    /// build the player, resolve the target direction, and start the injection. On success returns
+    /// `(duration_ms, play_id)` — the prompt's total playout duration and the playback id the actor
+    /// carries on the eventual [`Event::PlayFinished`]; on failure a `CmdResult::Error`.
     ///
     /// Promotion mirrors `set_echo`: an already-transcoding call is used as-is; an offer-only
     /// single-leg call is promoted via [`Self::promote_to_processing`] (the `a47c657` self-echo build)
@@ -3181,8 +3178,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         source: PlayMediaSource,
         repeat_times: Option<u64>,
         start_pos_ms: Option<u64>,
-        done: Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<u64, CmdResult> {
+    ) -> Result<(u64, u64), CmdResult> {
         let Some((call_from, call_to)) = self.owned_call(client, call_id, |call| {
             (call.from_tag.clone(), call.to_tag.clone())
         }) else {
@@ -3230,20 +3226,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             resolve_toward_a(from_tag, &call_from, call_to.as_deref())
         };
+        let play_id = self.next_play_id();
         self.media.control(
             call_id,
             MediaControl::PlayAudio {
                 toward_a,
                 player: Box::new(player),
-                done,
+                play_id,
             },
         );
-        Ok(duration_ms)
+        Ok((duration_ms, play_id))
     }
 
-    /// Inject a prompt / announcement toward a leg ([`Command::PlayMedia`]) — the fire-and-forget
-    /// (`wait = false`) path, and the entry the NG front-end always takes. Returns on accept; a
-    /// blocking (`wait = true`) native play goes through [`Self::play_media_deferred`] instead.
+    /// Inject a prompt / announcement toward a leg ([`Command::PlayMedia`]). Answers immediately
+    /// (accept-on-start) with the playback's `play_id` and total `duration_ms`; the prompt's end is
+    /// reported asynchronously as an [`Event::PlayFinished`] carrying the same `play_id`. A controller
+    /// that wants to sequence a following action awaits that event's `Completed` reason. The NG
+    /// front-end takes this same entry and never consumes the event (fire-and-forget).
     async fn play_media(
         &self,
         client: ClientId,
@@ -3254,72 +3253,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         start_pos_ms: Option<u64>,
     ) -> CmdResult {
         match self
-            .start_play(
-                client,
-                call_id,
-                from_tag,
-                source,
-                repeat_times,
-                start_pos_ms,
-                None,
-            )
+            .start_play(client, call_id, from_tag, source, repeat_times, start_pos_ms)
             .await
         {
-            Ok(duration_ms) => CmdResult::Ok {
+            Ok((duration_ms, play_id)) => CmdResult::Ok {
                 sdp: None,
                 duration_ms: Some(duration_ms),
+                play_id: Some(play_id),
                 to_tag: None,
                 stats: None,
             },
             Err(error) => error,
-        }
-    }
-
-    /// The **blocking** `play_media` (`wait = true`): start the prompt with a completion waiter and
-    /// return [`Dispatched::Deferred`] so the control server answers the request only once the prompt
-    /// has drained — without stalling its per-connection request loop while the prompt plays. An early
-    /// failure (unknown call, promote rejected, bad WAV) answers immediately with [`Dispatched::Now`].
-    /// Takes the whole [`Command::PlayMedia`] so the server can hand off the blocking case wholesale.
-    pub async fn play_media_deferred(&self, client: ClientId, command: Command) -> Dispatched {
-        let Command::PlayMedia {
-            call_id,
-            from_tag,
-            source,
-            repeat_times,
-            start_pos_ms,
-            ..
-        } = command
-        else {
-            // Only ever called with a PlayMedia command; be defensive rather than panic.
-            return Dispatched::Now(error_result("play_media", &"expected a play_media command"));
-        };
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        match self
-            .start_play(
-                client,
-                &call_id,
-                &from_tag,
-                source,
-                repeat_times,
-                start_pos_ms,
-                Some(done_tx),
-            )
-            .await
-        {
-            Ok(duration_ms) => Dispatched::Deferred {
-                done: done_rx,
-                on_done: CmdResult::Ok {
-                    sdp: None,
-                    duration_ms: Some(duration_ms),
-                    to_tag: None,
-                    stats: None,
-                },
-            },
-            Err(error) => {
-                // Parity with `handle`: count a rejected control command.
-                self.metrics.record_control_error();
-                Dispatched::Now(error)
-            }
         }
     }
 
@@ -3589,6 +3533,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         CmdResult::Ok {
             sdp: Some(offer),
             duration_ms: None,
+            play_id: None,
             to_tag: Some(subscription_id),
             stats: None,
         }
@@ -4476,6 +4421,7 @@ fn ok_sdp(sdp: String, to_tag: Option<String>) -> CmdResult {
     CmdResult::Ok {
         sdp: Some(sdp),
         duration_ms: None,
+        play_id: None,
         to_tag,
         stats: None,
     }
@@ -4486,6 +4432,7 @@ fn ok_empty() -> CmdResult {
     CmdResult::Ok {
         sdp: None,
         duration_ms: None,
+        play_id: None,
         to_tag: None,
         stats: None,
     }
@@ -10139,10 +10086,13 @@ mod tests {
     async fn play_media_promotes_an_offer_only_call_and_plays_the_prompt() {
         // A UAS IVR offers but never answers (single-leg). A prompt must play on it *before* any echo,
         // so `play_media` promotes the offer-only relay into a processing MediaCall (the same promote
-        // `echo` uses) and injects the prompt toward the caller. A blocking (`wait = true`) play
-        // returns `Dispatched::Deferred`, its response held until the prompt drains.
+        // `echo` uses) and injects the prompt toward the caller. The play accepts immediately with a
+        // `play_id`, and a `PlayFinished{Completed}` carrying that id arrives when the prompt drains.
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
+        // Register the owner's event channel *before* the play so the promoted actor's PlayFinished
+        // has somewhere to land (the actor's event sink is the owning client's channel).
+        let events_rx = engine.register_client(CLIENT);
         tokio::spawn(run_redirect_dispatcher(
             engine.datapath().rx(),
             engine.bridge(),
@@ -10178,8 +10128,8 @@ mod tests {
         recorder.write_pcm(&[1000i16; 320]);
         let wav = recorder.into_wav();
 
-        let dispatched = engine
-            .play_media_deferred(
+        let accepted = engine
+            .handle(
                 CLIENT,
                 Command::PlayMedia {
                     call_id: "play-solo".into(),
@@ -10189,25 +10139,16 @@ mod tests {
                     start_pos_ms: None,
                     duration_ms: None,
                     to_tag: None,
-                    wait: true,
                 },
             )
             .await;
-        let done = match dispatched {
-            Dispatched::Deferred { done, on_done } => {
-                assert!(
-                    matches!(
-                        on_done,
-                        CmdResult::Ok {
-                            duration_ms: Some(40),
-                            ..
-                        }
-                    ),
-                    "blocking play reports the 40 ms prompt duration, got {on_done:?}"
-                );
-                done
-            }
-            Dispatched::Now(result) => panic!("blocking play must defer, got {result:?}"),
+        let play_id = match accepted {
+            CmdResult::Ok {
+                duration_ms: Some(40),
+                play_id: Some(id),
+                ..
+            } => id,
+            other => panic!("play accepts with a 40 ms duration and a play_id, got {other:?}"),
         };
         assert!(
             engine.media().is_transcoding_call("play-solo"),
@@ -10237,18 +10178,38 @@ mod tests {
             "prompt encoded in A's own codec (µ-law PT 0)"
         );
 
-        // The blocking play resolves once the prompt drains (a couple of ticks after the last frame).
-        timeout(Duration::from_secs(2), done)
-            .await
-            .expect("blocking play resolves within the prompt duration")
-            .expect("the completion waiter fired (prompt drained), not dropped");
+        // The prompt drains a couple of ticks after the last frame → PlayFinished{Completed} for our
+        // play_id. Skip any unrelated event (e.g. a periodic quality report) while waiting.
+        let mut finished = None;
+        for _ in 0..50u16 {
+            match timeout(Duration::from_millis(200), events_rx.recv_async()).await {
+                Ok(Ok(Event::PlayFinished {
+                    call_id,
+                    play_id: id,
+                    reason,
+                    played_ms,
+                    ..
+                })) => {
+                    assert_eq!(call_id, "play-solo");
+                    finished = Some((id, reason, played_ms));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        let (id, reason, played_ms) =
+            finished.expect("a PlayFinished event arrives when the prompt drains");
+        assert_eq!(id, play_id, "the completion carries the accept's play_id");
+        assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
+        assert_eq!(played_ms, Some(40), "the whole 40 ms prompt played");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_play_on_an_unknown_call_answers_immediately_with_an_error() {
+    async fn play_media_on_an_unknown_call_returns_an_error() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
-        let dispatched = engine
-            .play_media_deferred(
+        let result = engine
+            .handle(
                 CLIENT,
                 Command::PlayMedia {
                     call_id: "no-such-call".into(),
@@ -10258,13 +10219,12 @@ mod tests {
                     start_pos_ms: None,
                     duration_ms: None,
                     to_tag: None,
-                    wait: true,
                 },
             )
             .await;
         assert!(
-            matches!(dispatched, Dispatched::Now(CmdResult::Error { .. })),
-            "an unknown call fails now, not deferred"
+            matches!(result, CmdResult::Error { .. }),
+            "an unknown call fails on accept"
         );
     }
 
