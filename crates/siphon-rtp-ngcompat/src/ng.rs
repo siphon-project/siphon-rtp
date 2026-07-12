@@ -404,6 +404,9 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         // Noise suppression is a native siphon-rtp (JSON control) extension; the NG/bencode front-end
         // never requests it.
         noise_suppression: false,
+        // Echo cancellation is likewise a native siphon-rtp (JSON control) extension; the NG/bencode
+        // front-end never sets it.
+        echo_cancellation: false,
         // The WS bridge and its voice-AI turn-taking knobs are native siphon-rtp (JSON control)
         // extensions; the NG/bencode front-end never sets them.
         ws_uri: None,

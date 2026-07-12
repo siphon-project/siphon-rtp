@@ -77,6 +77,12 @@ tikv-jemalloc-ctl = { workspace = true }
 tokio = { workspace = true }
 siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.1.0" }
 siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
+# Construct a `MediaCall`'s two `DirectionConfig`s directly (codecs, MOS class) and build RTP fixtures
+# for the media-pipeline echo-cancellation zero-allocation soak (tests/media_aec_zero_alloc.rs).
+siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.1.0" }
+siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.1.0" }
+siphon-rtp-hep = { path = "../siphon-rtp-hep", version = "0.1.0" }
+bytes = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 proptest = { workspace = true }

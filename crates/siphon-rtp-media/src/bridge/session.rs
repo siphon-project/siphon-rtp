@@ -15,7 +15,7 @@ use crate::bridge::protocol::{
 };
 use crate::bridge::{l16_le_to_pcm, pcm_to_l16_le};
 use crate::leg::{MediaLeg, PcmFrame};
-use siphon_rtp_dsp::{EnergyVad, NoiseSuppressor};
+use siphon_rtp_dsp::{EchoCanceller, EnergyVad, NoiseSuppressor};
 
 /// Largest frame the scratch PCM buffer holds (48 kHz × 20 ms).
 const MAX_FRAME_SAMPLES: usize = 960;
@@ -56,6 +56,14 @@ pub struct BridgeSession {
     /// only, so the steady-state per-frame path never touches (or allocates) it; drained by the
     /// transport via [`BridgeSession::next_control`].
     pending_control: Vec<ControlMessage>,
+    /// Optional acoustic echo canceller for the **uplink** (call → server) PCM (the `echo_cancellation`
+    /// profile flag). Its far-end **reference** is the *downlink* frame played toward the call this
+    /// tick (server → call), so the phone's echo of the voice-AI audio is cancelled off the uplink
+    /// before the server hears it — otherwise the model would transcribe its own reflected speech.
+    /// Built at the leg's native rate (decode == encode rate on a bridge leg, so uplink and downlink
+    /// share it); `None` when the leg was stood up without the flag or its rate is unsupported.
+    /// Preallocated ⇒ its per-frame `cancel` does zero heap allocation.
+    echo_canceller: Option<EchoCanceller>,
 }
 
 impl BridgeSession {
@@ -83,6 +91,7 @@ impl BridgeSession {
             barge_in: false,
             speaking: false,
             pending_control: Vec::new(),
+            echo_canceller: None,
         }
     }
 
@@ -107,6 +116,19 @@ impl BridgeSession {
     pub fn with_vad(mut self, threshold: i64, hangover_frames: u32, barge_in: bool) -> Self {
         self.vad = Some(EnergyVad::new(threshold, hangover_frames));
         self.barge_in = barge_in;
+        self
+    }
+
+    /// Attach an echo canceller to the uplink (call → server) audio (the `echo_cancellation` profile
+    /// flag). Each tick the phone's decoded uplink is echo-cancelled in place against the downlink
+    /// frame the bridge is rendering toward the call (the far-end reference — the audio the phone plays
+    /// and its mic re-captures), after noise suppression and before it is framed as L16, so the
+    /// voice-AI server does not hear its own reflected speech. `None` leaves the uplink unchanged. The
+    /// canceller must be built for the leg's native rate so its frame length matches the per-tick frame
+    /// (no per-frame reallocation).
+    #[must_use]
+    pub fn with_echo_canceller(mut self, echo_canceller: Option<EchoCanceller>) -> Self {
+        self.echo_canceller = echo_canceller;
         self
     }
 
@@ -201,6 +223,12 @@ impl BridgeSession {
     pub fn tick(&mut self, uplink_out: &mut [u8], downlink_rtp_out: &mut [u8]) -> TickResult {
         let mut result = TickResult::default();
 
+        // The downlink frame this tick renders toward the call is also the echo canceller's far-end
+        // reference for the uplink (the audio the phone plays and its mic re-captures). Take it up front
+        // so the uplink can cancel against it; it is rendered to RTP below (unchanged when AEC is off).
+        // A barge-in below drops it along with the rest of the queue, so no bot audio plays that tick.
+        let mut downlink_frame = self.playout.pop_front();
+
         // Uplink: pop one PCM frame from the leg and frame it as little-endian L16.
         let mut pcm = [0i16; MAX_FRAME_SAMPLES];
         let frame_samples = self.leg.frame_samples().min(MAX_FRAME_SAMPLES);
@@ -218,6 +246,9 @@ impl BridgeSession {
                     // Silence → speech: local barge-in (flush queued playout, no round-trip) + notify.
                     if self.barge_in {
                         self.playout.clear();
+                        // Also drop the frame already taken this tick, so no bot audio plays on barge-in
+                        // (matching the pre-AEC order where the downlink was popped after this flush).
+                        downlink_frame = None;
                     }
                     self.pending_control
                         .push(ControlMessage::SpeechStarted(SpeechData {
@@ -237,11 +268,23 @@ impl BridgeSession {
             if let Some(suppressor) = self.noise_suppressor.as_mut() {
                 suppressor.process(&mut pcm[..written]);
             }
+            // Echo cancellation on the uplink, referenced against the downlink played this tick: the
+            // canceller's GCC-PHAT delay estimate aligns the reference to the returned echo, so the
+            // model does not hear its own speech reflected by the phone. A silent (absent) downlink
+            // yields a zero reference — nothing to cancel. In place, zero per-frame heap.
+            if let Some(echo_canceller) = self.echo_canceller.as_mut() {
+                let mut reference = [0i16; MAX_FRAME_SAMPLES];
+                if let Some(frame) = downlink_frame.as_ref() {
+                    let count = frame.len().min(written);
+                    reference[..count].copy_from_slice(&frame[..count]);
+                }
+                echo_canceller.cancel(&mut pcm[..written], &reference[..written]);
+            }
             result.uplink_bytes = pcm_to_l16_le(&pcm[..written], uplink_out);
         }
 
-        // Downlink: render one queued playout frame to the call.
-        if let Some(frame) = self.playout.pop_front() {
+        // Downlink: render the frame taken above to the call.
+        if let Some(frame) = downlink_frame {
             match self.leg.encode_rtp(&frame, downlink_rtp_out) {
                 Ok(len) => result.downlink_bytes = len,
                 Err(error) => tracing::debug!(%error, "bridge downlink encode failed"),
@@ -563,5 +606,112 @@ mod tests {
                 "no VAD configured must mean no turn signals"
             );
         }
+    }
+
+    /// Deterministic LCG (fixed seed) — reproducible white noise, never `rand` / the wall clock.
+    struct Lcg(u32);
+    impl Lcg {
+        fn next_bipolar(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (self.0 >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+        }
+    }
+
+    /// A µ-law session with the uplink echo canceller attached at 8 kHz — the engine's default backend
+    /// (MDF partitioned-block + GCC-PHAT delay estimation + two-path DTD).
+    fn ulaw_session_with_echo_canceller() -> BridgeSession {
+        let leg = MediaLeg::new(
+            Box::new(G711::ulaw()),
+            Box::new(G711::ulaw()),
+            JitterBuffer::new(1, 16),
+            0x5555_6666,
+            0,
+        );
+        BridgeSession::new(
+            leg,
+            MediaFormat::telephony_default(),
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        )
+        .with_echo_canceller(Some(
+            EchoCanceller::with_mdf_delay_estimation(8_000, 512, 1_024)
+                .expect("build 8k aec")
+                .with_two_path_dtd(),
+        ))
+    }
+
+    /// Mean per-sample energy of the converged uplink L16 tail when the phone's uplink is a *pure echo*
+    /// of the downlink the bridge plays toward it — the far-end reference. Each tick feeds the downlink
+    /// (server → call, L16 over WS) and the echo of it as the uplink RTP (call → server, µ-law), then
+    /// ticks; a canceller wired to the downlink reference must return far less energy than a plain leg.
+    fn converged_uplink_echo_energy(session: &mut BridgeSession) -> f64 {
+        const FRAMES: usize = 400;
+        const N: usize = 160; // 20 ms @ 8 kHz
+        const DELAY: usize = 16; // echo-path delay (samples), recovered by GCC-PHAT
+        const RIR: [f32; 5] = [0.20, 0.0, -0.10, 0.0, 0.05]; // fixed, ~12 dB ERL (Geigel-safe)
+        let mut rng = Lcg(0x0EC0_B00B);
+        let total = FRAMES * N;
+        // Committed white far-end (downlink) stream and its echo (the uplink the phone returns).
+        let far: Vec<i16> = (0..total)
+            .map(|_| (4000.0 * rng.next_bipolar()) as i16)
+            .collect();
+        let echo: Vec<i16> = (0..total)
+            .map(|i| {
+                let mut acc = 0.0f32;
+                for (k, &tap) in RIR.iter().enumerate() {
+                    if let Some(idx) = i.checked_sub(DELAY + k) {
+                        acc += tap * f32::from(far[idx]);
+                    }
+                }
+                acc.round().clamp(-32768.0, 32767.0) as i16
+            })
+            .collect();
+
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        let mut downlink_bytes = [0u8; 2 * N];
+        let (mut energy, mut samples) = (0.0f64, 0u64);
+        for frame in 0..FRAMES {
+            let window = frame * N..(frame + 1) * N;
+            // Downlink toward the phone (the far-end reference), as an L16-little-endian WS binary frame.
+            let downlink_len = pcm_to_l16_le(&far[window.clone()], &mut downlink_bytes);
+            session.on_ws_binary(&downlink_bytes[..downlink_len]);
+            // Uplink from the phone = the echo of that downlink, as a µ-law RTP packet.
+            session.on_rtp(&ulaw_packet_pcm(frame as u16, &echo[window]));
+
+            let result = session.tick(&mut uplink, &mut downlink);
+            if frame < FRAMES / 2 {
+                continue; // convergence lead-in (delay lock + MDF settle)
+            }
+            for chunk in uplink[..result.uplink_bytes].chunks_exact(2) {
+                let value = f64::from(i16::from_le_bytes([chunk[0], chunk[1]]));
+                energy += value * value;
+                samples += 1;
+            }
+        }
+        if samples == 0 {
+            0.0
+        } else {
+            energy / samples as f64
+        }
+    }
+
+    #[test]
+    fn echo_canceller_cancels_the_uplink_echo_on_the_bridge_datapath() {
+        // The canceller must actually run on the uplink using the downlink as its reference: the same
+        // echo-laden uplink comes out measurably quieter through a session with the canceller attached
+        // than through a plain one — proving the downlink→uplink reference is wired into `tick`.
+        let plain_energy = converged_uplink_echo_energy(&mut ulaw_session());
+        let cancelled_energy =
+            converged_uplink_echo_energy(&mut ulaw_session_with_echo_canceller());
+
+        assert!(plain_energy > 0.0, "plain uplink must carry the echo");
+        assert!(
+            cancelled_energy < 0.5 * plain_energy,
+            "uplink echo not cancelled: {cancelled_energy:.1} vs plain {plain_energy:.1} \
+             (canceller did not run on the bridge datapath)"
+        );
     }
 }

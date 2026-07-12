@@ -29,7 +29,7 @@ use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
-use siphon_rtp_dsp::NoiseSuppressor;
+use siphon_rtp_dsp::{EchoCanceller, NoiseSuppressor};
 use siphon_rtp_media::dtmf::{DtmfDetector, DtmfGenerator};
 use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::ingress::IngressStats;
@@ -53,6 +53,118 @@ const QUALITY_INTERVAL_TICKS: u64 = 250;
 const MAX_RTP: usize = 1500;
 /// Largest decoded PCM frame (48 kHz × 40 ms mono, a safe ceiling for any telephony frame).
 const MAX_PCM: usize = 1920;
+
+/// Echo-canceller adaptive-filter tail, in milliseconds at the near-end codec rate. 64 ms (512 taps
+/// @ 8 kHz / 1024 @ 16 kHz) spans the line/acoustic residual impulse-response *after* the GCC-PHAT
+/// estimator removes the bulk transport delay — the MDF partitioned-block backend covers it at
+/// O(N log N), so a generous tail is cheap.
+const AEC_TAIL_MILLIS: u32 = 64;
+/// GCC-PHAT bulk-delay search range, in milliseconds at the near-end codec rate. 128 ms (1024 samples
+/// @ 8 kHz / 2048 @ 16 kHz) covers the loudspeaker→microphone acoustic path plus the network/jitter
+/// round-trip between the reference the engine sent toward a party and the echo that returns on that
+/// party's uplink (a media-relay echo path is longer than a handset's, so search wide).
+const AEC_DELAY_SEARCH_MILLIS: u32 = 128;
+
+/// A preallocated FIFO of far-end **reference** PCM: the egress samples one direction produced toward
+/// its receiving party, buffered for the *opposite* direction's [`EchoCanceller`] to cancel that
+/// party's uplink echo against (the audio played toward a party is the reference for cancelling the
+/// echo of it on that party's send path — spec §"Reference/near-end plumbing"). One contiguous ring;
+/// bounded with drop-oldest, since a producer/consumer interleave skew must never grow it without
+/// limit and late reference audio is worthless (CLAUDE.md media-backpressure policy). Zero per-frame
+/// heap allocation: the buffer is preallocated and `push`/`read_into` are copy loops over it.
+struct EchoReference {
+    /// Contiguous ring storage (`capacity` samples), oldest sample at `head`.
+    buffer: Box<[i16]>,
+    /// Index of the oldest valid sample.
+    head: usize,
+    /// Number of valid samples currently buffered (`0..=capacity`).
+    length: usize,
+    /// The sample rate the buffered reference PCM is at — the producing direction's egress codec
+    /// rate, which (by the offer/answer model) equals the consuming direction's near-end rate.
+    sample_rate_hz: u32,
+}
+
+impl EchoReference {
+    /// A ring holding up to `capacity` reference samples at `sample_rate_hz`.
+    fn new(capacity: usize, sample_rate_hz: u32) -> Self {
+        Self {
+            buffer: vec![0i16; capacity].into_boxed_slice(),
+            head: 0,
+            length: 0,
+            sample_rate_hz,
+        }
+    }
+
+    /// Append `samples` to the ring, dropping the oldest samples first when the ring is full so the
+    /// **newest** reference is always retained (a stalled consumer must not pin stale far-end audio).
+    fn push(&mut self, samples: &[i16]) {
+        let capacity = self.buffer.len();
+        if capacity == 0 {
+            return;
+        }
+        for &sample in samples {
+            if self.length == capacity {
+                // Full: overwrite the oldest slot and advance `head` (drop-oldest, length unchanged).
+                self.buffer[self.head] = sample;
+                self.head = (self.head + 1) % capacity;
+            } else {
+                let tail = (self.head + self.length) % capacity;
+                self.buffer[tail] = sample;
+                self.length += 1;
+            }
+        }
+    }
+
+    /// Drain the oldest `min(out.len(), length)` samples into `out` (frame-synchronous with the
+    /// near-end frame the caller is cancelling), zero-padding any shortfall so `out` is fully valid.
+    /// Returns the number of real (non-padded) reference samples delivered.
+    fn read_into(&mut self, out: &mut [i16]) -> usize {
+        let capacity = self.buffer.len();
+        let take = out.len().min(self.length);
+        for slot in out[..take].iter_mut() {
+            *slot = self.buffer[self.head];
+            self.head = (self.head + 1) % capacity;
+        }
+        self.length -= take;
+        for slot in out[take..].iter_mut() {
+            *slot = 0;
+        }
+        take
+    }
+}
+
+/// Build the engine's default [`EchoCanceller`] for a leg at `sample_rate_hz` (the near-end / uplink
+/// codec rate), or `None` when the rate is one the canceller rejects (< 8 kHz or not a 50 Hz multiple,
+/// or an MDF tail past its cap) — the leg is then transcoded/bridged uncancelled rather than failing.
+///
+/// The backend is the **MDF partitioned-block frequency-domain** filter with automatic GCC-PHAT
+/// bulk-delay estimation and the two-path/NCC double-talk detector — the safe, robust default: the
+/// estimator recovers the unknown loudspeaker→mic + network round-trip delay, the MDF's per-block NCC
+/// keeps the filter from ever learning (and thus cancelling) the near-end talker, and it re-converges
+/// cleanly after a delay re-lock. (The time-domain delay-estimation two-path path in `siphon-rtp-dsp`
+/// does **not** re-converge after a re-lock — it sticks in double-talk once `copies > 0` because the
+/// realign resets the filters but not the two-path bootstrapping bypass, so it is deliberately not used
+/// here; that is an upstream `aec.rs` defect to fix separately.) The MDF adds a fixed ~16 ms block
+/// algorithmic latency the receiving jitter buffer absorbs; its per-frame cost is tens of µs, so it
+/// stays inline on the actor (no `spawn_blocking`). The residual-echo WOLA post-filter is left off (a
+/// further ~32 ms latency) as a future config knob. All state is preallocated ⇒ `cancel` allocates
+/// nothing on the hot path. Shared by the 2-party transcode path ([`Direction::new`]) and the WS
+/// voice-AI bridge so both cancel with the identical, single-sourced configuration.
+pub(crate) fn build_echo_canceller(sample_rate_hz: u32) -> Option<EchoCanceller> {
+    let tail_samples = (sample_rate_hz * AEC_TAIL_MILLIS / 1000).max(1) as usize;
+    let search_range = (sample_rate_hz * AEC_DELAY_SEARCH_MILLIS / 1000).max(1) as usize;
+    match EchoCanceller::with_mdf_delay_estimation(sample_rate_hz, tail_samples, search_range) {
+        Ok(canceller) => Some(canceller.with_two_path_dtd()),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                sample_rate_hz,
+                "echo cancellation requested but unsupported at the codec rate; leaving it uncancelled"
+            );
+            None
+        }
+    }
+}
 
 /// An RTP/RTCP datagram the pipeline wants to transmit: from `endpoint` toward `dst`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +224,21 @@ pub struct Direction {
     /// signal. `Some` only when the control requested it *and* the ingress rate is 8/16 kHz (built and
     /// rate-gated in `Direction::new`); introduces the suppressor's WOLA latency on this leg.
     noise_suppressor: Option<NoiseSuppressor>,
+    /// Acoustic/line echo canceller for **this direction's near-end** (the decoded ingress uplink),
+    /// applied post-decode / post-NS, pre-resample/pre-encode (in the ingress codec's native-rate
+    /// domain) when the leg enabled the `echo_cancellation` profile flag. Its far-end **reference** is
+    /// the *opposite* direction's [`Direction::echo_reference`] — the PCM the engine most recently sent
+    /// toward this party — handed in per packet by [`MediaCall::process`] (no `Arc<Mutex>` over leg
+    /// state, mirroring [`Direction::echo_into`]). `None` on a leg without the flag, or when the
+    /// ingress codec rate is one the canceller rejects (< 8 kHz or not a 50 Hz multiple), in which case
+    /// the audio is transcoded uncancelled. Preallocated ⇒ its per-frame `cancel` allocates nothing.
+    echo_canceller: Option<EchoCanceller>,
+    /// A preallocated ring of **this direction's** egress PCM toward its receiving party (captured in
+    /// [`Direction::emit_pcm`], at the egress codec rate), read frame-synchronously by the *opposite*
+    /// direction's [`Direction::echo_canceller`] as the far-end reference. Present iff the *opposite*
+    /// direction cancels (it needs this direction's egress as its reference); `None` otherwise, so emit
+    /// captures nothing.
+    echo_reference: Option<EchoReference>,
     egress_sequence: u16,
     egress_timestamp: u32,
     egress_ssrc: u32,
@@ -231,6 +358,17 @@ pub struct DirectionConfig {
     /// Request noise suppression on this direction's decoded ingress audio. Built and rate-gated (to
     /// 8/16 kHz) in `Direction::new`; inert on an unsupported ingress rate.
     pub noise_suppression: bool,
+    /// Cancel this direction's near-end (uplink) echo, referenced against the opposite direction's
+    /// egress toward the same party. Built at the ingress codec's native rate; a codec at a rate the
+    /// canceller rejects (< 8 kHz or not a 50 Hz multiple) transcodes uncancelled.
+    pub echo_cancellation: bool,
+    /// Produce this direction's egress a far-end **reference** ring for the *opposite* direction's
+    /// canceller. True exactly when the opposite direction cancels (it needs the audio this direction
+    /// sends toward its party as its reference). For a symmetric leg (both directions cancel) this
+    /// equals `echo_cancellation`; it is separate so a future asymmetric single-leg AEC — and the
+    /// integration tests — can drive one direction's canceller from the other's reference without the
+    /// reverse also cancelling.
+    pub produce_echo_reference: bool,
     /// The G.107 codec class of the **ingress** stream (what this direction decodes), for the MOS in
     /// the periodic [`Event::CallQuality`] this direction reports.
     pub ingress_mos_codec: siphon_rtp_hep::mos::Codec,
@@ -363,6 +501,25 @@ impl Direction {
         } else {
             None
         };
+        // Echo cancellation on this direction's near-end (the decoded uplink), referenced against the
+        // opposite direction's egress toward the same party (spec §"Reference/near-end plumbing"). Built
+        // at the ingress codec's native rate (what the decoder emits, so its 20 ms frame matches the
+        // decoded frame) — see [`build_echo_canceller`] for the backend/default rationale.
+        let echo_canceller = if config.echo_cancellation {
+            build_echo_canceller(ingress_rate)
+        } else {
+            None
+        };
+        // When the *opposite* direction cancels, this direction produces the far-end reference it reads:
+        // a preallocated ring of the egress PCM this direction sends toward its party (captured in
+        // `emit_pcm`, at the egress codec rate). Bounded (drop-oldest), and only present when the sibling
+        // cancels. Sized to a couple of the largest possible frames so a single decoded frame always
+        // fits, while an interleave/rate skew is bounded by drop-oldest.
+        let echo_reference = if config.produce_echo_reference {
+            Some(EchoReference::new(2 * MAX_PCM, egress_rate))
+        } else {
+            None
+        };
         // The egress frame the encoder consumes (and the repacketizer drains) is the encoder's own
         // `frame_samples` — sizing it here from the encoder guarantees the repacketizer always feeds
         // the encoder exactly one frame's worth. A ptime override reaches this via the egress
@@ -398,6 +555,8 @@ impl Direction {
             encoder: config.encoder,
             resampler,
             noise_suppressor,
+            echo_canceller,
+            echo_reference,
             egress_sequence: 0,
             egress_timestamp: 0,
             egress_ssrc: config.egress_ssrc,
@@ -442,8 +601,11 @@ impl Direction {
             decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             encoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             resampler: None,
-            // A relay-only leg forwards verbatim (never decodes), so there is nothing to suppress.
+            // A relay-only leg forwards verbatim (never decodes), so there is nothing to suppress or
+            // cancel, and it produces no reference for the opposite direction.
             noise_suppressor: None,
+            echo_canceller: None,
+            echo_reference: None,
             egress_sequence: 0,
             egress_timestamp: 0,
             egress_ssrc: 0,
@@ -638,6 +800,10 @@ impl Direction {
         data: &[u8],
         arrival_micros: u64,
         dtmf_meta: DtmfMeta<'_>,
+        // The far-end reference for this direction's echo canceller: the *opposite* direction's egress
+        // ring (the PCM the engine sent toward this party). Handed in by [`MediaCall::process`] so the
+        // cross-direction read needs no `Arc<Mutex>` over leg state. `None` when the leg has no AEC.
+        echo_reference: Option<&mut EchoReference>,
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
     ) {
@@ -769,6 +935,23 @@ impl Direction {
         if let Some(suppressor) = self.noise_suppressor.as_mut() {
             suppressor.process(&mut decoded[..samples]);
         }
+        // Post-decode / post-NS echo cancellation, in the ingress codec's native-rate domain (pre-
+        // resample, pre-encode). The far-end reference is the *opposite* direction's egress toward this
+        // party — the audio the engine sent this party, whose echo returns on this uplink — handed in as
+        // `echo_reference`. Reference and near-end share the party's negotiated codec rate by
+        // construction (offer/answer: a party sends and receives in one codec), so no rate alignment is
+        // needed; `cancel` echo-subtracts in place with zero per-frame heap. A partially-filled
+        // reference frame is zero-padded by `read_into` (a silent far-end ⇒ nothing to cancel).
+        if let (Some(canceller), Some(reference)) = (self.echo_canceller.as_mut(), echo_reference) {
+            debug_assert_eq!(
+                reference.sample_rate_hz,
+                canceller.sample_rate_hz(),
+                "far-end reference and near-end must share the party's codec rate"
+            );
+            let mut far_end = [0i16; MAX_PCM];
+            reference.read_into(&mut far_end[..samples]);
+            canceller.cancel(&mut decoded[..samples], &far_end[..samples]);
+        }
         let decoded = &decoded[..samples];
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.write_pcm(decoded);
@@ -861,6 +1044,13 @@ impl Direction {
     /// direction's egress sequence/timestamp. Shared by the transcode path ([`Direction::handle`])
     /// and the echo path ([`Direction::echo_into`]); `pcm` must already be at the egress codec's rate.
     fn emit_pcm(&mut self, pcm: &[i16], marker: bool, out: &mut Vec<Outbound>) {
+        // Capture the egress PCM as the far-end reference for the *opposite* direction's echo canceller
+        // (present iff that direction cancels): this is exactly what the engine sends toward this party,
+        // whose echo the reverse direction cancels off that party's uplink. Whatever the egress source
+        // — transcode, injected prompt, or echo-test reflect — it is what the party hears.
+        if let Some(reference) = self.echo_reference.as_mut() {
+            reference.push(pcm);
+        }
         let mut payload = [0u8; MAX_RTP];
         let Ok(payload_len) = self.encoder.encode(pcm, &mut payload) else {
             return;
@@ -1141,8 +1331,17 @@ impl MediaCall {
                 self.a_to_b
                     .echo_into(&mut self.b_to_a, &packet.data, meta, out, events);
             } else {
-                self.a_to_b
-                    .handle(&packet.data, packet.arrival, meta, out, events);
+                // Cancel A's uplink echo against what the engine last sent *toward* A — the `b_to_a`
+                // egress reference ring (§"Reference/near-end plumbing"). Disjoint field borrows
+                // (`a_to_b` receiver, `b_to_a` reference) hand it across with no lock, as `echo_into`.
+                self.a_to_b.handle(
+                    &packet.data,
+                    packet.arrival,
+                    meta,
+                    self.b_to_a.echo_reference.as_mut(),
+                    out,
+                    events,
+                );
                 // RFC 4867 §4.3.1: A's Codec Mode Request steers the mode of the stream sent *back* to
                 // A (the b_to_a egress encoder). No-op for a fixed-rate codec / no request.
                 if let Some(mode) = self.a_to_b.decoder.last_mode_request() {
@@ -1164,8 +1363,16 @@ impl MediaCall {
                 self.b_to_a
                     .echo_into(&mut self.a_to_b, &packet.data, meta, out, events);
             } else {
-                self.b_to_a
-                    .handle(&packet.data, packet.arrival, meta, out, events);
+                // Symmetric: cancel B's uplink echo against the `a_to_b` egress reference (what the
+                // engine last sent toward B).
+                self.b_to_a.handle(
+                    &packet.data,
+                    packet.arrival,
+                    meta,
+                    self.a_to_b.echo_reference.as_mut(),
+                    out,
+                    events,
+                );
                 // Symmetric: B's CMR steers the a_to_b egress encoder (the stream sent back to B).
                 if let Some(mode) = self.b_to_a.decoder.last_mode_request() {
                     self.a_to_b.encoder.request_mode(mode);
@@ -1857,6 +2064,8 @@ mod tests {
             telephone_event_out: Some(101),
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -1872,6 +2081,8 @@ mod tests {
             telephone_event_out: Some(101),
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new(
@@ -2069,6 +2280,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -2084,6 +2297,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new(
@@ -2243,6 +2458,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -2258,6 +2475,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new(
@@ -2432,6 +2651,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -2448,6 +2669,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new(
@@ -2506,6 +2729,8 @@ mod tests {
                 telephone_event_out: None,
                 recorder: None,
                 noise_suppression: false,
+                echo_cancellation: false,
+                produce_echo_reference: false,
                 ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
 
@@ -2591,6 +2816,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let a_rtcp = "127.0.0.2:5001";
@@ -2686,6 +2913,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
 
@@ -2753,6 +2982,8 @@ mod tests {
                 telephone_event_out: Some(101),
                 recorder: None,
                 noise_suppression: false,
+                echo_cancellation: false,
+                produce_echo_reference: false,
                 ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
         let mut call = MediaCall::new(
@@ -2838,6 +3069,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -2853,6 +3086,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new(
@@ -3264,6 +3499,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -3279,6 +3516,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new("c", "a", None, a_to_b, b_to_a, true, None);
@@ -3803,6 +4042,8 @@ mod tests {
             telephone_event_out: None,
             recorder: Some(WavRecorder::new(8000, 1)),
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -3818,6 +4059,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new(
@@ -3854,6 +4097,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
@@ -3869,6 +4114,8 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         MediaCall::new("ns-call", "a", None, a_to_b, b_to_a, false, None)
@@ -3916,7 +4163,11 @@ mod tests {
             for (index, frame) in frames.iter().enumerate() {
                 let mut out = Vec::new();
                 let mut events = Vec::new();
-                call.process(&rx(1, A_ADDR, l16_rtp(index as u16, frame)), &mut out, &mut events);
+                call.process(
+                    &rx(1, A_ADDR, l16_rtp(index as u16, frame)),
+                    &mut out,
+                    &mut events,
+                );
                 if index < 30 {
                     continue; // let the suppressor's noise floor and WOLA converge first
                 }
@@ -3926,7 +4177,9 @@ mod tests {
                     }
                     let packet = RtpPacket::parse(&datagram.data).expect("parse egress");
                     let mut pcm = [0i16; MAX_PCM];
-                    let count = decoder.decode(packet.payload, &mut pcm).expect("decode egress");
+                    let count = decoder
+                        .decode(packet.payload, &mut pcm)
+                        .expect("decode egress");
                     energy += pcm[..count]
                         .iter()
                         .map(|&sample| f64::from(sample) * f64::from(sample))
@@ -3943,6 +4196,159 @@ mod tests {
         assert!(
             on < 0.7 * off,
             "noise suppression must attenuate through the pipeline: on {on:.3e} vs off {off:.3e}"
+        );
+    }
+
+    /// An L16 ↔ L16 (lossless linear-PCM) transcoding call for the ERLE measurement. When `aec` is set,
+    /// **only the A→B direction cancels** (A's uplink echo), reading the B→A egress toward A as its
+    /// reference; the B→A direction merely *produces* that reference ring (it does not cancel). Driving
+    /// a single direction's canceller isolates the cross-direction reference path under test from the
+    /// artificial feedback a symmetric echo-only bench would create (in a real call the two references
+    /// are different, uncorrelated talkers). L16 makes the decode → re-encode round-trip bit-exact, so
+    /// the measured A→B egress is the canceller's true residual — no codec quantization masking the ERLE.
+    fn aec_l16_call(aec: bool) -> MediaCall {
+        let direction = |ingress: u64,
+                         src: &str,
+                         egress: u64,
+                         dst: &str,
+                         ssrc: u32,
+                         cancel: bool,
+                         produce: bool| DirectionConfig {
+            ingress_endpoint: endpoint(ingress),
+            accepted_source: SourceFilter::Exact(addr(src).ip()),
+            egress_endpoint: endpoint(egress),
+            egress_dst: addr(dst),
+            decoder: Box::new(L16::new(8000, 20)),
+            encoder: Box::new(L16::new(8000, 20)),
+            egress_ssrc: ssrc,
+            egress_payload_type: 11,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: cancel,
+            produce_echo_reference: produce,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+        };
+        MediaCall::new(
+            "aec-call",
+            "a",
+            Some("b".into()),
+            // A→B cancels A's uplink; B→A produces the reference toward A but does not cancel.
+            direction(1, A_ADDR, 2, B_ADDR, 0xB000_0003, aec, false),
+            direction(2, B_ADDR, 1, A_ADDR, 0xA000_0003, false, aec),
+            true,
+            None,
+        )
+    }
+
+    #[test]
+    fn echo_cancellation_reduces_uplink_echo_on_the_transcode_datapath() {
+        // End-to-end proof that the cross-direction reference is wired and the canceller runs on
+        // `MediaCall::process`. A committed white far-end stream F is what the engine sends toward A
+        // (party B forwards it, so the `b_to_a` egress toward A carries F, captured as A's far-end
+        // reference). Party A's uplink is a *pure echo* of F — F convolved with a fixed sparse RIR at a
+        // bulk delay, near-end talker silent — so the transcoded egress toward B is the residual echo.
+        // With echo cancellation enabled the residual must fall by a large ERLE margin versus an
+        // identical AEC-off call (whose egress is the echo unchanged, since L16 is lossless).
+        const FRAMES: usize = 500;
+        const FRAME: usize = 160; // 20 ms @ 8 kHz
+        const DELAY: usize = 24; // bulk echo-path delay (samples), recovered by GCC-PHAT / spanned by the tail
+                                 // A fixed, committed room/line impulse response: a few decaying taps (deterministic, no clock).
+                                 // Kept below ~0.5 total gain (ERL ≈ 12 dB, the hands-free norm) so the echo never trips the
+                                 // canceller's Geigel double-talk pre-screen — a louder-than-far echo would look like near-end.
+        const RIR: [f32; 7] = [0.20, 0.0, -0.10, 0.0, 0.05, 0.0, -0.025];
+
+        // Committed white far-end stream (LCG, fixed seed). White ⇒ the reverse direction cannot predict
+        // F from the (delayed, correlated-only-at-lag) residual, so the reference toward A stays clean.
+        let mut state = 0x0EC0_1234u32;
+        let mut noise = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / (1u32 << 23) as f32 - 1.0) * 6000.0
+        };
+        let total = FRAMES * FRAME;
+        let far: Vec<i16> = (0..total).map(|_| noise() as i16).collect();
+        // echo[i] = Σ_k RIR[k] · far[i − DELAY − k] (the near-end mic signal, near-end talker silent).
+        let echo: Vec<i16> = (0..total)
+            .map(|i| {
+                let mut acc = 0.0f32;
+                for (k, &tap) in RIR.iter().enumerate() {
+                    if let Some(idx) = i.checked_sub(DELAY + k) {
+                        acc += tap * f32::from(far[idx]);
+                    }
+                }
+                acc.round().clamp(-32768.0, 32767.0) as i16
+            })
+            .collect();
+
+        // Drive one call and return (Σ echo², Σ residual²) over the converged tail (second half).
+        let run = |aec: bool| -> (f64, f64) {
+            let mut call = aec_l16_call(aec);
+            let mut decoder = L16::new(8000, 20);
+            let mut out = Vec::new();
+            let mut events = Vec::new();
+            let (mut echo_energy, mut residual_energy) = (0.0f64, 0.0f64);
+            for frame in 0..FRAMES {
+                let window = frame * FRAME..(frame + 1) * FRAME;
+                // B forwards the clean far-end F[t] → `b_to_a` egress toward A carries it (the reference).
+                out.clear();
+                events.clear();
+                call.process(
+                    &rx(2, B_ADDR, l16_rtp(frame as u16, &far[window.clone()])),
+                    &mut out,
+                    &mut events,
+                );
+                // A's uplink = pure echo of F. `a_to_b` cancels it against `b_to_a`'s reference (F[t]).
+                out.clear();
+                events.clear();
+                call.process(
+                    &rx(1, A_ADDR, l16_rtp(frame as u16, &echo[window.clone()])),
+                    &mut out,
+                    &mut events,
+                );
+                if frame < FRAMES / 2 {
+                    continue; // convergence lead-in (delay lock + MDF settle)
+                }
+                for datagram in &out {
+                    if datagram.endpoint != endpoint(2) {
+                        continue; // only the a_to_b egress toward B is the residual
+                    }
+                    let Ok(packet) = RtpPacket::parse(&datagram.data) else {
+                        continue;
+                    };
+                    let mut pcm = [0i16; MAX_PCM];
+                    let Ok(count) = decoder.decode(packet.payload, &mut pcm) else {
+                        continue;
+                    };
+                    for &value in &pcm[..count] {
+                        residual_energy += f64::from(value) * f64::from(value);
+                    }
+                }
+                for &value in &echo[window] {
+                    echo_energy += f64::from(value) * f64::from(value);
+                }
+            }
+            (echo_energy, residual_energy)
+        };
+
+        let (echo_on, residual_on) = run(true);
+        let (echo_off, residual_off) = run(false);
+        // Sanity: the far-end really produced echo, and AEC-off forwards it essentially unchanged
+        // (L16 is lossless, so the egress echo energy ≈ the input echo energy).
+        assert!(
+            echo_on > 0.0 && residual_off > 0.0,
+            "the uplink must carry echo"
+        );
+        let erle_off = 10.0 * (echo_off / residual_off).log10();
+        let erle_on = 10.0 * (echo_on / residual_on).log10();
+        assert!(
+            erle_off.abs() < 1.0,
+            "AEC off must forward the echo unchanged (ERLE ≈ 0), got {erle_off:.1} dB"
+        );
+        assert!(
+            erle_on >= 20.0,
+            "echo cancellation did not run on the datapath: ERLE on {erle_on:.1} dB \
+             (off {erle_off:.1} dB); residual on {residual_on:.0} vs off {residual_off:.0}"
         );
     }
 }
