@@ -352,6 +352,19 @@ pub struct ProfileFlags {
     /// `record_call` does. A native siphon-rtp extension — the NG/bencode front-end does not set it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub noise_suppression: bool,
+    /// Apply acoustic/line echo cancellation (`siphon-rtp-dsp`'s `EchoCanceller`) to this leg's
+    /// **send** path, using the audio played *toward* that party as the far-end reference. On a
+    /// transcoding (or promoted same-codec) call the engine cancels each party's decoded uplink echo
+    /// in the near-end codec domain (pre-resample/re-encode) before it is forwarded to the peer, the
+    /// reference being the reverse direction's egress PCM (what the engine sent toward that party);
+    /// on a WebSocket voice-AI bridge it cancels the phone uplink toward the AI using the AI downlink
+    /// as the reference. The canceller runs at the codec's native rate — narrowband 8 kHz or wideband
+    /// 16 kHz (G.711, AMR-WB, G.722) — so a codec at another rate passes through uncancelled. Like
+    /// `noise_suppression`, setting it on a same-codec plaintext call promotes it from the in-kernel
+    /// relay to the userspace media pipeline (decode → cancel → re-encode). A native siphon-rtp
+    /// extension — the NG/bencode front-end does not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub echo_cancellation: bool,
     /// Attach this call's offerer (leg A) audio to an external WebSocket media server (the
     /// mod_audio_stream / voice-AI integration). When set on `offer`/`answer`, the engine dials this
     /// URI as a WebSocket client and bridges leg A's RTP to it (decode → L16 uplink, L16 downlink →
