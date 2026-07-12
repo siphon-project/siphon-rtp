@@ -1815,11 +1815,12 @@ impl EchoCanceller {
         // loud (low-ERL) echo, which would stall convergence — the NCC (a scale-independent ratio) is
         // the primary detector and does not.
         let bootstrapping = self.copies == 0;
-        let background_adapt = far_active && (bootstrapping || self.doubletalk_hold_frames == 0);
+        let mut background_adapt =
+            far_active && (bootstrapping || self.doubletalk_hold_frames == 0);
 
         // --- GCC-PHAT bulk-delay estimation on the *raw* near-end (before it is overwritten) ---
         // A newly committed alignment invalidates *both* filters (they were tuned to the old offset),
-        // so reset them and the copy state; the filters re-converge over the following frames.
+        // so reset them and the copy/DTD state; the filters re-converge over the following frames.
         let realign = self.delay_estimator.as_mut().and_then(|estimator| {
             estimator.observe(&near_end[..n], &reference[..n], background_adapt)
         });
@@ -1828,6 +1829,19 @@ impl EchoCanceller {
                 self.reference.set_bulk_delay(new_delay);
                 self.weights.iter_mut().for_each(|weight| *weight = 0.0);
                 self.foreground.iter_mut().for_each(|weight| *weight = 0.0);
+                // The re-aligned filters are unconverged again — reset the two-path bootstrap/DTD state
+                // (mirrors `MdfFilter::set_bulk_delay`). Without clearing `copies`, `bootstrapping` stays
+                // false, so on a loud echo the zeroed filter (`sum_echo_sq == 0` → `ρ = None`, never
+                // `confident_echo_only`) leaves the Geigel-driven freeze permanently armed and the
+                // background never re-adapts — a permanent double-talk deadlock. Clearing it re-opens the
+                // bootstrap bypass so the NCC re-converges.
+                self.copies = 0;
+                self.doubletalk_hold_frames = 0;
+                self.doubletalk_active = false;
+                self.last_correlation = None;
+                // Re-open this frame's adaptation gate off the reset (bootstrapping) state so the zeroed
+                // background starts re-converging immediately rather than one frame late.
+                background_adapt = far_active;
             }
         }
 
@@ -2962,6 +2976,64 @@ mod tests {
             copies_before,
             canceller.foreground_copies(),
             "no copy may happen during double-talk"
+        );
+    }
+
+    /// Regression: the two-path filter converges at the start-up `bulk_delay = 0` (the echo delay `D`
+    /// fits inside the tail) so `copies > 0` while the GCC-PHAT estimator is still accumulating; the
+    /// estimator's first lock (0 → `D`) then re-aligns the ring and zeroes both filters. If that re-lock
+    /// does not also clear the two-path bootstrap/DTD state, a *loud* echo keeps the Geigel-driven freeze
+    /// armed forever — the zeroed filter yields `sum_echo_sq == 0` → `ρ = None` → never
+    /// `confident_echo_only`, so `background_adapt` stays false and the filter deadlocks at ~0 dB ERLE.
+    /// With the reset the bootstrap re-opens and it re-converges. Uses a 3× RIR (ERL ≈ 8 dB) so the
+    /// single-talk echo peak (~0.8× the far peak) trips Geigel every frame — the exact deadlock trigger.
+    #[test]
+    fn two_path_reconverges_after_delay_relock() {
+        let frame = 160;
+        let tail = 192;
+        let search_range = 512;
+        // Echo delay small enough to be cancellable at the start-up `bulk_delay = 0` (D + RIR spread
+        // 110 < tail 192), so the filter converges *before* the estimator commits and moves the ring.
+        let delay = 40usize;
+        let frames = 260;
+        let rir_loud: Vec<f32> = build_rir(128).iter().map(|&c| c * 3.0).collect();
+        let mut canceller = EchoCanceller::with_delay_estimation(8_000, tail, search_range)
+            .expect("build")
+            .with_two_path_dtd();
+        let mut prng = SplitMix64::new(0xC0DE_1111);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir_loud, delay);
+
+        let mut copies_before_lock = 0u64;
+        let mut late_erle = f64::INFINITY;
+        for index in 0..frames {
+            // Capture the copy count just before the estimator's first lock, to prove the regression is
+            // armed (the filter had converged, `copies > 0`, at the moment the re-lock zeroed it).
+            if canceller.estimated_bulk_delay().is_none() {
+                copies_before_lock = canceller.foreground_copies();
+            }
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range.clone()]);
+            if index >= frames - 20 {
+                late_erle = late_erle.min(erle_db(&echo[range], &mic));
+            }
+        }
+
+        let estimated = canceller
+            .estimated_bulk_delay()
+            .expect("GCC-PHAT must lock the delay");
+        assert!(
+            estimated.abs_diff(delay) <= DELAY_RECOVERY_TOLERANCE,
+            "estimator must lock {delay} (got {estimated}) so the re-lock path is exercised"
+        );
+        assert!(
+            copies_before_lock > 0,
+            "regression not armed: the filter must have converged (copies > 0) before the first lock"
+        );
+        assert!(
+            late_erle >= 20.0,
+            "two-path deadlocked after the delay re-lock: late ERLE {late_erle:.1} dB < 20 dB"
         );
     }
 
