@@ -258,11 +258,18 @@ async fn play_media_emits_play_finished_completed_on_drain() {
 
     // A ~100 ms prompt (5 frames × 20 ms) accepts on start with its play_id and duration.
     let (play_id, duration_ms) = play_blob(&mut control, "ivr", 800).await;
-    assert_eq!(duration_ms, Some(100), "the accept reports the prompt duration");
+    assert_eq!(
+        duration_ms,
+        Some(100),
+        "the accept reports the prompt duration"
+    );
 
     // The completion arrives asynchronously once the prompt drains.
     let (finished_id, reason, played_ms) = next_play_finished(&mut control).await;
-    assert_eq!(finished_id, play_id, "PlayFinished carries the accept's play_id");
+    assert_eq!(
+        finished_id, play_id,
+        "PlayFinished carries the accept's play_id"
+    );
     assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
     assert_eq!(played_ms, Some(100), "the whole 100 ms prompt played");
 }
@@ -305,7 +312,10 @@ async fn second_play_supersedes_the_first_then_completes() {
 
     // The superseded first play is reported first (for its own id), then the second completes.
     let (superseded_id, superseded_reason, _) = next_play_finished(&mut control).await;
-    assert_eq!(superseded_id, first_id, "the first play is the one superseded");
+    assert_eq!(
+        superseded_id, first_id,
+        "the first play is the one superseded"
+    );
     assert_eq!(
         superseded_reason,
         siphon_rtp_proto::PlayEndReason::Superseded

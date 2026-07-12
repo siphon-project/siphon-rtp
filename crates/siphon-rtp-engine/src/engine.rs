@@ -3253,7 +3253,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         start_pos_ms: Option<u64>,
     ) -> CmdResult {
         match self
-            .start_play(client, call_id, from_tag, source, repeat_times, start_pos_ms)
+            .start_play(
+                client,
+                call_id,
+                from_tag,
+                source,
+                repeat_times,
+                start_pos_ms,
+            )
             .await
         {
             Ok((duration_ms, play_id)) => CmdResult::Ok {
