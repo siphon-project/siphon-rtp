@@ -22,6 +22,10 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories
+      - uses: dtolnay/rust-toolchain@stable
+      # cargo-deny installed pinned and run directly (not the cargo-deny-action, whose injected
+      # --log-level flag broke on the cargo-deny 0.19 CLI, which removed that global flag).
+      - name: Install cargo-deny (pinned)
+        run: cargo install cargo-deny --version 0.19.9 --locked
+      - name: Check advisories
+        run: cargo deny --all-features check advisories
