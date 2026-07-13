@@ -39,10 +39,17 @@ impl Control {
 
         let mut chunk = [0u8; 4096];
         loop {
-            if let Some((response, consumed)) =
-                frame::decode::<Response>(&self.buffer).expect("decode response")
+            // The control connection interleaves async server events (e.g. the `Event::CallSummary`
+            // pushed on teardown) with request responses, exactly as a real client sees. Decode each
+            // frame generically and skip any event, returning only the correlated response.
+            if let Some((value, consumed)) =
+                frame::decode::<serde_json::Value>(&self.buffer).expect("decode frame")
             {
                 self.buffer.drain(..consumed);
+                if value.get("event").is_some() {
+                    continue; // a server-initiated event, not our response
+                }
+                let response: Response = serde_json::from_value(value).expect("response shape");
                 assert_eq!(response.id, id, "response correlates to request");
                 return response.result;
             }
@@ -596,13 +603,27 @@ async fn media_timeout_event_is_pushed_over_the_control_connection() {
     engine.datapath().advance_clock(40);
     assert_eq!(engine.reap_idle(30).await, vec!["doomed".to_string()]);
 
-    // The engine pushes a MediaTimeout event down the same control connection.
-    let event = control.recv_event().await;
-    assert_eq!(
-        event,
-        Event::MediaTimeout {
-            call_id: "doomed".into(),
-            from_tag: "ft".into()
+    // Reaping pushes two events down the same control connection: the end-of-call `CallSummary` (CDR)
+    // and the `MediaTimeout` dead-path signal SIPhon already relies on. Both arrive; confirm each.
+    let mut got_summary = false;
+    let mut got_timeout = false;
+    for _ in 0..2 {
+        match control.recv_event().await {
+            Event::CallSummary {
+                call_id, reason, ..
+            } => {
+                assert_eq!(call_id, "doomed");
+                assert_eq!(reason, "media_timeout");
+                got_summary = true;
+            }
+            Event::MediaTimeout { call_id, from_tag } => {
+                assert_eq!(call_id, "doomed");
+                assert_eq!(from_tag, "ft");
+                got_timeout = true;
+            }
+            other => panic!("unexpected event pushed on reap: {other:?}"),
         }
-    );
+    }
+    assert!(got_summary, "the CallSummary CDR event was pushed");
+    assert!(got_timeout, "the MediaTimeout event was pushed");
 }

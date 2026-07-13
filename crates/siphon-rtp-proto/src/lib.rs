@@ -565,6 +565,55 @@ pub struct SessionStats {
     pub packets_lost: u64,
 }
 
+/// One leg's end-of-call figures in an [`Event::CallSummary`]: the datapath byte/packet counters,
+/// plus — when a userspace media actor measured it — the RFC 3550 reception quality and ITU-T G.107
+/// MOS. The quality fields are omitted (`None`) on a leg with no actor (a plain in-kernel relay) or one
+/// that never received media, so a consumer can tell "counters only" from "measured". `mos_basis` is
+/// `"full"` when the MOS includes the G.107 delay term (an RTT was measured), else `"loss+jitter"`.
+///
+/// (No `Eq`: the MOS / loss / jitter figures are `f64`. `PartialEq` still derives.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegSummary {
+    /// The leg's tag: the offerer's `from_tag` (near) or the answerer's `to_tag` (far).
+    pub tag: String,
+    /// The leg's negotiated audio codec name, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    pub packets_in: u64,
+    pub bytes_in: u64,
+    pub packets_out: u64,
+    pub bytes_out: u64,
+    /// Packets dropped on the engine's side of this leg (source-gate / latch / jitter overflow), not
+    /// network loss — see `packets_lost` for the RFC 3550 network-loss estimate.
+    pub packets_dropped: u64,
+    /// The inbound stream's SSRC (RFC 3550), when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssrc: Option<u32>,
+    /// Cumulative network packets lost on the inbound stream (RFC 3550 §6.4.1), when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packets_lost: Option<u32>,
+    /// Inbound network packet loss as a percentage, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_percent: Option<f64>,
+    /// Inbound interarrival jitter in milliseconds (RFC 3550 §6.4.1), when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter_ms: Option<f64>,
+    /// Engine↔peer round-trip time in milliseconds, when a reception report yielded one (absent on the
+    /// relay/transcode path without RTCP RTT — the MOS is then `loss+jitter`-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    /// Mean / lowest / highest ITU-T G.107 MOS across the call, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mos_average: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mos_min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mos_max: Option<f64>,
+    /// `"full"` (MOS includes the G.107 delay term) or `"loss+jitter"` — how the MOS was derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mos_basis: Option<String>,
+}
+
 /// How a [`Command::PlayMedia`] playback ended, carried by [`Event::PlayFinished`]. Only
 /// [`PlayEndReason::Completed`] means the prompt played out in full; the others resolve a controller's
 /// await as *not* completed (the prompt did not finish on its own).
@@ -654,6 +703,22 @@ pub enum Event {
         loss_percent: f64,
         /// Estimated MOS-CQE (ITU-T G.107), in `1.0..=4.5`.
         mos: f64,
+    },
+    /// End-of-call summary (CDR), emitted once when a call is torn down (controller `delete` or the
+    /// media-timeout reaper). Carries the per-leg byte/packet counters and, for a transcode/relay call
+    /// with a userspace media actor, the RFC 3550 loss/jitter and ITU-T G.107 MOS shape across the
+    /// call — the structured twin of the `siphon_rtp::cdr` log block, so SIPhon writes one merged CDR
+    /// (its SIP side plus this media side) without scraping logs. Additive: a consumer predating this
+    /// variant decodes it as [`Event::Unknown`] and ignores it.
+    CallSummary {
+        call_id: String,
+        /// Why the call ended: `"delete"` (controller teardown) or `"media_timeout"` (dead-path reap).
+        reason: String,
+        /// Call lifetime in milliseconds (logical-clock resolution, ~1 s granularity).
+        duration_ms: u64,
+        /// One entry per leg — index 0 is the near (offerer) leg, index 1 the far (answerer) leg.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        legs: Vec<LegSummary>,
     },
     /// Unknown / future event kind (forward-compat).
     #[serde(other)]
@@ -765,6 +830,71 @@ mod tests {
         assert_eq!(json["call_id"], "abc@host");
         assert_eq!(json["profile"]["transport_protocol"], "RTP/SAVP");
         assert_eq!(json["profile"]["ws_uri"], "ws://127.0.0.1:9001/stream");
+    }
+
+    #[test]
+    fn call_summary_event_roundtrip_and_wire_shape() {
+        let event = Event::CallSummary {
+            call_id: "abc@host".to_string(),
+            reason: "delete".to_string(),
+            duration_ms: 94_000,
+            legs: vec![
+                // A measured (transcode) leg carries the full quality set.
+                LegSummary {
+                    tag: "ft-a".to_string(),
+                    codec: Some("PCMA".to_string()),
+                    packets_in: 2720,
+                    bytes_in: 467_840,
+                    packets_out: 3469,
+                    bytes_out: 596_468,
+                    packets_dropped: 0,
+                    ssrc: Some(0x8a8b_25c0),
+                    packets_lost: Some(1),
+                    loss_percent: Some(0.04),
+                    jitter_ms: Some(0.8),
+                    rtt_ms: Some(37.8),
+                    mos_average: Some(4.30),
+                    mos_min: Some(4.21),
+                    mos_max: Some(4.40),
+                    mos_basis: Some("full".to_string()),
+                },
+                // A counters-only leg (no media actor) omits every quality field.
+                LegSummary {
+                    tag: "ft-b".to_string(),
+                    codec: None,
+                    packets_in: 0,
+                    bytes_in: 0,
+                    packets_out: 32,
+                    bytes_out: 5388,
+                    packets_dropped: 0,
+                    ssrc: None,
+                    packets_lost: None,
+                    loss_percent: None,
+                    jitter_ms: None,
+                    rtt_ms: None,
+                    mos_average: None,
+                    mos_min: None,
+                    mos_max: None,
+                    mos_basis: None,
+                },
+            ],
+        };
+        roundtrip(&event);
+
+        let json = serde_json::to_value(&event).expect("to_value");
+        assert_eq!(json["event"], "call_summary", "snake_case event tag");
+        assert_eq!(json["duration_ms"], 94_000);
+        assert_eq!(json["legs"][0]["mos_basis"], "full");
+        assert!(
+            json["legs"][1].get("mos_average").is_none(),
+            "a counters-only leg omits its quality fields on the wire"
+        );
+
+        // Forward-compat (the property that lets a not-yet-updated SIPhon tolerate this new event): an
+        // unrecognized event tag decodes to `Unknown` via `#[serde(other)]`, never a hard error.
+        let future: Event =
+            serde_json::from_str(r#"{"event":"some_future_kind","x":1}"#).expect("tolerated");
+        assert_eq!(future, Event::Unknown);
     }
 
     #[test]

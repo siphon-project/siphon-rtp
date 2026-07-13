@@ -32,8 +32,8 @@ use siphon_rtp_media::pcap::{self, CapturedPacket};
 use siphon_rtp_media::player::{PcmPlayer, WavSource};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
-    BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, PlayMediaSource,
-    ProfileFlags, SessionStats,
+    BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
+    PlayMediaSource, ProfileFlags, SessionStats,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
@@ -2377,6 +2377,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &call.far,
             &far_counters,
             quality.as_ref().map(|quality| &quality.b_to_a),
+        );
+
+        // Structured twin of the CDR for the SBC: SIPhon merges this per-leg media summary with its own
+        // SIP-side record into one CDR. Additive `Event::CallSummary` — a consumer predating the variant
+        // decodes it as `Event::Unknown` and ignores it. Same assembly as the log block above.
+        self.push_event(
+            call.owner,
+            Event::CallSummary {
+                call_id: call_id.to_string(),
+                reason: reason.to_string(),
+                duration_ms: duration_s.saturating_mul(1000),
+                legs: vec![
+                    leg_summary(
+                        &call.from_tag,
+                        call.near_codec.as_ref(),
+                        &near_counters,
+                        quality.as_ref().map(|quality| &quality.a_to_b),
+                    ),
+                    leg_summary(
+                        call.to_tag.as_deref().unwrap_or("-"),
+                        call.far_codec.as_ref(),
+                        &far_counters,
+                        quality.as_ref().map(|quality| &quality.b_to_a),
+                    ),
+                ],
+            },
         );
 
         // Free everything the call held (the steps `delete` and `reap_idle` previously duplicated).
@@ -5455,6 +5481,57 @@ fn format_optional_mos(mos: Option<f64>) -> String {
 fn format_call_offset(milliseconds: u64) -> String {
     let seconds = milliseconds / 1000;
     format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// Assemble one leg's [`LegSummary`] for [`Event::CallSummary`] from its datapath counters and, when a
+/// media actor measured it, its reception quality — the structured mirror of [`Engine::log_cdr_leg`].
+/// The quality half is filled only when a direction actually measured a stream (an SSRC or inbound
+/// packets); otherwise the leg is counters-only (an in-kernel relay, or a leg that never received).
+fn leg_summary(
+    tag: &str,
+    codec: Option<&CodecSpec>,
+    counters: &siphon_rtp_datapath::EndpointStats,
+    quality: Option<&DirectionQuality>,
+) -> LegSummary {
+    let mut summary = LegSummary {
+        tag: tag.to_string(),
+        codec: codec.map(|codec| codec.encoding_name.clone()),
+        packets_in: counters.packets_in,
+        bytes_in: counters.bytes_in,
+        packets_out: counters.packets_out,
+        bytes_out: counters.bytes_out,
+        packets_dropped: counters.packets_dropped,
+        ssrc: None,
+        packets_lost: None,
+        loss_percent: None,
+        jitter_ms: None,
+        rtt_ms: None,
+        mos_average: None,
+        mos_min: None,
+        mos_max: None,
+        mos_basis: None,
+    };
+    if let Some(quality) =
+        quality.filter(|quality| quality.ssrc.is_some() || quality.packets_received > 0)
+    {
+        summary.ssrc = quality.ssrc;
+        summary.packets_lost = Some(quality.packets_lost);
+        summary.loss_percent = Some(quality.loss_percent);
+        summary.jitter_ms = Some(quality.jitter_ms);
+        summary.rtt_ms = quality.rtt_ms;
+        summary.mos_average = quality.mos_average;
+        summary.mos_min = quality.mos_min;
+        summary.mos_max = quality.mos_max;
+        summary.mos_basis = Some(
+            if quality.rtt_ms.is_some() {
+                "full"
+            } else {
+                "loss+jitter"
+            }
+            .to_string(),
+        );
+    }
+    summary
 }
 
 fn command_name(command: &Command) -> &'static str {
@@ -8618,6 +8695,75 @@ mod tests {
             .await;
         assert!(matches!(deleted, CmdResult::Ok { .. }));
         assert!(!engine.media().is_media_call("cdr-1"), "call deregistered");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_call_emits_a_call_summary_event_for_the_cdr() {
+        // Teardown pushes an `Event::CallSummary` (the structured twin of the cdr log block) to the
+        // owner's event sink. A plain relay (both PCMU) has no media actor, so the summary is
+        // counters-only — the common case, and it proves the emit path without needing live media.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "sum-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "sum-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let deleted = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "sum-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+
+        let mut summary = None;
+        while let Ok(event) = events.try_recv() {
+            if let Event::CallSummary {
+                call_id,
+                reason,
+                legs,
+                ..
+            } = event
+            {
+                summary = Some((call_id, reason, legs));
+            }
+        }
+        let (call_id, reason, legs) = summary.expect("CallSummary emitted on delete");
+        assert_eq!(call_id, "sum-1");
+        assert_eq!(reason, "delete");
+        assert_eq!(legs.len(), 2, "near + far legs");
+        assert_eq!(legs[0].tag, "tag-a", "near leg is the offerer");
+        assert_eq!(legs[1].tag, "tag-b", "far leg is the answerer");
+        assert!(
+            legs[0].mos_average.is_none(),
+            "a plain relay has no media actor ⇒ counters-only, no MOS"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12730,13 +12876,31 @@ mod tests {
         engine.datapath().advance_clock(10);
         assert_eq!(engine.reap_idle(5).await, vec!["gone".to_string()]);
 
-        let event = events.try_recv().expect("a media-timeout event was pushed");
-        assert_eq!(
-            event,
-            Event::MediaTimeout {
-                call_id: "gone".into(),
-                from_tag: "ft".into()
+        // Reaping pushes two events to the owner: the end-of-call `CallSummary` (CDR) and the
+        // `MediaTimeout` dead-path signal SIPhon already relies on. Both must fire (additive).
+        let mut got_summary = false;
+        let mut got_timeout = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::CallSummary {
+                    call_id, reason, ..
+                } => {
+                    assert_eq!(call_id, "gone");
+                    assert_eq!(reason, "media_timeout");
+                    got_summary = true;
+                }
+                Event::MediaTimeout { call_id, from_tag } => {
+                    assert_eq!(call_id, "gone");
+                    assert_eq!(from_tag, "ft");
+                    got_timeout = true;
+                }
+                other => panic!("unexpected event pushed on reap: {other:?}"),
             }
+        }
+        assert!(got_timeout, "the media-timeout event is still pushed");
+        assert!(
+            got_summary,
+            "reaping also emits the end-of-call CallSummary"
         );
     }
 
