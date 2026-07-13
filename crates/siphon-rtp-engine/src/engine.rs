@@ -45,8 +45,8 @@ use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
 use crate::ice::{self, IceCredentials};
 use crate::interface::{Interface, InterfaceTable};
 use crate::media_pipeline::{
-    DirectionConfig, MediaCall, MediaControl, MediaRegistry, PcapCapture, RawTee, RelayConfig,
-    RtcpRelay,
+    DirectionConfig, DirectionQuality, FinalCallQuality, MediaCall, MediaControl, MediaRegistry,
+    PcapCapture, RawTee, RelayConfig, RtcpRelay,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement};
@@ -2317,35 +2317,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .remove_if(call_id, |_, call| call.owner == client)
         {
             Some((_, call)) => {
-                let endpoints: Vec<EndpointId> = call
-                    .near
-                    .endpoint_ids()
-                    .chain(call.far.endpoint_ids())
-                    .collect();
-                // Drop any SIPREC subscriptions (detach forks, abort drains, free subscriber ports),
-                // then any SRTP-bridge, media-pipeline, or WS-bridge flows (a no-op for a plain
-                // relay), then free the sockets. `media.deregister` aborts the call's actor and
-                // flushes any recording; `ws.deregister` aborts the bridge + drain tasks (closing the
-                // WS connection).
-                self.drop_subscriptions(call_id).await;
-                self.bridge.deregister(endpoints.iter().copied());
-                self.media.deregister(call_id);
-                self.ws.deregister(call_id);
-                for endpoint in endpoints {
-                    self.datapath.remove_endpoint(endpoint).await;
-                    self.endpoint_calls.remove(&endpoint);
-                }
-                self.release_client_call(call.owner);
-                // Media-plane lifecycle: a controller-driven teardown (normal hangup) — the closing
-                // line that pairs with "call created". `duration_s` is the logical-clock lifetime
-                // (~1 tick/second). The end-of-call quality summary rides the CDR, not this line.
-                tracing::info!(
-                    target: "siphon_rtp::media",
-                    call_id = %call_id,
-                    from_tag = %call.from_tag,
-                    duration_s = self.datapath.now_ticks().saturating_sub(call.created_tick),
-                    "call deleted"
-                );
+                // Emit the CDR and free everything the call held (shared with the media-timeout reaper).
+                self.finish_call(call_id, &call, "delete").await;
                 CmdResult::Ok {
                     sdp: None,
                     duration_ms: None,
@@ -2355,6 +2328,168 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
             None => unknown_call(call_id),
+        }
+    }
+
+    /// Shared call teardown for both the controller-driven [`Self::delete`] and the media-timeout
+    /// reaper ([`Self::reap_idle`]): emit the end-of-call CDR (target `siphon_rtp::cdr`) — the
+    /// datapath byte/packet counters plus the media actor's per-direction quality (RFC 3550 loss and
+    /// jitter with an ITU-T G.107 MOS) — then free every resource the call held (SIPREC subscriptions,
+    /// SRTP/media/WS pipelines, datapath endpoints, and the owner's session quota).
+    ///
+    /// `call` has already been removed from the registry by the caller, so this runs **exactly once**
+    /// per call; `reason` labels why it ended (`delete` / `media_timeout`). The quality half is
+    /// best-effort: a plain in-kernel relay has no media actor, and a slow/aborted actor times out
+    /// ([`CDR_QUALITY_TIMEOUT`]) — the CDR then carries the byte/packet counters only. Counters are
+    /// snapshotted, and the actor is queried, **before** the endpoints and actor are torn down below.
+    async fn finish_call(&self, call_id: &str, call: &Call, reason: &str) {
+        let near_counters = self.leg_counters(&call.near);
+        let far_counters = self.leg_counters(&call.far);
+        let quality = self.media.final_quality(call_id, CDR_QUALITY_TIMEOUT).await;
+        let duration_s = self.datapath.now_ticks().saturating_sub(call.created_tick);
+
+        tracing::info!(
+            target: "siphon_rtp::cdr",
+            call_id = %call_id,
+            reason,
+            duration_s,
+            pipeline = ?call.pipeline,
+            near_codec = call.near_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
+            far_codec = call.far_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
+            "call finished"
+        );
+        // The near leg is party A (offerer, `from_tag`); the stream it *sent* is measured by the media
+        // actor's `a_to_b` ingress. The far leg is party B (answerer, `to_tag`) ⇒ the `b_to_a` ingress.
+        self.log_cdr_leg(
+            call_id,
+            "near",
+            &call.from_tag,
+            &call.near,
+            &near_counters,
+            quality.as_ref().map(|quality: &FinalCallQuality| &quality.a_to_b),
+        );
+        self.log_cdr_leg(
+            call_id,
+            "far",
+            call.to_tag.as_deref().unwrap_or("-"),
+            &call.far,
+            &far_counters,
+            quality.as_ref().map(|quality| &quality.b_to_a),
+        );
+
+        // Free everything the call held (the steps `delete` and `reap_idle` previously duplicated).
+        let endpoints: Vec<EndpointId> = call
+            .near
+            .endpoint_ids()
+            .chain(call.far.endpoint_ids())
+            .collect();
+        self.drop_subscriptions(call_id).await;
+        self.bridge.deregister(endpoints.iter().copied());
+        self.media.deregister(call_id);
+        self.ws.deregister(call_id);
+        for endpoint in endpoints {
+            self.datapath.remove_endpoint(endpoint).await;
+            self.endpoint_calls.remove(&endpoint);
+        }
+        self.release_client_call(call.owner);
+    }
+
+    /// Sum the datapath byte/packet counters across every endpoint a leg owns (RTP + optional RTCP) —
+    /// the same aggregation [`Self::query`] does, for the CDR's per-leg `in/out` figures.
+    fn leg_counters(&self, leg: &Leg) -> siphon_rtp_datapath::EndpointStats {
+        let mut total = siphon_rtp_datapath::EndpointStats::default();
+        for endpoint in leg.endpoint_ids() {
+            let stats = self.datapath.stats(endpoint).unwrap_or_default();
+            total.packets_in += stats.packets_in;
+            total.packets_out += stats.packets_out;
+            total.bytes_in += stats.bytes_in;
+            total.bytes_out += stats.bytes_out;
+            total.packets_dropped += stats.packets_dropped;
+        }
+        total
+    }
+
+    /// Render one CDR leg line (target `siphon_rtp::cdr`): the datapath byte/packet counters, plus —
+    /// when the media actor reported quality for this direction — the RFC 3550 loss/jitter and the
+    /// G.107 MOS shape across the call. `rtt_ms` is `n/a` on the relay/transcode path (no measured
+    /// RTT), and `mos_basis` states whether the MOS includes the G.107 delay term (`full`) or is
+    /// loss/jitter-only (`loss+jitter`) — the honest marker, never a fabricated zero RTT.
+    fn log_cdr_leg(
+        &self,
+        call_id: &str,
+        leg: &str,
+        tag: &str,
+        endpoints: &Leg,
+        counters: &siphon_rtp_datapath::EndpointStats,
+        quality: Option<&DirectionQuality>,
+    ) {
+        let local = endpoints.rtp.local_addr;
+        let remote = endpoints
+            .remote_rtp
+            .map_or_else(|| "-".to_string(), |addr| addr.to_string());
+        match quality {
+            Some(quality) if quality.ssrc.is_some() || quality.packets_received > 0 => {
+                let ssrc = quality
+                    .ssrc
+                    .map_or_else(|| "-".to_string(), |ssrc| format!("{ssrc:08x}"));
+                let rtt_ms = quality
+                    .rtt_ms
+                    .map_or_else(|| "n/a".to_string(), |rtt| format!("{rtt:.1}"));
+                let mos_average = format_optional_mos(quality.mos_average);
+                let mos_min = format_optional_mos(quality.mos_min);
+                let mos_max = format_optional_mos(quality.mos_max);
+                let mos_min_at = format_call_offset(quality.mos_min_at_ms);
+                let mos_max_at = format_call_offset(quality.mos_max_at_ms);
+                let mos_basis = if quality.rtt_ms.is_some() {
+                    "full"
+                } else {
+                    "loss+jitter"
+                };
+                tracing::info!(
+                    target: "siphon_rtp::cdr",
+                    call_id = %call_id,
+                    leg,
+                    tag,
+                    local = %local,
+                    remote = %remote,
+                    packets_in = counters.packets_in,
+                    bytes_in = counters.bytes_in,
+                    packets_out = counters.packets_out,
+                    bytes_out = counters.bytes_out,
+                    packets_dropped = counters.packets_dropped,
+                    ssrc = %ssrc,
+                    lost = quality.packets_lost,
+                    loss_percent = quality.loss_percent,
+                    loss_percent_max = quality.loss_percent_max,
+                    jitter_ms = quality.jitter_ms,
+                    jitter_ms_max = quality.jitter_ms_max,
+                    rtt_ms = %rtt_ms,
+                    mos_avg = %mos_average,
+                    mos_min = %mos_min,
+                    mos_min_at = %mos_min_at,
+                    mos_max = %mos_max,
+                    mos_max_at = %mos_max_at,
+                    mos_basis,
+                    "leg"
+                );
+            }
+            _ => {
+                // Counters-only — a plain in-kernel relay (no media actor) or a leg that never received.
+                tracing::info!(
+                    target: "siphon_rtp::cdr",
+                    call_id = %call_id,
+                    leg,
+                    tag,
+                    local = %local,
+                    remote = %remote,
+                    packets_in = counters.packets_in,
+                    bytes_in = counters.bytes_in,
+                    packets_out = counters.packets_out,
+                    bytes_out = counters.bytes_out,
+                    packets_dropped = counters.packets_dropped,
+                    "leg"
+                );
+            }
         }
     }
 
@@ -4445,20 +4580,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut reaped = Vec::new();
         for call_id in stale {
             if let Some((_, call)) = self.calls.remove(&call_id) {
-                let endpoints: Vec<EndpointId> = call
-                    .near
-                    .endpoint_ids()
-                    .chain(call.far.endpoint_ids())
-                    .collect();
-                self.drop_subscriptions(&call_id).await;
-                self.bridge.deregister(endpoints.iter().copied());
-                self.media.deregister(&call_id);
-                self.ws.deregister(&call_id);
-                for endpoint in endpoints {
-                    self.datapath.remove_endpoint(endpoint).await;
-                    self.endpoint_calls.remove(&endpoint);
-                }
-                self.release_client_call(call.owner);
+                // Emit the CDR + free every resource the call held (shared with `delete`), then notify
+                // the owner it was reaped.
+                self.finish_call(&call_id, &call, "media_timeout").await;
                 self.push_event(
                     call.owner,
                     Event::MediaTimeout {
@@ -5314,6 +5438,21 @@ async fn run_pcap_recorder(
     } else {
         tracing::info!(path, "pcap recording finalized");
     }
+}
+
+/// The `delete`/reap grace window for the CDR quality query: a slow or already-aborted media actor
+/// must never stall call teardown, so beyond this the CDR is logged with the byte/packet counters only.
+const CDR_QUALITY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Format a MOS value to two decimals, or `-` when no sample was taken on the leg.
+fn format_optional_mos(mos: Option<f64>) -> String {
+    mos.map_or_else(|| "-".to_string(), |value| format!("{value:.2}"))
+}
+
+/// Render a call-relative millisecond offset as `M:SS` — rtpengine's "lowest MOS ... at 0:33" style.
+fn format_call_offset(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1000;
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 fn command_name(command: &Command) -> &'static str {
@@ -8377,6 +8516,106 @@ mod tests {
             !engine.media().is_media_call("xcode-1"),
             "media call deregistered"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_quality_reports_per_direction_ingress_stats_for_the_cdr() {
+        // A transcode call accumulates RFC 3550 reception stats per direction; the engine reads them
+        // back over the actor mailbox (`MediaControl::Report`) at teardown to build the CDR. Prove that
+        // round-trip: after A sends media, the actor's `a_to_b` snapshot shows the received packets and
+        // A's SSRC, while the silent `b_to_a` direction shows nothing.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "cdr-1".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "cdr-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+
+        // A sends three consecutive frames; awaiting each transcoded output guarantees the actor has
+        // processed (and counted) the ingress packet before the next.
+        const A_SSRC: u32 = 0x0A0A_0A0A;
+        for sequence in 0..3u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, A_SSRC, 0xFF), near_addr)
+                .await
+                .expect("a send");
+            let _ = recv(&phone_b).await;
+        }
+
+        let quality = engine
+            .media()
+            .final_quality("cdr-1", std::time::Duration::from_secs(1))
+            .await
+            .expect("the actor answers the quality query");
+        assert_eq!(
+            quality.a_to_b.ssrc,
+            Some(A_SSRC),
+            "A's stream SSRC is captured for the CDR"
+        );
+        assert!(
+            quality.a_to_b.packets_received >= 3,
+            "A's received frames are counted, got {}",
+            quality.a_to_b.packets_received
+        );
+        assert_eq!(
+            quality.b_to_a.packets_received, 0,
+            "B never sent ⇒ nothing received on the reverse direction"
+        );
+        // No ~5 s periodic quality tick elapses within the test, so no MOS sample is folded yet — the
+        // CDR then renders `mos_avg=-` for this leg (honest: nothing measured), not a fabricated value.
+        assert_eq!(
+            quality.a_to_b.mos_samples, 0,
+            "no periodic MOS sample within the test window"
+        );
+
+        // The query is non-destructive: the call still tears down cleanly afterwards.
+        let deleted = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "cdr-1".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+        assert!(!engine.media().is_media_call("cdr-1"), "call deregistered");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
