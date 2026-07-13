@@ -124,6 +124,7 @@ fn try_build_xdp_datapath(
         Some(IpAddr::V4(ip)) if is_routable_relay_v4(ip) => ip,
         _ => {
             tracing::warn!(
+                target: "siphon_rtp::datapath",
                 "XDP requested but --relay-bind-ip is not a routable IPv4 relay address; \
                  using UDP-loopback"
             );
@@ -135,6 +136,7 @@ fn try_build_xdp_datapath(
     // "not supported" signal, distinct from the per-interface attach failures handled below.
     if !siphon_rtp_xdp::xdp_supported() {
         tracing::warn!(
+            target: "siphon_rtp::datapath",
             interface,
             "XDP not supported on this host (load/attach probe failed); using UDP-loopback"
         );
@@ -147,7 +149,7 @@ fn try_build_xdp_datapath(
         let loader = match Loader::load(interface, mode) {
             Ok(loader) => loader,
             Err(error) => {
-                tracing::debug!(interface, ?mode, %error, "XDP attach failed; trying next mode");
+                tracing::debug!(target: "siphon_rtp::datapath", interface, ?mode, %error, "XDP attach failed; trying next mode");
                 continue;
             }
         };
@@ -160,6 +162,7 @@ fn try_build_xdp_datapath(
         ) {
             Ok(datapath) => {
                 tracing::info!(
+                    target: "siphon_rtp::datapath",
                     interface,
                     queue,
                     local_ip = %local_ip,
@@ -169,12 +172,13 @@ fn try_build_xdp_datapath(
                 return Some(datapath);
             }
             Err(error) => {
-                tracing::debug!(interface, ?mode, %error, "AF_XDP bind failed; trying next mode");
+                tracing::debug!(target: "siphon_rtp::datapath", interface, ?mode, %error, "AF_XDP bind failed; trying next mode");
             }
         }
     }
 
     tracing::warn!(
+        target: "siphon_rtp::datapath",
         interface,
         "XDP unavailable after native + SKB attempts; using UDP-loopback"
     );
