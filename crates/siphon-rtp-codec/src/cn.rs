@@ -92,6 +92,16 @@ impl Cn {
             *sample = (normalized * peak).clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
         }
     }
+
+    /// Fill the whole of `out` with flat comfort noise at `level` (`-dBov`, RFC 3389 §3.1), recording
+    /// `level` as the last seen. Unlike [`Decoder::decode`], the caller owns the frame size — for an
+    /// emitter that synthesizes idle comfort noise directly (e.g. a single-leg IVR leg's egress) at an
+    /// arbitrary frame length rather than replaying a received CN payload.
+    pub fn fill(&mut self, level: u8, out: &mut [i16]) {
+        self.last_level = level;
+        let count = out.len();
+        self.generate(level, out, count);
+    }
 }
 
 impl Decoder for Cn {
@@ -211,6 +221,33 @@ mod tests {
                 needed: FRAME,
                 have: 10
             })
+        );
+    }
+
+    #[test]
+    fn fill_generates_noise_at_the_requested_level_for_any_frame_size() {
+        // `fill` owns the frame length (not the codec's own `frame_samples`) — a single-leg emitter
+        // synthesizes idle comfort noise directly. The output is audible noise (not silence) whose RMS
+        // tracks the level, and `fill` records the level for a later `conceal`.
+        let mut codec = Cn::new(8000, 20);
+        let mut frame = [0i16; 240]; // 30 ms at 8 kHz — a size that is not the codec's 20 ms frame
+        codec.fill(40, &mut frame);
+        assert!(
+            frame.iter().any(|&s| s != 0),
+            "fill emits noise, not silence"
+        );
+        let measured = rms(&frame);
+        let expected = 32_768.0 * 10f64.powf(-40.0 / 20.0);
+        assert!(
+            (measured / expected) > 0.6 && (measured / expected) < 1.4,
+            "RMS {measured:.0} not within tolerance of expected {expected:.0}"
+        );
+        // The last level is recorded, so a following conceal keeps the noise at the same floor.
+        let mut concealed = [0i16; 160];
+        codec.conceal(&mut concealed).expect("conceal");
+        assert!(
+            concealed.iter().any(|&s| s != 0),
+            "conceal keeps noise at the filled level"
         );
     }
 

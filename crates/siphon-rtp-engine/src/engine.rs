@@ -145,6 +145,12 @@ struct Call {
     /// unusable private address (docs/security-and-nat.md §4 layer 2). `None` when the offer carried
     /// no `received-from`. (The answer's own `received-from` gates the far (B) leg directly.)
     offer_received_from: Option<std::net::IpAddr>,
+    /// The RFC 3389 comfort-noise payload type negotiated in a **single-leg** local answer
+    /// (`answer_local`), when the caller offered CN at the chosen codec's clock rate. Carried so the
+    /// promoted single-leg [`MediaCall`] emits real CN packets on it while idle instead of looping the
+    /// caller's audio back (self-echo); `None` ⇒ audio-encoded low-level comfort noise. Unused by
+    /// 2-leg calls.
+    comfort_noise_payload_type: Option<u8>,
 }
 
 /// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off
@@ -1283,6 +1289,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,
+                // A 2-party offer never idles a single leg on comfort noise.
+                comfort_noise_payload_type: None,
             },
         );
 
@@ -1460,6 +1468,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,
+                // Set below once the answered codec is known (a single-leg local answer negotiates CN
+                // at the chosen codec's clock rate); left `None` for the reject path.
+                comfort_noise_payload_type: None,
             },
         );
 
@@ -1496,16 +1507,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Narrow the answer's `m=audio` to the single chosen codec (+ telephone-event) on the already
         // far-advertised address (RFC 3264 §6.1 — the answer offers exactly one format back).
-        let answer_sdp =
+        let mut answer_sdp =
             sdp::force_answer_codec(&rewritten.sdp, &chosen, info.telephone_event_payload_type());
+
+        // When the caller offered RFC 3389 comfort noise at the chosen codec's clock rate, negotiate it
+        // back so the single-leg leg can send real CN packets during idle gaps (the caller renders
+        // them) rather than looping the caller's audio back (self-echo). No match ⇒ the idle egress
+        // falls back to audio-encoded low-level comfort noise on the chosen codec.
+        let comfort_noise_payload_type = info.comfort_noise_payload_type(chosen.clock_rate_hz);
+        if let Some(cn_pt) = comfort_noise_payload_type {
+            answer_sdp = sdp::add_comfort_noise(&answer_sdp, cn_pt, chosen.clock_rate_hz);
+        }
 
         // Engage the transcoder now (single-leg, no far side). After this answer the offerer sends the
         // chosen codec, so set `near_codec = chosen` *before* promoting: `promote_to_processing`'s
         // single-leg branch (far_codec == None) uses `near_codec` for both decode and encode, yielding
         // a processing pipeline that decodes the caller's chosen codec and re-encodes prompt/echo PCM
-        // back into it.
+        // back into it. The negotiated CN payload type rides along so the promote wires comfort-idle.
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.near_codec = Some(chosen.clone());
+            call.comfort_noise_payload_type = comfort_noise_payload_type;
         }
         if let Err(reason) = self
             .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
@@ -3135,6 +3156,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // (which already folded in any `received-from` at the original answer), so the raw
                 // hint is not needed on the restored node.
                 offer_received_from: None,
+                // Single-leg IVR calls are not part of the proven HA-restore set, and the CN PT is not
+                // carried in the snapshot; a restored single-leg leg degrades to audio-encoded comfort
+                // noise. 2-leg (relay/bridge/transcode) restores never use this.
+                comfort_noise_payload_type: None,
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
@@ -4157,6 +4182,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             caller_facing_endpoint,
             caller_signalled_rtp,
             offer_received_from,
+            comfort_noise_pt,
         )) = self.owned_call_internal(call_id, |call| {
             (
                 call.owner,
@@ -4176,6 +4202,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // single-leg source gate keys on and reflects back toward.
                 call.near.remote_rtp,
                 call.offer_received_from,
+                // The negotiated RFC 3389 CN egress payload type for a single-leg local answer (`None`
+                // for the echo/play promote paths and 2-leg calls). Wires the comfort-idle egress.
+                call.comfort_noise_payload_type,
             )
         })
         else {
@@ -4312,6 +4341,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             latch,
             None,
         );
+        // Single-leg local answer / IVR (`offer_only_restore.is_some()` is the single-leg discriminator
+        // — the 2-leg echo arm leaves it `None`): its idle egress is a continuous comfort-noise stream,
+        // never the caller's own audio looped back (self-echo). CN packets on the negotiated PT when
+        // the caller offered CN, else audio-encoded low-level noise. The `echo` verb still reflects.
+        let call = if offer_only_restore.is_some() {
+            call.with_comfort_idle(comfort_noise_pt)
+        } else {
+            call
+        };
         self.media
             .register(call, self.datapath.clone(), owner_events);
 
@@ -13379,6 +13417,52 @@ mod tests {
         let far = call.far_codec.as_ref().expect("far codec chosen");
         assert_eq!(far.encoding_name, "PCMA");
         assert_eq!(far.payload_type, 8);
+    }
+
+    #[tokio::test]
+    async fn answer_local_negotiates_offered_comfort_noise() {
+        // The offer carries RFC 3389 comfort noise (static PT 13). The single-leg answer negotiates it
+        // back (m-line + rtpmap) so the leg can send real CN during idle gaps instead of self-echo,
+        // and the CN PT is recorded on the call for the promoted media actor.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let offer = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 127.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 127.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 0 13 101\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=ptime:20\r\n",
+        );
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "al-cn".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer.into(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = ok_sdp_text(&result);
+        // The answer advertises the engine's own port, so match the format list, not the port.
+        assert!(
+            answer.contains("RTP/AVP 0 101 13"),
+            "CN (PT 13) negotiated in the answer format list: {answer}"
+        );
+        assert!(
+            answer.contains("a=rtpmap:13 CN/8000"),
+            "CN rtpmap advertised: {answer}"
+        );
+        let call = engine.calls.get("al-cn").expect("call present");
+        assert_eq!(
+            call.comfort_noise_payload_type,
+            Some(13),
+            "the negotiated CN PT is recorded for the comfort-idle egress"
+        );
     }
 
     #[cfg(not(feature = "amr"))]

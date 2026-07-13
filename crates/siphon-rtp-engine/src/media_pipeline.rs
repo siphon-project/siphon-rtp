@@ -26,6 +26,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
+use siphon_rtp_codec::cn::Cn;
 use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
@@ -47,6 +48,12 @@ pub const INJECT_TICK: std::time::Duration = std::time::Duration::from_millis(20
 /// How many [`INJECT_TICK`]s between periodic per-leg [`Event::CallQuality`] reports — 250 × 20 ms ≈
 /// 5 s, the same reporting cadence the conference actor uses for its quality events / RTCP SRs.
 const QUALITY_INTERVAL_TICKS: u64 = 250;
+
+/// The comfort-noise level (`-dBov`, RFC 3389 §3.1) a single-leg local-answer / IVR leg emits while
+/// idle — a low, plausible background floor so the caller hears "nothing to say" rather than dead air
+/// or its own audio looped back. Sent as the level byte of a CN packet when CN was negotiated, or as
+/// the target level of the audio-encoded fallback noise otherwise.
+const COMFORT_NOISE_LEVEL_DBOV: u8 = 60;
 
 /// Largest RTP packet the egress scratch buffers accommodate.
 const MAX_RTP: usize = 1500;
@@ -256,6 +263,21 @@ pub struct RawTee {
 /// A direction may run in **relay-only** mode (`relay_only`): it forwards the ingress RTP verbatim to
 /// the peer (no decode/encode), used when a plain passthrough call is promoted to userspace so a
 /// SIPREC raw tee can be added to it. In that mode the codec fields are unused (a no-op G.711 pair).
+/// Idle-egress comfort noise for a **single-leg** local-answer / IVR leg (RFC 3389). Such a leg faces
+/// the caller on *both* directions, so re-encoding the decoded ingress would loop the caller's own
+/// audio back to it (self-echo). Instead the playout tick fills the idle egress with a continuous
+/// comfort-noise stream: a 1-byte CN packet on the negotiated [`Self::cn_pt`] when the caller offered
+/// CN (its own generator renders it), else a low-level noise frame from [`Self::generator`] encoded in
+/// the leg's audio codec. Either way the egress sequence/timestamp advance continuously, so a
+/// following prompt hands over with no gap or clip. `Some` on a `Direction` marks it comfort-idle.
+struct ComfortNoise {
+    /// RFC 3389 CN egress payload type when the caller negotiated CN at the egress clock rate; `None`
+    /// ⇒ audio-encoded low-level noise on the leg's own audio codec.
+    cn_pt: Option<u8>,
+    /// Noise source for the audio-encoded fallback (and unused when `cn_pt` is `Some`).
+    generator: Cn,
+}
+
 pub struct Direction {
     /// The endpoint datagrams arrive on for this direction (the sending party's engine socket).
     ingress_endpoint: EndpointId,
@@ -344,6 +366,12 @@ pub struct Direction {
     /// An active prompt / DTMF injection on this egress direction (PlayMedia / PlayDtmf). While set,
     /// transcoded audio toward this party is suppressed and the injected media plays instead.
     injection: Option<Injection>,
+    /// Idle-egress comfort noise for a **single-leg** local-answer / IVR leg (`Some` only on that
+    /// leg's caller-facing egress — [`MediaCall::with_comfort_idle`]). When set, [`Direction::handle`]
+    /// must not loop the caller's own audio back (self-echo): it decodes for recording / DTMF but
+    /// emits nothing, and the playout tick fills the idle egress with comfort noise instead (see
+    /// [`ComfortNoise`]). A player injection overrides it; the `echo` verb reflects via `echo_into`.
+    comfort: Option<ComfortNoise>,
     /// SDES-SRTP on a **secure + transcoding** leg (BGCF/SBC: e.g. a secure AMR-WB access leg ↔ a
     /// plaintext G.711 PSTN leg). When the *ingress* faces the secure peer, `secure_ingress` decrypts
     /// each datagram (SRTP→RTP / SRTCP→RTCP) before decode; when the *egress* faces the secure peer,
@@ -781,6 +809,9 @@ impl Direction {
             dtmf_blocked: false,
             egress_sample_rate: egress_rate,
             injection: None,
+            // A comfort-idle single-leg egress is opted in after construction via `enable_comfort_idle`
+            // (offer-only local answer / IVR); a normal 2-party direction never idles on comfort noise.
+            comfort: None,
             secure_ingress: None,
             secure_egress: None,
             // The ingress interarrival jitter is measured at the ingress codec's RTP clock (RFC 3550
@@ -834,6 +865,9 @@ impl Direction {
             dtmf_blocked: false,
             egress_sample_rate: 0,
             injection: None,
+            // A relay-only direction forwards opaque payloads and never synthesizes egress, so it is
+            // never comfort-idle (that is only a decode/re-encode single-leg IVR).
+            comfort: None,
             secure_ingress: None,
             secure_egress: None,
             // A relay-only direction never builds a quality report (a promoted passthrough is spawned
@@ -986,6 +1020,88 @@ impl Direction {
         };
         let mut buffer = [0u8; MAX_RTP];
         if let Ok(total) = write_packet(&header, &payload[..payload_len], &mut buffer) {
+            self.push_egress(&buffer[..total], out);
+            self.egress_sequence = self.egress_sequence.wrapping_add(1);
+            self.egress_timestamp = self
+                .egress_timestamp
+                .wrapping_add(self.egress_timestamp_increment);
+        }
+    }
+
+    /// Mark this egress direction as a **single-leg** local-answer / IVR leg's comfort-idle egress
+    /// (RFC 3389): [`Direction::handle`] stops looping the caller's audio back, and the playout tick
+    /// fills the idle egress with comfort noise. `cn_pt` is the negotiated CN payload type when the
+    /// caller offered CN (a 1-byte CN packet is sent on it, which the caller's own generator renders),
+    /// else `None` for audio-encoded low-level noise on the leg's own codec. The fallback noise
+    /// generator runs at the egress codec's native sample rate.
+    fn enable_comfort_idle(&mut self, cn_pt: Option<u8>) {
+        self.comfort = Some(ComfortNoise {
+            cn_pt,
+            generator: Cn::new(self.egress_sample_rate, self.egress_ptime_ms() as u8),
+        });
+    }
+
+    /// One playout tick for this egress direction. An active injection (prompt / DTMF) advances first;
+    /// otherwise, on a comfort-idle single-leg leg (`comfort.is_some()`) with `comfort_enabled` (the
+    /// `echo` verb off) and not blocked, one comfort-noise frame is emitted so the caller hears a
+    /// continuous "nothing to say" stream, never its own audio or dead air. A normal 2-party direction
+    /// with no injection emits nothing. Returns the [`FinishedPlay`] a drained prompt reports.
+    fn tick_egress(
+        &mut self,
+        comfort_enabled: bool,
+        out: &mut Vec<Outbound>,
+    ) -> Option<FinishedPlay> {
+        if self.injection.is_some() {
+            return self.tick_injection(out);
+        }
+        if comfort_enabled && !self.blocked && self.comfort.is_some() {
+            self.emit_comfort(out);
+        }
+        None
+    }
+
+    /// Emit one idle comfort-noise egress frame (RFC 3389), advancing the egress sequence/timestamp so
+    /// the stream stays continuous and a following prompt hands over with no gap or clip. `silence_media`
+    /// (hold/mute) emits digital silence instead; otherwise a 1-byte CN packet on the negotiated PT
+    /// (the caller renders it) when CN was negotiated, else audio-encoded low-level noise on the codec.
+    fn emit_comfort(&mut self, out: &mut Vec<Outbound>) {
+        let frame = self.egress_frame_samples as usize;
+        // Hold/mute (silence_media): digital silence, still a continuous stream on the audio codec.
+        if self.silenced {
+            let mut pcm = [0i16; MAX_PCM];
+            pcm[..frame].fill(0);
+            self.emit_encoded(&pcm[..frame], out);
+            return;
+        }
+        let cn_pt = self.comfort.as_ref().and_then(|comfort| comfort.cn_pt);
+        if let Some(payload_type) = cn_pt {
+            self.emit_comfort_cn(payload_type, out);
+            return;
+        }
+        // CN was not negotiated: audio-encoded low-level noise on the leg's own codec.
+        let mut pcm = [0i16; MAX_PCM];
+        if let Some(comfort) = self.comfort.as_mut() {
+            comfort
+                .generator
+                .fill(COMFORT_NOISE_LEVEL_DBOV, &mut pcm[..frame]);
+        }
+        self.emit_encoded(&pcm[..frame], out);
+    }
+
+    /// Emit one RFC 3389 comfort-noise packet (a single `-dBov` level byte, §3.1) on the negotiated CN
+    /// payload type, sharing the egress stream's SSRC and advancing its sequence + timestamp — CN
+    /// interleaves in the audio SSRC / sequence / timestamp space (§2), so a following prompt continues
+    /// the same stream seamlessly. The caller's own generator renders the noise from the level byte.
+    fn emit_comfort_cn(&mut self, payload_type: u8, out: &mut Vec<Outbound>) {
+        let header = RtpHeader {
+            marker: false,
+            payload_type,
+            sequence: self.egress_sequence,
+            timestamp: self.egress_timestamp,
+            ssrc: self.egress_ssrc,
+        };
+        let mut buffer = [0u8; MAX_RTP];
+        if let Ok(total) = write_packet(&header, &[COMFORT_NOISE_LEVEL_DBOV], &mut buffer) {
             self.push_egress(&buffer[..total], out);
             self.egress_sequence = self.egress_sequence.wrapping_add(1);
             self.egress_timestamp = self
@@ -1205,7 +1321,10 @@ impl Direction {
             }
             // `block DTMF`: still detect + emit the event above (the controller sees the digit), but
             // do not relay it to the peer — the far side never hears the tone. v1 = drop mode.
-            if !self.dtmf_blocked {
+            // A comfort-idle single-leg leg (`comfort.is_some()`) also never relays: it faces the
+            // caller on both directions, so repacketizing the event onto this egress would echo the
+            // caller's own DTMF tone back to it. The `Event::Dtmf` above still fired.
+            if !self.dtmf_blocked && self.comfort.is_none() {
                 self.relay_telephone_event(&parsed, out);
             }
             return Some(stream_ssrc);
@@ -1257,6 +1376,16 @@ impl Direction {
         // or disconnected subscriber drops the frame inside the sink — it never stalls the transcode.
         for fork in &mut self.forks {
             fork.write_pcm(decoded);
+        }
+
+        // Single-leg local-answer / IVR leg (RFC 3264 §6.1 single m-line): both directions face the
+        // caller, so re-encoding the decoded ingress back out this egress would loop the caller's own
+        // audio to it (self-echo). The decode above still fed the recorder / SIPREC forks / DTMF
+        // detector / reception stats, and the stream still latches (`Some(stream_ssrc)`); the idle
+        // egress is a continuous comfort-noise stream driven by the playout tick instead (see
+        // `tick_egress`). A player overrides it; the `echo` verb reflects via `echo_into`.
+        if self.comfort.is_some() {
+            return Some(stream_ssrc);
         }
 
         let silence;
@@ -2057,13 +2186,17 @@ impl MediaCall {
         }
     }
 
-    /// Advance any active injections by one playout tick, emitting their egress packets. A prompt that
-    /// drains this tick appends its [`Event::PlayFinished`] (reason `Completed`) to `events`.
+    /// Advance one playout tick: emit any active injection's egress packet (a prompt that drains this
+    /// tick appends its [`Event::PlayFinished`] `Completed` to `events`), else — on a comfort-idle
+    /// single-leg leg — one continuous comfort-noise frame. Comfort is suppressed while the `echo` verb
+    /// reflects (`echo_into` already emits the reflected stream on the packet path; a second egress
+    /// stream on the same SSRC would collide), so the idle stream and the echo reflect never coexist.
     pub fn tick(&mut self, out: &mut Vec<Outbound>, events: &mut Vec<Event>) {
-        if let Some(finished) = self.a_to_b.tick_injection(out) {
+        let comfort_enabled = !self.echo;
+        if let Some(finished) = self.a_to_b.tick_egress(comfort_enabled, out) {
             events.push(self.play_finished_event(finished));
         }
-        if let Some(finished) = self.b_to_a.tick_injection(out) {
+        if let Some(finished) = self.b_to_a.tick_egress(comfort_enabled, out) {
             events.push(self.play_finished_event(finished));
         }
     }
@@ -2109,6 +2242,25 @@ impl MediaCall {
     #[must_use]
     pub fn has_injection(&self) -> bool {
         self.a_to_b.injection.is_some() || self.b_to_a.injection.is_some()
+    }
+
+    /// Whether the actor must run the playout tick this cycle: an active injection, or a comfort-idle
+    /// single-leg leg that is not currently reflecting (`echo` off) — the latter emits a continuous
+    /// comfort-noise stream, so the tick fires every cycle for the life of the leg.
+    #[must_use]
+    pub fn needs_egress_tick(&self) -> bool {
+        self.has_injection() || (!self.echo && self.a_to_b.comfort.is_some())
+    }
+
+    /// Mark this call as a **single-leg** local-answer / IVR call whose caller-facing egress idles on
+    /// comfort noise instead of looping the caller's audio back (self-echo). Only `a_to_b` faces the
+    /// caller — [`MediaCall::process`] runs the `a_to_b` branch for the shared endpoint and prompts
+    /// inject there (`toward_a = false`) — so comfort idles on `a_to_b`. `cn_pt` is the negotiated CN
+    /// egress payload type (`None` ⇒ audio-encoded low-level noise); see the `ComfortNoise` type.
+    #[must_use]
+    pub fn with_comfort_idle(mut self, cn_pt: Option<u8>) -> Self {
+        self.a_to_b.enable_comfort_idle(cn_pt);
+        self
     }
 
     /// Take the recorded WAV bytes for both directions (mixed into a 2-channel-ish concatenation is
@@ -2494,10 +2646,11 @@ async fn run_media_call<D>(
             }
             _ = ticker.tick() => {
                 elapsed_ms = elapsed_ms.saturating_add(INJECT_TICK.as_millis() as u64);
-                if call.has_injection() {
+                if call.needs_egress_tick() {
                     outbound.clear();
                     emitted.clear();
-                    // A prompt that drains this tick appends its `PlayFinished{Completed}`.
+                    // A prompt that drains this tick appends its `PlayFinished{Completed}`; a
+                    // comfort-idle single-leg leg emits its continuous comfort-noise frame.
                     call.tick(&mut outbound, &mut emitted);
                     send_all(&datapath, &mut outbound).await;
                     emit_events(&mut emitted, &events);
@@ -4153,6 +4306,235 @@ mod tests {
             other => panic!("expected DTMF, got {other:?}"),
         }
         assert!(out.is_empty(), "the DTMF tone itself is not echoed back");
+    }
+
+    /// Build a single-leg local-answer / IVR call: both directions face caller A on endpoint(1),
+    /// µ-law both sides, comfort-idle. `cn_pt` is the negotiated RFC 3389 CN egress payload type (as
+    /// `promote_to_processing`'s offer-only branch builds it), or `None` for the audio-noise fallback.
+    fn single_leg_call(cn_pt: Option<u8>) -> MediaCall {
+        let direction = || DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(1), // faces A — both directions do (single leg)
+            egress_dst: addr(A_ADDR),
+            decoder: Box::new(G711::ulaw()),
+            encoder: Box::new(G711::ulaw()),
+            egress_ssrc: 0xA000_0001,
+            egress_payload_type: 0,
+            telephone_event_in: Some(101),
+            telephone_event_out: Some(101),
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+        };
+        MediaCall::new("ivr", "tag-a", None, direction(), direction(), true, None)
+            .with_comfort_idle(cn_pt)
+    }
+
+    #[test]
+    fn single_leg_handle_does_not_loop_caller_audio_back() {
+        // The core fix: a single-leg local answer must never re-encode the caller's decoded ingress
+        // back out the caller-facing egress (self-echo). `process` emits nothing from `handle`.
+        let mut call = single_leg_call(None);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(1, 0xFF)), &mut out, &mut events);
+        assert!(
+            out.is_empty(),
+            "single-leg handle must not loop the caller's own audio back"
+        );
+        // The stream still latched (a following comfort tick / prompt targets the observed source).
+        assert!(
+            call.needs_egress_tick(),
+            "single-leg call idles on the playout tick"
+        );
+    }
+
+    #[test]
+    fn single_leg_idle_tick_emits_audio_comfort_noise_when_cn_not_negotiated() {
+        // CN not offered ⇒ audio-encoded low-level noise on the leg's own codec (µ-law PT 0), not the
+        // constant byte of encoded digital silence, and never the caller's looped audio.
+        let mut call = single_leg_call(None);
+        let mut out = Vec::new();
+        call.tick(&mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1, "one comfort-noise packet per idle tick");
+        assert_eq!(out[0].endpoint, endpoint(1), "toward the caller");
+        assert_eq!(out[0].dst, addr(A_ADDR));
+        let (first_seq, first_ts) = {
+            let first = RtpPacket::parse(&out[0].data).expect("parse");
+            assert_eq!(
+                first.payload_type, 0,
+                "audio codec (µ-law), CN not negotiated"
+            );
+            assert_eq!(first.payload.len(), 160, "a full 20 ms G.711 frame");
+            assert!(
+                !first.payload.iter().all(|&byte| byte == first.payload[0]),
+                "comfort noise varies — not the constant byte of encoded silence"
+            );
+            (first.sequence, first.timestamp)
+        };
+        // A second tick continues the stream with the sequence/timestamp advancing (continuous).
+        out.clear();
+        call.tick(&mut out, &mut Vec::new());
+        let second = RtpPacket::parse(&out[0].data).expect("parse");
+        assert_eq!(second.sequence, first_seq.wrapping_add(1), "seq +1");
+        assert_eq!(
+            second.timestamp,
+            first_ts.wrapping_add(160),
+            "ts advances one 8 kHz/20 ms frame"
+        );
+    }
+
+    #[test]
+    fn single_leg_idle_tick_emits_cn_packet_when_negotiated() {
+        // CN negotiated (PT 13) ⇒ a 1-byte RFC 3389 CN packet on that PT, sharing the egress SSRC and
+        // advancing seq/ts so a following prompt hands over seamlessly.
+        let mut call = single_leg_call(Some(13));
+        let mut out = Vec::new();
+        call.tick(&mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1, "one CN packet per idle tick");
+        let (first_seq, first_ts) = {
+            let first = RtpPacket::parse(&out[0].data).expect("parse");
+            assert_eq!(first.payload_type, 13, "RFC 3389 CN payload type");
+            assert_eq!(
+                first.payload.len(),
+                1,
+                "a single -dBov level byte (RFC 3389 §3.1)"
+            );
+            assert_eq!(first.ssrc, 0xA000_0001, "shares the egress SSRC");
+            (first.sequence, first.timestamp)
+        };
+        out.clear();
+        call.tick(&mut out, &mut Vec::new());
+        let second = RtpPacket::parse(&out[0].data).expect("parse");
+        assert_eq!(second.sequence, first_seq.wrapping_add(1), "seq +1");
+        assert_eq!(second.timestamp, first_ts.wrapping_add(160), "ts +160");
+    }
+
+    #[test]
+    fn single_leg_silenced_tick_emits_digital_silence() {
+        // `silence_media` (hold/mute) still works on a comfort-idle leg: digital silence (a constant
+        // µ-law byte), not comfort noise and not a CN packet.
+        let mut call = single_leg_call(Some(13));
+        call.set_silenced(true);
+        let mut out = Vec::new();
+        call.tick(&mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1, "silence still emits a continuous stream");
+        let packet = RtpPacket::parse(&out[0].data).expect("parse");
+        assert_eq!(
+            packet.payload_type, 0,
+            "digital silence rides the audio codec"
+        );
+        assert_eq!(packet.payload.len(), 160);
+        assert!(
+            packet.payload.iter().all(|&byte| byte == packet.payload[0]),
+            "encoded digital silence is a constant byte"
+        );
+    }
+
+    #[test]
+    fn single_leg_player_overrides_comfort_then_resumes() {
+        // A prompt overrides the comfort idle; after it drains, comfort resumes — with no self-echo
+        // under or after the prompt.
+        let mut call = single_leg_call(None);
+        // toward_a = false injects on a_to_b (the caller-facing direction), as `start_play` does for a
+        // single-leg call.
+        call.start_play_audio(false, prompt_player(1), 7, &mut Vec::new());
+        assert!(call.has_injection(), "the prompt is active");
+        let mut out = Vec::new();
+        call.tick(&mut out, &mut Vec::new());
+        // The injection is checked before comfort, so the tick emits exactly the prompt frame (not the
+        // prompt *and* a comfort frame). The prompt is a constant 2000-tone → a constant µ-law byte.
+        assert_eq!(
+            out.len(),
+            1,
+            "one packet — the prompt, not prompt + comfort"
+        );
+        assert_eq!(
+            RtpPacket::parse(&out[0].data).expect("parse").payload_type,
+            0,
+            "the prompt plays in the leg's codec"
+        );
+        // Next tick drains the 1-frame prompt (Completed); the tick after resumes comfort noise.
+        out.clear();
+        let mut events = Vec::new();
+        call.tick(&mut out, &mut events);
+        assert_eq!(expect_one_play_finished(&events).0, 7, "prompt completes");
+        assert!(!call.has_injection(), "injection cleared");
+        out.clear();
+        call.tick(&mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1, "comfort resumes after the prompt");
+        let resumed = RtpPacket::parse(&out[0].data).expect("parse");
+        assert!(
+            !resumed
+                .payload
+                .iter()
+                .all(|&byte| byte == resumed.payload[0]),
+            "resumed egress is comfort noise (varies), not a stuck prompt or silence"
+        );
+    }
+
+    #[test]
+    fn single_leg_echo_reflects_and_suppresses_comfort() {
+        // The `echo` verb opts into the reflect: `process` loops the caller's audio back (as today),
+        // and the idle tick emits no comfort (the two would collide on one SSRC). Disabling echo
+        // returns to comfort-idle.
+        let mut call = single_leg_call(None);
+        call.set_echo(true);
+        assert!(
+            !call.needs_egress_tick(),
+            "no comfort tick while echo reflects"
+        );
+        let mut out = Vec::new();
+        call.process(&rx(1, A_ADDR, ulaw_rtp(9, 0xFF)), &mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1, "echo reflects the caller's audio");
+        assert_eq!(
+            RtpPacket::parse(&out[0].data).expect("parse").payload,
+            &[0xFFu8; 160][..],
+            "reflected in the caller's own codec (µ-law idempotent)"
+        );
+        // A tick emits nothing while echo is on.
+        out.clear();
+        call.tick(&mut out, &mut Vec::new());
+        assert!(out.is_empty(), "comfort suppressed during echo");
+        // Disable echo → comfort resumes, and process no longer reflects.
+        call.set_echo(false);
+        assert!(call.needs_egress_tick(), "comfort resumes when echo is off");
+        out.clear();
+        call.tick(&mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1, "comfort noise flows again");
+    }
+
+    #[test]
+    fn single_leg_detects_dtmf_without_echoing_the_tone() {
+        // DTMF is still detected on ingress (the SBC collects digits), but the tone is not relayed
+        // back to the caller (that would be a self-echo of the caller's own DTMF).
+        let mut call = single_leg_call(None);
+        let event_payload = [5u8, 0x80 | 10, 0x03, 0x20]; // event 5, End bit, 800-sample duration
+        let header = RtpHeader {
+            marker: true,
+            payload_type: 101,
+            sequence: 1,
+            timestamp: 16000,
+            ssrc: 0x1111_2222,
+        };
+        let mut buffer = vec![0u8; 16];
+        let len = write_packet(&header, &event_payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        call.process(&rx(1, A_ADDR, buffer), &mut out, &mut events);
+        assert_eq!(events.len(), 1, "DTMF detected on ingress");
+        match &events[0] {
+            Event::Dtmf { digit, .. } => assert_eq!(digit, "5"),
+            other => panic!("expected DTMF, got {other:?}"),
+        }
+        assert!(
+            out.is_empty(),
+            "the caller's own DTMF tone is not echoed back"
+        );
     }
 
     #[test]

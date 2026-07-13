@@ -209,6 +209,33 @@ async fn offer_ivr(control: &mut Control, call_id: &str) -> UdpSocket {
     phone_a
 }
 
+/// Offer a single-leg local answer (`answer_local`) for `call_id` carrying PCMU + RFC 3389 comfort
+/// noise (static PT 13) + telephone-event, and return the caller phone socket (kept alive by the
+/// caller). The engine answers itself (UAS) and promotes the leg — its idle egress is comfort noise.
+async fn answer_local_ivr(control: &mut Control, call_id: &str) -> UdpSocket {
+    let (phone_a, addr_a) = phone().await;
+    let offer = format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0 13 101\r\na=rtpmap:0 PCMU/8000\r\n\
+         a=rtpmap:101 telephone-event/8000\r\n",
+        ip = addr_a.ip(),
+        port = addr_a.port()
+    );
+    let result = control
+        .request(Command::AnswerLocal {
+            call_id: call_id.into(),
+            from_tag: "tag-a".into(),
+            sdp: offer,
+            profile: Default::default(),
+        })
+        .await;
+    assert!(
+        matches!(result, CmdResult::Ok { .. }),
+        "answer_local accepted: {result:?}"
+    );
+    phone_a
+}
+
 /// Await the next [`Event::PlayFinished`] on `control`, skipping any unrelated event. Returns
 /// `(play_id, reason, played_ms)`.
 async fn next_play_finished(
@@ -331,6 +358,41 @@ async fn second_play_supersedes_the_first_then_completes() {
     let (completed_id, completed_reason, _) = next_play_finished(&mut control).await;
     assert_eq!(completed_id, second_id, "the second play then completes");
     assert_eq!(completed_reason, siphon_rtp_proto::PlayEndReason::Completed);
+}
+
+/// A local answer idles on comfort noise, not self-echo: with **no play and no echo**, the caller
+/// receives a continuous RFC 3389 CN stream (the PT it negotiated), never its own audio looped back.
+/// Drives the whole chain end to end — answer_local → CN negotiation → promote → with_comfort_idle →
+/// the actor's playout tick → CN egress toward the caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answer_local_idles_on_comfort_noise_not_self_echo() {
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let phone_a = answer_local_ivr(&mut control, "ivr-cn").await;
+
+    // No play, no echo: the engine's playout tick already sends comfort noise toward the caller's
+    // signalled address. Read two packets and prove they are a continuous CN stream (not looped audio).
+    let (first, _) = recv(&phone_a).await;
+    let (second, _) = recv(&phone_a).await;
+    for packet in [&first, &second] {
+        assert_eq!(
+            packet[1] & 0x7f,
+            13,
+            "RFC 3389 comfort-noise payload type (PT 13): {packet:?}"
+        );
+        assert_eq!(
+            packet.len(),
+            13,
+            "12-byte RTP header + a single -dBov level byte"
+        );
+    }
+    let seq0 = u16::from_be_bytes([first[2], first[3]]);
+    let seq1 = u16::from_be_bytes([second[2], second[3]]);
+    assert_eq!(
+        seq1,
+        seq0.wrapping_add(1),
+        "the comfort stream is continuous (sequence advances)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -208,6 +208,29 @@ impl MediaInfo {
             .map(|map| map.payload_type)
     }
 
+    /// The RFC 3389 comfort-noise (`CN`) payload type offered on this stream at `clock_rate_hz`, if
+    /// any — so a single-leg local answer can send comfort noise the caller renders during idle gaps.
+    /// A CN payload is clock-rate-specific (RFC 3389 §2), so only a match at the media's own RTP clock
+    /// is usable: a `CN` `a=rtpmap` at that rate, else static payload type 13 (`CN/8000`, RFC 3551 §6)
+    /// offered without an rtpmap when `clock_rate_hz == 8000`.
+    #[must_use]
+    pub fn comfort_noise_payload_type(&self, clock_rate_hz: u32) -> Option<u8> {
+        if let Some(map) = self.rtpmaps.iter().find(|map| {
+            map.encoding_name.eq_ignore_ascii_case("CN") && map.clock_rate_hz == clock_rate_hz
+        }) {
+            return Some(map.payload_type);
+        }
+        // Static PT 13 = CN/8000 (RFC 3551 §6), commonly offered bare (no rtpmap). Only honour it when
+        // no rtpmap re-purposed 13 to something else at another rate.
+        if clock_rate_hz == 8000
+            && self.payload_types.contains(&13)
+            && !self.rtpmaps.iter().any(|map| map.payload_type == 13)
+        {
+            return Some(13);
+        }
+        None
+    }
+
     /// Resolve a payload type to a [`CodecSpec`] via its rtpmap, else the static table.
     fn codec_spec(&self, payload_type: u8) -> Option<CodecSpec> {
         if let Some(map) = self
@@ -1108,6 +1131,50 @@ pub fn force_answer_codec(sdp: &str, primary: &CodecSpec, telephone_event: Optio
             .and_then(|pt| pt.trim().parse::<u8>().ok())
             .is_some();
         if is_codec_attr {
+            continue;
+        }
+        // Preserve the trailing empty line if the input ended with CRLF.
+        if !(index == lines.len() - 1 && line.is_empty()) {
+            out.push((*line).to_string());
+        }
+    }
+    let mut rewritten = out.join(CRLF);
+    if sdp.ends_with('\n') {
+        rewritten.push_str(CRLF);
+    }
+    rewritten
+}
+
+/// Add an RFC 3389 comfort-noise payload type to an answer's `m=audio` format list and emit its
+/// `a=rtpmap:<pt> CN/<clock>` — so a single-leg local answer advertises the CN the engine will send
+/// during idle gaps (the caller's own generator renders it), instead of looping the caller's audio
+/// back. Applied *after* [`force_answer_codec`] on the offer-only `answer_local` path only; the 2-leg
+/// answer path never carries it. Best-effort and idempotent: returns the SDP unchanged when it has no
+/// `m=audio` line or already lists `payload_type`.
+#[must_use]
+pub fn add_comfort_noise(sdp: &str, payload_type: u8, clock_rate_hz: u32) -> String {
+    let lines: Vec<&str> = sdp.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+    let Some(media_index) = lines
+        .iter()
+        .position(|l| l.starts_with("m=audio ") || *l == "m=audio")
+    else {
+        return sdp.to_string();
+    };
+    // Already listed in the format list (fields after `m=audio <port> <proto>`)? Idempotent no-op.
+    let already_listed = lines[media_index]
+        .split(' ')
+        .skip(3)
+        .any(|field| field.parse::<u8>().ok() == Some(payload_type));
+    if already_listed {
+        return sdp.to_string();
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 1);
+    for (index, line) in lines.iter().enumerate() {
+        if index == media_index {
+            // Append the CN payload type to the format list, then its rtpmap (RFC 4566 is order-free).
+            out.push(format!("{line} {payload_type}"));
+            out.push(format!("a=rtpmap:{payload_type} CN/{clock_rate_hz}"));
             continue;
         }
         // Preserve the trailing empty line if the input ended with CRLF.
@@ -2176,6 +2243,66 @@ mod tests {
         let sdp = "v=0\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=video 5000 RTP/AVP 96\r\n";
         let pcmu = CodecSpec::new(0, "PCMU", 8000, 1, 20);
         assert_eq!(force_answer_codec(sdp, &pcmu, Some(96)), sdp);
+    }
+
+    #[test]
+    fn comfort_noise_payload_type_finds_static_pt13() {
+        // A bare offer of static PT 13 (no rtpmap) is CN/8000 (RFC 3551 §6).
+        let sdp = "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n\
+                   m=audio 40000 RTP/AVP 0 13 101\r\na=rtpmap:0 PCMU/8000\r\n\
+                   a=rtpmap:101 telephone-event/8000\r\n";
+        let info = parse(sdp).expect("parse");
+        assert_eq!(info.comfort_noise_payload_type(8000), Some(13));
+        // CN is clock-rate specific: no 16 kHz CN was offered.
+        assert_eq!(info.comfort_noise_payload_type(16000), None);
+    }
+
+    #[test]
+    fn comfort_noise_payload_type_finds_dynamic_cn_rtpmap_at_matching_clock() {
+        // A dynamic CN payload type at 16 kHz (for a wideband leg) is matched only at 16 kHz.
+        let sdp = "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n\
+                   m=audio 40000 RTP/AVP 96 100\r\na=rtpmap:96 AMR-WB/16000\r\n\
+                   a=rtpmap:100 CN/16000\r\n";
+        let info = parse(sdp).expect("parse");
+        assert_eq!(info.comfort_noise_payload_type(16000), Some(100));
+        assert_eq!(info.comfort_noise_payload_type(8000), None);
+    }
+
+    #[test]
+    fn comfort_noise_payload_type_absent_when_not_offered() {
+        let info = parse(&offer("203.0.113.7", 49170)).expect("parse");
+        assert_eq!(info.comfort_noise_payload_type(8000), None);
+    }
+
+    #[test]
+    fn add_comfort_noise_lists_pt_and_rtpmap() {
+        let answer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                      m=audio 40000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n\
+                      a=rtpmap:101 telephone-event/8000\r\na=ptime:20\r\n";
+        let out = add_comfort_noise(answer, 13, 8000);
+        assert!(
+            out.contains("m=audio 40000 RTP/AVP 0 101 13"),
+            "CN appended to the format list: {out}"
+        );
+        assert!(
+            out.contains("a=rtpmap:13 CN/8000"),
+            "CN rtpmap emitted: {out}"
+        );
+        // It reparses cleanly and still resolves PCMU as the primary audio codec (CN is not audio).
+        let info = parse(&out).expect("reparse");
+        assert_eq!(info.primary_codec().expect("codec").encoding_name, "PCMU");
+        assert_eq!(info.comfort_noise_payload_type(8000), Some(13));
+    }
+
+    #[test]
+    fn add_comfort_noise_is_idempotent_and_identity_without_audio() {
+        let answer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                      m=audio 40000 RTP/AVP 0 13\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:13 CN/8000\r\n";
+        // Already listed ⇒ unchanged.
+        assert_eq!(add_comfort_noise(answer, 13, 8000), answer);
+        // No m=audio ⇒ unchanged.
+        let video = "v=0\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=video 5000 RTP/AVP 96\r\n";
+        assert_eq!(add_comfort_noise(video, 13, 8000), video);
     }
 
     #[test]
