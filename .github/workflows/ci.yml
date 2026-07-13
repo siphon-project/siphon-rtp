@@ -240,23 +240,27 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-01-15 --component rust-src --profile minimal
           command -v bpf-linker >/dev/null 2>&1 || cargo install bpf-linker --locked
+      # No --locked below: this is a separate workspace whose Cargo.lock pins the sibling `siphon-rtp`
+      # crates by path and records their versions, so any main-workspace version bump or new dep
+      # restales it (and it is not auto-synced). This job is excluded from the `CI passed` rollup and
+      # is push/manual-only experimental, so resolve fresh rather than red the whole run on a lock skew.
       - name: Build the eBPF program + XDP/AF_XDP loader
-        run: cargo build --locked
+        run: cargo build
       # The XDP-enabled daemon binary: depends UP into the stable engine (`siphon-rtp`) + this crate,
       # probes/attaches the kernel datapath, and drives `siphon_rtp_engine::run_with_datapath`. Built
       # here (only where the eBPF toolchain exists); the default UDP `siphon-rtp` binary is unaffected
       # and stays xdp-free in every normal job.
       - name: Build the siphon-rtp-xdp-daemon binary
-        run: cargo build --locked --bin siphon-rtp-xdp-daemon
+        run: cargo build --bin siphon-rtp-xdp-daemon
       # Loader unit tests + the daemon's pure `choose_datapath` selection tests (NIC-free).
       - name: Run the loader + daemon unit tests
-        run: cargo test --locked
+        run: cargo test
       # Live veth XDP_TX relay smoke: attach the classifier in SKB mode, install a FORWARD flow,
       # inject an RTP/UDP datagram and capture the frame the program relays — asserting the L2/L3/L4
       # rewrite + both checksums. Self-skips (logs + passes) without CAP_NET_ADMIN / veth / generic
       # XDP, so it never fails an unprivileged runner; `--nocapture` surfaces the skip/run message.
       - name: veth XDP_TX relay smoke (self-skips without CAP_NET_ADMIN)
-        run: cargo test --locked --test xdp_tx_smoke -- --nocapture
+        run: cargo test --test xdp_tx_smoke -- --nocapture
 
   # Single required status check for branch protection: green only if every job above is green.
   # perf-gate is included: it runs on pull_request (success) and is skipped on the push-to-main build,
