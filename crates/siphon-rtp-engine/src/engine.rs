@@ -1228,6 +1228,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             PipelineKind::Passthrough
         };
 
+        // Media-plane lifecycle (target `siphon_rtp::media`): the offer allocated ports and is about to
+        // record the call — the first line of a call's story, correlated by the same `call_id` the SBC
+        // logs. `secure` flags a leg the far side offered as SRTP (SDES) or DTLS-SRTP.
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id = %call_id,
+            from_tag = %from_tag,
+            offerer = %info.remote_rtp,
+            near_local = %near_rtp.local_addr,
+            codec = near_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
+            secure = far_local_crypto.is_some() || far_dtls,
+            "call created"
+        );
+
         *self.client_calls.entry(client).or_insert(0) += 1;
         // Index this call's endpoints so observed RTCP can be correlated back to the call-id.
         for endpoint in [Some(near_rtp), near_rtcp, Some(far_rtp), far_rtcp]
@@ -1467,6 +1481,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: "no-encodable-codec".to_string(),
             };
         };
+
+        // Media-plane lifecycle: a single-leg UAS answer (IVR / echo / announcement) — the engine *is*
+        // the far side, so there is no peer and no far codec to negotiate; it answers with the one
+        // codec it picked from the offer and transcodes prompt/echo into it. Correlated by `call_id`.
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id = %call_id,
+            offerer = %info.remote_rtp,
+            codec = %chosen.encoding_name,
+            role = "uas_local",
+            "call created"
+        );
 
         // Narrow the answer's `m=audio` to the single chosen codec (+ telephone-event) on the already
         // far-advertised address (RFC 3264 §6.1 — the answer offers exactly one format back).
@@ -2262,6 +2288,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     sdp::force_answer_codec(&rewritten.sdp, near_codec, near_telephone_event);
             }
         }
+        // Media-plane lifecycle: negotiation is complete — the call now relays or transcodes. The
+        // pipeline kind tells an operator at a glance how the media is handled (Media/SrtpMedia
+        // transcode, SRTP bridge, WS leg, or a plain Passthrough relay). Pairs with "call created".
+        let near_codec_name = near_codec
+            .as_ref()
+            .map(|codec| codec.encoding_name.as_str())
+            .unwrap_or("-");
+        let far_codec_name = info.primary_codec().map(|codec| codec.encoding_name);
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id = %call_id,
+            to_tag = %to_tag,
+            answerer = %info.remote_rtp,
+            near_codec = near_codec_name,
+            far_codec = far_codec_name.as_deref().unwrap_or("-"),
+            pipeline = ?pipeline,
+            "answer applied"
+        );
         ok_sdp(rewritten.sdp, Some(to_tag))
     }
 
@@ -2292,6 +2336,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     self.endpoint_calls.remove(&endpoint);
                 }
                 self.release_client_call(call.owner);
+                // Media-plane lifecycle: a controller-driven teardown (normal hangup) — the closing
+                // line that pairs with "call created". `duration_s` is the logical-clock lifetime
+                // (~1 tick/second). The end-of-call quality summary rides the CDR, not this line.
+                tracing::info!(
+                    target: "siphon_rtp::media",
+                    call_id = %call_id,
+                    from_tag = %call.from_tag,
+                    duration_s = self.datapath.now_ticks().saturating_sub(call.created_tick),
+                    "call deleted"
+                );
                 CmdResult::Ok {
                     sdp: None,
                     duration_ms: None,

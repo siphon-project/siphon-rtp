@@ -440,6 +440,7 @@ where
     let turn_sweeper = turn.clone();
     let timeout_ticks = config.media_timeout_secs;
     tracing::info!(
+        target: "siphon_rtp::media",
         media_timeout_secs = timeout_ticks,
         "media-timeout sweeper enabled"
     );
@@ -453,12 +454,14 @@ where
             // on the loopback backend (which resolves the latch inline when forwarding).
             sweeper.refresh_latched_destinations().await;
             for call_id in sweeper.reap_idle(timeout_ticks).await {
-                tracing::warn!(%call_id, "media timeout — call reaped");
+                tracing::warn!(target: "siphon_rtp::media", %call_id, idle_secs = timeout_ticks, "media timeout — call reaped");
             }
             let reaped = sweeper.reap_idle_conferences(timeout_ticks).await;
             if reaped > 0 {
                 tracing::warn!(
+                    target: "siphon_rtp::media",
                     participants = reaped,
+                    idle_secs = timeout_ticks,
                     "media timeout — conference participants reaped"
                 );
             }
