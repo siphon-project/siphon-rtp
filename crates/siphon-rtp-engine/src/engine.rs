@@ -742,7 +742,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.cluster.is_draining()
             && matches!(
                 command,
-                Command::Offer { .. } | Command::ConferenceJoin { .. }
+                Command::Offer { .. }
+                    | Command::AnswerLocal { .. }
+                    | Command::ConferenceJoin { .. }
             )
         {
             return CmdResult::Error {
@@ -779,6 +781,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 profile,
             } => {
                 self.answer(client, &call_id, &from_tag, to_tag, &sdp, &profile)
+                    .await
+            }
+            Command::AnswerLocal {
+                call_id,
+                from_tag,
+                sdp,
+                profile,
+            } => {
+                self.answer_local(client, &call_id, from_tag, &sdp, &profile)
                     .await
             }
             Command::Delete { call_id, .. } => self.delete(client, &call_id).await,
@@ -1247,6 +1258,202 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
 
         ok_sdp(rewritten.sdp, None)
+    }
+
+    /// Single-leg UAS answer ([`Command::AnswerLocal`]): the engine *is* the far side (IVR / echo /
+    /// announcement). Given the offerer's SDP and **no** peer, it allocates media exactly as
+    /// [`Self::offer`] does, synthesises an RFC 3264 answer that advertises **one** audio codec chosen
+    /// from the offer (plus the telephone-event PT), and engages the transcoder now so a later PCM
+    /// prompt / echo encodes to the chosen codec — rather than waiting for an answer that never comes.
+    /// When no offered codec is encodable in this build it tears the half-built session down and
+    /// returns [`CmdResult::Error`] with reason `"no-encodable-codec"` (the controller renders SIP
+    /// 488) — RFC 3264 §6.1: the answer selects only from the **offered** formats, never a codec the
+    /// engine cannot produce. Unlike [`Self::answer`] there is no `to_tag`: there is no far leg.
+    async fn answer_local(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: String,
+        sdp: &str,
+        profile: &ProfileFlags,
+    ) -> CmdResult {
+        // Soft per-client call quota — a new session, gated exactly like `offer` (A3 / DoS, docs §5).
+        if self.client_call_count(client) >= self.max_calls_per_client {
+            return CmdResult::Error {
+                reason: "per-client call quota exceeded".to_string(),
+            };
+        }
+        let info = match sdp::parse(sdp) {
+            Ok(info) => info,
+            Err(error) => {
+                return CmdResult::Error {
+                    reason: format!("answer_local SDP parse failed: {error}"),
+                }
+            }
+        };
+
+        // Allocate the two legs exactly as `offer` does: `near` faces the offerer (its signalled
+        // address is the source-gate / reflect target) and `far` is the engine's caller-facing
+        // endpoint — the one the answer advertises and the offerer actually sends to (the single-leg
+        // `promote_to_processing` branch keys on `far.rtp.id`). No ICE / DTLS / SDES here: a single-leg
+        // IVR/echo leg is plaintext (the processing pipeline decodes/re-encodes clear audio), so the
+        // answer advertises no crypto the media path cannot back.
+        let near_family = AddressFamily::of(info.remote_rtp.ip());
+        let far_family = far_address_family(profile).unwrap_or(near_family);
+        let (near_mux, far_mux) = resolve_rtcp_mux(info.rtcp_mux, &profile.rtcp_mux);
+        let near_per_leg = if near_mux { 1 } else { 2 };
+        let far_per_leg = if far_mux { 1 } else { 2 };
+        let (near_interface, far_interface) = self.interfaces.resolve_direction(&profile.direction);
+        let (near_bind, near_advertised_override) = Self::leg_binding(near_interface, near_family);
+        let (far_bind, far_advertised_override) = Self::leg_binding(far_interface, far_family);
+        let near_endpoints = match self
+            .alloc_endpoints(near_per_leg, near_family, near_bind)
+            .await
+        {
+            Ok(endpoints) => endpoints,
+            Err(reason) => return CmdResult::Error { reason },
+        };
+        let far_endpoints = match self
+            .alloc_endpoints(far_per_leg, far_family, far_bind)
+            .await
+        {
+            Ok(endpoints) => endpoints,
+            Err(reason) => {
+                self.free(&near_endpoints).await;
+                return CmdResult::Error { reason };
+            }
+        };
+        let near_rtp = near_endpoints[0];
+        let far_rtp = far_endpoints[0];
+        let near_rtcp = (!near_mux).then(|| near_endpoints[1]);
+        let far_rtcp = (!far_mux).then(|| far_endpoints[1]);
+        let near_advertised = near_advertised_override.unwrap_or_else(|| near_rtp.local_addr.ip());
+        let far_advertised = far_advertised_override.unwrap_or_else(|| far_rtp.local_addr.ip());
+        let endpoints: Vec<_> = near_endpoints
+            .iter()
+            .chain(far_endpoints.iter())
+            .copied()
+            .collect();
+
+        // The answer is delivered back to the offerer, but — like `offer` — it advertises the `far`
+        // leg: the offerer sends its media there, which is where the single-leg processing pipeline
+        // listens (see `promote_to_processing`'s single-leg branch).
+        let engine = EngineMedia {
+            rtp: far_rtp.local_addr,
+            rtcp: far_rtcp.map(|endpoint| endpoint.local_addr),
+            advertised_ip: far_advertised,
+        };
+        let far_mux_override = (!profile.rtcp_mux.is_empty()).then_some(far_mux);
+        let mut rewritten =
+            match sdp::rewrite(sdp, engine, IceRewrite::Keep, None, far_mux_override) {
+                Ok(rewritten) => rewritten,
+                Err(error) => {
+                    self.free(&endpoints).await;
+                    return CmdResult::Error {
+                        reason: format!("answer_local SDP rewrite failed: {error}"),
+                    };
+                }
+            };
+        // rtpengine `replace: [origin]`: hide the originator's real IP behind the engine's advertised
+        // address (topology hiding).
+        if profile.replace.iter().any(|field| field == "origin") {
+            rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.advertised_ip);
+        }
+
+        // Record the half-built call before selecting the codec, so the reject path exercises the same
+        // teardown as a live call (frees the ports + releases the client quota). `to_tag: None` — there
+        // is no far leg. `near_codec` is set to the chosen codec below, right before promotion.
+        *self.client_calls.entry(client).or_insert(0) += 1;
+        for endpoint in [Some(near_rtp), near_rtcp, Some(far_rtp), far_rtcp]
+            .into_iter()
+            .flatten()
+        {
+            self.endpoint_calls.insert(endpoint.id, call_id.to_string());
+        }
+        self.calls.insert(
+            call_id.to_string(),
+            Call {
+                owner: client,
+                created_tick: self.datapath.now_ticks(),
+                ice: None,
+                from_tag,
+                to_tag: None,
+                near: Leg {
+                    rtp: near_rtp,
+                    rtcp: near_rtcp,
+                    remote_rtp: Some(info.remote_rtp),
+                    remote_rtcp: Some(info.remote_rtcp),
+                    advertised_ip: near_advertised,
+                },
+                far: Leg {
+                    rtp: far_rtp,
+                    rtcp: far_rtcp,
+                    remote_rtp: None,
+                    remote_rtcp: None,
+                    advertised_ip: far_advertised,
+                },
+                far_local_crypto: None,
+                far_remote_crypto: None,
+                far_dtls: false,
+                near_codec: None,
+                far_codec: None,
+                near_telephone_event: info.telephone_event_payload_type(),
+                far_telephone_event: None,
+                pipeline: PipelineKind::Passthrough,
+                relay_flows: Vec::new(),
+                promotion_reasons: HashSet::new(),
+                offer_received_from: profile.received_from,
+            },
+        );
+
+        // Pick the ONE negotiated codec (RFC 3264 §6.1). The candidate set is the offerer's own
+        // offered audio codecs, in offer order, edited by the profile's codec policy with answer-side
+        // semantics; the winner is the first candidate this build can actually *encode*
+        // (`factory::encoder_for` is the single source of truth — G.711/G.722/G.726/GSM always,
+        // AMR-WB/AMR only under the `amr` build feature).
+        let policy = parse_codec_flags(&profile.flags);
+        let candidates = answer_codec_candidates(&info, &policy);
+        let Some(chosen) = candidates
+            .into_iter()
+            .find(|spec| factory::encoder_for(spec).is_ok())
+        else {
+            // No offered codec is encodable in this build — tear the half-built session down and let
+            // the controller render SIP 488. The reason string is matched on by the SIPhon side.
+            self.teardown_call(call_id).await;
+            return CmdResult::Error {
+                reason: "no-encodable-codec".to_string(),
+            };
+        };
+
+        // Narrow the answer's `m=audio` to the single chosen codec (+ telephone-event) on the already
+        // far-advertised address (RFC 3264 §6.1 — the answer offers exactly one format back).
+        let answer_sdp =
+            sdp::force_answer_codec(&rewritten.sdp, &chosen, info.telephone_event_payload_type());
+
+        // Engage the transcoder now (single-leg, no far side). After this answer the offerer sends the
+        // chosen codec, so set `near_codec = chosen` *before* promoting: `promote_to_processing`'s
+        // single-leg branch (far_codec == None) uses `near_codec` for both decode and encode, yielding
+        // a processing pipeline that decodes the caller's chosen codec and re-encodes prompt/echo PCM
+        // back into it.
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.near_codec = Some(chosen.clone());
+        }
+        if let Err(reason) = self
+            .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
+            .await
+        {
+            self.teardown_call(call_id).await;
+            return error_result("answer_local: engage transcoder", &reason);
+        }
+        // Record the chosen egress codec + the promoted pipeline for observability. Promotion already
+        // set `pipeline = Media`; `far_codec` mirrors `near_codec` for a single-leg IVR (encode == the
+        // codec the caller will send).
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.far_codec = Some(chosen);
+            call.pipeline = PipelineKind::Media;
+        }
+
+        ok_sdp(answer_sdp, None)
     }
 
     /// Stand up the WebSocket bridge for leg A: install `Redirect` on A's RTP endpoint, dial the WS
@@ -4494,6 +4701,49 @@ fn parse_codec_flags(flags: &[String]) -> sdp::CodecPolicy {
     policy
 }
 
+/// The ordered candidate audio codecs a single-leg [`Command::AnswerLocal`] may answer with, derived
+/// from the offer and edited by the profile's [`sdp::CodecPolicy`] with **answer-side** semantics
+/// (RFC 3264 §6.1 — the answer may select only from the formats the offer contained, so nothing is
+/// ever injected). The caller then takes the first candidate this build can *encode*.
+///
+/// - `strip` / `mask` / `consume-X` (`policy.remove`) — remove X from the candidate set.
+/// - `except` / `accept-X` (`policy.keep`) — a keep-list: when non-empty, only the kept codecs survive.
+/// - `offer-X` (`policy.order`) — priority ordering: listed codecs float to the front, in flag order.
+/// - `transcode-X` (`policy.add`) — a *preference* among the offered codecs (a candidate whose encoding
+///   name matches an `add` entry floats forward). It never injects a codec the caller did not offer.
+///
+/// The two float operations are a single stable sort (offer order is preserved among equals), with the
+/// explicit `offer` ordering taking precedence over the `transcode` preference.
+fn answer_codec_candidates(info: &sdp::MediaInfo, policy: &sdp::CodecPolicy) -> Vec<CodecSpec> {
+    // The offerer's own audio codecs, in offer order, telephone-event already excluded.
+    let mut candidates = info.audio_codecs();
+    // `strip`/`mask`/`consume-X`: drop the named codec from the answer candidate set.
+    if !policy.remove.is_empty() {
+        candidates.retain(|spec| !policy.remove.contains(&spec.encoding_name));
+    }
+    // `except`/`accept-X`: a keep-list — when present, only these codecs may be answered with.
+    if !policy.keep.is_empty() {
+        candidates.retain(|spec| policy.keep.contains(&spec.encoding_name));
+    }
+    // `offer`-order (primary) then `transcode`-preference (secondary): float preferred codecs to the
+    // front without dropping any — a stable sort keeps the offered order among equal keys.
+    candidates.sort_by_key(|spec| {
+        let order_rank = policy
+            .order
+            .iter()
+            .position(|name| name == &spec.encoding_name)
+            .unwrap_or(usize::MAX);
+        let add_rank = usize::from(
+            !policy
+                .add
+                .iter()
+                .any(|added| added.encoding_name == spec.encoding_name),
+        );
+        (order_rank, add_rank)
+    });
+    candidates
+}
+
 /// Upper bound on a control-`ptime` override, in milliseconds. A sane telephony ceiling (the common
 /// values are 10 / 20 / 30 / 40 ms); it also keeps the egress frame within the transcode scratch
 /// buffer at every codec rate the engine encodes, so an absurd value can never overflow it.
@@ -4900,6 +5150,7 @@ fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Offer { .. } => "offer",
         Command::Answer { .. } => "answer",
+        Command::AnswerLocal { .. } => "answer_local",
         Command::Delete { .. } => "delete",
         Command::Query { .. } => "query",
         Command::Ping => "ping",
@@ -12020,5 +12271,254 @@ mod tests {
             cancelled.media().is_transcoding_call("aec-on"),
             "the echo_cancellation flag must promote the call to the media slow path where AEC runs"
         );
+    }
+
+    // ---- AnswerLocal: single-leg UAS answer (RFC 3264 §6.1) ----
+
+    /// VoLTE-shaped offer: AMR-WB (96) and AMR (97) are the caller's preferred codecs, then G.711
+    /// (PCMU 0 / PCMA 8), plus the RFC 4733 telephone-event (101). Used to prove the answer selects
+    /// the first codec this *build* can encode, not one from a hardcoded allow-list.
+    const VOLTE_OFFER: &str = concat!(
+        "v=0\r\n",
+        "o=- 1 1 IN IP4 127.0.0.1\r\n",
+        "s=-\r\n",
+        "c=IN IP4 127.0.0.1\r\n",
+        "t=0 0\r\n",
+        "m=audio 40000 RTP/AVP 96 97 0 8 101\r\n",
+        "a=rtpmap:96 AMR-WB/16000\r\n",
+        "a=rtpmap:97 AMR/8000\r\n",
+        "a=rtpmap:0 PCMU/8000\r\n",
+        "a=rtpmap:8 PCMA/8000\r\n",
+        "a=rtpmap:101 telephone-event/8000\r\n",
+        "a=ptime:20\r\n",
+    );
+
+    #[cfg(not(feature = "amr"))]
+    #[tokio::test]
+    async fn answer_local_volte_offer_answers_only_first_encodable_codec() {
+        // Default build (no `amr`): AMR-WB / AMR are decode-only, so the first *encodable* offered
+        // codec — PCMU — is the sole answered audio codec, alongside the telephone-event PT.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "al-volte".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: VOLTE_OFFER.into(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = ok_sdp_text(&result);
+        assert!(
+            answer.contains("RTP/AVP 0 101"),
+            "m=audio must list only PCMU (0) + telephone-event (101): {answer}"
+        );
+        assert!(answer.contains("a=rtpmap:0 PCMU/8000"), "{answer}");
+        assert!(
+            answer.contains("a=rtpmap:101 telephone-event/8000"),
+            "{answer}"
+        );
+        assert!(
+            !answer.contains("AMR"),
+            "the AMR / AMR-WB rtpmaps must be gone from the answer: {answer}"
+        );
+
+        // The transcoder is engaged now: a single-leg processing MediaCall answering in PCMU.
+        assert!(
+            engine.media().is_transcoding_call("al-volte"),
+            "answer_local must promote the single leg to a processing MediaCall"
+        );
+        let call = engine.calls.get("al-volte").expect("call present");
+        assert_eq!(call.pipeline, PipelineKind::Media);
+        let far = call.far_codec.as_ref().expect("far codec chosen");
+        assert_eq!(far.encoding_name, "PCMU");
+        assert_eq!(far.payload_type, 0);
+    }
+
+    #[tokio::test]
+    async fn answer_local_pcma_only_offer_answers_pcma() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let offer = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 127.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 127.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 8 101\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=ptime:20\r\n",
+        );
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "al-pcma".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer.into(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = ok_sdp_text(&result);
+        assert!(answer.contains("RTP/AVP 8 101"), "{answer}");
+        assert!(answer.contains("a=rtpmap:8 PCMA/8000"), "{answer}");
+        assert!(
+            answer.contains("a=rtpmap:101 telephone-event/8000"),
+            "{answer}"
+        );
+        let call = engine.calls.get("al-pcma").expect("call present");
+        let far = call.far_codec.as_ref().expect("far codec chosen");
+        assert_eq!(far.encoding_name, "PCMA");
+        assert_eq!(far.payload_type, 8);
+    }
+
+    #[cfg(not(feature = "amr"))]
+    #[tokio::test]
+    async fn answer_local_amr_only_offer_is_rejected_no_encodable_codec() {
+        // Only AMR-WB (decode-only in the default build) + telephone-event: nothing is encodable, so
+        // the answer is refused with the exact reason the SIPhon side maps to SIP 488, and the
+        // half-built session is torn down (ports freed, gone from the registry).
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let offer = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 127.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 127.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 96 101\r\n",
+            "a=rtpmap:96 AMR-WB/16000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+        );
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "al-amr".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer.into(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => assert_eq!(reason, "no-encodable-codec"),
+            other => panic!("expected no-encodable-codec error, got {other:?}"),
+        }
+        assert!(
+            engine.calls.get("al-amr").is_none(),
+            "the half-built session must be torn down on reject"
+        );
+        assert_eq!(engine.session_count(), 0, "no session leaks on reject");
+    }
+
+    #[tokio::test]
+    async fn answer_local_preserves_telephone_event_and_ptime() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let offer = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 127.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 127.0.0.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 0 101\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=ptime:30\r\n",
+        );
+        let answer = ok_sdp_text(
+            &engine
+                .handle(
+                    CLIENT,
+                    Command::AnswerLocal {
+                        call_id: "al-ptime".into(),
+                        from_tag: "tag-a".into(),
+                        sdp: offer.into(),
+                        profile: Default::default(),
+                    },
+                )
+                .await,
+        );
+        assert!(
+            answer.contains("a=rtpmap:101 telephone-event/8000"),
+            "telephone-event PT must be kept on a successful answer: {answer}"
+        );
+        assert!(
+            answer.contains("a=ptime:30"),
+            "the offered 30 ms ptime must be preserved: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_local_then_delete_drains_the_registry() {
+        // Leak/teardown: a single-leg answer registers a session; delete drains it back to baseline.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let ok = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "al-drain".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: VOLTE_OFFER.into(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(matches!(ok, CmdResult::Ok { .. }), "answer ok: {ok:?}");
+        assert!(
+            engine.calls.get("al-drain").is_some(),
+            "call present after answer"
+        );
+        assert_eq!(engine.session_count(), 1);
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "al-drain".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            engine.calls.get("al-drain").is_none(),
+            "the session must drain from the registry on delete"
+        );
+        assert_eq!(engine.session_count(), 0, "registry drains to baseline");
+    }
+
+    #[cfg(feature = "amr")]
+    #[tokio::test]
+    async fn answer_local_volte_offer_answers_amr_wb_with_the_amr_feature() {
+        // With the `amr` build feature the engine *can* encode AMR-WB, so the caller-preferred codec
+        // (96, first in the offer) wins — proving the pick is `encoder_for`-driven, not a hardcoded
+        // exclusion of AMR.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let answer = ok_sdp_text(
+            &engine
+                .handle(
+                    CLIENT,
+                    Command::AnswerLocal {
+                        call_id: "al-amr-wb".into(),
+                        from_tag: "tag-a".into(),
+                        sdp: VOLTE_OFFER.into(),
+                        profile: Default::default(),
+                    },
+                )
+                .await,
+        );
+        assert!(answer.contains("RTP/AVP 96 101"), "{answer}");
+        assert!(answer.contains("a=rtpmap:96 AMR-WB/16000"), "{answer}");
+        assert!(
+            !answer.contains("PCMU"),
+            "AMR-WB is caller-preferred and wins over G.711: {answer}"
+        );
+        let call = engine.calls.get("al-amr-wb").expect("call present");
+        let far = call.far_codec.as_ref().expect("far codec chosen");
+        assert_eq!(far.encoding_name, "AMR-WB");
+        assert_eq!(far.payload_type, 96);
     }
 }

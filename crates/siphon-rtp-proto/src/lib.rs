@@ -55,6 +55,22 @@ pub enum Command {
         #[serde(default)]
         profile: ProfileFlags,
     },
+    /// Single-leg UAS answer — the engine *is* the far side (IVR / echo / announcement). Given the
+    /// offerer's SDP (`sdp`) and no peer to answer for it, the engine allocates media, picks **one**
+    /// negotiated audio codec from the offer (honouring `profile`'s codec policy and constrained to a
+    /// codec this build can *encode* — RFC 3264 §6.1: the answer selects from the offered formats),
+    /// synthesises the RFC 3264 answer advertising that single codec plus the telephone-event PT, and
+    /// engages the transcoder now (PCM prompt → the chosen codec) rather than waiting for an answer
+    /// that never comes. Returns the answer SDP on [`CmdResult::Ok`]. When no offered codec is
+    /// encodable in this build it returns [`CmdResult::Error`] (the controller renders 488) — never a
+    /// codec it cannot produce. Unlike [`Command::Answer`] there is no `to_tag`: there is no far leg.
+    AnswerLocal {
+        call_id: String,
+        from_tag: String,
+        sdp: String,
+        #[serde(default)]
+        profile: ProfileFlags,
+    },
     /// Tear down a session (or one leg when `to_tag` is given).
     Delete {
         call_id: String,
@@ -808,6 +824,12 @@ mod tests {
                 sdp: "v=0".into(),
                 profile: ProfileFlags::default(),
             },
+            Command::AnswerLocal {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                sdp: "v=0".into(),
+                profile: ProfileFlags::default(),
+            },
             Command::Delete {
                 call_id: "c".into(),
                 from_tag: "f".into(),
@@ -929,6 +951,50 @@ mod tests {
         assert_eq!(value["command"], "echo");
         assert_eq!(value["enabled"], false);
         assert_eq!(value["to_tag"], "tt");
+    }
+
+    #[test]
+    fn answer_local_wire_shape_and_no_to_tag() {
+        // Minimal single-leg answer frame: call_id + from_tag + offer sdp, profile omitted (defaults).
+        // No `to_tag` field — there is no far leg (RFC 3264: the engine answers for itself).
+        let json = r#"{"command":"answer_local","call_id":"c","from_tag":"f","sdp":"v=0\r\n"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::AnswerLocal {
+                call_id,
+                from_tag,
+                sdp,
+                profile,
+            } => {
+                assert_eq!(call_id, "c");
+                assert_eq!(from_tag, "f");
+                assert_eq!(sdp, "v=0\r\n");
+                assert_eq!(profile, ProfileFlags::default());
+            }
+            other => panic!("expected answer_local, got {other:?}"),
+        }
+
+        // A codec-policy profile roundtrips and keeps the snake_case verb tag.
+        let request = Request {
+            id: 11,
+            command: Command::AnswerLocal {
+                call_id: "abc@host".into(),
+                from_tag: "ft".into(),
+                sdp: "v=0\r\n".into(),
+                profile: ProfileFlags {
+                    transport_protocol: Some("RTP/AVP".into()),
+                    flags: vec!["codec-transcode-PCMU".into()],
+                    ..Default::default()
+                },
+            },
+        };
+        roundtrip(&request);
+        let value = serde_json::to_value(&request).expect("to_value");
+        assert_eq!(value["command"], "answer_local");
+        assert_eq!(value["profile"]["flags"][0], "codec-transcode-PCMU");
+        assert!(
+            value.get("to_tag").is_none(),
+            "answer_local carries no to_tag"
+        );
     }
 
     #[test]
