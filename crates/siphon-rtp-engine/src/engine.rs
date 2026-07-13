@@ -2366,7 +2366,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &call.from_tag,
             &call.near,
             &near_counters,
-            quality.as_ref().map(|quality: &FinalCallQuality| &quality.a_to_b),
+            quality
+                .as_ref()
+                .map(|quality: &FinalCallQuality| &quality.a_to_b),
         );
         self.log_cdr_leg(
             call_id,

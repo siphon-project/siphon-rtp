@@ -2374,7 +2374,9 @@ impl MediaRegistry {
         let mailbox = self.calls.get(call_id)?.mailbox.clone();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if mailbox
-            .try_send(MediaInput::Control(MediaControl::Report { reply: reply_tx }))
+            .try_send(MediaInput::Control(MediaControl::Report {
+                reply: reply_tx,
+            }))
             .is_err()
         {
             return None;
@@ -2919,9 +2921,16 @@ mod tests {
         // 1) B's Sender Report (NTP middle-32 = 0x1234_5678) is relayed toward A at t = 1.0 s.
         const NTP_B: u64 = 0xABCD_1234_5678_9ABC;
         let mut sr_b = [0u8; 64];
-        let len =
-            siphon_rtp_media::rtcp::write_sender_report(0xBBBB_BBBB, NTP_B, 0, 0, 0, &[], &mut sr_b)
-                .expect("write B SR");
+        let len = siphon_rtp_media::rtcp::write_sender_report(
+            0xBBBB_BBBB,
+            NTP_B,
+            0,
+            0,
+            0,
+            &[],
+            &mut sr_b,
+        )
+        .expect("write B SR");
         call.process(
             &rx_at(2, B_ADDR, 1_000_000, sr_b[..len].to_vec()),
             &mut out,

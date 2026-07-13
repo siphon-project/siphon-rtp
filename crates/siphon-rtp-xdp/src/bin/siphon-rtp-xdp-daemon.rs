@@ -295,7 +295,10 @@ mod tests {
         );
         // An IPv6 relay address: the XDP fast path is IPv4-only.
         assert_eq!(
-            choose_datapath(Some("eth0"), Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))),
+            choose_datapath(
+                Some("eth0"),
+                Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+            ),
             DatapathChoice::Udp
         );
     }
