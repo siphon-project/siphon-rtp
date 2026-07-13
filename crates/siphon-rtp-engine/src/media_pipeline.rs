@@ -1659,6 +1659,12 @@ impl MediaCall {
                     }
                 }
             }
+            // Passive per-leg RTT (RFC 3550 §6.4.1) from the plaintext RTCP this leg relays: the
+            // engine↔A round trip feeds A's one-way delay so its MOS gains the delay term. A secure
+            // (SRTCP) leg's RTCP is opaque here, so its RTT stays absent (the CDR marks it honestly).
+            if self.a_to_b.secure_ingress.is_none() && is_rtcp_datagram(&packet.data) {
+                self.observe_rtcp_rtt(true, &packet.data, packet.arrival);
+            }
             true
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
             if !self.b_to_a.accepted_source.accepts(packet.source.ip()) {
@@ -1697,6 +1703,10 @@ impl MediaCall {
                     }
                 }
             }
+            // Passive per-leg RTT, mirrored for the B leg (engine↔B round trip).
+            if self.b_to_a.secure_ingress.is_none() && is_rtcp_datagram(&packet.data) {
+                self.observe_rtcp_rtt(false, &packet.data, packet.arrival);
+            }
             true
         } else if let Some(relay) = self
             .rtcp
@@ -1713,6 +1723,69 @@ impl MediaCall {
             true
         } else {
             false
+        }
+    }
+
+    /// Passively derive per-leg round-trip time from the plaintext RTCP the transcode path relays
+    /// (RFC 3550 §6.4.1), so a relay/transcode call's MOS gains its one-way-delay term (the CDR marks
+    /// it `mos_basis=full`) instead of loss+jitter only. `from_a` is `true` for party A's inbound RTCP
+    /// (it arrived on the `a_to_b` leg), `false` for party B's.
+    ///
+    /// A round trip spans both legs, so this lives on the `MediaCall` (which owns both directions), not
+    /// a single [`Direction`]. The engine↔party RTT for one party is reconstructed from the RTCP it
+    /// relays *to and from* that party:
+    ///
+    /// - A **Sender Report** carries the NTP timestamp the *receiving* party will echo back as `LSR` in
+    ///   its next reception report. When it arrives (about to be relayed to the peer), record it against
+    ///   the **peer's** ingress leg — the leg that will later process that echo — keyed by NTP-middle-32
+    ///   ([`IngressStats::record_sent_report`]), with the relay time ≈ its arrival.
+    /// - A **reception block** from a party (in its SR or RR) reports on the engine's egress stream
+    ///   toward that party (the *opposite* leg's egress SSRC) and echoes `LSR`/`DLSR`. Matching it
+    ///   against the recorded relay time yields the engine↔party RTT
+    ///   ([`IngressStats::record_reception_report`]), stored on that party's own ingress leg.
+    ///
+    /// `arrival_micros` is the datapath's logical receive time, so the RTT stays deterministic. Only
+    /// the plaintext relay path is observed — a secure (SRTCP) leg's RTCP is opaque here (the plaintext
+    /// exists only inside [`Direction::handle`]), so its RTT stays absent, which the CDR reports honestly.
+    fn observe_rtcp_rtt(&mut self, from_a: bool, data: &[u8], arrival_micros: u64) {
+        let Ok(compound) = siphon_rtp_media::rtcp::parse_compound(data) else {
+            return;
+        };
+        for packet in compound {
+            let blocks = match packet {
+                siphon_rtp_media::rtcp::RtcpPacket::SenderReport(report) => {
+                    // The SR's NTP is what the *peer* echoes as LSR — record it on the peer's ingress
+                    // leg (which processes that echo) as the engine's relay time for this SR.
+                    if from_a {
+                        self.b_to_a
+                            .ingress
+                            .record_sent_report(report.ntp_timestamp, arrival_micros);
+                    } else {
+                        self.a_to_b
+                            .ingress
+                            .record_sent_report(report.ntp_timestamp, arrival_micros);
+                    }
+                    report.reports
+                }
+                siphon_rtp_media::rtcp::RtcpPacket::ReceiverReport(report) => report.reports,
+                siphon_rtp_media::rtcp::RtcpPacket::Other { .. } => continue,
+            };
+            // A reception block from this party reports on the engine's egress toward it (the *opposite*
+            // leg's egress SSRC); matching its echoed LSR/DLSR yields the engine↔party RTT, stored on
+            // this party's own ingress leg.
+            for block in &blocks {
+                if from_a {
+                    let egress_ssrc = self.b_to_a.egress_ssrc;
+                    self.a_to_b
+                        .ingress
+                        .record_reception_report(egress_ssrc, block, arrival_micros);
+                } else {
+                    let egress_ssrc = self.a_to_b.egress_ssrc;
+                    self.b_to_a
+                        .ingress
+                        .record_reception_report(egress_ssrc, block, arrival_micros);
+                }
+            }
         }
     }
 
@@ -2458,6 +2531,12 @@ async fn run_media_call<D>(
     }
 }
 
+/// RFC 5761 demux: a datagram whose second byte's payload-type field is in `64..=95` is RTCP (never a
+/// valid RTP payload type at that offset), so the muxed RTP/RTCP flow can tell them apart.
+fn is_rtcp_datagram(data: &[u8]) -> bool {
+    data.len() >= 2 && (64..=95).contains(&(data[1] & 0x7f))
+}
+
 /// Push every queued control event to the owner's per-client sink, draining the buffer. A full or
 /// closed sink drops the event (best-effort, never blocks the actor) — the same posture the per-packet
 /// path takes for `Event::Dtmf`.
@@ -2825,6 +2904,68 @@ mod tests {
         assert_eq!(
             quality.b_to_a.mos_samples, 0,
             "B→A never received a packet ⇒ nothing folded"
+        );
+    }
+
+    #[test]
+    fn passive_rtt_from_relayed_rtcp_feeds_the_leg_mos_delay() {
+        // RFC 3550 §6.4.1: the engine reconstructs the engine↔party round-trip time from the plaintext
+        // RTCP it relays — a Sender Report forwarded to a party, echoed as LSR/DLSR in that party's next
+        // reception report. Deterministic on the logical clock (never `Instant::now()`).
+        let mut call = ulaw_alaw_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // 1) B's Sender Report (NTP middle-32 = 0x1234_5678) is relayed toward A at t = 1.0 s.
+        const NTP_B: u64 = 0xABCD_1234_5678_9ABC;
+        let mut sr_b = [0u8; 64];
+        let len =
+            siphon_rtp_media::rtcp::write_sender_report(0xBBBB_BBBB, NTP_B, 0, 0, 0, &[], &mut sr_b)
+                .expect("write B SR");
+        call.process(
+            &rx_at(2, B_ADDR, 1_000_000, sr_b[..len].to_vec()),
+            &mut out,
+            &mut events,
+        );
+
+        // 2) A's reception report (carried in an SR) echoes that SR — LSR = 0x1234_5678, DLSR = 0.5 s —
+        //    on the stream A receives (the engine's A-facing egress SSRC), arriving at t = 1.6 s.
+        let a_report = siphon_rtp_media::rtcp::ReceptionReport {
+            ssrc: 0xA000_0001, // b_to_a.egress_ssrc — the stream A receives from the engine
+            fraction_lost: 0,
+            cumulative_lost: 0,
+            extended_highest_seq: 0,
+            jitter: 0,
+            last_sr: 0x1234_5678,  // middle 32 bits of NTP_B
+            delay_last_sr: 32_768, // 0.5 s in 1/65536 s units
+        };
+        let mut sr_a = [0u8; 64];
+        let len = siphon_rtp_media::rtcp::write_sender_report(
+            0xAAAA_AAAA,
+            0,
+            0,
+            0,
+            0,
+            std::slice::from_ref(&a_report),
+            &mut sr_a,
+        )
+        .expect("write A SR+RR");
+        call.process(
+            &rx_at(1, A_ADDR, 1_600_000, sr_a[..len].to_vec()),
+            &mut out,
+            &mut events,
+        );
+
+        // RTT = arrival(1.6 s) − DLSR(0.5 s) − relay_time(1.0 s) = 100 ms on A's leg (RFC 3550 §6.4.1).
+        let quality = call.final_quality();
+        assert_eq!(
+            quality.a_to_b.rtt_ms,
+            Some(100.0),
+            "engine↔A RTT reconstructed from the relayed SR/RR exchange"
+        );
+        assert_eq!(
+            quality.b_to_a.rtt_ms, None,
+            "B never reported back ⇒ no RTT on the B leg (CDR marks it loss+jitter-only)"
         );
     }
 
