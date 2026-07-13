@@ -69,20 +69,20 @@ where
             // Stop accepting the moment shutdown is requested; drop out of the loop cleanly so the
             // daemon can drain in-flight calls and return from main (Drops run).
             _ = shutdown.cancelled() => {
-                tracing::info!("control accept loop draining (shutdown requested)");
+                tracing::info!(target: "siphon_rtp::control", "control accept loop draining (shutdown requested)");
                 return Ok(());
             }
             accepted = listener.accept() => accepted?,
         };
         let client = ClientId(next_client_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        tracing::debug!(%peer, ?client, "control connection accepted");
+        tracing::info!(target: "siphon_rtp::control", %peer, client = client.0, "control connection accepted");
         let engine = engine.clone();
         let secret = secret.clone();
         tokio::spawn(async move {
             if let Err(error) =
                 handle_connection(engine, client, secret, stream, max_control_rps).await
             {
-                tracing::warn!(%peer, %error, "control connection closed with error");
+                tracing::warn!(target: "siphon_rtp::control", %peer, client = client.0, %error, "control connection closed with error");
             }
         });
     }

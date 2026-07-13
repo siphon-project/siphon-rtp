@@ -362,6 +362,132 @@ pub struct Direction {
     /// The G.107 codec class (ITU-T G.107) of this direction's **ingress** stream, for the MOS in its
     /// quality report — the codec the sending party used (what this direction decodes).
     ingress_mos_codec: siphon_rtp_hep::mos::Codec,
+    /// Running min / mean / max of this direction's periodic MOS (and peak jitter / loss) across the
+    /// whole call, for the end-of-call CDR ([`Event::CallSummary`]). Folded one sample per periodic
+    /// quality tick (~5 s) by [`Direction::accumulate_quality`]; never touched on the per-packet path.
+    quality: QualityAggregate,
+}
+
+/// One periodic quality reading for a direction: an ITU-T G.107 MOS and the RFC 3550 loss/jitter it
+/// was derived from. Shared by the live [`Event::CallQuality`] emit and the end-of-call aggregate so
+/// both read one consistent computation.
+#[derive(Clone, Copy)]
+struct QualitySample {
+    mos: f64,
+    jitter_ms: f64,
+    loss_percent: f64,
+}
+
+/// Running end-of-call quality accumulation for one [`Direction`]'s ingress stream: the min / mean /
+/// max of its periodic G.107 MOS samples (each with the call-relative time it was taken), plus the
+/// peak RFC 3550 jitter and loss seen across the call. Fed one sample per periodic quality tick
+/// (~5 s) by [`Direction::accumulate_quality`], so it is plain arithmetic over already-computed
+/// estimates — no per-packet work and zero allocation. Read at teardown for the call's CDR: the
+/// instantaneous loss/jitter there come straight from [`IngressStats`], while these carry the
+/// over-the-call shape a single final snapshot cannot (rtpengine's "avg/min/max MOS ... at 0:33").
+#[derive(Debug, Default, Clone)]
+pub(crate) struct QualityAggregate {
+    samples: u32,
+    mos_sum: f64,
+    mos_min: f64,
+    mos_min_at_ms: u64,
+    mos_max: f64,
+    mos_max_at_ms: u64,
+    jitter_ms_max: f64,
+    loss_percent_max: f64,
+}
+
+impl QualityAggregate {
+    /// Fold one periodic quality sample, taken at call-relative time `at_ms`, into the running stats.
+    fn record(&mut self, mos: f64, jitter_ms: f64, loss_percent: f64, at_ms: u64) {
+        if self.samples == 0 || mos < self.mos_min {
+            self.mos_min = mos;
+            self.mos_min_at_ms = at_ms;
+        }
+        if self.samples == 0 || mos > self.mos_max {
+            self.mos_max = mos;
+            self.mos_max_at_ms = at_ms;
+        }
+        self.jitter_ms_max = self.jitter_ms_max.max(jitter_ms);
+        self.loss_percent_max = self.loss_percent_max.max(loss_percent);
+        self.mos_sum += mos;
+        self.samples += 1;
+    }
+
+    /// Number of samples folded (`0` ⇒ no inbound media was ever measured on this direction).
+    pub(crate) fn samples(&self) -> u32 {
+        self.samples
+    }
+
+    /// Mean MOS across the call, or `None` if no sample was ever taken.
+    pub(crate) fn mos_average(&self) -> Option<f64> {
+        (self.samples > 0).then(|| self.mos_sum / f64::from(self.samples))
+    }
+
+    /// Lowest MOS sample (worst instant), or `None` if none was taken.
+    pub(crate) fn mos_min(&self) -> Option<f64> {
+        (self.samples > 0).then_some(self.mos_min)
+    }
+
+    /// Call-relative time (ms) of the lowest MOS sample.
+    pub(crate) fn mos_min_at_ms(&self) -> u64 {
+        self.mos_min_at_ms
+    }
+
+    /// Highest MOS sample (best instant), or `None` if none was taken.
+    pub(crate) fn mos_max(&self) -> Option<f64> {
+        (self.samples > 0).then_some(self.mos_max)
+    }
+
+    /// Call-relative time (ms) of the highest MOS sample.
+    pub(crate) fn mos_max_at_ms(&self) -> u64 {
+        self.mos_max_at_ms
+    }
+
+    /// Peak interarrival jitter (ms) observed across the call.
+    pub(crate) fn jitter_ms_max(&self) -> f64 {
+        self.jitter_ms_max
+    }
+
+    /// Peak packet loss (%) observed across the call.
+    pub(crate) fn loss_percent_max(&self) -> f64 {
+        self.loss_percent_max
+    }
+}
+
+/// One direction's end-of-call quality, snapshotted from the media actor at teardown for the CDR: the
+/// RFC 3550 reception counters/estimates for the stream this direction *received*, plus its running
+/// G.107 MOS aggregate. `rtt_ms` is `Some` only when a reception report yielded a round-trip time
+/// (usually only the conference path); on the relay/transcode path it stays `None` and the CDR marks
+/// the MOS `loss+jitter`-based, never fabricating a zero RTT.
+#[derive(Debug, Clone, Default)]
+pub struct DirectionQuality {
+    pub ssrc: Option<u32>,
+    pub packets_received: u64,
+    pub packets_expected: u32,
+    pub packets_lost: u32,
+    pub loss_percent: f64,
+    pub jitter_ms: f64,
+    /// Peak interarrival jitter (ms) / packet loss (%) sampled across the call (worst instant), the
+    /// companion to the cumulative `jitter_ms` / `loss_percent` above.
+    pub jitter_ms_max: f64,
+    pub loss_percent_max: f64,
+    pub rtt_ms: Option<f64>,
+    pub mos_samples: u32,
+    pub mos_average: Option<f64>,
+    pub mos_min: Option<f64>,
+    pub mos_min_at_ms: u64,
+    pub mos_max: Option<f64>,
+    pub mos_max_at_ms: u64,
+}
+
+/// A media call's per-direction end-of-call quality: `a_to_b` measures what the offerer (`from_tag`)
+/// sent, `b_to_a` what the answerer (`to_tag`) sent. The engine requests this over the actor's mailbox
+/// at teardown (before the task is aborted) to assemble the call's CDR.
+#[derive(Debug, Clone, Default)]
+pub struct FinalCallQuality {
+    pub a_to_b: DirectionQuality,
+    pub b_to_a: DirectionQuality,
 }
 
 /// One playout tick's egress action, computed while the injection is borrowed and applied after.
@@ -661,6 +787,7 @@ impl Direction {
             // §6.4.1), which the decoder exposes — 8 kHz for G.711, 16 kHz for AMR-WB, etc.
             ingress: IngressStats::new(ingress_rtp_clock_rate_hz),
             ingress_mos_codec: config.ingress_mos_codec,
+            quality: QualityAggregate::default(),
         }
     }
 
@@ -714,6 +841,8 @@ impl Direction {
             // via `Engine::run_rtcp_export`), so its reception estimator stays inert — never fed.
             ingress: IngressStats::new(8000),
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+            // A relay-only direction never samples quality (see above), so the aggregate stays empty.
+            quality: QualityAggregate::default(),
         }
     }
 
@@ -872,7 +1001,14 @@ impl Direction {
     /// one-way mouth-to-ear delay is `RTT/2` (ITU-T G.107 §7.4) when a reception report has yielded an
     /// RTT, else 0 — the transcode path does not originate its own Sender Reports, so RTT is usually
     /// absent, matching the passive plain-relay QoS export.
-    fn quality_event(&self, call_id: &str, from_tag: &str) -> Option<Event> {
+    /// This direction's current MOS + the RFC 3550 loss/jitter it was derived from, or `None` before
+    /// any inbound packet (nothing to report) or on a relay-only direction (whose quality is reported
+    /// off the in-kernel relay's RTCP, not here). Shared by the periodic [`Self::quality_event`] and
+    /// the end-of-call [`Self::accumulate_quality`] so both read one consistent computation. The
+    /// one-way mouth-to-ear delay is `RTT/2` (ITU-T G.107 §7.4) when a reception report has yielded an
+    /// RTT, else 0 — the transcode path does not originate its own Sender Reports, so RTT is usually
+    /// absent, matching the passive plain-relay QoS export.
+    fn current_quality(&self) -> Option<QualitySample> {
         if self.relay_only || self.ingress.ssrc().is_none() {
             return None;
         }
@@ -882,14 +1018,56 @@ impl Direction {
             one_way_delay_ms,
             jitter_ms: self.ingress.jitter_ms(),
         };
+        Some(QualitySample {
+            mos: siphon_rtp_hep::mos::estimate_mos(self.ingress_mos_codec, impairments),
+            jitter_ms: impairments.jitter_ms,
+            loss_percent: impairments.loss_percent,
+        })
+    }
+
+    fn quality_event(&self, call_id: &str, from_tag: &str) -> Option<Event> {
+        let sample = self.current_quality()?;
         Some(Event::CallQuality {
             conference_id: None,
             call_id: Some(call_id.to_string()),
             from_tag: from_tag.to_string(),
-            jitter_ms: impairments.jitter_ms,
-            loss_percent: impairments.loss_percent,
-            mos: siphon_rtp_hep::mos::estimate_mos(self.ingress_mos_codec, impairments),
+            jitter_ms: sample.jitter_ms,
+            loss_percent: sample.loss_percent,
+            mos: sample.mos,
         })
+    }
+
+    /// Fold this direction's current quality into its running [`QualityAggregate`] for the call's CDR.
+    /// `at_ms` is the call-relative time of the sample (for the min/max timestamps in the summary). A
+    /// no-op before any inbound media, or on a relay-only direction. Driven on the ~5 s quality cadence
+    /// — pure arithmetic over accumulated estimates, no per-packet work.
+    fn accumulate_quality(&mut self, at_ms: u64) {
+        if let Some(sample) = self.current_quality() {
+            self.quality
+                .record(sample.mos, sample.jitter_ms, sample.loss_percent, at_ms);
+        }
+    }
+
+    /// Snapshot this direction's end-of-call quality for the CDR — the RFC 3550 reception stats for the
+    /// stream it received, plus its running MOS aggregate. All read-only; safe at teardown.
+    fn quality_snapshot(&self) -> DirectionQuality {
+        DirectionQuality {
+            ssrc: self.ingress.ssrc(),
+            packets_received: self.ingress.received(),
+            packets_expected: self.ingress.expected(),
+            packets_lost: self.ingress.cumulative_lost(),
+            loss_percent: self.ingress.loss_percent(),
+            jitter_ms: self.ingress.jitter_ms(),
+            jitter_ms_max: self.quality.jitter_ms_max(),
+            loss_percent_max: self.quality.loss_percent_max(),
+            rtt_ms: self.ingress.rtt_ms(),
+            mos_samples: self.quality.samples(),
+            mos_average: self.quality.mos_average(),
+            mos_min: self.quality.mos_min(),
+            mos_min_at_ms: self.quality.mos_min_at_ms(),
+            mos_max: self.quality.mos_max(),
+            mos_max_at_ms: self.quality.mos_max_at_ms(),
+        }
     }
 
     /// Transform one accepted datagram for this direction, appending any outbound datagrams and DTMF
@@ -1481,6 +1659,12 @@ impl MediaCall {
                     }
                 }
             }
+            // Passive per-leg RTT (RFC 3550 §6.4.1) from the plaintext RTCP this leg relays: the
+            // engine↔A round trip feeds A's one-way delay so its MOS gains the delay term. A secure
+            // (SRTCP) leg's RTCP is opaque here, so its RTT stays absent (the CDR marks it honestly).
+            if self.a_to_b.secure_ingress.is_none() && is_rtcp_datagram(&packet.data) {
+                self.observe_rtcp_rtt(true, &packet.data, packet.arrival);
+            }
             true
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
             if !self.b_to_a.accepted_source.accepts(packet.source.ip()) {
@@ -1519,6 +1703,10 @@ impl MediaCall {
                     }
                 }
             }
+            // Passive per-leg RTT, mirrored for the B leg (engine↔B round trip).
+            if self.b_to_a.secure_ingress.is_none() && is_rtcp_datagram(&packet.data) {
+                self.observe_rtcp_rtt(false, &packet.data, packet.arrival);
+            }
             true
         } else if let Some(relay) = self
             .rtcp
@@ -1535,6 +1723,69 @@ impl MediaCall {
             true
         } else {
             false
+        }
+    }
+
+    /// Passively derive per-leg round-trip time from the plaintext RTCP the transcode path relays
+    /// (RFC 3550 §6.4.1), so a relay/transcode call's MOS gains its one-way-delay term (the CDR marks
+    /// it `mos_basis=full`) instead of loss+jitter only. `from_a` is `true` for party A's inbound RTCP
+    /// (it arrived on the `a_to_b` leg), `false` for party B's.
+    ///
+    /// A round trip spans both legs, so this lives on the `MediaCall` (which owns both directions), not
+    /// a single [`Direction`]. The engine↔party RTT for one party is reconstructed from the RTCP it
+    /// relays *to and from* that party:
+    ///
+    /// - A **Sender Report** carries the NTP timestamp the *receiving* party will echo back as `LSR` in
+    ///   its next reception report. When it arrives (about to be relayed to the peer), record it against
+    ///   the **peer's** ingress leg — the leg that will later process that echo — keyed by NTP-middle-32
+    ///   ([`IngressStats::record_sent_report`]), with the relay time ≈ its arrival.
+    /// - A **reception block** from a party (in its SR or RR) reports on the engine's egress stream
+    ///   toward that party (the *opposite* leg's egress SSRC) and echoes `LSR`/`DLSR`. Matching it
+    ///   against the recorded relay time yields the engine↔party RTT
+    ///   ([`IngressStats::record_reception_report`]), stored on that party's own ingress leg.
+    ///
+    /// `arrival_micros` is the datapath's logical receive time, so the RTT stays deterministic. Only
+    /// the plaintext relay path is observed — a secure (SRTCP) leg's RTCP is opaque here (the plaintext
+    /// exists only inside [`Direction::handle`]), so its RTT stays absent, which the CDR reports honestly.
+    fn observe_rtcp_rtt(&mut self, from_a: bool, data: &[u8], arrival_micros: u64) {
+        let Ok(compound) = siphon_rtp_media::rtcp::parse_compound(data) else {
+            return;
+        };
+        for packet in compound {
+            let blocks = match packet {
+                siphon_rtp_media::rtcp::RtcpPacket::SenderReport(report) => {
+                    // The SR's NTP is what the *peer* echoes as LSR — record it on the peer's ingress
+                    // leg (which processes that echo) as the engine's relay time for this SR.
+                    if from_a {
+                        self.b_to_a
+                            .ingress
+                            .record_sent_report(report.ntp_timestamp, arrival_micros);
+                    } else {
+                        self.a_to_b
+                            .ingress
+                            .record_sent_report(report.ntp_timestamp, arrival_micros);
+                    }
+                    report.reports
+                }
+                siphon_rtp_media::rtcp::RtcpPacket::ReceiverReport(report) => report.reports,
+                siphon_rtp_media::rtcp::RtcpPacket::Other { .. } => continue,
+            };
+            // A reception block from this party reports on the engine's egress toward it (the *opposite*
+            // leg's egress SSRC); matching its echoed LSR/DLSR yields the engine↔party RTT, stored on
+            // this party's own ingress leg.
+            for block in &blocks {
+                if from_a {
+                    let egress_ssrc = self.b_to_a.egress_ssrc;
+                    self.a_to_b
+                        .ingress
+                        .record_reception_report(egress_ssrc, block, arrival_micros);
+                } else {
+                    let egress_ssrc = self.a_to_b.egress_ssrc;
+                    self.b_to_a
+                        .ingress
+                        .record_reception_report(egress_ssrc, block, arrival_micros);
+                }
+            }
         }
     }
 
@@ -1835,6 +2086,25 @@ impl MediaCall {
         }
     }
 
+    /// Fold both directions' current quality into their running [`QualityAggregate`]s for the call's
+    /// end-of-call CDR. Driven on the same ~5 s cadence as [`Self::build_quality_events`]; `at_ms` is
+    /// the call-relative age of the sample, carried through to the min/max timestamps in the summary.
+    pub fn accumulate_quality(&mut self, at_ms: u64) {
+        self.a_to_b.accumulate_quality(at_ms);
+        self.b_to_a.accumulate_quality(at_ms);
+    }
+
+    /// This call's per-direction end-of-call quality (RFC 3550 reception stats + running G.107 MOS) for
+    /// the CDR — `a_to_b` measures what the offerer (`from_tag`) sent, `b_to_a` what the answerer
+    /// (`to_tag`) sent. Requested by the engine over the actor mailbox ([`MediaControl::Report`]) at
+    /// teardown, before the task is aborted.
+    pub fn final_quality(&self) -> FinalCallQuality {
+        FinalCallQuality {
+            a_to_b: self.a_to_b.quality_snapshot(),
+            b_to_a: self.b_to_a.quality_snapshot(),
+        }
+    }
+
     /// Whether either direction has an active injection (the actor only needs the ticker while so).
     #[must_use]
     pub fn has_injection(&self) -> bool {
@@ -1923,6 +2193,13 @@ pub enum MediaControl {
     StartRecording { capture: PcapCapture },
     /// Stop the raw-RTP pcap capture (`stop recording`): drop the sink so the drain task finalizes.
     StopRecording,
+    /// Snapshot the call's end-of-call quality (per-direction MOS / loss / jitter) and return it over
+    /// `reply`, without stopping the actor. The engine sends this at teardown to build the call's CDR
+    /// before the task is aborted; the reply is best-effort (dropped if the actor is already gone, in
+    /// which case the engine logs a counters-only CDR).
+    Report {
+        reply: tokio::sync::oneshot::Sender<FinalCallQuality>,
+    },
     /// Tear the call down: flush recordings and exit the actor loop.
     Stop,
 }
@@ -2085,6 +2362,28 @@ impl MediaRegistry {
             .is_some_and(|handle| handle.relay_only)
     }
 
+    /// Snapshot a live media call's end-of-call quality for the CDR (per-direction MOS / loss / jitter),
+    /// by asking its actor over the mailbox. `None` if the call is unknown (e.g. a plain in-kernel relay
+    /// with no actor), its mailbox is closed, or the actor does not answer within `timeout` — a slow or
+    /// already-aborted actor must never stall teardown, so the engine then logs a counters-only CDR.
+    pub async fn final_quality(
+        &self,
+        call_id: &str,
+        timeout: std::time::Duration,
+    ) -> Option<FinalCallQuality> {
+        let mailbox = self.calls.get(call_id)?.mailbox.clone();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if mailbox
+            .try_send(MediaInput::Control(MediaControl::Report {
+                reply: reply_tx,
+            }))
+            .is_err()
+        {
+            return None;
+        }
+        tokio::time::timeout(timeout, reply_rx).await.ok()?.ok()
+    }
+
     /// Tear a call's actor down: stop it (flushing recordings), drop its routes, and abort the task.
     pub fn deregister(&self, call_id: &str) {
         if let Some((_, handle)) = self.calls.remove(call_id) {
@@ -2124,6 +2423,10 @@ async fn run_media_call<D>(
     // so a 2-party transcode call surfaces RFC 3550 loss/jitter + G.107 MOS on the control channel the
     // way a conference participant does — without any per-packet work.
     let mut ticks_since_quality = 0u64;
+    // Call-relative age, advanced one `INJECT_TICK` per playout tick, stamped onto each end-of-call
+    // MOS min/max so the CDR can render "worst at M:SS" (rtpengine parity). Approximate under a stalled
+    // reactor (the ticker's `Skip` may drop ticks) — a CDR label, never a control/DSP clock.
+    let mut elapsed_ms = 0u64;
     loop {
         tokio::select! {
             input = inbox.recv_async() => {
@@ -2182,10 +2485,15 @@ async fn run_media_call<D>(
                         call.start_recording(capture);
                     }
                     MediaInput::Control(MediaControl::StopRecording) => call.stop_recording(),
+                    MediaInput::Control(MediaControl::Report { reply }) => {
+                        // Read-only snapshot for the engine's CDR; the actor keeps running.
+                        let _ = reply.send(call.final_quality());
+                    }
                     MediaInput::Control(MediaControl::Stop) => break,
                 }
             }
             _ = ticker.tick() => {
+                elapsed_ms = elapsed_ms.saturating_add(INJECT_TICK.as_millis() as u64);
                 if call.has_injection() {
                     outbound.clear();
                     emitted.clear();
@@ -2196,10 +2504,12 @@ async fn run_media_call<D>(
                 }
                 // Periodic per-leg quality estimate (jitter/loss/MOS) on the control channel, so SIPhon
                 // sees live 2-party (relay/transcode) call quality without parsing RTCP itself — the
-                // control-channel complement to the HEP QoS export.
+                // control-channel complement to the HEP QoS export. The same sample is folded into the
+                // per-direction running aggregate for the end-of-call CDR.
                 ticks_since_quality += 1;
                 if ticks_since_quality >= QUALITY_INTERVAL_TICKS {
                     ticks_since_quality = 0;
+                    call.accumulate_quality(elapsed_ms);
                     emitted.clear();
                     call.build_quality_events(&mut emitted);
                     emit_events(&mut emitted, &events);
@@ -2221,6 +2531,12 @@ async fn run_media_call<D>(
             tracing::info!(path, "media-pipeline wrote recording");
         }
     }
+}
+
+/// RFC 5761 demux: a datagram whose second byte's payload-type field is in `64..=95` is RTCP (never a
+/// valid RTP payload type at that offset), so the muxed RTP/RTCP flow can tell them apart.
+fn is_rtcp_datagram(data: &[u8]) -> bool {
+    data.len() >= 2 && (64..=95).contains(&(data[1] & 0x7f))
 }
 
 /// Push every queued control event to the owner's per-client sink, draining the buffer. A full or
@@ -2510,6 +2826,156 @@ mod tests {
         // µ-law 0xFF and A-law decode of that sample differ at the byte level → genuinely transcoded.
         assert_ne!(packet.payload, &[0xFFu8; 160][..]);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn quality_aggregate_tracks_min_avg_max_with_timestamps() {
+        let mut aggregate = QualityAggregate::default();
+        assert_eq!(aggregate.samples(), 0);
+        assert!(aggregate.mos_average().is_none(), "no samples ⇒ no mean");
+        assert!(aggregate.mos_min().is_none());
+
+        // Three samples: a good open, a dip at 10 s, a peak at 15 s.
+        aggregate.record(4.2, 5.0, 0.0, 5_000);
+        aggregate.record(3.0, 12.0, 8.0, 10_000);
+        aggregate.record(4.4, 2.0, 1.0, 15_000);
+
+        assert_eq!(aggregate.samples(), 3);
+        let mean = aggregate.mos_average().expect("mean");
+        assert!(
+            (mean - (4.2 + 3.0 + 4.4) / 3.0).abs() < 1e-4,
+            "arithmetic mean MOS, got {mean}"
+        );
+        assert!((aggregate.mos_min().expect("min") - 3.0).abs() < 1e-6);
+        assert_eq!(
+            aggregate.mos_min_at_ms(),
+            10_000,
+            "the worst MOS is timestamped at its sample time"
+        );
+        assert!((aggregate.mos_max().expect("max") - 4.4).abs() < 1e-6);
+        assert_eq!(aggregate.mos_max_at_ms(), 15_000);
+        assert!(
+            (aggregate.jitter_ms_max() - 12.0).abs() < 1e-6,
+            "peak jitter across the call"
+        );
+        assert!(
+            (aggregate.loss_percent_max() - 8.0).abs() < 1e-6,
+            "peak loss across the call"
+        );
+    }
+
+    #[test]
+    fn accumulate_quality_folds_live_estimates_into_the_call_aggregate() {
+        // Drive a real 2-party transcode call with a lossy, jittered ingress stream, fold two periodic
+        // quality samples, and confirm the running aggregate captured a degraded mean MOS on the
+        // inbound direction while the silent reverse direction folded nothing.
+        let mut call = ulaw_alaw_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for (sequence, arrival) in [(0u16, 0u64), (1, 20_000), (3, 75_000), (4, 85_000)] {
+            call.process(
+                &rx_at(1, A_ADDR, arrival, ulaw_rtp(sequence, 0x40)),
+                &mut out,
+                &mut events,
+            );
+        }
+
+        call.accumulate_quality(5_000);
+        call.accumulate_quality(10_000);
+
+        // The end-of-call snapshot the engine reads for the CDR.
+        let quality = call.final_quality();
+        assert_eq!(
+            quality.a_to_b.mos_samples, 2,
+            "two samples folded on the direction that received audio"
+        );
+        assert!(
+            quality.a_to_b.packets_received > 0,
+            "the inbound packets were counted"
+        );
+        let mean = quality.a_to_b.mos_average.expect("mean");
+        assert!(
+            mean > 1.0 && mean < 3.5,
+            "20% loss ⇒ a degraded mean MOS in (1, 3.5), got {mean}"
+        );
+        assert!(quality.a_to_b.loss_percent > 0.0, "loss captured");
+        assert!(
+            quality.a_to_b.loss_percent_max > 0.0,
+            "peak loss captured across samples"
+        );
+        assert_eq!(
+            quality.b_to_a.mos_samples, 0,
+            "B→A never received a packet ⇒ nothing folded"
+        );
+    }
+
+    #[test]
+    fn passive_rtt_from_relayed_rtcp_feeds_the_leg_mos_delay() {
+        // RFC 3550 §6.4.1: the engine reconstructs the engine↔party round-trip time from the plaintext
+        // RTCP it relays — a Sender Report forwarded to a party, echoed as LSR/DLSR in that party's next
+        // reception report. Deterministic on the logical clock (never `Instant::now()`).
+        let mut call = ulaw_alaw_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // 1) B's Sender Report (NTP middle-32 = 0x1234_5678) is relayed toward A at t = 1.0 s.
+        const NTP_B: u64 = 0xABCD_1234_5678_9ABC;
+        let mut sr_b = [0u8; 64];
+        let len = siphon_rtp_media::rtcp::write_sender_report(
+            0xBBBB_BBBB,
+            NTP_B,
+            0,
+            0,
+            0,
+            &[],
+            &mut sr_b,
+        )
+        .expect("write B SR");
+        call.process(
+            &rx_at(2, B_ADDR, 1_000_000, sr_b[..len].to_vec()),
+            &mut out,
+            &mut events,
+        );
+
+        // 2) A's reception report (carried in an SR) echoes that SR — LSR = 0x1234_5678, DLSR = 0.5 s —
+        //    on the stream A receives (the engine's A-facing egress SSRC), arriving at t = 1.6 s.
+        let a_report = siphon_rtp_media::rtcp::ReceptionReport {
+            ssrc: 0xA000_0001, // b_to_a.egress_ssrc — the stream A receives from the engine
+            fraction_lost: 0,
+            cumulative_lost: 0,
+            extended_highest_seq: 0,
+            jitter: 0,
+            last_sr: 0x1234_5678,  // middle 32 bits of NTP_B
+            delay_last_sr: 32_768, // 0.5 s in 1/65536 s units
+        };
+        let mut sr_a = [0u8; 64];
+        let len = siphon_rtp_media::rtcp::write_sender_report(
+            0xAAAA_AAAA,
+            0,
+            0,
+            0,
+            0,
+            std::slice::from_ref(&a_report),
+            &mut sr_a,
+        )
+        .expect("write A SR+RR");
+        call.process(
+            &rx_at(1, A_ADDR, 1_600_000, sr_a[..len].to_vec()),
+            &mut out,
+            &mut events,
+        );
+
+        // RTT = arrival(1.6 s) − DLSR(0.5 s) − relay_time(1.0 s) = 100 ms on A's leg (RFC 3550 §6.4.1).
+        let quality = call.final_quality();
+        assert_eq!(
+            quality.a_to_b.rtt_ms,
+            Some(100.0),
+            "engine↔A RTT reconstructed from the relayed SR/RR exchange"
+        );
+        assert_eq!(
+            quality.b_to_a.rtt_ms, None,
+            "B never reported back ⇒ no RTT on the B leg (CDR marks it loss+jitter-only)"
+        );
     }
 
     #[test]
