@@ -54,8 +54,11 @@ transcoding bridges).
 
 ## 3. `call_quality` control events (MOS)
 
-Every ~5 s the conference pushes one `Event::CallQuality` per active participant to SIPhon over the
-JSON control channel — so the control plane sees live quality without parsing RTCP itself:
+Every few seconds the engine pushes one `Event::CallQuality` per active leg to SIPhon over the
+JSON control channel, so the control plane sees live quality without parsing RTCP itself. It fires
+for conference participants (keyed by `conference_id`) and for ordinary 2-party relay and transcode
+legs (keyed by `call_id`); exactly one identifier is present, matching the
+[JSON control](control/json.md) and [monitoring](cookbook/monitoring.md) contract:
 
 ```json
 { "event": "call_quality", "conference_id": "room-7", "from_tag": "alice",

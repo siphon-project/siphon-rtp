@@ -4,7 +4,7 @@ amr-wb/c-code/
 
 # The official test vectors (testv/: tst_mN.cod bitstreams + tst_mN.out decoded PCM) are the
 # bit-exact acceptance criteria. They are kept untracked until git-lfs is configured for them, then
-# committed via LFS (see project memory) — they must never enter normal git history as binaries.
+# committed via LFS; they must never enter normal git history as binaries.
 amr-wb/testv/
 
 # Opus RFC 6716 conformance reference data — the official testvectorNN.bit/.dec, the locally

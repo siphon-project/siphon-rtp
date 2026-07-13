@@ -7,7 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
-The initial public surface. This becomes `0.1.0` at the first tag.
+The initial public surface. The workspace version is `0.1.2` (a single number across
+every crate, see [VERSIONING.md](VERSIONING.md)); this is what the first public tag ships.
 
 ### Control plane
 - **Native JSON-over-TCP control protocol** (`siphon-rtp-proto`) — length-prefixed
@@ -16,8 +17,9 @@ The initial public surface. This becomes `0.1.0` at the first tag.
   statistics, load, node_info, drain/undrain, checkpoint, restore, play_media,
   stop_media, play_dtmf, silence/unsilence_media, block/unblock_media,
   block/unblock_dtmf, echo, start/stop_recording, subscribe_request/answer,
-  unsubscribe, conference_join/leave/route/bridge. Events: dtmf, media_timeout,
-  active_speaker, call_quality.
+  unsubscribe, conference_join/leave/route/bridge. `play_media` accepts immediately
+  with a `play_id` and reports its end asynchronously (below). Events: dtmf,
+  media_timeout, play_finished, active_speaker, call_quality.
 - **rtpengine NG/bencode front-end** (`--ng`, `siphon-rtp-ngcompat`) — drop-in for
   existing Kamailio / OpenSIPS + `mod_rtpengine` deployments, plus siphon-rtp
   extensions (cluster load/node-info/drain, HA checkpoint/restore).
@@ -28,17 +30,21 @@ The initial public surface. This becomes `0.1.0` at the first tag.
 - **Codecs**, pure Rust, bit-exact against the reference vectors: G.711 µ/A-law, L16,
   G.722, G.726 (16/24/32/40 kbit/s), GSM Full Rate, comfort noise (RFC 3389), and,
   behind the `amr` feature, AMR-WB (decode and encode all 9 modes) and AMR-NB
-  (decode all 8 modes, encode MR475 + MR122).
+  (decode and encode all 8 modes; DTX/SID out of scope).
 - **SRTP-SDES** (RFC 3711 / 4568) with anti-replay, and **DTLS-SRTP** (RFC 5764),
   both pure RustCrypto.
 - **ICE-lite + STUN**, and a **built-in TURN server** (RFC 5766 / 8656, coturn REST
   credentials, `turn:` / `turns:` over UDP/TCP/TLS).
 - **RTCP** SR/RR (parse and construct), **jitter buffer + PLC**, **resampler** (AVX2),
-  and an energy **VAD**.
+  an energy **VAD**, single-channel **noise suppression**, and **echo cancellation**
+  (wired on the transcode and WebSocket-bridge paths, not on SRTP/DTLS legs).
 - **Conferencing MCU** — N-party mixer with mix-minus-self, active-speaker selection,
   whisper/monitor roles, and room bridging.
 - **SIPREC forking** (raw-RTP tee) and **runtime pcap recording**.
-- **RTP↔WebSocket bridge** (`ws://` / `wss://`, raw L16 PCM) for voice-AI.
+- **RTP↔WebSocket bridge** (`ws://` / `wss://`, raw L16 PCM) for voice-AI, with
+  engine-side turn-taking: a local uplink VAD (`ws_vad`) emitting `speech_started` /
+  `speech_stopped` control frames, same-tick barge-in (`ws_barge_in`), and echo
+  cancellation of the phone's echo of the AI (`echo_cancellation`).
 - **Advertised media address + named interfaces** — advertise a public IP in SDP
   decoupled from the bound socket (`--advertise-ip`, for a single-homed host behind
   1:1 NAT such as an Elastic IP: bind private, advertise public, same port), and
