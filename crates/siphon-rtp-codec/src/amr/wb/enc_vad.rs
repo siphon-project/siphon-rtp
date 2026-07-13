@@ -1,15 +1,10 @@
-// AMR-WB encoder — WORK IN PROGRESS: not yet wired into the codec factory or validated
-// bit-exact. Ported from the 3GPP fixed-point C reference (index loops / manual slice
-// copies mirror the C, plus not-yet-used WIP code); these style + dead-code lints are
-// quieted module-wide until the encoder is complete and validated, then revisited.
+// AMR-WB encoder VAD tier. Ported bit-exact from the 3GPP fixed-point C reference; the index loops
+// and manual slice copies deliberately mirror the C (`wb_vad.c`) line-for-line so the port can be
+// audited against the spec source, so the matching idiom-style lints are quieted module-wide.
 #![allow(
     clippy::needless_range_loop,
     clippy::manual_memcpy,
-    clippy::explicit_counter_loop,
-    clippy::manual_div_ceil,
-    clippy::unnecessary_to_owned,
-    dead_code,
-    unused
+    clippy::explicit_counter_loop
 )]
 
 //! AMR-WB Voice Activity Detection (3GPP TS 26.190 encoder), bit-exact port of `wb_vad.c`
@@ -42,8 +37,9 @@ const COMPLEN: usize = 12;
 
 /// `= log2(MAX_16/UNITY)`, UNITY = 256 — `wb_vad_c.h` `UNIRSHFT`.
 const UNIRSHFT: i16 = 7;
-/// `(UNITY*UNITY)/512` — `wb_vad_c.h` `SCALE`.
-const SCALE: i16 = 128;
+// `wb_vad_c.h` `SCALE = (UNITY*UNITY)/512 = 128` is a reference `#define` used only to derive the
+// threshold constants below (`1.6*SCALE`, `6*SCALE`, …); those are precomputed here, so `SCALE`
+// itself is never referenced in code (as in the reference).
 
 /// Threshold for tone detection — `(Word16)(0.65*MAX_16) = (Word16)21298.55 = 21298`.
 const TONE_THR: i16 = 21298;
@@ -94,11 +90,7 @@ const THR_HIGH: i16 = 768;
 const THR_LOW: i16 = 217;
 /// `ilog2(1)`, Noise level for highest threshold — `wb_vad_c.h` `NO_P1`.
 const NO_P1: i16 = 31744;
-/// `ilog2(0.1*MAX_16)`, Noise level for lowest threshold — `wb_vad_c.h` `NO_P2` (unused below,
-/// retained for documentation / cross-reference with the C constants).
-#[allow(dead_code)]
-const NO_P2: i16 = 19786;
-/// `(Word16)(MAX_16*(THR_LOW-THR_HIGH)/(NO_P2-NO_P1))`
+/// `(Word16)(MAX_16*(THR_LOW-THR_HIGH)/(NO_P2-NO_P1))` — with `NO_P2 = ilog2(0.1*MAX_16) = 19786`
 /// `= (Word16)(32767*(217-768)/(19786-31744)) = (Word16)1509.83 = 1509`.
 const NO_SLOPE: i16 = 1509;
 
@@ -108,10 +100,7 @@ const SP_CH_MIN: i16 = -96;
 const SP_CH_MAX: i16 = 96;
 /// `ilog2(NOM_LEVEL/4)` — `wb_vad_c.h` `SP_P1`.
 const SP_P1: i16 = 22527;
-/// `ilog2(NOM_LEVEL*4)` — `wb_vad_c.h` `SP_P2` (unused below, retained for documentation).
-#[allow(dead_code)]
-const SP_P2: i16 = 17832;
-/// `(Word16)(MAX_16*(SP_CH_MAX-SP_CH_MIN)/(SP_P2-SP_P1))`
+/// `(Word16)(MAX_16*(SP_CH_MAX-SP_CH_MIN)/(SP_P2-SP_P1))` — with `SP_P2 = ilog2(NOM_LEVEL*4) = 17832`
 /// `= (Word16)(32767*(96-(-96))/(17832-22527)) = (Word16)(-1339.99) = -1339` (trunc toward zero).
 const SP_SLOPE: i16 = -1339;
 
@@ -122,24 +111,18 @@ const HANG_HIGH: i16 = 12;
 const HANG_LOW: i16 = 2;
 /// threshold for longest hangover — `wb_vad_c.h` `HANG_P1` = `THR_LOW` = 217.
 const HANG_P1: i16 = THR_LOW;
-/// threshold for shortest hangover — `(Word16)(4*SCALE) = 512` (`HANG_P2`, retained for reference).
-#[allow(dead_code)]
-const HANG_P2: i16 = 512;
-/// `(Word16)(MAX_16*(HANG_LOW-HANG_HIGH)/(HANG_P2-HANG_P1))`
+/// `(Word16)(MAX_16*(HANG_LOW-HANG_HIGH)/(HANG_P2-HANG_P1))` — with `HANG_P2 = 4*SCALE = 512`
 /// `= (Word16)(32767*(2-12)/(512-217)) = (Word16)(-1110.74) = -1110` (trunc toward zero).
 const HANG_SLOPE: i16 = -1110;
 
 /* Constants for burst length */
 /// longest burst length — `wb_vad_c.h` `BURST_HIGH`.
 const BURST_HIGH: i16 = 8;
-/// shortest burst length — `wb_vad_c.h` `BURST_LOW`.
-const BURST_LOW: i16 = 3;
+// `wb_vad_c.h` `BURST_LOW = 3` is defined but never used: unlike `hang_len` (clamped to `HANG_LOW`),
+// the reference `vad_decision` does NOT clamp `burst_len` to `BURST_LOW`, so it is dropped here too.
 /// threshold for longest burst — `wb_vad_c.h` `BURST_P1` = `THR_HIGH` = 768.
 const BURST_P1: i16 = THR_HIGH;
-/// threshold for shortest burst — `wb_vad_c.h` `BURST_P2` = `THR_LOW` = 217 (retained for reference).
-#[allow(dead_code)]
-const BURST_P2: i16 = THR_LOW;
-/// `(Word16)(MAX_16*(BURST_LOW-BURST_HIGH)/(BURST_P2-BURST_P1))`
+/// `(Word16)(MAX_16*(BURST_LOW-BURST_HIGH)/(BURST_P2-BURST_P1))` — with `BURST_P2 = THR_LOW = 217`
 /// `= (Word16)(32767*(3-8)/(217-768)) = (Word16)297.34 = 297`.
 const BURST_SLOPE: i16 = 297;
 

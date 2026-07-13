@@ -1,15 +1,11 @@
-// AMR-WB encoder — WORK IN PROGRESS: not yet wired into the codec factory or validated
-// bit-exact. Ported from the 3GPP fixed-point C reference (index loops / manual slice
-// copies mirror the C, plus not-yet-used WIP code); these style + dead-code lints are
-// quieted module-wide until the encoder is complete and validated, then revisited.
+// AMR-WB encoder LP-analysis tier. Ported bit-exact from the 3GPP fixed-point C reference; the index
+// loops and manual slice copies deliberately mirror the C (`coder.c` front end, `decim54.c`,
+// `autocorr.c`, `levinson.c`, `az_isp.c`, `qpisf_2s.c`) line-for-line so the port can be audited
+// against the spec source, so the matching idiom-style lints are quieted module-wide.
 #![allow(
     clippy::needless_range_loop,
     clippy::manual_memcpy,
-    clippy::explicit_counter_loop,
-    clippy::manual_div_ceil,
-    clippy::unnecessary_to_owned,
-    dead_code,
-    unused
+    clippy::explicit_counter_loop
 )]
 
 //! AMR-WB encoder LP-analysis tier (3GPP TS 26.190 / TS 26.173 reference `coder.c` front end):

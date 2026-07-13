@@ -1,15 +1,11 @@
-// AMR-WB encoder — WORK IN PROGRESS: not yet wired into the codec factory or validated
-// bit-exact. Ported from the 3GPP fixed-point C reference (index loops / manual slice
-// copies mirror the C, plus not-yet-used WIP code); these style + dead-code lints are
-// quieted module-wide until the encoder is complete and validated, then revisited.
+// AMR-WB encoder open-loop pitch tier. Ported bit-exact from the 3GPP fixed-point C reference; the
+// index loops and manual slice copies deliberately mirror the C (`p_med_ol.c`, `hp_wsp.c`)
+// line-for-line so the port can be audited against the spec source, so the matching idiom-style
+// lints are quieted module-wide.
 #![allow(
     clippy::needless_range_loop,
     clippy::manual_memcpy,
-    clippy::explicit_counter_loop,
-    clippy::manual_div_ceil,
-    clippy::unnecessary_to_owned,
-    dead_code,
-    unused
+    clippy::explicit_counter_loop
 )]
 
 //! AMR-WB encoder open-loop pitch tier (3GPP TS 26.173 `p_med_ol.c` + `hp_wsp.c`), ported bit-exact.
@@ -18,9 +14,7 @@
 //! correlation maximum, then a normalized correlation gain on the 180 Hz high-passed weighted speech
 //! ([`hp_wsp`]). [`med_olag`]/[`median5`] track the median of the last open-loop lags.
 
-use crate::amr::basic_ops::{
-    add, l_add, l_deposit_h, l_mac, l_shl, norm_l, round_word, shl, shr, sub,
-};
+use crate::amr::basic_ops::{add, l_add, l_deposit_h, l_mac, l_shl, norm_l, round_word, sub};
 use crate::amr::math_op::isqrt_n;
 use crate::amr::oper_32b::{l_comp, l_extract, mpy_32_16};
 

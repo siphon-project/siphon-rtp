@@ -145,12 +145,11 @@ impl PostFilter {
             subfr += L_SUBFR;
         }
 
-        // update syn_work[] history: synth_buf[0..M] = syn_work[L_FRAME-M..L_FRAME]
-        let tail_start = M + L_FRAME - M;
-        let tail: [i16; M] = self.synth_buf[tail_start..tail_start + M]
-            .try_into()
-            .expect("M-word tail");
-        self.synth_buf[..M].copy_from_slice(&tail);
+        // update syn_work[] history: synth_buf[0..M] = syn_work[L_FRAME-M..L_FRAME]. syn_work occupies
+        // synth_buf[M..], so the source is synth_buf[L_FRAME..L_FRAME+M]. `synth_buf` is fixed at
+        // [i16; L_FRAME + M], so this range is exactly its tail — `copy_within` is in-bounds by
+        // construction (no fallible slice→array conversion; house rule: no `.expect()` in production).
+        self.synth_buf.copy_within(L_FRAME..L_FRAME + M, 0);
     }
 }
 

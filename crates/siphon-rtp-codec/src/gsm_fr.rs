@@ -4,8 +4,10 @@
 //! RPE-LTP = Regular Pulse Excitation / Long-Term Prediction: pre-processing (offset compensation +
 //! pre-emphasis), 8th-order LPC analysis (→ 8 Log-Area-Ratios), a short-term analysis filter, then
 //! per 40-sample sub-frame a long-term predictor (lag + gain) and regular-pulse-excitation encoding
-//! (grid selection + APCM of 13 pulses). All integer fixed-point, ported from the canonical
-//! public-domain libgsm (Degener/Bormann) plain path — the bit-exact 3GPP TS 06.10 reference.
+//! (grid selection + APCM of 13 pulses). All integer fixed-point, ported from the canonical libgsm
+//! plain path — the bit-exact 3GPP TS 06.10 reference. libgsm is (c) 1992-2010 Jutta Degener /
+//! Carsten Bormann, Technische Universität Berlin, under a permissive attribution license (BSD-style)
+//! — not public domain.
 //!
 //! Field/function names follow libgsm so each step maps onto TS 06.10 §4.2/§4.3. The fixed-point
 //! contract is exact: `gsm_add`/`gsm_sub` saturate, `gsm_mult`/`gsm_mult_r` truncate (wrap) to 16

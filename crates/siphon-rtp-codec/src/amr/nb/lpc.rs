@@ -83,8 +83,17 @@ pub fn reorder_lsf(lsf: &mut [i16], min_dist: i16, n: usize) {
 /// LSF → LSP (cosine domain) via the cos look-up + linear interpolation (`lsp_lsf.c` `Lsf_lsp`).
 /// `lsf` Q15 normalized (0..0.5); `lsp` Q15 (-1..1).
 pub fn lsf_lsp(lsf: &[i16], lsp: &mut [i16], m: usize) {
+    // The cos look-up indexes `LSF_LSP_TABLE[ind]` and `[ind + 1]` off the top byte of each LSF.
+    // The reference `Lsf_lsp` assumes a normalized LSF (0..0.5 in Q15, so `ind <= 64`), but the AMR-NB
+    // `Reorder_lsf` (3GPP TS 26.090 §5.2.5) only enforces a *minimum* spacing — no upper clamp — so a
+    // hostile in-range bitstream can dequantize an LSF `>= 0x4100` whose top byte would index past this
+    // 66-entry table and panic on the live `AmrNb::decode` path. Bound the table index to the last
+    // valid pair so `[ind]`/`[ind + 1]` always stay in range. This is a no-op for every valid LSF
+    // (`ind <= 64`); it only clamps the out-of-range region. // 3GPP TS 26.090 §5.2.5 (Lsf_lsp),
+    // TS 26.073 `lsp_lsf.c`.
+    const IND_MAX: usize = LSF_LSP_TABLE.len() - 2;
     for i in 0..m {
-        let ind = shr(lsf[i], 8) as usize; // b8..b15
+        let ind = (shr(lsf[i], 8) as usize).min(IND_MAX); // b8..b15, clamped to the table bound
         let offset = lsf[i] & 0x00ff; // b0..b7
                                       // lsp = table[ind] + ((table[ind+1] - table[ind]) * offset) / 256
         let l_tmp = l_mult(sub(LSF_LSP_TABLE[ind + 1], LSF_LSP_TABLE[ind]), offset);
@@ -473,6 +482,31 @@ mod tests {
         int_lpc_1to3(&lsp, &lsp, &mut az2);
         for sf in 0..4 {
             assert_eq!(az2[sf * MP1], 4096);
+        }
+    }
+
+    // Regression (N2): `Reorder_lsf` (3GPP TS 26.090 §5.2.5) only enforces a *minimum* LSF spacing,
+    // so a hostile in-range bitstream can dequantize an LSF whose top byte (`ind = lsf >> 8`) would
+    // index past the 66-entry `LSF_LSP_TABLE` and panic on the live `AmrNb::decode` path. Fed the
+    // **full LSF range** — including the out-of-range region `>= 0x4100` and negatives — both the raw
+    // arbitrary set and its `reorder_lsf` output must run through `lsf_lsp` without panicking, and the
+    // clamped table index must stay within the last valid pair for every word.
+    proptest::proptest! {
+        #[test]
+        fn lsf_lsp_never_panics_over_full_lsf_range(
+            lsf in proptest::array::uniform10(i16::MIN..=i16::MAX)
+        ) {
+            const IND_MAX: usize = LSF_LSP_TABLE.len() - 2;
+            let mut lsp = [0i16; M];
+            // Raw hostile LSFs (skips even the minimum-spacing reorder).
+            lsf_lsp(&lsf, &mut lsp, M);
+            for &value in &lsf {
+                proptest::prop_assert!((shr(value, 8) as usize).min(IND_MAX) + 1 < LSF_LSP_TABLE.len());
+            }
+            // And the decode path's reordered set.
+            let mut reordered = lsf;
+            reorder_lsf(&mut reordered, LSF_GAP, M);
+            lsf_lsp(&reordered, &mut lsp, M);
         }
     }
 }
