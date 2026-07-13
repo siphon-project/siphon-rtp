@@ -147,6 +147,12 @@ impl DtmfDetector {
 /// playout level for generated digits).
 pub const DEFAULT_DTMF_VOLUME_DBM0: u8 = 10;
 
+/// Default inter-digit silence for a multi-digit `PlayDtmf` sequence when the request omits
+/// `pause_ms`. RFC 4733 events are separated by a gap so the receiver's detector resolves distinct
+/// presses (each event also carries its own start timestamp, §2.5.1.2); 40 ms is a short,
+/// widely-interoperable inter-digit pause.
+pub const DEFAULT_DTMF_PAUSE_MS: u32 = 40;
+
 /// Number of times the final End packet is repeated for redundancy (RFC 4733 §2.5.1.3).
 const END_PACKET_REDUNDANCY: u32 = 3;
 
@@ -286,6 +292,156 @@ impl DtmfGenerator {
         }
 
         None
+    }
+}
+
+/// One playout tick's action while a [`DtmfSequence`] is playing (`PlayDtmf` with a multi-digit code).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DtmfStep {
+    /// Emit this telephone-event payload. `timestamp_offset` is the number of samples from the
+    /// sequence's base RTP timestamp to *this digit's* event start: every digit is a distinct RFC 4733
+    /// event with its own start timestamp (RFC 4733 §2.5.1.2), so consecutive digits get strictly
+    /// increasing offsets and the receiver's detector resolves them as separate presses.
+    Event {
+        payload: DtmfPayload,
+        timestamp_offset: u32,
+    },
+    /// Inter-digit silence — emit no telephone-event this tick (the RFC 4733 gap between events).
+    Silence,
+    /// The whole multi-digit sequence has been produced.
+    Done,
+}
+
+/// Plays a multi-digit DTMF string (`PlayDtmf` `code`, e.g. `"123#"`) as a sequence of RFC 4733
+/// telephone events: each digit is one event of `duration_ms` (a [`DtmfGenerator`]), separated by
+/// `pause_ms` of inter-digit silence. Each digit event carries its own start RTP timestamp — the
+/// engine adds the step's `timestamp_offset` to the frozen base so the receiver's detector
+/// distinguishes consecutive presses (RFC 4733 §2.5.1.2). Driven one packet per playout tick via
+/// [`DtmfSequence::next_step`], mirroring how [`DtmfGenerator::next_payload`] drives a single digit.
+#[derive(Debug, Clone)]
+pub struct DtmfSequence {
+    /// Digits still to play, in order.
+    digits: std::collections::VecDeque<char>,
+    /// Per-digit generation parameters (each digit builds its own [`DtmfGenerator`]).
+    duration_ms: u32,
+    volume: u8,
+    clock_rate_hz: u32,
+    ptime_ms: u8,
+    /// Whole-packet inter-digit silence ticks emitted between one event's end and the next's start.
+    pause_ticks: u32,
+    /// Samples per packet at the clock rate (e.g. 160 for 20 ms @ 8 kHz), for the inter-digit gap.
+    samples_per_packet: u16,
+    /// The generator for the digit currently playing, if one is active.
+    current: Option<DtmfGenerator>,
+    /// Inter-digit silence ticks still to emit before the next digit starts.
+    pause_remaining: u32,
+    /// The currently-playing (or next) digit event's start offset in samples from the sequence base.
+    current_offset: u32,
+}
+
+impl DtmfSequence {
+    /// Build a sequence for `code` (each digit played for `duration_ms` at `volume` -dBm0), packetized
+    /// every `ptime_ms` at `clock_rate_hz`, with `pause_ms` of silence between digits. Returns `None`
+    /// when `code` is empty or carries a non-DTMF character — the caller validates the code up front
+    /// and treats `None` as "cannot start".
+    #[must_use]
+    pub fn new(
+        code: &str,
+        duration_ms: u32,
+        volume: u8,
+        clock_rate_hz: u32,
+        ptime_ms: u8,
+        pause_ms: u32,
+    ) -> Option<Self> {
+        if code.is_empty()
+            || code
+                .chars()
+                .any(|digit| digit_to_event_code(digit).is_none())
+        {
+            return None;
+        }
+        let ptime_ms = ptime_ms.max(1);
+        let samples_per_packet = ((u64::from(clock_rate_hz) * u64::from(ptime_ms)) / 1000)
+            .clamp(1, u64::from(u16::MAX)) as u16;
+        // The inter-digit gap is a whole number of playout packets (§2.5 leaves the exact gap to the
+        // sender); round up so a sub-ptime pause still yields at least one silence tick.
+        let pause_ticks = u64::from(pause_ms)
+            .div_ceil(u64::from(ptime_ms))
+            .min(u64::from(u32::MAX)) as u32;
+        Some(Self {
+            digits: code.chars().collect(),
+            duration_ms,
+            volume,
+            clock_rate_hz,
+            ptime_ms,
+            pause_ticks,
+            samples_per_packet,
+            current: None,
+            pause_remaining: 0,
+            current_offset: 0,
+        })
+    }
+
+    /// Pop the next digit off the queue and arm its generator. Returns `false` once the queue is empty
+    /// (the whole sequence has played).
+    fn start_next_digit(&mut self) -> bool {
+        while let Some(digit) = self.digits.pop_front() {
+            if let Some(generator) = DtmfGenerator::new(
+                digit,
+                self.duration_ms,
+                self.volume,
+                self.clock_rate_hz,
+                self.ptime_ms,
+            ) {
+                self.current = Some(generator);
+                return true;
+            }
+            // `new()` validated every character, so a non-DTMF digit here is unreachable; skip it
+            // defensively rather than emit a bogus event.
+        }
+        false
+    }
+
+    /// Produce the next tick's action: one telephone-event payload for the current digit, an
+    /// inter-digit silence tick, or [`DtmfStep::Done`] once the whole sequence has played.
+    pub fn next_step(&mut self) -> DtmfStep {
+        loop {
+            if self.pause_remaining > 0 {
+                self.pause_remaining -= 1;
+                return DtmfStep::Silence;
+            }
+            if self.current.is_none() && !self.start_next_digit() {
+                return DtmfStep::Done;
+            }
+            let offset = self.current_offset;
+            let finished_total = match self.current.as_mut() {
+                Some(generator) => match generator.next_payload() {
+                    Some(payload) => {
+                        return DtmfStep::Event {
+                            payload,
+                            timestamp_offset: offset,
+                        }
+                    }
+                    // The digit's event drained; capture its media duration to advance the base offset.
+                    None => generator.total_samples(),
+                },
+                None => return DtmfStep::Done, // unreachable: start_next_digit set `current`
+            };
+            self.current = None;
+            // The inter-digit gap only separates *consecutive* events — no trailing silence after the
+            // final digit. When another digit remains, advance the base offset past this event plus the
+            // gap and arm the silence; then loop to emit the pause / next digit (RFC 4733 §2.5.1.2).
+            if !self.digits.is_empty() {
+                let gap = self
+                    .pause_ticks
+                    .saturating_mul(u32::from(self.samples_per_packet));
+                self.current_offset = self
+                    .current_offset
+                    .wrapping_add(u32::from(finished_total))
+                    .wrapping_add(gap);
+                self.pause_remaining = self.pause_ticks;
+            }
+        }
     }
 }
 
@@ -551,5 +707,158 @@ mod tests {
         // Pulling the whole burst must terminate (no infinite loop on the saturating duration).
         let count = std::iter::from_fn(|| generator.next_payload()).count();
         assert!(count > 3);
+    }
+
+    /// Drain a whole [`DtmfSequence`], collecting each emitted step (events + silence ticks).
+    fn drain_sequence(sequence: &mut DtmfSequence) -> Vec<DtmfStep> {
+        let mut steps = Vec::new();
+        loop {
+            match sequence.next_step() {
+                DtmfStep::Done => break,
+                step => steps.push(step),
+            }
+        }
+        steps
+    }
+
+    #[test]
+    fn sequence_rejects_empty_or_non_dtmf_code() {
+        assert!(DtmfSequence::new("", 100, 10, 8000, 20, 40).is_none());
+        assert!(DtmfSequence::new("1X2", 100, 10, 8000, 20, 40).is_none());
+        assert!(DtmfSequence::new("12", 100, 10, 8000, 20, 40).is_some());
+    }
+
+    #[test]
+    fn single_digit_sequence_matches_the_lone_generator() {
+        // A one-digit sequence emits exactly the same telephone-event payloads a bare DtmfGenerator
+        // does, all at offset 0 — so the single-digit path is unchanged by multi-digit support.
+        let mut sequence =
+            DtmfSequence::new("5", 100, DEFAULT_DTMF_VOLUME_DBM0, 8000, 20, 40).expect("sequence");
+        let mut generator =
+            DtmfGenerator::new('5', 100, DEFAULT_DTMF_VOLUME_DBM0, 8000, 20).expect("generator");
+        while let Some(expected) = generator.next_payload() {
+            match sequence.next_step() {
+                DtmfStep::Event {
+                    payload,
+                    timestamp_offset,
+                } => {
+                    assert_eq!(payload, expected);
+                    assert_eq!(
+                        timestamp_offset, 0,
+                        "a single digit starts at the base timestamp"
+                    );
+                }
+                other => panic!("expected an event, got {other:?}"),
+            }
+        }
+        assert_eq!(sequence.next_step(), DtmfStep::Done);
+    }
+
+    #[test]
+    fn multi_digit_sequence_separates_events_by_pause_and_timestamp() {
+        // "12" @ 100 ms / 8 kHz / 20 ms ptime with a 40 ms pause → each digit is 5 updates + 3 End
+        // packets, and the two events are separated by 2 silence ticks (40 ms / 20 ms) with the
+        // second event's start timestamp advanced past the first (RFC 4733 §2.5.1.2).
+        let mut sequence = DtmfSequence::new("12", 100, 10, 8000, 20, 40).expect("sequence");
+        let steps = drain_sequence(&mut sequence);
+
+        let events: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match step {
+                DtmfStep::Event {
+                    payload,
+                    timestamp_offset,
+                } => Some((*payload, *timestamp_offset)),
+                DtmfStep::Silence => None,
+                DtmfStep::Done => None,
+            })
+            .collect();
+        let silence_ticks = steps.iter().filter(|s| **s == DtmfStep::Silence).count();
+        assert_eq!(
+            silence_ticks, 2,
+            "40 ms pause at 20 ms ptime is 2 silence ticks"
+        );
+        // 8 packets per digit (5 update + 3 End) × 2 digits.
+        assert_eq!(events.len(), 16);
+
+        // First digit '1' at offset 0; second digit '2' at offset 800 (its total) + 320 (2-tick gap).
+        let first_offset = events[0].1;
+        let second_offset = events[8].1;
+        assert_eq!(first_offset, 0);
+        assert_eq!(
+            second_offset,
+            800 + 320,
+            "second event starts past the first + the gap"
+        );
+        assert!(events[..8]
+            .iter()
+            .all(|(_, offset)| *offset == first_offset));
+        assert!(events[8..]
+            .iter()
+            .all(|(_, offset)| *offset == second_offset));
+
+        // Each digit's very first packet carries the marker (a new event); event codes are 1 then 2.
+        assert!(events[0].0.is_first, "digit 1 opens with the marker");
+        assert!(events[8].0.is_first, "digit 2 opens with the marker");
+        assert_eq!(events[0].0.bytes[0], 1);
+        assert_eq!(events[8].0.bytes[0], 2);
+    }
+
+    #[test]
+    fn multi_digit_sequence_decodes_back_to_every_press() {
+        // End-to-end: play "123#", packetize each event at base + its timestamp offset (§2.5.1.2),
+        // feed the redundant stream through the detector, and recover all four presses in order.
+        let mut sequence = DtmfSequence::new("123#", 80, 8, 8000, 20, 40).expect("sequence");
+        let mut detector = DtmfDetector::new();
+        let base_timestamp = 5000u32;
+        let mut pressed = Vec::new();
+        loop {
+            match sequence.next_step() {
+                DtmfStep::Event {
+                    payload,
+                    timestamp_offset,
+                } => {
+                    let timestamp = base_timestamp.wrapping_add(timestamp_offset);
+                    if let Some(event) = detector
+                        .on_packet(timestamp, &payload.bytes)
+                        .expect("detector")
+                    {
+                        pressed.push(event.digit);
+                    }
+                }
+                DtmfStep::Silence => {}
+                DtmfStep::Done => break,
+            }
+        }
+        assert_eq!(pressed, vec!['1', '2', '3', '#']);
+    }
+
+    #[test]
+    fn zero_pause_still_distinguishes_consecutive_digits_by_timestamp() {
+        // With no inter-digit pause the sequence emits no silence, but each event still gets a fresh
+        // start timestamp (advanced by the prior digit's duration), so a repeated digit "11" decodes
+        // as two presses rather than collapsing into one.
+        let mut sequence = DtmfSequence::new("11", 40, 10, 8000, 20, 0).expect("sequence");
+        let mut detector = DtmfDetector::new();
+        let base = 1000u32;
+        let mut pressed = Vec::new();
+        loop {
+            match sequence.next_step() {
+                DtmfStep::Event {
+                    payload,
+                    timestamp_offset,
+                } => {
+                    if let Some(event) = detector
+                        .on_packet(base.wrapping_add(timestamp_offset), &payload.bytes)
+                        .expect("detector")
+                    {
+                        pressed.push(event.digit);
+                    }
+                }
+                DtmfStep::Silence => panic!("a zero pause emits no silence ticks"),
+                DtmfStep::Done => break,
+            }
+        }
+        assert_eq!(pressed, vec!['1', '1']);
     }
 }

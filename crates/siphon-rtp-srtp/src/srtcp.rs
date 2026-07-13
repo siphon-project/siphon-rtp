@@ -111,7 +111,7 @@ impl SrtcpContext {
         apply_aes_cm(&self.session_key, &iv, &mut out[CLEAR_HEADER_LEN..]);
 
         out.extend_from_slice(&(ENCRYPT_FLAG | index).to_be_bytes());
-        let tag = hmac_sha1_80(&self.session_auth, out);
+        let tag = hmac_sha1_80(&self.session_auth, out)?;
         out.extend_from_slice(&tag);
         Ok(())
     }
@@ -144,7 +144,7 @@ impl SrtcpContext {
         if self.recv_replay.is_replay(u64::from(index)) {
             return Err(SrtpError::Replayed);
         }
-        let expected = hmac_sha1_80(&self.session_auth, authenticated);
+        let expected = hmac_sha1_80(&self.session_auth, authenticated)?;
         if expected.ct_eq(tag).unwrap_u8() != 1 {
             return Err(SrtpError::AuthFailed);
         }

@@ -267,7 +267,7 @@ impl SrtpContext {
         let iv = cipher_iv(&self.session_salt, ssrc, index);
         AesCm::new(&self.session_key.into(), &iv.into()).apply_keystream(&mut out[header_len..]);
 
-        let tag = auth_tag(&self.session_auth, out, roc);
+        let tag = auth_tag(&self.session_auth, out, roc)?;
         out.extend_from_slice(&tag);
         Ok(())
     }
@@ -293,7 +293,7 @@ impl SrtpContext {
             return Err(SrtpError::Replayed);
         }
 
-        let expected = auth_tag(&self.session_auth, authenticated, roc);
+        let expected = auth_tag(&self.session_auth, authenticated, roc)?;
         if expected.ct_eq(tag).unwrap_u8() != 1 {
             return Err(SrtpError::AuthFailed);
         }
@@ -330,24 +330,30 @@ pub(crate) fn apply_aes_cm(key: &[u8; 16], iv: &[u8; 16], buf: &mut [u8]) {
 
 /// HMAC-SHA1 over `data`, truncated to 80 bits. Shared by SRTP (which passes `header||cipher||ROC`)
 /// and SRTCP (which passes the authenticated portion through the SRTCP-index field).
-pub(crate) fn hmac_sha1_80(key: &[u8; 20], data: &[u8]) -> [u8; AUTH_TAG_LEN] {
-    let mut mac = HmacSha1::new_from_slice(key).expect("HMAC accepts any key length");
+///
+/// `new_from_slice` only rejects a key that violates the HMAC key-length bound, but HMAC accepts a key
+/// of any length, so the fixed 20-byte SRTP auth key can never trip it. The impossible error is mapped
+/// to a fail-closed [`SrtpError::AuthFailed`] rather than an `.expect()` panic in production code.
+pub(crate) fn hmac_sha1_80(key: &[u8; 20], data: &[u8]) -> Result<[u8; AUTH_TAG_LEN], SrtpError> {
+    let mut mac = HmacSha1::new_from_slice(key).map_err(|_| SrtpError::AuthFailed)?;
     mac.update(data);
     let full = mac.finalize().into_bytes();
     let mut tag = [0u8; AUTH_TAG_LEN];
     tag.copy_from_slice(&full[..AUTH_TAG_LEN]);
-    tag
+    Ok(tag)
 }
 
-/// HMAC-SHA1-80 over `data || ROC` — the SRTP authentication input (RFC 3711 §4.2).
-fn auth_tag(key: &[u8; 20], data: &[u8], roc: u32) -> [u8; AUTH_TAG_LEN] {
-    let mut mac = HmacSha1::new_from_slice(key).expect("HMAC accepts any key length");
+/// HMAC-SHA1-80 over `data || ROC` — the SRTP authentication input (RFC 3711 §4.2). Infallible for the
+/// fixed 20-byte key; the impossible key-length error fails closed as [`SrtpError::AuthFailed`] (no
+/// `.expect()` panic in production code).
+fn auth_tag(key: &[u8; 20], data: &[u8], roc: u32) -> Result<[u8; AUTH_TAG_LEN], SrtpError> {
+    let mut mac = HmacSha1::new_from_slice(key).map_err(|_| SrtpError::AuthFailed)?;
     mac.update(data);
     mac.update(&roc.to_be_bytes());
     let full = mac.finalize().into_bytes();
     let mut tag = [0u8; AUTH_TAG_LEN];
     tag.copy_from_slice(&full[..AUTH_TAG_LEN]);
-    tag
+    Ok(tag)
 }
 
 /// Parse just enough of an RTP header to find the encrypted-payload offset, SSRC, and sequence.

@@ -820,6 +820,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 source,
                 repeat_times,
                 start_pos_ms,
+                to_tag,
                 ..
             } => {
                 self.play_media(
@@ -829,6 +830,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     source,
                     repeat_times,
                     start_pos_ms,
+                    to_tag.as_deref(),
                 )
                 .await
             }
@@ -841,8 +843,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 code,
                 duration_ms,
                 volume_dbm0,
-                ..
-            } => self.play_dtmf(client, &call_id, &from_tag, &code, duration_ms, volume_dbm0),
+                pause_ms,
+                to_tag,
+            } => self.play_dtmf(
+                client,
+                &call_id,
+                &from_tag,
+                &code,
+                duration_ms,
+                volume_dbm0,
+                pause_ms,
+                to_tag.as_deref(),
+            ),
             Command::SubscribeRequest {
                 call_id,
                 from_tags,
@@ -870,9 +882,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Command::Echo {
                 call_id,
                 from_tag,
+                to_tag,
                 enabled,
-                ..
-            } => self.set_echo(client, &call_id, &from_tag, enabled).await,
+            } => {
+                self.set_echo(client, &call_id, &from_tag, to_tag.as_deref(), enabled)
+                    .await
+            }
             Command::StartRecording {
                 call_id,
                 recording_dir,
@@ -1166,10 +1181,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if !codec_policy.is_noop() {
             rewritten.sdp = sdp::apply_codec_policy(&rewritten.sdp, &codec_policy);
         }
-        // rtpengine `replace: [origin]`: rewrite the o= line to the engine's advertised address
-        // (topology hiding) — the interface's advertised IP, not the bound one.
-        if profile.replace.iter().any(|field| field == "origin") {
-            rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.advertised_ip);
+        // rtpengine `replace`: rewrite the o= line to the engine's advertised address (topology
+        // hiding) — the interface's advertised IP, not the bound one. Any other requested token is
+        // surfaced rather than silently ignored (pre-public-review B15).
+        let (replaced_sdp, unsupported_replace) =
+            apply_replace_directives(&rewritten.sdp, &profile.replace, engine.advertised_ip);
+        rewritten.sdp = replaced_sdp;
+        if !unsupported_replace.is_empty() {
+            tracing::warn!(
+                %call_id,
+                tokens = ?unsupported_replace,
+                "ignoring unsupported rtpengine `replace` directive(s); only `origin` is honoured",
+            );
         }
 
         // WebSocket bridge (mod_audio_stream / voice-AI): a native siphon-rtp extension. When the
@@ -1701,10 +1724,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     }
                 }
             };
-        // rtpengine `replace: [origin]`: rewrite the o= line to the engine's advertised address
-        // (topology hiding) — the interface's advertised IP, not the bound one.
-        if profile.replace.iter().any(|field| field == "origin") {
-            rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.advertised_ip);
+        // rtpengine `replace`: rewrite the o= line to the engine's advertised address (topology
+        // hiding) — the interface's advertised IP, not the bound one. Any other requested token is
+        // surfaced rather than silently ignored (pre-public-review B15).
+        let (replaced_sdp, unsupported_replace) =
+            apply_replace_directives(&rewritten.sdp, &profile.replace, engine.advertised_ip);
+        rewritten.sdp = replaced_sdp;
+        if !unsupported_replace.is_empty() {
+            tracing::warn!(
+                %call_id,
+                tokens = ?unsupported_replace,
+                "ignoring unsupported rtpengine `replace` directive(s); only `origin` is honoured",
+            );
         }
 
         // WebSocket bridge: if this call is (or is now being) bridged to a WS media server, leg A's
@@ -3114,10 +3145,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         client: ClientId,
         call_id: &str,
         _from_tag: &str,
+        to_tag: Option<&str>,
         enabled: bool,
     ) -> CmdResult {
-        if self.owned_call(client, call_id, |_| ()).is_none() {
+        let Some(call_to) = self.owned_call(client, call_id, |call| call.to_tag.clone()) else {
             return unknown_call(call_id);
+        };
+        // Echo is a whole-call operation (each party hears itself), so `from_tag` / `to_tag` are
+        // dialog-scoping keys, not per-leg selectors. Honour `to_tag` by validating that, when given,
+        // it names this call's UAS (to-tag) leg — a mismatched to-tag is a clean client error, never a
+        // silently-ignored knob (RFC 3264 dialog identity; pre-public-review B18).
+        if let Some(to_tag) = to_tag {
+            if call_to.as_deref() != Some(to_tag) {
+                return error_result("echo", &"to_tag does not match this call's to-tag");
+            }
         }
         if enabled {
             // Promote a plain relay into a processing MediaCall (idempotent on an already-promoted /
@@ -3387,10 +3428,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         source: PlayMediaSource,
         repeat_times: Option<u64>,
         start_pos_ms: Option<u64>,
+        to_tag: Option<&str>,
     ) -> Result<(u64, u64), CmdResult> {
-        let Some((call_from, call_to)) = self.owned_call(client, call_id, |call| {
-            (call.from_tag.clone(), call.to_tag.clone())
-        }) else {
+        let Some(call_to) = self.owned_call(client, call_id, |call| call.to_tag.clone()) else {
             return Err(unknown_call(call_id));
         };
         // Promote an offer-only single-leg IVR call (or a plain relay) to a processing MediaCall so a
@@ -3433,7 +3473,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let toward_a = if call_to.is_none() {
             false
         } else {
-            resolve_toward_a(from_tag, &call_from, call_to.as_deref())
+            resolve_toward_a(from_tag, call_to.as_deref(), to_tag)
         };
         let play_id = self.next_play_id();
         self.media.control(
@@ -3460,6 +3500,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         source: PlayMediaSource,
         repeat_times: Option<u64>,
         start_pos_ms: Option<u64>,
+        to_tag: Option<&str>,
     ) -> CmdResult {
         match self
             .start_play(
@@ -3469,6 +3510,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 source,
                 repeat_times,
                 start_pos_ms,
+                to_tag,
             )
             .await
         {
@@ -3495,8 +3537,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// Inject an RFC 4733 DTMF burst toward a leg ([`Command::PlayDtmf`]). Requires a media-processing
-    /// call with a negotiated telephone-event payload type on the target leg.
+    /// Inject an RFC 4733 DTMF sequence toward a leg ([`Command::PlayDtmf`]). Requires a
+    /// media-processing call with a negotiated telephone-event payload type on the target leg. The
+    /// whole `code` is played as one telephone-event per digit, each `duration_ms` long, separated by
+    /// `pause_ms` of inter-digit silence (RFC 4733). The target leg is resolved from `from_tag` /
+    /// `to_tag` the same way `block_dtmf` resolves its source leg.
+    #[allow(clippy::too_many_arguments)]
     fn play_dtmf(
         &self,
         client: ClientId,
@@ -3505,31 +3551,46 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         code: &str,
         duration_ms: Option<u64>,
         volume_dbm0: Option<i64>,
+        pause_ms: Option<u64>,
+        to_tag: Option<&str>,
     ) -> CmdResult {
-        let Some((call_from, call_to)) = self.owned_call(client, call_id, |call| {
-            (call.from_tag.clone(), call.to_tag.clone())
-        }) else {
+        let Some(call_to) = self.owned_call(client, call_id, |call| call.to_tag.clone()) else {
             return unknown_call(call_id);
         };
         if !self.media.is_transcoding_call(call_id) {
             return error_result("play_dtmf", &"requires a media-processing call");
         }
-        let Some(digit) = code.chars().next() else {
+        // Validate the whole code up front: an empty code or a non-DTMF character is a clean client
+        // error, never a silent truncation to the first digit (RFC 4733 §3.2 event codes).
+        if code.is_empty() {
             return error_result("play_dtmf", &"empty DTMF code");
-        };
+        }
+        if let Some(bad) = code
+            .chars()
+            .find(|digit| siphon_rtp_media::dtmf::digit_to_event_code(*digit).is_none())
+        {
+            return error_result(
+                "play_dtmf",
+                &format!("unsupported DTMF digit {bad:?} in code {code:?}"),
+            );
+        }
         let duration = duration_ms.unwrap_or(250).min(u64::from(u32::MAX)) as u32;
+        let pause = pause_ms
+            .map(|value| value.min(u64::from(u32::MAX)) as u32)
+            .unwrap_or(siphon_rtp_media::dtmf::DEFAULT_DTMF_PAUSE_MS);
         // `volume_dbm0` is a (negative) dBm0 power level; the generator takes its magnitude (0..=63).
         let volume = volume_dbm0
             .map(|value| value.unsigned_abs().min(63) as u8)
             .unwrap_or(10);
-        let toward_a = resolve_toward_a(from_tag, &call_from, call_to.as_deref());
+        let toward_a = resolve_toward_a(from_tag, call_to.as_deref(), to_tag);
         if self.media.control(
             call_id,
             MediaControl::PlayDtmf {
                 toward_a,
-                digit,
+                digits: code.to_string(),
                 duration_ms: duration,
                 volume,
+                pause_ms: pause,
             },
         ) {
             ok_empty()
@@ -5004,10 +5065,45 @@ fn build_direction(
     })
 }
 
-/// Which party a play/DTMF verb targets: the leg named by `from_tag`. Matching the call's `to_tag`
-/// (party B) plays toward B; otherwise toward A (the offerer) — the default.
-fn resolve_toward_a(from_tag: &str, _call_from: &str, call_to: Option<&str>) -> bool {
-    !matches!(call_to, Some(to_tag) if to_tag == from_tag)
+/// Which party a per-leg play/DTMF verb targets, as `toward_a` (`true` ⇒ play toward leg A, the
+/// offerer). A request names leg B when either its `to_tag` or its `from_tag` matches the call's
+/// to-tag (rtpengine / RFC 3264 identify a dialog side by its to-tag); otherwise leg A, the default.
+/// This mirrors `block_dtmf`'s to-tag resolution while keeping the historical `from_tag` selection
+/// working, so `to_tag` is honoured on `play_media` / `play_dtmf` rather than silently ignored
+/// (pre-public-review B18).
+fn resolve_toward_a(from_tag: &str, call_to: Option<&str>, to_tag: Option<&str>) -> bool {
+    let names_leg_b = |tag: Option<&str>| matches!((call_to, tag), (Some(to), Some(t)) if to == t);
+    !(names_leg_b(Some(from_tag)) || names_leg_b(to_tag))
+}
+
+/// Apply the supported rtpengine `replace` directives to `sdp`, returning the rewritten SDP and the
+/// list of requested tokens that were **not** applied.
+///
+/// Only `origin` is implemented (rewrite the `o=` line's unicast-address to the engine's advertised
+/// address for topology hiding, RFC 4566 §5.2). Every other rtpengine `replace` token
+/// (`session-connection`, `session-name`, `zero-address`, `SDES`, `force-increment-sdp-ver`, …) is a
+/// recognized directive we do not yet honour; rather than silently swallow it (pre-public-review B15)
+/// it is returned so the caller surfaces it in a `warn!`. Token matching is ASCII-case-insensitive.
+fn apply_replace_directives(
+    sdp: &str,
+    replace: &[String],
+    advertised_ip: std::net::IpAddr,
+) -> (String, Vec<String>) {
+    let mut rewrite_origin = false;
+    let mut unsupported = Vec::new();
+    for token in replace {
+        if token.eq_ignore_ascii_case("origin") {
+            rewrite_origin = true;
+        } else {
+            unsupported.push(token.clone());
+        }
+    }
+    let sdp = if rewrite_origin {
+        sdp::rewrite_origin(sdp, advertised_ip)
+    } else {
+        sdp.to_string()
+    };
+    (sdp, unsupported)
 }
 
 /// Default mean-square energy threshold for the WS uplink VAD (8/16 kHz L16) when the profile does
@@ -6188,6 +6284,56 @@ mod tests {
             "unknown family ignored"
         );
         assert_eq!(far_address_family(&ProfileFlags::default()), None);
+    }
+
+    #[test]
+    fn resolve_toward_a_honours_from_tag_and_to_tag() {
+        // A 2-leg call (to-tag "b"): the offerer (from_tag "a") plays toward leg A by default.
+        assert!(resolve_toward_a("a", Some("b"), None));
+        // from_tag naming the to-tag ⇒ leg B — the historical selection stays working.
+        assert!(!resolve_toward_a("b", Some("b"), None));
+        // to_tag naming the call's to-tag ⇒ leg B, even when from_tag is the offerer (B18: honoured).
+        assert!(!resolve_toward_a("a", Some("b"), Some("b")));
+        // A to_tag that does not match the call's to-tag does not select leg B.
+        assert!(resolve_toward_a("a", Some("b"), Some("nomatch")));
+        // An unanswered call (no to-tag) always resolves to leg A.
+        assert!(resolve_toward_a("a", None, Some("b")));
+    }
+
+    #[test]
+    fn apply_replace_directives_applies_origin_and_reports_the_rest() {
+        let ip: std::net::IpAddr = "203.0.113.9".parse().expect("ip");
+        let sdp = "v=0\r\no=alice 1 1 IN IP4 10.0.0.7\r\ns=-\r\nc=IN IP4 10.0.0.7\r\nt=0 0\r\n";
+        let o_line = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("o="))
+                .expect("o= line")
+                .to_string()
+        };
+
+        // `origin` rewrites only the o= line's unicast address; nothing is reported unsupported.
+        let (rewritten, unsupported) = apply_replace_directives(sdp, &["origin".into()], ip);
+        assert!(o_line(&rewritten).contains("203.0.113.9"));
+        assert!(!o_line(&rewritten).contains("10.0.0.7"));
+        assert!(unsupported.is_empty());
+
+        // An unimplemented token is reported (not silently swallowed); the SDP is untouched.
+        let (unchanged, unsupported) =
+            apply_replace_directives(sdp, &["session-connection".into()], ip);
+        assert_eq!(unchanged, sdp);
+        assert_eq!(unsupported, vec!["session-connection".to_string()]);
+
+        // Mixed: `origin` still applies (case-insensitive) and every other token is reported back.
+        let (mixed, unsupported) = apply_replace_directives(
+            sdp,
+            &["Origin".into(), "zero-address".into(), "SDES".into()],
+            ip,
+        );
+        assert!(o_line(&mixed).contains("203.0.113.9"));
+        assert_eq!(
+            unsupported,
+            vec!["zero-address".to_string(), "SDES".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -8967,6 +9113,266 @@ mod tests {
             }
         }
         assert!(saw_event, "expected a telephone-event packet toward A");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_dtmf_plays_every_digit_of_a_multi_digit_code() {
+        // B11/B14: a multi-digit `code` plays in full — every digit reaches the peer as its own RFC
+        // 4733 event — not truncated to the first digit, and `pause_ms` separates them.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\na=rtcp-mux\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+        );
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\na=rtcp-mux\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+        );
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dtmf-multi".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dtmf-multi".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        let played = engine
+            .handle(
+                CLIENT,
+                Command::PlayDtmf {
+                    call_id: "dtmf-multi".into(),
+                    from_tag: "tag-a".into(),
+                    code: "12".into(),
+                    duration_ms: Some(80),
+                    volume_dbm0: Some(-10),
+                    pause_ms: Some(40),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(played, CmdResult::Ok { .. }));
+
+        let mut saw_one = false;
+        let mut saw_two = false;
+        for _ in 0..80 {
+            let mut buffer = [0u8; 256];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(100), phone_a.recv_from(&mut buffer)).await
+            {
+                let packet =
+                    siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).expect("parse");
+                if packet.payload_type == 101 {
+                    match packet.payload[0] {
+                        1 => saw_one = true,
+                        2 => saw_two = true,
+                        other => panic!("unexpected DTMF event code {other}"),
+                    }
+                }
+            }
+            if saw_one && saw_two {
+                break;
+            }
+        }
+        assert!(
+            saw_one && saw_two,
+            "both digits of the code played toward A (not truncated to the first)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_dtmf_rejects_an_unsupported_digit_instead_of_truncating() {
+        // A non-DTMF character is a clean client error, never a silent drop / truncation (B14).
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\na=rtcp-mux\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+        );
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\na=rtcp-mux\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+        );
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dtmf-bad".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dtmf-bad".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::PlayDtmf {
+                    call_id: "dtmf-bad".into(),
+                    from_tag: "tag-a".into(),
+                    code: "1Z2".into(),
+                    duration_ms: None,
+                    volume_dbm0: None,
+                    pause_ms: None,
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, CmdResult::Error { .. }),
+            "an unsupported DTMF digit is rejected, not truncated"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn echo_rejects_a_mismatched_to_tag() {
+        // B18: `to_tag` on echo is no longer inert — a to-tag that does not name this call's UAS leg
+        // is a clean error rather than silently ignored, while the correct to-tag is accepted.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "echo-tt".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "echo-tt".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let mismatched = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-tt".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: Some("not-the-to-tag".into()),
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(
+            matches!(mismatched, CmdResult::Error { .. }),
+            "a to_tag that does not match the call is rejected"
+        );
+        let matched = engine
+            .handle(
+                CLIENT,
+                Command::Echo {
+                    call_id: "echo-tt".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: Some("tag-b".into()),
+                    enabled: true,
+                },
+            )
+            .await;
+        assert!(
+            matches!(matched, CmdResult::Ok { .. }),
+            "the call's real to-tag is accepted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_replace_unsupported_token_still_succeeds_without_rewriting_origin() {
+        // B15: an unimplemented `replace` token is surfaced (logged), not a hard failure — a common
+        // rtpengine controller sending `session-connection` must still complete its offer, and without
+        // `origin` the o= address is left untouched (topology hiding is not silently applied).
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let offer_sdp = format!(
+            "v=0\r\no=alice 1 1 IN IP4 10.0.0.7\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+            ip = addr.ip(),
+            port = addr.port()
+        );
+        let profile = ProfileFlags {
+            replace: vec!["session-connection".into()],
+            ..Default::default()
+        };
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ro-unknown".into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile,
+                },
+            )
+            .await;
+        let sdp = ok_sdp_text(&offer);
+        let o_line = sdp.lines().find(|l| l.starts_with("o=")).expect("o= line");
+        assert!(
+            o_line.contains("10.0.0.7"),
+            "without `origin`, the o= address is not rewritten: {o_line}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
