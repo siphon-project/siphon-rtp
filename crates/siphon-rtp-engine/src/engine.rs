@@ -726,9 +726,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Command::ConferenceLeave { .. } => self.metrics.record_conference_leave(),
             _ => {}
         }
+        // Per-command control-plane visibility (target `siphon_rtp::control`), correlated by the
+        // `call_id`/`conference_id` the command addresses — the same key the SBC logs, so a single
+        // grep reconstructs a call across both processes. `call_id` is captured before `dispatch`
+        // consumes `command`; the clone is a control-path (call-setup) allocation, never hot-path.
+        let verb = command_name(&command);
+        let call_id = command_call_id(&command).map(str::to_owned);
+        let call_id_field = call_id.as_deref().unwrap_or("-");
+        let chatty = is_chatty_command(&command);
+        // A `received` breadcrumb at DEBUG so a hung or panicking handler still shows the command's
+        // arrival before its completion line; the INFO story is the single `handled` line below.
+        tracing::debug!(target: "siphon_rtp::control", verb, call_id = call_id_field, client = client.0, "control command received");
+
+        let started = std::time::Instant::now();
         let result = self.dispatch(client, command).await;
-        if matches!(result, CmdResult::Error { .. }) {
+        let elapsed_us = started.elapsed().as_micros() as u64;
+
+        if let CmdResult::Error { reason } = &result {
             self.metrics.record_control_error();
+            tracing::warn!(target: "siphon_rtp::control", verb, call_id = call_id_field, client = client.0, elapsed_us, reason = reason.as_str(), "control command failed");
+        } else if chatty {
+            tracing::debug!(target: "siphon_rtp::control", verb, call_id = call_id_field, client = client.0, elapsed_us, "control command handled");
+        } else {
+            tracing::info!(target: "siphon_rtp::control", verb, call_id = call_id_field, client = client.0, elapsed_us, "control command handled");
         }
         result
     }
@@ -5281,6 +5301,65 @@ fn command_name(command: &Command) -> &'static str {
     }
 }
 
+/// The correlation id to log for a control command: the `call_id` it addresses, or the
+/// `conference_id` for the conference verbs. `None` for verbs that address no specific call
+/// (ping / census / cluster). Kept in step with [`command_name`] and the [`Command`] variants.
+fn command_call_id(command: &Command) -> Option<&str> {
+    match command {
+        Command::Offer { call_id, .. }
+        | Command::Answer { call_id, .. }
+        | Command::AnswerLocal { call_id, .. }
+        | Command::Delete { call_id, .. }
+        | Command::Query { call_id, .. }
+        | Command::Checkpoint { call_id, .. }
+        | Command::PlayMedia { call_id, .. }
+        | Command::StopMedia { call_id, .. }
+        | Command::PlayDtmf { call_id, .. }
+        | Command::SilenceMedia { call_id, .. }
+        | Command::UnsilenceMedia { call_id, .. }
+        | Command::Echo { call_id, .. }
+        | Command::BlockMedia { call_id, .. }
+        | Command::UnblockMedia { call_id, .. }
+        | Command::BlockDtmf { call_id, .. }
+        | Command::UnblockDtmf { call_id, .. }
+        | Command::StartRecording { call_id, .. }
+        | Command::StopRecording { call_id, .. }
+        | Command::SubscribeRequest { call_id, .. }
+        | Command::SubscribeAnswer { call_id, .. }
+        | Command::Unsubscribe { call_id, .. } => Some(call_id),
+        Command::ConferenceJoin { conference_id, .. }
+        | Command::ConferenceLeave { conference_id, .. }
+        | Command::ConferenceRoute { conference_id, .. } => Some(conference_id),
+        Command::ConferenceBridge {
+            conference_id_a, ..
+        } => Some(conference_id_a),
+        Command::Ping
+        | Command::List
+        | Command::Statistics
+        | Command::Load
+        | Command::NodeInfo
+        | Command::Drain
+        | Command::Undrain
+        | Command::Restore { .. }
+        | Command::Authenticate { .. } => None,
+    }
+}
+
+/// Read-only / health-probe verbs a controller polls frequently (the RTPEngine health probe pings
+/// every few seconds). These log the per-command breadcrumb at DEBUG so the default INFO stream
+/// stays a clean per-call story (offer / answer / delete and the media-control verbs).
+fn is_chatty_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Ping
+            | Command::List
+            | Command::Statistics
+            | Command::Load
+            | Command::NodeInfo
+            | Command::Query { .. }
+    )
+}
+
 /// This engine's software version (the daemon crate version), advertised in `node_info`.
 fn engine_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -5498,6 +5577,68 @@ mod tests {
             .expect("bind");
         let addr = socket.local_addr().expect("addr");
         (socket, addr)
+    }
+
+    #[test]
+    fn command_call_id_extracts_the_addressed_correlation_key() {
+        let offer = Command::Offer {
+            call_id: "call-42".into(),
+            from_tag: "ft".into(),
+            sdp: String::new(),
+            profile: ProfileFlags::default(),
+        };
+        assert_eq!(command_call_id(&offer), Some("call-42"));
+
+        let delete = Command::Delete {
+            call_id: "call-42".into(),
+            from_tag: "ft".into(),
+            to_tag: None,
+        };
+        assert_eq!(command_call_id(&delete), Some("call-42"));
+
+        // Conference verbs correlate on the conference id, not a call id.
+        let leave = Command::ConferenceLeave {
+            conference_id: "room-1".into(),
+            from_tag: "ft".into(),
+        };
+        assert_eq!(command_call_id(&leave), Some("room-1"));
+
+        // Census / health / cluster verbs address no specific call.
+        assert_eq!(command_call_id(&Command::Ping), None);
+        assert_eq!(command_call_id(&Command::List), None);
+        assert_eq!(
+            command_call_id(&Command::Restore {
+                snapshot: String::new()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn chatty_commands_are_the_polled_read_only_verbs() {
+        assert!(is_chatty_command(&Command::Ping));
+        assert!(is_chatty_command(&Command::Statistics));
+        assert!(is_chatty_command(&Command::NodeInfo));
+        assert!(is_chatty_command(&Command::Query {
+            call_id: "c".into(),
+            from_tag: "ft".into(),
+            to_tag: None,
+        }));
+
+        // The session-lifecycle verbs are NOT chatty — they log at INFO.
+        let offer = Command::Offer {
+            call_id: "c".into(),
+            from_tag: "ft".into(),
+            sdp: String::new(),
+            profile: ProfileFlags::default(),
+        };
+        assert!(!is_chatty_command(&offer));
+        let delete = Command::Delete {
+            call_id: "c".into(),
+            from_tag: "ft".into(),
+            to_tag: None,
+        };
+        assert!(!is_chatty_command(&delete));
     }
 
     #[test]
