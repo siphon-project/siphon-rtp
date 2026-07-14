@@ -1037,7 +1037,7 @@ impl Direction {
         })
     }
 
-    /// Fold this direction's current quality into its running [`QualityAggregate`] for the call's CDR.
+    /// Fold this direction's current quality into its running `QualityAggregate` for the call's CDR.
     /// `at_ms` is the call-relative time of the sample (for the min/max timestamps in the summary). A
     /// no-op before any inbound media, or on a relay-only direction. Driven on the ~5 s quality cadence
     /// — pure arithmetic over accumulated estimates, no per-packet work.
@@ -2086,7 +2086,7 @@ impl MediaCall {
         }
     }
 
-    /// Fold both directions' current quality into their running [`QualityAggregate`]s for the call's
+    /// Fold both directions' current quality into their running `QualityAggregate`s for the call's
     /// end-of-call CDR. Driven on the same ~5 s cadence as [`Self::build_quality_events`]; `at_ms` is
     /// the call-relative age of the sample, carried through to the min/max timestamps in the summary.
     pub fn accumulate_quality(&mut self, at_ms: u64) {
