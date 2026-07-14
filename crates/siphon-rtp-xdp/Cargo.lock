@@ -2012,6 +2012,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "flume",
+ "siphon-rtp-ebpf-common",
  "siphon-rtp-stun",
  "thiserror 2.0.18",
  "tokio",

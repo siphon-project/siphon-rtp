@@ -597,6 +597,9 @@ pub fn sum_flow_stats(per_cpu: impl IntoIterator<Item = FlowStats>) -> FlowStats
         total.bytes_out += value.bytes_out;
         total.packets_dropped += value.packets_dropped;
         total.last_seen_ns = total.last_seen_ns.max(value.last_seen_ns);
+        total.packets_lost += value.packets_lost;
+        // `last_rtp_seq` is per-CPU internal loss-estimator state (the last observed RTP sequence),
+        // not a summable counter — no meaningful cross-CPU reduction, so it is left 0 in the aggregate.
     }
     total
 }
@@ -970,6 +973,7 @@ impl Datapath for XdpDatapath {
             bytes_in: totals.bytes_in,
             bytes_out: totals.bytes_out,
             packets_dropped: totals.packets_dropped,
+            packets_lost: totals.packets_lost,
         })
     }
 
@@ -1234,6 +1238,7 @@ mod tests {
         assert_eq!(kernel_ns_to_tick(100, 5_000_000_000), 0);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flow_stats(
         packets_in: u64,
         packets_out: u64,
@@ -1241,6 +1246,8 @@ mod tests {
         bytes_out: u64,
         packets_dropped: u64,
         last_seen_ns: u64,
+        packets_lost: u64,
+        last_rtp_seq: u64,
     ) -> FlowStats {
         FlowStats {
             packets_in,
@@ -1249,15 +1256,17 @@ mod tests {
             bytes_out,
             packets_dropped,
             last_seen_ns,
+            packets_lost,
+            last_rtp_seq,
         }
     }
 
     #[test]
     fn sum_flow_stats_sums_counters_and_maxes_last_seen() {
         let per_cpu = [
-            flow_stats(3, 2, 300, 200, 1, 10),
-            flow_stats(4, 5, 400, 500, 0, 99),
-            flow_stats(0, 0, 0, 0, 2, 50),
+            flow_stats(3, 2, 300, 200, 1, 10, 4, 100),
+            flow_stats(4, 5, 400, 500, 0, 99, 5, 200),
+            flow_stats(0, 0, 0, 0, 2, 50, 6, 300),
         ];
         let total = sum_flow_stats(per_cpu);
         assert_eq!(total.packets_in, 7);
@@ -1267,6 +1276,10 @@ mod tests {
         assert_eq!(total.packets_dropped, 3);
         // last_seen_ns is a timestamp → max across CPUs, not a sum.
         assert_eq!(total.last_seen_ns, 99);
+        // packets_lost is a summable counter → summed across CPUs.
+        assert_eq!(total.packets_lost, 15);
+        // last_rtp_seq is per-CPU internal loss-estimator state → left 0 in the aggregate.
+        assert_eq!(total.last_rtp_seq, 0);
     }
 
     #[test]

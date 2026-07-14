@@ -26,8 +26,8 @@ use crate::{
 /// leaves headroom without paying for jumbo frames the media plane never sees.
 const MAX_DATAGRAM: usize = 2048;
 
-/// Lock-free per-endpoint counters, mutated from receive tasks and snapshotted by `stats`.
-#[derive(Default)]
+/// Lock-free per-endpoint counters, mutated from the endpoint's single receive task and snapshotted
+/// by `stats`.
 struct StatsAtomic {
     packets_in: AtomicU64,
     packets_out: AtomicU64,
@@ -36,6 +36,32 @@ struct StatsAtomic {
     packets_dropped: AtomicU64,
     /// Logical-clock tick of the last accepted packet (`0` = none), for the media-timeout sweep.
     last_seen: AtomicU64,
+    /// Cumulative RFC 3550 §A.1-style forward-gap loss estimate on this endpoint's **ingress** — the
+    /// number of missed inbound RTP media sequence numbers, so a plain relay leg reports network loss
+    /// to the CDR. Summable; only ever bumped from the single receive task.
+    packets_lost: AtomicU64,
+    /// Per-endpoint internal loss-estimator state: the last RTP sequence observed on ingress
+    /// ([`RTP_SEQ_NONE`](siphon_rtp_ebpf_common::loss::RTP_SEQ_NONE) before the first packet). Read +
+    /// written only by the endpoint's single receive task (`recv_loop` awaits each `dispatch` before
+    /// the next `recv_from`), so a plain `Relaxed` load/store carries no read-modify-write race.
+    last_rtp_seq: AtomicU64,
+}
+
+impl Default for StatsAtomic {
+    fn default() -> Self {
+        Self {
+            packets_in: AtomicU64::new(0),
+            packets_out: AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+            packets_dropped: AtomicU64::new(0),
+            last_seen: AtomicU64::new(0),
+            packets_lost: AtomicU64::new(0),
+            // No RTP sequence observed yet — the loss estimate establishes its baseline on the first
+            // accepted media packet, not on a spurious 0 -> first-seq gap.
+            last_rtp_seq: AtomicU64::new(siphon_rtp_ebpf_common::loss::RTP_SEQ_NONE),
+        }
+    }
 }
 
 impl StatsAtomic {
@@ -46,6 +72,7 @@ impl StatsAtomic {
             bytes_in: self.bytes_in.load(Ordering::Relaxed),
             bytes_out: self.bytes_out.load(Ordering::Relaxed),
             packets_dropped: self.packets_dropped.load(Ordering::Relaxed),
+            packets_lost: self.packets_lost.load(Ordering::Relaxed),
         }
     }
 }
@@ -242,6 +269,21 @@ impl Inner {
                 in_stats
                     .last_seen
                     .store(self.clock.load(Ordering::Relaxed), Ordering::Relaxed);
+
+                // RTP forward-gap loss estimate (RFC 3550 §A.1) for a plain userspace relay leg, so its
+                // CDR shows inbound network loss even without a transcode actor. RTCP / short datagrams
+                // are skipped. Single-task per endpoint (this `recv_loop` drives `dispatch` serially),
+                // so a plain Relaxed load/store on `last_rtp_seq` carries no read-modify-write race.
+                if siphon_rtp_ebpf_common::rewrite::rtp_media_ssrc(payload).is_some() {
+                    let seq = u16::from_be_bytes([payload[2], payload[3]]);
+                    let last = in_stats.last_rtp_seq.load(Ordering::Relaxed);
+                    let (updated_last, lost) =
+                        siphon_rtp_ebpf_common::loss::rtp_loss_update(last, seq);
+                    if lost > 0 {
+                        in_stats.packets_lost.fetch_add(lost, Ordering::Relaxed);
+                    }
+                    in_stats.last_rtp_seq.store(updated_last, Ordering::Relaxed);
+                }
 
                 // Forward toward the peer endpoint: prefer its latched source (symmetric RTP) over
                 // its configured destination; drop if neither resolves (never forward into the void).
@@ -1341,6 +1383,52 @@ mod tests {
             .expect("rtp send");
         let (data, _) = recv(&callee).await;
         assert_eq!(data, rtp(0x2222_2222, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_relay_counts_network_loss_from_sequence_gaps() {
+        // A plain Forward relay leg (no transcode actor) must still report inbound network loss to the
+        // CDR: the datapath folds each accepted RTP sequence into an RFC 3550 §A.1 forward-gap estimate
+        // on the ingress endpoint. A deliberate gap in the sequence numbers (nothing dropped by the
+        // gate) shows up as `packets_lost`, distinct from `packets_dropped`.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (peer, _) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (callee, callee_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule::symmetric(leg_b.id, Some(callee_addr))),
+            )
+            .expect("flow");
+
+        // seq 1 (baseline), 2 (in order), then 5 — 3 and 4 never arrived (two lost) — then 6. One SSRC
+        // throughout so the latch stays put. Recv each forwarded datagram before sending the next, so
+        // the single receive task has folded packet N's sequence (updating `last_rtp_seq`) before N+1.
+        for sequence in [1u16, 2, 5, 6] {
+            peer.send_to(&rtp(0x1234_5678, sequence), leg_a.local_addr)
+                .await
+                .expect("peer send");
+            let (data, _) = recv(&callee).await;
+            assert_eq!(data, rtp(0x1234_5678, sequence));
+        }
+
+        // The two missing sequences (3, 4) are counted as network loss; nothing was gate-dropped.
+        let mut lost = 0;
+        for _ in 0..50 {
+            lost = datapath.stats(leg_a.id).expect("stats").packets_lost;
+            if lost >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(lost, 2, "sequence gap 2->5 counts two lost packets");
+        assert_eq!(
+            datapath.stats(leg_a.id).expect("stats").packets_dropped,
+            0,
+            "network loss is not an engine-side gate drop"
+        );
     }
 
     #[tokio::test]
