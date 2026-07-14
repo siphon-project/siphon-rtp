@@ -56,10 +56,14 @@
 //!   **sibling** leg's `out_dst`, so a NATed peer's real post-latch source drives the in-kernel relay
 //!   (the in-kernel symmetric-RTP loop is now closed; docs/security-and-nat.md §4 layer 3).
 //!
-//! ## Remaining for a full hardware data plane (documented gaps, not yet wired)
+//! ## RTCP copy-to-userspace tap (wired)
 //!
-//! - **RTCP observation** is wired for the userspace-redirected path only; the `XDP_TX` fast path
-//!   needs an explicit RTCP copy-to-userspace, tracked with the `XDP_TX` work.
+//! The in-kernel `XDP_TX` Forward relay mirrors every **forwarded** RTCP datagram into the `RTCP_TAP`
+//! ring buffer (a fixed [`siphon_rtp_ebpf_common::RtcpTapRecord`] per packet) as a pure side-effect —
+//! the RTCP still `XDP_TX`-forwards exactly as before, and any tap failure is swallowed. The datapath
+//! thread drains the ring (`observed_rtcp_from_record`) into the bounded observe stream, so a
+//! kernelized relay's RTCP reaches the HEP QoS export (loss / jitter / RTT for VoIPmonitor / Homer)
+//! exactly like the userspace-redirected path. [`XdpDatapath::observe_rtcp`] returns that fed stream.
 //!
 //! ## ABI POD wrappers
 //!
@@ -73,7 +77,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use aya::maps::{HashMap as AyaHashMap, MapData, MapError, PerCpuArray, PerCpuHashMap, XskMap};
+use aya::maps::{
+    HashMap as AyaHashMap, MapData, MapError, PerCpuArray, PerCpuHashMap, RingBuf, XskMap,
+};
 use aya::programs::{Xdp, XdpFlags};
 use aya::{Ebpf, Pod};
 use bytes::Bytes;
@@ -83,7 +89,9 @@ use siphon_rtp_datapath::{
     Datapath, DatapathError, Endpoint, EndpointId, EndpointStats, FlowAction as DpFlowAction,
     ForwardRule, IceConfig, ObservedRtcp, RxPacket, SourceFilter,
 };
-use siphon_rtp_ebpf_common::{action, latch, source, FlowAction, FlowKey, FlowStats};
+use siphon_rtp_ebpf_common::{
+    action, latch, source, FlowAction, FlowKey, FlowStats, RtcpTapRecord, RTCP_TAP_MAX_PAYLOAD,
+};
 
 pub mod headers;
 pub mod neighbor;
@@ -314,6 +322,17 @@ impl Loader {
             detail: error.to_string(),
         })
     }
+
+    /// Take ownership of the `RTCP_TAP` ring buffer (the in-kernel RTCP copy-to-userspace tap) out of
+    /// the loaded program, so the datapath thread can drain it as its single owner without holding the
+    /// loader lock across the (blocking-capable) ring reads. `None` if the program has no such map
+    /// (older bytecode) or it is not a ring buffer — the caller then simply runs without the tap, and
+    /// [`XdpDatapath::observe_rtcp`] yields no in-kernel observations (never an error). The map's fd
+    /// stays alive in the returned handle, so the still-attached program keeps writing to it.
+    pub fn take_rtcp_tap_ring(&mut self) -> Option<RingBuf<MapData>> {
+        let map = self.ebpf.take_map("RTCP_TAP")?;
+        RingBuf::try_from(map).ok()
+    }
 }
 
 /// The first ephemeral media port the XDP backend hands out (the IANA dynamic range floor minus the
@@ -373,8 +392,9 @@ struct Inner {
     local_ip: Ipv4Addr,
     /// Receiver end of the redirect stream; the sole sender lives on the datapath thread.
     redirect_rx: flume::Receiver<RxPacket>,
-    /// Kept so the observe channel never closes; the in-kernel RTCP tap is wired with the XDP_TX work.
-    observe_tx: flume::Sender<ObservedRtcp>,
+    /// Receiver end of the RTCP observe stream ([`XdpDatapath::observe_rtcp`]). The sole sender lives on
+    /// the datapath thread, which drains the in-kernel `RTCP_TAP` ring into it — so the channel stays
+    /// open for the datapath's whole life (the thread is joined on teardown) and closes when it exits.
     observe_rx: flume::Receiver<ObservedRtcp>,
     /// TX command channel to the datapath thread (the single owner of the AF_XDP socket).
     tx_commands: flume::Sender<TxRequest>,
@@ -422,6 +442,10 @@ impl XdpDatapath {
         let ifindex = xsk::ifindex(interface);
         let socket = xsk::XskSocket::new(ifindex, queue, &config)?;
         loader.register_xsk(queue, socket.as_raw_fd())?;
+        // Take the in-kernel RTCP tap ring out of the program so the datapath thread owns it (drains it
+        // without touching the loader lock). `None` if the program predates the tap — the datapath then
+        // runs with no in-kernel RTCP observations, exactly as before this feature.
+        let tap_ring = loader.take_rtcp_tap_ring();
 
         let (redirect_tx, redirect_rx) = flume::unbounded();
         let (observe_tx, observe_rx) = flume::bounded(256);
@@ -447,7 +471,6 @@ impl XdpDatapath {
             start_ktime_ns,
             local_ip,
             redirect_rx,
-            observe_tx,
             observe_rx,
             tx_commands,
             datapath_thread: Mutex::new(None),
@@ -455,7 +478,9 @@ impl XdpDatapath {
 
         // The busy-poll thread is the single owner of the AF_XDP socket (actor model): it drains RX
         // into the redirect stream and serialises TX requests, so the ring is never touched
-        // concurrently. It shares the live endpoint registry via the `Arc` (not a snapshot).
+        // concurrently. It also owns and drains the in-kernel RTCP tap ring (the sole `observe_tx`
+        // sender lives here, feeding the observe stream), so it is the single owner of every kernel-fed
+        // stream. It shares the live endpoint registry via the `Arc` (not a snapshot).
         let thread_redirect = redirect_tx;
         let thread_endpoints = endpoints;
         let local_ip_copy = local_ip;
@@ -471,6 +496,8 @@ impl XdpDatapath {
                     local_ip_copy,
                     start,
                     thread_resolver,
+                    tap_ring,
+                    observe_tx,
                 );
             })
             .map_err(|error| XdpError::Xsk(xsk::XskError::Socket(error)))?;
@@ -726,6 +753,7 @@ fn apply_forward_target(
 /// The dedicated AF_XDP datapath thread: the single owner of the socket. It busy-polls the RX ring
 /// (draining received frames → the redirect stream, keyed by destination transport → endpoint) and
 /// serves TX requests from the command channel, completing TX frames between bursts.
+#[allow(clippy::too_many_arguments)]
 fn datapath_loop(
     mut socket: xsk::XskSocket,
     tx_rx: flume::Receiver<TxRequest>,
@@ -734,6 +762,8 @@ fn datapath_loop(
     _local_ip: Ipv4Addr,
     start: std::time::Instant,
     resolver: NeighborResolver,
+    mut tap_ring: Option<RingBuf<MapData>>,
+    observe: flume::Sender<ObservedRtcp>,
 ) {
     loop {
         // Stamp the resolver's freshness clock from the same monotonic origin the RX path uses
@@ -766,6 +796,20 @@ fn datapath_loop(
             if redirect.send(rx_packet).is_err() {
                 // No consumer; the whole datapath is being torn down.
                 return;
+            }
+        }
+
+        // Drain the in-kernel RTCP tap ring (low-rate; a full drain each poll turn is timely — the
+        // idle path below still wakes at least every 1 ms). Each record is a forwarded RTCP datagram
+        // the `XDP_TX` fast path mirrored; turn it into an `ObservedRtcp` for the HEP QoS export.
+        // Bounded try_send — drop on backpressure / no consumer, never block the datapath thread.
+        if let Some(ring) = tap_ring.as_mut() {
+            while let Some(item) = ring.next() {
+                if let Some(record) = parse_tap_record(&item) {
+                    if let Some(observed) = observed_rtcp_from_record(&record, &endpoints) {
+                        let _ = observe.try_send(observed);
+                    }
+                }
             }
         }
 
@@ -867,6 +911,55 @@ fn endpoint_for(
         .iter()
         .find(|entry| entry.value().local_addr == addr)
         .map(|entry| *entry.key())
+}
+
+/// Reinterpret one `RTCP_TAP` ring-buffer entry's bytes as the [`RtcpTapRecord`] the kernel wrote.
+/// `None` if the slot is shorter than the record (never expected — the kernel reserves exactly one
+/// record per submit). Pure and NIC-free: unit-tested by round-tripping a byte image of a record.
+///
+/// Safety: [`RtcpTapRecord`] is a `#[repr(C)]` POD of integers + a byte array, so every bit pattern is
+/// a valid value; the length check guarantees the read stays in-bounds. `read_unaligned` because a
+/// ring slot carries no alignment guarantee for our type.
+fn parse_tap_record(bytes: &[u8]) -> Option<RtcpTapRecord> {
+    if bytes.len() < std::mem::size_of::<RtcpTapRecord>() {
+        return None;
+    }
+    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RtcpTapRecord) })
+}
+
+/// Turn one kernel-tapped RTCP record into an [`ObservedRtcp`] for the telemetry export, resolving the
+/// owning [`EndpointId`] from the record's engine-local (ingress) transport. `None` when the endpoint
+/// is unknown (torn down between tap and drain) or the record's `payload_len` is out of range. All
+/// record transport fields are host order (the [`RtcpTapRecord`] ABI), so `Ipv4Addr::from` and the raw
+/// port reconstruct each [`SocketAddr`] directly. Pure — unit-tested with a synthetic record + a
+/// populated endpoint registry, no NIC needed.
+fn observed_rtcp_from_record(
+    record: &RtcpTapRecord,
+    endpoints: &DashMap<EndpointId, EndpointRecord>,
+) -> Option<ObservedRtcp> {
+    let payload_len = record.payload_len as usize;
+    if payload_len == 0 || payload_len > RTCP_TAP_MAX_PAYLOAD {
+        return None;
+    }
+    let local = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::from(record.local_ipv4)),
+        record.local_port,
+    );
+    let endpoint = endpoint_for(endpoints, local)?;
+    let source = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::from(record.source_ipv4)),
+        record.source_port,
+    );
+    let destination = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::from(record.dest_ipv4)),
+        record.dest_port,
+    );
+    Some(ObservedRtcp {
+        endpoint,
+        source,
+        destination,
+        payload: Bytes::copy_from_slice(&record.payload[..payload_len]),
+    })
 }
 
 impl Datapath for XdpDatapath {
@@ -1040,10 +1133,10 @@ impl Datapath for XdpDatapath {
     }
 
     fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp> {
-        // The observe tap is wired for the userspace-redirected path; the in-kernel XDP_TX fast path
-        // would need an explicit RTCP copy-to-userspace, tracked with the XDP_TX work. The sender is
-        // kept live so the receiver never sees a closed channel.
-        let _ = &self.inner.observe_tx;
+        // Fed by the in-kernel RTCP copy-to-userspace tap: the `XDP_TX` Forward fast path mirrors every
+        // forwarded RTCP datagram into the `RTCP_TAP` ring, and the datapath thread drains it into this
+        // bounded stream (`observed_rtcp_from_record`), so a kernelized relay's RTCP reaches the HEP QoS
+        // export exactly like the userspace-redirected path.
         self.inner.observe_rx.clone()
     }
 }
@@ -1376,5 +1469,147 @@ mod tests {
             now_first >= last_activity,
             "now_ticks must not precede a just-stamped last_activity (no sweep underflow)"
         );
+    }
+
+    // --- RTCP copy-to-userspace tap: the pure record -> ObservedRtcp reconstruction (NIC-free). -----
+
+    /// A synthetic tap record with host-order transports (as the kernel writes them) and `payload_len`
+    /// bytes of `payload`.
+    fn tap_record(
+        local: SocketAddrV4,
+        source: SocketAddrV4,
+        destination: SocketAddrV4,
+        payload_bytes: &[u8],
+    ) -> RtcpTapRecord {
+        let mut record = RtcpTapRecord::zeroed();
+        record.local_ipv4 = u32::from(*local.ip());
+        record.local_port = local.port();
+        record.source_ipv4 = u32::from(*source.ip());
+        record.source_port = source.port();
+        record.dest_ipv4 = u32::from(*destination.ip());
+        record.dest_port = destination.port();
+        record.payload[..payload_bytes.len()].copy_from_slice(payload_bytes);
+        record.payload_len = payload_bytes.len() as u16;
+        record
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), port)
+    }
+
+    #[test]
+    fn parse_tap_record_roundtrips_a_record_image() {
+        // A ring slot is a verbatim byte image of the `#[repr(C)]` record; `parse_tap_record` reads it
+        // back field-for-field, so the kernel emit and userspace read agree.
+        let record = tap_record(
+            v4(198, 51, 100, 1, 30000),
+            v4(203, 0, 113, 9, 7000),
+            v4(198, 51, 100, 9, 8000),
+            &[0x80, 0xC8, 0x00, 0x06],
+        );
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&record).cast::<u8>(),
+                std::mem::size_of::<RtcpTapRecord>(),
+            )
+        };
+        let parsed = parse_tap_record(bytes).expect("full-length slot parses");
+        assert_eq!(parsed.local_ipv4, record.local_ipv4);
+        assert_eq!(parsed.local_port, record.local_port);
+        assert_eq!(parsed.source_ipv4, record.source_ipv4);
+        assert_eq!(parsed.source_port, record.source_port);
+        assert_eq!(parsed.dest_ipv4, record.dest_ipv4);
+        assert_eq!(parsed.dest_port, record.dest_port);
+        assert_eq!(parsed.payload_len, 4);
+        assert_eq!(&parsed.payload[..4], &[0x80, 0xC8, 0x00, 0x06]);
+    }
+
+    #[test]
+    fn parse_tap_record_rejects_a_short_slice() {
+        // A slot shorter than the record (never expected — the kernel reserves exactly one) is refused
+        // rather than reading out of bounds.
+        assert!(parse_tap_record(&[0u8; 8]).is_none());
+        assert!(parse_tap_record(&[]).is_none());
+    }
+
+    #[test]
+    fn observed_rtcp_from_record_resolves_endpoint_and_transports() {
+        // The engine-local transport resolves the owning endpoint; source/destination and the RTCP
+        // payload reconstruct directly from the host-order record fields.
+        let endpoints = empty_endpoints();
+        let owner = EndpointId(5);
+        let local = v4(198, 51, 100, 1, 30000);
+        endpoints.insert(
+            owner,
+            EndpointRecord {
+                local_addr: SocketAddr::V4(local),
+                flow_key: FlowKey {
+                    local_ipv4: u32::from_be_bytes([198, 51, 100, 1]),
+                    local_port: 30000u16.to_be(),
+                    _pad: 0,
+                },
+            },
+        );
+        // A minimal RTCP sender report prefix (V=2, PT=200) — the bytes are opaque to the tap.
+        let payload = [0x80, 0xC8, 0x00, 0x06, 0xDE, 0xAD, 0xBE, 0xEF];
+        let record = tap_record(
+            local,
+            v4(203, 0, 113, 9, 7000),
+            v4(198, 51, 100, 9, 8000),
+            &payload,
+        );
+
+        let observed = observed_rtcp_from_record(&record, &endpoints).expect("resolves");
+        assert_eq!(observed.endpoint, owner);
+        assert_eq!(
+            observed.source,
+            "203.0.113.9:7000".parse::<SocketAddr>().expect("addr")
+        );
+        assert_eq!(
+            observed.destination,
+            "198.51.100.9:8000".parse::<SocketAddr>().expect("addr")
+        );
+        assert_eq!(&observed.payload[..], &payload[..]);
+    }
+
+    #[test]
+    fn observed_rtcp_from_record_unknown_endpoint_is_none() {
+        // The endpoint was torn down between the kernel tap and the userspace drain: no observation.
+        let endpoints = empty_endpoints();
+        let record = tap_record(
+            v4(198, 51, 100, 1, 30000),
+            v4(203, 0, 113, 9, 7000),
+            v4(198, 51, 100, 9, 8000),
+            &[0x80, 0xC8, 0x00, 0x06],
+        );
+        assert!(observed_rtcp_from_record(&record, &endpoints).is_none());
+    }
+
+    #[test]
+    fn observed_rtcp_from_record_rejects_out_of_range_payload_len() {
+        // A record with an implausible length is dropped, never indexing past the payload buffer.
+        let endpoints = empty_endpoints();
+        let local = v4(198, 51, 100, 1, 30000);
+        endpoints.insert(
+            EndpointId(1),
+            EndpointRecord {
+                local_addr: SocketAddr::V4(local),
+                flow_key: FlowKey {
+                    local_ipv4: 0,
+                    local_port: 0,
+                    _pad: 0,
+                },
+            },
+        );
+        let mut record = tap_record(
+            local,
+            v4(203, 0, 113, 9, 7000),
+            v4(198, 51, 100, 9, 8000),
+            &[0x80, 0xC8, 0x00, 0x06],
+        );
+        record.payload_len = 0;
+        assert!(observed_rtcp_from_record(&record, &endpoints).is_none());
+        record.payload_len = (RTCP_TAP_MAX_PAYLOAD + 1) as u16;
+        assert!(observed_rtcp_from_record(&record, &endpoints).is_none());
     }
 }

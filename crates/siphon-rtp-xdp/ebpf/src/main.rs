@@ -50,9 +50,9 @@ use aya_ebpf::{
         bpf_fib_lookup as bpf_fib_lookup_params, xdp_action, BPF_FIB_LKUP_RET_SUCCESS,
         BPF_FIB_LOOKUP_DIRECT,
     },
-    helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect},
+    helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_xdp_load_bytes},
     macros::{map, xdp},
-    maps::{HashMap, PerCpuArray, PerCpuHashMap, XskMap},
+    maps::{HashMap, PerCpuArray, PerCpuHashMap, RingBuf, XskMap},
     programs::XdpContext,
     EbpfContext,
 };
@@ -63,7 +63,7 @@ use siphon_rtp_ebpf_common::{
         ipv4_checksum_after_addr_rewrite, is_rtp_or_rtcp, latch_decision, rtp_media_ssrc,
         udp_checksum_after_rewrite, LatchVerdict, Latched,
     },
-    source, FlowAction, FlowKey, FlowStats,
+    source, FlowAction, FlowKey, FlowStats, RtcpTapRecord, RTCP_TAP_MAX_PAYLOAD,
 };
 
 /// Flow table: destination transport → relay rule. Keyed/valued by the shared ABI POD.
@@ -83,6 +83,15 @@ static STATS: PerCpuArray<FlowStats> = PerCpuArray::with_max_entries(1, 0);
 /// (docs/security-and-nat.md §4 layer 6) instead of the program-wide aggregate. Sized to `FLOWS`.
 #[map]
 static FLOW_STATS: PerCpuHashMap<FlowKey, FlowStats> = PerCpuHashMap::with_max_entries(65_536, 0);
+
+/// RTCP copy-to-userspace tap: the in-kernel `XDP_TX` Forward relay mirrors every **forwarded** RTCP
+/// datagram here (a fixed [`RtcpTapRecord`] per packet) so a kernelized relay's RTCP still reaches the
+/// HEP QoS export (VoIPmonitor / Homer) — the forward decision is never affected (the RTCP `XDP_TX`s
+/// exactly as before; the tap is a pure side-effect that skips itself on any failure). RTCP is
+/// low-rate (a few packets/second per leg), so 1 MiB is generously oversized; the loader drains it on
+/// its busy-poll thread. 1 MiB is a power-of-two multiple of the page size, as the kernel requires.
+#[map]
+static RTCP_TAP: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
 
 /// A zeroed per-flow stats value for the first-packet insert. A `const` reference so the insert
 /// carries no on-stack copy (the eBPF stack budget is 512 bytes; the FIB-lookup params already use it).
@@ -314,6 +323,78 @@ fn try_classify(ctx: &XdpContext) -> Result<u32, ()> {
     }
 }
 
+/// Mirror one forwarded RTCP datagram to userspace through the `RTCP_TAP` ring (the HEP QoS export
+/// for a kernelized relay). All transport fields are **host order** (the [`RtcpTapRecord`] ABI); the
+/// caller passes the datagram's original ingress transport (`local_*` — resolves the owning endpoint),
+/// its peer source (`source_*`), and the resolved forward destination (`dest_*`). Best-effort: on a
+/// full ring or a short/failed payload read it silently skips — the RTCP forward is never affected.
+///
+/// The RTCP payload is copied with `bpf_xdp_load_bytes` (helper 189, kernel ≥ 5.18) — it copies
+/// exactly `copy_len` bytes and does its own packet-bounds check, so the whole RTCP compound (SR/RR +
+/// SDES, all 32-bit aligned) is captured with no reception-block truncation. `copy_len` is provably
+/// bounded to `[4, RTCP_TAP_MAX_PAYLOAD]`, so the fixed 256-byte `payload` buffer always fits it
+/// (verifier: `ARG_PTR_TO_MEM` + `ARG_CONST_SIZE`).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn tap_rtcp(
+    ctx: &XdpContext,
+    payload_offset: usize,
+    payload_len: u64,
+    local_ip_host: u32,
+    local_port_host: u16,
+    source_ip_host: u32,
+    source_port_host: u16,
+    dest_ip_host: u32,
+    dest_port_host: u16,
+) {
+    // Too short to be a useful RTCP report — skip. Also keeps `copy_len` provably non-zero for the
+    // verifier's `ARG_CONST_SIZE` check on `bpf_xdp_load_bytes`.
+    if payload_len < 4 {
+        return;
+    }
+    // Reserve a fixed slot; a full ring just skips the tap (never affects forwarding).
+    let mut entry = match RTCP_TAP.reserve::<RtcpTapRecord>(0) {
+        Some(entry) => entry,
+        None => return,
+    };
+    let record = entry.as_mut_ptr();
+
+    // Provably bounded to [4, RTCP_TAP_MAX_PAYLOAD] so the fixed `payload` buffer always holds it.
+    let copy_len: u32 = if payload_len >= RTCP_TAP_MAX_PAYLOAD as u64 {
+        RTCP_TAP_MAX_PAYLOAD as u32
+    } else {
+        payload_len as u32
+    };
+    // Copy the RTCP bytes straight into the reserved ring slot (no stack bounce). A read error /
+    // short packet returns < 0 → discard the slot and skip the tap.
+    let loaded = unsafe {
+        let payload_ptr = core::ptr::addr_of_mut!((*record).payload);
+        bpf_xdp_load_bytes(
+            ctx.ctx,
+            payload_offset as u32,
+            payload_ptr as *mut _,
+            copy_len,
+        )
+    };
+    if loaded < 0 {
+        entry.discard(0);
+        return;
+    }
+    // Fill the transport header verbatim (host order) + the valid length, then publish the slot.
+    unsafe {
+        (*record).local_ipv4 = local_ip_host;
+        (*record).local_port = local_port_host;
+        (*record)._pad0 = 0;
+        (*record).source_ipv4 = source_ip_host;
+        (*record).source_port = source_port_host;
+        (*record)._pad1 = 0;
+        (*record).dest_ipv4 = dest_ip_host;
+        (*record).dest_port = dest_port_host;
+        (*record).payload_len = copy_len as u16;
+    }
+    entry.submit(0);
+}
+
 /// The in-kernel `XDP_TX` relay for an `action::FORWARD` flow (docs/security-and-nat.md §4).
 ///
 /// Enforces the layered secure symmetric-RTP posture before it forwards a single byte:
@@ -410,22 +491,32 @@ fn forward_in_kernel(
     // media-timeout / dead-path sweep needs (docs/security-and-nat.md §4 layer 6).
     stamp_last_seen(stats_entry, unsafe { bpf_ktime_get_ns() });
 
-    // In-kernel RTP loss estimate: fold this accepted media packet's sequence into the per-flow
-    // forward-gap counter (RFC 3550 §A.1-style) so a kernelized (XDP_TX) relay still reports network
-    // loss to the CDR. Skip RTCP (rtp_media_ssrc None) and short/non-RTP datagrams.
-    if let Ok(rtp_header) = load::<[u8; 12]>(ctx, payload_offset) {
-        if rtp_media_ssrc(&rtp_header).is_some() {
-            let seq = u16::from_be_bytes([rtp_header[2], rtp_header[3]]);
-            let last = stats_entry.map_or(RTP_SEQ_NONE, |entry| unsafe { (*entry).last_rtp_seq });
-            let (updated_last, lost) = rtp_loss_update(last, seq);
-            if lost > 0 {
-                account(stats_entry, |s| s.packets_lost += lost);
+    // Classify RTP media vs RTCP once (RFC 5761 §4 payload-type demux). This drives two side-effects
+    // that never touch the forward decision: the RTP forward-gap loss estimate (RTP media only) and
+    // the RTCP copy-to-userspace tap further below. A datagram too short for the 12-byte RTP header is
+    // treated as non-media (RTCP-class) — it never pins the media path anyway.
+    let is_rtcp = match load::<[u8; 12]>(ctx, payload_offset) {
+        Ok(rtp_header) => {
+            let is_media = rtp_media_ssrc(&rtp_header).is_some();
+            if is_media {
+                // In-kernel RTP loss estimate: fold this accepted media packet's sequence into the
+                // per-flow forward-gap counter (RFC 3550 §A.1-style) so a kernelized (XDP_TX) relay
+                // still reports network loss to the CDR.
+                let seq = u16::from_be_bytes([rtp_header[2], rtp_header[3]]);
+                let last =
+                    stats_entry.map_or(RTP_SEQ_NONE, |entry| unsafe { (*entry).last_rtp_seq });
+                let (updated_last, lost) = rtp_loss_update(last, seq);
+                if lost > 0 {
+                    account(stats_entry, |s| s.packets_lost += lost);
+                }
+                if let Some(flow) = stats_entry {
+                    unsafe { (*flow).last_rtp_seq = updated_last };
+                }
             }
-            if let Some(flow) = stats_entry {
-                unsafe { (*flow).last_rtp_seq = updated_last };
-            }
+            !is_media
         }
-    }
+        Err(()) => true,
+    };
 
     // --- Resolve the forward destination. The kernel forwards to the userspace-maintained
     //     destination (rtpengine `dst_addr` parity; the loopback backend's `.or(rule.out_dst)`
@@ -440,6 +531,33 @@ fn forward_in_kernel(
     }
     let new_src_ip_host = rule.out_local_ipv4; // host-order
     let new_src_port_host = u16::from_be(rule.out_src_port); // network-order -> host
+
+    // --- RTCP copy-to-userspace tap (HEP QoS export for a kernelized relay). Purely additive: the
+    //     RTCP datagram still XDP_TX-forwards below exactly as before; this only mirrors a copy to
+    //     userspace. Placed *after* the destination resolved (above), so — like the UDP backend's
+    //     post-send tap — it only fires for RTCP that has a real forward `destination`. Any tap
+    //     failure (ring full, short read) is swallowed and never affects the forward decision. -------
+    if is_rtcp {
+        // Read the engine-local (ingress) transport that resolves the owning endpoint in userspace.
+        // These fields are still the *original* destination here — the L3/L4 rewrite happens further
+        // below, only on a FIB hit. Defensive reads: on the (never-expected) short read, skip the tap.
+        if let (Ok(local_ip_host), Ok(local_port_host)) = (
+            load_be_u32(ctx, ip_offset + 16),
+            load_be_u16(ctx, udp_offset + 2),
+        ) {
+            tap_rtcp(
+                ctx,
+                payload_offset,
+                payload_len,
+                local_ip_host,
+                local_port_host,
+                src_ip_host,
+                src_port_host,
+                new_dst_ip_host,
+                new_dst_port_host,
+            );
+        }
+    }
 
     // --- Next hop (RFC 1122 §3.3): a FIB lookup on the *rewritten* destination. -----------------
     let ip_total_len_host = load_be_u16(ctx, ip_offset + 2)?;
