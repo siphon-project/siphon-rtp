@@ -219,6 +219,73 @@ pub struct FlowStats {
     pub last_rtp_seq: u64,
 }
 
+/// Max RTCP payload bytes carried in one [`RtcpTapRecord`]. RTCP compound packets (SR/RR + SDES) are
+/// small and always 32-bit word aligned (RFC 3550 §6.4.1); this covers the sender/reception-report
+/// blocks the HEP QoS export needs (loss / jitter / RTT — the RR block's LSR/DLSR sit within the first
+/// ~52 bytes of a single-source SR). A larger datagram is truncated to this prefix.
+pub const RTCP_TAP_MAX_PAYLOAD: usize = 256;
+
+/// One tapped RTCP datagram copied from the in-kernel `XDP_TX` fast path to userspace through the
+/// `RTCP_TAP` ring buffer, so a **kernelized** relay's RTCP still reaches the HEP QoS export
+/// (VoIPmonitor / Homer). The kernel `XDP_TX`-forwards the RTCP exactly as before and, as a pure
+/// side-effect, mirrors a copy of it here; userspace turns it into a `siphon_rtp_datapath::ObservedRtcp`.
+///
+/// Fixed size (`payload` is a fixed buffer, `payload_len` says how many bytes are valid) so the kernel
+/// emit is one `RingBuf::reserve`/`submit` and the userspace read is one plain `#[repr(C)]` copy —
+/// no dynamic-length ring reserve, which keeps the eBPF verifier's bounded-access reasoning trivial.
+///
+/// **Byte order.** Every address is a **host-order** `u32` — the integer `core::net::Ipv4Addr::from`
+/// reconstructs the dotted quad from directly — and every port a **host-order** `u16`. This matches
+/// how the loader already reconstructs an in-kernel-learned latch (`learned_latch_from_action`:
+/// `Ipv4Addr::from(latched_ipv4)`, raw `latched_port`), so userspace needs no byte-swap dance. The
+/// kernel fills them with `u32::from_be_bytes` / `u16::from_be_bytes` reads of the wire fields (and
+/// the loader-stored host-order `out_ipv4`), the same representation `FlowAction.latched_*` uses.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RtcpTapRecord {
+    /// The relay's engine-local IPv4 the RTCP was destined to (host order) — resolves the owning
+    /// `EndpointId` in userspace (matched against the endpoint's local transport).
+    pub local_ipv4: u32,
+    /// The relay's engine-local UDP port the RTCP was destined to (host order).
+    pub local_port: u16,
+    /// Padding to keep `source_ipv4` 4-byte aligned (fixed ABI layout).
+    pub _pad0: u16,
+    /// The peer that sent the RTCP — the observed `source` (host order).
+    pub source_ipv4: u32,
+    /// The peer's UDP source port (host order).
+    pub source_port: u16,
+    /// Padding to keep `dest_ipv4` 4-byte aligned (fixed ABI layout).
+    pub _pad1: u16,
+    /// Where the relay forwarded the RTCP — the observed `destination` (host order).
+    pub dest_ipv4: u32,
+    /// The forward-destination UDP port (host order).
+    pub dest_port: u16,
+    /// Valid bytes in `payload` (`<= RTCP_TAP_MAX_PAYLOAD`).
+    pub payload_len: u16,
+    /// The (possibly truncated) RTCP datagram bytes; only `payload[..payload_len]` is meaningful.
+    pub payload: [u8; RTCP_TAP_MAX_PAYLOAD],
+}
+
+impl RtcpTapRecord {
+    /// A zeroed record — the kernel reserves an uninitialised ring slot and fills the header fields
+    /// plus `payload[..payload_len]` explicitly, so this is only for host-side tests/construction.
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self {
+            local_ipv4: 0,
+            local_port: 0,
+            _pad0: 0,
+            source_ipv4: 0,
+            source_port: 0,
+            _pad1: 0,
+            dest_ipv4: 0,
+            dest_port: 0,
+            payload_len: 0,
+            payload: [0u8; RTCP_TAP_MAX_PAYLOAD],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +334,25 @@ mod tests {
         assert_eq!(offset_of!(FlowStats, last_seen_ns), 40);
         assert_eq!(offset_of!(FlowStats, packets_lost), 48);
         assert_eq!(offset_of!(FlowStats, last_rtp_seq), 56);
+    }
+
+    #[test]
+    fn rtcp_tap_record_abi_is_stable() {
+        // The RTCP copy-to-userspace ring ABI: the kernel `RingBuf::reserve::<RtcpTapRecord>` emit and
+        // the loader's `#[repr(C)]` read must agree byte-for-byte. Alignment 4 (largest field is a
+        // `u32`) also satisfies the ring buffer's `8 % align_of::<T>() == 0` reserve requirement.
+        assert_eq!(align_of::<RtcpTapRecord>(), 4);
+        assert_eq!(size_of::<RtcpTapRecord>(), 24 + RTCP_TAP_MAX_PAYLOAD);
+        assert_eq!(offset_of!(RtcpTapRecord, local_ipv4), 0);
+        assert_eq!(offset_of!(RtcpTapRecord, local_port), 4);
+        assert_eq!(offset_of!(RtcpTapRecord, source_ipv4), 8);
+        assert_eq!(offset_of!(RtcpTapRecord, source_port), 12);
+        assert_eq!(offset_of!(RtcpTapRecord, dest_ipv4), 16);
+        assert_eq!(offset_of!(RtcpTapRecord, dest_port), 20);
+        assert_eq!(offset_of!(RtcpTapRecord, payload_len), 22);
+        assert_eq!(offset_of!(RtcpTapRecord, payload), 24);
+        // The ring reserve requires 8 to be a multiple of the record's alignment.
+        assert_eq!(8 % align_of::<RtcpTapRecord>(), 0);
     }
 
     #[test]
