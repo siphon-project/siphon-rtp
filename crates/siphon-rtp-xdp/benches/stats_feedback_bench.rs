@@ -24,6 +24,8 @@ fn per_cpu_values(cpus: usize) -> Vec<FlowStats> {
             bytes_out: 144_000 + index as u64,
             packets_dropped: index as u64,
             last_seen_ns: 5_000_000_000 + (index as u64) * 1_000_000,
+            packets_lost: index as u64,
+            last_rtp_seq: 0,
         })
         .collect()
 }

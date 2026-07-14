@@ -2454,6 +2454,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             total.bytes_in += stats.bytes_in;
             total.bytes_out += stats.bytes_out;
             total.packets_dropped += stats.packets_dropped;
+            total.packets_lost += stats.packets_lost;
         }
         total
     }
@@ -2506,6 +2507,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     packets_out = counters.packets_out,
                     bytes_out = counters.bytes_out,
                     packets_dropped = counters.packets_dropped,
+                    net_lost = counters.packets_lost,
                     ssrc = %ssrc,
                     lost = quality.packets_lost,
                     loss_percent = quality.loss_percent,
@@ -2536,6 +2538,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     packets_out = counters.packets_out,
                     bytes_out = counters.bytes_out,
                     packets_dropped = counters.packets_dropped,
+                    net_lost = counters.packets_lost,
                     "leg"
                 );
             }
@@ -5568,6 +5571,12 @@ fn leg_summary(
             }
             .to_string(),
         );
+    } else if counters.packets_lost > 0 {
+        // Counters-only relay leg (kernelized XDP_TX or UDP-loopback Forward): no jitter buffer to
+        // derive the exact expected-minus-received figure, so surface the datapath's RFC 3550 §A.1
+        // forward-gap network-loss estimate instead — without it a lossy relay leg reports zero loss
+        // in the structured CDR. When the quality half IS present its measured loss wins (above).
+        summary.packets_lost = Some(u32::try_from(counters.packets_lost).unwrap_or(u32::MAX));
     }
     summary
 }

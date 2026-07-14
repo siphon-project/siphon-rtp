@@ -16,6 +16,10 @@
 /// latch state machine) shared by the in-kernel XDP_TX fast path and its host-side tests/benches.
 pub mod rewrite;
 
+/// Pure RFC 3550 §A.1-style forward-gap RTP loss estimate, shared by the in-kernel XDP_TX fast path
+/// and the UDP-loopback backend so a plain relay leg reports inbound network loss to the CDR.
+pub mod loss;
+
 /// Flow action discriminants ([`FlowAction::kind`]).
 pub mod action {
     /// Discard the datagram.
@@ -203,6 +207,16 @@ pub struct FlowStats {
     /// layer 6). `0` means no packet has been accepted yet. Per-CPU, so the loader takes the **max**
     /// across CPUs; unused (left `0`) in the program-wide `STATS` aggregate.
     pub last_seen_ns: u64,
+    /// Cumulative RFC 3550 §A.1-style forward-gap loss estimate — the number of missed inbound RTP
+    /// media packets seen on this flow's ingress. A summable counter (the loader **sums** it across
+    /// CPUs), fed by [`loss::rtp_loss_update`] at the in-kernel Forward accept point so a kernelized
+    /// (`XDP_TX`) relay still reports network loss to the CDR. Distinct from `packets_dropped`, which
+    /// is engine-side gate / no-destination drops, not inbound network loss.
+    pub packets_lost: u64,
+    /// Per-CPU internal state for the loss estimate: the last RTP sequence observed on this flow (as a
+    /// `u64`, [`loss::RTP_SEQ_NONE`] before the first packet). **Not** a summable counter — it has no
+    /// meaningful cross-CPU reduction, so the loader leaves it `0` in any aggregate.
+    pub last_rtp_seq: u64,
 }
 
 #[cfg(test)]
@@ -240,9 +254,10 @@ mod tests {
     #[test]
     fn flow_stats_abi_is_stable() {
         // Stage 3a widened the per-CPU value with `last_seen_ns` (the in-kernel activity stamp) for
-        // the per-flow `FLOW_STATS` map: size 40 -> 48, alignment unchanged (all `u64`), the five
-        // counters keep their offsets (0/8/16/24/32) and `last_seen_ns` is appended at offset 40.
-        assert_eq!(size_of::<FlowStats>(), 48);
+        // the per-flow `FLOW_STATS` map: size 40 -> 48. The RFC 3550 §A.1 loss estimate then appended
+        // `packets_lost` (summable) + `last_rtp_seq` (per-CPU internal state): size 48 -> 64, alignment
+        // unchanged (all `u64`), every earlier field keeps its offset.
+        assert_eq!(size_of::<FlowStats>(), 64);
         assert_eq!(align_of::<FlowStats>(), 8);
         assert_eq!(offset_of!(FlowStats, packets_in), 0);
         assert_eq!(offset_of!(FlowStats, packets_out), 8);
@@ -250,6 +265,8 @@ mod tests {
         assert_eq!(offset_of!(FlowStats, bytes_out), 24);
         assert_eq!(offset_of!(FlowStats, packets_dropped), 32);
         assert_eq!(offset_of!(FlowStats, last_seen_ns), 40);
+        assert_eq!(offset_of!(FlowStats, packets_lost), 48);
+        assert_eq!(offset_of!(FlowStats, last_rtp_seq), 56);
     }
 
     #[test]

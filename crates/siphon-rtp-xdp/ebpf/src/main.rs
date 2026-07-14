@@ -58,6 +58,7 @@ use aya_ebpf::{
 };
 use siphon_rtp_ebpf_common::{
     action, latch,
+    loss::{rtp_loss_update, RTP_SEQ_NONE},
     rewrite::{
         ipv4_checksum_after_addr_rewrite, is_rtp_or_rtcp, latch_decision, rtp_media_ssrc,
         udp_checksum_after_rewrite, LatchVerdict, Latched,
@@ -92,6 +93,8 @@ const EMPTY_FLOW_STATS: FlowStats = FlowStats {
     bytes_out: 0,
     packets_dropped: 0,
     last_seen_ns: 0,
+    packets_lost: 0,
+    last_rtp_seq: RTP_SEQ_NONE,
 };
 
 const ETH_HDR_LEN: usize = 14;
@@ -406,6 +409,23 @@ fn forward_in_kernel(
     // answer has not landed yet (no `out_dst`) records that the peer is alive, exactly what the
     // media-timeout / dead-path sweep needs (docs/security-and-nat.md §4 layer 6).
     stamp_last_seen(stats_entry, unsafe { bpf_ktime_get_ns() });
+
+    // In-kernel RTP loss estimate: fold this accepted media packet's sequence into the per-flow
+    // forward-gap counter (RFC 3550 §A.1-style) so a kernelized (XDP_TX) relay still reports network
+    // loss to the CDR. Skip RTCP (rtp_media_ssrc None) and short/non-RTP datagrams.
+    if let Ok(rtp_header) = load::<[u8; 12]>(ctx, payload_offset) {
+        if rtp_media_ssrc(&rtp_header).is_some() {
+            let seq = u16::from_be_bytes([rtp_header[2], rtp_header[3]]);
+            let last = stats_entry.map_or(RTP_SEQ_NONE, |entry| unsafe { (*entry).last_rtp_seq });
+            let (updated_last, lost) = rtp_loss_update(last, seq);
+            if lost > 0 {
+                account(stats_entry, |s| s.packets_lost += lost);
+            }
+            if let Some(flow) = stats_entry {
+                unsafe { (*flow).last_rtp_seq = updated_last };
+            }
+        }
+    }
 
     // --- Resolve the forward destination. The kernel forwards to the userspace-maintained
     //     destination (rtpengine `dst_addr` parity; the loopback backend's `.or(rule.out_dst)`

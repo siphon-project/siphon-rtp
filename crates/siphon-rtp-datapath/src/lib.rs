@@ -242,6 +242,14 @@ pub struct EndpointStats {
     pub bytes_out: u64,
     /// Datagrams received but discarded (no flow, `Drop`, or no resolvable destination yet).
     pub packets_dropped: u64,
+    /// RFC 3550 §A.1-style forward-gap estimate of inbound RTP media packets **lost on the network**
+    /// before reaching this endpoint (missed sequence numbers on the ingress stream). Distinct from
+    /// `packets_dropped`, which counts engine-side gate / no-destination discards, not network loss.
+    /// A plain Forward relay leg (no transcode actor) has no jitter buffer to derive the exact
+    /// expected-minus-received figure, so the datapath folds each accepted packet's sequence into this
+    /// fast-path counter (see `siphon_rtp_ebpf_common::loss`); the transcode path reports loss from the
+    /// actor's jitter buffer instead and leaves this `0`.
+    pub packets_lost: u64,
 }
 
 /// Errors from a datapath backend.
