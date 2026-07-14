@@ -1,0 +1,33 @@
+name: repo hygiene
+
+# Guards against a local, gitignored tool/editor scratch reference slipping into a tracked file (for
+# example a stray code comment or doc that names the local scratch directory). The search patterns are
+# assembled from fragments at run time so this guard file itself contains none of the literal tokens it
+# forbids. The .gitignore and .dockerignore intentionally list those directories to keep them out of
+# the tree, so they are excluded from the scan.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-stray-local-refs:
+    name: no stray local-tooling references
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Scan tracked files
+        run: |
+          # Fragments concatenated at run time, so this file contains none of the literal strings it
+          # searches for (a scan of the repo for them finds nothing here).
+          p1='cl''aude'; p2='anthr''opic'; p3='sub''agent'; p4='project mem''ory'
+          if git grep -nIiE "$p1|$p2|$p3|$p4" -- . ':!.gitignore' ':!.dockerignore'; then
+            echo "::error::a tracked file references local tooling that must stay out of the public repo; reword it"
+            exit 1
+          fi
+          echo "clean: no stray local-tooling references"
