@@ -7,7 +7,7 @@
 //! [`rewrite`](siphon_rtp_engine::sdp::rewrite) against a fixed engine endpoint (RFC 4566 / 3264).
 
 use libfuzzer_sys::fuzz_target;
-use siphon_rtp_engine::sdp::{self, EngineMedia, IceRewrite};
+use siphon_rtp_engine::sdp::{self, EngineMedia, IceRewrite, TextRewrite};
 
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
@@ -22,6 +22,6 @@ fuzz_target!(|data: &[u8]| {
         None,
     );
     // Rewrite against arbitrary input passing the peer's ICE through (no re-origination) with no
-    // security advertisement / mux override: must never panic.
-    let _ = sdp::rewrite(&text, engine, IceRewrite::Keep, None, None);
+    // security advertisement / mux override and no text-stream directive: must never panic.
+    let _ = sdp::rewrite(&text, engine, IceRewrite::Keep, None, None, TextRewrite::None);
 });

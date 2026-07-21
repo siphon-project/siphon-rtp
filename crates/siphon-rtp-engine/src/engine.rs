@@ -50,7 +50,7 @@ use crate::media_pipeline::{
     PcapCapture, RawTee, RelayConfig, RtcpRelay, SecureSide,
 };
 use crate::metrics::Metrics;
-use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement};
+use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
 use crate::ws_bridge::WsRegistry;
 use siphon_rtp_ice::{GatherAction, GatherConfig, Gatherer};
@@ -83,12 +83,31 @@ struct Leg {
     /// so `answer()` (which re-advertises the stored near leg, no re-allocation) uses the same IP the
     /// offer did, and so an HA checkpoint can carry it forward.
     advertised_ip: std::net::IpAddr,
+    /// The engine's RTP endpoint for this leg's RFC 4103 Real-Time Text stream, when the call
+    /// negotiated a plaintext `m=text` alongside the audio. `None` for an audio-only call (or a secure
+    /// text stream, which is declined in PR 1). One port per leg — text RTCP is not separately
+    /// endpointed here (single text port; text RTCP relay is a follow-up).
+    text: Option<Endpoint>,
+    /// This side's signalled text RTP address (the `m=text`/`c=` transport), when text was negotiated —
+    /// the forward destination and source-gate anchor for the sibling leg's text relay (mirrors
+    /// `remote_rtp`). `None` until known (the far leg's is filled at answer, like `remote_rtp`).
+    text_remote_rtp: Option<std::net::SocketAddr>,
 }
 
 impl Leg {
-    /// All datapath endpoints this leg owns (for teardown / stats).
+    /// The **audio** datapath endpoints this leg owns (RTP + companion RTCP). Feeds the per-leg CDR
+    /// counters and the HA endpoint-role map, which are audio-only in PR 1 — the text stream's counters
+    /// and HA restore are deliberately not folded in here (see [`Leg::all_endpoint_ids`]).
     fn endpoint_ids(&self) -> impl Iterator<Item = EndpointId> {
         std::iter::once(self.rtp.id).chain(self.rtcp.map(|endpoint| endpoint.id))
+    }
+
+    /// Every datapath endpoint this leg owns, including the RFC 4103 text stream — for teardown, the
+    /// media-timeout sweep, and the call-id index, so text ports are freed and text activity keeps the
+    /// call alive. Kept separate from [`Leg::endpoint_ids`] so text is not counted into the audio CDR.
+    fn all_endpoint_ids(&self) -> impl Iterator<Item = EndpointId> {
+        self.endpoint_ids()
+            .chain(self.text.map(|endpoint| endpoint.id))
     }
 }
 
@@ -171,6 +190,13 @@ struct Call {
     /// caller's audio back (self-echo); `None` ⇒ audio-encoded low-level comfort noise. Unused by
     /// 2-leg calls.
     comfort_noise_payload_type: Option<u8>,
+    /// The negotiated RFC 4103 T.140 payload type of a relayed text stream (from the offer's
+    /// `a=rtpmap:<pt> t140/1000`), captured for observability and the follow-up RED/T.140 decode.
+    /// `None` for an audio-only call or a declined/secure text stream.
+    text_t140_payload_type: Option<u8>,
+    /// The negotiated RFC 2198 redundancy payload type of a relayed text stream
+    /// (`a=rtpmap:<pt> red/1000`), when the offer wrapped T.140 in RED. `None` otherwise.
+    text_red_payload_type: Option<u8>,
 }
 
 /// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off
@@ -1396,11 +1422,54 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let near_advertised = near_advertised_override.unwrap_or_else(|| near_rtp.local_addr.ip());
         let far_advertised = far_advertised_override.unwrap_or_else(|| far_rtp.local_addr.ip());
         // Combined list for teardown on any later error path in this offer.
-        let endpoints: Vec<_> = near_endpoints
+        let mut endpoints: Vec<_> = near_endpoints
             .iter()
             .chain(far_endpoints.iter())
             .copied()
             .collect();
+
+        // RFC 4103 Real-Time Text: when the offer carries a *plaintext* `m=text` stream (and this is
+        // not a WS bridge, which has no B leg to relay to), anchor + transparently relay it as a second
+        // stream — allocate one text RTP endpoint per leg, sharing each leg's family/interface. A
+        // *secure* (`RTP/SAVP`) text stream is declined to B (`m=text 0`, RFC 3264 §6), never
+        // downgraded to plaintext (secure text is a follow-up). Text RTCP is not separately endpointed
+        // (single text port; text RTCP relay is a follow-up — docs/security-and-nat.md).
+        let text_secure = info.text.as_ref().is_some_and(|text| text.secure);
+        let anchor_text = info.text.is_some() && !text_secure && profile.ws_uri.is_none();
+        let (near_text_endpoint, far_text_endpoint, text_rewrite) = if anchor_text {
+            let near_text = match self.alloc_endpoints(1, near_family, near_bind).await {
+                Ok(mut allocated) => allocated.remove(0),
+                Err(reason) => {
+                    self.free(&endpoints).await;
+                    return CmdResult::Error { reason };
+                }
+            };
+            let far_text = match self.alloc_endpoints(1, far_family, far_bind).await {
+                Ok(mut allocated) => allocated.remove(0),
+                Err(reason) => {
+                    self.datapath.remove_endpoint(near_text.id).await;
+                    self.free(&endpoints).await;
+                    return CmdResult::Error { reason };
+                }
+            };
+            endpoints.push(near_text);
+            endpoints.push(far_text);
+            // The rewritten offer advertises the FAR text endpoint to B (same interface as far audio).
+            let far_text_engine = EngineMedia {
+                rtp: far_text.local_addr,
+                rtcp: None,
+                advertised_ip: far_advertised,
+            };
+            (
+                Some(near_text),
+                Some(far_text),
+                TextRewrite::Anchor(far_text_engine),
+            )
+        } else if text_secure {
+            (None, None, TextRewrite::Decline)
+        } else {
+            (None, None, TextRewrite::None)
+        };
 
         // The rewritten offer is delivered to B, so it advertises the `far` leg.
         let engine = EngineMedia {
@@ -1423,6 +1492,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtp: None,
                     remote_rtcp: None,
                     advertised_ip: far_advertised,
+                    // A throwaway leg used only to gather ICE candidates — it carries no text stream.
+                    text: None,
+                    text_remote_rtp: None,
                 };
                 self.gather_leg_candidates(
                     &far_leg,
@@ -1503,8 +1575,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // RFC 5761: when a `rtcp-mux` directive was given, present the resolved far-side mux to B
         // explicitly (force `a=rtcp-mux` on, or strip it); otherwise mirror the offer (`None`).
         let far_mux_override = (!profile.rtcp_mux.is_empty()).then_some(far_mux);
-        let mut rewritten = match sdp::rewrite(sdp, engine, ice_rewrite, security, far_mux_override)
-        {
+        let mut rewritten = match sdp::rewrite(
+            sdp,
+            engine,
+            ice_rewrite,
+            security,
+            far_mux_override,
+            text_rewrite,
+        ) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 self.free(&endpoints).await;
@@ -1558,14 +1636,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_local = %near_rtp.local_addr,
             codec = near_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
             secure = far_local_crypto.is_some() || far_dtls,
+            text = anchor_text,
+            text_secure,
             "call created"
         );
 
+        // The near (offerer) leg's signalled text address + the negotiated T.140/RED payload types,
+        // captured only when we anchored a plaintext text stream (else `None`).
+        let anchored_text = info.text.as_ref().filter(|_| anchor_text);
+        let near_text_remote = anchored_text.map(|text| text.remote_rtp);
+        let text_t140_payload_type = anchored_text.and_then(|text| text.t140_payload_type);
+        let text_red_payload_type = anchored_text.and_then(|text| text.red_payload_type);
+
         *self.client_calls.entry(client).or_insert(0) += 1;
-        // Index this call's endpoints so observed RTCP can be correlated back to the call-id.
-        for endpoint in [Some(near_rtp), near_rtcp, Some(far_rtp), far_rtcp]
-            .into_iter()
-            .flatten()
+        // Index this call's endpoints (including the text stream) so observed RTCP can be correlated
+        // back to the call-id and every port is released at teardown.
+        for endpoint in [
+            Some(near_rtp),
+            near_rtcp,
+            Some(far_rtp),
+            far_rtcp,
+            near_text_endpoint,
+            far_text_endpoint,
+        ]
+        .into_iter()
+        .flatten()
         {
             self.endpoint_calls.insert(endpoint.id, call_id.clone());
         }
@@ -1590,6 +1685,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtp: Some(info.remote_rtp),
                     remote_rtcp: Some(info.remote_rtcp),
                     advertised_ip: near_advertised,
+                    text: near_text_endpoint,
+                    text_remote_rtp: near_text_remote,
                 },
                 far: Leg {
                     rtp: far_rtp,
@@ -1597,6 +1694,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtp: None,
                     remote_rtcp: None,
                     advertised_ip: far_advertised,
+                    text: far_text_endpoint,
+                    // The far side's text address is unknown until its answer.
+                    text_remote_rtp: None,
                 },
                 far_local_crypto,
                 far_remote_crypto: None,
@@ -1611,6 +1711,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 offer_received_from: profile.received_from,
                 // A 2-party offer never idles a single leg on comfort noise.
                 comfort_noise_payload_type: None,
+                text_t140_payload_type,
+                text_red_payload_type,
             },
         );
 
@@ -1736,7 +1838,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let far_mux_override = (!profile.rtcp_mux.is_empty()).then_some(far_mux);
         let mut rewritten =
-            match sdp::rewrite(sdp, engine, IceRewrite::Keep, None, far_mux_override) {
+            // A single-leg local answer (IVR/echo) does not relay a text stream — leave any `m=text`
+            // section untouched (text anchoring/relay is a 2-leg concern; PR 1 scope).
+            match sdp::rewrite(
+                sdp,
+                engine,
+                IceRewrite::Keep,
+                None,
+                far_mux_override,
+                TextRewrite::None,
+            ) {
                 Ok(rewritten) => rewritten,
                 Err(error) => {
                     self.free(&endpoints).await;
@@ -1782,6 +1893,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtp: Some(info.remote_rtp),
                     remote_rtcp: Some(info.remote_rtcp),
                     advertised_ip: near_advertised,
+                    // A single-leg local answer relays no text stream.
+                    text: None,
+                    text_remote_rtp: None,
                 },
                 far: Leg {
                     rtp: far_rtp,
@@ -1789,6 +1903,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     remote_rtp: None,
                     remote_rtcp: None,
                     advertised_ip: far_advertised,
+                    text: None,
+                    text_remote_rtp: None,
                 },
                 far_local_crypto: None,
                 far_remote_crypto: None,
@@ -1804,6 +1920,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // Set below once the answered codec is known (a single-leg local answer negotiates CN
                 // at the chosen codec's clock rate); left `None` for the reject path.
                 comfort_noise_payload_type: None,
+                text_t140_payload_type: None,
+                text_red_payload_type: None,
             },
         );
 
@@ -2069,8 +2187,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some((_, call)) = self.calls.remove(call_id) {
             let endpoints: Vec<EndpointId> = call
                 .near
-                .endpoint_ids()
-                .chain(call.far.endpoint_ids())
+                .all_endpoint_ids()
+                .chain(call.far.all_endpoint_ids())
                 .collect();
             // Free any SIPREC subscriptions first (detach forks, abort drains, free subscriber ports)
             // before the media actor is deregistered.
@@ -2358,7 +2476,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None => IceRewrite::Keep,
         };
         let _ = profile;
-        match sdp::rewrite(sdp, engine, ice_rewrite, None, None) {
+        // RFC 8839 §5.4 ICE-restart re-offer re-advertises the same endpoints. An RFC 4103 text stream
+        // does not use ICE, so it is not re-anchored on this path (a follow-up); leave any `m=text`
+        // section untouched, which is the pre-text behaviour of this re-offer path.
+        match sdp::rewrite(sdp, engine, ice_rewrite, None, None, TextRewrite::None) {
             Ok(rewritten) => ok_sdp(rewritten.sdp, None),
             Err(error) => error_result("re-offer rewrite", &error),
         }
@@ -2483,15 +2604,46 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // otherwise mirror B's answer (`None`).
         let near_mux = near.rtcp.is_none();
         let near_mux_override = (!profile.rtcp_mux.is_empty()).then_some(near_mux);
-        let mut rewritten =
-            match sdp::rewrite(sdp, engine, ice_rewrite, security, near_mux_override) {
-                Ok(rewritten) => rewritten,
-                Err(error) => {
-                    return CmdResult::Error {
-                        reason: format!("answer SDP rewrite failed: {error}"),
-                    }
+        // RFC 4103 text: relay the stream when it was anchored at offer (both legs hold a text
+        // endpoint) AND B's answer accepted a *plaintext* text stream (a non-zero `m=text` port). B
+        // declining (port 0) or answering secure (`RTP/SAVP`) text → decline the near answer's text too
+        // (`m=text 0`, RFC 3264 §6), never bridged in PR 1. The near answer advertises the NEAR text
+        // endpoint to A (where A sends its text). A WS-bridged call has no B leg to relay text to, so a
+        // call turning into a WS leg here declines any text anchored at offer rather than advertising a
+        // text port it will not serve.
+        let becoming_ws = offer_pipeline == PipelineKind::Ws || profile.ws_uri.is_some();
+        let text_accepted = !becoming_ws
+            && info
+                .text
+                .as_ref()
+                .is_some_and(|text| !text.secure && text.remote_rtp.port() != 0);
+        let text_rewrite = match near.text {
+            Some(near_text) if far.text.is_some() && text_accepted => {
+                TextRewrite::Anchor(EngineMedia {
+                    rtp: near_text.local_addr,
+                    rtcp: None,
+                    advertised_ip: near.advertised_ip,
+                })
+            }
+            // A was offered text but B did not accept a plaintext stream — decline it back to A.
+            Some(_) => TextRewrite::Decline,
+            None => TextRewrite::None,
+        };
+        let mut rewritten = match sdp::rewrite(
+            sdp,
+            engine,
+            ice_rewrite,
+            security,
+            near_mux_override,
+            text_rewrite,
+        ) {
+            Ok(rewritten) => rewritten,
+            Err(error) => {
+                return CmdResult::Error {
+                    reason: format!("answer SDP rewrite failed: {error}"),
                 }
-            };
+            }
+        };
         // rtpengine `replace`: rewrite the o= line to the engine's advertised address (topology
         // hiding) — the interface's advertised IP, not the bound one. Any other requested token is
         // surfaced rather than silently ignored (pre-public-review B15).
@@ -3282,10 +3434,55 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
+        // RFC 4103 text relay — a second stream, wired independently of the audio pipeline kind (its
+        // endpoints are distinct, so it relays whether audio is a plain relay, transcode, or SRTP
+        // bridge). When both legs hold a text endpoint and B accepted a plaintext stream, install the
+        // in-datapath Forward flows `near.text ↔ far.text`. Each direction carries its OWN RTPBleed
+        // source-gate + symmetric latch (`ingress_rule` — the same defence the audio relay uses; the
+        // gate is per-stream, docs/security-and-nat.md §4). Text is forwarded verbatim (RED/T.140 is
+        // not parsed in PR 1). Text does not use ICE here (`ice = false`).
+        let mut far_text_remote = None;
+        if let (Some(near_text), Some(far_text), Some(b_text)) =
+            (near.text, far.text, info.text.as_ref())
+        {
+            if !b_text.secure && b_text.remote_rtp.port() != 0 {
+                let b_text_rtp = b_text.remote_rtp;
+                far_text_remote = Some(b_text_rtp);
+                // Gate each side's text ingress to its signalled source, tightened to the
+                // `received-from` public IP when the proxy supplied one (the audio-leg posture).
+                let near_text_gate = apply_received_from(near.text_remote_rtp, offer_received_from);
+                let far_text_gate = apply_received_from(Some(b_text_rtp), profile.received_from)
+                    .unwrap_or(b_text_rtp);
+                let near_text_action = FlowAction::Forward(ingress_rule(
+                    far_text.id,
+                    Some(b_text_rtp),
+                    near_text_gate,
+                    profile,
+                    false,
+                ));
+                if let Err(error) = self.datapath.install_flow(near_text.id, near_text_action) {
+                    return error_result("install near->far text flow", &error);
+                }
+                let far_text_action = FlowAction::Forward(ingress_rule(
+                    near_text.id,
+                    near.text_remote_rtp,
+                    Some(far_text_gate),
+                    profile,
+                    false,
+                ));
+                if let Err(error) = self.datapath.install_flow(far_text.id, far_text_action) {
+                    return error_result("install far->near text flow", &error);
+                }
+            }
+        }
+
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.to_tag = Some(to_tag.clone());
             call.far.remote_rtp = Some(info.remote_rtp);
             call.far.remote_rtcp = Some(info.remote_rtcp);
+            // The far side's signalled text address (its answer's `m=text`/`c=`), for the text relay's
+            // reverse forward destination + gate anchor. `None` when no text was relayed.
+            call.far.text_remote_rtp = far_text_remote;
             // Store the *effective* (ptime-overridden) codecs so an HA checkpoint captures the override
             // and a restore rebuilds the transcode at the same packetization (inert for a plain relay).
             call.near_codec = near_codec.clone();
@@ -3381,6 +3578,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             pipeline = ?call.pipeline,
             near_codec = call.near_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
             far_codec = call.far_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
+            // RFC 4103 Real-Time Text stream (when the call relayed one): the negotiated T.140 / RED
+            // payload types, `-` for an audio-only call.
+            text_t140 = call.text_t140_payload_type.map_or_else(|| "-".to_string(), |pt| pt.to_string()),
+            text_red = call.text_red_payload_type.map_or_else(|| "-".to_string(), |pt| pt.to_string()),
             "call finished"
         );
         // The near leg is party A (offerer, `from_tag`); the stream it *sent* is measured by the media
@@ -3430,11 +3631,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
 
-        // Free everything the call held (the steps `delete` and `reap_idle` previously duplicated).
+        // Free everything the call held (the steps `delete` and `reap_idle` previously duplicated) —
+        // including the RFC 4103 text endpoints (`all_endpoint_ids`), so a text stream's ports are
+        // released with the call.
         let endpoints: Vec<EndpointId> = call
             .near
-            .endpoint_ids()
-            .chain(call.far.endpoint_ids())
+            .all_endpoint_ids()
+            .chain(call.far.all_endpoint_ids())
             .collect();
         self.drop_subscriptions(call_id).await;
         // Any WS tee riding the same fan-out closes with the call, so its controller gets a final
@@ -3759,6 +3962,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .near
                 .advertised_ip
                 .unwrap_or_else(|| near_rtp.local_addr.ip()),
+            // RFC 4103 text stream: HA checkpoint/restore of the text endpoints is deferred (consistent
+            // with the deferred SrtpMedia/Ws restore) — a restored call carries audio only.
+            text: None,
+            text_remote_rtp: None,
         };
         let far = Leg {
             rtp: far_rtp,
@@ -3769,6 +3976,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .far
                 .advertised_ip
                 .unwrap_or_else(|| far_rtp.local_addr.ip()),
+            // RTT text stream: HA checkpoint/restore deferred (see the near leg).
+            text: None,
+            text_remote_rtp: None,
         };
 
         // Install the datapath flows and resolve the crypto per pipeline.
@@ -4190,6 +4400,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // carried in the snapshot; a restored single-leg leg degrades to audio-encoded comfort
                 // noise. 2-leg (relay/bridge/transcode) restores never use this.
                 comfort_noise_payload_type: None,
+                // RTT text stream: not carried in the HA snapshot (restore deferred) — a restored call
+                // is audio-only.
+                text_t140_payload_type: None,
+                text_red_payload_type: None,
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
@@ -4715,7 +4929,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // A conference leg is always RTP/RTCP-muxed onto the one participant endpoint; the mux
         // presentation mirrors the participant's offer (`None`) — the `rtcp-mux` directive is an
         // offer/answer relay concern, not a conference one.
-        match sdp::rewrite(sdp, engine, IceRewrite::Keep, security, None) {
+        // Conference text (RFC 9071 multiparty RTT) is a later phase — a join does not anchor a text
+        // stream yet (PR 1 scope).
+        match sdp::rewrite(
+            sdp,
+            engine,
+            IceRewrite::Keep,
+            security,
+            None,
+            TextRewrite::None,
+        ) {
             Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);
@@ -6187,7 +6410,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         for entry in self.calls.iter() {
             let call = entry.value();
             let mut last_activity = call.created_tick;
-            for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
+            for endpoint in call
+                .near
+                .all_endpoint_ids()
+                .chain(call.far.all_endpoint_ids())
+            {
                 if let Some(seen) = self.datapath.last_activity(endpoint) {
                     last_activity = last_activity.max(seen);
                 }

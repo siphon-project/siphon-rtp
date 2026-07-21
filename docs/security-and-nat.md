@@ -541,6 +541,41 @@ so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the 
   channel carries one room's *participant-only* mix (never its full mix, so a bridge cannot echo a
   room back to itself) to another room — no shared state between room actors (single-owner rule).
 
+### Layer 5d — The RFC 4103 Real-Time Text (RTT) relay path
+A VoLTE/IMS call may carry a second media stream: an `m=text` line (RFC 4103, T.140 over RTP, usually
+RFC 2198 RED-wrapped) alongside the audio. The engine parses it (section-aware SDP), anchors it to a
+**separate** engine endpoint per leg, and relays it. **RTPBleed is per-stream**, so the text stream is
+not a special case of the audio gate — it is a full inbound surface in its own right and gets its own
+copy of Layers 1–3.
+
+> **Status (landed — plaintext RTT relay):** `sdp::parse` yields `MediaInfo.text`
+> (`TextMediaInfo`: remote RTP/RTCP, `secure`, `t140`/`red` payload types); the section-scoped
+> `sdp::rewrite` takes a `TextRewrite` directive (`None` / `Anchor` / `Decline`). `offer`/`answer`
+> allocate one text RTP endpoint per leg and install the in-datapath `FlowAction::Forward` flows
+> `near.text ↔ far.text` — independent of the audio pipeline kind (the text endpoints are distinct, so
+> text relays whether audio is a plain relay, a transcode, or an SRTP bridge). The T.140/RED payload is
+> **not parsed** in this iteration — the stream is forwarded byte-for-byte.
+
+- **Per-stream source gate + symmetric latch.** Each text direction is an ordinary `Forward` rule built
+  by the same `ingress_rule` the audio relay uses: an `Exact`/`Subnet`/`Symmetric` `accepted_source`
+  and the SSRC-consistent `LatchPolicy` (Layers 1–3). A spoofed source on the text port is dropped
+  before it can move the text latch, exactly as on the audio port, and the two streams' gates/latches
+  are wholly independent (a hijack of one cannot move the other). The `received-from` public-IP hint
+  (Layer 2) tightens the text gate too.
+- **Secure text is declined, never downgraded.** An `m=text` offered over a secure profile
+  (`RTP/SAVP`) is answered `m=text 0` (RFC 3264 §6) rather than bridged or silently downgraded to
+  plaintext — the same "never silently bridge secure↔insecure" rule as Layer 5. Secure RTT (a
+  per-leg `SecureLeg` for text, mirroring Layer 5a) is a follow-up.
+- **Section scoping fixes two latent multi-`m=` bugs.** The audio-plane strips (ICE / crypto /
+  fingerprint / `rtcp-mux`, Layers 4–5) are scoped to the session region and the audio section only, so
+  a secure-audio rewrite can no longer strip a text (or video) section's own keying/ICE, and a text
+  section that relies on the session `c=` is anchored to the engine address rather than leaking the
+  UE's (often private) one.
+- **Idle reap + teardown.** The text endpoints are part of the call's endpoint set (`all_endpoint_ids`)
+  for the media-timeout sweep (text activity keeps the call alive) and teardown (their ports are freed
+  with the call). HA checkpoint/restore of the text stream is deferred (consistent with the deferred
+  `SrtpMedia`/`Ws` restore) — a restored call is audio-only.
+
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
 

@@ -477,6 +477,132 @@ async fn offer_answer_relay_delete_over_tcp_control() {
     assert!(matches!(requery, CmdResult::Error { .. }));
 }
 
+/// An `m=audio` (PCMU) + RFC 4103 `m=text` (RED pt 98 wrapping T.140 pt 99) SDP, each on its own port
+/// but sharing the loopback connection address.
+fn audio_text_sdp(audio: SocketAddr, text: SocketAddr) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {aport} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+         m=text {tport} RTP/AVP 98 99\r\na=rtpmap:98 red/1000\r\na=rtpmap:99 t140/1000\r\n",
+        ip = audio.ip(),
+        aport = audio.port(),
+        tport = text.port(),
+    )
+}
+
+/// The engine's advertised text-stream RTP address, parsed from a rewritten SDP's `m=text` section.
+fn text_engine_addr(result: &CmdResult) -> SocketAddr {
+    match result {
+        CmdResult::Ok {
+            sdp: Some(text), ..
+        } => {
+            sdp::parse(text)
+                .expect("parse engine text addr")
+                .text
+                .expect("text stream anchored")
+                .remote_rtp
+        }
+        other => panic!("expected Ok with sdp, got {other:?}"),
+    }
+}
+
+/// A minimal RTP packet on the RED payload type (98) carrying a T.140/RED-shaped payload — PR 1 relays
+/// it verbatim (RED/T.140 is not parsed yet), so the exact block bytes are opaque here.
+fn text_rtp(ssrc: u32) -> Vec<u8> {
+    // V=2, PT=98 (RED), seq 1, ts 0.
+    let mut packet = vec![0x80, 98, 0x00, 0x01, 0, 0, 0, 0];
+    packet.extend_from_slice(&ssrc.to_be_bytes());
+    // RED redundant-block header + primary header + a couple of T.140 characters (RFC 2198 §4).
+    packet.extend_from_slice(&[0xE3, 0x00, 0x00, 0x02, 0x63, b'h', b'i']);
+    packet
+}
+
+/// A plaintext `m=audio` + RFC 4103 `m=text` call relays BOTH streams end-to-end over the UDP-loopback
+/// datapath: a T.140/RED packet in one text port comes out the other, anchored to the engine's text
+/// address, while the audio relay is unaffected. Proves the section-aware SDP anchor plus the per-stream
+/// text relay + symmetric latch (PR 1). NIC-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offer_answer_relays_audio_and_rfc4103_text_end_to_end() {
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+
+    let (phone_a_audio, addr_a_audio) = phone().await;
+    let (phone_a_text, addr_a_text) = phone().await;
+    let (phone_b_audio, addr_b_audio) = phone().await;
+    let (phone_b_text, addr_b_text) = phone().await;
+
+    // Offer (A) carries m=audio + m=text; the rewritten offer anchors both to the engine's far ports.
+    let offer = control
+        .request(Command::Offer {
+            call_id: "rtt".into(),
+            from_tag: "tag-a".into(),
+            sdp: audio_text_sdp(addr_a_audio, addr_a_text),
+            profile: Default::default(),
+        })
+        .await;
+    let far_audio = engine_addr(&offer);
+    let far_text = text_engine_addr(&offer);
+    assert_ne!(
+        far_audio.port(),
+        far_text.port(),
+        "audio + text anchored on distinct engine ports"
+    );
+
+    // Answer (B) → the engine's near audio + text ports advertised back to A.
+    let answer = control
+        .request(Command::Answer {
+            call_id: "rtt".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: audio_text_sdp(addr_b_audio, addr_b_text),
+            profile: Default::default(),
+        })
+        .await;
+    let near_audio = engine_addr(&answer);
+    let near_text = text_engine_addr(&answer);
+
+    // Audio relay A → B is unaffected by the added text stream.
+    phone_a_audio
+        .send_to(&rtp(0x0A0A_0A0A), near_audio)
+        .await
+        .expect("send audio a");
+    let (data, from) = recv(&phone_b_audio).await;
+    assert_eq!(data, rtp(0x0A0A_0A0A), "audio relayed");
+    assert_eq!(from, far_audio, "audio arrives from the engine far port");
+
+    // Text relay A → B: a T.140/RED packet on the near text port emerges on B's text port, anchored to
+    // the engine's far text address.
+    phone_a_text
+        .send_to(&text_rtp(0x0A0A_7E77), near_text)
+        .await
+        .expect("send text a");
+    let (data, from) = recv(&phone_b_text).await;
+    assert_eq!(data, text_rtp(0x0A0A_7E77), "text relayed verbatim");
+    assert_eq!(from, far_text, "text arrives from the engine far text port");
+
+    // Text relay B → A (reverse), exercising the text stream's own symmetric latch.
+    phone_b_text
+        .send_to(&text_rtp(0x0B0B_7E77), far_text)
+        .await
+        .expect("send text b");
+    let (data, from) = recv(&phone_a_text).await;
+    assert_eq!(data, text_rtp(0x0B0B_7E77), "reverse text relayed verbatim");
+    assert_eq!(
+        from, near_text,
+        "reverse text arrives from the engine near text port"
+    );
+
+    // Teardown frees the text ports alongside the audio ports.
+    let delete = control
+        .request(Command::Delete {
+            call_id: "rtt".into(),
+            from_tag: "tag-a".into(),
+            to_tag: None,
+        })
+        .await;
+    assert!(matches!(delete, CmdResult::Ok { .. }));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transcoded_answer_advertises_the_offerers_own_codec() {
     // A offers PCMU only; `codec-transcode-PCMA` adds PCMA to the offer to B; B answers PCMA. The
