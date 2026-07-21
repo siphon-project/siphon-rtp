@@ -136,8 +136,9 @@ impl SymmetricLatch {
 /// The RTP SSRC (RFC 3550 §5.1, bytes 8..12) of an RTP media packet, or `None` when `data` is not one
 /// (too short, wrong version, or RTCP — RFC 5761: RTCP carries no comparable per-stream SSRC at this
 /// offset, so it never drives the SSRC re-latch). Mirrors the datapath's `rtp_ssrc` for the userspace
-/// relay-only path, which forwards the datagram verbatim and so does not otherwise parse it.
-fn rtp_source_ssrc(data: &[u8]) -> Option<u32> {
+/// relay-only path, which forwards the datagram verbatim and so does not otherwise parse it. Shared
+/// with [`crate::text_pipeline`], whose RFC 4103 text relay latches the same way.
+pub(crate) fn rtp_source_ssrc(data: &[u8]) -> Option<u32> {
     if data.len() < 12 || data[0] >> 6 != 2 {
         return None;
     }

@@ -576,6 +576,29 @@ copy of Layers 1–3.
   with the call). HA checkpoint/restore of the text stream is deferred (consistent with the deferred
   `SrtpMedia`/`Ws` restore) — a restored call is audio-only.
 
+> **Status (landed — text observability):** when a text-observability feature is active for a call
+> — control-plane `ProfileFlags.text_events`, or a runtime recording — the engine promotes **only** the
+> low-rate text endpoints off the in-kernel `Forward` relay onto the userspace text processor
+> (`engine/src/text_pipeline.rs`), switching them from `Forward` to `Redirect`. The audio
+> relay/transcode/SRTP path is **never** promoted for text observability — it stays byte-for-byte on its
+> own fast path. The text processor RED/T.140-reassembles the stream (`siphon-rtp-media::t140`) to
+> surface `Event::Text` + per-leg content QoS in the `CallSummary` CDR, then forwards the packet
+> **verbatim** (observe, don't transform). When no such feature is active, text stays on the PR-1
+> in-kernel relay unchanged — text observation is never always-on.
+
+- **The userspace text path keeps the exact same gate/latch as the in-kernel relay (RTPBleed, restated
+  for `Redirect`).** Promotion reconstructs each text direction's `accepted_source` (`Exact`/`Subnet`/
+  `Any`) and SSRC-consistent symmetric latch from the *same* stored text `Forward` rules the in-kernel
+  relay used (via `relay_layout_from_flows`), so switching to `Redirect` — which **bypasses** the
+  datapath's Forward-path layer-2 gate, exactly like Layers 5a–5c — loses no protection: `TextCall::process`
+  re-enforces the signalled-source gate before it forwards, records, observes, or moves the latch, and
+  only an authentic, SSRC-consistent packet re-points the reverse egress (Layer 3). A spoofed source on
+  the promoted text port is dropped with no forward, no `Event::Text`, and no latch movement — identical
+  to the in-kernel posture. Demotion (the last feature clears) reinstalls the same `Forward` rules.
+- **Secure text is still out of scope on this path.** Only a plaintext text stream is promoted;
+  secure (`RTP/SAVP`) text is still declined at `answer` (above). Secure-text observability rides the
+  deferred per-leg `SecureLeg`-for-text follow-up.
+
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
 

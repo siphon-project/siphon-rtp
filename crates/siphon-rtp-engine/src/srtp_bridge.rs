@@ -216,11 +216,41 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
 /// [`crate::conference::ConferenceRegistry`], and everything else to the TURN relay sink (when TURN
 /// is running). This is the single owner of `datapath.rx()` the datapath design calls for ("a single
 /// dispatcher should own it and route each RxPacket to the owning subsystem by EndpointId"). Routing
-/// order is bridge → media → ws → conference → turn. Runs until the redirect stream closes.
+/// order is bridge → media → text → ws → conference → turn. Runs until the redirect stream closes.
+///
+/// This convenience form does not route the RFC 4103 text-observability slow path (it stands up an
+/// empty [`crate::text_pipeline::TextRegistry`]); it exists so the test harnesses that predate text
+/// observability keep compiling. Production ([`crate::daemon`]) uses [`run_redirect_dispatcher_with_text`]
+/// with the engine's real text registry.
 pub async fn run_redirect_dispatcher<D: Datapath + Clone + 'static>(
     redirect_rx: flume::Receiver<RxPacket>,
     bridge: Arc<SrtpBridge<D>>,
     media: Arc<crate::media_pipeline::MediaRegistry>,
+    ws: Arc<crate::ws_bridge::WsRegistry>,
+    conference: Arc<crate::conference::ConferenceRegistry>,
+    turn_relay: Option<flume::Sender<RxPacket>>,
+) {
+    run_redirect_dispatcher_with_text(
+        redirect_rx,
+        bridge,
+        media,
+        Arc::new(crate::text_pipeline::TextRegistry::default()),
+        ws,
+        conference,
+        turn_relay,
+    )
+    .await;
+}
+
+/// The full redirect dispatcher, routing bridge → media → **text** → ws → conference → turn. The text
+/// slow path ([`crate::text_pipeline::TextRegistry`]) carries a promoted RFC 4103 `m=text` stream's
+/// datagrams to its per-call observer. Runs until the redirect stream closes.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_redirect_dispatcher_with_text<D: Datapath + Clone + 'static>(
+    redirect_rx: flume::Receiver<RxPacket>,
+    bridge: Arc<SrtpBridge<D>>,
+    media: Arc<crate::media_pipeline::MediaRegistry>,
+    text: Arc<crate::text_pipeline::TextRegistry>,
     ws: Arc<crate::ws_bridge::WsRegistry>,
     conference: Arc<crate::conference::ConferenceRegistry>,
     turn_relay: Option<flume::Sender<RxPacket>>,
@@ -230,6 +260,8 @@ pub async fn run_redirect_dispatcher<D: Datapath + Clone + 'static>(
             bridge.handle(packet).await;
         } else if media.owns(packet.endpoint) {
             media.dispatch(packet);
+        } else if text.owns(packet.endpoint) {
+            text.dispatch(packet);
         } else if ws.owns(packet.endpoint) {
             ws.dispatch(packet);
         } else if conference.owns(packet.endpoint) {

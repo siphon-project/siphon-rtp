@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+use siphon_rtp_datapath::Datapath;
+use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher_with_text;
 use siphon_rtp_engine::{sdp, server, Engine};
 use siphon_rtp_proto::{frame, CmdResult, Command, Event, ProfileFlags, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -601,6 +603,233 @@ async fn offer_answer_relays_audio_and_rfc4103_text_end_to_end() {
         })
         .await;
     assert!(matches!(delete, CmdResult::Ok { .. }));
+}
+
+/// A minimal RTP packet on the RED payload type (98) carrying a **primary-only** RED body (RFC 2198
+/// §3): the 1-byte primary header (`F=0 | PT=99` = 0x63) then the T.140 text bytes. The userspace text
+/// processor reassembles this to `primary` — unlike PR 1's opaque `text_rtp`, this decodes cleanly.
+fn red_text_rtp(sequence: u16, timestamp: u32, ssrc: u32, primary: &[u8]) -> Vec<u8> {
+    let mut packet = vec![0x80, 98];
+    packet.extend_from_slice(&sequence.to_be_bytes());
+    packet.extend_from_slice(&timestamp.to_be_bytes());
+    packet.extend_from_slice(&ssrc.to_be_bytes());
+    packet.push(0x63); // RED primary header: F=0, PT=99 (t140)
+    packet.extend_from_slice(primary);
+    packet
+}
+
+/// With `text_events` set, an audio+text call promotes ONLY the text stream to the userspace text
+/// processor: RED/T.140 text is observed (`Event::Text` on the control connection) and relayed to the
+/// far side, the end-of-call `CallSummary` carries per-leg RFC 4103 text counters, and — the load-bearing
+/// invariant — the audio path stays the plain in-kernel relay (never promoted, still relaying). NIC-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_events_promotes_only_text_emits_events_and_carries_cdr_counters() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    // The redirect dispatcher must run so the promoted text stream's Redirect datagrams reach the actor.
+    tokio::spawn(run_redirect_dispatcher_with_text(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.text(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    let serve_engine = engine.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(serve_engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    let (phone_a_audio, addr_a_audio) = phone().await;
+    let (phone_a_text, addr_a_text) = phone().await;
+    let (phone_b_audio, addr_b_audio) = phone().await;
+    let (phone_b_text, addr_b_text) = phone().await;
+
+    // Offer A carries m=audio + m=text, with text observability requested (`text_events`).
+    let offer = control
+        .request(Command::Offer {
+            call_id: "rtt-obs".into(),
+            from_tag: "tag-a".into(),
+            sdp: audio_text_sdp(addr_a_audio, addr_a_text),
+            profile: ProfileFlags {
+                text_events: true,
+                ..Default::default()
+            },
+        })
+        .await;
+    let far_audio = engine_addr(&offer);
+    let far_text = text_engine_addr(&offer);
+
+    let answer = control
+        .request(Command::Answer {
+            call_id: "rtt-obs".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: audio_text_sdp(addr_b_audio, addr_b_text),
+            profile: Default::default(),
+        })
+        .await;
+    let near_audio = engine_addr(&answer);
+    let near_text = text_engine_addr(&answer);
+
+    // The hard constraint: only text is promoted. Audio stays the plain in-kernel relay.
+    assert!(
+        !engine.media().is_media_call("rtt-obs"),
+        "audio was NOT promoted to userspace for text observability"
+    );
+    assert!(
+        engine.text().is_text_call("rtt-obs"),
+        "the text stream was promoted to the userspace text processor"
+    );
+
+    // Audio relay A → B still works entirely in-kernel (byte-for-byte, no transcode).
+    phone_a_audio
+        .send_to(&rtp(0x0A0A_0A0A), near_audio)
+        .await
+        .expect("send audio a");
+    let (data, from) = recv(&phone_b_audio).await;
+    assert_eq!(data, rtp(0x0A0A_0A0A), "audio relayed in-kernel");
+    assert_eq!(
+        from, far_audio,
+        "audio arrives from the engine far audio port"
+    );
+
+    // Text A → B: the RED/T.140 packet is relayed verbatim to B and observed as an Event::Text.
+    let text_packet = red_text_rtp(1, 1000, 0x0A0A_7E77, b"hi");
+    phone_a_text
+        .send_to(&text_packet, near_text)
+        .await
+        .expect("send text a");
+    let (data, from) = recv(&phone_b_text).await;
+    assert_eq!(data, text_packet, "text relayed verbatim through userspace");
+    assert_eq!(from, far_text, "text arrives from the engine far text port");
+
+    // The observed increment reaches the control plane as Event::Text (sender = A, direction a_to_b).
+    match control.recv_event().await {
+        Event::Text {
+            call_id,
+            from_tag,
+            text,
+            direction,
+            ..
+        } => {
+            assert_eq!(call_id, "rtt-obs");
+            assert_eq!(from_tag, "tag-a");
+            assert_eq!(text, "hi");
+            assert_eq!(direction.as_deref(), Some("a_to_b"));
+        }
+        other => panic!("expected Event::Text, got {other:?}"),
+    }
+
+    // Reap the call (advance the clock past the timeout) → the CallSummary CDR is pushed with the
+    // per-leg RFC 4103 text counters folded in.
+    engine.datapath().advance_clock(40);
+    assert_eq!(engine.reap_idle(30).await, vec!["rtt-obs".to_string()]);
+
+    let mut summary_text_chars = None;
+    for _ in 0..2 {
+        match control.recv_event().await {
+            Event::CallSummary { call_id, legs, .. } => {
+                assert_eq!(call_id, "rtt-obs");
+                let near = &legs[0];
+                let text = near.text.expect("near leg carries RFC 4103 text QoS");
+                assert_eq!(text.packets, 1, "one text packet accepted A->B");
+                assert_eq!(text.characters, 2, "'hi' = 2 characters delivered");
+                assert_eq!(text.missing_markers, 0);
+                assert_eq!(text.recovered_from_redundancy, 0);
+                summary_text_chars = Some(text.characters);
+            }
+            Event::MediaTimeout { .. } => {}
+            other => panic!("unexpected event on reap: {other:?}"),
+        }
+    }
+    assert_eq!(
+        summary_text_chars,
+        Some(2),
+        "the CallSummary carried the RFC 4103 text counters"
+    );
+}
+
+/// Without any text-observability feature, an audio+text call leaves the text stream on the PR-1
+/// in-kernel `Forward` relay (NOT promoted) — it still relays verbatim, and the audio relay is likewise
+/// in-kernel. Proves text observation is never always-on. NIC-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_observability_text_stays_in_kernel_and_still_relays() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    tokio::spawn(run_redirect_dispatcher_with_text(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.text(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    let serve_engine = engine.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(serve_engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    let (phone_a_audio, addr_a_audio) = phone().await;
+    let (phone_a_text, addr_a_text) = phone().await;
+    let (phone_b_audio, addr_b_audio) = phone().await;
+    let (phone_b_text, addr_b_text) = phone().await;
+
+    // Offer/answer with the default profile — no `text_events`, no recording.
+    let offer = control
+        .request(Command::Offer {
+            call_id: "rtt-plain".into(),
+            from_tag: "tag-a".into(),
+            sdp: audio_text_sdp(addr_a_audio, addr_a_text),
+            profile: Default::default(),
+        })
+        .await;
+    let _far_audio = engine_addr(&offer);
+    let far_text = text_engine_addr(&offer);
+    let answer = control
+        .request(Command::Answer {
+            call_id: "rtt-plain".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: audio_text_sdp(addr_b_audio, addr_b_text),
+            profile: Default::default(),
+        })
+        .await;
+    let _near_audio = engine_addr(&answer);
+    let near_text = text_engine_addr(&answer);
+
+    // Neither stream is promoted — text stays on the in-kernel relay (PR-1 behaviour preserved).
+    assert!(
+        !engine.text().is_text_call("rtt-plain"),
+        "text is NOT promoted without a text-observability feature"
+    );
+    assert!(
+        !engine.media().is_media_call("rtt-plain"),
+        "audio in-kernel"
+    );
+
+    // Text A → B still relays verbatim, in-kernel.
+    let text_packet = red_text_rtp(1, 1000, 0x0A0A_7E77, b"hi");
+    phone_a_text
+        .send_to(&text_packet, near_text)
+        .await
+        .expect("send text a");
+    let (data, from) = recv(&phone_b_text).await;
+    assert_eq!(data, text_packet, "text relayed verbatim in-kernel");
+    assert_eq!(from, far_text, "text arrives from the engine far text port");
+
+    // Keep the audio phones alive for the duration.
+    drop((phone_a_audio, phone_b_audio));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
