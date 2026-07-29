@@ -640,7 +640,9 @@ impl SecurityAdvertisement {
 }
 
 /// Host-candidate priority (RFC 8445 §5.1.2): type-pref 126, local-pref 65535, component 1 (RTP).
-const HOST_CANDIDATE_PRIORITY: u32 = (126 << 24) | (65535 << 8) | 255;
+/// Shared with the consent driver, whose checks must advertise the same PRIORITY they would carry in
+/// a connectivity check for this candidate (RFC 8445 §7.1.1) — one definition, not two.
+pub(crate) const HOST_CANDIDATE_PRIORITY: u32 = (126 << 24) | (65535 << 8) | 255;
 
 /// The SDP `addrtype` token for an IP address family (RFC 4566 §5.7): `IP4` for IPv4, `IP6` for
 /// IPv6. Used to emit the `c=` connection line (and the ICE `a=candidate`) in the family of the

@@ -463,9 +463,11 @@ pub trait Datapath: Send + Sync {
     /// consent checker (RFC 7675) can correlate its own outbound checks and detect a dead peer.
     ///
     /// Additive to `set_ice`; clear via `set_ice(endpoint, None)` or [`remove_endpoint`](Self::remove_endpoint).
-    /// The **default** installs the responder only (no forwarding) via `set_ice`, so a backend without
-    /// the seam (the XDP fast path) keeps compiling and answering checks — full-agent consent is a
-    /// UDP-datapath capability the loopback backend overrides to provide.
+    /// The **default** installs the responder only (no forwarding) via `set_ice` and **warns**, because
+    /// a backend that takes it cannot do consent at all: no Binding response ever reaches the checker,
+    /// so the caller silently gets ice-lite behaviour where it asked for a full agent. The warning is
+    /// the point — this degradation used to be invisible. A backend without the seam keeps compiling
+    /// and keeps answering inbound checks; it just says so.
     fn set_ice_agent(
         &self,
         endpoint: EndpointId,
@@ -473,7 +475,28 @@ pub trait Datapath: Send + Sync {
         events: flume::Sender<IceDatapathEvent>,
     ) {
         let _ = events;
+        tracing::warn!(
+            target: "siphon_rtp::datapath",
+            ?endpoint,
+            "datapath backend has no full-agent ICE seam — installing the responder only; RFC 7675 \
+             consent freshness is DISABLED on this endpoint (Binding responses cannot be correlated)"
+        );
         self.set_ice(endpoint, Some(config));
+    }
+
+    /// The peer transport address a **validated** ICE connectivity check adopted for `endpoint`
+    /// (RFC 8445 §7.3), or `None` when no check has validated a source yet — or when the endpoint
+    /// carries no ICE credentials at all.
+    ///
+    /// This is the path an RFC 7675 consent check must probe: the address the peer proved it can
+    /// receive on by answering a MESSAGE-INTEGRITY-signed check, **never** the signalled `c=` address
+    /// (for a NATed peer that is its unusable private address, so probing it would declare live calls
+    /// dead). Distinct from [`learned_source`](Self::learned_source), which reports a *media*-latched
+    /// source: on an ICE endpoint only an authenticated check ever moves this one.
+    ///
+    /// Default `None` — a backend with no ICE responder never adopts a source.
+    fn ice_validated_source(&self, _endpoint: EndpointId) -> Option<SocketAddr> {
+        None
     }
 
     /// A receiver for datagrams delivered by [`FlowAction::Redirect`] flows — the userspace slow path

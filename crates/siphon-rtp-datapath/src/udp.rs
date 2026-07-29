@@ -923,6 +923,19 @@ impl Datapath for UdpLoopbackDatapath {
         self.inner.ice_events.insert(endpoint, events);
     }
 
+    fn ice_validated_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        // Only an ICE endpoint has a *validated* source. On one, `handle_stun` is the sole writer of
+        // `latched` — media never creates or moves it (`Inner::dispatch`, layer 4) — so the latch is
+        // exactly the check-validated path. On a non-ICE endpoint the same map holds a media latch
+        // that no connectivity check ever authenticated; reporting that as validated would let a
+        // consent check (and, later, the full agent) treat an unauthenticated source as a selected
+        // pair. Gate on the credentials, not on the latch alone.
+        if !self.inner.ice.contains_key(&endpoint) {
+            return None;
+        }
+        self.inner.latched.get(&endpoint).map(|state| state.addr)
+    }
+
     fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp> {
         self.inner.observe_enabled.store(true, Ordering::Relaxed);
         self.inner.observe_rx.clone()
@@ -1956,6 +1969,92 @@ mod tests {
             datapath.last_activity(leg.id),
             Some(7),
             "a valid consent check stamps activity at the current tick"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_validated_source_reports_only_a_check_validated_peer() {
+        // The RFC 7675 consent target: the address a MESSAGE-INTEGRITY-verified check adopted
+        // (RFC 8445 §7.3) — nothing before that, and nothing a forgery claims.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        datapath.set_ice(
+            leg.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            None,
+            "no check has validated a source yet"
+        );
+
+        // A forgery must not become the consent target.
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let forged = stun::binding_request(&[3u8; 12], "ENG:remote", b"WRONG");
+        attacker
+            .send_to(&forged, leg.local_addr)
+            .await
+            .expect("send forged");
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, attacker.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "the forged check is dropped"
+        );
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            None,
+            "a check failing MESSAGE-INTEGRITY never adopts a source"
+        );
+
+        // The real peer's valid check does.
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let check = stun::binding_request(&[4u8; 12], "ENG:remote", b"engpass");
+        peer.send_to(&check, leg.local_addr)
+            .await
+            .expect("send check");
+        let _ = recv(&peer).await;
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            Some(peer_addr),
+            "the validated check's source is the selected path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_validated_source_never_reports_a_plain_media_latch() {
+        // A non-ICE endpoint latches on media (layer 3). That latch is not authenticated by any
+        // connectivity check, so it must never be offered as an ICE-validated path.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (phone_a, _) = phone().await;
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule {
+                    out_endpoint: leg_b.id,
+                    out_dst: None,
+                    accepted_source: SourceFilter::Any,
+                    latch: LatchPolicy::SignalledOnly,
+                }),
+            )
+            .expect("flow a");
+
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A, 1), leg_a.local_addr)
+            .await
+            .expect("send a");
+        // Let the datagram be processed (it latches; with no out_dst resolved it goes nowhere else).
+        tokio::time::sleep(NEGATIVE).await;
+        assert_eq!(
+            datapath.ice_validated_source(leg_a.id),
+            None,
+            "a media latch on a non-ICE endpoint is not an ICE-validated source"
         );
     }
 

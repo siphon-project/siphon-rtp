@@ -42,6 +42,7 @@ use siphon_rtp_srtp::StreamRollover;
 use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
 use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
+use crate::ice::driver::{ConsentOutcome, ConsentSupervisor};
 use crate::ice::{self, IceCredentials};
 use crate::interface::{Interface, InterfaceTable};
 use crate::media_pipeline::{
@@ -99,6 +100,14 @@ struct Call {
     /// The engine's own ICE-lite credentials for this call (its identity as the ICE server), or
     /// `None` for a non-ICE call.
     ice: Option<IceCredentials>,
+    /// The **near** (offerer, A) peer's ICE credentials, from its offer's `a=ice-ufrag`/`a=ice-pwd`.
+    /// Kept because an outbound check is signed with the *peer's* password and addressed
+    /// `<peer-ufrag>:<our-ufrag>` (RFC 8445 §7.1.2) — our own credentials are not enough to talk to
+    /// it. `None` when A offered no ICE.
+    near_remote_ice: Option<IceCredentials>,
+    /// The **far** (answerer, B) peer's ICE credentials, from its answer. Same purpose as
+    /// [`Self::near_remote_ice`], for the other leg; `None` until a B answer carrying ICE lands.
+    far_remote_ice: Option<IceCredentials>,
     from_tag: String,
     to_tag: Option<String>,
     near: Leg,
@@ -540,6 +549,10 @@ pub struct Engine<D: Datapath> {
     /// in the accept's `play_id` and in the matching [`Event::PlayFinished`], so a controller
     /// correlates a completion with the specific prompt it started (a leg may play several in sequence).
     play_id_counter: std::sync::atomic::AtomicU64,
+    /// RFC 7675 consent freshness, when the operator enabled it (`--ice-consent`). `None` ⇒ the
+    /// engine only *answers* checks (the RFC 7675 §4 ICE-lite posture) and dead paths are caught by
+    /// the media-timeout sweep alone. Shared with the sweeper task, which drives it once per tick.
+    consent: Option<Arc<ConsentSupervisor>>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -590,7 +603,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             )),
             // Start at 1 so a `play_id` of 0 never appears (a controller can treat 0 as "no play").
             play_id_counter: std::sync::atomic::AtomicU64::new(1),
+            // Off unless the operator opts in — see `with_consent`.
+            consent: None,
         }
+    }
+
+    /// Enable RFC 7675 consent freshness with the given cadence: every ICE leg is promoted to the
+    /// datapath's full-agent seam and actively probed on its validated pair, and a peer that stops
+    /// answering has its call torn down.
+    ///
+    /// **Off by default, deliberately.** RFC 7675 §4 is explicit that an ICE-**lite** agent does not
+    /// generate consent checks, it only responds to them — and ice-lite is what the engine advertises
+    /// (`a=ice-lite`) until the full agent lands. Initiating checks while advertising lite is a
+    /// deviation, so it is the operator's opt-in rather than the default; the full-agent work turns it
+    /// on unconditionally for legs that no longer claim lite. Builder-style consuming setter,
+    /// mirroring [`Self::with_cluster`].
+    #[must_use]
+    pub fn with_consent(mut self, config: crate::ice::driver::ConsentConfig) -> Self {
+        self.consent = Some(Arc::new(ConsentSupervisor::new(config)));
+        self
     }
 
     /// Build (once) and return the ring-backed rustls client configuration for `wss://` WebSocket
@@ -1262,6 +1293,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
                 ice: ice_creds,
+                // A's own credentials, from the offer — needed to *address* checks to A later
+                // (RFC 8445 §7.1.2); B's arrive with its answer.
+                near_remote_ice: peer_ice_credentials(&info),
+                far_remote_ice: None,
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -1441,6 +1476,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
                 ice: None,
+                // A single-leg local answer mints no ICE of its own, so there is no pair to keep
+                // consent on either side.
+                near_remote_ice: None,
+                far_remote_ice: None,
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -1679,6 +1718,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.bridge.deregister(endpoints.iter().copied());
             self.media.deregister(call_id);
             self.ws.deregister(call_id);
+            if let Some(consent) = &self.consent {
+                consent.unregister_call(call_id);
+            }
             for endpoint in endpoints {
                 self.datapath.remove_endpoint(endpoint).await;
                 self.endpoint_calls.remove(&endpoint);
@@ -1702,6 +1744,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near,
             far,
             ice_creds,
+            near_remote_ice,
             far_local_crypto,
             far_dtls,
             near_codec,
@@ -1719,6 +1762,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.near,
                     call.far,
                     call.ice.clone(),
+                    call.near_remote_ice.clone(),
                     call.far_local_crypto,
                     call.far_dtls,
                     call.near_codec.clone(),
@@ -1859,14 +1903,42 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 local_pwd: creds.pwd.clone(),
             };
             // `near` faces A (which offered ICE); enable the responder on its RTP and, under
-            // non-mux, its companion RTCP endpoint.
-            for endpoint in near.endpoint_ids() {
-                self.datapath.set_ice(endpoint, Some(config.clone()));
-            }
-            // `far` faces B; enable only when B also offered ICE.
-            if info.is_ice() {
-                for endpoint in far.endpoint_ids() {
-                    self.datapath.set_ice(endpoint, Some(config.clone()));
+            // non-mux, its companion RTCP endpoint. `far` faces B; enable only when B also offered
+            // ICE. With consent freshness on, each side is promoted to the datapath's **full-agent**
+            // seam instead (responder + STUN forwarding) and registered with the credentials of the
+            // peer *that* side faces — an outbound check is signed with the peer's password, so the
+            // two legs are not interchangeable (RFC 8445 §7.1.2).
+            let far_remote_ice = peer_ice_credentials(&info);
+            let sides = [
+                (near.endpoint_ids().collect::<Vec<_>>(), &near_remote_ice),
+                (
+                    if info.is_ice() {
+                        far.endpoint_ids().collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    },
+                    &far_remote_ice,
+                ),
+            ];
+            for (endpoints, remote) in sides {
+                for endpoint in endpoints {
+                    match (&self.consent, remote) {
+                        (Some(consent), Some(remote)) => {
+                            self.datapath
+                                .set_ice_agent(endpoint, config.clone(), consent.events());
+                            consent.register(
+                                endpoint,
+                                call_id,
+                                &creds.ufrag,
+                                &remote.ufrag,
+                                &remote.pwd,
+                            );
+                        }
+                        // Consent is off, or this peer signalled ICE without usable credentials:
+                        // the ice-lite responder alone (RFC 7675 §4 — a lite agent answers checks
+                        // and never initiates them).
+                        _ => self.datapath.set_ice(endpoint, Some(config.clone())),
+                    }
                 }
             }
         }
@@ -2298,6 +2370,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.relay_flows = relay_flows;
             // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
             call.far_remote_crypto = info.crypto.first().copied();
+            // B's ICE credentials from its answer — what an outbound consent check to B is addressed
+            // and signed with (RFC 8445 §7.1.2).
+            call.far_remote_ice = peer_ice_credentials(&info);
         }
         // Answer-side codec presentation: on a transcoding call (Media / SrtpMedia) the engine sends
         // A its *own* negotiated codec, so the answer relayed to A must advertise A's codec, never
@@ -2436,6 +2511,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.bridge.deregister(endpoints.iter().copied());
         self.media.deregister(call_id);
         self.ws.deregister(call_id);
+        // Consent state dies with the call — otherwise a torn-down leg keeps a checker (and its
+        // credentials) alive forever and the registry never drains to zero.
+        if let Some(consent) = &self.consent {
+            consent.unregister_call(call_id);
+        }
         for endpoint in endpoints {
             self.datapath.remove_endpoint(endpoint).await;
             self.endpoint_calls.remove(&endpoint);
@@ -3126,6 +3206,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.endpoint_calls
                 .insert(endpoint.id, snapshot.call_id.clone());
         }
+        // Read before the snapshot's credentials are moved into the call below.
+        let restored_ice = snapshot.ice.is_some();
         self.calls.insert(
             snapshot.call_id.clone(),
             Call {
@@ -3135,6 +3217,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ufrag: ice.ufrag,
                     pwd: ice.pwd,
                 }),
+                // The HA snapshot carries only the engine's *own* ICE credentials, never the peer's,
+                // so a restored leg cannot address a check to it (RFC 8445 §7.1.2 needs the peer's
+                // ufrag + password). A restored ICE call therefore runs no consent freshness — it
+                // falls back to the media-timeout sweep — and says so loudly below. Carrying the peer
+                // credentials in the snapshot belongs with the full-agent HA work, not here.
+                near_remote_ice: None,
+                far_remote_ice: None,
                 from_tag: snapshot.from_tag,
                 to_tag: snapshot.to_tag,
                 near,
@@ -3166,6 +3255,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
+        // Be loud about the gap rather than let a restored ICE call look fully covered: consent
+        // freshness needs the peer's credentials, which the snapshot does not carry.
+        if restored_ice && self.consent.is_some() {
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                call_id = %snapshot.call_id,
+                "restored ICE call runs WITHOUT RFC 7675 consent freshness — the HA snapshot carries \
+                 no peer ICE credentials; dead-path detection falls back to the media-timeout sweep"
+            );
+        }
         ok_empty()
     }
 
@@ -4645,24 +4744,97 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 stale.push(entry.key().clone());
             }
         }
-        // Second pass: tear each idle call down (no map guard held across the awaits).
+        // Second pass: tear each idle call down (no map guard held across the awaits). Shared with
+        // consent failure — both are dead-path detections and must free identical state.
         let mut reaped = Vec::new();
         for call_id in stale {
-            if let Some((_, call)) = self.calls.remove(&call_id) {
-                // Emit the CDR + free every resource the call held (shared with `delete`), then notify
-                // the owner it was reaped.
-                self.finish_call(&call_id, &call, "media_timeout").await;
-                self.push_event(
-                    call.owner,
-                    Event::MediaTimeout {
-                        call_id: call_id.clone(),
-                        from_tag: call.from_tag,
-                    },
-                );
+            if self.reap_call(&call_id, "media_timeout").await {
                 reaped.push(call_id);
             }
         }
         reaped
+    }
+
+    /// Drive RFC 7675 consent freshness one tick: correlate the STUN the datapath forwarded since the
+    /// last tick, emit each due connectivity check on its endpoint's **validated** path, and tear down
+    /// any call whose peer has stopped answering. Returns the call-ids torn down (for the sweeper's
+    /// log). A no-op when consent is disabled (the ICE-lite posture, RFC 7675 §4).
+    ///
+    /// Deterministic: driven by the datapath's logical clock, exactly like [`Self::reap_idle`], so
+    /// tests advance it with `advance_clock` instead of waiting on wall time.
+    pub async fn drive_consent(&self) -> Vec<String> {
+        let Some(consent) = self.consent.clone() else {
+            return Vec::new();
+        };
+        let now = self.datapath.now_ticks();
+        // Ingest first: a response that arrived this tick must refresh consent *before* expiry is
+        // evaluated, or a live path could be failed by a check answered moments ago.
+        consent.drain_events();
+        let outcomes = consent.poll(|endpoint| self.datapath.ice_validated_source(endpoint), now);
+
+        let mut failed = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                ConsentOutcome::Send {
+                    endpoint,
+                    dst,
+                    datagram,
+                } => {
+                    // Checks egress the media endpoint itself, so the peer sees them from the same
+                    // transport address it validated (RFC 8445 §7.1: a check is sent from the base of
+                    // the local candidate). A send failure is transient — the retransmit schedule
+                    // covers it; only the RFC 7675 window declares the pair dead.
+                    if let Err(error) = self.datapath.send(endpoint, dst, &datagram).await {
+                        tracing::debug!(
+                            target: "siphon_rtp::media",
+                            ?endpoint,
+                            %dst,
+                            %error,
+                            "failed to transmit ICE consent check"
+                        );
+                    }
+                }
+                ConsentOutcome::Failed { endpoint, call_id } => {
+                    // Only tear the call down once, even though both its legs may fail on the same
+                    // tick: `reap_call` removes it from the registry, so the second attempt is a
+                    // no-op and must not double-count.
+                    consent.unregister(endpoint);
+                    if self.reap_call(&call_id, "consent_failed").await {
+                        tracing::warn!(
+                            target: "siphon_rtp::media",
+                            %call_id,
+                            ?endpoint,
+                            "ICE consent freshness lost (RFC 7675) — peer stopped answering checks; call torn down"
+                        );
+                        failed.push(call_id);
+                    }
+                }
+            }
+        }
+        failed
+    }
+
+    /// Tear down one call as a **dead path**: emit its CDR with `reason`, free every resource it
+    /// holds, and notify its owner with [`Event::MediaTimeout`]. Returns whether the call was still
+    /// live (so a caller can avoid double-reporting). Shared by the media-timeout sweep and consent
+    /// failure so both dead-path detectors free exactly the same state.
+    ///
+    /// The event is `MediaTimeout` for a consent failure too: the control contract has no dedicated
+    /// ICE-state event yet, and to a controller both mean the same thing — this call's media path is
+    /// gone, tear the dialog down. The distinction is preserved in the CDR `reason` and the log.
+    async fn reap_call(&self, call_id: &str, reason: &str) -> bool {
+        let Some((_, call)) = self.calls.remove(call_id) else {
+            return false;
+        };
+        self.finish_call(call_id, &call, reason).await;
+        self.push_event(
+            call.owner,
+            Event::MediaTimeout {
+                call_id: call_id.to_string(),
+                from_tag: call.from_tag,
+            },
+        );
+        true
     }
 
     /// Propagate each in-kernel-learned peer source into the sibling leg's forward destination — the
@@ -5152,6 +5324,21 @@ fn ice_directive(profile: &ProfileFlags) -> Option<IceDirective> {
     match profile.ice.as_deref()?.trim().to_ascii_lowercase().as_str() {
         "force" | "force-relay" => Some(IceDirective::Force),
         "remove" => Some(IceDirective::Remove),
+        _ => None,
+    }
+}
+
+/// The peer's own ICE credentials from a parsed offer/answer — what an outbound connectivity check
+/// toward that peer is addressed with and signed by (RFC 8445 §7.1.2), as opposed to
+/// [`Call::ice`], which is the engine's identity. Both attributes are mandatory together (RFC 8839
+/// §5.4), so a peer that signalled only one of them has no usable credential and is treated as
+/// having offered none — the leg keeps the responder and simply runs no consent.
+fn peer_ice_credentials(info: &sdp::MediaInfo) -> Option<IceCredentials> {
+    match (info.ice_ufrag.as_ref(), info.ice_pwd.as_ref()) {
+        (Some(ufrag), Some(pwd)) => Some(IceCredentials {
+            ufrag: ufrag.clone(),
+            pwd: pwd.clone(),
+        }),
         _ => None,
     }
 }
@@ -13027,6 +13214,399 @@ mod tests {
             &buffer[..len],
             engine_pwd.as_bytes()
         ));
+    }
+
+    // ---- RFC 7675 consent freshness (end-to-end over the real datapath) --------------------------
+
+    /// A's ICE credentials in the consent tests.
+    const A_UFRAG: &str = "AAAAAA";
+    const A_PWD: &str = "apasswordapasswordapas";
+
+    /// Consent tuned for a short test: probe every tick, declare death after 6 ticks.
+    fn test_consent() -> crate::ice::driver::ConsentConfig {
+        crate::ice::driver::ConsentConfig {
+            interval_ticks: 1,
+            timeout_ticks: 6,
+            rto_ticks: 1,
+        }
+    }
+
+    /// An ICE offer from A at the socket it will actually send from.
+    fn ice_offer_from(addr: SocketAddr) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            ip = addr.ip(),
+            port = addr.port()
+        )
+    }
+
+    /// Offer + answer an ICE call (A offers ICE, B answers plain), then have A run one valid
+    /// connectivity check so the datapath adopts its source as the validated path. Returns the
+    /// engine's A-facing address (where A sends) and the engine's own advertised credentials.
+    async fn ice_call_with_validated_a(
+        engine: &Engine<UdpLoopbackDatapath>,
+        client: ClientId,
+        call_id: &str,
+        phone_a: &UdpSocket,
+        offer_sdp: String,
+        answer_addr: SocketAddr,
+    ) -> SocketAddr {
+        let offer = engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let _ = ok_sdp_text(&offer);
+        let answer = engine
+            .handle(
+                client,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(answer_addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer_out = ok_sdp_text(&answer);
+        let near = sdp::parse(&answer_out).expect("parse engine answer");
+        let engine_ufrag = near.ice_ufrag.clone().expect("engine ufrag");
+        let engine_pwd = near.ice_pwd.clone().expect("engine pwd");
+
+        // A's connectivity check: this is what makes its source the *validated* path.
+        let username = format!("{engine_ufrag}:{A_UFRAG}");
+        let check = siphon_rtp_stun::binding_request(&[7u8; 12], &username, engine_pwd.as_bytes());
+        phone_a
+            .send_to(&check, near.remote_rtp)
+            .await
+            .expect("send check");
+        // Await the engine's answer, so adoption has certainly happened before the test proceeds.
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("no timeout")
+            .expect("recv response");
+        assert_eq!(
+            siphon_rtp_stun::parse(&buffer[..len])
+                .expect("parse")
+                .message_type,
+            siphon_rtp_stun::BINDING_SUCCESS
+        );
+        near.remote_rtp
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_probes_the_validated_source_not_the_signalled_address() {
+        // The whole reason consent was not wired before: a NATed peer's `c=` is unusable. A signals
+        // 127.0.0.2:5000 but really sends from 127.0.0.50 — checks must follow the validated source.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 50)).await;
+        let (_phone_b, addr_b) = phone().await;
+        assert_ne!(addr_a.ip().to_string(), "127.0.0.2");
+
+        let mut lying = ice_offer_from(addr_a);
+        lying = lying.replace(&format!("c=IN IP4 {}", addr_a.ip()), "c=IN IP4 127.0.0.2");
+        let engine_near =
+            ice_call_with_validated_a(&engine, CLIENT, "nat", &phone_a, lying, addr_b).await;
+
+        engine.datapath().advance_clock(1);
+        assert!(
+            engine.drive_consent().await.is_empty(),
+            "a freshly validated pair is not failed"
+        );
+
+        // The check arrives at A's *real* socket, from the engine's A-facing endpoint.
+        let mut buffer = [0u8; 2048];
+        let (len, from) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("a consent check is sent")
+            .expect("recv");
+        assert_eq!(from, engine_near, "sourced from the leg's own media port");
+        let check = siphon_rtp_stun::parse(&buffer[..len]).expect("parse check");
+        assert!(check.is_binding_request());
+        // RFC 8445 §7.1.2: addressed to A, signed with A's password (not the engine's).
+        assert_eq!(
+            check.username(),
+            Some(format!("{A_UFRAG}:{}", engine_ufrag_of(&engine, "nat")).as_str())
+        );
+        assert!(
+            siphon_rtp_stun::verify_message_integrity(&buffer[..len], A_PWD.as_bytes()),
+            "the check is keyed by the peer's password"
+        );
+    }
+
+    /// The engine's own ufrag for `call_id` (its ICE identity), for asserting check USERNAMEs.
+    fn engine_ufrag_of(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) -> String {
+        engine
+            .calls
+            .get(call_id)
+            .and_then(|call| call.ice.as_ref().map(|ice| ice.ufrag.clone()))
+            .expect("the call has ICE credentials")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_tears_the_call_down_when_the_peer_stops_answering() {
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let client = ClientId(11);
+        let events = engine.register_client(client);
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        ice_call_with_validated_a(
+            &engine,
+            client,
+            "dead",
+            &phone_a,
+            ice_offer_from(addr_a),
+            addr_b,
+        )
+        .await;
+        assert_eq!(engine.session_count(), 1);
+
+        // A never answers another check. Drive the sweep tick by tick; the pair dies at the timeout.
+        let mut failed = Vec::new();
+        for _ in 0..12 {
+            engine.datapath().advance_clock(1);
+            failed = engine.drive_consent().await;
+            if !failed.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(failed, vec!["dead".to_string()], "consent expired");
+        assert_eq!(engine.session_count(), 0, "the call's resources are freed");
+        assert!(
+            engine.consent.as_ref().expect("consent on").is_empty(),
+            "no consent state outlives the call"
+        );
+
+        // The owner is told, on the same dead-path contract the media-timeout sweep uses, and the CDR
+        // records the distinct reason.
+        let mut got_timeout = false;
+        let mut cdr_reason = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::MediaTimeout { call_id, .. } => {
+                    assert_eq!(call_id, "dead");
+                    got_timeout = true;
+                }
+                Event::CallSummary { reason, .. } => cdr_reason = Some(reason),
+                _ => {}
+            }
+        }
+        assert!(got_timeout, "the owner is notified the path is dead");
+        assert_eq!(cdr_reason.as_deref(), Some("consent_failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answering_peer_keeps_consent_fresh_past_the_timeout() {
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let engine_near = ice_call_with_validated_a(
+            &engine,
+            CLIENT,
+            "alive",
+            &phone_a,
+            ice_offer_from(addr_a),
+            addr_b,
+        )
+        .await;
+
+        // Run well past the 6-tick window, answering every check exactly as a real ICE agent would
+        // (Binding success signed with A's own password — RFC 8445 §7.3).
+        for tick in 0..20 {
+            engine.datapath().advance_clock(1);
+            assert!(
+                engine.drive_consent().await.is_empty(),
+                "consent must not fail while the peer answers (tick {tick})"
+            );
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+            {
+                let check = siphon_rtp_stun::parse(&buffer[..len]).expect("parse check");
+                if check.is_binding_request() {
+                    let response = siphon_rtp_stun::binding_success_response(
+                        &check.transaction_id,
+                        addr_a,
+                        Some(A_PWD.as_bytes()),
+                    );
+                    phone_a
+                        .send_to(&response, engine_near)
+                        .await
+                        .expect("answer the check");
+                    // Let the datapath forward it through the full-agent seam before the next tick.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        assert_eq!(engine.session_count(), 1, "the call is still up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_is_off_by_default_and_never_probes() {
+        // The RFC 7675 §4 ICE-lite posture: answer checks, never initiate them.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        ice_call_with_validated_a(
+            &engine,
+            CLIENT,
+            "lite",
+            &phone_a,
+            ice_offer_from(addr_a),
+            addr_b,
+        )
+        .await;
+
+        for _ in 0..12 {
+            engine.datapath().advance_clock(1);
+            assert!(engine.drive_consent().await.is_empty());
+        }
+        let mut buffer = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "an ice-lite agent must not send consent checks"
+        );
+        assert_eq!(engine.session_count(), 1, "and the call stays up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_is_not_started_for_a_leg_whose_peer_never_checks() {
+        // No validated pair ⇒ nothing to probe, and crucially nothing to *fail*: a leg the peer has
+        // not yet checked must never be torn down by consent (the media-timeout sweep owns that).
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "silent".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "silent".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        for _ in 0..20 {
+            engine.datapath().advance_clock(1);
+            assert!(
+                engine.drive_consent().await.is_empty(),
+                "an unvalidated leg is never failed by consent"
+            );
+        }
+        assert_eq!(engine.session_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_ice_leg_is_probed_with_its_own_peer_credentials() {
+        // Both sides ICE: the near leg's checks are signed with A's password and the far leg's with
+        // B's. Signing either with the wrong side's password would be rejected by that peer.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        const B_UFRAG: &str = "BBBBBB";
+        const B_PWD: &str = "bpasswordbpasswordbpas";
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "both".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_offer = sdp::parse(&ok_sdp_text(&offer)).expect("parse far offer");
+        let engine_pwd = far_offer.ice_pwd.clone().expect("engine pwd");
+        let engine_ufrag = far_offer.ice_ufrag.clone().expect("engine ufrag");
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "both".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: format!(
+                        "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+                         a=ice-ufrag:{B_UFRAG}\r\na=ice-pwd:{B_PWD}\r\n\
+                         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+                        ip = addr_b.ip(),
+                        port = addr_b.port()
+                    ),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_answer = sdp::parse(&ok_sdp_text(&answer)).expect("parse near answer");
+
+        // Both peers validate their own leg.
+        for (phone, engine_addr, ufrag) in [
+            (&phone_a, near_answer.remote_rtp, A_UFRAG),
+            (&phone_b, far_offer.remote_rtp, B_UFRAG),
+        ] {
+            let check = siphon_rtp_stun::binding_request(
+                &[8u8; 12],
+                &format!("{engine_ufrag}:{ufrag}"),
+                engine_pwd.as_bytes(),
+            );
+            phone.send_to(&check, engine_addr).await.expect("check");
+            let mut buffer = [0u8; 2048];
+            timeout(Duration::from_secs(1), phone.recv_from(&mut buffer))
+                .await
+                .expect("no timeout")
+                .expect("response");
+        }
+
+        engine.datapath().advance_clock(1);
+        assert!(engine.drive_consent().await.is_empty());
+
+        for (phone, peer_ufrag, peer_pwd) in
+            [(&phone_a, A_UFRAG, A_PWD), (&phone_b, B_UFRAG, B_PWD)]
+        {
+            let mut buffer = [0u8; 2048];
+            let (len, _) = timeout(Duration::from_secs(1), phone.recv_from(&mut buffer))
+                .await
+                .expect("each ICE leg is probed")
+                .expect("recv");
+            let check = siphon_rtp_stun::parse(&buffer[..len]).expect("parse");
+            assert_eq!(
+                check.username(),
+                Some(format!("{peer_ufrag}:{engine_ufrag}").as_str())
+            );
+            assert!(
+                siphon_rtp_stun::verify_message_integrity(&buffer[..len], peer_pwd.as_bytes()),
+                "each leg's check is keyed by the password of the peer it faces"
+            );
+        }
     }
 
     /// An SDP whose `c=` claims `ip` (not necessarily where its media actually arrives from).

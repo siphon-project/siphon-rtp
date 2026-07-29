@@ -119,6 +119,15 @@ impl ConsentChecker {
         self.last_consent_tick
     }
 
+    /// The peer transport this checker probes — the validated pair it was armed for. The supervisor
+    /// compares it against the datapath's current ICE-validated source so a peer that re-validates
+    /// from a new address (a NAT rebind mid-call) re-arms consent on the new path instead of probing
+    /// the dead one.
+    #[must_use]
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
     /// Drive consent at `now_tick`. Returns the single action due this tick. The sweeper MUST call
     /// [`on_response`](Self::on_response) for any arrived STUN *before* `poll` so a just-received
     /// refresh is seen this tick.

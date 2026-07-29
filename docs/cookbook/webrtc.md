@@ -14,9 +14,11 @@ Rust, at different levels of maturity. This page says exactly which level.
   (MESSAGE-INTEGRITY + FINGERPRINT validated and returned).
 - A full built-in TURN server, `turn:` and `turns:`, with coturn REST
   credentials. A coturn replacement, not a shim.
+- RFC 7675 consent freshness, opt-in with `--ice-consent`: the engine probes the
+  validated pair and tears the call down when the peer stops answering.
 
-**Planned, not shipped:** the full ICE state machine (candidate pairs,
-checklists, acting as a controlling agent) and RFC 7675 consent freshness;
+**Planned, not shipped:** the full ICE state machine (candidate gathering,
+candidate pairs, checklists, nomination, acting as a controlling agent);
 transcoding on a DTLS leg (today a DTLS leg is bridged as-is, so both sides must
 share a codec); HA checkpoint/restore of a DTLS leg; DTLS or ICE legs into a
 conference (`conference_join` rejects them, plain `RTP/AVP` or SDES `RTP/SAVP`
@@ -112,11 +114,48 @@ bound to the SDP exchange, so it is a stronger latch signal than "first packet
 wins" ever could be (see [Security & NAT](../security-and-nat.md), layer 4).
 
 Be honest about the boundary: this is the responder half of ICE. The engine does
-not run checklists, does not pair candidates, does not nominate, and does not
-yet verify consent freshness (RFC 7675). For the server-side role against
-browsers this is normally sufficient (the browser, as full agent, drives the
-checks), but if you need the engine to be an ICE *client* (outbound WebRTC
-trunking), that work is planned and not in this release.
+not gather candidates, does not run checklists, does not pair candidates, and
+does not nominate. For the server-side role against browsers this is normally
+sufficient (the browser, as full agent, drives the checks), but if you need the
+engine to be an ICE *client* (outbound WebRTC trunking), that work is planned and
+not in this release.
+
+## Consent freshness (RFC 7675)
+
+A validated pair can go stale: the peer walks out of coverage, its NAT binding
+dies, or it simply stops caring. Consent freshness is the ICE-native answer, and
+it is opt-in:
+
+```
+siphon-rtp --ice-consent --consent-interval-secs 5 --consent-timeout-secs 30
+```
+
+With it on, every ICE leg is promoted to the datapath's full-agent seam (the
+responder plus forwarding of the Binding *responses* the responder would drop)
+and probed once per sweep tick. Checks go to the address the peer proved it can
+receive on, never to its signalled `c=` — for a NATed peer that is a private
+address, and probing it would kill healthy calls. Each leg is addressed
+`<peer-ufrag>:<our-ufrag>` and signed with that peer's password (RFC 8445
+§7.1.2), so the two legs of one call use different credentials. After the timeout
+with no verified response the call is torn down: CDR reason `consent_failed`, and
+the controller gets the same `Event::MediaTimeout` it already handles for a dead
+path.
+
+Why off by default: RFC 7675 §4 says an ICE-lite agent responds to consent checks
+and does not generate them, and `a=ice-lite` is what the engine advertises. So
+initiating them is a deliberate deviation you opt into, not something we do
+behind your back. It becomes the default for legs that stop claiming lite.
+
+Two limits worth knowing. A datapath backend without the full-agent seam (the XDP
+fast path) logs a warning per endpoint and stays responder-only — no silent
+downgrade. And an HA-restored ICE call runs without consent, because the snapshot
+carries the engine's own credentials but not the peer's, so no check can be
+addressed; it also says so in the log.
+
+Even with consent off, an ICE path that stops receiving checks is still reaped —
+a valid inbound check stamps the endpoint's activity, so the media-timeout sweep
+catches it. Consent shortens the detection window and makes it active rather than
+passive.
 
 ## TURN: the built-in relay
 

@@ -122,6 +122,26 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS)]
     pub shutdown_grace_secs: u64,
 
+    /// Actively probe ICE legs for consent freshness (RFC 7675) instead of only answering their
+    /// checks, tearing a call down when its peer stops responding on the validated path.
+    ///
+    /// Off by default on purpose: RFC 7675 §4 says an ICE-**lite** agent does not generate consent
+    /// checks, and `a=ice-lite` is what the engine advertises today, so initiating them is a
+    /// deviation the operator opts into. Requires a datapath with the full-agent seam (the UDP
+    /// backend); the XDP fast path logs a warning and keeps responder-only behaviour.
+    #[arg(long, default_value_t = false)]
+    pub ice_consent: bool,
+
+    /// Seconds between ICE consent checks on a validated pair (RFC 7675 §5.1 recommends ~5 s,
+    /// randomised). Only used with `--ice-consent`.
+    #[arg(long, default_value_t = DEFAULT_CONSENT_INTERVAL_SECS)]
+    pub consent_interval_secs: u64,
+
+    /// Seconds without a correlated consent response after which the pair is declared dead and the
+    /// call is torn down (RFC 7675 §5.1: 30 s). Only used with `--ice-consent`.
+    #[arg(long, default_value_t = DEFAULT_CONSENT_TIMEOUT_SECS)]
+    pub consent_timeout_secs: u64,
+
     /// Stable cluster node identifier reported by the `load` / `node_info` control commands so a SIP
     /// dispatcher can tell engines apart. Defaults to the host's `HOSTNAME` (else `siphon-rtp`).
     #[arg(long)]
@@ -169,6 +189,12 @@ pub struct RunConfig {
     pub media_timeout_secs: u64,
     /// Bounded SIGTERM/SIGINT drain grace period (seconds).
     pub shutdown_grace_secs: u64,
+    /// Actively run RFC 7675 consent freshness on ICE legs (off ⇒ the ICE-lite responder posture).
+    pub ice_consent: bool,
+    /// Seconds between consent checks on a validated pair.
+    pub consent_interval_secs: u64,
+    /// Seconds without a correlated consent response before the pair is declared dead.
+    pub consent_timeout_secs: u64,
     /// TURN UDP listen address (`turn:`); `None` = off.
     pub turn_udp: Option<SocketAddr>,
     /// TURN TCP listen address (`turn:` over TCP); `None` = off.
@@ -231,6 +257,24 @@ impl RunConfig {
                 explicit("shutdown_grace_secs"),
                 file.shutdown_grace_secs,
                 DEFAULT_SHUTDOWN_GRACE_SECS,
+            ),
+            ice_consent: resolve_defaulted(
+                args.ice_consent,
+                explicit("ice_consent"),
+                file.ice_consent,
+                false,
+            ),
+            consent_interval_secs: resolve_defaulted(
+                args.consent_interval_secs,
+                explicit("consent_interval_secs"),
+                file.consent_interval_secs,
+                DEFAULT_CONSENT_INTERVAL_SECS,
+            ),
+            consent_timeout_secs: resolve_defaulted(
+                args.consent_timeout_secs,
+                explicit("consent_timeout_secs"),
+                file.consent_timeout_secs,
+                DEFAULT_CONSENT_TIMEOUT_SECS,
             ),
             turn_udp: resolve_optional(args.turn_udp, file.turn_udp),
             turn_tcp: resolve_optional(args.turn_tcp, file.turn_tcp),
@@ -360,6 +404,10 @@ fn default_node_id() -> String {
 const DEFAULT_MEDIA_TIMEOUT_SECS: u64 = 30;
 /// Built-in default for `--shutdown-grace-secs` (mirrors the clap `default_value_t`).
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 25;
+/// Built-in default for `--consent-interval-secs` (RFC 7675 §5.1 recommends ~5 s, randomised).
+const DEFAULT_CONSENT_INTERVAL_SECS: u64 = 5;
+/// Built-in default for `--consent-timeout-secs` (RFC 7675 §5.1: consent expires after 30 s).
+const DEFAULT_CONSENT_TIMEOUT_SECS: u64 = 30;
 
 /// Run every post-datapath subsystem over the selected `datapath`: the cluster/engine, control
 /// server, built-in TURN server, the single redirect dispatcher, the media-timeout + TURN sweeper,
@@ -398,11 +446,24 @@ where
         max_sessions = config.max_sessions,
         "cluster node identity registered"
     );
-    let engine = Arc::new(
-        Engine::new(datapath.clone())
-            .with_cluster(cluster.clone())
-            .with_interfaces(interfaces),
-    );
+    let mut engine = Engine::new(datapath.clone())
+        .with_cluster(cluster.clone())
+        .with_interfaces(interfaces);
+    if config.ice_consent {
+        tracing::info!(
+            target: "siphon_rtp::media",
+            interval_secs = config.consent_interval_secs,
+            timeout_secs = config.consent_timeout_secs,
+            "RFC 7675 ICE consent freshness enabled — ICE legs are actively probed on their validated pair"
+        );
+        engine = engine.with_consent(crate::ice::driver::ConsentConfig {
+            // One sweeper tick is one wall second, so seconds and ticks are the same unit here.
+            interval_ticks: config.consent_interval_secs,
+            timeout_ticks: config.consent_timeout_secs,
+            ..Default::default()
+        });
+    }
+    let engine = Arc::new(engine);
 
     // Best-effort host-CPU sampler feeding the `load` command's load score (~1 Hz, off-reactor).
     cluster::spawn_cpu_sampler(cluster, cluster::DEFAULT_CPU_SAMPLE_INTERVAL);
@@ -453,6 +514,10 @@ where
             // closing the in-kernel symmetric-RTP loop (docs/security-and-nat.md §4 layer 3); a no-op
             // on the loopback backend (which resolves the latch inline when forwarding).
             sweeper.refresh_latched_destinations().await;
+            // RFC 7675 consent freshness on ICE legs: probe each validated pair and tear down a call
+            // whose peer stopped answering. A no-op unless `--ice-consent` is set. Runs *before* the
+            // idle reap so a call the peer just refreshed is not also evaluated as idle this tick.
+            sweeper.drive_consent().await;
             for call_id in sweeper.reap_idle(timeout_ticks).await {
                 tracing::warn!(target: "siphon_rtp::media", %call_id, idle_secs = timeout_ticks, "media timeout — call reaped");
             }
@@ -693,6 +758,9 @@ mod tests {
             max_control_rps: 0,
             media_timeout_secs: 30,
             shutdown_grace_secs: 25,
+            ice_consent: false,
+            consent_interval_secs: 5,
+            consent_timeout_secs: 30,
             turn_udp: None,
             turn_tcp: None,
             turn_tls: None,
