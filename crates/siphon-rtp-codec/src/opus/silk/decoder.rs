@@ -312,9 +312,10 @@ impl Default for StereoState {
     }
 }
 
-/// Index of the mid channel in [`SilkDecoder::channels`]-style accessors.
+/// Index of the mid channel for [`SilkDecoder::channel`] / [`SilkDecoder::channel_mut`]. In a mono
+/// stream this is the only channel.
 pub const MID_CHANNEL: usize = 0;
-/// Index of the side channel.
+/// Index of the side channel for [`SilkDecoder::channel`] / [`SilkDecoder::channel_mut`].
 pub const SIDE_CHANNEL: usize = 1;
 
 /// Complete SILK decoder state (libopus `silk_decoder`, `dec_API.c:47-56`): one
