@@ -38,6 +38,7 @@
 //! |---|---|
 //! | Shared constants and side-info types ([`types`]) | **landed** |
 //! | Cross-frame decoder state ([`decoder`]) | **landed** |
+//! | Header / stereo / frame-type / gain entropy tables ([`tables`]) | **landed** |
 //! | LP-layer header: VAD / LBRR flags (§4.2.3-4) | pending |
 //! | Stereo prediction weights, mid-only flag (§4.2.7.1-2) | pending |
 //! | Frame type (§4.2.7.3) | pending |
@@ -94,4 +95,5 @@
 //! build (`reference/opus/silk_only`, `reference/opus/build-trace`; see CONTRIBUTING.md).
 
 pub mod decoder;
+pub mod tables;
 pub mod types;
