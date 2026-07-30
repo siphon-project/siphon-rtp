@@ -46,7 +46,7 @@
 //! | Subframe gains (§4.2.7.4) ([`gains`]) | **landed** |
 //! | NLSF → LPC (§4.2.7.5) | pending |
 //! | Pitch lags, LTP filter, LTP scaling (§4.2.7.6) ([`ltp`]) | **landed** |
-//! | LCG seed + excitation / shell coder (§4.2.7.7-8) | pending |
+//! | LCG seed + excitation / shell coder (§4.2.7.7-8) ([`excitation`]) | **landed** |
 //! | LTP + LPC synthesis, stereo unmixing, resampling (§4.2.7.9, §4.2.8-9) | pending |
 //! | DTX / CNG and PLC (§4.4) | pending |
 //!
@@ -105,14 +105,15 @@
 //!   `ec_prev_*` fields must be updated by the caller even for frames that skip these symbols —
 //!   `ec_prev_lag_index` only on a voiced frame (`decode_indices.c:121`), `ec_prev_signal_type` on
 //!   every frame (`decode_indices.c:145`).
-//! * **Excitation (§4.2.7.7-8)** — `excitation::decode(dec, signal_type, quant_offset_type,
-//!   frame_length, seed) -> ...`, writing into [`decoder::ChannelState::excitation_q14`]. The
-//!   quantization offset constant is [`types::QuantOffsetType::offset_q10`]. The **LCG seed** is a
-//!   per-frame symbol (§4.2.7.7, `silk_uniform4_iCDF`) read immediately before the excitation, not
-//!   cross-frame state — there is deliberately no seed field on [`decoder::ChannelState`], because on
-//!   the normal decode path the generator is re-seeded every frame. The only PRNG seeds that *do*
-//!   cross frames belong to PLC and CNG (`silk_PLC_struct.rand_seed`, `silk_CNG_struct.rand_seed`),
-//!   and they land with §4.4.
+//! * **Excitation (§4.2.7.7-8)** — landed as [`excitation::decode_seed`] plus
+//!   [`excitation::decode`], which writes the signed pulses into a caller-owned
+//!   [`excitation::PULSE_BUFFER_LENGTH`] buffer and the reconstructed Q14 excitation into
+//!   `&mut channel.excitation_q14[..frame_length]`. The quantization offset constant is
+//!   [`types::QuantOffsetType::offset_q10`]. The **LCG seed** is a per-frame symbol (§4.2.7.7,
+//!   `silk_uniform4_iCDF`) read immediately before the excitation, not cross-frame state — there is
+//!   deliberately no seed field on [`decoder::ChannelState`], because on the normal decode path the
+//!   generator is re-seeded every frame. The only PRNG seeds that *do* cross frames belong to PLC and
+//!   CNG (`silk_PLC_struct.rand_seed`, `silk_CNG_struct.rand_seed`), and they land with §4.4.
 //! * **Synthesis (§4.2.7.9, §4.2.8-9)** — consumes the subframe gains, the LPC/LTP coefficients and
 //!   [`decoder::ChannelState::out_buf`] / [`decoder::ChannelState::lpc_state_q14`] /
 //!   [`decoder::ChannelState::prev_gain_q16`], and the stereo weights against
@@ -137,6 +138,7 @@
 //! match, not that the packet parses to its end.
 
 pub mod decoder;
+pub mod excitation;
 pub mod fixed;
 pub mod frame_type;
 pub mod gains;
