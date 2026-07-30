@@ -62,6 +62,18 @@ control = "127.0.0.1:8080"
 # never fails a call.
 # stun_server = ["198.51.100.1:3478"]
 
+# --- Full ICE (RFC 8445) ------------------------------------------------------------------------
+#
+# Run a full ICE agent on ICE legs — checklists, connectivity checks, role-conflict resolution,
+# peer-reflexive discovery, nomination (CLI: --ice-full). Default: false (the ICE-lite responder).
+#
+# NOTE the behaviour change: on a full-agent leg the datapath answers no checks and adopts no source;
+# the agent adopts the pair ICE selects, and media only flows after that. A peer that never completes
+# ICE gets no media and the call is reaped with CDR reason `ice_failed`. See docs/security-and-nat.md
+# §4 layer 4. Supersedes consent freshness on the legs it runs on (consent is the lite-agent
+# behaviour; a full agent runs its own checks).
+# ice_full = false
+
 # --- ICE consent freshness (RFC 7675) -----------------------------------------------------------
 #
 # Actively probe ICE legs on their validated candidate pair and tear a call down when the peer stops

@@ -142,12 +142,34 @@ the peer's media path. That is deliberate. An ICE check is cryptographically
 bound to the SDP exchange, so it is a stronger latch signal than "first packet
 wins" ever could be (see [Security & NAT](../security-and-nat.md), layer 4).
 
-Be honest about the boundary: this is still the responder half of ICE. The engine
-gathers candidates, but it does not run checklists, does not pair candidates, and
-does not nominate. For the server-side role against browsers this is normally
-sufficient (the browser, as full agent, drives the checks), but if you need the
-engine to be an ICE *client* (outbound WebRTC trunking), that work is planned and
-not in this release.
+## Full ICE (`--ice-full`)
+
+The default above is the responder half of ICE. Turn on the full agent and the
+engine runs the other half too:
+
+```
+siphon-rtp --ice-full
+```
+
+It forms a checklist from both candidate sets (RFC 8445 §6.1.2), sends
+connectivity checks paced at `Ta`, resolves a role conflict by tie-breaker with a
+487 response (§7.3.1.1), discovers peer-reflexive candidates in both directions
+(§7.3.1.3, §7.2.5.3.1), and nominates a pair with USE-CANDIDATE (§8.1.1).
+
+The behaviour change worth planning for: **media does not flow until ICE selects a
+pair.** On a full-agent leg the datapath answers nothing and adopts nothing; the
+agent adopts the selected pair, and only then does the layer-4 gate let media
+through. That is the correct posture — the path is the one ICE chose, not the one
+that sent first — but on a leg whose peer never completes ICE, media never starts
+and the call is torn down with CDR reason `ice_failed` instead of relaying.
+
+Off by default because ICE-lite is a valid, simpler posture for a server on a
+routable address, and it is what the engine advertises in its SDP.
+
+Still the responder half only in one respect: the engine does not yet perform an
+ICE restart (§9) or trickle (RFC 8838). If you need the engine to be an ICE
+*client* for outbound WebRTC trunking, that is the same agent driven from the
+offerer side and is a follow-up.
 
 ## Consent freshness (RFC 7675)
 

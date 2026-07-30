@@ -224,8 +224,10 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > tested. **Consent freshness (RFC 7675) is now wired and runnable** — see the bullet below.
 > **Candidate gathering (RFC 8445 §5.1.1) is wired**: the advertised candidate list is gathered per
 > leg and per component rather than being one hardcoded host line — host always, plus a
-> server-reflexive candidate per `--stun-server` that answers. **Remaining:** the rest of full
-> (non-lite) ICE — checklists, pairing, nomination, and the engine as ICE *controlling* agent.
+> server-reflexive candidate per `--stun-server` that answers. **The full RFC 8445 agent is wired too**
+> (`--ice-full`, off by default): checklists, connectivity checks, both roles with 487 conflict
+> resolution, peer-reflexive discovery, and regular nomination — with media gated on the selected
+> pair. **Remaining:** ICE restart (§9), trickle (RFC 8838), and relayed candidates.
 > RTCP-port ICE under non-mux is wired.
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
@@ -252,6 +254,28 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     `a=end-of-candidates` (RFC 8838 §14).
   - **Enforcement:** `siphon-rtp-ice/src/gather.rs` (the pure plan), `Engine::gather_leg_candidates` /
     `run_gatherer` (its I/O), `sdp::IceAdvertisement` (emission).
+- **The full agent (`--ice-full`) changes who decides the media path**, which is why it belongs in this
+  document rather than only in the cookbook:
+  - **The datapath stops answering checks on a full-agent leg** (`IceAgentMode::ForwardOnly`). It
+    forwards STUN to the engine and answers nothing, because answering correctly needs state the
+    datapath does not have: the role and tie-breaker for the §7.3.1.1 conflict check, the checklist for
+    §7.3.1.3 peer-reflexive discovery, and the nomination flag for §7.3.1.5.
+  - **The agent becomes the only writer of the latch**, through the new `Datapath::adopt_source`. It
+    is called when ICE selects a pair (§8.1.1), and only for a pair whose check the agent
+    authenticated with the negotiated credentials — the same authority the responder had, relocated
+    to the component that owns the checklist.
+  - **Media therefore does not start until ICE has chosen.** Under the layer-4 gate an ICE endpoint
+    forwards media only from the adopted source, so with nothing adopted, nothing flows. An early
+    media sender cannot pre-empt the choice, and neither can an attacker who simply sends first.
+  - **The forward rule follows for free.** The datapath already prefers an endpoint's adopted source
+    over the signalled `out_dst`, so adopting both gates ingress and re-points the sibling's egress.
+    RFC 7675 consent, which resolves its target from the same adopted source each tick, follows the
+    selection without being told.
+  - **A failed checklist tears the call down** (§8.1.2, CDR reason `ice_failed`): if no pair works,
+    there is no path, and holding the call open would only wait for a timeout.
+  - **Enforcement:** `siphon-rtp-ice/src/{checklist,agent}.rs` (the pure state machine),
+    `ice/driver.rs` `AgentSupervisor` + `Engine::drive_ice_agents` (its I/O), `IceAgentMode` and
+    `adopt_source` in `datapath`.
 - **No blind pre-check latch on a plaintext-RTP + ICE relay leg.** On the `Forward` fast path an ICE
   endpoint's media is gated to the STUN-validated latch: the connectivity-check responder
   (`handle_stun`) is the **only** writer of an ICE endpoint's latch, so media arriving *before* any

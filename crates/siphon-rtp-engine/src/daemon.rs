@@ -133,6 +133,15 @@ pub struct EngineArgs {
     #[arg(long)]
     pub stun_server: Vec<SocketAddr>,
 
+    /// Run a full RFC 8445 ICE agent on ICE legs (checklists, connectivity checks, role conflict
+    /// resolution, peer-reflexive discovery, nomination) instead of the ICE-lite responder.
+    ///
+    /// Off by default: ICE-lite is a valid and simpler posture for a server on a routable address,
+    /// and it is what the engine advertises. With this on, media on an ICE leg does not start until
+    /// ICE has selected a pair — which is the point, but it is a behaviour change.
+    #[arg(long, default_value_t = false)]
+    pub ice_full: bool,
+
     /// Actively probe ICE legs for consent freshness (RFC 7675) instead of only answering their
     /// checks, tearing a call down when its peer stops responding on the validated path.
     ///
@@ -202,6 +211,8 @@ pub struct RunConfig {
     pub shutdown_grace_secs: u64,
     /// STUN servers asked for a server-reflexive candidate when gathering; empty ⇒ host-only.
     pub stun_servers: Vec<SocketAddr>,
+    /// Run a full RFC 8445 ICE agent on ICE legs (off ⇒ the ICE-lite responder posture).
+    pub ice_full: bool,
     /// Actively run RFC 7675 consent freshness on ICE legs (off ⇒ the ICE-lite responder posture).
     pub ice_consent: bool,
     /// Seconds between consent checks on a validated pair.
@@ -278,6 +289,7 @@ impl RunConfig {
             } else {
                 args.stun_server
             },
+            ice_full: resolve_defaulted(args.ice_full, explicit("ice_full"), file.ice_full, false),
             ice_consent: resolve_defaulted(
                 args.ice_consent,
                 explicit("ice_consent"),
@@ -424,6 +436,9 @@ fn default_node_id() -> String {
 const DEFAULT_MEDIA_TIMEOUT_SECS: u64 = 30;
 /// Built-in default for `--shutdown-grace-secs` (mirrors the clap `default_value_t`).
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 25;
+/// How often the full-ICE driver polls its agents. Below the RFC 8445 §14.2 `Ta` of 50 ms, so pacing
+/// is decided by the agent rather than by the tick granularity.
+const ICE_DRIVER_INTERVAL_MS: u64 = 20;
 /// Built-in default for `--consent-interval-secs` (RFC 7675 §5.1 recommends ~5 s, randomised).
 const DEFAULT_CONSENT_INTERVAL_SECS: u64 = 5;
 /// Built-in default for `--consent-timeout-secs` (RFC 7675 §5.1: consent expires after 30 s).
@@ -477,6 +492,13 @@ where
         );
         engine = engine.with_stun_servers(config.stun_servers.clone());
     }
+    if config.ice_full {
+        tracing::info!(
+            target: "siphon_rtp::media",
+            "full RFC 8445 ICE enabled — ICE legs run checklists and connectivity checks; media waits for a selected pair"
+        );
+        engine = engine.with_full_ice();
+    }
     if config.ice_consent {
         tracing::info!(
             target: "siphon_rtp::media",
@@ -520,6 +542,30 @@ where
         engine.conference(),
         turn_relay,
     ));
+
+    // Full-ICE driver: the RFC's `Ta` pacing is 50 ms and its initial RTO 500 ms, so the agents need
+    // a sub-second clock of their own — the 1 Hz media sweep below is far too coarse. Idle (one
+    // no-op poll per tick) unless `--ice full` is set.
+    if config.ice_full {
+        let ice_engine = engine.clone();
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_millis(ICE_DRIVER_INTERVAL_MS));
+            // Under load a missed tick must not produce a burst of catch-up polls; the agent's own
+            // timers are elapsed-based, so skipping is correct and cheaper.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                for call_id in ice_engine
+                    .drive_ice_agents(started.elapsed().as_millis() as u64)
+                    .await
+                {
+                    tracing::warn!(target: "siphon_rtp::media", %call_id, "call torn down: ICE failed");
+                }
+            }
+        });
+    }
 
     // Media-timeout sweep: advance the logical clock ~1 tick/second, reap calls idle past the
     // timeout (docs/security-and-nat.md §4 layer 6), and reap expired TURN allocations on the same
@@ -787,6 +833,7 @@ mod tests {
             media_timeout_secs: 30,
             shutdown_grace_secs: 25,
             stun_servers: Vec::new(),
+            ice_full: false,
             ice_consent: false,
             consent_interval_secs: 5,
             consent_timeout_secs: 30,
