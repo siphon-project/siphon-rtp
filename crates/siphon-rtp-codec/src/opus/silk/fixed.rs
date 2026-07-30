@@ -48,6 +48,40 @@ pub fn smlabb(a32: i32, b32: i32, c32: i32) -> i32 {
     a32.wrapping_add(smulbb(b32, c32))
 }
 
+/// `silk_log2lin(inLog_Q7)` (`log2lin.c:36-58`) — an approximation of `2^(inLog_Q7 / 128)`, the
+/// inverse of `silk_lin2log`. Used to turn a quantized log-gain into a linear Q16 scale factor
+/// (RFC 6716 §4.2.7.4).
+///
+/// The integer part `i = inLog_Q7 >> 7` gives `1 << i`; the fractional part `f = inLog_Q7 & 127` is
+/// applied through a parabolic correction `f + ((-174 * f * (128 - f)) >> 16)`. RFC 6716 §4.2.7.4
+/// prints only the `inLog_Q7 >= 2048` form,
+/// `(1<<i) + ((-174*f*(128-f)>>16)+f)*((1<<i)>>7)` — which is the only branch the gain path can reach,
+/// since the smallest log-gain maps to 2090. libopus keeps a second branch for smaller inputs that
+/// multiplies before shifting, preserving precision when `1 << i` is small; both are ported.
+///
+/// The two guards are the C's: a negative input is 0, and 3967 (31.0 in Q7) or above saturates.
+#[inline]
+#[must_use]
+pub fn log2lin(in_log_q7: i32) -> i32 {
+    if in_log_q7 < 0 {
+        return 0;
+    }
+    if in_log_q7 >= 3967 {
+        return i32::MAX;
+    }
+    let out = 1i32 << (in_log_q7 >> 7);
+    let frac_q7 = in_log_q7 & 0x7F;
+    // silk_SMLAWB( frac_Q7, silk_SMULBB( frac_Q7, 128 - frac_Q7 ), -174 )
+    let correction = smlawb(frac_q7, smulbb(frac_q7, 128 - frac_q7), -174);
+    if in_log_q7 < 2048 {
+        // silk_ADD_RSHIFT32( out, silk_MUL( out, correction ), 7 )
+        out.wrapping_add(out.wrapping_mul(correction) >> 7)
+    } else {
+        // silk_MLA( out, silk_RSHIFT( out, 7 ), correction )
+        out.wrapping_add((out >> 7).wrapping_mul(correction))
+    }
+}
+
 /// `silk_LIMIT_int(a, lower, upper)` (`SigProc_FIX.h`) — clamp.
 ///
 /// The C macro evaluates `lower > upper ? (a < lower ? lower : a > upper ? upper : a) : ...`, which
@@ -124,6 +158,61 @@ mod tests {
     }
 
     #[test]
+    fn log2lin_guard_rails() {
+        assert_eq!(log2lin(-1), 0);
+        assert_eq!(log2lin(-100_000), 0);
+        assert_eq!(log2lin(3967), i32::MAX);
+        assert_eq!(log2lin(i32::MAX), i32::MAX);
+    }
+
+    /// Exact powers of two: `f = 0` makes the correction 0, so the result is exactly `1 << i`.
+    #[test]
+    fn log2lin_is_exact_at_powers_of_two() {
+        for i in 0..31i32 {
+            assert_eq!(log2lin(i << 7), 1i32 << i, "2^{i}");
+        }
+    }
+
+    /// RFC 6716 §4.2.7.4's own worked bounds: the SILK gain path spans exactly 81920..=1686110208 in
+    /// Q16 (scale factors 1.25 to 25728). Both endpoints have to come out on the nose — they are the
+    /// tightest published check on `log2lin`, `smulwb` and the gain offset all at once.
+    #[test]
+    fn log2lin_hits_the_rfc_gain_bounds() {
+        // log_gain = 0  -> inLog_Q7 = smulwb(1907825, 0)  + 2090 = 2090.
+        assert_eq!(log2lin(2090), 81_920);
+        // log_gain = 63 -> inLog_Q7 = smulwb(1907825, 63) + 2090 = 3923.
+        assert_eq!(smulwb(1_907_825, 63) + 2090, 3923);
+        assert_eq!(log2lin(3923), 1_686_110_208);
+    }
+
+    /// The RFC prints only the `inLog_Q7 >= 2048` formula. Reproduce it independently and require the
+    /// implementation to agree across that whole range — which is the entire gain path.
+    #[test]
+    fn log2lin_matches_the_rfc_formula_above_2048() {
+        for in_log_q7 in 2048..3967i32 {
+            let i = in_log_q7 >> 7;
+            let f = in_log_q7 & 127;
+            let expected = (1i32 << i) + (((-174 * f * (128 - f)) >> 16) + f) * ((1i32 << i) >> 7);
+            assert_eq!(log2lin(in_log_q7), expected, "inLog_Q7 = {in_log_q7}");
+        }
+    }
+
+    /// Monotonic over the whole legal domain: a larger log-gain must never decode to a smaller linear
+    /// gain, or the gain ladder would fold back on itself.
+    #[test]
+    fn log2lin_is_monotonic() {
+        let mut previous = log2lin(0);
+        for in_log_q7 in 1..3967i32 {
+            let current = log2lin(in_log_q7);
+            assert!(
+                current >= previous,
+                "log2lin({in_log_q7}) = {current} < {previous}"
+            );
+            previous = current;
+        }
+    }
+
+    #[test]
     fn limit_int_clamps() {
         assert_eq!(limit_int(-5, 0, 63), 0);
         assert_eq!(limit_int(70, 0, 63), 63);
@@ -158,6 +247,7 @@ mod tests {
             let _ = smlawb(a, b, c);
             let _ = smulbb(a, b);
             let _ = smlabb(a, b, c);
+            let _ = log2lin(a);
         }
     }
 }

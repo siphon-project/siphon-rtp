@@ -43,7 +43,7 @@
 //! | LP-layer header: VAD / LBRR flags (§4.2.3-4) ([`header`]) | **landed** |
 //! | Stereo prediction weights, mid-only flag (§4.2.7.1-2) ([`stereo_pred`]) | **landed** |
 //! | Frame type (§4.2.7.3) ([`frame_type`]) | **landed** |
-//! | Subframe gains (§4.2.7.4) | pending |
+//! | Subframe gains (§4.2.7.4) ([`gains`]) | **landed** |
 //! | NLSF → LPC (§4.2.7.5) | pending |
 //! | Pitch lags, LTP filter, LTP scaling (§4.2.7.6) | pending |
 //! | LCG seed + excitation / shell coder (§4.2.7.7-8) | pending |
@@ -98,6 +98,7 @@
 pub mod decoder;
 pub mod fixed;
 pub mod frame_type;
+pub mod gains;
 pub mod header;
 pub mod stereo_pred;
 pub mod tables;

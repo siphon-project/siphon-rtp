@@ -29,6 +29,10 @@ pub const MIN_LPC_ORDER: usize = 10;
 pub const LTP_ORDER: usize = 5;
 /// Number of quantization-gain levels — the 6-bit log-gain index (`N_LEVELS_QGAIN`).
 pub const N_LEVELS_QGAIN: i32 = 64;
+/// dB level of the lowest quantization-gain level (`MIN_QGAIN_DB`).
+pub const MIN_QGAIN_DB: i32 = 2;
+/// dB level of the highest quantization-gain level (`MAX_QGAIN_DB`).
+pub const MAX_QGAIN_DB: i32 = 88;
 /// Largest delta-gain index step upward (`MAX_DELTA_GAIN_QUANT`).
 pub const MAX_DELTA_GAIN_QUANT: i32 = 36;
 /// Largest delta-gain index step downward (`MIN_DELTA_GAIN_QUANT`).
