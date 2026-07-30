@@ -17,3 +17,4 @@
 pub mod celt;
 pub mod packet;
 pub mod range_coder;
+pub mod silk;
