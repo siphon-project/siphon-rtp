@@ -10,7 +10,7 @@
 
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_engine::{ClientId, Engine};
-use siphon_rtp_proto::{CmdResult, Command, ConferenceRole};
+use siphon_rtp_proto::{CmdResult, Command, ConferenceRole, WsTeeDirection};
 
 /// The soak drives the engine as a single control client.
 const CLIENT: ClientId = ClientId(1);
@@ -286,6 +286,138 @@ async fn conference_join_leave_does_not_leak() {
     assert!(
         after <= before + tolerance,
         "conferences leaked {} bytes over 1000 churned rooms (before={before}, after={after})",
+        after.saturating_sub(before)
+    );
+}
+
+/// A local WebSocket server that accepts connection after connection and drains every frame — the
+/// consumer side of the tee soak. Returns its `ws://` URI; the task lives for the test.
+async fn tee_sink_server() -> String {
+    use futures_util::StreamExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind tee ws");
+    let addr = listener.local_addr().expect("tee ws addr");
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let (_sink, mut source) = socket.split();
+                while let Some(Ok(_frame)) = source.next().await {}
+            });
+        }
+    });
+    format!("ws://{addr}/tee")
+}
+
+/// One tee churn cycle: offer → answer → attach a WS tee (which promotes the relay into the userspace
+/// media pipeline and dials the server) → detach (demoting it again) → delete.
+async fn ws_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, index: usize) {
+    let call_id = format!("tee-soak-{index}");
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for("198.51.100.1", 40_000),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "offer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for("203.0.113.1", 41_000),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "answer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri.to_string(),
+                    direction: WsTeeDirection::Both,
+                    channels: Some(2),
+                },
+            )
+            .await,
+        "attach_ws_tee",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await,
+        "detach_ws_tee",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_tee_attach_detach_does_not_leak() {
+    let uri = tee_sink_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let _prime = allocated_bytes();
+
+    // Warm up: the promote/demote paths, the dialled TCP+WebSocket stack, the tee's preallocated
+    // buffer pool and jemalloc's arenas all settle into steady state.
+    for index in 0..60 {
+        ws_tee_attach_detach(&engine, &uri, index).await;
+    }
+    quiesce().await;
+    assert_eq!(engine.session_count(), 0, "registry empty after warmup");
+    assert_eq!(engine.ws_tee_count(), 0, "no tee retained after warmup");
+    let before = allocated_bytes();
+
+    // Each cycle dials a WebSocket, promotes a relay into a processing media actor with two tee sinks,
+    // then detaches and demotes it. Across 300 cycles live bytes must not climb — no stranded mixer,
+    // sink, transport task or promoted actor.
+    for index in 60..360 {
+        ws_tee_attach_detach(&engine, &uri, index).await;
+    }
+    quiesce().await;
+    let after = allocated_bytes();
+
+    assert_eq!(engine.session_count(), 0, "registry drained after soak");
+    assert_eq!(engine.ws_tee_count(), 0, "tee registry drained after soak");
+    let tolerance = 512 * 1024;
+    assert!(
+        after <= before + tolerance,
+        "ws tee leaked {} bytes over 300 churned attach/detach cycles (before={before}, after={after})",
         after.saturating_sub(before)
     );
 }

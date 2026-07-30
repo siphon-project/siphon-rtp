@@ -33,7 +33,7 @@ use siphon_rtp_media::player::{PcmPlayer, WavSource};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    PlayMediaSource, ProfileFlags, SessionStats,
+    PlayMediaSource, ProfileFlags, SessionStats, WsTeeDirection, WsTeeEndReason,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
@@ -187,6 +187,10 @@ enum PromotionReason {
     /// actor can decode each party's ingress and re-emit it back to the sender (a relay-only promotion
     /// forwards opaque payloads to the peer and cannot loop them home).
     Echo,
+    /// A WebSocket **tee** is streaming this call's audio (`attach_ws_tee`). The tee taps the
+    /// post-decode fan-out, so a plain relay must be held in a **processing** MediaCall — a relay-only
+    /// promotion forwards RTP verbatim and never decodes, which would leave the tee with nothing.
+    WsTee,
     /// A userspace media op (`play_media`) needs a **processing** MediaCall to synthesize egress
     /// audio on an offer-only single-leg IVR call (or a plain relay). Unlike `Echo`, this hold is
     /// never released on its own — once a prompt has played, the call is a media-processing call for
@@ -571,6 +575,34 @@ pub struct Engine<D: Datapath> {
     /// Empty (the default) ⇒ host-only gathering, which is correct for a directly-addressable engine
     /// and costs no network round trip at call setup.
     stun_servers: Vec<SocketAddr>,
+    /// Live WebSocket **tees**, keyed by call-id — the send-only audio streams riding a relaying call
+    /// (`attach_ws_tee` / `ProfileFlags::ws_tee`). One per call; attaching again replaces the previous
+    /// one. Held here (not in the media actor) because the transport task, the WS socket and the
+    /// dropped/forwarded counters outlive individual control ops and must be torn down on `delete`.
+    ws_tees: DashMap<String, WsTee>,
+}
+
+/// A live WebSocket tee on one call: the shared mixer (for its counters), its transport task, and the
+/// per-leg fork tags so a detach removes exactly this tee's sinks and nothing else.
+struct WsTee {
+    /// The tee's stream id — also the fork tag on every leg it taps, and the event correlator.
+    stream_id: String,
+    /// The call's offerer tag and owning control client, copied here at attach time: teardown runs
+    /// *after* `delete` has already removed the call from the registry, so the end event cannot look
+    /// them up any more.
+    from_tag: String,
+    owner: ClientId,
+    /// Shared frame assembler; read at teardown for the `frames_sent` / `frames_dropped` on
+    /// [`Event::WsTeeEnded`].
+    mixer: Arc<std::sync::Mutex<siphon_rtp_media::bridge::tee::TeeMixer>>,
+    /// Which legs carry a sink for this tee (`true` = leg A / caller), so detach targets exactly them.
+    tapped_legs: Vec<bool>,
+    /// The transport task (dial → `start` → drain). Aborted on detach; it emits
+    /// [`Event::WsTeeEnded`] itself when the *server* ends the stream first.
+    transport: tokio::task::JoinHandle<()>,
+    /// Set once an end event has been emitted for this tee, so the controller sees exactly one
+    /// `ws_tee_ended` whether the server or the detach won the race.
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -626,6 +658,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_agents: None,
             // Host-only gathering unless the operator names a STUN server.
             stun_servers: Vec::new(),
+            ws_tees: DashMap::new(),
         }
     }
 
@@ -812,6 +845,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Live WebSocket tees — one per teed call (the `siphon_rtp_ws_tees` gauge).
+    #[must_use]
+    pub fn ws_tee_count(&self) -> usize {
+        self.ws_tees.len()
+    }
+
+    /// Audio frames handed to the live tees' transports so far. Read across every live tee; a tee that
+    /// has already ended has been removed, so this is a *live* sum rather than a process total.
+    #[must_use]
+    pub fn ws_tee_frames_sent(&self) -> u64 {
+        self.ws_tees
+            .iter()
+            .filter_map(|tee| tee.mixer.lock().ok().map(|mixer| mixer.forwarded()))
+            .sum()
+    }
+
+    /// Frames the live tees dropped because a consumer stalled. Non-zero means a WS server could not
+    /// keep up — by design that costs tee frames and never the call.
+    #[must_use]
+    pub fn ws_tee_frames_dropped(&self) -> u64 {
+        self.ws_tees
+            .iter()
+            .filter_map(|tee| tee.mixer.lock().ok().map(|mixer| mixer.dropped()))
+            .sum()
+    }
+
+    /// Push an asynchronous event to whichever client owns `call_id` (a no-op for an unknown call).
+    fn emit_call_event(&self, call_id: &str, event: Event) {
+        if let Some(owner) = self.owned_call_internal(call_id, |call| call.owner) {
+            self.push_event(owner, event);
+        }
+    }
+
     /// Handle one control command from `client`, producing the result to return to the caller.
     ///
     /// Increments the operational counters as a side effect: per-command totals (offer/answer/
@@ -901,8 +967,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp,
                 profile,
             } => {
-                self.answer(client, &call_id, &from_tag, to_tag, &sdp, &profile)
-                    .await
+                let result = self
+                    .answer(client, &call_id, &from_tag, to_tag, &sdp, &profile)
+                    .await;
+                self.apply_profile_ws_tee(&call_id, &profile, result).await
             }
             Command::AnswerLocal {
                 call_id,
@@ -910,8 +978,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp,
                 profile,
             } => {
-                self.answer_local(client, &call_id, from_tag, &sdp, &profile)
-                    .await
+                let result = self
+                    .answer_local(client, &call_id, from_tag, &sdp, &profile)
+                    .await;
+                self.apply_profile_ws_tee(&call_id, &profile, result).await
             }
             Command::Delete { call_id, .. } => self.delete(client, &call_id).await,
             Command::Query { call_id, .. } => self.query(client, &call_id),
@@ -1039,6 +1109,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 conference_id_b,
                 direction,
             } => self.conference_bridge(&conference_id_a, &conference_id_b, direction),
+            Command::AttachWsTee {
+                call_id,
+                ws_uri,
+                direction,
+                channels,
+                ..
+            } => {
+                self.attach_ws_tee(client, &call_id, &ws_uri, direction, channels)
+                    .await
+            }
+            Command::DetachWsTee { call_id, .. } => self.detach_ws_tee(client, &call_id).await,
             other => CmdResult::Error {
                 reason: format!("unsupported command: {}", command_name(&other)),
             },
@@ -1831,6 +1912,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Free any SIPREC subscriptions first (detach forks, abort drains, free subscriber ports)
             // before the media actor is deregistered.
             self.drop_subscriptions(call_id).await;
+            // …and any WS tee riding the same fan-out, so its transport closes and the controller
+            // gets its `ws_tee_ended` rather than a silently dead stream.
+            self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
             self.bridge.deregister(endpoints.iter().copied());
             self.media.deregister(call_id);
             self.ws.deregister(call_id);
@@ -2763,6 +2847,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .chain(call.far.endpoint_ids())
             .collect();
         self.drop_subscriptions(call_id).await;
+        // Any WS tee riding the same fan-out closes with the call, so its controller gets a final
+        // `ws_tee_ended` (with the lifetime frame counters) rather than a silently dead stream.
+        self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
         self.bridge.deregister(endpoints.iter().copied());
         self.media.deregister(call_id);
         self.ws.deregister(call_id);
@@ -4310,6 +4397,396 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ok_empty()
     }
 
+    /// Attach a **WebSocket tee** to an established call ([`Command::AttachWsTee`]): stream the call's
+    /// decoded audio to a WS server *while it keeps relaying*.
+    ///
+    /// The tee is a [`siphon_rtp_media::fanout::MediaSink`] on the same post-decode tap SIPREC forking
+    /// uses, so one decode of each stream feeds the peer, the recorder, any SIPREC fork **and** the WS
+    /// consumer — never a second [`siphon_rtp_media::leg::MediaLeg`] (two jitter buffers on one stream
+    /// make two different concealment decisions, and the consumer would hear artefacts the call never
+    /// had). A plain in-kernel relay is promoted to a **processing** media call for the tee's lifetime
+    /// (a relay-only promotion never decodes, so it would tee nothing) and demoted again on detach.
+    ///
+    /// This is *not* `ProfileFlags::ws_uri`: takeover makes the WS server leg A's far side and leaves
+    /// A↔B unwired, while a tee is send-only and additive. A takeover call therefore cannot be teed —
+    /// its media never reaches the media pipeline — and is rejected rather than silently ignored.
+    async fn attach_ws_tee(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        ws_uri: &str,
+        direction: WsTeeDirection,
+        channels: Option<u8>,
+    ) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        match self
+            .start_ws_tee(call_id, ws_uri, direction, channels)
+            .await
+        {
+            Ok(()) => ok_empty(),
+            Err(reason) => error_result("attach_ws_tee", &reason),
+        }
+    }
+
+    /// Stand a tee up on `call_id` (shared by [`Self::attach_ws_tee`] and the `ProfileFlags::ws_tee`
+    /// answer-time path, which has already validated ownership).
+    async fn start_ws_tee(
+        &self,
+        call_id: &str,
+        ws_uri: &str,
+        direction: WsTeeDirection,
+        channels: Option<u8>,
+    ) -> Result<(), String> {
+        use siphon_rtp_media::bridge::protocol::{Encoding, Endianness};
+        use siphon_rtp_media::bridge::tee::{
+            plan_ws_tee, tee_start_message, TeeChannel, WsTeeSink,
+        };
+
+        // A WS-takeover call's media is bridged to its own server and never reaches the pipeline, and a
+        // secure (SRTP-bridge) call's Redirect path is crypto-only — neither has a fan-out to tap.
+        // Reject clearly instead of attaching a sink that would never fire (mirrors `subscribe_request`).
+        let pipeline = self
+            .owned_call_internal(call_id, |call| call.pipeline)
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        if self.ws.is_ws_call(call_id) || pipeline == PipelineKind::Ws {
+            return Err(
+                "a WebSocket-takeover call (ws_uri) has no relay path to tee; use one or the other"
+                    .to_string(),
+            );
+        }
+        if pipeline == PipelineKind::Srtp {
+            return Err(
+                "teeing a secure (SRTP-bridge) call is not supported yet — the bridge relays \
+                 ciphertext without decoding"
+                    .to_string(),
+            );
+        }
+
+        // Which legs feed the tee. A single-leg (offer-only / local-answer) call has no callee, so a
+        // `both` request degrades to the caller's monologue rather than stalling on a channel that
+        // will never produce a frame (a stereo frame needs *both* rings full).
+        // A single-leg local answer (`answer_local`) has no answered far party, so its `far.remote_rtp`
+        // is `None` — the discriminator that works *before* promotion (the media registry's
+        // equal-endpoints test only exists once an actor is up).
+        let (near_codec, far_codec, two_leg) = self
+            .owned_call_internal(call_id, |call| {
+                (
+                    call.near_codec.clone(),
+                    call.far_codec.clone(),
+                    call.far.remote_rtp.is_some(),
+                )
+            })
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        let (tap_caller, tap_callee) = match direction {
+            WsTeeDirection::Caller => (true, false),
+            WsTeeDirection::Callee => (false, true),
+            WsTeeDirection::Both => (true, two_leg),
+        };
+        if tap_callee && !two_leg {
+            return Err("the call has no callee leg to tee".to_string());
+        }
+        let stereo_source = tap_caller && tap_callee;
+
+        // The wire rate is the *caller* leg's decoded PCM rate (the RTP clock is not it — G.722 samples
+        // at 16 kHz and clocks RTP at 8 kHz, RFC 3551 §4.5.2), so the common case (both legs on one
+        // codec) needs no conversion at all. A callee-only tee follows the callee's rate instead.
+        let caller_rate = near_codec.as_ref().map(pcm_rate_of).transpose()?;
+        let callee_rate = far_codec.as_ref().map(pcm_rate_of).transpose()?;
+        let wire_rate = if tap_caller {
+            caller_rate.ok_or_else(|| "the caller leg has no negotiated codec".to_string())?
+        } else {
+            callee_rate.ok_or_else(|| "the callee leg has no negotiated codec".to_string())?
+        };
+        let ptime = near_codec
+            .as_ref()
+            .map_or(20, |codec| codec.ptime_ms.max(1));
+        let wire_channels = match channels {
+            Some(requested) if stereo_source => requested.clamp(1, 2),
+            Some(_) => 1, // a single-leg tee is mono whatever was asked for
+            None if stereo_source => 2,
+            None => 1,
+        };
+
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: wire_rate,
+            channels: wire_channels,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime,
+        };
+        let plan = plan_ws_tee(format, stereo_source, !tap_caller);
+        let stream_id = format!("tee-{call_id}");
+
+        // Dial before attaching anything, so a bad URI fails cleanly with nothing to unwind.
+        let connector = tokio_tungstenite::Connector::Rustls(self.ws_tls_client_config());
+        let (socket, _response) =
+            tokio_tungstenite::connect_async_tls_with_config(ws_uri, None, false, Some(connector))
+                .await
+                .map_err(|error| format!("dial {ws_uri}: {error}"))?;
+
+        // A SIPREC subscription (or a pcap recording / DTMF block) may already hold this relay in
+        // userspace with a **relay-only** actor, which forwards RTP verbatim and never decodes — the
+        // post-decode fan-out a tee taps would stay dry. Rebuild it as a processing actor first. The
+        // raw SIPREC tee is copied in `Direction::handle` *before* the relay/transcode split, so it is
+        // unaffected by the decode; the subscriptions' tees are re-attached to the new actor.
+        if self.media.is_relay_call(call_id) {
+            self.upgrade_relay_to_processing(call_id).await?;
+        }
+        // Hold the call in a *processing* media pipeline for the tee's lifetime.
+        self.hold_in_userspace(call_id, PromotionReason::WsTee, PromoteMode::Processing)
+            .await?;
+
+        // Attach one sink per tapped leg, each resampling into the wire rate when its own codec differs.
+        let mut tapped_legs = Vec::new();
+        for (source_a, channel, leg_rate) in [
+            (true, TeeChannel::Caller, caller_rate),
+            (false, TeeChannel::Callee, callee_rate),
+        ] {
+            let wanted = if source_a { tap_caller } else { tap_callee };
+            if !wanted {
+                continue;
+            }
+            let resampler = match leg_rate {
+                Some(rate) if rate != wire_rate => Some(
+                    siphon_rtp_dsp::resample::Resampler::new(rate, wire_rate)
+                        .map_err(|error| format!("tee resampler {rate}→{wire_rate}: {error}"))?,
+                ),
+                _ => None,
+            };
+            let sink = WsTeeSink::new(channel, plan.mixer.clone(), stream_id.clone(), resampler);
+            if !self.media.control(
+                call_id,
+                MediaControl::AddFork {
+                    source_a,
+                    sink: Box::new(sink),
+                },
+            ) {
+                // Unwind: drop whatever we already attached and release the hold.
+                for attached in &tapped_legs {
+                    self.media.control(
+                        call_id,
+                        MediaControl::RemoveForkTagged {
+                            source_a: *attached,
+                            tag: stream_id.clone(),
+                        },
+                    );
+                }
+                self.release_userspace_hold(call_id, PromotionReason::WsTee)
+                    .await;
+                return Err("media actor unavailable".to_string());
+            }
+            tapped_legs.push(source_a);
+        }
+
+        // Replacing an existing tee: detach the old one first so its sinks and task go away.
+        if self.ws_tees.contains_key(call_id) {
+            self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+        }
+
+        let (owner, from_tag) = self
+            .owned_call_internal(call_id, |call| (call.owner, call.from_tag.clone()))
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let start = tee_start_message(&stream_id, call_id, plan.format, plan.tracks.clone());
+        let transport = {
+            let events = self.events.get(&owner).map(|sink| sink.value().clone());
+            let frames = plan.frames;
+            let recycle = plan.recycle;
+            let mixer = plan.mixer.clone();
+            let call_id = call_id.to_string();
+            let from_tag = from_tag.clone();
+            let stream_id = stream_id.clone();
+            let ended = ended.clone();
+            tokio::spawn(async move {
+                let outcome =
+                    siphon_rtp_media::bridge::run_ws_tee(socket, start, frames, recycle).await;
+                let reason = match outcome {
+                    Ok(siphon_rtp_media::bridge::TeeEndReason::ServerClosed) => {
+                        WsTeeEndReason::ServerClosed
+                    }
+                    Ok(siphon_rtp_media::bridge::TeeEndReason::ServerStopped) => {
+                        WsTeeEndReason::ServerStopped
+                    }
+                    Ok(siphon_rtp_media::bridge::TeeEndReason::CallEnded) => {
+                        WsTeeEndReason::CallEnded
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, call_id, "ws tee transport ended with an error");
+                        WsTeeEndReason::TransportError
+                    }
+                };
+                // The server (or the transport) ended it first — report that, once.
+                emit_ws_tee_ended(
+                    events.as_ref(),
+                    &ended,
+                    &call_id,
+                    &from_tag,
+                    &stream_id,
+                    reason,
+                    &mixer,
+                );
+            })
+        };
+
+        self.ws_tees.insert(
+            call_id.to_string(),
+            WsTee {
+                stream_id: stream_id.clone(),
+                from_tag: from_tag.clone(),
+                owner,
+                mixer: plan.mixer,
+                tapped_legs,
+                transport,
+                ended,
+            },
+        );
+        self.emit_call_event(
+            call_id,
+            Event::WsTeeStarted {
+                call_id: call_id.to_string(),
+                from_tag,
+                stream_id,
+                ws_uri: ws_uri.to_string(),
+                direction,
+                channels: wire_channels,
+                sample_rate: wire_rate,
+            },
+        );
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id,
+            ws_uri,
+            channels = wire_channels,
+            sample_rate = wire_rate,
+            "ws tee attached"
+        );
+        Ok(())
+    }
+
+    /// Rebuild a **relay-only** promoted call as a **processing** one, keeping every SIPREC raw tee it
+    /// carries. A relay-only actor (the promotion `start recording` / `block DTMF` / `subscribe_request`
+    /// take) forwards ingress RTP verbatim and never decodes, so nothing reaches the post-decode
+    /// fan-out a WS tee taps; a processing actor decodes and re-encodes, and still copies each raw tee
+    /// **before** the relay/transcode split, so the SRS keeps receiving the leg's original bytes.
+    ///
+    /// The old actor is deregistered first so its task is aborted rather than orphaned, and each
+    /// answered subscription's tee is re-installed on the new one. The call stays processing for the
+    /// rest of its life (a detach releases the tee's hold but does not rebuild the cheaper relay-only
+    /// actor) — the extra decode is the price of having asked for both features at once.
+    async fn upgrade_relay_to_processing(&self, call_id: &str) -> Result<(), String> {
+        self.media.deregister(call_id);
+        self.promote_to_processing(call_id).await?;
+        // Re-attach every answered subscription's raw tee to the new actor.
+        let tees: Vec<(bool, RawTee)> = self
+            .subscriptions
+            .get(call_id)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|subscription| {
+                        // A subscription still awaiting its `subscribe_answer` has no SRS address yet —
+                        // nothing to re-attach; `subscribe_answer` will install it on the new actor.
+                        let srs_dst = subscription.srs_rtp?;
+                        let tee = RawTee {
+                            subscriber_endpoint: subscription.subscriber_endpoint.id,
+                            srs_dst,
+                        };
+                        Some(
+                            subscription
+                                .taps
+                                .iter()
+                                .map(move |source_a| (*source_a, tee))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .flatten()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (source_a, tee) in tees {
+            self.media
+                .control(call_id, MediaControl::AddRawTee { source_a, tee });
+        }
+        Ok(())
+    }
+
+    /// Apply `ProfileFlags::ws_tee` after an `answer` / `answer_local` succeeded — the declarative twin
+    /// of [`Command::AttachWsTee`], so a controller gets a teed call in one round-trip. Attaching only
+    /// *after* the answer means the call's media path (and therefore the fan-out to tap) exists.
+    ///
+    /// A failing tee fails the answer, rather than returning a call that silently is not being streamed:
+    /// the controller asked for both, so half of it is not success. The answer's own SDP is preserved on
+    /// the success path untouched.
+    async fn apply_profile_ws_tee(
+        &self,
+        call_id: &str,
+        profile: &ProfileFlags,
+        result: CmdResult,
+    ) -> CmdResult {
+        let Some(ws_tee) = profile.ws_tee.as_deref() else {
+            return result;
+        };
+        if matches!(result, CmdResult::Error { .. }) {
+            return result;
+        }
+        match self
+            .start_ws_tee(
+                call_id,
+                ws_tee,
+                profile.ws_tee_direction.unwrap_or_default(),
+                profile.ws_tee_channels,
+            )
+            .await
+        {
+            Ok(()) => result,
+            Err(reason) => error_result("ws_tee", &reason),
+        }
+    }
+
+    /// Detach a call's WebSocket tee ([`Command::DetachWsTee`]). Idempotent — detaching a call with no
+    /// tee succeeds, so a controller may call it unconditionally on hangup.
+    async fn detach_ws_tee(&self, client: ClientId, call_id: &str) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+        ok_empty()
+    }
+
+    /// Tear a call's tee down: remove exactly this tee's sinks (by tag, so a SIPREC subscription on the
+    /// same leg is untouched), abort the transport, emit [`Event::WsTeeEnded`] if the transport has not
+    /// already, and release the userspace hold — demoting a promoted relay back to the kernel fast path
+    /// when nothing else holds it. A no-op when the call has no tee.
+    async fn stop_ws_tee(&self, call_id: &str, reason: WsTeeEndReason) {
+        let Some((_, tee)) = self.ws_tees.remove(call_id) else {
+            return;
+        };
+        for source_a in &tee.tapped_legs {
+            self.media.control(
+                call_id,
+                MediaControl::RemoveForkTagged {
+                    source_a: *source_a,
+                    tag: tee.stream_id.clone(),
+                },
+            );
+        }
+        tee.transport.abort();
+        let events = self.events.get(&tee.owner).map(|sink| sink.value().clone());
+        emit_ws_tee_ended(
+            events.as_ref(),
+            &tee.ended,
+            call_id,
+            &tee.from_tag,
+            &tee.stream_id,
+            reason,
+            &tee.mixer,
+        );
+        self.release_userspace_hold(call_id, PromotionReason::WsTee)
+            .await;
+    }
+
     /// SIPREC / monitor `subscribe_request` (RFC 7866): the engine **offers** one or more source
     /// legs' media to a send-only subscriber (a Session Recording Server, SRS). It resolves the source
     /// legs from `from_tags` (an MPTY subscription taps every named leg), allocates one subscriber
@@ -5586,6 +6063,57 @@ fn ok_sdp(sdp: String, to_tag: Option<String>) -> CmdResult {
     }
 }
 
+/// The decoded-PCM sample rate of `codec` — what the media pipeline's fan-out actually hands a sink.
+/// This is **not** the RTP clock rate: G.722 samples at 16 kHz while clocking RTP at 8 kHz (RFC 3551
+/// §4.5.2), so reading `clock_rate_hz` would size a tee's wire frame wrong. Built by asking the codec
+/// factory for a decoder, exactly as the WS-takeover bridge does.
+fn pcm_rate_of(codec: &CodecSpec) -> Result<u32, String> {
+    factory::decoder_for(codec)
+        .map(|decoder| decoder.params().sample_rate_hz)
+        .map_err(|error| format!("no decoder for {}: {error}", codec.encoding_name))
+}
+
+/// Emit a tee's [`Event::WsTeeEnded`] **exactly once**, whichever of the transport task or a detach
+/// gets there first (`ended` is the shared latch they race on). Carries the mixer's lifetime counters
+/// so a controller can see whether the consumer kept up.
+fn emit_ws_tee_ended(
+    events: Option<&flume::Sender<Event>>,
+    ended: &std::sync::atomic::AtomicBool,
+    call_id: &str,
+    from_tag: &str,
+    stream_id: &str,
+    reason: WsTeeEndReason,
+    mixer: &std::sync::Mutex<siphon_rtp_media::bridge::tee::TeeMixer>,
+) {
+    use std::sync::atomic::Ordering;
+    if ended.swap(true, Ordering::SeqCst) {
+        return; // already reported
+    }
+    let (frames_sent, frames_dropped) = match mixer.lock() {
+        Ok(guard) => (Some(guard.forwarded()), Some(guard.dropped())),
+        Err(_) => (None, None),
+    };
+    tracing::info!(
+        target: "siphon_rtp::media",
+        call_id,
+        stream_id,
+        ?reason,
+        frames_sent = frames_sent.unwrap_or(0),
+        frames_dropped = frames_dropped.unwrap_or(0),
+        "ws tee ended"
+    );
+    if let Some(sender) = events {
+        let _ = sender.try_send(Event::WsTeeEnded {
+            call_id: call_id.to_string(),
+            from_tag: from_tag.to_string(),
+            stream_id: stream_id.to_string(),
+            reason,
+            frames_sent,
+            frames_dropped,
+        });
+    }
+}
+
 /// A bare success (no SDP/stats) — the reply to control verbs like block/silence.
 fn ok_empty() -> CmdResult {
     CmdResult::Ok {
@@ -6278,6 +6806,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::ConferenceLeave { .. } => "conference_leave",
         Command::ConferenceRoute { .. } => "conference_route",
         Command::ConferenceBridge { .. } => "conference_bridge",
+        Command::AttachWsTee { .. } => "attach_ws_tee",
+        Command::DetachWsTee { .. } => "detach_ws_tee",
         Command::Authenticate { .. } => "authenticate",
     }
 }
@@ -6307,7 +6837,9 @@ fn command_call_id(command: &Command) -> Option<&str> {
         | Command::StopRecording { call_id, .. }
         | Command::SubscribeRequest { call_id, .. }
         | Command::SubscribeAnswer { call_id, .. }
-        | Command::Unsubscribe { call_id, .. } => Some(call_id),
+        | Command::Unsubscribe { call_id, .. }
+        | Command::AttachWsTee { call_id, .. }
+        | Command::DetachWsTee { call_id, .. } => Some(call_id),
         Command::ConferenceJoin { conference_id, .. }
         | Command::ConferenceLeave { conference_id, .. }
         | Command::ConferenceRoute { conference_id, .. } => Some(conference_id),
@@ -15251,5 +15783,686 @@ mod tests {
         let far = call.far_codec.as_ref().expect("far codec chosen");
         assert_eq!(far.encoding_name, "AMR-WB");
         assert_eq!(far.payload_type, 96);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // WebSocket tee (send-only audio streaming on a *relaying* call)
+    // ---------------------------------------------------------------------------------------------
+
+    /// A local WebSocket server for tee tests: accepts one connection and republishes every frame it
+    /// receives on the returned channel. Returns `(uri, frames)`.
+    async fn tee_server() -> (
+        String,
+        flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+    ) {
+        use futures_util::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tee ws");
+        let addr = listener.local_addr().expect("tee ws addr");
+        let (sender, receiver) = flume::unbounded();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept tee ws");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("tee ws handshake");
+            let (_sink, mut source) = socket.split();
+            while let Some(Ok(message)) = source.next().await {
+                if sender.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        (format!("ws://{addr}/tee"), receiver)
+    }
+
+    /// Drain the tee stream until the first binary (audio) frame, returning its bytes.
+    async fn next_tee_audio(
+        frames: &flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+    ) -> Vec<u8> {
+        use tokio_tungstenite::tungstenite::Message;
+        for _ in 0..40 {
+            let message = timeout(Duration::from_secs(3), frames.recv_async())
+                .await
+                .expect("no timeout")
+                .expect("a frame");
+            if let Message::Binary(bytes) = message {
+                return bytes.to_vec();
+            }
+        }
+        panic!("no binary tee frame arrived");
+    }
+
+    /// Assert the tee's first frame is a send-only `start`, and return its announced format.
+    async fn expect_tee_start(
+        frames: &flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+    ) -> siphon_rtp_media::bridge::protocol::StartData {
+        use siphon_rtp_media::bridge::protocol::{ControlMessage, Direction as WsProtoDirection};
+        use tokio_tungstenite::tungstenite::Message;
+        let first = timeout(Duration::from_secs(3), frames.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("a frame");
+        match first {
+            Message::Text(text) => match ControlMessage::from_json(text.as_str()) {
+                Ok(ControlMessage::Start(data)) => {
+                    assert_eq!(
+                        data.direction,
+                        WsProtoDirection::Send,
+                        "a tee announces itself send-only"
+                    );
+                    data
+                }
+                other => panic!("expected start, got {other:?}"),
+            },
+            other => panic!("expected a start text frame, got {other:?}"),
+        }
+    }
+
+    /// Stand up a plain two-party G.711 relay through the control plane and return both phones, both
+    /// engine-facing addresses, and a live engine with the redirect dispatcher running.
+    async fn two_party_relay(
+        call_id: &str,
+    ) -> (
+        Engine<UdpLoopbackDatapath>,
+        (UdpSocket, SocketAddr),
+        (UdpSocket, SocketAddr),
+    ) {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        (engine, (phone_a, near_addr), (phone_b, far_addr))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_tee_streams_both_legs_as_stereo_while_the_relay_keeps_running() {
+        // The headline: a tee is *additive*. A plain two-party G.711 relay is promoted to userspace,
+        // both legs' decoded audio is interleaved as stereo L16 to the WS server, AND each peer keeps
+        // receiving the other's media — asserted on both the WS frames and the peers' received RTP.
+        let (engine, (phone_a, near_addr), (phone_b, far_addr)) =
+            two_party_relay("tee-stereo").await;
+        assert!(
+            !engine.media().is_media_call("tee-stereo"),
+            "a plain relay starts on the in-kernel fast path"
+        );
+
+        let (uri, frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-stereo".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Both,
+                    channels: Some(2),
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "attach: {attached:?}"
+        );
+        assert!(
+            engine.media().is_media_call("tee-stereo"),
+            "attaching a tee promotes the relay into the userspace media pipeline"
+        );
+
+        let start = expect_tee_start(&frames).await;
+        assert_eq!(start.media.channels, 2, "stereo caller/callee");
+        assert_eq!(start.media.sample_rate, 8000);
+        assert_eq!(start.tracks, vec!["inbound", "outbound"]);
+
+        // Both parties talk. Each peer must still receive the other's media (the relay is untouched),
+        // and the tee must produce interleaved stereo frames.
+        let mut stereo_frame = None;
+        for sequence in 0..12u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+            phone_b
+                .send_to(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0xFF), far_addr)
+                .await
+                .expect("b send");
+            if stereo_frame.is_none() {
+                if let Ok(Ok(bytes)) = timeout(Duration::from_millis(300), async {
+                    Ok::<_, ()>(next_tee_audio(&frames).await)
+                })
+                .await
+                {
+                    stereo_frame = Some(bytes);
+                }
+            }
+        }
+        let bytes = stereo_frame.expect("a stereo tee frame arrived");
+        assert_eq!(
+            bytes.len(),
+            640,
+            "8 kHz / 20 ms stereo L16 = 2 channels x 160 samples x 2 bytes"
+        );
+
+        // The relay itself never stopped: each peer receives the other's stream.
+        let (to_b, _) = recv(&phone_b).await;
+        assert!(
+            !to_b.is_empty(),
+            "B still receives A's media through the tee'd call"
+        );
+        let (to_a, _) = recv(&phone_a).await;
+        assert!(
+            !to_a.is_empty(),
+            "A still receives B's media through the tee'd call"
+        );
+
+        // Detach demotes the relay back to the in-kernel fast path, and media keeps flowing.
+        let detached = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: "tee-stereo".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(detached, CmdResult::Ok { .. }),
+            "detach: {detached:?}"
+        );
+        assert!(
+            !engine.media().is_media_call("tee-stereo"),
+            "detaching the last tee demotes the relay back to the kernel Forward path"
+        );
+        phone_a
+            .send_to(&g711_rtp(0, 99, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let (after_detach, _) = recv(&phone_b).await;
+        assert!(
+            !after_detach.is_empty(),
+            "the call keeps relaying after the tee is gone"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_caller_only_ws_tee_streams_the_monologue_as_mono() {
+        let (engine, (phone_a, near_addr), _b) = two_party_relay("tee-mono").await;
+        let (uri, frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-mono".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "attach: {attached:?}"
+        );
+
+        let start = expect_tee_start(&frames).await;
+        assert_eq!(start.media.channels, 1, "a single-leg tee is mono");
+        assert_eq!(start.tracks, vec!["inbound"], "only the caller's track");
+
+        // Only A talks — a caller-only tee must still produce frames (no waiting on the silent callee).
+        for sequence in 0..6u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let bytes = next_tee_audio(&frames).await;
+        assert_eq!(bytes.len(), 320, "8 kHz / 20 ms mono L16");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ws_tee_and_a_siprec_subscription_coexist_on_the_same_leg() {
+        // A tee attaches where SIPREC attaches (the post-decode fan-out). Detaching the tee must remove
+        // *only* the tee's sink: the SRS keeps receiving the subscribed monologue afterwards.
+        let (engine, (phone_a, near_addr), _b) = two_party_relay("tee-siprec").await;
+        let (srs, srs_addr) = phone().await;
+
+        let subscribe = engine
+            .handle(
+                CLIENT,
+                Command::SubscribeRequest {
+                    call_id: "tee-siprec".into(),
+                    from_tags: vec!["tag-a".into()],
+                    sdp: None,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let subscription_tag = match subscribe {
+            CmdResult::Ok {
+                to_tag: Some(to_tag),
+                ..
+            } => to_tag,
+            other => panic!("expected a subscription to_tag, got {other:?}"),
+        };
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::SubscribeAnswer {
+                    call_id: "tee-siprec".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: subscription_tag,
+                    sdp: sdp_single_codec(srs_addr, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(answered, CmdResult::Ok { .. }),
+            "subscribe_answer: {answered:?}"
+        );
+
+        let (uri, frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-siprec".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "attach: {attached:?}"
+        );
+        expect_tee_start(&frames).await;
+
+        // A talks: the SRS gets the SIPREC copy and the WS server gets the teed PCM.
+        for sequence in 0..6u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let (to_srs, _) = recv(&srs).await;
+        assert!(!to_srs.is_empty(), "the SRS receives the SIPREC fork");
+        assert_eq!(
+            next_tee_audio(&frames).await.len(),
+            320,
+            "and the tee streams too"
+        );
+
+        // Detach the tee only — the subscription's fork must survive (tagged removal).
+        let detached = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: "tee-siprec".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(detached, CmdResult::Ok { .. }),
+            "detach: {detached:?}"
+        );
+        assert!(
+            engine.media().is_media_call("tee-siprec"),
+            "the subscription still holds the relay in userspace"
+        );
+        for sequence in 10..16u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let (still_recording, _) = recv(&srs).await;
+        assert!(
+            !still_recording.is_empty(),
+            "detaching the tee must not tear down the SIPREC fork on the same leg"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ws_tee_server_that_never_reads_does_not_stall_the_call() {
+        // The hot-path contract: a stalled consumer drops tee frames, it never blocks the media actor.
+        // The server here completes the WebSocket handshake and then never reads a byte.
+        let (engine, (phone_a, near_addr), (phone_b, _far)) = two_party_relay("tee-stall").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled ws");
+        let stalled_addr = listener.local_addr().expect("addr");
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            // Hold the socket open forever without reading a single frame.
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-stall".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: format!("ws://{stalled_addr}/tee"),
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "attach: {attached:?}"
+        );
+
+        // Push far more frames than any buffer holds; B must keep receiving every one of them.
+        let mut relayed = 0;
+        for sequence in 0..200u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+            if timeout(Duration::from_millis(200), async {
+                let mut buffer = [0u8; 2048];
+                phone_b.recv_from(&mut buffer).await
+            })
+            .await
+            .is_ok()
+            {
+                relayed += 1;
+            }
+        }
+        assert!(
+            relayed >= 190,
+            "the call must keep relaying at full rate past a stalled tee consumer (relayed {relayed}/200)"
+        );
+        stalled.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn attaching_a_ws_tee_to_a_websocket_takeover_call_is_rejected() {
+        // Takeover (`ws_uri`) routes leg A's media to its own server and never wires A<->B, so there is
+        // no relay path to tee. Reject clearly rather than attaching a sink that would never fire.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
+        let ws_addr = listener.local_addr().expect("ws addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            std::future::pending::<()>().await;
+        });
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (_phone_a, addr_a) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "tee-takeover".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some(format!("ws://{ws_addr}/stream")),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        assert!(matches!(offer, CmdResult::Ok { .. }), "ws offer: {offer:?}");
+
+        let (uri, _frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-takeover".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        match attached {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("takeover"),
+                "expected a takeover-conflict error, got {reason}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn detaching_a_ws_tee_on_a_call_without_one_is_a_noop() {
+        let (engine, _a, _b) = two_party_relay("tee-none").await;
+        let detached = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: "tee-none".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(detached, CmdResult::Ok { .. }),
+            "idempotent detach"
+        );
+        let unknown = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: "nope".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(unknown, CmdResult::Error { .. }),
+            "unknown call still errors"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_ws_tee_attach_detach_cycles_leave_no_residue() {
+        // Leak soak: every attach/detach cycle must return the engine to its starting shape — no tee
+        // rows retained, the relay demoted back to the kernel fast path, and media still flowing.
+        let (engine, (phone_a, near_addr), (phone_b, _far)) = two_party_relay("tee-soak").await;
+        for cycle in 0..8 {
+            let (uri, frames) = tee_server().await;
+            let attached = engine
+                .handle(
+                    CLIENT,
+                    Command::AttachWsTee {
+                        call_id: "tee-soak".into(),
+                        from_tag: "tag-a".into(),
+                        ws_uri: uri,
+                        direction: WsTeeDirection::Caller,
+                        channels: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(attached, CmdResult::Ok { .. }),
+                "cycle {cycle} attach: {attached:?}"
+            );
+            assert_eq!(engine.ws_tee_count(), 1, "exactly one tee per call");
+            expect_tee_start(&frames).await;
+
+            phone_a
+                .send_to(&g711_rtp(0, cycle as u16, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+
+            let detached = engine
+                .handle(
+                    CLIENT,
+                    Command::DetachWsTee {
+                        call_id: "tee-soak".into(),
+                        from_tag: "tag-a".into(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(detached, CmdResult::Ok { .. }),
+                "cycle {cycle} detach: {detached:?}"
+            );
+            assert_eq!(
+                engine.ws_tee_count(),
+                0,
+                "cycle {cycle} left a tee row behind"
+            );
+            assert!(
+                !engine.media().is_media_call("tee-soak"),
+                "cycle {cycle} left the relay promoted in userspace"
+            );
+        }
+
+        // The call is untouched by the churn.
+        phone_a
+            .send_to(&g711_rtp(0, 500, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let (relayed, _) = recv(&phone_b).await;
+        assert!(
+            !relayed.is_empty(),
+            "the relay survived every attach/detach cycle"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_ws_tee_profile_flag_attaches_at_answer_time() {
+        // The declarative twin of attach_ws_tee: `profile.ws_tee` on the answer stands the tee up in
+        // one round-trip, and the call is teed the moment it is answered.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let (uri, frames) = tee_server().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "tee-profile".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "tee-profile".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: ProfileFlags {
+                        ws_tee: Some(uri),
+                        ws_tee_direction: Some(WsTeeDirection::Caller),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("the answer still returns SDP")
+            .remote_rtp;
+        let start = expect_tee_start(&frames).await;
+        assert_eq!(start.call_id, "tee-profile");
+        assert_eq!(start.media.channels, 1);
+
+        for sequence in 0..6u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        assert_eq!(next_tee_audio(&frames).await.len(), 320);
+
+        // Deleting the call closes the tee.
+        engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "tee-profile".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            engine.ws_tee_count(),
+            0,
+            "delete tore the tee down with the call"
+        );
     }
 }

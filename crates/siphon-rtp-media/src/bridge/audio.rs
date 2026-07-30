@@ -26,7 +26,7 @@ use crate::bridge::protocol::{
 use siphon_rtp_dsp::{EchoCanceller, EnergyVad, NoiseSuppressor};
 
 /// Largest frame the scratch PCM buffers hold (48 kHz × 20 ms).
-pub(crate) const MAX_FRAME_SAMPLES: usize = 960;
+pub const MAX_FRAME_SAMPLES: usize = 960;
 
 /// The PCM-domain core of a WS bridge session. See the module docs for the uplink/downlink contract.
 pub struct BridgeCore {

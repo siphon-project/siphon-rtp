@@ -7,6 +7,16 @@ RTP to linear PCM, streams it uplink, and encodes PCM coming back down into RTP 
 caller. Your agent server never touches RTP, jitter buffers, or codecs; it reads and writes raw
 PCM frames on a WebSocket.
 
+There are **two** modes, and they are separate fields on purpose:
+
+| Mode | Field | What it does |
+|---|---|---|
+| **Takeover** | `ws_uri` | The WS server *is* leg A's far side. Duplex. A↔B is not wired. Use it when the AI answers the call. |
+| **Tee** | `ws_tee` / `attach_ws_tee` | A send-only stream riding a call that keeps relaying normally. Use it to listen to a live two-party call. |
+
+A call may hold both — they attach at different points. Takeover is the rest of this page;
+the tee has [its own section](#teeing-a-live-call-to-a-websocket) further down.
+
 Two things to be clear about up front:
 
 - This is a native siphon-rtp extension. The `ws_uri` field exists only on the JSON-over-TCP
@@ -178,6 +188,68 @@ are rejected on it: `block_media` / `silence_media`, `start_recording` (pcap), S
 rejected (the WS connection cannot be rebuilt from a snapshot yet). Latency is tuned for
 voice-AI: a shallow jitter buffer (target one frame) and the bounded playout queue keep
 mouth-to-ear delay low at the cost of a little more concealment under jitter.
+
+## Teeing a live call to a WebSocket
+
+Takeover replaces leg A's far side. A **tee** does the opposite: the call relays (or transcodes)
+exactly as it would have, and a *copy* of the decoded audio is streamed to a WebSocket server.
+That is what you want for live transcription, supervisor monitoring, or real-time analytics on a
+normal two-party call — the parties keep talking to each other, and the AI listens.
+
+The tee attaches where SIPREC forking already attaches: the post-decode fan-out. One decode of
+each stream feeds the peer, the recorder, any SIPREC subscription **and** the WebSocket. There is
+no second jitter buffer and no second concealment decision, so the WS consumer hears exactly what
+the call carried.
+
+Attach it on a live call:
+
+```json
+{
+  "id": 7,
+  "command": "attach_ws_tee",
+  "call_id": "call-7@198.51.100.2",
+  "from_tag": "caller",
+  "ws_uri": "ws://127.0.0.1:9002/tee",
+  "direction": "both",
+  "channels": 2
+}
+```
+
+or declaratively at answer time with `"profile": { "ws_tee": "ws://127.0.0.1:9002/tee" }`, which
+saves a round-trip. `detach_ws_tee` (same `call_id` / `from_tag`) stops it; it is idempotent, and
+`delete` tears any tee down with the call.
+
+- **`direction`** — `both` (default), `caller`, or `callee`. `caller` is the offerer's audio.
+- **`channels`** — with `direction: both`, `2` interleaves the two legs as stereo L16 (channel 0
+  caller, channel 1 callee) and `1` mixes them to mono with saturation. A single-leg tee is always
+  mono. Stereo on one connection beats one socket per leg: you get speaker separation for free.
+
+The wire is the same envelope as takeover, except `start` announces `"direction": "send"` and
+carries the track labels (`inbound` / `outbound`). Audio flows one way only — a v1 tee never
+injects into the call. The wire sample rate follows the *caller* leg's decoded PCM rate, and a
+callee on a different codec is resampled into it, so a stereo frame is always one rate.
+
+Two behaviours worth knowing before you build on it:
+
+- **A silent leg produces no frames.** The tee is driven by decoded ingress packets, not a clock,
+  so a muted or gapped leg simply emits nothing (unlike takeover, whose ticker emits silence). A
+  stereo tee needs a frame from *both* legs before it can interleave one, so a one-sided
+  conversation streams only as fast as the quieter side.
+- **A slow consumer loses frames, never the call.** The queue between the media path and the
+  socket is bounded and drops on overflow. The `siphon_rtp_ws_tee_frames_dropped_total` metric and
+  the `frames_dropped` field on the `ws_tee_ended` event tell you when that happened; the call's
+  own RTP is never delayed by a byte.
+
+The controller sees two events: `ws_tee_started` (with the negotiated `channels` / `sampleRate`
+and the `stream_id` matching the `start` frame) and `ws_tee_ended` with a `reason`
+(`detached`, `server_closed`, `server_stopped`, `call_ended`, `transport_error`) plus the lifetime
+frame counters — so a stream that dies is visible, not silent.
+
+Attaching a tee to a plain in-kernel relay promotes it to the userspace media pipeline for the
+tee's lifetime and demotes it again on detach. A tee cannot be attached to a takeover
+(`ws_uri`) call — that call has no relay path to copy — or to an SRTP-bridge call, whose
+`Redirect` path carries ciphertext without decoding. Like `ws_uri`, the tee is native-JSON only;
+the NG/bencode front-end does not carry it.
 
 ## How to verify
 

@@ -120,6 +120,9 @@ async fn metrics_and_health_endpoint_over_tcp() {
             ),
             cpu_permille,
             draining: cluster.is_draining(),
+            ws_tees: gauge_engine.ws_tee_count() as u64,
+            ws_tee_frames_sent: gauge_engine.ws_tee_frames_sent(),
+            ws_tee_frames_dropped: gauge_engine.ws_tee_frames_dropped(),
         }
     };
     tokio::spawn(metrics::serve_metrics(listener, engine.metrics(), live));

@@ -80,5 +80,72 @@ fn bench_tick(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_tick);
+/// The WS **tee**'s per-frame cost — what a relaying call pays per decoded ingress frame for having a
+/// tee attached (`MediaSink::write_pcm`: ring push → interleave/mix → L16 → bounded `try_send`). Three
+/// shapes: a single-leg monologue, a stereo (both-legs) tee whose emit also interleaves, and a leg that
+/// must resample into the tee rate. Each iteration drains + recycles as the transport task does, so the
+/// measured cost is the steady-state, allocation-free path.
+fn bench_tee(criterion: &mut Criterion) {
+    use siphon_rtp_media::bridge::protocol::{Encoding, Endianness};
+    use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
+    use siphon_rtp_media::fanout::MediaSink;
+
+    let format = |sample_rate: u32, channels: u8| MediaFormat {
+        encoding: Encoding::L16,
+        sample_rate,
+        channels,
+        bit_depth: 16,
+        endianness: Endianness::Little,
+        ptime: 20,
+    };
+
+    let mut group = criterion.benchmark_group("ws_tee_write_pcm_20ms");
+    let frame = [4321i16; FRAME_SAMPLES];
+
+    group.bench_function("mono_8k", |bencher| {
+        let plan = plan_ws_tee(format(8000, 1), false, false);
+        let mut sink = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee", None);
+        bencher.iter(|| {
+            sink.write_pcm(black_box(&frame));
+            if let Ok(buffer) = plan.frames.try_recv() {
+                let _ = plan.recycle.send(buffer);
+            }
+        });
+    });
+
+    group.bench_function("stereo_8k", |bencher| {
+        let plan = plan_ws_tee(format(8000, 2), true, false);
+        let mut caller = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee", None);
+        let mut callee = WsTeeSink::new(TeeChannel::Callee, plan.mixer.clone(), "tee", None);
+        bencher.iter(|| {
+            caller.write_pcm(black_box(&frame));
+            callee.write_pcm(black_box(&frame));
+            if let Ok(buffer) = plan.frames.try_recv() {
+                let _ = plan.recycle.send(buffer);
+            }
+        });
+    });
+
+    group.bench_function("mono_16k_resampled_to_8k", |bencher| {
+        let plan = plan_ws_tee(format(8000, 1), false, false);
+        let resampler =
+            siphon_rtp_dsp::resample::Resampler::new(16_000, 8_000).expect("build resampler");
+        let mut sink = WsTeeSink::new(
+            TeeChannel::Caller,
+            plan.mixer.clone(),
+            "tee",
+            Some(resampler),
+        );
+        let wideband = [4321i16; 2 * FRAME_SAMPLES];
+        bencher.iter(|| {
+            sink.write_pcm(black_box(&wideband));
+            if let Ok(buffer) = plan.frames.try_recv() {
+                let _ = plan.recycle.send(buffer);
+            }
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_tick, bench_tee);
 criterion_main!(benches);

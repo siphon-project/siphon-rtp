@@ -2152,6 +2152,20 @@ impl MediaCall {
         direction.forks.clear();
     }
 
+    /// Detach only the forks a source leg carries under `tag` ([`MediaControl::RemoveForkTagged`]),
+    /// leaving every other sink on that leg attached. This is what lets a WS tee (tagged with its
+    /// stream id) be detached mid-call without tearing down a SIPREC subscription forking the same leg
+    /// — [`Self::remove_forks`] clears them all, which is right at teardown and wrong for a detach.
+    pub fn remove_forks_tagged(&mut self, source_a: bool, tag: &str) {
+        let direction = self.ingress_direction(source_a);
+        for fork in &mut direction.forks {
+            if fork.tag() == Some(tag) {
+                fork.finish();
+            }
+        }
+        direction.forks.retain(|fork| fork.tag() != Some(tag));
+    }
+
     /// Number of forks attached to a source leg's ingress (test/observability helper).
     #[must_use]
     pub fn fork_count(&self, source_a: bool) -> usize {
@@ -2332,6 +2346,9 @@ pub enum MediaControl {
     },
     /// Detach every fork on a source leg's ingress, closing their output channels.
     RemoveFork { source_a: bool },
+    /// Detach only the forks a source leg carries under `tag`, leaving the others attached — how a WS
+    /// tee detaches without disturbing a SIPREC subscription forking the same leg.
+    RemoveForkTagged { source_a: bool, tag: String },
     /// Attach a SIPREC / monitor **raw-RTP tee** to a source leg's ingress (`source_a` selects leg A
     /// vs leg B). The leg's original ingress RTP is copied byte-for-byte toward the SRS — its
     /// negotiated codec, no re-encode (RFC 7866 §6). Send-only: the engine installs no inbound flow on
@@ -2629,6 +2646,9 @@ async fn run_media_call<D>(
                     }
                     MediaInput::Control(MediaControl::RemoveFork { source_a }) => {
                         call.remove_forks(source_a);
+                    }
+                    MediaInput::Control(MediaControl::RemoveForkTagged { source_a, tag }) => {
+                        call.remove_forks_tagged(source_a, &tag);
                     }
                     MediaInput::Control(MediaControl::AddRawTee { source_a, tee }) => {
                         call.add_raw_tee(source_a, tee);

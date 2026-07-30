@@ -3,8 +3,12 @@
 //! The audio logic lives in [`audio::BridgeCore`], whose boundary is **PCM**: uplink frames in,
 //! cleaned L16 out, downlink playout queued and dequeued one frame per tick. Two shells wrap it —
 //! [`session::BridgeSession`] adds the RTP layer for **takeover** mode (the WS server is the leg's far
-//! side, so the session owns a [`crate::leg::MediaLeg`]), while a **teed** call feeds already-decoded
-//! PCM straight in from the media pipeline's fan-out. One decode per stream, either way.
+//! side, so the session owns a [`crate::leg::MediaLeg`]), while a **teed** call ([`tee`]) feeds
+//! already-decoded PCM straight in from the media pipeline's fan-out. One decode per stream, either way.
+//!
+//! The two modes are named, not one overloaded field: **takeover** (`ws_uri`) makes the server leg A's
+//! far side and A↔B is not wired; a **tee** (`ws_tee`) rides a normally-relaying call as a
+//! [`crate::fanout::MediaSink`] and is send-only. A call may hold both — they attach at different points.
 //!
 //! [`protocol`] is the raw-WS-PCM control protocol (text frames). This module also holds the
 //! binary-audio framing helpers: the M1 wire order is **little-endian L16**, while RTP L16
@@ -14,6 +18,7 @@
 pub mod audio;
 pub mod protocol;
 pub mod session;
+pub mod tee;
 pub mod ws;
 
 pub use audio::BridgeCore;
@@ -21,6 +26,7 @@ pub use protocol::{
     ControlMessage, Direction, Encoding, Endianness, MediaFormat, PlaySource, StartData,
 };
 pub use session::{BridgeSession, TickResult};
+pub use tee::{plan_ws_tee, run_ws_tee, TeeChannel, TeeEndReason, WsTeePlan, WsTeeSink};
 pub use ws::{run_bridge, BridgeError};
 
 /// Encode i16 PCM samples to little-endian L16 bytes (the M1 binary-frame wire order).
