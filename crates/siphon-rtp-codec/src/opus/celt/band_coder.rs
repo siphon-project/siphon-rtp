@@ -4,25 +4,22 @@
 //! The heart of CELT: `compute_theta` codes the mid/side (or time-) split angle, and
 //! [`quant_partition`] recursively splits a band in half — coding the energy split with `theta` —
 //! down to leaves where the PVQ shape is quantised (`alg_quant`) or de-quantised (`alg_unquant`),
-//! or noise/folding fills an empty band. [`quant_band_n1`] handles the single-coefficient case.
-//! These draw bits from the shared [`BandCtx`] budget; the wrappers ([`quant_band`] /
-//! [`quant_all_bands`]) sit above and orchestrate tf-resolution + the per-band loop.
+//! or noise/folding fills an empty band. [`quant_band_n1`] handles the single-coefficient case and
+//! [`quant_band_stereo`] the two-channel one. These draw bits from the shared [`BandCtx`] budget;
+//! the wrappers ([`quant_band`] / [`quant_all_bands`]) sit above and orchestrate tf-resolution + the
+//! per-band loop.
 //!
 //! libopus writes this once and branches on an `encode` flag at every symbol; the Rust equivalent
 //! is the [`CeltCoder`] generic parameter, so there is exactly one copy of the band recursion and
-//! the two directions cannot drift apart.
-//!
-//! **Scope note.** The stereo band path (libopus `quant_band_stereo`) is absent in both directions
-//! — the CELT decoder in this crate is mono-only, and so is the encoder. The `stereo` flag threaded
-//! through `compute_theta` is pre-existing decoder plumbing; on the encode side only
-//! `stereo == false` (a mono time split) is reachable, and there is deliberately no stereo caller
-//! rather than a hollow one.
+//! the two directions cannot drift apart. The same holds across channel counts: mono and stereo
+//! share `quant_partition`/`quant_band`, and `quant_band_stereo` is the one extra body libopus has.
 
 use crate::opus::celt::bands::{
-    bitexact_cos, bitexact_log2tan, compute_qn, deinterleave_hadamard, frac_mul16, haar1,
-    interleave_hadamard,
+    bitexact_cos, bitexact_log2tan, compute_channel_weights, compute_qn, deinterleave_hadamard,
+    frac_mul16, haar1, intensity_stereo, interleave_hadamard, stereo_merge, stereo_split,
 };
 use crate::opus::celt::entropy::CeltCoder;
+use crate::opus::celt::mathops::celt_inner_prod;
 use crate::opus::celt::rate::{bits2pulses, cache_max_bits, get_pulses, pulses2bits};
 use crate::opus::celt::synthesis::celt_lcg_rand;
 use crate::opus::celt::tables::{E_BANDS, LOG_N, NB_BANDS, SPREAD_AGGRESSIVE};
@@ -33,9 +30,14 @@ const QTHETA_OFFSET: i32 = 4;
 const QTHETA_OFFSET_TWOPHASE: i32 = 16;
 /// Largest band dimension (scratch size) — 48 kHz max is 176.
 const MAX_BAND: usize = 256;
+/// Largest per-channel fold buffer: `M*eBands[NB_BANDS-1]` at `M = 8`, `start = 0`, i.e. 624.
+const MAX_NORM: usize = 640;
+/// Largest Opus packet (RFC 6716 §3.4) — the widest byte range a theta trial can dirty.
+const MAX_PACKET_BYTES: usize = 1275;
 
 /// Shared per-band coding context (libopus `band_ctx`, `bands.c:673`).
-pub struct BandCtx {
+#[derive(Clone, Copy)]
+pub struct BandCtx<'a> {
     /// Current band index `i`.
     pub band: usize,
     /// First band coded with intensity stereo.
@@ -51,18 +53,26 @@ pub struct BandCtx {
     /// Disable the stereo inversion flag (downmix safety).
     pub disable_inv: bool,
     /// Reconstruct the quantised spectrum as we go (libopus `ctx->resynth`). Always `true` for a
-    /// decoder; `false` for the mono encoder, whose reference build reconstructs nothing
-    /// (`bands.c:1428`: `resynth = !encode || theta_rdo`, and `theta_rdo` requires stereo) — which
-    /// is why the encoder needs no folding reference.
+    /// decoder; for an encoder it is `theta_rdo` (`bands.c:1428`: `resynth = !encode || theta_rdo`),
+    /// which needs stereo — so a mono encoder reconstructs nothing and needs no folding reference.
     pub resynth: bool,
     /// "Avoid injecting noise in the first band on transients" (`bands.c:1473`) — an encode-only
     /// guard that pushes `theta` to a pole when the bit split would starve one side.
     pub avoid_split_noise: bool,
+    /// Per-band amplitudes, `2*NB_BANDS` (libopus `ctx->bandE`) — the mixing weights
+    /// [`intensity_stereo`] uses. Only ever read on a **stereo encode**; a decoder and a mono
+    /// encoder pass an empty slice, which no reachable path indexes.
+    pub band_energy: &'a [f32],
+    /// Rounding direction for the stereo theta rate-distortion trial (libopus `ctx->theta_round`):
+    /// 0 = nearest (the normal path), -1 = round down, +1 = round up.
+    pub theta_round: i32,
 }
 
 /// The mid/side split decision (libopus `split_ctx`).
 #[derive(Default)]
 struct SplitCtx {
+    /// Stereo phase-inversion flag; only the stereo band path acts on it.
+    inv: bool,
     imid: i32,
     iside: i32,
     delta: i32,
@@ -73,14 +83,16 @@ struct SplitCtx {
 /// Code the split angle `theta` and derive the mid/side gains + bit-split `delta` (libopus
 /// `compute_theta`, `bands.c:700`). Consumes bits from `*b` and may mask `*fill`.
 ///
-/// `x`/`y` are the two halves being split; the encoder measures their energies to pick `theta`, the
-/// decoder ignores them.
+/// `x`/`y` are the two halves being split (mono time split) or the two channels (stereo). The
+/// decoder only reads the coded angle; the encoder measures their energies to pick it, and on the
+/// stereo path additionally rewrites `x`/`y` in place — either collapsing them with
+/// [`intensity_stereo`] or rotating them with [`stereo_split`], exactly as `bands.c:836` does.
 #[allow(clippy::too_many_arguments)]
 fn compute_theta<C: CeltCoder>(
     ctx: &BandCtx,
     sctx: &mut SplitCtx,
-    x: &[f32],
-    y: &[f32],
+    x: &mut [f32],
+    y: &mut [f32],
     n: usize,
     b: &mut i32,
     big_b: usize,
@@ -108,22 +120,35 @@ fn compute_theta<C: CeltCoder>(
         0
     };
     let tell = coder.tell_frac() as i32;
+    let mut inv = false;
     if qn != 1 {
         if C::ENCODE {
-            itheta = (itheta * qn + 8192) >> 14;
-            if !stereo && ctx.avoid_split_noise && itheta > 0 && itheta < qn {
-                // "Check if the selected value of theta will cause the bit allocation to inject
-                // noise on one side. If so, make sure the energy of that side is zero."
-                // (bands.c:750)
-                let unquantized = (itheta * 16384) / qn;
-                let imid = i32::from(bitexact_cos(unquantized as i16));
-                let iside = i32::from(bitexact_cos((16384 - unquantized) as i16));
-                let delta = frac_mul16((n as i32 - 1) << 7, bitexact_log2tan(iside, imid));
-                if delta > *b {
-                    itheta = qn;
-                } else if delta < -*b {
-                    itheta = 0;
+            if !stereo || ctx.theta_round == 0 {
+                itheta = (itheta * qn + 8192) >> 14;
+                if !stereo && ctx.avoid_split_noise && itheta > 0 && itheta < qn {
+                    // "Check if the selected value of theta will cause the bit allocation to inject
+                    // noise on one side. If so, make sure the energy of that side is zero."
+                    // (bands.c:750)
+                    let unquantized = (itheta * 16384) / qn;
+                    let imid = i32::from(bitexact_cos(unquantized as i16));
+                    let iside = i32::from(bitexact_cos((16384 - unquantized) as i16));
+                    let delta = frac_mul16((n as i32 - 1) << 7, bitexact_log2tan(iside, imid));
+                    if delta > *b {
+                        itheta = qn;
+                    } else if delta < -*b {
+                        itheta = 0;
+                    }
                 }
+            } else {
+                // "Bias quantization towards itheta=0 and itheta=16384" for the RD trial's two
+                // rounding directions (bands.c:764).
+                let bias = if itheta > 8192 {
+                    32767 / qn
+                } else {
+                    -32767 / qn
+                };
+                let down = (qn - 1).min(0.max((itheta * qn + bias) >> 14));
+                itheta = if ctx.theta_round < 0 { down } else { down + 1 };
             }
         }
         // Entropy coding of the angle: a step pdf for stereo, uniform for a time split of more than
@@ -136,13 +161,34 @@ fn compute_theta<C: CeltCoder>(
             coder.code_theta_triangular(&mut itheta, qn);
         }
         itheta = (itheta * 16384) / qn;
+        if C::ENCODE && stereo {
+            // The encoder now has to *produce* what the decoder will reconstruct: either the
+            // intensity-collapsed mono band, or the mid/side rotation (bands.c:836).
+            if itheta == 0 {
+                intensity_stereo(x, y, ctx.band_energy, ctx.band, n);
+            } else {
+                stereo_split(x, y, n);
+            }
+        }
     } else if stereo {
-        // The stereo inversion flag. Its *value* only matters to `quant_band_stereo`, which is not
-        // implemented in either direction here (see the module scope note); the symbol is still read
-        // so a stereo decoder would stay in sync, and `disable_inv` is honoured as the C does.
-        let mut inv = false;
+        // Pure intensity stereo: no angle, just the phase-inversion flag (bands.c:845).
+        if C::ENCODE {
+            inv = itheta > 8192 && !ctx.disable_inv;
+            if inv {
+                for v in y[..n].iter_mut() {
+                    *v = -*v;
+                }
+            }
+            intensity_stereo(x, y, ctx.band_energy, ctx.band, n);
+        }
         if *b > 2 << BITRES && ctx.remaining_bits > 2 << BITRES {
             coder.code_bit_logp(&mut inv, 2);
+        } else {
+            inv = false;
+        }
+        // "inv flag override to avoid problems with downmixing." (bands.c:862)
+        if ctx.disable_inv {
+            inv = false;
         }
         itheta = 0;
     }
@@ -166,7 +212,7 @@ fn compute_theta<C: CeltCoder>(
         delta = frac_mul16((n as i32 - 1) << 7, bitexact_log2tan(iside, imid));
     }
 
-    let _ = ctx.disable_inv; // consumed by the (absent) stereo band path; kept in `BandCtx` for it
+    sctx.inv = inv;
     sctx.imid = imid;
     sctx.iside = iside;
     sctx.delta = delta;
@@ -174,13 +220,8 @@ fn compute_theta<C: CeltCoder>(
     sctx.qalloc = qalloc;
 }
 
-/// Code a single-coefficient band: one sign bit (libopus `quant_band_n1`, `bands.c:904`).
-pub fn quant_band_n1<C: CeltCoder>(
-    ctx: &mut BandCtx,
-    x: &mut [f32],
-    lowband_out: Option<&mut [f32]>,
-    coder: &mut C,
-) -> u32 {
+/// One channel of the single-coefficient band: its sign bit (libopus `quant_band_n1`'s loop body).
+fn quant_band_n1_channel<C: CeltCoder>(ctx: &mut BandCtx, x: &mut [f32], coder: &mut C) {
     let mut sign = 0u32;
     if ctx.remaining_bits >= 1 << BITRES {
         if C::ENCODE {
@@ -192,7 +233,23 @@ pub fn quant_band_n1<C: CeltCoder>(
     if ctx.resynth {
         x[0] = if sign != 0 { -1.0 } else { 1.0 };
     }
+}
+
+/// Code a single-coefficient band: one sign bit per channel (libopus `quant_band_n1`,
+/// `bands.c:904`). `y` carries the second channel on a stereo band.
+pub fn quant_band_n1<C: CeltCoder>(
+    ctx: &mut BandCtx,
+    x: &mut [f32],
+    y: Option<&mut [f32]>,
+    lowband_out: Option<&mut [f32]>,
+    coder: &mut C,
+) -> u32 {
+    quant_band_n1_channel(ctx, x, coder);
+    if let Some(y) = y {
+        quant_band_n1_channel(ctx, y, coder);
+    }
     if let Some(lo) = lowband_out {
+        // `SHR16(X[0],4)` — the identity in the float build (`arch.h`).
         lo[0] = x[0];
     }
     1
@@ -226,7 +283,7 @@ pub fn quant_partition<C: CeltCoder>(
 
         let mut sctx = SplitCtx::default();
         {
-            let (x_lo, x_hi) = x.split_at(half);
+            let (x_lo, x_hi) = x.split_at_mut(half);
             compute_theta(
                 ctx, &mut sctx, x_lo, x_hi, half, &mut b, new_big_b, b0, new_lm, false, &mut fill,
                 coder,
@@ -408,7 +465,7 @@ pub fn quant_band<C: CeltCoder>(
     let mut n_b = n / big_b;
 
     if n == 1 {
-        return quant_band_n1(ctx, x, lowband_out, coder);
+        return quant_band_n1(ctx, x, None, lowband_out, coder);
     }
 
     let mut tf_change = ctx.tf_change;
@@ -526,30 +583,419 @@ pub fn quant_band<C: CeltCoder>(
     cm
 }
 
-/// Duplicate first-band folding data so the second band can fold (libopus `special_hybrid_folding`).
-/// A no-op for CELT-only (`start == 0`), where `n2 == n1`.
-fn special_hybrid_folding(norm: &mut [f32], start: usize, m: usize) {
+/// Code one **stereo** band (libopus `quant_band_stereo`, `bands.c:1235`): code the mid/side angle,
+/// then hand the mid and the side to the mono [`quant_band`] with the bit split `theta` implies, and
+/// (when resynthesising) undo the rotation with [`stereo_merge`].
+///
+/// `N == 2` is a special case: mid and side are orthogonal there, so the side costs a single sign
+/// bit and the pair is reconstructed directly rather than merged (`bands.c:1281`).
+#[allow(clippy::too_many_arguments)]
+pub fn quant_band_stereo<C: CeltCoder>(
+    ctx: &mut BandCtx,
+    x: &mut [f32],
+    y: &mut [f32],
+    n: usize,
+    b: i32,
+    big_b: usize,
+    lowband: Option<&[f32]>,
+    lm: i32,
+    lowband_out: Option<&mut [f32]>,
+    fill: i32,
+    coder: &mut C,
+) -> u32 {
+    if n == 1 {
+        return quant_band_n1(ctx, x, Some(y), lowband_out, coder);
+    }
+    let orig_fill = fill;
+    let mut fill = fill;
+    let mut b = b;
+
+    let mut sctx = SplitCtx::default();
+    compute_theta(
+        ctx, &mut sctx, x, y, n, &mut b, big_b, big_b, lm, true, &mut fill, coder,
+    );
+    let inv = sctx.inv;
+    let mid = sctx.imid as f32 / 32768.0;
+    let side = sctx.iside as f32 / 32768.0;
+    let itheta = sctx.itheta;
+    let delta = sctx.delta;
+    let qalloc = sctx.qalloc;
+
+    let cm;
+    if n == 2 {
+        // "This is a special case for N=2 that only works for stereo and takes advantage of the
+        // fact that mid and side are orthogonal to encode the side with just one bit."
+        // (bands.c:1277)
+        let sbits = if itheta != 0 && itheta != 16384 {
+            1 << BITRES
+        } else {
+            0
+        };
+        let mbits = b - sbits;
+        let swap = itheta > 8192;
+        ctx.remaining_bits -= qalloc + sbits;
+        {
+            let (x2, y2): (&mut [f32], &mut [f32]) = if swap {
+                (&mut *y, &mut *x)
+            } else {
+                (&mut *x, &mut *y)
+            };
+            let mut sign = 0u32;
+            if sbits != 0 {
+                if C::ENCODE {
+                    // Only the side's sign is left to code.
+                    sign = u32::from(x2[0] * y2[1] - x2[1] * y2[0] < 0.0);
+                }
+                coder.code_bits(&mut sign, 1);
+            }
+            let signed = 1.0 - 2.0 * sign as f32;
+            // "We use orig_fill here because we want to fold the side, but if itheta==16384, we'll
+            // have cleared the low bits of fill." (bands.c:1305)
+            cm = quant_band(
+                ctx,
+                x2,
+                n,
+                mbits,
+                big_b,
+                lowband,
+                lm,
+                lowband_out,
+                1.0,
+                orig_fill,
+                coder,
+            );
+            y2[0] = -signed * x2[1];
+            y2[1] = signed * x2[0];
+        }
+        if ctx.resynth {
+            x[0] *= mid;
+            x[1] *= mid;
+            y[0] *= side;
+            y[1] *= side;
+            let tmp = x[0];
+            x[0] = tmp - y[0];
+            y[0] += tmp;
+            let tmp = x[1];
+            x[1] = tmp - y[1];
+            y[1] += tmp;
+        }
+    } else {
+        // "Normal" split code (bands.c:1329).
+        let mut mbits = b.min((b - delta) / 2).max(0);
+        let mut sbits = b - mbits;
+        ctx.remaining_bits -= qalloc;
+        let rebalance_before = ctx.remaining_bits;
+        if mbits >= sbits {
+            // "In stereo mode, we do not apply a scaling to the mid because we need the normalized
+            // mid for folding later."
+            let mut cm0 = quant_band(
+                ctx,
+                x,
+                n,
+                mbits,
+                big_b,
+                lowband,
+                lm,
+                lowband_out,
+                1.0,
+                fill,
+                coder,
+            );
+            let rebalance = mbits - (rebalance_before - ctx.remaining_bits);
+            if rebalance > 3 << BITRES && itheta != 0 {
+                sbits += rebalance - (3 << BITRES);
+            }
+            // "For a stereo split, the high bits of fill are always zero, so no folding will be
+            // done to the side."
+            cm0 |= quant_band(
+                ctx,
+                y,
+                n,
+                sbits,
+                big_b,
+                None,
+                lm,
+                None,
+                side,
+                fill >> big_b,
+                coder,
+            );
+            cm = cm0;
+        } else {
+            let mut cm0 = quant_band(
+                ctx,
+                y,
+                n,
+                sbits,
+                big_b,
+                None,
+                lm,
+                None,
+                side,
+                fill >> big_b,
+                coder,
+            );
+            let rebalance = sbits - (rebalance_before - ctx.remaining_bits);
+            if rebalance > 3 << BITRES && itheta != 16384 {
+                mbits += rebalance - (3 << BITRES);
+            }
+            cm0 |= quant_band(
+                ctx,
+                x,
+                n,
+                mbits,
+                big_b,
+                lowband,
+                lm,
+                lowband_out,
+                1.0,
+                fill,
+                coder,
+            );
+            cm = cm0;
+        }
+    }
+
+    // Used by the decoder and by the resynthesis-enabled encoder (bands.c:1370).
+    if ctx.resynth {
+        if n != 2 {
+            stereo_merge(x, y, mid, n);
+        }
+        if inv {
+            for v in y[..n].iter_mut() {
+                *v = -*v;
+            }
+        }
+    }
+    cm
+}
+
+/// Duplicate first-band folding data so the second band can fold (libopus
+/// `special_hybrid_folding`). A no-op for CELT-only (`start == 0`), where `n2 == n1`.
+fn special_hybrid_folding(norm: &mut [f32], norm2: &mut [f32], start: usize, m: usize, dual: bool) {
     let n1 = m * (E_BANDS[start + 1] - E_BANDS[start]) as usize;
     let n2 = m * (E_BANDS[start + 2] - E_BANDS[start + 1]) as usize;
     if n2 > n1 {
         norm.copy_within((2 * n1 - n2)..n1, n1);
+        if dual {
+            norm2.copy_within((2 * n1 - n2)..n1, n1);
+        }
+    }
+}
+
+/// Caller-owned scratch for the encoder's stereo theta rate-distortion trial (libopus keeps the
+/// same buffers on the stack of `quant_all_bands`, `bands.c:1409`).
+///
+/// It lives in the encoder state rather than on the stack of [`quant_all_bands`] so the decode and
+/// mono paths — which never run the trial — pay nothing for it, not even the zeroing.
+pub struct ThetaRdo {
+    x_save: [f32; MAX_BAND],
+    y_save: [f32; MAX_BAND],
+    x_save2: [f32; MAX_BAND],
+    y_save2: [f32; MAX_BAND],
+    norm_save2: [f32; MAX_BAND],
+    bytes: [u8; MAX_PACKET_BYTES],
+}
+
+impl ThetaRdo {
+    /// A zeroed trial buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            x_save: [0.0; MAX_BAND],
+            y_save: [0.0; MAX_BAND],
+            x_save2: [0.0; MAX_BAND],
+            y_save2: [0.0; MAX_BAND],
+            norm_save2: [0.0; MAX_BAND],
+            bytes: [0; MAX_PACKET_BYTES],
+        }
+    }
+}
+
+impl Default for ThetaRdo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Everything the stereo band path needs that the mono path does not — libopus threads these
+/// through `band_ctx` plus the `quant_all_bands` argument list. Passing `None` for the whole struct
+/// is what `Y_ == NULL` means in the C: a mono frame.
+pub struct StereoBands<'a> {
+    /// Per-band amplitudes, `2*NB_BANDS` (libopus `bandE`), feeding [`intensity_stereo`]. Read only
+    /// on the encode side; a decoder passes an empty slice.
+    pub band_energy: &'a [f32],
+    /// First band coded with intensity stereo (libopus `st->intensity`).
+    pub intensity: usize,
+    /// Code L/R independently instead of mid/side (libopus `dual_stereo`).
+    pub dual_stereo: bool,
+    /// Encoder analysis depth; `>= 8` turns on the theta rate-distortion trial (`bands.c:1425`).
+    pub complexity: i32,
+    /// Caller-owned scratch for that trial. `None` disables it, which is what a decoder wants —
+    /// `theta_rdo` is gated on `encode` in the reference too.
+    pub rdo: Option<&'a mut ThetaRdo>,
+}
+
+/// The per-band folding buffers (libopus `norm` / `norm2`), one per coded channel.
+struct FoldBuffers {
+    norm: [f32; MAX_NORM],
+    norm2: [f32; MAX_NORM],
+}
+
+/// Run the stereo band twice — rounding `theta` down, then up — and keep whichever reconstruction is
+/// closer to the original in the channel-weighted inner-product sense (libopus `bands.c:1580`).
+///
+/// This is the one place the encoder must be able to *undo* coded symbols, which is why
+/// [`CeltCoder`] carries a snapshot/rollback pair.
+#[allow(clippy::too_many_arguments)]
+fn quant_band_stereo_rdo<C: CeltCoder>(
+    ctx: &mut BandCtx,
+    rdo: &mut ThetaRdo,
+    x: &mut [f32],
+    y: &mut [f32],
+    n: usize,
+    b: i32,
+    big_b: usize,
+    lm: i32,
+    fill: i32,
+    weights: [f32; 2],
+    hybrid_refold: Option<(usize, usize)>,
+    norm: &mut [f32],
+    cur_norm: usize,
+    effective_lowband: i32,
+    last: bool,
+    coder: &mut C,
+) -> u32 {
+    /// One trial at the given rounding: the fold source (below `cur_norm`) and the fold destination
+    /// (at `cur_norm`) are disjoint halves of `norm`, so they are re-split per trial.
+    #[allow(clippy::too_many_arguments)]
+    fn trial<C: CeltCoder>(
+        ctx: &mut BandCtx,
+        round: i32,
+        x: &mut [f32],
+        y: &mut [f32],
+        n: usize,
+        b: i32,
+        big_b: usize,
+        lm: i32,
+        fill: i32,
+        norm: &mut [f32],
+        cur_norm: usize,
+        effective_lowband: i32,
+        last: bool,
+        coder: &mut C,
+    ) -> u32 {
+        ctx.theta_round = round;
+        let (norm_lo, norm_hi) = norm.split_at_mut(cur_norm);
+        let lowband: Option<&[f32]> = if effective_lowband >= 0 {
+            Some(&norm_lo[effective_lowband as usize..])
+        } else {
+            None
+        };
+        let out: Option<&mut [f32]> = if last { None } else { Some(&mut norm_hi[..n]) };
+        quant_band_stereo(ctx, x, y, n, b, big_b, lowband, lm, out, fill, coder)
+    }
+
+    rdo.x_save[..n].copy_from_slice(&x[..n]);
+    rdo.y_save[..n].copy_from_slice(&y[..n]);
+    let coder_save = coder.save_state();
+    let ctx_save = *ctx;
+    let nstart = coder.coded_bytes();
+    let nend = coder.buffer_len();
+
+    // Trial 1: round theta down.
+    let cm_down = trial(
+        ctx,
+        -1,
+        x,
+        y,
+        n,
+        b,
+        big_b,
+        lm,
+        fill,
+        norm,
+        cur_norm,
+        effective_lowband,
+        last,
+        coder,
+    );
+    let dist_down = weights[0] * celt_inner_prod(&rdo.x_save, x, n)
+        + weights[1] * celt_inner_prod(&rdo.y_save, y, n);
+
+    // Save trial 1's result before trying the other rounding.
+    rdo.x_save2[..n].copy_from_slice(&x[..n]);
+    rdo.y_save2[..n].copy_from_slice(&y[..n]);
+    if !last {
+        rdo.norm_save2[..n].copy_from_slice(&norm[cur_norm..cur_norm + n]);
+    }
+    let coder_after_down = coder.save_state();
+    let saved = coder.snapshot_bytes(nstart, &mut rdo.bytes[..nend.saturating_sub(nstart)]);
+
+    // Restore and run trial 2: round theta up.
+    coder.restore_state(&coder_save);
+    *ctx = ctx_save;
+    x[..n].copy_from_slice(&rdo.x_save[..n]);
+    y[..n].copy_from_slice(&rdo.y_save[..n]);
+    if let Some((start, m)) = hybrid_refold {
+        // `theta_rdo` implies `!dual_stereo`, so the second channel's fold buffer is untouched here.
+        special_hybrid_folding(norm, &mut [], start, m, false);
+    }
+    let cm_up = trial(
+        ctx,
+        1,
+        x,
+        y,
+        n,
+        b,
+        big_b,
+        lm,
+        fill,
+        norm,
+        cur_norm,
+        effective_lowband,
+        last,
+        coder,
+    );
+    let dist_up = weights[0] * celt_inner_prod(&rdo.x_save, x, n)
+        + weights[1] * celt_inner_prod(&rdo.y_save, y, n);
+
+    // A *larger* inner product with the original is a better reconstruction, so keep trial 1 unless
+    // trial 2 strictly beat it (`bands.c:1626`).
+    if dist_down >= dist_up {
+        coder.restore_state(&coder_after_down);
+        x[..n].copy_from_slice(&rdo.x_save2[..n]);
+        y[..n].copy_from_slice(&rdo.y_save2[..n]);
+        if !last {
+            norm[cur_norm..cur_norm + n].copy_from_slice(&rdo.norm_save2[..n]);
+        }
+        coder.restore_bytes(nstart, &rdo.bytes[..saved]);
+        // `ctx` is left as trial 2 left it, matching `ctx = ctx_save2` in the C — the two trials
+        // differ only in the bits they consumed, which the coder rollback already undid.
+        cm_down
+    } else {
+        cm_up
     }
 }
 
 /// Code all CELT bands `start..end` of the normalised coefficient buffer `x_` (libopus
-/// `quant_all_bands`, `bands.c:1398`, mono path). Manages the `norm` fold buffer and the per-band
-/// bit balance, calling [`quant_band`] per band and recording each band's collapse mask. `*seed` is
-/// advanced.
+/// `quant_all_bands`, `bands.c:1398`). `x_` holds `channels * frame_len` coefficients, channel-major
+/// (`Y_ = X_ + N` in the C); `stereo` is `Some` exactly when a second channel is present. Manages
+/// the `norm` fold buffers and the per-band bit balance, calling [`quant_band`] /
+/// [`quant_band_stereo`] per band and recording each band's collapse mask (`collapse_masks[i*C+c]`).
+/// `*seed` is advanced.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub fn quant_all_bands<C: CeltCoder>(
     start: usize,
     end: usize,
     x_: &mut [f32],
+    frame_len: usize,
+    stereo: Option<&mut StereoBands<'_>>,
     collapse_masks: &mut [u8],
     pulses: &[i32],
     short_blocks: bool,
     spread: u32,
-    intensity: usize,
     tf_res: &[i32],
     total_bits: i32,
     mut balance: i32,
@@ -563,14 +1009,28 @@ pub fn quant_all_bands<C: CeltCoder>(
     let big_b = if short_blocks { m } else { 1 };
     let norm_offset = m * E_BANDS[start] as usize;
     let norm_len = m * E_BANDS[NB_BANDS - 1] as usize - norm_offset;
-    let mut norm_buf = [0f32; 1024];
-    let norm = &mut norm_buf[..norm_len];
+    let mut folds = FoldBuffers {
+        norm: [0f32; MAX_NORM],
+        norm2: [0f32; MAX_NORM],
+    };
 
-    // libopus: `resynth = !encode || theta_rdo`, and `theta_rdo` needs stereo, so a mono encoder
-    // reconstructs nothing (`bands.c:1428`). `lowband_offset` then stays 0 throughout, so the
-    // encoder never folds and always passes the all-ones fill mask — none of which is *coded*, so
-    // the bitstream still matches exactly what a folding decoder reads.
-    let resynth = !C::ENCODE;
+    let (channels, band_energy, intensity, mut dual_stereo, complexity, mut rdo) = match stereo {
+        Some(s) => (
+            2usize,
+            s.band_energy,
+            s.intensity,
+            s.dual_stereo,
+            s.complexity,
+            s.rdo.as_deref_mut(),
+        ),
+        None => (1usize, &[][..], 0usize, false, 0i32, None),
+    };
+    // libopus: `theta_rdo = encode && Y_ != NULL && !dual_stereo && complexity >= 8`
+    // (`bands.c:1425`), and `resynth = !encode || theta_rdo` (`bands.c:1428`) — so a mono encoder
+    // reconstructs nothing, never folds, and always passes the all-ones fill mask. None of that is
+    // *coded*, so the bitstream still matches exactly what a folding decoder reads.
+    let theta_rdo = C::ENCODE && channels == 2 && !dual_stereo && complexity >= 8 && rdo.is_some();
+    let resynth = !C::ENCODE || theta_rdo;
 
     let mut ctx = BandCtx {
         band: start,
@@ -583,9 +1043,13 @@ pub fn quant_all_bands<C: CeltCoder>(
         resynth,
         // "Avoid injecting noise in the first band on transients." (bands.c:1473)
         avoid_split_noise: big_b > 1,
+        band_energy,
+        theta_round: 0,
     };
     let mut lowband_offset = 0usize;
     let mut update_lowband = true;
+
+    let (x_ch0, x_ch1) = x_.split_at_mut(frame_len.min(x_.len()));
 
     for i in start..end {
         ctx.band = i;
@@ -614,7 +1078,13 @@ pub fn quant_all_bands<C: CeltCoder>(
             lowband_offset = i;
         }
         if i == start + 1 {
-            special_hybrid_folding(norm, start, m);
+            special_hybrid_folding(
+                &mut folds.norm[..norm_len],
+                &mut folds.norm2[..norm_len],
+                start,
+                m,
+                dual_stereo,
+            );
         }
 
         let tf_change = tf_res[i];
@@ -622,7 +1092,7 @@ pub fn quant_all_bands<C: CeltCoder>(
 
         // Conservative collapse-mask estimate of the bands we'll fold from.
         let mut effective_lowband: i32 = -1;
-        let fill_init: u32;
+        let (mut x_cm, mut y_cm);
         if lowband_offset != 0 && (spread != SPREAD_AGGRESSIVE || big_b > 1 || tf_change < 0) {
             effective_lowband =
                 ((m * E_BANDS[lowband_offset] as usize) as i32 - norm_offset as i32 - n as i32)
@@ -642,49 +1112,169 @@ pub fn quant_all_bands<C: CeltCoder>(
                     break;
                 }
             }
-            let mut cm = 0u32;
+            let (mut cm_x, mut cm_y) = (0u32, 0u32);
             let mut fold_i = fold_start;
             loop {
-                cm |= u32::from(collapse_masks[fold_i]);
+                cm_x |= u32::from(collapse_masks[fold_i * channels]);
+                cm_y |= u32::from(collapse_masks[fold_i * channels + channels - 1]);
                 fold_i += 1;
                 if fold_i >= fold_end {
                     break;
                 }
             }
-            fill_init = cm;
+            x_cm = cm_x;
+            y_cm = cm_y;
         } else {
-            fill_init = (1u32 << big_b) - 1;
+            x_cm = (1u32 << big_b) - 1;
+            y_cm = x_cm;
         }
 
-        // Mono: split the fold buffer into read (earlier bands) + write (this band) halves.
-        let cur_norm = band_lo - norm_offset;
-        let (norm_lo, norm_hi) = norm.split_at_mut(cur_norm);
-        let lowband: Option<&[f32]> = if effective_lowband >= 0 {
-            Some(&norm_lo[effective_lowband as usize..])
-        } else {
-            None
-        };
-        let lowband_out: Option<&mut [f32]> = if last || !resynth {
-            None
-        } else {
-            Some(&mut norm_hi[..n])
-        };
+        // Switching off dual stereo to do intensity has to fold the two channels' references
+        // together first (bands.c:1560).
+        if dual_stereo && i == intensity {
+            dual_stereo = false;
+            if resynth {
+                for j in 0..(band_lo - norm_offset) {
+                    folds.norm[j] = 0.5 * (folds.norm[j] + folds.norm2[j]);
+                }
+            }
+        }
 
-        let x = &mut x_[band_lo..band_hi];
-        let x_cm = quant_band(
-            &mut ctx,
-            x,
-            n,
-            b,
-            big_b,
-            lowband,
-            lm,
-            lowband_out,
-            1.0,
-            fill_init as i32,
-            coder,
-        );
-        collapse_masks[i] = x_cm as u8;
+        let cur_norm = band_lo - norm_offset;
+        let x = &mut x_ch0[band_lo..band_hi];
+
+        if channels == 2 {
+            let y = &mut x_ch1[band_lo..band_hi];
+            if dual_stereo {
+                let (norm_lo, norm_hi) = folds.norm[..norm_len].split_at_mut(cur_norm);
+                let (norm2_lo, norm2_hi) = folds.norm2[..norm_len].split_at_mut(cur_norm);
+                let lowband: Option<&[f32]> = if effective_lowband >= 0 {
+                    Some(&norm_lo[effective_lowband as usize..])
+                } else {
+                    None
+                };
+                let lowband2: Option<&[f32]> = if effective_lowband >= 0 {
+                    Some(&norm2_lo[effective_lowband as usize..])
+                } else {
+                    None
+                };
+                let out: Option<&mut [f32]> = if last || !resynth {
+                    None
+                } else {
+                    Some(&mut norm_hi[..n])
+                };
+                let out2: Option<&mut [f32]> = if last || !resynth {
+                    None
+                } else {
+                    Some(&mut norm2_hi[..n])
+                };
+                x_cm = quant_band(
+                    &mut ctx,
+                    x,
+                    n,
+                    b / 2,
+                    big_b,
+                    lowband,
+                    lm,
+                    out,
+                    1.0,
+                    x_cm as i32,
+                    coder,
+                );
+                y_cm = quant_band(
+                    &mut ctx,
+                    y,
+                    n,
+                    b / 2,
+                    big_b,
+                    lowband2,
+                    lm,
+                    out2,
+                    1.0,
+                    y_cm as i32,
+                    coder,
+                );
+            } else {
+                let fill = (x_cm | y_cm) as i32;
+                let run_rdo = theta_rdo && i < intensity;
+                if run_rdo {
+                    // `rdo` is `Some` whenever `theta_rdo` is set (it is part of the condition).
+                    if let Some(rdo) = rdo.as_deref_mut() {
+                        let weights =
+                            compute_channel_weights(band_energy[i], band_energy[i + NB_BANDS]);
+                        let hybrid_refold = if i == start + 1 {
+                            Some((start, m))
+                        } else {
+                            None
+                        };
+                        x_cm = quant_band_stereo_rdo(
+                            &mut ctx,
+                            rdo,
+                            x,
+                            y,
+                            n,
+                            b,
+                            big_b,
+                            lm,
+                            fill,
+                            weights,
+                            hybrid_refold,
+                            &mut folds.norm[..norm_len],
+                            cur_norm,
+                            effective_lowband,
+                            last,
+                            coder,
+                        );
+                    }
+                } else {
+                    let (norm_lo, norm_hi) = folds.norm[..norm_len].split_at_mut(cur_norm);
+                    let lowband: Option<&[f32]> = if effective_lowband >= 0 {
+                        Some(&norm_lo[effective_lowband as usize..])
+                    } else {
+                        None
+                    };
+                    let out: Option<&mut [f32]> = if last || !resynth {
+                        None
+                    } else {
+                        Some(&mut norm_hi[..n])
+                    };
+                    ctx.theta_round = 0;
+                    x_cm = quant_band_stereo(
+                        &mut ctx, x, y, n, b, big_b, lowband, lm, out, fill, coder,
+                    );
+                }
+                y_cm = x_cm;
+            }
+        } else {
+            let (norm_lo, norm_hi) = folds.norm[..norm_len].split_at_mut(cur_norm);
+            let lowband: Option<&[f32]> = if effective_lowband >= 0 {
+                Some(&norm_lo[effective_lowband as usize..])
+            } else {
+                None
+            };
+            let lowband_out: Option<&mut [f32]> = if last || !resynth {
+                None
+            } else {
+                Some(&mut norm_hi[..n])
+            };
+            x_cm = quant_band(
+                &mut ctx,
+                x,
+                n,
+                b,
+                big_b,
+                lowband,
+                lm,
+                lowband_out,
+                1.0,
+                (x_cm | y_cm) as i32,
+                coder,
+            );
+            y_cm = x_cm;
+        }
+
+        collapse_masks[i * channels] = x_cm as u8;
+        collapse_masks[i * channels + channels - 1] = y_cm as u8;
         balance += pulses[i] + tell;
         update_lowband = b > (n as i32) << BITRES;
         // "We only need to avoid noise on a split for the first band. After that, we have folding."
@@ -699,7 +1289,7 @@ mod tests {
     use super::*;
     use crate::opus::range_coder::{RangeDecoder, RangeEncoder};
 
-    fn decode_ctx(band: usize, tf_change: i32, remaining_bits: i32, seed: u32) -> BandCtx {
+    fn decode_ctx<'a>(band: usize, tf_change: i32, remaining_bits: i32, seed: u32) -> BandCtx<'a> {
         BandCtx {
             band,
             intensity: 0,
@@ -710,6 +1300,8 @@ mod tests {
             disable_inv: true,
             resynth: true,
             avoid_split_noise: false,
+            band_energy: &[],
+            theta_round: 0,
         }
     }
 
@@ -806,7 +1398,7 @@ mod tests {
     fn quant_all_bands_decodes_full_frame_without_panic() {
         let lm = 3i32;
         let m = 1usize << lm;
-        let n_total = m * 100; // M * eBands[NB_BANDS]
+        let n_total = m * 120; // N = M*shortMdctSize
         let mut x = vec![0.0f32; n_total];
         let mut collapse = vec![0u8; NB_BANDS];
         let pulses = vec![60i32; NB_BANDS];
@@ -825,11 +1417,12 @@ mod tests {
             0,
             NB_BANDS,
             &mut x,
+            n_total,
+            None,
             &mut collapse,
             &pulses,
             false,
             2,
-            0,
             &tf_res,
             6000,
             0,
@@ -855,11 +1448,37 @@ mod tests {
         let mut x = [0.0f32];
         let mut lo = [0.0f32];
         let mut dec = RangeDecoder::new(&buf);
-        let cm = quant_band_n1(&mut ctx, &mut x, Some(&mut lo), &mut dec);
+        let cm = quant_band_n1(&mut ctx, &mut x, None, Some(&mut lo), &mut dec);
         assert_eq!(cm, 1);
         assert!(x[0] == 1.0 || x[0] == -1.0);
         assert_eq!(lo[0], x[0]);
         assert_eq!(ctx.remaining_bits, 64 - (1 << BITRES));
+    }
+
+    /// A stereo `N == 1` band spends one sign bit *per channel* (`bands.c:912` loops over
+    /// `1 + stereo`), and the fold reference still comes from the first channel.
+    #[test]
+    fn quant_band_n1_stereo_codes_both_channel_signs() {
+        let mut buf = vec![0u8; 16];
+        {
+            let mut enc = RangeEncoder::new(&mut buf);
+            enc.enc_bits(1, 1);
+            enc.enc_bits(0, 1);
+            enc.done();
+        }
+        let mut ctx = decode_ctx(0, 0, 64, 1);
+        let mut x = [0.0f32];
+        let mut y = [0.0f32];
+        let mut lo = [0.0f32];
+        let mut dec = RangeDecoder::new(&buf);
+        let cm = quant_band_n1(&mut ctx, &mut x, Some(&mut y), Some(&mut lo), &mut dec);
+        assert_eq!(cm, 1);
+        assert_eq!(lo[0], x[0]);
+        assert_eq!(
+            ctx.remaining_bits,
+            64 - 2 * (1 << BITRES),
+            "two sign bits must be charged"
+        );
     }
 
     // ── Encoder ↔ decoder agreement ─────────────────────────────────────────────────────────────
@@ -890,6 +1509,46 @@ mod tests {
         x
     }
 
+    /// A two-channel normalised spectrum whose channels correlate by `correlation`.
+    fn synthetic_stereo_spectrum(m: usize, seed: u32, correlation: f32) -> Vec<f32> {
+        let frame = m * 120;
+        let left = synthetic_normalised_spectrum(m, seed);
+        let right = synthetic_normalised_spectrum(m, seed ^ 0x5EED);
+        let mut out = vec![0f32; 2 * frame];
+        for i in 0..NB_BANDS {
+            let lo = m * E_BANDS[i] as usize;
+            let hi = m * E_BANDS[i + 1] as usize;
+            for j in lo..hi {
+                out[j] = left[j];
+                out[frame + j] = correlation * left[j] + (1.0 - correlation.abs()) * right[j];
+            }
+        }
+        // Renormalise the right channel per band so both are unit-norm, as `normalise_bands` leaves
+        // them.
+        for i in 0..NB_BANDS {
+            let lo = frame + m * E_BANDS[i] as usize;
+            let hi = frame + m * E_BANDS[i + 1] as usize;
+            let norm = out[lo..hi].iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for slot in out[lo..hi].iter_mut() {
+                    *slot /= norm;
+                }
+            }
+        }
+        out
+    }
+
+    /// Per-band amplitudes to drive `intensity_stereo`'s mixing weights.
+    fn synthetic_band_energy(tilt: f32) -> Vec<f32> {
+        (0..2 * NB_BANDS)
+            .map(|i| {
+                let band = i % NB_BANDS;
+                let channel = i / NB_BANDS;
+                (1.0 + band as f32 * 0.3) * if channel == 0 { 1.0 } else { tilt }
+            })
+            .collect()
+    }
+
     /// Encode a whole frame's bands, then decode it: both sides must end on the identical
     /// `tell_frac` and range value, across every frame size, transient/non-transient, spread
     /// setting, and a wide budget spread.
@@ -897,6 +1556,7 @@ mod tests {
     fn quant_all_bands_encode_then_decode_agrees_on_the_bitstream() {
         for lm in 0..4i32 {
             let m = 1usize << lm;
+            let frame = m * 120;
             for &short_blocks in &[false, true] {
                 for spread in 0..4u32 {
                     for &bytes in &[20usize, 60, 200, 600] {
@@ -911,6 +1571,7 @@ mod tests {
 
                         let mut buf = vec![0u8; bytes];
                         let mut enc_x = synthetic_normalised_spectrum(m, 0x5A5A + lm as u32);
+                        enc_x.resize(frame, 0.0);
                         let mut enc_collapse = vec![0u8; NB_BANDS];
                         let mut enc_seed = 0x1234_5678u32;
                         let (enc_tell, enc_rng);
@@ -920,11 +1581,12 @@ mod tests {
                                 0,
                                 NB_BANDS,
                                 &mut enc_x,
+                                frame,
+                                None,
                                 &mut enc_collapse,
                                 &pulses,
                                 short_blocks,
                                 spread,
-                                0,
                                 &tf_res,
                                 total_bits,
                                 0,
@@ -944,7 +1606,7 @@ mod tests {
                             );
                         }
 
-                        let mut dec_x = vec![0f32; m * E_BANDS[NB_BANDS] as usize];
+                        let mut dec_x = vec![0f32; frame];
                         let mut dec_collapse = vec![0u8; NB_BANDS];
                         let mut dec_seed = 0x1234_5678u32;
                         let mut dec = RangeDecoder::new(&buf);
@@ -952,11 +1614,12 @@ mod tests {
                             0,
                             NB_BANDS,
                             &mut dec_x,
+                            frame,
+                            None,
                             &mut dec_collapse,
                             &pulses,
                             short_blocks,
                             spread,
-                            0,
                             &tf_res,
                             total_bits,
                             0,
@@ -988,17 +1651,259 @@ mod tests {
         }
     }
 
+    /// The same gate for **stereo**, swept over the mid/side and dual-stereo modes, the whole
+    /// intensity range (0 collapses every band to intensity stereo; `NB_BANDS` codes none that way),
+    /// the phase-inversion flag, and complexity 8 (the theta rate-distortion trial). A stereo
+    /// desync would show up here as a `tell_frac` or `final_range` mismatch.
+    #[test]
+    fn quant_all_bands_stereo_encode_then_decode_agrees_on_the_bitstream() {
+        for lm in 0..4i32 {
+            let m = 1usize << lm;
+            let frame = m * 120;
+            for &short_blocks in &[false, true] {
+                for &dual in &[false, true] {
+                    for &intensity in &[0usize, 6, 14, NB_BANDS] {
+                        for &disable_inv in &[false, true] {
+                            for &complexity in &[5i32, 8] {
+                                for &bytes in &[24usize, 80, 300, 800] {
+                                    let pulses: Vec<i32> = (0..NB_BANDS)
+                                        .map(|i| ((bytes as i32) * 2).max(0) - (i as i32) * 8)
+                                        .map(|p| p.max(0))
+                                        .collect();
+                                    let tf_res: Vec<i32> = (0..NB_BANDS)
+                                        .map(|i| if short_blocks { 0 } else { -(i as i32 % 2) })
+                                        .collect();
+                                    let total_bits = (bytes as i32) * (8 << BITRES);
+                                    let band_energy = synthetic_band_energy(0.4);
+                                    let source =
+                                        synthetic_stereo_spectrum(m, 0xA11CE + lm as u32, 0.6);
+
+                                    let mut buf = vec![0u8; bytes];
+                                    let mut enc_x = source.clone();
+                                    let mut enc_collapse = vec![0u8; 2 * NB_BANDS];
+                                    let mut enc_seed = 0x1234_5678u32;
+                                    let mut rdo = ThetaRdo::new();
+                                    let (enc_tell, enc_rng);
+                                    {
+                                        let mut enc = RangeEncoder::new(&mut buf);
+                                        let mut stereo = StereoBands {
+                                            band_energy: &band_energy,
+                                            intensity,
+                                            dual_stereo: dual,
+                                            complexity,
+                                            rdo: Some(&mut rdo),
+                                        };
+                                        quant_all_bands(
+                                            0,
+                                            NB_BANDS,
+                                            &mut enc_x,
+                                            frame,
+                                            Some(&mut stereo),
+                                            &mut enc_collapse,
+                                            &pulses,
+                                            short_blocks,
+                                            2,
+                                            &tf_res,
+                                            total_bits,
+                                            0,
+                                            lm,
+                                            NB_BANDS,
+                                            &mut enc_seed,
+                                            disable_inv,
+                                            &mut enc,
+                                        );
+                                        enc_tell = enc.tell_frac();
+                                        enc_rng = CeltCoder::rng(&enc);
+                                        enc.done();
+                                        assert!(!enc.error(), "encoder overflow");
+                                    }
+
+                                    let mut dec_x = vec![0f32; 2 * frame];
+                                    let mut dec_collapse = vec![0u8; 2 * NB_BANDS];
+                                    let mut dec_seed = 0x1234_5678u32;
+                                    let mut dec = RangeDecoder::new(&buf);
+                                    let mut stereo = StereoBands {
+                                        band_energy: &[],
+                                        intensity,
+                                        dual_stereo: dual,
+                                        complexity: 0,
+                                        rdo: None,
+                                    };
+                                    quant_all_bands(
+                                        0,
+                                        NB_BANDS,
+                                        &mut dec_x,
+                                        frame,
+                                        Some(&mut stereo),
+                                        &mut dec_collapse,
+                                        &pulses,
+                                        short_blocks,
+                                        2,
+                                        &tf_res,
+                                        total_bits,
+                                        0,
+                                        lm,
+                                        NB_BANDS,
+                                        &mut dec_seed,
+                                        disable_inv,
+                                        &mut dec,
+                                    );
+                                    let tag = format!(
+                                        "lm={lm} short={short_blocks} dual={dual} \
+                                         intensity={intensity} inv_off={disable_inv} \
+                                         complexity={complexity} bytes={bytes}"
+                                    );
+                                    assert_eq!(
+                                        dec.tell_frac(),
+                                        enc_tell,
+                                        "{tag}: tell_frac diverged"
+                                    );
+                                    assert_eq!(
+                                        CeltCoder::rng(&dec),
+                                        enc_rng,
+                                        "{tag}: final_range diverged"
+                                    );
+                                    // The encoder only masks `cm` down to `(1<<B)-1` when it
+                                    // resynthesises (`bands.c:1219` is inside the resynth block),
+                                    // and it only resynthesises for the theta trial. Elsewhere its
+                                    // masks are write-only — `lowband_offset` stays 0 without
+                                    // resynth, so nothing ever folds from them — so they are only
+                                    // comparable when the trial is on.
+                                    if complexity >= 8 && !dual {
+                                        assert_eq!(
+                                            dec_collapse, enc_collapse,
+                                            "{tag}: collapse masks diverged"
+                                        );
+                                    }
+                                    assert!(
+                                        dec_x.iter().all(|v| v.is_finite()),
+                                        "{tag}: non-finite reconstruction"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both stereo channels must actually be reconstructed — bit agreement alone would also hold
+    /// for a coder that dropped the side and duplicated the mid.
+    #[test]
+    fn quant_all_bands_stereo_reconstructs_both_channels() {
+        let lm = 3i32;
+        let m = 1usize << lm;
+        let frame = m * 120;
+        let bytes = 500usize;
+        let pulses: Vec<i32> = (0..NB_BANDS).map(|i| 900 - (i as i32) * 20).collect();
+        let tf_res = vec![0i32; NB_BANDS];
+        let total_bits = (bytes as i32) * (8 << BITRES);
+        let band_energy = synthetic_band_energy(1.0);
+        // Deliberately *uncorrelated* channels, so a mid-only reconstruction cannot pass.
+        let source = synthetic_stereo_spectrum(m, 0xBEEF, 0.0);
+
+        let mut buf = vec![0u8; bytes];
+        let mut enc_x = source.clone();
+        let mut enc_collapse = vec![0u8; 2 * NB_BANDS];
+        let mut enc_seed = 11u32;
+        {
+            let mut enc = RangeEncoder::new(&mut buf);
+            let mut stereo = StereoBands {
+                band_energy: &band_energy,
+                intensity: NB_BANDS,
+                dual_stereo: false,
+                complexity: 5,
+                rdo: None,
+            };
+            quant_all_bands(
+                0,
+                NB_BANDS,
+                &mut enc_x,
+                frame,
+                Some(&mut stereo),
+                &mut enc_collapse,
+                &pulses,
+                false,
+                2,
+                &tf_res,
+                total_bits,
+                0,
+                lm,
+                NB_BANDS,
+                &mut enc_seed,
+                false,
+                &mut enc,
+            );
+            enc.done();
+            assert!(!enc.error());
+        }
+        let mut dec_x = vec![0f32; 2 * frame];
+        let mut dec_collapse = vec![0u8; 2 * NB_BANDS];
+        let mut dec_seed = 11u32;
+        let mut dec = RangeDecoder::new(&buf);
+        let mut stereo = StereoBands {
+            band_energy: &[],
+            intensity: NB_BANDS,
+            dual_stereo: false,
+            complexity: 0,
+            rdo: None,
+        };
+        quant_all_bands(
+            0,
+            NB_BANDS,
+            &mut dec_x,
+            frame,
+            Some(&mut stereo),
+            &mut dec_collapse,
+            &pulses,
+            false,
+            2,
+            &tf_res,
+            total_bits,
+            0,
+            lm,
+            NB_BANDS,
+            &mut dec_seed,
+            false,
+            &mut dec,
+        );
+        let correlation = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(p, q)| p * q).sum();
+            let na = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if na * nb > 0.0 {
+                dot / (na * nb)
+            } else {
+                0.0
+            }
+        };
+        for i in 0..10 {
+            let lo = m * E_BANDS[i] as usize;
+            let hi = m * E_BANDS[i + 1] as usize;
+            let left = correlation(&source[lo..hi], &dec_x[lo..hi]);
+            let right = correlation(
+                &source[frame + lo..frame + hi],
+                &dec_x[frame + lo..frame + hi],
+            );
+            assert!(left > 0.5, "band {i}: left channel correlation {left}");
+            assert!(right > 0.5, "band {i}: right channel correlation {right}");
+        }
+    }
+
     /// The decoded spectrum must actually resemble the encoded one — bit agreement alone could be
     /// achieved by a stream that codes the wrong shapes.
     #[test]
     fn quant_all_bands_reconstruction_correlates_with_the_input() {
         let lm = 3i32;
         let m = 1usize << lm;
+        let frame = m * 120;
         let bytes = 400usize;
         let pulses: Vec<i32> = (0..NB_BANDS).map(|i| 700 - (i as i32) * 20).collect();
         let tf_res = vec![0i32; NB_BANDS];
         let total_bits = (bytes as i32) * (8 << BITRES);
-        let source = synthetic_normalised_spectrum(m, 0xC0DE);
+        let mut source = synthetic_normalised_spectrum(m, 0xC0DE);
+        source.resize(frame, 0.0);
 
         let mut buf = vec![0u8; bytes];
         let mut enc_x = source.clone();
@@ -1010,11 +1915,12 @@ mod tests {
                 0,
                 NB_BANDS,
                 &mut enc_x,
+                frame,
+                None,
                 &mut enc_collapse,
                 &pulses,
                 false,
                 2,
-                0,
                 &tf_res,
                 total_bits,
                 0,
@@ -1027,7 +1933,7 @@ mod tests {
             enc.done();
             assert!(!enc.error());
         }
-        let mut dec_x = vec![0f32; m * E_BANDS[NB_BANDS] as usize];
+        let mut dec_x = vec![0f32; frame];
         let mut dec_collapse = vec![0u8; NB_BANDS];
         let mut dec_seed = 7u32;
         let mut dec = RangeDecoder::new(&buf);
@@ -1035,11 +1941,12 @@ mod tests {
             0,
             NB_BANDS,
             &mut dec_x,
+            frame,
+            None,
             &mut dec_collapse,
             &pulses,
             false,
             2,
-            0,
             &tf_res,
             total_bits,
             0,

@@ -792,11 +792,12 @@ impl CeltEncoder {
             start,
             end,
             &mut x,
+            n,
+            None, // mono: `Y_ == NULL` in the C (celt_encoder.c:2238)
             &mut collapse_masks,
             &pulses,
             short_blocks,
             self.spread_decision,
-            intensity,
             &tf_res,
             band_total_bits,
             balance,

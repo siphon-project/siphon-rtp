@@ -412,11 +412,12 @@ impl CeltDecoder {
             start,
             end,
             x,
+            n,
+            None, // mono: `Y_ == NULL` in the C (celt_decoder.c:1272)
             &mut collapse_masks,
             &pulses,
             short_blocks,
             spread,
-            intensity,
             &tf_res,
             band_total_bits,
             balance,

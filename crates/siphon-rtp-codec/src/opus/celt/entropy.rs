@@ -14,12 +14,38 @@
 
 use crate::opus::celt::bands::isqrt32;
 use crate::opus::celt::vq::{alg_quant, alg_unquant};
-use crate::opus::range_coder::{RangeDecoder, RangeEncoder};
+use crate::opus::range_coder::{RangeDecoder, RangeDecoderState, RangeEncoder, RangeEncoderState};
 
 /// One side of the CELT entropy layer, as seen by the shared band-coding and allocation code.
 pub trait CeltCoder {
     /// `true` for the encoder, `false` for the decoder (libopus' `encode` flag).
     const ENCODE: bool;
+
+    /// Scalar snapshot of the coder state — everything libopus copies when it says
+    /// `ec_save = *ec` before a trial (`bands.c:1586`, `quant_bands.c:296`).
+    type State: Copy;
+
+    /// Snapshot the scalar state so a trial can be rolled back.
+    fn save_state(&self) -> Self::State;
+    /// Restore a [`Self::save_state`] snapshot.
+    ///
+    /// Together with [`Self::restore_bytes`] this must leave the coder observably identical to the
+    /// moment of the snapshot. For a decoder that is the whole job: its packet is immutable, so
+    /// rewinding the scalars *is* a complete rollback.
+    fn restore_state(&mut self, state: &Self::State);
+    /// Bytes the range coder has produced/consumed from the front of the buffer (libopus
+    /// `ec->offs`) — the low end of the byte range a trial can dirty.
+    fn coded_bytes(&self) -> usize;
+    /// The coder buffer's total size in bytes (libopus `ec->storage`) — the high end of that range,
+    /// because raw bits are written backwards from the very end.
+    fn buffer_len(&self) -> usize;
+    /// Copy the coded bytes from `from` to the end of the buffer into `out`, returning how many
+    /// were written. A decoder never writes to its packet, so it has nothing to snapshot and
+    /// answers 0.
+    fn snapshot_bytes(&self, from: usize, out: &mut [u8]) -> usize;
+    /// Put back bytes captured by [`Self::snapshot_bytes`]. Writing nothing is the correct and
+    /// complete answer for a coder whose buffer is read-only.
+    fn restore_bytes(&mut self, from: usize, bytes: &[u8]);
 
     /// Bits consumed/produced so far, rounded up (libopus `ec_tell`).
     fn tell(&self) -> i32;
@@ -76,6 +102,37 @@ fn theta_step_range(x: i32, x0: i32, p0: i32) -> (i32, i32) {
 
 impl CeltCoder for RangeEncoder<'_> {
     const ENCODE: bool = true;
+    type State = RangeEncoderState;
+
+    fn save_state(&self) -> Self::State {
+        RangeEncoder::save_state(self)
+    }
+    fn restore_state(&mut self, state: &Self::State) {
+        RangeEncoder::restore_state(self, state);
+    }
+    fn coded_bytes(&self) -> usize {
+        self.range_bytes() as usize
+    }
+    fn buffer_len(&self) -> usize {
+        (self.storage_bits() / 8) as usize
+    }
+    fn snapshot_bytes(&self, from: usize, out: &mut [u8]) -> usize {
+        let buffer = self.buffer();
+        let end = buffer.len().min(from + out.len());
+        if from >= end {
+            return 0;
+        }
+        let count = end - from;
+        out[..count].copy_from_slice(&buffer[from..end]);
+        count
+    }
+    fn restore_bytes(&mut self, from: usize, bytes: &[u8]) {
+        let buffer = self.buffer_mut();
+        let end = buffer.len().min(from + bytes.len());
+        if from < end {
+            buffer[from..end].copy_from_slice(&bytes[..end - from]);
+        }
+    }
 
     fn tell(&self) -> i32 {
         RangeEncoder::tell(self)
@@ -142,6 +199,32 @@ impl CeltCoder for RangeEncoder<'_> {
 
 impl CeltCoder for RangeDecoder<'_> {
     const ENCODE: bool = false;
+    type State = RangeDecoderState;
+
+    fn save_state(&self) -> Self::State {
+        RangeDecoder::save_state(self)
+    }
+    fn restore_state(&mut self, state: &Self::State) {
+        RangeDecoder::restore_state(self, state);
+    }
+    fn coded_bytes(&self) -> usize {
+        self.range_bytes() as usize
+    }
+    fn buffer_len(&self) -> usize {
+        (self.storage_bits() / 8) as usize
+    }
+    /// Nothing to snapshot: the packet a decoder reads is immutable, so no trial can dirty it and
+    /// rewinding the scalar state via [`CeltCoder::restore_state`] is already a complete rollback.
+    fn snapshot_bytes(&self, _from: usize, _out: &mut [u8]) -> usize {
+        0
+    }
+    /// Counterpart of the above: there is nothing to put back.
+    fn restore_bytes(&mut self, _from: usize, bytes: &[u8]) {
+        debug_assert!(
+            bytes.is_empty(),
+            "a decoder never snapshots bytes, so it can never be asked to restore any"
+        );
+    }
 
     fn tell(&self) -> i32 {
         RangeDecoder::tell(self)
