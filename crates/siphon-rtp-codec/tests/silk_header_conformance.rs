@@ -251,7 +251,10 @@ fn parse_trace(text: &str) -> Result<BTreeMap<usize, Vec<TraceEvent>>, String> {
                     gains_q16,
                 }
             }
-            other => return Err(format!("unknown trace event {other}")),
+            // A later sub-phase adds its own field groups to the same dump (the instrumented
+            // build is one shared patch). An event this harness does not consume is not an
+            // error — it is a field group belonging to a phase that lives elsewhere.
+            _ => continue,
         };
         packets.entry(index).or_default().push(event);
     }
