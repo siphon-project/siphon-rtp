@@ -64,6 +64,14 @@ test = false
 doc = false
 bench = false
 
+# RFC 8445 §7.2/§7.3 — the ICE agent's datagram ingest (checks, responses, role conflict, prflx).
+[[bin]]
+name = "ice_agent_fuzz"
+path = "fuzz_targets/ice_agent_fuzz.rs"
+test = false
+doc = false
+bench = false
+
 # RFC 8839 §5.1/§5.6 — ICE candidate + ice-options grammar off a peer's SDP.
 [[bin]]
 name = "ice_candidate_fuzz"
