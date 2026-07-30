@@ -140,6 +140,7 @@ pub mod fixed;
 pub mod frame_type;
 pub mod gains;
 pub mod header;
+pub mod lpc;
 pub mod nlsf_tables;
 pub mod stereo_pred;
 pub mod tables;

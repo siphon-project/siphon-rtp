@@ -94,6 +94,129 @@ pub fn limit_int(value: i32, lower: i32, upper: i32) -> i32 {
     value.clamp(lower, upper)
 }
 
+/// `silk_SMULWW(a32, b32)` — `(a32 * b32) >> 16` (`macros.h:86`). Unlike [`smulwb`] neither operand
+/// is narrowed, so the full 64-bit product is shifted; the result is a floor.
+#[inline]
+#[must_use]
+pub fn smulww(a32: i32, b32: i32) -> i32 {
+    ((i64::from(a32) * i64::from(b32)) >> 16) as i32
+}
+
+/// `silk_SMMUL(a32, b32)` — `(a32 * b32) >> 32` (`SigProc_FIX.h:610`), i.e. the signed high word of
+/// the product.
+#[inline]
+#[must_use]
+pub fn smmul(a32: i32, b32: i32) -> i32 {
+    ((i64::from(a32) * i64::from(b32)) >> 32) as i32
+}
+
+/// `silk_RSHIFT_ROUND(a, shift)` (`SigProc_FIX.h:531`) — right shift with round-half-up.
+///
+/// The C spells it `((a) >> ((shift) - 1)) + 1) >> 1`, which rounds ties **towards +infinity**, not
+/// away from zero. That asymmetry is observable in the Q12 LPC coefficients, so it is reproduced
+/// exactly rather than replaced with a "nicer" rounding. `shift` must be >= 1, as the macro says.
+#[inline]
+#[must_use]
+pub fn rshift_round(a: i32, shift: u32) -> i32 {
+    debug_assert!(shift >= 1, "silk: RSHIFT_ROUND needs shift >= 1");
+    if shift == 1 {
+        (a >> 1) + (a & 1)
+    } else {
+        ((a >> (shift - 1)) + 1) >> 1
+    }
+}
+
+/// `silk_RSHIFT_ROUND64(a, shift)` (`SigProc_FIX.h:532`) — [`rshift_round`] on a 64-bit value.
+#[inline]
+#[must_use]
+pub fn rshift_round64(a: i64, shift: u32) -> i64 {
+    debug_assert!(shift >= 1, "silk: RSHIFT_ROUND64 needs shift >= 1");
+    if shift == 1 {
+        (a >> 1) + (a & 1)
+    } else {
+        ((a >> (shift - 1)) + 1) >> 1
+    }
+}
+
+/// `silk_SAT16(a)` (`SigProc_FIX.h:474`) — saturate to `i16`.
+#[inline]
+#[must_use]
+pub fn sat16(a: i32) -> i16 {
+    a.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
+/// `silk_ADD_SAT16(a, b)` (`SigProc_FIX.h:483`) — add in 32 bits, then saturate to `i16`.
+#[inline]
+#[must_use]
+pub fn add_sat16(a: i16, b: i16) -> i16 {
+    sat16(i32::from(a) + i32::from(b))
+}
+
+/// `silk_LSHIFT_SAT32(a, shift)` (`SigProc_FIX.h:514`) — clamp so the left shift cannot overflow,
+/// **then** shift. Note the C clamps against `int32_MIN >> shift` / `int32_MAX >> shift`, so this is
+/// not the same as shifting and saturating afterwards.
+#[inline]
+#[must_use]
+pub fn lshift_sat32(a: i32, shift: u32) -> i32 {
+    let lower = i32::MIN >> shift;
+    let upper = i32::MAX >> shift;
+    a.clamp(lower, upper) << shift
+}
+
+/// `silk_SUB_SAT32(a, b)` (`macros.h:103`) — subtract, saturating at the `i32` bounds.
+#[inline]
+#[must_use]
+pub fn sub_sat32(a: i32, b: i32) -> i32 {
+    a.saturating_sub(b)
+}
+
+/// `silk_abs(a)` (`SigProc_FIX.h:588`) — magnitude, wrapping at `i32::MIN` exactly as the C macro
+/// does. The C carries its own warning about that case; the callers here bound their input first.
+#[inline]
+#[must_use]
+pub fn abs_wrapping(a: i32) -> i32 {
+    if a > 0 {
+        a
+    } else {
+        a.wrapping_neg()
+    }
+}
+
+/// `silk_INVERSE32_varQ(b32, Qres)` (`Inlines.h:143-182`) — `(1 << Qres) / b32` to about 30 bits of
+/// precision, without a divide in the inner loop.
+///
+/// Only ever called with a strictly positive `b32` on the decode path (`LPC_inv_pred_gain.c:76`
+/// passes `rc_mult1_Q30`, which the C asserts is in `(1<<15, 1<<30]`), so a zero denominator returns
+/// 0 rather than reproducing the C's `silk_assert`.
+#[inline]
+#[must_use]
+pub fn inverse32_var_q(b32: i32, q_result: i32) -> i32 {
+    if b32 == 0 {
+        return 0;
+    }
+    // silk_CLZ32( silk_abs(b32) ) - 1.
+    let head_room = (b32.unsigned_abs().leading_zeros() as i32) - 1;
+    let b32_normalized = ((b32 as u32) << head_room) as i32;
+    // Inverse of b32 with 14 bits of precision.
+    let b32_inverse = (i32::MAX >> 2) / (b32_normalized >> 16);
+    let mut result = ((b32_inverse as u32) << 16) as i32;
+    // One Newton refinement: err = 1 - b32_nrm * b32_inv, in Q32.
+    let error_q32 = ((1i32 << 29).wrapping_sub(smulwb(b32_normalized, b32_inverse)) as u32) << 3;
+    let error_q32 = error_q32 as i32;
+    // silk_SMLAWW( result, err_Q32, b32_inv ) = result + ((err * inv) >> 16).
+    result = result.wrapping_add(smulww(error_q32, b32_inverse));
+
+    let left_shift = 61 - head_room - q_result;
+    if left_shift <= 0 {
+        lshift_sat32(result, (-left_shift) as u32)
+    } else if left_shift < 32 {
+        result >> left_shift
+    } else {
+        // "Avoid undefined result" (Inlines.h:178-180).
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +341,127 @@ mod tests {
         assert_eq!(limit_int(70, 0, 63), 63);
         assert_eq!(limit_int(31, 0, 63), 31);
         assert_eq!(limit_int(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn smulww_shifts_the_full_product() {
+        assert_eq!(smulww(65536, 65536), 65536);
+        assert_eq!(smulww(1, 1), 0, "floors");
+        assert_eq!(smulww(-1, 1), -1, "floor(-1/65536) = -1");
+        // Neither operand is narrowed, unlike smulwb: 0x1_0001 stays 65537 here.
+        assert_eq!(smulww(65536, 0x1_0001), 0x1_0001);
+        assert_eq!(smulwb(65536, 0x1_0001), 1);
+        // The bwexpander chirp update: chirp_Q16 * ar in Q16.
+        assert_eq!(smulww(65_470, 1 << 20), 1_047_520);
+    }
+
+    #[test]
+    fn smmul_is_the_signed_high_word() {
+        assert_eq!(smmul(1 << 16, 1 << 16), 1);
+        assert_eq!(smmul(i32::MAX, i32::MAX), 1_073_741_823);
+        assert_eq!(smmul(1, 1), 0);
+        assert_eq!(smmul(-(1 << 16), 1 << 16), -1);
+    }
+
+    /// The C rounds ties **up**, not away from zero: `-3 >> 1` with rounding is -1, not -2.
+    #[test]
+    fn rshift_round_rounds_ties_upward() {
+        assert_eq!(rshift_round(4, 1), 2);
+        assert_eq!(rshift_round(3, 1), 2);
+        assert_eq!(rshift_round(-3, 1), -1, "ties round towards +infinity");
+        assert_eq!(rshift_round(-4, 1), -2);
+        assert_eq!(rshift_round(5, 2), 1);
+        assert_eq!(rshift_round(6, 2), 2, "6/4 = 1.5 rounds to 2");
+        assert_eq!(rshift_round(-6, 2), -1, "-1.5 rounds to -1, not -2");
+        assert_eq!(rshift_round(0, 5), 0);
+    }
+
+    /// The 64-bit form must agree with the 32-bit one everywhere the 32-bit one is defined.
+    #[test]
+    fn rshift_round64_matches_the_32_bit_form() {
+        for value in [
+            -1000i32,
+            -7,
+            -4,
+            -3,
+            -1,
+            0,
+            1,
+            3,
+            4,
+            7,
+            1000,
+            i32::MAX,
+            i32::MIN,
+        ] {
+            for shift in 1..=16u32 {
+                assert_eq!(
+                    i64::from(rshift_round(value, shift)),
+                    rshift_round64(i64::from(value), shift),
+                    "value {value}, shift {shift}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saturation_helpers_clamp_at_the_int16_bounds() {
+        assert_eq!(sat16(32_767), 32_767);
+        assert_eq!(sat16(32_768), 32_767);
+        assert_eq!(sat16(-32_768), -32_768);
+        assert_eq!(sat16(-32_769), -32_768);
+        assert_eq!(sat16(i32::MAX), 32_767);
+        assert_eq!(
+            add_sat16(32_000, 1_000),
+            32_767,
+            "adds in 32 bits, then saturates"
+        );
+        assert_eq!(add_sat16(-32_000, -1_000), -32_768);
+        assert_eq!(add_sat16(100, 200), 300);
+    }
+
+    /// `silk_LSHIFT_SAT32` clamps *before* shifting, which is not the same as shifting then
+    /// saturating — the difference is exactly what stops the shift from overflowing.
+    #[test]
+    fn lshift_sat32_clamps_before_shifting() {
+        assert_eq!(lshift_sat32(1, 4), 16);
+        assert_eq!(lshift_sat32(i32::MAX, 1), (i32::MAX >> 1) << 1);
+        assert_eq!(lshift_sat32(i32::MIN, 1), (i32::MIN >> 1) << 1);
+        assert_eq!(lshift_sat32(-3, 2), -12);
+        assert_eq!(lshift_sat32(7, 0), 7);
+    }
+
+    /// `silk_INVERSE32_varQ` against exact division. libopus documents ~14 bits refined to ~30, so
+    /// require a relative error well inside 2^-20 over the domain the LPC stability check uses
+    /// (`rc_mult1_Q30` in (2^15, 2^30]).
+    #[test]
+    fn inverse32_var_q_approximates_the_reciprocal() {
+        for denominator in [
+            1i32 << 16,
+            (1 << 20) + 12_345,
+            1 << 25,
+            (1 << 29) + 7,
+            1 << 30,
+        ] {
+            for q_result in [40i32, 45, 50, 55] {
+                let approximation = f64::from(inverse32_var_q(denominator, q_result));
+                let exact = 2f64.powi(q_result) / f64::from(denominator);
+                if exact > f64::from(i32::MAX) {
+                    continue; // Saturates; the exact value is not representable.
+                }
+                assert!(
+                    (approximation - exact).abs() <= exact / 1_000_000.0 + 1.0,
+                    "1/{denominator} in Q{q_result}: {approximation} vs {exact}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inverse32_var_q_guard_rails() {
+        assert_eq!(inverse32_var_q(0, 30), 0, "no divide by zero");
+        // 61 - head_room - Qres >= 32 means the result would underflow to nothing.
+        assert_eq!(inverse32_var_q(1 << 30, 1), 0);
     }
 
     proptest! {
