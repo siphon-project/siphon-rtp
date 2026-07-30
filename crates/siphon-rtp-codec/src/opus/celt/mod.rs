@@ -16,11 +16,13 @@
 //! (neural PLC) paths are not part of RFC 6716 and are omitted.
 
 pub mod anti_collapse;
+pub mod band_analysis;
 pub mod band_decode;
 pub mod bands;
 pub mod decoder;
 pub mod energy;
 pub mod laplace;
+pub mod mathops;
 pub mod mdct;
 pub mod postfilter;
 pub mod pvq;
