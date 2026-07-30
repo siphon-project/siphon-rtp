@@ -51,8 +51,19 @@ const NARROWBAND_RATE_HZ: u32 = 8_000;
 const ROOM_FRAME: usize = (ROOM_RATE_HZ as usize / 1000) * 20;
 /// The room playout tick — one mixed frame per participant per 20 ms (RFC 3551 default ptime).
 pub const ROOM_TICK: std::time::Duration = std::time::Duration::from_millis(20);
-/// Largest decoded native frame the scratch buffers accommodate (48 kHz × 40 ms ceiling).
-const MAX_NATIVE_FRAME: usize = 1920;
+/// Samples **per channel** in the longest decoded native frame the scratch buffers accommodate:
+/// 48 kHz (Opus full-band, RFC 7587 §4.1) × 120 ms (the RFC 7587 §6.1 `maxptime` ceiling, which is
+/// also the longest audio one RFC 6716 §3.2 code-3 packet can carry) = 5760.
+const MAX_NATIVE_SAMPLES: usize =
+    48_000 / 1000 * siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS as usize;
+/// Audio channels in the longest decoded frame — an Opus RTP stream is mono or stereo (RFC 7587 §6.1);
+/// multistream / surround (RFC 7845) is out of scope and every other codec is mono.
+const MAX_NATIVE_CHANNELS: usize = 2;
+/// Largest decoded native frame the scratch buffers accommodate, in **interleaved `i16` values**
+/// (5760 × 2 = 11520 — see the channel contract in `siphon_rtp_codec`). A multi-channel participant's
+/// frame is folded to mono immediately after decode, so every buffer downstream of `native_in` is
+/// bounded by [`MAX_NATIVE_SAMPLES`].
+const MAX_NATIVE_FRAME: usize = MAX_NATIVE_SAMPLES * MAX_NATIVE_CHANNELS;
 /// Largest egress RTP packet.
 const MAX_RTP: usize = 1500;
 /// Jitter buffer: prime at 2 frames (~40 ms), cap at 16 (bounded playout latency).
@@ -142,7 +153,14 @@ struct Participant {
     /// This participant's codec sample rate, kept so its resamplers can be rebuilt if the room rate
     /// flips (e.g. a wideband leg joins an all-narrowband room).
     native_rate: u32,
+    /// Samples **per channel** in one of this participant's decoded frames — the room-row / egress
+    /// frame length, and the length its resamplers work in. For a mono participant (everything but a
+    /// stereo Opus leg) it is also the decoder's whole output count.
     native_frame: usize,
+    /// Audio channels this participant's decoder emits (interleaved). > 1 only for a stereo Opus
+    /// ingress (RFC 7587 §6.1 `sprop-stereo=1`); the decoded frame is folded to mono before it enters
+    /// the room, since the mix bus and both resamplers are single-channel.
+    native_channels: u8,
     /// The egress RTP payload type (the participant's codec PT) — the shared-encode class key.
     egress_payload_type: u8,
     /// This participant's codec for the G.107 MOS estimate (resolved at join from the encoding name).
@@ -316,9 +334,19 @@ impl Conference {
         {
             return false;
         }
-        let native_rate = config.decoder.params().sample_rate_hz;
-        let native_frame = config.decoder.frame_samples();
-        if native_frame == 0 || native_frame > MAX_NATIVE_FRAME {
+        let native_params = config.decoder.params();
+        let native_rate = native_params.sample_rate_hz;
+        let native_channels = native_params.channels.max(1);
+        // `Decoder::frame_samples` is the interleaved value count (the channel contract in
+        // `siphon_rtp_codec`); the room works in per-channel samples, since a multi-channel frame is
+        // folded to mono on the way in. Bound the *interleaved* count against the scratch capacity —
+        // that is the buffer `next_pcm` decodes into.
+        let native_values = config.decoder.frame_samples();
+        if native_values == 0 || native_values > MAX_NATIVE_FRAME {
+            return false;
+        }
+        let native_frame = native_values / native_channels as usize;
+        if native_frame == 0 {
             return false;
         }
         let stateless = config.encoder.is_stateless();
@@ -344,6 +372,7 @@ impl Conference {
             reverse_latch: SymmetricLatch::default(),
             native_rate,
             native_frame,
+            native_channels,
             egress_payload_type,
             mos_codec: config.mos_codec,
             stateless,
@@ -638,8 +667,18 @@ impl Conference {
             self.roles[index] = self.participants[index].routing.role;
             let produced = {
                 let participant = &mut self.participants[index];
+                let channels = participant.native_channels;
                 match participant.leg.next_pcm(&mut self.native_in) {
-                    Ok(PcmFrame::Decoded(samples) | PcmFrame::Concealed(samples)) => Some(samples),
+                    Ok(PcmFrame::Decoded(values) | PcmFrame::Concealed(values)) => {
+                        // Fold a multi-channel decoded frame to mono at the codec boundary: the mix
+                        // bus, both resamplers, and the VAD are all single-channel. A no-op for every
+                        // mono participant, and driven by the channel count rather than the codec's
+                        // identity (the channel contract in `siphon_rtp_codec`).
+                        Some(siphon_rtp_codec::downmix_to_mono(
+                            &mut self.native_in[..values],
+                            channels,
+                        ))
+                    }
                     Ok(PcmFrame::Starved) | Err(_) => None,
                 }
             };
@@ -1435,6 +1474,7 @@ mod tests {
     use super::*;
     use siphon_rtp_codec::g711::G711;
     use siphon_rtp_media::rtp::{write_packet, RtpHeader};
+    use std::sync::{Arc, Mutex};
 
     const PCMU: u8 = 0;
 
@@ -1478,6 +1518,191 @@ mod tests {
         let written = write_packet(&header, &payload[..len], &mut buffer).expect("write");
         buffer.truncate(written);
         buffer
+    }
+
+    /// A 48 kHz / 20 ms decoder over `channels` interleaved channels — a stand-in for an Opus ingress
+    /// (RFC 7587 §4.1 clocks Opus at 48 kHz; §6.1 makes the stream mono or stereo), with none of the
+    /// codec. One payload byte expands to a whole frame: channel 0 carries `+base`, channel 1 carries
+    /// `-base`, so a correct stereo→mono fold is exactly 0 and a missing one is not.
+    struct Wideband48Decoder {
+        channels: u8,
+    }
+
+    impl Wideband48Decoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            siphon_rtp_codec::CodecParams {
+                sample_rate_hz: 48_000,
+                channels: self.channels,
+                ptime_ms: 20,
+            }
+        }
+    }
+
+    impl Decoder for Wideband48Decoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            Wideband48Decoder::params(self)
+        }
+        fn frame_samples(&self) -> usize {
+            Wideband48Decoder::params(self).frame_values()
+        }
+        fn decode(
+            &mut self,
+            payload: &[u8],
+            out: &mut [i16],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            let values = Wideband48Decoder::params(self).frame_values();
+            if out.len() < values {
+                return Err(siphon_rtp_codec::CodecError::OutputTooSmall {
+                    needed: values,
+                    have: out.len(),
+                });
+            }
+            let base = i16::from(*payload.first().unwrap_or(&0)) * 100;
+            for (index, sample) in out[..values].iter_mut().enumerate() {
+                *sample = if index % self.channels as usize == 0 {
+                    base
+                } else {
+                    -base
+                };
+            }
+            Ok(values)
+        }
+        fn conceal(&mut self, out: &mut [i16]) -> Result<usize, siphon_rtp_codec::CodecError> {
+            let values = Wideband48Decoder::params(self).frame_values();
+            out[..values].fill(0);
+            Ok(values)
+        }
+    }
+
+    /// The mono 48 kHz egress half of the fixture — what the engine encodes toward a wideband
+    /// participant (`CodecSpec::encode_channels` is always 1). Records each PCM frame it is handed.
+    struct Wideband48Encoder {
+        encoded: Arc<Mutex<Vec<Vec<i16>>>>,
+    }
+
+    impl Encoder for Wideband48Encoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            siphon_rtp_codec::CodecParams {
+                sample_rate_hz: 48_000,
+                channels: 1,
+                ptime_ms: 20,
+            }
+        }
+        fn frame_samples(&self) -> usize {
+            960
+        }
+        fn encode(
+            &mut self,
+            pcm: &[i16],
+            out: &mut [u8],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            if pcm.len() != 960 {
+                return Err(siphon_rtp_codec::CodecError::BadFrameSize {
+                    expected: 960,
+                    got: pcm.len(),
+                });
+            }
+            if let Ok(mut log) = self.encoded.lock() {
+                log.push(pcm.to_vec());
+            }
+            out[0] = 0x42;
+            Ok(1)
+        }
+    }
+
+    /// A [`Wideband48Decoder`]/[`Wideband48Encoder`] participant, plus its egress PCM log.
+    fn wideband_config(
+        index: usize,
+        channels: u8,
+        source_ip: &str,
+        dst: &str,
+    ) -> (ParticipantConfig, Arc<Mutex<Vec<Vec<i16>>>>) {
+        let encoded = Arc::new(Mutex::new(Vec::new()));
+        let config = ParticipantConfig {
+            tag: format!("wideband-{index}"),
+            decoder: Box::new(Wideband48Decoder { channels }),
+            encoder: Box::new(Wideband48Encoder {
+                encoded: encoded.clone(),
+            }),
+            ingress_endpoint: EndpointId(index as u64 + 1),
+            egress_endpoint: EndpointId(index as u64 + 1),
+            egress_dst: addr(dst),
+            accepted_source: SourceFilter::Exact(source_ip.parse().expect("ip")),
+            latch: false,
+            egress_ssrc: 0xD000_0000 + index as u32,
+            egress_payload_type: 111,
+            mos_codec: siphon_rtp_hep::mos::Codec::Opus,
+            telephone_event_in: None,
+            secure: None,
+            routing: Routing::default(),
+        };
+        (config, encoded)
+    }
+
+    #[test]
+    fn a_long_frame_wideband_participant_is_seated_not_rejected() {
+        // 48 kHz × 60 ms = 2880 samples and × 120 ms = 5760 both exceeded the old 1920-sample scratch
+        // ceiling, so `add_participant` declined the participant outright (RFC 7587 §6.1 allows ptime
+        // up to 120 ms; RFC 6716 §3.2 packets carry up to 120 ms regardless).
+        for ptime_ms in [20u8, 40, 60, 120] {
+            let mut room = Conference::new(format!("room-{ptime_ms}"), DEFAULT_TOP_M);
+            let config = ParticipantConfig {
+                decoder: Box::new(siphon_rtp_codec::l16::L16::new(48_000, ptime_ms)),
+                encoder: Box::new(siphon_rtp_codec::l16::L16::new(48_000, ptime_ms)),
+                ..ulaw_config(0, "127.0.0.2", "127.0.0.2:5000")
+            };
+            assert!(
+                room.add_participant(config),
+                "{ptime_ms} ms / 48 kHz participant must be seated"
+            );
+            assert_eq!(
+                room.participants[0].native_frame,
+                48 * usize::from(ptime_ms),
+                "{ptime_ms} ms native frame"
+            );
+            assert_eq!(room.participants[0].native_channels, 1);
+        }
+    }
+
+    #[test]
+    fn a_stereo_participant_is_folded_into_the_mono_room() {
+        // A multi-channel decoder hands back interleaved PCM (the channel contract in
+        // `siphon_rtp_codec`); the mix bus and both resamplers are single-channel, so the frame is
+        // folded once, on the way in. `native_frame` is the per-channel count, not the value count.
+        let mut room = Conference::new("stereo-room".to_string(), DEFAULT_TOP_M);
+        let (config, encoded) = wideband_config(0, 2, "127.0.0.2", "127.0.0.2:5000");
+        assert!(room.add_participant(config), "stereo participant is seated");
+        assert_eq!(room.participants[0].native_channels, 2);
+        assert_eq!(
+            room.participants[0].native_frame, 960,
+            "20 ms at 48 kHz, per channel — not the 1920 interleaved values"
+        );
+
+        // Drive two ticks' worth of ingress, then tick past the jitter-buffer prime.
+        let mut out = Vec::new();
+        for sequence in 0..4u16 {
+            let header = RtpHeader {
+                marker: false,
+                payload_type: 111,
+                sequence,
+                timestamp: u32::from(sequence) * 960,
+                ssrc: 0x0111_0111,
+            };
+            let mut buffer = vec![0u8; 13];
+            let written = write_packet(&header, &[5u8], &mut buffer).expect("write");
+            buffer.truncate(written);
+            assert!(room.ingest(&rx(1, "127.0.0.2:5000", buffer)));
+        }
+        for _ in 0..4 {
+            room.tick(&mut out);
+        }
+        // The egress encoder is mono and only ever sees 960-sample frames — the fold happened before
+        // the room row, so a stereo ingress never leaks its interleaving into the mix.
+        let log = encoded.lock().expect("log");
+        assert!(!log.is_empty(), "the room must have encoded toward the leg");
+        for pcm in log.iter() {
+            assert_eq!(pcm.len(), 960);
+        }
     }
 
     fn rx(endpoint: u64, source: &str, data: Vec<u8>) -> RxPacket {

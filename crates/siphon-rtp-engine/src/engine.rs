@@ -290,6 +290,17 @@ fn codec_snapshot(codec: &CodecSpec) -> crate::ha::CodecSnapshot {
         channels: codec.channels,
         ptime_ms: codec.ptime_ms,
         encode_mode: codec.encode_mode,
+        allowed_modes: codec.allowed_modes.clone(),
+        opus: codec.opus.map(|params| crate::ha::OpusSnapshot {
+            max_average_bitrate: params.max_average_bitrate,
+            max_playback_rate_hz: params.max_playback_rate_hz,
+            max_ptime_ms: params.max_ptime_ms,
+            stereo: params.stereo,
+            sprop_stereo: params.sprop_stereo,
+            cbr: params.cbr,
+            use_inband_fec: params.use_inband_fec,
+            use_dtx: params.use_dtx,
+        }),
     }
 }
 
@@ -303,6 +314,21 @@ fn restore_codec(snapshot: &crate::ha::CodecSnapshot) -> CodecSpec {
         snapshot.ptime_ms,
     )
     .with_encode_mode(snapshot.encode_mode)
+    .with_allowed_modes(snapshot.allowed_modes.clone())
+    .with_opus_params(
+        snapshot
+            .opus
+            .map(|params| siphon_rtp_codec::factory::OpusParams {
+                max_average_bitrate: params.max_average_bitrate,
+                max_playback_rate_hz: params.max_playback_rate_hz,
+                max_ptime_ms: params.max_ptime_ms,
+                stereo: params.stereo,
+                sprop_stereo: params.sprop_stereo,
+                cbr: params.cbr,
+                use_inband_fec: params.use_inband_fec,
+                use_dtx: params.use_dtx,
+            }),
+    )
 }
 
 /// Map an SDES [`CryptoAttribute`] to its snapshot (suite name + hex key material).
@@ -5105,23 +5131,47 @@ fn with_ptime_override(codec: &CodecSpec, override_ms: Option<u8>) -> CodecSpec 
     }
 }
 
+/// A conventional dynamic RTP payload type for Opus. Not registered — RFC 7587 §7 makes Opus a
+/// dynamic payload type — but 111 is what WebRTC endpoints offer in practice, so using it keeps the
+/// engine's offer familiar to the peers most likely to answer it. Distinct from the 96 the other
+/// dynamic entries in [`transcode_codec_spec`] use, so an offer can carry both.
+const OPUS_DYNAMIC_PAYLOAD_TYPE: u8 = 111;
+
 /// Map a `codec-transcode-<NAME>` target to a [`CodecSpec`] the engine can both advertise and
 /// **encode** (so the forced transcode does not fail at answer). Static codecs use their RFC 3551
-/// payload type; dynamic ones use a conventional number. `None` for an unknown or not-yet-encodable
-/// codec (e.g. AMR-NB, whose encoder is WIP; or AMR-WB without the `amr` build feature) — skipped.
+/// payload type; dynamic ones use a conventional number.
+///
+/// `None` for an unknown name, and — crucially — for a *known* name the codec factory cannot actually
+/// build an encoder for. That is enforced by probing [`factory::encoder_for`] rather than by a
+/// hand-maintained list, so this table can never drift into advertising a transcode target that fails
+/// at answer: AMR-WB without the `amr` build feature, or Opus before its encoder lands, simply drop
+/// out, and light up on their own once the factory can serve them.
 fn transcode_codec_spec(name: &str) -> Option<CodecSpec> {
     let upper = name.to_ascii_uppercase();
-    let (payload_type, clock_rate_hz) = match upper.as_str() {
-        "PCMU" => (0u8, 8000u32),
-        "PCMA" => (8, 8000),
-        "G722" => (9, 8000),
-        "GSM" => (3, 8000),
-        "G726-32" => (96, 8000),
+    // (payload type, RTP clock, rtpmap channels, ptime): the last two are per-codec, not universal —
+    // Opus signals `opus/48000/2` (RFC 7587 §7) even for a mono stream.
+    let (payload_type, clock_rate_hz, channels, ptime_ms) = match upper.as_str() {
+        "PCMU" => (0u8, 8000u32, 1u8, 20u8),
+        "PCMA" => (8, 8000, 1, 20),
+        "G722" => (9, 8000, 1, 20),
+        "GSM" => (3, 8000, 1, 20),
+        "G726-32" => (96, 8000, 1, 20),
         #[cfg(feature = "amr")]
-        "AMR-WB" => (96, 16000),
+        "AMR-WB" => (96, 16000, 1, 20),
+        // RFC 7587: 48 kHz clock (§4.1), rtpmap channel count 2 (§7 — normalised by `CodecSpec::new`
+        // regardless), 20 ms default ptime (§6.1). The engine's egress is mono, declared as
+        // `sprop-stereo=0` by `sdp::egress_fmtp_line`.
+        "OPUS" => (
+            OPUS_DYNAMIC_PAYLOAD_TYPE,
+            siphon_rtp_codec::factory::OPUS_CLOCK_RATE_HZ,
+            siphon_rtp_codec::factory::OPUS_RTPMAP_CHANNELS,
+            20,
+        ),
         _ => return None,
     };
-    Some(CodecSpec::new(payload_type, &upper, clock_rate_hz, 1, 20))
+    let spec = CodecSpec::new(payload_type, &upper, clock_rate_hz, channels, ptime_ms);
+    // Advertise only what we can genuinely encode — see the doc comment.
+    factory::encoder_for(&spec).is_ok().then_some(spec)
 }
 
 /// The far-leg engine endpoint address family requested by the rtpengine `address family` flag
@@ -5467,12 +5517,8 @@ fn subscriber_offer_sdp(
         port = local_addr.port(),
         name = codec.encoding_name,
         clock = codec.clock_rate_hz,
-        // RFC 4566 §6: the optional /channels suffix is emitted only for multi-channel codecs.
-        channels = if codec.channels > 1 {
-            format!("/{}", codec.channels)
-        } else {
-            String::new()
-        },
+        // RFC 4566 §6 / RFC 7587 §7 — the one shared rule for the optional /channels suffix.
+        channels = sdp::rtpmap_channel_suffix(codec),
     );
     sdp
 }
@@ -5688,6 +5734,13 @@ fn engine_version() -> &'static str {
 /// dispatcher only routes a call to a node that can serve its codec. The always-available set (pure
 /// relay + the bit-exact pure-Rust codecs) plus the AMR family under the `amr` build feature — kept
 /// in step with `factory::encoder_for`.
+///
+/// Opus is **not** in the static list and carries no build feature (it is royalty-free —
+/// docs/codec-licensing.md). It is added only when the codec factory can build **both** a decoder and
+/// an encoder for it, probed at runtime by [`opus_is_transcodable`]. The list has no per-direction
+/// field, so advertising Opus while only one direction worked would let a dispatcher route a call the
+/// engine then fails at setup; requiring both keeps the advertisement honest and needs no further edit
+/// when the codec lands.
 fn supported_codecs() -> Vec<String> {
     let base = [
         "PCMU",
@@ -5704,10 +5757,30 @@ fn supported_codecs() -> Vec<String> {
     let extra: &[&str] = &["AMR-WB", "AMR"];
     #[cfg(not(feature = "amr"))]
     let extra: &[&str] = &[];
+    let opus: &[&str] = if opus_is_transcodable() {
+        &["opus"]
+    } else {
+        &[]
+    };
     base.iter()
         .chain(extra.iter())
+        .chain(opus.iter())
         .map(|name| (*name).to_string())
         .collect()
+}
+
+/// Whether this build can transcode Opus in **both** directions — i.e. whether `factory` yields both a
+/// decoder and an encoder for an RFC 7587 Opus spec. Probed rather than assumed so the capability
+/// advertisement cannot drift from the factory (see [`supported_codecs`]).
+fn opus_is_transcodable() -> bool {
+    let spec = CodecSpec::new(
+        OPUS_DYNAMIC_PAYLOAD_TYPE,
+        "opus",
+        siphon_rtp_codec::factory::OPUS_CLOCK_RATE_HZ,
+        siphon_rtp_codec::factory::OPUS_RTPMAP_CHANNELS,
+        20,
+    );
+    factory::decoder_for(&spec).is_ok() && factory::encoder_for(&spec).is_ok()
 }
 
 /// The capability flags this build ships, advertised in `node_info`.
@@ -5896,6 +5969,142 @@ mod tests {
             .expect("bind");
         let addr = socket.local_addr().expect("addr");
         (socket, addr)
+    }
+
+    #[test]
+    fn codec_snapshot_round_trips_the_opus_fmtp_parameters() {
+        // A checkpoint/restore must not lose negotiated Opus parameters: the restored leg has to keep
+        // the same channel layout (`sprop-stereo`), packetization ceiling (`maxptime`), and
+        // rate-control / FEC / DTX limits, or the standby re-encodes outside what the peer accepted.
+        let params = siphon_rtp_codec::factory::OpusParams {
+            max_average_bitrate: Some(24_000),
+            max_playback_rate_hz: 16_000,
+            max_ptime_ms: 40,
+            stereo: true,
+            sprop_stereo: true,
+            cbr: true,
+            use_inband_fec: true,
+            use_dtx: true,
+        };
+        let original = CodecSpec::new(111, "opus", 48_000, 2, 40).with_opus_params(Some(params));
+        let snapshot = codec_snapshot(&original);
+        // Through JSON, exactly as `checkpoint` → `restore` carries it.
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let decoded: crate::ha::CodecSnapshot = serde_json::from_str(&json).expect("deserialize");
+        let restored = restore_codec(&decoded);
+        assert_eq!(restored, original);
+        assert_eq!(restored.opus_params(), params);
+        // …and the derived behaviour survives with it.
+        assert_eq!(restored.decode_channels(), 2);
+        assert_eq!(restored.ptime_ms, 40);
+    }
+
+    #[test]
+    fn codec_snapshot_round_trips_the_amr_mode_set() {
+        // The AMR counterpart: without `allowed_modes` a restored encoder could answer a peer's RFC
+        // 4867 CMR with a mode that peer disallowed.
+        let original = CodecSpec::new(96, "AMR-WB", 16_000, 1, 20)
+            .with_encode_mode(Some(1))
+            .with_allowed_modes(vec![0, 1]);
+        let json = serde_json::to_string(&codec_snapshot(&original)).expect("serialize");
+        let decoded: crate::ha::CodecSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restore_codec(&decoded), original);
+    }
+
+    #[test]
+    fn codec_snapshot_stays_compatible_with_a_pre_opus_standby() {
+        // A snapshot written before these fields existed (and one for a plain G.711 leg) must still
+        // restore: both new fields are `serde(default)` and are omitted when empty.
+        let json = concat!(
+            r#"{"payload_type":0,"encoding_name":"PCMU","clock_rate_hz":8000,"#,
+            r#""channels":1,"ptime_ms":20}"#
+        );
+        let decoded: crate::ha::CodecSnapshot = serde_json::from_str(json).expect("deserialize");
+        assert!(decoded.allowed_modes.is_empty());
+        assert_eq!(decoded.opus, None);
+        let restored = restore_codec(&decoded);
+        assert_eq!(restored.encoding_name, "PCMU");
+        assert!(restored.opus.is_none());
+        // A plain G.711 snapshot does not grow either field.
+        let plain = serde_json::to_string(&codec_snapshot(&CodecSpec::new(0, "PCMU", 8000, 1, 20)))
+            .expect("serialize");
+        assert!(!plain.contains("allowed_modes"), "{plain}");
+        assert!(!plain.contains("opus"), "{plain}");
+    }
+
+    #[test]
+    fn transcode_codec_spec_advertises_only_what_the_factory_can_encode() {
+        // The always-encodable set resolves, with its RFC 3551 static payload types.
+        for (name, payload_type, clock) in [
+            ("PCMU", 0u8, 8000u32),
+            ("pcma", 8, 8000),
+            ("G722", 9, 8000),
+            ("GSM", 3, 8000),
+        ] {
+            let spec = transcode_codec_spec(name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(spec.payload_type, payload_type, "{name}");
+            assert_eq!(spec.clock_rate_hz, clock, "{name}");
+            assert_eq!(spec.channels, 1, "{name}");
+        }
+        // An unknown name never resolves.
+        assert_eq!(transcode_codec_spec("EVS"), None);
+        assert_eq!(transcode_codec_spec(""), None);
+
+        // Opus resolves exactly when the factory can encode it, never otherwise — the table is gated
+        // on a real `factory::encoder_for` probe, not on a hand-maintained availability list.
+        let opus_probe = CodecSpec::new(
+            OPUS_DYNAMIC_PAYLOAD_TYPE,
+            "opus",
+            siphon_rtp_codec::factory::OPUS_CLOCK_RATE_HZ,
+            siphon_rtp_codec::factory::OPUS_RTPMAP_CHANNELS,
+            20,
+        );
+        let encodable = factory::encoder_for(&opus_probe).is_ok();
+        match transcode_codec_spec("OPUS") {
+            None => assert!(
+                !encodable,
+                "Opus was withheld even though the factory can encode it"
+            ),
+            Some(spec) => {
+                assert!(
+                    encodable,
+                    "Opus was advertised but the factory cannot encode it"
+                );
+                // RFC 7587: 48 kHz clock (§4.1) and rtpmap channel count 2 (§7), mono or not.
+                assert_eq!(spec.clock_rate_hz, 48_000);
+                assert_eq!(spec.channels, 2);
+                assert_eq!(spec.ptime_ms, 20, "RFC 7587 §6.1 default ptime");
+                assert_eq!(spec.payload_type, OPUS_DYNAMIC_PAYLOAD_TYPE);
+            }
+        }
+    }
+
+    #[test]
+    fn supported_codecs_advertises_opus_only_when_it_is_bidirectionally_transcodable() {
+        let codecs = supported_codecs();
+        // The always-available set is advertised unconditionally.
+        for name in [
+            "PCMU",
+            "PCMA",
+            "G722",
+            "GSM",
+            "CN",
+            "L16",
+            "telephone-event",
+        ] {
+            assert!(
+                codecs.iter().any(|c| c == name),
+                "{name} must be advertised"
+            );
+        }
+        // Opus appears if and only if the factory can build both directions — advertising it while
+        // only one worked would let a dispatcher route a call the engine then fails at setup.
+        let advertised = codecs.iter().any(|c| c.eq_ignore_ascii_case("opus"));
+        assert_eq!(
+            advertised,
+            opus_is_transcodable(),
+            "the node_info codec list must track the factory, not a static list"
+        );
     }
 
     #[test]
