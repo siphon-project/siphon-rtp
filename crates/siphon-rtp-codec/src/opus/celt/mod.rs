@@ -26,6 +26,7 @@ pub mod entropy;
 pub mod laplace;
 pub mod mathops;
 pub mod mdct;
+pub mod pitch;
 pub mod postfilter;
 pub mod pvq;
 pub mod rate;
