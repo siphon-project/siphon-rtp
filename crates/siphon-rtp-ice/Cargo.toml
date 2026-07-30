@@ -34,3 +34,7 @@ harness = false
 [[bench]]
 name = "gather"
 harness = false
+
+[[bench]]
+name = "agent"
+harness = false
