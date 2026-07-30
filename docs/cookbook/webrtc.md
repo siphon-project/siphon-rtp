@@ -166,6 +166,13 @@ and the call is torn down with CDR reason `ice_failed` instead of relaying.
 Off by default because ICE-lite is a valid, simpler posture for a server on a
 routable address, and it is what the engine advertises in its SDP.
 
+On a DTLS-SRTP leg the handshake waits for ICE too (RFC 8445 §12): it starts
+against the address ICE selected, not the signalled one. That matters for a NATed
+browser, where the signalled address cannot answer — handshaking against it would
+burn the DTLS retransmissions and fail a call ICE would have completed. Without
+`--ice-full` the handshake starts immediately at the signalled address, exactly as
+before.
+
 Still the responder half only in one respect: the engine does not yet perform an
 ICE restart (§9) or trickle (RFC 8838). If you need the engine to be an ICE
 *client* for outbound WebRTC trunking, that is the same agent driven from the
