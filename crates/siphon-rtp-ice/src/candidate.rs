@@ -21,6 +21,31 @@ pub const MAX_COMPONENT_ID: u16 = 256;
 /// §5.1). Its presence ends trickling; its absence means more candidates may still arrive.
 pub const END_OF_CANDIDATES_ATTRIBUTE: &str = "a=end-of-candidates";
 
+/// The SDP attribute an answerer sends when the offer's ICE is unusable because something in the
+/// path rewrote it (RFC 8839 §5.3) — classically a SIP ALG that rewrote `c=`/`m=` but left the
+/// `a=candidate` lines alone.
+pub const ICE_MISMATCH_ATTRIBUTE: &str = "a=ice-mismatch";
+
+/// Whether an offer's ICE is *mismatched* per RFC 8839 §5.3: it carried candidates, but the default
+/// destination (the `c=` address and `m=` port the media would go to without ICE) is none of them.
+///
+/// That combination means the SDP was altered in transit — an ALG rewrote the address it understood
+/// and left the candidates it did not. ICE cannot be used on such a stream, because the candidates
+/// describe a topology that no longer matches where media is actually being sent. The answerer says
+/// so with `a=ice-mismatch` and both sides fall back to the signalled address.
+///
+/// Returns `false` when no candidates were offered (that is simply a non-ICE stream, not a mismatch)
+/// and when any candidate matches the default destination, including one this agent cannot use — an
+/// unresolvable mDNS candidate still proves the SDP was not rewritten, so callers should pass the
+/// candidates *as parsed*, before filtering.
+#[must_use]
+pub fn is_ice_mismatch(default_destination: SocketAddr, candidates: &[Candidate]) -> bool {
+    !candidates.is_empty()
+        && !candidates
+            .iter()
+            .any(|candidate| candidate.address == default_destination)
+}
+
 /// RFC 8839 §5.1 `foundation = 1*32ice-char` — the wire cap on a foundation string.
 const MAX_FOUNDATION_LEN: usize = 32;
 
@@ -832,6 +857,32 @@ mod tests {
         let preferences = interleaved_local_preferences(&addresses);
         assert_eq!(preferences, vec![u16::MAX, u16::MAX - 1, u16::MAX - 2]);
         assert!(interleaved_local_preferences(&[]).is_empty());
+    }
+
+    #[test]
+    fn detects_an_ice_mismatch_per_rfc_8839_5_3() {
+        let default: SocketAddr = address_of("203.0.113.7:30000");
+        let matching =
+            Candidate::parse("a=candidate:1 1 UDP 2130706431 203.0.113.7 30000 typ host")
+                .expect("parses");
+        let other = Candidate::parse("a=candidate:2 1 UDP 1694498815 198.51.100.9 40000 typ srflx raddr 10.0.0.1 rport 40000")
+            .expect("parses");
+
+        // A candidate matching the default destination ⇒ the SDP reached us intact.
+        assert!(!is_ice_mismatch(
+            default,
+            &[matching.clone(), other.clone()]
+        ));
+        // None matching ⇒ something rewrote the address but not the candidates.
+        assert!(is_ice_mismatch(default, &[other]));
+        // No candidates at all is a plain non-ICE stream, not a mismatch.
+        assert!(!is_ice_mismatch(default, &[]));
+        // The matching candidate need not be first.
+        assert!(!is_ice_mismatch(default, &[matching]));
+    }
+
+    fn address_of(text: &str) -> SocketAddr {
+        text.parse().expect("addr")
     }
 
     #[test]

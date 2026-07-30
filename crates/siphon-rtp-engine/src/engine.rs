@@ -1147,7 +1147,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // overrides the SDP-derived default (RFC 8445): `force`/`force-relay` mint them regardless of
         // the offer, `remove` suppresses them, otherwise mirror whether the offer carried ICE.
         let ice_directive = ice_directive(profile);
+        // RFC 8839 §5.3: the offer carried candidates but its default destination is none of them, so
+        // the SDP was rewritten in transit (a SIP ALG). ICE describes a topology that no longer
+        // matches where media actually goes, so it must not be used — we say `a=ice-mismatch` and both
+        // sides fall back to the signalled address. An explicit `ICE=force` still wins: an operator
+        // who forces ICE has said they know better than the heuristic.
+        let ice_mismatch = siphon_rtp_ice::is_ice_mismatch(info.remote_rtp, &info.candidates)
+            && ice_directive != Some(IceDirective::Force);
+        if ice_mismatch {
+            tracing::info!(
+                target: "siphon_rtp::control",
+                %call_id,
+                signalled = %info.remote_rtp,
+                candidates = info.candidates.len(),
+                "ICE mismatch (RFC 8839 §5.3): the offer's default destination matches none of its \
+                 candidates — the SDP was altered in transit; falling back to non-ICE"
+            );
+        }
         let want_ice = match ice_directive {
+            _ if ice_mismatch => false,
             Some(IceDirective::Force) => true,
             Some(IceDirective::Remove) => false,
             None => info.is_ice(),
@@ -1251,6 +1269,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 pwd: creds.pwd.as_str(),
                 candidates: &far_ice_candidates,
             }),
+            // Say why ICE is absent rather than dropping it silently, so the offerer stops waiting
+            // for connectivity checks that will never come (RFC 8839 §5.3).
+            (None, _) if ice_mismatch => IceRewrite::Mismatch,
             (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
             (None, _) => IceRewrite::Keep,
         };
@@ -2031,8 +2052,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // seam instead (responder + STUN forwarding) and registered with the credentials of the
             // peer *that* side faces — an outbound check is signed with the peer's password, so the
             // two legs are not interchangeable (RFC 8445 §7.1.2).
-            let far_remote_ice = peer_ice_credentials(&info);
-            if !info.is_ice() {
+            let far_remote_ice = if info.ice_mismatch {
+                // RFC 8839 §5.3: B says our offer's ICE reached it altered, so ICE is unusable on that
+                // leg. Treat B as non-ICE — the endpoints below are cleared and the leg falls back to
+                // the signalled-source gate.
+                tracing::info!(
+                    target: "siphon_rtp::control",
+                    %call_id,
+                    "peer answered a=ice-mismatch (RFC 8839 §5.3) — running the far leg without ICE"
+                );
+                None
+            } else {
+                peer_ice_credentials(&info)
+            };
+            if !info.is_ice() || info.ice_mismatch {
                 // B answered without ICE. Gathering at offer time installed the responder on the far
                 // endpoints (that is how it received its own Binding responses), and leaving it there
                 // would arm the layer-4 gate — which forwards media *only* from a STUN-validated
@@ -2045,7 +2078,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let sides = [
                 (near.endpoint_ids().collect::<Vec<_>>(), &near_remote_ice),
                 (
-                    if info.is_ice() {
+                    if info.is_ice() && !info.ice_mismatch {
                         far.endpoint_ids().collect::<Vec<_>>()
                     } else {
                         Vec::new()
@@ -2067,7 +2100,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_peer_is_lite,
                 ),
                 (
-                    if info.is_ice() {
+                    if info.is_ice() && !info.ice_mismatch {
                         far.endpoint_ids().collect::<Vec<_>>()
                     } else {
                         Vec::new()
@@ -13902,6 +13935,168 @@ mod tests {
         let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
             .await
             .expect("B's media reaches A — the far leg is not ICE-gated")
+            .expect("recv");
+        assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+    }
+
+    // ---- RFC 8839 §5.3 ice-mismatch --------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rewritten_offer_is_answered_with_ice_mismatch_and_no_ice() {
+        // A SIP ALG rewrote `c=`/`m=` to its own address but left the candidates alone, so the
+        // candidates describe a topology that no longer matches where media goes. RFC 8839 §5.3: say
+        // `a=ice-mismatch` and fall back to the signalled address rather than running ICE on a lie.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let mangled = format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 198.51.100.77 5555 typ host\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port()
+        );
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "alg".into(),
+                    from_tag: "a".into(),
+                    sdp: mangled,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far = ok_sdp_text(&offer);
+
+        assert!(far.contains("a=ice-mismatch"), "{far}");
+        assert!(
+            !far.contains("a=ice-lite"),
+            "no ICE is re-originated: {far}"
+        );
+        assert!(!far.contains("a=ice-ufrag"), "and no credentials: {far}");
+        // The peer's stale candidate is not forwarded either.
+        assert!(!far.contains("198.51.100.77"), "{far}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consistent_ice_offer_is_not_treated_as_a_mismatch() {
+        // The candidate matches the default destination, so the SDP reached us intact — ICE runs.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "intact".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far = ok_sdp_text(&offer);
+        assert!(!far.contains("a=ice-mismatch"), "{far}");
+        assert!(far.contains("a=ice-lite"), "ICE is re-originated: {far}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_force_overrides_the_mismatch_heuristic() {
+        // An operator who forces ICE has said they know better than the §5.3 heuristic.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let mangled = format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 198.51.100.77 5555 typ host\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port()
+        );
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "forced".into(),
+                    from_tag: "a".into(),
+                    sdp: mangled,
+                    profile: ProfileFlags {
+                        ice: Some("force".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let far = ok_sdp_text(&offer);
+        assert!(!far.contains("a=ice-mismatch"), "{far}");
+        assert!(
+            far.contains("a=ice-lite"),
+            "forced ICE still re-originates: {far}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_answering_ice_mismatch_disables_ice_on_that_leg() {
+        // B tells us our offer's ICE arrived altered (RFC 8839 §5.3). The far leg must then run
+        // without ICE — leaving the responder armed would gate media on checks B will never send.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mismatch-answer".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:BBBBBB\r\na=ice-pwd:bpasswordbpasswordbpas\r\na=ice-mismatch\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port()
+        );
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "mismatch-answer".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: answer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_rtp = engine
+            .calls
+            .get("mismatch-answer")
+            .map(|call| call.far.rtp.id)
+            .expect("call");
+        assert_eq!(
+            engine.datapath().ice_validated_source(far_rtp),
+            None,
+            "the far leg carries no ICE credentials at all"
+        );
+
+        // And B's media relays to A on the plain signalled-source path.
+        let far_addr = engine
+            .calls
+            .get("mismatch-answer")
+            .map(|call| call.far.rtp.local_addr)
+            .expect("call");
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), far_addr)
+            .await
+            .expect("send from B");
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("B's media reaches A without ICE")
             .expect("recv");
         assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
     }
