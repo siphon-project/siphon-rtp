@@ -712,6 +712,116 @@ pub fn clt_mdct_backward(
     }
 }
 
+/// Largest `N/2` any 48 kHz forward MDCT needs as scratch (`1920 >> 0` → 960).
+const MAX_MDCT_N2: usize = 960;
+/// Largest `N/4` any 48 kHz forward MDCT needs as scratch (`1920 >> 0` → 480).
+const MAX_MDCT_N4: usize = MAX_MDCT_N2 / 2;
+
+/// Forward MDCT: faithful port of libopus `clt_mdct_forward_c` (float build, `mdct.c:118`).
+///
+/// The exact transpose of [`clt_mdct_backward`], and the analysis half of the CELT encoder.
+///
+/// * `input`: the pre-emphasised, prefiltered time signal for this block, read **contiguously**.
+///   The window/shuffle/fold stage touches `input[0 .. N/2 + overlap]`, so the caller's per-block
+///   slice must be at least that long (`celt_encoder.c:484` hands each of the `B` blocks
+///   `in + b*N` out of a `B*N + overlap` buffer, which is exactly `N/2 + overlap` per block since
+///   the MDCT length is twice the block's sample count).
+/// * `output`: the frequency-domain coefficients, written with `stride` (`out[i*stride]`,
+///   `i in 0..N/2`) so `B` interleaved short blocks share one buffer.
+/// * `window`: the analysis window of length `overlap` (48 kHz mode: 120).
+/// * `shift`: selects the sub-transform (see the module table); `stride`: `B`.
+///
+/// Stages, verbatim from `mdct.c`:
+/// 1. window / shuffle / fold the four quarters `[a, b, c, d]` into `N/2` reals,
+/// 2. pre-rotate by `trig` and scale by `1/nfft` into bit-reversed order (`st->scale`, which the
+///    float build sets to `1.f/nfft` — `kiss_fft.c:kiss_fft_alloc_twiddles`),
+/// 3. `opus_fft_impl` (in-place complex FFT of size `N/4`, no scaling/bitrev),
+/// 4. post-rotate, writing forward from `out[0]` and backward from `out[stride*(N/2-1)]`.
+pub fn clt_mdct_forward(
+    state: &MdctLookup,
+    input: &[f32],
+    output: &mut [f32],
+    window: &[f32],
+    overlap: usize,
+    shift: usize,
+    stride: usize,
+) {
+    let n = state.n >> shift;
+    let n2 = n >> 1;
+    let n4 = n >> 2;
+    let trig = &state.trig[shift];
+    let st = &state.kfft[shift];
+    // float build: `st->scale = 1.f/nfft`, and `PSHR32(MULT16_32_Q16(scale, x), scale_shift)`
+    // reduces to `scale * x` (`scale_shift` exists only under FIXED_POINT).
+    let scale = 1.0f32 / st.nfft as f32;
+
+    // Caller-owned-equivalent stack scratch (`ALLOC(f, N2)` / `ALLOC(f2, N4)`): no heap on the
+    // per-frame path.
+    debug_assert!(n2 <= MAX_MDCT_N2);
+    let mut f = [0f32; MAX_MDCT_N2];
+    let mut f2 = [Complex::default(); MAX_MDCT_N4];
+
+    // ----- Stage 1: window, shuffle, fold (mdct.c:161) -----------------------
+    // The input is four blocks [a, b, c, d]; the folded result is the real part
+    // `-d-cR` / imaginary part `-b+aR` in the first quarter-overlap, the plain
+    // `a-bR` / `-c-dR` in the middle, and the mirrored windowed pair at the end.
+    // The C walks five pointers; we index off `i` instead, which is equivalent and keeps every
+    // index in range (the C's cursors step one past their range on the final iteration).
+    {
+        let half_overlap = overlap >> 1;
+        let quarter = (overlap + 3) >> 2;
+        let tail_start = n4 - quarter;
+        for i in 0..n4 {
+            let xp1 = half_overlap + 2 * i; // in + (overlap>>1), stepping by 2
+            let xp2 = n2 - 1 + half_overlap - 2 * i; // in + N2-1+(overlap>>1), stepping by -2
+            let yp = 2 * i;
+            if i < quarter {
+                // Real part arranged as -d-cR, imaginary part as -b+aR (mdct.c:169).
+                let wp1 = half_overlap + 2 * i;
+                let wp2 = half_overlap - 1 - 2 * i;
+                f[yp] = window[wp2] * input[xp1 + n2] + window[wp1] * input[xp2];
+                f[yp + 1] = window[wp1] * input[xp1] - window[wp2] * input[xp2 - n2];
+            } else if i < tail_start {
+                // Real part arranged as a-bR, imaginary part as -c-dR (mdct.c:180).
+                f[yp] = input[xp2];
+                f[yp + 1] = input[xp1];
+            } else {
+                // Mirrored windowed pair (mdct.c:186); the window cursors restart at 0/overlap-1.
+                let j = i - tail_start;
+                let wp1 = 2 * j;
+                let wp2 = overlap - 1 - 2 * j;
+                f[yp] = -window[wp1] * input[xp1 - n2] + window[wp2] * input[xp2];
+                f[yp + 1] = window[wp2] * input[xp1] + window[wp1] * input[xp2 + n2];
+            }
+        }
+    }
+
+    // ----- Stage 2: pre-rotation + scale, into bit-reversed order (mdct.c:199) ----
+    for i in 0..n4 {
+        let t0 = trig[i];
+        let t1 = trig[n4 + i];
+        let re = f[2 * i];
+        let im = f[2 * i + 1];
+        let yr = re * t0 - im * t1;
+        let yi = im * t0 + re * t1;
+        f2[st.bitrev[i]] = Complex::new(scale * yr, scale * yi);
+    }
+
+    // ----- Stage 3: N/4 complex FFT in place (mdct.c:215) -------------------
+    opus_fft_impl(st, &mut f2[..n4], 0);
+
+    // ----- Stage 4: post-rotation, strided from both ends (mdct.c:218) ------
+    for i in 0..n4 {
+        let fp = f2[i];
+        let t0 = trig[i];
+        let t1 = trig[n4 + i];
+        let yr = fp.im * t1 - fp.re * t0;
+        let yi = fp.re * t1 + fp.im * t0;
+        output[2 * stride * i] = yr;
+        output[stride * (n2 - 1) - 2 * stride * i] = yi;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,6 +1201,212 @@ mod tests {
                 (lhs - rhs).abs() < 1e-2,
                 "nonlinear at j={j}: {lhs} != {rhs}"
             );
+        }
+    }
+
+    // ---- forward MDCT validated against the libopus reference basis ----
+    //
+    // Mirrors libopus' own `celt/tests/test_unit_mdct.c` `check()` (the forward half):
+    //   window = all ones, overlap = nfft/2, input length nfft,
+    //   clt_mdct_forward(cfg, in, out, window, nfft/2, shift, 1),
+    //   reference: out[bin] = sum_{k<nfft} in[k]
+    //                * cos(2*pi*(k + 0.5 + nfft/4)*(bin + 0.5)/nfft) / (nfft/4),
+    //   require SNR > 60 dB.
+
+    /// Reference forward MDCT — the exact basis libopus validates against
+    /// (`test_unit_mdct.c` `check`), including its `1/(nfft/4)` normalisation.
+    fn reference_mdct(input: &[f32], nfft: usize) -> Vec<f64> {
+        (0..nfft / 2)
+            .map(|bin| {
+                let mut acc = 0.0_f64;
+                for (k, &x) in input.iter().take(nfft).enumerate() {
+                    let phase =
+                        2.0 * PI * (k as f64 + 0.5 + 0.25 * nfft as f64) * (bin as f64 + 0.5)
+                            / nfft as f64;
+                    acc += x as f64 * phase.cos() / (nfft as f64 / 4.0);
+                }
+                acc
+            })
+            .collect()
+    }
+
+    fn mdct_snr_for_shift(lookup: &MdctLookup, shift: usize, seed: u32) -> f64 {
+        let nfft = lookup.n() >> shift;
+        let overlap = nfft / 2;
+        let window = vec![1.0f32; overlap];
+
+        let mut rng = Lcg(seed);
+        let input: Vec<f32> = (0..nfft).map(|_| rng.next_f32() * 32768.0).collect();
+
+        let mut out = vec![0.0f32; nfft / 2];
+        clt_mdct_forward(lookup, &input, &mut out, &window, overlap, shift, 1);
+
+        let want = reference_mdct(&input, nfft);
+        let mut errpow = 0.0_f64;
+        let mut sigpow = 0.0_f64;
+        for (bin, &g) in out.iter().enumerate() {
+            let d = want[bin] - g as f64;
+            errpow += d * d;
+            sigpow += want[bin] * want[bin];
+        }
+        10.0 * (sigpow / errpow.max(1e-300)).log10()
+    }
+
+    #[test]
+    fn mdct_forward_matches_libopus_reference_all_lm() {
+        let lookup = MdctLookup::new(N_BASE, MAX_SHIFT).expect("build 48k mode");
+        for shift in 0..=MAX_SHIFT {
+            let seed = 0x0BAD_F00Du32 ^ (shift as u32).wrapping_mul(2_654_435_761);
+            let snr = mdct_snr_for_shift(&lookup, shift, seed);
+            let nfft = N_BASE >> shift;
+            // libopus gate is 60 dB; f32 reaches ~130 dB. A strict 100 dB floor so any real
+            // sign/phase/scale bug (which collapses SNR toward 0 dB) cannot slip through.
+            assert!(
+                snr > 100.0,
+                "shift={shift} (nfft={nfft}): forward MDCT SNR {snr:.2} dB below 100 dB floor"
+            );
+        }
+    }
+
+    #[test]
+    fn mdct_forward_basis_is_exact_for_impulse() {
+        // A single nonzero time sample must produce exactly one column of the analysis basis.
+        // This pins the fold offsets and the 1/nfft scale directly, not statistically.
+        let lookup = MdctLookup::new(N_BASE, MAX_SHIFT).expect("build");
+        let shift = 3usize;
+        let nfft = N_BASE >> shift; // 240
+        let overlap = nfft / 2;
+        let window = vec![1.0f32; overlap];
+
+        for k_in in [0usize, 1, 37, nfft / 2, nfft - 1] {
+            let mut input = vec![0.0f32; nfft];
+            input[k_in] = 1000.0;
+            let mut out = vec![0.0f32; nfft / 2];
+            clt_mdct_forward(&lookup, &input, &mut out, &window, overlap, shift, 1);
+            let want = reference_mdct(&input, nfft);
+            let mut max_diff = 0.0_f64;
+            for (bin, &g) in out.iter().enumerate() {
+                max_diff = max_diff.max((want[bin] - g as f64).abs());
+            }
+            assert!(
+                max_diff < 1e-2,
+                "k_in={k_in}: impulse forward MDCT vs reference cosine max diff {max_diff}"
+            );
+        }
+    }
+
+    /// Forward → inverse over two consecutive 50 %-overlapping frames must reconstruct the middle
+    /// frame (time-domain alias cancellation). Uses the real CELT window, which satisfies the
+    /// Princen-Bradley condition, so this is the property the codec actually relies on.
+    #[test]
+    fn mdct_forward_then_backward_reconstructs_via_tdac() {
+        use crate::opus::celt::tables::WINDOW120;
+        let lookup = MdctLookup::new(N_BASE, MAX_SHIFT).expect("build");
+        let shift = 0usize; // long 20 ms block: mdct N = 1920, frame = 960
+        let n = N_BASE >> shift;
+        let n2 = n >> 1; // 960 samples per frame
+        let overlap = 120usize;
+
+        // Three frames of signal so the middle one has both neighbours.
+        let total = 3 * n2 + overlap;
+        let mut rng = Lcg(0x5EED);
+        let signal: Vec<f32> = (0..total).map(|_| rng.next_f32() * 8000.0).collect();
+
+        // Analyse frames 0 and 1 (each reads n2 + overlap samples starting at frame*n2).
+        let analyse = |offset: usize| {
+            let mut coeffs = vec![0.0f32; n2];
+            clt_mdct_forward(
+                &lookup,
+                &signal[offset..],
+                &mut coeffs,
+                &WINDOW120,
+                overlap,
+                shift,
+                1,
+            );
+            coeffs
+        };
+        let c0 = analyse(0);
+        let c1 = analyse(n2);
+
+        // Synthesise with overlap-add: each backward MDCT writes overlap/2 + n2/2 samples and
+        // adds into the preserved tail, exactly as `celt_synthesis` does through the decode ring.
+        let mut ring = vec![0.0f32; 2 * n2 + overlap];
+        clt_mdct_backward(&lookup, &c0, &mut ring, &WINDOW120, overlap, shift, 1);
+        // Mirror-fold the second half of block 0 (TDAC), which the decoder's ring gets for free
+        // from the next block's front overlap.
+        for k in 0..(n / 4) {
+            ring[n - k - 1] = ring[n / 2 + k];
+        }
+        let mut ring2 = vec![0.0f32; 2 * n2 + overlap];
+        ring2[..overlap / 2].copy_from_slice(&ring[n2..n2 + overlap / 2]);
+        clt_mdct_backward(&lookup, &c1, &mut ring2, &WINDOW120, overlap, shift, 1);
+
+        // The reconstructed region is ring2[overlap/2 .. n2] plus the previous block's tail; the
+        // core (well away from the block edges) must match the input scaled by the MDCT gain.
+        // clt_mdct_forward normalises by 1/nfft and the reference basis by 1/(nfft/4), so the
+        // round trip gain is nfft/4 / (nfft/2) ... rather than derive it, measure it once from
+        // the middle sample and require the whole core to follow the same single scale factor.
+        let probe = 400usize;
+        let gain = ring2[probe] / signal[n2 + probe];
+        assert!(
+            gain.is_finite() && gain.abs() > 1e-6,
+            "degenerate gain {gain}"
+        );
+        let mut errpow = 0.0f64;
+        let mut sigpow = 0.0f64;
+        for j in overlap..n2 {
+            let want = signal[n2 + j] * gain;
+            let d = f64::from(ring2[j] - want);
+            errpow += d * d;
+            sigpow += f64::from(want) * f64::from(want);
+        }
+        let snr = 10.0 * (sigpow / errpow.max(1e-300)).log10();
+        assert!(
+            snr > 80.0,
+            "TDAC reconstruction SNR {snr:.2} dB below 80 dB"
+        );
+    }
+
+    #[test]
+    fn mdct_forward_stride_matches_per_block() {
+        // The encoder interleaves B short blocks into one output with stride B; each block reads
+        // its own contiguous input slice. A stride-B run must reproduce the stride-1 result.
+        let lookup = MdctLookup::new(N_BASE, MAX_SHIFT).expect("build");
+        let shift = 2usize;
+        let nfft = N_BASE >> shift; // 480
+        let n2 = nfft / 2;
+        let overlap = nfft / 2;
+        let window = vec![1.0f32; overlap];
+        let b = 2usize;
+
+        let mut rng = Lcg(4242);
+        let blocks: Vec<Vec<f32>> = (0..b)
+            .map(|_| (0..nfft).map(|_| rng.next_f32() * 32768.0).collect())
+            .collect();
+
+        let mut interleaved = vec![0.0f32; b * n2];
+        for (block, blk) in blocks.iter().enumerate() {
+            clt_mdct_forward(
+                &lookup,
+                blk,
+                &mut interleaved[block..],
+                &window,
+                overlap,
+                shift,
+                b,
+            );
+        }
+        for (block, blk) in blocks.iter().enumerate() {
+            let mut want = vec![0.0f32; n2];
+            clt_mdct_forward(&lookup, blk, &mut want, &window, overlap, shift, 1);
+            for (i, &w) in want.iter().enumerate() {
+                let got = interleaved[i * b + block];
+                assert!(
+                    (got - w).abs() < 1e-4,
+                    "block={block} i={i}: stride-{b} {got} != stride-1 {w}"
+                );
+            }
         }
     }
 
