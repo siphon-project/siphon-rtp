@@ -102,7 +102,7 @@ pub fn comb_filter(
 /// filters: the decoder runs in place (`x == y`), so its taps read the *already filtered* history and
 /// it is recursive, while the encoder's prefilter reads the untouched input and is feed-forward.
 /// Rust's aliasing rules make one body serving both impossible anyway; the shared part — the tap
-/// gains — is factored into [`comb_taps`].
+/// gains — is factored into the private `comb_taps` helper.
 ///
 /// `src[..base]` must hold at least [`COMBFILTER_MAXPERIOD`] + 2 history samples. Passing
 /// `g0 == g1 == 0` copies `src` to `dst` unchanged, exactly as the C does for `x != y`.

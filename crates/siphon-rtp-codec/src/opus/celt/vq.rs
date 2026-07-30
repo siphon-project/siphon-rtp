@@ -119,7 +119,7 @@ fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
 
 /// Pyramid-VQ nearest-neighbour search (libopus `op_pvq_search_c`, `vq.c:165`, float path): pick
 /// the `k`-pulse integer vector `iy` maximising `⟨X,y⟩ / ‖y‖` for the (sign-stripped) input `x`.
-/// Returns `Σ y_i²` (`yy`), which [`normalise_residual`] needs.
+/// Returns `Σ y_i²` (`yy`), which the shape normalisation needs.
 ///
 /// `x` is **modified in place** to its absolute value, matching the C ("Get rid of the sign"); the
 /// signs are put back into `iy` at the end. The search is greedy: a projection pre-pass places most
