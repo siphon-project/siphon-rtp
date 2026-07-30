@@ -1132,6 +1132,42 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: "per-client call quota exceeded".to_string(),
             };
         }
+        // An offer for a call-id that already exists.
+        //
+        // Ownership first (A3 — docs/security-and-nat.md §5): only the client that created a call may
+        // affect it. Another client offering the same id must not be able to disturb it, and must not
+        // learn that it exists — so it gets the same `unknown_call` any other cross-client reference
+        // does, and the live call is left completely untouched.
+        //
+        // For the owner, this replaces the call. That was already the effect (the registry entry was
+        // overwritten), but the previous `Call` was dropped without freeing anything: its 2-4 datapath
+        // endpoints leaked their ports and FDs, and its quota slot was never released, so a client
+        // repeating an offer bled both until the node refused new calls. Tear the old one down
+        // properly first — same path as `delete`, so the CDR is emitted and every resource is
+        // released — then build the replacement.
+        //
+        // Note this is *replacement*, not re-negotiation: the new call gets fresh ports, so the peer
+        // must be told the new address. A true re-offer (SIP re-INVITE — renegotiating codecs or
+        // addresses on the *existing* ports, and the trigger an RFC 8445 §9 ICE restart needs) is a
+        // separate control verb that does not exist yet.
+        if let Some(existing) = self.calls.get(&call_id) {
+            if existing.owner != client {
+                drop(existing);
+                return unknown_call(&call_id);
+            }
+            drop(existing);
+            tracing::info!(
+                target: "siphon_rtp::control",
+                %call_id,
+                "offer replaces an existing call with the same id — tearing the old one down first"
+            );
+            if let Some((_, previous)) = self.calls.remove(&call_id) {
+                // `finish_call` emits the CDR and frees endpoints, pipelines, subscriptions and the
+                // quota slot. No `MediaTimeout` event: the controller caused this, it is not a dead
+                // path, and telling it otherwise would be a lie.
+                self.finish_call(&call_id, &previous, "replaced").await;
+            }
+        }
         let info = match sdp::parse(sdp) {
             Ok(info) => info,
             Err(error) => {
@@ -13937,6 +13973,158 @@ mod tests {
             .expect("B's media reaches A — the far leg is not ICE-gated")
             .expect("recv");
         assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+    }
+
+    // ---- duplicate offer on a live call-id -------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_offer_replaces_the_call_without_leaking_ports_or_quota() {
+        // A repeated offer used to overwrite the registry entry and drop the old `Call` on the floor:
+        // its endpoints were never freed and its quota slot never released, so a client repeating an
+        // offer (what a SIP re-INVITE looks like from here) bled ports and quota until the node
+        // refused calls.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(21);
+        let events = engine.register_client(client);
+        let (_phone, addr) = phone().await;
+
+        let first = engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: "dup".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let first_port = sdp::parse(&ok_sdp_text(&first))
+            .expect("parse")
+            .remote_rtp
+            .port();
+        let first_endpoints: Vec<EndpointId> = engine
+            .calls
+            .get("dup")
+            .map(|call| {
+                call.near
+                    .endpoint_ids()
+                    .chain(call.far.endpoint_ids())
+                    .collect()
+            })
+            .expect("call exists");
+
+        let second = engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: "dup".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let second_port = sdp::parse(&ok_sdp_text(&second))
+            .expect("parse")
+            .remote_rtp
+            .port();
+
+        assert_eq!(engine.session_count(), 1, "one call, not two");
+        assert_eq!(
+            engine.client_calls.get(&client).map(|count| *count),
+            Some(1),
+            "the quota slot of the replaced call is released, not leaked"
+        );
+        // The old endpoints are gone from the datapath, not merely forgotten by the engine.
+        for endpoint in first_endpoints {
+            assert_eq!(
+                engine.datapath().stats(endpoint),
+                None,
+                "the replaced call's endpoint {endpoint:?} was freed"
+            );
+        }
+        assert_ne!(first_port, second_port, "the replacement bound fresh ports");
+
+        // The replaced call is reported as ended, with its own reason — and not as a dead path.
+        let mut summary_reason = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::CallSummary { reason, .. } => summary_reason = Some(reason),
+                Event::MediaTimeout { .. } => {
+                    panic!("a controller-driven replacement is not a media timeout")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(summary_reason.as_deref(), Some("replaced"));
+
+        // And the surviving call still works end to end.
+        let (_phone_b, addr_b) = phone().await;
+        let answer = engine
+            .handle(
+                client,
+                Command::Answer {
+                    call_id: "dup".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(matches!(answer, CmdResult::Ok { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_client_cannot_replace_a_call_it_does_not_own() {
+        // A3 (docs/security-and-nat.md §5): only the owning client may affect a call. Before this,
+        // any client could offer an existing call-id and destroy someone else's call.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let owner = ClientId(31);
+        let intruder = ClientId(32);
+        let (_phone, addr) = phone().await;
+
+        let first = engine
+            .handle(
+                owner,
+                Command::Offer {
+                    call_id: "owned".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let owner_port = sdp::parse(&ok_sdp_text(&first))
+            .expect("parse")
+            .remote_rtp
+            .port();
+
+        let stolen = engine
+            .handle(
+                intruder,
+                Command::Offer {
+                    call_id: "owned".into(),
+                    from_tag: "x".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stolen, CmdResult::Error { .. }),
+            "an unrelated client is refused: {stolen:?}"
+        );
+
+        // The owner's call is untouched: same ports, same owner, still answerable.
+        assert_eq!(engine.session_count(), 1);
+        let call = engine.calls.get("owned").expect("still there");
+        assert_eq!(call.owner, owner);
+        assert_eq!(call.far.rtp.local_addr.port(), owner_port);
+        drop(call);
+        // And the intruder was charged nothing.
+        assert_eq!(engine.client_calls.get(&intruder).map(|count| *count), None);
     }
 
     // ---- RFC 8839 §5.3 ice-mismatch --------------------------------------------------------------
