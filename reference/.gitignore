@@ -11,4 +11,6 @@ amr-wb/testv/
 # generated CELT-only oracle vectors (celt_only/, from a libopus OPUS_SET_FORCE_MODE oracle), and any
 # libopus source/oracle build artifacts. All reference-only acceptance data: never committed (bloat +
 # licensing), kept untracked like the AMR-WB vectors. Tests skip-when-absent.
-opus/
+# No trailing slash: the tree is big enough that it is normally built once and reached from a
+# secondary checkout through a symlink, which a directory-only pattern would not match.
+opus

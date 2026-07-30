@@ -167,6 +167,33 @@ The dump is only read, never regenerated, by the test — so the instrumented bu
 cover it, and prefer those: an intermediate-state diff proves the fields match, not that the whole
 packet parses.
 
+#### Per-kernel goldens for the CELT stereo kernels
+
+`opus_compare` and `final_range` both score a *whole packet*, so neither can tell you which kernel is
+wrong — and a round trip proves nothing at all, because a shared encode/decode bug passes one. The
+stereo kernels (`stereo_itheta`, `intensity_stereo`, `stereo_split`, `stereo_merge`,
+`compute_channel_weights`, `compute_qn`, the theta gain/bit split, `stereo_analysis`, the `C == 2`
+branches of `alloc_trim_analysis` / `dynalloc_analysis` / `patch_transient_decision`) are therefore
+pinned to values libopus itself produced, in
+[`crates/siphon-rtp-codec/tests/celt_stereo_golden.rs`](crates/siphon-rtp-codec/tests/celt_stereo_golden.rs).
+
+Most of those helpers are file-static in `celt/bands.c` and `celt/celt_encoder.c`, so the generator
+`reference/opus/celt_stereo_golden.c` `#include`s those two translation units directly and prints the
+literals. The *inputs* are regenerated on the Rust side from the same LCG, so only the outputs are
+carried across and the test needs no reference tree — it runs in CI unconditionally. Re-run the
+generator only when a kernel's expected behaviour is deliberately changed:
+
+```sh
+cd reference/opus
+gcc -O2 -DCPU_INFO_BY_ASM -DDISABLE_DEBUG_FLOAT -DENABLE_HARDENING -DHAVE_ALLOCA_H \
+    -DHAVE_CONFIG_H -DHAVE_LRINT -DHAVE_LRINTF -DOPUS_BUILD -DOPUS_HAVE_RTCD \
+    -DOPUS_X86_MAY_HAVE_AVX2 -DOPUS_X86_MAY_HAVE_SSE -DOPUS_X86_MAY_HAVE_SSE2 \
+    -DOPUS_X86_MAY_HAVE_SSE4_1 -DOPUS_X86_PRESUME_SSE -DOPUS_X86_PRESUME_SSE2 -DVAR_ARRAYS \
+    -I build -I opus-1.5.2/include -I opus-1.5.2/celt -I opus-1.5.2/silk -I opus-1.5.2 \
+    celt_stereo_golden.c build/libopus.a -lm -o build/celt_stereo_golden
+./build/celt_stereo_golden
+```
+
 ## Fuzzing
 
 Every parser that eats untrusted bytes off the network is fuzzed with `cargo-fuzz` (libFuzzer,
