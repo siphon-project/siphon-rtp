@@ -132,6 +132,17 @@ impl<'a> RangeDecoder<'a> {
         self.storage * 8
     }
 
+    /// Account the whole packet as already read (libopus `celt_decoder.c:1327`:
+    /// "Pretend we've read all the remaining bits", `dec->nbits_total += tell - ec_tell(dec)`).
+    ///
+    /// A silent CELT frame codes only its silence flag; both sides then pin `nbits_total` to the
+    /// packet size so every `tell + X <= total_bits` gate fails and neither reads nor writes another
+    /// symbol. Without it a decoder consumes phantom symbols the encoder never wrote and the two
+    /// end the packet on different `rng` values.
+    pub fn declare_bits_used(&mut self, total_bits: i32) {
+        self.nbits_total += total_bits - self.tell();
+    }
+
     #[inline]
     fn read_byte(&mut self) -> i32 {
         if self.offs < self.storage {

@@ -107,6 +107,8 @@ pub fn comb_filter(
 /// `src[..base]` must hold at least [`COMBFILTER_MAXPERIOD`] + 2 history samples. Passing
 /// `g0 == g1 == 0` copies `src` to `dst` unchanged, exactly as the C does for `x != y`.
 #[allow(clippy::too_many_arguments)]
+// `dst[i]` and `src[base+i]` advance together, so the index is the clearer form here.
+#[allow(clippy::needless_range_loop)]
 pub fn comb_filter_out_of_place(
     dst: &mut [f32],
     src: &[f32],
@@ -256,17 +258,13 @@ mod tests {
             &mut got, &src, BASE, n, t, t, g, g, tapset, tapset, &WINDOW120, 120,
         );
         let (g10, g11, g12) = comb_taps(g, tapset);
-        for i in 0..n {
+        for (i, &value) in got.iter().enumerate().take(n) {
             let b = BASE + i;
             let want = src[b]
                 + g10 * src[b - t]
                 + g11 * (src[b - t + 1] + src[b - t - 1])
                 + g12 * (src[b - t + 2] + src[b - t - 2]);
-            assert!(
-                (got[i] - want).abs() < 1e-5,
-                "sample {i}: {} vs {want}",
-                got[i]
-            );
+            assert!((value - want).abs() < 1e-5, "sample {i}: {value} vs {want}");
         }
 
         // The recursive in-place form must give a *different* answer — proving the two are not

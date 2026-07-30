@@ -21,6 +21,7 @@ pub mod band_analysis;
 pub mod band_coder;
 pub mod bands;
 pub mod decoder;
+pub mod encoder;
 pub mod energy;
 pub mod entropy;
 pub mod laplace;

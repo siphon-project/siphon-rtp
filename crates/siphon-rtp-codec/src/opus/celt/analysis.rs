@@ -32,8 +32,9 @@ const INV_TABLE: [u8; 128] = [
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2,
 ];
 
-/// Result of the time-domain transient analysis.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Result of the time-domain transient analysis. `Default` is the "analysis disabled" answer the
+/// encoder uses at complexity 0 (`celt_encoder.c:1717`): not a transient, no VBR boost.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TransientAnalysis {
     /// Code the frame as `M` short MDCTs rather than one long one (the `isTransient` symbol).
     pub is_transient: bool,

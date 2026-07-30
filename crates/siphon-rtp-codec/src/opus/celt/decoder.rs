@@ -239,12 +239,14 @@ impl CeltDecoder {
         } else {
             false
         };
-        // libopus advances `nbits_total` to `len*8` on silence so every `tell+X<=total_bits` guard
-        // below fails and no further symbols are read. `RangeDecoder` doesn't expose that knob, so on
-        // a silent frame we still call the decode pipeline (which reads a few phantom symbols) — but
-        // `silence` pins the energies and `denormalise_bands(silence=true)` zeroes the spectrum, so
-        // the synthesized output is silent regardless. The only top-level guard we gate on `!silence`
-        // is the post-filter (so a silent frame leaves the post-filter state untouched).
+        // "Pretend we've read all the remaining bits" (celt_decoder.c:1325): advance `nbits_total`
+        // to `len*8` so every `tell+X <= total_bits` guard below fails and no further symbol is
+        // read — which is exactly what the encoder does on a silent frame, so both sides end the
+        // packet on the same range value. `silence` additionally pins the energies and
+        // `denormalise_bands(silence=true)` zeroes the spectrum.
+        if silence {
+            dec.declare_bits_used(total_bits_i);
+        }
 
         // ── Post-filter params (start==0, celt_decoder.c:1334) ───────────────────────────────────
         let mut postfilter_gain = 0.0f32;

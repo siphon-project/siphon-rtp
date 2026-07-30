@@ -234,6 +234,8 @@ fn compute_pitch_gain(xy: f32, xx: f32, yy: f32) -> f32 {
 ///
 /// A strong correlation at `T0` is often also strong at `T0/k`; picking the shorter period gives a
 /// better prefilter. `t0` is updated in place with the chosen period; the return value is the gain.
+// The `k` loop indexes `SECOND_CHECK` by the reference's own octave divisor.
+#[allow(clippy::needless_range_loop)]
 pub fn remove_doubling(
     x: &[f32],
     maxperiod: usize,
