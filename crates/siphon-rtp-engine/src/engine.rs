@@ -5354,6 +5354,11 @@ fn build_direction(
     // Record at the codec's *native* PCM rate (what the decoder emits), not the RTP clock — they
     // differ for G.722 (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2), and a clock-rate WAV header
     // would replay the recording at the wrong pitch.
+    //
+    // One channel, and that stays right even for a stereo ingress: the media path folds a
+    // multi-channel decoded frame to mono at the codec trait boundary (`downmix_to_mono`) *before*
+    // the recorder sees it, so the PCM written here is always single-channel. Only a genuinely
+    // multi-channel media path would change this, not a multi-channel codec.
     let recorder = record_path.map(|_| WavRecorder::new(decoder.params().sample_rate_hz, 1));
     Ok(DirectionConfig {
         ingress_endpoint,
