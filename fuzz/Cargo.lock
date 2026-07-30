@@ -1543,6 +1543,7 @@ dependencies = [
  "siphon-rtp-dsp",
  "siphon-rtp-dtls",
  "siphon-rtp-hep",
+ "siphon-rtp-ice",
  "siphon-rtp-media",
  "siphon-rtp-ngcompat",
  "siphon-rtp-proto",
@@ -1616,6 +1617,7 @@ dependencies = [
  "libfuzzer-sys",
  "siphon-rtp",
  "siphon-rtp-codec",
+ "siphon-rtp-ice",
  "siphon-rtp-media",
  "siphon-rtp-ngcompat",
  "siphon-rtp-proto",
@@ -1627,6 +1629,13 @@ name = "siphon-rtp-hep"
 version = "0.1.4"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "siphon-rtp-ice"
+version = "0.1.4"
+dependencies = [
+ "thiserror 2.0.18",
 ]
 
 [[package]]
