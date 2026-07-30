@@ -2450,6 +2450,13 @@ impl MediaRegistry {
         // so an HA checkpoint can reach its SRTP rollover (RFC 3711 §3.3.1). The `Arc` is the same
         // instance the actor holds — reads are a brief, uncontended lock.
         let secure_leg = call.far_secure_leg();
+        // Re-registering a call id **replaces** its actor, so retire the displaced one first: a
+        // `DashMap::insert` would only drop its `CallHandle`, and dropping a `JoinHandle` *detaches*
+        // the task rather than aborting it — the old actor would keep running forever, unreachable but
+        // still holding its codec state, jitter buffers, recorders and fork sinks. Stop it (flushing
+        // recordings) and drop its routes before the new ones go in, so an overlapping endpoint is
+        // re-pointed rather than orphaned.
+        self.deregister(&call_id);
         let (mailbox, inbox) = flume::bounded(1024);
         for endpoint in endpoints
             .iter()
@@ -2762,10 +2769,16 @@ mod tests {
 
     /// Build a µ-law(A) ↔ A-law(B) transcoding call, both legs 8 kHz/20 ms.
     fn ulaw_alaw_call() -> MediaCall {
+        ulaw_alaw_call_on(1, 2)
+    }
+
+    /// The same call wired to a chosen pair of engine endpoints, for tests that need two registrations
+    /// with *different* endpoint sets.
+    fn ulaw_alaw_call_on(a_endpoint: u64, b_endpoint: u64) -> MediaCall {
         let a_to_b = DirectionConfig {
-            ingress_endpoint: endpoint(1), // A's engine socket
+            ingress_endpoint: endpoint(a_endpoint), // A's engine socket
             accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
-            egress_endpoint: endpoint(2), // B's engine socket
+            egress_endpoint: endpoint(b_endpoint), // B's engine socket
             egress_dst: addr(B_ADDR),
             decoder: Box::new(G711::ulaw()),
             encoder: Box::new(G711::alaw()),
@@ -2780,9 +2793,9 @@ mod tests {
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let b_to_a = DirectionConfig {
-            ingress_endpoint: endpoint(2),
+            ingress_endpoint: endpoint(b_endpoint),
             accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
-            egress_endpoint: endpoint(1),
+            egress_endpoint: endpoint(a_endpoint),
             egress_dst: addr(A_ADDR),
             decoder: Box::new(G711::alaw()),
             encoder: Box::new(G711::ulaw()),
@@ -2805,6 +2818,58 @@ mod tests {
             true,
             None,
         )
+    }
+
+    /// Re-registering a call id must **retire** the displaced actor, not detach it. Dropping a
+    /// `JoinHandle` leaves the task running, so without the explicit retire an actor rebuilt in place
+    /// (`upgrade_relay_to_processing`, a re-answer) would keep a whole second pipeline alive forever —
+    /// unreachable, but still holding its codec state, jitter buffers, recorders and fork sinks.
+    #[tokio::test]
+    async fn re_registering_a_call_id_retires_the_displaced_actor() {
+        use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+
+        let registry = MediaRegistry::default();
+        let datapath = UdpLoopbackDatapath::new();
+        registry.register(ulaw_alaw_call(), datapath.clone(), None);
+        let first = registry
+            .calls
+            .get("call-1")
+            .expect("registered")
+            .task
+            .abort_handle();
+        assert!(!first.is_finished(), "the first actor is running");
+
+        // Register a second actor under the same call id on a **different** endpoint set. This is the
+        // case that orphans: an overlapping endpoint's route would be replaced (dropping the old
+        // mailbox clone), but a route the new actor does not claim keeps a sender alive forever, so the
+        // old actor's `recv_async` never ends and its task runs on undetected.
+        registry.register(ulaw_alaw_call_on(11, 12), datapath, None);
+        for _ in 0..200 {
+            if first.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            first.is_finished(),
+            "the displaced actor was detached instead of retired (an orphan pipeline)"
+        );
+
+        // The replacement is live on its own endpoints, and the displaced actor's stale routes are gone
+        // (a datagram for an old endpoint must not resolve to a retired actor).
+        assert!(registry.owns(endpoint(11)));
+        assert!(registry.owns(endpoint(12)));
+        assert!(
+            !registry.owns(endpoint(1)),
+            "stale route dropped with the old actor"
+        );
+        assert!(
+            !registry.owns(endpoint(2)),
+            "stale route dropped with the old actor"
+        );
+        assert!(registry.is_media_call("call-1"));
+        registry.deregister("call-1");
+        assert!(!registry.owns(endpoint(11)), "routes released on teardown");
     }
 
     fn ulaw_rtp(sequence: u16, payload_byte: u8) -> Vec<u8> {

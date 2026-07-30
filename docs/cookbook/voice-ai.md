@@ -184,10 +184,19 @@ you hear yourself back with roughly one jitter-buffer frame plus one playout fra
 
 The on-the-wire bytes of a WS call are not the clear two-party media, so several runtime verbs
 are rejected on it: `block_media` / `silence_media`, `start_recording` (pcap), SIPREC
-`subscribe_request`, and `block_dtmf`. HA `checkpoint` works but `restore` of a WS call is
-rejected (the WS connection cannot be rebuilt from a snapshot yet). Latency is tuned for
-voice-AI: a shallow jitter buffer (target one frame) and the bounded playout queue keep
+`subscribe_request`, `block_dtmf`, and `attach_ws_tee`. HA `checkpoint` works but `restore` of a
+WS call is rejected (the WS connection cannot be rebuilt from a snapshot yet). Latency is tuned
+for voice-AI: a shallow jitter buffer (target one frame) and the bounded playout queue keep
 mouth-to-ear delay low at the cost of a little more concealment under jitter.
+
+**A takeover call cannot be bridged to a second party in place.** A WS call's leg B ports are
+allocated by offer/answer, which makes it look like a later `answer` might hand the caller to a
+real party — it does not. `answer` short-circuits on a WS call and returns the rewritten SDP
+without installing any A↔B path, so the caller's media keeps going to the WS server and leg B
+receives nothing. Moving a WS-bridged caller onto a live second leg (keeping A's ports and SSRC
+continuous so no re-INVITE is needed) is a distinct transition that is **not implemented**. Today
+the way to hand the call away is a SIP-level transfer (REFER), which takes the call off this
+engine's WS bridge entirely.
 
 ## Teeing a live call to a WebSocket
 

@@ -4677,6 +4677,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// rest of its life (a detach releases the tee's hold but does not rebuild the cheaper relay-only
     /// actor) — the extra decode is the price of having asked for both features at once.
     async fn upgrade_relay_to_processing(&self, call_id: &str) -> Result<(), String> {
+        // Rebuilding the actor rebuilds its *state*, and only the SIPREC raw tees can be reconstructed
+        // from what the engine still holds. A live pcap capture's channel (whose drain task owns the
+        // file) and a per-direction `block DTMF` gate would both be silently lost, so refuse instead of
+        // quietly turning either off — the same posture `echo` already takes on a relay-only promotion.
+        let blocking = self
+            .owned_call_internal(call_id, |call| {
+                let mut blocking = Vec::new();
+                if call.promotion_reasons.contains(&PromotionReason::Recording) {
+                    blocking.push("a pcap recording");
+                }
+                if call.promotion_reasons.contains(&PromotionReason::DtmfBlock) {
+                    blocking.push("a DTMF block");
+                }
+                blocking
+            })
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        if !blocking.is_empty() {
+            return Err(format!(
+                "a WebSocket tee needs the call decoded, but {} holds this relay in a \
+                 forward-only pipeline; stop it first",
+                blocking.join(" and ")
+            ));
+        }
         self.media.deregister(call_id);
         self.promote_to_processing(call_id).await?;
         // Re-attach every answered subscription's raw tee to the new actor.
@@ -16288,6 +16311,153 @@ mod tests {
             ),
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ws_tee_is_refused_while_a_pcap_recording_holds_the_relay_forward_only() {
+        // A pcap recording promotes the relay *forward-only* (no decode). Attaching a tee would have to
+        // rebuild the actor, which cannot carry the live capture channel across — so refuse rather than
+        // silently stop recording. (Attaching the tee first works: `start_recording` then reuses the
+        // already-decoding actor.)
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (engine, (_phone_a, _near), _b) = two_party_relay("tee-vs-pcap").await;
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "tee-vs-pcap".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(directory.path().to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(started, CmdResult::Ok { .. }),
+            "start_recording: {started:?}"
+        );
+
+        let (uri, _frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-vs-pcap".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        match attached {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("pcap recording"),
+                "expected the recording conflict to be named, got {reason}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert_eq!(
+            engine.ws_tee_count(),
+            0,
+            "the refused attach left no tee behind"
+        );
+        assert!(
+            engine.media().is_relay_call("tee-vs-pcap"),
+            "the recording's forward-only actor is untouched by the refusal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_on_a_ws_takeover_call_does_not_wire_the_relay_to_leg_b() {
+        // Establishes the single-leg -> two-party question rather than assuming it: a WS-takeover call
+        // allocates leg B's endpoints at offer/answer, so it *looks* like a later `answer` might bridge
+        // the caller to a second party. It does not. `answer` short-circuits on `PipelineKind::Ws` and
+        // returns the rewritten SDP without installing any A<->B path, so the caller's media continues
+        // to the WS server only and B receives nothing.
+        //
+        // Handing a WS-bridged caller to a real leg B therefore needs a new transition (detach the
+        // bridge, wire the relay, keep leg A's ports and SSRC continuous so no re-INVITE is required) —
+        // it is not an emergent property of the current answer path.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
+        let ws_addr = ws_listener.local_addr().expect("ws addr");
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let (stream, _) = ws_listener.accept().await.expect("accept");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            let (_sink, mut source) = socket.split();
+            while let Some(Ok(_frame)) = source.next().await {}
+        });
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-then-answer".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some(format!("ws://{ws_addr}/stream")),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ws-then-answer".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("the answer still returns SDP")
+            .remote_rtp;
+        assert!(
+            engine.ws().is_ws_call("ws-then-answer"),
+            "the call is still WS-bridged after the answer"
+        );
+        assert!(
+            !engine.media().is_media_call("ws-then-answer"),
+            "no media pipeline was stood up, so there is no A<->B path"
+        );
+
+        // A's media goes to the WS server; B — although its ports are allocated and its answer was
+        // accepted — receives nothing.
+        for sequence in 0..10u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let mut buffer = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(300), phone_b.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "a WS-takeover call must not relay to leg B (the transition is unimplemented, not implicit)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
