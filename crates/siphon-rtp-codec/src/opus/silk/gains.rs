@@ -84,6 +84,9 @@ pub struct SubframeGains {
     /// The 6-bit log-gain index each subframe resolved to, 0..=63. Kept because the excitation decode
     /// and the noise-shaping quantiser reason in the log domain.
     pub log_gains: [i8; MAX_NB_SUBFR],
+    /// The raw coded indices these gains came from ([`GainIndices::indices`]), carried through so a
+    /// caller can compare against a reference decoder's side info without re-deriving them.
+    pub indices: [i8; MAX_NB_SUBFR],
     /// Number of 5 ms subframes.
     pub count: usize,
 }
@@ -118,8 +121,8 @@ pub fn decode_gain_indices(
     };
 
     // Remaining subframes: always delta-coded (decode_indices.c:73-75).
-    for index in 1..subframe_count {
-        indices[index] = decoder.dec_icdf(&DELTA_GAIN_ICDF, ICDF_FTB) as i8;
+    for slot in indices.iter_mut().take(subframe_count).skip(1) {
+        *slot = decoder.dec_icdf(&DELTA_GAIN_ICDF, ICDF_FTB) as i8;
     }
 
     Ok(GainIndices {
@@ -184,6 +187,7 @@ pub fn dequantize_gains(indices: &GainIndices, last_gain_index: &mut i8) -> Subf
     SubframeGains {
         gains_q16,
         log_gains,
+        indices: indices.indices,
         count: indices.count,
     }
 }

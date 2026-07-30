@@ -57,6 +57,7 @@ Fetch the vectors from their sources and drop them under `reference/<codec>/test
 | AMR-WB | 3GPP TS 26.174 | `reference/amr-wb/testv` |
 | Opus | RFC 6716 official vectors (opus-codec.org) | `reference/opus/opus_testvectors` |
 | Opus (CELT layer) | generated locally — see "Opus conformance oracle" below | `reference/opus/celt_only` |
+| Opus (SILK layer) | generated locally — see "Opus conformance oracle" below | `reference/opus/silk_only` |
 
 (G.711 and L16 need no external vectors: G.711 is validated exhaustively over all 256 code points,
 L16 is an exact byte-order transform.)
@@ -83,9 +84,15 @@ cmake -S reference/opus/opus-1.5.2 -B reference/opus/build \
       -DCMAKE_BUILD_TYPE=Release -DOPUS_BUILD_PROGRAMS=ON -DOPUS_BUILD_TESTING=ON
 cmake --build reference/opus/build -j
 sh reference/opus/gen_celt_only.sh          # writes reference/opus/celt_only/*.bit + *.dec
+sh reference/opus/gen_silk_only.sh          # writes reference/opus/silk_only/*.bit + *.dec
 SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
     cargo test -p siphon-rtp-codec --test celt_only_conformance --test opus_conformance
 ```
+
+`gen_celt_only.sh` uses `opus_demo -e restricted-lowdelay` (which forces `MODE_CELT_ONLY`);
+`gen_silk_only.sh` uses `opus_demo -e voip` at a low bitrate with the bandwidth capped at NB/MB/WB,
+which keeps the encoder in `MODE_SILK_ONLY`. Neither is taken on trust: both harnesses assert
+`toc.mode()` per packet and fail loudly if libopus ever slipped a frame of the other mode in.
 
 `SIPHON_RTP_OPUS_COMPARE` defaults to `/tmp/opus_compare`. Set it explicitly when working in a git
 worktree — `reference/` is untracked, so a fresh worktree has no oracle of its own and should point at
@@ -103,6 +110,34 @@ Two things about this oracle are worth knowing before you fight it:
   per packet — it is the exact check, it localises a desync to one packet, and it is what actually
   caught the CELT band-range bug. Prefer it when debugging; treat `opus_compare` as the acceptance
   gate, not the diagnostic.
+
+#### Instrumented libopus, for validating a half-finished layer
+
+Both oracles above need the decoder to consume a packet to its end, so neither can say anything about a
+layer that is only partly ported — a SILK decoder that stops at the NLSF stage produces no PCM and never
+reaches a final range. For that case there is a second, **intermediate-state** oracle: the same libopus
+source built with printf dumps of the side info it decoded, diffed field by field against ours.
+
+`reference/opus/silk_trace.patch` adds `#ifdef SILK_TRACE` blocks to `silk/dec_API.c`,
+`silk/decode_indices.c` and `silk/gain_quant.c` (VAD/LBRR flags, stereo predictors, mid-only flag,
+frame type, gain indices, dequantized gains), each line tagged with the packet index. It is purely
+additive — stripping the guarded blocks gives the original files back byte for byte. Apply it, build into
+a **separate** build directory so the plain oracle above is untouched, dump, then revert:
+
+```sh
+patch -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch
+cmake -S reference/opus/opus-1.5.2 -B reference/opus/build-trace \
+      -DCMAKE_BUILD_TYPE=Release -DOPUS_BUILD_PROGRAMS=ON -DCMAKE_C_FLAGS=-DSILK_TRACE
+cmake --build reference/opus/build-trace -j
+patch -R -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch   # keep the source pristine
+sh reference/opus/dump_silk_trace.sh        # writes reference/opus/silk_only/*.trace
+cargo test -p siphon-rtp-codec --test silk_header_conformance
+```
+
+The dump is only read, never regenerated, by the test — so the instrumented build is a one-off. Delete
+`reference/opus/build-trace` once the layer is finished and the `final_range` + `opus_compare` gates
+cover it, and prefer those: an intermediate-state diff proves the fields match, not that the whole
+packet parses.
 
 ## Fuzzing
 
