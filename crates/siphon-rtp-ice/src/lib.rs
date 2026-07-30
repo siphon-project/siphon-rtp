@@ -24,8 +24,10 @@
 #![deny(missing_docs)]
 
 pub mod candidate;
+pub mod gather;
 
 pub use candidate::{
     interleaved_local_preferences, priority, Candidate, CandidateKind, CandidateParseError,
     IceOptions, Transport, END_OF_CANDIDATES_ATTRIBUTE, MAX_COMPONENT_ID,
 };
+pub use gather::{GatherAction, GatherConfig, Gatherer};

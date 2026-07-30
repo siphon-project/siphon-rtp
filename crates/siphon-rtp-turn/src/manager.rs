@@ -163,6 +163,9 @@ impl<D: Datapath> AllocationManager<D> {
                 self.handle_send_indication(five_tuple, &message).await;
             }
             turn::CLASS_REQUEST => match method {
+                turn::METHOD_BINDING => {
+                    self.handle_binding(five_tuple, &transport, &message).await;
+                }
                 turn::METHOD_ALLOCATE => {
                     self.handle_allocate(five_tuple, transport, &message, datagram)
                         .await;
@@ -183,6 +186,35 @@ impl<D: Datapath> AllocationManager<D> {
             },
             _ => {} // responses / other indications → ignore
         }
+    }
+
+    /// Answer a plain STUN Binding request (RFC 8489 §7.3.1) — the reflexive-address probe, not a
+    /// TURN method.
+    ///
+    /// RFC 8656 §12 requires a TURN server to support Binding requests, and the practical payoff is
+    /// that the built-in server doubles as the STUN server our own ICE candidate gathering asks for
+    /// its server-reflexive address: one listener, one port to firewall, no coturn next door.
+    ///
+    /// Deliberately **unauthenticated**: RFC 8489 §9.1 makes authentication optional for Binding, and
+    /// a client discovering its reflexive address has no credentials to offer yet. The response leaks
+    /// only the source address the request already came from, so this adds no exposure — it cannot be
+    /// used to enumerate allocations or reach a peer. (A TURN *allocation* still requires long-term
+    /// credentials; nothing here changes that.) No amplification either: the response is comparable in
+    /// size to the request.
+    async fn handle_binding(
+        &self,
+        five_tuple: FiveTuple,
+        transport: &ClientTransport,
+        message: &StunMessage,
+    ) {
+        // The shared codec builds this exact response for the datapath's ICE responder — one
+        // definition of "Binding success with XOR-MAPPED-ADDRESS", not a second one here.
+        let response = stun::binding_success_response(
+            &message.transaction_id,
+            five_tuple.client,
+            None, // unauthenticated: see the doc comment (RFC 8489 §9.1)
+        );
+        transport.send(&response).await;
     }
 
     /// Handle an Allocate request (RFC 5766 §6.2).

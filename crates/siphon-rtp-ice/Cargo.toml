@@ -18,6 +18,9 @@ keywords = ["ice", "stun", "webrtc", "voip", "nat"]
 categories = ["network-programming"]
 
 [dependencies]
+# The STUN codec + the RFC 8489 retransmission clock candidate gathering drives. Both crates are
+# I/O-free, so the ICE core stays pure.
+siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
@@ -26,4 +29,8 @@ proptest = { workspace = true }
 
 [[bench]]
 name = "candidate"
+harness = false
+
+[[bench]]
+name = "gather"
 harness = false

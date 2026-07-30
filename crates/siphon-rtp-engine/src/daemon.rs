@@ -122,6 +122,17 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS)]
     pub shutdown_grace_secs: u64,
 
+    /// STUN server to ask for a server-reflexive ICE candidate during gathering (RFC 8445 §5.1.1.2).
+    /// Repeat the flag for several. The built-in TURN server answers Binding requests (RFC 8656 §12),
+    /// so `--turn-udp`'s address works here.
+    ///
+    /// Only useful when the engine itself sits behind a NAT it cannot be addressed through. On a
+    /// routable media address the reflexive probe returns the address already advertised and is
+    /// pruned as redundant (RFC 8445 §5.1.3) — so leaving this unset keeps call setup free of any
+    /// network round trip.
+    #[arg(long)]
+    pub stun_server: Vec<SocketAddr>,
+
     /// Actively probe ICE legs for consent freshness (RFC 7675) instead of only answering their
     /// checks, tearing a call down when its peer stops responding on the validated path.
     ///
@@ -189,6 +200,8 @@ pub struct RunConfig {
     pub media_timeout_secs: u64,
     /// Bounded SIGTERM/SIGINT drain grace period (seconds).
     pub shutdown_grace_secs: u64,
+    /// STUN servers asked for a server-reflexive candidate when gathering; empty ⇒ host-only.
+    pub stun_servers: Vec<SocketAddr>,
     /// Actively run RFC 7675 consent freshness on ICE legs (off ⇒ the ICE-lite responder posture).
     pub ice_consent: bool,
     /// Seconds between consent checks on a validated pair.
@@ -258,6 +271,13 @@ impl RunConfig {
                 file.shutdown_grace_secs,
                 DEFAULT_SHUTDOWN_GRACE_SECS,
             ),
+            // A repeated CLI flag has no "explicit" bit to test, so a non-empty list simply wins over
+            // the file (the same precedence, expressed for a `Vec`).
+            stun_servers: if args.stun_server.is_empty() {
+                file.stun_server.unwrap_or_default()
+            } else {
+                args.stun_server
+            },
             ice_consent: resolve_defaulted(
                 args.ice_consent,
                 explicit("ice_consent"),
@@ -449,6 +469,14 @@ where
     let mut engine = Engine::new(datapath.clone())
         .with_cluster(cluster.clone())
         .with_interfaces(interfaces);
+    if !config.stun_servers.is_empty() {
+        tracing::info!(
+            target: "siphon_rtp::control",
+            servers = ?config.stun_servers,
+            "ICE gathering will probe these STUN servers for a server-reflexive candidate"
+        );
+        engine = engine.with_stun_servers(config.stun_servers.clone());
+    }
     if config.ice_consent {
         tracing::info!(
             target: "siphon_rtp::media",
@@ -758,6 +786,7 @@ mod tests {
             max_control_rps: 0,
             media_timeout_secs: 30,
             shutdown_grace_secs: 25,
+            stun_servers: Vec::new(),
             ice_consent: false,
             consent_interval_secs: 5,
             consent_timeout_secs: 30,

@@ -9,9 +9,10 @@ Rust, at different levels of maturity. This page says exactly which level.
 
 - DTLS-SRTP termination on a call leg: the offer advertises `a=fingerprint` +
   `a=setup:actpass`, the handshake keys the leg (webrtc-dtls, pure RustCrypto).
-- ICE-lite server posture: per-call credentials, `a=ice-lite` plus one host
-  candidate in the rewritten SDP, and a STUN Binding responder on the media port
-  (MESSAGE-INTEGRITY + FINGERPRINT validated and returned).
+- ICE-lite server posture: per-call credentials, `a=ice-lite` plus a gathered
+  candidate list in the rewritten SDP (host per component, and a server-reflexive
+  candidate per `--stun-server` that answers), and a STUN Binding responder on the
+  media port (MESSAGE-INTEGRITY + FINGERPRINT validated and returned).
 - A full built-in TURN server, `turn:` and `turns:`, with coturn REST
   credentials. A coturn replacement, not a shim.
 - RFC 7675 consent freshness, opt-in with `--ice-consent`: the engine probes the
@@ -100,9 +101,37 @@ a=ice-pwd:H7f2kQ91bXcR3sT8wLpZv0Ay
 a=candidate:1 1 UDP 2130706431 203.0.113.10 40002 typ host
 ```
 
-One host candidate, because the engine sits on a public (or routable) address by
-design (`--relay-bind-ip`); an ICE-lite agent never gathers reflexive or relayed
-candidates (RFC 8445 §2.5). Incoming Binding requests on the media port are
+The candidate list is **gathered** (RFC 8445 §5.1.1), not hardcoded: a host
+candidate per component — RTP, plus RTCP when the leg is not muxed — carrying the
+leg's advertised address, so a 1:1-NAT deployment offers its routable IP rather
+than the bound private one.
+
+Point `--stun-server` at a STUN server and the engine also probes it from each
+media endpoint for a **server-reflexive** candidate:
+
+```
+siphon-rtp --stun-server 198.51.100.1:3478
+```
+
+The built-in TURN server answers plain Binding requests (RFC 8656 §12), so its
+own address works there and you do not need a second service.
+
+Most deployments should leave it unset. On a routable media address the probe
+comes back reporting the address already advertised, which is pruned as redundant
+(RFC 8445 §5.1.3) — so you would pay a round trip on every call setup to learn
+nothing. It earns its keep only when the engine itself sits behind a NAT it cannot
+be addressed through.
+
+Gathering runs on the offer/answer path and is bounded: probes retransmit per RFC
+8489 §6.2.1, the plan gives up at a deadline, and whatever was gathered is
+advertised. A STUN server that is down costs one bounded delay and a host-only
+candidate list, logged as a warning. It never fails the call. Both components
+gather concurrently, so that delay is paid once per leg.
+
+Since there is no trickle yet, the offer or answer carries the complete list and
+says so with `a=end-of-candidates` (RFC 8838 §14).
+
+Incoming Binding requests on the media port are
 answered per RFC 8445 §7.3: the USERNAME must address our ufrag and the
 MESSAGE-INTEGRITY must verify against our password, then the response carries
 XOR-MAPPED-ADDRESS, MESSAGE-INTEGRITY, and FINGERPRINT. An invalid check is
@@ -113,8 +142,8 @@ the peer's media path. That is deliberate. An ICE check is cryptographically
 bound to the SDP exchange, so it is a stronger latch signal than "first packet
 wins" ever could be (see [Security & NAT](../security-and-nat.md), layer 4).
 
-Be honest about the boundary: this is the responder half of ICE. The engine does
-not gather candidates, does not run checklists, does not pair candidates, and
+Be honest about the boundary: this is still the responder half of ICE. The engine
+gathers candidates, but it does not run checklists, does not pair candidates, and
 does not nominate. For the server-side role against browsers this is normally
 sufficient (the browser, as full agent, drives the checks), but if you need the
 engine to be an ICE *client* (outbound WebRTC trunking), that work is planned and

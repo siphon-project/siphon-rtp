@@ -14,7 +14,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use siphon_rtp_codec::factory::CodecSpec;
-use siphon_rtp_ice::{Candidate, IceOptions};
+use siphon_rtp_ice::{Candidate, IceOptions, END_OF_CANDIDATES_ATTRIBUTE};
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
 /// Default packetization when the SDP carries no `a=ptime` (RFC 3551: 20 ms for telephony codecs).
@@ -650,14 +650,18 @@ pub fn parse(sdp: &str) -> Result<MediaInfo, SdpError> {
     media_info(&scan(sdp))
 }
 
-/// ICE-lite credentials to advertise in a rewritten SDP: `a=ice-lite` (session-level) plus
-/// `a=ice-ufrag` / `a=ice-pwd` and a host `a=candidate` for the engine's media address.
+/// The engine's ICE identity to advertise in a rewritten SDP: `a=ice-lite` (session-level) plus
+/// `a=ice-ufrag` / `a=ice-pwd` and the **gathered** candidate set.
 #[derive(Debug, Clone, Copy)]
 pub struct IceAdvertisement<'a> {
     /// The engine's local ICE username fragment.
     pub ufrag: &'a str,
     /// The engine's local ICE password.
     pub pwd: &'a str,
+    /// The candidates gathered for this leg (RFC 8445 §5.1.1), emitted in order as `a=candidate`
+    /// lines. Always at least the host candidate — gathering produces that without touching the
+    /// network — plus a server-reflexive one per STUN server that answered.
+    pub candidates: &'a [Candidate],
 }
 
 /// How [`rewrite`] treats the audio stream's ICE attributes (RFC 8445 / RFC 8839 §5). Decouples the
@@ -833,13 +837,14 @@ pub fn rewrite(
                 lines.push(format!("a=ice-pwd:{}", ice.pwd));
                 // RFC 8839 §5.1: the candidate's connection-address is a bare IP literal in either
                 // family — `IpAddr`'s Display emits a v6 literal without brackets, exactly as the
-                // `a=candidate` grammar requires (brackets are an `m=`/`c=`-line concern only). The
-                // advertised (public) IP is emitted, the bound port; they share a family by construction.
-                lines.push(format!(
-                    "a=candidate:1 1 UDP {HOST_CANDIDATE_PRIORITY} {} {} typ host",
-                    engine.advertised_ip,
-                    engine.rtp.port()
-                ));
+                // `a=candidate` grammar requires (brackets are an `m=`/`c=`-line concern only).
+                for candidate in ice.candidates {
+                    lines.push(candidate.to_attribute_line());
+                }
+                // RFC 8838 §14: our list is complete before the SDP is built (gathering runs to
+                // completion, or to its deadline, on the control path), so say so — a trickle-capable
+                // peer can stop waiting for more instead of holding its checklist open.
+                lines.push(END_OF_CANDIDATES_ATTRIBUTE.to_string());
             }
         } else if index == conn_index {
             // RFC 4566 §5.7: emit the addrtype of the engine endpoint's own family (`IP4`/`IP6`),
@@ -1710,19 +1715,27 @@ mod tests {
              a=ice-ufrag:PEERUF\r\na=ice-pwd:peerpassword01234567\r\n\
              m=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
         let engine = EngineMedia::new("[::1]:40000".parse().unwrap(), None);
+        let candidates = gathered_host_candidates("[::1]:40000");
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
+            candidates: &candidates,
         };
         let result = rewrite(sdp, engine, IceRewrite::Reoriginate(advert), None, None)
             .expect("rewrite v6 ice");
         assert!(result.sdp.contains("c=IN IP6 ::1"));
+        let emitted = result
+            .sdp
+            .lines()
+            .find(|line| line.starts_with("a=candidate:"))
+            .expect("a candidate line");
         assert!(
-            result
-                .sdp
-                .contains("a=candidate:1 1 UDP 2130706431 ::1 40000 typ host"),
-            "v6 host candidate as a bare literal: {}",
-            result.sdp
+            emitted.contains(" ::1 40000 typ host"),
+            "v6 host candidate as a bare literal: {emitted}"
+        );
+        assert_eq!(
+            Candidate::parse(emitted).expect("parses").address,
+            "[::1]:40000".parse::<SocketAddr>().expect("addr")
         );
         assert!(
             !result.sdp.contains("2001:db8::7"),
@@ -1794,13 +1807,25 @@ mod tests {
         assert!(info.ice_ufrag.is_none());
     }
 
+    /// The candidate set a host-only gather produces for `address` — what the engine now hands the
+    /// rewriter instead of a hardcoded line.
+    fn gathered_host_candidates(address: &str) -> Vec<Candidate> {
+        let address: SocketAddr = address.parse().expect("addr");
+        let mut gatherer =
+            siphon_rtp_ice::Gatherer::new(siphon_rtp_ice::GatherConfig::host_only(address), 0);
+        let _ = gatherer.poll(0);
+        gatherer.candidates().to_vec()
+    }
+
     #[test]
     fn rewrite_re_originates_ice_as_ice_lite() {
         let sdp = ice_offer("203.0.113.7", 49170);
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let candidates = gathered_host_candidates("127.0.0.1:40000");
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
+            candidates: &candidates,
         };
         let result =
             rewrite(&sdp, engine, IceRewrite::Reoriginate(advert), None, None).expect("rewrite");
@@ -1809,9 +1834,21 @@ mod tests {
         assert!(result.sdp.contains("a=ice-lite"));
         assert!(result.sdp.contains("a=ice-ufrag:ENGUF"));
         assert!(result.sdp.contains("a=ice-pwd:engpassword01234567"));
-        assert!(result
+        // The host candidate is emitted from the gathered set. Its foundation is now derived per
+        // RFC 8445 §5.1.1.3 (an arbitrary string that tracks type/base/protocol/server) rather than
+        // the literal `1` every candidate used to carry, so assert the fields the spec constrains.
+        let emitted = result
             .sdp
-            .contains("a=candidate:1 1 UDP 2130706431 127.0.0.1 40000 typ host"));
+            .lines()
+            .find(|line| line.starts_with("a=candidate:"))
+            .expect("a candidate line");
+        let candidate = Candidate::parse(emitted).expect("our own candidate parses");
+        assert_eq!(candidate.component, 1);
+        assert_eq!(candidate.kind, siphon_rtp_ice::CandidateKind::Host);
+        assert_eq!(candidate.priority, 2_130_706_431);
+        assert_eq!(candidate.address, "127.0.0.1:40000".parse().expect("addr"));
+        // Gathering is complete before the SDP is written, so we say so (RFC 8838 §14).
+        assert!(result.sdp.contains("a=end-of-candidates"));
         // The peer's ICE attributes are gone.
         assert!(!result.sdp.contains("PEERUF"));
         assert!(!result.sdp.contains("peerpassword01234567"));

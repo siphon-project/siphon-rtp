@@ -2024,6 +2024,7 @@ version = "0.1.4"
 dependencies = [
  "criterion",
  "proptest",
+ "siphon-rtp-stun",
  "thiserror 2.0.18",
 ]
 
