@@ -33,7 +33,9 @@ every crate, see [VERSIONING.md](VERSIONING.md)); this is what the first public 
   (decode and encode all 8 modes; DTX/SID out of scope).
 - **SRTP-SDES** (RFC 3711 / 4568) with anti-replay, and **DTLS-SRTP** (RFC 5764),
   both pure RustCrypto.
-- **ICE-lite + STUN**, and a **built-in TURN server** (RFC 5766 / 8656, coturn REST
+- **ICE-lite + STUN**, with opt-in **consent freshness** (RFC 7675, `--ice-consent`:
+  probes the validated candidate pair and tears the call down when the peer stops
+  answering), and a **built-in TURN server** (RFC 5766 / 8656, coturn REST
   credentials, `turn:` / `turns:` over UDP/TCP/TLS).
 - **RTCP** SR/RR (parse and construct), **jitter buffer + PLC**, **resampler** (AVX2),
   an energy **VAD**, single-channel **noise suppression**, and **echo cancellation**

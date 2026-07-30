@@ -11,6 +11,7 @@
 //! in `siphon-rtp-stun`. Pure, tick-driven logic; the daemon sweeper drives it (wired in a follow-up).
 
 pub mod consent;
+pub mod driver;
 
 /// The engine's short-term ICE credentials for one call (its own identity as the ICE-lite server).
 #[derive(Debug, Clone, PartialEq, Eq)]

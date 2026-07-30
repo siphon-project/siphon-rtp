@@ -48,6 +48,28 @@ control = "127.0.0.1:8080"
 # Default: 30.
 # media_timeout_secs = 30
 
+# --- ICE consent freshness (RFC 7675) -----------------------------------------------------------
+#
+# Actively probe ICE legs on their validated candidate pair and tear a call down when the peer stops
+# answering (CLI: --ice-consent). Default: false.
+#
+# Off by default on purpose: RFC 7675 §4 says an ICE-LITE agent responds to consent checks and does
+# not generate them, and `a=ice-lite` is what the engine advertises today — so initiating them is a
+# deviation you opt into. Checks are always sent to the STUN-VALIDATED source, never to the peer's
+# signalled c= address (which for a NATed peer is unusable, and probing it would reap live calls).
+# Needs a datapath with the full-agent seam: the UDP backend has it; the XDP fast path logs a warning
+# per endpoint and stays responder-only. See docs/security-and-nat.md §4 layer 4.
+# ice_consent = false
+
+# Seconds between consent checks on a validated pair; RFC 7675 §5.1 recommends ~5 s, randomised
+# (CLI: --consent-interval-secs). Default: 5.
+# consent_interval_secs = 5
+
+# Seconds with no correlated, MESSAGE-INTEGRITY-verified response before the pair is declared dead
+# and the call is torn down — CDR reason `consent_failed` (CLI: --consent-timeout-secs). RFC 7675
+# §5.1 specifies 30 s. Default: 30.
+# consent_timeout_secs = 30
+
 # --- Advertised address & named interfaces (rtpengine-style) ------------------------------------
 #
 # The engine separates the IP it BINDS media sockets to (relay_bind_ip / an interface `address`) from
