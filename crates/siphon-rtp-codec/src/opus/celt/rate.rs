@@ -12,8 +12,8 @@
 //! pulse count `K` lives in `quant_all_bands` (`bits2pulses`), not here.
 
 use crate::opus::celt::energy::MAX_FINE_BITS;
+use crate::opus::celt::entropy::CeltCoder;
 use crate::opus::celt::tables::{BAND_ALLOCATION, CACHE_CAPS50, E_BANDS, LOG_N, NB_BANDS};
-use crate::opus::range_coder::RangeDecoder;
 
 /// Bisection steps for the fine interpolation (libopus `ALLOC_STEPS`).
 const ALLOC_STEPS: i32 = 6;
@@ -142,10 +142,15 @@ pub fn cache_max_bits(band: usize, lm: i32) -> i32 {
 }
 
 /// Interpolate the fine allocation point and split each band's budget into PVQ bits + fine-energy
-/// bits, reading skip / intensity / dual-stereo decisions from the range coder (libopus
-/// `interp_bits2pulses`, decoder path). Returns the number of coded (non-skipped) bands.
+/// bits, coding the skip / intensity / dual-stereo decisions (libopus `interp_bits2pulses`,
+/// `rate.c:263`). Returns the number of coded (non-skipped) bands.
+///
+/// The skip loop is the only part of the allocator that is *not* mandated by the bitstream: an
+/// encoder chooses which bands to drop and signals each choice, a decoder just reads the flags
+/// (`rate.c:346-372`). `prev` (the previous frame's coded-band count) and `signal_bandwidth` feed
+/// that encoder-only decision.
 #[allow(clippy::too_many_arguments)]
-fn interp_bits2pulses(
+fn interp_bits2pulses<C: CeltCoder>(
     start: usize,
     end: usize,
     skip_start: usize,
@@ -165,7 +170,9 @@ fn interp_bits2pulses(
     fine_priority: &mut [i32],
     channels: usize,
     lm: usize,
-    dec: &mut RangeDecoder,
+    prev: usize,
+    signal_bandwidth: usize,
+    coder: &mut C,
 ) -> usize {
     let c = channels as i32;
     let alloc_floor = c << BITRES;
@@ -225,8 +232,28 @@ fn interp_bits2pulses(
         let rem = (left - (E_BANDS[j] as i32 - E_BANDS[start] as i32)).max(0);
         let band_width = E_BANDS[coded_bands] as i32 - E_BANDS[j] as i32;
         let mut band_bits = bits[j] + percoeff * band_width + rem;
+        // Only code a skip decision if we're above the threshold for this band; otherwise it is
+        // force-skipped (this ensures we have enough bits to code the skip flag).
         if band_bits >= thresh[j].max(alloc_floor + (1 << BITRES)) {
-            if dec.dec_bit_logp(1) {
+            let mut stop = false;
+            if C::ENCODE {
+                // "We choose a threshold with some hysteresis to keep bands from fluctuating in and
+                // out, but we try not to fold below a certain point." (rate.c:352)
+                let depth_threshold = if coded_bands > 17 {
+                    if j < prev {
+                        7
+                    } else {
+                        9
+                    }
+                } else {
+                    0
+                };
+                stop = coded_bands <= start + 2
+                    || (band_bits > ((depth_threshold * band_width) << lm << BITRES) >> 4
+                        && j <= signal_bandwidth);
+            }
+            coder.code_bit_logp(&mut stop, 1);
+            if stop {
                 break;
             }
             psum += 1 << BITRES; // a bit was spent on the skip flag
@@ -249,7 +276,12 @@ fn interp_bits2pulses(
 
     // Intensity / dual-stereo parameters.
     if intensity_rsv > 0 {
-        *intensity = start + dec.dec_uint((coded_bands + 1 - start) as u32) as usize;
+        if C::ENCODE {
+            *intensity = (*intensity).min(coded_bands);
+        }
+        let mut value = (*intensity).saturating_sub(start) as u32;
+        coder.code_uint(&mut value, (coded_bands + 1 - start) as u32);
+        *intensity = start + value as usize;
     } else {
         *intensity = 0;
     }
@@ -257,11 +289,11 @@ fn interp_bits2pulses(
         total += dual_stereo_rsv;
         dual_stereo_rsv = 0;
     }
-    *dual_stereo = if dual_stereo_rsv > 0 {
-        dec.dec_bit_logp(1)
+    if dual_stereo_rsv > 0 {
+        coder.code_bit_logp(dual_stereo, 1);
     } else {
-        false
-    };
+        *dual_stereo = false;
+    }
 
     // Distribute the remaining bits proportionally across the coded bands.
     let mut left = total - psum;
@@ -336,12 +368,16 @@ fn interp_bits2pulses(
     coded_bands
 }
 
-/// Compute the full per-band bit allocation (libopus `clt_compute_allocation`, decoder path). Fills
-/// `pulses` (PVQ bits), `ebits` (fine bits), `fine_priority`, and `intensity`/`dual_stereo`; returns
-/// the number of coded bands. `offsets` are the dynalloc boosts, `cap` from [`init_caps`], `total`
-/// the remaining bit budget in 1/8 bits.
+/// Compute the full per-band bit allocation (libopus `clt_compute_allocation`, `rate.c:534`) —
+/// **shared by encoder and decoder**, exactly as in libopus, so the two can never disagree on the
+/// budget. Fills `pulses` (PVQ bits), `ebits` (fine bits), `fine_priority`, and
+/// `intensity`/`dual_stereo`; returns the number of coded bands.
+///
+/// `offsets` are the dynalloc boosts, `cap` from [`init_caps`], `total` the remaining bit budget in
+/// 1/8 bits. `prev` (last frame's coded-band count) and `signal_bandwidth` only affect the
+/// encoder's band-skip decision; a decoder passes anything (they are unread when `!C::ENCODE`).
 #[allow(clippy::too_many_arguments)]
-pub fn clt_compute_allocation(
+pub fn clt_compute_allocation<C: CeltCoder>(
     start: usize,
     end: usize,
     offsets: &[i32],
@@ -356,7 +392,9 @@ pub fn clt_compute_allocation(
     fine_priority: &mut [i32],
     channels: usize,
     lm: usize,
-    dec: &mut RangeDecoder,
+    prev: usize,
+    signal_bandwidth: usize,
+    coder: &mut C,
 ) -> usize {
     let c = channels as i32;
     total = total.max(0);
@@ -476,13 +514,16 @@ pub fn clt_compute_allocation(
         fine_priority,
         channels,
         lm,
-        dec,
+        prev,
+        signal_bandwidth,
+        coder,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opus::range_coder::{RangeDecoder, RangeEncoder};
 
     fn cache_count(band: usize, lm: i32) -> usize {
         CACHE_BITS50[CACHE_INDEX50[(lm + 1) as usize * NB_BANDS + band] as usize] as usize
@@ -578,6 +619,8 @@ mod tests {
                         &mut fine_priority,
                         channels,
                         lm,
+                        0,
+                        0,
                         &mut dec,
                     );
                     assert!(
@@ -603,5 +646,147 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The allocator is a **single** shared implementation, so encoder and decoder must land on
+    /// byte-identical allocations for the same budget: the encoder decides which bands to skip and
+    /// signals them, and the decoder reading those flags must reproduce every `pulses`, `ebits`,
+    /// `fine_priority`, `balance`, `intensity`/`dual_stereo` and the coded-band count.
+    #[test]
+    fn allocation_encode_then_decode_produces_identical_allocations() {
+        for &lm in &[0usize, 1, 2, 3] {
+            for &channels in &[1usize, 2] {
+                for &total in &[120i32, 700, 2500, 9000, 40000] {
+                    for &boost in &[0i32, 60] {
+                        for &signal_bandwidth in &[NB_BANDS - 1, 13] {
+                            let mut cap = [0i32; NB_BANDS];
+                            init_caps(&mut cap, lm, channels);
+                            let offsets: [i32; NB_BANDS] =
+                                core::array::from_fn(|j| if j % 5 == 0 { boost } else { 0 });
+
+                            let mut buf = vec![0u8; 1500];
+                            let mut enc_intensity = channels;
+                            let mut enc_dual = channels == 2;
+                            let mut enc_pulses = [0i32; NB_BANDS];
+                            let mut enc_ebits = [0i32; NB_BANDS];
+                            let mut enc_prio = [0i32; NB_BANDS];
+                            let mut enc_balance = 0i32;
+                            let enc_coded;
+                            {
+                                let mut enc = RangeEncoder::new(&mut buf);
+                                enc_coded = clt_compute_allocation(
+                                    0,
+                                    NB_BANDS,
+                                    &offsets,
+                                    &cap,
+                                    5,
+                                    &mut enc_intensity,
+                                    &mut enc_dual,
+                                    total,
+                                    &mut enc_balance,
+                                    &mut enc_pulses,
+                                    &mut enc_ebits,
+                                    &mut enc_prio,
+                                    channels,
+                                    lm,
+                                    NB_BANDS,
+                                    signal_bandwidth,
+                                    &mut enc,
+                                );
+                                enc.done();
+                                assert!(!enc.error(), "lm={lm} total={total}: encoder overflow");
+                            }
+
+                            let mut dec_intensity = 0usize;
+                            let mut dec_dual = false;
+                            let mut dec_pulses = [0i32; NB_BANDS];
+                            let mut dec_ebits = [0i32; NB_BANDS];
+                            let mut dec_prio = [0i32; NB_BANDS];
+                            let mut dec_balance = 0i32;
+                            let mut dec = RangeDecoder::new(&buf);
+                            let dec_coded = clt_compute_allocation(
+                                0,
+                                NB_BANDS,
+                                &offsets,
+                                &cap,
+                                5,
+                                &mut dec_intensity,
+                                &mut dec_dual,
+                                total,
+                                &mut dec_balance,
+                                &mut dec_pulses,
+                                &mut dec_ebits,
+                                &mut dec_prio,
+                                channels,
+                                lm,
+                                0,
+                                0,
+                                &mut dec,
+                            );
+
+                            let tag = format!(
+                                "lm={lm} c={channels} total={total} boost={boost} \
+                                 sb={signal_bandwidth}"
+                            );
+                            assert_eq!(dec_coded, enc_coded, "{tag}: coded bands");
+                            assert_eq!(dec_pulses, enc_pulses, "{tag}: pulses");
+                            assert_eq!(dec_ebits, enc_ebits, "{tag}: ebits");
+                            assert_eq!(dec_prio, enc_prio, "{tag}: fine_priority");
+                            assert_eq!(dec_balance, enc_balance, "{tag}: balance");
+                            assert_eq!(dec_intensity, enc_intensity, "{tag}: intensity");
+                            assert_eq!(dec_dual, enc_dual, "{tag}: dual_stereo");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The encoder's skip decision must actually respond to `signal_bandwidth`: forcing a low
+    /// bandwidth has to drop bands the wide setting keeps (otherwise the knob is decorative).
+    #[test]
+    fn signal_bandwidth_narrows_the_coded_band_count() {
+        let lm = 3usize;
+        let channels = 1usize;
+        let total = 3000i32;
+        let mut cap = [0i32; NB_BANDS];
+        init_caps(&mut cap, lm, channels);
+        let offsets = [0i32; NB_BANDS];
+
+        let run = |signal_bandwidth: usize| -> usize {
+            let mut buf = vec![0u8; 1500];
+            let mut intensity = 0usize;
+            let mut dual = false;
+            let mut pulses = [0i32; NB_BANDS];
+            let mut ebits = [0i32; NB_BANDS];
+            let mut prio = [0i32; NB_BANDS];
+            let mut balance = 0i32;
+            let mut enc = RangeEncoder::new(&mut buf);
+            clt_compute_allocation(
+                0,
+                NB_BANDS,
+                &offsets,
+                &cap,
+                5,
+                &mut intensity,
+                &mut dual,
+                total,
+                &mut balance,
+                &mut pulses,
+                &mut ebits,
+                &mut prio,
+                channels,
+                lm,
+                NB_BANDS,
+                signal_bandwidth,
+                &mut enc,
+            )
+        };
+        let wide = run(NB_BANDS - 1);
+        let narrow = run(8);
+        assert!(
+            narrow < wide,
+            "signal_bandwidth had no effect: narrow {narrow} vs wide {wide}"
+        );
     }
 }

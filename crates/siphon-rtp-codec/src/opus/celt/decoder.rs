@@ -17,7 +17,7 @@
 //! Line references below cite `celt/celt_decoder.c` from the libopus tree the port was made against.
 
 use crate::opus::celt::anti_collapse::anti_collapse;
-use crate::opus::celt::band_decode::quant_all_bands;
+use crate::opus::celt::band_coder::quant_all_bands;
 use crate::opus::celt::energy::{
     unquant_coarse_energy, unquant_energy_finalise, unquant_fine_energy,
 };
@@ -239,12 +239,14 @@ impl CeltDecoder {
         } else {
             false
         };
-        // libopus advances `nbits_total` to `len*8` on silence so every `tell+X<=total_bits` guard
-        // below fails and no further symbols are read. `RangeDecoder` doesn't expose that knob, so on
-        // a silent frame we still call the decode pipeline (which reads a few phantom symbols) — but
-        // `silence` pins the energies and `denormalise_bands(silence=true)` zeroes the spectrum, so
-        // the synthesized output is silent regardless. The only top-level guard we gate on `!silence`
-        // is the post-filter (so a silent frame leaves the post-filter state untouched).
+        // "Pretend we've read all the remaining bits" (celt_decoder.c:1325): advance `nbits_total`
+        // to `len*8` so every `tell+X <= total_bits` guard below fails and no further symbol is
+        // read — which is exactly what the encoder does on a silent frame, so both sides end the
+        // packet on the same range value. `silence` additionally pins the energies and
+        // `denormalise_bands(silence=true)` zeroes the spectrum.
+        if silence {
+            dec.declare_bits_used(total_bits_i);
+        }
 
         // ── Post-filter params (start==0, celt_decoder.c:1334) ───────────────────────────────────
         let mut postfilter_gain = 0.0f32;
@@ -374,6 +376,10 @@ impl CeltDecoder {
             &mut fine_priority,
             CHANNELS,
             lm,
+            // `prev` / `signal_bandwidth` drive the *encoder's* band-skip choice only; a decoder
+            // reads the flags (`rate.c:346`), so these are unread here.
+            0,
+            0,
             &mut dec,
         );
 
@@ -395,15 +401,17 @@ impl CeltDecoder {
         self.decode_mem.copy_within(n.., 0);
 
         // ── Band / PVQ decode (celt_decoder.c:1493) ──────────────────────────────────────────────
-        // X is the C*N interleaved normalised MDCT coefficient buffer; mono → length N.
-        let mut x = vec![0f32; n];
+        // X is the C*N interleaved normalised MDCT coefficient buffer; mono → length N. Fixed stack
+        // scratch, not a per-frame `Vec`: the hot path must not touch the allocator.
+        let mut x_buf = [0f32; MAX_FRAME_SAMPLES];
+        let x = &mut x_buf[..n];
         let mut collapse_masks = [0u8; CHANNELS * NB_BANDS];
         // total_bits arg = len*(8<<BITRES) - anti_collapse_rsv  (1/8 bits).
         let band_total_bits = (frame.len() as i32) * (8 << BITRES) - anti_collapse_rsv;
         quant_all_bands(
             start,
             end,
-            &mut x,
+            x,
             &mut collapse_masks,
             &pulses,
             short_blocks,
@@ -441,7 +449,7 @@ impl CeltDecoder {
 
         if anti_collapse_on {
             self.rng = anti_collapse(
-                &mut x,
+                x,
                 &collapse_masks,
                 lm,
                 CHANNELS,
@@ -466,7 +474,7 @@ impl CeltDecoder {
         // final per-band energy and sidesteps borrowing `self` immutably across the `&mut self` call.
         let band_energy = self.old_band_energy;
         self.celt_synthesis(
-            &x,
+            x,
             &band_energy,
             start,
             eff_end,
@@ -610,9 +618,11 @@ impl CeltDecoder {
             (1usize, n, MAX_LM - lm)
         };
 
-        // freq: the interleaved signal MDCTs (celt_decoder.c:432), length N.
-        let mut freq = vec![0f32; n];
-        denormalise_bands(x, &mut freq, old_band_energy, start, eff_end, m, 1, silence);
+        // freq: the interleaved signal MDCTs (celt_decoder.c:432), length N. Fixed stack scratch,
+        // not a per-frame `Vec` — the hot path must not touch the allocator.
+        let mut freq_buf = [0f32; MAX_FRAME_SAMPLES];
+        let freq = &mut freq_buf[..n];
+        denormalise_bands(x, freq, old_band_energy, start, eff_end, m, 1, silence);
 
         // out_syn[0] = decode_mem + DECODE_BUFFER_SIZE - N (celt_decoder.c:1274).
         let out_syn = DECODE_BUFFER_SIZE - n;
