@@ -327,6 +327,17 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 - **Note:** for non-ICE legacy VoLTE/PSTN UAs (the common case), layers 1–3 are the whole story; ICE
   applies to ICE-capable peers (RCS, WebRTC bridges, modern clients).
 
+- **A repeated `offer` on a live call-id is owner-only, and replaces cleanly.** Another client
+  offering an existing call-id gets `unknown_call` and the live call is untouched — it cannot be
+  destroyed, and its existence is not disclosed (A3, §5). For the owner the offer *replaces* the call:
+  the previous one is torn down through the same path as `delete` (CDR emitted, endpoints, pipelines,
+  subscriptions and the quota slot all released) before the replacement is built. Previously the
+  registry entry was simply overwritten and the old `Call` dropped unfreed, leaking its media ports
+  and its quota slot on every repeat — a client re-offering in a loop could exhaust both. Note this is
+  replacement, not re-negotiation: the replacement binds fresh ports, so the peer must be told the new
+  address. A true re-offer on the existing ports (a SIP re-INVITE, and the trigger an RFC 8445 §9 ICE
+  restart needs) is a separate control verb that does not exist yet.
+
 ### Layer 5 — SRTP / DTLS-SRTP
 The cryptographic fix: authenticated media cannot be injected or silently hijacked even if the latch
 is wrong, and encryption defeats A2 eavesdrop.
