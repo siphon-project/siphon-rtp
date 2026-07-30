@@ -17,7 +17,7 @@
 //! Line references below cite `celt/celt_decoder.c` from the libopus tree the port was made against.
 
 use crate::opus::celt::anti_collapse::anti_collapse;
-use crate::opus::celt::band_decode::quant_all_bands;
+use crate::opus::celt::band_coder::quant_all_bands;
 use crate::opus::celt::energy::{
     unquant_coarse_energy, unquant_energy_finalise, unquant_fine_energy,
 };
@@ -374,6 +374,10 @@ impl CeltDecoder {
             &mut fine_priority,
             CHANNELS,
             lm,
+            // `prev` / `signal_bandwidth` drive the *encoder's* band-skip choice only; a decoder
+            // reads the flags (`rate.c:346`), so these are unread here.
+            0,
+            0,
             &mut dec,
         );
 

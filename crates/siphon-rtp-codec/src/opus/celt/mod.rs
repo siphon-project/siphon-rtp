@@ -17,10 +17,11 @@
 
 pub mod anti_collapse;
 pub mod band_analysis;
-pub mod band_decode;
+pub mod band_coder;
 pub mod bands;
 pub mod decoder;
 pub mod energy;
+pub mod entropy;
 pub mod laplace;
 pub mod mathops;
 pub mod mdct;
