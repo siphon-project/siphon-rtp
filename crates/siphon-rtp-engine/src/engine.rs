@@ -53,6 +53,8 @@ use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement};
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
 use crate::ws_bridge::WsRegistry;
+use siphon_rtp_ice::{GatherAction, GatherConfig, Gatherer};
+use std::net::SocketAddr;
 
 use siphon_rtp_media::bridge::protocol::{Direction as WsDirection, MediaFormat};
 use siphon_rtp_media::bridge::{run_bridge, BridgeSession};
@@ -553,6 +555,10 @@ pub struct Engine<D: Datapath> {
     /// engine only *answers* checks (the RFC 7675 §4 ICE-lite posture) and dead paths are caught by
     /// the media-timeout sweep alone. Shared with the sweeper task, which drives it once per tick.
     consent: Option<Arc<ConsentSupervisor>>,
+    /// STUN servers asked for a server-reflexive candidate during gathering (RFC 8445 §5.1.1.2).
+    /// Empty (the default) ⇒ host-only gathering, which is correct for a directly-addressable engine
+    /// and costs no network round trip at call setup.
+    stun_servers: Vec<SocketAddr>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -605,7 +611,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             play_id_counter: std::sync::atomic::AtomicU64::new(1),
             // Off unless the operator opts in — see `with_consent`.
             consent: None,
+            // Host-only gathering unless the operator names a STUN server.
+            stun_servers: Vec::new(),
         }
+    }
+
+    /// Ask these STUN servers for a server-reflexive candidate when gathering (RFC 8445 §5.1.1.2).
+    ///
+    /// Only useful when the engine itself sits behind a NAT it cannot be addressed through — the
+    /// normal deployment is a routable media address, where the host candidate is the whole story and
+    /// a reflexive probe would only return the address we already advertise (and be pruned as
+    /// redundant, RFC 8445 §5.1.3). Leaving this empty keeps call setup free of any network round
+    /// trip. Builder-style consuming setter, mirroring [`Self::with_cluster`].
+    #[must_use]
+    pub fn with_stun_servers(mut self, servers: Vec<SocketAddr>) -> Self {
+        self.stun_servers = servers;
+        self
     }
 
     /// Enable RFC 7675 consent freshness with the given cadence: every ICE leg is promoted to the
@@ -1157,10 +1178,35 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // ICE rewrite mode (RFC 8839 §5): re-originate ICE-lite when we minted creds; on `ice: remove`
         // with none minted, strip the peer's ICE without advertising our own; otherwise pass it
         // through. `IceAdvertisement` borrows `ice_creds`, so it is built here and kept alive to rewrite.
+        // Gather the far leg's candidates before the offer is written — the offer *is* the candidate
+        // list, and without trickle there is no second chance to add to it (RFC 8445 §5.1.1). Host-only
+        // gathering (the default) is instant and touches no socket; with a STUN server configured this
+        // costs one bounded round trip on the control path.
+        let far_ice_candidates = match ice_creds.as_ref() {
+            Some(creds) => {
+                let far_leg = Leg {
+                    rtp: far_rtp,
+                    rtcp: far_rtcp,
+                    remote_rtp: None,
+                    remote_rtcp: None,
+                    advertised_ip: far_advertised,
+                };
+                self.gather_leg_candidates(
+                    &far_leg,
+                    &IceConfig {
+                        local_ufrag: creds.ufrag.clone(),
+                        local_pwd: creds.pwd.clone(),
+                    },
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
         let ice_rewrite = match (ice_creds.as_ref(), ice_directive) {
             (Some(creds), _) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
                 ufrag: creds.ufrag.as_str(),
                 pwd: creds.pwd.as_str(),
+                candidates: &far_ice_candidates,
             }),
             (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
             (None, _) => IceRewrite::Keep,
@@ -1808,10 +1854,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         // The A-facing near leg re-originates ICE-lite iff the offer minted engine creds (the ICE
         // posture was decided at offer); otherwise the peer's ICE (if any) passes through unchanged.
+        // The near leg's candidates, gathered now for the same reason the far leg's were at offer:
+        // this answer is the complete candidate list A will ever see from us.
+        let near_ice_candidates = match ice_creds.as_ref() {
+            Some(creds) => {
+                self.gather_leg_candidates(
+                    &near,
+                    &IceConfig {
+                        local_ufrag: creds.ufrag.clone(),
+                        local_pwd: creds.pwd.clone(),
+                    },
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
         let ice_rewrite = match ice_creds.as_ref() {
             Some(creds) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
                 ufrag: creds.ufrag.as_str(),
                 pwd: creds.pwd.as_str(),
+                candidates: &near_ice_candidates,
             }),
             None => IceRewrite::Keep,
         };
@@ -1909,6 +1971,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // peer *that* side faces — an outbound check is signed with the peer's password, so the
             // two legs are not interchangeable (RFC 8445 §7.1.2).
             let far_remote_ice = peer_ice_credentials(&info);
+            if !info.is_ice() {
+                // B answered without ICE. Gathering at offer time installed the responder on the far
+                // endpoints (that is how it received its own Binding responses), and leaving it there
+                // would arm the layer-4 gate — which forwards media *only* from a STUN-validated
+                // source — on a leg that will never send a check, blackholing B's media. Clear it, so
+                // the far leg falls back to the signalled-source gate like any non-ICE leg.
+                for endpoint in far.endpoint_ids() {
+                    self.datapath.set_ice(endpoint, None);
+                }
+            }
             let sides = [
                 (near.endpoint_ids().collect::<Vec<_>>(), &near_remote_ice),
                 (
@@ -4755,6 +4827,113 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         reaped
     }
 
+    /// Gather the ICE candidates to advertise for one leg (RFC 8445 §5.1.1): the host candidate for
+    /// its RTP endpoint, a server-reflexive one per configured STUN server that answers, and — when
+    /// the leg is not muxed — the same for its companion RTCP endpoint as component 2 (RFC 8445
+    /// §4.1.1.1).
+    ///
+    /// Runs on the offer/answer control path, so it is **bounded by construction**: with no STUN
+    /// server configured it completes without a single packet, and with one it gives up at the
+    /// gatherer's deadline and advertises what it has. A dead STUN server costs one bounded delay and
+    /// a host-only candidate list; it never fails the call.
+    ///
+    /// Wall time, deliberately: this is a network deadline on the control path, not a media clock, and
+    /// the datapath's logical clock only advances once per second. The *decisions* (pacing,
+    /// retransmission, pruning, completion) all live in the pure [`Gatherer`], which the crate's own
+    /// tests drive on a logical millisecond clock — nothing here re-implements them.
+    async fn gather_leg_candidates(
+        &self,
+        leg: &Leg,
+        ice_config: &IceConfig,
+    ) -> Vec<siphon_rtp_ice::Candidate> {
+        let components = [(leg.rtp, 1u16), (leg.rtcp.unwrap_or(leg.rtp), 2u16)];
+        let component_count = if leg.rtcp.is_some() { 2 } else { 1 };
+        // Gather both components **concurrently**: they probe independent endpoints, and running them
+        // in sequence would make a dead STUN server cost two deadlines on the control path instead of
+        // one. `join_all` preserves order, so component 1's candidates still come first.
+        let gathers = components
+            .into_iter()
+            .take(component_count)
+            .map(|(endpoint, component)| {
+                let config = GatherConfig {
+                    component,
+                    // The advertised address keeps the leg's interface policy (1:1 NAT) — the bound
+                    // address is the base, the advertised one is what a peer must be able to reach.
+                    advertised: SocketAddr::new(leg.advertised_ip, endpoint.local_addr.port()),
+                    ..GatherConfig::host_only(endpoint.local_addr)
+                        .with_stun_servers(self.stun_servers.clone())
+                };
+                self.run_gatherer(endpoint.id, config, ice_config)
+            });
+        futures_util::future::join_all(gathers)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Drive one endpoint's [`Gatherer`] to completion, doing its I/O.
+    async fn run_gatherer(
+        &self,
+        endpoint: EndpointId,
+        config: GatherConfig,
+        ice_config: &IceConfig,
+    ) -> Vec<siphon_rtp_ice::Candidate> {
+        let mut gatherer = Gatherer::new(config, 0);
+        // Host-only: the answer is already known, so never touch the socket or the clock.
+        if gatherer.is_complete() {
+            return gatherer.candidates().to_vec();
+        }
+        // Reflexive gathering needs the datapath's full-agent seam to hand back the Binding
+        // *responses* the ICE responder drops. The sink is replaced at answer time by the consent
+        // supervisor's (or cleared, if the peer turns out not to speak ICE).
+        let (events_tx, events_rx) = flume::bounded(GATHER_EVENT_QUEUE_DEPTH);
+        self.datapath
+            .set_ice_agent(endpoint, ice_config.clone(), events_tx);
+
+        let started = tokio::time::Instant::now();
+        let elapsed_ms = |start: tokio::time::Instant| start.elapsed().as_millis() as u64;
+        loop {
+            match gatherer.poll(elapsed_ms(started)) {
+                GatherAction::Complete => break,
+                GatherAction::Probe { server, datagram } => {
+                    if let Err(error) = self.datapath.send(endpoint, server, &datagram).await {
+                        // A send failure is not fatal: the retransmission schedule tries again and
+                        // the deadline still bounds the whole thing.
+                        tracing::debug!(
+                            target: "siphon_rtp::control",
+                            ?endpoint, %server, %error,
+                            "failed to transmit ICE gathering probe"
+                        );
+                    }
+                }
+                GatherAction::Idle => {}
+            }
+            // Wait for a response, but never longer than the pacing slot — so a silent server still
+            // gets its retransmissions on schedule.
+            if let Ok(Ok(event)) = tokio::time::timeout(
+                std::time::Duration::from_millis(GATHER_POLL_INTERVAL_MS),
+                events_rx.recv_async(),
+            )
+            .await
+            {
+                gatherer.on_datagram(event.source, &event.datagram, elapsed_ms(started));
+            }
+        }
+        let unanswered = gatherer.unanswered_servers();
+        if !unanswered.is_empty() {
+            // Say it out loud: the advertised set is smaller than it was meant to be.
+            tracing::warn!(
+                target: "siphon_rtp::control",
+                ?endpoint,
+                servers = ?unanswered,
+                elapsed_ms = elapsed_ms(started),
+                "ICE gathering: STUN server(s) did not answer — advertising without a server-reflexive candidate"
+            );
+        }
+        gatherer.candidates().to_vec()
+    }
+
     /// Drive RFC 7675 consent freshness one tick: correlate the STUN the datapath forwarded since the
     /// last tick, emit each due connectivity check on its endpoint's **validated** path, and tear down
     /// any call whose peer has stopped answering. Returns the call-ids torn down (for the sweeper's
@@ -5699,6 +5878,14 @@ async fn run_pcap_recorder(
 /// The `delete`/reap grace window for the CDR quality query: a slow or already-aborted media actor
 /// must never stall call teardown, so beyond this the CDR is logged with the byte/packet counters only.
 const CDR_QUALITY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Depth of the per-endpoint STUN queue used while gathering. Gathering sends a handful of probes and
+/// drains continuously, so this only has to absorb a burst; drop-on-full costs at most one refresh.
+const GATHER_EVENT_QUEUE_DEPTH: usize = 32;
+
+/// How long the gathering loop waits for a response before re-polling the plan. Shorter than the
+/// RFC 8445 §14.2 `Ta` pacing slot, so a silent STUN server still gets its retransmissions on time.
+const GATHER_POLL_INTERVAL_MS: u64 = 10;
 
 /// Format a MOS value to two decimals, or `-` when no sample was taken on the leg.
 fn format_optional_mos(mos: Option<f64>) -> String {
@@ -13214,6 +13401,254 @@ mod tests {
             &buffer[..len],
             engine_pwd.as_bytes()
         ));
+    }
+
+    // ---- RFC 8445 §5.1.1 candidate gathering (end-to-end over the real datapath) -----------------
+
+    /// A stand-in STUN server that reports `mapped` as the source it saw — a NAT the loopback test
+    /// network cannot otherwise produce (on loopback the real reflexive address *is* the base, which
+    /// the gatherer correctly prunes as redundant). Answers every Binding request it receives.
+    async fn fake_stun_server(mapped: SocketAddr) -> SocketAddr {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind stun server");
+        let address = socket.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 2048];
+            while let Ok((len, from)) = socket.recv_from(&mut buffer).await {
+                let Ok(request) = siphon_rtp_stun::parse(&buffer[..len]) else {
+                    continue;
+                };
+                if !request.is_binding_request() {
+                    continue;
+                }
+                let response = siphon_rtp_stun::binding_success_response(
+                    &request.transaction_id,
+                    mapped,
+                    None,
+                );
+                let _ = socket.send_to(&response, from).await;
+            }
+        });
+        address
+    }
+
+    /// The `a=candidate` lines of an SDP, parsed.
+    fn candidates_of(sdp: &str) -> Vec<siphon_rtp_ice::Candidate> {
+        sdp.lines()
+            .filter(|line| line.starts_with("a=candidate:"))
+            .map(|line| siphon_rtp_ice::Candidate::parse(line).expect("our own candidate parses"))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gathering_advertises_a_server_reflexive_candidate_from_a_stun_server() {
+        // The end-to-end proof that gathering is wired, not just implemented: the engine probes the
+        // configured STUN server from its own media endpoint, correlates the response through the
+        // datapath's full-agent seam, and puts the resulting candidate in the SDP it hands the peer.
+        let mapped: SocketAddr = "203.0.113.5:52000".parse().expect("addr");
+        let stun_server = fake_stun_server(mapped).await;
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_stun_servers(vec![stun_server]);
+        let (_phone_a, addr_a) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "gather".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let offer_out = ok_sdp_text(&offer);
+
+        // The offer is not muxed, so the leg has an RTCP endpoint too and gathers for both components
+        // (RFC 8445 §4.1.1.1): host + srflx for component 1 (RTP) and for component 2 (RTCP).
+        let all = candidates_of(&offer_out);
+        assert_eq!(all.len(), 4, "host + srflx per component: {offer_out}");
+        let candidates: Vec<_> = all
+            .iter()
+            .filter(|candidate| candidate.component == 1)
+            .cloned()
+            .collect();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].kind, siphon_rtp_ice::CandidateKind::Host);
+        assert!(
+            all.iter().any(|candidate| candidate.component == 2
+                && candidate.kind == siphon_rtp_ice::CandidateKind::Host),
+            "a non-muxed leg advertises its RTCP component too"
+        );
+
+        let reflexive = &candidates[1];
+        assert_eq!(
+            reflexive.kind,
+            siphon_rtp_ice::CandidateKind::ServerReflexive
+        );
+        assert_eq!(reflexive.address, mapped, "the address the server reported");
+        assert_eq!(
+            reflexive.related,
+            Some(candidates[0].address),
+            "RFC 8839 §5.1: raddr is the base it was discovered from"
+        );
+        assert!(
+            reflexive.priority < candidates[0].priority,
+            "srflx ranks below host (RFC 8445 §5.1.2.2)"
+        );
+        assert_ne!(
+            reflexive.foundation, candidates[0].foundation,
+            "different type and server ⇒ different foundation (RFC 8445 §5.1.1.3)"
+        );
+        assert!(
+            offer_out.contains("a=end-of-candidates"),
+            "the list is complete when the offer is written (RFC 8838 §14)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_stun_server_still_yields_a_usable_offer() {
+        // Gathering runs on the control path, so it must be bounded: a STUN server that never answers
+        // costs one deadline and a host-only candidate list — never a failed call.
+        let dead = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let dead_addr = dead.local_addr().expect("addr");
+        drop(dead); // nothing is listening on that port now
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_stun_servers(vec![dead_addr]);
+        let (_phone_a, addr_a) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dead-stun".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let offer_out = ok_sdp_text(&offer);
+        let candidates = candidates_of(&offer_out);
+        // Host only, one per component — no reflexive candidate, and no failure either.
+        assert_eq!(candidates.len(), 2, "host only: {offer_out}");
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.kind == siphon_rtp_ice::CandidateKind::Host));
+        assert_eq!(engine.session_count(), 1, "and the call was still set up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_only_gathering_adds_no_round_trip_and_no_candidate_change() {
+        // The default deployment (no STUN server): exactly the one host candidate the engine has
+        // always advertised, gathered without touching the network.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "host-only".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let candidates = candidates_of(&ok_sdp_text(&offer));
+        // One host candidate per component — the offer is not muxed, so RTP and RTCP both get one.
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.kind == siphon_rtp_ice::CandidateKind::Host));
+        let rtp = &candidates[0];
+        assert_eq!(rtp.component, 1);
+        assert_eq!(rtp.priority, 2_130_706_431);
+        // RFC 8445 §5.1.2.1: the RTCP component ranks exactly one below the RTP component.
+        assert_eq!(candidates[1].component, 2);
+        assert_eq!(candidates[1].priority, 2_130_706_430);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_muxed_leg_gathers_only_the_rtp_component() {
+        // Under RFC 5761 rtcp-mux there is no second component to gather for.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let muxed = format!("{}a=rtcp-mux\r\n", ice_offer_from(addr_a));
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "muxed".into(),
+                    from_tag: "a".into(),
+                    sdp: muxed,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let candidates = candidates_of(&ok_sdp_text(&offer));
+        assert_eq!(candidates.len(), 1, "one component under mux");
+        assert_eq!(candidates[0].component, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ice_answer_clears_the_ice_gate_gathering_installed_on_the_far_leg() {
+        // Regression guard for the gathering wiring: gathering installs the ICE responder on the far
+        // endpoints at *offer* time (that is how it receives its own Binding responses). If B then
+        // answers without ICE, leaving it there would arm the layer-4 gate — media only from a
+        // STUN-validated source — on a leg that will never send a check, and B's media would be
+        // dropped forever. The answer must clear it.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mixed".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "mixed".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    // B answers plain RTP — no ICE at all.
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("parse answer");
+
+        // B's media must reach A even though B never ran a connectivity check.
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), near.remote_rtcp)
+            .await
+            .ok();
+        let far_rtp = engine
+            .calls
+            .get("mixed")
+            .map(|call| call.far.rtp.local_addr)
+            .expect("call exists");
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), far_rtp)
+            .await
+            .expect("send from B");
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("B's media reaches A — the far leg is not ICE-gated")
+            .expect("recv");
+        assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
     }
 
     // ---- RFC 7675 consent freshness (end-to-end over the real datapath) --------------------------

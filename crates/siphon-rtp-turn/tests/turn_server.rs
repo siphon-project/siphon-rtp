@@ -333,6 +333,45 @@ async fn relay_without_permission_is_dropped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answers_a_plain_stun_binding_request() {
+    // RFC 8656 §12: a TURN server MUST support Binding requests. That conformance is also what lets
+    // the built-in server be the STUN server our own ICE gathering asks for a server-reflexive
+    // address, instead of requiring a separate STUN service next to it.
+    let server = start(permissive_config()).await;
+    let (client, client_addr) = udp().await;
+
+    // A bare Binding request: no USERNAME, no MESSAGE-INTEGRITY. RFC 8489 §9.1 makes authentication
+    // optional for Binding, and a client discovering its reflexive address has no credentials yet.
+    let request = stun::MessageBuilder::new(stun::BINDING_REQUEST, &[42u8; 12]).finish(None, true);
+    let response = exchange(&client, server.addr, &request).await;
+
+    assert_eq!(response.message_type, stun::BINDING_SUCCESS);
+    assert_eq!(response.transaction_id, [42u8; 12]);
+    assert_eq!(
+        response.xor_mapped_address(),
+        Some(client_addr),
+        "the response reports the source the server saw — the reflexive address"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_binding_request_never_grants_an_allocation() {
+    // Answering Binding without credentials must not weaken TURN itself: an allocation still
+    // requires the long-term credential dance (RFC 8656 §7.2).
+    let server = start(permissive_config()).await;
+    let (client, _) = udp().await;
+
+    let request = stun::MessageBuilder::new(stun::BINDING_REQUEST, &[1u8; 12]).finish(None, true);
+    let binding = exchange(&client, server.addr, &request).await;
+    assert_eq!(binding.message_type, stun::BINDING_SUCCESS);
+
+    // The very same 5-tuple still gets 401-challenged for an Allocate.
+    let challenge = exchange(&client, server.addr, &allocate_unauth(&[2u8; 12])).await;
+    assert_eq!(turn::class_of(challenge.message_type), turn::CLASS_ERROR);
+    assert_eq!(turn::error_code(&challenge), Some(turn::ERROR_UNAUTHORIZED));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unauthenticated_request_is_challenged() {
     let server = start(permissive_config()).await;
     let (client, _) = udp().await;

@@ -222,12 +222,36 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > **ICE-lite** — advertising `a=ice-lite` + its own ufrag/pwd + a host candidate and calling
 > `set_ice` on the ICE legs, which then answer checks and adopt the validated source; end-to-end
 > tested. **Consent freshness (RFC 7675) is now wired and runnable** — see the bullet below.
-> **Remaining:** full (non-lite) ICE — candidate gathering, checklists, pairing, nomination, and the
-> engine as ICE *controlling* agent. RTCP-port ICE under non-mux is wired.
+> **Candidate gathering (RFC 8445 §5.1.1) is wired**: the advertised candidate list is gathered per
+> leg and per component rather than being one hardcoded host line — host always, plus a
+> server-reflexive candidate per `--stun-server` that answers. **Remaining:** the rest of full
+> (non-lite) ICE — checklists, pairing, nomination, and the engine as ICE *controlling* agent.
+> RTCP-port ICE under non-mux is wired.
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
   never saw. The validated candidate pair, not "first packet wins", becomes the path.
+- **Candidate gathering** (RFC 8445 §5.1.1) decides what we advertise as reachable, so it is part of
+  the same story:
+  - **Host** candidates come from the leg's own endpoints — one per component (RTP, plus RTCP when the
+    leg is not muxed, RFC 8445 §4.1.1.1) — and carry the leg's *advertised* address, so a 1:1-NAT
+    deployment offers the routable IP rather than the bound private one.
+  - **Server-reflexive** candidates are gathered by probing each `--stun-server` from the media
+    endpoint itself. A reflexive address equal to the base (or to the advertised address) is pruned as
+    redundant (RFC 8445 §5.1.3), which is exactly what a directly-addressable engine sees — so the
+    default deployment gathers host-only and pays **no** round trip at call setup. The built-in TURN
+    server answers plain Binding requests (RFC 8656 §12), so it can be its own STUN server.
+  - A gathering response is accepted only when its transaction id matches an outstanding probe **and**
+    it came from the server that probe was sent to. Without the source check, anyone able to guess a
+    transaction id could plant a reflexive candidate in our offer.
+  - Gathering is **bounded**: it runs on the offer/answer control path, retransmits per RFC 8489
+    §6.2.1, and gives up at a deadline, advertising what it has and logging which servers went quiet.
+    A dead STUN server costs one bounded delay and a host-only list — never a failed call. Components
+    gather concurrently, so that delay is paid once per leg, not once per component.
+  - Because there is no trickle yet, the offer/answer *is* the complete list, and it is marked
+    `a=end-of-candidates` (RFC 8838 §14).
+  - **Enforcement:** `siphon-rtp-ice/src/gather.rs` (the pure plan), `Engine::gather_leg_candidates` /
+    `run_gatherer` (its I/O), `sdp::IceAdvertisement` (emission).
 - **No blind pre-check latch on a plaintext-RTP + ICE relay leg.** On the `Forward` fast path an ICE
   endpoint's media is gated to the STUN-validated latch: the connectivity-check responder
   (`handle_stun`) is the **only** writer of an ICE endpoint's latch, so media arriving *before* any

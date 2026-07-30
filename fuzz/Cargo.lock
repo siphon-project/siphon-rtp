@@ -1635,6 +1635,7 @@ dependencies = [
 name = "siphon-rtp-ice"
 version = "0.1.4"
 dependencies = [
+ "siphon-rtp-stun",
  "thiserror 2.0.18",
 ]
 
