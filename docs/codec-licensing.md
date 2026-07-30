@@ -54,7 +54,7 @@ status on the right (passthrough of every codec is always available, per the rul
 | CN (RFC 3389) | free | generate/decode only |
 | iLBC | royalty-free (Google/WebRTC, BSD) | not implemented (passthrough only) |
 | Speex | royalty-free (Xiph, patent-free by design, BSD) | not implemented (passthrough only) |
-| Opus | royalty-free (IETF RF by design, RFC 6716) | in progress, not yet factory-wired (passthrough only) |
+| Opus | royalty-free (IETF RF by design, RFC 6716) | in progress: the RFC 7587 negotiation surface is wired, the codec is not yet in the factory (transcode still declines; passthrough always available) — and **no Cargo feature**, since it is royalty-free |
 
 **Patent-encumbered — transcoding gated behind an opt-in feature:**
 
