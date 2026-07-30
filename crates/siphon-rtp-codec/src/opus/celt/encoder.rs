@@ -121,6 +121,11 @@ pub struct CeltEncoder {
     vbr_count: i32,
     /// Peak sample of the previous frame's overlap region (`st->overlap_max`).
     overlap_max: f32,
+    /// Running estimate of how many bits a correlated stereo pair saves (`st->stereo_saving`),
+    /// produced by [`alloc_trim_analysis`] and consumed by the VBR target. Mono never writes it.
+    stereo_saving: f32,
+    /// First band coded with intensity stereo (`st->intensity`), chosen by rate with hysteresis.
+    intensity: usize,
     /// Running spectral average for the temporal-VBR term (`st->spec_avg`).
     spec_avg: f32,
     /// Previous frame's per-band log2 energy (`oldBandE`), `2*NB_BANDS`.
@@ -173,6 +178,8 @@ impl CeltEncoder {
             vbr_offset: 0,
             vbr_count: 0,
             overlap_max: 0.0,
+            stereo_saving: 0.0,
+            intensity: 0,
             spec_avg: 0.0,
             old_band_energy: [0.0; 2 * NB_BANDS],
             old_log_energy: [ENERGY_RESET_DB; 2 * NB_BANDS],
@@ -487,7 +494,7 @@ impl CeltEncoder {
             && enc.tell() + 3 <= total_bits
             && !transient.is_transient
             && self.complexity >= 5
-            && patch_transient_decision(&band_log_e, &self.old_band_energy, start, end)
+            && patch_transient_decision(&band_log_e, &self.old_band_energy, start, end, CHANNELS)
         {
             transient.is_transient = true;
             short_blocks = true;
@@ -518,6 +525,7 @@ impl CeltEncoder {
             &self.old_band_energy,
             start,
             end,
+            CHANNELS,
             &mut offsets,
             self.lsb_depth,
             transient.is_transient,
@@ -660,10 +668,21 @@ impl CeltEncoder {
         let mut alloc_trim = 5i32;
         if tell + (6 << BITRES) <= total_bits_frac - total_boost {
             if start > 0 {
+                self.stereo_saving = 0.0;
                 alloc_trim = 5;
             } else {
-                alloc_trim =
-                    alloc_trim_analysis(&band_log_e, end, lm, transient.tf_estimate, equiv_rate);
+                alloc_trim = alloc_trim_analysis(
+                    &x,
+                    &band_log_e,
+                    end,
+                    lm,
+                    CHANNELS,
+                    n,
+                    &mut self.stereo_saving,
+                    transient.tf_estimate,
+                    self.intensity,
+                    equiv_rate,
+                );
             }
             enc.enc_icdf(alloc_trim as usize, &TRIM_ICDF, 7);
             tell = enc.tell_frac() as i32;
@@ -683,7 +702,10 @@ impl CeltEncoder {
                 lm,
                 equiv_rate,
                 self.last_coded_bands,
+                CHANNELS,
+                self.intensity,
                 constrained_vbr,
+                self.stereo_saving,
                 dynalloc.tot_boost,
                 transient.tf_estimate,
                 dynalloc.max_depth,
@@ -746,7 +768,6 @@ impl CeltEncoder {
             };
         bits -= anti_collapse_rsv;
         let signal_bandwidth = end - 1;
-        let mut intensity = 0usize;
         let mut dual_stereo = false;
         let mut balance = 0i32;
         let coded_bands = clt_compute_allocation(
@@ -755,7 +776,8 @@ impl CeltEncoder {
             &offsets,
             &cap,
             alloc_trim,
-            &mut intensity,
+            // In/out, exactly as `&st->intensity` is in the C (`celt_encoder.c:2227`).
+            &mut self.intensity,
             &mut dual_stereo,
             bits,
             &mut balance,
@@ -1067,15 +1089,18 @@ fn peak_abs(pcm: &[f32]) -> f32 {
     peak
 }
 
-/// The VBR target in 1/8 bits per frame (libopus `compute_vbr`, `celt_encoder.c:1320`, mono, no
-/// surround mask and no tonality analysis).
+/// The VBR target in 1/8 bits per frame (libopus `compute_vbr`, `celt_encoder.c:1320`; no surround
+/// mask and no tonality analysis, both of which live above CELT).
 #[allow(clippy::too_many_arguments)]
 fn compute_vbr(
     base_target: i32,
     lm: usize,
     bitrate: i32,
     last_coded_bands: usize,
+    channels: usize,
+    intensity: usize,
     constrained_vbr: bool,
+    stereo_saving: f32,
     tot_boost: i32,
     tf_estimate: f32,
     max_depth: f32,
@@ -1086,8 +1111,26 @@ fn compute_vbr(
     } else {
         NB_BANDS
     };
-    let coded_bins = (E_BANDS[coded_bands] as i32) << lm;
+    let mut coded_bins = (E_BANDS[coded_bands] as i32) << lm;
+    if channels == 2 {
+        coded_bins += (E_BANDS[intensity.min(coded_bands)] as i32) << lm;
+    }
     let mut target = base_target;
+
+    // "Stereo savings" (celt_encoder.c:1351): the more correlated the two channels are, the less the
+    // side costs, so the target comes down — capped both by a fraction of the target and by the
+    // degrees of freedom actually coded in stereo.
+    if channels == 2 {
+        let coded_stereo_bands = intensity.min(coded_bands);
+        let coded_stereo_dof =
+            ((E_BANDS[coded_stereo_bands] as i32) << lm) - coded_stereo_bands as i32;
+        // "Maximum fraction of the bits we can save if the signal is mono."
+        let max_frac = 0.8 * coded_stereo_dof as f32 / coded_bins as f32;
+        let stereo_saving = stereo_saving.min(1.0);
+        let saving = (max_frac * target as f32)
+            .min((stereo_saving - 0.1) * ((coded_stereo_dof << BITRES) as f32));
+        target -= saving as i32;
+    }
 
     // "Boost the rate according to dynalloc (minus the dynalloc average for calibration)."
     target += tot_boost - (19 << lm);
@@ -1098,7 +1141,7 @@ fn compute_vbr(
     {
         // Never spend more bits than the signal has depth above the noise floor.
         let bins = (E_BANDS[NB_BANDS - 2] as i32) << lm;
-        let mut floor_depth = (((CHANNELS as i32 * bins) << BITRES) as f32 * max_depth) as i32;
+        let mut floor_depth = (((channels as i32 * bins) << BITRES) as f32 * max_depth) as i32;
         floor_depth = floor_depth.max(target >> 2);
         target = target.min(floor_depth);
     }
@@ -1116,7 +1159,6 @@ fn compute_vbr(
     }
 
     // "Don't allow more than doubling the rate."
-    let _ = coded_bins; // (only the surround/tonality terms use it, which are absent here)
     (2 * base_target).min(target)
 }
 

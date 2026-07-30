@@ -19,6 +19,9 @@
 // the shortest f32-exact spelling would break that, for no change in value.
 #![allow(clippy::excessive_precision)]
 
+use siphon_rtp_codec::opus::celt::analysis::{
+    alloc_trim_analysis, dynalloc_analysis, patch_transient_decision, stereo_analysis,
+};
 use siphon_rtp_codec::opus::celt::bands::{
     bitexact_cos, bitexact_log2tan, compute_channel_weights, compute_qn, frac_mul16,
     intensity_stereo, stereo_merge, stereo_split,
@@ -582,5 +585,258 @@ fn theta_gains_and_bit_split_match_libopus_exactly() {
         assert_eq!(iside, want_iside, "itheta {itheta}: iside");
         let delta = frac_mul16((n - 1) << 7, bitexact_log2tan(iside, imid));
         assert_eq!(delta, want_delta, "itheta {itheta} N {n}: delta");
+    }
+}
+
+// ── stereo_analysis (libopus `celt_encoder.c:889`) ──────────────────────────────────────────────
+
+/// Inter-channel correlation per case: the right channel is `corr*L + (1-|corr|)*noise`.
+const STEREO_ANALYSIS_CORRELATIONS: [f32; 6] = [1.0, 0.9, 0.5, 0.0, -0.5, -1.0];
+/// `(case, LM, dual_stereo)`. Only the anti-correlated-but-not-inverted case is worth coding L/R;
+/// everything else — including the *fully* inverted pair, whose mid is zero — is cheaper as mid/side.
+const STEREO_ANALYSIS: [(usize, usize, bool); 24] = [
+    (0, 0, false),
+    (0, 1, false),
+    (0, 2, false),
+    (0, 3, false),
+    (1, 0, false),
+    (1, 1, false),
+    (1, 2, false),
+    (1, 3, false),
+    (2, 0, false),
+    (2, 1, false),
+    (2, 2, false),
+    (2, 3, false),
+    (3, 0, false),
+    (3, 1, false),
+    (3, 2, false),
+    (3, 3, false),
+    (4, 0, true),
+    (4, 1, true),
+    (4, 2, true),
+    (4, 3, true),
+    (5, 0, false),
+    (5, 1, false),
+    (5, 2, false),
+    (5, 3, false),
+];
+
+/// The generator's stereo spectrum for a given case and frame size.
+fn stereo_spectrum(case: usize, lm: usize) -> (Vec<f32>, usize) {
+    let n0 = 120usize << lm;
+    let correlation = STEREO_ANALYSIS_CORRELATIONS[case];
+    let mut x = vec![0f32; 2 * n0];
+    for j in 0..n0 {
+        let left = sig(case as i32 + 81, j, 0.4);
+        x[j] = left;
+        x[n0 + j] = correlation * left + (1.0 - correlation.abs()) * sig(case as i32 + 91, j, 0.4);
+    }
+    (x, n0)
+}
+
+#[test]
+fn stereo_analysis_matches_libopus() {
+    for &(case, lm, want) in &STEREO_ANALYSIS {
+        let (x, n0) = stereo_spectrum(case, lm);
+        assert_eq!(
+            stereo_analysis(&x, lm, n0),
+            want,
+            "correlation {} LM {lm}: dual-stereo decision",
+            STEREO_ANALYSIS_CORRELATIONS[case]
+        );
+    }
+}
+
+// ── alloc_trim_analysis, C == 2 (libopus `celt_encoder.c:816`) ──────────────────────────────────
+
+/// `(case, rate index, trim, stereo_saving)` at LM 3 / N0 960, with the case's own `intensity` and
+/// inter-channel correlation.
+const ALLOC_TRIM_RATES: [i32; 4] = [24_000, 64_000, 72_000, 200_000];
+const ALLOC_TRIM_INTENSITIES: [usize; 4] = [0, 8, 14, 21];
+const ALLOC_TRIM_CORRELATIONS: [f32; 4] = [1.0, 0.5, 0.0, -0.8];
+const ALLOC_TRIM: [(usize, usize, i32, f32); 16] = [
+    (0, 0, 5, 3.856195509e-02),
+    (0, 1, 5, 3.856195509e-02),
+    (0, 2, 6, 3.856195509e-02),
+    (0, 3, 6, 3.856195509e-02),
+    (1, 0, 6, 4.058708728e-04),
+    (1, 1, 6, 4.058708728e-04),
+    (1, 2, 6, 4.058708728e-04),
+    (1, 3, 7, 4.058708728e-04),
+    (2, 0, 5, 4.553090315e-03),
+    (2, 1, 5, 4.553090315e-03),
+    (2, 2, 5, 4.553090315e-03),
+    (2, 3, 6, 4.553090315e-03),
+    (3, 0, 6, -6.957641453e-04),
+    (3, 1, 6, -6.957641453e-04),
+    (3, 2, 6, -6.957641453e-04),
+    (3, 3, 7, -6.957641453e-04),
+];
+
+#[test]
+fn alloc_trim_analysis_stereo_matches_libopus() {
+    for &(case, rate_index, want_trim, want_saving) in &ALLOC_TRIM {
+        let (lm, n0) = (3usize, 960usize);
+        let correlation = ALLOC_TRIM_CORRELATIONS[case];
+        let mut x = vec![0f32; 2 * n0];
+        for j in 0..n0 {
+            let left = sig(case as i32 + 101, j, 0.4);
+            x[j] = left;
+            x[n0 + j] =
+                correlation * left + (1.0 - correlation.abs()) * sig(case as i32 + 111, j, 0.4);
+        }
+        let mut band_log_e = vec![0f32; 2 * NB_BANDS];
+        for j in 0..NB_BANDS {
+            band_log_e[j] = 3.0 - 0.2 * j as f32 + 0.5 * sig(case as i32 + 121, j, 1.0);
+            band_log_e[NB_BANDS + j] = 2.5 - 0.15 * j as f32 + 0.5 * sig(case as i32 + 131, j, 1.0);
+        }
+        let mut stereo_saving = 0f32;
+        let trim = alloc_trim_analysis(
+            &x,
+            &band_log_e,
+            NB_BANDS,
+            lm,
+            2,
+            n0,
+            &mut stereo_saving,
+            0.1,
+            ALLOC_TRIM_INTENSITIES[case],
+            ALLOC_TRIM_RATES[rate_index],
+        );
+        assert_eq!(
+            trim, want_trim,
+            "case {case} rate {}: trim",
+            ALLOC_TRIM_RATES[rate_index]
+        );
+        assert_close(
+            &[stereo_saving],
+            &[want_saving],
+            &format!("case {case}: stereo_saving"),
+        );
+    }
+}
+
+// ── dynalloc_analysis, C == 2 (libopus `celt_encoder.c:1099`) ───────────────────────────────────
+
+/// Per case: the boosts, the TF-Viterbi importance weights, and the spreading masking weights.
+/// Case 1 spikes the **left** channel's band 10, case 2 the **right** channel's — the cross-talk
+/// follower must react to either, and the two must not produce identical masking.
+const DYNALLOC: [([i32; NB_BANDS], [i32; NB_BANDS], [i32; NB_BANDS]); 3] = [
+    ([0; NB_BANDS], [13; NB_BANDS], [32; NB_BANDS]),
+    (
+        [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+        [
+            13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 208, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+        ],
+        [
+            32, 32, 32, 32, 32, 32, 32, 16, 2, 1, 32, 1, 1, 1, 1, 4, 8, 8, 4, 2, 1,
+        ],
+    ),
+    (
+        [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+        [
+            13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 208, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+        ],
+        [
+            32, 32, 32, 32, 32, 32, 32, 32, 4, 1, 32, 1, 1, 1, 2, 8, 16, 16, 8, 4, 2,
+        ],
+    ),
+];
+/// `(tot_boost, max_depth)` per case.
+const DYNALLOC_TOTALS: [(i32, f32); 3] = [
+    (0, 2.338882256e+01),
+    (1008, 3.116749954e+01),
+    (1008, 3.116749954e+01),
+];
+
+#[test]
+fn dynalloc_analysis_stereo_matches_libopus() {
+    for case in 0..3usize {
+        let mut band_log_e = vec![0f32; 2 * NB_BANDS];
+        let mut band_log_e2 = vec![0f32; 2 * NB_BANDS];
+        let mut old_band_e = vec![0f32; 2 * NB_BANDS];
+        for j in 0..2 * NB_BANDS {
+            band_log_e[j] = 4.0 - 0.1 * (j % NB_BANDS) as f32 + sig(case as i32 + 141, j, 2.0);
+            band_log_e2[j] = band_log_e[j] - 0.05;
+            old_band_e[j] = band_log_e[j] - 0.3;
+        }
+        if case == 1 {
+            band_log_e[10] = 14.0;
+            band_log_e2[10] = 13.95;
+        }
+        if case == 2 {
+            band_log_e[NB_BANDS + 10] = 14.0;
+            band_log_e2[NB_BANDS + 10] = 13.95;
+        }
+        let mut offsets = [0i32; NB_BANDS];
+        let mut importance = [0i32; NB_BANDS];
+        let mut spread_weight = [0i32; NB_BANDS];
+        let result = dynalloc_analysis(
+            &band_log_e,
+            &band_log_e2,
+            &old_band_e,
+            0,
+            NB_BANDS,
+            2,
+            &mut offsets,
+            24,
+            false,
+            true,
+            false,
+            3,
+            200,
+            &mut importance,
+            &mut spread_weight,
+        );
+        let (want_offsets, want_importance, want_spread) = &DYNALLOC[case];
+        assert_eq!(&offsets, want_offsets, "case {case}: dynalloc offsets");
+        assert_eq!(&importance, want_importance, "case {case}: importance");
+        assert_eq!(&spread_weight, want_spread, "case {case}: spread weight");
+        let (want_boost, want_depth) = DYNALLOC_TOTALS[case];
+        assert_eq!(result.tot_boost, want_boost, "case {case}: tot_boost");
+        assert_close(
+            &[result.max_depth],
+            &[want_depth],
+            &format!("case {case}: max_depth"),
+        );
+    }
+}
+
+// ── patch_transient_decision, C == 2 (libopus `celt_encoder.c:431`) ─────────────────────────────
+
+/// `(case, decision)`. Case 3 raises **only the right channel**, which a mono-shaped implementation
+/// would miss entirely.
+const PATCH_TRANSIENT: [(usize, bool); 4] = [(0, false), (1, true), (2, false), (3, true)];
+
+#[test]
+fn patch_transient_decision_stereo_matches_libopus() {
+    for &(case, want) in &PATCH_TRANSIENT {
+        let mut old_e = vec![0f32; 2 * NB_BANDS];
+        let mut new_e = vec![0f32; 2 * NB_BANDS];
+        for j in 0..2 * NB_BANDS {
+            old_e[j] = 2.0 + sig(case as i32 + 151, j, 0.5);
+            new_e[j] = old_e[j]
+                + if case == 1 {
+                    6.0
+                } else if case == 2 {
+                    -3.0
+                } else {
+                    0.0
+                };
+        }
+        if case == 3 {
+            for j in 0..NB_BANDS {
+                new_e[NB_BANDS + j] = old_e[NB_BANDS + j] + 6.0;
+            }
+        }
+        assert_eq!(
+            patch_transient_decision(&new_e, &old_e, 0, NB_BANDS, 2),
+            want,
+            "case {case}"
+        );
     }
 }

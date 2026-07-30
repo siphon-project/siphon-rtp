@@ -6,12 +6,18 @@
 //! ([`tf_analysis`]), the PVQ spreading and post-filter tapset ([`spreading_decision`]), the
 //! allocation trim ([`alloc_trim_analysis`]), and the dynalloc boosts ([`dynalloc_analysis`]).
 //!
-//! **Mono.** The encoder is mono, so the `C == 2` sub-branches of the reference (inter-channel
-//! correlation in `alloc_trim_analysis`, the cross-talk follower and the `stereo_analysis`
-//! mid/side-vs-L/R decision) are absent rather than half-wired — see the scope note on
-//! [`crate::opus::celt::band_coder`]. Everything that is present is the reference algorithm.
+//! **Mono and stereo.** Every `C == 2` sub-branch of the reference is here: the inter-channel
+//! correlation term of [`alloc_trim_analysis`] (and the `stereo_saving` it feeds back into the VBR
+//! target), the cross-talk follower in [`dynalloc_analysis`], the two-channel spread of
+//! [`patch_transient_decision`], and [`stereo_analysis`] — the L/R-vs-mid/side decision that sets
+//! `dual_stereo`.
+//!
+//! Two libopus inputs are deliberately absent rather than half-wired, both of which live *above*
+//! CELT in `opus_encoder.c`/`analysis.c`: the `AnalysisInfo` tonality estimator and the surround
+//! energy mask (`surround_trim` / `surround_dynalloc`). Everything that is present is the reference
+//! algorithm.
 
-use crate::opus::celt::mathops::celt_exp2;
+use crate::opus::celt::mathops::{celt_exp2, celt_inner_prod, celt_log2};
 use crate::opus::celt::tables::{
     BITRES, E_BANDS, E_MEANS, LOG_N, NB_BANDS, SPREAD_AGGRESSIVE, SPREAD_LIGHT, SPREAD_NONE,
     SPREAD_NORMAL, TF_SELECT_TABLE,
@@ -153,13 +159,30 @@ pub fn transient_analysis(
 /// "Looks for sudden increases of energy to decide whether we need to patch the transient decision"
 /// (libopus `patch_transient_decision`, `celt_encoder.c:423`) — the last chance to catch a transient
 /// the time-domain analysis missed, run on the coded band energies.
-pub fn patch_transient_decision(new_e: &[f32], old_e: &[f32], start: usize, end: usize) -> bool {
+///
+/// With `channels == 2` the spreading function is seeded from the **louder** channel per band and
+/// the mean increase is averaged over both (`celt_encoder.c:431,445`), so a transient in either
+/// channel is caught.
+pub fn patch_transient_decision(
+    new_e: &[f32],
+    old_e: &[f32],
+    start: usize,
+    end: usize,
+    channels: usize,
+) -> bool {
     // "Apply an aggressive (-6 dB/Bark) spreading function to the old frame to avoid false
     // detection caused by irrelevant bands."
     let mut spread_old = [0f32; NB_BANDS + 5];
-    spread_old[start] = old_e[start];
+    let old_max = |i: usize| -> f32 {
+        if channels == 2 {
+            old_e[i].max(old_e[i + NB_BANDS])
+        } else {
+            old_e[i]
+        }
+    };
+    spread_old[start] = old_max(start);
     for i in start + 1..end {
-        spread_old[i] = (spread_old[i - 1] - 1.0).max(old_e[i]);
+        spread_old[i] = (spread_old[i - 1] - 1.0).max(old_max(i));
     }
     for i in (start..end - 1).rev() {
         spread_old[i] = spread_old[i].max(spread_old[i + 1] - 1.0);
@@ -169,13 +192,46 @@ pub fn patch_transient_decision(new_e: &[f32], old_e: &[f32], start: usize, end:
         return false;
     }
     let mut mean_diff = 0f32;
-    for i in lo..end - 1 {
-        let x1 = new_e[i].max(0.0);
-        let x2 = spread_old[i].max(0.0);
-        mean_diff += (x1 - x2).max(0.0);
+    for c in 0..channels {
+        for i in lo..end - 1 {
+            let x1 = new_e[i + c * NB_BANDS].max(0.0);
+            let x2 = spread_old[i].max(0.0);
+            mean_diff += (x1 - x2).max(0.0);
+        }
     }
-    mean_diff /= (end - 1 - lo) as f32;
+    mean_diff /= (channels * (end - 1 - lo)) as f32;
     mean_diff > 1.0
+}
+
+/// Decide whether to code the two channels independently (L/R, "dual stereo") instead of mid/side
+/// (libopus `stereo_analysis`, `celt_encoder.c:889`).
+///
+/// It models the entropy of each representation with an `L1` norm over the first 13 bands and picks
+/// L/R when mid/side would not pay for the `theta` angles it also has to send — `thetas` is that
+/// overhead, and it drops to 5 at `LM <= 1` because the narrow low bands are not split there.
+///
+/// `x` is the `2 * n0` normalised spectrum, channel-major.
+#[must_use]
+// libopus spells 1/sqrt(2) as the truncated literal `0.707107f`, and this comparison decides a
+// coded flag, so the reference's exact constant is required.
+#[allow(clippy::approx_constant)]
+pub fn stereo_analysis(x: &[f32], lm: usize, n0: usize) -> bool {
+    const EPSILON: f32 = 1e-15;
+    let mut sum_lr = EPSILON;
+    let mut sum_ms = EPSILON;
+    for i in 0..13 {
+        for j in (E_BANDS[i] as usize) << lm..(E_BANDS[i + 1] as usize) << lm {
+            let left = x[j];
+            let right = x[n0 + j];
+            sum_lr += left.abs() + right.abs();
+            sum_ms += (left + right).abs() + (left - right).abs();
+        }
+    }
+    sum_ms *= 0.707107;
+    // "We don't need thetas for lower bands with LM<=1" (celt_encoder.c:906).
+    let thetas = if lm <= 1 { 13 - 8 } else { 13 };
+    let width = (i32::from(E_BANDS[13]) << (lm + 1)) as f32;
+    (width + thetas as f32) * sum_ms > width * sum_lr
 }
 
 /// `L1` norm of a band with libopus' resolution bias (libopus `l1_metric`, `celt_encoder.c:582`):
@@ -387,6 +443,7 @@ pub fn dynalloc_analysis(
     old_band_e: &[f32],
     start: usize,
     end: usize,
+    channels: usize,
     offsets: &mut [i32],
     lsb_depth: i32,
     is_transient: bool,
@@ -398,7 +455,7 @@ pub fn dynalloc_analysis(
     spread_weight: &mut [i32],
 ) -> DynallocAnalysis {
     let mut tot_boost = 0i32;
-    let mut follower = [0f32; NB_BANDS];
+    let mut follower = [0f32; 2 * NB_BANDS];
     let mut noise_floor = [0f32; NB_BANDS];
     let mut band_log_e3 = [0f32; NB_BANDS];
     offsets[..NB_BANDS].fill(0);
@@ -410,8 +467,10 @@ pub fn dynalloc_analysis(
         noise_floor[i] = 0.0625 * f32::from(LOG_N[i]) + 0.5 + (9 - lsb_depth) as f32 - E_MEANS[i]
             + 0.0062 * ((i + 5) * (i + 5)) as f32;
     }
-    for i in 0..end {
-        max_depth = max_depth.max(band_log_e[i] - noise_floor[i]);
+    for c in 0..channels {
+        for i in 0..end {
+            max_depth = max_depth.max(band_log_e[i + c * NB_BANDS] - noise_floor[i]);
+        }
     }
     {
         // "Compute a really simple masking model to avoid taking into account completely masked
@@ -420,6 +479,11 @@ pub fn dynalloc_analysis(
         let mut sig = [0f32; NB_BANDS];
         for i in 0..end {
             mask[i] = band_log_e[i] - noise_floor[i];
+        }
+        if channels == 2 {
+            for i in 0..end {
+                mask[i] = mask[i].max(band_log_e[NB_BANDS + i] - noise_floor[i]);
+            }
         }
         sig[..end].copy_from_slice(&mask[..end]);
         for i in 1..end {
@@ -438,47 +502,64 @@ pub fn dynalloc_analysis(
     // "Make sure that dynamic allocation can't make us bust the budget. We enable the feature
     // starting at 24 kb/s for 20-ms frames and 96 kb/s for 2.5 ms frames."
     if effective_bytes >= (30 + 5 * lm as i32) {
+        // `last` is deliberately *shared* across the channel loop, exactly as in the C
+        // (`celt_encoder.c:1052` declares it outside the `do { } while (++c<C)`).
         let mut last = 0usize;
-        band_log_e3[..end].copy_from_slice(&band_log_e2[..end]);
-        if lm == 0 {
-            // "For 2.5 ms frames, the first 8 bands have just one bin, so the energy is highly
-            // unreliable (high variance); take the max with the previous energy so that at least 2
-            // bins are getting used."
-            for i in 0..8.min(end) {
-                band_log_e3[i] = band_log_e2[i].max(old_band_e[i]);
+        for c in 0..channels {
+            let base = c * NB_BANDS;
+            band_log_e3[..end].copy_from_slice(&band_log_e2[base..base + end]);
+            if lm == 0 {
+                // "For 2.5 ms frames, the first 8 bands have just one bin, so the energy is highly
+                // unreliable (high variance); take the max with the previous energy so that at
+                // least 2 bins are getting used."
+                for i in 0..8.min(end) {
+                    band_log_e3[i] = band_log_e2[base + i].max(old_band_e[base + i]);
+                }
+            }
+            let f = &mut follower[base..base + NB_BANDS];
+            f[0] = band_log_e3[0];
+            for i in 1..end {
+                // "The last band to be at least 3 dB higher than the previous one is the last we'll
+                // consider. Otherwise, we run into problems on bandlimited signals."
+                if band_log_e3[i] > band_log_e3[i - 1] + 0.5 {
+                    last = i;
+                }
+                f[i] = (f[i - 1] + 1.5).min(band_log_e3[i]);
+            }
+            for i in (0..last).rev() {
+                f[i] = f[i].min((f[i + 1] + 2.0).min(band_log_e3[i]));
+            }
+            // "Combine with a median filter to avoid dynalloc triggering unnecessarily. The offset
+            // value controls how conservative we are."
+            let offset = 1.0f32;
+            for i in 2..end.saturating_sub(2) {
+                f[i] = f[i].max(median_of_5(&band_log_e3[i - 2..i + 3]) - offset);
+            }
+            if end >= 3 {
+                let tmp = median_of_3(&band_log_e3[0..3]) - offset;
+                f[0] = f[0].max(tmp);
+                f[1] = f[1].max(tmp);
+                let tmp = median_of_3(&band_log_e3[end - 3..end]) - offset;
+                f[end - 2] = f[end - 2].max(tmp);
+                f[end - 1] = f[end - 1].max(tmp);
+            }
+            for i in 0..end {
+                f[i] = f[i].max(noise_floor[i]);
             }
         }
-        follower[0] = band_log_e3[0];
-        for i in 1..end {
-            // "The last band to be at least 3 dB higher than the previous one is the last we'll
-            // consider. Otherwise, we run into problems on bandlimited signals."
-            if band_log_e3[i] > band_log_e3[i - 1] + 0.5 {
-                last = i;
+        if channels == 2 {
+            for i in start..end {
+                // "Consider 24 dB cross-talk" (celt_encoder.c:1099).
+                follower[NB_BANDS + i] = follower[NB_BANDS + i].max(follower[i] - 4.0);
+                follower[i] = follower[i].max(follower[NB_BANDS + i] - 4.0);
+                follower[i] = 0.5
+                    * ((band_log_e[i] - follower[i]).max(0.0)
+                        + (band_log_e[NB_BANDS + i] - follower[NB_BANDS + i]).max(0.0));
             }
-            follower[i] = (follower[i - 1] + 1.5).min(band_log_e3[i]);
-        }
-        for i in (0..last).rev() {
-            follower[i] = follower[i].min((follower[i + 1] + 2.0).min(band_log_e3[i]));
-        }
-        // "Combine with a median filter to avoid dynalloc triggering unnecessarily. The offset value
-        // controls how conservative we are."
-        let offset = 1.0f32;
-        for i in 2..end.saturating_sub(2) {
-            follower[i] = follower[i].max(median_of_5(&band_log_e3[i - 2..i + 3]) - offset);
-        }
-        if end >= 3 {
-            let tmp = median_of_3(&band_log_e3[0..3]) - offset;
-            follower[0] = follower[0].max(tmp);
-            follower[1] = follower[1].max(tmp);
-            let tmp = median_of_3(&band_log_e3[end - 3..end]) - offset;
-            follower[end - 2] = follower[end - 2].max(tmp);
-            follower[end - 1] = follower[end - 1].max(tmp);
-        }
-        for i in 0..end {
-            follower[i] = follower[i].max(noise_floor[i]);
-        }
-        for i in start..end {
-            follower[i] = (band_log_e[i] - follower[i]).max(0.0);
+        } else {
+            for i in start..end {
+                follower[i] = (band_log_e[i] - follower[i]).max(0.0);
+            }
         }
         for i in start..end {
             importance[i] = (0.5 + 13.0 * celt_exp2(follower[i].min(4.0))).floor() as i32;
@@ -499,7 +580,7 @@ pub fn dynalloc_analysis(
         }
         for i in start..end {
             follower[i] = follower[i].min(4.0);
-            let width = ((E_BANDS[i + 1] - E_BANDS[i]) as i32) << lm;
+            let width = (channels as i32 * i32::from(E_BANDS[i + 1] - E_BANDS[i])) << lm;
             let (boost, boost_bits);
             if width < 6 {
                 boost = follower[i] as i32;
@@ -534,16 +615,30 @@ pub fn dynalloc_analysis(
     }
 }
 
-/// Decide the allocation `trim` symbol (libopus `alloc_trim_analysis`, `celt_encoder.c:797`, mono
-/// path): a 0..10 tilt of the allocation curve, pulled down by a bright spectrum, by transients, and
-/// by a low equivalent bitrate.
-// See the note on `dynalloc_analysis`: the loop indexes `band_log_e` by the reference's own `i`.
+/// Decide the allocation `trim` symbol (libopus `alloc_trim_analysis`, `celt_encoder.c:795`): a
+/// 0..10 tilt of the allocation curve, pulled down by a bright spectrum, by transients, and by a low
+/// equivalent bitrate.
+///
+/// With `channels == 2` it also measures the inter-channel correlation of the low bands (and, up to
+/// `intensity`, the *worst* band's correlation) and tilts toward the low bands when the two channels
+/// are alike — a correlated pair spends little on the side, so the trim can afford it. The same
+/// numbers produce `stereo_saving`, which the VBR target subtracts (`celt_encoder.c:1360`); it is
+/// carried in encoder state, hence the `&mut`.
+///
+/// `x` is the `2 * n0` normalised spectrum (channel-major); it is unread when `channels == 1`.
+// See the note on `dynalloc_analysis`: the loops index `band_log_e` by the reference's own `i`.
 #[allow(clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 pub fn alloc_trim_analysis(
+    x: &[f32],
     band_log_e: &[f32],
     end: usize,
     lm: usize,
+    channels: usize,
+    n0: usize,
+    stereo_saving: &mut f32,
     tf_estimate: f32,
+    intensity: usize,
     equiv_rate: i32,
 ) -> i32 {
     // "At low bitrate, reducing the trim seems to help."
@@ -555,15 +650,41 @@ pub fn alloc_trim_analysis(
     } else {
         5.0
     };
+    if channels == 2 {
+        // Inter-channel correlation of the low frequencies (celt_encoder.c:816). Every `SHR32`/
+        // `EXTRACT16`/`MULT16_16_Q15` around it is the identity in the float build.
+        let band_corr = |i: usize| -> f32 {
+            let lo = (E_BANDS[i] as usize) << lm;
+            let width = ((E_BANDS[i + 1] - E_BANDS[i]) as usize) << lm;
+            celt_inner_prod(&x[lo..], &x[n0 + lo..], width)
+        };
+        let mut sum = 0f32;
+        for i in 0..8 {
+            sum += band_corr(i);
+        }
+        sum *= 1.0 / 8.0;
+        sum = 1.0f32.min(sum.abs());
+        let mut min_cross = sum;
+        for i in 8..intensity {
+            min_cross = min_cross.min(band_corr(i).abs());
+        }
+        min_cross = 1.0f32.min(min_cross.abs());
+        // Mid-side savings estimated from the LF average, and from the worst correlated band.
+        let log_xc = celt_log2(1.001 - sum * sum);
+        let log_xc2 = (0.5 * log_xc).max(celt_log2(1.001 - min_cross * min_cross));
+        trim += (-4.0f32).max(0.75 * log_xc);
+        *stereo_saving = (*stereo_saving + 0.25).min(-0.5 * log_xc2);
+    }
     // Estimate the spectral tilt.
     let mut diff = 0f32;
-    for i in 0..end - 1 {
-        diff += band_log_e[i] * (2 + 2 * i as i32 - end as i32) as f32;
+    for c in 0..channels {
+        for i in 0..end - 1 {
+            diff += band_log_e[i + c * NB_BANDS] * (2 + 2 * i as i32 - end as i32) as f32;
+        }
     }
-    diff /= (end - 1) as f32;
+    diff /= (channels * (end - 1)) as f32;
     trim -= (-2.0f32).max((2.0f32).min((diff + 1.0) / 6.0));
     trim -= 2.0 * tf_estimate;
-    let _ = lm; // (`lm` enters the trim only via `equiv_rate`, which the caller already scaled)
     ((0.5 + trim).floor() as i32).clamp(0, 10)
 }
 
@@ -743,12 +864,12 @@ mod tests {
     fn patch_transient_decision_detects_sudden_energy_growth() {
         let old_e = vec![2.0f32; NB_BANDS];
         let same = vec![2.0f32; NB_BANDS];
-        assert!(!patch_transient_decision(&same, &old_e, 0, NB_BANDS));
+        assert!(!patch_transient_decision(&same, &old_e, 0, NB_BANDS, 1));
         let jumped: Vec<f32> = (0..NB_BANDS).map(|_| 8.0f32).collect();
-        assert!(patch_transient_decision(&jumped, &old_e, 0, NB_BANDS));
+        assert!(patch_transient_decision(&jumped, &old_e, 0, NB_BANDS, 1));
         // A quieter frame must never be a transient.
         let quieter = vec![-4.0f32; NB_BANDS];
-        assert!(!patch_transient_decision(&quieter, &old_e, 0, NB_BANDS));
+        assert!(!patch_transient_decision(&quieter, &old_e, 0, NB_BANDS, 1));
     }
 
     #[test]
@@ -845,6 +966,7 @@ mod tests {
             &flat,
             0,
             NB_BANDS,
+            1,
             &mut offsets,
             24,
             false,
@@ -874,6 +996,7 @@ mod tests {
             &peaky,
             0,
             NB_BANDS,
+            1,
             &mut offsets,
             24,
             false,
@@ -900,6 +1023,7 @@ mod tests {
             &spiky,
             0,
             NB_BANDS,
+            1,
             &mut offsets,
             24,
             false,
@@ -921,15 +1045,30 @@ mod tests {
     #[test]
     fn alloc_trim_is_in_range_and_responds_to_rate_and_transients() {
         let flat = vec![3.0f32; NB_BANDS];
+        let trim = |band_log_e: &[f32], tf_estimate: f32, rate: i32| -> i32 {
+            let mut saving = 0f32;
+            alloc_trim_analysis(
+                &[],
+                band_log_e,
+                NB_BANDS,
+                3,
+                1,
+                960,
+                &mut saving,
+                tf_estimate,
+                0,
+                rate,
+            )
+        };
         for &rate in &[16_000i32, 48_000, 64_000, 72_000, 128_000, 400_000] {
-            let t = alloc_trim_analysis(&flat, NB_BANDS, 3, 0.0, rate);
+            let t = trim(&flat, 0.0, rate);
             assert!((0..=10).contains(&t), "rate={rate}: trim {t}");
         }
-        let low = alloc_trim_analysis(&flat, NB_BANDS, 3, 0.0, 24_000);
-        let high = alloc_trim_analysis(&flat, NB_BANDS, 3, 0.0, 200_000);
+        let low = trim(&flat, 0.0, 24_000);
+        let high = trim(&flat, 0.0, 200_000);
         assert!(low <= high, "low-rate trim {low} > high-rate {high}");
-        let steady = alloc_trim_analysis(&flat, NB_BANDS, 3, 0.0, 200_000);
-        let transient = alloc_trim_analysis(&flat, NB_BANDS, 3, 0.8, 200_000);
+        let steady = trim(&flat, 0.0, 200_000);
+        let transient = trim(&flat, 0.8, 200_000);
         assert!(
             transient < steady,
             "a transient must lower the trim: {transient} vs {steady}"
@@ -937,10 +1076,7 @@ mod tests {
         // A bright (rising) spectrum must trim differently from a dark (falling) one.
         let rising: Vec<f32> = (0..NB_BANDS).map(|i| i as f32 * 0.5).collect();
         let falling: Vec<f32> = (0..NB_BANDS).map(|i| -(i as f32) * 0.5).collect();
-        assert_ne!(
-            alloc_trim_analysis(&rising, NB_BANDS, 3, 0.0, 200_000),
-            alloc_trim_analysis(&falling, NB_BANDS, 3, 0.0, 200_000)
-        );
+        assert_ne!(trim(&rising, 0.0, 200_000), trim(&falling, 0.0, 200_000));
     }
 
     /// The spreading decision must return one of the four legal values, pick aggressive spreading for
