@@ -251,6 +251,10 @@ fn parse_trace(text: &str) -> Result<BTreeMap<usize, Vec<TraceEvent>>, String> {
                     gains_q16,
                 }
             }
+            // The later SILK phases share this dump. Their per-frame groups (all tagged with a `u=`
+            // unit counter) belong to `silk_excitation_conformance`, which owns §4.2.7.6-8; skip
+            // them here rather than rejecting them, so one instrumented build serves both harnesses.
+            "NLSFSYM" | "PITCH" | "SEED" | "PULSES" | "RC" | "EXC" => continue,
             other => return Err(format!("unknown trace event {other}")),
         };
         packets.entry(index).or_default().push(event);

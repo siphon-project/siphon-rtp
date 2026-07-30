@@ -615,6 +615,7 @@ pub fn dequantize(indices: &LtpIndices, rate: InternalRate) -> LtpParameters {
 mod tests {
     use super::*;
     use crate::opus::range_coder::RangeEncoder;
+    use proptest::prelude::*;
 
     /// Total frequency of every SILK ICDF: they are all decoded with `ftb = 8`.
     const FT: u16 = 256;
@@ -1313,6 +1314,74 @@ mod tests {
                 min_lag(rate) + i32::from(largest_index),
                 max_lag(rate) - 1,
                 "{rate:?}: the top absolute lag is one below lag_max (18 ms exclusive)"
+            );
+        }
+    }
+
+    proptest! {
+        /// Arbitrary (and, since the range decoder reads zeros past the end, truncated) payloads
+        /// must never panic, never index out of bounds and never spin — and every value they yield
+        /// has to be a legal index into its own codebook, with the assembled pitch lags inside
+        /// `[lag_min, lag_max]`.
+        #[test]
+        fn arbitrary_payloads_never_panic_and_stay_in_range(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+            rate_index in 0usize..3,
+            duration_index in 0usize..2,
+            cond_index in 0usize..3,
+            previous_voiced in any::<bool>(),
+            previous_lag in any::<i16>(),
+        ) {
+            let rate = [
+                InternalRate::Narrow8k,
+                InternalRate::Medium12k,
+                InternalRate::Wide16k,
+            ][rate_index];
+            let layout = SubframeLayout::from_duration_ms([10usize, 20][duration_index])
+                .expect("a legal SILK duration");
+            let cond_coding = [
+                CondCoding::Independently,
+                CondCoding::IndependentlyNoLtpScaling,
+                CondCoding::Conditionally,
+            ][cond_index];
+            let previous_signal_type = if previous_voiced {
+                SignalType::Voiced
+            } else {
+                SignalType::Unvoiced
+            };
+
+            let mut decoder = RangeDecoder::new(&bytes);
+            let indices = decode_indices(
+                &mut decoder,
+                rate,
+                layout,
+                cond_coding,
+                previous_signal_type,
+                previous_lag,
+            );
+
+            prop_assert_eq!(indices.subframe_count, layout.subframe_count);
+            prop_assert!(indices.voiced);
+            let contour = PitchContourCodebook::select(rate, layout.subframe_count);
+            prop_assert!(usize::from(indices.contour_index) < contour.len());
+            prop_assert!(usize::from(indices.periodicity_index) < LTP_CODEBOOK_COUNT);
+            let filter = LtpFilterCodebook::select(indices.periodicity_index);
+            for &index in &indices.filter_indices[..layout.subframe_count] {
+                prop_assert!(usize::from(index) < filter.len());
+            }
+            prop_assert!(usize::from(indices.ltp_scale_index) < LTP_SCALES_Q14.len());
+            // A frame that codes no scaling symbol must leave the index at 0 (§4.2.7.6.3).
+            if cond_coding != CondCoding::Independently {
+                prop_assert_eq!(indices.ltp_scale_index, 0);
+            }
+
+            let parameters = dequantize(&indices, rate);
+            for &lag in &parameters.pitch_lags[..layout.subframe_count] {
+                prop_assert!((min_lag(rate)..=max_lag(rate)).contains(&lag));
+            }
+            prop_assert_eq!(
+                parameters.scale_q14,
+                LTP_SCALES_Q14[usize::from(indices.ltp_scale_index)]
             );
         }
     }

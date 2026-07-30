@@ -666,6 +666,201 @@ fn bench_celt_kernels(c: &mut Criterion) {
     group.finish();
 }
 
+/// SILK's §4.2.7.6-8 side-info stages: the LTP indices, the shell coder and the §4.2.7.8.6
+/// reconstruction. These are per-frame costs on every SILK and hybrid packet, so they are benched
+/// separately from the whole-frame decode that will sit on top of them.
+///
+/// The payloads are built with our own range *encoder* rather than read from a vector file, so the
+/// bench runs anywhere (no reference data) and the symbol mix is fixed and reproducible.
+fn bench_silk_excitation(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::range_coder::{RangeDecoder, RangeEncoder};
+    use siphon_rtp_codec::opus::silk::excitation::{
+        self, PULSES_PER_BLOCK_ICDF, PULSE_BUFFER_LENGTH, RATE_LEVELS_ICDF, SHELL_BLOCK_LENGTH,
+        SHELL_CODE_TABLE0, SHELL_CODE_TABLE1, SHELL_CODE_TABLE2, SHELL_CODE_TABLE3,
+        SHELL_CODE_TABLE_OFFSETS, SIGN_ICDF,
+    };
+    use siphon_rtp_codec::opus::silk::ltp;
+    use siphon_rtp_codec::opus::silk::types::{
+        CondCoding, InternalRate, QuantOffsetType, SignalType, SubframeLayout, MAX_FRAME_LENGTH,
+    };
+
+    const FTB: u32 = 8;
+    /// The sub-table for `pulse_count` inside a shell-code table (RFC 6716 Tables 47-50).
+    fn split(table: &[u8; 152], pulse_count: usize) -> &[u8] {
+        let start = SHELL_CODE_TABLE_OFFSETS[pulse_count] as usize;
+        &table[start..start + pulse_count + 1]
+    }
+
+    let mut group = c.benchmark_group("silk_excitation");
+
+    // ── The excitation stage, at each frame length RFC 6716 Table 44 lists ─────────────────────
+    for &(label, frame_length) in &[
+        ("decode_nb_10ms", 80usize),
+        ("decode_nb_20ms", 160),
+        ("decode_wb_10ms", 160),
+        ("decode_wb_20ms", 320),
+    ] {
+        let block_count = frame_length.div_ceil(SHELL_BLOCK_LENGTH);
+        let rate_level = 5usize;
+        let signal_type = SignalType::Voiced;
+        let quant_offset_type = QuantOffsetType::High;
+
+        // A realistic block mix: a few pulses spread over the block, one loud block per frame.
+        let blocks: Vec<[u16; SHELL_BLOCK_LENGTH]> = (0..block_count)
+            .map(|block| {
+                let mut pulses = [0u16; SHELL_BLOCK_LENGTH];
+                pulses[block % SHELL_BLOCK_LENGTH] = 3;
+                pulses[(block * 5 + 1) % SHELL_BLOCK_LENGTH] += 2;
+                pulses[(block * 11 + 7) % SHELL_BLOCK_LENGTH] += 1;
+                pulses
+            })
+            .collect();
+
+        let mut payload = vec![0u8; 2048];
+        let written = {
+            let mut encoder = RangeEncoder::new(&mut payload);
+            encoder.enc_icdf(rate_level, &RATE_LEVELS_ICDF[1], FTB);
+            for block in &blocks {
+                let total: u16 = block.iter().sum();
+                encoder.enc_icdf(usize::from(total), &PULSES_PER_BLOCK_ICDF[rate_level], FTB);
+            }
+            for block in &blocks {
+                // libopus' `silk_shell_encoder` symbol order (shell_coder.c:78-115).
+                let combine = |input: &[u16]| -> Vec<u16> {
+                    input.chunks_exact(2).map(|p| p[0] + p[1]).collect()
+                };
+                let level0 = block.to_vec();
+                let level1 = combine(&level0);
+                let level2 = combine(&level1);
+                let level3 = combine(&level2);
+                let level4 = combine(&level3);
+                let mut emit = |child: u16, parent: u16, table: &[u8; 152]| {
+                    if parent > 0 {
+                        encoder.enc_icdf(
+                            usize::from(child),
+                            split(table, usize::from(parent)),
+                            FTB,
+                        );
+                    }
+                };
+                emit(level3[0], level4[0], &SHELL_CODE_TABLE3);
+                emit(level2[0], level3[0], &SHELL_CODE_TABLE2);
+                emit(level1[0], level2[0], &SHELL_CODE_TABLE1);
+                emit(level0[0], level1[0], &SHELL_CODE_TABLE0);
+                emit(level0[2], level1[1], &SHELL_CODE_TABLE0);
+                emit(level1[2], level2[1], &SHELL_CODE_TABLE1);
+                emit(level0[4], level1[2], &SHELL_CODE_TABLE0);
+                emit(level0[6], level1[3], &SHELL_CODE_TABLE0);
+                emit(level2[2], level3[1], &SHELL_CODE_TABLE2);
+                emit(level1[4], level2[2], &SHELL_CODE_TABLE1);
+                emit(level0[8], level1[4], &SHELL_CODE_TABLE0);
+                emit(level0[10], level1[5], &SHELL_CODE_TABLE0);
+                emit(level1[6], level2[3], &SHELL_CODE_TABLE1);
+                emit(level0[12], level1[6], &SHELL_CODE_TABLE0);
+                emit(level0[14], level1[7], &SHELL_CODE_TABLE0);
+            }
+            // Signs: voiced / high offset is row 5 of Table 52.
+            for block in &blocks {
+                let total: u16 = block.iter().sum();
+                let icdf = [SIGN_ICDF[35 + usize::from(total).min(6)], 0];
+                for (sample, &magnitude) in block.iter().enumerate() {
+                    if magnitude > 0 {
+                        encoder.enc_icdf(sample & 1, &icdf, FTB);
+                    }
+                }
+            }
+            encoder.done() as usize
+        };
+        payload.truncate(written.max(1));
+
+        group.bench_function(label, |b| {
+            let mut pulses = [0i16; PULSE_BUFFER_LENGTH];
+            let mut excitation_q14 = [0i32; MAX_FRAME_LENGTH];
+            b.iter(|| {
+                let mut decoder = RangeDecoder::new(black_box(&payload));
+                let summary = excitation::decode(
+                    &mut decoder,
+                    signal_type,
+                    quant_offset_type,
+                    frame_length,
+                    2,
+                    &mut pulses,
+                    &mut excitation_q14[..frame_length],
+                )
+                .expect("decode");
+                black_box(summary.total_pulses())
+            });
+        });
+    }
+
+    // ── The §4.2.7.8.6 reconstruction alone, so a regression can be localised to it ────────────
+    {
+        let mut pulses = [0i16; MAX_FRAME_LENGTH];
+        for (index, slot) in pulses.iter_mut().enumerate() {
+            *slot = match index % 7 {
+                0 => 0,
+                1 => 1,
+                2 => -2,
+                3 => 5,
+                _ => 0,
+            };
+        }
+        group.bench_function("reconstruct_20ms_wb", |b| {
+            let mut excitation_q14 = [0i32; MAX_FRAME_LENGTH];
+            b.iter(|| {
+                excitation::reconstruct(
+                    black_box(&pulses),
+                    SignalType::Voiced,
+                    QuantOffsetType::Low,
+                    3,
+                    &mut excitation_q14,
+                )
+                .expect("reconstruct");
+                black_box(excitation_q14[0])
+            });
+        });
+    }
+
+    // ── The LTP side info: index decode plus the codebook lookups synthesis consumes ───────────
+    {
+        let layout = SubframeLayout::from_duration_ms(20).expect("20 ms");
+        let rate = InternalRate::Wide16k;
+        let contour = ltp::PitchContourCodebook::select(rate, layout.subframe_count);
+        let filter = ltp::LtpFilterCodebook::select(2);
+        let mut payload = vec![0u8; 64];
+        let written = {
+            let mut encoder = RangeEncoder::new(&mut payload);
+            encoder.enc_icdf(17, &ltp::PITCH_LAG_ICDF, FTB);
+            encoder.enc_icdf(5, ltp::lag_low_bits_icdf(rate), FTB);
+            encoder.enc_icdf(20, contour.icdf(), FTB);
+            encoder.enc_icdf(2, &ltp::LTP_PERIODICITY_ICDF, FTB);
+            for index in 0..layout.subframe_count {
+                encoder.enc_icdf(index * 3, filter.icdf(), FTB);
+            }
+            encoder.enc_icdf(1, &ltp::LTP_SCALE_ICDF, FTB);
+            encoder.done() as usize
+        };
+        payload.truncate(written.max(1));
+
+        group.bench_function("ltp_indices_20ms_wb", |b| {
+            b.iter(|| {
+                let mut decoder = RangeDecoder::new(black_box(&payload));
+                let indices = ltp::decode_indices(
+                    &mut decoder,
+                    rate,
+                    layout,
+                    CondCoding::Independently,
+                    SignalType::Unvoiced,
+                    0,
+                );
+                black_box(ltp::dequantize(&indices, rate).pitch_lags[0])
+            });
+        });
+    }
+
+    group.finish();
+}
+
 // AMR-WB/NB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
 #[cfg(feature = "amr")]
 criterion_group!(
@@ -677,6 +872,7 @@ criterion_group!(
     bench_cn,
     bench_celt_encode,
     bench_celt_kernels,
+    bench_silk_excitation,
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
@@ -695,6 +891,7 @@ criterion_group!(
     bench_gsm_fr,
     bench_cn,
     bench_celt_encode,
-    bench_celt_kernels
+    bench_celt_kernels,
+    bench_silk_excitation
 );
 criterion_main!(benches);
