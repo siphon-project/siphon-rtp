@@ -110,6 +110,8 @@ pub struct FileConfig {
     pub shutdown_grace_secs: Option<u64>,
     /// STUN servers asked for a server-reflexive ICE candidate when gathering (`--stun-server`).
     pub stun_server: Option<Vec<SocketAddr>>,
+    /// Run a full RFC 8445 ICE agent on ICE legs (`--ice-full`).
+    pub ice_full: Option<bool>,
     /// Actively run RFC 7675 consent freshness on ICE legs (`--ice-consent`).
     pub ice_consent: Option<bool>,
     /// Seconds between ICE consent checks (`--consent-interval-secs`).

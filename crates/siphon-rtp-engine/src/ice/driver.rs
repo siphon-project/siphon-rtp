@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 
 use dashmap::DashMap;
 use siphon_rtp_datapath::{EndpointId, IceDatapathEvent};
+use siphon_rtp_ice::agent::{AgentAction, AgentConfig, IceAgent, IceState};
 use siphon_rtp_stun::client::IceRole;
 
 use super::consent::{ConsentAction, ConsentChecker, ConsentParams};
@@ -498,5 +499,193 @@ mod tests {
         // randomisation so a box full of calls does not emit one synchronised burst).
         assert_ne!(tie_breaker(EndpointId(1)), tie_breaker(EndpointId(2)));
         assert_ne!(tie_breaker(EndpointId(1)), 0, "a zero seed would stick");
+    }
+}
+
+// ---- RFC 8445 full agent -----------------------------------------------------------------------
+
+/// What [`AgentSupervisor::poll`] asks the engine to do for one endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentOutcome {
+    /// Transmit `datagram` from `endpoint` to `dst` (a connectivity check).
+    Send {
+        /// The endpoint to source it from.
+        endpoint: EndpointId,
+        /// Where to send it.
+        dst: SocketAddr,
+        /// The STUN datagram.
+        datagram: Vec<u8>,
+    },
+    /// ICE selected a pair (RFC 8445 §8.1.1). `remote` is now the media path for `endpoint`.
+    Selected {
+        /// The endpoint whose path was decided.
+        endpoint: EndpointId,
+        /// The call that owns it.
+        call_id: String,
+        /// The peer transport address media must use.
+        remote: SocketAddr,
+    },
+    /// Every candidate pair failed (RFC 8445 §8.1.2): there is no usable path. Tear the call down.
+    Failed {
+        /// The endpoint whose checklist was exhausted.
+        endpoint: EndpointId,
+        /// The call that owns it.
+        call_id: String,
+    },
+}
+
+/// One endpoint's registered agent.
+#[derive(Debug)]
+struct AgentEntry {
+    call_id: String,
+    /// The local transport address the agent's checks egress from.
+    local: SocketAddr,
+    agent: IceAgent,
+    /// Whether a `Selected` outcome has already been reported (so it is reported exactly once).
+    announced: bool,
+}
+
+/// The per-engine registry of full ICE agents, one per ICE-enabled endpoint.
+///
+/// Mirrors [`ConsentSupervisor`]: shared (`DashMap`) because registration happens on the control path
+/// while polling happens on the driver task, and pure with respect to I/O — it returns
+/// [`AgentOutcome`]s for the engine to execute.
+#[derive(Debug)]
+pub struct AgentSupervisor {
+    agents: DashMap<EndpointId, AgentEntry>,
+    events_tx: flume::Sender<IceDatapathEvent>,
+    events_rx: flume::Receiver<IceDatapathEvent>,
+}
+
+impl Default for AgentSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentSupervisor {
+    /// Build an empty supervisor.
+    #[must_use]
+    pub fn new() -> Self {
+        let (events_tx, events_rx) = flume::bounded(EVENT_QUEUE_DEPTH);
+        Self {
+            agents: DashMap::new(),
+            events_tx,
+            events_rx,
+        }
+    }
+
+    /// The STUN sink to hand to [`siphon_rtp_datapath::Datapath::set_ice_agent`].
+    #[must_use]
+    pub fn events(&self) -> flume::Sender<IceDatapathEvent> {
+        self.events_tx.clone()
+    }
+
+    /// How many endpoints are running an agent (the leak assertion's hook).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.agents.len()
+    }
+
+    /// Whether no endpoint has an agent.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.agents.is_empty()
+    }
+
+    /// Start an agent on `endpoint`.
+    pub fn register(
+        &self,
+        endpoint: EndpointId,
+        call_id: &str,
+        local: SocketAddr,
+        config: AgentConfig,
+        now_ms: u64,
+    ) {
+        self.agents.insert(
+            endpoint,
+            AgentEntry {
+                call_id: call_id.to_string(),
+                local,
+                agent: IceAgent::new(config, now_ms),
+                announced: false,
+            },
+        );
+    }
+
+    /// Stop every agent belonging to `call_id`.
+    pub fn unregister_call(&self, call_id: &str) {
+        self.agents.retain(|_, entry| entry.call_id != call_id);
+    }
+
+    /// The agent state for `endpoint` (diagnostics and tests).
+    #[must_use]
+    pub fn state(&self, endpoint: EndpointId) -> Option<IceState> {
+        self.agents.get(&endpoint).map(|entry| entry.agent.state())
+    }
+
+    /// Feed the datapath's forwarded STUN into the agents. MUST run before [`Self::poll`], so a check
+    /// that arrived this tick is answered on this tick rather than the next.
+    pub fn drain_events(&self, now_ms: u64) -> Vec<AgentOutcome> {
+        let mut outcomes = Vec::new();
+        while let Ok(event) = self.events_rx.try_recv() {
+            let Some(mut entry) = self.agents.get_mut(&event.endpoint) else {
+                continue;
+            };
+            let local = entry.local;
+            let actions = entry
+                .agent
+                .on_datagram(local, event.source, &event.datagram, now_ms);
+            let endpoint = event.endpoint;
+            Self::translate(&mut entry, endpoint, actions, &mut outcomes);
+        }
+        outcomes
+    }
+
+    /// Drive every agent at `now_ms`.
+    pub fn poll(&self, now_ms: u64) -> Vec<AgentOutcome> {
+        let mut outcomes = Vec::new();
+        for mut entry in self.agents.iter_mut() {
+            let endpoint = *entry.key();
+            let entry = entry.value_mut();
+            let actions = entry.agent.poll(now_ms);
+            Self::translate(entry, endpoint, actions, &mut outcomes);
+        }
+        outcomes
+    }
+
+    /// Convert the agent's actions into engine outcomes, reporting a selection exactly once.
+    fn translate(
+        entry: &mut AgentEntry,
+        endpoint: EndpointId,
+        actions: Vec<AgentAction>,
+        outcomes: &mut Vec<AgentOutcome>,
+    ) {
+        for action in actions {
+            match action {
+                AgentAction::Send { to, datagram, .. } => outcomes.push(AgentOutcome::Send {
+                    endpoint,
+                    dst: to,
+                    datagram,
+                }),
+                AgentAction::Selected { remote, .. } => {
+                    if !entry.announced {
+                        entry.announced = true;
+                        outcomes.push(AgentOutcome::Selected {
+                            endpoint,
+                            call_id: entry.call_id.clone(),
+                            remote,
+                        });
+                    }
+                }
+                AgentAction::StateChanged(IceState::Failed) => {
+                    outcomes.push(AgentOutcome::Failed {
+                        endpoint,
+                        call_id: entry.call_id.clone(),
+                    });
+                }
+                AgentAction::StateChanged(_) => {}
+            }
+        }
     }
 }

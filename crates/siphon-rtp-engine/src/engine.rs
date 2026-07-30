@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_datapath::{
-    AddressFamily, Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy,
-    ObservedRtcp, SourceFilter,
+    AddressFamily, Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceAgentMode,
+    IceConfig, LatchPolicy, ObservedRtcp, SourceFilter,
 };
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_hep::exporter::HepExporter;
@@ -42,7 +42,7 @@ use siphon_rtp_srtp::StreamRollover;
 use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
 use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
-use crate::ice::driver::{ConsentOutcome, ConsentSupervisor};
+use crate::ice::driver::{AgentOutcome, AgentSupervisor, ConsentOutcome, ConsentSupervisor};
 use crate::ice::{self, IceCredentials};
 use crate::interface::{Interface, InterfaceTable};
 use crate::media_pipeline::{
@@ -110,6 +110,15 @@ struct Call {
     /// The **far** (answerer, B) peer's ICE credentials, from its answer. Same purpose as
     /// [`Self::near_remote_ice`], for the other leg; `None` until a B answer carrying ICE lands.
     far_remote_ice: Option<IceCredentials>,
+    /// A's ICE candidates from its offer — the remote set the near leg's agent pairs against
+    /// (RFC 8445 §6.1.2.2). Empty for a non-ICE offer.
+    near_remote_candidates: Vec<siphon_rtp_ice::Candidate>,
+    /// Whether A advertised `a=ice-lite`. A lite agent can never be controlling (RFC 8445 §6.1.1), so
+    /// this decides our role on the near leg.
+    near_peer_is_lite: bool,
+    /// The candidates gathered for the **far** leg at offer time, kept because the far agent is only
+    /// started at answer (when B's own set arrives) and re-gathering would change what we advertised.
+    far_local_candidates: Vec<siphon_rtp_ice::Candidate>,
     from_tag: String,
     to_tag: Option<String>,
     near: Leg,
@@ -555,6 +564,9 @@ pub struct Engine<D: Datapath> {
     /// engine only *answers* checks (the RFC 7675 §4 ICE-lite posture) and dead paths are caught by
     /// the media-timeout sweep alone. Shared with the sweeper task, which drives it once per tick.
     consent: Option<Arc<ConsentSupervisor>>,
+    /// The full RFC 8445 agents, when the operator enabled `--ice full`. `None` ⇒ the ICE-lite
+    /// responder posture. Shared with the driver task, which polls them on a sub-second clock.
+    ice_agents: Option<Arc<AgentSupervisor>>,
     /// STUN servers asked for a server-reflexive candidate during gathering (RFC 8445 §5.1.1.2).
     /// Empty (the default) ⇒ host-only gathering, which is correct for a directly-addressable engine
     /// and costs no network round trip at call setup.
@@ -611,6 +623,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             play_id_counter: std::sync::atomic::AtomicU64::new(1),
             // Off unless the operator opts in — see `with_consent`.
             consent: None,
+            ice_agents: None,
             // Host-only gathering unless the operator names a STUN server.
             stun_servers: Vec::new(),
         }
@@ -626,6 +639,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     #[must_use]
     pub fn with_stun_servers(mut self, servers: Vec<SocketAddr>) -> Self {
         self.stun_servers = servers;
+        self
+    }
+
+    /// The bound local address of one of a call's endpoints — where that leg's agent sources its
+    /// checks from, and the local side of every pair it forms.
+    fn endpoint_address(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        self.calls.iter().find_map(|entry| {
+            let call = entry.value();
+            [
+                Some(call.near.rtp),
+                call.near.rtcp,
+                Some(call.far.rtp),
+                call.far.rtcp,
+            ]
+            .into_iter()
+            .flatten()
+            .find(|candidate| candidate.id == endpoint)
+            .map(|candidate| candidate.local_addr)
+        })
+    }
+
+    /// Run a full RFC 8445 ICE agent on every ICE leg instead of the ICE-lite responder: the engine
+    /// forms checklists, sends connectivity checks, resolves role conflicts, discovers peer-reflexive
+    /// candidates, and nominates a pair — and media only starts once a pair is selected.
+    ///
+    /// Off by default: `a=ice-lite` is what the engine advertises, and a lite agent is a valid and
+    /// simpler posture for a server on a routable address. Builder-style consuming setter.
+    #[must_use]
+    pub fn with_full_ice(mut self) -> Self {
+        self.ice_agents = Some(Arc::new(AgentSupervisor::new()));
         self
     }
 
@@ -1343,6 +1386,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // (RFC 8445 §7.1.2); B's arrive with its answer.
                 near_remote_ice: peer_ice_credentials(&info),
                 far_remote_ice: None,
+                near_remote_candidates: info.candidates.clone(),
+                near_peer_is_lite: info.ice_lite,
+                far_local_candidates: far_ice_candidates.clone(),
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -1526,6 +1572,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // consent on either side.
                 near_remote_ice: None,
                 far_remote_ice: None,
+                near_remote_candidates: Vec::new(),
+                near_peer_is_lite: false,
+                far_local_candidates: Vec::new(),
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -1767,6 +1816,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if let Some(consent) = &self.consent {
                 consent.unregister_call(call_id);
             }
+            if let Some(agents) = &self.ice_agents {
+                agents.unregister_call(call_id);
+            }
             for endpoint in endpoints {
                 self.datapath.remove_endpoint(endpoint).await;
                 self.endpoint_calls.remove(&endpoint);
@@ -1791,6 +1843,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far,
             ice_creds,
             near_remote_ice,
+            near_remote_candidates,
+            near_peer_is_lite,
+            far_local_candidates,
             far_local_crypto,
             far_dtls,
             near_codec,
@@ -1809,6 +1864,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.far,
                     call.ice.clone(),
                     call.near_remote_ice.clone(),
+                    call.near_remote_candidates.clone(),
+                    call.near_peer_is_lite,
+                    call.far_local_candidates.clone(),
                     call.far_local_crypto,
                     call.far_dtls,
                     call.near_codec.clone(),
@@ -1992,12 +2050,98 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &far_remote_ice,
                 ),
             ];
+            // Full RFC 8445 agent, when the operator enabled it and this side's peer gave us both
+            // credentials and candidates. It supersedes consent on that side: a full agent runs its
+            // own checks, and RFC 7675 consent is what a *lite* agent does instead.
+            let full_ice_sides = [
+                (
+                    near.endpoint_ids().collect::<Vec<_>>(),
+                    &near_remote_ice,
+                    &near_remote_candidates,
+                    &near_ice_candidates,
+                    // RFC 8445 §6.1.1: the offerer controls. We answered A, so A controls — unless A
+                    // is a lite agent, which can never control (§6.1.1), leaving it to us.
+                    near_peer_is_lite,
+                ),
+                (
+                    if info.is_ice() {
+                        far.endpoint_ids().collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    },
+                    &far_remote_ice,
+                    &info.candidates,
+                    &far_local_candidates,
+                    // We offered to B, so we control this leg either way.
+                    true,
+                ),
+            ];
+            let mut agent_endpoints: Vec<EndpointId> = Vec::new();
+            if let Some(agents) = &self.ice_agents {
+                for (endpoints, remote, remote_candidates, local_candidates, controlling) in
+                    full_ice_sides
+                {
+                    let (Some(remote), false) = (remote, remote_candidates.is_empty()) else {
+                        continue;
+                    };
+                    for endpoint in endpoints {
+                        let Some(local_addr) = self.endpoint_address(endpoint) else {
+                            continue;
+                        };
+                        // Only this endpoint's own component takes part in its checklist.
+                        let component = if endpoint == near.rtp.id || endpoint == far.rtp.id {
+                            1
+                        } else {
+                            2
+                        };
+                        let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
+                            siphon_rtp_ice::agent::Credentials::new(
+                                creds.ufrag.clone(),
+                                creds.pwd.clone(),
+                            ),
+                            siphon_rtp_ice::agent::Credentials::new(
+                                remote.ufrag.clone(),
+                                remote.pwd.clone(),
+                            ),
+                            controlling,
+                            ice_tie_breaker(),
+                        )
+                        .with_candidates(
+                            filter_component(local_candidates, component),
+                            filter_component(remote_candidates, component),
+                        );
+                        self.datapath.set_ice_agent(
+                            endpoint,
+                            config.clone(),
+                            // The agent owns request handling: answering needs the role (§7.3.1.1),
+                            // the checklist (§7.3.1.3) and the nomination flag (§7.3.1.5), none of
+                            // which the datapath has. It is also then the only thing that may adopt a
+                            // source, so media cannot start before ICE has chosen a pair.
+                            IceAgentMode::ForwardOnly,
+                            agents.events(),
+                        );
+                        agents.register(endpoint, call_id, local_addr, agent_config, 0);
+                        agent_endpoints.push(endpoint);
+                    }
+                }
+            }
+
             for (endpoints, remote) in sides {
                 for endpoint in endpoints {
+                    if agent_endpoints.contains(&endpoint) {
+                        continue; // a full agent already owns this endpoint
+                    }
                     match (&self.consent, remote) {
                         (Some(consent), Some(remote)) => {
-                            self.datapath
-                                .set_ice_agent(endpoint, config.clone(), consent.events());
+                            self.datapath.set_ice_agent(
+                                endpoint,
+                                config.clone(),
+                                // Consent is a lite-agent behaviour: the datapath keeps answering
+                                // checks, and the sink exists only so Binding *responses* reach the
+                                // checker (RFC 7675 §4).
+                                IceAgentMode::RespondAndForward,
+                                consent.events(),
+                            );
                             consent.register(
                                 endpoint,
                                 call_id,
@@ -2587,6 +2731,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // credentials) alive forever and the registry never drains to zero.
         if let Some(consent) = &self.consent {
             consent.unregister_call(call_id);
+        }
+        if let Some(agents) = &self.ice_agents {
+            agents.unregister_call(call_id);
         }
         for endpoint in endpoints {
             self.datapath.remove_endpoint(endpoint).await;
@@ -3296,6 +3443,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // credentials in the snapshot belongs with the full-agent HA work, not here.
                 near_remote_ice: None,
                 far_remote_ice: None,
+                near_remote_candidates: Vec::new(),
+                near_peer_is_lite: false,
+                far_local_candidates: Vec::new(),
                 from_tag: snapshot.from_tag,
                 to_tag: snapshot.to_tag,
                 near,
@@ -4888,8 +5038,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // *responses* the ICE responder drops. The sink is replaced at answer time by the consent
         // supervisor's (or cleared, if the peer turns out not to speak ICE).
         let (events_tx, events_rx) = flume::bounded(GATHER_EVENT_QUEUE_DEPTH);
-        self.datapath
-            .set_ice_agent(endpoint, ice_config.clone(), events_tx);
+        // Gathering only needs its own Binding responses back; the datapath keeps answering inbound
+        // checks meanwhile, so an early peer check is not lost while we gather.
+        self.datapath.set_ice_agent(
+            endpoint,
+            ice_config.clone(),
+            IceAgentMode::RespondAndForward,
+            events_tx,
+        );
 
         let started = tokio::time::Instant::now();
         let elapsed_ms = |start: tokio::time::Instant| start.elapsed().as_millis() as u64;
@@ -4932,6 +5088,71 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             );
         }
         gatherer.candidates().to_vec()
+    }
+
+    /// Drive the full RFC 8445 agents one tick at `now_ms`: hand them the STUN the datapath
+    /// forwarded, let them emit checks, and act on what they decide.
+    ///
+    /// A no-op unless `--ice full` is set. Called on a sub-second clock (the RFC's `Ta` pacing is
+    /// 50 ms and its initial RTO 500 ms — far finer than the 1 Hz media sweep), which is why it takes
+    /// an explicit millisecond rather than reading the datapath's logical tick.
+    pub async fn drive_ice_agents(&self, now_ms: u64) -> Vec<String> {
+        let Some(agents) = self.ice_agents.clone() else {
+            return Vec::new();
+        };
+        // Ingest first, so a check that arrived this tick is answered on this tick.
+        let mut outcomes = agents.drain_events(now_ms);
+        outcomes.extend(agents.poll(now_ms));
+
+        let mut failed = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                AgentOutcome::Send {
+                    endpoint,
+                    dst,
+                    datagram,
+                } => {
+                    if let Err(error) = self.datapath.send(endpoint, dst, &datagram).await {
+                        // Transient: the RFC 8489 retransmission covers it, and the checklist's own
+                        // failure path covers a pair that never works.
+                        tracing::debug!(
+                            target: "siphon_rtp::media",
+                            ?endpoint, %dst, %error,
+                            "failed to transmit ICE connectivity check"
+                        );
+                    }
+                }
+                AgentOutcome::Selected {
+                    endpoint,
+                    call_id,
+                    remote,
+                } => {
+                    // The one write that opens the media path. The datapath's forward rule already
+                    // prefers an endpoint's adopted source over the signalled `out_dst`, so this both
+                    // gates ingress to the selected pair and re-points the sibling's egress at it —
+                    // and RFC 7675 consent, which resolves its target from the same adopted source,
+                    // follows the selection without being told.
+                    self.datapath.adopt_source(endpoint, remote);
+                    tracing::info!(
+                        target: "siphon_rtp::media",
+                        %call_id, ?endpoint, %remote,
+                        "ICE selected a candidate pair (RFC 8445 §8.1.1) — media path open"
+                    );
+                }
+                AgentOutcome::Failed { endpoint, call_id } => {
+                    // RFC 8445 §8.1.2: every pair failed, so there is no path to this peer at all.
+                    if self.reap_call(&call_id, "ice_failed").await {
+                        tracing::warn!(
+                            target: "siphon_rtp::media",
+                            %call_id, ?endpoint,
+                            "ICE failed — no candidate pair succeeded; call torn down"
+                        );
+                        failed.push(call_id);
+                    }
+                }
+            }
+        }
+        failed
     }
 
     /// Drive RFC 7675 consent freshness one tick: correlate the STUN the datapath forwarded since the
@@ -5504,6 +5725,30 @@ fn ice_directive(profile: &ProfileFlags) -> Option<IceDirective> {
         "force" | "force-relay" => Some(IceDirective::Force),
         "remove" => Some(IceDirective::Remove),
         _ => None,
+    }
+}
+
+/// The candidates of one ICE component, for the checklist that component's agent forms.
+fn filter_component(
+    candidates: &[siphon_rtp_ice::Candidate],
+    component: u16,
+) -> Vec<siphon_rtp_ice::Candidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.component == component)
+        .cloned()
+        .collect()
+}
+
+/// A fresh RFC 8445 §5.2 tie-breaker from the OS CSPRNG. Unlike the consent driver's derived value
+/// this one really is security-relevant — it decides who wins a role conflict — so it must not be
+/// predictable from the endpoint id. Falls back to a fixed value only if the RNG is unavailable, in
+/// which case a conflict resolves deterministically rather than not at all.
+fn ice_tie_breaker() -> u64 {
+    let mut bytes = [0u8; 8];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u64::from_be_bytes(bytes),
+        Err(_) => 1,
     }
 }
 
@@ -13649,6 +13894,173 @@ mod tests {
             .expect("B's media reaches A — the far leg is not ICE-gated")
             .expect("recv");
         assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+    }
+
+    // ---- RFC 8445 full agent (end-to-end over the real datapath) ---------------------------------
+
+    /// Build the peer-side ICE agent for a phone at `local`, from the engine's own advertised SDP.
+    /// The peer is **controlling**: it offered ICE, and RFC 8445 §6.1.1 gives the offerer that role.
+    fn peer_agent(engine_sdp: &sdp::MediaInfo, local: SocketAddr) -> siphon_rtp_ice::IceAgent {
+        use siphon_rtp_ice::agent::{AgentConfig, Credentials};
+        let local_candidate = siphon_rtp_ice::Candidate::new(
+            "peer".to_string(),
+            1,
+            local,
+            siphon_rtp_ice::CandidateKind::Host,
+            65535,
+        );
+        siphon_rtp_ice::IceAgent::new(
+            AgentConfig::new(
+                Credentials::new(A_UFRAG, A_PWD),
+                Credentials::new(
+                    engine_sdp.ice_ufrag.clone().expect("engine ufrag"),
+                    engine_sdp.ice_pwd.clone().expect("engine pwd"),
+                ),
+                true,
+                0xFFFF_0000_FFFF_0000,
+            )
+            .with_candidates(
+                vec![local_candidate],
+                engine_sdp
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.component == 1)
+                    .cloned()
+                    .collect(),
+            ),
+            0,
+        )
+    }
+
+    /// An ICE offer from A that also carries its host candidate, so the engine's agent has something
+    /// to pair against.
+    fn ice_offer_with_candidate(addr: SocketAddr) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 {ip} {port} typ host\r\n\
+             a=end-of-candidates\r\n",
+            ip = addr.ip(),
+            port = addr.port()
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_ice_leg_opens_its_media_path_only_after_a_pair_is_selected() {
+        // The end-to-end proof that the agent is wired: a real peer agent runs against the engine's
+        // over the loopback datapath, and media is gated on ICE's decision rather than on arrival.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "full".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "full".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("parse answer");
+        let engine_near = near.remote_rtp;
+        let near_rtp = engine
+            .calls
+            .get("full")
+            .map(|call| call.near.rtp.id)
+            .expect("call");
+
+        // Before ICE runs, nothing has been adopted — so A's media would be dropped.
+        assert_eq!(engine.datapath().ice_validated_source(near_rtp), None);
+
+        // Drive both agents until the engine selects a pair.
+        let mut peer = peer_agent(&near, addr_a);
+        let mut buffer = [0u8; 2048];
+        let mut now = 0u64;
+        while now < 4_000 && engine.datapath().ice_validated_source(near_rtp).is_none() {
+            for action in peer.poll(now) {
+                if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                    phone_a.send_to(&datagram, to).await.expect("peer send");
+                }
+            }
+            engine.drive_ice_agents(now).await;
+            // Drain whatever the engine sent back into the peer agent.
+            while let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(20), phone_a.recv_from(&mut buffer)).await
+            {
+                for action in peer.on_datagram(addr_a, from, &buffer[..len], now) {
+                    if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                        phone_a.send_to(&datagram, to).await.expect("peer send");
+                    }
+                }
+                engine.drive_ice_agents(now).await;
+            }
+            now += 20;
+        }
+
+        // ICE selected A's real transport address, and the datapath adopted it.
+        assert_eq!(
+            engine.datapath().ice_validated_source(near_rtp),
+            Some(addr_a),
+            "the agent adopted the selected pair's remote"
+        );
+        assert_eq!(engine_near.ip(), addr_a.ip(), "same loopback family");
+
+        // And now media flows A -> engine -> B.
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), engine_near)
+            .await
+            .expect("send media");
+        let (len, _) = timeout(Duration::from_secs(1), phone_b.recv_from(&mut buffer))
+            .await
+            .expect("media reaches B once ICE has chosen a pair")
+            .expect("recv");
+        assert_eq!(&buffer[..len], rtp(0x0A0A_0A0A).as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_ice_is_off_by_default_and_keeps_the_lite_responder() {
+        // Without `--ice full` the datapath still answers checks itself and adopts the validated
+        // source, exactly as before — no behaviour change for existing deployments.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        ice_call_with_validated_a(
+            &engine,
+            CLIENT,
+            "lite-default",
+            &phone_a,
+            ice_offer_with_candidate(addr_a),
+            addr_b,
+        )
+        .await;
+        let near_rtp = engine
+            .calls
+            .get("lite-default")
+            .map(|call| call.near.rtp.id)
+            .expect("call");
+        assert_eq!(
+            engine.datapath().ice_validated_source(near_rtp),
+            Some(addr_a),
+            "the datapath responder adopted the source, as an ice-lite agent does"
+        );
+        // And the driver is inert.
+        assert!(engine.drive_ice_agents(0).await.is_empty());
     }
 
     // ---- RFC 7675 consent freshness (end-to-end over the real datapath) --------------------------
