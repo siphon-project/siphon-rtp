@@ -147,10 +147,12 @@ reaches a final range. For that case there is a second, **intermediate-state** o
 source built with printf dumps of the side info it decoded, diffed field by field against ours.
 
 `reference/opus/silk_trace.patch` adds `#ifdef SILK_TRACE` blocks to `silk/dec_API.c`,
-`silk/decode_indices.c` and `silk/gain_quant.c` (VAD/LBRR flags, stereo predictors, mid-only flag,
-frame type, gain indices, dequantized gains), each line tagged with the packet index. It is purely
-additive — stripping the guarded blocks gives the original files back byte for byte. Apply it, build into
-a **separate** build directory so the plain oracle above is untouched, dump, then revert:
+`silk/decode_indices.c`, `silk/gain_quant.c`, `silk/decode_pulses.c` and `silk/decode_core.c`, each
+line tagged with the packet index and — for the per-frame groups — a `u=` counter that increments once
+per decoded SILK frame (LBRR frames first, then the regular ones), so a stereo or 60 ms packet is
+unambiguous. It is purely additive: stripping the guarded blocks gives the original files back byte for
+byte, and `patch -R` is verified to restore them exactly. Apply it, build into a **separate** build
+directory so the plain oracle above is untouched, dump, then revert:
 
 ```sh
 patch -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch
@@ -159,10 +161,33 @@ cmake -S reference/opus/opus-1.5.2 -B reference/opus/build-trace \
 cmake --build reference/opus/build-trace -j
 patch -R -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch   # keep the source pristine
 sh reference/opus/dump_silk_trace.sh        # writes reference/opus/silk_only/*.trace
-cargo test -p siphon-rtp-codec --test silk_header_conformance
+cargo test -p siphon-rtp-codec --test silk_header_conformance --test silk_excitation_conformance
 ```
 
-The dump is only read, never regenerated, by the test — so the instrumented build is a one-off. Delete
+What the dump carries, by group:
+
+| Line | Source | Consumed by |
+|---|---|---|
+| `HDR`, `LBRRFLAGS`, `STEREO`, `MIDONLY`, `TYPE`, `GAINIDX`, `GAINS` | `dec_API.c`, `decode_indices.c`, `gain_quant.c` | `silk_header_conformance` |
+| `NLSFSYM` — the `(fl, fh)` of every normalized-LSF symbol | `decode_indices.c` | `silk_excitation_conformance` |
+| `PITCH`, `SEED` — LTP indices (§4.2.7.6) and the LCG seed (§4.2.7.7) | `decode_indices.c` | `silk_excitation_conformance` |
+| `PULSES`, `RC` — rate level, per-shell-block counts and LSB shifts, the pulse signal's checksum, and the range-coder `rng`/`tell` at the end of the frame | `decode_pulses.c` | `silk_excitation_conformance` |
+| `EXC` — the reconstructed Q14 excitation (§4.2.7.8.6), checksummed | `decode_core.c` | `silk_excitation_conformance` |
+
+`NLSFSYM` is what lets a half-finished decoder still consume a whole packet. A SILK frame's bitstream is
+exactly `silk_decode_indices` followed by `silk_decode_pulses`, and everything in that span is ported
+except the NLSF indices; replaying the recorded `(fl, fh)` pairs through the range decoder's
+`decode`/`dec_update` is *state-equivalent* to `ec_dec_icdf` at `ftb = 8`, so the decoder lands on the
+right bit for the LTP stage without owning a single NLSF table. Every other symbol is decoded for real.
+Delete the `NLSFSYM` replay from the harness once the NLSF phase lands.
+
+`RC` deserves a note: it is this layer's own `final_range` check, at **per-frame** rather than
+per-packet resolution. Whole-packet `final_range` is not usable here — for a SILK-only packet with
+spare bits, libopus reads a redundancy flag and a CELT redundancy frame after the SILK layer and folds
+that into the reported value (`opus_decoder.c:452-480`, `rangeFinal = dec.rng ^ redundant_rng`) — so the
+trace records `rng` and `ec_tell` at the exact end of each SILK frame instead, which is strictly finer.
+
+The dump is only read, never regenerated, by the tests — so the instrumented build is a one-off. Delete
 `reference/opus/build-trace` once the layer is finished and the `final_range` + `opus_compare` gates
 cover it, and prefer those: an intermediate-state diff proves the fields match, not that the whole
 packet parses.
