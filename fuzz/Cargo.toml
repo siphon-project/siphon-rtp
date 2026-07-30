@@ -21,6 +21,7 @@ siphon-rtp-engine = { package = "siphon-rtp", path = "../crates/siphon-rtp-engin
 siphon-rtp-ngcompat = { path = "../crates/siphon-rtp-ngcompat" }
 siphon-rtp-proto = { path = "../crates/siphon-rtp-proto" }
 siphon-rtp-stun = { path = "../crates/siphon-rtp-stun" }
+siphon-rtp-ice = { path = "../crates/siphon-rtp-ice" }
 siphon-rtp-codec = { path = "../crates/siphon-rtp-codec", features = ["amr"] }
 
 # RFC 3550/3551/5761 — RTP header, compound RTCP, rtcp-mux classifier.
@@ -59,6 +60,14 @@ bench = false
 [[bin]]
 name = "stun_fuzz"
 path = "fuzz_targets/stun_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 8839 §5.1/§5.6 — ICE candidate + ice-options grammar off a peer's SDP.
+[[bin]]
+name = "ice_candidate_fuzz"
+path = "fuzz_targets/ice_candidate_fuzz.rs"
 test = false
 doc = false
 bench = false

@@ -1,0 +1,29 @@
+# siphon-rtp-ice — pure-Rust ICE (RFC 8445) agent core: the candidate model, the RFC 8839 SDP
+# grammar, and (as later milestones land) checklists, connectivity checks, and nomination.
+#
+# Deliberately I/O-free and dependency-light: no tokio, no sockets, no clock. Everything is driven by
+# a caller-supplied logical clock and returns actions for the caller to execute, which is what makes
+# the RFC's behaviour testable without a runtime or a network.
+[package]
+name = "siphon-rtp-ice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "siphon-rtp ICE (RFC 8445) agent core — candidates, priorities, and the RFC 8839 SDP grammar, pure Rust, zero C"
+readme = "README.md"
+keywords = ["ice", "stun", "webrtc", "voip", "nat"]
+categories = ["network-programming"]
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "candidate"
+harness = false
