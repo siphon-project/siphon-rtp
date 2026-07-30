@@ -44,6 +44,7 @@
 //! | Stereo prediction weights, mid-only flag (§4.2.7.1-2) ([`stereo_pred`]) | **landed** |
 //! | Frame type (§4.2.7.3) ([`frame_type`]) | **landed** |
 //! | Subframe gains (§4.2.7.4) ([`gains`]) | **landed** |
+//! | NLSF codebooks and the LSF cosine table ([`nlsf_tables`]) | **landed** |
 //! | NLSF → LPC (§4.2.7.5) | pending |
 //! | Pitch lags, LTP filter, LTP scaling (§4.2.7.6) | pending |
 //! | LCG seed + excitation / shell coder (§4.2.7.7-8) | pending |
@@ -139,6 +140,7 @@ pub mod fixed;
 pub mod frame_type;
 pub mod gains;
 pub mod header;
+pub mod nlsf_tables;
 pub mod stereo_pred;
 pub mod tables;
 pub mod types;
