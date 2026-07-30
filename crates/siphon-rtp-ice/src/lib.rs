@@ -30,8 +30,9 @@ pub mod gather;
 
 pub use agent::{AgentAction, AgentConfig, Credentials, IceAgent, IceState};
 pub use candidate::{
-    interleaved_local_preferences, priority, Candidate, CandidateKind, CandidateParseError,
-    IceOptions, Transport, END_OF_CANDIDATES_ATTRIBUTE, MAX_COMPONENT_ID,
+    interleaved_local_preferences, is_ice_mismatch, priority, Candidate, CandidateKind,
+    CandidateParseError, IceOptions, Transport, END_OF_CANDIDATES_ATTRIBUTE,
+    ICE_MISMATCH_ATTRIBUTE, MAX_COMPONENT_ID,
 };
 pub use checklist::{pair_priority, CandidatePair, Checklist, PairState};
 pub use gather::{GatherAction, GatherConfig, Gatherer};

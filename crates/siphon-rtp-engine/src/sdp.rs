@@ -14,7 +14,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use siphon_rtp_codec::factory::CodecSpec;
-use siphon_rtp_ice::{Candidate, IceOptions, END_OF_CANDIDATES_ATTRIBUTE};
+use siphon_rtp_ice::{Candidate, IceOptions, END_OF_CANDIDATES_ATTRIBUTE, ICE_MISMATCH_ATTRIBUTE};
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
 /// Default packetization when the SDP carries no `a=ptime` (RFC 3551: 20 ms for telephony codecs).
@@ -78,6 +78,10 @@ pub struct MediaInfo {
     /// Whether the peer advertised `a=ice-lite` (RFC 8839 §5.2). A full agent facing a lite peer is
     /// always the **controlling** agent (RFC 8445 §6.1.1).
     pub ice_lite: bool,
+    /// Whether the peer sent `a=ice-mismatch` (RFC 8839 §5.3) — it saw our offer's ICE as altered in
+    /// transit, so ICE must not be used on this stream and both sides fall back to the signalled
+    /// address.
+    pub ice_mismatch: bool,
     /// The `m=audio` payload-type list, in offered order (the codec priority order).
     pub payload_types: Vec<u8>,
     /// `a=rtpmap` entries for the audio stream (payload type → encoding name / clock / channels).
@@ -351,6 +355,8 @@ struct AudioScan {
     end_of_candidates: bool,
     /// Whether the peer advertised `a=ice-lite` (RFC 8839 §5.2).
     ice_lite: bool,
+    /// Whether the peer sent `a=ice-mismatch` (RFC 8839 §5.3).
+    ice_mismatch: bool,
 }
 
 /// Parse an `a=rtpmap` attribute body (`rtpmap:<pt> <encoding>/<clock>[/<channels>]`).
@@ -460,6 +466,7 @@ fn scan(sdp: &str) -> AudioScan {
         ice_options: IceOptions::default(),
         end_of_candidates: false,
         ice_lite: false,
+        ice_mismatch: false,
         payload_types: Vec::new(),
         rtpmaps: Vec::new(),
         fmtp_mode_sets: Vec::new(),
@@ -526,6 +533,10 @@ fn scan(sdp: &str) -> AudioScan {
                     if in_audio || scan.ice_options.is_empty() {
                         scan.ice_options = IceOptions::parse(value);
                     }
+                } else if value.starts_with("ice-mismatch") {
+                    // RFC 8839 §5.3: the peer could not use our ICE because the SDP was rewritten
+                    // in transit (a SIP ALG). Session- or media-level.
+                    scan.ice_mismatch = true;
                 } else if value.starts_with("end-of-candidates") {
                     // RFC 8838 §14: the peer's candidate list is complete — no more will trickle in.
                     scan.end_of_candidates = true;
@@ -638,6 +649,7 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         ice_options: scan.ice_options.clone(),
         end_of_candidates: scan.end_of_candidates,
         ice_lite: scan.ice_lite,
+        ice_mismatch: scan.ice_mismatch,
         payload_types: scan.payload_types.clone(),
         rtpmaps: scan.rtpmaps.clone(),
         mode_sets: scan.fmtp_mode_sets.clone(),
@@ -678,6 +690,10 @@ pub enum IceRewrite<'a> {
     /// Strip the peer's ICE and re-originate ICE-lite with the engine's own credentials plus a host
     /// `a=candidate` (rtpengine `ICE=force`, or mirroring a peer's ICE offer; RFC 8445 §2.7 ICE-lite).
     Reoriginate(IceAdvertisement<'a>),
+    /// Strip the peer's ICE and advertise `a=ice-mismatch` (RFC 8839 §5.3): its offer carried
+    /// candidates but its default destination matched none of them, so the SDP was altered in transit
+    /// and ICE cannot be used on this stream. The leg falls back to the signalled address.
+    Mismatch,
 }
 
 /// How to advertise the audio stream's security on rewrite (RFC 3264 transport + RFC 4568 SDES /
@@ -774,8 +790,12 @@ pub fn rewrite(
         .ok_or(SdpError::ConnectionAddress)?;
     let rtcp_index = scan.audio_rtcp.map(|(index, _)| index);
 
-    // Both `Strip` and `Reoriginate` drop the peer's ICE attributes; only `Reoriginate` re-adds ours.
-    let strip_peer_ice = matches!(ice, IceRewrite::Strip | IceRewrite::Reoriginate(_));
+    // `Strip`, `Reoriginate` and `Mismatch` all drop the peer's ICE attributes; only `Reoriginate`
+    // re-adds ours, and only `Mismatch` says why they are gone (RFC 8839 §5.3).
+    let strip_peer_ice = matches!(
+        ice,
+        IceRewrite::Strip | IceRewrite::Reoriginate(_) | IceRewrite::Mismatch
+    );
     let mut lines: Vec<String> = Vec::new();
     for (index, raw_line) in sdp.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -831,6 +851,11 @@ pub fn rewrite(
                     lines.push(format!("a=setup:{}", setup.token()));
                 }
                 Some(SecurityAdvertisement::Plain) | None => {}
+            }
+            if matches!(ice, IceRewrite::Mismatch) {
+                // RFC 8839 §5.3: say why ICE is absent rather than silently dropping it, so the
+                // offerer knows its SDP was rewritten and does not keep waiting for checks.
+                lines.push(ICE_MISMATCH_ATTRIBUTE.to_string());
             }
             if let IceRewrite::Reoriginate(ice) = ice {
                 lines.push(format!("a=ice-ufrag:{}", ice.ufrag));
