@@ -21,6 +21,11 @@ use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::g722::G722;
 use siphon_rtp_codec::g726::{Rate, G726};
 use siphon_rtp_codec::gsm_fr::GsmFr;
+use siphon_rtp_codec::opus::celt::band_analysis::compute_band_energies;
+use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
+use siphon_rtp_codec::opus::celt::mdct::{clt_mdct_forward, MdctLookup};
+use siphon_rtp_codec::opus::celt::tables::{NB_BANDS, OVERLAP, WINDOW120};
+use siphon_rtp_codec::opus::celt::vq::op_pvq_search;
 use siphon_rtp_codec::{Decoder, Encoder};
 
 #[cfg(feature = "amr")]
@@ -531,6 +536,136 @@ fn bench_amrwb_encode_cmr(criterion: &mut Criterion) {
     });
 }
 
+/// A deterministic 48 kHz test signal in `[-1, 1)` — a few harmonics plus a little noise, so the
+/// encoder's analysis has real decisions to make (a pure tone would take unrealistically cheap paths).
+fn celt_signal(samples: usize) -> Vec<f32> {
+    let mut state = 0x5EED_u32;
+    (0..samples)
+        .map(|i| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((state >> 16) as f32 / 32768.0 - 1.0) * 0.02;
+            let t = i as f32;
+            0.35 * (t * 0.031).sin() + 0.18 * (t * 0.097).sin() + 0.07 * (t * 0.21).cos() + noise
+        })
+        .collect()
+}
+
+/// The CELT **encoder** hot path, one frame per iteration — criterion's time-per-iteration is
+/// therefore directly the µs/frame this repo gates on.
+fn bench_celt_encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("celt_encode");
+    for &(label, frame_size) in &[
+        ("2.5ms_120", 120usize),
+        ("5ms_240", 240),
+        ("10ms_480", 480),
+        ("20ms_960", 960),
+    ] {
+        let signal = celt_signal(frame_size * 64);
+        group.bench_function(label, |b| {
+            let mut encoder = CeltEncoder::new().expect("build CELT encoder");
+            encoder.set_bitrate(64_000);
+            encoder.set_rate_control(RateControl::ConstrainedVbr);
+            let mut payload = vec![0u8; 1275];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let lo = (frame % 64) * frame_size;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(
+                            black_box(&signal[lo..lo + frame_size]),
+                            frame_size,
+                            &mut payload,
+                        )
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+    // The rate-control extremes, at the frame size RTP actually uses.
+    let signal = celt_signal(960 * 64);
+    for &(label, bitrate, rate_control) in &[
+        ("20ms_cbr_32k", 32_000i32, RateControl::ConstantBitrate),
+        ("20ms_vbr_128k", 128_000, RateControl::Vbr),
+    ] {
+        group.bench_function(label, |b| {
+            let mut encoder = CeltEncoder::new().expect("build");
+            encoder.set_bitrate(bitrate);
+            encoder.set_rate_control(rate_control);
+            let mut payload = vec![0u8; 1275];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let lo = (frame % 64) * 960;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(black_box(&signal[lo..lo + 960]), 960, &mut payload)
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
+/// The CELT encoder's per-frame sub-kernels, so a regression can be localised.
+fn bench_celt_kernels(c: &mut Criterion) {
+    let mut group = c.benchmark_group("celt_kernels");
+    let lookup = MdctLookup::new(1920, 3).expect("build 48 kHz MDCT lookup");
+
+    // Forward MDCT: one long block per frame size (shift = maxLM - LM).
+    for &(label, shift, n) in &[
+        ("mdct_forward_2.5ms", 3usize, 120usize),
+        ("mdct_forward_5ms", 2, 240),
+        ("mdct_forward_10ms", 1, 480),
+        ("mdct_forward_20ms", 0, 960),
+    ] {
+        let input = celt_signal(n + OVERLAP);
+        group.bench_function(label, |b| {
+            let mut out = vec![0f32; n];
+            b.iter(|| {
+                clt_mdct_forward(
+                    &lookup,
+                    black_box(&input),
+                    &mut out,
+                    &WINDOW120,
+                    OVERLAP,
+                    shift,
+                    1,
+                );
+                black_box(out[0])
+            });
+        });
+    }
+
+    // Band energies over a full 20 ms spectrum.
+    let spectrum: Vec<f32> = celt_signal(960).iter().map(|v| v * 4000.0).collect();
+    group.bench_function("compute_band_energies_20ms", |b| {
+        let mut band_e = vec![0f32; 2 * NB_BANDS];
+        b.iter(|| {
+            compute_band_energies(black_box(&spectrum), &mut band_e, NB_BANDS, 1, 3);
+            black_box(band_e[0])
+        });
+    });
+
+    // The PVQ search: the encoder's most expensive inner loop. Two representative band shapes.
+    for &(label, n, k) in &[
+        ("pvq_search_n16_k8", 16usize, 8usize),
+        ("pvq_search_n48_k6", 48, 6),
+    ] {
+        let shape: Vec<f32> = (0..n).map(|i| (i as f32 * 0.41).sin()).collect();
+        group.bench_function(label, |b| {
+            let mut x = shape.clone();
+            let mut iy = vec![0i32; n];
+            b.iter(|| {
+                x.copy_from_slice(&shape);
+                black_box(op_pvq_search(&mut x, &mut iy, k, n))
+            });
+        });
+    }
+    group.finish();
+}
+
 // AMR-WB/NB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
 #[cfg(feature = "amr")]
 criterion_group!(
@@ -540,6 +675,8 @@ criterion_group!(
     bench_g726,
     bench_gsm_fr,
     bench_cn,
+    bench_celt_encode,
+    bench_celt_kernels,
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
@@ -556,6 +693,8 @@ criterion_group!(
     bench_g722,
     bench_g726,
     bench_gsm_fr,
-    bench_cn
+    bench_cn,
+    bench_celt_encode,
+    bench_celt_kernels
 );
 criterion_main!(benches);

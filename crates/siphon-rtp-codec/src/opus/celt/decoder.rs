@@ -401,15 +401,17 @@ impl CeltDecoder {
         self.decode_mem.copy_within(n.., 0);
 
         // ── Band / PVQ decode (celt_decoder.c:1493) ──────────────────────────────────────────────
-        // X is the C*N interleaved normalised MDCT coefficient buffer; mono → length N.
-        let mut x = vec![0f32; n];
+        // X is the C*N interleaved normalised MDCT coefficient buffer; mono → length N. Fixed stack
+        // scratch, not a per-frame `Vec`: the hot path must not touch the allocator.
+        let mut x_buf = [0f32; MAX_FRAME_SAMPLES];
+        let x = &mut x_buf[..n];
         let mut collapse_masks = [0u8; CHANNELS * NB_BANDS];
         // total_bits arg = len*(8<<BITRES) - anti_collapse_rsv  (1/8 bits).
         let band_total_bits = (frame.len() as i32) * (8 << BITRES) - anti_collapse_rsv;
         quant_all_bands(
             start,
             end,
-            &mut x,
+            x,
             &mut collapse_masks,
             &pulses,
             short_blocks,
@@ -447,7 +449,7 @@ impl CeltDecoder {
 
         if anti_collapse_on {
             self.rng = anti_collapse(
-                &mut x,
+                x,
                 &collapse_masks,
                 lm,
                 CHANNELS,
@@ -472,7 +474,7 @@ impl CeltDecoder {
         // final per-band energy and sidesteps borrowing `self` immutably across the `&mut self` call.
         let band_energy = self.old_band_energy;
         self.celt_synthesis(
-            &x,
+            x,
             &band_energy,
             start,
             eff_end,
@@ -616,9 +618,11 @@ impl CeltDecoder {
             (1usize, n, MAX_LM - lm)
         };
 
-        // freq: the interleaved signal MDCTs (celt_decoder.c:432), length N.
-        let mut freq = vec![0f32; n];
-        denormalise_bands(x, &mut freq, old_band_energy, start, eff_end, m, 1, silence);
+        // freq: the interleaved signal MDCTs (celt_decoder.c:432), length N. Fixed stack scratch,
+        // not a per-frame `Vec` — the hot path must not touch the allocator.
+        let mut freq_buf = [0f32; MAX_FRAME_SAMPLES];
+        let freq = &mut freq_buf[..n];
+        denormalise_bands(x, freq, old_band_energy, start, eff_end, m, 1, silence);
 
         // out_syn[0] = decode_mem + DECODE_BUFFER_SIZE - N (celt_decoder.c:1274).
         let out_syn = DECODE_BUFFER_SIZE - n;

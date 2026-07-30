@@ -104,6 +104,34 @@ Two things about this oracle are worth knowing before you fight it:
   caught the CELT band-range bug. Prefer it when debugging; treat `opus_compare` as the acceptance
   gate, not the diagnostic.
 
+#### Validating the CELT **encoder**
+
+An encoder has no reference `final_range` to match, so `celt_encode_conformance` stacks four checks
+(same oracle build, same env override):
+
+```sh
+SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
+    cargo test -p siphon-rtp-codec --test celt_encode_conformance -- --nocapture
+```
+
+1. Our stream is written in `opus_demo`'s `.bit` framing with **our encoder's** `final_range` beside
+   every packet, so `opus_demo -d` aborts with "Range coder state mismatch" unless libopus' own
+   decoder ends every packet exactly where we said. That is an exact bitstream check.
+2. `CeltDecoder` decodes the same packets and must agree on every packet's `final_range` too.
+3. libopus encodes the same source at the identical configuration (`opus_demo -e
+   restricted-lowdelay -cvbr -bandwidth X -framesize Y`); our segmental SNR must be within 1 dB of
+   its. This is the gate that works at *every* rate.
+4. `opus_compare` against the original PCM, for fullband at the top of the rate range.
+
+Two traps specific to the encode direction:
+
+- **Compensate the 120-sample codec delay** before scoring. `opus_demo -d` cannot know the encoder's
+  lookahead, so its output is shifted; unaligned, even libopus' own 256 kb/s fullband round trip
+  scores 0.396 (fail) instead of 0.042 (83 % quality).
+- **Do not score a band-limited or low-rate encode against the original PCM.** `opus_compare` measures
+  *decoder* deviation. A 12 kb/s narrowband encode is legitimately far outside that tolerance — use
+  check 3 there.
+
 ## Fuzzing
 
 Every parser that eats untrusted bytes off the network is fuzzed with `cargo-fuzz` (libFuzzer,

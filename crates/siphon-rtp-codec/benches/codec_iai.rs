@@ -14,10 +14,16 @@ use iai_callgrind::{
 use std::hint::black_box;
 
 use siphon_rtp_codec::g711::G711;
+use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
+use siphon_rtp_codec::opus::celt::mdct::{clt_mdct_forward, MdctLookup};
+use siphon_rtp_codec::opus::celt::tables::{OVERLAP, WINDOW120};
+use siphon_rtp_codec::opus::celt::vq::op_pvq_search;
 use siphon_rtp_codec::{Decoder, Encoder};
 
 /// One 20 ms G.711 frame at 8 kHz.
 const FRAME: usize = 160;
+/// One 20 ms CELT frame at 48 kHz.
+const CELT_FRAME: usize = 960;
 
 fn ulaw_decode_setup() -> (G711, [u8; FRAME], [i16; FRAME]) {
     (G711::ulaw(), [0x7f; FRAME], [0i16; FRAME])
@@ -42,7 +48,89 @@ fn g711_encode(input: (G711, [i16; FRAME], [u8; FRAME])) {
     let _ = black_box(codec.encode(black_box(&pcm), &mut out));
 }
 
-library_benchmark_group!(name = codec; benchmarks = g711_decode, g711_encode);
+/// A deterministic 48 kHz signal in `[-1, 1)`: harmonics plus a little noise, so the CELT analysis
+/// takes realistic branches instead of the degenerate ones a pure tone or silence would.
+fn celt_signal(samples: usize) -> Vec<f32> {
+    let mut state = 0x5EED_u32;
+    (0..samples)
+        .map(|i| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((state >> 16) as f32 / 32768.0 - 1.0) * 0.02;
+            let t = i as f32;
+            0.35 * (t * 0.031).sin() + 0.18 * (t * 0.097).sin() + 0.07 * (t * 0.21).cos() + noise
+        })
+        .collect()
+}
+
+type CeltEncodeInput = (CeltEncoder, Vec<f32>, Vec<u8>);
+
+fn celt_encode_setup() -> CeltEncodeInput {
+    let mut encoder = CeltEncoder::new().expect("build CELT encoder");
+    encoder.set_bitrate(64_000);
+    encoder.set_rate_control(RateControl::ConstrainedVbr);
+    // Prime the encoder so the measured frame runs with a warm prefilter / energy history rather
+    // than the cheaper start-up state.
+    let signal = celt_signal(2 * CELT_FRAME);
+    let mut payload = vec![0u8; 1275];
+    let _ = encoder.encode(&signal[..CELT_FRAME], CELT_FRAME, &mut payload);
+    (encoder, signal[CELT_FRAME..].to_vec(), payload)
+}
+
+type MdctInput = (MdctLookup, Vec<f32>, Vec<f32>);
+
+fn celt_mdct_setup() -> MdctInput {
+    let lookup = MdctLookup::new(1920, 3).expect("build 48 kHz MDCT lookup");
+    (
+        lookup,
+        celt_signal(CELT_FRAME + OVERLAP),
+        vec![0f32; CELT_FRAME],
+    )
+}
+
+type PvqInput = (Vec<f32>, Vec<i32>);
+
+fn celt_pvq_setup() -> PvqInput {
+    let shape: Vec<f32> = (0..16).map(|i| (i as f32 * 0.41).sin()).collect();
+    (shape, vec![0i32; 16])
+}
+
+// One whole 20 ms CELT frame through the encoder — the per-frame cost the datapath pays.
+#[library_benchmark]
+#[bench::mono_20ms(setup = celt_encode_setup)]
+fn celt_encode(input: CeltEncodeInput) {
+    let (mut encoder, signal, mut payload) = input;
+    let _ = black_box(encoder.encode(black_box(&signal[..CELT_FRAME]), CELT_FRAME, &mut payload));
+}
+
+// The forward MDCT alone (20 ms long block), so a transform regression is localised.
+#[library_benchmark]
+#[bench::long_20ms(setup = celt_mdct_setup)]
+fn celt_mdct_forward(input: MdctInput) {
+    let (lookup, signal, mut out) = input;
+    clt_mdct_forward(
+        &lookup,
+        black_box(&signal),
+        &mut out,
+        &WINDOW120,
+        OVERLAP,
+        0,
+        1,
+    );
+    black_box(out[0]);
+}
+
+// The PVQ nearest-neighbour search — the encoder's hottest inner loop, run once per band leaf.
+#[library_benchmark]
+#[bench::n16_k8(setup = celt_pvq_setup)]
+fn celt_pvq_search(input: PvqInput) {
+    let (mut x, mut iy) = input;
+    let _ = black_box(op_pvq_search(black_box(&mut x), &mut iy, 8, 16));
+}
+
+library_benchmark_group!(
+    name = codec;
+    benchmarks = g711_decode, g711_encode, celt_encode, celt_mdct_forward, celt_pvq_search
+);
 
 // Fail the run (non-zero exit) if any measured kernel executes >10% more instructions than the
 // `--baseline`. Instruction counts are deterministic under callgrind, so this is a real regression,
