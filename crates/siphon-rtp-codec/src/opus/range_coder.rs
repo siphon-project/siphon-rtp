@@ -319,6 +319,24 @@ pub struct RangeEncoder<'a> {
     error: i32,
 }
 
+/// A rollback point for [`RangeEncoder`] — every scalar field of libopus' `ec_enc`, so a trial
+/// encode can be undone (`quant_bands.c:296,333`). The output *bytes* are deliberately excluded:
+/// they are large and the caller only ever needs the range it actually touched.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeEncoderState {
+    storage: u32,
+    offs: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: i32,
+    nbits_total: i32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: i32,
+    error: i32,
+}
+
 impl<'a> RangeEncoder<'a> {
     /// Initialize an encoder writing into `buf` (libopus `ec_enc_init`).
     #[must_use]
@@ -356,6 +374,82 @@ impl<'a> RangeEncoder<'a> {
     #[must_use]
     pub fn tell_frac(&self) -> u32 {
         ec_tell_frac(self.nbits_total, self.rng)
+    }
+
+    /// The current range value (libopus `ec_ctx.rng` / `OPUS_GET_FINAL_RANGE` after
+    /// [`Self::done`]) — the exact per-packet conformance oracle a decoder must reproduce.
+    #[must_use]
+    pub fn rng(&self) -> u32 {
+        self.rng
+    }
+
+    /// The output buffer's capacity in bits (libopus `enc->storage*8`, the budget every
+    /// `tell + X <= budget` gate in the CELT encoder compares against).
+    #[must_use]
+    pub fn storage_bits(&self) -> u32 {
+        self.storage * 8
+    }
+
+    /// Bytes the range coder has written from the front of the buffer (libopus `ec_range_bytes`).
+    /// The two-pass coarse-energy trial uses it to bound the byte range it must save and restore.
+    #[must_use]
+    pub fn range_bytes(&self) -> u32 {
+        self.offs
+    }
+
+    /// Read-only view of the output buffer (libopus `ec_get_buffer`).
+    #[must_use]
+    pub fn buffer(&self) -> &[u8] {
+        self.buf
+    }
+
+    /// Mutable view of the output buffer, for restoring a trial encode's bytes
+    /// (`quant_bands.c:342`). Prefer the `enc_*` methods for everything else.
+    pub fn buffer_mut(&mut self) -> &mut [u8] {
+        self.buf
+    }
+
+    /// Account the whole packet as already written (libopus `celt_encoder.c:1673`,
+    /// `enc->nbits_total += tell - ec_tell(enc)` on a silent frame): every later
+    /// `tell + X <= total_bits` budget gate then fails, so no further symbols get coded and the
+    /// remaining bytes stay the zeros the initialiser left.
+    pub fn declare_bits_used(&mut self, total_bits: i32) {
+        self.nbits_total += total_bits - self.tell();
+    }
+
+    /// Snapshot the scalar coder state so a trial encode can be rolled back
+    /// (libopus copies the whole struct: `quant_bands.c:296` `enc_start_state = *enc`).
+    #[must_use]
+    pub fn save_state(&self) -> RangeEncoderState {
+        RangeEncoderState {
+            storage: self.storage,
+            offs: self.offs,
+            end_offs: self.end_offs,
+            end_window: self.end_window,
+            nend_bits: self.nend_bits,
+            nbits_total: self.nbits_total,
+            rng: self.rng,
+            val: self.val,
+            ext: self.ext,
+            rem: self.rem,
+            error: self.error,
+        }
+    }
+
+    /// Restore a [`Self::save_state`] snapshot. The buffer bytes are **not** restored — the caller
+    /// saves and replays the affected byte range itself, exactly as `quant_coarse_energy` does.
+    pub fn restore_state(&mut self, state: &RangeEncoderState) {
+        self.storage = state.storage;
+        self.offs = state.offs;
+        self.end_offs = state.end_offs;
+        self.end_window = state.end_window;
+        self.nend_bits = state.nend_bits;
+        self.nbits_total = state.nbits_total;
+        self.rng = state.rng;
+        self.val = state.val;
+        self.ext = state.ext;
+        self.rem = state.rem;
+        self.error = state.error;
     }
 
     #[inline]
