@@ -15,6 +15,7 @@
 //! (the `#ifndef FIXED_POINT` branches). The `ENABLE_QEXT` (quality-extension) and `ENABLE_DEEP_PLC`
 //! (neural PLC) paths are not part of RFC 6716 and are omitted.
 
+pub mod analysis;
 pub mod anti_collapse;
 pub mod band_analysis;
 pub mod band_coder;
