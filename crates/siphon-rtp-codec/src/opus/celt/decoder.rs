@@ -30,6 +30,7 @@ use crate::opus::celt::tables::{
     SPREAD_NORMAL, TAPSET_ICDF, TRIM_ICDF, WINDOW120,
 };
 use crate::opus::celt::tf::tf_decode;
+use crate::opus::packet::Bandwidth;
 use crate::opus::range_coder::RangeDecoder;
 use crate::CodecError;
 
@@ -48,6 +49,9 @@ const CHANNELS: usize = 1;
 /// is a 50 %-overlapping transform (an N-sample frame is reconstructed by an MDCT of length 2N). The
 /// `mdct.rs` docs require `MdctLookup::new(1920, 3)`.
 const MDCT_BASE_LEN: usize = 1920;
+
+/// Largest CELT frame in samples: `shortMdctSize << MAX_LM` = 960 (20 ms at 48 kHz).
+const MAX_FRAME_SAMPLES: usize = SHORT_MDCT_SIZE << MAX_LM;
 
 /// `-28 dB` in the log2 energy domain (libopus `-GCONST(28.f)`), the reset value for the energy
 /// history (`celt_decoder.c:1810`).
@@ -86,6 +90,12 @@ pub struct CeltDecoder {
     postfilter_tapset: usize,
     /// Comb post-filter tapset, previous frame (`postfilter_tapset_old`).
     postfilter_tapset_old: usize,
+    /// First coded band (`st->start`). 0 for CELT-only; 17 for Hybrid, where SILK carries everything
+    /// below (RFC 6716 §4.3, `opus_decoder.c:546` `CELT_SET_START_BAND`).
+    start_band: usize,
+    /// One past the last coded band (`st->end`), set from the packet bandwidth — **not** always 21.
+    /// See [`CeltDecoder::set_band_range`].
+    end_band: usize,
 }
 
 impl CeltDecoder {
@@ -110,7 +120,57 @@ impl CeltDecoder {
             postfilter_gain_old: 0.0,
             postfilter_tapset: 0,
             postfilter_tapset_old: 0,
+            start_band: 0,
+            end_band: NB_BANDS,
         })
+    }
+
+    /// Set the coded band range (libopus `CELT_SET_START_BAND` / `CELT_SET_END_BAND`,
+    /// `opus_decoder.c:523,546`).
+    ///
+    /// `end` is **derived from the packet bandwidth**, not fixed at 21 — a narrower bandwidth codes
+    /// fewer bands, and decoding it as fullband desynchronises the range decoder
+    /// (`opus_decoder.c:498-523`):
+    ///
+    /// | Bandwidth | `end` |
+    /// |---|---|
+    /// | Narrowband | 13 |
+    /// | Medium / Wideband | 17 |
+    /// | Super-wideband | 19 |
+    /// | Fullband | 21 |
+    ///
+    /// `start` is 0 for CELT-only and 17 for Hybrid (SILK owns the bands below).
+    pub fn set_band_range(&mut self, start: usize, end: usize) -> Result<(), CodecError> {
+        if start > end || end > NB_BANDS {
+            return Err(CodecError::Unsupported(
+                "celt: band range must satisfy start <= end <= 21",
+            ));
+        }
+        self.start_band = start;
+        self.end_band = end;
+        Ok(())
+    }
+
+    /// The range coder's final range after the last decoded frame (libopus `OPUS_GET_FINAL_RANGE`).
+    ///
+    /// `opus_demo` stores the *encoder's* final range alongside every packet it writes, and treats a
+    /// decoder that ends a packet on a different value as a hard error ("Range coder state mismatch").
+    /// It is therefore an exact, per-packet conformance oracle — far stricter than the `opus_compare`
+    /// tolerance metric, and it localises a desync to the packet that caused it.
+    #[must_use]
+    pub fn final_range(&self) -> u32 {
+        self.rng
+    }
+
+    /// The CELT `end` band for an Opus packet bandwidth (`opus_decoder.c:498-523`).
+    #[must_use]
+    pub fn end_band_for_bandwidth(bandwidth: Bandwidth) -> usize {
+        match bandwidth {
+            Bandwidth::Narrowband => 13,
+            Bandwidth::Mediumband | Bandwidth::Wideband => 17,
+            Bandwidth::SuperWideband => 19,
+            Bandwidth::Fullband => NB_BANDS,
+        }
     }
 
     /// Decode one mono CELT-only frame from `frame` into `pcm` as interleaved (mono → contiguous)
@@ -146,9 +206,9 @@ impl CeltDecoder {
 
         let m = 1usize << lm; // M = 1<<LM (celt_decoder.c:1266)
         let n = m * SHORT_MDCT_SIZE; // N = M*shortMdctSize (celt_decoder.c:1271)
-        let start = 0usize; // st->start (mono CELT-only)
-        let end = NB_BANDS; // st->end = effEBands = 21
-        let eff_end = end; // effEnd = end (celt_decoder.c:1277)
+        let start = self.start_band; // st->start
+        let end = self.end_band; // st->end, from the packet bandwidth (see `set_band_range`)
+        let eff_end = end.min(NB_BANDS); // effEnd = IMIN(end, effEBands) (celt_decoder.c:1277)
 
         if pcm.len() < n {
             return Err(CodecError::OutputTooSmall {
@@ -486,8 +546,19 @@ impl CeltDecoder {
                 *log_e = log_e.min(band_e);
             }
         }
-        // (backgroundLogE / start..end edge fixups: backgroundLogE is PLC-only and start/end are
-        //  fixed at 0/21 for the mono CELT-only path, so the C edge loops are no-ops here.)
+        // "In case start or end were to change" (celt_decoder.c:1344-1357): bands outside the coded
+        // range are reset, for both channel slots, so a later frame that widens the range does not
+        // predict from stale energy. Not a no-op once `end` tracks the packet bandwidth.
+        for channel in 0..2 {
+            let base = channel * NB_BANDS;
+            for i in (0..start).chain(end..NB_BANDS) {
+                self.old_band_energy[base + i] = 0.0;
+                self.old_log_energy[base + i] = ENERGY_RESET_DB;
+                self.old_log_energy2[base + i] = ENERGY_RESET_DB;
+            }
+        }
+        // (`backgroundLogE` (celt_decoder.c:1341-1343) is consumed only by the PLC path, which this
+        //  decoder does not implement yet; it must be added with concealment.)
 
         // Resync the cross-frame fold/anti-collapse PRNG seed to the range-coder register, so the
         // next frame's noise fold is seeded from the entropy state (celt_decoder.c:1597
@@ -497,10 +568,11 @@ impl CeltDecoder {
 
         // ── De-emphasis → float PCM, then to i16 for the harness (celt_decoder.c:1602) ───────────
         // deemphasis(out_syn, pcm, N, C, 0, PREEMPH[0], &mut preemph_memD).
-        let mut pcm_f = vec![0f32; n];
+        // Caller-owned/stack scratch — the hot path must not heap-allocate per frame.
+        let mut pcm_f = [0f32; MAX_FRAME_SAMPLES];
         deemphasis(
             &self.decode_mem[out_syn..out_syn + n],
-            &mut pcm_f,
+            &mut pcm_f[..n],
             n,
             CHANNELS,
             0,
@@ -649,6 +721,93 @@ mod tests {
             pcm.iter().all(|&s| s.abs() < 4000),
             "silent frame should be quiet"
         );
+    }
+
+    /// RFC 6716 §4.3 / `opus_decoder.c:498-523`: the CELT `end` band is derived from the packet
+    /// bandwidth. Decoding a narrower bandwidth as fullband reads bands the encoder never coded and
+    /// desynchronises the range decoder.
+    #[test]
+    fn end_band_follows_packet_bandwidth() {
+        assert_eq!(
+            CeltDecoder::end_band_for_bandwidth(Bandwidth::Narrowband),
+            13
+        );
+        assert_eq!(
+            CeltDecoder::end_band_for_bandwidth(Bandwidth::Mediumband),
+            17
+        );
+        assert_eq!(CeltDecoder::end_band_for_bandwidth(Bandwidth::Wideband), 17);
+        assert_eq!(
+            CeltDecoder::end_band_for_bandwidth(Bandwidth::SuperWideband),
+            19
+        );
+        assert_eq!(
+            CeltDecoder::end_band_for_bandwidth(Bandwidth::Fullband),
+            NB_BANDS
+        );
+    }
+
+    #[test]
+    fn defaults_to_the_fullband_celt_only_range() {
+        let decoder = CeltDecoder::new().expect("build");
+        assert_eq!(decoder.start_band, 0);
+        assert_eq!(decoder.end_band, NB_BANDS);
+    }
+
+    #[test]
+    fn set_band_range_accepts_every_real_configuration() {
+        let mut decoder = CeltDecoder::new().expect("build");
+        // Every CELT-only bandwidth, plus the Hybrid start band (SILK owns 0..17).
+        for end in [13usize, 17, 19, NB_BANDS] {
+            decoder.set_band_range(0, end).expect("celt-only range");
+            assert_eq!(decoder.end_band, end);
+        }
+        decoder.set_band_range(17, NB_BANDS).expect("hybrid range");
+        assert_eq!(decoder.start_band, 17);
+        // Degenerate but legal: an empty range (start == end).
+        decoder.set_band_range(5, 5).expect("empty range");
+    }
+
+    #[test]
+    fn set_band_range_rejects_out_of_range() {
+        let mut decoder = CeltDecoder::new().expect("build");
+        assert!(decoder.set_band_range(0, NB_BANDS + 1).is_err());
+        assert!(decoder.set_band_range(10, 4).is_err());
+        // A rejected call must not have mutated the state.
+        assert_eq!(decoder.start_band, 0);
+        assert_eq!(decoder.end_band, NB_BANDS);
+    }
+
+    /// Bands outside the coded range must be reset after each frame (`celt_decoder.c:1344-1357`), in
+    /// both channel slots, so widening the range later cannot predict from stale energy.
+    #[test]
+    fn decode_resets_energy_outside_the_coded_range() {
+        let mut decoder = CeltDecoder::new().expect("build");
+        // Seed every band with a value that is neither 0 nor the reset floor.
+        decoder.old_band_energy = [7.0; 2 * NB_BANDS];
+        decoder.old_log_energy = [7.0; 2 * NB_BANDS];
+        decoder.old_log_energy2 = [7.0; 2 * NB_BANDS];
+        decoder.set_band_range(0, 13).expect("narrowband range");
+
+        let mut frame = vec![0u8; 60];
+        for (i, b) in frame.iter_mut().enumerate() {
+            *b = ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8;
+        }
+        frame[0] &= 0x7f; // bias away from the silence bit
+        let mut pcm = vec![0i16; 960];
+        decoder.decode(&frame, &mut pcm, 960).expect("decode");
+
+        for channel in 0..2 {
+            for band in 13..NB_BANDS {
+                let i = channel * NB_BANDS + band;
+                assert_eq!(
+                    decoder.old_band_energy[i], 0.0,
+                    "band {band} (channel {channel}) above end must be zeroed"
+                );
+                assert_eq!(decoder.old_log_energy[i], ENERGY_RESET_DB);
+                assert_eq!(decoder.old_log_energy2[i], ENERGY_RESET_DB);
+            }
+        }
     }
 
     #[test]

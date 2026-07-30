@@ -55,6 +55,8 @@ Fetch the vectors from their sources and drop them under `reference/<codec>/test
 | GSM Full Rate | ETSI / 3GPP TS 06.10 | `reference/gsm-fr/testv` |
 | AMR-NB | 3GPP TS 26.074 | `reference/amr-nb/testv` |
 | AMR-WB | 3GPP TS 26.174 | `reference/amr-wb/testv` |
+| Opus | RFC 6716 official vectors (opus-codec.org) | `reference/opus/opus_testvectors` |
+| Opus (CELT layer) | generated locally — see "Opus conformance oracle" below | `reference/opus/celt_only` |
 
 (G.711 and L16 need no external vectors: G.711 is validated exhaustively over all 256 code points,
 L16 is an exact byte-order transform.)
@@ -65,6 +67,42 @@ To make a conformance run **fail loudly instead of silently skipping** when the 
 ```sh
 SIPHON_RTP_REQUIRE_VECTORS=1 cargo test --workspace --all-features
 ```
+
+### Opus conformance oracle
+
+Opus is the one codec whose conformance criterion is **not** bit-exact PCM: RFC 6716 §6 defines it as
+a pass of the `opus_compare` perceptual metric, so float and fixed-point decoders both conform. That
+tool ships with libopus, which means Opus conformance needs a **locally built, test-only C reference**.
+libopus is never a dependency — `deny.toml` bans the `opus` / `audiopus` / `magnum-opus` crates by
+name, and CI enforces it. It is an out-of-tree oracle binary, nothing more.
+
+Unpack the libopus source under `reference/opus/opus-1.5.2/`, then:
+
+```sh
+cmake -S reference/opus/opus-1.5.2 -B reference/opus/build \
+      -DCMAKE_BUILD_TYPE=Release -DOPUS_BUILD_PROGRAMS=ON -DOPUS_BUILD_TESTING=ON
+cmake --build reference/opus/build -j
+sh reference/opus/gen_celt_only.sh          # writes reference/opus/celt_only/*.bit + *.dec
+SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
+    cargo test -p siphon-rtp-codec --test celt_only_conformance --test opus_conformance
+```
+
+`SIPHON_RTP_OPUS_COMPARE` defaults to `/tmp/opus_compare`. Set it explicitly when working in a git
+worktree — `reference/` is untracked, so a fresh worktree has no oracle of its own and should point at
+a shared build.
+
+Two things about this oracle are worth knowing before you fight it:
+
+- **The reference `.dec` must be the *stereo* decode** (`opus_demo -d 48000 2`). `opus_compare` reads
+  its reference file as 2-channel unconditionally and folds it to mono; hand it a mono `.dec` and it
+  sees half the samples and exits with "Sample counts do not match". The official vectors are stereo
+  for exactly this reason.
+- **`opus_compare` is a tolerance metric and can pass a subtly wrong decoder.** Every packet in a
+  `.bit` file also carries the encoder's range-coder final value, and a conformant decoder must finish
+  the packet on exactly that value (`opus_demo` itself rejects a mismatch). The harnesses assert this
+  per packet — it is the exact check, it localises a desync to one packet, and it is what actually
+  caught the CELT band-range bug. Prefer it when debugging; treat `opus_compare` as the acceptance
+  gate, not the diagnostic.
 
 ## Fuzzing
 

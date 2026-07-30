@@ -20,6 +20,10 @@ const REQUIRED_VECTOR_DIRS: &[&str] = &[
     "../../reference/g722/testv",
     "../../reference/g726/testv",
     "../../reference/gsm-fr/testv",
+    // Opus: the official RFC 6716 `testvectorNN.bit`/`.dec` set, plus the locally generated
+    // CELT-only oracle streams (`celt_only/`, see CONTRIBUTING.md — they need a local libopus build).
+    "../../reference/opus/opus_testvectors",
+    "../../reference/opus/celt_only",
 ];
 
 fn is_present_and_non_empty(dir: &Path) -> bool {

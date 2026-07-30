@@ -29,8 +29,11 @@ const CONFORMANCE_RATE_HZ: u32 = 48_000;
 struct BitPacket {
     /// The Opus packet payload bytes.
     payload: Vec<u8>,
-    /// The reference encoder's final range value (libopus `OPUS_GET_FINAL_RANGE`); a future range
-    /// decoder self-check can compare `dec.tell()`-era state against this. Unused for now.
+    /// The reference *encoder's* range-coder final value (libopus `OPUS_GET_FINAL_RANGE`). A
+    /// conformant decoder must end the packet on exactly this value — `opus_demo` itself rejects a
+    /// mismatch as "Range coder state mismatch". This is the exact companion to the `opus_compare`
+    /// tolerance metric and is asserted per packet once `OpusDecoder` exists; see
+    /// `celt_only_conformance.rs` for the CELT-layer version already doing it.
     #[allow(dead_code)]
     final_range: u32,
 }
@@ -140,9 +143,13 @@ fn decode_vector_to_pcm(packets: &[BitPacket], channels: u8) -> Result<Vec<u8>, 
 /// Run `opus_compare` over a decoded buffer vs the reference `.dec`. Returns `Ok(())` on a pass.
 #[allow(dead_code)]
 fn run_opus_compare(reference_dec: &Path, decoded_pcm: &[u8], channels: u8) -> Result<(), String> {
-    let compare = Path::new("/tmp/opus_compare");
+    let compare = std::env::var_os("SIPHON_RTP_OPUS_COMPARE")
+        .map_or_else(|| PathBuf::from("/tmp/opus_compare"), PathBuf::from);
     if !compare.exists() {
-        return Err("/tmp/opus_compare not built (test-only C reference)".to_string());
+        return Err(format!(
+            "{} not built (test-only C reference)",
+            compare.display()
+        ));
     }
     let tmp = std::env::temp_dir().join(format!("opus_decoded_{}.sw", std::process::id()));
     std::fs::write(&tmp, decoded_pcm).map_err(|e| e.to_string())?;
