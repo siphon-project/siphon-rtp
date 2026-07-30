@@ -271,6 +271,10 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     over the signalled `out_dst`, so adopting both gates ingress and re-points the sibling's egress.
     RFC 7675 consent, which resolves its target from the same adopted source each tick, follows the
     selection without being told.
+  - **A DTLS-SRTP leg keys the selected pair, not the signalled address** (RFC 8445 §12). Its
+    handshake is held until ICE selects, then released and pointed at the chosen pair; records and
+    media follow it. Gated only when a full agent is actually running on that leg — otherwise no
+    selection is coming and waiting would hang a working leg.
   - **A failed checklist tears the call down** (§8.1.2, CDR reason `ice_failed`): if no pair works,
     there is no path, and holding the call open would only wait for a timeout.
   - **Enforcement:** `siphon-rtp-ice/src/{checklist,agent}.rs` (the pure state machine),

@@ -2017,6 +2017,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // any relay flow is installed, so an ICE leg is STUN-gated from its first packet — the
         // datapath's layer-4 gate then forwards media only from a validated source and a Forward flow
         // is never live with a blind-latch window (docs/security-and-nat.md §4 layer 4; RFC 8445).
+        // Endpoints on which a full ICE agent ends up running — consulted later by the DTLS plan,
+        // which must hold its handshake for a selection only when one is actually coming.
+        let mut agent_endpoints: Vec<EndpointId> = Vec::new();
         if let Some(creds) = &ice_creds {
             let config = IceConfig {
                 local_ufrag: creds.ufrag.clone(),
@@ -2076,7 +2079,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     true,
                 ),
             ];
-            let mut agent_endpoints: Vec<EndpointId> = Vec::new();
             if let Some(agents) = &self.ice_agents {
                 for (endpoints, remote, remote_candidates, local_candidates, controlling) in
                     full_ice_sides
@@ -2282,6 +2284,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     peer_fingerprint.hash_function,
                     peer_fingerprint.bytes,
                 ),
+                // Hold the handshake for ICE only when a full agent is actually running on this leg
+                // (RFC 8445 §12). Without one there is no selection coming, and gating would hang a
+                // leg that works perfectly well against its signalled address.
+                gate_on_ice: agent_endpoints.contains(&far.rtp.id),
             });
         } else if pipeline == PipelineKind::SrtpMedia {
             // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
@@ -5133,6 +5139,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // and RFC 7675 consent, which resolves its target from the same adopted source,
                     // follows the selection without being told.
                     self.datapath.adopt_source(endpoint, remote);
+                    // A DTLS-SRTP leg keys the path ICE chose: this releases a gated handshake and
+                    // re-points its records and media at the selected pair (RFC 8445 §12). A no-op
+                    // for a leg with no DTLS bridge.
+                    self.dtls_bridge().set_ice_selected(endpoint, remote);
                     tracing::info!(
                         target: "siphon_rtp::media",
                         %call_id, ?endpoint, %remote,
