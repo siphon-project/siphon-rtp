@@ -45,7 +45,7 @@
 //! | Frame type (§4.2.7.3) ([`frame_type`]) | **landed** |
 //! | Subframe gains (§4.2.7.4) ([`gains`]) | **landed** |
 //! | NLSF → LPC (§4.2.7.5) | pending |
-//! | Pitch lags, LTP filter, LTP scaling (§4.2.7.6) | pending |
+//! | Pitch lags, LTP filter, LTP scaling (§4.2.7.6) ([`ltp`]) | **landed** |
 //! | LCG seed + excitation / shell coder (§4.2.7.7-8) | pending |
 //! | LTP + LPC synthesis, stereo unmixing, resampling (§4.2.7.9, §4.2.8-9) | pending |
 //! | DTX / CNG and PLC (§4.4) | pending |
@@ -97,12 +97,14 @@
 //!   anchor is [`decoder::ChannelState::prev_nlsf_q15`], and interpolation is suppressed whenever
 //!   [`decoder::ChannelState::first_frame_after_reset`] is set (`decode_parameters.c:59-61`) or the
 //!   frame has two subframes (`decode_indices.c:94-98`).
-//! * **LTP (§4.2.7.6)** — `ltp::decode_indices(dec, rate, layout, cond_coding, ec_prev_signal_type,
-//!   ec_prev_lag_index) -> LtpIndices`. A delta pitch lag is only legal when the frame is
-//!   [`types::CondCoding::Conditionally`] coded *and* the previous frame was voiced, measured against
-//!   [`decoder::ChannelState::ec_prev_lag_index`]; the LTP scaling symbol appears only for
-//!   [`types::CondCoding::Independently`] (`decode_indices.c:139-143`). Both `ec_prev_*` fields must
-//!   be updated even for frames that skip these symbols.
+//! * **LTP (§4.2.7.6)** — landed as [`ltp::decode_indices`], with [`ltp::dequantize`] turning the
+//!   indices into per-subframe pitch lags, Q14 filter taps and the Q14 LTP scale. A delta pitch lag is
+//!   only legal when the frame is [`types::CondCoding::Conditionally`] coded *and* the previous frame
+//!   was voiced, measured against [`decoder::ChannelState::ec_prev_lag_index`]; the LTP scaling symbol
+//!   appears only for [`types::CondCoding::Independently`] (`decode_indices.c:139-143`). Both
+//!   `ec_prev_*` fields must be updated by the caller even for frames that skip these symbols —
+//!   `ec_prev_lag_index` only on a voiced frame (`decode_indices.c:121`), `ec_prev_signal_type` on
+//!   every frame (`decode_indices.c:145`).
 //! * **Excitation (§4.2.7.7-8)** — `excitation::decode(dec, signal_type, quant_offset_type,
 //!   frame_length, seed) -> ...`, writing into [`decoder::ChannelState::excitation_q14`]. The
 //!   quantization offset constant is [`types::QuantOffsetType::offset_q10`]. The **LCG seed** is a
@@ -139,6 +141,7 @@ pub mod fixed;
 pub mod frame_type;
 pub mod gains;
 pub mod header;
+pub mod ltp;
 pub mod stereo_pred;
 pub mod tables;
 pub mod types;
