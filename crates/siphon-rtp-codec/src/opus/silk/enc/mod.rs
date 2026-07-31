@@ -82,6 +82,8 @@ pub mod gains;
 pub mod lpc_analysis;
 pub mod nlsf_quant;
 pub mod noise_shape;
+pub mod nsq;
+pub mod nsq_del_dec;
 pub mod pitch;
 pub mod pred_coefs;
 
