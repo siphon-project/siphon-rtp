@@ -143,6 +143,110 @@ fn celt_encode_of_silence_makes_no_heap_allocation() {
     );
 }
 
+/// Interleave a mono signal with a decorrelated copy of itself, so the stereo band coder faces a
+/// real mid/side decision rather than the degenerate "both channels identical" one.
+fn celt_stereo_signal(samples: usize) -> Vec<f32> {
+    let left = celt_signal(samples);
+    let right = celt_signal(samples + 7);
+    (0..samples)
+        .flat_map(|i| [left[i], 0.6 * left[i] + 0.4 * right[i + 7]])
+        .collect()
+}
+
+/// The same invariant for **stereo**, which adds the mid/side band path, `intensity_stereo`, the
+/// second channel's analysis and MDCT, and — at complexity 10 — the theta rate-distortion trial with
+/// its coder rollback. The trial's scratch lives on the encoder state precisely so this stays zero.
+#[test]
+fn celt_stereo_encode_makes_no_heap_allocation_per_frame() {
+    for &frame_size in &[120usize, 240, 480, 960] {
+        for &complexity in &[5i32, 10] {
+            for &rate_control in &[RateControl::ConstantBitrate, RateControl::ConstrainedVbr] {
+                let signal = celt_stereo_signal(frame_size * 16);
+                let mut encoder = CeltEncoder::with_channels(2).expect("build stereo encoder");
+                encoder.set_bitrate(96_000);
+                encoder.set_rate_control(rate_control);
+                encoder.set_complexity(complexity).expect("complexity");
+                let mut payload = vec![0u8; 1275];
+
+                let mut frame = 0usize;
+                let encode_one =
+                    |encoder: &mut CeltEncoder, payload: &mut [u8], frame: &mut usize| {
+                        let lo = (*frame % 16) * frame_size * 2;
+                        *frame += 1;
+                        encoder
+                            .encode(&signal[lo..lo + 2 * frame_size], frame_size, payload)
+                            .expect("encode");
+                    };
+                for _ in 0..64 {
+                    encode_one(&mut encoder, &mut payload, &mut frame);
+                }
+
+                let allocations = count_allocations(1_000, || {
+                    encode_one(&mut encoder, &mut payload, &mut frame);
+                });
+                assert_eq!(
+                    allocations, 0,
+                    "stereo CELT encode ({frame_size} samples, complexity {complexity}, \
+                     {rate_control:?}) allocated {allocations} times across 1000 frames"
+                );
+            }
+        }
+    }
+}
+
+/// A warmed-up **stereo** encode + decode round trip, the shape a stereo transcode leg runs at
+/// steady state, must not touch the allocator on either side.
+#[test]
+fn celt_stereo_round_trip_makes_no_heap_allocation_per_frame() {
+    for &frame_size in &[120usize, 480, 960] {
+        let signal = celt_stereo_signal(frame_size * 8);
+        let mut encoder = CeltEncoder::with_channels(2).expect("build");
+        encoder.set_bitrate(96_000);
+        encoder.set_rate_control(RateControl::ConstrainedVbr);
+        let mut decoder = CeltDecoder::with_channels(2).expect("build");
+        let mut payload = vec![0u8; 1275];
+        let mut pcm = vec![0i16; 2 * frame_size];
+        let mut frame = 0usize;
+        let round_trip = |encoder: &mut CeltEncoder,
+                          decoder: &mut CeltDecoder,
+                          payload: &mut Vec<u8>,
+                          pcm: &mut Vec<i16>,
+                          frame: &mut usize| {
+            let lo = (*frame % 8) * frame_size * 2;
+            *frame += 1;
+            let written = encoder
+                .encode(&signal[lo..lo + 2 * frame_size], frame_size, payload)
+                .expect("encode");
+            decoder
+                .decode(&payload[..written], pcm, frame_size)
+                .expect("decode");
+        };
+        for _ in 0..32 {
+            round_trip(
+                &mut encoder,
+                &mut decoder,
+                &mut payload,
+                &mut pcm,
+                &mut frame,
+            );
+        }
+        let allocations = count_allocations(500, || {
+            round_trip(
+                &mut encoder,
+                &mut decoder,
+                &mut payload,
+                &mut pcm,
+                &mut frame,
+            );
+        });
+        assert_eq!(
+            allocations, 0,
+            "a warmed-up stereo round trip ({frame_size} samples) allocated {allocations} times \
+             across 500 frames"
+        );
+    }
+}
+
 /// Constructing an encoder *is* allowed to allocate (the MDCT/FFT twiddle tables), but only once —
 /// this pins that it happens at construction and not per frame, which is the whole reason the
 /// per-frame loop above can be allocation-free.

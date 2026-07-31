@@ -14,6 +14,7 @@ use iai_callgrind::{
 use std::hint::black_box;
 
 use siphon_rtp_codec::g711::G711;
+use siphon_rtp_codec::opus::celt::decoder::CeltDecoder;
 use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
 use siphon_rtp_codec::opus::celt::mdct::{clt_mdct_forward, MdctLookup};
 use siphon_rtp_codec::opus::celt::tables::{OVERLAP, WINDOW120};
@@ -76,6 +77,62 @@ fn celt_encode_setup() -> CeltEncodeInput {
     (encoder, signal[CELT_FRAME..].to_vec(), payload)
 }
 
+/// Interleave a mono signal with a decorrelated copy of itself, so the stereo band coder has a real
+/// mid/side decision to make instead of the degenerate "both channels identical" one.
+fn celt_stereo_signal(samples: usize) -> Vec<f32> {
+    let left = celt_signal(samples);
+    let right = celt_signal(samples + 7);
+    (0..samples)
+        .flat_map(|i| [left[i], 0.6 * left[i] + 0.4 * right[i + 7]])
+        .collect()
+}
+
+fn celt_stereo_encode_setup() -> CeltEncodeInput {
+    let mut encoder = CeltEncoder::with_channels(2).expect("build stereo CELT encoder");
+    encoder.set_bitrate(96_000);
+    encoder.set_rate_control(RateControl::ConstrainedVbr);
+    let signal = celt_stereo_signal(2 * CELT_FRAME);
+    let mut payload = vec![0u8; 1275];
+    let _ = encoder.encode(&signal[..2 * CELT_FRAME], CELT_FRAME, &mut payload);
+    (encoder, signal[2 * CELT_FRAME..].to_vec(), payload)
+}
+
+type CeltDecodeInput = (CeltDecoder, Vec<u8>, Vec<i16>);
+
+/// Encode two frames at `channels`, hand back the decoder primed on the first and the second
+/// packet: the measured call then decodes with a warm ring and energy history.
+fn celt_decode_setup(channels: usize, bitrate: i32) -> CeltDecodeInput {
+    let mut encoder = CeltEncoder::with_channels(channels).expect("build CELT encoder");
+    encoder.set_bitrate(bitrate);
+    encoder.set_rate_control(RateControl::ConstrainedVbr);
+    let signal = if channels == 2 {
+        celt_stereo_signal(2 * CELT_FRAME)
+    } else {
+        celt_signal(2 * CELT_FRAME)
+    };
+    let block = CELT_FRAME * channels;
+    let mut payload = vec![0u8; 1275];
+    let mut decoder = CeltDecoder::with_channels(channels).expect("build CELT decoder");
+    let mut pcm = vec![0i16; block];
+    let first = encoder
+        .encode(&signal[..block], CELT_FRAME, &mut payload)
+        .expect("encode");
+    let first = payload[..first].to_vec();
+    let _ = decoder.decode(&first, &mut pcm, CELT_FRAME);
+    let second = encoder
+        .encode(&signal[block..2 * block], CELT_FRAME, &mut payload)
+        .expect("encode");
+    (decoder, payload[..second].to_vec(), pcm)
+}
+
+fn celt_decode_mono_setup() -> CeltDecodeInput {
+    celt_decode_setup(1, 64_000)
+}
+
+fn celt_decode_stereo_setup() -> CeltDecodeInput {
+    celt_decode_setup(2, 96_000)
+}
+
 type MdctInput = (MdctLookup, Vec<f32>, Vec<f32>);
 
 fn celt_mdct_setup() -> MdctInput {
@@ -100,6 +157,27 @@ fn celt_pvq_setup() -> PvqInput {
 fn celt_encode(input: CeltEncodeInput) {
     let (mut encoder, signal, mut payload) = input;
     let _ = black_box(encoder.encode(black_box(&signal[..CELT_FRAME]), CELT_FRAME, &mut payload));
+}
+
+// The same frame in stereo: mid/side plus intensity on top of two channels of analysis and MDCT.
+#[library_benchmark]
+#[bench::stereo_20ms(setup = celt_stereo_encode_setup)]
+fn celt_encode_stereo(input: CeltEncodeInput) {
+    let (mut encoder, signal, mut payload) = input;
+    let _ = black_box(encoder.encode(
+        black_box(&signal[..2 * CELT_FRAME]),
+        CELT_FRAME,
+        &mut payload,
+    ));
+}
+
+// One 20 ms CELT frame through the decoder, mono and stereo — the relay/transcode ingress cost.
+#[library_benchmark]
+#[bench::mono_20ms(setup = celt_decode_mono_setup)]
+#[bench::stereo_20ms(setup = celt_decode_stereo_setup)]
+fn celt_decode(input: CeltDecodeInput) {
+    let (mut decoder, packet, mut pcm) = input;
+    let _ = black_box(decoder.decode(black_box(&packet), &mut pcm, CELT_FRAME));
 }
 
 // The forward MDCT alone (20 ms long block), so a transform regression is localised.
@@ -129,7 +207,14 @@ fn celt_pvq_search(input: PvqInput) {
 
 library_benchmark_group!(
     name = codec;
-    benchmarks = g711_decode, g711_encode, celt_encode, celt_mdct_forward, celt_pvq_search
+    benchmarks =
+        g711_decode,
+        g711_encode,
+        celt_encode,
+        celt_encode_stereo,
+        celt_decode,
+        celt_mdct_forward,
+        celt_pvq_search
 );
 
 // Fail the run (non-zero exit) if any measured kernel executes >10% more instructions than the

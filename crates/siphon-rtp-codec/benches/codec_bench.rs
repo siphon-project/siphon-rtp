@@ -22,6 +22,7 @@ use siphon_rtp_codec::g722::G722;
 use siphon_rtp_codec::g726::{Rate, G726};
 use siphon_rtp_codec::gsm_fr::GsmFr;
 use siphon_rtp_codec::opus::celt::band_analysis::compute_band_energies;
+use siphon_rtp_codec::opus::celt::decoder::CeltDecoder;
 use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
 use siphon_rtp_codec::opus::celt::mdct::{clt_mdct_forward, MdctLookup};
 use siphon_rtp_codec::opus::celt::tables::{NB_BANDS, OVERLAP, WINDOW120};
@@ -605,6 +606,118 @@ fn bench_celt_encode(c: &mut Criterion) {
             });
         });
     }
+
+    // Stereo: two channels of analysis and MDCT plus the mid/side band coder. `complexity_10` adds
+    // the theta rate-distortion trial, which encodes each stereo band twice.
+    for &(label, frame_size) in &[
+        ("stereo_2.5ms_120", 120usize),
+        ("stereo_5ms_240", 240),
+        ("stereo_10ms_480", 480),
+        ("stereo_20ms_960", 960),
+    ] {
+        let signal = celt_stereo_signal(frame_size * 64);
+        group.bench_function(label, |b| {
+            let mut encoder = CeltEncoder::with_channels(2).expect("build stereo CELT encoder");
+            encoder.set_bitrate(96_000);
+            encoder.set_rate_control(RateControl::ConstrainedVbr);
+            let mut payload = vec![0u8; 1275];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let lo = (frame % 64) * frame_size * 2;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(
+                            black_box(&signal[lo..lo + 2 * frame_size]),
+                            frame_size,
+                            &mut payload,
+                        )
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+    let stereo_signal = celt_stereo_signal(960 * 64);
+    group.bench_function("stereo_20ms_complexity_10", |b| {
+        let mut encoder = CeltEncoder::with_channels(2).expect("build");
+        encoder.set_bitrate(96_000);
+        encoder.set_rate_control(RateControl::ConstrainedVbr);
+        encoder.set_complexity(10).expect("complexity");
+        let mut payload = vec![0u8; 1275];
+        let mut frame = 0usize;
+        b.iter(|| {
+            let lo = (frame % 64) * 1920;
+            frame += 1;
+            black_box(
+                encoder
+                    .encode(black_box(&stereo_signal[lo..lo + 1920]), 960, &mut payload)
+                    .expect("encode"),
+            )
+        });
+    });
+    group.finish();
+}
+
+/// Interleave a mono signal with a decorrelated copy of itself, so the stereo band coder faces a
+/// real mid/side decision rather than the degenerate "both channels identical" one.
+fn celt_stereo_signal(samples: usize) -> Vec<f32> {
+    let left = celt_signal(samples);
+    let right = celt_signal(samples + 7);
+    (0..samples)
+        .flat_map(|i| [left[i], 0.6 * left[i] + 0.4 * right[i + 7]])
+        .collect()
+}
+
+/// The CELT **decoder** hot path, one frame per iteration — the cost a relay/transcode leg pays on
+/// ingress. The packets are encoded up front so only the decode is measured.
+fn bench_celt_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("celt_decode");
+    for &(label, channels, frame_size, bitrate) in &[
+        ("mono_2.5ms_120", 1usize, 120usize, 64_000i32),
+        ("mono_5ms_240", 1, 240, 64_000),
+        ("mono_10ms_480", 1, 480, 64_000),
+        ("mono_20ms_960", 1, 960, 64_000),
+        ("stereo_2.5ms_120", 2, 120, 96_000),
+        ("stereo_5ms_240", 2, 240, 96_000),
+        ("stereo_10ms_480", 2, 480, 96_000),
+        ("stereo_20ms_960", 2, 960, 96_000),
+    ] {
+        let frames = 64usize;
+        let block = frame_size * channels;
+        let signal = if channels == 2 {
+            celt_stereo_signal(frame_size * frames)
+        } else {
+            celt_signal(frame_size * frames)
+        };
+        let mut encoder = CeltEncoder::with_channels(channels).expect("build CELT encoder");
+        encoder.set_bitrate(bitrate);
+        encoder.set_rate_control(RateControl::ConstrainedVbr);
+        let mut payload = vec![0u8; 1275];
+        let packets: Vec<Vec<u8>> = (0..frames)
+            .map(|frame| {
+                let lo = frame * block;
+                let written = encoder
+                    .encode(&signal[lo..lo + block], frame_size, &mut payload)
+                    .expect("encode");
+                payload[..written].to_vec()
+            })
+            .collect();
+
+        group.bench_function(label, |b| {
+            let mut decoder = CeltDecoder::with_channels(channels).expect("build CELT decoder");
+            let mut pcm = vec![0i16; block];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let packet = &packets[frame % frames];
+                frame += 1;
+                black_box(
+                    decoder
+                        .decode(black_box(packet), &mut pcm, frame_size)
+                        .expect("decode"),
+                )
+            });
+        });
+    }
     group.finish();
 }
 
@@ -871,6 +984,7 @@ criterion_group!(
     bench_gsm_fr,
     bench_cn,
     bench_celt_encode,
+    bench_celt_decode,
     bench_celt_kernels,
     bench_silk_excitation,
     bench_basic_ops,
@@ -891,6 +1005,7 @@ criterion_group!(
     bench_gsm_fr,
     bench_cn,
     bench_celt_encode,
+    bench_celt_decode,
     bench_celt_kernels,
     bench_silk_excitation
 );

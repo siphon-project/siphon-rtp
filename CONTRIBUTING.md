@@ -89,6 +89,16 @@ SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
     cargo test -p siphon-rtp-codec --test celt_only_conformance --test opus_conformance
 ```
 
+`gen_celt_only.sh` writes two directories: `celt_only/` (mono) and `celt_only_stereo/`. They are kept
+apart because the mono harness globs its directory and rejects a two-channel packet, so a checkout
+that only has one of them still works. Note that the **Opus layer above CELT** has its own,
+content-adaptive stereo decision and will downmix to mono below its threshold — mid-stream, not just
+at the first packet — so the stereo sweep starts at the lowest rate that stays genuinely stereo for
+each frame duration (64 kb/s at 2.5 ms, 48 kb/s at 5 ms, 24 kb/s at 10/20 ms). The harness fails
+loudly on a mono packet in a stereo vector rather than tolerating it; the fix is to regenerate that
+configuration higher, not to relax the check. Stereo streams are scored with `opus_compare -s`, so
+both channels are compared instead of a downmix.
+
 `gen_celt_only.sh` uses `opus_demo -e restricted-lowdelay` (which forces `MODE_CELT_ONLY`);
 `gen_silk_only.sh` uses `opus_demo -e voip` at a low bitrate with the bandwidth capped at NB/MB/WB,
 which keeps the encoder in `MODE_SILK_ONLY`. Neither is taken on trust: both harnesses assert
@@ -217,6 +227,33 @@ One more oracle is worth knowing about for the tables rather than the decode pat
 `silk_nlsf_tables_vs_libopus` re-parses `reference/opus/opus-1.5.2/silk/tables_NLSF_CB_*.c` and diffs
 all 2569 ported NLSF codebook entries against the C element by element. It needs only the unpacked
 libopus source, not a build.
+
+#### Per-kernel goldens for the CELT stereo kernels
+
+`opus_compare` and `final_range` both score a *whole packet*, so neither can tell you which kernel is
+wrong — and a round trip proves nothing at all, because a shared encode/decode bug passes one. The
+stereo kernels (`stereo_itheta`, `intensity_stereo`, `stereo_split`, `stereo_merge`,
+`compute_channel_weights`, `compute_qn`, the theta gain/bit split, `stereo_analysis`, the `C == 2`
+branches of `alloc_trim_analysis` / `dynalloc_analysis` / `patch_transient_decision`) are therefore
+pinned to values libopus itself produced, in
+[`crates/siphon-rtp-codec/tests/celt_stereo_golden.rs`](crates/siphon-rtp-codec/tests/celt_stereo_golden.rs).
+
+Most of those helpers are file-static in `celt/bands.c` and `celt/celt_encoder.c`, so the generator
+`reference/opus/celt_stereo_golden.c` `#include`s those two translation units directly and prints the
+literals. The *inputs* are regenerated on the Rust side from the same LCG, so only the outputs are
+carried across and the test needs no reference tree — it runs in CI unconditionally. Re-run the
+generator only when a kernel's expected behaviour is deliberately changed:
+
+```sh
+cd reference/opus
+gcc -O2 -DCPU_INFO_BY_ASM -DDISABLE_DEBUG_FLOAT -DENABLE_HARDENING -DHAVE_ALLOCA_H \
+    -DHAVE_CONFIG_H -DHAVE_LRINT -DHAVE_LRINTF -DOPUS_BUILD -DOPUS_HAVE_RTCD \
+    -DOPUS_X86_MAY_HAVE_AVX2 -DOPUS_X86_MAY_HAVE_SSE -DOPUS_X86_MAY_HAVE_SSE2 \
+    -DOPUS_X86_MAY_HAVE_SSE4_1 -DOPUS_X86_PRESUME_SSE -DOPUS_X86_PRESUME_SSE2 -DVAR_ARRAYS \
+    -I build -I opus-1.5.2/include -I opus-1.5.2/celt -I opus-1.5.2/silk -I opus-1.5.2 \
+    celt_stereo_golden.c build/libopus.a -lm -o build/celt_stereo_golden
+./build/celt_stereo_golden
+```
 
 ## Fuzzing
 

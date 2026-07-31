@@ -72,6 +72,24 @@ pub struct RangeDecoder<'a> {
     error: i32,
 }
 
+/// A rollback point for [`RangeDecoder`] — every scalar field of libopus' `ec_dec`. Unlike the
+/// encoder's, this is a *complete* snapshot: the packet a decoder reads is immutable, so restoring
+/// the scalars rewinds the decoder exactly.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeDecoderState {
+    storage: u32,
+    offs: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: i32,
+    nbits_total: i32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: i32,
+    error: i32,
+}
+
 impl<'a> RangeDecoder<'a> {
     /// Initialize a decoder over `buf` (libopus `ec_dec_init`).
     #[must_use]
@@ -141,6 +159,48 @@ impl<'a> RangeDecoder<'a> {
     /// end the packet on different `rng` values.
     pub fn declare_bits_used(&mut self, total_bits: i32) {
         self.nbits_total += total_bits - self.tell();
+    }
+
+    /// Bytes read from the front of the buffer so far (libopus `dec->offs`), the mirror of
+    /// [`RangeEncoder::range_bytes`].
+    #[must_use]
+    pub fn range_bytes(&self) -> u32 {
+        self.offs
+    }
+
+    /// Snapshot the decoder so a speculative decode can be rewound (the mirror of
+    /// [`RangeEncoder::save_state`]).
+    #[must_use]
+    pub fn save_state(&self) -> RangeDecoderState {
+        RangeDecoderState {
+            storage: self.storage,
+            offs: self.offs,
+            end_offs: self.end_offs,
+            end_window: self.end_window,
+            nend_bits: self.nend_bits,
+            nbits_total: self.nbits_total,
+            rng: self.rng,
+            val: self.val,
+            ext: self.ext,
+            rem: self.rem,
+            error: self.error,
+        }
+    }
+
+    /// Restore a [`Self::save_state`] snapshot. The buffer is borrowed read-only and never changes,
+    /// so this alone rewinds the decoder completely.
+    pub fn restore_state(&mut self, state: &RangeDecoderState) {
+        self.storage = state.storage;
+        self.offs = state.offs;
+        self.end_offs = state.end_offs;
+        self.end_window = state.end_window;
+        self.nend_bits = state.nend_bits;
+        self.nbits_total = state.nbits_total;
+        self.rng = state.rng;
+        self.val = state.val;
+        self.ext = state.ext;
+        self.rem = state.rem;
+        self.error = state.error;
     }
 
     #[inline]
@@ -824,6 +884,45 @@ mod tests {
         assert!(!enc.error());
         enc.done();
         assert_eq!(buf[0] >> 6, 0b11, "top 2 bits patched to 3");
+    }
+
+    /// Decoder rollback must be exact: rewinding to a snapshot has to replay the identical symbol
+    /// sequence, `tell_frac` and `rng`. The CELT stereo theta trial relies on this being a complete
+    /// rollback (the packet itself is immutable, so the scalars are the whole state).
+    #[test]
+    fn decoder_state_snapshot_rewinds_exactly() {
+        let icdf = [25u8, 23, 2, 0];
+        let mut buf = vec![0u8; 512];
+        {
+            let mut enc = RangeEncoder::new(&mut buf);
+            for k in 0..40u32 {
+                enc.enc_uint(k % 13, 13);
+                enc.enc_icdf((k % 3) as usize, &icdf, 5);
+                enc.enc_bits(k & 0x3f, 6);
+            }
+            enc.done();
+            assert!(!enc.error());
+        }
+        let mut dec = RangeDecoder::new(&buf);
+        for _ in 0..10u32 {
+            let _ = dec.dec_uint(13);
+            let _ = dec.dec_icdf(&icdf, 5);
+            let _ = dec.dec_bits(6);
+        }
+        let snapshot = dec.save_state();
+        let (tell, rng, offs) = (dec.tell_frac(), dec.rng(), dec.range_bytes());
+        let first: Vec<(u32, usize, u32)> = (0..30)
+            .map(|_| (dec.dec_uint(13), dec.dec_icdf(&icdf, 5), dec.dec_bits(6)))
+            .collect();
+        dec.restore_state(&snapshot);
+        assert_eq!(
+            (dec.tell_frac(), dec.rng(), dec.range_bytes()),
+            (tell, rng, offs)
+        );
+        let second: Vec<(u32, usize, u32)> = (0..30)
+            .map(|_| (dec.dec_uint(13), dec.dec_icdf(&icdf, 5), dec.dec_bits(6)))
+            .collect();
+        assert_eq!(first, second, "rollback did not replay the same symbols");
     }
 
     #[test]
