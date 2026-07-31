@@ -75,6 +75,7 @@
 //! 3. **Invariants** (`proptest`): a limited LPC filter is always stable, a pitch lag is always
 //!    inside the legal per-rate range, and an NLSF index vector is always decodable.
 
+pub mod bitstream;
 pub mod fixed;
 pub mod float;
 pub mod frame;
