@@ -217,6 +217,130 @@ pub fn inverse32_var_q(b32: i32, q_result: i32) -> i32 {
     }
 }
 
+/// `silk_DIV32_varQ(a32, b32, Qres)` (`Inlines.h:97-140`) — `(a32 << Qres) / b32` to about 30 bits
+/// of precision, by the same normalise-invert-refine shape as [`inverse32_var_q`].
+///
+/// A zero denominator returns 0 instead of reproducing the C's `silk_assert`; the decode path only
+/// ever divides by a subframe gain, which RFC 6716 §4.2.7.4 bounds below by 81920.
+#[inline]
+#[must_use]
+pub fn div32_var_q(a32: i32, b32: i32, q_result: i32) -> i32 {
+    if b32 == 0 {
+        return 0;
+    }
+    // silk_CLZ32( silk_abs(a32) ) - 1 — `abs` of 0 is 0, whose CLZ is 32, so the head room is 31.
+    let a_head_room = (a32.unsigned_abs().leading_zeros() as i32) - 1;
+    let mut a32_normalized = ((a32 as u32) << a_head_room) as i32;
+    let b_head_room = (b32.unsigned_abs().leading_zeros() as i32) - 1;
+    let b32_normalized = ((b32 as u32) << b_head_room) as i32;
+
+    // Inverse of b32 with 14 bits of precision.
+    let b32_inverse = (i32::MAX >> 2) / (b32_normalized >> 16);
+    let mut result = smulwb(a32_normalized, b32_inverse);
+    // "It's OK to overflow because the final value of a32_nrm should always be small."
+    a32_normalized =
+        a32_normalized.wrapping_sub(((smmul(b32_normalized, result) as u32) << 3) as i32);
+    result = smlawb(result, a32_normalized, b32_inverse);
+
+    let left_shift = 29 + a_head_room - b_head_room - q_result;
+    if left_shift < 0 {
+        lshift_sat32(result, (-left_shift) as u32)
+    } else if left_shift < 32 {
+        result >> left_shift
+    } else {
+        // "Avoid undefined result" (Inlines.h:135-137).
+        0
+    }
+}
+
+/// `silk_SMULTT(a32, b32)` — `(a32 >> 16) * (b32 >> 16)` (`macros.h:80`), the product of the two
+/// *high* halves. Used by the CNG gain estimate on values too large for [`smulww`].
+#[inline]
+#[must_use]
+pub fn smultt(a32: i32, b32: i32) -> i32 {
+    (a32 >> 16).wrapping_mul(b32 >> 16)
+}
+
+/// `silk_SQRT_APPROX(x)` (`Inlines.h:71-94`) — square root to within ±10 % for outputs above 15 and
+/// ±2.5 % above 120. Exactly this approximation, not a real `sqrt`: the CNG gain it produces is
+/// audible state, so the error is part of the bitstream-defined behaviour.
+#[inline]
+#[must_use]
+pub fn sqrt_approx(x: i32) -> i32 {
+    if x <= 0 {
+        return 0;
+    }
+    // silk_CLZ_FRAC: leading zeros, plus the 7 bits immediately right of the leading one. The C's
+    // `silk_ROR32(in, 24 - lzeros)` is a rotate *right* whose count goes negative for small inputs;
+    // rotation is cyclic mod 32, so masking the two's-complement count reproduces both branches.
+    let leading_zeros = x.leading_zeros() as i32;
+    let fraction_q7 = x.rotate_right(((24 - leading_zeros) as u32) & 31) & 0x7F;
+
+    // sqrt(2) * 32768 = 46214 when the leading one sits at an even bit position.
+    let mut y = if leading_zeros & 1 != 0 { 32768 } else { 46214 };
+    y >>= leading_zeros >> 1;
+    smlawb(y, y, smulbb(213, fraction_q7))
+}
+
+/// `silk_ADD_LSHIFT32(a, b, shift)` (`SigProc_FIX.h:521`) — `a + (b << shift)`, wrapping.
+#[inline]
+#[must_use]
+pub fn add_lshift32(a: i32, b: i32, shift: u32) -> i32 {
+    a.wrapping_add(((b as u32) << shift) as i32)
+}
+
+/// `silk_SUB_LSHIFT32(a, b, shift)` (`SigProc_FIX.h:524`) — `a - (b << shift)`, wrapping.
+#[inline]
+#[must_use]
+pub fn sub_lshift32(a: i32, b: i32, shift: u32) -> i32 {
+    a.wrapping_sub(((b as u32) << shift) as i32)
+}
+
+/// `silk_sum_sqr_shift(energy, shift, x, len)` (`sum_sqr_shift.c:36-82`) — the sum of squares of an
+/// `i16` vector, right-shifted by however much it takes to fit an `i32` with two bits of head room.
+///
+/// Returns `(energy, shift)`. The two-pass shape is the C's: a first pass with the maximum shift
+/// `31 - CLZ(len)` establishes the magnitude, then a second pass redoes the sum with the tightest
+/// shift that keeps it in range. Two energies are only comparable after normalising to a common
+/// shift, which is what `silk_PLC_conceal` and `silk_PLC_glue_frames` do with the pair.
+#[must_use]
+pub fn sum_sqr_shift(x: &[i16]) -> (i32, i32) {
+    let len = x.len() as i32;
+    if len == 0 {
+        return (0, 0);
+    }
+    /// One pass of the C's pairwise accumulate: `nrg += (unsigned)(x[i]^2 + x[i+1]^2) >> shift`.
+    fn accumulate(x: &[i16], seed: i32, shift: i32) -> i32 {
+        let mut energy = seed;
+        let mut index = 0usize;
+        while index + 1 < x.len() {
+            let pair = smlabb(
+                smulbb(i32::from(x[index]), i32::from(x[index])),
+                i32::from(x[index + 1]),
+                i32::from(x[index + 1]),
+            );
+            energy = energy.wrapping_add(((pair as u32) >> shift) as i32);
+            index += 2;
+        }
+        if index < x.len() {
+            let single = smulbb(i32::from(x[index]), i32::from(x[index]));
+            energy = energy.wrapping_add(((single as u32) >> shift) as i32);
+        }
+        energy
+    }
+
+    let mut shift = 31 - (len.leading_zeros() as i32);
+    // "Let's be conservative with rounding and start with nrg=len."
+    let energy = accumulate(x, len, shift);
+    // "Make sure the result will fit in a 32-bit signed integer with two bits of headroom."
+    // `energy` is non-negative, so its leading-zero count is at least 1 and the second shift can
+    // exceed the first by at most 2. SILK only ever calls this with at most `MAX_FRAME_LENGTH`
+    // samples, where the first shift is at most 8, so the clamp is unreachable — it is there so a
+    // caller cannot turn an over-long slice into a shift-overflow panic.
+    shift = (shift + 3 - (energy.leading_zeros() as i32)).clamp(0, 31);
+    (accumulate(x, 0, shift), shift)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +616,224 @@ mod tests {
             let _ = smulbb(a, b);
             let _ = smlabb(a, b, c);
             let _ = log2lin(a);
+            let _ = smultt(a, b);
+            let _ = sqrt_approx(a);
+            let _ = add_lshift32(a, b, 3);
+            let _ = sub_lshift32(a, b, 3);
         }
+
+        /// `silk_DIV32_varQ` claims "a good approximation"; over the domain the decoder actually
+        /// uses — a ratio of two subframe gains, in Q16 — it must be within a few LSBs of the exact
+        /// quotient. This is what keeps the gain adjustment from drifting the filter state.
+        #[test]
+        fn div32_var_q_approximates_the_real_quotient(
+            numerator in 81_920i32..1_686_110_208,
+            denominator in 81_920i32..1_686_110_208,
+        ) {
+            let exact = ((i64::from(numerator) << 16) / i64::from(denominator)) as f64;
+            let approximate = f64::from(div32_var_q(numerator, denominator, 16));
+            // A 30-bit-precision reciprocal followed by one refinement: the relative error is well
+            // under 2^-24, and the absolute error never matters below one LSB.
+            prop_assert!(
+                (approximate - exact).abs() <= 1.0 + exact * 1e-6,
+                "div32_var_q({numerator}, {denominator}, 16) = {approximate}, exact {exact}"
+            );
+        }
+
+        /// `silk_SQRT_APPROX` is documented as accurate to ±10 % above 15 and ±2.5 % above 120.
+        #[test]
+        fn sqrt_approx_holds_its_documented_accuracy(x in 1i32..=i32::MAX) {
+            let exact = f64::from(x).sqrt();
+            let approximate = f64::from(sqrt_approx(x));
+            if approximate > 120.0 {
+                prop_assert!((approximate - exact).abs() <= 0.025 * exact + 1.0);
+            } else if approximate > 15.0 {
+                prop_assert!((approximate - exact).abs() <= 0.10 * exact + 1.0);
+            }
+        }
+
+        /// The energy `sum_sqr_shift` reports, scaled back by its shift, must be the real sum of
+        /// squares to within the rounding the shift itself introduces.
+        #[test]
+        fn sum_sqr_shift_reconstructs_the_energy(
+            samples in proptest::collection::vec(i16::MIN..=i16::MAX, 1..=320),
+        ) {
+            let (energy, shift) = sum_sqr_shift(&samples);
+            prop_assert!(energy >= 0, "energy must be non-negative");
+            prop_assert!((0..=31).contains(&shift));
+            let exact: i64 = samples.iter().map(|&x| i64::from(x) * i64::from(x)).sum();
+            let reported = i64::from(energy) << shift;
+            // Every pair is truncated once by the shift, so the deficit is bounded by the number of
+            // accumulation steps times the shift's granularity.
+            let slack = ((samples.len() as i64 / 2) + 1) << shift;
+            prop_assert!(
+                reported <= exact + slack && reported + slack >= exact,
+                "sum_sqr_shift = {reported} (energy {energy} << {shift}), exact {exact}"
+            );
+        }
+    }
+
+    /// Q16 identities that pin the scaling: 1.0/x, x/x, and x/1.0.
+    #[test]
+    fn div32_var_q_known_values() {
+        // Not exactly 65536: the reciprocal is a 14-bit estimate plus one Newton step, so the
+        // identity lands one LSB low. That inexactness is the specified behaviour — reproducing it
+        // is the point, since the decoder feeds the result straight into its filter state.
+        assert_eq!(div32_var_q(1 << 16, 1 << 16, 16), 65_535, "x / x ~ 1.0");
+        // 1.0 / 2.0 = 0.5 in Q16, to within the approximation's precision.
+        let half = div32_var_q(1 << 16, 2 << 16, 16);
+        assert!((half - (1 << 15)).abs() <= 1, "got {half}");
+        // A zero denominator cannot happen on the decode path; it must not panic or divide by zero.
+        assert_eq!(div32_var_q(12345, 0, 16), 0);
+    }
+
+    #[test]
+    fn sqrt_approx_known_values() {
+        assert_eq!(sqrt_approx(0), 0);
+        assert_eq!(sqrt_approx(-1), 0);
+        assert_eq!(sqrt_approx(1), 1);
+        // Exact powers of four are where the approximation is at its best.
+        for root in [16i32, 64, 256, 1024, 4096, 16384] {
+            let approximate = sqrt_approx(root * root);
+            assert!(
+                (approximate - root).abs() <= root / 40 + 1,
+                "sqrt_approx({}) = {approximate}, want ~{root}",
+                root * root
+            );
+        }
+    }
+
+    #[test]
+    fn smultt_multiplies_the_high_halves() {
+        assert_eq!(smultt(1 << 16, 1 << 16), 1);
+        assert_eq!(smultt(3 << 16, 5 << 16), 15);
+        // The low halves are discarded, not rounded.
+        assert_eq!(smultt(0x0001_FFFF, 0x0001_FFFF), 1);
+        assert_eq!(smultt(-1 << 16, 1 << 16), -1);
+    }
+
+    #[test]
+    fn shift_helpers_wrap_like_the_c_macros() {
+        assert_eq!(add_lshift32(10, 3, 2), 22);
+        assert_eq!(sub_lshift32(10, 3, 2), -2);
+        // `silk_LSHIFT` is a plain shift: overflow wraps rather than saturating.
+        assert_eq!(add_lshift32(0, i32::MAX, 1), -2);
+    }
+
+    /// All-zero input, and a single known vector computed by hand.
+    #[test]
+    fn sum_sqr_shift_known_values() {
+        let (energy, shift) = sum_sqr_shift(&[0i16; 16]);
+        assert_eq!((energy, shift), (0, 0));
+        // Four samples of 100: 4 * 10_000 = 40_000, small enough that no shift is needed.
+        let (energy, shift) = sum_sqr_shift(&[100i16; 4]);
+        assert_eq!(shift, 0);
+        assert_eq!(energy, 40_000);
+        // Full-scale samples force a shift so the sum still fits with two bits of head room.
+        let (energy, shift) = sum_sqr_shift(&[i16::MIN; 320]);
+        assert!(shift > 0, "full-scale energy must be shifted down");
+        assert!(energy >= 0);
+        assert_eq!(i64::from(energy) << shift, 320 * (1i64 << 30));
+    }
+
+    #[test]
+    fn sum_sqr_shift_of_an_empty_slice_is_zero() {
+        assert_eq!(sum_sqr_shift(&[]), (0, 0));
+    }
+
+    /// Known answers taken from libopus itself (`silk/Inlines.h`, `silk/sum_sqr_shift.c`, built and
+    /// run over these exact inputs). These are approximations whose *error* is part of the decoded
+    /// signal, so "close enough" is not a passing grade — every value below is bit-exact.
+    #[test]
+    fn div32_var_q_matches_libopus() {
+        for (numerator, denominator, q_result, expected) in [
+            (65_536i32, 65_536i32, 16i32, 65_535i32),
+            (65_536, 131_072, 16, 32_767),
+            (81_920, 1_686_110_208, 16, 3),
+            (1_686_110_208, 81_920, 16, 1_348_888_166),
+            (100_000, 3, 16, 2_147_483_644),
+            (-100_000, 7, 16, -936_228_572),
+            (123_456_789, 987_654, 16, 8_192_002),
+            (1, 1_686_110_208, 16, 0),
+        ] {
+            assert_eq!(
+                div32_var_q(numerator, denominator, q_result),
+                expected,
+                "DIV32_varQ({numerator}, {denominator}, {q_result})"
+            );
+        }
+    }
+
+    #[test]
+    fn sqrt_approx_matches_libopus() {
+        for (input, expected) in [
+            (0i32, 0i32),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (15, 2),
+            (16, 4),
+            (100, 9),
+            (255, 15),
+            (256, 16),
+            (1_000, 30),
+            (65_535, 254),
+            (65_536, 256),
+            (1_000_000, 994),
+            (16_777_216, 4_096),
+            (1_073_741_824, 32_768),
+            (2_147_483_647, 46_293),
+            (12_345_678, 3_451),
+        ] {
+            assert_eq!(sqrt_approx(input), expected, "SQRT_APPROX({input})");
+        }
+    }
+
+    #[test]
+    fn inverse32_var_q_matches_libopus_at_the_gain_scaling_q() {
+        // Q47 is what `silk_decode_core` asks for when it inverts a subframe gain.
+        for (input, expected) in [
+            (65_536i32, 2_147_483_646i32),
+            (81_920, 1_717_986_918),
+            (1_686_110_208, 83_468),
+            (1_000, 2_147_483_520),
+            (7, 2_147_467_264),
+        ] {
+            assert_eq!(
+                inverse32_var_q(input, 47),
+                expected,
+                "INVERSE32_varQ({input})"
+            );
+        }
+    }
+
+    #[test]
+    fn sum_sqr_shift_matches_libopus() {
+        // The same deterministic LCG vector the C probe used.
+        let mut seed: u32 = 12_345;
+        let samples: Vec<i16> = (0..320)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as i16
+            })
+            .collect();
+        for (length, energy, shift) in [
+            (1usize, 127_690_000i32, 0i32),
+            (2, 323_309_200, 1),
+            (4, 386_149_102, 1),
+            (8, 469_159_388, 2),
+            (16, 380_730_900, 4),
+            (32, 390_917_774, 5),
+            (64, 388_155_464, 6),
+            (128, 373_117_878, 7),
+            (256, 364_014_984, 8),
+        ] {
+            assert_eq!(
+                sum_sqr_shift(&samples[..length]),
+                (energy, shift),
+                "sum_sqr_shift over {length} samples"
+            );
+        }
+        assert_eq!(sum_sqr_shift(&[i16::MIN; 320]), (335_544_320, 10));
     }
 }

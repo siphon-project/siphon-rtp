@@ -49,28 +49,29 @@
 //! | NLSF → Q12 LPC, stability limiting (§4.2.7.5.8) ([`lpc`]) | **landed** |
 //! | Pitch lags, LTP filter, LTP scaling (§4.2.7.6) ([`ltp`]) | **landed** |
 //! | LCG seed + excitation / shell coder (§4.2.7.7-8) ([`excitation`]) | **landed** |
-//! | LTP + LPC synthesis, stereo unmixing, resampling (§4.2.7.9, §4.2.8-9) | pending |
-//! | DTX / CNG and PLC (§4.4) | pending |
+//! | Per-frame decoder control + LTP/LPC synthesis (§4.2.7.9) ([`synthesis`]) | **landed** |
+//! | Stereo unmixing (§4.2.8) ([`stereo_unmix`]) | **landed** |
+//! | Internal-rate to API-rate resampling (§4.2.9) ([`resampler`]) | **landed** |
+//! | Packet-loss concealment (§4.4) ([`plc`]) | **landed** |
+//! | DTX / comfort noise (§4.4) ([`cng`]) | **landed** |
+//! | Frame integrator, all durations and both channels ([`frame`]) | **landed** |
 //!
 //! Nothing above is stubbed: a sub-phase is either fully implemented and tested, or it has no module
-//! and no function at all. There is deliberately no `decode_frame` entry point yet — one cannot exist
-//! before the excitation and synthesis phases do, and a version that returned silence would read as
-//! working.
+//! and no function at all.
 //!
-//! # Seams the remaining sub-phases build against
+//! # Using it
 //!
-//! The per-frame side info is **not** modelled as one shared mutable bag (the C's
-//! `SideInfoIndices`). Each sub-phase instead exposes a free function over
-//! [`super::range_coder::RangeDecoder`] that returns its own owned index/parameter struct, and the
-//! integrator calls them in Table 5 order. That keeps every phase independently testable against a
-//! libopus dump, and makes the bitstream order explicit at one call site instead of implicit in a
-//! struct's field order.
-//!
-//! What exists today, in the order a frame is read — this is the call sequence the remaining phases
-//! extend, not replace:
+//! Two call shapes, and both are legitimate:
 //!
 //! ```text
 //! decoder.configure(channels, InternalRate::from_bandwidth(toc.bandwidth()), duration_ms)
+//! decoder.decode(Some(&mut range), LossFlag::Normal, &mut pcm)   // -> samples per channel
+//! ```
+//!
+//! is the whole layer for one Opus frame ([`frame`]). Driving it stage by stage is also supported —
+//! that is how the intermediate-state harnesses check one field group at a time:
+//!
+//! ```text
 //! decoder.decode_lp_layer_header(range)                     // §4.2.3-4, once per Opus frame
 //!   per 20 ms SILK frame, mid channel then side:
 //!     stereo_pred::decode_stereo_weights(range)             // §4.2.7.1, stereo + mid channel only
@@ -82,10 +83,22 @@
 //!     ltp::dequantize(&indices, rate)                        // -> LtpParameters
 //!     excitation::decode_seed(range)                         // §4.2.7.7
 //!     excitation::decode(range, signal_type, quant_offset, frame_length, seed, ..) // §4.2.7.8
-//!     ── everything below is pending ──
+//!     synthesis::decode_core(channel, control, ..)           // §4.2.7.9
+//!     plc::run / cng::run / plc::glue_frames                 // §4.4
+//!     stereo_unmix::mid_side_to_left_right(..)               // §4.2.8
+//!     channel.resampler.process(out, &pcm[1..])              // §4.2.9
 //! ```
 //!
-//! Two conventions that are easy to get wrong and are already settled here:
+//! The per-frame side info is **not** modelled as one shared mutable bag (the C's
+//! `SideInfoIndices`). Each sub-phase instead exposes a free function over
+//! [`super::range_coder::RangeDecoder`] that returns its own owned index/parameter struct, and the
+//! integrator calls them in Table 5 order. That keeps every phase independently testable against a
+//! libopus dump, and makes the bitstream order explicit at one call site instead of implicit in a
+//! struct's field order. The one aggregate that *is* shared is
+//! [`synthesis::DecoderControl`] (the C's `silk_decoder_control`), because synthesis, PLC and CNG all
+//! read it and two of them write back to it.
+//!
+//! Two conventions that are easy to get wrong and are settled here:
 //!
 //! * **`cond_coding` is derived, never decoded.** Use [`decoder::ChannelState::cond_coding`] — it
 //!   ports the `dec_API.c:342-354` decision table, including the
@@ -96,7 +109,7 @@
 //!   factor is 4 for a two-subframe frame (`decode_indices.c:97`). Never read the symbol "just in
 //!   case" — every one of those costs bits and desynchronises the rest of the frame.
 //!
-//! Concretely, the pending phases are expected to add:
+//! Per-stage notes worth keeping in view when reading the integrator:
 //!
 //! * **NLSF (§4.2.7.5)** — landed as [`decoder::SilkDecoder::decode_nlsf`], returning
 //!   [`nlsf::LpcCoefficients`] (both Q12 LPC halves, the Q15 NLSFs and the interpolation factor).
@@ -123,58 +136,75 @@
 //!   `silk_uniform4_iCDF`) read immediately before the excitation, not cross-frame state — there is
 //!   deliberately no seed field on [`decoder::ChannelState`], because on the normal decode path the
 //!   generator is re-seeded every frame. The only PRNG seeds that *do* cross frames belong to PLC and
-//!   CNG (`silk_PLC_struct.rand_seed`, `silk_CNG_struct.rand_seed`), and they land with §4.4.
-//! * **Synthesis (§4.2.7.9, §4.2.8-9)** — consumes the subframe gains, the LPC/LTP coefficients and
-//!   [`decoder::ChannelState::out_buf`] / [`decoder::ChannelState::lpc_state_q14`] /
-//!   [`decoder::ChannelState::prev_gain_q16`], and the stereo weights against
-//!   [`decoder::StereoState`]. This is the phase that ports the C's `silk_decoder_control`
-//!   (`structs.h:342-350`) as its per-frame input aggregate; it is deliberately absent here rather
-//!   than present with four of its five fields always zero. The short-term filter half of that
-//!   aggregate already exists: [`nlsf::LpcCoefficients`] carries `PredCoef_Q12[0]` and
-//!   `PredCoef_Q12[1]`, and it is synthesis' job to clear
+//!   CNG ([`plc::PlcState::rand_seed`], [`cng::CngState::rand_seed`]).
+//! * **Synthesis (§4.2.7.9)** — [`synthesis::decode_core`] consumes the subframe gains, the LPC/LTP
+//!   coefficients and [`decoder::ChannelState::out_buf`] / [`decoder::ChannelState::lpc_state_q14`] /
+//!   [`decoder::ChannelState::prev_gain_q16`]. It is also what clears
 //!   [`decoder::ChannelState::first_frame_after_reset`] once a frame has decoded without error
 //!   (`decode_frame.c:130`) — the NLSF phase reads that flag but must not clear it.
+//! * **Stereo and resampling (§4.2.8-9)** — [`stereo_unmix::mid_side_to_left_right`] against
+//!   [`decoder::StereoState`], then [`resampler::Resampler`] per channel. Both carry a **one-sample
+//!   delay**: the unmixer's low-passed mid needs one sample of look-ahead, so the resampler is fed
+//!   from index 1 of a `frame_length + 2` buffer, and a mono stream pays the same delay through
+//!   [`stereo_unmix::buffer_mono`] so a mid-stream mono/stereo switch does not click.
 //!
 //! # Conformance
 //!
-//! The acceptance criterion is the same two-part oracle the CELT layer uses: exact per-packet
-//! range-coder `final_range` equality against the value libopus stored with the packet, then the
-//! RFC 6716 §6 `opus_compare` tolerance metric against libopus' own decode. Neither can run until a
-//! whole SILK frame decodes — both need the decoder to consume the packet to its end.
+//! The acceptance gate is `tests/silk_only_conformance.rs`: 64 SILK-only streams
+//! (`reference/opus/gen_silk_only.sh` — both source signals, NB/MB/WB, 10/20/40/60 ms, mono and
+//! stereo, LBRR-bearing) decoded end to end and compared with libopus' own decode **sample for
+//! sample**, then through the RFC 6716 §6 `opus_compare` metric. Bit-exactness is the real bar: this
+//! port is integer-faithful to the reference fixed-point arithmetic all the way through the
+//! resampler, so anything less than an exact match is a bug, not a rounding difference.
 //!
-//! Until then, each sub-phase is diffed field by field against printf dumps from an **instrumented**
-//! libopus build over `reference/opus/silk_only` (64 SILK-only streams generated by
-//! `reference/opus/gen_silk_only.sh`, with `.trace` dumps from `reference/opus/dump_silk_trace.sh`;
-//! recipe in CONTRIBUTING.md):
+//! Whole-packet `final_range` is deliberately **not** checked there. For a SILK-only packet with
+//! spare bits libopus reads a redundancy flag and a CELT redundancy frame after the SILK layer and
+//! folds that into the value it reports (`opus_decoder.c:452-480`); that belongs to the top-level
+//! decoder. The equivalent check at this layer's own resolution lives in
+//! `tests/silk_excitation_conformance.rs`, which pins the range coder's `rng` and bit position at the
+//! end of **every** SILK frame of every packet.
+//!
+//! Each sub-phase additionally has an intermediate-state oracle — printf dumps from an
+//! **instrumented** libopus build over the same 64 streams (`reference/opus/dump_silk_trace.sh`;
+//! recipe in CONTRIBUTING.md), diffed field by field:
 //!
 //! * `tests/silk_header_conformance.rs` — the LP layer through the subframe gains (§4.2.3-§4.2.7.4).
-//! * `tests/silk_excitation_conformance.rs` — the LTP and excitation stages (§4.2.7.6-8), for **every
-//!   SILK frame of every packet**, including LBRR frames. It gets past the not-yet-ported NLSF stage
-//!   by replaying the `(fl, fh)` of each NLSF symbol the dump records through the range decoder,
-//!   which is state-equivalent to `ec_dec_icdf`; everything else is decoded for real. Because a SILK
-//!   frame's bitstream ends at `silk_decode_pulses`, it can also assert the range coder's `rng` and
-//!   bit position at the end of each frame — this layer's own `final_range` check, at finer
-//!   resolution than the whole-packet one.
-//!
 //! * `tests/silk_nlsf_conformance.rs` — the NLSF stage (§4.2.7.5): the coded indices, the dequantized
 //!   residual with its unpacked prediction weights and entropy-table selection, the reconstruction
 //!   *before* and *after* stabilisation, the interpolated vector, and both Q12 LPC coefficient sets.
+//! * `tests/silk_excitation_conformance.rs` — the LTP and excitation stages (§4.2.7.6-8), for every
+//!   SILK frame of every packet, including LBRR frames, plus the per-frame range-coder state above.
 //!
 //! Extending this for a new sub-phase is two steps: add the field group to
 //! `reference/opus/silk_trace.patch` (it is one shared patch — **extend it, never replace it**, and
 //! rebuild `build-trace` from the union), and decode one more symbol group per frame in the harness.
 //! A harness must ignore field groups it does not own, or each new stage breaks its siblings the next
-//! time the dumps are regenerated. Treat these as the working diagnostic and the two whole-packet
-//! gates as the acceptance criterion — an intermediate-state diff proves the fields match, not that
-//! the packet parses to its end.
+//! time the dumps are regenerated. Treat these as the working diagnostic and the end-to-end gate as
+//! the acceptance criterion — an intermediate-state diff proves the fields match, not that the packet
+//! decodes to the right audio.
 //!
 //! The tables have their own oracle, `tests/silk_nlsf_tables_vs_libopus.rs`, which re-parses the
 //! libopus source and compares every ported NLSF codebook entry element by element.
+//!
+//! # Performance
+//!
+//! Whole-frame decode is benched in `benches/codec_bench.rs` (`silk_frame`), with the components
+//! broken out separately (`silk_synthesis`, `silk_excitation`) so a regression names itself. On a
+//! Ryzen AI 9 HX 370 one 20 ms wideband frame decodes to 48 kHz stereo in ~12 µs mono / ~17 µs
+//! stereo — under 0.1 % of the frame's own duration.
+//!
+//! **Zero heap allocation per frame** is an invariant, not an aspiration: every buffer is either
+//! caller-owned or a fixed-size array on [`decoder::SilkDecoder`] / [`decoder::ChannelState`],
+//! including the resampler's batch scratch (the one place the C uses a `VARDECL` whose size depends
+//! on the rate pair). `tests/silk_frame_zero_alloc.rs` and `tests/silk_excitation_zero_alloc.rs`
+//! assert it with a counting allocator across the whole decode path.
 
+pub mod cng;
 pub mod decoder;
 pub mod enc;
 pub mod excitation;
 pub mod fixed;
+pub mod frame;
 pub mod frame_type;
 pub mod gains;
 pub mod header;
@@ -182,6 +212,10 @@ pub mod lpc;
 pub mod ltp;
 pub mod nlsf;
 pub mod nlsf_tables;
+pub mod plc;
+pub mod resampler;
 pub mod stereo_pred;
+pub mod stereo_unmix;
+pub mod synthesis;
 pub mod tables;
 pub mod types;

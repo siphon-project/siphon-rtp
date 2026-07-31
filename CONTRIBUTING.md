@@ -86,8 +86,10 @@ cmake -S reference/opus/opus-1.5.2 -B reference/opus/build \
 cmake --build reference/opus/build -j
 sh reference/opus/gen_celt_only.sh          # writes reference/opus/celt_only/*.bit + *.dec
 sh reference/opus/gen_silk_only.sh          # writes reference/opus/silk_only/*.bit + *.dec
+sh reference/opus/gen_silk_plc.sh           # adds reference/opus/silk_only/*.plcdec + plc.loss
 SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
-    cargo test -p siphon-rtp-codec --test celt_only_conformance --test opus_conformance
+    cargo test -p siphon-rtp-codec --test celt_only_conformance --test silk_only_conformance \
+                                   --test silk_plc_conformance --test opus_conformance
 ```
 
 `gen_celt_only.sh` writes two directories: `celt_only/` (mono) and `celt_only_stereo/`. They are kept
@@ -104,6 +106,28 @@ both channels are compared instead of a downmix.
 `gen_silk_only.sh` uses `opus_demo -e voip` at a low bitrate with the bandwidth capped at NB/MB/WB,
 which keeps the encoder in `MODE_SILK_ONLY`. Neither is taken on trust: both harnesses assert
 `toc.mode()` per packet and fail loudly if libopus ever slipped a frame of the other mode in.
+
+`gen_silk_plc.sh` re-decodes the same SILK-only streams with `opus_demo -lossfile`, against a fixed
+loss pattern, so `silk_plc_conformance` has an oracle for RFC 6716 §4.4. Concealment and comfort
+noise are the only SILK stages that leave **no** trace in the range coder, so nothing else in the
+suite can tell a real concealer from one that returns silence.
+
+#### The SILK layer's own gates
+
+`silk_only_conformance` decodes every SILK-only stream end to end and compares against libopus'
+`.dec` **sample for sample** before running `opus_compare`. Bit-exactness is the real bar there: the
+SILK port is integer-faithful to the reference fixed-point arithmetic all the way through the
+resampler, so a rounding difference is a bug, not a tolerance. Two things it does not do, both
+deliberate:
+
+- **It does not check whole-packet `final_range`.** For a SILK-only packet with 17 or more spare bits
+  libopus reads a redundancy flag and a CELT redundancy frame *after* the SILK layer and folds both
+  into the reported range and into the last 2.5 ms of the output (`opus_decoder.c:452-480`). That is
+  the top-level decoder's behaviour. The equivalent exact check at this layer's resolution is the
+  per-frame `rng`/`tell` assertion in `silk_excitation_conformance`.
+- **It excludes those redundancy-bearing packets from the PCM comparison**, on both sides, and
+  reports how many (16 of ~75 000). They are not fudged and not silently tolerated — they are simply
+  not this layer's output.
 
 `SIPHON_RTP_OPUS_COMPARE` defaults to `/tmp/opus_compare`. Set it explicitly when working in a git
 worktree — `reference/` is untracked, so a fresh worktree has no oracle of its own and should point at
@@ -195,17 +219,18 @@ What the dump carries, by group:
 | Line | Source | Consumed by |
 |---|---|---|
 | `HDR`, `LBRRFLAGS`, `STEREO`, `MIDONLY`, `TYPE`, `GAINIDX`, `GAINS` | `dec_API.c`, `decode_indices.c`, `gain_quant.c` | `silk_header_conformance` |
-| `NLSFSYM` — the `(fl, fh)` of every normalized-LSF symbol | `decode_indices.c` | `silk_excitation_conformance` |
+| `NLSFIDX`, `NLSFRES`, `NLSFPRE`, `NLSFPOST`, `NLSFINT`, `LPC` — the NLSF stage end to end (§4.2.7.5) | `decode_indices.c`, `NLSF_decode.c`, `decode_parameters.c` | `silk_nlsf_conformance` |
+| `NLSFSYM` — the `(fl, fh)` of every normalized-LSF symbol | `decode_indices.c` | *nothing, since the NLSF stage landed* |
 | `PITCH`, `SEED` — LTP indices (§4.2.7.6) and the LCG seed (§4.2.7.7) | `decode_indices.c` | `silk_excitation_conformance` |
 | `PULSES`, `RC` — rate level, per-shell-block counts and LSB shifts, the pulse signal's checksum, and the range-coder `rng`/`tell` at the end of the frame | `decode_pulses.c` | `silk_excitation_conformance` |
 | `EXC` — the reconstructed Q14 excitation (§4.2.7.8.6), checksummed | `decode_core.c` | `silk_excitation_conformance` |
 
-`NLSFSYM` is what lets a half-finished decoder still consume a whole packet. A SILK frame's bitstream is
-exactly `silk_decode_indices` followed by `silk_decode_pulses`, and everything in that span is ported
-except the NLSF indices; replaying the recorded `(fl, fh)` pairs through the range decoder's
-`decode`/`dec_update` is *state-equivalent* to `ec_dec_icdf` at `ftb = 8`, so the decoder lands on the
-right bit for the LTP stage without owning a single NLSF table. Every other symbol is decoded for real.
-Delete the `NLSFSYM` replay from the harness once the NLSF phase lands.
+`NLSFSYM` was what let a half-finished decoder consume a whole packet: replaying the recorded
+`(fl, fh)` pairs through the range decoder's `decode`/`dec_update` is *state-equivalent* to
+`ec_dec_icdf` at `ftb = 8`, so `silk_excitation_conformance` could reach the LTP stage before the NLSF
+tables existed. The NLSF stage has landed and that replay is gone — the harness decodes those symbols
+for real. The group stays in the patch because **removing** a field group breaks every sibling harness
+the next time the dumps are regenerated; the harnesses ignore groups they do not own.
 
 `RC` deserves a note: it is this layer's own `final_range` check, at **per-frame** rather than
 per-packet resolution. Whole-packet `final_range` is not usable here — for a SILK-only packet with
@@ -220,9 +245,11 @@ skip rather than a green run. `silk_nlsf_conformance` additionally requires that
 interpolation path, the stage-2 saturation extension symbol, frames the stabiliser actually modified,
 and both codebook orders — a decode that never took a branch has not tested it.
 
-Delete `reference/opus/build-trace` once the layer is finished and the `final_range` + `opus_compare`
-gates cover it, and prefer those: an intermediate-state diff proves the fields match, not that the whole
-packet parses.
+Prefer the end-to-end gates now that they exist — `silk_only_conformance` and
+`silk_plc_conformance` both compare *decoded audio*, which an intermediate-state diff cannot: matching
+fields do not prove the packet parses to its end, and nothing in the trace can see the synthesis
+filters, the stereo unmixing, the resampler or §4.4 concealment at all. Keep `build-trace` around only
+while a stage is being written; it is a diagnostic, not a gate.
 
 #### Validating the SILK **encoder**'s analysis front end
 
