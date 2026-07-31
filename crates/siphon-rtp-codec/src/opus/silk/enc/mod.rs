@@ -71,6 +71,7 @@
 pub mod fixed;
 pub mod float;
 pub mod lpc_analysis;
+pub mod nlsf_quant;
 pub mod pitch;
 
 /// `MAX_SHAPE_LPC_ORDER` (`define.h:155`) — the largest noise-shaping AR order, at complexity 10.

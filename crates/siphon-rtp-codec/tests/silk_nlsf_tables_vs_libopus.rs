@@ -1,7 +1,8 @@
 //! Byte-for-byte diff of the ported SILK NLSF tables against the libopus C they came from.
 //!
 //! The NLSF codebooks are the largest tables in the codec — 832 stage-1 codebook entries, 832
-//! weights, 416 stage-2 select bytes, two 72-entry stage-2 PDF banks, and a 129-point cosine table.
+//! weights, 416 stage-2 select bytes, two 72-entry stage-2 PDF banks, two matching 72-entry
+//! encoder-side rate banks, and a 129-point cosine table.
 //! A single mistyped byte in an entropy table silently desynchronises the range decoder; a mistyped
 //! byte in a codebook vector detunes the LPC filter with no decode error at all. Spot-checking a
 //! handful of "known entries" would not find either, so this test compares **every element**
@@ -20,9 +21,9 @@ use std::path::{Path, PathBuf};
 
 use siphon_rtp_codec::opus::silk::nlsf_tables::{
     LSF_COS_TAB_Q12, NB_MB_CB1_ICDF, NB_MB_CB1_Q8, NB_MB_CB1_WEIGHT_Q9, NB_MB_CB2_ICDF,
-    NB_MB_CB2_SELECT, NB_MB_DELTA_MIN_Q15, NB_MB_PREDICTION_Q8, NLSF_EXT_ICDF,
+    NB_MB_CB2_RATES_Q5, NB_MB_CB2_SELECT, NB_MB_DELTA_MIN_Q15, NB_MB_PREDICTION_Q8, NLSF_EXT_ICDF,
     NLSF_INTERPOLATION_FACTOR_ICDF, WB_CB1_ICDF, WB_CB1_Q8, WB_CB1_WEIGHT_Q9, WB_CB2_ICDF,
-    WB_CB2_SELECT, WB_DELTA_MIN_Q15, WB_PREDICTION_Q8,
+    WB_CB2_RATES_Q5, WB_CB2_SELECT, WB_DELTA_MIN_Q15, WB_PREDICTION_Q8,
 };
 
 /// `reference/opus/opus-1.5.2/silk`, if the libopus source has been unpacked.
@@ -171,6 +172,13 @@ fn silk_nlsf_tables_match_libopus_byte_for_byte() {
     compared += NB_MB_CB2_ICDF.len();
     compare(
         &mut failures,
+        "silk_NLSF_CB2_BITS_NB_MB_Q5",
+        &nb_mb,
+        &NB_MB_CB2_RATES_Q5,
+    );
+    compared += NB_MB_CB2_RATES_Q5.len();
+    compare(
+        &mut failures,
         "silk_NLSF_PRED_NB_MB_Q8",
         &nb_mb,
         &NB_MB_PREDICTION_Q8,
@@ -204,6 +212,13 @@ fn silk_nlsf_tables_match_libopus_byte_for_byte() {
     compared += WB_CB2_SELECT.len();
     compare(&mut failures, "silk_NLSF_CB2_iCDF_WB", &wb, &WB_CB2_ICDF);
     compared += WB_CB2_ICDF.len();
+    compare(
+        &mut failures,
+        "silk_NLSF_CB2_BITS_WB_Q5",
+        &wb,
+        &WB_CB2_RATES_Q5,
+    );
+    compared += WB_CB2_RATES_Q5.len();
     compare(
         &mut failures,
         "silk_NLSF_PRED_WB_Q8",
@@ -242,10 +257,11 @@ fn silk_nlsf_tables_match_libopus_byte_for_byte() {
         "silk NLSF tables differ from libopus:\n  {}",
         failures.join("\n  ")
     );
-    // Non-vacuous: the parser must actually have read every table.
+    // Non-vacuous: the parser must actually have read every table. 2569 decoder-side entries plus
+    // the two 72-entry encoder-only `ec_Rates_Q5` banks.
     assert_eq!(
-        compared, 2569,
-        "expected 2569 table entries to be compared; the parser missed some"
+        compared, 2713,
+        "expected 2713 table entries to be compared; the parser missed some"
     );
 }
 
