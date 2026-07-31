@@ -632,6 +632,9 @@ where
                 load_permille: cluster::load_permille(sessions, max_sessions, cpu_permille),
                 cpu_permille,
                 draining: cluster.is_draining(),
+                ws_tees: gauge_engine.ws_tee_count() as u64,
+                ws_tee_frames_sent: gauge_engine.ws_tee_frames_sent(),
+                ws_tee_frames_dropped: gauge_engine.ws_tee_frames_dropped(),
             }
         };
         tokio::spawn(metrics::serve_metrics(metrics_listener, metrics, live));

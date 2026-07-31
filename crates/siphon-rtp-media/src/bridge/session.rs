@@ -1,24 +1,21 @@
-//! The bridge session: a synchronous, deterministic pump between a [`MediaLeg`] and the WS
-//! message stream. The async transport (tokio-tungstenite) drives it; keeping the state machine
-//! sync makes the audio logic — uplink, downlink playout, barge-in flush — unit-testable without
-//! sockets or a wall clock (the driver's tick cadence is the logical sample-tick clock).
+//! The bridge session: **takeover mode's** RTP shell around the PCM core.
 //!
-//! - **Uplink** (call → server): RTP in → [`MediaLeg`] jitter/decode → L16 → WS binary frame.
-//! - **Downlink** (server → call): WS binary frame → L16 → PCM enqueued → one frame/tick →
+//! In takeover mode the WS server *is* leg A's far side, so the session owns a [`MediaLeg`] and the
+//! RTP boundary sits here: leg A's inbound RTP is jitter-buffered and decoded into the
+//! [`BridgeCore`]'s uplink, and the core's downlink playout frame is encoded back into an RTP packet
+//! for the call. Everything that is not RTP — uplink cleaning, VAD/barge-in, the playout queue, the
+//! WS control protocol — lives in [`BridgeCore`], so a **teed** call (whose media pipeline has
+//! already decoded the frame) reuses the identical audio logic without a second jitter buffer.
+//!
+//! - **Uplink** (call → server): RTP in → [`MediaLeg`] jitter/decode → [`BridgeCore`] → L16 WS frame.
+//! - **Downlink** (server → call): WS binary frame → [`BridgeCore`] playout → one frame/tick →
 //!   [`MediaLeg`] encode → RTP to the call.
-//! - **Barge-in**: `clear` drops the queued playout within one tick.
+//! - **Barge-in**: `clear` (or the local VAD) drops the queued playout within one tick.
 
-use std::collections::VecDeque;
-
-use crate::bridge::protocol::{
-    ControlMessage, Direction, ErrorData, MarkData, MediaFormat, PlaySource, SpeechData, StartData,
-};
-use crate::bridge::{l16_le_to_pcm, pcm_to_l16_le};
+use crate::bridge::audio::{BridgeCore, MAX_FRAME_SAMPLES};
+use crate::bridge::protocol::{ControlMessage, Direction, MediaFormat};
 use crate::leg::{MediaLeg, PcmFrame};
-use siphon_rtp_dsp::{EchoCanceller, EnergyVad, NoiseSuppressor};
-
-/// Largest frame the scratch PCM buffer holds (48 kHz × 20 ms).
-const MAX_FRAME_SAMPLES: usize = 960;
+use siphon_rtp_dsp::EchoCanceller;
 
 /// What one [`BridgeSession::tick`] produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,41 +26,10 @@ pub struct TickResult {
     pub downlink_bytes: usize,
 }
 
-/// A bidirectional WS↔leg bridge session for one call leg.
+/// A bidirectional WS↔leg bridge session for one call leg (takeover mode).
 pub struct BridgeSession {
     leg: MediaLeg,
-    format: MediaFormat,
-    stream_id: String,
-    call_id: String,
-    direction: Direction,
-    /// Downlink PCM frames awaiting render to the call (drop-oldest bounded).
-    playout: VecDeque<Vec<i16>>,
-    playout_cap: usize,
-    stopped: bool,
-    /// Single-channel noise suppression on the uplink (call → server) audio, so the voice-AI receives
-    /// cleaned speech. `Some` only when requested *and* the uplink rate is 8/16 kHz (see
-    /// [`BridgeSession::with_noise_suppression`]); introduces the suppressor's WOLA latency on uplink.
-    noise_suppressor: Option<NoiseSuppressor>,
-    /// Local energy VAD on the uplink, driving `speech_started`/`speech_stopped` turn signals (and
-    /// barge-in when `barge_in`). `Some` only when requested (see [`BridgeSession::with_vad`]).
-    vad: Option<EnergyVad>,
-    /// When `vad` fires a speech-start edge, flush the queued downlink playout in the same tick — a
-    /// local barge-in that skips the server round-trip. No effect unless `vad` is set.
-    barge_in: bool,
-    /// Latched VAD state, so `tick` emits a turn signal only on an edge (silence↔speech transition).
-    speaking: bool,
-    /// Tick-originated control messages awaiting the socket (turn signals). Populated on VAD edges
-    /// only, so the steady-state per-frame path never touches (or allocates) it; drained by the
-    /// transport via [`BridgeSession::next_control`].
-    pending_control: Vec<ControlMessage>,
-    /// Optional acoustic echo canceller for the **uplink** (call → server) PCM (the `echo_cancellation`
-    /// profile flag). Its far-end **reference** is the *downlink* frame played toward the call this
-    /// tick (server → call), so the phone's echo of the voice-AI audio is cancelled off the uplink
-    /// before the server hears it — otherwise the model would transcribe its own reflected speech.
-    /// Built at the leg's native rate (decode == encode rate on a bridge leg, so uplink and downlink
-    /// share it); `None` when the leg was stood up without the flag or its rate is unsupported.
-    /// Preallocated ⇒ its per-frame `cancel` does zero heap allocation.
-    echo_canceller: Option<EchoCanceller>,
+    core: BridgeCore,
 }
 
 impl BridgeSession {
@@ -79,92 +45,53 @@ impl BridgeSession {
     ) -> Self {
         Self {
             leg,
-            format,
-            stream_id: stream_id.into(),
-            call_id: call_id.into(),
-            direction,
-            playout: VecDeque::new(),
-            playout_cap: playout_cap.max(1),
-            stopped: false,
-            noise_suppressor: None,
-            vad: None,
-            barge_in: false,
-            speaking: false,
-            pending_control: Vec::new(),
-            echo_canceller: None,
+            core: BridgeCore::new(format, stream_id, call_id, direction, playout_cap),
         }
     }
 
-    /// Enable single-channel noise suppression on the uplink audio (call → voice-AI server). Built
-    /// from the advertised uplink sample rate; a no-op unless `enabled` is set *and* that rate is
-    /// 8 or 16 kHz (the suppressor's supported rates — e.g. a 48 kHz Opus leg leaves it off).
+    /// Enable single-channel noise suppression on the uplink audio — see
+    /// [`BridgeCore::with_noise_suppression`].
     #[must_use]
     pub fn with_noise_suppression(mut self, enabled: bool) -> Self {
-        self.noise_suppressor = enabled
-            .then(|| NoiseSuppressor::new(self.format.sample_rate).ok())
-            .flatten();
+        self.core = self.core.with_noise_suppression(enabled);
         self
     }
 
-    /// Enable local energy-VAD turn-taking on the uplink. Each tick the raw (pre-noise-suppression)
-    /// decoded frame is classified; on a silence→speech edge the session emits `speech_started` (and,
-    /// when `barge_in`, flushes the downlink playout in that same tick — no server round-trip), and on
-    /// the speech→silence edge past `hangover_frames` it emits `speech_stopped` (the turn endpoint).
-    /// `threshold` is the mean-square energy for speech; `hangover_frames` is the trailing hold in
-    /// ptime frames (see [`EnergyVad`]). Turn signals are drained via [`BridgeSession::next_control`].
+    /// Enable local energy-VAD turn-taking (and optional barge-in) on the uplink — see
+    /// [`BridgeCore::with_vad`].
     #[must_use]
     pub fn with_vad(mut self, threshold: i64, hangover_frames: u32, barge_in: bool) -> Self {
-        self.vad = Some(EnergyVad::new(threshold, hangover_frames));
-        self.barge_in = barge_in;
+        self.core = self.core.with_vad(threshold, hangover_frames, barge_in);
         self
     }
 
-    /// Attach an echo canceller to the uplink (call → server) audio (the `echo_cancellation` profile
-    /// flag). Each tick the phone's decoded uplink is echo-cancelled in place against the downlink
-    /// frame the bridge is rendering toward the call (the far-end reference — the audio the phone plays
-    /// and its mic re-captures), after noise suppression and before it is framed as L16, so the
-    /// voice-AI server does not hear its own reflected speech. `None` leaves the uplink unchanged. The
-    /// canceller must be built for the leg's native rate so its frame length matches the per-tick frame
-    /// (no per-frame reallocation).
+    /// Attach an echo canceller to the uplink audio — see [`BridgeCore::with_echo_canceller`].
     #[must_use]
     pub fn with_echo_canceller(mut self, echo_canceller: Option<EchoCanceller>) -> Self {
-        self.echo_canceller = echo_canceller;
+        self.core = self.core.with_echo_canceller(echo_canceller);
         self
     }
 
     /// Take the next tick-originated control message to send to the server (turn signals), or `None`.
-    /// Drained FIFO by the transport after each [`BridgeSession::tick`]; returns `None` with no work
-    /// (and no allocation) on the steady-state path.
     pub fn next_control(&mut self) -> Option<ControlMessage> {
-        if self.pending_control.is_empty() {
-            None
-        } else {
-            Some(self.pending_control.remove(0))
-        }
+        self.core.next_control()
     }
 
     /// The `start` message to send as the first text frame.
     pub fn start_message(&self) -> ControlMessage {
-        ControlMessage::Start(StartData {
-            stream_id: self.stream_id.clone(),
-            call_id: self.call_id.clone(),
-            direction: self.direction,
-            media: self.format,
-            tracks: Vec::new(),
-            metadata: None,
-        })
+        self.core.start_message()
     }
 
     /// Whether a `stop` has been received/sent (the driver should close the socket).
     #[must_use]
     pub fn is_stopped(&self) -> bool {
-        self.stopped
+        self.core.is_stopped()
     }
 
     /// Frames currently queued for downlink playout.
     #[must_use]
     pub fn playout_depth(&self) -> usize {
-        self.playout.len()
+        self.core.playout_depth()
     }
 
     /// Feed an inbound RTP packet from the call (uplink ingress).
@@ -176,115 +103,36 @@ impl BridgeSession {
 
     /// Feed an inbound binary WS frame (downlink playout audio, L16 little-endian).
     pub fn on_ws_binary(&mut self, bytes: &[u8]) {
-        let mut pcm = vec![0i16; bytes.len() / 2];
-        let samples = l16_le_to_pcm(bytes, &mut pcm);
-        pcm.truncate(samples);
-        if pcm.is_empty() {
-            return;
-        }
-        if self.playout.len() >= self.playout_cap {
-            self.playout.pop_front(); // drop-oldest backpressure
-        }
-        self.playout.push_back(pcm);
+        self.core.on_ws_binary(bytes);
     }
 
-    /// Handle an inbound control message, returning a message to send back when one is warranted
-    /// (e.g. an `error` for an unsupported request).
+    /// Handle an inbound control message, returning a message to send back when one is warranted.
     pub fn on_control(&mut self, message: ControlMessage) -> Option<ControlMessage> {
-        match message {
-            ControlMessage::Clear(data) => {
-                self.playout.clear();
-                // Surface the flush as a mark so the server can resynchronize turn boundaries.
-                Some(ControlMessage::Mark(MarkData {
-                    stream_id: self.stream_id.clone(),
-                    play_id: data.play_id,
-                    name: "cleared".to_string(),
-                }))
-            }
-            ControlMessage::Stop(_) => {
-                self.stopped = true;
-                None
-            }
-            ControlMessage::PlayStart(data) if data.source == PlaySource::Inline => {
-                // Inline base64 playout is a later addition; binary-frame playout works today.
-                Some(ControlMessage::Error(ErrorData {
-                    stream_id: self.stream_id.clone(),
-                    code: "unsupported_source".to_string(),
-                    message: "inline play_start not yet supported; use source=binary".to_string(),
-                    fatal: false,
-                }))
-            }
-            _ => None,
-        }
+        self.core.on_control(message)
     }
 
-    /// Advance one ptime: emit an uplink WS audio frame (if the leg has audio) and render one
-    /// queued downlink frame to an RTP packet for the call.
+    /// Advance one ptime: decode one frame off the leg into the core's uplink, emit the cleaned L16
+    /// uplink frame, and render the core's downlink playout frame to an RTP packet for the call.
+    ///
+    /// The leg decode and the core's playout dequeue touch disjoint state, so the RTP shell may pull
+    /// its frame before the core ticks — the echo canceller still references the very downlink frame
+    /// this tick renders, and a barge-in still drops it before it is encoded.
     pub fn tick(&mut self, uplink_out: &mut [u8], downlink_rtp_out: &mut [u8]) -> TickResult {
-        let mut result = TickResult::default();
-
-        // The downlink frame this tick renders toward the call is also the echo canceller's far-end
-        // reference for the uplink (the audio the phone plays and its mic re-captures). Take it up front
-        // so the uplink can cancel against it; it is rendered to RTP below (unchanged when AEC is off).
-        // A barge-in below drops it along with the rest of the queue, so no bot audio plays that tick.
-        let mut downlink_frame = self.playout.pop_front();
-
-        // Uplink: pop one PCM frame from the leg and frame it as little-endian L16.
-        let mut pcm = [0i16; MAX_FRAME_SAMPLES];
+        // Uplink: decode one PCM frame off the leg's jitter buffer straight into the core's staging
+        // slot — no intermediate frame buffer, so the split costs the per-tick path nothing.
         let frame_samples = self.leg.frame_samples().min(MAX_FRAME_SAMPLES);
-        if let Ok(PcmFrame::Decoded(written) | PcmFrame::Concealed(written)) =
-            self.leg.next_pcm(&mut pcm[..frame_samples])
-        {
-            // Turn-taking VAD runs on the *raw* decoded frame, before noise suppression can swallow
-            // low-energy speech onsets. Emits a signal only on an edge; barge-in flushes here.
-            let speaking = self
-                .vad
-                .as_mut()
-                .map(|vad| vad.is_speech_with_energy(EnergyVad::energy(&pcm[..written])));
-            if let Some(speaking) = speaking {
-                if speaking && !self.speaking {
-                    // Silence → speech: local barge-in (flush queued playout, no round-trip) + notify.
-                    if self.barge_in {
-                        self.playout.clear();
-                        // Also drop the frame already taken this tick, so no bot audio plays on barge-in
-                        // (matching the pre-AEC order where the downlink was popped after this flush).
-                        downlink_frame = None;
-                    }
-                    self.pending_control
-                        .push(ControlMessage::SpeechStarted(SpeechData {
-                            stream_id: self.stream_id.clone(),
-                        }));
-                } else if !speaking && self.speaking {
-                    // Speech → silence past hangover: the turn endpoint.
-                    self.pending_control
-                        .push(ControlMessage::SpeechStopped(SpeechData {
-                            stream_id: self.stream_id.clone(),
-                        }));
-                }
-                self.speaking = speaking;
-            }
-
-            // Clean the uplink audio in place before framing it toward the server, when enabled.
-            if let Some(suppressor) = self.noise_suppressor.as_mut() {
-                suppressor.process(&mut pcm[..written]);
-            }
-            // Echo cancellation on the uplink, referenced against the downlink played this tick: the
-            // canceller's GCC-PHAT delay estimate aligns the reference to the returned echo, so the
-            // model does not hear its own speech reflected by the phone. A silent (absent) downlink
-            // yields a zero reference — nothing to cancel. In place, zero per-frame heap.
-            if let Some(echo_canceller) = self.echo_canceller.as_mut() {
-                let mut reference = [0i16; MAX_FRAME_SAMPLES];
-                if let Some(frame) = downlink_frame.as_ref() {
-                    let count = frame.len().min(written);
-                    reference[..count].copy_from_slice(&frame[..count]);
-                }
-                echo_canceller.cancel(&mut pcm[..written], &reference[..written]);
-            }
-            result.uplink_bytes = pcm_to_l16_le(&pcm[..written], uplink_out);
+        let decoded = self.leg.next_pcm(self.core.uplink_slot(frame_samples));
+        if let Ok(PcmFrame::Decoded(written) | PcmFrame::Concealed(written)) = decoded {
+            self.core.commit_uplink(written);
         }
 
-        // Downlink: render the frame taken above to the call.
-        if let Some(frame) = downlink_frame {
+        let mut result = TickResult {
+            uplink_bytes: self.core.tick(uplink_out),
+            downlink_bytes: 0,
+        };
+
+        // Downlink: render the frame the core dequeued (absent after a barge-in) toward the call.
+        if let Some(frame) = self.core.take_downlink_pcm() {
             match self.leg.encode_rtp(&frame, downlink_rtp_out) {
                 Ok(len) => result.downlink_bytes = len,
                 Err(error) => tracing::debug!(%error, "bridge downlink encode failed"),
@@ -299,6 +147,7 @@ impl BridgeSession {
 mod tests {
     use super::*;
     use crate::bridge::protocol::{ClearData, StopData};
+    use crate::bridge::{l16_le_to_pcm, pcm_to_l16_le};
     use crate::jitter::JitterBuffer;
     use crate::rtp::{write_packet, RtpHeader, RtpPacket};
     use siphon_rtp_codec::g711::G711;
@@ -696,6 +545,117 @@ mod tests {
         } else {
             energy / samples as f64
         }
+    }
+
+    /// The pre-refactor takeover-mode output, captured from the build that owned the RTP decode
+    /// inside [`BridgeSession`] itself. See `takeover_path_matches_the_pre_refactor_golden_vector`.
+    const GOLDEN_DIGEST: u64 = 1_009_670_988_991_603_878;
+    const GOLDEN_UPLINK_FRAMES: usize = 60;
+    /// 57, not 60: three downlink frames were dropped by the local barge-in on a speech edge.
+    const GOLDEN_DOWNLINK_FRAMES: usize = 57;
+    const GOLDEN_CONTROLS: usize = 5;
+
+    /// FNV-1a (64-bit) over a byte stream — a stable, dependency-free digest for the golden vector
+    /// below. Deterministic across platforms (no hashing-state randomization).
+    fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
+        let mut hash = seed;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Run the full takeover-mode datapath over a fixed input vector and digest everything it
+    /// produced: the uplink L16 bytes, the rendered downlink RTP packets, and the control messages.
+    /// Every audio stage is engaged (VAD + barge-in, noise suppression, echo cancellation) so the
+    /// digest covers the whole per-tick order of operations, not just the framing.
+    fn takeover_golden_digest() -> (u64, usize, usize, usize) {
+        const FRAMES: usize = 60;
+        const N: usize = 160; // 20 ms @ 8 kHz
+
+        let leg = MediaLeg::new(
+            Box::new(G711::ulaw()),
+            Box::new(G711::ulaw()),
+            JitterBuffer::new(1, 16),
+            0x5555_6666,
+            0,
+        );
+        let mut session = BridgeSession::new(
+            leg,
+            MediaFormat::telephony_default(),
+            "str_golden",
+            "call_golden",
+            Direction::Duplex,
+            8,
+        )
+        .with_noise_suppression(true)
+        .with_vad(1_000_000, 3, true)
+        .with_echo_canceller(Some(
+            EchoCanceller::with_mdf_delay_estimation(8_000, 512, 1_024)
+                .expect("build 8k aec")
+                .with_two_path_dtd(),
+        ));
+
+        // Committed pseudo-random uplink and downlink streams (fixed seeds — never `rand`/wall clock).
+        let mut uplink_rng = Lcg(0x1234_5678);
+        let mut downlink_rng = Lcg(0x9ABC_DEF0);
+
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        let mut downlink_bytes = [0u8; 2 * N];
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        let (mut uplink_frames, mut downlink_frames, mut controls) = (0usize, 0usize, 0usize);
+
+        for frame in 0..FRAMES {
+            // A downlink L16 frame every tick, and an uplink RTP packet whose level alternates between
+            // loud (speech) and quiet every 12 frames, so the VAD crosses both edges several times.
+            let far: Vec<i16> = (0..N)
+                .map(|_| (3000.0 * downlink_rng.next_bipolar()) as i16)
+                .collect();
+            let length = pcm_to_l16_le(&far, &mut downlink_bytes);
+            session.on_ws_binary(&downlink_bytes[..length]);
+
+            let gain = if (frame / 12) % 2 == 0 { 5000.0 } else { 20.0 };
+            let near: Vec<i16> = (0..N)
+                .map(|_| (gain * uplink_rng.next_bipolar()) as i16)
+                .collect();
+            session.on_rtp(&ulaw_packet_pcm(frame as u16, &near));
+
+            let result = session.tick(&mut uplink, &mut downlink);
+            if result.uplink_bytes > 0 {
+                uplink_frames += 1;
+                digest = fnv1a(&uplink[..result.uplink_bytes], digest);
+            }
+            if result.downlink_bytes > 0 {
+                downlink_frames += 1;
+                digest = fnv1a(&downlink[..result.downlink_bytes], digest);
+            }
+            while let Some(control) = session.next_control() {
+                controls += 1;
+                digest = fnv1a(control.to_json().expect("json").as_bytes(), digest);
+            }
+        }
+        (digest, uplink_frames, downlink_frames, controls)
+    }
+
+    /// The takeover path is byte-for-byte what it was before the PCM-core split: same uplink L16, same
+    /// rendered downlink RTP, same control messages, in the same per-tick order. The constants below
+    /// were captured from the pre-refactor build — a change to any of them is a behaviour change on
+    /// the shipped voice-AI bridge, not a refactor.
+    #[test]
+    fn takeover_path_matches_the_pre_refactor_golden_vector() {
+        let (digest, uplink_frames, downlink_frames, controls) = takeover_golden_digest();
+        assert_eq!(uplink_frames, GOLDEN_UPLINK_FRAMES, "uplink frame count");
+        assert_eq!(
+            downlink_frames, GOLDEN_DOWNLINK_FRAMES,
+            "downlink frame count"
+        );
+        assert_eq!(controls, GOLDEN_CONTROLS, "turn-signal count");
+        assert_eq!(
+            digest, GOLDEN_DIGEST,
+            "takeover-mode output changed — this is a behaviour change, not a refactor"
+        );
     }
 
     #[test]

@@ -38,6 +38,14 @@ pub struct LiveGauges {
     pub cpu_permille: Option<u16>,
     /// Whether this node is draining (rejecting new sessions) — also drives `/readyz`.
     pub draining: bool,
+    /// Live WebSocket tees (send-only audio streams riding a relaying call).
+    pub ws_tees: u64,
+    /// Wire frames handed to the WS-tee transports over this process's lifetime.
+    pub ws_tee_frames_sent: u64,
+    /// WS-tee frames dropped because a consumer stalled (bounded queue full) or a channel ring
+    /// overflowed. Non-zero means a tee consumer could not keep up — the calls themselves are never
+    /// affected, so this is the metric that distinguishes "the stream is thin" from "the call is bad".
+    pub ws_tee_frames_dropped: u64,
 }
 
 /// Process-wide operational counters and gauges, shared via `Arc`.
@@ -168,6 +176,27 @@ impl Metrics {
             "Live conference participants across all rooms.",
             "gauge",
             live.conference_participants,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_ws_tees",
+            "Live WebSocket tees streaming a relaying call's audio.",
+            "gauge",
+            live.ws_tees,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_ws_tee_frames_sent_total",
+            "Audio frames handed to a WebSocket tee transport.",
+            "counter",
+            live.ws_tee_frames_sent,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_ws_tee_frames_dropped_total",
+            "WebSocket tee frames dropped because the consumer stalled (the call is unaffected).",
+            "counter",
+            live.ws_tee_frames_dropped,
         );
         metric(
             &mut output,
@@ -526,6 +555,9 @@ mod tests {
                 load_permille: 203,
                 cpu_permille: Some(247),
                 draining: true,
+                ws_tees: 2,
+                ws_tee_frames_sent: 1500,
+                ws_tee_frames_dropped: 7,
             },
             4096,
         );
@@ -534,6 +566,10 @@ mod tests {
         assert!(body.contains("# TYPE siphon_rtp_sessions gauge\nsiphon_rtp_sessions 3\n"));
         assert!(body
             .contains("# TYPE siphon_rtp_conference_rooms gauge\nsiphon_rtp_conference_rooms 5\n"));
+        assert!(body.contains("# TYPE siphon_rtp_ws_tees gauge\nsiphon_rtp_ws_tees 2\n"));
+        assert!(body.contains(
+            "# TYPE siphon_rtp_ws_tee_frames_dropped_total counter\nsiphon_rtp_ws_tee_frames_dropped_total 7\n"
+        ));
         assert!(body.contains(
             "# TYPE siphon_rtp_conference_participants gauge\nsiphon_rtp_conference_participants 9\n"
         ));
@@ -559,9 +595,9 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_cpu_permille 247\n"));
         assert!(body.contains("# TYPE siphon_rtp_draining gauge\nsiphon_rtp_draining 1\n"));
-        // Every series carries a HELP + TYPE line (16 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 16);
-        assert_eq!(body.matches("# TYPE ").count(), 16);
+        // Every series carries a HELP + TYPE line (19 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 19);
+        assert_eq!(body.matches("# TYPE ").count(), 19);
     }
 
     #[test]
@@ -583,8 +619,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (15 vs 16).
-        assert_eq!(body.matches("# TYPE ").count(), 15);
+        // One fewer series than the CPU-present case (18 vs 19).
+        assert_eq!(body.matches("# TYPE ").count(), 18);
     }
 
     #[test]
