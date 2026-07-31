@@ -28,19 +28,24 @@ pub fn smlaww(a32: i32, b32: i32, c32: i32) -> i32 {
     a32.wrapping_add(((i64::from(b32) * i64::from(c32)) >> 16) as i32)
 }
 
-/// `silk_ADD_POS_SAT32(a, b)` (`SigProc_FIX.h:499`) — add two values known to be non-negative,
-/// saturating at `i32::MAX`.
+/// `silk_ADD_POS_SAT32(a, b)` (`SigProc_FIX.h:499`) — add, returning `i32::MAX` whenever the sum's
+/// sign bit comes out set.
 ///
-/// The C detects the overflow by testing the sign bit of the *unsigned* sum, which is only correct
-/// because both operands are non-negative at every call site; the same assumption is asserted here
-/// in debug builds rather than silently reproduced.
+/// The name says "POS", and the macro is written for non-negative operands: it detects overflow by
+/// testing the sign bit of the *unsigned* sum. But `silk_quant_LTP_gains` calls it with a value
+/// that is routinely **negative** — `rate_dist_Q7_subfr` is
+/// `subfr_len * (lin2log(residual energy) - 15<<7)`, which goes below zero for any tap set whose
+/// weighted residual energy is under 1.0, i.e. for every good one (`quant_LTP_gains.c:101`,
+/// `VQ_WMat_EC.c:117`).
+///
+/// So this is *not* a saturating add in practice: a running rate-distortion total that dips below
+/// zero collapses to `i32::MAX` and that codebook loses. That is libopus' actual behaviour and it
+/// decides which LTP codebook a voiced frame uses, so it is reproduced literally — clamping the
+/// operands non-negative "to be safe" changes the chosen codebook on roughly a quarter of voiced
+/// frames.
 #[inline]
 #[must_use]
 pub fn add_pos_sat32(a: i32, b: i32) -> i32 {
-    debug_assert!(
-        a >= 0 && b >= 0,
-        "silk enc: ADD_POS_SAT32 operands must be non-negative"
-    );
     if (a as u32).wrapping_add(b as u32) & 0x8000_0000 != 0 {
         i32::MAX
     } else {

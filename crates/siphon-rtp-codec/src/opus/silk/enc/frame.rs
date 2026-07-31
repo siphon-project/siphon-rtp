@@ -377,6 +377,13 @@ pub struct AnalysisControl {
     pub ltp_prediction_gain_db: f32,
     /// `ResNrg[MAX_NB_SUBFR]` — residual energy per subframe after the quantised LPC filter.
     pub residual_energy: [f32; MAX_NB_SUBFR],
+    /// The **unquantized** NLSFs the Burg + A2NLSF stage produced, before the quantiser replaced
+    /// them. Not part of libopus' `silk_encoder_control_FLP` — it works in place and loses them —
+    /// but keeping them is what lets a conformance diff separate a spectral-analysis bug from a
+    /// quantiser bug.
+    pub unquantized_nlsf_q15: [i16; MAX_LPC_ORDER],
+    /// The combined prediction-gain ceiling the Burg analysis ran under.
+    pub min_inverse_gain: f32,
 }
 
 /// What [`analyze_frame`] produces.
@@ -589,6 +596,8 @@ pub fn analyze_frame(
         prediction_gain: pitch.prediction_gain,
         ltp_prediction_gain_db: predictors.ltp.prediction_gain_db,
         residual_energy: predictors.residual_energy,
+        unquantized_nlsf_q15: predictors.unquantized_nlsf_q15,
+        min_inverse_gain: predictors.min_inverse_gain,
     };
 
     Ok(FrameAnalysis { indices, control })

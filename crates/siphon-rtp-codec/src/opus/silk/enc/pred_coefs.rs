@@ -131,6 +131,12 @@ pub fn corr_vector(correlation: &mut [f32], x: &[f32], target: &[f32], length: u
 ///
 /// `matrix` is row-major `Order x Order` and comes out symmetric. `x` must start `Order - 1`
 /// samples before the first column.
+///
+/// **The window updates multiply in `f32`, not `f64`.** `silk_energy_FLP` and the pitch analysis
+/// both spell their products `a * (double)a` to force double precision; `corrMatrix_FLP.c:77,89`
+/// does **not**, so the C computes those in single precision and only the accumulator is `double`.
+/// Widening them moves the fifth significant digit of the correlation matrix, which is enough to
+/// pick a different LTP codebook vector on a marginal frame — a discrete, audible difference.
 pub fn corr_matrix(matrix: &mut [f32], x: &[f32], length: usize, order: usize) {
     debug_assert_eq!(matrix.len(), order * order);
     let first = order - 1;
@@ -139,8 +145,8 @@ pub fn corr_matrix(matrix: &mut [f32], x: &[f32], length: usize, order: usize) {
     matrix[0] = running as f32;
     for j in 1..order {
         // Slide the window one sample back: one sample enters at the front, one leaves at the end.
-        running += f64::from(x[first - j]) * f64::from(x[first - j])
-            - f64::from(x[first + length - j]) * f64::from(x[first + length - j]);
+        running += f64::from(x[first - j] * x[first - j])
+            - f64::from(x[first + length - j] * x[first + length - j]);
         matrix[j * order + j] = running as f32;
     }
 
@@ -151,8 +157,8 @@ pub fn corr_matrix(matrix: &mut [f32], x: &[f32], length: usize, order: usize) {
         matrix[lag * order] = running as f32;
         matrix[lag] = running as f32;
         for j in 1..(order - lag) {
-            running += f64::from(x[first - j]) * f64::from(x[column - j])
-                - f64::from(x[first + length - j]) * f64::from(x[column + length - j]);
+            running += f64::from(x[first - j] * x[column - j])
+                - f64::from(x[first + length - j] * x[column + length - j]);
             matrix[(lag + j) * order + j] = running as f32;
             matrix[j * order + lag + j] = running as f32;
         }
@@ -254,9 +260,10 @@ fn vq_wmat_ec(
         let taps = taps_q7_table.taps_q7(entry);
         let gain_q7 = i32::from(effective_gains_q7[entry]);
 
-        // SILK_FIX_CONST( 1.001, 15 ) — the constant term of `1 - 2 xX'c + c' XX c`, nudged up so
-        // the energy passed to `lin2log` is never exactly zero.
-        let mut sum1_q15 = 32_800i32;
+        // SILK_FIX_CONST( 1.001, 15 ) = (opus_int32)(1.001 * 32768 + 0.5) = 32801 — the constant
+        // term of `1 - 2 xX'c + c' XX c`, nudged up so the energy passed to `lin2log` is never
+        // exactly zero.
+        let mut sum1_q15 = 32_801i32;
         // Penalty for exceeding the cumulative gain budget.
         let penalty = (gain_q7 - max_gain_q7).max(0) << 11;
 
@@ -356,7 +363,7 @@ pub fn quant_ltp_gains(
     let mut best_periodicity = 0i8;
     let mut best_indices = [0i8; MAX_NB_SUBFR];
     let mut best_sum_log_gain_q7 = 0i32;
-    let mut best_residual_energy_q15 = 0i32;
+    let mut last_residual_energy_q15 = 0i32;
 
     for periodicity in 0..LTP_CODEBOOK_COUNT {
         let mut residual_energy_q15 = 0i32;
@@ -376,10 +383,11 @@ pub fn quant_ltp_gains(
                 subframe_length,
             );
             indices[subframe] = result.index;
-            residual_energy_q15 =
-                add_pos_sat32(residual_energy_q15, result.residual_energy_q15.max(0));
-            rate_distortion_q7 =
-                add_pos_sat32(rate_distortion_q7, result.rate_distortion_q8.max(0));
+            // Both accumulate through `silk_ADD_POS_SAT32` — including the rate-distortion score,
+            // which is routinely negative. See [`add_pos_sat32`] for why that is load-bearing and
+            // why clamping the operands non-negative changes which codebook wins.
+            residual_energy_q15 = add_pos_sat32(residual_energy_q15, result.residual_energy_q15);
+            rate_distortion_q7 = add_pos_sat32(rate_distortion_q7, result.rate_distortion_q8);
             running_sum_log_gain_q7 = (running_sum_log_gain_q7
                 + lin2log(GAIN_SAFETY_Q7 + result.gain_q7)
                 - SUM_LOG_GAIN_OFFSET_Q7)
@@ -391,8 +399,14 @@ pub fn quant_ltp_gains(
             best_periodicity = periodicity as i8;
             best_indices = indices;
             best_sum_log_gain_q7 = running_sum_log_gain_q7;
-            best_residual_energy_q15 = residual_energy_q15;
         }
+        // Deliberately outside the `if`: `res_nrg_Q15` is declared *outside* the codebook loop in
+        // the C and reassigned on every iteration, so after the loop it holds the **last**
+        // codebook's residual energy, not the winner's (`quant_LTP_gains.c:78,100,124-131`). The
+        // prediction gain below is derived from that value. It reads like a bug in libopus and it
+        // very likely is one, but it is observable — `LTPredCodGain` feeds the Burg prediction-gain
+        // ceiling and the gain reduction — so it is reproduced rather than "fixed".
+        last_residual_energy_q15 = residual_energy_q15;
     }
 
     let codebook = LtpFilterCodebook::select(best_periodicity as u8);
@@ -407,9 +421,9 @@ pub fn quant_ltp_gains(
 
     // The energy is averaged over the frame's subframes before the gain is derived.
     let averaged_q15 = if subframe_count == 2 {
-        best_residual_energy_q15 >> 1
+        last_residual_energy_q15 >> 1
     } else {
-        best_residual_energy_q15 >> 2
+        last_residual_energy_q15 >> 2
     };
     *sum_log_gain_q7 = best_sum_log_gain_q7;
     let prediction_gain_db_q7 = smulbb(-3, lin2log(averaged_q15) - (15 << 7));
@@ -596,6 +610,15 @@ pub struct PredCoefs {
     pub ltp_scale: f32,
     /// The quantised NLSFs and both Q12 LPC coefficient sets.
     pub nlsf: QuantizedNlsf,
+    /// The **unquantized** NLSFs [`super::lpc_analysis::find_lpc`] produced, before the quantiser
+    /// overwrote them. libopus does not keep these — `silk_process_NLSFs` works in place — but they
+    /// are the only view of the Burg + A2NLSF stage that is independent of the quantiser, which is
+    /// what makes an `ELPC` trace diff localise a bug to one or the other.
+    pub unquantized_nlsf_q15: [i16; MAX_LPC_ORDER],
+    /// The combined prediction-gain ceiling handed to Burg (`find_pred_coefs_FLP.c:96-102`). Kept
+    /// for the same reason as the unquantized NLSFs: it separates "we computed a different LTP
+    /// gain" from "we ran Burg differently" when the two filters disagree.
+    pub min_inverse_gain: f32,
     /// `psEncCtrl->PredCoef` — the same two coefficient sets as floats, which is what the
     /// noise-shaping quantiser's fixed-point conversion reads.
     pub prediction_coefficients: [[f32; MAX_LPC_ORDER]; 2],
@@ -653,7 +676,13 @@ pub fn find_pred_coefs(
         prediction_gain_db: 0.0,
     };
     let mut ltp_scale_index = 0i8;
-    let mut ltp_scale = f32::from(LTP_SCALES_Q14[0]) / 16_384.0;
+    // Zero, not `LTPScales_table_Q14[0]`, on the unvoiced path. libopus never assigns
+    // `psEncCtrl->LTP_scale` for an unvoiced frame (`silk_LTP_scale_ctrl_FLP` is only called from
+    // the voiced branch), and its NSQ wrapper substitutes 0 for any non-voiced frame
+    // (`wrappers_FLP.c:145-149`) — which is also exactly what the decoder holds
+    // (`decode_parameters.c:115`, mirrored in [`crate::opus::silk::ltp::LtpParameters::scale_q14`]).
+    // Carrying the voiced default here instead would leave a value the NSQ must remember to ignore.
+    let mut ltp_scale = 0.0f32;
 
     if signal_type == SignalType::Voiced {
         debug_assert!(
@@ -787,6 +816,8 @@ pub fn find_pred_coefs(
         ltp_scale_index,
         ltp_scale,
         nlsf,
+        unquantized_nlsf_q15: analysis.nlsf_q15,
+        min_inverse_gain,
         prediction_coefficients,
         residual_energy: residual_energies,
     }

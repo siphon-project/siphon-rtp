@@ -107,9 +107,12 @@ pub fn burg_modified(
             let mut tmp1 = f64::from(block[stage]);
             let mut tmp2 = f64::from(block[subframe_length - stage - 1]);
             for k in 0..stage {
-                c_first_row[k] -= f64::from(block[stage]) * f64::from(block[stage - k - 1]);
-                c_last_row[k] -= f64::from(block[subframe_length - stage - 1])
-                    * f64::from(block[subframe_length - stage + k]);
+                // These two products are `float` in the C (`burg_modified_FLP.c:83-84` has no
+                // `(double)` cast, unlike `silk_energy_FLP`), so only the accumulator is double.
+                c_first_row[k] -= f64::from(block[stage] * block[stage - k - 1]);
+                c_last_row[k] -= f64::from(
+                    block[subframe_length - stage - 1] * block[subframe_length - stage + k],
+                );
                 let coefficient = prediction[k];
                 tmp1 += f64::from(block[stage - k - 1]) * coefficient;
                 tmp2 += f64::from(block[subframe_length - stage + k]) * coefficient;
