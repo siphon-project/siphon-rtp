@@ -27,6 +27,9 @@ const REQUIRED_VECTOR_DIRS: &[&str] = &[
     "../../reference/opus/opus_testvectors",
     "../../reference/opus/celt_only",
     "../../reference/opus/silk_only",
+    // The unpacked libopus source itself: `silk_nlsf_tables_vs_libopus` diffs the ported SILK NLSF
+    // codebooks against it element by element, and skips without it.
+    "../../reference/opus/opus-1.5.2/silk",
 ];
 
 /// Extra per-directory requirement: a file extension that must appear at least once. Catches a

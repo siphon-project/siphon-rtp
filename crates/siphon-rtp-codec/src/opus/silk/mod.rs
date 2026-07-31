@@ -44,7 +44,9 @@
 //! | Stereo prediction weights, mid-only flag (§4.2.7.1-2) ([`stereo_pred`]) | **landed** |
 //! | Frame type (§4.2.7.3) ([`frame_type`]) | **landed** |
 //! | Subframe gains (§4.2.7.4) ([`gains`]) | **landed** |
-//! | NLSF → LPC (§4.2.7.5) | pending |
+//! | NLSF codebooks and the LSF cosine table ([`nlsf_tables`]) | **landed** |
+//! | NLSF stage 1/2, stabilisation, interpolation (§4.2.7.5.1-5) ([`nlsf`]) | **landed** |
+//! | NLSF → Q12 LPC, stability limiting (§4.2.7.5.8) ([`lpc`]) | **landed** |
 //! | Pitch lags, LTP filter, LTP scaling (§4.2.7.6) ([`ltp`]) | **landed** |
 //! | LCG seed + excitation / shell coder (§4.2.7.7-8) ([`excitation`]) | **landed** |
 //! | LTP + LPC synthesis, stereo unmixing, resampling (§4.2.7.9, §4.2.8-9) | pending |
@@ -75,6 +77,11 @@
 //!     stereo_pred::decode_mid_only(range)                   // §4.2.7.2, iff mid_only_flag_is_coded()
 //!     frame_type::decode_frame_type(range, flags.is_active(frame_index, is_lbrr))   // §4.2.7.3
 //!     decoder.decode_subframe_gains(range, channel, signal_type, cond_coding)       // §4.2.7.4
+//!     decoder.decode_nlsf(range, channel, signal_type)       // §4.2.7.5 -> LpcCoefficients
+//!     ltp::decode_indices(range, rate, layout, cond_coding, prev_type, prev_lag)   // §4.2.7.6
+//!     ltp::dequantize(&indices, rate)                        // -> LtpParameters
+//!     excitation::decode_seed(range)                         // §4.2.7.7
+//!     excitation::decode(range, signal_type, quant_offset, frame_length, seed, ..) // §4.2.7.8
 //!     ── everything below is pending ──
 //! ```
 //!
@@ -91,12 +98,15 @@
 //!
 //! Concretely, the pending phases are expected to add:
 //!
-//! * **NLSF (§4.2.7.5)** — `nlsf::decode_indices(dec, rate, signal_type) -> NlsfIndices` plus
-//!   `nlsf::to_lpc_q12(...)`. Needs [`types::InternalRate::lpc_order`] to pick the order-10 (NB/MB) or
-//!   order-16 (WB) codebook, and [`types::SignalType`] to pick the stage-1 PDF. The interpolation
-//!   anchor is [`decoder::ChannelState::prev_nlsf_q15`], and interpolation is suppressed whenever
+//! * **NLSF (§4.2.7.5)** — landed as [`decoder::SilkDecoder::decode_nlsf`], returning
+//!   [`nlsf::LpcCoefficients`] (both Q12 LPC halves, the Q15 NLSFs and the interpolation factor).
+//!   [`types::InternalRate::lpc_order`] picks the order-10 (NB/MB) or order-16 (WB) codebook and
+//!   [`types::SignalType`] picks the stage-1 PDF. The interpolation anchor is
+//!   [`decoder::ChannelState::prev_nlsf_q15`], and interpolation is suppressed whenever
 //!   [`decoder::ChannelState::first_frame_after_reset`] is set (`decode_parameters.c:59-61`) or the
-//!   frame has two subframes (`decode_indices.c:94-98`).
+//!   frame has two subframes (`decode_indices.c:94-98`). It deliberately does **not** clear
+//!   `first_frame_after_reset` — that belongs to synthesis, at the end of a successfully decoded
+//!   frame (`decode_frame.c:130`).
 //! * **LTP (§4.2.7.6)** — landed as [`ltp::decode_indices`], with [`ltp::dequantize`] turning the
 //!   indices into per-subframe pitch lags, Q14 filter taps and the Q14 LTP scale. A delta pitch lag is
 //!   only legal when the frame is [`types::CondCoding::Conditionally`] coded *and* the previous frame
@@ -119,7 +129,11 @@
 //!   [`decoder::ChannelState::prev_gain_q16`], and the stereo weights against
 //!   [`decoder::StereoState`]. This is the phase that ports the C's `silk_decoder_control`
 //!   (`structs.h:342-350`) as its per-frame input aggregate; it is deliberately absent here rather
-//!   than present with four of its five fields always zero.
+//!   than present with four of its five fields always zero. The short-term filter half of that
+//!   aggregate already exists: [`nlsf::LpcCoefficients`] carries `PredCoef_Q12[0]` and
+//!   `PredCoef_Q12[1]`, and it is synthesis' job to clear
+//!   [`decoder::ChannelState::first_frame_after_reset`] once a frame has decoded without error
+//!   (`decode_frame.c:130`) — the NLSF phase reads that flag but must not clear it.
 //!
 //! # Conformance
 //!
@@ -142,10 +156,20 @@
 //!   bit position at the end of each frame — this layer's own `final_range` check, at finer
 //!   resolution than the whole-packet one.
 //!
+//! * `tests/silk_nlsf_conformance.rs` — the NLSF stage (§4.2.7.5): the coded indices, the dequantized
+//!   residual with its unpacked prediction weights and entropy-table selection, the reconstruction
+//!   *before* and *after* stabilisation, the interpolated vector, and both Q12 LPC coefficient sets.
+//!
 //! Extending this for a new sub-phase is two steps: add the field group to
-//! `reference/opus/silk_trace.patch`, and decode one more symbol group per frame in the harness.
-//! Treat it as the working diagnostic and the two whole-packet gates as the acceptance criterion —
-//! an intermediate-state diff proves the fields match, not that the packet parses to its end.
+//! `reference/opus/silk_trace.patch` (it is one shared patch — **extend it, never replace it**, and
+//! rebuild `build-trace` from the union), and decode one more symbol group per frame in the harness.
+//! A harness must ignore field groups it does not own, or each new stage breaks its siblings the next
+//! time the dumps are regenerated. Treat these as the working diagnostic and the two whole-packet
+//! gates as the acceptance criterion — an intermediate-state diff proves the fields match, not that
+//! the packet parses to its end.
+//!
+//! The tables have their own oracle, `tests/silk_nlsf_tables_vs_libopus.rs`, which re-parses the
+//! libopus source and compares every ported NLSF codebook entry element by element.
 
 pub mod decoder;
 pub mod excitation;
@@ -153,7 +177,10 @@ pub mod fixed;
 pub mod frame_type;
 pub mod gains;
 pub mod header;
+pub mod lpc;
 pub mod ltp;
+pub mod nlsf;
+pub mod nlsf_tables;
 pub mod stereo_pred;
 pub mod tables;
 pub mod types;

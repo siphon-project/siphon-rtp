@@ -146,13 +146,27 @@ layer that is only partly ported — a SILK decoder that stops at the NLSF stage
 reaches a final range. For that case there is a second, **intermediate-state** oracle: the same libopus
 source built with printf dumps of the side info it decoded, diffed field by field against ours.
 
-`reference/opus/silk_trace.patch` adds `#ifdef SILK_TRACE` blocks to `silk/dec_API.c`,
-`silk/decode_indices.c`, `silk/gain_quant.c`, `silk/decode_pulses.c` and `silk/decode_core.c`, each
-line tagged with the packet index and — for the per-frame groups — a `u=` counter that increments once
-per decoded SILK frame (LBRR frames first, then the regular ones), so a stereo or 60 ms packet is
-unambiguous. It is purely additive: stripping the guarded blocks gives the original files back byte for
-byte, and `patch -R` is verified to restore them exactly. Apply it, build into a **separate** build
-directory so the plain oracle above is untouched, dump, then revert:
+`reference/opus/silk_trace.patch` adds `#ifdef SILK_TRACE` blocks to the SILK decode path, each line
+tagged with the packet index and — for the per-frame groups — a `u=` counter that increments once per
+decoded SILK frame (LBRR frames first, then the regular ones), so a stereo or 60 ms packet is
+unambiguous:
+
+| File | Field group |
+|---|---|
+| `silk/dec_API.c` | VAD / LBRR flags, stereo predictors, mid-only flag |
+| `silk/decode_indices.c` | frame type, gain indices, NLSF stage-1 + stage-2 indices, interpolation factor, pitch lags, LTP taps, LTP scaling |
+| `silk/gain_quant.c` | dequantized Q16 gains |
+| `silk/NLSF_decode.c` | dequantized Q10 residual with its unpacked prediction weights and entropy-table indices, the reconstructed NLSFs **before** stabilisation, and the stabilised NLSFs |
+| `silk/decode_parameters.c` | the interpolated first-half NLSFs, and both halves' Q12 LPC coefficients |
+| `silk/decode_pulses.c` | LCG seed, rate level, per-shell-block pulse counts, LSB blocks |
+| `silk/decode_core.c` | the reconstructed excitation, and the range coder's `rng`/`tell` at the end of each frame |
+
+It is purely additive — stripping the guarded blocks gives the original files back byte for byte, and
+`patch -R` is verified to restore them exactly — and it is **one shared patch that every sub-phase
+extends**, so add a field group rather than replacing the file, rebuild `build-trace` from the union,
+and re-dump afterwards. A harness must ignore field groups it does not own; a closed allow-list means
+whichever stage extended the patch last breaks every sibling harness. Apply it, build into a
+**separate** build directory so the plain oracle above is untouched, dump, then revert:
 
 ```sh
 patch -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch
@@ -161,7 +175,8 @@ cmake -S reference/opus/opus-1.5.2 -B reference/opus/build-trace \
 cmake --build reference/opus/build-trace -j
 patch -R -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch   # keep the source pristine
 sh reference/opus/dump_silk_trace.sh        # writes reference/opus/silk_only/*.trace
-cargo test -p siphon-rtp-codec --test silk_header_conformance --test silk_excitation_conformance
+cargo test -p siphon-rtp-codec --test silk_header_conformance \
+    --test silk_nlsf_conformance --test silk_excitation_conformance
 ```
 
 What the dump carries, by group:
@@ -187,10 +202,21 @@ spare bits, libopus reads a redundancy flag and a CELT redundancy frame after th
 that into the reported value (`opus_decoder.c:452-480`, `rangeFinal = dec.rng ^ redundant_rng`) — so the
 trace records `rng` and `ec_tell` at the exact end of each SILK frame instead, which is strictly finer.
 
-The dump is only read, never regenerated, by the tests — so the instrumented build is a one-off. Delete
-`reference/opus/build-trace` once the layer is finished and the `final_range` + `opus_compare` gates
-cover it, and prefer those: an intermediate-state diff proves the fields match, not that the whole
+The dump is only read, never regenerated, by the tests, so the instrumented build is a one-off. Each
+harness ignores field groups it does not consume, and refuses to pass vacuously: it counts what it
+scored and asserts the counts are non-trivial, so a stale dump that is missing a group shows up as a
+skip rather than a green run. `silk_nlsf_conformance` additionally requires that the run exercised the
+interpolation path, the stage-2 saturation extension symbol, frames the stabiliser actually modified,
+and both codebook orders — a decode that never took a branch has not tested it.
+
+Delete `reference/opus/build-trace` once the layer is finished and the `final_range` + `opus_compare`
+gates cover it, and prefer those: an intermediate-state diff proves the fields match, not that the whole
 packet parses.
+
+One more oracle is worth knowing about for the tables rather than the decode path:
+`silk_nlsf_tables_vs_libopus` re-parses `reference/opus/opus-1.5.2/silk/tables_NLSF_CB_*.c` and diffs
+all 2569 ported NLSF codebook entries against the C element by element. It needs only the unpacked
+libopus source, not a build.
 
 ## Fuzzing
 
