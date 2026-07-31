@@ -182,5 +182,6 @@ pub mod ltp;
 pub mod nlsf;
 pub mod nlsf_tables;
 pub mod stereo_pred;
+pub mod synthesis;
 pub mod tables;
 pub mod types;
