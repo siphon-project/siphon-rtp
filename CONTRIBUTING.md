@@ -89,6 +89,16 @@ SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
     cargo test -p siphon-rtp-codec --test celt_only_conformance --test opus_conformance
 ```
 
+`gen_celt_only.sh` writes two directories: `celt_only/` (mono) and `celt_only_stereo/`. They are kept
+apart because the mono harness globs its directory and rejects a two-channel packet, so a checkout
+that only has one of them still works. Note that the **Opus layer above CELT** has its own,
+content-adaptive stereo decision and will downmix to mono below its threshold — mid-stream, not just
+at the first packet — so the stereo sweep starts at the lowest rate that stays genuinely stereo for
+each frame duration (64 kb/s at 2.5 ms, 48 kb/s at 5 ms, 24 kb/s at 10/20 ms). The harness fails
+loudly on a mono packet in a stereo vector rather than tolerating it; the fix is to regenerate that
+configuration higher, not to relax the check. Stereo streams are scored with `opus_compare -s`, so
+both channels are compared instead of a downmix.
+
 `gen_celt_only.sh` uses `opus_demo -e restricted-lowdelay` (which forces `MODE_CELT_ONLY`);
 `gen_silk_only.sh` uses `opus_demo -e voip` at a low bitrate with the bandwidth capped at NB/MB/WB,
 which keeps the encoder in `MODE_SILK_ONLY`. Neither is taken on trust: both harnesses assert
