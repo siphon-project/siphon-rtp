@@ -15,6 +15,13 @@ use siphon_rtp_proto::{CmdResult, Command, ConferenceRole, WsTeeDirection};
 /// The soak drives the engine as a single control client.
 const CLIENT: ClientId = ClientId(1);
 
+/// Serializes the soaks in this binary. libtest runs them **concurrently in one process**, and every
+/// one of them measures the same *process-global* jemalloc counter — so without this, one soak's
+/// allocations land inside another's before/after window and report as that other soak's leak. (A
+/// thread-local arm-flag, the trick the zero-alloc tests use, cannot help: `stats.allocated` is
+/// process-wide by construction.) `tokio::sync::Mutex` because the guard is held across `.await`.
+static SOAK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -92,6 +99,7 @@ async fn quiesce() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offer_answer_delete_does_not_leak() {
+    let _serialized = SOAK.lock().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let _prime = allocated_bytes();
 
@@ -223,6 +231,7 @@ async fn record_start_stop(engine: &Engine<UdpLoopbackDatapath>, dir: &str, inde
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn record_start_stop_does_not_leak() {
+    let _serialized = SOAK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_string_lossy().into_owned();
     let engine = Engine::new(UdpLoopbackDatapath::new());
@@ -255,6 +264,7 @@ async fn record_start_stop_does_not_leak() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conference_join_leave_does_not_leak() {
+    let _serialized = SOAK.lock().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let _prime = allocated_bytes();
 
@@ -389,6 +399,7 @@ async fn ws_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, i
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_tee_attach_detach_does_not_leak() {
+    let _serialized = SOAK.lock().await;
     let uri = tee_sink_server().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let _prime = allocated_bytes();
