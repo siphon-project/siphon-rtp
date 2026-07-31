@@ -218,7 +218,7 @@ pub fn decode_indices(
 ///
 /// Runs from the **highest** coefficient down: each dequantized value predicts the next lower one
 /// through that coefficient's Q8 weight. Every non-zero index also gives back 0.1 quantizer steps
-/// ([`QUANT_LEVEL_ADJUST_Q10`]) — the dead zone the encoder's quantizer left around zero.
+/// (`NLSF_QUANT_LEVEL_ADJ`, 0.1 in Q10) — the dead zone the encoder's quantizer left around zero.
 ///
 /// Writes `order` values in Q10 into `residual_q10`.
 pub fn residual_dequant(
@@ -276,7 +276,7 @@ fn reconstruct(
 /// The reconstructed vector is regularly out of order or too tightly packed, and an LPC filter built
 /// from such a vector is unstable, so this is part of decoding rather than a guard. The algorithm
 /// repeatedly finds the *worst* violated spacing and repairs it, keeping the offending pair's centre
-/// frequency where it was, for at most [`MAX_STABILIZE_LOOPS`] passes; if that budget runs out it
+/// frequency where it was, for at most `MAX_LOOPS` (20) passes; if that budget runs out it
 /// falls back to a sort plus a forward and a backward clamp, which always terminates.
 ///
 /// `delta_min_q15` has `order + 1` entries: `[0]` is the floor below the first coefficient and
