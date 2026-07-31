@@ -265,7 +265,7 @@ fn a2nlsf_init(a_q16: &[i32], symmetric: &mut [i32], antisymmetric: &mut [i32], 
 /// bandwidth-expanded and the search restarts, and the caller sees the expanded filter. `order` must
 /// be even. The output is `order` values in Q15, strictly increasing.
 ///
-/// The two exit paths are the C's: all roots found, or [`MAX_A2NLSF_ITERATIONS`] expansions
+/// The two exit paths are the C's: all roots found, or `MAX_A2NLSF_ITERATIONS` expansions
 /// exhausted, in which case the NLSFs are set to a flat (white) spectrum rather than left
 /// undefined. Nothing here can loop forever — each failed pass increments the expansion counter.
 pub fn a2nlsf(nlsf_q15: &mut [i16], a_q16: &mut [i32], order: usize) {

@@ -20,7 +20,7 @@
 //!    clears `search_thres2`; if none does, the frame is unvoiced.
 //! 3. **Full rate, ±2 samples, larger contour codebook.** Only for 12/16 kHz. The correlations and
 //!    energies for the whole neighbourhood are precomputed once
-//!    ([`calc_correlations_stage3`] / [`calc_energies_stage3`]) rather than recomputed per
+//!    (`calc_correlations_stage3` / `calc_energies_stage3`) rather than recomputed per
 //!    candidate, which is the whole reason this stage is affordable.
 //!
 //! # Why the decimation is integer

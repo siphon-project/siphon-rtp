@@ -13,7 +13,7 @@
 //!
 //! # Why the LTP search is entropy-constrained
 //!
-//! [`vq_wmat_ec`] does not pick the closest codebook vector. It scores
+//! `vq_wmat_ec` does not pick the closest codebook vector. It scores
 //! `bits(residual energy) + codelength/2`, i.e. it converts the residual energy the tap set leaves
 //! into bits at the high-rate 6 dB-per-bit assumption and adds half the vector's own code length
 //! (the C's `3-1` shift, with its comment saying the halving "seems to slightly improve quality").
