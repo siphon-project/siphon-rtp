@@ -185,6 +185,19 @@
 //!
 //! The tables have their own oracle, `tests/silk_nlsf_tables_vs_libopus.rs`, which re-parses the
 //! libopus source and compares every ported NLSF codebook entry element by element.
+//!
+//! # Performance
+//!
+//! Whole-frame decode is benched in `benches/codec_bench.rs` (`silk_frame`), with the components
+//! broken out separately (`silk_synthesis`, `silk_excitation`) so a regression names itself. On a
+//! Ryzen AI 9 HX 370 one 20 ms wideband frame decodes to 48 kHz stereo in ~12 µs mono / ~17 µs
+//! stereo — under 0.1 % of the frame's own duration.
+//!
+//! **Zero heap allocation per frame** is an invariant, not an aspiration: every buffer is either
+//! caller-owned or a fixed-size array on [`decoder::SilkDecoder`] / [`decoder::ChannelState`],
+//! including the resampler's batch scratch (the one place the C uses a `VARDECL` whose size depends
+//! on the rate pair). `tests/silk_frame_zero_alloc.rs` and `tests/silk_excitation_zero_alloc.rs`
+//! assert it with a counting allocator across the whole decode path.
 
 pub mod cng;
 pub mod decoder;

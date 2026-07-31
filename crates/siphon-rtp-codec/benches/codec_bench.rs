@@ -666,9 +666,268 @@ fn bench_celt_kernels(c: &mut Criterion) {
     group.finish();
 }
 
+/// SILK's synthesis-side per-frame costs: the §4.2.7.9 LTP + LPC filters, the §4.2.8 stereo
+/// unmixing, the §4.2.9 resampler and the §4.4 concealment path.
+///
+/// None of these read a bitstream, so they bench anywhere with no reference data. Together with
+/// [`bench_silk_frame`] (which needs a vector) they cover everything a SILK packet pays per 20 ms.
+fn bench_silk_synthesis(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::silk::decoder::{ChannelState, StereoState};
+    use siphon_rtp_codec::opus::silk::plc::{self, PlcScratch};
+    use siphon_rtp_codec::opus::silk::resampler::Resampler;
+    use siphon_rtp_codec::opus::silk::stereo_unmix::mid_side_to_left_right;
+    use siphon_rtp_codec::opus::silk::synthesis::{decode_core, CoreScratch, DecoderControl};
+    use siphon_rtp_codec::opus::silk::types::{
+        InternalRate, SignalType, SubframeLayout, LTP_ORDER, MAX_FRAME_LENGTH, MAX_NB_SUBFR,
+    };
+
+    /// A channel primed with a plausible history and excitation, as a real decode would leave it.
+    fn primed_channel(rate: InternalRate) -> ChannelState {
+        let mut channel = ChannelState::new();
+        let layout = SubframeLayout::from_duration_ms(20).expect("20 ms");
+        channel.set_internal_rate(rate, layout);
+        channel.first_frame_after_reset = false;
+        for (index, slot) in channel.out_buf.iter_mut().enumerate() {
+            *slot = (7000.0 * ((index as f64) * 0.06).sin()) as i16;
+        }
+        for (index, slot) in channel.excitation_q14.iter_mut().enumerate() {
+            *slot = (((index * 7919) % 4001) as i32 - 2000) << 6;
+        }
+        channel
+    }
+
+    /// A voiced control block with a mid-range gain and a real pitch.
+    fn voiced_control(rate: InternalRate) -> DecoderControl {
+        let mut control = DecoderControl::new();
+        control.gains_q16 = [1 << 18, 1 << 19, 1 << 18, 1 << 17];
+        control.pitch_lags = [(6 * rate.khz()) as i32; MAX_NB_SUBFR];
+        control.ltp_scale_q14 = 15_565;
+        for subframe in 0..MAX_NB_SUBFR {
+            for tap in 0..LTP_ORDER {
+                control.ltp_coef_q14[subframe * LTP_ORDER + tap] = 1_600 + (tap as i16) * 200;
+            }
+        }
+        for order in 0..rate.lpc_order() {
+            let value = 1_800 - (order as i16) * 90;
+            control.pred_coef_q12[0][order] = value;
+            control.pred_coef_q12[1][order] = value;
+        }
+        control
+    }
+
+    let mut group = c.benchmark_group("silk_synthesis");
+
+    for (label, rate) in [
+        ("nb_8k", InternalRate::Narrow8k),
+        ("wb_16k", InternalRate::Wide16k),
+    ] {
+        for (voiced, signal_type) in [
+            ("voiced", SignalType::Voiced),
+            ("unvoiced", SignalType::Unvoiced),
+        ] {
+            let mut channel = primed_channel(rate);
+            let mut control = voiced_control(rate);
+            let mut scratch = CoreScratch::new();
+            let mut output = [0i16; MAX_FRAME_LENGTH];
+            group.bench_function(format!("decode_core_20ms_{label}_{voiced}"), |b| {
+                b.iter(|| {
+                    decode_core(
+                        &mut channel,
+                        &mut control,
+                        signal_type,
+                        false,
+                        black_box(&mut output),
+                        &mut scratch,
+                    )
+                    .expect("synthesis");
+                    black_box(output[0])
+                });
+            });
+        }
+    }
+
+    // §4.2.8 stereo unmixing, 20 ms wideband.
+    {
+        let mut state = StereoState::new();
+        let mut mid = vec![0i16; 322];
+        let mut side = vec![0i16; 322];
+        for index in 0..322 {
+            mid[index] = (6000.0 * ((index as f64) * 0.04).sin()) as i16;
+            side[index] = (1500.0 * ((index as f64) * 0.11).cos()) as i16;
+        }
+        group.bench_function("stereo_unmix_20ms_wb", |b| {
+            b.iter(|| {
+                mid_side_to_left_right(
+                    &mut state,
+                    black_box(&mut mid),
+                    black_box(&mut side),
+                    [4096, -2048],
+                    InternalRate::Wide16k,
+                    320,
+                )
+                .expect("unmix");
+                black_box(mid[1])
+            });
+        });
+    }
+
+    // §4.2.9 resampling to the API rate, one 20 ms frame per call.
+    for (label, input_hz, samples) in [
+        ("8k_to_48k", 8_000u32, 160usize),
+        ("12k_to_48k", 12_000, 240),
+        ("16k_to_48k", 16_000, 320),
+        ("16k_to_8k", 16_000, 320),
+    ] {
+        let output_hz = if label.ends_with("8k") && input_hz == 16_000 {
+            8_000
+        } else {
+            48_000
+        };
+        let mut resampler = Resampler::new();
+        resampler.configure(input_hz, output_hz).expect("configure");
+        let input: Vec<i16> = (0..samples)
+            .map(|n| (8000.0 * ((n as f64) * 0.07).sin()) as i16)
+            .collect();
+        let mut output = vec![0i16; resampler.output_length(samples)];
+        group.bench_function(format!("resample_20ms_{label}"), |b| {
+            b.iter(|| {
+                resampler
+                    .process(black_box(&mut output), black_box(&input))
+                    .expect("resample");
+                black_box(output[0])
+            });
+        });
+    }
+
+    // §4.4 concealment: one lost 20 ms wideband frame.
+    {
+        let mut channel = primed_channel(InternalRate::Wide16k);
+        let mut control = voiced_control(InternalRate::Wide16k);
+        let mut scratch = PlcScratch::new();
+        let mut frame = [0i16; MAX_FRAME_LENGTH];
+        // One good-frame update first, so the concealer has real parameters to work from.
+        plc::run(
+            &mut channel,
+            &mut control,
+            SignalType::Voiced,
+            false,
+            &mut frame,
+            &mut scratch,
+        )
+        .expect("plc update");
+        group.bench_function("plc_conceal_20ms_wb", |b| {
+            b.iter(|| {
+                plc::run(
+                    &mut channel,
+                    &mut control,
+                    SignalType::Voiced,
+                    true,
+                    black_box(&mut frame),
+                    &mut scratch,
+                )
+                .expect("conceal");
+                black_box(frame[0])
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Whole-frame SILK decode — one Opus frame of a real SILK-only stream, from the range decoder all
+/// the way to interleaved 48 kHz stereo PCM.
+///
+/// This is the number that matters for a transcoding leg: everything else in `silk_*` is a component
+/// of it. It needs a real bitstream, so it reads the first packet of a `reference/opus/silk_only`
+/// stream and is skipped (with a notice) when the vectors are absent — the same skip-when-absent rule
+/// the conformance harnesses follow.
+fn bench_silk_frame(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::packet;
+    use siphon_rtp_codec::opus::range_coder::RangeDecoder;
+    use siphon_rtp_codec::opus::silk::decoder::SilkDecoder;
+    use siphon_rtp_codec::opus::silk::frame::LossFlag;
+    use siphon_rtp_codec::opus::silk::types::InternalRate;
+    use std::path::Path;
+
+    /// First packet payload of an `opus_demo` `.bit` file.
+    fn first_packet(path: &Path) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.len() < 8 {
+            return None;
+        }
+        let length = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        // The first packet of a silence lead-in is tiny; take the first one with real content.
+        let mut offset = 0usize;
+        let mut best: Option<Vec<u8>> = None;
+        let mut length = length;
+        while offset + 8 + length <= bytes.len() {
+            let payload = bytes[offset + 8..offset + 8 + length].to_vec();
+            if payload.len() > 20 {
+                best = Some(payload);
+                break;
+            }
+            offset += 8 + length;
+            if offset + 8 > bytes.len() {
+                break;
+            }
+            length = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+        }
+        best
+    }
+
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/opus/silk_only");
+    let cases = [
+        ("nb_20ms_mono", "s01_NB_20_10000.bit"),
+        ("wb_20ms_mono", "s01_WB_20_18000.bit"),
+        ("wb_20ms_stereo", "s01_WB_20_18000_st.bit"),
+        ("wb_60ms_mono", "s01_WB_60_18000.bit"),
+    ];
+
+    let mut group = c.benchmark_group("silk_frame");
+    let mut benched = 0usize;
+    for (label, file) in cases {
+        let Some(payload) = first_packet(&directory.join(file)) else {
+            continue;
+        };
+        let Ok(parsed) = packet::parse(&payload) else {
+            continue;
+        };
+        let frame = parsed.frames()[0].to_vec();
+        let channels = usize::from(parsed.toc.channels());
+        let rate = InternalRate::from_bandwidth(parsed.toc.bandwidth());
+        let duration_ms = parsed.toc.samples_per_frame(48_000) / 48;
+        let mut silk = SilkDecoder::new(48_000, 2).expect("decoder");
+        let mut output = vec![0i16; 2880 * 2];
+        group.bench_function(format!("decode_{label}"), |b| {
+            b.iter(|| {
+                silk.configure(channels, rate, duration_ms)
+                    .expect("configure");
+                let mut decoder = RangeDecoder::new(black_box(&frame));
+                let produced = silk
+                    .decode(Some(&mut decoder), LossFlag::Normal, black_box(&mut output))
+                    .expect("decode");
+                black_box(produced)
+            });
+        });
+        benched += 1;
+    }
+    if benched == 0 {
+        eprintln!(
+            "silk_frame bench: no vectors in {} — run reference/opus/gen_silk_only.sh (see CONTRIBUTING.md)",
+            directory.display()
+        );
+    }
+    group.finish();
+}
+
 /// SILK's §4.2.7.6-8 side-info stages: the LTP indices, the shell coder and the §4.2.7.8.6
 /// reconstruction. These are per-frame costs on every SILK and hybrid packet, so they are benched
-/// separately from the whole-frame decode that will sit on top of them.
+/// separately from the whole-frame decode that sits on top of them.
 ///
 /// The payloads are built with our own range *encoder* rather than read from a vector file, so the
 /// bench runs anywhere (no reference data) and the symbol mix is fixed and reproducible.
@@ -873,6 +1132,8 @@ criterion_group!(
     bench_celt_encode,
     bench_celt_kernels,
     bench_silk_excitation,
+    bench_silk_synthesis,
+    bench_silk_frame,
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
@@ -892,6 +1153,8 @@ criterion_group!(
     bench_cn,
     bench_celt_encode,
     bench_celt_kernels,
-    bench_silk_excitation
+    bench_silk_excitation,
+    bench_silk_synthesis,
+    bench_silk_frame
 );
 criterion_main!(benches);
