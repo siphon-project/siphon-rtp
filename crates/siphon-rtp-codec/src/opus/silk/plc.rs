@@ -14,7 +14,7 @@
 //!   audible as a tone.
 //! * [`PlcState::rand_scale_q14`] and [`PlcState::pitch_lag_q8`] — the running attenuation and the
 //!   slowly drifting pitch, both updated per subframe *inside* the concealment loop.
-//! * [`PlcState::conc_energy`] — the energy of the last concealed frame, used by
+//! * [`PlcState::concealed_energy`] — the energy of the last concealed frame, used by
 //!   [`glue_frames`] to fade the first good frame in rather than let it step.
 
 use crate::opus::silk::decoder::ChannelState;
@@ -140,7 +140,8 @@ impl Default for PlcState {
     }
 }
 
-/// Scratch for [`conceal`] — the C's two `VARDECL`s, caller-owned so concealment allocates nothing.
+/// Scratch for the concealment path — the C's two `VARDECL`s, caller-owned so concealment allocates
+/// nothing.
 #[derive(Debug, Clone)]
 pub struct PlcScratch {
     /// `sLTP[ltp_mem_length]` — the re-whitened output history.

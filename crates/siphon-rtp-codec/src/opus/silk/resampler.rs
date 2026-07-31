@@ -24,7 +24,7 @@
 //!
 //! The **input delay** table is the subtle part: each rate pair compensates a different number of
 //! input samples so that every configuration presents the same total codec delay. It is applied by
-//! holding back `input_delay` samples in [`Resampler::delay_buffer`] and processing the first
+//! holding back `input_delay` samples in the resampler's own delay buffer and processing the first
 //! millisecond out of that buffer, which is why [`Resampler::process`] needs at least 1 ms of input
 //! per call.
 
