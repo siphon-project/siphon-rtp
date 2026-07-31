@@ -45,7 +45,7 @@ use crate::opus::silk::stereo_pred::{
 };
 use crate::opus::silk::stereo_unmix::{buffer_mono, mid_side_to_left_right, STEREO_HISTORY};
 use crate::opus::silk::synthesis::{decode_core, update_output_history, DecoderControl};
-use crate::opus::silk::types::{CondCoding, SignalType};
+use crate::opus::silk::types::{CondCoding, SignalType, MAX_FRAMES_PER_PACKET};
 use crate::CodecError;
 
 /// Longest one SILK frame can be at the API rate — 20 ms at 48 kHz.
@@ -94,13 +94,12 @@ impl SilkDecoder {
         let mut range = range;
         let mut written = 0usize;
         for interval in 0..intervals {
-            let produced = self.decode_silk_frame(
-                range.as_deref_mut(),
-                loss,
-                interval == 0,
-                &mut output[written * api_channels..],
-            )?;
-            written += produced;
+            let tail = output
+                .get_mut(written * api_channels..)
+                .ok_or(CodecError::Unsupported(
+                    "silk: output buffer shorter than the Opus frame",
+                ))?;
+            written += self.decode_silk_frame(range.as_deref_mut(), loss, interval == 0, tail)?;
         }
         Ok(written)
     }
@@ -129,6 +128,13 @@ impl SilkDecoder {
             for channel in self.channels.iter_mut().take(channel_count) {
                 channel.frames_decoded = 0;
             }
+        }
+        // An Opus frame carries at most three 20 ms intervals (RFC 6716 §4.2.2). A caller driving
+        // this directly could otherwise walk past the end of the VAD / LBRR flag arrays.
+        if self.channels[MID_CHANNEL].frames_decoded >= intervals.min(MAX_FRAMES_PER_PACKET) {
+            return Err(CodecError::Unsupported(
+                "silk: more 20 ms intervals decoded than the Opus frame carries",
+            ));
         }
 
         // ── LP-layer header and LBRR data, once per Opus frame (§4.2.3-5) ──────────────────────
