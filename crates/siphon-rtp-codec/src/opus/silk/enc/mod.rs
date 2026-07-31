@@ -71,6 +71,7 @@
 pub mod fixed;
 pub mod float;
 pub mod lpc_analysis;
+pub mod pitch;
 
 /// `MAX_SHAPE_LPC_ORDER` (`define.h:155`) — the largest noise-shaping AR order, at complexity 10.
 pub const MAX_SHAPE_LPC_ORDER: usize = 24;
@@ -106,6 +107,50 @@ pub const MAX_PREDICTION_POWER_GAIN: f32 = 1e4;
 /// `MAX_PREDICTION_POWER_GAIN_AFTER_RESET` (`define.h:140`) — the much tighter ceiling for the
 /// first frame after a reset, so a decoder that starts mid-stream cannot inherit a runaway filter.
 pub const MAX_PREDICTION_POWER_GAIN_AFTER_RESET: f32 = 1e2;
+
+/// The signal measures the VAD produced for this frame, which several analysis thresholds read.
+///
+/// These are **inputs** to the analysis front end: `silk_VAD_GetSA_Q8` (`silk/VAD.c`) computes them
+/// before a frame reaches this chain, and it lives outside this module — see the module docs. Every
+/// field is genuinely wired:
+///
+/// * `speech_activity_q8` moves the pitch search's voicing threshold
+///   (`find_pitch_lags_FLP.c:112`), the noise-shaping gain reduction during background noise
+///   (`noise_shape_analysis_FLP.c:180-181`), the low-frequency shaping strength (`:302`), the noise
+///   tilt during voiced speech (`:311-312`), the NLSF rate weight (`process_NLSFs.c:57`) and the
+///   quantiser's rate-distortion lambda (`process_gains_FLP.c:96`).
+/// * `input_quality_bands_q15` sets the input-quality measure the shaping and lambda both read
+///   (`noise_shape_analysis_FLP.c:173`).
+/// * `input_tilt_q15` moves the pitch threshold (`find_pitch_lags_FLP.c:114`) and the voiced
+///   quantisation-offset decision (`process_gains_FLP.c:85`).
+/// * `previous_signal_type` biases the pitch threshold towards voiced after a voiced frame
+///   (`find_pitch_lags_FLP.c:113`).
+#[derive(Debug, Clone, Copy)]
+pub struct SignalMeasures {
+    /// `psEncC->speech_activity_Q8` — 0..=256.
+    pub speech_activity_q8: i32,
+    /// `psEncC->input_quality_bands_Q15` — per-VAD-band input quality; only the lowest two bands
+    /// are read, and only as their average.
+    pub input_quality_bands_q15: [i32; 4],
+    /// `psEncC->input_tilt_Q15` — spectral tilt of the input, signed.
+    pub input_tilt_q15: i32,
+    /// `psEncC->prevSignalType` — the previous frame's signal type.
+    pub previous_signal_type: super::types::SignalType,
+}
+
+impl Default for SignalMeasures {
+    /// Silence, as `silk_init_encoder` leaves it: no activity, no tilt, nothing voiced before.
+    /// `input_quality_bands_Q15` starts at zero too, which reads as "worst quality" and makes the
+    /// shaping conservative — the same posture the C starts from.
+    fn default() -> Self {
+        Self {
+            speech_activity_q8: 0,
+            input_quality_bands_q15: [0; 4],
+            input_tilt_q15: 0,
+            previous_signal_type: super::types::SignalType::Inactive,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
