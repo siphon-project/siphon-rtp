@@ -13,12 +13,17 @@
 //! `[i16; N]` fields, so a decoder allocates once at construction and never again — the repo's
 //! zero-per-frame-heap-allocation invariant.
 //!
-//! Deliberately **not** modelled here, because the phases that own them are not written yet:
-//! `resampler_state` (§4.2.9), `sCNG` / `sPLC` (§4.4), the NLSF codebook and pitch-table pointers
-//! (`psNLSF_CB`, `pitch_lag_low_bits_iCDF`, `pitch_contour_iCDF` — those are selected from
-//! [`InternalRate`] and belong with the NLSF/LTP decode), and `SideInfoIndices` (the per-frame index
-//! bag: each decode phase returns its own indices instead, see the module docs in `silk/mod.rs`).
+//! Deliberately **not** modelled here: the NLSF codebook and pitch-table pointers (`psNLSF_CB`,
+//! `pitch_lag_low_bits_iCDF`, `pitch_contour_iCDF` — those are selected from [`InternalRate`] and
+//! belong with the NLSF/LTP decode) and `SideInfoIndices` (the per-frame index bag: each decode
+//! phase returns its own indices instead, see the module docs in `silk/mod.rs`).
 
+use crate::opus::silk::cng::{CngScratch, CngState};
+use crate::opus::silk::excitation::PULSE_BUFFER_LENGTH;
+use crate::opus::silk::frame::MAX_API_FRAME_LENGTH;
+use crate::opus::silk::plc::{PlcScratch, PlcState};
+use crate::opus::silk::resampler::Resampler;
+use crate::opus::silk::synthesis::CoreScratch;
 use crate::opus::silk::types::{
     CondCoding, InternalRate, SignalType, SubframeLayout, MAX_FRAMES_PER_PACKET, MAX_FRAME_LENGTH,
     MAX_LPC_ORDER, MAX_SUB_FRAME_LENGTH,
@@ -112,6 +117,16 @@ pub struct ChannelState {
     /// `prevSignalType` — signal type of the last *successfully decoded* frame (distinct from
     /// `ec_prev_signal_type`, which the entropy coder maintains even for skipped frames).
     pub prev_signal_type: SignalType,
+    /// `sPLC` — packet-loss concealment state (RFC 6716 §4.4).
+    pub plc: PlcState,
+    /// `sCNG` — comfort-noise state (RFC 6716 §4.4).
+    pub cng: CngState,
+
+    // ── Output-rate conversion (RFC 6716 §4.2.9) ──────────────────────────────────────────────
+    /// `resampler_state` — internal rate to API rate. It sits inside the C's reset region
+    /// (`SILK_DECODER_STATE_RESET_START` is `prev_gain_Q16`, and `resampler_state` comes after it),
+    /// so a decoder reset clears the filter memory and the next rate configuration re-initialises it.
+    pub resampler: Resampler,
 }
 
 impl ChannelState {
@@ -144,6 +159,9 @@ impl ChannelState {
             lbrr_flags: [false; MAX_FRAMES_PER_PACKET],
             loss_count: 0,
             prev_signal_type: SignalType::Inactive,
+            plc: PlcState::new(),
+            cng: CngState::new(),
+            resampler: Resampler::new(),
         };
         state.reset();
         state
@@ -173,6 +191,24 @@ impl ChannelState {
         self.lbrr_flags = [false; MAX_FRAMES_PER_PACKET];
         self.loss_count = 0;
         self.prev_signal_type = SignalType::Inactive;
+        // `silk_reset_decoder` memsets both of these and then calls `silk_CNG_Reset` /
+        // `silk_PLC_Reset` while `LPC_order` and `frame_length` are still zero, so the seeded state
+        // is exactly the fresh one — and the lazy `fs_kHz` check inside each stage re-seeds them
+        // properly on the first frame after the rate is known (`init_decoder.c:48-59`).
+        self.plc = PlcState::new();
+        self.cng = CngState::new();
+        self.resampler = Resampler::new();
+    }
+
+    /// Configure the §4.2.9 output resampler for this channel (libopus `decoder_set_fs.c:51-56`).
+    ///
+    /// Split out from [`ChannelState::set_internal_rate`] because it is the one part of
+    /// `silk_decoder_set_fs` that needs the *API* rate, which the channel does not otherwise know.
+    /// Re-initialising is guarded on the rate pair inside [`Resampler::configure`], so calling this
+    /// every packet — as the C does — never restarts the filter mid-stream.
+    pub fn configure_resampler(&mut self, api_rate_hz: u32) -> Result<(), CodecError> {
+        let rate = self.internal_rate()?;
+        self.resampler.configure(rate.hz(), api_rate_hz)
     }
 
     /// Configure the internal rate and subframe layout for the current packet (libopus
@@ -330,20 +366,39 @@ pub const SIDE_CHANNEL: usize = 1;
 pub struct SilkDecoder {
     /// `channel_state[DECODER_NUM_CHANNELS]` — mid first, side second. The side channel is kept
     /// allocated even for a mono stream so a mid-packet mono→stereo switch costs no allocation.
-    channels: [ChannelState; 2],
+    pub(crate) channels: [ChannelState; 2],
     /// `nChannelsInternal` — 1 or 2, from the Opus TOC stereo flag (RFC 6716 §3.1).
-    channel_count: usize,
+    pub(crate) channel_count: usize,
     /// `nChannelsAPI` — channels the caller wants out.
-    api_channel_count: usize,
+    pub(crate) api_channel_count: usize,
     /// `fs_API_hz` — the caller's output rate, the target of the §4.2.9 resampler. SILK itself never
     /// decodes at this rate.
-    api_rate_hz: u32,
+    pub(crate) api_rate_hz: u32,
     /// `sStereo`.
-    stereo: StereoState,
+    pub(crate) stereo: StereoState,
     /// `prev_decode_only_middle` — the previous frame coded no side channel. Feeds both the
     /// "reset the side channel's prediction memory" rule (`dec_API.c:303-310`) and the
     /// `CODE_INDEPENDENTLY_NO_LTP_SCALING` decision.
-    prev_decode_only_middle: bool,
+    pub(crate) prev_decode_only_middle: bool,
+    /// `stereo_to_mono` — see [`SilkDecoder::stereo_to_mono`].
+    pub(crate) stereo_to_mono: bool,
+
+    // ── Per-frame scratch (the C's `VARDECL`s, hoisted so decoding allocates nothing) ─────────
+    /// `samplesOut1_tmp[2]` — one channel's PCM at the *internal* rate, with the two leading
+    /// history samples the §4.2.8 unmixing prepends.
+    pub(crate) channel_pcm: [[i16; MAX_FRAME_LENGTH + 2]; 2],
+    /// `samplesOut2_tmp` — one channel's PCM at the API rate, before interleaving.
+    pub(crate) resample_scratch: [i16; MAX_API_FRAME_LENGTH],
+    /// `pulses[]` — the shell-coded pulse signal, padded to whole 16-sample blocks.
+    pub(crate) pulses: [i16; PULSE_BUFFER_LENGTH],
+    /// The reconstructed Q14 excitation, before it is copied onto the channel.
+    pub(crate) excitation_scratch: [i32; MAX_FRAME_LENGTH],
+    /// Working buffers for [`crate::opus::silk::synthesis::decode_core`].
+    pub(crate) core_scratch: CoreScratch,
+    /// Working buffers for [`crate::opus::silk::plc`].
+    pub(crate) plc_scratch: PlcScratch,
+    /// Working buffers for [`crate::opus::silk::cng`].
+    pub(crate) cng_scratch: CngScratch,
 }
 
 impl SilkDecoder {
@@ -368,6 +423,14 @@ impl SilkDecoder {
             api_rate_hz,
             stereo: StereoState::new(),
             prev_decode_only_middle: false,
+            stereo_to_mono: false,
+            channel_pcm: [[0; MAX_FRAME_LENGTH + 2]; 2],
+            resample_scratch: [0; MAX_API_FRAME_LENGTH],
+            pulses: [0; PULSE_BUFFER_LENGTH],
+            excitation_scratch: [0; MAX_FRAME_LENGTH],
+            core_scratch: CoreScratch::new(),
+            plc_scratch: PlcScratch::new(),
+            cng_scratch: CngScratch::new(),
         })
     }
 
@@ -380,6 +443,7 @@ impl SilkDecoder {
         }
         self.stereo = StereoState::new();
         self.prev_decode_only_middle = false;
+        self.stereo_to_mono = false;
     }
 
     /// Configure for the current packet: internal channel count, internal rate, and Opus frame
@@ -409,10 +473,19 @@ impl SilkDecoder {
         if channel_count > self.channel_count {
             self.channels[SIDE_CHANNEL].reset();
         }
-        // First genuinely stereo frame after mono: the interpolation anchor must be zero.
+        // `stereo_to_mono`: a stereo stream collapsing to mono at the same internal rate. The C
+        // keeps decoding the right channel through the *side* channel's resampler for one frame so
+        // the collapse does not click (`dec_API.c:177-178, 419-426`).
+        self.stereo_to_mono = channel_count == 1
+            && self.channel_count == 2
+            && self.channels[MID_CHANNEL].internal_rate() == Ok(rate);
+        // First genuinely stereo frame after mono: the interpolation anchor must be zero, and the
+        // side channel inherits the mid channel's resampler state (`dec_API.c:214-218`).
         if self.api_channel_count == 2 && channel_count == 2 && self.channel_count == 1 {
             self.stereo.pred_prev_q13 = [0; 2];
             self.stereo.side_history = [0; 2];
+            let mid_resampler = self.channels[MID_CHANNEL].resampler.clone();
+            self.channels[SIDE_CHANNEL].resampler = mid_resampler;
         }
         self.channel_count = channel_count;
 
@@ -420,7 +493,17 @@ impl SilkDecoder {
             channel.set_internal_rate(rate, layout);
             channel.frames_decoded = 0;
         }
+        let api_rate_hz = self.api_rate_hz;
+        for channel in self.channels.iter_mut().take(channel_count) {
+            channel.configure_resampler(api_rate_hz)?;
+        }
         Ok(())
+    }
+
+    /// `stereo_to_mono` — the stream just collapsed from stereo to mono at the same internal rate.
+    #[must_use]
+    pub fn stereo_to_mono(&self) -> bool {
+        self.stereo_to_mono
     }
 
     /// `nChannelsInternal` — internal (bitstream) channel count for the current packet.
@@ -472,22 +555,33 @@ impl SilkDecoder {
         self.prev_decode_only_middle
     }
 
-    /// Record whether the frame just decoded coded the mid channel only (`dec_API.c:437`).
+    /// Record whether the frame just decoded coded the mid channel only (`dec_API.c:437`), dropping
+    /// the side channel's prediction memory on a `true` → `false` edge.
     ///
-    /// A `true` → `false` edge means the side channel is coming back after being skipped, so its
-    /// prediction memory has to be dropped before it is used again (`dec_API.c:303-310`): the LTP
-    /// history it would otherwise reach into belongs to a different time interval.
+    /// This is the convenience form, for a caller driving the decode stage by stage. The frame
+    /// integrator uses the two halves separately, because the C does the memory reset *before* the
+    /// frames are decoded (`dec_API.c:302-310`) while the conditional-coding decision it shares a
+    /// condition with still needs the **old** `prev_decode_only_middle` (`dec_API.c:348`).
     pub fn set_decode_only_middle(&mut self, decode_only_middle: bool) {
         if !decode_only_middle && self.prev_decode_only_middle && self.channel_count == 2 {
-            let side = &mut self.channels[SIDE_CHANNEL];
-            side.out_buf = [0; OUT_BUF_LENGTH];
-            side.lpc_state_q14 = [0; MAX_LPC_ORDER];
-            side.lag_prev = LAG_PREV_RESET;
-            side.last_gain_index = LAST_GAIN_INDEX_RESET;
-            side.prev_signal_type = SignalType::Inactive;
-            side.first_frame_after_reset = true;
+            self.reset_side_channel_prediction();
         }
         self.prev_decode_only_middle = decode_only_middle;
+    }
+
+    /// Drop the side channel's prediction memory (`dec_API.c:303-310`).
+    ///
+    /// Called when the side channel returns after one or more mid-only frames: the LTP history it
+    /// would otherwise reach into belongs to a different time interval, so continuing from it would
+    /// splice unrelated audio into the pitch predictor.
+    pub fn reset_side_channel_prediction(&mut self) {
+        let side = &mut self.channels[SIDE_CHANNEL];
+        side.out_buf = [0; OUT_BUF_LENGTH];
+        side.lpc_state_q14 = [0; MAX_LPC_ORDER];
+        side.lag_prev = LAG_PREV_RESET;
+        side.last_gain_index = LAST_GAIN_INDEX_RESET;
+        side.prev_signal_type = SignalType::Inactive;
+        side.first_frame_after_reset = true;
     }
 }
 
