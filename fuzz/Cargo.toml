@@ -15,7 +15,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 # Every crate with a parser that eats untrusted bytes off the network gets a fuzz target. The codec
 # crate is included with the `amr` feature so the AMR-NB/WB RFC 4867 payload decoders (a hostile
-# codec bitstream off the wire) are fuzzed too. (Opus stays out until its decoder lands.)
+# codec bitstream off the wire) are fuzzed too, alongside the Opus packet framing and CELT decode.
 siphon-rtp-media = { path = "../crates/siphon-rtp-media" }
 siphon-rtp-engine = { package = "siphon-rtp", path = "../crates/siphon-rtp-engine" }
 siphon-rtp-ngcompat = { path = "../crates/siphon-rtp-ngcompat" }
@@ -75,6 +75,15 @@ bench = false
 [[bin]]
 name = "amr_nb_decode_fuzz"
 path = "fuzz_targets/amr_nb_decode_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 6716 — Opus packet framing (§3) + CELT decode (§4.3). The most reachable codec parser here: an
+# Opus leg is a WebRTC peer sending arbitrary bytes.
+[[bin]]
+name = "opus_decode_fuzz"
+path = "fuzz_targets/opus_decode_fuzz.rs"
 test = false
 doc = false
 bench = false
