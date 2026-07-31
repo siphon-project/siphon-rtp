@@ -24,9 +24,10 @@
 //! stored flat, exactly as the C stores it, because the algorithms index it as
 //! `table[index * order + coefficient]`.
 //!
-//! Two fields of the C's `silk_NLSF_CB_struct` are deliberately **absent**: `invQuantStepSize_Q6`
-//! and `ec_Rates_Q5` are read only by `silk_NLSF_encode` / `silk_NLSF_del_dec_quant`, so carrying
-//! them here would be dead weight in a decoder. They belong with the SILK encoder when it lands.
+//! All ten fields of the C's `silk_NLSF_CB_struct` are here. Two of them —
+//! [`NlsfCodebook::inv_quant_step_size_q6`] and [`NlsfCodebook::ec_rates_q5`] — are read only by
+//! `silk_NLSF_encode` / `silk_NLSF_del_dec_quant`, i.e. by
+//! [`crate::opus::silk::enc::nlsf_quant`]; nothing on the decode path touches them.
 
 use crate::opus::silk::types::InternalRate;
 
@@ -47,8 +48,7 @@ pub const NLSF_STAGE2_PDF_COUNT: usize = 8;
 /// (`LSF_COS_TAB_SZ_FIX`, `define.h:201`).
 pub const LSF_COS_TAB_SIZE: usize = 128;
 
-/// One NLSF codebook (libopus `silk_NLSF_CB_struct`, `structs.h:100-113`), minus the two
-/// encoder-only fields.
+/// One NLSF codebook (libopus `silk_NLSF_CB_struct`, `structs.h:100-113`).
 ///
 /// `NB_MB` and `WB` are the only two instances RFC 6716 defines; there is no way to build another.
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +60,10 @@ pub struct NlsfCodebook {
     /// `quantStepSize_Q16` — the stage-2 residual step size in Q16
     /// (`SILK_FIX_CONST(0.18, 16)` for NB/MB, `SILK_FIX_CONST(0.15, 16)` for WB).
     pub quant_step_size_q16: i32,
+    /// `invQuantStepSize_Q6` — the reciprocal of the above in Q6, so the **encoder** can pick a
+    /// quantisation index with a multiply instead of a divide (`NLSF_del_dec_quant.c:93`).
+    /// Encoder-only; the decoder never needs it, because dequantising is a multiply already.
+    pub inv_quant_step_size_q6: i16,
     /// `CB1_NLSF_Q8` — the stage-1 codebook vectors, `vector_count * order` entries in Q8.
     pub cb1_nlsf_q8: &'static [u8],
     /// `CB1_Wght_Q9` — the per-coefficient weights in Q9, one per `cb1_nlsf_q8` entry.
@@ -77,6 +81,14 @@ pub struct NlsfCodebook {
     /// `ec_iCDF` — the [`NLSF_STAGE2_PDF_COUNT`] stage-2 residual inverse CDFs, stored flat as
     /// `NLSF_STAGE2_PDF_COUNT * NLSF_STAGE2_SYMBOLS` entries.
     pub ec_icdf: &'static [u8],
+    /// `ec_Rates_Q5` — the **cost in Q5 bits** of each stage-2 symbol under each of the
+    /// [`NLSF_STAGE2_PDF_COUNT`] PDFs, same flat layout as `ec_icdf`.
+    ///
+    /// Encoder-only: it is the rate half of the trellis quantiser's rate-distortion metric
+    /// (`NLSF_del_dec_quant.c:109-125`). It is not derived from `ec_icdf` at run time — libopus
+    /// stores it precomputed, and a symbol outside the ±4 alphabet is charged an extrapolated
+    /// `280 + 43 * excess` instead of a table lookup.
+    pub ec_rates_q5: &'static [u8],
     /// `deltaMin_Q15` — minimum spacing between consecutive NLSFs in Q15, `order + 1` entries:
     /// `[0]` is the floor below the first coefficient and `[order]` the ceiling above the last
     /// (`NLSF_stabilize.c:65-80`).
@@ -125,6 +137,14 @@ impl NlsfCodebook {
         let start = pdf_index * NLSF_STAGE2_SYMBOLS;
         &self.ec_icdf[start..start + NLSF_STAGE2_SYMBOLS]
     }
+
+    /// One stage-2 residual **rate** row, in Q5 bits per symbol (`NLSF_del_dec_quant.c:88`, where
+    /// the C indexes `ec_Rates_Q5` by the same byte offset `ec_ix[i]`). Encoder-only.
+    #[must_use]
+    pub fn stage2_rates_q5(&self, pdf_index: usize) -> &'static [u8] {
+        let start = pdf_index * NLSF_STAGE2_SYMBOLS;
+        &self.ec_rates_q5[start..start + NLSF_STAGE2_SYMBOLS]
+    }
 }
 
 /// The order-10 codebook used by narrowband and mediumband frames (libopus `silk_NLSF_CB_NB_MB`,
@@ -134,12 +154,15 @@ pub static NB_MB: NlsfCodebook = NlsfCodebook {
     order: 10,
     // SILK_FIX_CONST( 0.18, 16 ) = (opus_int32)(0.18 * 65536 + 0.5).
     quant_step_size_q16: 11_796,
+    // SILK_FIX_CONST( 1.0 / 0.18, 6 ) = (opus_int32)(5.5555... * 64 + 0.5).
+    inv_quant_step_size_q6: 356,
     cb1_nlsf_q8: &NB_MB_CB1_Q8,
     cb1_weight_q9: &NB_MB_CB1_WEIGHT_Q9,
     cb1_icdf: &NB_MB_CB1_ICDF,
     prediction_q8: &NB_MB_PREDICTION_Q8,
     ec_select: &NB_MB_CB2_SELECT,
     ec_icdf: &NB_MB_CB2_ICDF,
+    ec_rates_q5: &NB_MB_CB2_RATES_Q5,
     delta_min_q15: &NB_MB_DELTA_MIN_Q15,
 };
 
@@ -150,12 +173,15 @@ pub static WB: NlsfCodebook = NlsfCodebook {
     order: 16,
     // SILK_FIX_CONST( 0.15, 16 ) = (opus_int32)(0.15 * 65536 + 0.5).
     quant_step_size_q16: 9_830,
+    // SILK_FIX_CONST( 1.0 / 0.15, 6 ) = (opus_int32)(6.6666... * 64 + 0.5).
+    inv_quant_step_size_q6: 427,
     cb1_nlsf_q8: &WB_CB1_Q8,
     cb1_weight_q9: &WB_CB1_WEIGHT_Q9,
     cb1_icdf: &WB_CB1_ICDF,
     prediction_q8: &WB_PREDICTION_Q8,
     ec_select: &WB_CB2_SELECT,
     ec_icdf: &WB_CB2_ICDF,
+    ec_rates_q5: &WB_CB2_RATES_Q5,
     delta_min_q15: &WB_DELTA_MIN_Q15,
 };
 
@@ -234,6 +260,20 @@ pub const NB_MB_CB2_ICDF: [u8; 72] = [
     4, 2, 1, 0, 255, 254, 246, 194, 71, 10, 2, 1, 0, 255, 252, 236, 183, 82, 8, 2, 1, 0, 255, 252,
     235, 180, 90, 17, 2, 1, 0, 255, 248, 224, 171, 97, 30, 4, 1, 0, 255, 254, 236, 173, 95, 37, 7,
     1, 0,
+];
+
+/// `silk_NLSF_CB2_BITS_NB_MB_Q5` — the matching stage-2 symbol **costs** in Q5 bits, 8 PDFs of 9
+/// symbols (`tables_NLSF_CB_NB_MB.c:158`). Encoder-only; see [`NlsfCodebook::ec_rates_q5`].
+/// One PDF per line, same order as [`NB_MB_CB2_ICDF`].
+pub const NB_MB_CB2_RATES_Q5: [u8; 72] = [
+    255, 255, 255, 131, 6, 145, 255, 255, 255, //
+    255, 255, 236, 93, 15, 96, 255, 255, 255, //
+    255, 255, 194, 83, 25, 71, 221, 255, 255, //
+    255, 255, 162, 73, 34, 66, 162, 255, 255, //
+    255, 210, 126, 73, 43, 57, 173, 255, 255, //
+    255, 201, 125, 71, 48, 58, 130, 255, 255, //
+    255, 166, 110, 73, 57, 62, 104, 210, 255, //
+    255, 251, 123, 65, 55, 68, 100, 171, 255,
 ];
 
 /// `silk_NLSF_PRED_NB_MB_Q8` — the two backward prediction weight sets in Q8, 9 entries
@@ -345,6 +385,20 @@ pub const WB_CB2_ICDF: [u8; 72] = [
     4, 2, 1, 0, 255, 254, 244, 195, 69, 4, 2, 1, 0, 255, 251, 232, 184, 84, 7, 2, 1, 0, 255, 254,
     240, 186, 86, 14, 2, 1, 0, 255, 254, 239, 178, 91, 30, 5, 1, 0, 255, 248, 227, 177, 100, 19, 2,
     1, 0,
+];
+
+/// `silk_NLSF_CB2_BITS_WB_Q5` — the matching stage-2 symbol **costs** in Q5 bits, 8 PDFs of 9
+/// symbols (`tables_NLSF_CB_WB.c:194`). Encoder-only; see [`NlsfCodebook::ec_rates_q5`].
+/// One PDF per line, same order as [`WB_CB2_ICDF`].
+pub const WB_CB2_RATES_Q5: [u8; 72] = [
+    255, 255, 255, 156, 4, 154, 255, 255, 255, //
+    255, 255, 227, 102, 15, 92, 255, 255, 255, //
+    255, 255, 213, 83, 24, 72, 236, 255, 255, //
+    255, 255, 150, 76, 33, 63, 214, 255, 255, //
+    255, 190, 121, 77, 43, 55, 185, 255, 255, //
+    255, 245, 137, 71, 43, 59, 139, 255, 255, //
+    255, 255, 131, 66, 50, 66, 107, 194, 255, //
+    255, 166, 116, 76, 55, 53, 125, 255, 255,
 ];
 
 /// `silk_NLSF_PRED_WB_Q8` — the two backward prediction weight sets in Q8, 15 entries

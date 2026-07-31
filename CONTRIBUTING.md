@@ -58,6 +58,7 @@ Fetch the vectors from their sources and drop them under `reference/<codec>/test
 | Opus | RFC 6716 official vectors (opus-codec.org) | `reference/opus/opus_testvectors` |
 | Opus (CELT layer) | generated locally — see "Opus conformance oracle" below | `reference/opus/celt_only` |
 | Opus (SILK layer) | generated locally — see "Opus conformance oracle" below | `reference/opus/silk_only` |
+| Opus (SILK encoder analysis) | generated locally — see "Opus conformance oracle" below | `reference/opus/silk_enc` |
 
 (G.711 and L16 need no external vectors: G.711 is validated exhaustively over all 256 code points,
 L16 is an exact byte-order transform.)
@@ -222,6 +223,53 @@ and both codebook orders — a decode that never took a branch has not tested it
 Delete `reference/opus/build-trace` once the layer is finished and the `final_range` + `opus_compare`
 gates cover it, and prefer those: an intermediate-state diff proves the fields match, not that the whole
 packet parses.
+
+#### Validating the SILK **encoder**'s analysis front end
+
+The same instrumented build, but driven in the *encode* direction. There is no `final_range` on this
+side at all — RFC 6716 is decoder-normative, so an encoder has no bitstream to match — which makes the
+per-kernel diff the primary gate rather than a diagnostic.
+
+`silk_trace.patch` also adds `#ifdef SILK_TRACE` dumps to `silk/float/encode_frame_FLP.c` and
+`silk/float/find_pred_coefs_FLP.c`, covering the whole analysis chain:
+
+| Line | Source | What it pins down |
+|---|---|---|
+| `EIN` / `ESTATE` / `ECFG` | `encode_frame_FLP.c` | the input signal window as raw IEEE-754 bit patterns, the cross-frame state, and every configuration value that moves a threshold |
+| `EPITCH` | after `silk_find_pitch_lags_FLP` | voicing, lag index, contour index, per-subframe lags, prediction gain, normalized correlation |
+| `ESHAPE` | after `silk_noise_shape_analysis_FLP` | shaping AR coefficients, tilt, harmonic gain, low-frequency shaping, initial gains, input/coding quality, quantisation offset |
+| `ELTPCORR` / `ELPC` | inside `silk_find_pred_coefs_FLP` | the LTP correlation matrix/vector (the codebook search's *input*), and the **unquantized** NLSFs plus the prediction-gain ceiling |
+| `ELTP` | after `silk_find_pred_coefs_FLP` | LTP codebook and per-subframe indices, taps, scale, NLSF indices, both Q12 LPC halves, residual energies |
+| `EGAINS` | after `silk_process_gains_FLP` | gain indices, quantised gains, the rate-distortion lambda, the running gain index |
+
+Because each frame's dump carries its own inputs *and* its own cross-frame state, every frame is
+scored in isolation — a mismatch names one kernel in one frame instead of being blamed on drift.
+
+```sh
+patch -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch
+cmake -S reference/opus/opus-1.5.2 -B reference/opus/build-trace \
+      -DCMAKE_BUILD_TYPE=Release -DOPUS_BUILD_PROGRAMS=ON \
+      -DOPUS_DISABLE_INTRINSICS=ON -DCMAKE_C_FLAGS=-DSILK_TRACE
+cmake --build reference/opus/build-trace -j
+patch -R -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch
+SILK_ENC_TRACE_MAX_FRAMES=60 sh reference/opus/dump_silk_enc_trace.sh
+cargo test -p siphon-rtp-codec --test silk_encoder_analysis_conformance -- --nocapture
+```
+
+Three things about this build differ from the decoder recipe and all three matter:
+
+- **`-DOPUS_DISABLE_INTRINSICS=ON`.** `silk/float/x86/inner_product_FLP_avx2.c` accumulates in a
+  different order from `silk_inner_product_FLP_c`, which is what the Rust port reproduces; leaving it
+  on compares against a third implementation and inflates every tolerance. libopus' fixed-point SSE4.1
+  paths are bit-exact, so the decoder dumps are unaffected — use one `build-trace` for both.
+- **`SILK_ENC_TRACE_MAX_FRAMES`** (default 8) caps how many frames dump their input window, which is
+  the only large field. 60 frames × 36 configurations is ~38 MB and reaches real voiced speech; every
+  frame would be gigabytes.
+- **Float, so state a tolerance.** GCC's default `-ffp-contract=fast` fuses multiply-adds that Rust
+  never fuses, and `libm` differs in the last ulp, so continuous fields carry a per-kernel relative
+  tolerance (documented at the top of the harness). Every **discrete** field — a codebook index, a
+  pitch lag, a gain index, a voicing verdict — must match exactly; a tolerance on one of those is a
+  bug, not a relaxation.
 
 One more oracle is worth knowing about for the tables rather than the decode path:
 `silk_nlsf_tables_vs_libopus` re-parses `reference/opus/opus-1.5.2/silk/tables_NLSF_CB_*.c` and diffs

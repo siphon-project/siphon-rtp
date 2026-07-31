@@ -974,6 +974,208 @@ fn bench_silk_excitation(c: &mut Criterion) {
     group.finish();
 }
 
+/// SILK **encoder** analysis front end: the whole per-frame chain, plus each of the kernels that
+/// dominates it (`silk/float/`, RFC 6716 §4.2 is decoder-normative so these are libopus-equivalent
+/// decisions rather than a spec requirement).
+///
+/// The frame-level number is the one that matters for a real transcode — 20 ms of audio has to
+/// analyse in well under 20 ms of CPU, and this runs once per frame per channel. The kernel numbers
+/// are what say *where* a regression landed: the pitch search is the expensive one (three stages,
+/// two of them over a decimated copy of the frame), Burg is quadratic in the LPC order, and the NLSF
+/// trellis is linear in the survivor count, which is the knob complexity actually turns.
+fn bench_silk_encoder_analysis(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::silk::enc::frame::{
+        analyze_frame, AnalysisConfig, AnalysisState, ComplexitySettings,
+    };
+    use siphon_rtp_codec::opus::silk::enc::lpc_analysis::burg_modified;
+    use siphon_rtp_codec::opus::silk::enc::nlsf_quant::{nlsf_encode, nlsf_vq_weights_laroia};
+    use siphon_rtp_codec::opus::silk::enc::noise_shape::{
+        noise_shape_analysis, NoiseShapeConfig, ShapeState,
+    };
+    use siphon_rtp_codec::opus::silk::enc::pitch::pitch_analysis_core;
+    use siphon_rtp_codec::opus::silk::enc::SignalMeasures;
+    use siphon_rtp_codec::opus::silk::nlsf::{NlsfIndices, MAX_NLSF_INDICES, NO_INTERPOLATION_Q2};
+    use siphon_rtp_codec::opus::silk::nlsf_tables::{NB_MB, WB};
+    use siphon_rtp_codec::opus::silk::types::{
+        CondCoding, InternalRate, SignalType, SubframeLayout, MAX_LPC_ORDER, MAX_NB_SUBFR,
+        SUB_FRAME_LENGTH_MS,
+    };
+
+    /// A deterministic voiced-like input at a known pitch. Logical sample clock only.
+    fn voiced_signal(length: usize, period: usize) -> Vec<f32> {
+        let mut state = 24_680u32;
+        let mut signal = vec![0.0f32; length];
+        let mut history = [0.0f32; 2];
+        for (index, slot) in signal.iter_mut().enumerate() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((state >> 20) as i32 - 2048) as f32 * 0.5;
+            let pulse = if index % period == 0 { 4000.0 } else { 0.0 };
+            let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+            history[1] = history[0];
+            history[0] = value;
+            *slot = value.clamp(-30_000.0, 30_000.0);
+        }
+        signal
+    }
+
+    let measures = SignalMeasures {
+        speech_activity_q8: 220,
+        input_quality_bands_q15: [22_000; 4],
+        input_tilt_q15: 1000,
+        previous_signal_type: SignalType::Voiced,
+    };
+
+    let mut group = c.benchmark_group("silk_encoder_analysis");
+
+    // ---- Whole-frame analysis, per rate and complexity ----
+    for (rate, label) in [
+        (InternalRate::Narrow8k, "nb_8k"),
+        (InternalRate::Wide16k, "wb_16k"),
+    ] {
+        for complexity in [0u8, 5, 10] {
+            let config = AnalysisConfig {
+                internal_rate: rate,
+                layout: SubframeLayout::from_duration_ms(20).expect("20 ms"),
+                settings: ComplexitySettings::for_complexity(complexity),
+                snr_db_q7: 2600,
+                use_cbr: false,
+                packet_loss_percent: 10,
+                frames_per_packet: 1,
+                lbrr_enabled: false,
+            };
+            let history = config.required_history();
+            let total = history + config.frame_length() + config.required_lookahead();
+            let signal = voiced_signal(total, 5 * rate.khz());
+            let mut state = AnalysisState {
+                first_frame_after_reset: false,
+                ..AnalysisState::default()
+            };
+
+            group.bench_function(format!("frame_{label}_c{complexity}_20ms"), |b| {
+                b.iter(|| {
+                    let analysis = analyze_frame(
+                        &mut state,
+                        black_box(&signal),
+                        history,
+                        SignalType::Unvoiced,
+                        CondCoding::Independently,
+                        &measures,
+                        &config,
+                    );
+                    black_box(analysis.map(|value| value.control.lambda))
+                });
+            });
+        }
+    }
+
+    // ---- Open-loop pitch search, the dominant kernel ----
+    for (fs_khz, label) in [(8usize, "8k"), (16, "16k")] {
+        let frame = voiced_signal(40 * fs_khz, 5 * fs_khz);
+        for complexity in [0usize, 2] {
+            group.bench_function(format!("pitch_core_{label}_c{complexity}"), |b| {
+                b.iter(|| {
+                    black_box(pitch_analysis_core(
+                        black_box(&frame),
+                        0.5,
+                        5 * fs_khz as i32,
+                        0.8,
+                        0.4,
+                        fs_khz,
+                        complexity,
+                        MAX_NB_SUBFR,
+                    ))
+                });
+            });
+        }
+    }
+
+    // ---- Burg AR analysis, at both LPC orders ----
+    for (order, subframe_length, label) in [(10usize, 40usize, "order10"), (16, 80, "order16")] {
+        let stacked = voiced_signal((order + subframe_length) * MAX_NB_SUBFR, subframe_length);
+        group.bench_function(format!("burg_{label}"), |b| {
+            let mut coefficients = [0.0f32; MAX_LPC_ORDER];
+            b.iter(|| {
+                black_box(burg_modified(
+                    &mut coefficients[..order],
+                    black_box(&stacked),
+                    1.0 / 1e4,
+                    order + subframe_length,
+                    MAX_NB_SUBFR,
+                ))
+            });
+        });
+    }
+
+    // ---- Noise-shaping analysis, warped and unwarped ----
+    for (warping_q16, label) in [(0i32, "flat"), (16 * 983, "warped")] {
+        let config = NoiseShapeConfig {
+            fs_khz: 16,
+            subframe_count: MAX_NB_SUBFR,
+            subframe_length: 80,
+            la_shape: 80,
+            shape_window_length: SUB_FRAME_LENGTH_MS * 16 + 160,
+            shaping_lpc_order: 24,
+            warping_q16,
+            snr_db_q7: 2600,
+            use_cbr: false,
+        };
+        let signal = voiced_signal(1200, 80);
+        let residual = voiced_signal(1200, 80);
+        group.bench_function(format!("noise_shape_{label}"), |b| {
+            let mut state = ShapeState::default();
+            b.iter(|| {
+                black_box(noise_shape_analysis(
+                    &mut state,
+                    black_box(&signal),
+                    400,
+                    &residual,
+                    SignalType::Voiced,
+                    &[80; MAX_NB_SUBFR],
+                    50.0,
+                    0.6,
+                    &measures,
+                    &config,
+                ))
+            });
+        });
+    }
+
+    // ---- NLSF quantisation, at the survivor-count extremes ----
+    for (codebook, label) in [(&NB_MB, "nb_mb"), (&WB, "wb")] {
+        let order = codebook.order;
+        let step = (1 << 15) / (order as i32 + 1);
+        let mut source: Vec<i16> = (1..=order).map(|k| (k as i32 * step) as i16).collect();
+        source[order / 2] = source[order / 2 - 1] + 60;
+        let mut weights = vec![0i16; order];
+        nlsf_vq_weights_laroia(&mut weights, &source);
+
+        for survivors in [2usize, 16] {
+            group.bench_function(format!("nlsf_quant_{label}_s{survivors}"), |b| {
+                b.iter(|| {
+                    let mut quantized = [0i16; MAX_LPC_ORDER];
+                    quantized[..order].copy_from_slice(&source);
+                    let mut indices = NlsfIndices {
+                        indices: [0i8; MAX_NLSF_INDICES],
+                        order,
+                        interpolation_factor_q2: NO_INTERPOLATION_Q2,
+                    };
+                    black_box(nlsf_encode(
+                        &mut indices,
+                        &mut quantized[..order],
+                        codebook,
+                        black_box(&weights),
+                        3146,
+                        survivors,
+                        2,
+                    ))
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 // AMR-WB/NB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
 #[cfg(feature = "amr")]
 criterion_group!(
@@ -987,6 +1189,7 @@ criterion_group!(
     bench_celt_decode,
     bench_celt_kernels,
     bench_silk_excitation,
+    bench_silk_encoder_analysis,
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
@@ -1007,6 +1210,7 @@ criterion_group!(
     bench_celt_encode,
     bench_celt_decode,
     bench_celt_kernels,
-    bench_silk_excitation
+    bench_silk_excitation,
+    bench_silk_encoder_analysis
 );
 criterion_main!(benches);
