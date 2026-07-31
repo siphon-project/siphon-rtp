@@ -584,7 +584,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "clap",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-codec"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "siphon-rtp-simd",
  "thiserror 2.0.18",
@@ -1571,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-datapath"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dsp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "siphon-rtp-simd",
  "thiserror 2.0.18",
@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dtls"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ebpf-common"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "siphon-rtp-fuzz"
@@ -1626,14 +1626,14 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-hep"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "siphon-rtp-ice"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "siphon-rtp-stun",
  "thiserror 2.0.18",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-media"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "flume",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ngcompat"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "siphon-rtp-proto",
  "thiserror 2.0.18",
@@ -1668,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -1678,11 +1678,11 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-simd"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "siphon-rtp-srtp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aes",
  "base64",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-stun"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "getrandom 0.3.4",
  "thiserror 2.0.18",
@@ -1704,7 +1704,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-turn"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "flume",
@@ -1907,9 +1907,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
  "bytes",
  "libc",
