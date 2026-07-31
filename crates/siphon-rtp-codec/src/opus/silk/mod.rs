@@ -172,6 +172,7 @@
 //! libopus source and compares every ported NLSF codebook entry element by element.
 
 pub mod decoder;
+pub mod enc;
 pub mod excitation;
 pub mod fixed;
 pub mod frame_type;
