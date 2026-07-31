@@ -36,6 +36,12 @@ iai-callgrind = { workspace = true }
 name = "codec_bench"
 harness = false
 
+# The SILK NLSF stage (RFC 6716 §4.2.7.5): a per-20 ms-frame datapath cost of its own, kept in its
+# own bench file so it can be run without building the whole codec bench.
+[[bench]]
+name = "silk_nlsf_bench"
+harness = false
+
 # Deterministic instruction-count gate (valgrind/callgrind). Unlike the criterion wall-clock benches,
 # these are stable enough on a shared CI runner to fail on a >N% regression. See ci.yml `perf-gate`.
 [[bench]]
