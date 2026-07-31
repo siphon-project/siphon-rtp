@@ -39,6 +39,13 @@ const REQUIRED_EXTENSIONS: &[(&str, &str)] = &[
     // `silk_header_conformance` and `silk_excitation_conformance` skip every stream and prove
     // nothing.
     ("../../reference/opus/silk_only", "trace"),
+    // libopus' own decode of the same streams, from `gen_silk_only.sh`; `silk_only_conformance`
+    // compares against it sample for sample.
+    ("../../reference/opus/silk_only", "dec"),
+    // libopus' decode of the same streams *under simulated packet loss*, from `gen_silk_plc.sh`.
+    // Without them `silk_plc_conformance` skips, and RFC 6716 §4.4 has no oracle at all — nothing
+    // else in the suite can see concealment or comfort noise.
+    ("../../reference/opus/silk_only", "plcdec"),
 ];
 
 fn contains_extension(dir: &Path, extension: &str) -> bool {
