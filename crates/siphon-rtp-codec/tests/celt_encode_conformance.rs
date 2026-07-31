@@ -1,7 +1,8 @@
 //! CELT **encode** conformance: encode real PCM with our [`CeltEncoder`], have *libopus* decode the
-//! result, and score that decode against the original with `opus_compare` (RFC 6716 §6).
+//! result, and score that decode against the original with `opus_compare` (RFC 6716 §6). Mono and
+//! stereo.
 //!
-//! An encoder has no reference `final_range` of its own to match, so this harness stacks the three
+//! An encoder has no reference `final_range` of its own to match, so this harness stacks the four
 //! checks that do exist, from strongest to weakest:
 //!
 //! 1. **libopus agrees on the entropy state.** Our stream is written in `opus_demo`'s `.bit` framing,
@@ -12,8 +13,8 @@
 //!    [`CeltDecoder`] and every packet's `final_range` must equal the encoder's. Encoder and decoder
 //!    disagreeing is a bug in one of them, and this localises it to the packet.
 //! 3. **Quality at least libopus'.** The same source is encoded by libopus itself at the identical
-//!    configuration (`opus_demo -e restricted-lowdelay`, same bandwidth / frame size / rate / CVBR)
-//!    and decoded; our segmental SNR against the original must be within
+//!    configuration (`opus_demo -e restricted-lowdelay`, same channels / bandwidth / frame size /
+//!    rate / CVBR) and decoded; our segmental SNR against the original must be within
 //!    [`SNR_MARGIN_DB`] of libopus'. This runs over the *whole* matrix, including the very low rates,
 //!    where `opus_compare` cannot be used as the criterion: it is a *decoder* tolerance metric, and
 //!    two independent 12 kb/s encodes legitimately differ by more than it allows.
@@ -24,7 +25,7 @@
 //!
 //! The matrix sweeps all four CELT bandwidths × the four CELT frame sizes (2.5/5/10/20 ms) × a
 //! bitrate spread from very low (sparse allocation, folding, anti-collapse active) to very high, over
-//! two real source signals.
+//! two real source signals, in both mono and stereo.
 //!
 //! Like the decode harnesses, this is a no-op (with a printed notice) when the reference tree or the
 //! oracle binaries are absent, so it never breaks CI on a machine without them — and it does **not**
@@ -76,9 +77,9 @@ fn oracle(reference: &Path, name: &str) -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
-/// The TOC byte for a mono CELT-only frame (RFC 6716 §3.1, Table 2): configs 16..31 are CELT-only,
-/// four per bandwidth in ascending frame duration, then `stereo = 0` and `code = 0` (one frame).
-fn celt_toc(bandwidth: Bandwidth, lm: usize) -> u8 {
+/// The TOC byte for a CELT-only frame (RFC 6716 §3.1, Table 2): configs 16..31 are CELT-only, four
+/// per bandwidth in ascending frame duration, then the stereo flag and `code = 0` (one frame).
+fn celt_toc(bandwidth: Bandwidth, lm: usize, channels: usize) -> u8 {
     let bandwidth_index = match bandwidth {
         Bandwidth::Narrowband => 0,
         // CELT-only has no medium-band config; libopus maps MB to WB there too.
@@ -87,17 +88,17 @@ fn celt_toc(bandwidth: Bandwidth, lm: usize) -> u8 {
         Bandwidth::Fullband => 3,
     };
     let config = 16 + 4 * bandwidth_index + lm as u8;
-    // `| (stereo << 2) | code` with both zero — mono, one frame per packet.
-    config << 3
+    (config << 3) | (u8::from(channels == 2) << 2)
 }
 
-/// Read a 16-bit little-endian mono `.sw` file as `f32` in `[-1, 1)`.
-fn read_sw(path: &Path, max_samples: usize) -> Option<Vec<f32>> {
+/// Read a 16-bit little-endian `.sw` file as `f32` in `[-1, 1)`. `max_values` counts interleaved
+/// values, not sample instants.
+fn read_sw(path: &Path, max_values: usize) -> Option<Vec<f32>> {
     let bytes = std::fs::read(path).ok()?;
     Some(
         bytes
             .chunks_exact(2)
-            .take(max_samples)
+            .take(max_values)
             .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
             .collect(),
     )
@@ -107,7 +108,7 @@ fn read_sw(path: &Path, max_samples: usize) -> Option<Vec<f32>> {
 struct Encoded {
     /// `[u32 BE payload_len][u32 BE final_range][payload]` per packet — `opus_demo`'s `.bit` format.
     bit_stream: Vec<u8>,
-    /// The exact input samples that were encoded, as **mono** 16-bit LE.
+    /// The exact input samples that were encoded, as interleaved 16-bit LE.
     source_pcm: Vec<u8>,
     /// Total payload bytes, for the reported achieved bitrate.
     payload_bytes: usize,
@@ -120,6 +121,7 @@ struct Encoded {
 fn encode_and_self_check(
     signal: &[f32],
     frame_size: usize,
+    channels: usize,
     bandwidth: Bandwidth,
     bitrate: i32,
     rate_control: RateControl,
@@ -129,15 +131,17 @@ fn encode_and_self_check(
         .iter()
         .position(|&f| f == frame_size)
         .ok_or_else(|| format!("frame size {frame_size} is not a CELT frame"))?;
-    let toc = celt_toc(bandwidth, lm);
+    let toc = celt_toc(bandwidth, lm, channels);
 
-    let mut encoder = CeltEncoder::new().map_err(|e| format!("CeltEncoder::new: {e:?}"))?;
+    let mut encoder =
+        CeltEncoder::with_channels(channels).map_err(|e| format!("CeltEncoder::new: {e:?}"))?;
     encoder.set_bitrate(bitrate);
     encoder.set_rate_control(rate_control);
     encoder
         .set_band_range(0, end)
         .map_err(|e| format!("set_band_range: {e:?}"))?;
-    let mut decoder = CeltDecoder::new().map_err(|e| format!("CeltDecoder::new: {e:?}"))?;
+    let mut decoder =
+        CeltDecoder::with_channels(channels).map_err(|e| format!("CeltDecoder::new: {e:?}"))?;
     decoder
         .set_band_range(0, end)
         .map_err(|e| format!("set_band_range: {e:?}"))?;
@@ -145,13 +149,14 @@ fn encode_and_self_check(
     let mut bit_stream = Vec::new();
     let mut source_pcm = Vec::new();
     let mut payload = vec![0u8; MAX_PACKET_BYTES];
-    let mut decoded = vec![0i16; frame_size];
+    let mut decoded = vec![0i16; frame_size * channels];
     let mut payload_bytes = 0usize;
-    let frames = signal.len() / frame_size;
+    let block_values = frame_size * channels;
+    let frames = signal.len() / block_values;
 
     for frame in 0..frames {
-        let lo = frame * frame_size;
-        let block = &signal[lo..lo + frame_size];
+        let lo = frame * block_values;
+        let block = &signal[lo..lo + block_values];
         let written = encoder
             .encode(block, frame_size, &mut payload)
             .map_err(|e| format!("frame {frame}: encode: {e:?}"))?;
@@ -189,16 +194,16 @@ fn encode_and_self_check(
     })
 }
 
-/// Segmental SNR in dB of `test` against `reference`, both mono 16-bit LE (the metric this repo
-/// already uses for DSP quality work): per-20 ms-frame SNR, clamped to `[-10, 35]` dB, averaged over
-/// the frames where the reference actually has energy.
+/// Segmental SNR in dB of `test` against `reference`, both interleaved 16-bit LE (the metric this
+/// repo already uses for DSP quality work): per-20 ms-frame SNR, clamped to `[-10, 35]` dB, averaged
+/// over the frames where the reference actually has energy. A stereo frame covers both channels.
 ///
 /// Used to compare *our* encoder against *libopus'* at the same configuration. Unlike
 /// `opus_compare` — a decoder tolerance metric that both encodes are legitimately outside at low
 /// rate — this is a direct, monotone quality measure, so "ours is within X dB of theirs" is a
 /// meaningful encoder gate across the whole matrix.
-fn segmental_snr_db(reference: &[u8], test: &[u8]) -> f32 {
-    const FRAME: usize = 960; // 20 ms at 48 kHz
+fn segmental_snr_db(reference: &[u8], test: &[u8], channels: usize) -> f32 {
+    let frame = 960 * channels; // 20 ms at 48 kHz, interleaved
     let to_i16 = |b: &[u8]| -> Vec<f32> {
         b.chunks_exact(2)
             .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])))
@@ -209,13 +214,13 @@ fn segmental_snr_db(reference: &[u8], test: &[u8]) -> f32 {
     let n = r.len().min(t.len());
     let mut total = 0f32;
     let mut frames = 0usize;
-    let mut frame = 0usize;
-    while (frame + 1) * FRAME <= n {
-        let lo = frame * FRAME;
-        let hi = lo + FRAME;
+    let mut index = 0usize;
+    while (index + 1) * frame <= n {
+        let lo = index * frame;
+        let hi = lo + frame;
         let signal: f32 = r[lo..hi].iter().map(|v| v * v).sum();
         // Skip near-silent frames: their SNR is dominated by the reference's own dither.
-        if signal > FRAME as f32 * 4.0 {
+        if signal > frame as f32 * 4.0 {
             let noise: f32 = r[lo..hi]
                 .iter()
                 .zip(&t[lo..hi])
@@ -225,7 +230,7 @@ fn segmental_snr_db(reference: &[u8], test: &[u8]) -> f32 {
             total += (10.0 * (signal / noise).log10()).clamp(-10.0, 35.0);
             frames += 1;
         }
-        frame += 1;
+        index += 1;
     }
     if frames == 0 {
         return 0.0;
@@ -244,26 +249,41 @@ fn mono_to_stereo(mono: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Run `opus_compare -r 48000 <reference> <test>` over two in-memory mono buffers, trimming both to
+/// Run `opus_compare [-s] -r 48000 <reference> <test>` over two in-memory buffers, trimming both to
 /// the shorter length. `Ok(())` on a pass.
-fn compare_mono(
+///
+/// `opus_compare` always reads its reference file as two channels, so a mono reference is duplicated
+/// here; a stereo one is already the right shape and `-s` keeps the test file stereo too.
+fn compare_pcm(
     opus_compare: &Path,
     tag: &str,
-    reference_mono: &[u8],
-    test_mono: &[u8],
+    reference: &[u8],
+    test: &[u8],
+    channels: usize,
 ) -> Result<(), String> {
-    let samples = (reference_mono.len() / 2).min(test_mono.len() / 2);
-    if samples == 0 {
+    let values = (reference.len() / 2).min(test.len() / 2);
+    // Compare whole sample instants only.
+    let values = values - values % channels;
+    if values == 0 {
         return Err("nothing to compare".to_string());
     }
     let tmp = std::env::temp_dir();
     let unique = format!("celt_cmp_{}_{}", std::process::id(), tag);
     let ref_path = tmp.join(format!("{unique}.ref.sw"));
     let test_path = tmp.join(format!("{unique}.test.sw"));
-    std::fs::write(&ref_path, mono_to_stereo(&reference_mono[..2 * samples]))
-        .map_err(|e| e.to_string())?;
-    std::fs::write(&test_path, &test_mono[..2 * samples]).map_err(|e| e.to_string())?;
-    let output = std::process::Command::new(opus_compare)
+    let reference = &reference[..2 * values];
+    let reference_stereo = if channels == 2 {
+        reference.to_vec()
+    } else {
+        mono_to_stereo(reference)
+    };
+    std::fs::write(&ref_path, &reference_stereo).map_err(|e| e.to_string())?;
+    std::fs::write(&test_path, &test[..2 * values]).map_err(|e| e.to_string())?;
+    let mut command = std::process::Command::new(opus_compare);
+    if channels == 2 {
+        command.arg("-s");
+    }
+    let output = command
         .arg("-r")
         .arg(RATE_HZ.to_string())
         .arg(&ref_path)
@@ -284,8 +304,13 @@ fn compare_mono(
 /// Decode an `opus_demo`-framed bitstream with libopus. **This is check 1**: `opus_demo -d` compares
 /// its own decoder's range-coder state against the `final_range` stored beside every packet and
 /// aborts on any difference, so a success is an exact per-packet bitstream agreement with libopus.
-/// Returns the decoded mono 16-bit LE PCM with the codec delay already trimmed.
-fn libopus_decode(opus_demo: &Path, tag: &str, bit_stream: &[u8]) -> Result<Vec<u8>, String> {
+/// Returns the decoded interleaved 16-bit LE PCM with the codec delay already trimmed.
+fn libopus_decode(
+    opus_demo: &Path,
+    tag: &str,
+    bit_stream: &[u8],
+    channels: usize,
+) -> Result<Vec<u8>, String> {
     let tmp = std::env::temp_dir();
     let unique = format!("celt_dec_{}_{}", std::process::id(), tag);
     let bit_path = tmp.join(format!("{unique}.bit"));
@@ -294,7 +319,7 @@ fn libopus_decode(opus_demo: &Path, tag: &str, bit_stream: &[u8]) -> Result<Vec<
     let demo = std::process::Command::new(opus_demo)
         .arg("-d")
         .arg(RATE_HZ.to_string())
-        .arg("1")
+        .arg(channels.to_string())
         .arg(&bit_path)
         .arg(&dec_path)
         .output()
@@ -313,7 +338,7 @@ fn libopus_decode(opus_demo: &Path, tag: &str, bit_stream: &[u8]) -> Result<Vec<
     let _ = std::fs::remove_file(&bit_path);
     let _ = std::fs::remove_file(&dec_path);
     let decoded = result?;
-    let front = 2 * CODEC_DELAY_SAMPLES;
+    let front = 2 * CODEC_DELAY_SAMPLES * channels;
     if decoded.len() <= front {
         return Err(format!(
             "opus_demo -d produced only {} bytes, less than the codec delay",
@@ -324,12 +349,13 @@ fn libopus_decode(opus_demo: &Path, tag: &str, bit_stream: &[u8]) -> Result<Vec<
 }
 
 /// Encode the same source with libopus itself at the identical configuration and decode it — the
-/// reference side of check 3. Returns mono 16-bit LE PCM with the codec delay trimmed.
+/// reference side of check 3. Returns interleaved 16-bit LE PCM with the codec delay trimmed.
 #[allow(clippy::too_many_arguments)]
 fn libopus_reference_roundtrip(
     opus_demo: &Path,
     tag: &str,
-    source_mono: &[u8],
+    source: &[u8],
+    channels: usize,
     bandwidth_name: &str,
     frame_ms: &str,
     bitrate: i32,
@@ -338,14 +364,14 @@ fn libopus_reference_roundtrip(
     let unique = format!("celt_ref_{}_{}", std::process::id(), tag);
     let src_path = tmp.join(format!("{unique}.src.sw"));
     let bit_path = tmp.join(format!("{unique}.bit"));
-    std::fs::write(&src_path, source_mono).map_err(|e| e.to_string())?;
+    std::fs::write(&src_path, source).map_err(|e| e.to_string())?;
     // `restricted-lowdelay` forces `MODE_CELT_ONLY`, which is what we are comparing against.
     let encode = std::process::Command::new(opus_demo)
         .args([
             "-e",
             "restricted-lowdelay",
             &RATE_HZ.to_string(),
-            "1",
+            &channels.to_string(),
             &bitrate.to_string(),
             "-cvbr",
             "-bandwidth",
@@ -370,7 +396,24 @@ fn libopus_reference_roundtrip(
     }
     let bit_stream = std::fs::read(&bit_path).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&bit_path);
-    libopus_decode(opus_demo, &format!("{tag}_ref"), &bit_stream)
+    libopus_decode(opus_demo, &format!("{tag}_ref"), &bit_stream, channels)
+}
+
+/// The rate sweep for a given channel count and frame duration.
+///
+/// Stereo starts higher at the short frame sizes because libopus' *Opus-layer* stereo decision
+/// downmixes to mono below its threshold (64 kb/s at 2.5 ms, 48 kb/s at 5 ms) — its encode would
+/// then be a mono one and check 3 would be comparing two different things. Above those floors both
+/// encoders code real stereo.
+fn bitrates_for(channels: usize, frame_size: usize) -> &'static [i32] {
+    if channels == 1 {
+        return &[12_000, 32_000, 96_000, 256_000];
+    }
+    match frame_size {
+        120 => &[64_000, 96_000, 256_000],
+        240 => &[48_000, 96_000, 256_000],
+        _ => &[24_000, 64_000, 96_000, 256_000],
+    }
 }
 
 #[test]
@@ -388,125 +431,144 @@ fn our_celt_encoder_streams_pass_libopus_and_opus_compare() {
         return;
     };
 
-    // Two real sources: speech-like and music-like (the same files the CELT-only decode vectors are
-    // generated from).
-    let sources: Vec<(String, Vec<f32>)> = ["src01.sw", "src09.sw"]
-        .iter()
-        .filter_map(|name| {
-            read_sw(&reference.join(name), SECONDS * RATE_HZ as usize)
-                .map(|pcm| ((*name).to_string(), pcm))
-        })
-        .filter(|(_, pcm)| pcm.len() >= 48_000)
-        .collect();
-    if sources.is_empty() {
-        eprintln!(
-            "celt encode conformance: no source PCM in {} — skipping",
-            reference.display()
-        );
-        return;
-    }
-
     let bandwidths = [
         ("NB", Bandwidth::Narrowband),
         ("WB", Bandwidth::Wideband),
         ("SWB", Bandwidth::SuperWideband),
         ("FB", Bandwidth::Fullband),
     ];
-    // A spread from "very low" (sparse allocation, folding and anti-collapse active) to "very high".
-    let bitrates = [12_000i32, 32_000, 96_000, 256_000];
     let frame_sizes = [("2.5", 120usize), ("5", 240), ("10", 480), ("20", 960)];
 
     let mut passed: Vec<String> = Vec::new();
     let mut transparent_passed: Vec<String> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
+    let mut stereo_scored = 0usize;
 
-    for (source_name, signal) in &sources {
-        for &(bandwidth_name, bandwidth) in &bandwidths {
-            for &(frame_ms, frame_size) in &frame_sizes {
-                for &bitrate in &bitrates {
-                    // Skip rates that cannot fill even a 3-byte payload for this frame duration;
-                    // libopus refuses such combinations at the Opus layer too.
-                    if bitrate * frame_size as i32 / (RATE_HZ as i32 * 8) < 3 {
-                        continue;
-                    }
-                    let tag = format!(
-                        "{}_{bandwidth_name}_{frame_ms}ms_{}k",
-                        source_name.trim_end_matches(".sw"),
-                        bitrate / 1000
-                    );
-                    // Checks 1 + 2: encode, verify our own decoder tracks the entropy state, then
-                    // let libopus decode (which verifies its decoder does too).
-                    let encoded = match encode_and_self_check(
-                        signal,
-                        frame_size,
-                        bandwidth,
-                        bitrate,
-                        RateControl::ConstrainedVbr,
-                    ) {
-                        Ok(e) => e,
-                        Err(reason) => {
-                            failed.push((tag, reason));
-                            continue;
-                        }
-                    };
-                    let achieved = encoded.payload_bytes * 8 * RATE_HZ as usize
-                        / (encoded.frames * frame_size);
-                    let ours = match libopus_decode(&opus_demo, &tag, &encoded.bit_stream) {
-                        Ok(pcm) => pcm,
-                        Err(reason) => {
-                            failed.push((tag, reason));
-                            continue;
-                        }
-                    };
-                    // Check 3: against libopus' own encode of the same source at the same config.
-                    let theirs = match libopus_reference_roundtrip(
-                        &opus_demo,
-                        &tag,
-                        &encoded.source_pcm,
-                        bandwidth_name,
-                        frame_ms,
-                        bitrate,
-                    ) {
-                        Ok(pcm) => pcm,
-                        Err(reason) => {
-                            failed.push((tag, format!("reference encode: {reason}")));
-                            continue;
-                        }
-                    };
-                    // Quality relative to the reference encoder, over the whole matrix.
-                    let ours_snr = segmental_snr_db(&encoded.source_pcm, &ours);
-                    let theirs_snr = segmental_snr_db(&encoded.source_pcm, &theirs);
-                    if ours_snr < theirs_snr - SNR_MARGIN_DB {
-                        failed.push((
-                            tag,
-                            format!(
-                                "quality below libopus: {ours_snr:.2} dB vs {theirs_snr:.2} dB \
-                                 segmental SNR (margin {SNR_MARGIN_DB} dB)"
-                            ),
-                        ));
-                        continue;
-                    }
-                    passed.push(format!(
-                        "{tag}@{}k snr {ours_snr:.1}/{theirs_snr:.1}dB",
-                        achieved / 1000
-                    ));
+    for channels in [1usize, 2] {
+        // Two real sources: speech-like and music-like (the same files the CELT-only decode vectors
+        // are generated from), mono or stereo as the configuration needs.
+        let names: [&str; 2] = if channels == 1 {
+            ["src01.sw", "src09.sw"]
+        } else {
+            ["src01_stereo.sw", "src09_stereo.sw"]
+        };
+        let sources: Vec<(String, Vec<f32>)> = names
+            .iter()
+            .filter_map(|name| {
+                read_sw(&reference.join(name), SECONDS * RATE_HZ as usize * channels)
+                    .map(|pcm| ((*name).to_string(), pcm))
+            })
+            .filter(|(_, pcm)| pcm.len() >= 48_000 * channels)
+            .collect();
+        if sources.is_empty() {
+            eprintln!(
+                "celt encode conformance: no {channels}-channel source PCM in {} — skipping that \
+                 half",
+                reference.display()
+            );
+            continue;
+        }
 
-                    // Check 4: the literal RFC §6 comparison against the original PCM, for the
-                    // configurations where the encode is near-transparent enough for a *decoder*
-                    // tolerance metric to be a fair test.
-                    // Required only for fullband at the top of the rate range: anything narrower
-                    // discards spectrum the original still has (SWB drops 12-20 kHz, which the music
-                    // source fills), and anything slower than ~256 kb/s is not transparent enough for
-                    // a *decoder* tolerance metric to be a fair encoder test. Lower rates are still
-                    // scored and reported, they just do not gate.
-                    let gated = bitrate >= 256_000 && bandwidth == Bandwidth::Fullband;
-                    if gated || bitrate >= 96_000 {
-                        match compare_mono(&opus_compare, &tag, &encoded.source_pcm, &ours) {
-                            Ok(()) => transparent_passed.push(tag),
-                            Err(reason) if gated => {
-                                failed.push((tag, format!("vs the original PCM: {reason}")));
+        for (source_name, signal) in &sources {
+            for &(bandwidth_name, bandwidth) in &bandwidths {
+                for &(frame_ms, frame_size) in &frame_sizes {
+                    for &bitrate in bitrates_for(channels, frame_size) {
+                        // Skip rates that cannot fill even a 3-byte payload for this frame duration;
+                        // libopus refuses such combinations at the Opus layer too.
+                        if bitrate * frame_size as i32 / (RATE_HZ as i32 * 8) < 3 {
+                            continue;
+                        }
+                        let tag = format!(
+                            "{}_{bandwidth_name}_{frame_ms}ms_{}k_c{channels}",
+                            source_name.trim_end_matches(".sw"),
+                            bitrate / 1000
+                        );
+                        // Checks 1 + 2: encode, verify our own decoder tracks the entropy state,
+                        // then let libopus decode (which verifies its decoder does too).
+                        let encoded = match encode_and_self_check(
+                            signal,
+                            frame_size,
+                            channels,
+                            bandwidth,
+                            bitrate,
+                            RateControl::ConstrainedVbr,
+                        ) {
+                            Ok(e) => e,
+                            Err(reason) => {
+                                failed.push((tag, reason));
+                                continue;
                             }
-                            Err(_) => {}
+                        };
+                        let achieved = encoded.payload_bytes * 8 * RATE_HZ as usize
+                            / (encoded.frames * frame_size);
+                        let ours =
+                            match libopus_decode(&opus_demo, &tag, &encoded.bit_stream, channels) {
+                                Ok(pcm) => pcm,
+                                Err(reason) => {
+                                    failed.push((tag, reason));
+                                    continue;
+                                }
+                            };
+                        // Check 3: against libopus' own encode of the same source at the same config.
+                        let theirs = match libopus_reference_roundtrip(
+                            &opus_demo,
+                            &tag,
+                            &encoded.source_pcm,
+                            channels,
+                            bandwidth_name,
+                            frame_ms,
+                            bitrate,
+                        ) {
+                            Ok(pcm) => pcm,
+                            Err(reason) => {
+                                failed.push((tag, format!("reference encode: {reason}")));
+                                continue;
+                            }
+                        };
+                        // Quality relative to the reference encoder, over the whole matrix.
+                        let ours_snr = segmental_snr_db(&encoded.source_pcm, &ours, channels);
+                        let theirs_snr = segmental_snr_db(&encoded.source_pcm, &theirs, channels);
+                        if ours_snr < theirs_snr - SNR_MARGIN_DB {
+                            failed.push((
+                                tag,
+                                format!(
+                                    "quality below libopus: {ours_snr:.2} dB vs {theirs_snr:.2} dB \
+                                     segmental SNR (margin {SNR_MARGIN_DB} dB)"
+                                ),
+                            ));
+                            continue;
+                        }
+                        passed.push(format!(
+                            "{tag}@{}k snr {ours_snr:.1}/{theirs_snr:.1}dB",
+                            achieved / 1000
+                        ));
+                        if channels == 2 {
+                            stereo_scored += 1;
+                        }
+
+                        // Check 4: the literal RFC §6 comparison against the original PCM, for the
+                        // configurations where the encode is near-transparent enough for a *decoder*
+                        // tolerance metric to be a fair test.
+                        // Required only for fullband at the top of the rate range: anything narrower
+                        // discards spectrum the original still has (SWB drops 12-20 kHz, which the
+                        // music source fills), and anything slower than ~256 kb/s is not transparent
+                        // enough for a *decoder* tolerance metric to be a fair encoder test. Lower
+                        // rates are still scored and reported, they just do not gate.
+                        let gated = bitrate >= 256_000 && bandwidth == Bandwidth::Fullband;
+                        if gated || bitrate >= 96_000 {
+                            match compare_pcm(
+                                &opus_compare,
+                                &tag,
+                                &encoded.source_pcm,
+                                &ours,
+                                channels,
+                            ) {
+                                Ok(()) => transparent_passed.push(tag),
+                                Err(reason) if gated => {
+                                    failed.push((tag, format!("vs the original PCM: {reason}")));
+                                }
+                                Err(_) => {}
+                            }
                         }
                     }
                 }
@@ -516,7 +578,7 @@ fn our_celt_encoder_streams_pass_libopus_and_opus_compare() {
 
     eprintln!(
         "celt encode conformance: {} configurations passed (vs libopus' own encode), {} of them \
-         also pass against the original PCM, {} failed",
+         also pass against the original PCM, {} failed; {stereo_scored} of the passes were stereo",
         passed.len(),
         transparent_passed.len(),
         failed.len()
@@ -540,5 +602,9 @@ fn our_celt_encoder_streams_pass_libopus_and_opus_compare() {
     assert!(
         !transparent_passed.is_empty(),
         "celt encode: no configuration was scored against the original PCM"
+    );
+    assert!(
+        stereo_scored > 0,
+        "celt encode: no stereo configuration was scored — are the stereo sources present?"
     );
 }
