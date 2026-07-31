@@ -207,21 +207,20 @@ fn celt_stereo_round_trip_makes_no_heap_allocation_per_frame() {
         let mut payload = vec![0u8; 1275];
         let mut pcm = vec![0i16; 2 * frame_size];
         let mut frame = 0usize;
-        let mut round_trip =
-            |encoder: &mut CeltEncoder,
-             decoder: &mut CeltDecoder,
-             payload: &mut Vec<u8>,
-             pcm: &mut Vec<i16>,
-             frame: &mut usize| {
-                let lo = (*frame % 8) * frame_size * 2;
-                *frame += 1;
-                let written = encoder
-                    .encode(&signal[lo..lo + 2 * frame_size], frame_size, payload)
-                    .expect("encode");
-                decoder
-                    .decode(&payload[..written], pcm, frame_size)
-                    .expect("decode");
-            };
+        let round_trip = |encoder: &mut CeltEncoder,
+                          decoder: &mut CeltDecoder,
+                          payload: &mut Vec<u8>,
+                          pcm: &mut Vec<i16>,
+                          frame: &mut usize| {
+            let lo = (*frame % 8) * frame_size * 2;
+            *frame += 1;
+            let written = encoder
+                .encode(&signal[lo..lo + 2 * frame_size], frame_size, payload)
+                .expect("encode");
+            decoder
+                .decode(&payload[..written], pcm, frame_size)
+                .expect("decode");
+        };
         for _ in 0..32 {
             round_trip(
                 &mut encoder,
