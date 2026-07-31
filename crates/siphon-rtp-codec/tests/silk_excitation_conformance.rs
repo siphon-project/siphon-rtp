@@ -2,18 +2,12 @@
 //! SILK-only oracle streams and diff the pitch, LTP and excitation state against libopus' own decode
 //! of the same bits, field by field.
 //!
-//! # Why this harness can reach the end of a packet before the NLSF phase exists
-//!
 //! A SILK frame's bitstream is exactly `silk_decode_indices` followed by `silk_decode_pulses`
-//! (`decode_frame.c:80-89`) — nothing else in the layer reads a bit. Everything in that span is
-//! implemented here **except** the normalized-LSF indices (§4.2.7.5), which another phase owns. The
-//! instrumented libopus therefore records the `(fl, fh)` pair of every NLSF symbol it decoded, and
-//! this harness replays those pairs through
-//! [`RangeDecoder::decode`](siphon_rtp_codec::opus::range_coder::RangeDecoder::decode) +
-//! `dec_update`. That is *exactly* state-equivalent to `ec_dec_icdf` at `ftb = 8` — both reduce to
-//! `ext = rng >> 8`, `val -= ext*(256 - fh)`, `rng = fl > 0 ? ext*(fh - fl) : rng - ext*(256 - fh)` —
-//! so the decoder arrives at the LTP stage on exactly the right bit without owning a single NLSF
-//! table. Replay is confined to the NLSF span; every other symbol of the packet is decoded for real.
+//! (`decode_frame.c:80-89`) — nothing else in the layer reads a bit — and every symbol in that span
+//! is decoded here for real. (Until the NLSF phase landed, this harness replayed the `(fl, fh)` of
+//! each normalized-LSF symbol from the dump to get past it; that crutch is gone, and the NLSF indices
+//! are decoded like everything else. The dump still records them, since removing a field group from
+//! the shared trace patch would break the sibling harnesses that do consume it.)
 //!
 //! # What is checked, per SILK frame
 //!
@@ -45,6 +39,7 @@ use siphon_rtp_codec::opus::silk::excitation::{self, PULSE_BUFFER_LENGTH};
 use siphon_rtp_codec::opus::silk::frame_type::decode_frame_type;
 use siphon_rtp_codec::opus::silk::gains::decode_gain_indices;
 use siphon_rtp_codec::opus::silk::ltp;
+use siphon_rtp_codec::opus::silk::nlsf;
 use siphon_rtp_codec::opus::silk::stereo_pred::{
     decode_mid_only, decode_stereo_weights, mid_only_flag_is_coded,
 };
@@ -54,9 +49,6 @@ use siphon_rtp_codec::opus::silk::types::{
 
 /// The rate the reference decode ran at (`dump_silk_trace.sh` uses `opus_demo -d 48000 2`).
 const REFERENCE_RATE_HZ: u32 = 48_000;
-
-/// Total frequency of every SILK ICDF symbol, which is what makes the NLSF `(fl, fh)` replay exact.
-const ICDF_FT: u32 = 256;
 
 /// One packet of an `opus_demo` `.bit` file: `[u32 BE len][u32 BE final_range][payload]`.
 struct BitPacket {
@@ -109,8 +101,6 @@ fn parse_bit_stream(bytes: &[u8]) -> Result<Vec<BitPacket>, String> {
 /// counter it increments once per `silk_decode_indices` call.
 #[derive(Debug, Default, Clone)]
 struct FrameTrace {
-    /// `(fl, fh)` of every NLSF-stage symbol, in bitstream order.
-    nlsf_symbols: Vec<(u32, u32)>,
     /// `PITCH` — absent for an unvoiced frame, which codes no LTP data at all.
     pitch: Option<PitchTrace>,
     /// `SEED` — the §4.2.7.7 LCG seed and whether the frame was voiced.
@@ -234,22 +224,6 @@ fn parse_trace(text: &str) -> Result<BTreeMap<usize, PacketTrace>, String> {
                     });
                 }
             }
-            "NLSFSYM" => {
-                let unit = number(field(tokens.next(), "u")?)? as usize;
-                let count = number(field(tokens.next(), "n")?)? as usize;
-                let values: Vec<u32> = tokens.map(unsigned).collect::<Result<_, _>>()?;
-                if values.len() != count * 2 {
-                    return Err(format!(
-                        "NLSFSYM n={count} but {} values (want {})",
-                        values.len(),
-                        count * 2
-                    ));
-                }
-                packet.frames.entry(unit).or_default().nlsf_symbols = values
-                    .chunks_exact(2)
-                    .map(|pair| (pair[0], pair[1]))
-                    .collect();
-            }
             "PITCH" => {
                 let unit = number(field(tokens.next(), "u")?)? as usize;
                 let _lbrr = field(tokens.next(), "lbrr")?;
@@ -350,13 +324,6 @@ fn hash32(values: &[i32]) -> u32 {
     hash
 }
 
-/// Replay one NLSF-stage symbol: `decode(ft)` then `dec_update(fl, fh, ft)` puts our range decoder in
-/// exactly the state `ec_dec_icdf` left libopus'.
-fn replay_symbol(decoder: &mut RangeDecoder<'_>, fl: u32, fh: u32) {
-    let _ = decoder.decode(ICDF_FT);
-    decoder.dec_update(fl, fh, ICDF_FT);
-}
-
 /// What one stream's comparison exercised, so the run can prove it was not vacuous.
 #[derive(Default, Debug)]
 struct Coverage {
@@ -434,22 +401,12 @@ fn check_frame(
             .map_err(|e| format!("{label}: gains: {e:?}"))?;
     }
 
-    // ── NLSF (§4.2.7.5) — replayed from the dump, see the module docs ─────────────────────────
-    if trace.nlsf_symbols.is_empty() {
-        return Err(format!("{label}: no NLSFSYM event"));
-    }
-    let expected_symbols = 1 + rate.lpc_order() + usize::from(layout.subframe_count == 4);
-    if trace.nlsf_symbols.len() < expected_symbols {
-        return Err(format!(
-            "{label}: {} NLSF symbols, expected at least {expected_symbols} \
-             (1 stage-1 + {} coefficients + interpolation factor)",
-            trace.nlsf_symbols.len(),
-            rate.lpc_order()
-        ));
-    }
-    for &(fl, fh) in &trace.nlsf_symbols {
-        replay_symbol(decoder, fl, fh);
-    }
+    // ── NLSF (§4.2.7.5) ───────────────────────────────────────────────────────────────────────
+    // Only the *indices* are read here, never dequantized: this harness owns the LTP and excitation
+    // stages, and `silk_decode_parameters` — which is what would move the NLSF interpolation anchor —
+    // is not part of the bitstream. `silk_nlsf_conformance` checks the values themselves.
+    nlsf::decode_indices(decoder, rate, signal_type, layout.subframe_count)
+        .map_err(|e| format!("{label}: nlsf indices: {e:?}"))?;
 
     // ── LTP (§4.2.7.6) ────────────────────────────────────────────────────────────────────────
     let previous_signal_type = silk
@@ -956,12 +913,13 @@ fn silk_ltp_and_excitation_match_libopus() {
             ));
             continue;
         };
-        // A dump made by the pre-LTP instrumentation has no NLSFSYM lines; treat it as a missing
-        // dump rather than a failure, so an out-of-date reference tree skips instead of lying.
-        if !trace_text.contains(" NLSFSYM ") {
+        // A dump made by the pre-LTP instrumentation has none of the field groups this harness owns;
+        // treat it as a missing dump rather than a failure, so an out-of-date reference tree skips
+        // instead of lying.
+        if !trace_text.contains(" PULSES ") {
             skipped.push((
                 name,
-                "stale .trace (no NLSFSYM) — rebuild reference/opus/build-trace".to_string(),
+                "stale .trace (no PULSES) — rebuild reference/opus/build-trace".to_string(),
             ));
             continue;
         }
