@@ -19,8 +19,8 @@
 
 use crate::opus::celt::mathops::{celt_exp2, celt_inner_prod, celt_log2};
 use crate::opus::celt::tables::{
-    BITRES, E_BANDS, E_MEANS, LOG_N, NB_BANDS, SPREAD_AGGRESSIVE, SPREAD_LIGHT, SPREAD_NONE,
-    SPREAD_NORMAL, TF_SELECT_TABLE,
+    BITRES, E_BANDS, E_MEANS, LOG_N, NB_BANDS, SHORT_MDCT_SIZE, SPREAD_AGGRESSIVE, SPREAD_LIGHT,
+    SPREAD_NONE, SPREAD_NORMAL, TF_SELECT_TABLE,
 };
 
 /// Longest analysis window: the largest frame plus the MDCT overlap (`N + overlap` = 960 + 120).
@@ -702,6 +702,7 @@ pub fn spreading_decision(
     tapset_decision: &mut usize,
     update_hf: bool,
     end: usize,
+    channels: usize,
     m: usize,
     spread_weight: &[i32],
 ) -> u32 {
@@ -709,43 +710,46 @@ pub fn spreading_decision(
     if m * (E_BANDS[end] - E_BANDS[end - 1]) as usize <= 8 {
         return SPREAD_NONE;
     }
+    let n0 = m * SHORT_MDCT_SIZE;
     let mut sum = 0i32;
     let mut nb_bands = 0i32;
     let mut hf_sum = 0i32;
-    for i in 0..end {
-        let lo = m * E_BANDS[i] as usize;
-        let n = m * (E_BANDS[i + 1] - E_BANDS[i]) as usize;
-        if n <= 8 {
-            continue;
-        }
-        // Rough CDF of |x[j]|.
-        let mut tcount = [0i32; 3];
-        for &v in &x[lo..lo + n] {
-            let x2n = v * v * n as f32;
-            if x2n < 0.25 {
-                tcount[0] += 1;
+    for c in 0..channels {
+        for i in 0..end {
+            let lo = c * n0 + m * E_BANDS[i] as usize;
+            let n = m * (E_BANDS[i + 1] - E_BANDS[i]) as usize;
+            if n <= 8 {
+                continue;
             }
-            if x2n < 0.0625 {
-                tcount[1] += 1;
+            // Rough CDF of |x[j]|.
+            let mut tcount = [0i32; 3];
+            for &v in &x[lo..lo + n] {
+                let x2n = v * v * n as f32;
+                if x2n < 0.25 {
+                    tcount[0] += 1;
+                }
+                if x2n < 0.0625 {
+                    tcount[1] += 1;
+                }
+                if x2n < 0.015625 {
+                    tcount[2] += 1;
+                }
             }
-            if x2n < 0.015625 {
-                tcount[2] += 1;
+            // "Only include four last bands (8 kHz and up)".
+            if i > NB_BANDS - 4 {
+                hf_sum += 32 * (tcount[1] + tcount[0]) / n as i32;
             }
+            let tmp = i32::from(2 * tcount[2] >= n as i32)
+                + i32::from(2 * tcount[1] >= n as i32)
+                + i32::from(2 * tcount[0] >= n as i32);
+            sum += tmp * spread_weight[i];
+            nb_bands += spread_weight[i];
         }
-        // "Only include four last bands (8 kHz and up)".
-        if i > NB_BANDS - 4 {
-            hf_sum += 32 * (tcount[1] + tcount[0]) / n as i32;
-        }
-        let tmp = i32::from(2 * tcount[2] >= n as i32)
-            + i32::from(2 * tcount[1] >= n as i32)
-            + i32::from(2 * tcount[0] >= n as i32);
-        sum += tmp * spread_weight[i];
-        nb_bands += spread_weight[i];
     }
 
     if update_hf {
         if hf_sum != 0 {
-            hf_sum /= (4 + end - NB_BANDS) as i32;
+            hf_sum /= (channels * (4 + end - NB_BANDS)) as i32;
         }
         *hf_average = (*hf_average + hf_sum) >> 1;
         hf_sum = *hf_average;
@@ -1118,6 +1122,7 @@ mod tests {
             &mut tapset,
             true,
             NB_BANDS,
+            1,
             m,
             &spread_weight,
         );
@@ -1139,6 +1144,7 @@ mod tests {
             &mut tapset,
             true,
             NB_BANDS,
+            1,
             m,
             &spread_weight,
         );
@@ -1180,6 +1186,7 @@ mod tests {
             &mut tapset,
             true,
             8,
+            1,
             m,
             &spread_weight,
         );

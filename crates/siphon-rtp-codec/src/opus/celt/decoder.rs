@@ -1,4 +1,4 @@
-//! CELT-only **mono float** decode orchestration (RFC 6716 §4.3; libopus
+//! CELT-only **float** decode orchestration, mono or stereo (RFC 6716 §4.3; libopus
 //! `celt/celt_decoder.c` `celt_decode_with_ec_dred` + `celt_synthesis`, `#ifndef FIXED_POINT`).
 //!
 //! **Phase 3 (assembly).** Every sub-component — range coder, band-energy decode, tf-resolution,
@@ -8,16 +8,18 @@
 //! (`CELTDecoder` in `celt_decoder.c:87`) and a decode entry point that drives those pieces in the
 //! exact order libopus does, with the exact 1/8-bit (`BITRES`) bit-budget arguments.
 //!
-//! Scope is deliberately narrow, matching the task: **mono (`C = 1`), CELT-only, valid data packet**.
-//! All `ENABLE_QEXT` (quality-extension), `ENABLE_DEEP_PLC` (neural PLC), and packet-loss / PLC
-//! branches of the C are stripped — the caller (the Opus packet/mode dispatcher) is responsible for
-//! framing, mode selection, and loss concealment. The float decoder conforms via the `opus_compare`
-//! tolerance metric, not bit-exact PCM (RFC 6716 §6), so this is a faithful float port.
+//! Scope: **CELT-only, valid data packet, `C = CC` (1 or 2)**. All `ENABLE_QEXT`
+//! (quality-extension), `ENABLE_DEEP_PLC` (neural PLC), and packet-loss / PLC branches of the C are
+//! stripped — the caller (the Opus packet/mode dispatcher) is responsible for framing, mode
+//! selection, and loss concealment. The mono/stereo downmix and upmix paths of `celt_synthesis`
+//! (`CC == 2 && C == 1` and vice versa) belong to that dispatcher too and are not here. The float
+//! decoder conforms via the `opus_compare` tolerance metric, not bit-exact PCM (RFC 6716 §6), so
+//! this is a faithful float port.
 //!
 //! Line references below cite `celt/celt_decoder.c` from the libopus tree the port was made against.
 
 use crate::opus::celt::anti_collapse::anti_collapse;
-use crate::opus::celt::band_coder::quant_all_bands;
+use crate::opus::celt::band_coder::{quant_all_bands, StereoBands};
 use crate::opus::celt::energy::{
     unquant_coarse_energy, unquant_energy_finalise, unquant_fine_energy,
 };
@@ -41,8 +43,8 @@ const DECODE_BUFFER_SIZE: usize = 2048;
 /// Total per-channel decode-ring length (`DECODE_BUFFER_SIZE + mode->overlap`).
 const DECODE_MEM_LEN: usize = DECODE_BUFFER_SIZE + OVERLAP;
 
-/// The 48 kHz CELT mode is always mono here (`C = CC = 1`).
-const CHANNELS: usize = 1;
+/// Largest channel count (RFC 6716 is mono or stereo; Opus multistream is out of scope).
+const MAX_CHANNELS: usize = 2;
 
 /// Base inverse-MDCT length for the 48 kHz mode (libopus `mode->mdct.n`). This is `2 *
 /// shortMdctSize * nbShortMdcts = 2 * 120 * 8` — twice the long-frame sample count, because the MDCT
@@ -57,10 +59,12 @@ const MAX_FRAME_SAMPLES: usize = SHORT_MDCT_SIZE << MAX_LM;
 /// history (`celt_decoder.c:1810`).
 const ENERGY_RESET_DB: f32 = -28.0;
 
-/// Persistent CELT decoder state (libopus `struct CELTDecoder`, `celt_decoder.c:87`, mono float — the
-/// `DECODER_RESET_START` block plus the MDCT lookup and the cleared decode ring). Stereo, QEXT, PLC,
-/// and LPC fields are omitted (out of scope for the mono CELT-only path).
+/// Persistent CELT decoder state (libopus `struct CELTDecoder`, `celt_decoder.c:87`, float — the
+/// `DECODER_RESET_START` block plus the MDCT lookup and the cleared decode ring). QEXT, PLC and LPC
+/// fields are omitted (out of scope for the CELT-only data path).
 pub struct CeltDecoder {
+    /// Coded channels, 1 or 2 (`st->channels == st->stream_channels`).
+    channels: usize,
     /// Inverse-MDCT / FFT lookup for the 48 kHz mode (`mode->mdct`, base length 1920, shifts 0..=3).
     mdct: MdctLookup,
     /// Previous frame's per-band log2 energy, `2*NB_BANDS` (`oldBandE`). Channel `c`'s band `i` is
@@ -70,12 +74,12 @@ pub struct CeltDecoder {
     old_log_energy: [f32; 2 * NB_BANDS],
     /// Energy two frames back (`oldLogE2`); reset to `-28 dB`. Feeds anti-collapse `Ediff`.
     old_log_energy2: [f32; 2 * NB_BANDS],
-    /// The decode ring (`_decode_mem`, mono → one channel of `DECODE_BUFFER_SIZE + overlap`). Holds
-    /// the synthesized SIG-domain time signal + the overlap tail across frames; the comb post-filter
-    /// reaches back into it for pitch history.
-    decode_mem: [f32; DECODE_MEM_LEN],
-    /// De-emphasis 1-pole memory (`preemph_memD`), persists across frames.
-    preemph_mem: f32,
+    /// The decode ring (`_decode_mem`), **one per channel**, each `DECODE_BUFFER_SIZE + overlap`
+    /// long. Holds the synthesized SIG-domain time signal + the overlap tail across frames; the comb
+    /// post-filter reaches back into it for pitch history.
+    decode_mem: [[f32; DECODE_MEM_LEN]; MAX_CHANNELS],
+    /// De-emphasis 1-pole memory (`preemph_memD`), per channel, persists across frames.
+    preemph_mem: [f32; MAX_CHANNELS],
     /// Range-coder state carried across frames (`st->rng`) — the anti-collapse / fold PRNG seed.
     rng: u32,
     /// Comb post-filter pitch period for the *current* frame (`postfilter_period`).
@@ -99,20 +103,31 @@ pub struct CeltDecoder {
 }
 
 impl CeltDecoder {
-    /// Construct a fresh mono CELT decoder in the reset state (libopus `opus_custom_decoder_init` +
-    /// `OPUS_RESET_STATE`, `celt_decoder.c:242,1794`): cleared ring/energy, `oldLogE/oldLogE2 = -28 dB`,
-    /// `rng = 0`, post-filter params 0.
+    /// Construct a fresh **mono** CELT decoder in the reset state.
     pub fn new() -> Result<Self, CodecError> {
+        Self::with_channels(1)
+    }
+
+    /// Construct a fresh CELT decoder for 1 or 2 channels, in the reset state (libopus
+    /// `opus_custom_decoder_init` + `OPUS_RESET_STATE`, `celt_decoder.c:242,1794`): cleared
+    /// ring/energy, `oldLogE/oldLogE2 = -28 dB`, `rng = 0`, post-filter params 0.
+    pub fn with_channels(channels: usize) -> Result<Self, CodecError> {
+        if channels == 0 || channels > MAX_CHANNELS {
+            return Err(CodecError::Unsupported(
+                "celt: channel count must be 1 or 2",
+            ));
+        }
         // Base MDCT length 1920, shifts 0..=MAX_LM (=3) for the 48 kHz mode (`mdct.rs` docs).
         let mdct = MdctLookup::new(MDCT_BASE_LEN, MAX_LM)
             .map_err(|_| CodecError::Unsupported("celt: failed to build 48 kHz MDCT lookup"))?;
         Ok(Self {
+            channels,
             mdct,
             old_band_energy: [0.0; 2 * NB_BANDS],
             old_log_energy: [ENERGY_RESET_DB; 2 * NB_BANDS],
             old_log_energy2: [ENERGY_RESET_DB; 2 * NB_BANDS],
-            decode_mem: [0.0; DECODE_MEM_LEN],
-            preemph_mem: 0.0,
+            decode_mem: [[0.0; DECODE_MEM_LEN]; MAX_CHANNELS],
+            preemph_mem: [0.0; MAX_CHANNELS],
             rng: 0,
             postfilter_period: 0,
             postfilter_period_old: 0,
@@ -162,6 +177,12 @@ impl CeltDecoder {
         self.rng
     }
 
+    /// Coded channels, 1 or 2. `decode`'s PCM output is interleaved to this width.
+    #[must_use]
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
     /// The CELT `end` band for an Opus packet bandwidth (`opus_decoder.c:498-523`).
     #[must_use]
     pub fn end_band_for_bandwidth(bandwidth: Bandwidth) -> usize {
@@ -173,11 +194,13 @@ impl CeltDecoder {
         }
     }
 
-    /// Decode one mono CELT-only frame from `frame` into `pcm` as interleaved (mono → contiguous)
-    /// 16-bit samples, returning the number of samples written. `frame_size` is the requested PCM
-    /// sample count (which selects `LM`); it must be one of 120/240/480/960 (2.5/5/10/20 ms at
-    /// 48 kHz). A faithful float port of `celt_decode_with_ec_dred` (`celt_decoder.c:1104`) for the
-    /// valid-data, mono, CELT-only path — no PLC, no QEXT.
+    /// Decode one CELT-only frame from `frame` into `pcm` as **interleaved** 16-bit samples,
+    /// returning the number of samples **per channel** written (`pcm` must therefore hold
+    /// `frame_size * channels` values — the crate's channel contract). `frame_size` is the requested
+    /// per-channel PCM sample count (which selects `LM`); it must be one of 120/240/480/960
+    /// (2.5/5/10/20 ms at 48 kHz). A faithful float port of `celt_decode_with_ec_dred`
+    /// (`celt_decoder.c:1104`) for the valid-data, CELT-only path — no PLC, no QEXT.
+    #[allow(clippy::too_many_lines)]
     pub fn decode(
         &mut self,
         frame: &[u8],
@@ -206,13 +229,14 @@ impl CeltDecoder {
 
         let m = 1usize << lm; // M = 1<<LM (celt_decoder.c:1266)
         let n = m * SHORT_MDCT_SIZE; // N = M*shortMdctSize (celt_decoder.c:1271)
+        let channels = self.channels; // C = CC = st->stream_channels
         let start = self.start_band; // st->start
         let end = self.end_band; // st->end, from the packet bandwidth (see `set_band_range`)
         let eff_end = end.min(NB_BANDS); // effEnd = IMIN(end, effEBands) (celt_decoder.c:1277)
 
-        if pcm.len() < n {
+        if pcm.len() < n * channels {
             return Err(CodecError::OutputTooSmall {
-                needed: n,
+                needed: n * channels,
                 have: pcm.len(),
             });
         }
@@ -222,10 +246,13 @@ impl CeltDecoder {
 
         // C==1: fold the (duplicated) second channel's energy into the first (celt_decoder.c:1309).
         // On the mono path band E[NB_BANDS..] mirrors band E[..NB_BANDS] (kept in sync at frame end),
-        // so this is the max of a value with itself; preserved for exactness.
-        for i in 0..NB_BANDS {
-            self.old_band_energy[i] =
-                self.old_band_energy[i].max(self.old_band_energy[NB_BANDS + i]);
+        // so this is the max of a value with itself; preserved for exactness. A stereo stream keeps
+        // the two halves genuinely separate, so the fold must not run.
+        if channels == 1 {
+            for i in 0..NB_BANDS {
+                self.old_band_energy[i] =
+                    self.old_band_energy[i].max(self.old_band_energy[NB_BANDS + i]);
+            }
         }
 
         let total_bits_i = (frame.len() as i32) * 8; // total_bits = len*8 (celt_decoder.c:1315)
@@ -288,7 +315,7 @@ impl CeltDecoder {
             &mut self.old_band_energy,
             intra_ener,
             &mut dec,
-            CHANNELS,
+            channels,
             lm,
         );
 
@@ -306,7 +333,7 @@ impl CeltDecoder {
 
         // ── Caps + dynalloc boost loop (celt_decoder.c:1407-1442) ────────────────────────────────
         let mut cap = [0i32; NB_BANDS];
-        init_caps(&mut cap, lm, CHANNELS);
+        init_caps(&mut cap, lm, channels);
 
         let mut offsets = [0i32; NB_BANDS];
         let mut dynalloc_logp = 6i32;
@@ -315,7 +342,7 @@ impl CeltDecoder {
         let mut tell_frac = dec.tell_frac() as i32;
         for i in start..end {
             // width = C*(eBands[i+1]-eBands[i])<<LM
-            let width = ((CHANNELS as i32) * i32::from(E_BANDS[i + 1] - E_BANDS[i])) << lm;
+            let width = ((channels as i32) * i32::from(E_BANDS[i + 1] - E_BANDS[i])) << lm;
             // quanta = IMIN(width<<BITRES, IMAX(6<<BITRES, width))
             let quanta = (width << BITRES).min((6 << BITRES).max(width));
             let mut dynalloc_loop_logp = dynalloc_logp;
@@ -374,7 +401,7 @@ impl CeltDecoder {
             &mut pulses,
             &mut fine_quant,
             &mut fine_priority,
-            CHANNELS,
+            channels,
             lm,
             // `prev` / `signal_bandwidth` drive the *encoder's* band-skip choice only; a decoder
             // reads the flags (`rate.c:346`), so these are unread here.
@@ -390,7 +417,7 @@ impl CeltDecoder {
             &mut self.old_band_energy,
             &fine_quant,
             &mut dec,
-            CHANNELS,
+            channels,
         );
 
         // ── Shift the decode ring left by N (celt_decoder.c:1487) ────────────────────────────────
@@ -398,23 +425,34 @@ impl CeltDecoder {
         // samples, sliding the rest down so the IMDCT overlap-add + the comb post-filter's pitch
         // history line up for this frame. The moved count is exactly `DECODE_MEM_LEN - N`, i.e. the
         // whole tail `[N..]` → `[0..]`.
-        self.decode_mem.copy_within(n.., 0);
+        for c in 0..channels {
+            self.decode_mem[c].copy_within(n.., 0);
+        }
 
         // ── Band / PVQ decode (celt_decoder.c:1493) ──────────────────────────────────────────────
-        // X is the C*N interleaved normalised MDCT coefficient buffer; mono → length N. Fixed stack
-        // scratch, not a per-frame `Vec`: the hot path must not touch the allocator.
-        let mut x_buf = [0f32; MAX_FRAME_SAMPLES];
-        let x = &mut x_buf[..n];
-        let mut collapse_masks = [0u8; CHANNELS * NB_BANDS];
+        // X is the C*N normalised MDCT coefficient buffer, channel-major (`Y_ = X_ + N` in the C).
+        // Fixed stack scratch, not a per-frame `Vec`: the hot path must not touch the allocator.
+        let mut x_buf = [0f32; MAX_CHANNELS * MAX_FRAME_SAMPLES];
+        let x = &mut x_buf[..channels * n];
+        let mut collapse_masks = [0u8; MAX_CHANNELS * NB_BANDS];
         // total_bits arg = len*(8<<BITRES) - anti_collapse_rsv  (1/8 bits).
         let band_total_bits = (frame.len() as i32) * (8 << BITRES) - anti_collapse_rsv;
+        // `bandE`/`complexity`/`rdo` are encode-only inputs (`intensity_stereo`'s weights and the
+        // theta trial), so a decoder passes none of them (`celt_decoder.c:1272` passes `NULL`/`0`).
+        let mut stereo = StereoBands {
+            band_energy: &[],
+            intensity,
+            dual_stereo,
+            complexity: 0,
+            rdo: None,
+        };
         quant_all_bands(
             start,
             end,
             x,
             n,
-            None, // mono: `Y_ == NULL` in the C (celt_decoder.c:1272)
-            &mut collapse_masks,
+            (channels == 2).then_some(&mut stereo),
+            &mut collapse_masks[..channels * NB_BANDS],
             &pulses,
             short_blocks,
             spread,
@@ -424,7 +462,7 @@ impl CeltDecoder {
             lm as i32,
             coded_bands,
             &mut self.rng,
-            true, // disable_inv = (channels == 1) → always true for mono (celt_decoder.c:261)
+            channels == 1, // st->disable_inv = (channels == 1) (celt_decoder.c:227)
             &mut dec,
         );
 
@@ -445,15 +483,15 @@ impl CeltDecoder {
             &fine_priority,
             (frame.len() as i32) * 8 - dec.tell(),
             &mut dec,
-            CHANNELS,
+            channels,
         );
 
         if anti_collapse_on {
             self.rng = anti_collapse(
                 x,
-                &collapse_masks,
+                &collapse_masks[..channels * NB_BANDS],
                 lm,
-                CHANNELS,
+                channels,
                 n,
                 start,
                 end,
@@ -486,42 +524,45 @@ impl CeltDecoder {
         );
 
         // ── Comb post-filter on out_syn (celt_decoder.c:1541-1564) ───────────────────────────────
-        // out_syn[0] = decode_mem + DECODE_BUFFER_SIZE - N; comb_filter is in place on the ring,
-        // reaching back into the (preserved) history before out_syn for the pitch taps.
+        // out_syn[c] = decode_mem[c] + DECODE_BUFFER_SIZE - N; comb_filter is in place on the ring,
+        // reaching back into the (preserved) history before out_syn for the pitch taps. The
+        // post-filter parameters are per *frame*, not per channel, so both channels use the same.
         let out_syn = DECODE_BUFFER_SIZE - n;
         self.postfilter_period = self.postfilter_period.max(COMBFILTER_MINPERIOD);
         self.postfilter_period_old = self.postfilter_period_old.max(COMBFILTER_MINPERIOD);
-        // First comb_filter: out_syn[0..shortMdctSize], old→current params.
-        comb_filter(
-            &mut self.decode_mem,
-            out_syn,
-            SHORT_MDCT_SIZE,
-            self.postfilter_period_old,
-            self.postfilter_period,
-            self.postfilter_gain_old,
-            self.postfilter_gain,
-            self.postfilter_tapset_old,
-            self.postfilter_tapset,
-            &WINDOW120,
-            OVERLAP,
-        );
-        if lm != 0 {
-            // Second comb_filter: out_syn[shortMdctSize .. N], current→new (next frame) params.
-            // `postfilter_pitch` is passed raw (unclamped) exactly as libopus does — `comb_filter`
-            // clamps `t1` to COMBFILTER_MINPERIOD internally (postfilter.rs).
+        for c in 0..channels {
+            // First comb_filter: out_syn[0..shortMdctSize], old→current params.
             comb_filter(
-                &mut self.decode_mem,
-                out_syn + SHORT_MDCT_SIZE,
-                n - SHORT_MDCT_SIZE,
+                &mut self.decode_mem[c],
+                out_syn,
+                SHORT_MDCT_SIZE,
+                self.postfilter_period_old,
                 self.postfilter_period,
-                postfilter_pitch,
+                self.postfilter_gain_old,
                 self.postfilter_gain,
-                postfilter_gain,
+                self.postfilter_tapset_old,
                 self.postfilter_tapset,
-                postfilter_tapset,
                 &WINDOW120,
                 OVERLAP,
             );
+            if lm != 0 {
+                // Second comb_filter: out_syn[shortMdctSize .. N], current→new (next frame) params.
+                // `postfilter_pitch` is passed raw (unclamped) exactly as libopus does —
+                // `comb_filter` clamps `t1` to COMBFILTER_MINPERIOD internally (postfilter.rs).
+                comb_filter(
+                    &mut self.decode_mem[c],
+                    out_syn + SHORT_MDCT_SIZE,
+                    n - SHORT_MDCT_SIZE,
+                    self.postfilter_period,
+                    postfilter_pitch,
+                    self.postfilter_gain,
+                    postfilter_gain,
+                    self.postfilter_tapset,
+                    postfilter_tapset,
+                    &WINDOW120,
+                    OVERLAP,
+                );
+            }
         }
         // Roll the post-filter params old<-current<-new (celt_decoder.c:1553).
         self.postfilter_period_old = self.postfilter_period;
@@ -537,9 +578,13 @@ impl CeltDecoder {
         }
 
         // ── Energy history update (celt_decoder.c:1566-1596) ─────────────────────────────────────
-        // C==1: mirror band energy into the (duplicated) second channel slots.
-        for i in 0..NB_BANDS {
-            self.old_band_energy[NB_BANDS + i] = self.old_band_energy[i];
+        // C==1: mirror band energy into the (duplicated) second channel slots, which is what makes
+        // the fold at the top of the next frame a no-op. A stereo stream has real energy in both
+        // halves, so the mirror must not run.
+        if channels == 1 {
+            for i in 0..NB_BANDS {
+                self.old_band_energy[NB_BANDS + i] = self.old_band_energy[i];
+            }
         }
         if !is_transient {
             // oldLogE2 <- oldLogE <- oldBandE
@@ -575,29 +620,32 @@ impl CeltDecoder {
         // `quant_all_bands`/`anti_collapse`; this overwrite is what carries forward.
         self.rng = dec.rng();
 
-        // ── De-emphasis → float PCM, then to i16 for the harness (celt_decoder.c:1602) ───────────
-        // deemphasis(out_syn, pcm, N, C, 0, PREEMPH[0], &mut preemph_memD).
-        // Caller-owned/stack scratch — the hot path must not heap-allocate per frame.
-        let mut pcm_f = [0f32; MAX_FRAME_SAMPLES];
-        deemphasis(
-            &self.decode_mem[out_syn..out_syn + n],
-            &mut pcm_f[..n],
-            n,
-            CHANNELS,
-            0,
-            PREEMPH[0],
-            &mut self.preemph_mem,
-        );
-        for (dst, &sample) in pcm.iter_mut().zip(pcm_f.iter()).take(n) {
+        // ── De-emphasis → interleaved float PCM, then to i16 (celt_decoder.c:1602) ───────────────
+        // deemphasis(out_syn, pcm, N, C, 0, PREEMPH[0], preemph_memD) — one pass per channel,
+        // interleaving as it writes. Caller-owned/stack scratch: no per-frame heap allocation.
+        let mut pcm_f = [0f32; MAX_CHANNELS * MAX_FRAME_SAMPLES];
+        for c in 0..channels {
+            deemphasis(
+                &self.decode_mem[c][out_syn..out_syn + n],
+                &mut pcm_f[..channels * n],
+                n,
+                channels,
+                c,
+                PREEMPH[0],
+                &mut self.preemph_mem[c],
+            );
+        }
+        for (dst, &sample) in pcm.iter_mut().zip(pcm_f.iter()).take(channels * n) {
             *dst = float_to_i16(sample);
         }
 
         Ok(n)
     }
 
-    /// CELT synthesis (libopus `celt_synthesis`, `celt_decoder.c:413`, mono float path): denormalise
-    /// the band coefficients into the frequency buffer, then run the inverse MDCT of each short block
-    /// straight into the decode ring at `out_syn`, where it overlap-adds with the preserved tail.
+    /// CELT synthesis (libopus `celt_synthesis`, `celt_decoder.c:413`, the `C == CC` "normal case"
+    /// float path): per channel, denormalise the band coefficients into the frequency buffer, then
+    /// run the inverse MDCT of each short block straight into that channel's decode ring at
+    /// `out_syn`, where it overlap-adds with the preserved tail.
     #[allow(clippy::too_many_arguments)]
     fn celt_synthesis(
         &mut self,
@@ -619,33 +667,44 @@ impl CeltDecoder {
             (1usize, n, MAX_LM - lm)
         };
 
-        // freq: the interleaved signal MDCTs (celt_decoder.c:432), length N. Fixed stack scratch,
+        // freq: one channel's signal MDCTs (celt_decoder.c:432), length N. Fixed stack scratch,
         // not a per-frame `Vec` — the hot path must not touch the allocator.
         let mut freq_buf = [0f32; MAX_FRAME_SAMPLES];
         let freq = &mut freq_buf[..n];
-        denormalise_bands(x, freq, old_band_energy, start, eff_end, m, 1, silence);
-
-        // out_syn[0] = decode_mem + DECODE_BUFFER_SIZE - N (celt_decoder.c:1274).
+        // out_syn[c] = decode_mem[c] + DECODE_BUFFER_SIZE - N (celt_decoder.c:1274).
         let out_syn = DECODE_BUFFER_SIZE - n;
-        // For each short block b (celt_decoder.c:500): clt_mdct_backward reads `freq` with stride B
-        // starting at offset b, and writes its block at `out_syn + NB*b`. Each backward MDCT writes
-        // `overlap/2 + (mode->mdct.n>>shift)/2` samples — i.e. its `N/2` core PLUS the front overlap
-        // half — so its destination must extend `overlap/2` past `out_syn + N`. We hand it the whole
-        // remaining ring tail (`decode_mem[dst..]`, which has +overlap headroom by construction) and
-        // it writes only the prefix it needs; the front `overlap/2` samples it touches are the
-        // previous frame's preserved tail, giving the cross-frame overlap-add (mdct.c:371 mirror
-        // fold reads the existing `out[..overlap/2]`).
-        for b in 0..blocks {
-            let dst = out_syn + nb * b;
-            clt_mdct_backward(
-                &self.mdct,
-                &freq[b..],
-                &mut self.decode_mem[dst..],
-                &WINDOW120,
-                OVERLAP,
-                shift,
-                blocks,
+        for c in 0..self.channels {
+            denormalise_bands(
+                &x[c * n..],
+                freq,
+                &old_band_energy[c * NB_BANDS..],
+                start,
+                eff_end,
+                m,
+                1,
+                silence,
             );
+            // For each short block b (celt_decoder.c:500): clt_mdct_backward reads `freq` with
+            // stride B starting at offset b, and writes its block at `out_syn + NB*b`. Each backward
+            // MDCT writes `overlap/2 + (mode->mdct.n>>shift)/2` samples — i.e. its `N/2` core PLUS
+            // the front overlap half — so its destination must extend `overlap/2` past
+            // `out_syn + N`. We hand it the whole remaining ring tail (`decode_mem[c][dst..]`, which
+            // has +overlap headroom by construction) and it writes only the prefix it needs; the
+            // front `overlap/2` samples it touches are the previous frame's preserved tail, giving
+            // the cross-frame overlap-add (mdct.c:371 mirror fold reads the existing
+            // `out[..overlap/2]`).
+            for b in 0..blocks {
+                let dst = out_syn + nb * b;
+                clt_mdct_backward(
+                    &self.mdct,
+                    &freq[b..],
+                    &mut self.decode_mem[c][dst..],
+                    &WINDOW120,
+                    OVERLAP,
+                    shift,
+                    blocks,
+                );
+            }
         }
         // (libopus SATURATEs out_syn to SIG_SAT here; in the float build SATURATE is the identity
         //  outside the optional hardening guards, so we leave the samples untouched.)
@@ -655,6 +714,7 @@ impl CeltDecoder {
 impl std::fmt::Debug for CeltDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CeltDecoder")
+            .field("channels", &self.channels)
             .field("rng", &self.rng)
             .field("postfilter_period", &self.postfilter_period)
             .field("postfilter_gain", &self.postfilter_gain)

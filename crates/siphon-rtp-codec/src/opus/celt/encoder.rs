@@ -8,23 +8,22 @@
 //! with the exact 1/8-bit (`BITRES`) budget arguments, so the symbol sequence is what a decoder
 //! reads.
 //!
-//! Scope, stated plainly: **mono, CELT-only, no `ENABLE_QEXT`, no surround energy mask, no
-//! `AnalysisInfo` tonality estimator, no LFE mode.** Those are separate libopus features (the last
-//! two live above CELT, in `opus_encoder.c`/`analysis.c`) and are absent rather than half-wired. The
-//! `C == 2` paths (stereo analysis, dual stereo, intensity, the theta rate-distortion trial) are
-//! absent for the same reason the decoder is mono — see the scope note on
-//! [`band_coder`](crate::opus::celt::band_coder).
+//! Scope, stated plainly: **CELT-only, mono or stereo, no `ENABLE_QEXT`, no surround energy mask,
+//! no `AnalysisInfo` tonality estimator, no LFE mode.** Those are separate libopus features (the
+//! last two live above CELT, in `opus_encoder.c`/`analysis.c`) and are absent rather than
+//! half-wired. Stereo is complete: the `stereo_analysis` L/R-vs-mid/side decision, the rate-driven
+//! intensity threshold, dual stereo, and the theta rate-distortion trial at complexity ≥ 8.
 //!
 //! Line references cite `celt/celt_encoder.c` from the libopus tree this was ported against.
 
 use crate::opus::celt::analysis::{
     alloc_trim_analysis, dynalloc_analysis, patch_transient_decision, spreading_decision,
-    tf_analysis, transient_analysis,
+    stereo_analysis, tf_analysis, transient_analysis,
 };
 use crate::opus::celt::band_analysis::{
     amp2_log2, celt_preemphasis, compute_band_energies, normalise_bands,
 };
-use crate::opus::celt::band_coder::quant_all_bands;
+use crate::opus::celt::band_coder::{quant_all_bands, StereoBands, ThetaRdo};
 use crate::opus::celt::energy::{quant_coarse_energy, quant_energy_finalise, quant_fine_energy};
 use crate::opus::celt::mdct::{clt_mdct_forward, MdctLookup};
 use crate::opus::celt::pitch::{pitch_downsample, pitch_search, remove_doubling};
@@ -41,8 +40,8 @@ use crate::opus::packet::Bandwidth;
 use crate::opus::range_coder::RangeEncoder;
 use crate::CodecError;
 
-/// The 48 kHz CELT mode is always mono here (`C = CC = 1`).
-const CHANNELS: usize = 1;
+/// Largest channel count (RFC 6716 is mono or stereo).
+const MAX_CHANNELS: usize = 2;
 /// Base MDCT length for the 48 kHz mode (`mode->mdct.n`); see [`MdctLookup`].
 const MDCT_BASE_LEN: usize = 1920;
 /// Largest CELT frame in samples: `shortMdctSize << MAX_LM` = 960 (20 ms at 48 kHz).
@@ -71,6 +70,8 @@ pub enum RateControl {
 /// Persistent CELT encoder state (libopus `struct OpusCustomEncoder`, `celt_encoder.c:58`, mono
 /// float — the `ENCODER_RESET_START` block plus the config fields we support).
 pub struct CeltEncoder {
+    /// Coded channels, 1 or 2 (`st->channels == st->stream_channels`).
+    channels: usize,
     /// Forward-MDCT / FFT lookup for the 48 kHz mode (`mode->mdct`, base length 1920, shifts 0..=3).
     mdct: MdctLookup,
     /// Target bitrate in bit/s (`st->bitrate`).
@@ -112,8 +113,8 @@ pub struct CeltEncoder {
     prefilter_tapset: usize,
     /// Consecutive transient count (`st->consec_transient`); gates anti-collapse.
     consec_transient: i32,
-    /// Pre-emphasis 1-pole memory (`st->preemph_memE`), persists across frames.
-    preemph_mem: f32,
+    /// Pre-emphasis 1-pole memory (`st->preemph_memE`), per channel, persists across frames.
+    preemph_mem: [f32; MAX_CHANNELS],
     /// Constrained-VBR reservoir / drift / offset and frame count (`st->vbr_*`).
     vbr_reservoir: i32,
     vbr_drift: i32,
@@ -135,10 +136,13 @@ pub struct CeltEncoder {
     old_log_energy2: [f32; 2 * NB_BANDS],
     /// Residual coarse-energy error per band (`energyError`), used to bias the next frame.
     energy_error: [f32; 2 * NB_BANDS],
-    /// The overlap tail of the pre-emphasised input (`st->in_mem`).
-    in_mem: [f32; OVERLAP],
-    /// Prefilter history (`prefilter_mem`), `COMBFILTER_MAXPERIOD` samples.
-    prefilter_mem: [f32; COMBFILTER_MAXPERIOD],
+    /// The overlap tail of the pre-emphasised input (`st->in_mem`), per channel.
+    in_mem: [[f32; OVERLAP]; MAX_CHANNELS],
+    /// Prefilter history (`prefilter_mem`), `COMBFILTER_MAXPERIOD` samples per channel.
+    prefilter_mem: [[f32; COMBFILTER_MAXPERIOD]; MAX_CHANNELS],
+    /// Caller-owned scratch for the stereo theta rate-distortion trial (`bands.c:1409`), kept here
+    /// so the mono and decode paths never pay for it.
+    theta_rdo: ThetaRdo,
     /// First coded band (`st->start`) — 0 for CELT-only.
     start_band: usize,
     /// One past the last coded band (`st->end`), from the target bandwidth.
@@ -146,12 +150,23 @@ pub struct CeltEncoder {
 }
 
 impl CeltEncoder {
-    /// Construct a fresh mono CELT encoder in the reset state (libopus
-    /// `opus_custom_encoder_init_arch` + `OPUS_RESET_STATE`, `celt_encoder.c:166`).
+    /// Construct a fresh **mono** CELT encoder in the reset state.
     pub fn new() -> Result<Self, CodecError> {
+        Self::with_channels(1)
+    }
+
+    /// Construct a fresh CELT encoder for 1 or 2 channels, in the reset state (libopus
+    /// `opus_custom_encoder_init_arch` + `OPUS_RESET_STATE`, `celt_encoder.c:166`).
+    pub fn with_channels(channels: usize) -> Result<Self, CodecError> {
+        if channels == 0 || channels > MAX_CHANNELS {
+            return Err(CodecError::Unsupported(
+                "celt: channel count must be 1 or 2",
+            ));
+        }
         let mdct = MdctLookup::new(MDCT_BASE_LEN, MAX_LM)
             .map_err(|_| CodecError::Unsupported("celt: failed to build 48 kHz MDCT lookup"))?;
         Ok(Self {
+            channels,
             mdct,
             // `OPUS_BITRATE_MAX` in libopus; the caller normally sets a real target.
             bitrate: -1,
@@ -172,7 +187,7 @@ impl CeltEncoder {
             prefilter_gain: 0.0,
             prefilter_tapset: 0,
             consec_transient: 0,
-            preemph_mem: 0.0,
+            preemph_mem: [0.0; MAX_CHANNELS],
             vbr_reservoir: 0,
             vbr_drift: 0,
             vbr_offset: 0,
@@ -185,8 +200,9 @@ impl CeltEncoder {
             old_log_energy: [ENERGY_RESET_DB; 2 * NB_BANDS],
             old_log_energy2: [ENERGY_RESET_DB; 2 * NB_BANDS],
             energy_error: [0.0; 2 * NB_BANDS],
-            in_mem: [0.0; OVERLAP],
-            prefilter_mem: [0.0; COMBFILTER_MAXPERIOD],
+            in_mem: [[0.0; OVERLAP]; MAX_CHANNELS],
+            prefilter_mem: [[0.0; COMBFILTER_MAXPERIOD]; MAX_CHANNELS],
+            theta_rdo: ThetaRdo::new(),
             start_band: 0,
             end_band: NB_BANDS,
         })
@@ -275,9 +291,16 @@ impl CeltEncoder {
         self.rng
     }
 
-    /// Encode one mono CELT-only frame.
+    /// Coded channels, 1 or 2. `encode`'s PCM is interleaved to this width.
+    #[must_use]
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Encode one CELT-only frame, mono or stereo.
     ///
-    /// `pcm` holds `frame_size` samples nominally in `[-1, 1)`; `frame_size` must be 120/240/480/960
+    /// `pcm` holds `frame_size * channels` **interleaved** samples nominally in `[-1, 1)` — the
+    /// crate's channel contract; `frame_size` is the per-channel count and must be 120/240/480/960
     /// (2.5/5/10/20 ms at 48 kHz). `output` is the caller-owned payload buffer — its length is the
     /// hard ceiling on the packet (`max_payload`), clamped to 1275 bytes. Returns the number of
     /// bytes written.
@@ -300,9 +323,10 @@ impl CeltEncoder {
             })?;
         let m = 1usize << lm;
         let n = m * SHORT_MDCT_SIZE;
-        if pcm.len() < n {
+        let channels = self.channels;
+        if pcm.len() < n * channels {
             return Err(CodecError::OutputTooSmall {
-                needed: n,
+                needed: n * channels,
                 have: pcm.len(),
             });
         }
@@ -344,10 +368,10 @@ impl CeltEncoder {
         // "equiv_rate" — the rate a 20 ms frame would need for the same quality
         // (celt_encoder.c:1600).
         let mut equiv_rate = ((nb_compressed_bytes * 8 * 50) << (3 - lm))
-            - (40 * CHANNELS as i32 + 20) * ((400 >> lm) - 50);
+            - (40 * channels as i32 + 20) * ((400 >> lm) - 50);
         if self.bitrate > 0 {
             equiv_rate =
-                equiv_rate.min(self.bitrate - (40 * CHANNELS as i32 + 20) * ((400 >> lm) - 50));
+                equiv_rate.min(self.bitrate - (40 * channels as i32 + 20) * ((400 >> lm) - 50));
         }
 
         let mut encoder_buffer = [0u8; MAX_PACKET_BYTES];
@@ -369,12 +393,14 @@ impl CeltEncoder {
         let mut total_bits = nb_compressed_bytes * 8;
 
         // ── Silence detection + flag (celt_encoder.c:1644) ───────────────────────────────────────
-        let head = n.saturating_sub(OVERLAP);
+        // The peak is taken over `C*(N-overlap)` interleaved samples and then over the `C*overlap`
+        // tail, which is carried into the next frame.
+        let head = channels * n.saturating_sub(OVERLAP);
         let sample_max = self
             .overlap_max
             .max(peak_abs(&pcm[..head]))
-            .max(peak_abs(&pcm[head..n]));
-        self.overlap_max = peak_abs(&pcm[head..n]);
+            .max(peak_abs(&pcm[head..channels * n]));
+        self.overlap_max = peak_abs(&pcm[head..channels * n]);
         let silence = sample_max <= 1.0 / (1 << self.lsb_depth) as f32;
         enc.enc_bit_logp(silence, 15);
         if silence {
@@ -389,22 +415,27 @@ impl CeltEncoder {
         }
 
         // ── Pre-emphasis (celt_encoder.c:1675) ───────────────────────────────────────────────────
-        // `in` layout: [overlap tail of the previous frame][this frame's N samples].
-        let mut input = [0f32; MAX_IN_LEN];
+        // `in` layout, per channel and channel-major with stride `N + overlap`:
+        // [overlap tail of the previous frame][this frame's N samples].
+        let mut input = [0f32; MAX_CHANNELS * MAX_IN_LEN];
         let need_clip = self.clip && sample_max > 2.0;
-        celt_preemphasis(
-            pcm,
-            &mut input[OVERLAP..OVERLAP + n],
-            n,
-            CHANNELS,
-            0,
-            PREEMPH[0],
-            &mut self.preemph_mem,
-            need_clip,
-        );
+        let stride = n + OVERLAP;
+        for c in 0..channels {
+            let base = c * stride + OVERLAP;
+            celt_preemphasis(
+                pcm,
+                &mut input[base..base + n],
+                n,
+                channels,
+                c,
+                PREEMPH[0],
+                &mut self.preemph_mem[c],
+                need_clip,
+            );
+        }
 
         // ── Prefilter: pitch period + gain, and the comb applied to the input (celt_encoder.c:1686)
-        let prefilter_enabled = nb_compressed_bytes > 12 * CHANNELS as i32
+        let prefilter_enabled = nb_compressed_bytes > 12 * channels as i32
             && !silence
             && self.complexity >= 5
             && start == 0;
@@ -434,7 +465,7 @@ impl CeltEncoder {
 
         // ── Transient analysis (celt_encoder.c:1717) ─────────────────────────────────────────────
         let mut transient = if self.complexity >= 1 {
-            transient_analysis(&input, n + OVERLAP, CHANNELS, false)
+            transient_analysis(&input, n + OVERLAP, channels, false)
         } else {
             Default::default()
         };
@@ -446,7 +477,7 @@ impl CeltEncoder {
         let mut short_blocks = transient.is_transient;
 
         // ── Forward MDCT + band energies (celt_encoder.c:1741) ───────────────────────────────────
-        let mut freq = [0f32; MAX_FRAME_SAMPLES];
+        let mut freq = [0f32; MAX_CHANNELS * MAX_FRAME_SAMPLES];
         let mut band_e = [0f32; 2 * NB_BANDS];
         let mut band_log_e = [0f32; 2 * NB_BANDS];
         let mut band_log_e2 = [0f32; 2 * NB_BANDS];
@@ -456,16 +487,18 @@ impl CeltEncoder {
         let second_mdct = short_blocks && self.complexity >= 8;
         if second_mdct {
             self.compute_mdcts(false, &input, &mut freq, lm, n);
-            compute_band_energies(&freq, &mut band_e, eff_end, CHANNELS, lm);
-            amp2_log2(&band_e, &mut band_log_e2, eff_end, end, CHANNELS);
-            for i in 0..end {
-                band_log_e2[i] += 0.5 * lm as f32;
+            compute_band_energies(&freq, &mut band_e, eff_end, channels, lm);
+            amp2_log2(&band_e, &mut band_log_e2, eff_end, end, channels);
+            for c in 0..channels {
+                for i in 0..end {
+                    band_log_e2[c * NB_BANDS + i] += 0.5 * lm as f32;
+                }
             }
         }
 
         self.compute_mdcts(short_blocks, &input, &mut freq, lm, n);
-        compute_band_energies(&freq, &mut band_e, eff_end, CHANNELS, lm);
-        amp2_log2(&band_e, &mut band_log_e, eff_end, end, CHANNELS);
+        compute_band_energies(&freq, &mut band_e, eff_end, channels, lm);
+        amp2_log2(&band_e, &mut band_log_e, eff_end, end, channels);
 
         // Temporal VBR: how loud this frame is versus the running average (celt_encoder.c:1850).
         let temporal_vbr;
@@ -475,6 +508,9 @@ impl CeltEncoder {
             let offset = if short_blocks { 0.5 * lm as f32 } else { 0.0 };
             for i in start..end {
                 follow = (follow - 1.0).max(band_log_e[i] - offset);
+                if channels == 2 {
+                    follow = follow.max(band_log_e[i + NB_BANDS] - offset);
+                }
                 frame_avg += follow;
             }
             if end > start {
@@ -485,7 +521,7 @@ impl CeltEncoder {
         }
 
         if !second_mdct {
-            band_log_e2[..CHANNELS * NB_BANDS].copy_from_slice(&band_log_e[..CHANNELS * NB_BANDS]);
+            band_log_e2[..channels * NB_BANDS].copy_from_slice(&band_log_e[..channels * NB_BANDS]);
         }
 
         // "Last chance to catch any transient we might have missed in the time-domain analysis"
@@ -494,16 +530,18 @@ impl CeltEncoder {
             && enc.tell() + 3 <= total_bits
             && !transient.is_transient
             && self.complexity >= 5
-            && patch_transient_decision(&band_log_e, &self.old_band_energy, start, end, CHANNELS)
+            && patch_transient_decision(&band_log_e, &self.old_band_energy, start, end, channels)
         {
             transient.is_transient = true;
             short_blocks = true;
             self.compute_mdcts(true, &input, &mut freq, lm, n);
-            compute_band_energies(&freq, &mut band_e, eff_end, CHANNELS, lm);
-            amp2_log2(&band_e, &mut band_log_e, eff_end, end, CHANNELS);
+            compute_band_energies(&freq, &mut band_e, eff_end, channels, lm);
+            amp2_log2(&band_e, &mut band_log_e, eff_end, end, channels);
             // Compensate for the scaling of short vs long MDCTs.
-            for i in 0..end {
-                band_log_e2[i] += 0.5 * lm as f32;
+            for c in 0..channels {
+                for i in 0..end {
+                    band_log_e2[c * NB_BANDS + i] += 0.5 * lm as f32;
+                }
             }
             transient.tf_estimate = 0.2;
         }
@@ -512,8 +550,8 @@ impl CeltEncoder {
         }
 
         // ── Band normalisation (celt_encoder.c:1903) ─────────────────────────────────────────────
-        let mut x = [0f32; MAX_FRAME_SAMPLES];
-        normalise_bands(&freq, &mut x, &band_e, eff_end, CHANNELS, m);
+        let mut x = [0f32; MAX_CHANNELS * MAX_FRAME_SAMPLES];
+        normalise_bands(&freq, &mut x, &band_e, eff_end, channels, m);
 
         // ── Dynalloc + importance/spread weights (celt_encoder.c:1911) ───────────────────────────
         let mut offsets = [0i32; NB_BANDS];
@@ -525,7 +563,7 @@ impl CeltEncoder {
             &self.old_band_energy,
             start,
             end,
-            CHANNELS,
+            channels,
             &mut offsets,
             self.lsb_depth,
             transient.is_transient,
@@ -539,7 +577,7 @@ impl CeltEncoder {
 
         // ── tf resolution (celt_encoder.c:1915) ──────────────────────────────────────────────────
         let mut tf_res = [0i32; NB_BANDS];
-        let enable_tf_analysis = effective_bytes >= 15 * CHANNELS as i32 && self.complexity >= 2;
+        let enable_tf_analysis = effective_bytes >= 15 * channels as i32 && self.complexity >= 2;
         let tf_select = if enable_tf_analysis {
             let lambda = (80i32).max(20480 / effective_bytes.max(1) + 2);
             let sel = tf_analysis(
@@ -567,11 +605,14 @@ impl CeltEncoder {
 
         // ── Coarse energy (celt_encoder.c:1944) ──────────────────────────────────────────────────
         let mut error = [0f32; 2 * NB_BANDS];
-        for i in start..end {
-            // "When the energy is stable, slightly bias energy quantization towards the previous
-            // error to make the gain more stable (a constant offset is better than fluctuations)."
-            if (band_log_e[i] - self.old_band_energy[i]).abs() < 2.0 {
-                band_log_e[i] -= 0.25 * self.energy_error[i];
+        for c in 0..channels {
+            for i in start + c * NB_BANDS..end + c * NB_BANDS {
+                // "When the energy is stable, slightly bias energy quantization towards the previous
+                // error to make the gain more stable (a constant offset is better than
+                // fluctuations)."
+                if (band_log_e[i] - self.old_band_energy[i]).abs() < 2.0 {
+                    band_log_e[i] -= 0.25 * self.energy_error[i];
+                }
             }
         }
         quant_coarse_energy(
@@ -583,7 +624,7 @@ impl CeltEncoder {
             total_bits,
             &mut error,
             &mut enc,
-            CHANNELS,
+            channels,
             lm,
             nb_compressed_bytes,
             self.force_intra,
@@ -606,7 +647,7 @@ impl CeltEncoder {
         if enc.tell() + 4 <= total_bits {
             self.spread_decision = if short_blocks
                 || self.complexity < 3
-                || nb_compressed_bytes < 10 * CHANNELS as i32
+                || nb_compressed_bytes < 10 * channels as i32
             {
                 if self.complexity == 0 {
                     SPREAD_NONE
@@ -622,6 +663,7 @@ impl CeltEncoder {
                     &mut self.tapset_decision,
                     pf_on && !short_blocks,
                     eff_end,
+                    channels,
                     m,
                     &spread_weight,
                 )
@@ -631,13 +673,13 @@ impl CeltEncoder {
 
         // ── Caps + dynalloc boost coding (celt_encoder.c:2014) ───────────────────────────────────
         let mut cap = [0i32; NB_BANDS];
-        init_caps(&mut cap, lm, CHANNELS);
+        init_caps(&mut cap, lm, channels);
         let mut dynalloc_logp = 6i32;
         let total_bits_frac = total_bits << BITRES;
         let mut total_boost = 0i32;
         let mut tell = enc.tell_frac() as i32;
         for i in start..end {
-            let width = ((CHANNELS as i32) * i32::from(E_BANDS[i + 1] - E_BANDS[i])) << lm;
+            let width = ((channels as i32) * i32::from(E_BANDS[i + 1] - E_BANDS[i])) << lm;
             // "quanta is 6 bits, but no more than 1 bit/sample and no less than 1/8 bit/sample"
             let quanta = (width << BITRES).min((6 << BITRES).max(width));
             let mut dynalloc_loop_logp = dynalloc_logp;
@@ -664,6 +706,22 @@ impl CeltEncoder {
             offsets[i] = boost;
         }
 
+        // ── Stereo mode: intensity threshold + dual stereo (celt_encoder.c:2052) ─────────────────
+        let mut dual_stereo = false;
+        if channels == 2 {
+            // "Always use MS for 2.5 ms frames until we can do a better analysis."
+            if lm != 0 {
+                dual_stereo = stereo_analysis(&x, lm, n);
+            }
+            self.intensity = hysteresis_decision(
+                (equiv_rate / 1000) as f32,
+                &INTENSITY_THRESHOLDS,
+                &INTENSITY_HYSTERESIS,
+                self.intensity,
+            );
+            self.intensity = self.intensity.clamp(start, end);
+        }
+
         // ── Allocation trim (celt_encoder.c:2069) ────────────────────────────────────────────────
         let mut alloc_trim = 5i32;
         if tell + (6 << BITRES) <= total_bits_frac - total_boost {
@@ -676,7 +734,7 @@ impl CeltEncoder {
                     &band_log_e,
                     end,
                     lm,
-                    CHANNELS,
+                    channels,
                     n,
                     &mut self.stereo_saving,
                     transient.tf_estimate,
@@ -693,7 +751,7 @@ impl CeltEncoder {
             let lm_diff = MAX_LM as i32 - lm as i32;
             // "Don't attempt to use more than 510 kb/s, even for frames smaller than 20 ms."
             nb_compressed_bytes = nb_compressed_bytes.min(1275 >> (3 - lm));
-            let mut base_target = vbr_rate - ((40 * CHANNELS as i32 + 20) << BITRES);
+            let mut base_target = vbr_rate - ((40 * channels as i32 + 20) << BITRES);
             if constrained_vbr {
                 base_target += self.vbr_offset >> lm_diff;
             }
@@ -702,7 +760,7 @@ impl CeltEncoder {
                 lm,
                 equiv_rate,
                 self.last_coded_bands,
-                CHANNELS,
+                channels,
                 self.intensity,
                 constrained_vbr,
                 self.stereo_saving,
@@ -768,7 +826,6 @@ impl CeltEncoder {
             };
         bits -= anti_collapse_rsv;
         let signal_bandwidth = end - 1;
-        let mut dual_stereo = false;
         let mut balance = 0i32;
         let coded_bands = clt_compute_allocation(
             start,
@@ -784,7 +841,7 @@ impl CeltEncoder {
             &mut pulses,
             &mut fine_quant,
             &mut fine_priority,
-            CHANNELS,
+            channels,
             lm,
             self.last_coded_bands,
             signal_bandwidth,
@@ -804,19 +861,26 @@ impl CeltEncoder {
             &mut error,
             &fine_quant,
             &mut enc,
-            CHANNELS,
+            channels,
         );
 
         // ── Residual (band/PVQ) quantisation (celt_encoder.c:2238) ───────────────────────────────
-        let mut collapse_masks = [0u8; CHANNELS * NB_BANDS];
+        let mut collapse_masks = [0u8; MAX_CHANNELS * NB_BANDS];
         let band_total_bits = nb_compressed_bytes * (8 << BITRES) - anti_collapse_rsv;
+        let mut stereo = StereoBands {
+            band_energy: &band_e,
+            intensity: self.intensity,
+            dual_stereo,
+            complexity: self.complexity,
+            rdo: Some(&mut self.theta_rdo),
+        };
         quant_all_bands(
             start,
             end,
             &mut x,
             n,
-            None, // mono: `Y_ == NULL` in the C (celt_encoder.c:2238)
-            &mut collapse_masks,
+            (channels == 2).then_some(&mut stereo),
+            &mut collapse_masks[..channels * NB_BANDS],
             &pulses,
             short_blocks,
             self.spread_decision,
@@ -826,7 +890,9 @@ impl CeltEncoder {
             lm as i32,
             coded_bands,
             &mut self.rng,
-            true, // disable_inv = (channels == 1)
+            // `st->disable_inv` is 0 for an encoder unless the caller turns phase inversion off; the
+            // mono path has no side channel to invert, so the flag is moot there.
+            channels == 1,
             &mut enc,
         );
 
@@ -845,11 +911,13 @@ impl CeltEncoder {
             &fine_priority,
             nb_compressed_bytes * 8 - enc.tell(),
             &mut enc,
-            CHANNELS,
+            channels,
         );
         self.energy_error.fill(0.0);
-        for i in start..end {
-            self.energy_error[i] = error[i].clamp(-0.5, 0.5);
+        for c in 0..channels {
+            for i in start + c * NB_BANDS..end + c * NB_BANDS {
+                self.energy_error[i] = error[i].clamp(-0.5, 0.5);
+            }
         }
 
         if silence {
@@ -860,9 +928,12 @@ impl CeltEncoder {
         self.prefilter_period = pitch_index;
         self.prefilter_gain = gain1;
         self.prefilter_tapset = prefilter_tapset;
-        // C==1: mirror band energy into the (duplicated) second channel slots.
-        for i in 0..NB_BANDS {
-            self.old_band_energy[NB_BANDS + i] = self.old_band_energy[i];
+        // C==1: mirror band energy into the (duplicated) second channel slots, so the next frame's
+        // `max` fold is a no-op. A stereo stream keeps the two halves genuinely separate.
+        if channels == 1 {
+            for i in 0..NB_BANDS {
+                self.old_band_energy[NB_BANDS + i] = self.old_band_energy[i];
+            }
         }
         if !transient.is_transient {
             self.old_log_energy2 = self.old_log_energy;
@@ -905,9 +976,9 @@ impl CeltEncoder {
         Ok(written)
     }
 
-    /// Window and forward-MDCT the pre-emphasised input into the interleaved spectrum (libopus
-    /// `compute_mdcts`, `celt_encoder.c:461`): one long block, or `M` short blocks interleaved with
-    /// stride `M`.
+    /// Window and forward-MDCT the pre-emphasised input into the spectrum (libopus `compute_mdcts`,
+    /// `celt_encoder.c:461`): per channel, one long block or `M` short blocks interleaved with
+    /// stride `M`. `input` is channel-major with stride `N + overlap`, `out` with stride `N`.
     fn compute_mdcts(
         &self,
         short_blocks: bool,
@@ -921,25 +992,33 @@ impl CeltEncoder {
         } else {
             (1usize, n, MAX_LM - lm)
         };
-        for b in 0..blocks {
-            clt_mdct_forward(
-                &self.mdct,
-                &input[b * block_n..],
-                &mut out[b..],
-                &WINDOW120,
-                OVERLAP,
-                shift,
-                blocks,
-            );
+        for c in 0..self.channels {
+            let in_base = c * (n + OVERLAP);
+            let out_base = c * n;
+            for b in 0..blocks {
+                clt_mdct_forward(
+                    &self.mdct,
+                    &input[in_base + b * block_n..],
+                    &mut out[out_base + b..],
+                    &WINDOW120,
+                    OVERLAP,
+                    shift,
+                    blocks,
+                );
+            }
         }
     }
 
     /// Pitch search + the prefilter comb applied to `input` (libopus `run_prefilter`,
     /// `celt_encoder.c:1188`). Returns `(pf_on, pitch_index, gain, quantised_gain)`.
     ///
-    /// `input[..OVERLAP]` is filled with the previous frame's tail on entry and `input[OVERLAP..]`
-    /// holds this frame's pre-emphasised samples; on exit the whole `OVERLAP + n` region is
-    /// prefiltered and the tail is saved for the next frame.
+    /// Each channel's `input[c*(n+OVERLAP)..][..OVERLAP]` is filled with the previous frame's tail on
+    /// entry and the rest holds this frame's pre-emphasised samples; on exit the whole `OVERLAP + n`
+    /// region of every channel is prefiltered and the tails are saved for the next frame. The pitch
+    /// search runs once, on the channel-summed downmix, so both channels share one comb.
+    // The channel loops index four parallel per-channel arrays (`pre`, `input`, `in_mem`,
+    // `prefilter_mem`) with the reference's own `c`; zipping them would obscure the correspondence.
+    #[allow(clippy::needless_range_loop)]
     fn run_prefilter(
         &mut self,
         input: &mut [f32],
@@ -948,18 +1027,24 @@ impl CeltEncoder {
         enabled: bool,
         nb_available_bytes: i32,
     ) -> (bool, usize, f32, u32) {
-        // `pre` = [COMBFILTER_MAXPERIOD of history][this frame's N samples].
-        let mut pre = [0f32; COMBFILTER_MAXPERIOD + MAX_FRAME_SAMPLES];
-        pre[..COMBFILTER_MAXPERIOD].copy_from_slice(&self.prefilter_mem);
-        pre[COMBFILTER_MAXPERIOD..COMBFILTER_MAXPERIOD + n]
-            .copy_from_slice(&input[OVERLAP..OVERLAP + n]);
+        let channels = self.channels;
+        let stride = n + OVERLAP;
+        // `pre[c]` = [COMBFILTER_MAXPERIOD of history][this frame's N samples].
+        let mut pre = [[0f32; COMBFILTER_MAXPERIOD + MAX_FRAME_SAMPLES]; MAX_CHANNELS];
+        for c in 0..channels {
+            pre[c][..COMBFILTER_MAXPERIOD].copy_from_slice(&self.prefilter_mem[c]);
+            let base = c * stride + OVERLAP;
+            pre[c][COMBFILTER_MAXPERIOD..COMBFILTER_MAXPERIOD + n]
+                .copy_from_slice(&input[base..base + n]);
+        }
 
         let mut pitch_index = COMBFILTER_MINPERIOD;
         let mut gain1 = 0f32;
         if enabled {
             let mut pitch_buf = [0f32; (COMBFILTER_MAXPERIOD + MAX_FRAME_SAMPLES) / 2];
             let len = COMBFILTER_MAXPERIOD + n;
-            pitch_downsample(&[&pre[..len]], &mut pitch_buf, len, 1);
+            let channel_views: [&[f32]; MAX_CHANNELS] = [&pre[0][..len], &pre[1][..len]];
+            pitch_downsample(&channel_views[..channels], &mut pitch_buf, len, channels);
             // "Don't search the last 1.5 octave of the range because there's too many
             // false-positives due to short-term correlation" (celt_encoder.c:1222).
             let index = pitch_search(
@@ -1031,52 +1116,92 @@ impl CeltEncoder {
         // throughout; the rest crossfades to the new ones.
         let offset = SHORT_MDCT_SIZE - OVERLAP;
         self.prefilter_period = self.prefilter_period.max(COMBFILTER_MINPERIOD);
-        input[..OVERLAP].copy_from_slice(&self.in_mem);
         let mut filtered = [0f32; MAX_FRAME_SAMPLES];
-        if offset != 0 {
+        for c in 0..channels {
+            let base = c * stride;
+            input[base..base + OVERLAP].copy_from_slice(&self.in_mem[c]);
+            if offset != 0 {
+                comb_filter_out_of_place(
+                    &mut filtered[..offset],
+                    &pre[c],
+                    COMBFILTER_MAXPERIOD,
+                    offset,
+                    self.prefilter_period,
+                    self.prefilter_period,
+                    -self.prefilter_gain,
+                    -self.prefilter_gain,
+                    self.prefilter_tapset,
+                    self.prefilter_tapset,
+                    &WINDOW120,
+                    0,
+                );
+            }
             comb_filter_out_of_place(
-                &mut filtered[..offset],
-                &pre,
-                COMBFILTER_MAXPERIOD,
-                offset,
+                &mut filtered[offset..n],
+                &pre[c],
+                COMBFILTER_MAXPERIOD + offset,
+                n - offset,
                 self.prefilter_period,
-                self.prefilter_period,
+                pitch_index,
                 -self.prefilter_gain,
-                -self.prefilter_gain,
+                -gain1,
                 self.prefilter_tapset,
-                self.prefilter_tapset,
+                prefilter_tapset,
                 &WINDOW120,
-                0,
+                OVERLAP,
             );
-        }
-        comb_filter_out_of_place(
-            &mut filtered[offset..n],
-            &pre,
-            COMBFILTER_MAXPERIOD + offset,
-            n - offset,
-            self.prefilter_period,
-            pitch_index,
-            -self.prefilter_gain,
-            -gain1,
-            self.prefilter_tapset,
-            prefilter_tapset,
-            &WINDOW120,
-            OVERLAP,
-        );
-        input[OVERLAP..OVERLAP + n].copy_from_slice(&filtered[..n]);
-        self.in_mem.copy_from_slice(&input[n..n + OVERLAP]);
+            input[base + OVERLAP..base + OVERLAP + n].copy_from_slice(&filtered[..n]);
+            self.in_mem[c].copy_from_slice(&input[base + n..base + n + OVERLAP]);
 
-        // Roll the prefilter history.
-        if n > COMBFILTER_MAXPERIOD {
-            self.prefilter_mem
-                .copy_from_slice(&pre[n..n + COMBFILTER_MAXPERIOD]);
-        } else {
-            self.prefilter_mem.copy_within(n.., 0);
-            self.prefilter_mem[COMBFILTER_MAXPERIOD - n..]
-                .copy_from_slice(&pre[COMBFILTER_MAXPERIOD..COMBFILTER_MAXPERIOD + n]);
+            // Roll the prefilter history.
+            if n > COMBFILTER_MAXPERIOD {
+                self.prefilter_mem[c].copy_from_slice(&pre[c][n..n + COMBFILTER_MAXPERIOD]);
+            } else {
+                self.prefilter_mem[c].copy_within(n.., 0);
+                self.prefilter_mem[c][COMBFILTER_MAXPERIOD - n..]
+                    .copy_from_slice(&pre[c][COMBFILTER_MAXPERIOD..COMBFILTER_MAXPERIOD + n]);
+            }
         }
         (pf_on, pitch_index, gain1, qg)
     }
+}
+
+/// Bitrate (kb/s) at which each band starts being coded with intensity stereo (libopus
+/// `intensity_thresholds`, `celt_encoder.c:2054`). The chosen index is the first band coded with
+/// intensity stereo, so a higher rate keeps more bands in true stereo.
+const INTENSITY_THRESHOLDS: [f32; NB_BANDS] = [
+    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 16.0, 24.0, 36.0, 44.0, 50.0, 56.0, 62.0, 67.0, 72.0,
+    79.0, 88.0, 106.0, 134.0,
+];
+/// Hysteresis around those thresholds, so the intensity band cannot oscillate frame to frame
+/// (libopus `intensity_histeresis`).
+const INTENSITY_HYSTERESIS: [f32; NB_BANDS] = [
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 4.0, 5.0, 6.0,
+    8.0, 8.0,
+];
+
+/// Pick the first threshold `val` falls below, refusing to move off `prev` until `val` clears the
+/// neighbouring hysteresis band (libopus `hysteresis_decision`, `bands.c:46`).
+fn hysteresis_decision(
+    val: f32,
+    thresholds: &[f32; NB_BANDS],
+    hysteresis: &[f32; NB_BANDS],
+    prev: usize,
+) -> usize {
+    let mut index = thresholds.len();
+    for (i, &threshold) in thresholds.iter().enumerate() {
+        if val < threshold {
+            index = i;
+            break;
+        }
+    }
+    if index > prev && val < thresholds[prev] + hysteresis[prev] {
+        index = prev;
+    }
+    if index < prev && val > thresholds[prev - 1] - hysteresis[prev - 1] {
+        index = prev;
+    }
+    index
 }
 
 /// Peak absolute value in the SIG domain (libopus `celt_maxabs16` on the caller's PCM, scaled by
@@ -1165,6 +1290,7 @@ fn compute_vbr(
 impl std::fmt::Debug for CeltEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CeltEncoder")
+            .field("channels", &self.channels)
             .field("bitrate", &self.bitrate)
             .field("rate_control", &self.rate_control)
             .field("complexity", &self.complexity)
@@ -1270,6 +1396,183 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Interleave two mono signals into one stereo buffer.
+    fn interleave(left: &[f32], right: &[f32]) -> Vec<f32> {
+        left.iter().zip(right).flat_map(|(&l, &r)| [l, r]).collect()
+    }
+
+    /// The same entropy-state gate for **stereo**, over the whole matrix: 4 bandwidths × 4 frame
+    /// sizes × a bitrate spread from "intensity stereo everywhere" to "true stereo everywhere" ×
+    /// all three rate-control modes × complexity 5 and 10 (the latter turning on the theta
+    /// rate-distortion trial and the second MDCT), on both a correlated and an uncorrelated pair.
+    /// A stereo desync — a missed `theta`, a wrong inversion flag, a mis-restored trial — cannot
+    /// survive this.
+    #[test]
+    fn stereo_encoder_and_decoder_agree_on_final_range() {
+        let bandwidths = [
+            Bandwidth::Narrowband,
+            Bandwidth::Wideband,
+            Bandwidth::SuperWideband,
+            Bandwidth::Fullband,
+        ];
+        for &frame_size in &[120usize, 240, 480, 960] {
+            for &bandwidth in &bandwidths {
+                for &bitrate in &[6_000i32, 24_000, 64_000, 128_000, 400_000] {
+                    for &rate_control in &[
+                        RateControl::ConstantBitrate,
+                        RateControl::ConstrainedVbr,
+                        RateControl::Vbr,
+                    ] {
+                        for &complexity in &[5i32, 10] {
+                            for &correlated in &[true, false] {
+                                let end = CeltEncoder::end_band_for_bandwidth(bandwidth);
+                                let mut encoder =
+                                    CeltEncoder::with_channels(2).expect("build encoder");
+                                encoder.set_bitrate(bitrate);
+                                encoder.set_rate_control(rate_control);
+                                encoder.set_complexity(complexity).expect("complexity");
+                                encoder.set_band_range(0, end).expect("band range");
+                                let mut decoder =
+                                    CeltDecoder::with_channels(2).expect("build decoder");
+                                decoder.set_band_range(0, end).expect("band range");
+
+                                let frames = 6usize;
+                                let samples = frames * frame_size;
+                                let left = test_signal(samples, 0xF00D + frame_size as u32);
+                                let right = if correlated {
+                                    // A slightly delayed, attenuated copy: strongly mid-dominant.
+                                    let mut r = vec![0f32; samples];
+                                    r[3..].copy_from_slice(&left[..samples - 3]);
+                                    r.iter().map(|v| v * 0.8).collect()
+                                } else {
+                                    test_signal(samples, 0x5A5A + frame_size as u32)
+                                };
+                                let signal = interleave(&left, &right);
+                                let mut payload = vec![0u8; MAX_PACKET_BYTES];
+                                let mut pcm = vec![0i16; 2 * frame_size];
+
+                                for frame in 0..frames {
+                                    let lo = 2 * frame * frame_size;
+                                    let written = encoder
+                                        .encode(
+                                            &signal[lo..lo + 2 * frame_size],
+                                            frame_size,
+                                            &mut payload,
+                                        )
+                                        .expect("encode");
+                                    assert!(
+                                        (2..=MAX_PACKET_BYTES).contains(&written),
+                                        "frame={frame}: wrote {written} bytes"
+                                    );
+                                    let decoded = decoder
+                                        .decode(&payload[..written], &mut pcm, frame_size)
+                                        .expect("decode our own packet");
+                                    assert_eq!(decoded, frame_size);
+                                    assert_eq!(
+                                        decoder.final_range(),
+                                        encoder.final_range(),
+                                        "frame_size={frame_size} bw={bandwidth:?} rate={bitrate} \
+                                         rc={rate_control:?} complexity={complexity} \
+                                         correlated={correlated} frame={frame}: final_range \
+                                         diverged (packet was {written} bytes)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A stereo encode must actually carry both channels: at a rate high enough to keep the bands in
+    /// true stereo, two *uncorrelated* inputs must come back as two distinguishable outputs, each
+    /// correlating with its own source. A mid-only coder (or a swapped channel) fails this.
+    #[test]
+    fn stereo_round_trip_keeps_the_channels_apart() {
+        let frame_size = 960usize;
+        let frames = 12usize;
+        let samples = frames * frame_size;
+        let mut encoder = CeltEncoder::with_channels(2).expect("build");
+        encoder.set_bitrate(160_000);
+        let mut decoder = CeltDecoder::with_channels(2).expect("build");
+        let left = test_signal(samples, 0x1357);
+        // A different harmonic set, so the two channels are genuinely independent.
+        let right: Vec<f32> = (0..samples)
+            .map(|i| {
+                let t = i as f32;
+                0.3 * (t * 0.017).sin() + 0.2 * (t * 0.143).cos()
+            })
+            .collect();
+        let signal = interleave(&left, &right);
+        let mut payload = vec![0u8; MAX_PACKET_BYTES];
+        let mut pcm = vec![0i16; 2 * frame_size];
+        let mut out_left = Vec::with_capacity(samples);
+        let mut out_right = Vec::with_capacity(samples);
+        for frame in 0..frames {
+            let lo = 2 * frame * frame_size;
+            let written = encoder
+                .encode(&signal[lo..lo + 2 * frame_size], frame_size, &mut payload)
+                .expect("encode");
+            decoder
+                .decode(&payload[..written], &mut pcm, frame_size)
+                .expect("decode");
+            for pair in pcm.chunks_exact(2) {
+                out_left.push(f32::from(pair[0]) / 32768.0);
+                out_right.push(f32::from(pair[1]) / 32768.0);
+            }
+        }
+        // Skip the start-up frames, then align on the best lag within one overlap.
+        let skip = 2 * frame_size;
+        let best_correlation = |reference: &[f32], decoded: &[f32]| -> f32 {
+            (0..=OVERLAP)
+                .map(|lag| {
+                    let a = &reference[skip..reference.len() - OVERLAP];
+                    let b = &decoded[skip + lag..skip + lag + a.len()];
+                    let dot: f32 = a.iter().zip(b).map(|(p, q)| p * q).sum();
+                    let na = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    if na * nb > 0.0 {
+                        dot / (na * nb)
+                    } else {
+                        0.0
+                    }
+                })
+                .fold(f32::MIN, f32::max)
+        };
+        let left_own = best_correlation(&left, &out_left);
+        let right_own = best_correlation(&right, &out_right);
+        let left_cross = best_correlation(&right, &out_left);
+        let right_cross = best_correlation(&left, &out_right);
+        assert!(left_own > 0.8, "left channel correlates only {left_own}");
+        assert!(right_own > 0.8, "right channel correlates only {right_own}");
+        assert!(
+            left_own > left_cross + 0.3 && right_own > right_cross + 0.3,
+            "channels are not separated: own {left_own}/{right_own} vs cross \
+             {left_cross}/{right_cross}"
+        );
+    }
+
+    /// Mono and stereo are separate constructions, and the channel count must be validated.
+    #[test]
+    fn channel_count_is_validated() {
+        assert_eq!(CeltEncoder::new().expect("mono").channels(), 1);
+        assert_eq!(CeltEncoder::with_channels(2).expect("stereo").channels(), 2);
+        assert!(CeltEncoder::with_channels(0).is_err());
+        assert!(CeltEncoder::with_channels(3).is_err());
+        assert_eq!(CeltDecoder::new().expect("mono").channels(), 1);
+        assert_eq!(CeltDecoder::with_channels(2).expect("stereo").channels(), 2);
+        assert!(CeltDecoder::with_channels(0).is_err());
+        assert!(CeltDecoder::with_channels(3).is_err());
+        // A stereo encode needs interleaved input of `2 * frame_size`.
+        let mut encoder = CeltEncoder::with_channels(2).expect("stereo");
+        let mut out = vec![0u8; 200];
+        assert!(matches!(
+            encoder.encode(&vec![0f32; 960], 960, &mut out),
+            Err(CodecError::OutputTooSmall { .. })
+        ));
     }
 
     /// The same gate on a transient input, which takes the short-block path (and therefore the
