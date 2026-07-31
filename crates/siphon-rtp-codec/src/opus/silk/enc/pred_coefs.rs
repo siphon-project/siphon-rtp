@@ -633,8 +633,14 @@ pub fn find_pred_coefs(
     let subframe_length = config.subframe_length;
     let subframe_count = config.subframe_count;
 
+    // Only the frame's own subframes: a 10 ms frame leaves `gains[2..]` untouched, and dividing by
+    // one of those would be a division by zero rather than a harmless waste.
     let mut inverse_gains = [0.0f32; MAX_NB_SUBFR];
-    for (slot, &gain) in inverse_gains.iter_mut().zip(gains.iter()) {
+    for (slot, &gain) in inverse_gains
+        .iter_mut()
+        .zip(gains.iter())
+        .take(subframe_count)
+    {
         debug_assert!(gain > 0.0, "silk enc: subframe gains must be positive");
         *slot = 1.0 / gain;
     }

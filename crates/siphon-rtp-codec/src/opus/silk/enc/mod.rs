@@ -13,13 +13,17 @@
 //! `silk_encode_frame_FLP` (`encode_frame_FLP.c:141-160`), in the order it runs them:
 //!
 //! ```text
-//!   silk_find_pitch_lags_FLP        -> `pitch`        open-loop pitch + whitening residual
-//!   silk_noise_shape_analysis_FLP   -> `noise_shape`  shaping AR coefs, tilt, initial gains
-//!   silk_find_pred_coefs_FLP        -> `pred_coefs`   LTP search + quantisation, then
-//!       silk_find_LPC_FLP           -> `lpc_analysis` Burg AR + A2NLSF + interpolation search
-//!       silk_process_NLSFs_FLP      -> `nlsf_quant`   Laroia weights + trellis NLSF quantiser
-//!   silk_process_gains_FLP          -> `gains`        gain limiting, quantisation, lambda
+//!   silk_find_pitch_lags_FLP        -> pitch        open-loop pitch + whitening residual
+//!   silk_noise_shape_analysis_FLP   -> noise_shape  shaping AR coefs, tilt, initial gains
+//!   silk_find_pred_coefs_FLP        -> pred_coefs   LTP search + quantisation, then
+//!       silk_find_LPC_FLP           -> lpc_analysis Burg AR + A2NLSF + interpolation search
+//!       silk_process_NLSFs_FLP      -> nlsf_quant   Laroia weights + trellis NLSF quantiser
+//!   silk_process_gains_FLP          -> gains        gain limiting, quantisation, lambda
 //! ```
+//!
+//! [`frame::analyze_frame`] drives exactly that sequence and is the front end's entry point; it
+//! returns the [`frame::SideIndices`] the bitstream writer needs and the [`frame::AnalysisControl`]
+//! the noise-shaping quantiser runs on.
 //!
 //! # What deliberately does not live here, and where its seam is
 //!
@@ -27,21 +31,24 @@
 //! `nsq.rs` that returned zero pulses would read as working. They are described here in prose so
 //! the next change knows precisely what it is building against.
 //!
-//! * **Noise-shaping quantiser** (`silk_NSQ` / `silk_NSQ_del_dec`). It consumes an
-//!   `AnalysisControl` whole: `gains`, `pred_coef`, `ltp_coef`, `ltp_scale`, `pitch_lags` as the
-//!   prediction half, and `shaping_ar`, `lf_ma_shp`, `lf_ar_shp`, `tilt`, `harm_shape_gain`,
-//!   `lambda` as the shaping half. libopus converts those floats to fixed point in
+//! * **Noise-shaping quantiser** (`silk_NSQ` / `silk_NSQ_del_dec`). It consumes a
+//!   [`frame::AnalysisControl`] whole: `gains`, `prediction_coefficients`, `ltp_coefficients`,
+//!   `ltp_scale`, `pitch_lags` as the prediction half, and `shaping_ar`, `lf_ma_shp`, `lf_ar_shp`,
+//!   `tilt`, `harmonic_shape_gain`, `lambda` as the shaping half. libopus converts those floats to
+//!   fixed point in
 //!   `silk_NSQ_wrapper_FLP` (`wrappers_FLP.c:94-153`) with fixed Q domains — AR in Q13, LF/tilt/harm
 //!   in Q14, lambda in Q10, LTP taps in Q14, LPC in Q12, gains in Q16 — and that conversion belongs
 //!   with the NSQ, not here, because the NSQ is the only consumer and the analysis stays float.
 //! * **Rate control** (`silk_control_SNR`, the gain-multiplier bisection loop at
-//!   `encode_frame_FLP.c:170-300`, VBR / constrained VBR / CBR). It owns `SignalMeasures::snr_db_q7`
-//!   and it re-runs the gain stage and the NSQ per bisection iteration, so it wraps this front end
-//!   rather than living inside it. Note the loop re-enters at *`process_gains`*, not at the pitch
-//!   analysis: everything above the gain stage is computed once per frame.
-//! * **Bitstream writer** (`silk_encode_indices`, `silk_encode_pulses`). It consumes `SideIndices`,
-//!   which is laid out to mirror the C's `SideInfoIndices` field for field so the writer can be a
-//!   direct port of `encode_indices.c`.
+//!   `encode_frame_FLP.c:170-300`, VBR / constrained VBR / CBR). It owns
+//!   [`frame::AnalysisConfig::snr_db_q7`] and it re-runs the gain stage and the NSQ per bisection
+//!   iteration, so it wraps this front end rather than living inside it. Note the loop re-enters at
+//!   *[`gains::process_gains`]*, not at the pitch analysis: everything above the gain stage is
+//!   computed once per frame, which is why [`gains::ProcessedGains::unquantized_q16`] and
+//!   [`gains::ProcessedGains::previous_index_before`] exist.
+//! * **Bitstream writer** (`silk_encode_indices`, `silk_encode_pulses`). It consumes
+//!   [`frame::SideIndices`], which is laid out to mirror the C's `SideInfoIndices` field for field
+//!   so the writer can be a direct port of `encode_indices.c`.
 //! * **VAD** (`silk_VAD_GetSA_Q8`). It produces `speech_activity_q8`, `input_quality_bands_q15` and
 //!   `input_tilt_q15`, which this front end reads as inputs. They are genuinely wired — every one of
 //!   them moves a threshold in the pitch, noise-shaping or NLSF stage — but they are measured
@@ -70,6 +77,7 @@
 
 pub mod fixed;
 pub mod float;
+pub mod frame;
 pub mod gains;
 pub mod lpc_analysis;
 pub mod nlsf_quant;
