@@ -311,9 +311,13 @@ fn parse_trace(text: &str) -> Result<BTreeMap<usize, PacketTrace>, String> {
                     hash,
                 });
             }
-            // Owned by silk_header_conformance.rs.
-            "LBRRFLAGS" | "STEREO" | "MIDONLY" | "TYPE" | "GAINIDX" | "GAINS" => {}
-            other => return Err(format!("unknown trace event {other}")),
+            // Every other event kind belongs to a different SILK stage's harness. The `.trace` dump
+            // is one shared, append-only stream that several harnesses read, so an unrecognised kind
+            // is ignored rather than rejected: a closed allow-list here means any stage that adds an
+            // event to `silk_trace.patch` breaks every sibling harness the next time the dumps are
+            // regenerated. Nothing is lost by ignoring — a typo in an event this harness *does* own
+            // surfaces as a missing-field or coverage-zero failure instead.
+            _ => {}
         }
     }
     Ok(packets)

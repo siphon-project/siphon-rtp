@@ -251,11 +251,13 @@ fn parse_trace(text: &str) -> Result<BTreeMap<usize, Vec<TraceEvent>>, String> {
                     gains_q16,
                 }
             }
-            // The later SILK phases share this dump. Their per-frame groups (all tagged with a `u=`
-            // unit counter) belong to `silk_excitation_conformance`, which owns §4.2.7.6-8; skip
-            // them here rather than rejecting them, so one instrumented build serves both harnesses.
-            "NLSFSYM" | "PITCH" | "SEED" | "PULSES" | "RC" | "EXC" => continue,
-            other => return Err(format!("unknown trace event {other}")),
+            // The later SILK phases share this dump. Their per-frame groups belong to the harnesses
+            // that own those stages, so skip anything this one does not recognise rather than
+            // rejecting it — one instrumented build serves every harness, and a closed allow-list
+            // would mean each new stage breaks its siblings the next time the dumps are regenerated.
+            // A typo in an event this harness *does* own still surfaces, as a missing-field or
+            // zero-coverage failure.
+            _ => continue,
         };
         packets.entry(index).or_default().push(event);
     }
