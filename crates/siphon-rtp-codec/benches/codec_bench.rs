@@ -1653,6 +1653,111 @@ fn bench_silk_encode(c: &mut Criterion) {
         });
     }
 
+/// Whole-**packet** Opus decode through [`OpusDecoder`], one bench per mode.
+///
+/// The per-layer benches above (`silk_frame`, `celt_decode`) measure what SILK and CELT each cost.
+/// This measures what a *packet* costs: TOC dispatch, the layer(s) it selects, the redundancy and
+/// mode-transition work in between, and the output conversion. A Hybrid packet pays both layers on
+/// one payload, so it is the expensive case and the one an IMS leg bridging Opus to AMR-WB will hit.
+///
+/// Driven from the official RFC 6716 vectors, which are the only source of real SILK and Hybrid
+/// packets the tree has (there is no SILK encoder yet). Skipped with a notice when they are absent,
+/// the same skip-when-absent rule the conformance harnesses follow.
+fn bench_opus_decode(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
+    use siphon_rtp_codec::opus::packet::{self, Mode};
+    use std::path::Path;
+
+    /// The first packet of `path` whose TOC selects `mode` and which carries real content.
+    fn packet_of_mode(path: &Path, mode: Mode) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(path).ok()?;
+        let mut offset = 0usize;
+        while offset + 8 <= bytes.len() {
+            let length = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+            offset += 8;
+            if offset + length > bytes.len() {
+                return None;
+            }
+            let payload = &bytes[offset..offset + length];
+            offset += length;
+            if payload.len() < 20 {
+                continue;
+            }
+            if let Ok(parsed) = packet::parse(payload) {
+                if parsed.toc.mode() == mode {
+                    return Some(payload.to_vec());
+                }
+            }
+        }
+        None
+    }
+
+    let directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/opus/opus_testvectors");
+    // Vector 03 is SILK throughout, 05 Hybrid throughout, 11 CELT throughout.
+    let cases = [
+        ("silk", Mode::Silk, "testvector03.bit"),
+        ("hybrid", Mode::Hybrid, "testvector05.bit"),
+        ("celt", Mode::Celt, "testvector11.bit"),
+    ];
+
+    let mut group = c.benchmark_group("opus_decode");
+    let mut benched = 0usize;
+    for (label, mode, file) in cases {
+        let Some(payload) = packet_of_mode(&directory.join(file), mode) else {
+            continue;
+        };
+        let Ok(parsed) = packet::parse(&payload) else {
+            continue;
+        };
+        let frame_ms = parsed.toc.samples_per_frame(48_000) * parsed.frame_count() / 48;
+        for channels in [1usize, 2] {
+            let mut decoder = OpusDecoder::new(48_000, channels).expect("decoder");
+            let mut output = vec![0i16; MAX_PACKET_SAMPLES * channels];
+            group.bench_function(format!("{label}_{frame_ms}ms_{channels}ch"), |b| {
+                b.iter(|| {
+                    let produced = decoder
+                        .decode(
+                            Some(black_box(&payload)),
+                            black_box(&mut output),
+                            MAX_PACKET_SAMPLES,
+                            false,
+                        )
+                        .expect("decode");
+                    black_box(produced)
+                });
+            });
+        }
+        // Concealment costs what the previous mode's PLC costs, and is on the hot path of any lossy
+        // leg, so it is measured next to the decode it stands in for.
+        let mut decoder = OpusDecoder::new(48_000, 1).expect("decoder");
+        let mut output = vec![0i16; MAX_PACKET_SAMPLES];
+        decoder
+            .decode(Some(&payload), &mut output, MAX_PACKET_SAMPLES, false)
+            .expect("prime the decoder");
+        let conceal_samples = 960usize;
+        group.bench_function(format!("{label}_conceal_20ms_1ch"), |b| {
+            b.iter(|| {
+                let produced = decoder
+                    .decode(None, black_box(&mut output), conceal_samples, false)
+                    .expect("conceal");
+                black_box(produced)
+            });
+        });
+        benched += 1;
+    }
+    if benched == 0 {
+        eprintln!(
+            "opus_decode bench: no vectors in {} — see the Opus conformance oracle section of \
+             CONTRIBUTING.md",
+            directory.display()
+        );
+    }
     group.finish();
 }
 
@@ -1673,6 +1778,7 @@ criterion_group!(
     bench_silk_synthesis,
     bench_silk_frame,
     bench_silk_encode,
+    bench_opus_decode,
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
@@ -1697,6 +1803,7 @@ criterion_group!(
     bench_silk_encoder_analysis,
     bench_silk_synthesis,
     bench_silk_frame,
-    bench_silk_encode
+    bench_silk_encode,
+    bench_opus_decode
 );
 criterion_main!(benches);

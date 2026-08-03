@@ -29,6 +29,7 @@ pub mod laplace;
 pub mod mathops;
 pub mod mdct;
 pub mod pitch;
+pub mod plc;
 pub mod postfilter;
 pub mod pvq;
 pub mod rate;

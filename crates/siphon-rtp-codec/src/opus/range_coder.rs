@@ -168,6 +168,21 @@ impl<'a> RangeDecoder<'a> {
         self.offs
     }
 
+    /// Hide the last `bytes` of the buffer from this decoder (libopus
+    /// `dec->storage -= redundancy_bytes`, `opus_decoder.c:479`).
+    ///
+    /// A packet that carries an Opus-layer redundancy frame stores it at the **end** of the payload,
+    /// where [`Self::dec_bits`] reads its raw bits from. Shrinking the storage is what stops the main
+    /// frame's raw-bit reader from walking into the redundancy frame's bytes; the redundancy frame
+    /// itself is then decoded by a *separate* range decoder over those trailing bytes.
+    ///
+    /// Shrinking below what has already been consumed is refused (the storage never moves behind the
+    /// read cursor), which is the "sanity check" the C performs one line earlier.
+    pub fn shrink_storage(&mut self, bytes: u32) {
+        let floor = self.offs.max(self.end_offs);
+        self.storage = self.storage.saturating_sub(bytes).max(floor);
+    }
+
     /// Snapshot the decoder so a speculative decode can be rewound (the mirror of
     /// [`RangeEncoder::save_state`]).
     #[must_use]
@@ -764,6 +779,35 @@ impl<'a> RangeEncoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `opus_decoder.c:479` — hiding the trailing redundancy bytes must stop [`RangeDecoder::dec_bits`]
+    /// (which reads from the *end* of the buffer) from reaching into them.
+    #[test]
+    fn shrink_storage_hides_the_trailing_bytes_from_the_raw_bit_reader() {
+        let buf = [0x00u8, 0x00, 0x00, 0x00, 0xAB, 0xCD];
+        let mut full = RangeDecoder::new(&buf);
+        let mut shrunk = RangeDecoder::new(&buf);
+        shrunk.shrink_storage(2);
+        assert_eq!(shrunk.storage_bits(), 4 * 8);
+        // The full decoder reads the real trailing byte; the shrunk one reads the byte two earlier.
+        assert_eq!(full.dec_bits(8), 0xCD);
+        assert_eq!(shrunk.dec_bits(8), 0x00);
+        // Shrinking further than the buffer holds clamps instead of wrapping.
+        shrunk.shrink_storage(1_000);
+        assert!(shrunk.storage_bits() <= 4 * 8);
+    }
+
+    /// The storage must never move behind the read cursor, whatever the caller asks for.
+    #[test]
+    fn shrink_storage_never_moves_behind_the_read_cursor() {
+        let buf = [0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0];
+        let mut dec = RangeDecoder::new(&buf);
+        let _ = dec.dec_uint(1000); // consume a few bytes from the front
+        let consumed = dec.range_bytes();
+        assert!(consumed > 0);
+        dec.shrink_storage(8);
+        assert!(dec.storage_bits() >= consumed * 8);
+    }
 
     #[test]
     fn ilog_matches_definition() {

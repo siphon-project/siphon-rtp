@@ -19,6 +19,7 @@ use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
 use siphon_rtp_codec::opus::celt::mdct::{clt_mdct_forward, MdctLookup};
 use siphon_rtp_codec::opus::celt::tables::{OVERLAP, WINDOW120};
 use siphon_rtp_codec::opus::celt::vq::op_pvq_search;
+use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
 use siphon_rtp_codec::{Decoder, Encoder};
 
 /// One 20 ms G.711 frame at 8 kHz.
@@ -205,6 +206,79 @@ fn celt_pvq_search(input: PvqInput) {
     let _ = black_box(op_pvq_search(black_box(&mut x), &mut iy, 8, 16));
 }
 
+type OpusDecodeInput = (OpusDecoder, Vec<u8>, Vec<i16>);
+
+/// A deterministic 20 ms packet in the given mode, and a decoder already primed on an identical one
+/// so the measured call runs with warm state (decode ring, energy history, SILK prediction) rather
+/// than paying a first-frame cost the datapath never pays twice.
+///
+/// The payload is a fixed pseudo-random byte string rather than a real encode: there is no SILK
+/// encoder yet, and the official vectors are gitignored, so a self-contained bench is the only one
+/// that can run on a CI box. The range coder reads any byte string, so every stage still executes —
+/// what it decodes to is not audio, but the instruction count is deterministic, which is the whole
+/// point of this file.
+fn opus_decode_setup(config: u8, channels: usize) -> OpusDecodeInput {
+    let mut packet = Vec::with_capacity(61);
+    packet.push(config << 3);
+    for i in 0..60u32 {
+        packet.push((i.wrapping_mul(2_654_435_761) >> 24) as u8);
+    }
+    packet[1] &= 0x7f; // bias away from the CELT silence flag so the full pipeline runs
+    let mut decoder = OpusDecoder::new(48_000, channels).expect("build Opus decoder");
+    let mut pcm = vec![0i16; MAX_PACKET_SAMPLES * channels];
+    decoder
+        .decode(Some(&packet), &mut pcm, MAX_PACKET_SAMPLES, false)
+        .expect("prime the decoder");
+    (decoder, packet, pcm)
+}
+
+/// SILK-only, wideband, 20 ms (config 9).
+fn opus_decode_silk_setup() -> OpusDecodeInput {
+    opus_decode_setup(9, 1)
+}
+
+/// Hybrid, fullband, 20 ms (config 15) — both layers on one payload, the expensive case.
+fn opus_decode_hybrid_setup() -> OpusDecodeInput {
+    opus_decode_setup(15, 1)
+}
+
+/// CELT-only, fullband, 20 ms (config 31).
+fn opus_decode_celt_setup() -> OpusDecodeInput {
+    opus_decode_setup(31, 1)
+}
+
+/// Hybrid in stereo: two SILK channels plus CELT mid/side on the same payload.
+fn opus_decode_hybrid_stereo_setup() -> OpusDecodeInput {
+    opus_decode_setup(15, 2)
+}
+
+// One whole 20 ms Opus *packet* through the top-level decoder, per mode: TOC dispatch, the layer(s)
+// it selects, and the output conversion. This is the per-packet cost an Opus leg actually pays.
+#[library_benchmark]
+#[bench::silk_20ms(setup = opus_decode_silk_setup)]
+#[bench::hybrid_20ms(setup = opus_decode_hybrid_setup)]
+#[bench::celt_20ms(setup = opus_decode_celt_setup)]
+#[bench::hybrid_20ms_stereo(setup = opus_decode_hybrid_stereo_setup)]
+fn opus_decode(input: OpusDecodeInput) {
+    let (mut decoder, packet, mut pcm) = input;
+    let _ = black_box(decoder.decode(
+        Some(black_box(&packet)),
+        &mut pcm,
+        MAX_PACKET_SAMPLES,
+        false,
+    ));
+}
+
+// Concealment in each mode: what a lossy leg pays for a packet that never arrived.
+#[library_benchmark]
+#[bench::silk_20ms(setup = opus_decode_silk_setup)]
+#[bench::hybrid_20ms(setup = opus_decode_hybrid_setup)]
+#[bench::celt_20ms(setup = opus_decode_celt_setup)]
+fn opus_conceal(input: OpusDecodeInput) {
+    let (mut decoder, _packet, mut pcm) = input;
+    let _ = black_box(decoder.decode(None, &mut pcm, 960, false));
+}
+
 library_benchmark_group!(
     name = codec;
     benchmarks =
@@ -214,7 +288,9 @@ library_benchmark_group!(
         celt_encode_stereo,
         celt_decode,
         celt_mdct_forward,
-        celt_pvq_search
+        celt_pvq_search,
+        opus_decode,
+        opus_conceal
 );
 
 // Fail the run (non-zero exit) if any measured kernel executes >10% more instructions than the
