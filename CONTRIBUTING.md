@@ -88,8 +88,9 @@ sh reference/opus/gen_celt_only.sh          # writes reference/opus/celt_only/*.
 sh reference/opus/gen_silk_only.sh          # writes reference/opus/silk_only/*.bit + *.dec
 sh reference/opus/gen_silk_plc.sh           # adds reference/opus/silk_only/*.plcdec + plc.loss
 SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
-    cargo test -p siphon-rtp-codec --test celt_only_conformance --test silk_only_conformance \
-                                   --test silk_plc_conformance --test opus_conformance
+    cargo test -p siphon-rtp-codec --release \
+        --test celt_only_conformance --test silk_only_conformance --test silk_plc_conformance \
+        --test opus_conformance --test opus_redundancy_conformance
 ```
 
 `gen_celt_only.sh` writes two directories: `celt_only/` (mono) and `celt_only_stereo/`. They are kept
@@ -128,6 +129,35 @@ deliberate:
 - **It excludes those redundancy-bearing packets from the PCM comparison**, on both sides, and
   reports how many (16 of ~75 000). They are not fudged and not silently tolerated — they are simply
   not this layer's output.
+
+Both of those are covered at full strength by `opus_redundancy_conformance`, which re-decodes the
+same 64 streams through the **top-level** `OpusDecoder` with nothing excluded: whole-packet
+`final_range` on all 75 166 packets (which only matches if the redundancy frame was decoded *and*
+XOR-folded in) plus the PCM against the same `.dec`. It refuses to pass if it never sees a
+redundancy-bearing packet, so a regenerated oracle that stopped producing them fails loudly instead
+of covering nothing.
+
+#### The top-level decoder's gate, and the vector-set gap
+
+`opus_conformance` is the acceptance gate for the whole decoder: all 12 official vectors, mono and
+stereo, held to three checks — exact `final_range` on every packet, within one LSB of libopus' own
+decode of the same bitstream (`opus_demo`, found beside `opus_compare` or at
+`SIPHON_RTP_OPUS_DEMO`), and the RFC 6716 §6 `opus_compare` metric.
+
+Expect ten of the twenty-four passes to report **`refgap`** rather than `pass`. `run_vectors.sh`
+accepts a pass against *either* `testvectorNN.dec` *or* `testvectorNNm.dec`, because a given
+vector's distributed `.dec` may be the other build's reference; the set at opus-codec.org carries
+only the first, so for those ten there is no reference decode this build can be scored against —
+and libopus itself fails them, to five decimal places of the same weighted error. That is a gap in
+the vectors, not the decoder, and the harness proves which by scoring libopus' own decode through
+the same `opus_compare` call: **libopus passing where we fail is a hard failure**, neither passing
+is a `refgap`, and in that case the within-one-LSB check is what stands in for the metric. Drop the
+`m.dec` companions into `reference/opus/opus_testvectors/` and those ten flip to `pass` on their
+own. Do not "fix" a `refgap` by relaxing anything.
+
+`SIPHON_RTP_OPUS_DUMP=<dir>` writes each decoded stream out as raw little-endian PCM, for diffing
+against `opus_demo -d 48000 <ch>` by hand — `opus_compare` scores a whole file, and finding *which*
+packet first diverges needs the samples.
 
 `SIPHON_RTP_OPUS_COMPARE` defaults to `/tmp/opus_compare`. Set it explicitly when working in a git
 worktree — `reference/` is untracked, so a fresh worktree has no oracle of its own and should point at
