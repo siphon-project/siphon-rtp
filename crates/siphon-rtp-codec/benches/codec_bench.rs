@@ -1652,6 +1652,7 @@ fn bench_silk_encode(c: &mut Criterion) {
             });
         });
     }
+}
 
 /// Whole-**packet** Opus decode through [`OpusDecoder`], one bench per mode.
 ///
