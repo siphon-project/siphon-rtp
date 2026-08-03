@@ -266,7 +266,7 @@ mod tests {
 
         let mut back = vec![0f32; n];
         let mut dec_mem = 0f32;
-        deemphasis(&sig, &mut back, n, 1, 0, coef0, &mut dec_mem);
+        deemphasis(&sig, &mut back, n, 1, 0, coef0, 1, &mut dec_mem);
 
         for i in 0..n {
             assert!(

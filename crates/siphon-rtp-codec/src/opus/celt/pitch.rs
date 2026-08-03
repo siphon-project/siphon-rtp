@@ -64,6 +64,76 @@ pub fn celt_autocorr(x: &[f32], ac: &mut [f32], lag: usize, n: usize) {
     }
 }
 
+/// Largest `n` [`celt_autocorr_windowed`] is asked for — `MAX_PERIOD`, the concealment's excitation
+/// window (libopus `celt_decoder.c:747`).
+const MAX_AUTOCORR_WINDOW: usize = 1024;
+
+/// [`celt_autocorr`] with the ends tapered by `window` (libopus `_celt_autocorr` with
+/// `overlap != 0`, `celt_lpc.c:296-305`).
+///
+/// Both ends of the analysis window are multiplied by the MDCT window before the correlation, which
+/// is what stops the concealment's LPC fit from seeing the abrupt truncation at the buffer edges as
+/// signal. Only the packet-loss concealment uses this form; the pitch prefilter analysis does not
+/// taper (`overlap == 0` there).
+pub fn celt_autocorr_windowed(
+    x: &[f32],
+    ac: &mut [f32],
+    window: &[f32],
+    overlap: usize,
+    lag: usize,
+    n: usize,
+) {
+    debug_assert!(n <= MAX_AUTOCORR_WINDOW);
+    debug_assert!(2 * overlap <= n);
+    if overlap == 0 {
+        celt_autocorr(x, ac, lag, n);
+        return;
+    }
+    let mut tapered = [0f32; MAX_AUTOCORR_WINDOW];
+    tapered[..n].copy_from_slice(&x[..n]);
+    for i in 0..overlap {
+        tapered[i] = x[i] * window[i];
+        tapered[n - i - 1] = x[n - i - 1] * window[i];
+    }
+    celt_autocorr(&tapered[..n], ac, lag, n);
+}
+
+/// FIR filter `y[i] = x[i] + Σ_k num[k]·x[i-1-k]` (libopus `celt_fir_c`, `celt_lpc.c:137`, float
+/// path — `SIG_SHIFT` scaling and `SROUND16` are the identity there).
+///
+/// `x` is laid out as `ord` samples of **history** followed by the `n` samples to filter, so `x`
+/// must be at least `ord + n` long. That is the C's `x - ord` pointer made explicit; the caller's
+/// "sample 0" is `x[ord]`. Output goes to `y[0..n]`, which must not alias `x`.
+pub fn celt_fir(x: &[f32], num: &[f32], y: &mut [f32], n: usize, ord: usize) {
+    for i in 0..n {
+        let mut sum = x[ord + i];
+        for k in 0..ord {
+            sum += num[k] * x[ord + i - 1 - k];
+        }
+        y[i] = sum;
+    }
+}
+
+/// All-pole IIR `y[i] = x[i] - Σ_k den[k]·y[i-1-k]`, filtering `buf[base..base+n]` **in place**
+/// (libopus `celt_iir`, `celt_lpc.c:186`, float path).
+///
+/// `mem` carries the last `ord` outputs, most recent first (`mem[k] == y[i-1-k]`), and is updated to
+/// the tail of this run. The C's non-`SMALL_FOOTPRINT` body unrolls this by four over a sign-flipped
+/// history array; in the float build the two are the same arithmetic, so this is the direct form.
+pub fn celt_iir(buf: &mut [f32], base: usize, den: &[f32], n: usize, ord: usize, mem: &mut [f32]) {
+    for i in 0..n {
+        let mut sum = buf[base + i];
+        for k in 0..ord {
+            sum -= den[k] * mem[k];
+        }
+        for k in (1..ord).rev() {
+            mem[k] = mem[k - 1];
+        }
+        mem[0] = sum;
+        buf[base + i] = sum;
+    }
+}
+
 /// 5-tap FIR applied in place (libopus `celt_fir5`, `pitch.c:105`, float path — the `SIG_SHIFT`
 /// scaling is the identity there).
 fn celt_fir5(x: &mut [f32], num: &[f32; 5], n: usize) {
@@ -88,7 +158,7 @@ fn celt_fir5(x: &mut [f32], num: &[f32; 5], n: usize) {
 /// `channels` inputs (each `len` long) are summed into `x_lp[0..len/2]`.
 pub fn pitch_downsample(x: &[&[f32]], x_lp: &mut [f32], len: usize, channels: usize) {
     let half = len >> 1;
-    debug_assert!(half <= MAX_PITCH_BUF);
+    debug_assert!(half <= x_lp.len());
     for i in 1..half {
         x_lp[i] = 0.25 * x[0][2 * i - 1] + 0.25 * x[0][2 * i + 1] + 0.5 * x[0][2 * i];
     }
