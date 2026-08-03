@@ -12,6 +12,7 @@ use crate::g722::G722;
 use crate::g726::{Rate, G726};
 use crate::gsm_fr::GsmFr;
 use crate::l16::L16;
+use crate::opus::codec::OpusCodec;
 use crate::{CodecError, Decoder, Encoder};
 
 /// Map an SDP encoding name to a G.726 bit rate (RFC 3551 §4.5.4 names `G726-16/24/32/40`; `G721`
@@ -377,6 +378,21 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         // (patent-licensed — docs/codec-licensing.md).
         #[cfg(feature = "amr")]
         "AMR" => Ok(Box::new(AmrNb::new())),
+        // Opus decode is complete and conformant (RFC 6716 §4: SILK, CELT and Hybrid, every
+        // bandwidth and frame duration, stereo, PLC and in-band FEC — gated on all 12 official
+        // vectors plus exact per-packet `final_range`). Royalty-free, so no build feature.
+        //
+        // Three spec-driven inputs, and nothing else from the leg is decode-side: the output rate is
+        // the clock rate RFC 7587 §4.1 pins at 48 kHz; the channel count is the peer's `sprop-stereo`
+        // (§6.1, sender-only — *not* the rtpmap `/2`, which §7 mandates even for mono); and the
+        // nominal frame is the negotiated ptime. Every other Opus fmtp parameter
+        // (`maxaveragebitrate`, `maxplaybackrate`, `cbr`, `useinbandfec`, `usedtx`) constrains what
+        // the engine *sends*, so it belongs to the encoder, not here.
+        OPUS_ENCODING_NAME => Ok(Box::new(OpusCodec::new(
+            spec.clock_rate_hz,
+            spec.decode_channels(),
+            spec.ptime_ms,
+        )?)),
         _ => Err(CodecError::Unsupported(unsupported_name(
             &spec.encoding_name,
         ))),
@@ -456,7 +472,13 @@ fn unsupported_name(encoding_name: &str) -> &'static str {
             "AMR transcoding requires the `amr` build feature (patent-licensed — see \
              docs/codec-licensing.md); AMR passthrough/relay is always available"
         }
-        "OPUS" => "Opus codec not yet implemented",
+        // Decode-side Opus is wired in `decoder_for`, so this is only ever reached from
+        // `encoder_for`: the RFC 6716 encoder is still being built. Say which direction is missing
+        // rather than "not implemented" — a controller reading this needs to know that transcoding
+        // *from* Opus works today and only *toward* Opus does not.
+        OPUS_ENCODING_NAME => {
+            "Opus encode is not implemented yet; Opus decode (transcoding from an Opus leg) is wired"
+        }
         "TELEPHONE-EVENT" => "telephone-event is not an audio codec",
         _ => "unknown or unsupported codec",
     }
@@ -563,16 +585,54 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_codec_is_unsupported_not_panic() {
+    fn opus_decodes_but_has_no_encoder_yet() {
+        // The decode half of Opus is wired (RFC 6716 §4, conformant against all 12 official
+        // vectors), so Opus → G.711 / AMR-WB transcode builds; the encoder is still being written,
+        // so the encode direction must decline — cleanly, never a panic.
         let spec = CodecSpec::new(96, "opus", 48000, 2, 20);
-        assert!(matches!(
-            decoder_for(&spec),
-            Err(CodecError::Unsupported(_))
-        ));
-        assert!(matches!(
-            encoder_for(&spec),
-            Err(CodecError::Unsupported(_))
-        ));
+        let decoder = decoder_for(&spec).expect("Opus decodes");
+        // RFC 7587 §4.1: Opus clocks RTP at 48 kHz in every mode, whatever it decodes to.
+        assert_eq!(decoder.rtp_clock_rate_hz(), 48_000);
+        let Err(CodecError::Unsupported(reason)) = encoder_for(&spec) else {
+            panic!("Opus encode is not implemented yet");
+        };
+        assert!(
+            reason.contains("encode"),
+            "the Unsupported message must name the direction that is missing, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn opus_decoder_follows_the_spec_rate_channels_and_ptime() {
+        // Mono (no `sprop-stereo`), 20 ms: 48 kHz × 20 ms = 960 samples, 960 interleaved values.
+        let mono = CodecSpec::new(111, "opus", 48_000, 2, 20);
+        let decoder = decoder_for(&mono).expect("mono Opus decoder");
+        assert_eq!(decoder.params().sample_rate_hz, 48_000);
+        assert_eq!(decoder.params().channels, 1, "sprop-stereo defaults to 0");
+        assert_eq!(decoder.params().ptime_ms, 20);
+        assert_eq!(decoder.frame_samples(), 960);
+
+        // RFC 7587 §6.1 `sprop-stereo=1`: the peer sends stereo, so the decoder is built for two
+        // channels and one 20 ms frame is 1920 **interleaved** values (the crate channel contract).
+        let stereo =
+            CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(OpusParams {
+                sprop_stereo: true,
+                ..OpusParams::default()
+            }));
+        let decoder = decoder_for(&stereo).expect("stereo Opus decoder");
+        assert_eq!(decoder.params().channels, 2);
+        assert_eq!(decoder.frame_samples(), 1920);
+        assert_eq!(
+            decoder.params().frame_samples(),
+            960,
+            "per channel, in time"
+        );
+
+        // A 60 ms leg (RFC 6716 §3.1 frame duration) scales the frame, not the rate.
+        let long = CodecSpec::new(111, "opus", 48_000, 2, 60);
+        let decoder = decoder_for(&long).expect("60 ms Opus decoder");
+        assert_eq!(decoder.frame_samples(), 2880);
+        assert_eq!(decoder.rtp_clock_rate_hz(), 48_000);
     }
 
     #[test]
