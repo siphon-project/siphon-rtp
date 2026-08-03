@@ -953,10 +953,17 @@ mod tests {
                 order,
                 interpolation_factor_q2: NO_INTERPOLATION_Q2,
             };
+            // The returned rate-distortion value is deliberately *not* asserted non-negative here.
+            // `RD_Q25` is an `opus_int32` accumulated by `silk_SMLABB(silk_MLA(..))`
+            // (`NLSF_del_dec_quant.c:129-131`), and this port uses the same 32-bit chain — widening it
+            // would change which survivor wins and break the field-exact conformance gate. Arbitrary
+            // unspaced NLSFs make `silk_NLSF_VQ_weights_laroia` saturate at `i16::MAX` (the gaps go to
+            // 1), and `diff² × 32767` then wraps, in libopus exactly as here. The reachable domain is
+            // covered by `spaced_input_keeps_the_rate_distortion_accumulator_positive` below.
             let rate_distortion = nlsf_encode(
                 &mut indices, &mut quantized, codebook, &weights, mu_q20, survivors, 2,
             );
-            prop_assert!(rate_distortion >= 0, "RD {}", rate_distortion);
+            let _ = rate_distortion;
 
             let stage1 = indices.indices[0];
             prop_assert!(stage1 >= 0 && (stage1 as usize) < codebook.vector_count);
@@ -975,6 +982,43 @@ mod tests {
             prop_assert!(
                 inverse_prediction_gain_q12(&a_q12[..order]) > 0,
                 "unstable filter from {:?}", decoded
+            );
+        }
+
+        /// The rate-distortion accumulator stays positive over the domain the encoder can actually
+        /// reach.
+        ///
+        /// `silk_NLSF_encode` is only ever handed NLSFs from `silk_A2NLSF` on a stabilised LPC
+        /// filter, so they carry the codebook's minimum spacing and the Laroia weights stay far below
+        /// saturation. Reproduced here by stabilising before the weights are computed — which is what
+        /// makes the difference, not the encode itself (`nlsf_encode` stabilises internally too, but
+        /// by then the caller has already derived the weights from the raw vector).
+        #[test]
+        fn spaced_input_keeps_the_rate_distortion_accumulator_positive(
+            raw in prop::collection::vec(1i16..32_000, 16..=16),
+            survivors in 1usize..=16,
+            mu_q20 in 0i32..=5243,
+        ) {
+            let codebook = &WB;
+            let order = codebook.order;
+            let mut source = raw;
+            source.sort_unstable();
+            stabilize(&mut source[..order], codebook.delta_min_q15);
+
+            let mut weights = vec![0i16; order];
+            nlsf_vq_weights_laroia(&mut weights, &source);
+            let mut quantized = source.clone();
+            let mut indices = NlsfIndices {
+                indices: [0i8; MAX_NLSF_INDICES],
+                order,
+                interpolation_factor_q2: NO_INTERPOLATION_Q2,
+            };
+            let rate_distortion = nlsf_encode(
+                &mut indices, &mut quantized, codebook, &weights, mu_q20, survivors, 2,
+            );
+            prop_assert!(
+                rate_distortion >= 0,
+                "RD {rate_distortion} from spaced input {source:?}"
             );
         }
 
