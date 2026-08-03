@@ -351,9 +351,10 @@ impl Conference {
         self.participants.len()
     }
 
-    /// The live room mix rate — the lowest [`ROOM_RATE_TIERS`] entry that carries every seated
-    /// participant without downsampling it (8 kHz all-narrowband, 16 kHz mixed/wideband, 48 kHz
-    /// all-full-band), or [`BRIDGE_RATE_HZ`] while the room is bridged.
+    /// The live room mix rate — the lowest of [`NARROWBAND_RATE_HZ`] / [`WIDEBAND_RATE_HZ`] /
+    /// [`FULLBAND_RATE_HZ`] that carries every seated participant without downsampling it (8 kHz
+    /// all-narrowband, 16 kHz mixed or wideband, 48 kHz all-full-band), or [`WIDEBAND_RATE_HZ`] —
+    /// the fixed bridge rate — while the room is bridged.
     #[must_use]
     pub fn room_rate(&self) -> u32 {
         self.room_rate
