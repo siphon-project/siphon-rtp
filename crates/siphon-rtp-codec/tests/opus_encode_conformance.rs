@@ -35,7 +35,7 @@
 //!    both decoders turn those bits into the same audio, which is the part `final_range` cannot
 //!    see — a mis-scaled gain, a redundancy frame cross-faded over the wrong window, a resampler
 //!    off by a phase all leave the range coder in exactly the right place. Our decoder is itself
-//!    gated on the 12 official RFC 6716 vectors and 75 166 redundancy-bearing packets, so two
+//!    gated on the 12 official RFC 6716 vectors and the 75 166 packets of the redundancy gate, so two
 //!    independently written decoders agreeing on a stream *neither has seen before* is the
 //!    strongest statement available about that stream. It is **sample-exact on SILK-only streams**
 //!    and within one LSB where CELT's float arithmetic is involved; see
@@ -1292,7 +1292,7 @@ fn cross_decode(
 /// cross-fade window, the SILK↔CELT sum in hybrid, the resampler, the stereo unmixing and the PLC
 /// state a mode switch leaves behind. Two decoders that were written independently agreeing on a
 /// stream neither has seen before is a very strong statement about that stream — and our decoder is
-/// itself gated on the 12 official RFC 6716 vectors and 75 166 redundancy-bearing packets.
+/// itself gated on the 12 official RFC 6716 vectors and the 75 166 packets of the redundancy gate.
 ///
 /// The bar is **sample-exact wherever sample-exactness exists**, and it is not one number:
 ///

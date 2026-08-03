@@ -985,7 +985,7 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
 }
 
 /// Hand back the two windows of `norm` a band coder needs at once: the `n`-sample spectral-folding
-/// source libopus addresses as `norm + effective_lowband` (`bands.c:1553`), and everything from
+/// source libopus addresses as `norm + effective_lowband` (`bands.c:1575`), and everything from
 /// `cur_norm` on, whose first `n` samples are the `lowband_out` the same call writes
 /// (`bands.c:1576`). `None` for the source is the C's `NULL` lowband.
 ///
@@ -993,7 +993,7 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
 /// satisfies `effective_lowband + n <= cur_norm` and the source is borrowed straight out of `norm`
 /// at no cost.
 ///
-/// They are **not disjoint in Hybrid**. `effective_lowband` clamps to 0 (`bands.c:1543`) while
+/// They are **not disjoint in Hybrid**. `effective_lowband` clamps to 0 (`bands.c:1542`) while
 /// `cur_norm` is only band `start`'s width, so a wider band `start + 1` reads *past* the boundary —
 /// deliberately, into exactly the samples [`special_hybrid_folding`] duplicated there for it
 /// (`bands.c:1384-1395`); with `start = 17` at `M = 8` that is a 96-sample read from a 64-sample

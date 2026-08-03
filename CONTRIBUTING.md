@@ -267,9 +267,10 @@ SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
 5. **Two independent decoders on the same stream.** Everything above scores the *bitstream*; this
    scores the **audio**. The same packets are decoded by our `OpusDecoder` and by `opus_demo -d`, at
    the same rate and channel count, and the two outputs are compared — 114 streams, 42 260 packets,
-   23 644 800 samples. Our decoder is separately gated on the 12 official vectors and on 75 166
-   redundancy-bearing packets, so two independently written decoders agreeing on a stream neither has
-   seen is a strong statement about it, and it is the only check that sees the redundancy cross-fade
+   23 644 800 samples. Our decoder is separately gated on the 12 official vectors and on the 75 166
+   packets of `opus_redundancy_conformance`, so two independently written decoders agreeing on a
+   stream neither has seen is a strong statement about it, and it is the only check that sees the
+   redundancy cross-fade
    window, the SILK↔CELT sum in hybrid, the resampler, the stereo unmixing, or the state a mode
    switch leaves behind — all of which leave the range coder in exactly the right place.
 
