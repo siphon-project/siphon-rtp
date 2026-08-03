@@ -332,7 +332,8 @@ pub struct ModeInputs {
 /// The mode decision (`opus_encoder.c:1330-1394`) — SILK/hybrid versus CELT-only.
 ///
 /// Hybrid is *not* chosen here: `MODE_HYBRID` only appears later, when the bandwidth turns out to be
-/// above wideband while the mode is SILK ([`promote_to_hybrid`]). The C is explicit that this
+/// above wideband while the mode is SILK, which the encoder does after the bandwidth is settled
+/// (`opus_encoder.c:1546-1549`). The C is explicit that this
 /// function must never switch to or from CELT-only afterwards, because the redundancy and prefill
 /// logic keys off it.
 #[must_use]
