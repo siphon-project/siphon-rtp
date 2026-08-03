@@ -29,9 +29,12 @@
 //! # Conformance
 //!
 //! `tests/opus_conformance.rs` decodes all 12 official RFC 6716 test vectors, mono and stereo, and
-//! requires both the §6 `opus_compare` pass **and** exact per-packet `final_range` equality with the
-//! encoder value stored in the `.bit` file. The second is the strict one: it is bitstream-exactness,
-//! and it is what proves every symbol was read in the right order.
+//! requires the §6 `opus_compare` pass, exact per-packet `final_range` equality with the encoder
+//! value stored in the `.bit` file, and agreement with libopus' own decode to within one LSB. The
+//! second is the strict one: it is bitstream-exactness, and it is what proves every symbol was read
+//! in the right order — including the redundancy frame, which is why it is only checkable here.
+//! `tests/opus_redundancy_conformance.rs` re-decodes the SILK oracle streams through this layer so
+//! the redundancy-bearing packets the SILK harness has to exclude are covered at full strength.
 //!
 //! # Deliberately not here
 //!
