@@ -34,6 +34,7 @@
 
 pub mod celt;
 pub mod decoder;
+pub mod enc;
 pub mod packet;
 pub mod range_coder;
 pub mod silk;

@@ -27,6 +27,8 @@ use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
 use siphon_rtp_codec::opus::celt::mdct::{clt_mdct_forward, MdctLookup};
 use siphon_rtp_codec::opus::celt::tables::{NB_BANDS, OVERLAP, WINDOW120};
 use siphon_rtp_codec::opus::celt::vq::op_pvq_search;
+use siphon_rtp_codec::opus::enc::decision::Application as OpusApplication;
+use siphon_rtp_codec::opus::enc::encoder::{OpusEncoder, RateControl as OpusRateControl};
 use siphon_rtp_codec::{Decoder, Encoder};
 
 #[cfg(feature = "amr")]
@@ -549,6 +551,115 @@ fn celt_signal(samples: usize) -> Vec<f32> {
             0.35 * (t * 0.031).sin() + 0.18 * (t * 0.097).sin() + 0.07 * (t * 0.21).cos() + noise
         })
         .collect()
+}
+
+/// Speech-like 16-bit input for the top-level encoder: a pitch pulse train through a resonance plus
+/// noise, so the mode and bandwidth decisions have something real to decide about.
+fn opus_signal(samples: usize, channels: usize) -> Vec<i16> {
+    let mut state = 0x2468_u32;
+    let mut history = [0.0f32; 2];
+    let mut out = Vec::with_capacity(samples * channels);
+    for index in 0..samples {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let noise = ((state >> 20) as i32 - 2048) as f32 * 1.5;
+        let pulse = if index % 240 == 0 { 6000.0 } else { 0.0 };
+        let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+        history[1] = history[0];
+        history[0] = value;
+        let sample = value.clamp(-24_000.0, 24_000.0) as i16;
+        out.push(sample);
+        if channels == 2 {
+            out.push((i32::from(sample) * 2 / 3) as i16);
+        }
+    }
+    out
+}
+
+/// The **top-level Opus encoder**, one 20 ms frame per iteration, per mode — the whole per-packet
+/// cost a transcoding leg pays: the decisions, the high-pass, the API-rate resampler, whichever
+/// codec layers the mode uses, and the packing.
+///
+/// The modes are reached the way a real stream reaches them (rate and application) rather than by
+/// forcing, so each number is what that operating point actually costs.
+fn bench_opus_encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("opus_encode");
+    const FRAME: usize = 960;
+    for &(label, channels, bitrate, application) in &[
+        (
+            "silk_mono_20ms_16k",
+            1usize,
+            16_000i32,
+            OpusApplication::Voip,
+        ),
+        ("hybrid_mono_20ms_32k", 1, 32_000, OpusApplication::Voip),
+        (
+            "celt_mono_20ms_64k",
+            1,
+            64_000,
+            OpusApplication::RestrictedLowdelay,
+        ),
+        ("hybrid_stereo_20ms_64k", 2, 64_000, OpusApplication::Voip),
+        ("celt_stereo_20ms_128k", 2, 128_000, OpusApplication::Audio),
+    ] {
+        let signal = opus_signal(FRAME * 64, channels);
+        group.bench_function(label, |b| {
+            let mut encoder =
+                OpusEncoder::new(48_000, channels, application).expect("build Opus encoder");
+            encoder.set_bitrate(Some(bitrate)).expect("bitrate");
+            encoder.set_rate_control(OpusRateControl::ConstrainedVariable);
+            encoder.set_complexity(9).expect("complexity");
+            let mut payload = vec![0u8; 1500];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let lo = (frame % 64) * FRAME * channels;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(
+                            black_box(&signal[lo..lo + FRAME * channels]),
+                            FRAME,
+                            &mut payload,
+                        )
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+    // The durations that need several Opus frames in one packet, and the CBR path that pads.
+    let signal = opus_signal(2880 * 24, 1);
+    for &(label, frame_size, rate_control) in &[
+        (
+            "silk_mono_60ms_24k",
+            2880usize,
+            OpusRateControl::ConstrainedVariable,
+        ),
+        ("hybrid_mono_20ms_cbr_32k", 960, OpusRateControl::Constant),
+    ] {
+        group.bench_function(label, |b| {
+            let mut encoder =
+                OpusEncoder::new(48_000, 1, OpusApplication::Voip).expect("build Opus encoder");
+            encoder.set_bitrate(Some(32_000)).expect("bitrate");
+            encoder.set_rate_control(rate_control);
+            encoder.set_complexity(9).expect("complexity");
+            let mut payload = vec![0u8; 1500];
+            let mut frame = 0usize;
+            let frames = signal.len() / frame_size;
+            b.iter(|| {
+                let lo = (frame % frames) * frame_size;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(
+                            black_box(&signal[lo..lo + frame_size]),
+                            frame_size,
+                            &mut payload,
+                        )
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+    group.finish();
 }
 
 /// The CELT **encoder** hot path, one frame per iteration — criterion's time-per-iteration is
@@ -1772,6 +1883,7 @@ criterion_group!(
     bench_gsm_fr,
     bench_cn,
     bench_celt_encode,
+    bench_opus_encode,
     bench_celt_decode,
     bench_celt_kernels,
     bench_silk_excitation,
@@ -1798,6 +1910,7 @@ criterion_group!(
     bench_gsm_fr,
     bench_cn,
     bench_celt_encode,
+    bench_opus_encode,
     bench_celt_decode,
     bench_celt_kernels,
     bench_silk_excitation,

@@ -20,6 +20,8 @@ use siphon_rtp_codec::opus::celt::mdct::{clt_mdct_forward, MdctLookup};
 use siphon_rtp_codec::opus::celt::tables::{OVERLAP, WINDOW120};
 use siphon_rtp_codec::opus::celt::vq::op_pvq_search;
 use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
+use siphon_rtp_codec::opus::enc::decision::Application;
+use siphon_rtp_codec::opus::enc::encoder::{OpusEncoder, RateControl as OpusRateControl};
 use siphon_rtp_codec::{Decoder, Encoder};
 
 /// One 20 ms G.711 frame at 8 kHz.
@@ -150,6 +152,92 @@ type PvqInput = (Vec<f32>, Vec<i32>);
 fn celt_pvq_setup() -> PvqInput {
     let shape: Vec<f32> = (0..16).map(|i| (i as f32 * 0.41).sin()).collect();
     (shape, vec![0i32; 16])
+}
+
+/// A 20 ms Opus frame at 48 kHz, the ptime a transcoding leg actually runs at.
+const OPUS_FRAME: usize = 960;
+
+type OpusEncodeInput = (OpusEncoder, Vec<i16>, Vec<u8>);
+
+/// Speech-like 16-bit input: a pitch pulse train through a resonance plus noise, so the mode and
+/// bandwidth decisions have something real to decide about.
+fn opus_signal(samples: usize, channels: usize) -> Vec<i16> {
+    let mut state = 24_680u32;
+    let mut history = [0.0f32; 2];
+    let mut out = Vec::with_capacity(samples * channels);
+    for index in 0..samples {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let noise = ((state >> 20) as i32 - 2048) as f32 * 1.5;
+        let pulse = if index % 240 == 0 { 6000.0 } else { 0.0 };
+        let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+        history[1] = history[0];
+        history[0] = value;
+        let sample = value.clamp(-24_000.0, 24_000.0) as i16;
+        out.push(sample);
+        if channels == 2 {
+            out.push((i32::from(sample) * 2 / 3) as i16);
+        }
+    }
+    out
+}
+
+/// One warmed-up Opus encoder at a bitrate that lands it in a particular mode, plus its input.
+///
+/// The first frame is encoded during setup so the measured one pays the steady-state cost rather
+/// than the first-frame-after-reset one.
+fn opus_encode_setup(channels: usize, bitrate: i32, application: Application) -> OpusEncodeInput {
+    let mut encoder = OpusEncoder::new(48_000, channels, application).expect("encoder");
+    encoder.set_bitrate(Some(bitrate)).expect("bitrate");
+    encoder.set_rate_control(OpusRateControl::ConstrainedVariable);
+    encoder.set_complexity(9).expect("complexity");
+    let signal = opus_signal(3 * OPUS_FRAME, channels);
+    let mut payload = vec![0u8; 1500];
+    let _ = encoder.encode(&signal[..OPUS_FRAME * channels], OPUS_FRAME, &mut payload);
+    (encoder, signal[OPUS_FRAME * channels..].to_vec(), payload)
+}
+
+/// SILK-only: low rate, speech, so the mode decision stays below the CELT threshold.
+fn opus_encode_silk_setup() -> OpusEncodeInput {
+    opus_encode_setup(1, 16_000, Application::Voip)
+}
+
+/// Hybrid: high enough for superwideband but still speech-flavoured, so SILK keeps the low band and
+/// CELT takes band 17 up through the same range coder.
+fn opus_encode_hybrid_setup() -> OpusEncodeInput {
+    opus_encode_setup(1, 32_000, Application::Voip)
+}
+
+/// CELT-only: restricted low delay forces it whatever the rate.
+fn opus_encode_celt_setup() -> OpusEncodeInput {
+    opus_encode_setup(1, 64_000, Application::RestrictedLowdelay)
+}
+
+/// Stereo hybrid — the widest per-frame path this layer has.
+fn opus_encode_stereo_setup() -> OpusEncodeInput {
+    opus_encode_setup(2, 64_000, Application::Voip)
+}
+
+// One whole 20 ms Opus frame through the top-level encoder, per mode: the decisions, the high-pass,
+// the resampler, both codec layers and the packing — what a transcoding leg pays per packet.
+#[library_benchmark]
+#[bench::silk_mono_20ms(setup = opus_encode_silk_setup)]
+#[bench::hybrid_mono_20ms(setup = opus_encode_hybrid_setup)]
+#[bench::celt_mono_20ms(setup = opus_encode_celt_setup)]
+fn opus_encode(input: OpusEncodeInput) {
+    let (mut encoder, signal, mut payload) = input;
+    let _ = black_box(encoder.encode(black_box(&signal[..OPUS_FRAME]), OPUS_FRAME, &mut payload));
+}
+
+// The same frame in stereo: the width estimator, mid/side SILK and two channels of CELT analysis.
+#[library_benchmark]
+#[bench::hybrid_stereo_20ms(setup = opus_encode_stereo_setup)]
+fn opus_encode_stereo(input: OpusEncodeInput) {
+    let (mut encoder, signal, mut payload) = input;
+    let _ = black_box(encoder.encode(
+        black_box(&signal[..2 * OPUS_FRAME]),
+        OPUS_FRAME,
+        &mut payload,
+    ));
 }
 
 // One whole 20 ms CELT frame through the encoder — the per-frame cost the datapath pays.
@@ -286,6 +374,8 @@ library_benchmark_group!(
         g711_encode,
         celt_encode,
         celt_encode_stereo,
+        opus_encode,
+        opus_encode_stereo,
         celt_decode,
         celt_mdct_forward,
         celt_pvq_search,

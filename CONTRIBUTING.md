@@ -239,6 +239,48 @@ does not: it shrinks the range encoder to exactly the bytes SILK used, as `opus_
 because a SILK-only packet with 17 or more spare bits makes libopus' *top-level* decoder go looking
 for a redundancy frame. That belongs to the Opus layer, not to the SILK encoder.
 
+#### Validating the **top-level Opus encoder**
+
+The layer above SILK and CELT adds what neither of them can check on its own: which mode runs, at
+what bandwidth, over how many channels, and — in hybrid — both of them writing into **one** range
+coder with no length field between them. `opus_encode_conformance` stacks four checks plus two that
+exist to stop the others passing for the wrong reason:
+
+```sh
+SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
+    cargo test -p siphon-rtp-codec --release --test opus_encode_conformance -- --nocapture
+```
+
+1. **Exact bitstream check**, as for the two layers below: our `.bit` file carries **our encoder's**
+   `final_range` per packet and `opus_demo -d` aborts unless libopus ends every packet on it. This is
+   the only check that reaches inside a hybrid frame, where the SILK/CELT seam is implicit in the
+   symbol sequence.
+2. **Discrete decisions against libopus'.** Mode, bandwidth, stream channels and frame duration all
+   land in the TOC byte, so ours must equal libopus' packet for packet. libopus is driven at
+   **`-complexity 6`** — the highest setting at which it does *not* run its tonality analysis
+   (`opus_encoder.c:1117`), the one subsystem this encoder does not implement — so both are deciding
+   from the same information. A tolerance here would be a bug: these are discrete values.
+3. **Quality**: our decoded segmental SNR must be within 1 dB of libopus' at the same configuration.
+4. **`opus_compare`** against the original PCM at fullband and a high rate, with the codec delay
+   compensated — `Fs/400 + Fs/250` = 312 samples at 48 kHz for VoIP and audio (`OPUS_GET_LOOKAHEAD`),
+   **not** the 120 the CELT harness uses, which is the restricted-low-delay figure.
+5. **A mode-switching stream.** The fixed matrix holds one bitrate per configuration, so the mode is
+   decided once and the redundancy path is never reached. A separate test sweeps the rate across the
+   SILK/CELT crossing with FEC and DTX moving underneath it and requires libopus to accept every
+   packet — that is what covers the redundancy flag, the 5 ms bridging frame and the `rng ^
+   redundant_rng` fold.
+6. **A liveness check.** One byte of one packet is corrupted and libopus *must* reject the stream, so
+   check 1 cannot pass because the harness wrote a file nothing actually verified.
+
+Two traps specific to this layer:
+
+- **`opus_compare` reads its reference as 2-channel and its test file at the `-s` channel count**
+  (`opus_compare.c:231-236`). A mono comparison therefore needs a *mono* decode and a *stereo*
+  reference (the mono source duplicated), not two mono files.
+- **The tonality analysis is not implemented**, deliberately — see the module docs on
+  `opus::enc::decision`. Comparing against a libopus that *is* running it compares against a
+  different encoder, which is what the complexity-6 pinning above avoids.
+
 #### Instrumented libopus, for validating a half-finished layer
 
 Both oracles above need the decoder to consume a packet to its end, so neither can say anything about a

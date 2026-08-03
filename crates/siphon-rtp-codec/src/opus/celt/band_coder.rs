@@ -794,6 +794,10 @@ pub struct ThetaRdo {
     x_save2: [f32; MAX_BAND],
     y_save2: [f32; MAX_BAND],
     norm_save2: [f32; MAX_BAND],
+    /// Snapshot of the fold source for whichever trial is running, when it overlaps the window that
+    /// trial writes — see [`split_fold_source`]. Re-taken per trial, so it cannot be shared with the
+    /// buffers above.
+    fold: [f32; MAX_BAND],
     bytes: [u8; MAX_PACKET_BYTES],
 }
 
@@ -807,6 +811,7 @@ impl ThetaRdo {
             x_save2: [0.0; MAX_BAND],
             y_save2: [0.0; MAX_BAND],
             norm_save2: [0.0; MAX_BAND],
+            fold: [0.0; MAX_BAND],
             bytes: [0; MAX_PACKET_BYTES],
         }
     }
@@ -866,9 +871,10 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
     last: bool,
     coder: &mut C,
 ) -> u32 {
-    /// One trial at the given rounding. The fold source is snapshotted per trial (see
-    /// [`fold_source`]) because trial 2 re-runs [`special_hybrid_folding`] over `norm` first, so the
-    /// two trials do not see the same bytes.
+    /// One trial at the given rounding. The fold source is taken from `norm` at the point of use
+    /// (see [`split_fold_source`]) rather than once for both trials, because trial 1 can write over
+    /// part of it and trial 2 re-runs [`special_hybrid_folding`] to put it back — which is exactly
+    /// what libopus does between the two calls (`bands.c:1628`).
     #[allow(clippy::too_many_arguments)]
     fn trial<C: CeltCoder>(
         ctx: &mut BandCtx,
@@ -883,17 +889,14 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
         norm: &mut [f32],
         cur_norm: usize,
         effective_lowband: i32,
+        fold_scratch: &mut [f32; MAX_BAND],
         last: bool,
         coder: &mut C,
     ) -> u32 {
         ctx.theta_round = round;
-        let mut lowband_scratch = [0f32; MAX_BAND];
-        let lowband = fold_source(&mut lowband_scratch, norm, effective_lowband, n);
-        let out: Option<&mut [f32]> = if last {
-            None
-        } else {
-            Some(&mut norm[cur_norm..cur_norm + n])
-        };
+        let (lowband, norm_hi) =
+            split_fold_source(fold_scratch, norm, cur_norm, effective_lowband, n);
+        let out: Option<&mut [f32]> = if last { None } else { Some(&mut norm_hi[..n]) };
         quant_band_stereo(ctx, x, y, n, b, big_b, lowband, lm, out, fill, coder)
     }
 
@@ -918,6 +921,7 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
         norm,
         cur_norm,
         effective_lowband,
+        &mut rdo.fold,
         last,
         coder,
     );
@@ -955,6 +959,7 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
         norm,
         cur_norm,
         effective_lowband,
+        &mut rdo.fold,
         last,
         coder,
     );
@@ -979,30 +984,52 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
     }
 }
 
-/// Snapshot the spectral-folding source libopus addresses as `norm + effective_lowband`
-/// (`bands.c:1553`), `n` samples of it, into `scratch`.
+/// Hand back the two windows of `norm` a band coder needs at once: the `n`-sample spectral-folding
+/// source libopus addresses as `norm + effective_lowband` (`bands.c:1553`), and everything from
+/// `cur_norm` on, whose first `n` samples are the `lowband_out` the same call writes
+/// (`bands.c:1576`). `None` for the source is the C's `NULL` lowband.
 ///
-/// The copy is not an optimisation, it is what makes the C's aliasing expressible. In **Hybrid**,
-/// `effective_lowband` clamps to 0 while `cur_norm` is only one band wide, so the fold source runs
-/// *past* the band boundary and overlaps the `lowband_out` window the same call writes — reading
-/// exactly the samples [`special_hybrid_folding`] duplicated there for the purpose. `quant_band`
-/// consumes the fold source before it ever writes `lowband_out`, so snapshotting is equivalent and
-/// keeps the two as a plain `&` and `&mut`. In CELT-only the source never crosses the boundary and
-/// the snapshot is the same slice the split would have produced.
-fn fold_source<'s>(
-    scratch: &'s mut [f32; MAX_BAND],
-    norm: &[f32],
+/// The two are **disjoint in CELT-only**: `norm_offset` is 0 there, so every band with a fold source
+/// satisfies `effective_lowband + n <= cur_norm` and the source is borrowed straight out of `norm`
+/// at no cost.
+///
+/// They are **not disjoint in Hybrid**. `effective_lowband` clamps to 0 (`bands.c:1543`) while
+/// `cur_norm` is only band `start`'s width, so a wider band `start + 1` reads *past* the boundary —
+/// deliberately, into exactly the samples [`special_hybrid_folding`] duplicated there for it
+/// (`bands.c:1384-1395`); with `start = 17` at `M = 8` that is a 96-sample read from a 64-sample
+/// window. libopus reads that out of one flat buffer that it also writes; Rust cannot hold a `&` and
+/// a `&mut` over the same bytes, so the source is snapshotted into `scratch` first. That is
+/// equivalent rather than merely close, because `quant_band` takes the lowband by shared reference
+/// and is done with it before it writes `lowband_out` — the C copies it aside at `bands.c:1143` for
+/// precisely that reason, since it transforms the lowband in place.
+///
+/// Taken at the point of use, so the encoder's two theta-RDO trials each read the buffer as
+/// [`special_hybrid_folding`] most recently left it — the C re-runs the fold between the trials
+/// (`bands.c:1628`) exactly because trial 1 overwrote part of its own fold source.
+fn split_fold_source<'a>(
+    scratch: &'a mut [f32; MAX_BAND],
+    norm: &'a mut [f32],
+    cur_norm: usize,
     effective_lowband: i32,
     n: usize,
-) -> Option<&'s [f32]> {
+) -> (Option<&'a [f32]>, &'a mut [f32]) {
+    let (below, at) = norm.split_at_mut(cur_norm);
     if effective_lowband < 0 {
-        return None;
+        return (None, at);
     }
     let from = effective_lowband as usize;
-    let to = (from + n).min(norm.len());
-    scratch[..n].fill(0.0);
-    scratch[..to - from].copy_from_slice(&norm[from..to]);
-    Some(&scratch[..n])
+    if from + n <= cur_norm {
+        return (Some(&below[from..from + n]), at);
+    }
+    // Hybrid: the source straddles `cur_norm`, so stitch the two halves back together. The tail
+    // clamp is defensive — `effective_lowband + n` never exceeds the normalised length for any band
+    // the loop reaches — and pads with the silence a shorter buffer would have folded from anyway.
+    let head = cur_norm - from;
+    let tail = (n - head).min(at.len());
+    scratch[..head].copy_from_slice(&below[from..]);
+    scratch[head..head + tail].copy_from_slice(&at[..tail]);
+    scratch[head + tail..n].fill(0.0);
+    (Some(&scratch[..n]), at)
 }
 
 /// Code all CELT bands `start..end` of the normalised coefficient buffer `x_` (libopus
@@ -1075,6 +1102,10 @@ pub fn quant_all_bands<C: CeltCoder>(
     };
     let mut lowband_offset = 0usize;
     let mut update_lowband = true;
+    // Reused across bands by [`split_fold_source`], which only writes them on the hybrid overlap —
+    // CELT-only leaves them untouched for the whole frame.
+    let mut lowband_scratch = [0f32; MAX_BAND];
+    let mut lowband2_scratch = [0f32; MAX_BAND];
 
     let (x_ch0, x_ch1) = x_.split_at_mut(frame_len.min(x_.len()));
 
@@ -1168,32 +1199,30 @@ pub fn quant_all_bands<C: CeltCoder>(
         }
 
         let cur_norm = band_lo - norm_offset;
+
         let x = &mut x_ch0[band_lo..band_hi];
-        let mut lowband_scratch = [0f32; MAX_BAND];
-        let mut lowband2_scratch = [0f32; MAX_BAND];
 
         if channels == 2 {
             let y = &mut x_ch1[band_lo..band_hi];
             if dual_stereo {
-                let lowband = fold_source(
+                let (lowband, norm_hi) = split_fold_source(
                     &mut lowband_scratch,
-                    &folds.norm[..norm_len],
+                    &mut folds.norm[..norm_len],
+                    cur_norm,
                     effective_lowband,
                     n,
                 );
-                let lowband2 = fold_source(
+                let (lowband2, norm2_hi) = split_fold_source(
                     &mut lowband2_scratch,
-                    &folds.norm2[..norm_len],
+                    &mut folds.norm2[..norm_len],
+                    cur_norm,
                     effective_lowband,
                     n,
                 );
                 let (out, out2): (Option<&mut [f32]>, Option<&mut [f32]>) = if last || !resynth {
                     (None, None)
                 } else {
-                    (
-                        Some(&mut folds.norm[cur_norm..cur_norm + n]),
-                        Some(&mut folds.norm2[cur_norm..cur_norm + n]),
-                    )
+                    (Some(&mut norm_hi[..n]), Some(&mut norm2_hi[..n]))
                 };
                 x_cm = quant_band(
                     &mut ctx,
@@ -1254,16 +1283,17 @@ pub fn quant_all_bands<C: CeltCoder>(
                         );
                     }
                 } else {
-                    let lowband = fold_source(
+                    let (lowband, norm_hi) = split_fold_source(
                         &mut lowband_scratch,
-                        &folds.norm[..norm_len],
+                        &mut folds.norm[..norm_len],
+                        cur_norm,
                         effective_lowband,
                         n,
                     );
                     let out: Option<&mut [f32]> = if last || !resynth {
                         None
                     } else {
-                        Some(&mut folds.norm[cur_norm..cur_norm + n])
+                        Some(&mut norm_hi[..n])
                     };
                     ctx.theta_round = 0;
                     x_cm = quant_band_stereo(
@@ -1273,16 +1303,17 @@ pub fn quant_all_bands<C: CeltCoder>(
                 y_cm = x_cm;
             }
         } else {
-            let lowband = fold_source(
+            let (lowband, norm_hi) = split_fold_source(
                 &mut lowband_scratch,
-                &folds.norm[..norm_len],
+                &mut folds.norm[..norm_len],
+                cur_norm,
                 effective_lowband,
                 n,
             );
             let lowband_out: Option<&mut [f32]> = if last || !resynth {
                 None
             } else {
-                Some(&mut folds.norm[cur_norm..cur_norm + n])
+                Some(&mut norm_hi[..n])
             };
             x_cm = quant_band(
                 &mut ctx,

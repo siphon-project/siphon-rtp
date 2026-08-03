@@ -47,12 +47,19 @@ const MAX_FIR_ORDER: usize = 36;
 const MAX_IIR_ORDER: usize = 6;
 /// `RESAMPLER_MAX_BATCH_SIZE_MS` (`resampler_private.h:40`).
 const MAX_BATCH_SIZE_MS: usize = 10;
-/// Highest decoder-side input rate in kHz. `silk_resampler_init(forEnc = 0)` rejects anything above
-/// 16 kHz on the input side (`resampler.c:99-103`), which is what bounds every buffer below.
-const MAX_INPUT_KHZ: usize = 16;
-/// Largest batch of input samples one kernel iteration consumes.
-const MAX_BATCH_SIZE_IN: usize = MAX_BATCH_SIZE_MS * MAX_INPUT_KHZ;
-/// `delayBuf[48]` (`resampler_structs.h:44`).
+/// Highest input rate in kHz that reaches an *upsampling* kernel. Upsampling only ever runs from a
+/// SILK internal rate — 8→12/16/24/48 on the decoder side, 8→12 and 12→16 on the encoder side — so
+/// the interpolator's scratch never needs more than 16 kHz of input per batch.
+const MAX_UPSAMPLE_INPUT_KHZ: usize = 16;
+/// Highest input rate in kHz that reaches a *decimating* kernel. `silk_resampler_init(forEnc = 1)`
+/// accepts 48 kHz in (`resampler.c:92-93`), which is what bounds the decimator's scratch.
+const MAX_DOWNSAMPLE_INPUT_KHZ: usize = 48;
+/// Largest batch of input samples one upsampling kernel iteration consumes.
+const MAX_BATCH_SIZE_UP: usize = MAX_BATCH_SIZE_MS * MAX_UPSAMPLE_INPUT_KHZ;
+/// Largest batch of input samples one decimating kernel iteration consumes.
+const MAX_BATCH_SIZE_DOWN: usize = MAX_BATCH_SIZE_MS * MAX_DOWNSAMPLE_INPUT_KHZ;
+/// `delayBuf[48]` (`resampler_structs.h:44`). Exactly one millisecond at the highest encoder-side
+/// input rate, which is what `silk_resampler` folds through it.
 const DELAY_BUFFER_LENGTH: usize = 48;
 
 /// `silk_resampler_down2_0` / `_1` — the plain 2x downsampler's allpass coefficients. Unused by the
@@ -131,6 +138,34 @@ const DELAY_MATRIX_DEC: [[i8; 5]; 3] = [
     /* 16 */ [0, 3, 12, 7, 7],
 ];
 
+/// `delay_matrix_enc[5][3]` (`resampler.c:53-60`) — the same compensation for the *encode*
+/// direction, indexed `[input rate][output rate]` over 8/12/16/24/48 kHz in and 8/12/16 kHz out.
+///
+/// The two matrices are not transposes of each other and must not be conflated: they exist to make
+/// the *total* codec delay identical across configurations, and the encode and decode halves of a
+/// given rate pair contribute different amounts of it.
+const DELAY_MATRIX_ENC: [[i8; 3]; 5] = [
+    // in \ out    8  12  16
+    /*  8 */ [6, 0, 3],
+    /* 12 */ [0, 7, 3],
+    /* 16 */ [0, 1, 10],
+    /* 24 */ [0, 2, 6],
+    /* 48 */ [18, 10, 12],
+];
+
+/// Which half of the codec a [`Resampler`] serves — libopus' `forEnc` argument
+/// (`silk_resampler_init`, `resampler.c:82`).
+///
+/// It decides two things and nothing else: which rate range is legal on each side, and which delay
+/// matrix supplies the compensation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// `forEnc = 1` — API rate (8/12/16/24/48 kHz) down to a SILK internal rate (8/12/16 kHz).
+    Encode,
+    /// `forEnc = 0` — a SILK internal rate up to the API rate.
+    Decode,
+}
+
 /// `rateID(R)` (`resampler.c:70`) — 8/12/16/24/48 kHz to 0..=4.
 fn rate_id(rate_hz: u32) -> Option<usize> {
     match rate_hz {
@@ -183,9 +218,9 @@ pub struct Resampler {
     /// `delayBuf[48]` — the held-back input samples that implement the delay compensation.
     delay_buffer: [i16; DELAY_BUFFER_LENGTH],
     /// Scratch for the upsampling kernel — `2 * batchSize + RESAMPLER_ORDER_FIR_12`.
-    upsample_scratch: [i16; 2 * MAX_BATCH_SIZE_IN + ORDER_FIR_12],
+    upsample_scratch: [i16; 2 * MAX_BATCH_SIZE_UP + ORDER_FIR_12],
     /// Scratch for the decimating kernel — `batchSize + FIR_Order`.
-    downsample_scratch: [i32; MAX_BATCH_SIZE_IN + MAX_FIR_ORDER],
+    downsample_scratch: [i32; MAX_BATCH_SIZE_DOWN + MAX_FIR_ORDER],
     kernel: Kernel,
     /// `batchSize` — input samples per kernel iteration.
     batch_size: usize,
@@ -200,6 +235,10 @@ pub struct Resampler {
     input_delay: usize,
     /// The configured pair, so a repeat [`Resampler::configure`] can keep the state.
     configured: Option<(u32, u32)>,
+    /// Which delay matrix the configured pair drew from. Part of the identity of a configuration: a
+    /// rate pair legal in both directions (8→8, 8→12, …) gets a *different* `inputDelay` in each, so
+    /// switching direction must re-initialise even though the rates match.
+    direction: Direction,
 }
 
 impl Resampler {
@@ -212,8 +251,8 @@ impl Resampler {
             fir_state_i32: [0; MAX_FIR_ORDER],
             fir_state_i16: [0; ORDER_FIR_12],
             delay_buffer: [0; DELAY_BUFFER_LENGTH],
-            upsample_scratch: [0; 2 * MAX_BATCH_SIZE_IN + ORDER_FIR_12],
-            downsample_scratch: [0; MAX_BATCH_SIZE_IN + MAX_FIR_ORDER],
+            upsample_scratch: [0; 2 * MAX_BATCH_SIZE_UP + ORDER_FIR_12],
+            downsample_scratch: [0; MAX_BATCH_SIZE_DOWN + MAX_FIR_ORDER],
             kernel: Kernel::Copy,
             batch_size: 0,
             inverse_ratio_q16: 0,
@@ -221,27 +260,66 @@ impl Resampler {
             output_khz: 0,
             input_delay: 0,
             configured: None,
+            direction: Direction::Decode,
         }
     }
 
-    /// Select the kernel for a rate pair (libopus `silk_resampler_init`, `resampler.c:78-170`, with
-    /// `forEnc = 0`).
+    /// Select the kernel for a rate pair on the **decode** side (libopus `silk_resampler_init`,
+    /// `resampler.c:78-170`, with `forEnc = 0`).
     ///
     /// **Clears the filter state**, exactly as the C's opening `silk_memset` does — but only when
     /// the pair actually changes. `silk_decoder_set_fs` guards the call the same way
     /// (`decoder_set_fs.c:51-56`); re-initialising every packet would restart the filters mid-stream.
     pub fn configure(&mut self, input_hz: u32, output_hz: u32) -> Result<(), CodecError> {
-        if self.configured == Some((input_hz, output_hz)) {
+        self.configure_direction(input_hz, output_hz, Direction::Decode)
+    }
+
+    /// Select the kernel for a rate pair on the **encode** side (`forEnc = 1`): the API rate down to
+    /// a SILK internal rate.
+    ///
+    /// Same guard as [`Resampler::configure`] — a repeat call with the same pair keeps the filter
+    /// state, which is what lets `silk_Encode` call it every packet without clicking.
+    pub fn configure_for_encoder(
+        &mut self,
+        input_hz: u32,
+        output_hz: u32,
+    ) -> Result<(), CodecError> {
+        self.configure_direction(input_hz, output_hz, Direction::Encode)
+    }
+
+    /// The shared body of both `configure*` entry points.
+    fn configure_direction(
+        &mut self,
+        input_hz: u32,
+        output_hz: u32,
+        direction: Direction,
+    ) -> Result<(), CodecError> {
+        if self.configured == Some((input_hz, output_hz)) && self.direction == direction {
             return Ok(());
         }
-        let input_id = rate_id(input_hz)
-            .filter(|&id| id <= 2)
-            .ok_or(CodecError::Unsupported(
-                "silk: resampler input rate must be 8, 12 or 16 kHz",
-            ))?;
-        let output_id = rate_id(output_hz).ok_or(CodecError::Unsupported(
-            "silk: resampler output rate must be 8, 12, 16, 24 or 48 kHz",
-        ))?;
+        // The legal rate ranges swap with the direction (`resampler.c:91-105`).
+        let (input_id, output_id) = match direction {
+            Direction::Decode => (
+                rate_id(input_hz)
+                    .filter(|&id| id <= 2)
+                    .ok_or(CodecError::Unsupported(
+                        "silk: resampler input rate must be 8, 12 or 16 kHz",
+                    ))?,
+                rate_id(output_hz).ok_or(CodecError::Unsupported(
+                    "silk: resampler output rate must be 8, 12, 16, 24 or 48 kHz",
+                ))?,
+            ),
+            Direction::Encode => (
+                rate_id(input_hz).ok_or(CodecError::Unsupported(
+                    "silk: resampler input rate must be 8, 12, 16, 24 or 48 kHz",
+                ))?,
+                rate_id(output_hz)
+                    .filter(|&id| id <= 2)
+                    .ok_or(CodecError::Unsupported(
+                        "silk: resampler output rate must be 8, 12 or 16 kHz",
+                    ))?,
+            ),
+        };
 
         // Clear state (resampler.c:88).
         self.iir_state = [0; MAX_IIR_ORDER];
@@ -249,7 +327,11 @@ impl Resampler {
         self.fir_state_i16 = [0; ORDER_FIR_12];
         self.delay_buffer = [0; DELAY_BUFFER_LENGTH];
 
-        self.input_delay = DELAY_MATRIX_DEC[input_id][output_id] as usize;
+        self.input_delay = match direction {
+            Direction::Decode => DELAY_MATRIX_DEC[input_id][output_id],
+            Direction::Encode => DELAY_MATRIX_ENC[input_id][output_id],
+        } as usize;
+        self.direction = direction;
         self.input_khz = (input_hz / 1000) as usize;
         self.output_khz = (output_hz / 1000) as usize;
         self.batch_size = self.input_khz * MAX_BATCH_SIZE_MS;
@@ -682,6 +764,222 @@ mod tests {
                 assert!(
                     resampler.configure(input, output).is_ok(),
                     "{input} -> {output} must be supported"
+                );
+            }
+        }
+    }
+
+    /// Every decimator ROM, diffed against `silk/resampler_rom.c` element by element.
+    ///
+    /// Three of these tables — 1:3, 1:4 and 1:6 — are only ever selected by a 24 or 48 kHz *encoder*
+    /// input, so until the encode direction existed nothing in the suite touched them and a
+    /// transcription slip would have sat there unnoticed. The check re-parses the C rather than
+    /// trusting a hand comparison, and skips when the reference tree is absent.
+    #[test]
+    fn decimator_coefficients_match_libopus() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../reference/opus/opus-1.5.2/silk/resampler_rom.c");
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: {} is absent", path.display());
+            return;
+        };
+
+        // `silk_<name>[ ... ] = { <i16 list> };`
+        let parse = |name: &str| -> Vec<i16> {
+            let start = source
+                .find(&format!("silk_{name}["))
+                .unwrap_or_else(|| panic!("{name} not found in resampler_rom.c"));
+            let open = start + source[start..].find('{').expect("opening brace");
+            let close = open + source[open..].find("};").expect("closing brace");
+            // `silk_resampler_frac_FIR_12` is a table of tables, so the inner braces have to go
+            // before the split — otherwise the first token of every row carries one.
+            source[open + 1..close]
+                .replace(['{', '}'], " ")
+                .split(',')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(|token| {
+                    token
+                        .parse::<i16>()
+                        .unwrap_or_else(|_| panic!("{name}: not an i16 literal: {token:?}"))
+                })
+                .collect()
+        };
+
+        for (name, ours) in [
+            ("Resampler_3_4_COEFS", &COEFS_3_4[..]),
+            ("Resampler_2_3_COEFS", &COEFS_2_3[..]),
+            ("Resampler_1_2_COEFS", &COEFS_1_2[..]),
+            ("Resampler_1_3_COEFS", &COEFS_1_3[..]),
+            ("Resampler_1_4_COEFS", &COEFS_1_4[..]),
+            ("Resampler_1_6_COEFS", &COEFS_1_6[..]),
+        ] {
+            assert_eq!(parse(name), ours, "silk_{name}");
+        }
+
+        let fractional = parse("resampler_frac_FIR_12");
+        let flattened: Vec<i16> = FRAC_FIR_12.iter().flatten().copied().collect();
+        assert_eq!(fractional, flattened, "silk_resampler_frac_FIR_12");
+
+        let up2: Vec<i16> = UP2_HQ_EVEN
+            .iter()
+            .chain(UP2_HQ_ODD.iter())
+            .copied()
+            .collect();
+        assert_eq!(
+            up2.len(),
+            6,
+            "the 2x upsampler has two three-section chains"
+        );
+    }
+
+    /// The encode direction accepts 24 and 48 kHz *in* and only SILK internal rates *out* — the
+    /// mirror image of the decode direction's range (`resampler.c:91-105`).
+    #[test]
+    fn encoder_configure_accepts_the_api_rates_and_rejects_the_decoder_range() {
+        let mut resampler = Resampler::new();
+        for input in [8_000u32, 12_000, 16_000, 24_000, 48_000] {
+            for output in [8_000u32, 12_000, 16_000] {
+                assert!(
+                    resampler.configure_for_encoder(input, output).is_ok(),
+                    "{input} -> {output} must be supported on the encode side"
+                );
+            }
+        }
+        assert!(
+            resampler.configure_for_encoder(16_000, 48_000).is_err(),
+            "encode side is 8/12/16 kHz out"
+        );
+        assert!(resampler.configure_for_encoder(44_100, 16_000).is_err());
+        assert!(resampler.configure_for_encoder(16_000, 44_100).is_err());
+    }
+
+    /// `delay_matrix_enc` (`resampler.c:53-60`), value for value. This is not cosmetic: the delay is
+    /// what makes every configuration present the same total codec delay, so a transposed or
+    /// mis-copied entry shifts the encoder's output against the decoder's by a few samples and shows
+    /// up as a quality loss nothing else in the suite would name.
+    #[test]
+    fn encoder_delay_matrix_matches_the_c_table() {
+        let expected: [[usize; 3]; 5] = [[6, 0, 3], [0, 7, 3], [0, 1, 10], [0, 2, 6], [18, 10, 12]];
+        let mut resampler = Resampler::new();
+        for (input_index, input) in [8_000u32, 12_000, 16_000, 24_000, 48_000]
+            .into_iter()
+            .enumerate()
+        {
+            for (output_index, output) in [8_000u32, 12_000, 16_000].into_iter().enumerate() {
+                resampler
+                    .configure_for_encoder(input, output)
+                    .expect("configure");
+                assert_eq!(
+                    resampler.input_delay, expected[input_index][output_index],
+                    "delay_matrix_enc[{input}][{output}]"
+                );
+                assert!(
+                    resampler.input_delay <= resampler.input_khz,
+                    "the delay must fit in the one millisecond `silk_resampler` folds through it"
+                );
+            }
+        }
+    }
+
+    /// A rate pair legal in both directions carries a *different* delay in each, so re-configuring
+    /// the same pair the other way round must re-initialise rather than short-circuit.
+    #[test]
+    fn switching_direction_reinitialises_a_shared_rate_pair() {
+        let mut resampler = Resampler::new();
+        resampler.configure(8_000, 8_000).expect("decode");
+        assert_eq!(resampler.input_delay, 4, "delay_matrix_dec[8][8]");
+        resampler
+            .configure_for_encoder(8_000, 8_000)
+            .expect("encode");
+        assert_eq!(resampler.input_delay, 6, "delay_matrix_enc[8][8]");
+        resampler.configure(8_000, 8_000).expect("decode again");
+        assert_eq!(resampler.input_delay, 4);
+    }
+
+    /// The three decimating kernels the decode side never reaches — 1:3, 1:4 and 1:6 — are exactly
+    /// the ones a 24/48 kHz API rate needs.
+    #[test]
+    fn encoder_kernel_selection_follows_the_resampler_matrix() {
+        let mut resampler = Resampler::new();
+        let cases = [
+            (48_000u32, 16_000u32, 1usize, DOWN_ORDER_FIR2),
+            (48_000, 12_000, 1, DOWN_ORDER_FIR2),
+            (48_000, 8_000, 1, DOWN_ORDER_FIR2),
+            (24_000, 8_000, 1, DOWN_ORDER_FIR2),
+            (24_000, 12_000, 1, DOWN_ORDER_FIR1),
+            (24_000, 16_000, 2, DOWN_ORDER_FIR0),
+            (16_000, 12_000, 3, DOWN_ORDER_FIR0),
+            (16_000, 8_000, 1, DOWN_ORDER_FIR1),
+            (12_000, 8_000, 2, DOWN_ORDER_FIR0),
+        ];
+        for (input, output, fractions, order) in cases {
+            resampler
+                .configure_for_encoder(input, output)
+                .expect("configure");
+            match resampler.kernel {
+                Kernel::DownFir {
+                    fractions: got_fractions,
+                    order: got_order,
+                    ..
+                } => {
+                    assert_eq!(got_fractions, fractions, "{input} -> {output} fractions");
+                    assert_eq!(got_order, order, "{input} -> {output} order");
+                }
+                other => panic!("{input} -> {output} selected {other:?}"),
+            }
+        }
+        // The three non-decimating encode pairs.
+        resampler.configure_for_encoder(8_000, 16_000).expect("up2");
+        assert_eq!(resampler.kernel, Kernel::Up2Hq);
+        resampler.configure_for_encoder(8_000, 12_000).expect("uf");
+        assert_eq!(resampler.kernel, Kernel::IirFir);
+        resampler
+            .configure_for_encoder(16_000, 16_000)
+            .expect("copy");
+        assert_eq!(resampler.kernel, Kernel::Copy);
+    }
+
+    /// Every encode-side pair must consume a 20 ms API frame and emit exactly 20 ms at the internal
+    /// rate, without walking off either buffer. The 48 kHz input is the case the decode-side
+    /// buffers were never sized for.
+    #[test]
+    fn encoder_resampling_produces_one_frame_per_frame() {
+        for input in [8_000u32, 12_000, 16_000, 24_000, 48_000] {
+            for output in [8_000u32, 12_000, 16_000] {
+                let mut resampler = Resampler::new();
+                resampler
+                    .configure_for_encoder(input, output)
+                    .expect("configure");
+                let input_frame = input as usize / 50;
+                let output_frame = output as usize / 50;
+                // A 300 Hz tone, well inside every target band, so nothing is filtered away.
+                let samples: Vec<i16> = (0..input_frame * 5)
+                    .map(|index| {
+                        let phase =
+                            2.0 * std::f64::consts::PI * 300.0 * index as f64 / f64::from(input);
+                        (8000.0 * phase.sin()) as i16
+                    })
+                    .collect();
+                let mut out = vec![0i16; output_frame];
+                let mut peak = 0i32;
+                for block in 0..5 {
+                    let produced = resampler
+                        .process(
+                            &mut out,
+                            &samples[block * input_frame..(block + 1) * input_frame],
+                        )
+                        .expect("process");
+                    assert_eq!(produced, output_frame, "{input} -> {output}");
+                    if block > 0 {
+                        peak = peak.max(out.iter().map(|&s| i32::from(s).abs()).max().unwrap_or(0));
+                    }
+                }
+                // The tone survives: a broken kernel selection or a mis-sized scratch buffer either
+                // panics above or leaves silence here.
+                assert!(
+                    peak > 4_000,
+                    "{input} -> {output} lost the tone (peak {peak})"
                 );
             }
         }
