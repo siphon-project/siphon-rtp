@@ -1435,6 +1435,227 @@ fn bench_silk_encoder_analysis(c: &mut Criterion) {
     group.finish();
 }
 
+/// The SILK **encoder**: the whole packet path, and the two stages that dominate it.
+///
+/// Reported per *frame* so the numbers sit next to the decoder's. The three sub-benches say where
+/// the time goes: the noise-shaping quantiser is the hot inner loop (and its delayed-decision
+/// variant is `nStatesDelayedDecision` times the work), the bitstream writer is pure table lookup,
+/// and the whole-packet number includes the rate loop, which may run the quantiser and the writer
+/// up to seven times for one frame.
+fn bench_silk_encode(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::range_coder::RangeEncoder;
+    use siphon_rtp_codec::opus::silk::enc::bitstream::{
+        encode_indices, encode_pulses, EntropyContext,
+    };
+    use siphon_rtp_codec::opus::silk::enc::encoder::{EncoderConfig, RateMode, SilkEncoder};
+    use siphon_rtp_codec::opus::silk::enc::frame::{
+        analyze_frame, AnalysisConfig, AnalysisState, ComplexitySettings,
+    };
+    use siphon_rtp_codec::opus::silk::enc::nsq::{quantize, NsqConfig, NsqInput, NsqState};
+    use siphon_rtp_codec::opus::silk::enc::SignalMeasures;
+    use siphon_rtp_codec::opus::silk::types::{
+        CondCoding, InternalRate, SignalType, SubframeLayout, MAX_FRAME_LENGTH,
+    };
+
+    /// A deterministic voiced-like input at a known pitch. Logical sample clock only.
+    fn voiced(length: usize, period: usize) -> Vec<f32> {
+        let mut state = 24_680u32;
+        let mut signal = vec![0.0f32; length];
+        let mut history = [0.0f32; 2];
+        for (index, slot) in signal.iter_mut().enumerate() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((state >> 20) as i32 - 2048) as f32 * 0.5;
+            let pulse = if index % period == 0 { 4000.0 } else { 0.0 };
+            let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+            history[1] = history[0];
+            history[0] = value;
+            *slot = value.clamp(-30_000.0, 30_000.0);
+        }
+        signal
+    }
+
+    let mut group = c.benchmark_group("silk_encode");
+
+    // ── The noise-shaping quantiser, per frame, at each survivor depth ────────────────────────
+    for (label, rate, states, warping) in [
+        ("nsq_wb_20ms_plain", InternalRate::Wide16k, 1usize, 0i32),
+        ("nsq_wb_20ms_deldec2", InternalRate::Wide16k, 2, 0),
+        ("nsq_wb_20ms_deldec4", InternalRate::Wide16k, 4, 983 * 16),
+        ("nsq_nb_20ms_deldec4", InternalRate::Narrow8k, 4, 983 * 8),
+    ] {
+        let settings = ComplexitySettings::for_complexity(10);
+        let layout = SubframeLayout::from_duration_ms(20).expect("20 ms");
+        let configuration = AnalysisConfig {
+            internal_rate: rate,
+            layout,
+            settings,
+            snr_db_q7: 2600,
+            use_cbr: false,
+            packet_loss_percent: 0,
+            frames_per_packet: 1,
+            lbrr_enabled: false,
+        };
+        let history = configuration.required_history();
+        let frame_length = configuration.frame_length();
+        let signal = voiced(
+            history + frame_length + configuration.required_lookahead(),
+            5 * rate.khz(),
+        );
+        let mut state = AnalysisState {
+            first_frame_after_reset: false,
+            ..AnalysisState::default()
+        };
+        let measures = SignalMeasures {
+            speech_activity_q8: 220,
+            input_quality_bands_q15: [22_000; 4],
+            input_tilt_q15: 1000,
+            previous_signal_type: SignalType::Voiced,
+        };
+        let analysis = analyze_frame(
+            &mut state,
+            &signal,
+            history,
+            SignalType::Unvoiced,
+            CondCoding::Independently,
+            &measures,
+            &configuration,
+        )
+        .expect("analysis");
+
+        let nsq_config = NsqConfig {
+            subframe_length: configuration.subframe_length(),
+            subframe_count: layout.subframe_count,
+            ltp_memory_length: configuration.ltp_memory_length(),
+            predict_lpc_order: rate.lpc_order(),
+            shaping_lpc_order: settings.shaping_lpc_order,
+            warping_q16: warping,
+            delayed_decision_states: states,
+        };
+        let input = NsqInput::from_analysis(&analysis.control, &analysis.indices, 1, &nsq_config);
+        let mut x16 = [0i16; MAX_FRAME_LENGTH];
+        for (slot, &sample) in x16.iter_mut().zip(signal[history..].iter()) {
+            *slot = sample as i16;
+        }
+
+        group.bench_function(label, |bencher| {
+            let mut nsq = NsqState::default();
+            let mut pulses = [0i8; MAX_FRAME_LENGTH];
+            bencher.iter(|| {
+                black_box(quantize(
+                    &mut nsq,
+                    black_box(&input),
+                    black_box(&x16),
+                    &mut pulses,
+                    &nsq_config,
+                ))
+            });
+        });
+
+        // ── The bitstream writer, per frame, on the same frame's output ───────────────────────
+        if label == "nsq_wb_20ms_deldec4" {
+            let mut nsq = NsqState::default();
+            let mut pulses = [0i8; MAX_FRAME_LENGTH];
+            let seed = quantize(&mut nsq, &input, &x16, &mut pulses, &nsq_config);
+            group.bench_function("writer_wb_20ms", |bencher| {
+                let mut buffer = [0u8; 1275];
+                bencher.iter(|| {
+                    let mut range = RangeEncoder::new(&mut buffer);
+                    let mut context = EntropyContext::default();
+                    let mut scratch = pulses;
+                    encode_indices(
+                        &mut range,
+                        black_box(&analysis.indices),
+                        seed,
+                        rate,
+                        layout.subframe_count,
+                        CondCoding::Independently,
+                        false,
+                        &mut context,
+                    );
+                    encode_pulses(
+                        &mut range,
+                        analysis.indices.signal_type,
+                        analysis.indices.quant_offset_type,
+                        &mut scratch,
+                        frame_length,
+                    );
+                    black_box(range.tell())
+                });
+            });
+        }
+    }
+
+    // ── The whole packet path, including the rate loop, per SILK frame ────────────────────────
+    for (label, rate, duration_ms, channels, bitrate, mode) in [
+        (
+            "packet_wb_20ms_mono_vbr",
+            InternalRate::Wide16k,
+            20usize,
+            1usize,
+            24_000i32,
+            RateMode::Variable,
+        ),
+        (
+            "packet_wb_20ms_mono_cbr",
+            InternalRate::Wide16k,
+            20,
+            1,
+            24_000,
+            RateMode::Constant,
+        ),
+        (
+            "packet_wb_20ms_stereo_vbr",
+            InternalRate::Wide16k,
+            20,
+            2,
+            48_000,
+            RateMode::Variable,
+        ),
+        (
+            "packet_nb_20ms_mono_vbr",
+            InternalRate::Narrow8k,
+            20,
+            1,
+            10_000,
+            RateMode::Variable,
+        ),
+        (
+            "packet_wb_60ms_mono_vbr",
+            InternalRate::Wide16k,
+            60,
+            1,
+            24_000,
+            RateMode::Variable,
+        ),
+    ] {
+        let mut config = EncoderConfig::new(rate, duration_ms, bitrate);
+        config.channels = channels;
+        config.rate_mode = mode;
+        config.max_bytes = 250;
+        let per_packet = duration_ms * rate.khz() * channels;
+        let float_signal = voiced(per_packet * 4, 5 * rate.khz());
+        let input: Vec<i16> = float_signal.iter().map(|&value| value as i16).collect();
+
+        group.bench_function(label, |bencher| {
+            let mut encoder = SilkEncoder::new(config).expect("encoder");
+            let mut buffer = vec![0u8; 1275];
+            let mut offset = 0usize;
+            bencher.iter(|| {
+                let start = offset % (input.len() - per_packet);
+                offset += per_packet;
+                let mut range = RangeEncoder::new(&mut buffer);
+                black_box(
+                    encoder
+                        .encode(black_box(&input[start..start + per_packet]), &mut range)
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+
+    group.finish();
+}
+
 // AMR-WB/NB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
 #[cfg(feature = "amr")]
 criterion_group!(
@@ -1451,6 +1672,7 @@ criterion_group!(
     bench_silk_encoder_analysis,
     bench_silk_synthesis,
     bench_silk_frame,
+    bench_silk_encode,
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
@@ -1474,6 +1696,7 @@ criterion_group!(
     bench_silk_excitation,
     bench_silk_encoder_analysis,
     bench_silk_synthesis,
-    bench_silk_frame
+    bench_silk_frame,
+    bench_silk_encode
 );
 criterion_main!(benches);

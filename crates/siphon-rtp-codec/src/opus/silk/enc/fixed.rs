@@ -28,6 +28,26 @@ pub fn smlaww(a32: i32, b32: i32, c32: i32) -> i32 {
     a32.wrapping_add(((i64::from(b32) * i64::from(c32)) >> 16) as i32)
 }
 
+/// `silk_SMULWT(a32, b32)` — `(a32 * (b32 >> 16)) >> 16` (`macros.h:56-61`).
+///
+/// The **top** half of `b32` is the multiplier, which is what lets the noise-shaping quantiser pack
+/// the two low-frequency shaping coefficients into one `LF_shp_Q14` word: `silk_SMULWB` reads
+/// `LF_MA_shp` out of the low half and this reads `LF_AR_shp` out of the high half
+/// (`NSQ.c:255-256`).
+#[inline]
+#[must_use]
+pub fn smulwt(a32: i32, b32: i32) -> i32 {
+    ((i64::from(a32) * i64::from(b32 >> 16)) >> 16) as i32
+}
+
+/// `silk_SMLAWT(a32, b32, c32)` — `a32 + ((b32 * (c32 >> 16)) >> 16)` (`macros.h:63-68`), i.e.
+/// [`smulwt`] accumulated.
+#[inline]
+#[must_use]
+pub fn smlawt(a32: i32, b32: i32, c32: i32) -> i32 {
+    a32.wrapping_add(smulwt(b32, c32))
+}
+
 /// `silk_ADD_POS_SAT32(a, b)` (`SigProc_FIX.h:499`) — add, returning `i32::MAX` whenever the sum's
 /// sign bit comes out set.
 ///

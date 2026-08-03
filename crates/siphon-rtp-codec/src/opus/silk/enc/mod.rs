@@ -75,6 +75,8 @@
 //! 3. **Invariants** (`proptest`): a limited LPC filter is always stable, a pitch lag is always
 //!    inside the legal per-rate range, and an NLSF index vector is always decodable.
 
+pub mod bitstream;
+pub mod encoder;
 pub mod fixed;
 pub mod float;
 pub mod frame;
@@ -82,8 +84,13 @@ pub mod gains;
 pub mod lpc_analysis;
 pub mod nlsf_quant;
 pub mod noise_shape;
+pub mod nsq;
+pub mod nsq_del_dec;
 pub mod pitch;
 pub mod pred_coefs;
+pub mod rate_control;
+pub mod stereo;
+pub mod vad;
 
 /// `MAX_SHAPE_LPC_ORDER` (`define.h:155`) — the largest noise-shaping AR order, at complexity 10.
 pub const MAX_SHAPE_LPC_ORDER: usize = 24;
