@@ -69,11 +69,13 @@ const ROOM_TICK_MS: usize = 20;
 const ROOM_FRAME: usize = (MAX_ROOM_RATE_HZ as usize / 1000) * ROOM_TICK_MS;
 /// The room playout tick — one mixed frame per participant per 20 ms (RFC 3551 default ptime).
 pub const ROOM_TICK: std::time::Duration = std::time::Duration::from_millis(ROOM_TICK_MS as u64);
+/// The longest packetization interval a participant may carry: the RFC 7587 §6.1 `maxptime`
+/// ceiling, which is also the longest audio one RFC 6716 §3.2 code-3 packet can hold. Every other
+/// codec here is far below it (G.711/AMR at 20 ms).
+const MAX_PTIME_MS: u8 = siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS;
 /// Samples **per channel** in the longest decoded native frame the scratch buffers accommodate:
-/// 48 kHz (Opus full-band, RFC 7587 §4.1) × 120 ms (the RFC 7587 §6.1 `maxptime` ceiling, which is
-/// also the longest audio one RFC 6716 §3.2 code-3 packet can carry) = 5760.
-const MAX_NATIVE_SAMPLES: usize =
-    48_000 / 1000 * siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS as usize;
+/// 48 kHz (Opus full-band, RFC 7587 §4.1) × 120 ms = 5760.
+const MAX_NATIVE_SAMPLES: usize = MAX_ROOM_RATE_HZ as usize / 1000 * MAX_PTIME_MS as usize;
 /// Audio channels in the longest decoded frame — an Opus RTP stream is mono or stereo (RFC 7587 §6.1);
 /// multistream / surround (RFC 7845) is out of scope and every other codec is mono.
 const MAX_NATIVE_CHANNELS: usize = 2;
@@ -353,8 +355,9 @@ impl Conference {
         self.top_m = top_m;
     }
 
-    /// Seat a participant. Returns `false` if the room is full ([`MAX_PARTICIPANTS`]), the codec's
-    /// frame is larger than the scratch ceiling, or a tag is already seated.
+    /// Seat a participant. Returns `false` if the room is full ([`MAX_PARTICIPANTS`]), a tag is
+    /// already seated, the codec's frame is larger than the scratch ceiling, or the participant's
+    /// decoder and encoder disagree (see the `native_frame` invariant below).
     pub fn add_participant(&mut self, config: ParticipantConfig) -> bool {
         if self.participants.len() >= MAX_PARTICIPANTS {
             return false;
@@ -369,16 +372,64 @@ impl Conference {
         let native_params = config.decoder.params();
         let native_rate = native_params.sample_rate_hz;
         let native_channels = native_params.channels.max(1);
+        // Bound the packetization interval directly rather than only the frame length: an upsample
+        // from the lowest tier to the highest multiplies the sample count by 6, and the room's
+        // `resample_scratch` is sized for one `MAX_PTIME_MS` frame at [`MAX_ROOM_RATE_HZ`]. A codec
+        // claiming a longer interval would grow that buffer mid-tick — a heap allocation on the hot
+        // path, which is a standing invariant here, not a nicety.
+        if native_params.ptime_ms == 0 || native_params.ptime_ms > MAX_PTIME_MS {
+            tracing::warn!(
+                conference = %self.conference_id,
+                tag = %config.tag,
+                ptime_ms = native_params.ptime_ms,
+                "conference refused a participant: packetization interval outside 1..={MAX_PTIME_MS} ms"
+            );
+            return false;
+        }
         // `Decoder::frame_samples` is the interleaved value count (the channel contract in
         // `siphon_rtp_codec`); the room works in per-channel samples, since a multi-channel frame is
         // folded to mono on the way in. Bound the *interleaved* count against the scratch capacity —
         // that is the buffer `next_pcm` decodes into.
         let native_values = config.decoder.frame_samples();
         if native_values == 0 || native_values > MAX_NATIVE_FRAME {
+            tracing::warn!(
+                conference = %self.conference_id,
+                tag = %config.tag,
+                native_values,
+                "conference refused a participant: decoded frame exceeds the room scratch ceiling"
+            );
             return false;
         }
         let native_frame = native_values / native_channels as usize;
         if native_frame == 0 {
+            return false;
+        }
+        // **The `native_frame` invariant.** One number does double duty: the room decodes each tick
+        // *into* a `native_frame`-sample buffer and encodes the participant's egress *out of* one.
+        // That is only sound while the two halves of the leg agree — same sample rate, same
+        // packetization interval, and a mono egress, since the mix bus is mono and hands the encoder
+        // mono PCM (a multi-channel *ingress* is folded at the codec boundary, but nothing ever
+        // re-interleaves on the way out). Enforce it here rather than documenting it: a mismatched
+        // pair would hand the encoder a wrong-length frame on every single tick, which most codecs
+        // answer with `BadFrameSize` and the room answers by silently dropping that leg's egress.
+        let egress_params = config.encoder.params();
+        if egress_params.sample_rate_hz != native_rate
+            || egress_params.ptime_ms != native_params.ptime_ms
+            || egress_params.channels > 1
+            || config.encoder.frame_samples() != native_frame
+        {
+            tracing::warn!(
+                conference = %self.conference_id,
+                tag = %config.tag,
+                decode_rate_hz = native_rate,
+                decode_ptime_ms = native_params.ptime_ms,
+                decode_frame = native_frame,
+                encode_rate_hz = egress_params.sample_rate_hz,
+                encode_ptime_ms = egress_params.ptime_ms,
+                encode_channels = egress_params.channels,
+                encode_frame = config.encoder.frame_samples(),
+                "conference refused a participant: its decoder and encoder disagree on rate / ptime / channels"
+            );
             return false;
         }
         let stateless = config.encoder.is_stateless();
@@ -1902,6 +1953,81 @@ mod tests {
             );
             assert_eq!(room.participants[0].native_channels, 1);
         }
+    }
+
+    #[test]
+    fn a_participant_whose_decoder_and_encoder_disagree_is_refused() {
+        // `Participant.native_frame` is one number doing double duty — the room decodes each tick
+        // into a frame that long and encodes the egress out of one. A leg whose two halves disagree
+        // would hand its encoder a wrong-length frame every tick (silently dropping that leg's
+        // egress), so the pair is checked at the door instead of being trusted.
+        use siphon_rtp_codec::l16::L16;
+
+        /// A named decoder/encoder pair that must be refused.
+        type Mismatch = (&'static str, Box<dyn Decoder>, Box<dyn Encoder>);
+
+        let mismatches: Vec<Mismatch> = vec![
+            (
+                "sample rate",
+                Box::new(L16::new(16_000, 20)),
+                Box::new(L16::new(8_000, 20)),
+            ),
+            (
+                "packetization interval",
+                Box::new(L16::new(16_000, 20)),
+                Box::new(L16::new(16_000, 40)),
+            ),
+        ];
+        for (what, decoder, encoder) in mismatches {
+            let mut room = Conference::new(format!("room-{what}"), 0);
+            let config = ParticipantConfig {
+                decoder,
+                encoder,
+                ..ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")
+            };
+            assert!(
+                !room.add_participant(config),
+                "a {what} mismatch between decoder and encoder must be refused"
+            );
+            assert_eq!(room.participant_count(), 0);
+        }
+
+        // The matching pair is seated, and `native_frame` describes both halves of the leg.
+        let mut room = Conference::new("room".into(), 0);
+        let config = ParticipantConfig {
+            decoder: Box::new(L16::new(16_000, 20)),
+            encoder: Box::new(L16::new(16_000, 20)),
+            ..ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")
+        };
+        assert!(room.add_participant(config));
+        assert_eq!(room.participants[0].native_frame, 320);
+    }
+
+    #[test]
+    fn a_participant_beyond_the_packetization_ceiling_is_refused() {
+        // The room's resample scratch is sized for one `MAX_PTIME_MS` frame at the top room rate; a
+        // codec claiming a longer interval would grow it mid-tick, which is a heap allocation on the
+        // hot path. 120 ms is the RFC 7587 §6.1 `maxptime` ceiling and the longest audio one RFC 6716
+        // §3.2 packet carries, so nothing legitimate is turned away.
+        use siphon_rtp_codec::l16::L16;
+
+        let mut room = Conference::new("room".into(), 0);
+        let too_long = ParticipantConfig {
+            decoder: Box::new(L16::new(8_000, MAX_PTIME_MS + 1)),
+            encoder: Box::new(L16::new(8_000, MAX_PTIME_MS + 1)),
+            ..ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")
+        };
+        assert!(
+            !room.add_participant(too_long),
+            "121 ms is beyond the ceiling"
+        );
+
+        let at_ceiling = ParticipantConfig {
+            decoder: Box::new(L16::new(8_000, MAX_PTIME_MS)),
+            encoder: Box::new(L16::new(8_000, MAX_PTIME_MS)),
+            ..ulaw_config(0, "10.0.0.1", "10.0.0.1:4000")
+        };
+        assert!(room.add_participant(at_ceiling), "120 ms is allowed");
     }
 
     #[test]
