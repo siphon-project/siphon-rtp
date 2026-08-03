@@ -28,7 +28,7 @@ codec is free, running it is not. See [Codec licensing](codec-licensing.md).
 | Comfort noise | `CN` (13) | generate only | no | RFC 3389 (a generator, not a codec) | none |
 | AMR-WB | `AMR-WB` (dynamic) | all 9 modes | all 9 modes | 3GPP TS 26.174 vectors, per mode | `amr` |
 | AMR-NB | `AMR` (dynamic) | all 8 modes | all 8 modes | 3GPP TS 26.074 vectors | `amr` |
-| Opus | `opus` (dynamic, `opus/48000/2`) | in progress | in progress | RFC 6716 test vectors (targeted) | none (royalty-free) |
+| Opus | `opus` (dynamic, `opus/48000/2`) | yes — SILK, CELT and Hybrid, mono and stereo, all bandwidths and frame durations, PLC and in-band FEC | in progress | all 12 official RFC 6716 vectors (mono + stereo), plus exact per-packet `final_range` | none (royalty-free) |
 | EVS | | no | no | | absent |
 
 The engine resolves a codec from the `a=rtpmap` encoding name (case-insensitive, RFC
@@ -74,12 +74,30 @@ a gain adaptor, then a modified codebook-gain search) and is the only mode that 
 gain indices per subframe. This is a full AMR-NB encoder for G.711 transcoding in both
 directions; only DTX/SID (comfort-noise generation) is out of scope.
 
-**Opus.** The codec implementation is under way with RFC 6716 conformance gating and is
-**not yet wired into the codec factory**: a call that requires Opus transcoding still
-fails at setup with a clean error. Opus passthrough relays fine, like everything else.
+**Opus.** The **decoder is complete and wired into the codec factory**, so transcoding
+*from* an Opus leg — Opus → G.711 / AMR-WB, the WebRTC-trunk and voice-AI cases — works
+end to end. It covers everything RFC 6716 §4 defines: SILK-only, CELT-only and Hybrid
+including mid-packet mode switching and redundancy frames, all five bandwidths, every
+frame duration from 2.5 ms to a 120 ms multi-frame packet, full stereo, all five output
+rates, PLC, in-band FEC (LBRR) and DTX. It is gated on all 12 official RFC 6716 test
+vectors in both the mono and the stereo pass, and additionally on exact `final_range`
+equality for every packet of every vector — bitstream-exactness, which the §6
+`opus_compare` tolerance metric cannot see.
 
-The *engine surface around* it is in place, so the codec is the only thing missing. The
-engine parses and honours the RFC 7587 payload format:
+The **encoder is still being built**, so transcoding *toward* an Opus leg fails at setup
+with a clean error naming the missing direction, and Opus is not advertised in the
+`node_info` capability list (that list requires both directions — see below). Opus
+passthrough relays fine either way, like everything else.
+
+Three things the negotiated SDP contributes to the decoder, and nothing else does: the
+output sample rate (the RFC 7587 §4.1 clock rate, 48 kHz), the ingress channel count (the
+peer's `sprop-stereo`, §6.1 — *not* the rtpmap `/2`, which §7 mandates even for mono), and
+the nominal frame (the negotiated `ptime`). A packet carrying more than the negotiated
+ptime still decodes in full: the media path's decode buffer is sized for the 120 ms
+ceiling, which is exactly why a 60 ms Opus sender does not lose audio.
+
+The rest of the engine surface is in place. The engine parses and honours the RFC 7587
+payload format:
 
 - `a=rtpmap:<pt> opus/48000/2` is emitted **unconditionally**, mono included — RFC 7587 §7
   requires the channel count, and it names the RTP channel count, not the audio one. A
