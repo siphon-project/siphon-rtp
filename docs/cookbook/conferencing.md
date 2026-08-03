@@ -56,9 +56,11 @@ the mirror: two decodes fill a tick, and two packets leave it. Either way the le
 the wall clock. A 20 ms leg (all of G.711, G.722, G.726, GSM-FR, AMR-NB/WB, and the Opus default)
 takes the direct path and allocates neither buffer.
 
-A leg is refused at join if its decoder and encoder disagree on sample rate, packetization interval,
-or channel count, or if its interval exceeds the 120 ms ceiling — the room works in one frame length
-per participant, and a mismatched pair would hand its encoder a wrong-length frame every tick.
+Two things get a leg refused at join. Its decoder and encoder must agree on sample rate,
+packetization interval, and channel count: the room works in one frame length per participant, and a
+mismatched pair would hand its encoder a wrong-length frame every tick. And its interval must be at
+most 120 ms — the interval sizes the leg's ingress carry, its egress accumulator, and its playout
+queue, so an unbounded `a=ptime` would buy a peer arbitrary per-participant buffering.
 
 ### Shared encode
 
@@ -67,10 +69,10 @@ once per codec class per tick and fans the payload out with each leg's own RTP h
 for stateless codecs (G.711, L16); stateful encoders (G.722, G.726) and active talkers still
 encode per leg. Listeners running below the room rate share the resample too — one room-to-8 kHz
 and one room-to-16 kHz downsample per tick, not one per listener — so a 48 kHz Opus room with a
-G.711 gallery and an AMR-WB gallery pays two downsamples between them. A 40-listener G.711 webinar
-pays one encode per tick, not forty. A listener whose packetization interval is not the room tick is
-excluded from the shared class: the shared payload is exactly one tick of the listener mix, and such
-a leg's frames straddle tick boundaries at its own phase.
+G.711 gallery and a 16 kHz gallery pays two downsamples between all of them. A 40-listener G.711
+webinar pays one encode per tick, not forty. A listener whose packetization interval is not the room
+tick is excluded from the shared class: the shared payload is exactly one tick of the listener mix,
+and such a leg's frames straddle tick boundaries at its own phase.
 
 ## What a conference leg accepts
 

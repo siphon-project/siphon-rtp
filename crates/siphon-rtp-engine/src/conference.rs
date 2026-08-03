@@ -394,11 +394,14 @@ impl Conference {
         let native_params = config.decoder.params();
         let native_rate = native_params.sample_rate_hz;
         let native_channels = native_params.channels.max(1);
-        // Bound the packetization interval directly rather than only the frame length: an upsample
-        // from the lowest tier to the highest multiplies the sample count by 6, and the room's
-        // `resample_scratch` is sized for one `MAX_PTIME_MS` frame at [`MAX_ROOM_RATE_HZ`]. A codec
-        // claiming a longer interval would grow that buffer mid-tick — a heap allocation on the hot
-        // path, which is a standing invariant here, not a nicety.
+        // Bound the packetization interval directly rather than only the frame length. A leg whose
+        // interval is not the room tick carries an ingress carry and an egress accumulator sized
+        // from it, and the jitter buffer holds `JITTER_MAX` of its frames — so an unbounded `a=ptime`
+        // (a `u8`, and `CodecSpec::new` only floors it at 1 for a non-Opus codec) buys the peer
+        // arbitrary per-participant buffering and playout latency. `MAX_PTIME_MS` is the RFC 7587
+        // §6.1 ceiling, well above the 20 ms every codec here actually negotiates, so nothing
+        // legitimate is turned away and a pathological value is refused loudly instead of quietly
+        // seated.
         if native_params.ptime_ms == 0 || native_params.ptime_ms > MAX_PTIME_MS {
             tracing::warn!(
                 conference = %self.conference_id,
@@ -1029,12 +1032,16 @@ impl Conference {
                 }
                 Ok(PcmFrame::Starved) | Err(_) => break,
             };
-            if decoded == 0 {
-                break; // a codec that produced nothing would spin this loop forever
-            }
             let participant = &mut self.participants[index];
             let start = participant.carry_len;
             let end = (start + decoded).min(participant.ingress_carry.len());
+            // The carry is sized `native_frame + tick_samples` and a decode is only attempted while
+            // fewer than `tick_samples` are held, so `end > start` always. Break rather than trust
+            // that: this loop runs inside the room actor, and a zero-progress iteration would hang
+            // the whole room, not just this leg.
+            if end == start {
+                break;
+            }
             participant.ingress_carry[start..end].copy_from_slice(&self.native_in[..end - start]);
             participant.carry_len = end;
         }
@@ -1097,7 +1104,7 @@ impl Conference {
             let native_rate = self.participants[index].native_rate;
             // The shared payload is one room tick's worth of the listener mix, and `shareable` only
             // admits a leg whose codec frame *is* one tick, so this is its whole frame.
-            let native_frame = self.participants[index].tick_samples;
+            let tick_samples = self.participants[index].tick_samples;
             let len = if native_rate == self.room_rate {
                 self.participants[index]
                     .leg
@@ -1111,7 +1118,7 @@ impl Conference {
                 self.participants[index]
                     .leg
                     .encode_payload(
-                        &self.listener_native_buf[tier][..native_frame],
+                        &self.listener_native_buf[tier][..tick_samples],
                         &mut self.payload,
                     )
                     .ok()?
@@ -2266,10 +2273,10 @@ mod tests {
 
     #[test]
     fn a_participant_beyond_the_packetization_ceiling_is_refused() {
-        // The room's resample scratch is sized for one `MAX_PTIME_MS` frame at the top room rate; a
-        // codec claiming a longer interval would grow it mid-tick, which is a heap allocation on the
-        // hot path. 120 ms is the RFC 7587 §6.1 `maxptime` ceiling and the longest audio one RFC 6716
-        // §3.2 packet carries, so nothing legitimate is turned away.
+        // A leg's packetization interval sizes its ingress carry, its egress accumulator, and (times
+        // `JITTER_MAX`) its playout queue, so an unbounded `a=ptime` buys a peer arbitrary
+        // per-participant buffering. 120 ms is the RFC 7587 §6.1 `maxptime` ceiling and the longest
+        // audio one RFC 6716 §3.2 packet carries, so nothing legitimate is turned away.
         use siphon_rtp_codec::l16::L16;
 
         let mut room = Conference::new("room".into(), 0);
