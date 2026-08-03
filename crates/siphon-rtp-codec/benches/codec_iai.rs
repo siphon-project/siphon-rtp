@@ -13,6 +13,7 @@ use iai_callgrind::{
 };
 use std::hint::black_box;
 
+use siphon_rtp_codec::factory::{decoder_for, CodecSpec, OpusParams};
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::opus::celt::decoder::CeltDecoder;
 use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
@@ -279,6 +280,75 @@ fn opus_conceal(input: OpusDecodeInput) {
     let _ = black_box(decoder.decode(None, &mut pcm, 960, false));
 }
 
+type OpusCodecInput = (Box<dyn Decoder>, Vec<u8>, Vec<i16>);
+
+/// The **factory** path: a `Box<dyn Decoder>` built exactly as the media slow path builds one for a
+/// negotiated Opus leg, plus a real CELT-encoded 20 ms packet and a decode buffer of the size
+/// `Direction` hands it (the 120 ms ceiling, so a longer-than-ptime packet still fits).
+///
+/// Distinct from `opus_decode` above, which measures `OpusDecoder` directly: this one also covers the
+/// trait dispatch, the interleaved-count conversion, and the capacity arithmetic the leg pays per
+/// packet — i.e. the number an Opus→G.711 transcode actually costs at the trait boundary.
+fn opus_codec_setup(channels: u8) -> OpusCodecInput {
+    let mut encoder = CeltEncoder::new().expect("build CELT encoder");
+    encoder.set_bitrate(64_000);
+    encoder.set_rate_control(RateControl::ConstrainedVbr);
+    let signal = celt_signal(3 * CELT_FRAME);
+    let mut payload = vec![0u8; 1275];
+    // Prime the encoder, then keep the third frame — warm prefilter and energy history.
+    for index in 0..2 {
+        let _ = encoder.encode(
+            &signal[index * CELT_FRAME..(index + 1) * CELT_FRAME],
+            CELT_FRAME,
+            &mut payload,
+        );
+    }
+    let written = encoder
+        .encode(&signal[2 * CELT_FRAME..], CELT_FRAME, &mut payload)
+        .expect("encode");
+    // RFC 6716 §3.2.2 code-0 packet: config 31 (CELT-only, fullband, 20 ms) TOC, then the frame.
+    let mut packet = Vec::with_capacity(1 + written);
+    packet.push(31 << 3);
+    packet.extend_from_slice(&payload[..written]);
+
+    let spec = CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(OpusParams {
+        sprop_stereo: channels == 2,
+        ..OpusParams::default()
+    }));
+    let mut decoder = decoder_for(&spec).expect("build Opus decoder through the factory");
+    let mut pcm = vec![0i16; MAX_PACKET_SAMPLES * usize::from(channels)];
+    // Two packets so the measured call runs with a warm decode ring, as a live leg does.
+    let _ = decoder.decode(&packet, &mut pcm);
+    let _ = decoder.decode(&packet, &mut pcm);
+    (decoder, packet, pcm)
+}
+
+fn opus_codec_mono_setup() -> OpusCodecInput {
+    opus_codec_setup(1)
+}
+
+fn opus_codec_stereo_setup() -> OpusCodecInput {
+    opus_codec_setup(2)
+}
+
+// One 20 ms Opus packet through the `Decoder` trait object the media path holds — the per-packet
+// ingress cost of an Opus→G.711/AMR-WB transcode leg.
+#[library_benchmark]
+#[bench::mono_20ms(setup = opus_codec_mono_setup)]
+#[bench::stereo_20ms(setup = opus_codec_stereo_setup)]
+fn opus_codec_decode(input: OpusCodecInput) {
+    let (mut decoder, packet, mut pcm) = input;
+    let _ = black_box(decoder.decode(black_box(&packet), &mut pcm));
+}
+
+// `Decoder::conceal` — what the jitter buffer costs per lost packet on an Opus leg (RFC 6716 §4.4).
+#[library_benchmark]
+#[bench::mono_20ms(setup = opus_codec_mono_setup)]
+fn opus_codec_conceal(input: OpusCodecInput) {
+    let (mut decoder, _packet, mut pcm) = input;
+    let _ = black_box(decoder.conceal(&mut pcm));
+}
+
 library_benchmark_group!(
     name = codec;
     benchmarks =
@@ -290,7 +360,9 @@ library_benchmark_group!(
         celt_mdct_forward,
         celt_pvq_search,
         opus_decode,
-        opus_conceal
+        opus_conceal,
+        opus_codec_decode,
+        opus_codec_conceal
 );
 
 // Fail the run (non-zero exit) if any measured kernel executes >10% more instructions than the
