@@ -243,7 +243,7 @@ for a redundancy frame. That belongs to the Opus layer, not to the SILK encoder.
 
 The layer above SILK and CELT adds what neither of them can check on its own: which mode runs, at
 what bandwidth, over how many channels, and — in hybrid — both of them writing into **one** range
-coder with no length field between them. `opus_encode_conformance` stacks four checks plus two that
+coder with no length field between them. `opus_encode_conformance` stacks five checks plus two that
 exist to stop the others passing for the wrong reason:
 
 ```sh
@@ -264,15 +264,42 @@ SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
 4. **`opus_compare`** against the original PCM at fullband and a high rate, with the codec delay
    compensated — `Fs/400 + Fs/250` = 312 samples at 48 kHz for VoIP and audio (`OPUS_GET_LOOKAHEAD`),
    **not** the 120 the CELT harness uses, which is the restricted-low-delay figure.
-5. **A mode-switching stream.** The fixed matrix holds one bitrate per configuration, so the mode is
+5. **Two independent decoders on the same stream.** Everything above scores the *bitstream*; this
+   scores the **audio**. The same packets are decoded by our `OpusDecoder` and by `opus_demo -d`, at
+   the same rate and channel count, and the two outputs are compared — 114 streams, 42 260 packets,
+   23 644 800 samples. Our decoder is separately gated on the 12 official vectors and on 75 166
+   redundancy-bearing packets, so two independently written decoders agreeing on a stream neither has
+   seen is a strong statement about it, and it is the only check that sees the redundancy cross-fade
+   window, the SILK↔CELT sum in hybrid, the resampler, the stereo unmixing, or the state a mode
+   switch leaves behind — all of which leave the range coder in exactly the right place.
+
+   The bar is **sample-exact wherever sample-exactness exists**, which is not one number:
+
+   - a **SILK-only** stream must be identical with **no tolerance** — both decoders are integer
+     fixed-point there, so a rounding difference is a bug. All 9 such streams are sample-exact.
+   - a stream carrying a **CELT or hybrid** packet is held to **one LSB**, and to a bound on the
+     *rate* of differing samples (observed 6 014 / 23 644 800 = 0.025 %). CELT is float in both
+     implementations — libopus is built here without `OPUS_FIXED_POINT` — and two independent float
+     implementations of the same transform do not agree on the last bit (operation order, GCC's
+     `-ffp-contract=fast` fusing multiply-adds Rust never fuses, `libm`'s last ulp). This is not a
+     defect to be fixed: it is why RFC 6716 §6 defines conformance as an `opus_compare` pass rather
+     than as bit-exact PCM, so that a fixed-point and a float decoder are both conformant. The same
+     bound, for the same reason, is what `opus_conformance` and `opus_redundancy_conformance` hold
+     the decoder to.
+
+   What stops the tolerance being a hole is that only *post-entropy arithmetic* is inside it: every
+   packet's `final_range` is an exact equality checked from **both** sides — `opus_demo -d` against
+   our encoder's value, and our decoder against it too — so both decoders provably read the identical
+   symbol sequence before a single sample is compared. Do not widen this to make a change pass.
+6. **A mode-switching stream.** The fixed matrix holds one bitrate per configuration, so the mode is
    decided once and the redundancy path is never reached. A separate test sweeps the rate across the
    SILK/CELT crossing with FEC and DTX moving underneath it and requires libopus to accept every
    packet — that is what covers the redundancy flag, the 5 ms bridging frame and the `rng ^
-   redundant_rng` fold.
-6. **A liveness check.** One byte of one packet is corrupted and libopus *must* reject the stream, so
+   redundant_rng` fold. Check 5 is run over the same sweep (without DTX, see below).
+7. **A liveness check.** One byte of one packet is corrupted and libopus *must* reject the stream, so
    check 1 cannot pass because the harness wrote a file nothing actually verified.
 
-Two traps specific to this layer:
+Three traps specific to this layer:
 
 - **`opus_compare` reads its reference as 2-channel and its test file at the `-s` channel count**
   (`opus_compare.c:231-236`). A mono comparison therefore needs a *mono* decode and a *stereo*
@@ -280,6 +307,13 @@ Two traps specific to this layer:
 - **The tonality analysis is not implemented**, deliberately — see the module docs on
   `opus::enc::decision`. Comparing against a libopus that *is* running it compares against a
   different encoder, which is what the complexity-6 pinning above avoids.
+- **`opus_demo` treats a zero-length packet as a *loss* and conceals it** (`opus_demo.c:981`), which
+  would put samples in its output that came from no packet at all and make check 5 meaningless. Our
+  encoder never emits one — DTX is a bare one-byte TOC (RFC 6716 §3.1) — and check 5 asserts that
+  rather than filtering, but it does leave DTX off in its own copy of the switching sweep, which is
+  the one place a future change could produce one. `opus_demo -d` applies no skip on the decode-only
+  path (`opus_demo.c:382`; `skip` is only assigned from `OPUS_GET_LOOKAHEAD` on the encode side), so
+  the two decodes align sample zero to sample zero with no delay to compensate — unlike check 4.
 
 #### Instrumented libopus, for validating a half-finished layer
 

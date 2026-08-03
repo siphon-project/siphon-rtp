@@ -1,7 +1,7 @@
 //! Top-level **Opus encoder** conformance: encode with [`OpusEncoder`], then hold the result up
-//! against libopus four different ways.
+//! against libopus five different ways.
 //!
-//! # Why four checks and not one
+//! # Why five checks and not one
 //!
 //! RFC 6716 is decoder-normative, so an encoder has no reference bitstream and no `final_range` of
 //! its own to match. Each check below closes a different hole, and none of them is redundant:
@@ -29,12 +29,27 @@
 //!    means something. It measures *decoder* deviation, so a 12 kb/s narrowband encode is
 //!    legitimately far outside its tolerance; it is run at fullband and a high rate, where a
 //!    transparent encode is the expectation, with the 120-sample codec delay compensated first.
+//! 5. **Two independent decoders on the same audio.** Checks 1-4 score the *bitstream*; this scores
+//!    what comes out of it. The same stream is decoded by [`OpusDecoder`] and by `opus_demo -d` and
+//!    the two outputs are compared. Check 1 says libopus consumed the same bits we wrote; this says
+//!    both decoders turn those bits into the same audio, which is the part `final_range` cannot
+//!    see — a mis-scaled gain, a redundancy frame cross-faded over the wrong window, a resampler
+//!    off by a phase all leave the range coder in exactly the right place. Our decoder is itself
+//!    gated on the 12 official RFC 6716 vectors and 75 166 redundancy-bearing packets, so two
+//!    independently written decoders agreeing on a stream *neither has seen before* is the
+//!    strongest statement available about that stream. It is **sample-exact on SILK-only streams**
+//!    and within one LSB where CELT's float arithmetic is involved; see
+//!    [`our_decoder_and_libopus_agree_sample_for_sample_on_our_own_stream`] and
+//!    [`MAX_LSB_DIFFERENCE`] for why that split is the correct bar and not a relaxation.
 //!
-//! # The one tolerance, and why it is only on check 3
+//! # The tolerances, and why they are where they are
 //!
-//! [`SNR_MARGIN_DB`] compares two *different encoders'* rate/distortion decisions. It is a quality
-//! bound, not a correctness one, and it is stated in dB rather than hidden in a relative epsilon.
-//! Checks 1 and 2 are exact equalities and carry no tolerance at all.
+//! [`SNR_MARGIN_DB`] on check 3 compares two *different encoders'* rate/distortion decisions. It is
+//! a quality bound, not a correctness one, and it is stated in dB rather than hidden in a relative
+//! epsilon. [`MAX_LSB_DIFFERENCE`] on check 5 is the float/fixed-point latitude RFC 6716 §6 grants
+//! a *decoder*, and it applies only to arithmetic downstream of an entropy decode that checks 1 and
+//! 5 have already proven identical. Checks 1 and 2 are exact equalities and carry no tolerance at
+//! all, and neither does check 5 on a stream that never leaves SILK.
 //!
 //! Skips gracefully when the reference tree is absent, and refuses to pass vacuously: it requires
 //! all three modes, every frame duration, both channel counts, all three rate modes, and a
@@ -44,6 +59,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
 use siphon_rtp_codec::opus::enc::decision::{Application, SignalHint};
 use siphon_rtp_codec::opus::enc::encoder::{OpusEncoder, RateControl};
 use siphon_rtp_codec::opus::packet::{self, Bandwidth, Mode};
@@ -75,6 +91,30 @@ const SKIP_MS: usize = 2_000;
 /// and `opus_compare` is very sensitive to misalignment: even libopus' own 256 kb/s fullband round
 /// trip fails unaligned.
 const CODEC_DELAY_SAMPLES: usize = 120 + 192;
+
+/// How far a sample of *our* decode of *our own* stream may sit from libopus' decode of the same
+/// stream, once a CELT or hybrid packet is in it.
+///
+/// Zero is the bar wherever it is attainable, and check 5 enforces zero on every SILK-only stream —
+/// SILK is integer fixed-point in both decoders, so a rounding difference there is a bug. CELT is
+/// **float** in both (libopus is built here without `OPUS_FIXED_POINT`), and two independent float
+/// implementations of the same transform do not agree on the last bit: the operation order differs,
+/// GCC's default `-ffp-contract=fast` fuses multiply-adds that Rust never fuses, and `libm` differs
+/// in the last ulp. That is not a defect to be fixed but the reason RFC 6716 §6 defines conformance
+/// as an `opus_compare` pass rather than as bit-exact PCM — a fixed-point and a float decoder are
+/// both conformant and cannot be sample-identical.
+///
+/// What keeps this from being a hole is that it is *only* the arithmetic after entropy decoding that
+/// is in scope. Every packet's `final_range` is checked exactly, from both sides — `opus_demo -d`
+/// against our encoder's value and our decoder against it too — so the two decoders provably read
+/// the identical symbol sequence before a single sample is compared. The same bound, for the same
+/// reason, is what `opus_conformance` and `opus_redundancy_conformance` hold the decoder to.
+const MAX_LSB_DIFFERENCE: i32 = 1;
+
+/// The largest fraction of samples allowed to differ at all, across the whole run. A bound of one
+/// LSB cannot by itself distinguish "float rounds the other way now and then" from a systematic
+/// half-LSB bias, so the *rate* is bounded too. The observed rate is ~0.025 %.
+const MAX_DIFFERING_FRACTION: f64 = 0.005;
 
 fn reference_dir() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/opus");
@@ -322,6 +362,77 @@ fn encode(configuration: &Configuration, source: &[i16]) -> Result<Vec<EncodedPa
         return Err("no packets encoded".to_string());
     }
     Ok(packets)
+}
+
+/// The three mode-switching streams the exactness gates are driven over, as
+/// `(label, channels, application, half-period in packets)`.
+const SWITCHING_STREAMS: [(&str, usize, Application, usize); 3] = [
+    ("mono_voip_fast", 1, Application::Voip, 3),
+    ("mono_audio_slow", 1, Application::Audio, 11),
+    ("stereo_audio", 2, Application::Audio, 5),
+];
+
+/// How many 20 ms packets each switching stream encodes.
+const SWITCHING_PACKETS: usize = 120;
+
+/// Encode a stream that **switches mode mid-flight**: the rate is swept back and forth across the
+/// SILK/CELT crossing on `period`-packet half-cycles, with FEC, packet loss and DTX turned on and
+/// off underneath it so the mode moves for several different reasons rather than one.
+///
+/// Returns the packets and how many times the mode actually changed, so a caller can refuse to pass
+/// on a sweep that never switched.
+fn encode_switching(
+    channels: usize,
+    application: Application,
+    period: usize,
+    with_dtx: bool,
+    source: &[i16],
+) -> Result<(Vec<EncodedPacket>, usize), String> {
+    let frame_size = 960usize;
+    let mut encoder = OpusEncoder::new(REFERENCE_RATE_HZ, channels, application)
+        .map_err(|error| format!("OpusEncoder::new: {error:?}"))?;
+    encoder
+        .set_complexity(COMPARISON_COMPLEXITY)
+        .map_err(|error| format!("set_complexity: {error:?}"))?;
+    encoder.set_rate_control(RateControl::ConstrainedVariable);
+
+    let mut packets = Vec::new();
+    let mut previous_mode = None;
+    let mut mode_changes = 0usize;
+    for index in 0..SWITCHING_PACKETS {
+        let start = index * frame_size * channels;
+        if start + frame_size * channels > source.len() {
+            break;
+        }
+        let low = (index / period).is_multiple_of(2);
+        let bitrate = if low { 10_000 } else { 140_000 } * channels as i32;
+        encoder
+            .set_bitrate(Some(bitrate))
+            .map_err(|error| format!("set_bitrate: {error:?}"))?;
+        encoder.set_in_band_fec(index % 17 < 6);
+        encoder
+            .set_packet_loss_percent(if index % 17 < 6 { 25 } else { 0 })
+            .map_err(|error| format!("set_packet_loss_percent: {error:?}"))?;
+        encoder.set_dtx(with_dtx && index % 23 < 4);
+
+        let mut buffer = vec![0u8; 1500];
+        let result = encoder
+            .encode(
+                &source[start..start + frame_size * channels],
+                frame_size,
+                &mut buffer,
+            )
+            .map_err(|error| format!("packet {index}: {error:?}"))?;
+        if previous_mode.is_some_and(|mode| mode != result.mode) {
+            mode_changes += 1;
+        }
+        previous_mode = Some(result.mode);
+        packets.push(EncodedPacket {
+            payload: buffer[..result.bytes].to_vec(),
+            final_range: result.final_range,
+        });
+    }
+    Ok((packets, mode_changes))
 }
 
 /// `opus_demo`'s `.bit` framing: per packet `[u32 BE len][u32 BE final_range][packet]`.
@@ -779,67 +890,18 @@ fn a_stream_that_switches_mode_mid_flight_still_matches_libopus_on_range_state()
     let mut scored = 0usize;
     let mut mode_changes = 0usize;
 
-    for &(label, channels, application, period) in &[
-        ("mono_voip_fast", 1usize, Application::Voip, 3usize),
-        ("mono_audio_slow", 1, Application::Audio, 11),
-        ("stereo_audio", 2, Application::Audio, 5),
-    ] {
+    for &(label, channels, application, period) in &SWITCHING_STREAMS {
         let source = fixture.source(channels);
-        let frame_size = 960usize;
-        let mut encoder = match OpusEncoder::new(REFERENCE_RATE_HZ, channels, application) {
-            Ok(encoder) => encoder,
+        let (packets, changes) = match encode_switching(channels, application, period, true, source)
+        {
+            Ok(encoded) => encoded,
             Err(error) => {
-                failures.push(format!("{label}: OpusEncoder::new: {error:?}"));
+                failures.push(format!("{label}: {error}"));
                 continue;
             }
         };
-        if encoder.set_complexity(COMPARISON_COMPLEXITY).is_err() {
-            failures.push(format!("{label}: set_complexity"));
-            continue;
-        }
-        encoder.set_rate_control(RateControl::ConstrainedVariable);
-
-        let mut packets = Vec::new();
-        let mut previous_mode = None;
-        let count = 120usize;
-        for index in 0..count {
-            let start = index * frame_size * channels;
-            if start + frame_size * channels > source.len() {
-                break;
-            }
-            // Sweep the rate back and forth across the SILK/CELT crossing, and turn FEC and DTX on
-            // and off underneath it, so the mode moves for several different reasons.
-            let low = (index / period) % 2 == 0;
-            let bitrate = if low { 10_000 } else { 140_000 } * channels as i32;
-            encoder.set_bitrate(Some(bitrate)).expect("bitrate");
-            encoder.set_in_band_fec(index % 17 < 6);
-            encoder
-                .set_packet_loss_percent(if index % 17 < 6 { 25 } else { 0 })
-                .expect("loss");
-            encoder.set_dtx(index % 23 < 4);
-
-            let mut buffer = vec![0u8; 1500];
-            let result = match encoder.encode(
-                &source[start..start + frame_size * channels],
-                frame_size,
-                &mut buffer,
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    failures.push(format!("{label}: packet {index}: {error:?}"));
-                    break;
-                }
-            };
-            if previous_mode.is_some_and(|mode| mode != result.mode) {
-                mode_changes += 1;
-            }
-            previous_mode = Some(result.mode);
-            packets.push(EncodedPacket {
-                payload: buffer[..result.bytes].to_vec(),
-                final_range: result.final_range,
-            });
-        }
-        if packets.len() < count / 2 {
+        mode_changes += changes;
+        if packets.len() < SWITCHING_PACKETS / 2 {
             failures.push(format!("{label}: only {} packets encoded", packets.len()));
             continue;
         }
@@ -1116,4 +1178,271 @@ fn high_rate_fullband_encodes_pass_opus_compare() {
     for (label, quality) in &scores {
         eprintln!("  {label}: opus_compare {quality:.1}%");
     }
+}
+
+/// What one stream's cross-decode proved.
+#[derive(Default)]
+struct CrossDecode {
+    packets: usize,
+    samples: usize,
+    differing: usize,
+    worst_lsb: i32,
+    worst_at: usize,
+    modes: BTreeSet<&'static str>,
+    channel_counts: BTreeSet<usize>,
+}
+
+/// Decode `packets` with [`OpusDecoder`] and with `opus_demo -d`, and require the two to be
+/// identical — same sample count, same samples, and the same range state at the end of every packet.
+///
+/// The two decoders are driven at the same rate and channel count so nothing about the comparison
+/// is resampled or downmixed, and `opus_demo -d` applies no skip on the decode-only path
+/// (`opus_demo.c:382`, where `skip` is only assigned from `OPUS_GET_LOOKAHEAD` on the encode side),
+/// so the two outputs are aligned sample zero to sample zero with no shift to compensate.
+fn cross_decode(
+    fixture: &Fixture,
+    label: &str,
+    channels: usize,
+    packets: &[EncodedPacket],
+) -> Result<CrossDecode, String> {
+    // `opus_demo` treats a zero-length packet as a *loss* and conceals it (`opus_demo.c:981`),
+    // which would put samples in its output that came from no packet at all. Our encoder never
+    // emits one — DTX is a bare one-byte TOC (RFC 6716 §3.1) — so this is a guard, not a filter.
+    if let Some(index) = packets.iter().position(|packet| packet.payload.is_empty()) {
+        return Err(format!(
+            "packet {index} is zero-length, which opus_demo would conceal rather than decode"
+        ));
+    }
+
+    let bit_path = fixture.scratch.join(format!("cross_{label}.bit"));
+    let dec_path = fixture.scratch.join(format!("cross_{label}.dec"));
+    write_bit_file(&bit_path, packets)?;
+    let theirs = decode_with_libopus(&bit_path, &dec_path, channels)?;
+
+    let mut decoder = OpusDecoder::new(REFERENCE_RATE_HZ, channels)
+        .map_err(|error| format!("OpusDecoder::new: {error}"))?;
+    let mut frame = vec![0i16; MAX_PACKET_SAMPLES * channels];
+    let mut ours: Vec<i16> = Vec::with_capacity(theirs.len());
+    let mut result = CrossDecode::default();
+
+    for (index, packet) in packets.iter().enumerate() {
+        let written = decoder
+            .decode(Some(&packet.payload), &mut frame, MAX_PACKET_SAMPLES, false)
+            .map_err(|error| format!("packet {index}: our decode failed: {error}"))?;
+        ours.extend_from_slice(&frame[..written * channels]);
+        // Both directions on one packet: our decoder must land on the value our encoder reported,
+        // which `opus_demo -d` has already checked from its side. A divergence here names the
+        // packet, which a sample diff further down the stream would not.
+        if decoder.final_range() != packet.final_range {
+            return Err(format!(
+                "packet {index}: our decoder ended on {:#010x}, our encoder said {:#010x}",
+                decoder.final_range(),
+                packet.final_range
+            ));
+        }
+        let toc = packet::Toc::parse(packet.payload[0]);
+        result.modes.insert(mode_name(toc.mode()));
+        result.packets += 1;
+    }
+    result.channel_counts.insert(channels);
+
+    if ours.len() != theirs.len() {
+        return Err(format!(
+            "sample count differs: ours {}, libopus {}",
+            ours.len(),
+            theirs.len()
+        ));
+    }
+
+    // A stream every one of whose packets is SILK-only is held to *zero*: both decoders are integer
+    // fixed-point all the way through, so there is nothing for them to round differently and a
+    // single differing sample is a bug. This is the same bar `silk_encode_conformance` holds against
+    // `SilkDecoder`, raised to the Opus layer, and it is met on every SILK-only stream here.
+    let silk_only = result.modes.len() == 1 && result.modes.contains("silk");
+    let allowed = if silk_only { 0 } else { MAX_LSB_DIFFERENCE };
+
+    for (index, (&ours_sample, &their_sample)) in ours.iter().zip(theirs.iter()).enumerate() {
+        let delta = (i32::from(ours_sample) - i32::from(their_sample)).abs();
+        if delta == 0 {
+            continue;
+        }
+        result.differing += 1;
+        if delta > result.worst_lsb {
+            result.worst_lsb = delta;
+            result.worst_at = index;
+        }
+        if delta > allowed {
+            return Err(format!(
+                "sample {index} of {} differs by {delta} (ours {ours_sample}, libopus \
+                 {their_sample}); this stream's modes are {:?}, which allows {allowed}",
+                ours.len(),
+                result.modes
+            ));
+        }
+    }
+    result.samples = ours.len();
+    Ok(result)
+}
+
+/// **Check 5**: our decoder and libopus' must turn our encoder's stream into **the same audio**,
+/// over the whole matrix and over a stream that switches mode mid-flight.
+///
+/// This is the check the encoder could not be held to while the top-level decoder lived on another
+/// branch. It reaches everything `final_range` structurally cannot: the redundancy frame's
+/// cross-fade window, the SILK↔CELT sum in hybrid, the resampler, the stereo unmixing and the PLC
+/// state a mode switch leaves behind. Two decoders that were written independently agreeing on a
+/// stream neither has seen before is a very strong statement about that stream — and our decoder is
+/// itself gated on the 12 official RFC 6716 vectors and 75 166 redundancy-bearing packets.
+///
+/// The bar is **sample-exact wherever sample-exactness exists**, and it is not one number:
+///
+/// * a **SILK-only** stream must be identical, sample for sample, with no tolerance at all — both
+///   decoders are integer fixed-point there. Every SILK-only stream in this matrix meets that.
+/// * a stream carrying a **CELT or hybrid** packet is held to [`MAX_LSB_DIFFERENCE`] and to
+///   [`MAX_DIFFERING_FRACTION`]. CELT is float in both implementations, which RFC 6716 §6 accounts
+///   for by defining conformance as an `opus_compare` pass rather than as bit-exact PCM. See
+///   [`MAX_LSB_DIFFERENCE`] for why that is not a hole: every packet's range state is still an exact
+///   equality checked from both sides, so only post-entropy arithmetic is in the tolerance.
+#[test]
+fn our_decoder_and_libopus_agree_sample_for_sample_on_our_own_stream() {
+    let Some(fixture) = fixture() else {
+        eprintln!("skipping: reference/opus, opus_demo or the source vectors are absent");
+        return;
+    };
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut total = CrossDecode::default();
+    let mut streams = 0usize;
+    let mut silk_only_streams = 0usize;
+
+    for configuration in matrix() {
+        let label = configuration.label();
+        let packets = match encode(&configuration, fixture.source(configuration.channels)) {
+            Ok(packets) => packets,
+            Err(error) => {
+                failures.push(format!("{label}: encode: {error}"));
+                continue;
+            }
+        };
+        match cross_decode(&fixture, &label, configuration.channels, &packets) {
+            Ok(scored) => {
+                if scored.differing > 0 {
+                    eprintln!(
+                        "  {label}: {}/{} differ, worst {} LSB at {}, modes {:?}",
+                        scored.differing,
+                        scored.samples,
+                        scored.worst_lsb,
+                        scored.worst_at,
+                        scored.modes
+                    );
+                }
+                if scored.modes.len() == 1 && scored.modes.contains("silk") {
+                    silk_only_streams += 1;
+                }
+                total.packets += scored.packets;
+                total.samples += scored.samples;
+                total.differing += scored.differing;
+                total.worst_lsb = total.worst_lsb.max(scored.worst_lsb);
+                total.modes.extend(scored.modes);
+                total.channel_counts.extend(scored.channel_counts);
+                streams += 1;
+            }
+            Err(error) => failures.push(format!("{label}: {error}")),
+        }
+    }
+
+    // The mode-switching stream, which the fixed matrix cannot reach: every configuration above
+    // holds one bitrate, so its mode is decided once. DTX is left off here — not because it is
+    // untested (the switching gate above sweeps it) but because it is the one setting that could
+    // produce a packet `opus_demo` conceals instead of decoding, and this comparison is only
+    // meaningful when both decoders are fed exactly the same frames.
+    let mut switching_changes = 0usize;
+    for &(label, channels, application, period) in &SWITCHING_STREAMS {
+        let (packets, changes) = match encode_switching(
+            channels,
+            application,
+            period,
+            false,
+            fixture.source(channels),
+        ) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                failures.push(format!("switch_{label}: {error}"));
+                continue;
+            }
+        };
+        switching_changes += changes;
+        match cross_decode(&fixture, &format!("switch_{label}"), channels, &packets) {
+            Ok(scored) => {
+                if scored.differing > 0 {
+                    eprintln!(
+                        "  switch_{label}: {}/{} differ, worst {} LSB at {}",
+                        scored.differing, scored.samples, scored.worst_lsb, scored.worst_at
+                    );
+                }
+                total.packets += scored.packets;
+                total.samples += scored.samples;
+                total.differing += scored.differing;
+                total.worst_lsb = total.worst_lsb.max(scored.worst_lsb);
+                total.modes.extend(scored.modes);
+                total.channel_counts.extend(scored.channel_counts);
+                streams += 1;
+            }
+            Err(error) => failures.push(format!("switch_{label}: {error}")),
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "our decoder and libopus disagreed on our own stream:\n  {}",
+        failures.join("\n  ")
+    );
+    assert!(streams >= 100, "only {streams} streams cross-decoded");
+    assert_eq!(
+        total.modes,
+        BTreeSet::from(["celt", "hybrid", "silk"]),
+        "all three modes must be cross-decoded"
+    );
+    assert_eq!(
+        total.channel_counts,
+        BTreeSet::from([1, 2]),
+        "both channel counts must be cross-decoded"
+    );
+    assert!(
+        switching_changes >= 30,
+        "the switching streams only changed mode {switching_changes} times"
+    );
+    assert!(
+        total.samples > 10_000_000,
+        "only {} samples compared",
+        total.samples
+    );
+    assert!(
+        total.worst_lsb <= MAX_LSB_DIFFERENCE,
+        "worst sample difference {} LSB",
+        total.worst_lsb
+    );
+    let differing_fraction = total.differing as f64 / total.samples as f64;
+    assert!(
+        differing_fraction <= MAX_DIFFERING_FRACTION,
+        "{:.4} % of samples differ, over the {:.4} % bound — a bound of one LSB alone cannot tell \
+         float rounding from a systematic bias",
+        differing_fraction * 100.0,
+        MAX_DIFFERING_FRACTION * 100.0
+    );
+    assert!(
+        silk_only_streams > 0,
+        "no SILK-only stream was cross-decoded, so the zero-tolerance arm covered nothing"
+    );
+    eprintln!(
+        "Opus encode cross-decode: {streams} streams ({silk_only_streams} SILK-only, all \
+         sample-exact), {} packets, {} samples, {} differing ({:.4} %), worst {} LSB, modes {:?}, \
+         {switching_changes} mode changes",
+        total.packets,
+        total.samples,
+        total.differing,
+        differing_fraction * 100.0,
+        total.worst_lsb,
+        total.modes,
+    );
 }
