@@ -939,3 +939,368 @@ fn soft_clip_pcm(pcm: &mut [f32], samples: usize, channels: usize, mem: &mut [f3
         *carry = a;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic pseudo-random payload behind a TOC byte. Any byte string is a decodable (if
+    /// musically meaningless) Opus frame — the range coder reads whatever is there — so this is how
+    /// the structural tests reach every mode without needing an encoder.
+    fn packet(config: u8, stereo: bool, frame_code: u8, bytes: usize) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(bytes + 1);
+        payload.push((config << 3) | (u8::from(stereo) << 2) | frame_code);
+        for i in 0..bytes {
+            payload.push(((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8);
+        }
+        // Bias the first payload byte away from the CELT silence flag so the full pipeline runs.
+        if let Some(first) = payload.get_mut(1) {
+            *first &= 0x7f;
+        }
+        payload
+    }
+
+    /// Config numbers for the three modes at 20 ms (RFC 6716 §3.1, Table 2): SILK wideband
+    /// (8..=11, `config & 3` picks 10/20/40/60 ms), Hybrid fullband (14/15, `config & 1` picks
+    /// 10/20 ms), CELT fullband (28..=31, `config & 3` picks 2.5/5/10/20 ms).
+    const SILK_WB_20MS: u8 = 9;
+    const HYBRID_FB_20MS: u8 = 15;
+    const CELT_FB_20MS: u8 = 31;
+
+    #[test]
+    fn rejects_rates_and_channel_counts_outside_rfc_6716() {
+        assert!(OpusDecoder::new(44_100, 1).is_err());
+        assert!(OpusDecoder::new(0, 1).is_err());
+        assert!(OpusDecoder::new(48_000, 0).is_err());
+        assert!(OpusDecoder::new(48_000, 3).is_err());
+        for rate in [8_000u32, 12_000, 16_000, 24_000, 48_000] {
+            for channels in [1usize, 2] {
+                let decoder = OpusDecoder::new(rate, channels).expect("valid configuration");
+                assert_eq!(decoder.sample_rate(), rate);
+                assert_eq!(decoder.channels(), channels);
+            }
+        }
+    }
+
+    /// Every mode, every output rate, both channel counts, both stream channel counts: the packet
+    /// must decode to exactly the duration its TOC declares.
+    #[test]
+    fn every_mode_decodes_to_the_duration_its_toc_declares() {
+        for config in [SILK_WB_20MS, HYBRID_FB_20MS, CELT_FB_20MS] {
+            for stereo in [false, true] {
+                for rate in [8_000u32, 12_000, 16_000, 24_000, 48_000] {
+                    for channels in [1usize, 2] {
+                        let mut decoder = OpusDecoder::new(rate, channels).expect("decoder");
+                        let data = packet(config, stereo, 0, 60);
+                        let expected = rate as usize / 50; // 20 ms
+                        let mut pcm = vec![0i16; expected * channels];
+                        let written = decoder
+                            .decode(Some(&data), &mut pcm, expected, false)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "config {config} stereo={stereo} {rate} Hz {channels}ch: {error}"
+                                )
+                            });
+                        assert_eq!(
+                            written, expected,
+                            "config {config} stereo={stereo} {rate} Hz {channels}ch"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A multi-frame packet (code 1/3) must produce every frame's audio, not just the first.
+    #[test]
+    fn multi_frame_packets_produce_every_frame() {
+        // Code 1: two equal CELT frames, so an even payload.
+        let mut decoder = OpusDecoder::new(48_000, 1).expect("decoder");
+        let data = packet(CELT_FB_20MS, false, 1, 80);
+        let mut pcm = vec![0i16; 3 * 960];
+        let written = decoder
+            .decode(Some(&data), &mut pcm, 2 * 960, false)
+            .expect("code 1 decodes");
+        assert_eq!(written, 2 * 960, "two 20 ms frames");
+
+        // Code 3 VBR: three frames with explicit lengths.
+        let mut data = vec![(CELT_FB_20MS << 3) | 3, 0x83, 20, 30];
+        for i in 0..90u32 {
+            data.push((i.wrapping_mul(2_654_435_761) >> 24) as u8);
+        }
+        let mut decoder = OpusDecoder::new(48_000, 1).expect("decoder");
+        let written = decoder
+            .decode(Some(&data), &mut pcm, 3 * 960, false)
+            .expect("code 3 decodes");
+        assert_eq!(written, 3 * 960, "three 20 ms frames");
+    }
+
+    /// Concealment before any packet has arrived returns silence, not comfort noise
+    /// (`opus_decoder.c:302-309`) — there is no mode to conceal in yet.
+    #[test]
+    fn concealment_before_the_first_packet_is_silence() {
+        for channels in [1usize, 2] {
+            let mut decoder = OpusDecoder::new(48_000, channels).expect("decoder");
+            let mut pcm = vec![123i16; 960 * channels];
+            let written = decoder.decode(None, &mut pcm, 960, false).expect("conceal");
+            assert_eq!(written, 960);
+            assert!(
+                pcm[..960 * channels].iter().all(|&sample| sample == 0),
+                "{channels}ch: concealment with no prior packet must be silent"
+            );
+            // And it reports no range, since nothing was decoded.
+            assert_eq!(decoder.final_range(), 0);
+        }
+    }
+
+    /// After a real packet, concealment runs the previous mode's PLC and must stay finite and
+    /// bounded for every mode — including across a gap longer than one frame.
+    #[test]
+    fn concealment_after_a_packet_stays_bounded_in_every_mode() {
+        for config in [SILK_WB_20MS, HYBRID_FB_20MS, CELT_FB_20MS] {
+            let mut decoder = OpusDecoder::new(48_000, 2).expect("decoder");
+            let data = packet(config, true, 0, 60);
+            let mut pcm = vec![0i16; 2880 * 2];
+            decoder
+                .decode(Some(&data), &mut pcm, 960, false)
+                .expect("good packet");
+            for gap in 0..6 {
+                let written = decoder
+                    .decode(None, &mut pcm, 960, false)
+                    .unwrap_or_else(|error| panic!("config {config} gap {gap}: {error}"));
+                assert_eq!(written, 960, "config {config} gap {gap}");
+            }
+            // A gap longer than 20 ms recurses through the F20 splitter.
+            let written = decoder
+                .decode(None, &mut pcm, 2880, false)
+                .expect("60 ms of concealment");
+            assert_eq!(written, 2880);
+        }
+    }
+
+    /// In-band FEC re-decodes the *previous* frame, so it produces the requested duration, and it
+    /// falls back to plain concealment when the packet cannot carry FEC (CELT-only).
+    #[test]
+    fn fec_decode_produces_the_requested_duration() {
+        let mut decoder = OpusDecoder::new(48_000, 1).expect("decoder");
+        let silk = packet(SILK_WB_20MS, false, 0, 60);
+        let mut pcm = vec![0i16; 1920];
+        decoder
+            .decode(Some(&silk), &mut pcm, 960, false)
+            .expect("prime the decoder");
+        // 20 ms of FEC: exactly the packet's own frame size.
+        let written = decoder
+            .decode(Some(&silk), &mut pcm, 960, true)
+            .expect("fec decode");
+        assert_eq!(written, 960);
+        // 40 ms requested: 20 ms concealed, then 20 ms from the LBRR copy.
+        let written = decoder
+            .decode(Some(&silk), &mut pcm, 1920, true)
+            .expect("fec decode with a concealed head");
+        assert_eq!(written, 1920);
+        // A CELT-only packet carries no FEC: the call degrades to plain concealment.
+        let celt = packet(CELT_FB_20MS, false, 0, 60);
+        let written = decoder
+            .decode(Some(&celt), &mut pcm, 960, true)
+            .expect("fec falls back to plc");
+        assert_eq!(written, 960);
+        // FEC needs a 2.5 ms multiple.
+        assert!(decoder.decode(Some(&silk), &mut pcm, 961, true).is_err());
+    }
+
+    /// Switching mode packet to packet must keep decoding — every transition arm in both directions,
+    /// including the ones that conceal 5 ms of the previous mode to cross-fade from.
+    #[test]
+    fn mode_switching_in_both_directions_keeps_decoding() {
+        let order = [
+            CELT_FB_20MS,
+            SILK_WB_20MS,
+            CELT_FB_20MS,
+            HYBRID_FB_20MS,
+            SILK_WB_20MS,
+            HYBRID_FB_20MS,
+            CELT_FB_20MS,
+        ];
+        for channels in [1usize, 2] {
+            let mut decoder = OpusDecoder::new(48_000, channels).expect("decoder");
+            let mut pcm = vec![0i16; 960 * channels];
+            for (step, &config) in order.iter().enumerate() {
+                let data = packet(config, step % 2 == 0, 0, 60);
+                let written = decoder
+                    .decode(Some(&data), &mut pcm, 960, false)
+                    .unwrap_or_else(|error| panic!("{channels}ch step {step}: {error}"));
+                assert_eq!(written, 960, "{channels}ch step {step}");
+            }
+        }
+    }
+
+    /// The float and 16-bit entry points must agree, modulo the soft clipping the 16-bit one adds.
+    #[test]
+    fn float_and_integer_entry_points_agree() {
+        let data = packet(CELT_FB_20MS, false, 0, 60);
+        let mut integer_decoder = OpusDecoder::new(48_000, 1).expect("decoder");
+        let mut float_decoder = OpusDecoder::new(48_000, 1).expect("decoder");
+        let mut integer_pcm = vec![0i16; 960];
+        let mut float_pcm = vec![0f32; 960];
+        let a = integer_decoder
+            .decode(Some(&data), &mut integer_pcm, 960, false)
+            .expect("i16");
+        let b = float_decoder
+            .decode_float(Some(&data), &mut float_pcm, 960, false)
+            .expect("f32");
+        assert_eq!(a, b);
+        assert_eq!(integer_decoder.final_range(), float_decoder.final_range());
+        for (index, (&integer, &float)) in integer_pcm.iter().zip(float_pcm.iter()).enumerate() {
+            // Soft clipping only moves samples that would have exceeded ±1.
+            if float.abs() < 0.9 {
+                assert_eq!(
+                    integer,
+                    crate::opus::celt::synthesis::float_to_i16(float),
+                    "sample {index}"
+                );
+            }
+        }
+    }
+
+    /// A malformed or hostile packet must error, never panic and never read out of bounds.
+    #[test]
+    fn malformed_packets_error_rather_than_panic() {
+        let mut decoder = OpusDecoder::new(48_000, 2).expect("decoder");
+        let mut pcm = vec![0i16; MAX_PACKET_SAMPLES * 2];
+        // An empty packet is a legal DTX gap: it conceals rather than erroring.
+        assert!(decoder.decode(Some(&[]), &mut pcm, 960, false).is_ok());
+        // Framing the parser rejects outright.
+        assert!(decoder
+            .decode(Some(&[0x01, 0xAA, 0xBB, 0xCC]), &mut pcm, 960, false)
+            .is_err()); // code 1 with an odd payload
+        assert!(decoder
+            .decode(Some(&[0x03, 0x00, 1, 2]), &mut pcm, 960, false)
+            .is_err()); // code 3 with zero frames
+                        // An undersized output buffer is an error, not a truncated write.
+        let data = packet(CELT_FB_20MS, true, 0, 60);
+        let mut small = vec![0i16; 100];
+        assert!(decoder.decode(Some(&data), &mut small, 960, false).is_err());
+
+        // Arbitrary byte soup across every config: decode-or-error, never panic.
+        for seed in 0u32..400 {
+            let length = (seed % 60) as usize + 2;
+            let mut bytes: Vec<u8> = (0..length)
+                .map(|k| (seed.wrapping_mul(2_654_435_761).wrapping_add(k as u32) >> 11) as u8)
+                .collect();
+            bytes[0] = (((seed % 32) as u8) << 3) | ((seed >> 5) & 0x7) as u8;
+            let _ = decoder.decode(Some(&bytes), &mut pcm, MAX_PACKET_SAMPLES, false);
+        }
+    }
+
+    /// `packet_samples` is `opus_packet_get_nb_samples`: frame count times frame duration.
+    #[test]
+    fn packet_samples_matches_the_toc() {
+        // One 20 ms CELT frame.
+        let data = packet(CELT_FB_20MS, false, 0, 10);
+        assert_eq!(
+            OpusDecoder::packet_samples(&data, 48_000).expect("samples"),
+            960
+        );
+        assert_eq!(
+            OpusDecoder::packet_samples(&data, 16_000).expect("samples"),
+            320
+        );
+        // Two frames.
+        let data = packet(CELT_FB_20MS, false, 1, 10);
+        assert_eq!(
+            OpusDecoder::packet_samples(&data, 48_000).expect("samples"),
+            1920
+        );
+        // An empty buffer has no TOC at all.
+        assert!(OpusDecoder::packet_samples(&[], 48_000).is_err());
+    }
+
+    /// A reset must return the decoder to its fresh state — in particular concealment goes back to
+    /// returning silence, which is only true when `prev_mode` was cleared.
+    #[test]
+    fn reset_returns_the_decoder_to_the_fresh_state() {
+        let mut decoder = OpusDecoder::new(48_000, 1).expect("decoder");
+        let data = packet(CELT_FB_20MS, false, 0, 60);
+        let mut pcm = vec![0i16; 960];
+        decoder
+            .decode(Some(&data), &mut pcm, 960, false)
+            .expect("decode");
+        assert_ne!(decoder.final_range(), 0);
+        assert_eq!(decoder.last_packet_duration(), 960);
+
+        decoder.reset();
+        assert_eq!(decoder.final_range(), 0);
+        assert_eq!(decoder.last_packet_duration(), 0);
+        assert!(!decoder.last_frame_had_redundancy());
+        let mut pcm = vec![7i16; 960];
+        decoder.decode(None, &mut pcm, 960, false).expect("conceal");
+        assert!(
+            pcm.iter().all(|&sample| sample == 0),
+            "after a reset there is no mode to conceal in"
+        );
+        // Configuration survives.
+        assert_eq!(decoder.sample_rate(), 48_000);
+        assert_eq!(decoder.channels(), 1);
+    }
+
+    /// The two `smooth_fade` orientations must produce the same cross-fade — they differ only in
+    /// which buffer is written back.
+    #[test]
+    fn the_two_smooth_fade_orientations_agree() {
+        // The real 48 kHz shape: 2.5 ms of overlap over the full 120-tap window, step 1.
+        let overlap = 120usize;
+        let channels = 2usize;
+        let first: Vec<f32> = (0..overlap * channels).map(|i| i as f32).collect();
+        let second: Vec<f32> = (0..overlap * channels).map(|i| 100.0 - i as f32).collect();
+
+        let mut over_first = first.clone();
+        smooth_fade_into_second(&mut over_first, &second, overlap, channels, 1);
+        let mut over_second = second.clone();
+        smooth_fade_into_first(&first, &mut over_second, overlap, channels, 1);
+        for index in 0..overlap * channels {
+            assert!(
+                (over_first[index] - over_second[index]).abs() < 1e-6,
+                "sample {index}: {} vs {}",
+                over_first[index],
+                over_second[index]
+            );
+        }
+        // The fade really is a fade: it starts near `first` and ends near `second`.
+        assert!((over_first[0] - first[0]).abs() < (over_first[0] - second[0]).abs());
+        let last = (overlap - 1) * channels;
+        assert!((over_first[last] - second[last]).abs() < (over_first[last] - first[last]).abs());
+    }
+
+    /// Soft clipping must bring an over-range signal inside ±1 without touching a signal already in
+    /// range (`opus.c:36`).
+    #[test]
+    fn soft_clip_bounds_the_signal_without_touching_a_quiet_one() {
+        let mut memory = [0.0f32; MAX_CHANNELS];
+        // Already in range: untouched.
+        let quiet: Vec<f32> = (0..64).map(|i| 0.4 * ((i as f32) * 0.3).sin()).collect();
+        let mut pcm = quiet.clone();
+        soft_clip_pcm(&mut pcm, 64, 1, &mut memory);
+        assert_eq!(pcm, quiet);
+
+        // Over range: pulled inside ±1, and still recognisably the same waveform.
+        let mut memory = [0.0f32; MAX_CHANNELS];
+        let loud: Vec<f32> = (0..256).map(|i| 1.7 * ((i as f32) * 0.1).sin()).collect();
+        let mut pcm = loud.clone();
+        soft_clip_pcm(&mut pcm, 256, 1, &mut memory);
+        assert!(
+            pcm.iter().all(|&sample| sample.abs() <= 1.0),
+            "soft clip must bound the output"
+        );
+        for (index, (&clipped, &original)) in pcm.iter().zip(loud.iter()).enumerate() {
+            assert!(
+                clipped * original >= 0.0,
+                "sample {index} changed sign: {clipped} vs {original}"
+            );
+        }
+        // Anything past ±2 saturates first, so it cannot escape either.
+        let mut memory = [0.0f32; MAX_CHANNELS];
+        let mut pcm = vec![9.0f32; 32];
+        soft_clip_pcm(&mut pcm, 32, 1, &mut memory);
+        assert!(pcm.iter().all(|&sample| sample.abs() <= 1.0));
+    }
+}
