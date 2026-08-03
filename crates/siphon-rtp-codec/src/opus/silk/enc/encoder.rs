@@ -34,14 +34,20 @@
 //! # The seam above this
 //!
 //! [`SilkEncoder::encode`] takes PCM **at the SILK internal rate** (8, 12 or 16 kHz) and produces the
-//! SILK layer of one Opus frame into a caller-supplied [`RangeEncoder`]. The API-rate resampler and
-//! the `variable_HP_smth` high-pass live in libopus' *Opus* layer (`src/opus_encoder.c:1799-1805`,
-//! and `silk_resampler` driven from `enc_API.c:292-329`), not here, and this module deliberately
-//! exposes no knob for either — wiring one that did nothing would be worse than its absence. The
-//! mode/bandwidth decision that chooses the internal rate is the same layer's business.
+//! SILK layer of one Opus frame into a caller-supplied [`RangeEncoder`]. The API-rate resampler is
+//! the *Opus* layer's (`silk_resampler` driven from `enc_API.c:292-329`), and so is the adaptive
+//! high-pass **filter** (`opus_encoder.c:1799-1809`); the mode/bandwidth decision that chooses the
+//! internal rate is the same layer's business.
+//!
+//! The high-pass's *tracker* is the one part of that split that lives here, because libopus puts it
+//! here too: `silk_HP_variable_cutoff` (`enc_API.c:398`) drives `variable_HP_smth1_Q15` from SILK's
+//! own pitch lag, signal type, speech activity and input quality, none of which the Opus layer can
+//! see. [`SilkEncoder::high_pass_smth1_q15`] is what the Opus layer reads out of it, exactly as
+//! `opus_encoder.c:1799` reaches into `state_Fxx[0].sCmn`.
 
 use crate::opus::range_coder::RangeEncoder;
 use crate::opus::silk::enc::bitstream::{encode_indices, encode_pulses};
+use crate::opus::silk::enc::fixed::lin2log;
 use crate::opus::silk::enc::frame::{AnalysisConfig, ComplexitySettings};
 use crate::opus::silk::enc::rate_control::{
     control_snr, encode_frame, FrameEncodeRequest, FrameEncoderState, LbrrFrame,
@@ -53,7 +59,7 @@ use crate::opus::silk::enc::vad::{
     analyse, classify, DtxState, VadState, LBRR_SPEECH_ACTIVITY_THRESHOLD_Q8,
 };
 use crate::opus::silk::enc::{SignalMeasures, LA_SHAPE_MS};
-use crate::opus::silk::fixed::smulwb;
+use crate::opus::silk::fixed::{smlawb, smulbb, smulwb};
 use crate::opus::silk::tables::{LBRR_FLAGS_2_ICDF, LBRR_FLAGS_3_ICDF};
 use crate::opus::silk::types::{
     CondCoding, InternalRate, SignalType, SubframeLayout, MAX_FRAMES_PER_PACKET, MAX_FRAME_LENGTH,
@@ -70,6 +76,11 @@ const INPUT_BUFFER: usize = 2 * MAX_FRAME_LENGTH + LA_SHAPE_MS * 16;
 /// `BITRESERVOIR_DECAY_TIME_MS` (`tuning_parameters.h:44`) — how fast the bit reservoir forgives an
 /// overspend.
 const BIT_RESERVOIR_DECAY_MS: i32 = 500;
+
+/// `VARIABLE_HP_MIN_CUTOFF_HZ` (`tuning_parameters.h:72`).
+pub const MIN_CUTOFF_HZ: i32 = 60;
+/// `VARIABLE_HP_MAX_CUTOFF_HZ` (`tuning_parameters.h:73`).
+pub const MAX_CUTOFF_HZ: i32 = 100;
 
 /// How the encoder should spend its bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,8 +171,11 @@ struct ChannelState {
     lbrr_gain_increase: i32,
     /// Whether LBRR was enabled for the previous packet, which decides the gain increase.
     lbrr_was_enabled: bool,
-    /// `speech_activity_Q8` of the frame just analysed, kept for the stereo smoother.
-    speech_activity_q8: i32,
+    /// The VAD's verdict on the frame just analysed. Kept whole rather than reduced to
+    /// `speech_activity_Q8`: the stereo smoother reads the activity, the analysis front end reads
+    /// all four fields (see [`SignalMeasures`]), and `silk_HP_variable_cutoff` reads the activity
+    /// and the lowest input-quality band.
+    measures: SignalMeasures,
 }
 
 impl Default for ChannelState {
@@ -180,7 +194,7 @@ impl Default for ChannelState {
             lbrr: [LbrrFrame::default(); MAX_FRAMES_PER_PACKET],
             lbrr_gain_increase: 7,
             lbrr_was_enabled: false,
-            speech_activity_q8: 0,
+            measures: SignalMeasures::default(),
         }
     }
 }
@@ -214,6 +228,10 @@ pub struct SilkEncoder {
     bits_exceeded: i32,
     /// `nBitsUsedLBRR` — an exponential moving average of what LBRR costs.
     lbrr_bits_used: i32,
+    /// `state_Fxx[0].sCmn.variable_HP_smth1_Q15` — the SILK-side half of the adaptive high-pass
+    /// (`silk_HP_variable_cutoff`). The filter itself is the Opus layer's; only the tracking state
+    /// belongs here, because it is driven by SILK's own pitch and quality measures.
+    high_pass_smth1_q15: i32,
 }
 
 impl SilkEncoder {
@@ -236,6 +254,10 @@ impl SilkEncoder {
             previous_mid_only: false,
             bits_exceeded: 0,
             lbrr_bits_used: 0,
+            // `silk_init_encoder` (`init_encoder.c:58`): start at the minimum cutoff. The C reaches
+            // it through the Q16 form and the `-(16<<7)` correction rather than `lin2log(60)`
+            // directly, and the two are not quite identical — keep its arithmetic.
+            high_pass_smth1_q15: (lin2log(MIN_CUTOFF_HZ << 16) - (16 << 7)) << 8,
         })
     }
 
@@ -428,6 +450,11 @@ impl SilkEncoder {
         lbrr_bits: i32,
         any_active: &mut bool,
     ) -> Result<(), CodecError> {
+        // ── The adaptive high-pass tracker (`enc_API.c:398`) ──────────────────────────────────
+        // Runs before this interval's VAD and analysis, so it sees the previous interval's pitch,
+        // activity and quality — which is exactly what the C does.
+        self.update_high_pass_smoother();
+
         // ── This interval's share of the packet budget ────────────────────────────────────────
         let mut frame_bits =
             self.config.bitrate_bps * self.config.duration_ms as i32 / 1000 - self.lbrr_bits_used;
@@ -551,7 +578,7 @@ impl SilkEncoder {
             mid[index + 2] = input[2 * (start + index)];
             side[index + 2] = input[2 * (start + index) + 1];
         }
-        let previous_activity = self.channels[0].speech_activity_q8;
+        let previous_activity = self.channels[0].measures.speech_activity_q8;
         let (indices, rates) = left_right_to_mid_side(
             &mut self.stereo,
             &mut mid[..frame_length + 2],
@@ -579,7 +606,63 @@ impl SilkEncoder {
         // The Opus layer's own VAD is not modelled here; SILK's own verdict stands.
         let verdict = classify(&mut measures, &mut channel.dtx, use_dtx, true);
         channel.vad_flags[interval] = verdict.active;
-        channel.speech_activity_q8 = verdict.measures.speech_activity_q8;
+        channel.measures = verdict.measures;
+    }
+
+    /// `silk_HP_variable_cutoff` (`HP_variable_cutoff.c:39-77`) — track the low end of the pitch
+    /// frequency range and move the high-pass cutoff towards it.
+    ///
+    /// Only the state lives here; the filter itself is the Opus layer's, which is where libopus puts
+    /// it too (`opus_encoder.c:1799-1809`). Reading it out is [`SilkEncoder::high_pass_smth1_q15`].
+    /// Everything is the *previous* interval's: libopus calls this at the head of an interval,
+    /// before the VAD and the analysis have run on the new one (`enc_API.c:398`).
+    fn update_high_pass_smoother(&mut self) {
+        let channel = &self.channels[0];
+        if channel.frame.analysis.previous_signal_type != SignalType::Voiced {
+            return;
+        }
+        let previous_lag = channel.frame.analysis.previous_lag.max(1);
+        // Estimate the low end of the pitch frequency range, in the log domain.
+        let pitch_freq_hz_q16 =
+            ((self.config.internal_rate.khz() as i32 * 1000) << 16) / previous_lag;
+        let mut pitch_freq_log_q7 = lin2log(pitch_freq_hz_q16) - (16 << 7);
+
+        // Adjustment based on quality: a noisy input pulls the estimate back down towards the
+        // minimum cutoff rather than trusting its pitch track.
+        let quality_q15 = channel.measures.input_quality_bands_q15[0];
+        pitch_freq_log_q7 = smlawb(
+            pitch_freq_log_q7,
+            smulwb(-quality_q15 << 2, quality_q15),
+            pitch_freq_log_q7 - (lin2log(MIN_CUTOFF_HZ << 16) - (16 << 7)),
+        );
+
+        let mut delta_freq_q7 = pitch_freq_log_q7 - (self.high_pass_smth1_q15 >> 8);
+        if delta_freq_q7 < 0 {
+            // "less smoothing for decreasing pitch frequency, to track something close to the
+            // minimum" (`HP_variable_cutoff.c:61`).
+            delta_freq_q7 *= 3;
+        }
+        // SILK_FIX_CONST( VARIABLE_HP_MAX_DELTA_FREQ, 7 ) with VARIABLE_HP_MAX_DELTA_FREQ = 0.4.
+        const MAX_DELTA_FREQ_Q7: i32 = 51;
+        delta_freq_q7 = delta_freq_q7.clamp(-MAX_DELTA_FREQ_Q7, MAX_DELTA_FREQ_Q7);
+
+        // SILK_FIX_CONST( VARIABLE_HP_SMTH_COEF1, 16 ) with VARIABLE_HP_SMTH_COEF1 = 0.1.
+        const SMTH_COEF1_Q16: i32 = 6554;
+        self.high_pass_smth1_q15 = smlawb(
+            self.high_pass_smth1_q15,
+            smulbb(channel.measures.speech_activity_q8, delta_freq_q7),
+            SMTH_COEF1_Q16,
+        );
+        self.high_pass_smth1_q15 = self
+            .high_pass_smth1_q15
+            .clamp(lin2log(MIN_CUTOFF_HZ) << 8, lin2log(MAX_CUTOFF_HZ) << 8);
+    }
+
+    /// `variable_HP_smth1_Q15` — the SILK-side smoother the Opus layer's high-pass reads
+    /// (`opus_encoder.c:1799`). Q15 log2 of the cutoff in Hz.
+    #[must_use]
+    pub fn high_pass_smth1_q15(&self) -> i32 {
+        self.high_pass_smth1_q15
     }
 
     /// Slide one channel's float input buffer along and encode its frame.
@@ -655,7 +738,8 @@ impl SilkEncoder {
 
         // LBRR: only for a frame active enough to be worth a redundant copy.
         let lbrr_wanted = self.config.use_in_band_fec
-            && self.channels[channel_index].speech_activity_q8 > LBRR_SPEECH_ACTIVITY_THRESHOLD_Q8;
+            && self.channels[channel_index].measures.speech_activity_q8
+                > LBRR_SPEECH_ACTIVITY_THRESHOLD_Q8;
         let lbrr_continues = interval > 0 && self.channels[channel_index].lbrr_flags[interval - 1];
         let gain_increase = self.channels[channel_index].lbrr_gain_increase;
 
@@ -666,10 +750,10 @@ impl SilkEncoder {
         } else {
             SignalType::Inactive
         };
-        let measures = SignalMeasures {
-            speech_activity_q8: channel.speech_activity_q8,
-            ..SignalMeasures::default()
-        };
+        // The VAD's whole verdict, not just its activity: `input_quality_bands_Q15` sets the shaping
+        // and the lambda, `input_tilt_Q15` moves the pitch threshold and the voiced quantisation
+        // offset, and `previous_signal_type` biases the pitch search — see [`SignalMeasures`].
+        let measures = channel.measures;
 
         let request = FrameEncodeRequest {
             signal: &channel.input,
@@ -816,16 +900,22 @@ mod tests {
         assert!(!encoder.stereo_indices[0].mid_only);
     }
 
-    /// CBR must aim at the target size on every packet; VBR must be free to come in under it.
+    /// CBR must hold every packet at its per-packet target; VBR must not be bound by that target.
     ///
-    /// "Aim", not "hit exactly": at this layer CBR is the gain loop driving the frame to within a
+    /// "Hold", not "hit exactly": at this layer CBR is the gain loop driving the frame to within a
     /// few bits of its budget, and the gain multiplier is floored at 64 in Q8, so a frame the
     /// analysis aimed well below the budget cannot always be inflated all the way to it. Exact
     /// constant packet sizes are the *Opus* layer's job, which pads the packet — that is why
     /// `opus_encoder.c` still tracks a padding length after SILK has finished.
+    ///
+    /// The distinguishing property is the **ceiling**, not the total. VBR's per-frame `max_bits` is
+    /// the whole remaining packet cap, so a frame worth spending on is allowed straight past the
+    /// nominal per-packet target; CBR's is `min(target, share)` and cannot be. Comparing the two
+    /// totals instead would be reading a rate-distortion outcome as if it were a rule, and which way
+    /// it falls depends on the content.
     #[test]
-    fn cbr_aims_at_the_target_where_vbr_comes_in_under_it() {
-        let target_bytes = 24_000 * 20 / 1000 / 8;
+    fn cbr_holds_the_target_where_vbr_is_free_to_pass_it() {
+        let target_bytes = (24_000 * 20 / 1000 / 8) as usize;
         let mut config = EncoderConfig::new(InternalRate::Wide16k, 20, 24_000);
         // A cap well above the target, so the two modes differ by their own decision rather than by
         // running into the same ceiling.
@@ -838,23 +928,22 @@ mod tests {
 
         let cbr_sizes: Vec<usize> = cbr.iter().map(|result| result.payload_bytes).collect();
         let vbr_sizes: Vec<usize> = vbr.iter().map(|result| result.payload_bytes).collect();
-        let cbr_total: usize = cbr_sizes.iter().sum();
-        let vbr_total: usize = vbr_sizes.iter().sum();
 
-        assert!(
-            cbr_total > vbr_total,
-            "cbr {cbr_sizes:?} did not fill more than vbr {vbr_sizes:?}"
-        );
         for (index, &size) in cbr_sizes.iter().enumerate() {
             assert!(
-                size <= target_bytes as usize + 1,
+                size <= target_bytes + 1,
                 "cbr packet {index} overshot its target: {size} of {target_bytes}"
             );
             assert!(
-                size * 4 >= target_bytes as usize * 3,
+                size * 4 >= target_bytes * 3,
                 "cbr packet {index} under-filled badly: {size} of {target_bytes}"
             );
         }
+        assert!(
+            vbr_sizes.iter().any(|&size| size > target_bytes),
+            "vbr {vbr_sizes:?} never passed the per-packet target, so the cap it does not have was \
+             never demonstrated (cbr was {cbr_sizes:?})"
+        );
     }
 
     /// Constrained VBR must never exceed the cap, whatever the signal does.
@@ -947,6 +1036,90 @@ mod tests {
         let with: usize = with_fec.iter().map(|r| r.payload_bytes).sum();
         let without: usize = without_fec.iter().map(|r| r.payload_bytes).sum();
         assert!(with > without, "fec cost nothing: {with} vs {without}");
+    }
+
+    /// The adaptive high-pass tracker must start at the minimum cutoff, stay inside
+    /// `[VARIABLE_HP_MIN_CUTOFF_HZ, VARIABLE_HP_MAX_CUTOFF_HZ]` forever, and actually *move* on
+    /// voiced speech — a tracker pinned at its initial value would read as working.
+    #[test]
+    fn the_high_pass_tracker_starts_at_the_minimum_and_tracks_voiced_pitch() {
+        let config = EncoderConfig::new(InternalRate::Wide16k, 20, 24_000);
+        let mut encoder = SilkEncoder::new(config).expect("config");
+        let initial = encoder.high_pass_smth1_q15();
+        assert_eq!(
+            initial,
+            (lin2log(MIN_CUTOFF_HZ << 16) - (16 << 7)) << 8,
+            "init_encoder.c:58"
+        );
+
+        let lower = lin2log(MIN_CUTOFF_HZ) << 8;
+        let upper = lin2log(MAX_CUTOFF_HZ) << 8;
+
+        // Nothing but a *voiced* previous frame moves it (`HP_variable_cutoff.c:48`), so drive the
+        // state directly rather than hoping a synthetic signal trips the pitch search: an inactive
+        // stream would make a broken tracker look correct.
+        encoder.channels[0].frame.analysis.previous_signal_type = SignalType::Unvoiced;
+        encoder.channels[0].frame.analysis.previous_lag = 80;
+        encoder.channels[0].measures.speech_activity_q8 = 256;
+        encoder.channels[0].measures.input_quality_bands_q15 = [22_000; 4];
+        encoder.update_high_pass_smoother();
+        assert_eq!(
+            encoder.high_pass_smth1_q15(),
+            initial,
+            "an unvoiced previous frame must leave the tracker alone"
+        );
+
+        // A 200 Hz pitch at 16 kHz — a lag of 80 samples — is well above the 60 Hz floor, so the
+        // smoother must climb towards it and then settle inside the legal band.
+        encoder.channels[0].frame.analysis.previous_signal_type = SignalType::Voiced;
+        let mut previous = initial;
+        for step in 0..200 {
+            encoder.update_high_pass_smoother();
+            let smoothed = encoder.high_pass_smth1_q15();
+            assert!(
+                (lower..=upper).contains(&smoothed),
+                "step {step}: {smoothed} left [{lower}, {upper}]"
+            );
+            assert!(
+                smoothed >= previous,
+                "step {step}: the smoother went backwards on a constant pitch"
+            );
+            previous = smoothed;
+        }
+        assert!(
+            previous > initial,
+            "the tracker never left its initial value on voiced speech"
+        );
+
+        // Silence has no speech activity, so the update is multiplied by zero and holds.
+        encoder.channels[0].measures.speech_activity_q8 = 0;
+        let held = encoder.high_pass_smth1_q15();
+        for _ in 0..10 {
+            encoder.update_high_pass_smoother();
+        }
+        assert_eq!(
+            encoder.high_pass_smth1_q15(),
+            held,
+            "with no speech activity the smoother's step is zero"
+        );
+
+        // And the whole thing must survive a real stream without leaving the band.
+        let per_packet = encoder.samples_per_packet();
+        let speech = voiced(per_packet * 12, 80);
+        for packet in 0..10 {
+            let mut buffer = vec![0u8; config.max_bytes];
+            let mut range = RangeEncoder::new(&mut buffer);
+            let start = packet * per_packet;
+            encoder
+                .encode(&speech[start..start + per_packet], &mut range)
+                .expect("encode");
+            range.done();
+            let smoothed = encoder.high_pass_smth1_q15();
+            assert!(
+                (lower..=upper).contains(&smoothed),
+                "packet {packet}: {smoothed} left [{lower}, {upper}]"
+            );
+        }
     }
 
     /// A configuration SILK does not define must be rejected rather than silently coerced.

@@ -791,11 +791,18 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} not found in resampler_rom.c"));
             let open = start + source[start..].find('{').expect("opening brace");
             let close = open + source[open..].find("};").expect("closing brace");
+            // `silk_resampler_frac_FIR_12` is a table of tables, so the inner braces have to go
+            // before the split — otherwise the first token of every row carries one.
             source[open + 1..close]
+                .replace(['{', '}'], " ")
                 .split(',')
                 .map(str::trim)
                 .filter(|token| !token.is_empty())
-                .map(|token| token.parse::<i16>().expect("i16 literal"))
+                .map(|token| {
+                    token
+                        .parse::<i16>()
+                        .unwrap_or_else(|_| panic!("{name}: not an i16 literal: {token:?}"))
+                })
                 .collect()
         };
 
