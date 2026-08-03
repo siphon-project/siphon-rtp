@@ -88,6 +88,7 @@ pub mod nsq_del_dec;
 pub mod pitch;
 pub mod pred_coefs;
 pub mod rate_control;
+pub mod vad;
 
 /// `MAX_SHAPE_LPC_ORDER` (`define.h:155`) — the largest noise-shaping AR order, at complexity 10.
 pub const MAX_SHAPE_LPC_ORDER: usize = 24;
