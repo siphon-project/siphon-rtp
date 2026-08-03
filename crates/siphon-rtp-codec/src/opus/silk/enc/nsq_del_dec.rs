@@ -32,7 +32,7 @@
 //!
 //! Each state starts from `(k + Seed) & 3` (`NSQ_del_dec.c:160`), so the four states explore four
 //! different dither sequences, and the winner's **initial** seed is what gets coded. That is why
-//! [`quantize_del_dec`] returns a seed at all: the frame driver must write the winner's, not its
+//! `quantize_del_dec` returns a seed at all: the frame driver must write the winner's, not its
 //! own frame counter's.
 //!
 //! # The state-replacement memcpy
