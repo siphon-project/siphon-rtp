@@ -94,6 +94,10 @@ pub struct OpusDecoder {
     /// `st->prev_redundancy` — the previous frame ended on a SILK→CELT redundancy frame, so the
     /// CELT state is *not* stale even though the previous mode was not CELT.
     prev_redundancy: bool,
+    /// Whether the frame just decoded carried a redundancy frame at all, in either direction — see
+    /// [`OpusDecoder::last_frame_had_redundancy`]. Distinct from `prev_redundancy`, which is only
+    /// the SILK→CELT half of it.
+    last_frame_redundancy: bool,
     /// `st->last_packet_duration` — samples the last call produced, per channel.
     last_packet_duration: usize,
     /// `st->softclip_mem` — the declipping non-linearity's per-channel carry-over.
@@ -142,6 +146,7 @@ impl OpusDecoder {
             // `st->frame_size = Fs/400` (`opus_decoder.c:168`) — 2.5 ms, the shortest frame there is.
             frame_size: sample_rate as usize / 400,
             prev_redundancy: false,
+            last_frame_redundancy: false,
             last_packet_duration: 0,
             softclip_mem: [0.0; MAX_CHANNELS],
             range_final: 0,
@@ -162,6 +167,7 @@ impl OpusDecoder {
         self.prev_mode = None;
         self.frame_size = self.sample_rate as usize / 400;
         self.prev_redundancy = false;
+        self.last_frame_redundancy = false;
         self.last_packet_duration = 0;
         self.softclip_mem = [0.0; MAX_CHANNELS];
         self.range_final = 0;
@@ -198,6 +204,18 @@ impl OpusDecoder {
     #[must_use]
     pub fn last_packet_duration(&self) -> usize {
         self.last_packet_duration
+    }
+
+    /// Whether the frame just decoded carried an RFC 6716 §4.5.1 redundancy frame.
+    ///
+    /// An encoder emits one on a SILK↔CELT switch: an extra 5 ms CELT frame at the end of the
+    /// payload, cross-faded over the boundary. Exposed because it is otherwise invisible from
+    /// outside — the audio is already blended in and the extra bytes never reach the caller — while
+    /// being exactly what a conformance harness needs to prove it decoded some, and what a live leg
+    /// would report as mode-switch churn.
+    #[must_use]
+    pub fn last_frame_had_redundancy(&self) -> bool {
+        self.last_frame_redundancy
     }
 
     /// Samples per channel `packet` decodes to at `sample_rate` (libopus
@@ -760,6 +778,7 @@ impl OpusDecoder {
         };
         self.prev_mode = Some(mode);
         self.prev_redundancy = redundancy && !celt_to_silk;
+        self.last_frame_redundancy = redundancy;
         Ok(audiosize)
     }
 
