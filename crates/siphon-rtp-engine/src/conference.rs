@@ -2617,6 +2617,75 @@ mod tests {
     }
 
     #[test]
+    fn a_full_band_room_tick_never_grows_its_scratch() {
+        // The room's per-tick scratch is sized once, for the *maximum* room rate and packetization
+        // interval; a 48 kHz tick is 3× the samples of a 16 kHz one and the mixed-rate room drives
+        // both shared downsamplers, so this is exactly where a buffer sized for the old 16 kHz
+        // ceiling would start reallocating on the hot path. Capacity is the observable: a `Vec` that
+        // never grows never allocated.
+        use siphon_rtp_codec::l16::L16;
+
+        let mut conference = Conference::new("room".into(), 0);
+        let (talker, _log) = wideband_config(0, 1, "10.0.0.1", "10.0.0.1:4000");
+        assert!(conference.add_participant(talker));
+        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        let mut wideband = ulaw_config(2, "10.0.0.3", "10.0.0.3:4000");
+        wideband.decoder = Box::new(L16::new(16_000, 20));
+        wideband.encoder = Box::new(L16::new(16_000, 20));
+        wideband.egress_payload_type = 97;
+        assert!(conference.add_participant(wideband));
+        assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
+
+        let mut out = Vec::new();
+        // Warm up past the jitter prime, then record every scratch capacity.
+        for sequence in 0..60 {
+            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 60))));
+            out.clear();
+            conference.tick(&mut out);
+        }
+        let scratch = conference.resample_scratch.capacity();
+        let rows: Vec<usize> = conference
+            .room_rows
+            .iter()
+            .map(|row| row.capacity())
+            .collect();
+        let shared: Vec<usize> = conference
+            .listener_native_buf
+            .iter()
+            .map(|buffer| buffer.capacity())
+            .collect();
+        let payload = conference.payload.capacity();
+
+        for sequence in 60..200 {
+            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 60))));
+            out.clear();
+            conference.tick(&mut out);
+        }
+        assert_eq!(
+            conference.resample_scratch.capacity(),
+            scratch,
+            "the resample scratch must never grow mid-tick"
+        );
+        assert!(
+            conference
+                .room_rows
+                .iter()
+                .map(|row| row.capacity())
+                .eq(rows),
+            "the room rows must never grow mid-tick"
+        );
+        assert!(
+            conference
+                .listener_native_buf
+                .iter()
+                .map(|buffer| buffer.capacity())
+                .eq(shared),
+            "the shared listener downsample buffers must never grow mid-tick"
+        );
+        assert_eq!(conference.payload.capacity(), payload);
+    }
+
+    #[test]
     fn a_full_band_room_mixes_minus_self_at_48k() {
         // The mix itself at the new rate: three loud 48 kHz talkers, each hearing the other two and
         // never itself, across the full 960-sample frame.
