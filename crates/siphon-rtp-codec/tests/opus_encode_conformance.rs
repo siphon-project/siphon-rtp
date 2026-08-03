@@ -755,6 +755,122 @@ fn our_packets_match_libopus_on_range_state_and_on_every_discrete_decision() {
     );
 }
 
+/// A stream that **switches mode mid-flight** must still satisfy check 1, packet for packet.
+///
+/// This is the path the fixed matrix cannot reach: every configuration there holds one bitrate, so
+/// the mode is decided once and never changes. A switch is the hardest thing this layer does —
+/// libopus signals it with a redundancy flag inside the range coder (unconditionally in hybrid,
+/// whether or not redundancy follows) and bridges the seam with a 5 ms CELT frame appended after the
+/// main payload, whose own range value is XORed into the packet's. Get any of that wrong — the flag,
+/// the redundancy length, the order of the two frames, the XOR — and libopus' decoder either
+/// desynchronises or ends the packet on a different value. Both show up here.
+///
+/// Both switch directions are covered: the rate sweep crosses in both, and DTX-driven and
+/// FEC-driven mode changes are swept alongside so the redundancy decision is reached from more than
+/// one cause.
+#[test]
+fn a_stream_that_switches_mode_mid_flight_still_matches_libopus_on_range_state() {
+    let Some(fixture) = fixture() else {
+        eprintln!("skipping: reference/opus, opus_demo or the source vectors are absent");
+        return;
+    };
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut scored = 0usize;
+    let mut mode_changes = 0usize;
+
+    for &(label, channels, application, period) in &[
+        ("mono_voip_fast", 1usize, Application::Voip, 3usize),
+        ("mono_audio_slow", 1, Application::Audio, 11),
+        ("stereo_audio", 2, Application::Audio, 5),
+    ] {
+        let source = fixture.source(channels);
+        let frame_size = 960usize;
+        let mut encoder = match OpusEncoder::new(REFERENCE_RATE_HZ, channels, application) {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                failures.push(format!("{label}: OpusEncoder::new: {error:?}"));
+                continue;
+            }
+        };
+        if encoder.set_complexity(COMPARISON_COMPLEXITY).is_err() {
+            failures.push(format!("{label}: set_complexity"));
+            continue;
+        }
+        encoder.set_rate_control(RateControl::ConstrainedVariable);
+
+        let mut packets = Vec::new();
+        let mut previous_mode = None;
+        let count = 120usize;
+        for index in 0..count {
+            let start = index * frame_size * channels;
+            if start + frame_size * channels > source.len() {
+                break;
+            }
+            // Sweep the rate back and forth across the SILK/CELT crossing, and turn FEC and DTX on
+            // and off underneath it, so the mode moves for several different reasons.
+            let low = (index / period) % 2 == 0;
+            let bitrate = if low { 10_000 } else { 140_000 } * channels as i32;
+            encoder.set_bitrate(Some(bitrate)).expect("bitrate");
+            encoder.set_in_band_fec(index % 17 < 6);
+            encoder
+                .set_packet_loss_percent(if index % 17 < 6 { 25 } else { 0 })
+                .expect("loss");
+            encoder.set_dtx(index % 23 < 4);
+
+            let mut buffer = vec![0u8; 1500];
+            let result = match encoder.encode(
+                &source[start..start + frame_size * channels],
+                frame_size,
+                &mut buffer,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    failures.push(format!("{label}: packet {index}: {error:?}"));
+                    break;
+                }
+            };
+            if previous_mode.is_some_and(|mode| mode != result.mode) {
+                mode_changes += 1;
+            }
+            previous_mode = Some(result.mode);
+            packets.push(EncodedPacket {
+                payload: buffer[..result.bytes].to_vec(),
+                final_range: result.final_range,
+            });
+        }
+        if packets.len() < count / 2 {
+            failures.push(format!("{label}: only {} packets encoded", packets.len()));
+            continue;
+        }
+
+        let bit_path = fixture.scratch.join(format!("switch_{label}.bit"));
+        let dec_path = fixture.scratch.join(format!("switch_{label}.dec"));
+        if let Err(error) = write_bit_file(&bit_path, &packets) {
+            failures.push(format!("{label}: {error}"));
+            continue;
+        }
+        match decode_with_libopus(&bit_path, &dec_path, channels) {
+            Ok(_) => scored += 1,
+            Err(error) => failures.push(format!("{label}: libopus decode: {error}")),
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "mode-switch conformance failures:\n  {}",
+        failures.join("\n  ")
+    );
+    assert_eq!(scored, 3, "not every switching stream was scored");
+    assert!(
+        mode_changes >= 30,
+        "the sweep only changed mode {mode_changes} times, so the switch path is barely covered"
+    );
+    eprintln!(
+        "Opus mode switching: 3 streams, {mode_changes} mode changes, all accepted by libopus"
+    );
+}
+
 /// Check 1 has to be *live*: corrupt one byte of one packet and libopus must reject the stream.
 /// Without this, a harness that silently wrote a broken `.bit` file would pass for the wrong reason.
 #[test]

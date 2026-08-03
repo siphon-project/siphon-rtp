@@ -37,7 +37,7 @@
 //!   is not implemented, and no knob claims otherwise.
 
 use crate::opus::celt::encoder::{CeltEncoder, RateControl as CeltRateControl, SilkInfo};
-use crate::opus::celt::tables::{NB_BANDS, OVERLAP, WINDOW120};
+use crate::opus::celt::tables::{OVERLAP, WINDOW120};
 use crate::opus::enc::decision::{
     automatic_bitrate, bandwidth_index, choose_bandwidth, choose_mode, compute_equiv_rate,
     compute_redundancy_bytes, compute_silk_rate_for_hybrid, compute_stereo_width, decide_dtx_mode,
@@ -1048,7 +1048,11 @@ impl OpusEncoder {
         // ── The 5 ms redundant CELT frame, before the main one for a CELT->SILK switch ──────────
         let mut redundant_range = 0u32;
         if redundancy && celt_to_silk {
-            self.celt.set_band_range(0, NB_BANDS)?;
+            // Only `start` moves (`opus_encoder.c:2242`): the redundant frame covers the whole
+            // spectrum from band 0, but still stops where this packet's bandwidth stops. Coding it to
+            // band 21 would put a band count in the bitstream that the decoder does not expect.
+            self.celt
+                .set_band_range(0, CeltEncoder::end_band_for_bandwidth(curr_bandwidth))?;
             self.celt.set_rate_control(CeltRateControl::ConstantBitrate);
             self.celt.set_bitrate(-1);
             let half = self.sample_rate_hz as usize / 200;
@@ -1129,21 +1133,25 @@ impl OpusEncoder {
             let half = self.sample_rate_hz as usize / 200;
             let quarter = self.sample_rate_hz as usize / 400;
             self.celt.reset_state();
-            self.celt.set_band_range(0, NB_BANDS)?;
+            self.celt
+                .set_band_range(0, CeltEncoder::end_band_for_bandwidth(curr_bandwidth))?;
             self.celt.set_prediction(0)?;
             self.celt.set_rate_control(CeltRateControl::ConstantBitrate);
             self.celt.set_bitrate(-1);
             redundant_length = {
                 let channels = self.channels;
-                let total = frame_size + total_buffer;
                 let mut scratch = [0u8; 2];
-                let warm_start = (total - half - quarter) * channels;
+                // Counted from the start of the staging buffer, which is where libopus counts from
+                // too: `pcm_buf` there already has the delay compensation in front of it, so the
+                // redundant frame lands on the *last* 5 ms of the frame CELT just coded, not 4 ms
+                // past its end.
+                let warm_start = (frame_size - half - quarter) * channels;
                 let _ = self.celt.encode(
                     &self.pcm_buffer[warm_start..warm_start + quarter * channels],
                     quarter,
                     &mut scratch,
                 );
-                let start = (total - half) * channels;
+                let start = (frame_size - half) * channels;
                 self.celt.encode(
                     &self.pcm_buffer[start..start + half * channels],
                     half,
@@ -1962,7 +1970,7 @@ mod tests {
         encoder.set_bitrate(Some(32_000)).expect("bitrate");
         let mut output = vec![0u8; 1500];
 
-        let poison = vec![0.0f32 / 0.0; 960];
+        let poison = vec![f32::NAN; 960];
         let result = encoder
             .encode_float(&poison, 960, &mut output)
             .expect("a NaN frame must encode, not error");
