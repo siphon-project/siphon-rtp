@@ -174,6 +174,41 @@ Two traps specific to the encode direction:
   *decoder* deviation. A 12 kb/s narrowband encode is legitimately far outside that tolerance — use
   check 3 there.
 
+#### Validating the SILK **encoder**
+
+An encoder has no reference `final_range` to match, but the SILK layer has something better than the
+CELT one did: a **decoder that is already bit-exact against libopus over 64 streams**. Two
+independent decoders agreeing on every sample of a stream neither has seen before is a very strong
+statement about that stream, and it is what `silk_encode_conformance` asserts:
+
+```sh
+SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
+    cargo test -p siphon-rtp-codec --release --test silk_encode_conformance -- --nocapture
+```
+
+1. Our stream is written in `opus_demo`'s `.bit` framing with **our encoder's** `final_range` beside
+   every packet, so `opus_demo -d` aborts with "Range coder state mismatch" unless libopus' own
+   range decoder finishes each packet exactly where we said. Exact, per packet.
+2. `SilkDecoder` decodes the same packets and the two PCM outputs must be identical **sample for
+   sample** — no tolerance, both are integer-faithful to the same reference arithmetic.
+3. libopus encodes the same source at the identical bandwidth, frame size, bitrate and rate mode;
+   our decoded segmental SNR must be within 1 dB of its. This is the gate that works at *every*
+   rate and catches an encoder that is legal but bad.
+4. `opus_compare` on the two decodes of **our own** stream, which check 2 says must score 100.0 %.
+
+Two `opus_compare` runs are deliberately **not** made. Against the original 48 kHz PCM is
+meaningless — SILK is band-limited to at most 8 kHz and the metric measures *decoder* deviation.
+Against libopus' decode of libopus' own stream is equally meaningless: two independent encodings of
+the same audio score a weighted error around 3 even when both encoders are perfectly good. Check 3
+is the right tool for "as good as theirs".
+
+The harness needs `reference/opus/src01.sw` (written by `gen_silk_only.sh`) and the plain
+`reference/opus/build` — not `build-trace`. It skips the vector's first 2 s, which are near-silence,
+so it is scored on real speech rather than on the DTX path. One thing it does that `SilkEncoder`
+does not: it shrinks the range encoder to exactly the bytes SILK used, as `opus_encoder.c` does,
+because a SILK-only packet with 17 or more spare bits makes libopus' *top-level* decoder go looking
+for a redundancy frame. That belongs to the Opus layer, not to the SILK encoder.
+
 #### Instrumented libopus, for validating a half-finished layer
 
 Both oracles above need the decoder to consume a packet to its end, so neither can say anything about a
