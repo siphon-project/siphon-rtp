@@ -1472,11 +1472,8 @@ criterion_group!(
     bench_celt_decode,
     bench_celt_kernels,
     bench_silk_excitation,
-<<<<<<< HEAD
-    bench_silk_encoder_analysis
-=======
+    bench_silk_encoder_analysis,
     bench_silk_synthesis,
     bench_silk_frame
->>>>>>> feat/opus-silk-synthesis
 );
 criterion_main!(benches);
