@@ -85,9 +85,9 @@ pub fn amp2_log2(
     }
 }
 
-/// Input pre-emphasis (libopus `celt_preemphasis`, `celt_encoder.c:507`, the `coef[1] == 0`,
-/// `upsample == 1` fast path used by the 48 kHz mode): `in[i] = x[i]·32768 − mem`,
-/// `mem = coef0·x[i]·32768`, reading channel `channel` out of `channels`-interleaved PCM.
+/// Input pre-emphasis (libopus `celt_preemphasis`, `celt_encoder.c:507`, the `coef[1] == 0` path
+/// used by the 48 kHz mode): `in[i] = x[i]·32768 − mem`, `mem = coef0·x[i]·32768`, reading channel
+/// `channel` out of `channels`-interleaved PCM at one sample in `upsample`.
 ///
 /// `mem` persists across frames in the encoder state; it is the exact counterpart of the decoder's
 /// de-emphasis memory. `clip` reproduces the reference's `[-65536, 65536]` SIG-domain clamp, which
@@ -98,6 +98,7 @@ pub fn celt_preemphasis(
     n: usize,
     channels: usize,
     channel: usize,
+    upsample: usize,
     coef0: f32,
     mem: &mut f32,
     clip: bool,
@@ -105,14 +106,26 @@ pub fn celt_preemphasis(
     // `SCALEIN` in the float build is `(x)*CELT_SIG_SCALE` = x*32768 (arch.h float path).
     const CELT_SIG_SCALE: f32 = 32768.0;
     let mut m = *mem;
-    for i in 0..n {
+    // CELT always runs its MDCT at 48 kHz. A lower API rate is carried by zero-stuffing the input by
+    // `upsample` and letting `compute_mdcts` clear everything above the original Nyquist
+    // (`celt_preemphasis`, `celt_encoder.c:533-539`) — an integer-ratio interpolation whose images
+    // the band range then discards, not a resampler.
+    let source_length = n / upsample;
+    if upsample != 1 {
+        inp[..n].fill(0.0);
+    }
+    for i in 0..source_length {
         let mut x = pcm[channels * i + channel] * CELT_SIG_SCALE;
         if clip {
             x = x.clamp(-65536.0, 65536.0);
         }
+        inp[i * upsample] = x;
+    }
+    for slot in inp[..n].iter_mut() {
+        let x = *slot;
         // SHL32(x, SIG_SHIFT) and SHR32(MULT16_16(coef0,x), 15-SIG_SHIFT) are both the identity
         // scaling in the float build (arch.h: SIG_SHIFT is fixed-point only).
-        inp[i] = x - m;
+        *slot = x - m;
         m = coef0 * x;
     }
     *mem = m;
@@ -262,7 +275,7 @@ mod tests {
 
         let mut sig = vec![0f32; n];
         let mut enc_mem = 0f32;
-        celt_preemphasis(&pcm, &mut sig, n, 1, 0, coef0, &mut enc_mem, false);
+        celt_preemphasis(&pcm, &mut sig, n, 1, 0, 1, coef0, &mut enc_mem, false);
 
         let mut back = vec![0f32; n];
         let mut dec_mem = 0f32;
@@ -287,7 +300,7 @@ mod tests {
         // One 200-sample pass.
         let mut one = vec![0f32; 200];
         let mut mem = 0f32;
-        celt_preemphasis(&pcm, &mut one, 200, 1, 0, coef0, &mut mem, false);
+        celt_preemphasis(&pcm, &mut one, 200, 1, 0, 1, coef0, &mut mem, false);
 
         // Two 100-sample passes sharing the memory.
         let mut two = vec![0f32; 200];
@@ -298,12 +311,13 @@ mod tests {
             100,
             1,
             0,
+            1,
             coef0,
             &mut mem2,
             false,
         );
         let (_, second) = two.split_at_mut(100);
-        celt_preemphasis(&pcm[100..], second, 100, 1, 0, coef0, &mut mem2, false);
+        celt_preemphasis(&pcm[100..], second, 100, 1, 0, 1, coef0, &mut mem2, false);
 
         assert_eq!(one, two);
         assert!((mem - mem2).abs() < 1e-9);
@@ -324,8 +338,8 @@ mod tests {
         let mut right = vec![0f32; n];
         let mut ml = 0f32;
         let mut mr = 0f32;
-        celt_preemphasis(&pcm, &mut left, n, 2, 0, coef0, &mut ml, false);
-        celt_preemphasis(&pcm, &mut right, n, 2, 1, coef0, &mut mr, false);
+        celt_preemphasis(&pcm, &mut left, n, 2, 0, 1, coef0, &mut ml, false);
+        celt_preemphasis(&pcm, &mut right, n, 2, 1, 1, coef0, &mut mr, false);
         // First sample has no memory yet, so it is just the scaled input.
         assert!((left[0] - 0.0).abs() < 1e-6);
         assert!((right[1] - (-0.02 * 32768.0 - coef0 * 0.0)).abs() < 1e-2);
@@ -339,7 +353,7 @@ mod tests {
         let pcm = [3.0f32, -3.0, 0.5];
         let mut clipped = [0f32; 3];
         let mut mem = 0f32;
-        celt_preemphasis(&pcm, &mut clipped, 3, 1, 0, coef0, &mut mem, true);
+        celt_preemphasis(&pcm, &mut clipped, 3, 1, 0, 1, coef0, &mut mem, true);
         // 3.0*32768 = 98304 clamps to 65536.
         assert!((clipped[0] - 65536.0).abs() < 1e-3, "{}", clipped[0]);
 
@@ -348,8 +362,18 @@ mod tests {
         let mut without_clip = [0f32; 2];
         let mut m1 = 0f32;
         let mut m2 = 0f32;
-        celt_preemphasis(&inside, &mut with_clip, 2, 1, 0, coef0, &mut m1, true);
-        celt_preemphasis(&inside, &mut without_clip, 2, 1, 0, coef0, &mut m2, false);
+        celt_preemphasis(&inside, &mut with_clip, 2, 1, 0, 1, coef0, &mut m1, true);
+        celt_preemphasis(
+            &inside,
+            &mut without_clip,
+            2,
+            1,
+            0,
+            1,
+            coef0,
+            &mut m2,
+            false,
+        );
         assert_eq!(with_clip, without_clip);
     }
 }

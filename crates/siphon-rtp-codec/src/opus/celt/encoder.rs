@@ -98,6 +98,10 @@ pub struct CeltEncoder {
     /// `st->disable_pf` — set by `CELT_SET_PREDICTION(0..1)`; the Opus layer turns the prefilter off
     /// for a redundancy frame, which must be decodable without the previous frame's comb state.
     disable_pf: bool,
+    /// `st->upsample` = `48000 / Fs` (`resampling_factor`, `celt/modes.c`). CELT has exactly one
+    /// mode, at 48 kHz; a lower API rate is carried by zero-stuffing the input and clearing the
+    /// spectrum above the original Nyquist, not by a second MDCT size.
+    upsample: usize,
     /// Forward-MDCT / FFT lookup for the 48 kHz mode (`mode->mdct`, base length 1920, shifts 0..=3).
     mdct: MdctLookup,
     /// Target bitrate in bit/s (`st->bitrate`).
@@ -196,6 +200,7 @@ impl CeltEncoder {
             stream_channels: channels,
             silk_info: SilkInfo::default(),
             disable_pf: false,
+            upsample: 1,
             mdct,
             // `OPUS_BITRATE_MAX` in libopus; the caller normally sets a real target.
             bitrate: -1,
@@ -363,6 +368,28 @@ impl CeltEncoder {
         Ok(())
     }
 
+    /// Set the API sample rate, 8/12/16/24/48 kHz (`celt_encoder_init`'s `Fs`).
+    ///
+    /// It selects `upsample = 48000 / Fs`, which is the *only* thing a lower rate changes: the MDCT,
+    /// the band layout and the bitstream all stay the 48 kHz mode's, and the input is zero-stuffed
+    /// with the images cleared. `frame_size` in [`CeltEncoder::encode`] stays the count at the API
+    /// rate.
+    pub fn set_sample_rate(&mut self, sample_rate_hz: u32) -> Result<(), CodecError> {
+        self.upsample = match sample_rate_hz {
+            48_000 => 1,
+            24_000 => 2,
+            16_000 => 3,
+            12_000 => 4,
+            8_000 => 6,
+            _ => {
+                return Err(CodecError::Unsupported(
+                    "celt: sample rate must be 8, 12, 16, 24 or 48 kHz",
+                ))
+            }
+        };
+        Ok(())
+    }
+
     /// `CELT_SET_SILK_INFO` — what the SILK layer decided for this frame. Only read in hybrid mode
     /// (`start != 0`), where it moves the tf resolution and the VBR target.
     pub fn set_silk_info(&mut self, info: SilkInfo) {
@@ -487,7 +514,10 @@ impl CeltEncoder {
         enc: &mut RangeEncoder<'_>,
         packet_bytes: i32,
     ) -> Result<usize, CodecError> {
-        // ── Frame size → LM (celt_encoder.c:1520) ────────────────────────────────────────────────
+        // ── Frame size → LM (celt_encoder.c:1519-1527) ───────────────────────────────────────────
+        // `frame_size` is the count at the API rate; the MDCT always runs at 48 kHz.
+        let api_frame_size = frame_size;
+        let frame_size = frame_size * self.upsample;
         let lm = (0..=MAX_LM)
             .find(|&candidate| (SHORT_MDCT_SIZE << candidate) == frame_size)
             .ok_or(CodecError::BadFrameSize {
@@ -500,9 +530,9 @@ impl CeltEncoder {
         let cc = self.channels;
         // `C` — coded channels, which the entropy coding and the band analysis work in.
         let channels = self.stream_channels;
-        if pcm.len() < n * cc {
+        if pcm.len() < api_frame_size * cc {
             return Err(CodecError::OutputTooSmall {
-                needed: n * cc,
+                needed: api_frame_size * cc,
                 have: pcm.len(),
             });
         }
@@ -586,12 +616,13 @@ impl CeltEncoder {
         // ── Silence detection + flag (celt_encoder.c:1644) ───────────────────────────────────────
         // The peak is taken over `C*(N-overlap)` interleaved samples and then over the `C*overlap`
         // tail, which is carried into the next frame.
-        let head = channels * n.saturating_sub(OVERLAP);
+        let head = channels * n.saturating_sub(OVERLAP) / self.upsample;
+        let tail_end = channels * n / self.upsample;
         let sample_max = self
             .overlap_max
             .max(peak_abs(&pcm[..head]))
-            .max(peak_abs(&pcm[head..channels * n]));
-        self.overlap_max = peak_abs(&pcm[head..channels * n]);
+            .max(peak_abs(&pcm[head..tail_end]));
+        self.overlap_max = peak_abs(&pcm[head..tail_end]);
         // The flag is the first symbol of a CELT-only frame; in hybrid the decoder does not read one
         // and the frame is never silent as far as CELT is concerned (celt_encoder.c:1656-1659).
         let silence = if tell_at_entry == 1 {
@@ -629,6 +660,7 @@ impl CeltEncoder {
                 n,
                 cc,
                 c,
+                self.upsample,
                 PREEMPH[0],
                 &mut self.preemph_mem[c],
                 need_clip,
@@ -1287,6 +1319,18 @@ impl CeltEncoder {
                 out[i] = 0.5 * out[i] + 0.5 * out[n + i];
             }
         }
+        if self.upsample != 1 {
+            // The zero-stuffed input has `upsample` copies of the spectrum; keep the first and clear
+            // the images, scaling to undo the interpolation's loss (`celt_encoder.c:494-503`).
+            let bound = n / self.upsample;
+            for c in 0..self.stream_channels {
+                let base = c * n;
+                for i in 0..bound {
+                    out[base + i] *= self.upsample as f32;
+                }
+                out[base + bound..base + n].fill(0.0);
+            }
+        }
     }
 
     /// Pitch search + the prefilter comb applied to `input` (libopus `run_prefilter`,
@@ -1875,6 +1919,59 @@ mod hybrid_tests {
                 b[..written_b],
                 "frame {frame}: bytes diverged"
             );
+        }
+    }
+
+    /// Band `start + 1` of a hybrid frame is **wider** than band `start`, so its fold source runs
+    /// past the current band's own start in the norm buffer — which is exactly what
+    /// `special_hybrid_folding` sets up. Every stereo path has to survive that, including the theta
+    /// rate-distortion trials at complexity 10, which re-derive the fold source per trial.
+    ///
+    /// A regression here is an out-of-bounds index, not a quality loss, so the assertion is simply
+    /// that a full sweep encodes.
+    #[test]
+    fn the_hybrid_fold_source_survives_every_stereo_path() {
+        const FRAME: usize = 960;
+        let mono = signal(FRAME * 6, 0xF01D);
+        let mut interleaved = vec![0f32; FRAME * 6 * 2];
+        for (index, &sample) in mono.iter().enumerate() {
+            interleaved[2 * index] = sample;
+            interleaved[2 * index + 1] = 0.6 * sample + 0.4 * mono[mono.len() - 1 - index];
+        }
+
+        for complexity in [5i32, 8, 10] {
+            for &(bitrate, rate_control) in &[
+                (24_000i32, RateControl::Vbr),
+                (48_000, RateControl::ConstrainedVbr),
+                (96_000, RateControl::ConstantBitrate),
+            ] {
+                for end in [19usize, NB_BANDS] {
+                    let mut encoder = CeltEncoder::with_channels(2).expect("encoder");
+                    encoder.set_bitrate(bitrate);
+                    encoder.set_rate_control(rate_control);
+                    encoder.set_complexity(complexity).expect("complexity");
+                    encoder.set_band_range(17, end).expect("band range");
+                    for frame in 0..6 {
+                        let mut buffer = [0u8; 300];
+                        let mut enc = RangeEncoder::new(&mut buffer);
+                        fill_prefix(&mut enc, 400);
+                        encoder
+                            .encode_with_range_encoder(
+                                &interleaved[frame * FRAME * 2..(frame + 1) * FRAME * 2],
+                                FRAME,
+                                &mut enc,
+                                300,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "complexity {complexity}, {bitrate} bit/s, end {end}, \
+                                     frame {frame}: {error:?}"
+                                )
+                            });
+                        enc.done();
+                    }
+                }
+            }
         }
     }
 

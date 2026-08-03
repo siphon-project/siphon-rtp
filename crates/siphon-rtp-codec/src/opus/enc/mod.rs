@@ -18,5 +18,6 @@
 
 pub mod decision;
 
+pub mod encoder;
 pub mod highpass;
 pub mod packer;

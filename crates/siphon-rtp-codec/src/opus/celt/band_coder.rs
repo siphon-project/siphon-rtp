@@ -863,11 +863,13 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
     norm: &mut [f32],
     cur_norm: usize,
     effective_lowband: i32,
+    overlapping_lowband: Option<&[f32]>,
     last: bool,
     coder: &mut C,
 ) -> u32 {
     /// One trial at the given rounding: the fold source (below `cur_norm`) and the fold destination
-    /// (at `cur_norm`) are disjoint halves of `norm`, so they are re-split per trial.
+    /// (at `cur_norm`) are disjoint halves of `norm`, so they are re-split per trial — except in the
+    /// hybrid case where the source runs past `cur_norm` and the caller hands it in pre-copied.
     #[allow(clippy::too_many_arguments)]
     fn trial<C: CeltCoder>(
         ctx: &mut BandCtx,
@@ -882,12 +884,15 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
         norm: &mut [f32],
         cur_norm: usize,
         effective_lowband: i32,
+        overlapping_lowband: Option<&[f32]>,
         last: bool,
         coder: &mut C,
     ) -> u32 {
         ctx.theta_round = round;
         let (norm_lo, norm_hi) = norm.split_at_mut(cur_norm);
-        let lowband: Option<&[f32]> = if effective_lowband >= 0 {
+        let lowband: Option<&[f32]> = if overlapping_lowband.is_some() {
+            overlapping_lowband
+        } else if effective_lowband >= 0 {
             Some(&norm_lo[effective_lowband as usize..])
         } else {
             None
@@ -917,6 +922,7 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
         norm,
         cur_norm,
         effective_lowband,
+        overlapping_lowband,
         last,
         coder,
     );
@@ -954,6 +960,7 @@ fn quant_band_stereo_rdo<C: CeltCoder>(
         norm,
         cur_norm,
         effective_lowband,
+        overlapping_lowband,
         last,
         coder,
     );
@@ -1141,6 +1148,29 @@ pub fn quant_all_bands<C: CeltCoder>(
         }
 
         let cur_norm = band_lo - norm_offset;
+
+        // The fold source can legitimately run *past* the current band's start. In hybrid mode band
+        // `start + 1` is wider than band `start`, so `special_hybrid_folding` duplicates band
+        // `start`'s norm forward to give it a full `n` samples to fold from (`bands.c:1113-1127`),
+        // and `effective_lowband` is then clamped to 0 with `effective_lowband + n > cur_norm`.
+        // libopus reads that straight out of the flat `norm` buffer, where the fold source and the
+        // current band's output region overlap; splitting the borrow at `cur_norm` would truncate it
+        // and index out of bounds. Copy those `n` samples out first — `quant_band` only reads the
+        // lowband, and only before anything is written back, so the copy is equivalent.
+        //
+        // CELT-only never takes this path (`norm_offset` is 0, so `cur_norm >= n` always holds for
+        // every band that has a fold source), and pays no copy.
+        let mut lowband_copy = [0f32; MAX_BAND];
+        let mut lowband2_copy = [0f32; MAX_BAND];
+        let overlapping_lowband =
+            effective_lowband >= 0 && (effective_lowband as usize) + n > cur_norm;
+        if overlapping_lowband {
+            let from = effective_lowband as usize;
+            let take = n.min(norm_len.saturating_sub(from));
+            lowband_copy[..take].copy_from_slice(&folds.norm[from..from + take]);
+            lowband2_copy[..take].copy_from_slice(&folds.norm2[from..from + take]);
+        }
+
         let x = &mut x_ch0[band_lo..band_hi];
 
         if channels == 2 {
@@ -1148,13 +1178,17 @@ pub fn quant_all_bands<C: CeltCoder>(
             if dual_stereo {
                 let (norm_lo, norm_hi) = folds.norm[..norm_len].split_at_mut(cur_norm);
                 let (norm2_lo, norm2_hi) = folds.norm2[..norm_len].split_at_mut(cur_norm);
-                let lowband: Option<&[f32]> = if effective_lowband >= 0 {
+                let lowband: Option<&[f32]> = if !overlapping_lowband && effective_lowband >= 0 {
                     Some(&norm_lo[effective_lowband as usize..])
+                } else if overlapping_lowband {
+                    Some(&lowband_copy[..n])
                 } else {
                     None
                 };
-                let lowband2: Option<&[f32]> = if effective_lowband >= 0 {
+                let lowband2: Option<&[f32]> = if !overlapping_lowband && effective_lowband >= 0 {
                     Some(&norm2_lo[effective_lowband as usize..])
+                } else if overlapping_lowband {
+                    Some(&lowband2_copy[..n])
                 } else {
                     None
                 };
@@ -1222,13 +1256,16 @@ pub fn quant_all_bands<C: CeltCoder>(
                             &mut folds.norm[..norm_len],
                             cur_norm,
                             effective_lowband,
+                            overlapping_lowband.then_some(&lowband_copy[..n]),
                             last,
                             coder,
                         );
                     }
                 } else {
                     let (norm_lo, norm_hi) = folds.norm[..norm_len].split_at_mut(cur_norm);
-                    let lowband: Option<&[f32]> = if effective_lowband >= 0 {
+                    let lowband: Option<&[f32]> = if overlapping_lowband {
+                        Some(&lowband_copy[..n])
+                    } else if effective_lowband >= 0 {
                         Some(&norm_lo[effective_lowband as usize..])
                     } else {
                         None
@@ -1247,7 +1284,9 @@ pub fn quant_all_bands<C: CeltCoder>(
             }
         } else {
             let (norm_lo, norm_hi) = folds.norm[..norm_len].split_at_mut(cur_norm);
-            let lowband: Option<&[f32]> = if effective_lowband >= 0 {
+            let lowband: Option<&[f32]> = if overlapping_lowband {
+                Some(&lowband_copy[..n])
+            } else if effective_lowband >= 0 {
                 Some(&norm_lo[effective_lowband as usize..])
             } else {
                 None

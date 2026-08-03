@@ -24,7 +24,11 @@
 
 use crate::CodecError;
 
-/// Largest Opus packet (RFC 6716 §3.4).
+/// Largest single Opus **frame** (RFC 6716 §3.4: the compressed data for one frame is at most 1275
+/// bytes, which is what the length field can express).
+///
+/// A *packet* is larger: a code-0 packet is a TOC plus a frame, so 1276 bytes, and a multi-frame
+/// packet is larger still. libopus caps its own output at 1276 (`opus_encoder.c:1090`).
 pub const MAX_PACKET_BYTES: usize = 1275;
 
 /// At most 48 frames per packet (§3.2.5): the 6-bit count, capped by the 120 ms total.
@@ -171,7 +175,12 @@ impl PacketBuilder {
             }
         });
         let lengths = &lengths[..self.count];
-        let max_len = pad_to.unwrap_or_else(|| output.len().min(MAX_PACKET_BYTES));
+        if lengths.iter().any(|&length| length > MAX_PACKET_BYTES) {
+            return Err(CodecError::Unsupported(
+                "opus enc: a frame longer than 1275 bytes has no representable length",
+            ));
+        }
+        let max_len = pad_to.unwrap_or(output.len());
         if max_len > output.len() {
             return Err(CodecError::OutputTooSmall {
                 needed: max_len,

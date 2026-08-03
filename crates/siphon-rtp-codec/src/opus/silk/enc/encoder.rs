@@ -119,6 +119,10 @@ pub struct EncoderConfig {
     /// The far end's reported packet loss, 0..=100. Moves the LBRR gain increase and the LTP
     /// scaling decision.
     pub packet_loss_percent: i32,
+    /// `silk_mode.toMono` — the Opus layer is about to drop this stream to one coded channel, so
+    /// fade the side channel out over this packet rather than cutting it (`silk_stereo_LR_to_MS`'s
+    /// `toMono`, `stereo_LR_to_MS.c:117-127`). It is set for exactly one packet before the switch.
+    pub to_mono: bool,
 }
 
 impl EncoderConfig {
@@ -136,6 +140,7 @@ impl EncoderConfig {
             use_in_band_fec: false,
             use_dtx: false,
             packet_loss_percent: 0,
+            to_mono: false,
         }
     }
 
@@ -167,6 +172,13 @@ struct ChannelState {
     lbrr_flags: [bool; MAX_FRAMES_PER_PACKET],
     /// `pulses_LBRR` / `indices_LBRR` — the redundant frames awaiting the next packet.
     lbrr: [LbrrFrame; MAX_FRAMES_PER_PACKET],
+    /// `LBRR_flag` — whether this channel wrote any LBRR data into the packet being built.
+    ///
+    /// Deliberately **not** `lbrr_flags.iter().any(...)` at patch time: by then those flags have been
+    /// cleared and repopulated with the frames generated for the *next* packet, so reading them
+    /// would advertise redundancy this packet does not carry. libopus keeps the two apart for the
+    /// same reason (`enc_API.c:359`, `:527`).
+    lbrr_flag: bool,
     /// `LBRR_GainIncreases`.
     lbrr_gain_increase: i32,
     /// Whether LBRR was enabled for the previous packet, which decides the gain increase.
@@ -192,6 +204,7 @@ impl Default for ChannelState {
             vad_flags: [false; MAX_FRAMES_PER_PACKET],
             lbrr_flags: [false; MAX_FRAMES_PER_PACKET],
             lbrr: [LbrrFrame::default(); MAX_FRAMES_PER_PACKET],
+            lbrr_flag: false,
             lbrr_gain_increase: 7,
             lbrr_was_enabled: false,
             measures: SignalMeasures::default(),
@@ -267,6 +280,67 @@ impl SilkEncoder {
         &self.config
     }
 
+    /// Retune a live encoder (libopus `silk_control_encoder`, `control_codec.c:56-150`).
+    ///
+    /// The Opus layer calls this every packet, because the bitrate, the reported loss and the FEC
+    /// and DTX flags can all move without anything else changing. Those are pure retunes and reset
+    /// nothing. Two changes are **not** retunes and reset the state the reference resets:
+    ///
+    /// * **The internal rate** (`silk_setup_fs`, `control_codec.c:187-297`): every filter in the
+    ///   analysis, the noise-shaping quantiser and the NLSF predictor is defined at one rate, so
+    ///   carrying their state across is meaningless. The C clears the shaping state, the NSQ, the
+    ///   previous NLSFs and the LP state and re-seeds `prevLag = 100`, `LastGainIndex = 10`,
+    ///   `prevSignalType = inactive`, `first_frame_after_reset = 1` — which is exactly
+    ///   [`FrameEncoderState::default`] as this encoder builds it. The VAD, the stereo state and the
+    ///   bit reservoir survive, as they do in the C.
+    /// * **A frame-duration or channel-count change** (`transition`, `enc_API.c:198`): the pending
+    ///   LBRR frames were generated for a layout this packet no longer has, so their flags are
+    ///   cleared rather than written into a packet that cannot carry them.
+    ///
+    /// Errors on a configuration SILK does not define, leaving the encoder untouched.
+    pub fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), CodecError> {
+        if config.channels == 0 || config.channels > 2 {
+            return Err(CodecError::Unsupported(
+                "silk enc: internal channels must be 1 or 2",
+            ));
+        }
+        config.layout()?;
+
+        let rate_changed = config.internal_rate != self.config.internal_rate;
+        if rate_changed {
+            for channel in self.channels.iter_mut() {
+                let mut frame = FrameEncoderState::default();
+                // `silk_control_encoder`'s re-seed (`control_codec.c:246-258`).
+                frame.analysis.shape.last_gain_index = 10;
+                frame.analysis.previous_lag = 100;
+                channel.frame = frame;
+                channel.input = [0.0; INPUT_BUFFER];
+            }
+        }
+        // `silk_setup_fs` sets `first_frame_after_reset`, and `enc_API.c:259-263` clears the pending
+        // LBRR flags on either that or a layout transition. Both matter for the same reason: those
+        // redundant frames were generated at the *old* rate and layout, and writing them into a
+        // packet coded at the new one desynchronises the decoder outright — which is exactly what it
+        // did, at the second packet of a rate-switching FEC stream.
+        let transition = rate_changed
+            || config.duration_ms != self.config.duration_ms
+            || config.channels != self.config.channels;
+        if config.channels > self.config.channels {
+            // Mono to stereo: the side channel has no history at all (`enc_API.c:181-196`).
+            self.channels[1] = ChannelState::default();
+            self.stereo = StereoEncoderState::default();
+        }
+        if transition {
+            for channel in self.channels.iter_mut() {
+                channel.lbrr_flags = [false; MAX_FRAMES_PER_PACKET];
+            }
+            self.stereo_indices = [StereoIndices::default(); MAX_FRAMES_PER_PACKET];
+            self.previous_mid_only = false;
+        }
+        self.config = config;
+        Ok(())
+    }
+
     /// Samples per channel one [`SilkEncoder::encode`] call consumes.
     #[must_use]
     pub fn samples_per_packet(&self) -> usize {
@@ -321,7 +395,7 @@ impl SilkEncoder {
             for frame in 0..layout.frames_per_packet {
                 flags = (flags << 1) | u32::from(channel.vad_flags[frame]);
             }
-            flags = (flags << 1) | u32::from(channel.lbrr_flags.iter().any(|&flag| flag));
+            flags = (flags << 1) | u32::from(channel.lbrr_flag);
         }
         let flag_bits = (layout.frames_per_packet as u32 + 1) * channels as u32;
         encoder.patch_initial_bits(flags, flag_bits);
@@ -367,11 +441,14 @@ impl SilkEncoder {
         // The per-channel LBRR bit patterns. The global flag itself is patched in at the end, so
         // only the multi-frame pattern symbol is coded here.
         let mut any = false;
-        for channel in self.channels.iter().take(channels) {
+        for channel in self.channels.iter_mut().take(channels) {
             let mut symbol = 0usize;
             for frame in 0..layout.frames_per_packet {
                 symbol |= usize::from(channel.lbrr_flags[frame]) << frame;
             }
+            // `LBRR_flag` is latched here, from what is about to be written, and read again when the
+            // header flags are patched in — long after `lbrr_flags` has been reused.
+            channel.lbrr_flag = symbol > 0;
             if symbol > 0 {
                 any = true;
                 if layout.frames_per_packet > 1 {
@@ -585,7 +662,7 @@ impl SilkEncoder {
             &mut side[..frame_length + 2],
             target_bps,
             previous_activity,
-            false,
+            self.config.to_mono,
             rate_khz,
             frame_length,
         );
@@ -1120,6 +1197,74 @@ mod tests {
                 "packet {packet}: {smoothed} left [{lower}, {upper}]"
             );
         }
+    }
+
+    /// A retune must not disturb the stream; an internal-rate change must reset the rate-dependent
+    /// state and nothing else.
+    #[test]
+    fn reconfiguring_resets_exactly_what_the_rate_depends_on() {
+        let config = EncoderConfig::new(InternalRate::Wide16k, 20, 24_000);
+        let mut encoder = SilkEncoder::new(config).expect("config");
+        let per_packet = encoder.samples_per_packet();
+        let speech = voiced(per_packet * 12, 80);
+        let encode = |encoder: &mut SilkEncoder, packet: usize| -> Vec<u8> {
+            let mut buffer = vec![0u8; 1275];
+            let mut range = RangeEncoder::new(&mut buffer);
+            let start = packet * encoder.samples_per_packet();
+            let count = encoder.samples_per_packet();
+            let result = encoder
+                .encode(&speech[start..start + count], &mut range)
+                .expect("encode");
+            range.done();
+            buffer[..result.payload_bytes.max(1)].to_vec()
+        };
+        for packet in 0..4 {
+            encode(&mut encoder, packet);
+        }
+
+        // A pure retune: the bitrate moves, nothing resets, so the next packet must differ from what
+        // the *original* rate would have produced but must still carry the previous frames' history.
+        let before_lag = encoder.channels[0].frame.analysis.previous_lag;
+        let mut retuned = config;
+        retuned.bitrate_bps = 32_000;
+        retuned.packet_loss_percent = 10;
+        encoder.reconfigure(retuned).expect("retune");
+        assert_eq!(
+            encoder.channels[0].frame.analysis.previous_lag, before_lag,
+            "a retune must not reset the analysis"
+        );
+        assert_eq!(encoder.config().bitrate_bps, 32_000);
+        assert_eq!(encoder.config().packet_loss_percent, 10);
+
+        // An internal-rate change resets the rate-dependent state to its documented seeds.
+        let mut narrowed = retuned;
+        narrowed.internal_rate = InternalRate::Narrow8k;
+        encoder.reconfigure(narrowed).expect("rate change");
+        assert_eq!(encoder.channels[0].frame.analysis.previous_lag, 100);
+        assert_eq!(encoder.channels[0].frame.analysis.shape.last_gain_index, 10);
+        assert!(encoder.channels[0].frame.analysis.first_frame_after_reset);
+        assert_eq!(encoder.samples_per_packet(), 160);
+        // The VAD and the reservoir are *not* reset, as in the C.
+        assert!(encoder.channels[0].measures.speech_activity_q8 > 0);
+
+        // And the reconfigured encoder still produces packets.
+        let mut buffer = vec![0u8; 1275];
+        let mut range = RangeEncoder::new(&mut buffer);
+        let result = encoder
+            .encode(&vec![0i16; encoder.samples_per_packet()], &mut range)
+            .expect("encode after reconfigure");
+        range.done();
+        assert!(result.payload_bytes > 0);
+
+        // An illegal configuration must be refused without disturbing the encoder.
+        let mut illegal = narrowed;
+        illegal.duration_ms = 30;
+        assert!(encoder.reconfigure(illegal).is_err());
+        assert_eq!(encoder.config().duration_ms, 20);
+        illegal.duration_ms = 20;
+        illegal.channels = 3;
+        assert!(encoder.reconfigure(illegal).is_err());
+        assert_eq!(encoder.config().channels, 1);
     }
 
     /// A configuration SILK does not define must be rejected rather than silently coerced.
