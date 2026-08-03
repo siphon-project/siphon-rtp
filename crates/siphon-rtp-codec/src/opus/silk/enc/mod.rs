@@ -76,6 +76,7 @@
 //!    inside the legal per-rate range, and an NLSF index vector is always decodable.
 
 pub mod bitstream;
+pub mod encoder;
 pub mod fixed;
 pub mod float;
 pub mod frame;
@@ -88,6 +89,7 @@ pub mod nsq_del_dec;
 pub mod pitch;
 pub mod pred_coefs;
 pub mod rate_control;
+pub mod stereo;
 pub mod vad;
 
 /// `MAX_SHAPE_LPC_ORDER` (`define.h:155`) — the largest noise-shaping AR order, at complexity 10.
