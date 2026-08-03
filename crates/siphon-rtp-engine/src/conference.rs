@@ -40,17 +40,35 @@ use siphon_rtp_srtp::leg::SecureLeg;
 
 use crate::media_pipeline::{Outbound, SymmetricLatch};
 
-/// The wideband room rate. A room runs at this rate whenever any participant is wideband (>8 kHz) or
-/// the room is bridged; an all-narrowband, unbridged room drops to `NARROWBAND_RATE_HZ` so it pays
-/// no resampling at all (the common all-G.711 / PSTN conference).
-pub const ROOM_RATE_HZ: u32 = 16_000;
 /// The narrowband fast-path room rate (all-G.711/G.726/PSTN, unbridged).
-const NARROWBAND_RATE_HZ: u32 = 8_000;
+pub const NARROWBAND_RATE_HZ: u32 = 8_000;
+/// The wideband room rate — G.722 (RFC 3551 §4.5.2), AMR-WB (3GPP TS 26.171), 16 kHz Opus.
+pub const WIDEBAND_RATE_HZ: u32 = 16_000;
+/// The full-band room rate. Opus is a 48 kHz codec (RFC 7587 §4.1 fixes its RTP clock at 48 kHz and
+/// RFC 6716 §2 its full-band mode at a 20 kHz audio bandwidth), so an all-full-band, unbridged room
+/// mixes here and no resampler is built at all — the WebRTC/voice-AI conference keeps everything
+/// Opus carries instead of being folded into a 16 kHz room.
+pub const FULLBAND_RATE_HZ: u32 = 48_000;
+/// The room-rate ladder, ascending. [`Conference::recompute_room_rate`] picks the **lowest tier that
+/// is at least every participant's native rate**, so no participant is ever downsampled on the way
+/// into the mix (an all-narrowband room stays at 8 kHz and pays no resampling; an all-full-band room
+/// stays at 48 kHz for the same reason). A participant between two tiers — a 12/24 kHz Opus
+/// `maxplaybackrate`, say — is upsampled to the tier above rather than losing band on the way in.
+/// The ladder index also keys the shared listener downsamplers, so it must stay ascending.
+const ROOM_RATE_TIERS: [u32; 3] = [NARROWBAND_RATE_HZ, WIDEBAND_RATE_HZ, FULLBAND_RATE_HZ];
+/// The rate a **bridged** room is pinned to. A bridge carries bare room-rate frames with no rate tag
+/// and the two rooms' memberships move independently, so the only way both ends can agree without
+/// inter-room resampling is a fixed rate — the wideband tier, which every codec here can reach.
+const BRIDGE_RATE_HZ: u32 = WIDEBAND_RATE_HZ;
+/// The highest room rate — the room-frame scratch capacity.
+pub const MAX_ROOM_RATE_HZ: u32 = FULLBAND_RATE_HZ;
+/// The room playout interval in milliseconds (RFC 3551 default ptime).
+const ROOM_TICK_MS: usize = 20;
 /// Samples in one 20 ms room frame at the **maximum** room rate — the scratch-buffer capacity. The
-/// live frame is `room_frame` (8 kHz → 160, 16 kHz → 320).
-const ROOM_FRAME: usize = (ROOM_RATE_HZ as usize / 1000) * 20;
+/// live frame is `room_frame` (8 kHz → 160, 16 kHz → 320, 48 kHz → 960).
+const ROOM_FRAME: usize = (MAX_ROOM_RATE_HZ as usize / 1000) * ROOM_TICK_MS;
 /// The room playout tick — one mixed frame per participant per 20 ms (RFC 3551 default ptime).
-pub const ROOM_TICK: std::time::Duration = std::time::Duration::from_millis(20);
+pub const ROOM_TICK: std::time::Duration = std::time::Duration::from_millis(ROOM_TICK_MS as u64);
 /// Samples **per channel** in the longest decoded native frame the scratch buffers accommodate:
 /// 48 kHz (Opus full-band, RFC 7587 §4.1) × 120 ms (the RFC 7587 §6.1 `maxptime` ceiling, which is
 /// also the longest audio one RFC 6716 §3.2 code-3 packet can carry) = 5760.
@@ -200,8 +218,10 @@ pub struct Conference {
     participants: Vec<Participant>,
     /// Active-speaker cap (`0` = no cap).
     top_m: usize,
-    /// The live room mix rate — [`NARROWBAND_RATE_HZ`] for an all-narrowband, unbridged room, else
-    /// [`ROOM_RATE_HZ`]. Recomputed on every membership / bridge change.
+    /// The live room mix rate — the lowest [`ROOM_RATE_TIERS`] entry that carries every participant
+    /// without downsampling ([`NARROWBAND_RATE_HZ`] for an all-narrowband room, [`FULLBAND_RATE_HZ`]
+    /// for an all-Opus one), or [`BRIDGE_RATE_HZ`] while the room is bridged. Recomputed on every
+    /// membership / bridge change.
     room_rate: u32,
     /// Samples per 20 ms room frame at `room_rate` (≤ [`ROOM_FRAME`], the buffer capacity).
     room_frame: usize,
@@ -219,7 +239,7 @@ pub struct Conference {
     rtp: Vec<u8>,
     /// Room bridges (live-configurable, plan §7): each tick this room feeds its participant mix to
     /// every `bridge_out` and hears every `bridge_in` as an extra contributor. A bridged room is
-    /// forced to [`ROOM_RATE_HZ`], so both ends of a bridge share the rate and no inter-room
+    /// forced to [`BRIDGE_RATE_HZ`], so both ends of a bridge share the rate and no inter-room
     /// resampling is needed.
     bridge_in: Vec<flume::Receiver<Vec<i16>>>,
     bridge_out: Vec<flume::Sender<Vec<i16>>>,
@@ -231,15 +251,18 @@ pub struct Conference {
     /// reused across ticks (`share_count` is the live length); only the first `share_count` are valid.
     share_classes: Vec<(u8, Vec<u8>)>,
     share_count: usize,
-    /// Shared room→8 kHz downsampler for the **mixed-rate** shared-encode path: when the room runs at
-    /// 16 kHz, narrowband listeners hear one downsampled copy of the listener mix (not each their own),
-    /// so the resample is shared too. `Some` only when the room is wideband.
-    listener_downsample: Option<Resampler>,
-    /// The listener mix downsampled to 8 kHz this tick (filled lazily by the first narrowband
-    /// shared-encode listener), reused by the rest.
-    listener_native_buf: Vec<i16>,
-    /// Whether `listener_native_buf` has been computed this tick.
-    listener_native_ready: bool,
+    /// Shared room→tier downsamplers for the **mixed-rate** shared-encode path, indexed by
+    /// [`ROOM_RATE_TIERS`]. Entry `i` converts the listener mix down to `ROOM_RATE_TIERS[i]` and is
+    /// `Some` exactly while that tier sits below the live room rate. A 48 kHz room therefore shares
+    /// *one* 8 kHz copy and *one* 16 kHz copy of the listener mix with all of its narrowband and
+    /// wideband listeners, rather than resampling once per listener. The top tier never needs one
+    /// (nothing is above it), so the array is one shorter than the ladder.
+    listener_downsample: [Option<Resampler>; ROOM_RATE_TIERS.len() - 1],
+    /// The listener mix downsampled to each lower tier this tick, filled lazily by that tier's first
+    /// shared-encode listener and reused by the rest.
+    listener_native_buf: [Vec<i16>; ROOM_RATE_TIERS.len() - 1],
+    /// Whether `listener_native_buf[i]` has been computed this tick.
+    listener_native_ready: [bool; ROOM_RATE_TIERS.len() - 1],
     /// DTMF events detected on ingress this drain cycle (RFC 4733), drained by the actor to the
     /// control channel.
     pending_events: Vec<Event>,
@@ -260,8 +283,8 @@ impl Conference {
             mixer: Mixer::new(MAX_PARTICIPANTS, ROOM_FRAME),
             participants: Vec::new(),
             top_m,
-            room_rate: ROOM_RATE_HZ,
-            room_frame: ROOM_FRAME,
+            room_rate: WIDEBAND_RATE_HZ,
+            room_frame: room_frame_for(WIDEBAND_RATE_HZ),
             room_rows: (0..MAX_PARTICIPANTS)
                 .map(|_| vec![0i16; ROOM_FRAME])
                 .collect(),
@@ -281,10 +304,11 @@ impl Conference {
             external_buf: vec![0i16; ROOM_FRAME],
             share_classes: Vec::new(),
             share_count: 0,
-            // The room starts wideband (16 kHz), so the room→8 kHz downsampler exists from the start.
-            listener_downsample: Resampler::new(ROOM_RATE_HZ, NARROWBAND_RATE_HZ).ok(),
-            listener_native_buf: vec![0i16; ROOM_FRAME],
-            listener_native_ready: false,
+            // The room starts wideband, so only the 8 kHz shared downsampler exists from the start;
+            // `recompute_room_rate` rebuilds the set whenever the room rate moves.
+            listener_downsample: build_listener_downsamplers(WIDEBAND_RATE_HZ),
+            listener_native_buf: std::array::from_fn(|_| vec![0i16; ROOM_FRAME]),
+            listener_native_ready: [false; ROOM_RATE_TIERS.len() - 1],
             pending_events: Vec::new(),
             clear_in: Vec::with_capacity(MAX_RTP),
             secure_out: Vec::with_capacity(MAX_RTP),
@@ -304,10 +328,18 @@ impl Conference {
         self.participants.len()
     }
 
-    /// The live room mix rate (8 kHz for an all-narrowband, unbridged room, else 16 kHz).
+    /// The live room mix rate — the lowest [`ROOM_RATE_TIERS`] entry that carries every seated
+    /// participant without downsampling it (8 kHz all-narrowband, 16 kHz mixed/wideband, 48 kHz
+    /// all-full-band), or [`BRIDGE_RATE_HZ`] while the room is bridged.
     #[must_use]
     pub fn room_rate(&self) -> u32 {
         self.room_rate
+    }
+
+    /// Samples in one 20 ms room frame at the live room rate.
+    #[must_use]
+    pub fn room_frame(&self) -> usize {
+        self.room_frame
     }
 
     /// Whether the room has no participants (the actor tears the room down when this becomes true).
@@ -738,7 +770,7 @@ impl Conference {
         // listener mix; resample room → native, encode, packetize with the leg's own SSRC, transmit.
         // Stateless listeners on the same codec share one encode of the listener mix (shared-encode).
         self.share_count = 0;
-        self.listener_native_ready = false;
+        self.listener_native_ready = [false; ROOM_RATE_TIERS.len() - 1];
         for index in 0..count {
             let dst = self.participants[index].egress_dst;
             if !destination_usable(dst) {
@@ -749,13 +781,14 @@ impl Conference {
             let native_frame = self.participants[index].native_frame;
 
             // A listener (no distinct mix) on a stateless codec shares the encode: either the listener
-            // mix is already its native PCM (native == room), or it is one shared room→8 kHz downsample
-            // (narrowband listener in a wideband room) — encode once per codec and fan out.
+            // mix is already its native PCM (native == room), or it is one shared room→tier downsample
+            // (a narrowband or wideband listener in a higher-rate room, e.g. G.711 and AMR-WB legs in
+            // a 48 kHz Opus room) — encode once per codec and fan out.
             let native_rate = self.participants[index].native_rate;
             let shareable = !self.mixer.has_distinct_output(index)
                 && self.participants[index].stateless
                 && (native_rate == self.room_rate
-                    || (native_rate == NARROWBAND_RATE_HZ && self.room_rate == ROOM_RATE_HZ));
+                    || shared_downsample_tier(native_rate, self.room_rate).is_some());
 
             let payload_len = if shareable {
                 match self.shared_encode(index) {
@@ -866,8 +899,9 @@ impl Conference {
             Some(len)
         } else {
             // First listener of this codec this tick: encode the listener mix once and cache it. When
-            // the listener's native rate differs from the room (a narrowband leg in a wideband room),
-            // encode the shared room→8 kHz downsample instead of the room-rate mix.
+            // the listener's native rate is below the room's (a narrowband or wideband leg in a
+            // higher-rate room), encode that tier's shared room→tier downsample instead of the
+            // room-rate mix — one resample per tier per tick, not one per listener.
             let native_rate = self.participants[index].native_rate;
             let native_frame = self.participants[index].native_frame;
             let len = if native_rate == self.room_rate {
@@ -876,10 +910,16 @@ impl Conference {
                     .encode_payload(self.mixer.listener_mix(), &mut self.payload)
                     .ok()?
             } else {
-                self.ensure_listener_native();
+                let tier = shared_downsample_tier(native_rate, self.room_rate)?;
+                if !self.ensure_listener_native(tier) {
+                    return None;
+                }
                 self.participants[index]
                     .leg
-                    .encode_payload(&self.listener_native_buf[..native_frame], &mut self.payload)
+                    .encode_payload(
+                        &self.listener_native_buf[tier][..native_frame],
+                        &mut self.payload,
+                    )
                     .ok()?
             };
             if self.share_count < self.share_classes.len() {
@@ -896,22 +936,26 @@ impl Conference {
         }
     }
 
-    /// Downsample the listener mix to 8 kHz once per tick (shared by every narrowband shared-encode
-    /// listener), into [`Conference::listener_native_buf`].
-    fn ensure_listener_native(&mut self) {
-        if self.listener_native_ready {
-            return;
+    /// Downsample the listener mix to [`ROOM_RATE_TIERS`]`[tier]` once per tick, into
+    /// `listener_native_buf[tier]` — shared by every shared-encode listener at that rate. Returns
+    /// whether the frame is available (`false` only when no downsampler exists for that tier, i.e.
+    /// the caller mis-classified the listener).
+    fn ensure_listener_native(&mut self, tier: usize) -> bool {
+        if self.listener_native_ready[tier] {
+            return true;
         }
-        if let Some(resampler) = self.listener_downsample.as_mut() {
-            self.resample_scratch.clear();
-            resampler.process(self.mixer.listener_mix(), &mut self.resample_scratch);
-            let narrowband_frame = (NARROWBAND_RATE_HZ as usize / 1000) * 20;
-            fill_padded(
-                &mut self.listener_native_buf[..narrowband_frame],
-                &self.resample_scratch,
-            );
-            self.listener_native_ready = true;
-        }
+        let Some(resampler) = self.listener_downsample[tier].as_mut() else {
+            return false;
+        };
+        self.resample_scratch.clear();
+        resampler.process(self.mixer.listener_mix(), &mut self.resample_scratch);
+        let tier_frame = room_frame_for(ROOM_RATE_TIERS[tier]);
+        fill_padded(
+            &mut self.listener_native_buf[tier][..tier_frame],
+            &self.resample_scratch,
+        );
+        self.listener_native_ready[tier] = true;
+        true
     }
 
     /// The single loudest active talker this tick (the dominant speaker), if any.
@@ -977,35 +1021,80 @@ impl Conference {
     }
 
     /// Recompute the room mix rate from the current membership + bridge state, rebuilding every
-    /// participant's resamplers if it changed. A room is narrowband only when every participant is
-    /// narrowband **and** it is not bridged (a bridge forces the wideband rate so both ends match).
+    /// participant's resamplers (and the shared listener downsamplers) if it changed.
+    ///
+    /// Unbridged, the room runs at the **lowest [`ROOM_RATE_TIERS`] entry that is at least the
+    /// highest seated participant's native rate**: an all-G.711 room stays at 8 kHz, an all-Opus room
+    /// at 48 kHz, and either way the participants at the room rate build no resampler at all. A
+    /// bridged room is pinned to [`BRIDGE_RATE_HZ`] instead, so both ends of a bridge agree on the
+    /// frames they exchange without any inter-room resampling.
     fn recompute_room_rate(&mut self) {
         let bridged = !self.bridge_in.is_empty() || !self.bridge_out.is_empty();
-        let all_narrowband = self
-            .participants
-            .iter()
-            .all(|participant| participant.native_rate <= NARROWBAND_RATE_HZ);
-        let target = if all_narrowband && !bridged {
-            NARROWBAND_RATE_HZ
+        let target = if bridged {
+            BRIDGE_RATE_HZ
         } else {
-            ROOM_RATE_HZ
+            let highest = self
+                .participants
+                .iter()
+                .map(|participant| participant.native_rate)
+                .max()
+                .unwrap_or(NARROWBAND_RATE_HZ);
+            room_tier_for(highest)
         };
         if target != self.room_rate {
             self.room_rate = target;
-            self.room_frame = (target as usize / 1000) * 20;
+            self.room_frame = room_frame_for(target);
             for participant in &mut self.participants {
                 let (to_room, from_room) = build_resamplers(participant.native_rate, target);
                 participant.to_room = to_room;
                 participant.from_room = from_room;
             }
-            // The shared room→8 kHz downsampler exists only when the room is wideband.
-            self.listener_downsample = if target == ROOM_RATE_HZ {
-                Resampler::new(ROOM_RATE_HZ, NARROWBAND_RATE_HZ).ok()
-            } else {
-                None
-            };
+            // Rebuild the shared room→tier downsamplers for the tiers now below the room rate.
+            self.listener_downsample = build_listener_downsamplers(target);
         }
     }
+}
+
+/// The lowest room tier that carries `rate` without downsampling it — the room-rate rule. A rate
+/// above the top tier (no codec here reaches one) is capped at [`MAX_ROOM_RATE_HZ`].
+fn room_tier_for(rate: u32) -> u32 {
+    ROOM_RATE_TIERS
+        .iter()
+        .copied()
+        .find(|&tier| tier >= rate)
+        .unwrap_or(MAX_ROOM_RATE_HZ)
+}
+
+/// Samples in one 20 ms room frame at `rate` (8 kHz → 160, 16 kHz → 320, 48 kHz → 960).
+const fn room_frame_for(rate: u32) -> usize {
+    (rate as usize / 1000) * ROOM_TICK_MS
+}
+
+/// The [`ROOM_RATE_TIERS`] index of `rate` when it is a ladder tier strictly **below** `room_rate` —
+/// i.e. when a shared room→`rate` downsample of the listener mix exists for it. `None` for a
+/// participant already at the room rate, above it, or off the ladder entirely (which then pays its
+/// own per-leg resample rather than joining a shared class).
+fn shared_downsample_tier(rate: u32, room_rate: u32) -> Option<usize> {
+    if rate >= room_rate {
+        return None;
+    }
+    ROOM_RATE_TIERS
+        .iter()
+        .position(|&tier| tier == rate)
+        .filter(|&index| index + 1 < ROOM_RATE_TIERS.len())
+}
+
+/// Build the shared room→tier downsamplers for a room running at `room_rate`: one per ladder tier
+/// strictly below it, `None` for the rest.
+fn build_listener_downsamplers(room_rate: u32) -> [Option<Resampler>; ROOM_RATE_TIERS.len() - 1] {
+    std::array::from_fn(|index| {
+        let tier = ROOM_RATE_TIERS[index];
+        if tier < room_rate {
+            Resampler::new(room_rate, tier).ok()
+        } else {
+            None
+        }
+    })
 }
 
 /// Build a participant's native↔room resampler pair (both `None` when the rates already match).
@@ -1520,6 +1609,68 @@ mod tests {
         buffer
     }
 
+    /// Full-scale amplitude of the [`Nyquist48Decoder`] probe tone.
+    const NYQUIST_AMPLITUDE: i16 = 8_000;
+
+    /// A mono 48 kHz / 20 ms decoder that emits the alternating `+A, −A, …` pattern — a full-scale
+    /// tone at the 24 kHz Nyquist limit of a 48 kHz stream. **No lower rate can carry it**: any
+    /// resample down to 16 kHz (or 8) runs it through an anti-alias low-pass that erases it, and the
+    /// trip back up cannot invent it again. So a room that hands this pattern back sample-for-sample
+    /// has provably built no resampler into the path — the assertion a "sounds fine" test cannot make.
+    struct Nyquist48Decoder;
+
+    impl Nyquist48Decoder {
+        /// One decoded frame: 960 samples of the alternating Nyquist pattern.
+        fn frame() -> Vec<i16> {
+            (0..960)
+                .map(|index| {
+                    if index % 2 == 0 {
+                        NYQUIST_AMPLITUDE
+                    } else {
+                        -NYQUIST_AMPLITUDE
+                    }
+                })
+                .collect()
+        }
+    }
+
+    impl Decoder for Nyquist48Decoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            siphon_rtp_codec::CodecParams {
+                sample_rate_hz: 48_000,
+                channels: 1,
+                ptime_ms: 20,
+            }
+        }
+        fn frame_samples(&self) -> usize {
+            960
+        }
+        fn decode(
+            &mut self,
+            _payload: &[u8],
+            out: &mut [i16],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            if out.len() < 960 {
+                return Err(siphon_rtp_codec::CodecError::OutputTooSmall {
+                    needed: 960,
+                    have: out.len(),
+                });
+            }
+            for (index, sample) in out[..960].iter_mut().enumerate() {
+                *sample = if index % 2 == 0 {
+                    NYQUIST_AMPLITUDE
+                } else {
+                    -NYQUIST_AMPLITUDE
+                };
+            }
+            Ok(960)
+        }
+        fn conceal(&mut self, out: &mut [i16]) -> Result<usize, siphon_rtp_codec::CodecError> {
+            out[..960].fill(0);
+            Ok(960)
+        }
+    }
+
     /// A 48 kHz / 20 ms decoder over `channels` interleaved channels — a stand-in for an Opus ingress
     /// (RFC 7587 §4.1 clocks Opus at 48 kHz; §6.1 makes the stream mono or stereo), with none of the
     /// codec. One payload byte expands to a whole frame: channel 0 carries `+base`, channel 1 carries
@@ -1637,6 +1788,95 @@ mod tests {
             routing: Routing::default(),
         };
         (config, encoded)
+    }
+
+    /// A full-band (48 kHz) participant carrying `decoder`, with a mono 48 kHz egress encoder whose
+    /// PCM is logged. `stateless` picks which egress path it takes: `true` joins the shared-encode
+    /// class, `false` takes the per-leg encode (the path that would build a room→native resampler).
+    fn full_band_config(
+        index: usize,
+        decoder: Box<dyn Decoder>,
+        stateless: bool,
+    ) -> (ParticipantConfig, Arc<Mutex<Vec<Vec<i16>>>>) {
+        let encoded = Arc::new(Mutex::new(Vec::new()));
+        let config = ParticipantConfig {
+            tag: format!("fullband-{index}"),
+            decoder,
+            encoder: Box::new(FullBand48Encoder {
+                encoded: encoded.clone(),
+                stateless,
+            }),
+            ingress_endpoint: EndpointId(index as u64 + 1),
+            egress_endpoint: EndpointId(index as u64 + 1),
+            egress_dst: addr(&format!("10.0.0.{}:4000", index + 1)),
+            accepted_source: SourceFilter::Exact(
+                format!("10.0.0.{}", index + 1).parse().expect("ip"),
+            ),
+            latch: false,
+            egress_ssrc: 0xE000_0000 + index as u32,
+            egress_payload_type: 111,
+            mos_codec: siphon_rtp_hep::mos::Codec::Opus,
+            telephone_event_in: None,
+            secure: None,
+            routing: Routing::default(),
+        };
+        (config, encoded)
+    }
+
+    /// Like [`Wideband48Encoder`] but with a configurable [`Encoder::is_stateless`], so a test can
+    /// choose the shared-encode or the per-leg egress path.
+    struct FullBand48Encoder {
+        encoded: Arc<Mutex<Vec<Vec<i16>>>>,
+        stateless: bool,
+    }
+
+    impl Encoder for FullBand48Encoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            siphon_rtp_codec::CodecParams {
+                sample_rate_hz: 48_000,
+                channels: 1,
+                ptime_ms: 20,
+            }
+        }
+        fn frame_samples(&self) -> usize {
+            960
+        }
+        fn encode(
+            &mut self,
+            pcm: &[i16],
+            out: &mut [u8],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            if pcm.len() != 960 {
+                return Err(siphon_rtp_codec::CodecError::BadFrameSize {
+                    expected: 960,
+                    got: pcm.len(),
+                });
+            }
+            if let Ok(mut log) = self.encoded.lock() {
+                log.push(pcm.to_vec());
+            }
+            out[0] = 0x24;
+            Ok(1)
+        }
+        fn is_stateless(&self) -> bool {
+            self.stateless
+        }
+    }
+
+    /// A one-byte RTP packet toward a 48 kHz participant (the fixture decoders expand it themselves);
+    /// the timestamp steps one 20 ms full-band frame, as RFC 7587 §4.1's 48 kHz clock requires.
+    fn full_band_rtp(index: usize, sequence: u16, payload_byte: u8) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 111,
+            sequence,
+            timestamp: u32::from(sequence) * 960,
+            ssrc: 0x2000_0000 + index as u32,
+        };
+        let mut buffer = vec![0u8; 13];
+        let written = write_packet(&header, &[payload_byte], &mut buffer).expect("write");
+        buffer.truncate(written);
+        buffer
     }
 
     #[test]
@@ -1954,6 +2194,341 @@ mod tests {
         let (sender, _receiver) = flume::bounded(2);
         conference.add_bridge_out(sender);
         assert_eq!(conference.room_rate(), 16_000, "a bridge forces 16 kHz");
+    }
+
+    #[test]
+    fn room_rate_is_the_lowest_tier_that_carries_every_member() {
+        // The full room-rate matrix. The rule is one line — the lowest ladder tier at or above the
+        // highest seated participant's native rate — so no leg is ever downsampled into the mix, and
+        // a room whose members all sit exactly on a tier resamples nothing at all.
+        use siphon_rtp_codec::g722::G722;
+        use siphon_rtp_codec::l16::L16;
+
+        let narrowband = || -> Box<dyn Decoder> { Box::new(G711::ulaw()) }; // 8 kHz
+        let wideband = || -> Box<dyn Decoder> { Box::new(G722::new(20)) }; // 16 kHz
+        let full_band = || -> Box<dyn Decoder> { Box::new(L16::new(48_000, 20)) }; // 48 kHz
+        let between = || -> Box<dyn Decoder> { Box::new(L16::new(24_000, 20)) }; // 24 kHz (off-ladder)
+
+        // (membership, expected room rate)
+        let cases: Vec<(Vec<Box<dyn Decoder>>, u32)> = vec![
+            (vec![narrowband(), narrowband()], NARROWBAND_RATE_HZ),
+            (vec![wideband(), wideband()], WIDEBAND_RATE_HZ),
+            (vec![full_band(), full_band()], FULLBAND_RATE_HZ),
+            (vec![narrowband(), wideband()], WIDEBAND_RATE_HZ),
+            (vec![narrowband(), full_band()], FULLBAND_RATE_HZ),
+            (vec![wideband(), full_band()], FULLBAND_RATE_HZ),
+            (
+                vec![narrowband(), wideband(), full_band()],
+                FULLBAND_RATE_HZ,
+            ),
+            // A rate between two tiers is carried by the tier *above* it — upsampled into the mix
+            // rather than losing band on the way in.
+            (vec![between()], FULLBAND_RATE_HZ),
+            (vec![narrowband(), between()], FULLBAND_RATE_HZ),
+        ];
+
+        for (index, (decoders, expected)) in cases.into_iter().enumerate() {
+            let mut conference = Conference::new(format!("room-{index}"), 0);
+            for (seat, decoder) in decoders.into_iter().enumerate() {
+                let rate = decoder.params().sample_rate_hz;
+                let ptime = decoder.params().ptime_ms;
+                let mut config = ulaw_config(
+                    seat,
+                    &format!("10.0.0.{}", seat + 1),
+                    &format!("10.0.0.{}:4000", seat + 1),
+                );
+                config.tag = format!("seat-{seat}");
+                config.decoder = decoder;
+                config.encoder = Box::new(L16::new(rate, ptime));
+                config.egress_payload_type = 96 + seat as u8;
+                assert!(conference.add_participant(config), "seat {seat}");
+            }
+            assert_eq!(
+                conference.room_rate(),
+                expected,
+                "case {index}: room rate must be the lowest tier carrying every member"
+            );
+            assert_eq!(
+                conference.room_frame(),
+                (expected as usize / 1000) * 20,
+                "case {index}: room frame follows the room rate"
+            );
+        }
+    }
+
+    #[test]
+    fn room_rate_moves_up_and_back_down_as_members_join_and_leave() {
+        // Mid-call transitions: every rate change must rebuild each seated participant's resamplers,
+        // so the leg that *was* at the room rate starts resampling and the one that arrives at it
+        // stops. A rate that changes without that rebuild would silently mix at the wrong length.
+        use siphon_rtp_codec::g722::G722;
+        use siphon_rtp_codec::l16::L16;
+
+        let mut conference = Conference::new("room".into(), 0);
+        conference.add_participant(ulaw_config(0, "10.0.0.1", "10.0.0.1:4000"));
+        assert_eq!(conference.room_rate(), NARROWBAND_RATE_HZ);
+        assert!(
+            conference.participants[0].to_room.is_none(),
+            "the narrowband leg is at the 8 kHz room rate — no resampler"
+        );
+
+        // A wideband leg joins: 8 kHz → 16 kHz, and the narrowband leg gains resamplers.
+        let mut wideband = ulaw_config(1, "10.0.0.2", "10.0.0.2:4000");
+        wideband.decoder = Box::new(G722::new(20));
+        wideband.encoder = Box::new(G722::new(20));
+        wideband.egress_payload_type = 9;
+        conference.add_participant(wideband);
+        assert_eq!(conference.room_rate(), WIDEBAND_RATE_HZ);
+        assert!(
+            conference.participants[0].to_room.is_some(),
+            "8 kHz → 16 kHz"
+        );
+        assert!(conference.participants[1].to_room.is_none(), "16 kHz leg");
+
+        // A full-band leg joins: 16 kHz → 48 kHz, and *both* earlier legs are rebuilt.
+        let mut full_band = ulaw_config(2, "10.0.0.3", "10.0.0.3:4000");
+        full_band.decoder = Box::new(L16::new(48_000, 20));
+        full_band.encoder = Box::new(L16::new(48_000, 20));
+        full_band.egress_payload_type = 97;
+        conference.add_participant(full_band);
+        assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
+        assert!(conference.participants[0].to_room.is_some(), "8 → 48 kHz");
+        assert!(conference.participants[1].to_room.is_some(), "16 → 48 kHz");
+        assert!(
+            conference.participants[2].to_room.is_none(),
+            "the 48 kHz leg is at the room rate"
+        );
+
+        // The full-band leg leaves: 48 kHz → 16 kHz again, and the wideband leg loses its resampler.
+        conference.remove_participant("party-2");
+        assert_eq!(conference.room_rate(), WIDEBAND_RATE_HZ);
+        assert!(conference.participants[1].to_room.is_none());
+
+        // The wideband leg leaves too: back to the 8 kHz fast path, nobody resampling.
+        conference.remove_participant("party-1");
+        assert_eq!(conference.room_rate(), NARROWBAND_RATE_HZ);
+        assert!(conference.participants[0].to_room.is_none());
+        assert!(conference.participants[0].from_room.is_none());
+    }
+
+    #[test]
+    fn a_bridge_pins_even_an_all_full_band_room_to_the_wideband_rate() {
+        // A bridge carries bare room-rate frames with no rate tag and the two rooms' memberships move
+        // independently, so both ends are pinned to one fixed rate. That is a deliberate trade: a
+        // bridged full-band room gives up its 48 kHz mix rather than risk mixing two rooms' frames at
+        // different rates (which is what "no inter-room resampling" actually costs).
+        use siphon_rtp_codec::l16::L16;
+
+        let mut conference = Conference::new("room".into(), 0);
+        for index in 0..2 {
+            let mut config = ulaw_config(
+                index,
+                &format!("10.0.0.{}", index + 1),
+                &format!("10.0.0.{}:4000", index + 1),
+            );
+            config.decoder = Box::new(L16::new(48_000, 20));
+            config.encoder = Box::new(L16::new(48_000, 20));
+            config.egress_payload_type = 96 + index as u8;
+            assert!(conference.add_participant(config));
+        }
+        assert_eq!(
+            conference.room_rate(),
+            FULLBAND_RATE_HZ,
+            "all-full-band room"
+        );
+
+        let (sender, _receiver) = flume::bounded(2);
+        conference.add_bridge_out(sender);
+        assert_eq!(
+            conference.room_rate(),
+            BRIDGE_RATE_HZ,
+            "a bridge pins the room to the shared bridge rate"
+        );
+        assert_eq!(conference.room_frame(), 320);
+        for participant in &conference.participants {
+            assert!(
+                participant.to_room.is_some() && participant.from_room.is_some(),
+                "the 48 kHz legs now resample into the pinned bridge rate"
+            );
+        }
+    }
+
+    #[test]
+    fn an_all_full_band_room_resamples_nothing() {
+        // The Phase 7 gate. Two 48 kHz legs; one speaks a full-scale tone at the 24 kHz Nyquist
+        // limit — content that *only* a 48 kHz path can carry, since any resample down to 16 kHz runs
+        // it through an anti-alias low-pass that erases it for good. The listener therefore hears it
+        // back sample-for-sample only if the room built no resampler at all.
+        let mut conference = Conference::new("opus-room".into(), 0);
+        let (talker, _talker_log) = full_band_config(0, Box::new(Nyquist48Decoder), false);
+        let (listener, listener_log) = full_band_config(1, Box::new(Nyquist48Decoder), false);
+        assert!(conference.add_participant(talker));
+        assert!(conference.add_participant(listener));
+
+        assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
+        assert_eq!(conference.room_frame(), 960, "48 kHz × 20 ms");
+        // Structural proof: not one resampler exists on either leg, in either direction.
+        for participant in &conference.participants {
+            assert!(
+                participant.to_room.is_none(),
+                "no ingress resampler in an all-full-band room"
+            );
+            assert!(
+                participant.from_room.is_none(),
+                "no egress resampler in an all-full-band room"
+            );
+        }
+
+        // Only seat 0 sends; seat 1 stays silent, so it hears exactly seat 0's frame.
+        for sequence in 0..10 {
+            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 1))));
+        }
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.clear();
+            conference.tick(&mut out);
+        }
+
+        // Audio proof: the listener's encoder was handed the Nyquist pattern back, bit for bit.
+        let log = listener_log.lock().expect("log");
+        let heard = log.last().expect("the listener was encoded toward");
+        assert_eq!(
+            heard.as_slice(),
+            Nyquist48Decoder::frame().as_slice(),
+            "a 24 kHz tone survives the room only if nothing resampled it"
+        );
+        // And no shared room→tier downsample ran either — nothing below 48 kHz was needed.
+        assert_eq!(
+            conference.listener_native_ready,
+            [false; ROOM_RATE_TIERS.len() - 1],
+            "an all-full-band room never touches the shared downsamplers"
+        );
+    }
+
+    #[test]
+    fn narrowband_and_wideband_listeners_each_share_one_downsample_in_a_full_band_room() {
+        // The three-rate shared-encode path: a 48 kHz room with both 8 kHz and 16 kHz listeners pays
+        // *one* room→8 kHz resample and *one* room→16 kHz resample per tick — one per tier, not one
+        // per listener — and one encode per codec class on top of each.
+        use siphon_rtp_codec::l16::L16;
+
+        let mut conference = Conference::new("mixed-room".into(), 0);
+        // Seat 0: the full-band talker (a loud constant, so it survives the downsample as energy).
+        let (talker, _talker_log) = wideband_config(0, 1, "10.0.0.1", "10.0.0.1:4000");
+        assert!(conference.add_participant(talker));
+        // Seats 1-2: G.711 (8 kHz) listeners. Seats 3-4: L16 (16 kHz) listeners. All stateless.
+        for index in 1..3 {
+            assert!(conference.add_participant(ulaw_config(
+                index,
+                &format!("10.0.0.{}", index + 1),
+                &format!("10.0.0.{}:4000", index + 1),
+            )));
+        }
+        for index in 3..5 {
+            let mut config = ulaw_config(
+                index,
+                &format!("10.0.0.{}", index + 1),
+                &format!("10.0.0.{}:4000", index + 1),
+            );
+            config.decoder = Box::new(L16::new(16_000, 20));
+            config.encoder = Box::new(L16::new(16_000, 20));
+            config.egress_payload_type = 97;
+            assert!(conference.add_participant(config));
+        }
+        assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
+
+        // Drive the full-band talker (payload byte 60 → a constant 6000, loud enough for the VAD).
+        for sequence in 0..10 {
+            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", full_band_rtp(0, sequence, 60))));
+        }
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.clear();
+            conference.tick(&mut out);
+        }
+
+        let datagram = |endpoint: u64| {
+            out.iter()
+                .find(|datagram| datagram.endpoint == EndpointId(endpoint))
+                .unwrap_or_else(|| panic!("no egress for endpoint {endpoint}"))
+        };
+        let narrowband_one = RtpPacket::parse(&datagram(2).data).expect("rtp");
+        let narrowband_two = RtpPacket::parse(&datagram(3).data).expect("rtp");
+        let wideband_one = RtpPacket::parse(&datagram(4).data).expect("rtp");
+        let wideband_two = RtpPacket::parse(&datagram(5).data).expect("rtp");
+
+        assert_eq!(narrowband_one.payload.len(), 160, "8 kHz / 20 ms G.711");
+        assert_eq!(wideband_one.payload.len(), 640, "16 kHz / 20 ms L16");
+        assert_eq!(
+            narrowband_one.payload, narrowband_two.payload,
+            "both 8 kHz listeners share the one room→8 kHz downsample + encode"
+        );
+        assert_eq!(
+            wideband_one.payload, wideband_two.payload,
+            "both 16 kHz listeners share the one room→16 kHz downsample + encode"
+        );
+        assert_ne!(narrowband_one.ssrc, narrowband_two.ssrc, "distinct streams");
+        assert_ne!(wideband_one.ssrc, wideband_two.ssrc, "distinct streams");
+        // Both tiers actually ran their shared downsample this tick — and the audio arrived.
+        assert_eq!(
+            conference.listener_native_ready,
+            [true; ROOM_RATE_TIERS.len() - 1],
+            "one shared downsample per tier below the room rate"
+        );
+        assert!(
+            frame_energy(&decode_ulaw(&datagram(2).data)) > VAD_THRESHOLD,
+            "the narrowband listeners hear the full-band talker"
+        );
+        let mut wideband_pcm = vec![0i16; 320];
+        let decoded = L16::new(16_000, 20)
+            .decode(wideband_one.payload, &mut wideband_pcm)
+            .expect("decode");
+        assert_eq!(decoded, 320);
+        assert!(
+            frame_energy(&wideband_pcm) > VAD_THRESHOLD,
+            "the wideband listeners hear the full-band talker"
+        );
+    }
+
+    #[test]
+    fn a_full_band_room_mixes_minus_self_at_48k() {
+        // The mix itself at the new rate: three loud 48 kHz talkers, each hearing the other two and
+        // never itself, across the full 960-sample frame.
+        let mut conference = Conference::new("room".into(), 0);
+        let mut logs = Vec::new();
+        for index in 0..3 {
+            let (config, log) =
+                full_band_config(index, Box::new(Wideband48Decoder { channels: 1 }), false);
+            assert!(conference.add_participant(config));
+            logs.push(log);
+        }
+        assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
+
+        // Levels 1000 / 2000 / 3000 (payload byte × 100), all above the VAD threshold.
+        for sequence in 0..10 {
+            for index in 0..3u8 {
+                assert!(conference.ingest(&rx(
+                    u64::from(index) + 1,
+                    &format!("10.0.0.{}:5000", index + 1),
+                    full_band_rtp(index as usize, sequence, (index + 1) * 10),
+                )));
+            }
+        }
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.clear();
+            conference.tick(&mut out);
+        }
+        assert_eq!(out.len(), 3, "one mixed packet per participant");
+        for (index, expected) in [(0usize, 5000i16), (1, 4000), (2, 3000)] {
+            let log = logs[index].lock().expect("log");
+            let heard = log.last().expect("encoded toward");
+            assert_eq!(heard.len(), 960, "a 48 kHz / 20 ms frame");
+            assert!(
+                heard.iter().all(|&sample| sample == expected),
+                "seat {index} hears the other two ({expected}) across the whole 960-sample frame"
+            );
+        }
     }
 
     #[test]
