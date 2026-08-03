@@ -15,6 +15,7 @@
 //! conformant Opus decoder need not be sample-identical), wired once CELT + SILK decode exist.
 
 pub mod celt;
+pub mod decoder;
 pub mod packet;
 pub mod range_coder;
 pub mod silk;
