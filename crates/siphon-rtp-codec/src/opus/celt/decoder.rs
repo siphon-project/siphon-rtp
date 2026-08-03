@@ -382,7 +382,8 @@ impl CeltDecoder {
     /// * `data` — the frame's bytes, or `None` for "no bitstream, conceal". A `data` of 0 or 1 byte
     ///   is also concealment (`celt_decoder.c:1086`): those are DTX / padding-only frames.
     /// * `frame_size` — samples per channel at the **API** rate; internally multiplied by
-    ///   [`CeltDecoder::downsample`] to reach the 48 kHz `N` that selects `LM`.
+    ///   the decoder's downsample factor (48000 / its API rate) to reach the 48 kHz `N` that
+    ///   selects `LM`.
     /// * `range` — an external range decoder to continue from. Hybrid passes the same decoder SILK
     ///   just read its layer from, so both layers share one entropy stream over one payload
     ///   (RFC 6716 §4.5). `None` starts a fresh decoder over `data`.

@@ -8,7 +8,7 @@
 //!   get an excitation, then extrapolate that excitation periodically at the searched pitch lag,
 //!   fading it by the measured decay per period, and re-synthesise through the LPC filter. What
 //!   comes out is time-domain audio, not an MDCT frame, which is why the *next* good frame has to
-//!   [`CeltDecoder::prefilter_and_fold`] the ring before it can overlap-add onto it.
+//!   pre-filter and fold the ring before it can overlap-add onto it.
 //! * **Noise-based (CNG)** — once the loss has run past 40 samples' worth of frames, or the pitch
 //!   history is untrustworthy (`skip_plc`), or this is a Hybrid frame where CELT only owns the high
 //!   band (`start != 0`). Fill each band with unit-norm noise from the range coder's own PRNG,
