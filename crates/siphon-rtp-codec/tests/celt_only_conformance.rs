@@ -73,6 +73,18 @@ fn parse_bit_stream(bytes: &[u8]) -> Result<Vec<BitPacket>, String> {
     Ok(packets)
 }
 
+/// The locally built, test-only `opus_compare`, if it exists.
+///
+/// `$SIPHON_RTP_OPUS_COMPARE`, falling back to `/tmp/opus_compare`. The override matters because each
+/// git worktree has its own untracked `reference/` tree, so the oracle is normally built once and
+/// shared. Absent is a legitimate state — a fresh checkout has the vectors but no libopus build, and
+/// CONTRIBUTING promises such a checkout still goes green.
+fn opus_compare_path() -> Option<PathBuf> {
+    let path = std::env::var_os("SIPHON_RTP_OPUS_COMPARE")
+        .map_or_else(|| PathBuf::from("/tmp/opus_compare"), PathBuf::from);
+    path.exists().then_some(path)
+}
+
 /// A CELT-only vector directory under `reference/opus`, if present.
 fn vector_dir(name: &str) -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -155,11 +167,9 @@ fn decode_celt_only(packets: &[BitPacket], channels: usize) -> Result<Vec<u8>, S
 /// to `/tmp/opus_compare` — an override matters because each worktree has its own untracked
 /// `reference/` tree, so the oracle is normally built once and shared.
 fn run_opus_compare(reference_dec: &Path, decoded_pcm: &[u8], stereo: bool) -> Result<(), String> {
-    let compare = std::env::var_os("SIPHON_RTP_OPUS_COMPARE")
-        .map_or_else(|| PathBuf::from("/tmp/opus_compare"), PathBuf::from);
-    if !compare.exists() {
-        return Err(format!("{} not built", compare.display()));
-    }
+    let Some(compare) = opus_compare_path() else {
+        return Err("opus_compare not built".to_string());
+    };
     let tmp = std::env::temp_dir().join(format!(
         "celt_only_{}_{}.sw",
         std::process::id(),
@@ -253,14 +263,24 @@ fn run_directory(dir: &Path, channels: usize, label: &str) {
         "celt-only ({label}): {} stream(s) failed: {failed:?}",
         failed.len()
     );
-    // Vectors were present (we got here), so at least one stream must have actually been scored.
-    // Without this the test passes vacuously when `opus_compare` is missing and everything skips.
-    assert!(
-        !passed.is_empty(),
-        "celt-only ({label}): {} stream(s) present but none scored — is opus_compare built? \
-         skipped={skipped:?}",
-        bit_files.len()
-    );
+    // Non-vacuous only when the oracle is actually available. A checkout with the vectors but no
+    // local libopus build legitimately scores nothing, and CONTRIBUTING promises it stays green; a
+    // checkout that *has* the oracle and still scored nothing is a broken harness hiding behind a
+    // skip, which is what this catches.
+    if opus_compare_path().is_some() {
+        assert!(
+            !passed.is_empty(),
+            "celt-only ({label}): {} stream(s) present and opus_compare built, but none scored — \
+             the harness skipped everything. skipped={skipped:?}",
+            bit_files.len()
+        );
+    } else {
+        eprintln!(
+            "celt-only ({label}): opus_compare not built — {} stream(s) skipped, set \
+             SIPHON_RTP_OPUS_COMPARE to score them",
+            skipped.len()
+        );
+    }
 }
 
 #[test]
