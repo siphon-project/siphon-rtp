@@ -173,10 +173,31 @@ struct Participant {
     /// This participant's codec sample rate, kept so its resamplers can be rebuilt if the room rate
     /// flips (e.g. a wideband leg joins an all-narrowband room).
     native_rate: u32,
-    /// Samples **per channel** in one of this participant's decoded frames — the room-row / egress
-    /// frame length, and the length its resamplers work in. For a mono participant (everything but a
-    /// stereo Opus leg) it is also the decoder's whole output count.
+    /// Samples **per channel** in one of this participant's decoded/encoded frames — its
+    /// packetization interval at `native_rate`. Both halves of the leg share it: `add_participant`
+    /// refuses a participant whose decoder and encoder disagree on rate, ptime or channels, so this
+    /// one number is a valid decode-frame *and* encode-frame length. For a mono participant
+    /// (everything but a stereo Opus leg) it is also the decoder's whole output count.
     native_frame: usize,
+    /// Samples this participant contributes to — and hears from — one 20 ms room tick, i.e.
+    /// `native_rate × ROOM_TICK_MS`. Equal to `native_frame` for the overwhelmingly common 20 ms leg
+    /// (RFC 3551's default ptime), in which case one decode is exactly one tick and the carry /
+    /// accumulator below stay unallocated and unused.
+    tick_samples: usize,
+    /// Ingress carry for a leg whose packetization interval is **not** the room tick (RFC 7587 §6.1
+    /// allows an Opus leg 10..120 ms): decoded native-rate mono PCM the room has not spent yet. A
+    /// 60 ms decode feeds three ticks; a 10 ms one takes two decodes to fill a tick. Empty (never
+    /// allocated) for a 20 ms leg.
+    ingress_carry: Vec<i16>,
+    /// Valid samples in `ingress_carry`, and how many of them a tick has already spent.
+    carry_len: usize,
+    carry_pos: usize,
+    /// Egress accumulator, the mirror of `ingress_carry`: room output at the native rate, held until
+    /// a whole encoder frame is ready. A 60 ms leg emits one packet every third tick; a 10 ms leg
+    /// emits two per tick. Empty (never allocated) for a 20 ms leg.
+    egress_accum: Vec<i16>,
+    /// Valid samples in `egress_accum`.
+    accum_len: usize,
     /// Audio channels this participant's decoder emits (interleaved). > 1 only for a stereo Opus
     /// ingress (RFC 7587 §6.1 `sprop-stereo=1`); the decoded frame is folded to mono before it enters
     /// the room, since the mix bus and both resamplers are single-channel.
@@ -434,6 +455,15 @@ impl Conference {
         }
         let stateless = config.encoder.is_stateless();
         let egress_payload_type = config.egress_payload_type;
+        // A leg whose packetization interval is not the 20 ms room tick needs a carry on each side —
+        // both sized for "whatever a tick leaves over, plus one whole codec frame". A 20 ms leg (all
+        // of G.711/AMR/G.722 and the Opus default) allocates neither and takes the direct path.
+        let tick_samples = (native_rate as usize / 1000) * ROOM_TICK_MS;
+        let off_tick_capacity = if native_frame == tick_samples {
+            0
+        } else {
+            native_frame + tick_samples
+        };
         // Build against the current room rate; `recompute_room_rate` below rebuilds these if seating
         // this participant flips the room (e.g. a wideband leg joins an all-narrowband room).
         let (to_room, from_room) = build_resamplers(native_rate, self.room_rate);
@@ -455,6 +485,12 @@ impl Conference {
             reverse_latch: SymmetricLatch::default(),
             native_rate,
             native_frame,
+            tick_samples,
+            ingress_carry: vec![0i16; off_tick_capacity],
+            carry_len: 0,
+            carry_pos: 0,
+            egress_accum: vec![0i16; off_tick_capacity],
+            accum_len: 0,
             native_channels,
             egress_payload_type,
             mos_codec: config.mos_codec,
@@ -748,23 +784,7 @@ impl Conference {
         // Decode pass: each participant → one room-rate frame + its VAD/energy.
         for index in 0..count {
             self.roles[index] = self.participants[index].routing.role;
-            let produced = {
-                let participant = &mut self.participants[index];
-                let channels = participant.native_channels;
-                match participant.leg.next_pcm(&mut self.native_in) {
-                    Ok(PcmFrame::Decoded(values) | PcmFrame::Concealed(values)) => {
-                        // Fold a multi-channel decoded frame to mono at the codec boundary: the mix
-                        // bus, both resamplers, and the VAD are all single-channel. A no-op for every
-                        // mono participant, and driven by the channel count rather than the codec's
-                        // identity (the channel contract in `siphon_rtp_codec`).
-                        Some(siphon_rtp_codec::downmix_to_mono(
-                            &mut self.native_in[..values],
-                            channels,
-                        ))
-                    }
-                    Ok(PcmFrame::Starved) | Err(_) => None,
-                }
-            };
+            let produced = self.next_tick_pcm(index);
             match produced {
                 Some(samples) => {
                     let room_frame = self.room_frame;
@@ -828,70 +848,80 @@ impl Conference {
                 continue; // never transmit to an unresolved destination
             }
             let egress_endpoint = self.participants[index].egress_endpoint;
-            let marker = !self.participants[index].started;
             let native_frame = self.participants[index].native_frame;
+            let tick_samples = self.participants[index].tick_samples;
 
             // A listener (no distinct mix) on a stateless codec shares the encode: either the listener
             // mix is already its native PCM (native == room), or it is one shared room→tier downsample
             // (a narrowband or wideband listener in a higher-rate room, e.g. G.711 and AMR-WB legs in
-            // a 48 kHz Opus room) — encode once per codec and fan out.
+            // a 48 kHz Opus room) — encode once per codec and fan out. A leg whose packetization
+            // interval is not the room tick is excluded: the shared payload *is* one tick of the
+            // listener mix, and such a leg's frames straddle tick boundaries at its own phase.
             let native_rate = self.participants[index].native_rate;
             let shareable = !self.mixer.has_distinct_output(index)
                 && self.participants[index].stateless
+                && native_frame == tick_samples
                 && (native_rate == self.room_rate
                     || shared_downsample_tier(native_rate, self.room_rate).is_some());
 
-            let payload_len = if shareable {
-                match self.shared_encode(index) {
-                    Some(len) => len,
-                    None => continue,
+            if shareable {
+                if let Some(payload_len) = self.shared_encode(index) {
+                    self.emit(index, payload_len, dst, egress_endpoint, out);
                 }
+                continue;
+            }
+
+            // Per-leg encode: bring this tick's mix down (or up) to the leg's native rate.
+            if let Some(resampler) = self.participants[index].from_room.as_mut() {
+                let output = self.mixer.output_for(index);
+                self.resample_scratch.clear();
+                resampler.process(output, &mut self.resample_scratch);
+                fill_padded(&mut self.native_out[..tick_samples], &self.resample_scratch);
             } else {
-                if let Some(resampler) = self.participants[index].from_room.as_mut() {
-                    let output = self.mixer.output_for(index);
-                    self.resample_scratch.clear();
-                    resampler.process(output, &mut self.resample_scratch);
-                    fill_padded(&mut self.native_out[..native_frame], &self.resample_scratch);
-                } else {
-                    let output = self.mixer.output_for(index);
-                    fill_padded(&mut self.native_out[..native_frame], output);
-                }
-                match self.participants[index]
+                let output = self.mixer.output_for(index);
+                fill_padded(&mut self.native_out[..tick_samples], output);
+            }
+
+            if native_frame == tick_samples {
+                // The common case: one tick is exactly one codec frame.
+                let participant = &mut self.participants[index];
+                let payload_len = match participant
                     .leg
-                    .encode_payload(&self.native_out[..native_frame], &mut self.payload)
+                    .encode_payload(&self.native_out[..tick_samples], &mut self.payload)
                 {
                     Ok(len) => len,
                     Err(_) => continue,
-                }
-            };
+                };
+                self.emit(index, payload_len, dst, egress_endpoint, out);
+                continue;
+            }
 
-            let rtp_len = match self.participants[index].leg.packetize(
-                &self.payload[..payload_len],
-                marker,
-                &mut self.rtp,
-            ) {
-                Ok(len) => len,
-                Err(_) => continue,
-            };
-            // SRTP: encrypt the egress packet for a secure participant; plain legs send it as is.
-            let wire: &[u8] = if let Some(secure) = self.participants[index].secure.as_mut() {
-                self.secure_out.clear();
-                if secure
-                    .protect(&self.rtp[..rtp_len], &mut self.secure_out)
-                    .is_err()
-                {
-                    continue;
+            // Off-tick ptime: hold the mix until a whole codec frame is ready, then emit each one
+            // that is (a 60 ms leg emits on every third tick; a 10 ms leg emits twice per tick), so
+            // its RTP timestamp advances at the wall clock instead of at the tick rate.
+            {
+                let participant = &mut self.participants[index];
+                let start = participant.accum_len;
+                let end = (start + tick_samples).min(participant.egress_accum.len());
+                participant.egress_accum[start..end]
+                    .copy_from_slice(&self.native_out[..end - start]);
+                participant.accum_len = end;
+            }
+            while self.participants[index].accum_len >= native_frame {
+                let participant = &mut self.participants[index];
+                let encoded = participant
+                    .leg
+                    .encode_payload(&participant.egress_accum[..native_frame], &mut self.payload);
+                // Consume the frame either way — a failed encode must not wedge the accumulator.
+                participant
+                    .egress_accum
+                    .copy_within(native_frame..participant.accum_len, 0);
+                participant.accum_len -= native_frame;
+                match encoded {
+                    Ok(payload_len) => self.emit(index, payload_len, dst, egress_endpoint, out),
+                    Err(_) => break,
                 }
-                &self.secure_out
-            } else {
-                &self.rtp[..rtp_len]
-            };
-            out.push(Outbound {
-                endpoint: egress_endpoint,
-                dst,
-                data: Bytes::copy_from_slice(wire),
-            });
-            self.participants[index].started = true;
+            }
         }
 
         // Active-speaker change detection (the single loudest active talker).
@@ -904,6 +934,116 @@ impl Conference {
             self.last_dominant_tag = dominant_tag.clone();
             ActiveSpeakerChange::Changed(dominant_tag)
         }
+    }
+
+    /// Packetize the `payload_len` bytes already staged in [`Conference::payload`] as participant
+    /// `index`'s next egress packet (its own SSRC / sequence / timestamp, RFC 3550 §5.1),
+    /// SRTP-protect it for a secure leg, and queue it toward `dst`. A leg emits zero, one, or several
+    /// of these per room tick depending on how its packetization interval divides the 20 ms tick.
+    fn emit(
+        &mut self,
+        index: usize,
+        payload_len: usize,
+        dst: SocketAddr,
+        egress_endpoint: EndpointId,
+        out: &mut Vec<Outbound>,
+    ) {
+        let marker = !self.participants[index].started;
+        let rtp_len = match self.participants[index].leg.packetize(
+            &self.payload[..payload_len],
+            marker,
+            &mut self.rtp,
+        ) {
+            Ok(len) => len,
+            Err(_) => return,
+        };
+        // SRTP: encrypt the egress packet for a secure participant; plain legs send it as is.
+        let wire: &[u8] = if let Some(secure) = self.participants[index].secure.as_mut() {
+            self.secure_out.clear();
+            if secure
+                .protect(&self.rtp[..rtp_len], &mut self.secure_out)
+                .is_err()
+            {
+                return;
+            }
+            &self.secure_out
+        } else {
+            &self.rtp[..rtp_len]
+        };
+        out.push(Outbound {
+            endpoint: egress_endpoint,
+            dst,
+            data: Bytes::copy_from_slice(wire),
+        });
+        self.participants[index].started = true;
+    }
+
+    /// Stage participant `index`'s next **20 ms** of native-rate mono PCM at the head of
+    /// [`Conference::native_in`], returning the sample count, or `None` when the leg cannot yet
+    /// supply a whole tick (starved — the caller zero-fills its room row).
+    ///
+    /// The room tick is a fixed 20 ms; a leg's packetization interval need not be (RFC 7587 §6.1
+    /// lets an Opus leg negotiate 10..120 ms). The common 20 ms leg takes the direct path — one
+    /// decode is one tick, exactly as before. Anything else is drained through the participant's
+    /// carry so a 60 ms decode feeds three ticks instead of being truncated to the first 20 ms, and
+    /// a 10 ms one is decoded twice instead of leaving two thirds of the tick as silence.
+    fn next_tick_pcm(&mut self, index: usize) -> Option<usize> {
+        let tick_samples = self.participants[index].tick_samples;
+        if self.participants[index].native_frame == tick_samples {
+            let participant = &mut self.participants[index];
+            let channels = participant.native_channels;
+            return match participant.leg.next_pcm(&mut self.native_in) {
+                Ok(PcmFrame::Decoded(values) | PcmFrame::Concealed(values)) => {
+                    // Fold a multi-channel decoded frame to mono at the codec boundary: the mix bus,
+                    // both resamplers, and the VAD are all single-channel. A no-op for every mono
+                    // participant, and driven by the channel count rather than the codec's identity
+                    // (the channel contract in `siphon_rtp_codec`).
+                    Some(siphon_rtp_codec::downmix_to_mono(
+                        &mut self.native_in[..values],
+                        channels,
+                    ))
+                }
+                Ok(PcmFrame::Starved) | Err(_) => None,
+            };
+        }
+
+        // Off-tick ptime. Compact whatever the previous ticks left over to the front of the carry,
+        // then decode until a whole tick is available (or the leg starves).
+        {
+            let participant = &mut self.participants[index];
+            if participant.carry_pos > 0 {
+                participant
+                    .ingress_carry
+                    .copy_within(participant.carry_pos..participant.carry_len, 0);
+                participant.carry_len -= participant.carry_pos;
+                participant.carry_pos = 0;
+            }
+        }
+        while self.participants[index].carry_len < tick_samples {
+            let participant = &mut self.participants[index];
+            let channels = participant.native_channels;
+            let decoded = match participant.leg.next_pcm(&mut self.native_in) {
+                Ok(PcmFrame::Decoded(values) | PcmFrame::Concealed(values)) => {
+                    siphon_rtp_codec::downmix_to_mono(&mut self.native_in[..values], channels)
+                }
+                Ok(PcmFrame::Starved) | Err(_) => break,
+            };
+            if decoded == 0 {
+                break; // a codec that produced nothing would spin this loop forever
+            }
+            let participant = &mut self.participants[index];
+            let start = participant.carry_len;
+            let end = (start + decoded).min(participant.ingress_carry.len());
+            participant.ingress_carry[start..end].copy_from_slice(&self.native_in[..end - start]);
+            participant.carry_len = end;
+        }
+        if self.participants[index].carry_len < tick_samples {
+            return None; // keep what did arrive; the next tick tries again
+        }
+        let participant = &mut self.participants[index];
+        self.native_in[..tick_samples].copy_from_slice(&participant.ingress_carry[..tick_samples]);
+        participant.carry_pos = tick_samples;
+        Some(tick_samples)
     }
 
     /// Rebuild the sparse whisper/monitor index lists from each participant's tag-named routing.
@@ -954,7 +1094,9 @@ impl Conference {
             // higher-rate room), encode that tier's shared room→tier downsample instead of the
             // room-rate mix — one resample per tier per tick, not one per listener.
             let native_rate = self.participants[index].native_rate;
-            let native_frame = self.participants[index].native_frame;
+            // The shared payload is one room tick's worth of the listener mix, and `shareable` only
+            // admits a leg whose codec frame *is* one tick, so this is its whole frame.
+            let native_frame = self.participants[index].tick_samples;
             let len = if native_rate == self.room_rate {
                 self.participants[index]
                     .leg
@@ -1914,6 +2056,124 @@ mod tests {
         }
     }
 
+    /// A decoder at an arbitrary rate and packetization interval that expands one payload byte into
+    /// a constant-valued frame — the fixture for a leg whose ptime is *not* the 20 ms room tick.
+    struct ProbeDecoder {
+        rate: u32,
+        ptime_ms: u8,
+    }
+
+    impl ProbeDecoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            siphon_rtp_codec::CodecParams {
+                sample_rate_hz: self.rate,
+                channels: 1,
+                ptime_ms: self.ptime_ms,
+            }
+        }
+    }
+
+    impl Decoder for ProbeDecoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            ProbeDecoder::params(self)
+        }
+        fn frame_samples(&self) -> usize {
+            ProbeDecoder::params(self).frame_values()
+        }
+        fn decode(
+            &mut self,
+            payload: &[u8],
+            out: &mut [i16],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            let values = ProbeDecoder::params(self).frame_values();
+            if out.len() < values {
+                return Err(siphon_rtp_codec::CodecError::OutputTooSmall {
+                    needed: values,
+                    have: out.len(),
+                });
+            }
+            let level = i16::from(*payload.first().unwrap_or(&0)) * 100;
+            out[..values].fill(level);
+            Ok(values)
+        }
+        fn conceal(&mut self, out: &mut [i16]) -> Result<usize, siphon_rtp_codec::CodecError> {
+            let values = ProbeDecoder::params(self).frame_values();
+            out[..values].fill(0);
+            Ok(values)
+        }
+    }
+
+    /// The matching encoder: records every PCM frame it is handed and emits one byte, so a test can
+    /// see exactly how long each frame was and what it carried.
+    struct ProbeEncoder {
+        rate: u32,
+        ptime_ms: u8,
+        encoded: Arc<Mutex<Vec<Vec<i16>>>>,
+    }
+
+    impl Encoder for ProbeEncoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            siphon_rtp_codec::CodecParams {
+                sample_rate_hz: self.rate,
+                channels: 1,
+                ptime_ms: self.ptime_ms,
+            }
+        }
+        fn frame_samples(&self) -> usize {
+            Encoder::params(self).frame_values()
+        }
+        fn encode(
+            &mut self,
+            pcm: &[i16],
+            out: &mut [u8],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            let expected = Encoder::params(self).frame_values();
+            if pcm.len() != expected {
+                return Err(siphon_rtp_codec::CodecError::BadFrameSize {
+                    expected,
+                    got: pcm.len(),
+                });
+            }
+            if let Ok(mut log) = self.encoded.lock() {
+                log.push(pcm.to_vec());
+            }
+            out[0] = 0x77;
+            Ok(1)
+        }
+    }
+
+    /// A [`ProbeDecoder`]/[`ProbeEncoder`] participant at `rate` / `ptime_ms`, plus its egress log.
+    fn probe_config(
+        index: usize,
+        rate: u32,
+        ptime_ms: u8,
+    ) -> (ParticipantConfig, Arc<Mutex<Vec<Vec<i16>>>>) {
+        let encoded = Arc::new(Mutex::new(Vec::new()));
+        let config = ParticipantConfig {
+            tag: format!("probe-{index}"),
+            decoder: Box::new(ProbeDecoder { rate, ptime_ms }),
+            encoder: Box::new(ProbeEncoder {
+                rate,
+                ptime_ms,
+                encoded: encoded.clone(),
+            }),
+            ingress_endpoint: EndpointId(index as u64 + 1),
+            egress_endpoint: EndpointId(index as u64 + 1),
+            egress_dst: addr(&format!("10.0.0.{}:4000", index + 1)),
+            accepted_source: SourceFilter::Exact(
+                format!("10.0.0.{}", index + 1).parse().expect("ip"),
+            ),
+            latch: false,
+            egress_ssrc: 0xF000_0000 + index as u32,
+            egress_payload_type: 111,
+            mos_codec: siphon_rtp_hep::mos::Codec::Opus,
+            telephone_event_in: None,
+            secure: None,
+            routing: Routing::default(),
+        };
+        (config, encoded)
+    }
+
     /// A one-byte RTP packet toward a 48 kHz participant (the fixture decoders expand it themselves);
     /// the timestamp steps one 20 ms full-band frame, as RFC 7587 §4.1's 48 kHz clock requires.
     fn full_band_rtp(index: usize, sequence: u16, payload_byte: u8) -> Vec<u8> {
@@ -2614,6 +2874,168 @@ mod tests {
             frame_energy(&wideband_pcm) > VAD_THRESHOLD,
             "the wideband listeners hear the full-band talker"
         );
+    }
+
+    /// A one-byte RTP packet whose timestamp steps `frame_samples` — the packetization interval of
+    /// the [`ProbeDecoder`] it feeds.
+    fn probe_rtp(index: usize, sequence: u16, payload_byte: u8, frame_samples: u32) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 111,
+            sequence,
+            timestamp: u32::from(sequence) * frame_samples,
+            ssrc: 0x3000_0000 + index as u32,
+        };
+        let mut buffer = vec![0u8; 13];
+        let written = write_packet(&header, &[payload_byte], &mut buffer).expect("write");
+        buffer.truncate(written);
+        buffer
+    }
+
+    #[test]
+    fn a_leg_whose_ptime_exceeds_the_room_tick_hears_whole_frames_in_real_time() {
+        // The room ticks every 20 ms but RFC 7587 §6.1 lets an Opus leg negotiate up to 120 ms, so a
+        // 60 ms leg must hear one *whole* 60 ms frame every third tick — not a 20 ms frame padded
+        // with 40 ms of silence three times as fast, which is what a fixed one-frame-per-tick egress
+        // produces (audible as gapped, chipmunked audio, with the RTP timestamp running at 3× real
+        // time against the wall clock).
+        let mut conference = Conference::new("room".into(), 0);
+        let (talker, _talker_log) = probe_config(0, 48_000, 20);
+        let (long_ptime, long_log) = probe_config(1, 48_000, 60);
+        assert!(conference.add_participant(talker));
+        assert!(conference.add_participant(long_ptime));
+        assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
+
+        // Only seat 0 speaks (level 6000, above the VAD threshold); seat 1 listens.
+        for sequence in 0..30 {
+            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", probe_rtp(0, sequence, 60, 960))));
+        }
+        let mut emitted = Vec::new();
+        for _ in 0..12 {
+            let mut out = Vec::new();
+            conference.tick(&mut out);
+            for datagram in out {
+                if datagram.endpoint == EndpointId(2) {
+                    emitted.push(datagram);
+                }
+            }
+        }
+
+        let log = long_log.lock().expect("log");
+        assert_eq!(
+            log.len(),
+            4,
+            "12 ticks are 240 ms, which is exactly four 60 ms frames — one per tick would be twelve, \
+             running the leg's clock at 3x real time"
+        );
+        for frame in log.iter() {
+            assert_eq!(frame.len(), 2880, "one whole 60 ms frame at 48 kHz");
+            assert!(
+                frame.iter().all(|&sample| sample == 6000),
+                "the whole 60 ms carries audio — a padded frame would be 2/3 zeros"
+            );
+        }
+        assert_eq!(
+            emitted.len(),
+            log.len(),
+            "one egress packet per encoded frame, not one per tick"
+        );
+        // Real time: the RTP timestamp advances one 60 ms frame per packet (RFC 3550 §5.1), so the
+        // stream's clock matches the wall clock instead of running three times ahead of it.
+        let timestamps: Vec<u32> = emitted
+            .iter()
+            .map(|datagram| {
+                RtpPacket::parse(&datagram.data)
+                    .expect("valid egress RTP")
+                    .timestamp
+            })
+            .collect();
+        for pair in timestamps.windows(2) {
+            assert_eq!(
+                pair[1].wrapping_sub(pair[0]),
+                2880,
+                "60 ms at 48 kHz per packet"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leg_whose_ptime_is_shorter_than_the_room_tick_hears_every_frame() {
+        // The mirror case: a 10 ms Opus leg needs *two* packets out of every 20 ms tick, or half the
+        // audio is dropped on the floor and its RTP timestamp runs at half real time.
+        let mut conference = Conference::new("room".into(), 0);
+        let (talker, _talker_log) = probe_config(0, 48_000, 20);
+        let (short_ptime, short_log) = probe_config(1, 48_000, 10);
+        assert!(conference.add_participant(talker));
+        assert!(conference.add_participant(short_ptime));
+
+        for sequence in 0..30 {
+            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", probe_rtp(0, sequence, 60, 960))));
+        }
+        let mut emitted = 0usize;
+        for _ in 0..6 {
+            let mut out = Vec::new();
+            conference.tick(&mut out);
+            emitted += out
+                .iter()
+                .filter(|datagram| datagram.endpoint == EndpointId(2))
+                .count();
+        }
+
+        let log = short_log.lock().expect("log");
+        for frame in log.iter() {
+            assert_eq!(frame.len(), 480, "one whole 10 ms frame at 48 kHz");
+        }
+        assert_eq!(
+            log.len(),
+            12,
+            "six 20 ms ticks are 120 ms, which is twelve 10 ms frames — one per tick would drop \
+             half the audio and halve the RTP clock"
+        );
+        assert_eq!(emitted, log.len(), "one egress packet per encoded frame");
+        assert!(
+            log.iter().all(|frame| frame.iter().all(|&s| s == 6000)),
+            "every 10 ms frame carries the talker's audio"
+        );
+    }
+
+    #[test]
+    fn a_long_ptime_ingress_is_drained_a_tick_at_a_time() {
+        // The ingress mirror: a 60 ms leg hands the room 60 ms of PCM per decode, which must be spent
+        // over three ticks. Consuming a whole frame per tick would burn its jitter buffer three times
+        // too fast and drop two thirds of its audio; the room row is only 20 ms long.
+        let mut conference = Conference::new("room".into(), 0);
+        let (long_ptime, _long_log) = probe_config(0, 48_000, 60);
+        let (listener, listener_log) = probe_config(1, 48_000, 20);
+        assert!(conference.add_participant(long_ptime));
+        assert!(conference.add_participant(listener));
+
+        // Exactly four 60 ms packets = 240 ms of audio = 12 room ticks' worth.
+        for sequence in 0..4 {
+            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", probe_rtp(0, sequence, 60, 2880))));
+        }
+        for _ in 0..12 {
+            let mut out = Vec::new();
+            conference.tick(&mut out);
+        }
+
+        let log = listener_log.lock().expect("log");
+        let with_audio = log
+            .iter()
+            .filter(|frame| frame.iter().all(|&sample| sample == 6000))
+            .count();
+        assert_eq!(
+            with_audio, 12,
+            "four 60 ms packets are 240 ms of audio, which is exactly twelve 20 ms ticks; \
+             consuming a whole 60 ms frame per tick would spend them in four and leave eight silent"
+        );
+        for frame in log.iter() {
+            assert_eq!(
+                frame.len(),
+                960,
+                "the 20 ms listener still hears 20 ms frames"
+            );
+        }
     }
 
     #[test]
