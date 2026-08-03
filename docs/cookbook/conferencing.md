@@ -31,19 +31,48 @@ ranking drives the dominant-speaker detection behind the `active_speaker` event.
 
 ### Dynamic room rate
 
-A room runs at 8 kHz when every participant is narrowband (G.711, G.726, GSM-FR, ...) and the
-room is not bridged. The common all-G.711/PSTN conference then pays zero resampling. The moment a
-wideband leg joins (G.722, AMR-WB) or the room is bridged to another room, the room flips to
-16 kHz and every participant's resampler pair is rebuilt. A bridge always forces 16 kHz so both
-ends share the rate and no inter-room resampling is needed.
+An unbridged room runs at the lowest of three rates — 8 kHz, 16 kHz, 48 kHz — that is at or above
+every seated participant's own sample rate, so no leg is ever downsampled on the way into the mix.
+An all-narrowband room (G.711, G.726, GSM-FR, ...) stays at 8 kHz, so the common all-G.711/PSTN
+conference pays zero resampling. A wideband leg (G.722, AMR-WB) lifts it to 16 kHz; a full-band leg
+(Opus, which RFC 7587 §4.1 clocks at 48 kHz) lifts it to 48 kHz, and an all-Opus room therefore
+mixes full-band with no resampler in the path at all. Every rate change rebuilds every
+participant's resampler pair, mid-call, in either direction. A leg whose rate falls between two
+tiers (a 24 kHz Opus `maxplaybackrate`, say) is carried by the tier above it — upsampled, rather
+than losing band on the way in.
+
+A bridged room is the exception: it is pinned to 16 kHz regardless of membership. A bridge carries
+bare room-rate frames with no rate tag and the two rooms' memberships move independently, so one
+fixed rate is the only way both ends can agree without inter-room resampling.
+
+### Packetization intervals that are not 20 ms
+
+The room tick is a fixed 20 ms, but a leg's packetization interval need not be — RFC 7587 §6.1 lets
+an Opus leg negotiate anything from 10 ms to 120 ms. Such a leg is drained and re-accumulated at the
+room boundary rather than forced onto the tick: a 60 ms decode feeds three ticks instead of being
+truncated to its first 20 ms, and the mix is held until a whole 60 ms frame is ready, so the leg
+emits one packet every third tick with its RTP timestamp advancing 60 ms at a time. A 10 ms leg is
+the mirror: two decodes fill a tick, and two packets leave it. Either way the leg's RTP clock tracks
+the wall clock. A 20 ms leg (all of G.711, G.722, G.726, GSM-FR, AMR-NB/WB, and the Opus default)
+takes the direct path and allocates neither buffer.
+
+Two things get a leg refused at join. Its decoder and encoder must agree on sample rate,
+packetization interval, and channel count: the room works in one frame length per participant, and a
+mismatched pair would hand its encoder a wrong-length frame every tick. And its interval must be at
+most 120 ms — the interval sizes the leg's ingress carry, its egress accumulator, and its playout
+queue, so an unbounded `a=ptime` would buy a peer arbitrary per-participant buffering.
 
 ### Shared encode
 
 Every listener (and every non-contributing talker) hears the same frame, so the engine encodes it
 once per codec class per tick and fans the payload out with each leg's own RTP header. This works
 for stateless codecs (G.711, L16); stateful encoders (G.722, G.726) and active talkers still
-encode per leg. In a 16 kHz room, narrowband listeners share a single room-to-8 kHz downsample
-too. A 40-listener G.711 webinar pays one encode per tick, not forty.
+encode per leg. Listeners running below the room rate share the resample too — one room-to-8 kHz
+and one room-to-16 kHz downsample per tick, not one per listener — so a 48 kHz Opus room with a
+G.711 gallery and a 16 kHz gallery pays two downsamples between all of them. A 40-listener G.711
+webinar pays one encode per tick, not forty. A listener whose packetization interval is not the room
+tick is excluded from the shared class: the shared payload is exactly one tick of the listener mix,
+and such a leg's frames straddle tick boundaries at its own phase.
 
 ## What a conference leg accepts
 
