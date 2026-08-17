@@ -87,9 +87,16 @@ bytes = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 proptest = { workspace = true }
+criterion = { workspace = true }
 tempfile = { workspace = true }
 # `wss://` handshake test: a self-signed TLS WebSocket server (rcgen cert → tokio-rustls acceptor)
 # the engine dials, proving the ring/rustls connector completes the TLS + WS upgrade end-to-end.
 rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+
+# The per-packet cost a *secure* media-pipeline leg pays — the SRTP (de)crypt the pipeline adds on
+# top of a plaintext transcode, and the cost of the DTLS pending-key gate before a leg is keyed.
+[[bench]]
+name = "secure_pipeline_bench"
+harness = false

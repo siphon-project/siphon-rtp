@@ -355,6 +355,9 @@ is wrong, and encryption defeats A2 eavesdrop.
 > **DTLS-SRTP is implemented** (the WebRTC keying path, RFC 5764) via `siphon-rtp-dtls` +
 > `engine/src/dtls_bridge.rs`: the offer advertises `a=fingerprint` + `a=setup:actpass`, and the
 > handshake keys the same `SecureLeg` through the same profile flags below.
+>
+> **A DTLS leg reaches the media pipeline** (`PipelineKind::DtlsMedia`), so a WebRTC leg can be
+> transcoded, recorded, noise-suppressed or WS-teed rather than only relayed — see Layer 5d.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The
@@ -429,6 +432,53 @@ datapath's Forward-path layer-2 gate.
   packet, exactly as the conference actor does); a spoofed source that fails the gate does **not**, so
   it cannot keep a dead path alive. The daemon sweep (Layer 6) then reaps a media call idle past the
   media timeout — an actively-transcoding/echoing call is kept alive, a silent one is torn down.
+
+### Layer 5d — A DTLS-SRTP leg on the media Redirect path
+A DTLS leg whose media must actually be *decoded* — a different codec per side, recording, noise
+suppression, echo cancellation — resolves to `PipelineKind::DtlsMedia`, the DTLS analogue of
+`SrtpMedia`. It is the path that makes a WebRTC leg more than a relay.
+
+**Split of responsibility.** The DTLS endpoint stays owned by `dtls_bridge.rs`, because only it can
+do the two things that are genuinely DTLS-specific: the RFC 7983 demux (Layer 1) and the handshake.
+Everything after that belongs to the per-call `MediaCall` actor:
+
+| Sub-stream (RFC 7983) | Handled by |
+|---|---|
+| STUN | the ICE responder / agent (Layer 4) |
+| DTLS | the handshake task in `dtls_bridge.rs` |
+| SRTP / SRTCP media | forwarded **still encrypted** to the `MediaCall` actor, which decrypts on its own `secure_ingress` |
+
+Forwarding media encrypted — rather than decrypting in the bridge and passing plaintext on — keeps a
+single owner for the `SecureLeg`. Its SRTP contexts, the decode/re-encode, and the reverse
+direction's `protect` all sit behind one actor mailbox, so no crypto state straddles two tasks. This
+is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now joins it.
+
+- **Keying is asynchronous, and the gap is closed by dropping, not by trusting.** SDES delivers its
+  key in the answer; DTLS produces one only when the handshake finishes, which is after the control
+  command has returned. The actor is therefore built **pending** (`with_far_secure_pending`), and
+  every direction facing the secure peer drops media until
+  `MediaControl::AttachSecureLeg` delivers the key. This is a security property, not a nicety:
+  - an unkeyed secure **ingress** must not be decoded as if it were plaintext (SRTP payload decoded
+    as G.711 is noise at the far end, and it would put ciphertext-derived audio on the wire);
+  - an unkeyed secure **egress** must not emit the other party's cleartext toward a peer that
+    negotiated encryption.
+  The egress guard sits in `Direction::push_egress`, the single choke point every emitted datagram
+  passes through — transcode, injected prompt, comfort noise, relayed telephone-event and echo
+  reflect alike — so a new egress caller cannot bypass it by construction. Non-muxed SRTCP relays
+  carry the same gate (`RtcpRelay::with_pending_secure`).
+- **No unkeyed window.** On handshake success the key is handed to the actor *first* and only then
+  published to the bridge. Because the actor's mailbox is FIFO and the bridge releases no media until
+  that flag is set, the key is always already queued ahead of the first media packet. A handshake
+  that completes after the call is gone leaves the leg unkeyed, so media keeps being dropped.
+- **Source gate and latch (RTPBleed, restated).** Unchanged and applied twice: the bridge re-enforces
+  the signalled-source gate before the demux (`Redirect` bypasses the datapath's Forward-path gate),
+  and the actor re-enforces it again per direction before any decode. The SSRC-consistent latch still
+  only ever follows an **authenticated** packet — on this path the SRTP `unprotect` inside the actor
+  is what authenticates, so a forged packet cannot move the reply direction (Layer 3).
+- **Not yet on this path.** Conference (MCU) legs still reject DTLS: a room stores each participant's
+  `SecureLeg` by value rather than behind a shared handle, so deferred keying needs its own control
+  message into the room actor. Tracked, not silently degraded — `conference_join` refuses a DTLS leg
+  rather than seating it unencrypted.
 
 ### Layer 5c — The conference (MCU) Redirect path
 The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,

@@ -1916,6 +1916,7 @@ version = "0.1.5"
 dependencies = [
  "bytes",
  "clap",
+ "criterion",
  "dashmap",
  "flume",
  "futures-util",
