@@ -12,7 +12,7 @@
 //!   [`MediaLeg`] encode → RTP to the call.
 //! - **Barge-in**: `clear` (or the local VAD) drops the queued playout within one tick.
 
-use crate::bridge::audio::{BridgeCore, MAX_FRAME_SAMPLES};
+use crate::bridge::audio::{BridgeCore, MAX_FRAME_VALUES};
 use crate::bridge::protocol::{ControlMessage, Direction, MediaFormat};
 use crate::leg::{MediaLeg, PcmFrame};
 use siphon_rtp_dsp::EchoCanceller;
@@ -30,6 +30,18 @@ pub struct TickResult {
 pub struct BridgeSession {
     leg: MediaLeg,
     core: BridgeCore,
+    /// Audio channels the leg's decoder emits per frame — 1 for every telephony codec, 2 for a
+    /// stereo Opus ingress (RFC 7587 §6.1 `sprop-stereo=1`). Cached at construction so the per-tick
+    /// path does not pay a virtual call for it; handed to [`BridgeCore::commit_uplink`], which folds
+    /// the decoded frame to the mono the WS format advertises.
+    decode_channels: u8,
+    /// Uplink frames the leg's decoder rejected. Counted so a persistently undecodable stream is
+    /// visible rather than silent — a swallowed decode error here means a call that looks healthy
+    /// from every angle while carrying no audio at all to the server.
+    uplink_decode_errors: u64,
+    /// Downlink frames the leg's encoder rejected (e.g. a server frame that is not one codec frame
+    /// long, or a payload past the MTU bound). Same reasoning as `uplink_decode_errors`.
+    downlink_encode_errors: u64,
 }
 
 impl BridgeSession {
@@ -44,9 +56,25 @@ impl BridgeSession {
         playout_cap: usize,
     ) -> Self {
         Self {
+            decode_channels: leg.decode_channels(),
             leg,
             core: BridgeCore::new(format, stream_id, call_id, direction, playout_cap),
+            uplink_decode_errors: 0,
+            downlink_encode_errors: 0,
         }
+    }
+
+    /// Uplink frames this session's decoder rejected — audio the WS server never received. Non-zero
+    /// means the leg is carrying media the bridge cannot decode; see [`BridgeSession::tick`].
+    #[must_use]
+    pub fn uplink_decode_errors(&self) -> u64 {
+        self.uplink_decode_errors
+    }
+
+    /// Downlink frames this session's encoder rejected — server audio the call never heard.
+    #[must_use]
+    pub fn downlink_encode_errors(&self) -> u64 {
+        self.downlink_encode_errors
     }
 
     /// Enable single-channel noise suppression on the uplink audio — see
@@ -117,13 +145,47 @@ impl BridgeSession {
     /// The leg decode and the core's playout dequeue touch disjoint state, so the RTP shell may pull
     /// its frame before the core ticks — the echo canceller still references the very downlink frame
     /// this tick renders, and a barge-in still drops it before it is encoded.
+    ///
+    /// A failed decode or encode is **counted and logged**, never swallowed: dropping it silently
+    /// leaves a call that looks healthy from every angle — the socket is up, the ticker runs, RTP
+    /// arrives — while the server hears nothing at all.
     pub fn tick(&mut self, uplink_out: &mut [u8], downlink_rtp_out: &mut [u8]) -> TickResult {
         // Uplink: decode one PCM frame off the leg's jitter buffer straight into the core's staging
         // slot — no intermediate frame buffer, so the split costs the per-tick path nothing.
-        let frame_samples = self.leg.frame_samples().min(MAX_FRAME_SAMPLES);
-        let decoded = self.leg.next_pcm(self.core.uplink_slot(frame_samples));
-        if let Ok(PcmFrame::Decoded(written) | PcmFrame::Concealed(written)) = decoded {
-            self.core.commit_uplink(written);
+        //
+        // The slot is the **ceiling**, not this leg's nominal frame, for the same reason the media
+        // pipeline hands its decoder a ceiling-sized scratch: what a packet carries is the peer's
+        // choice, not the negotiated `a=ptime`. RFC 6716 §3.2 lets an Opus packet hold up to 120 ms
+        // whatever was signalled, and RFC 4566 §6 makes `ptime` a recommendation rather than a
+        // constraint — sizing the slot at the leg's nominal frame would fail the decode of a longer
+        // packet, which is exactly the silent uplink this path already had once.
+        match self.leg.next_pcm(self.core.uplink_slot(MAX_FRAME_VALUES)) {
+            Ok(PcmFrame::Decoded(written) | PcmFrame::Concealed(written)) => {
+                self.core.commit_uplink(written, self.decode_channels);
+            }
+            Ok(PcmFrame::Starved) => {} // nothing to play this tick — not a failure
+            Err(error) => {
+                // First occurrence at `error!`, the rest at `debug!`: a hostile or misconfigured
+                // stream must not be able to flood the log one line per ptime.
+                self.uplink_decode_errors += 1;
+                if self.uplink_decode_errors == 1 {
+                    tracing::error!(
+                        target: "siphon_rtp::media",
+                        %error,
+                        nominal_frame_values = self.leg.frame_samples(),
+                        channels = self.decode_channels,
+                        "ws bridge uplink frame failed to decode — no audio reaches the server \
+                         (further failures at debug)"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "siphon_rtp::media",
+                        %error,
+                        uplink_decode_errors = self.uplink_decode_errors,
+                        "ws bridge uplink frame failed to decode — no audio reaches the server"
+                    );
+                }
+            }
         }
 
         let mut result = TickResult {
@@ -135,7 +197,25 @@ impl BridgeSession {
         if let Some(frame) = self.core.take_downlink_pcm() {
             match self.leg.encode_rtp(&frame, downlink_rtp_out) {
                 Ok(len) => result.downlink_bytes = len,
-                Err(error) => tracing::debug!(%error, "bridge downlink encode failed"),
+                Err(error) => {
+                    self.downlink_encode_errors += 1;
+                    if self.downlink_encode_errors == 1 {
+                        tracing::error!(
+                            target: "siphon_rtp::media",
+                            %error,
+                            frame_samples = frame.len(),
+                            "ws bridge downlink frame failed to encode — the call hears nothing \
+                             (further failures at debug)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "siphon_rtp::media",
+                            %error,
+                            downlink_encode_errors = self.downlink_encode_errors,
+                            "ws bridge downlink frame failed to encode — the call hears nothing"
+                        );
+                    }
+                }
             }
         }
 
@@ -146,11 +226,12 @@ impl BridgeSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::protocol::{ClearData, StopData};
+    use crate::bridge::protocol::{ClearData, Encoding, Endianness, StopData};
     use crate::bridge::{l16_le_to_pcm, pcm_to_l16_le};
     use crate::jitter::JitterBuffer;
-    use crate::rtp::{write_packet, RtpHeader, RtpPacket};
+    use crate::rtp::{write_packet, RtpHeader, RtpPacket, FIXED_HEADER_LEN};
     use siphon_rtp_codec::g711::G711;
+    use siphon_rtp_codec::l16::L16;
 
     fn ulaw_session() -> BridgeSession {
         let leg = MediaLeg::new(
@@ -656,6 +737,451 @@ mod tests {
             digest, GOLDEN_DIGEST,
             "takeover-mode output changed — this is a behaviour change, not a refactor"
         );
+    }
+
+    /// A bridge session over an `L16/<rate>` leg at `a=ptime:<ptime_ms>` — the cheapest fixture for a
+    /// leg whose codec frame is longer than 20 ms at 48 kHz, and proof the long-frame path is not
+    /// Opus-specific (RFC 3551 §4.5.11 L16; RFC 4566 §6 `a=ptime`).
+    fn l16_session(sample_rate_hz: u32, ptime_ms: u8) -> BridgeSession {
+        let leg = MediaLeg::new(
+            Box::new(L16::new(sample_rate_hz, ptime_ms)),
+            Box::new(L16::new(sample_rate_hz, ptime_ms)),
+            JitterBuffer::new(1, 16),
+            0x5555_6666,
+            11,
+        );
+        BridgeSession::new(
+            leg,
+            MediaFormat {
+                encoding: Encoding::L16,
+                sample_rate: sample_rate_hz,
+                channels: 1,
+                bit_depth: 16,
+                endianness: Endianness::Little,
+                ptime: ptime_ms,
+            },
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        )
+    }
+
+    /// One RTP packet carrying `pcm` as an L16 payload (RFC 3551 §4.5.11: network byte order).
+    fn l16_packet(sequence: u16, pcm: &[i16]) -> Vec<u8> {
+        let mut payload = vec![0u8; pcm.len() * 2];
+        for (sample, chunk) in pcm.iter().zip(payload.chunks_exact_mut(2)) {
+            chunk.copy_from_slice(&sample.to_be_bytes());
+        }
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 11,
+            sequence,
+            timestamp: u32::from(sequence) * pcm.len() as u32,
+            ssrc: 1,
+        };
+        let mut buffer = vec![0u8; FIXED_HEADER_LEN + payload.len()];
+        let written = write_packet(&header, &payload, &mut buffer).expect("write");
+        buffer.truncate(written);
+        buffer
+    }
+
+    /// A deterministic ramp, so a truncated uplink is distinguishable from a shifted one.
+    fn ramp(samples: usize) -> Vec<i16> {
+        (0..samples)
+            .map(|index| ((index % 4096) as i16).wrapping_mul(7))
+            .collect()
+    }
+
+    /// A leg whose nominal frame is longer than 20 ms at 48 kHz must still deliver its audio to the
+    /// WS server. `L16/48000` at `a=ptime:40` is 1920 samples per frame — more than one 48 kHz 20 ms
+    /// frame — and every sample of it has to arrive: not silence, not a truncated half frame.
+    #[test]
+    fn a_long_ptime_leg_delivers_its_whole_frame_to_the_uplink() {
+        const FRAME: usize = 1920; // 48 kHz × 40 ms
+        let mut session = l16_session(48_000, 40);
+        let pcm = ramp(FRAME);
+        session.on_rtp(&l16_packet(0, &pcm));
+
+        let mut uplink = [0u8; 4 * FRAME];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+
+        assert_eq!(
+            result.uplink_bytes,
+            2 * FRAME,
+            "the whole 40 ms frame must reach the uplink, not a 20 ms slice of it"
+        );
+        let mut back = vec![0i16; FRAME];
+        let count = l16_le_to_pcm(&uplink[..result.uplink_bytes], &mut back);
+        assert_eq!(count, FRAME);
+        assert_eq!(back, pcm, "the uplink audio must be the audio that went in");
+    }
+
+    /// The same at the engine's ptime ceiling (`OPUS_MAX_PTIME_MS`), which is what sizes the staging
+    /// buffer — a leg at exactly the ceiling must not be one sample short.
+    #[test]
+    fn a_leg_at_the_ptime_ceiling_delivers_its_whole_frame_to_the_uplink() {
+        let ptime_ms = siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS;
+        let frame = 48 * usize::from(ptime_ms); // 48 kHz × 120 ms = 5760
+        let mut session = l16_session(48_000, ptime_ms);
+        let pcm = ramp(frame);
+        session.on_rtp(&l16_packet(0, &pcm));
+
+        let mut uplink = vec![0u8; 4 * frame];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+
+        assert_eq!(result.uplink_bytes, 2 * frame);
+        let mut back = vec![0i16; frame];
+        l16_le_to_pcm(&uplink[..result.uplink_bytes], &mut back);
+        assert_eq!(back, pcm);
+    }
+
+    /// The reachable-from-a-WebRTC-peer case: an Opus leg at `a=ptime:60` (RFC 7587 §7, RFC 6716
+    /// §2.1.4 — 60 ms is a legal Opus frame duration), 2880 samples at the 48 kHz clock RFC 7587
+    /// §4.1 pins. Opus is lossy, so this asserts the uplink carries the *frame* and real energy
+    /// rather than exact samples.
+    #[test]
+    fn an_opus_leg_at_ptime_60_delivers_its_whole_frame_to_the_uplink() {
+        use siphon_rtp_codec::factory::{CodecSpec, OpusParams};
+
+        const FRAME: usize = 2880; // 48 kHz × 60 ms
+        let spec = CodecSpec::new(111, "opus", 48_000, 2, 60).with_opus_params(Some(OpusParams {
+            max_average_bitrate: Some(64_000),
+            ..OpusParams::default()
+        }));
+        let decoder = siphon_rtp_codec::factory::decoder_for(&spec).expect("opus decoder");
+        let encoder = siphon_rtp_codec::factory::encoder_for(&spec).expect("opus encoder");
+        assert_eq!(decoder.frame_samples(), FRAME, "48 kHz × 60 ms, mono");
+
+        let leg = MediaLeg::new(decoder, encoder, JitterBuffer::new(1, 16), 0x5555_6666, 111);
+        let mut session = BridgeSession::new(
+            leg,
+            MediaFormat {
+                encoding: Encoding::L16,
+                sample_rate: 48_000,
+                channels: 1,
+                bit_depth: 16,
+                endianness: Endianness::Little,
+                ptime: 60,
+            },
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        );
+
+        // A 500 Hz tone at 48 kHz — well inside every Opus bandwidth, so it survives the codec.
+        let tone: Vec<i16> = (0..FRAME)
+            .map(|index| {
+                (8000.0 * (std::f64::consts::TAU * 500.0 * index as f64 / 48_000.0).sin()) as i16
+            })
+            .collect();
+        let mut wire_encoder = siphon_rtp_codec::factory::encoder_for(&spec).expect("opus encoder");
+        let mut payload = [0u8; 1500];
+        let payload_len = wire_encoder.encode(&tone, &mut payload).expect("encode");
+
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 111,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 1,
+        };
+        let mut packet = vec![0u8; FIXED_HEADER_LEN + payload_len];
+        let written =
+            write_packet(&header, &payload[..payload_len], &mut packet).expect("write packet");
+        packet.truncate(written);
+        session.on_rtp(&packet);
+
+        let mut uplink = vec![0u8; 4 * FRAME];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+
+        assert_eq!(
+            result.uplink_bytes,
+            2 * FRAME,
+            "the whole 60 ms Opus frame must reach the uplink"
+        );
+        let mut back = vec![0i16; FRAME];
+        l16_le_to_pcm(&uplink[..result.uplink_bytes], &mut back);
+        let energy: f64 = back
+            .iter()
+            .map(|&sample| f64::from(sample) * f64::from(sample))
+            .sum::<f64>()
+            / FRAME as f64;
+        let input_energy: f64 = tone
+            .iter()
+            .map(|&sample| f64::from(sample) * f64::from(sample))
+            .sum::<f64>()
+            / FRAME as f64;
+        assert!(
+            energy > 0.25 * input_energy,
+            "the uplink is silent or gutted: {energy:.1} vs {input_energy:.1} in"
+        );
+    }
+
+    /// What a packet *carries* is the sender's choice, not the negotiated `a=ptime`: RFC 4566 §6
+    /// makes `ptime` "the recommended length", and RFC 6716 §3.2 lets an Opus packet hold up to
+    /// 120 ms whatever was signalled (which is also why `OpusCodec` snaps a signalled ptime down to a
+    /// frame duration it can emit, so a leg's nominal frame can be shorter than what arrives). A
+    /// 60 ms packet on a leg negotiated at 20 ms must therefore still decode.
+    #[test]
+    fn a_packet_longer_than_the_negotiated_ptime_still_reaches_the_uplink() {
+        use siphon_rtp_codec::factory::CodecSpec;
+
+        const SENT: usize = 2880; // 48 kHz × 60 ms actually on the wire
+        let negotiated = CodecSpec::new(111, "opus", 48_000, 2, 20);
+        let decoder = siphon_rtp_codec::factory::decoder_for(&negotiated).expect("opus decoder");
+        let encoder = siphon_rtp_codec::factory::encoder_for(&negotiated).expect("opus encoder");
+        assert_eq!(
+            decoder.frame_samples(),
+            960,
+            "the leg's nominal frame is 20 ms"
+        );
+
+        let leg = MediaLeg::new(decoder, encoder, JitterBuffer::new(1, 16), 0x5555_6666, 111);
+        let mut session = BridgeSession::new(
+            leg,
+            MediaFormat {
+                encoding: Encoding::L16,
+                sample_rate: 48_000,
+                channels: 1,
+                bit_depth: 16,
+                endianness: Endianness::Little,
+                ptime: 20,
+            },
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        );
+
+        // The peer packetizes at 60 ms even though 20 ms was negotiated.
+        let long_spec = CodecSpec::new(111, "opus", 48_000, 2, 60);
+        let mut peer = siphon_rtp_codec::factory::encoder_for(&long_spec).expect("opus encoder");
+        let tone: Vec<i16> = (0..SENT)
+            .map(|index| {
+                (8000.0 * (std::f64::consts::TAU * 500.0 * index as f64 / 48_000.0).sin()) as i16
+            })
+            .collect();
+        let mut payload = [0u8; 1500];
+        let payload_len = peer.encode(&tone, &mut payload).expect("encode");
+
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 111,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 1,
+        };
+        let mut packet = vec![0u8; FIXED_HEADER_LEN + payload_len];
+        let written =
+            write_packet(&header, &payload[..payload_len], &mut packet).expect("write packet");
+        packet.truncate(written);
+        session.on_rtp(&packet);
+
+        let mut uplink = vec![0u8; 4 * SENT];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+
+        assert_eq!(
+            session.uplink_decode_errors(),
+            0,
+            "a longer-than-negotiated packet is legal, not a decode failure"
+        );
+        assert_eq!(
+            result.uplink_bytes,
+            2 * SENT,
+            "the whole 60 ms the peer actually sent must reach the uplink"
+        );
+    }
+
+    /// A decoder that rejects every frame — stands in for the class of faults that used to vanish
+    /// here: a hostile payload, a codec/SDP mismatch, or an output buffer the leg outgrew.
+    struct FailingDecoder;
+
+    impl siphon_rtp_codec::Decoder for FailingDecoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            siphon_rtp_codec::CodecParams {
+                sample_rate_hz: 8000,
+                channels: 1,
+                ptime_ms: 20,
+            }
+        }
+        fn frame_samples(&self) -> usize {
+            160
+        }
+        fn decode(
+            &mut self,
+            _payload: &[u8],
+            _out: &mut [i16],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            Err(siphon_rtp_codec::CodecError::Malformed(
+                "test decoder rejects everything",
+            ))
+        }
+        fn conceal(&mut self, _out: &mut [i16]) -> Result<usize, siphon_rtp_codec::CodecError> {
+            Err(siphon_rtp_codec::CodecError::Malformed(
+                "test decoder rejects everything",
+            ))
+        }
+    }
+
+    /// An encoder that rejects every frame — the egress counterpart of [`FailingDecoder`].
+    struct FailingEncoder;
+
+    impl siphon_rtp_codec::Encoder for FailingEncoder {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            siphon_rtp_codec::CodecParams {
+                sample_rate_hz: 8000,
+                channels: 1,
+                ptime_ms: 20,
+            }
+        }
+        fn frame_samples(&self) -> usize {
+            160
+        }
+        fn encode(
+            &mut self,
+            _pcm: &[i16],
+            _out: &mut [u8],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            Err(siphon_rtp_codec::CodecError::Malformed(
+                "test encoder rejects everything",
+            ))
+        }
+    }
+
+    /// The (level, target) of every `tracing` event a closure emitted.
+    #[derive(Clone, Default)]
+    struct CapturedEvents(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    /// A minimal `tracing` subscriber that records event levels and targets — enough to prove the
+    /// failure path is *observable*, without pulling a subscriber crate into the media plane.
+    struct CapturingSubscriber(CapturedEvents);
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let metadata = event.metadata();
+            if let Ok(mut events) = self.0 .0.lock() {
+                events.push((*metadata.level(), metadata.target().to_string()));
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// An undecodable uplink is **loud**, not silent: every failure is counted, the first is reported
+    /// at `error!` and the rest at `debug!` (a per-ptime `error!` would be a log-flood vector on a
+    /// hostile stream). This is the regression guard for the swallowed `if let Ok(..)` that let a
+    /// bridged call run for its whole duration carrying no audio, with nothing in the logs.
+    #[test]
+    fn an_undecodable_uplink_frame_is_counted_and_logged_not_swallowed() {
+        const FRAMES: usize = 4;
+        let leg = MediaLeg::new(
+            Box::new(FailingDecoder),
+            Box::new(G711::ulaw()),
+            JitterBuffer::new(1, 16),
+            0x5555_6666,
+            0,
+        );
+        let mut session = BridgeSession::new(
+            leg,
+            MediaFormat::telephony_default(),
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        );
+
+        let captured = CapturedEvents::default();
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        tracing::subscriber::with_default(CapturingSubscriber(captured.clone()), || {
+            for sequence in 0..FRAMES {
+                session.on_rtp(&ulaw_packet(sequence as u16, 0xFF));
+                let result = session.tick(&mut uplink, &mut downlink);
+                assert_eq!(result.uplink_bytes, 0, "nothing decodable, nothing framed");
+            }
+        });
+
+        assert_eq!(
+            session.uplink_decode_errors(),
+            FRAMES as u64,
+            "every failed uplink frame must be counted"
+        );
+        let events = captured.0.lock().expect("captured events").clone();
+        let media: Vec<tracing::Level> = events
+            .iter()
+            .filter(|(_, target)| target == "siphon_rtp::media")
+            .map(|(level, _)| *level)
+            .collect();
+        assert_eq!(
+            media.len(),
+            FRAMES,
+            "one media-target event per failed frame, got {events:?}"
+        );
+        assert_eq!(media[0], tracing::Level::ERROR, "the first failure is loud");
+        assert!(
+            media[1..]
+                .iter()
+                .all(|level| *level == tracing::Level::DEBUG),
+            "later failures drop to debug so a hostile stream cannot flood the log: {media:?}"
+        );
+    }
+
+    /// The downlink counterpart: a playout frame the leg's encoder rejects is counted and logged too
+    /// — the call hearing nothing must not be silent in the logs either.
+    #[test]
+    fn an_unencodable_downlink_frame_is_counted_and_logged() {
+        let leg = MediaLeg::new(
+            Box::new(G711::ulaw()),
+            Box::new(FailingEncoder),
+            JitterBuffer::new(1, 16),
+            0x5555_6666,
+            0,
+        );
+        let mut session = BridgeSession::new(
+            leg,
+            MediaFormat::telephony_default(),
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        );
+        let mut l16 = [0u8; 320];
+        pcm_to_l16_le(&[1000i16; 160], &mut l16);
+        session.on_ws_binary(&l16);
+        session.on_ws_binary(&l16);
+
+        let captured = CapturedEvents::default();
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        tracing::subscriber::with_default(CapturingSubscriber(captured.clone()), || {
+            for _ in 0..2 {
+                let result = session.tick(&mut uplink, &mut downlink);
+                assert_eq!(result.downlink_bytes, 0);
+            }
+        });
+
+        assert_eq!(session.downlink_encode_errors(), 2);
+        let events = captured.0.lock().expect("captured events").clone();
+        let media: Vec<tracing::Level> = events
+            .iter()
+            .filter(|(_, target)| target == "siphon_rtp::media")
+            .map(|(level, _)| *level)
+            .collect();
+        assert_eq!(media, vec![tracing::Level::ERROR, tracing::Level::DEBUG]);
     }
 
     #[test]

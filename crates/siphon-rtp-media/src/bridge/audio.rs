@@ -25,8 +25,30 @@ use crate::bridge::protocol::{
 };
 use siphon_rtp_dsp::{EchoCanceller, EnergyVad, NoiseSuppressor};
 
-/// Largest frame the scratch PCM buffers hold (48 kHz × 20 ms).
-pub const MAX_FRAME_SAMPLES: usize = 960;
+/// Longest packetization a leg on this path can negotiate, in milliseconds. Single-sourced from
+/// [`siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS`] — the RFC 7587 §6.1 `maxptime` ceiling, which is
+/// also what the engine clamps its control-flag ptime to and what bounds the media pipeline's frame
+/// buffers — so the bridge's idea of "the longest frame" can never drift from the rest of the engine's.
+pub const MAX_PTIME_MS: usize = siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS as usize;
+/// Highest native sample rate any codec on this path runs at, in Hz: RFC 7587 §4.1 pins Opus at
+/// 48 kHz, and every other codec here samples at 8 or 16 kHz.
+const MAX_SAMPLE_RATE_HZ: usize = 48_000;
+/// Audio channels in the longest **decoded** frame. RFC 7587 §6.1 makes an Opus RTP stream mono or
+/// stereo (`sprop-stereo`); Opus multistream / surround (RFC 7845) is out of scope and every other
+/// codec here is mono.
+const MAX_CHANNELS: usize = 2;
+
+/// Samples **per channel** in the longest frame a leg can hand the bridge — 48 kHz × 120 ms = 5760.
+/// Sizes every *mono* buffer on the bridge: the staged uplink frame after the channel fold, the echo
+/// reference, and (through it) the L16 uplink the transport writes.
+pub const MAX_FRAME_SAMPLES: usize = MAX_SAMPLE_RATE_HZ / 1000 * MAX_PTIME_MS;
+
+/// Largest decoded frame in **interleaved `i16` values** — 5760 × 2 = 11520 (see the channel contract
+/// in `siphon_rtp_codec`: [`crate::leg::MediaLeg::frame_samples`] is the interleaved count, so this,
+/// not [`MAX_FRAME_SAMPLES`], is what a decode output buffer must measure). Only the staging slot is
+/// this long; the fold at the codec boundary means everything downstream is bounded by
+/// [`MAX_FRAME_SAMPLES`].
+pub const MAX_FRAME_VALUES: usize = MAX_FRAME_SAMPLES * MAX_CHANNELS;
 
 /// The PCM-domain core of a WS bridge session. See the module docs for the uplink/downlink contract.
 pub struct BridgeCore {
@@ -62,10 +84,17 @@ pub struct BridgeCore {
     /// share it); `None` when the leg was stood up without the flag or its rate is unsupported.
     /// Preallocated ⇒ its per-frame `cancel` does zero heap allocation.
     echo_canceller: Option<EchoCanceller>,
+    /// Preallocated far-end reference for `echo_canceller` — the downlink frame this tick plays,
+    /// zero-padded to the near-end frame length. Allocated **once**, with the canceller, rather than
+    /// being a per-tick stack array: at the ptime ceiling that array would be 11 KB to zero on every
+    /// tick, which costs more than the cancellation it feeds. Empty when the core does not cancel.
+    echo_reference: Vec<i16>,
     /// Uplink PCM staged by [`BridgeCore::on_pcm_uplink`], consumed by the next [`BridgeCore::tick`].
-    /// A fixed buffer, so staging a frame allocates nothing.
-    uplink: Box<[i16; MAX_FRAME_SAMPLES]>,
-    /// Valid sample count in `uplink`, or `None` when no frame was staged for this tick.
+    /// A fixed buffer, so staging a frame allocates nothing. [`MAX_FRAME_VALUES`] long, because a
+    /// producer decodes **into** it ([`BridgeCore::uplink_slot`]) and a decoder writes interleaved
+    /// values; only the first `uplink_samples` (mono, post-fold) are ever read back out.
+    uplink: Box<[i16; MAX_FRAME_VALUES]>,
+    /// Valid **mono** sample count in `uplink`, or `None` when no frame was staged for this tick.
     uplink_samples: Option<usize>,
     /// The frame [`BridgeCore::tick`] dequeued from `playout` for the caller to render this tick.
     downlink: Option<Vec<i16>>,
@@ -95,7 +124,8 @@ impl BridgeCore {
             speaking: false,
             pending_control: Vec::new(),
             echo_canceller: None,
-            uplink: Box::new([0i16; MAX_FRAME_SAMPLES]),
+            echo_reference: Vec::new(),
+            uplink: Box::new([0i16; MAX_FRAME_VALUES]),
             uplink_samples: None,
             downlink: None,
         }
@@ -134,6 +164,13 @@ impl BridgeCore {
     /// reallocation).
     #[must_use]
     pub fn with_echo_canceller(mut self, echo_canceller: Option<EchoCanceller>) -> Self {
+        // Only a cancelling core ever reads a far-end frame; sized to the longest near-end frame it
+        // will be subtracted from, so the per-tick slice is always in bounds without a bounds check.
+        self.echo_reference = if echo_canceller.is_some() {
+            vec![0i16; MAX_FRAME_SAMPLES]
+        } else {
+            Vec::new()
+        };
         self.echo_canceller = echo_canceller;
         self
     }
@@ -192,18 +229,32 @@ impl BridgeCore {
         self.uplink_samples = Some(count);
     }
 
-    /// Borrow the staging slot for one `samples`-sample uplink frame, to decode **directly into** —
-    /// takeover mode's [`crate::leg::MediaLeg`] does this so the per-tick path carries no extra frame
-    /// copy at all. Commit what was actually written with [`BridgeCore::commit_uplink`]; without a
-    /// commit the next tick sees no staged frame. Truncated to [`MAX_FRAME_SAMPLES`].
-    pub fn uplink_slot(&mut self, samples: usize) -> &mut [i16] {
-        let count = samples.min(MAX_FRAME_SAMPLES);
+    /// Borrow the staging slot for one uplink frame of `values` **interleaved** `i16` values, to
+    /// decode **directly into** — takeover mode's [`crate::leg::MediaLeg`] does this so the per-tick
+    /// path carries no extra frame copy at all. `values` is the decoder's buffer contract
+    /// ([`crate::leg::MediaLeg::frame_samples`], an interleaved count), so it is measured against
+    /// [`MAX_FRAME_VALUES`], not [`MAX_FRAME_SAMPLES`]. Commit what was actually written with
+    /// [`BridgeCore::commit_uplink`]; without a commit the next tick sees no staged frame.
+    ///
+    /// A slot shorter than the decoder needs makes the decode fail rather than silently truncate, so
+    /// the constant above has to cover every legitimate leg — see [`MAX_FRAME_VALUES`].
+    pub fn uplink_slot(&mut self, values: usize) -> &mut [i16] {
+        let count = values.min(MAX_FRAME_VALUES);
         &mut self.uplink[..count]
     }
 
-    /// Mark the first `samples` samples of [`BridgeCore::uplink_slot`] as this tick's staged uplink
-    /// frame.
-    pub fn commit_uplink(&mut self, samples: usize) {
+    /// Mark the first `values` **interleaved** values of [`BridgeCore::uplink_slot`] as this tick's
+    /// staged uplink frame, folding them to mono in place when `channels > 1`.
+    ///
+    /// The fold happens here, once, at the codec boundary — the same place the transcode pipeline
+    /// does it — because everything downstream of it (VAD, noise suppression, echo cancellation, the
+    /// L16 wire frame the server is told is mono) is single-channel. Staging interleaved stereo as
+    /// mono would read channel pairs as consecutive samples and play back at double speed with the
+    /// channels smeared: audible garbage with no error anywhere. A mono leg (`channels <= 1`) pays
+    /// nothing — the fold is a no-op returning the same count.
+    pub fn commit_uplink(&mut self, values: usize, channels: u8) {
+        let values = values.min(MAX_FRAME_VALUES);
+        let samples = siphon_rtp_codec::downmix_to_mono(&mut self.uplink[..values], channels);
         self.uplink_samples = Some(samples.min(MAX_FRAME_SAMPLES));
     }
 
@@ -305,12 +356,17 @@ impl BridgeCore {
             // model does not hear its own speech reflected by the phone. A silent (absent) downlink
             // yields a zero reference — nothing to cancel. In place, zero per-frame heap.
             if let Some(echo_canceller) = self.echo_canceller.as_mut() {
-                let mut reference = [0i16; MAX_FRAME_SAMPLES];
-                if let Some(frame) = downlink_frame.as_ref() {
+                // Preallocated (see `echo_reference`), so only the *tail* past the downlink frame is
+                // zeroed each tick — not the whole ceiling-sized buffer. `written` is bounded by
+                // `MAX_FRAME_SAMPLES`, which is exactly the reference's length.
+                let reference = &mut self.echo_reference[..written];
+                let carried = downlink_frame.as_ref().map_or(0, |frame| {
                     let count = frame.len().min(written);
                     reference[..count].copy_from_slice(&frame[..count]);
-                }
-                echo_canceller.cancel(pcm, &reference[..written]);
+                    count
+                });
+                reference[carried..].fill(0);
+                echo_canceller.cancel(pcm, reference);
             }
             uplink_bytes = pcm_to_l16_le(pcm, uplink_out);
         }
@@ -399,8 +455,51 @@ mod tests {
     fn an_oversized_staged_frame_is_truncated_not_panicking() {
         let mut core = core();
         core.on_pcm_uplink(&vec![3i16; MAX_FRAME_SAMPLES * 2]);
-        let mut uplink = [0u8; 4096];
+        let mut uplink = vec![0u8; MAX_FRAME_SAMPLES * 4];
         assert_eq!(core.tick(&mut uplink), MAX_FRAME_SAMPLES * 2);
+    }
+
+    #[test]
+    fn the_frame_bounds_are_derived_from_the_engines_ptime_ceiling() {
+        // 48 kHz × 120 ms = 5760 samples per channel, 11520 interleaved values. Asserted against the
+        // arithmetic rather than a literal so a change to the ceiling moves both together.
+        let ceiling = usize::from(siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS);
+        assert_eq!(MAX_FRAME_SAMPLES, 48 * ceiling);
+        assert_eq!(MAX_FRAME_VALUES, MAX_FRAME_SAMPLES * 2);
+    }
+
+    #[test]
+    fn a_committed_stereo_frame_is_folded_to_mono() {
+        // A stereo Opus ingress (RFC 7587 §6.1 `sprop-stereo=1`) decodes interleaved L,R,L,R… Staged
+        // as-is it would frame twice the samples at double speed; the fold at commit makes it mono.
+        let mut core = core();
+        let slot = core.uplink_slot(8);
+        slot.copy_from_slice(&[100, 300, 200, 400, -100, -300, 0, 2]);
+        core.commit_uplink(8, 2);
+
+        let mut uplink = [0u8; 64];
+        assert_eq!(core.tick(&mut uplink), 8, "4 mono samples = 8 bytes");
+        let mut back = [0i16; 4];
+        l16_le_to_pcm(&uplink[..8], &mut back);
+        assert_eq!(
+            back,
+            [200, 300, -200, 1],
+            "per-instant mean of the two channels"
+        );
+    }
+
+    #[test]
+    fn a_committed_mono_frame_is_unchanged_by_the_fold() {
+        let mut core = core();
+        let slot = core.uplink_slot(3);
+        slot.copy_from_slice(&[7, -9, 11]);
+        core.commit_uplink(3, 1);
+
+        let mut uplink = [0u8; 16];
+        assert_eq!(core.tick(&mut uplink), 6);
+        let mut back = [0i16; 3];
+        l16_le_to_pcm(&uplink[..6], &mut back);
+        assert_eq!(back, [7, -9, 11]);
     }
 
     #[test]
