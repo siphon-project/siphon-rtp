@@ -46,6 +46,25 @@ pub enum Command {
         #[serde(default)]
         profile: ProfileFlags,
     },
+    /// SDP **re-offer** on a live call (a SIP re-INVITE, RFC 3264 §8): renegotiate *on the existing
+    /// media ports* rather than replacing the call.
+    ///
+    /// The distinction from a repeated [`Command::Offer`] matters. An `Offer` on a live call-id
+    /// *replaces* it — the old call is torn down and the replacement binds fresh ports, so the peer
+    /// must be told a new address. A `Reoffer` keeps the ports, so the dialog continues uninterrupted.
+    /// That is what a re-INVITE needs, and it is what an RFC 8445 §9 **ICE restart** is detected from:
+    /// a re-offer whose `a=ice-ufrag`/`a=ice-pwd` differ from the current ones restarts ICE while
+    /// media keeps flowing on the previously selected pair.
+    ///
+    /// Owner-only, like every verb that touches a live call. Returns the rewritten SDP, advertising
+    /// the same ports it already advertised (plus fresh ICE credentials when a restart was detected).
+    Reoffer {
+        call_id: String,
+        from_tag: String,
+        sdp: String,
+        #[serde(default)]
+        profile: ProfileFlags,
+    },
     /// SDP answer (B→A). Completes negotiation; returns the rewritten SDP.
     Answer {
         call_id: String,

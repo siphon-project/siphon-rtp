@@ -971,6 +971,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
         }
         match command {
+            Command::Reoffer {
+                call_id,
+                from_tag,
+                sdp,
+                profile,
+            } => {
+                self.reoffer(client, &call_id, &from_tag, &sdp, &profile)
+                    .await
+            }
             Command::Ping => CmdResult::Pong,
             Command::List => self.list(client),
             Command::Statistics => self.statistics(),
@@ -1997,6 +2006,194 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.endpoint_calls.remove(&endpoint);
             }
             self.release_client_call(call.owner);
+        }
+    }
+
+    /// Handle a **re-offer** on a live call (RFC 3264 §8 — a SIP re-INVITE): renegotiate on the
+    /// *existing* media ports, and restart ICE if the peer's credentials changed (RFC 8445 §9).
+    ///
+    /// The contrast with a repeated [`Self::offer`] is the whole point of the verb. An `Offer` on a
+    /// live call-id replaces it: the old call is torn down and the replacement binds fresh ports, so
+    /// the peer has to be told a new address. A `Reoffer` keeps every port, so the media path is
+    /// undisturbed and the dialog continues — which is what a re-INVITE means, and what makes an ICE
+    /// restart possible at all (there is nothing to restart if the call was replaced).
+    ///
+    /// Owner-only (A3 — docs/security-and-nat.md §5).
+    ///
+    /// **Scope, stated rather than silently ignored:** this renegotiates the peer's *transport* — its
+    /// signalled address and its ICE credentials/candidates. A re-offer that changes the negotiated
+    /// codec is **rejected**, not quietly accepted: rebuilding a live transcode pipeline mid-call is
+    /// its own piece of work, and answering "ok" while continuing to run the old codec would be worse
+    /// than saying no.
+    async fn reoffer(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+        sdp: &str,
+        profile: &ProfileFlags,
+    ) -> CmdResult {
+        let info = match sdp::parse(sdp) {
+            Ok(info) => info,
+            Err(error) => {
+                return CmdResult::Error {
+                    reason: format!("re-offer SDP parse failed: {error}"),
+                }
+            }
+        };
+
+        // Snapshot what we need under the guard, enforcing ownership and dialog identity first.
+        let Some((near, ice_creds, previous_remote_ice, previous_codec, advertised_ip)) =
+            self.calls.get(call_id).and_then(|call| {
+                (call.owner == client && call.from_tag == from_tag).then(|| {
+                    (
+                        call.near,
+                        call.ice.clone(),
+                        call.near_remote_ice.clone(),
+                        call.near_codec.clone(),
+                        call.near.advertised_ip,
+                    )
+                })
+            })
+        else {
+            return unknown_call(call_id);
+        };
+
+        // A codec change needs a pipeline rebuild we do not do here — say so.
+        let offered_codec = info.primary_codec();
+        if let (Some(previous), Some(offered)) = (previous_codec.as_ref(), offered_codec.as_ref()) {
+            if previous.encoding_name != offered.encoding_name
+                || previous.clock_rate_hz != offered.clock_rate_hz
+            {
+                return CmdResult::Error {
+                    reason: format!(
+                        "re-offer changes the negotiated codec ({} → {}); not supported on a live \
+                         call — replace it with a fresh offer instead",
+                        previous.encoding_name, offered.encoding_name
+                    ),
+                };
+            }
+        }
+
+        // RFC 8445 §9.1.1.1: an ICE restart is signalled by new credentials on the re-offer.
+        let new_remote_ice = peer_ice_credentials(&info);
+        let ice_restart = match (previous_remote_ice.as_ref(), new_remote_ice.as_ref()) {
+            (Some(previous), Some(new)) => previous != new,
+            // Peer added ICE where it had none, or dropped it: both change the ICE session.
+            (None, Some(_)) | (Some(_), None) => true,
+            (None, None) => false,
+        };
+
+        // Fresh local credentials for a restart (§9.1.1.1: a restarting agent MUST use new ones);
+        // otherwise keep advertising the ones already in play.
+        let ice_creds = if ice_restart && new_remote_ice.is_some() {
+            ice::generate_credentials()
+        } else {
+            ice_creds
+        };
+
+        if ice_restart {
+            tracing::info!(
+                target: "siphon_rtp::media",
+                %call_id,
+                "ICE restart (RFC 8445 §9): the re-offer carries new peer credentials — new session, \
+                 media continues on the current pair until the new one is selected"
+            );
+        }
+
+        // Re-gather for the leg we are re-advertising. Host-only gathering is instant and yields the
+        // same addresses, since the ports are unchanged — which is exactly the property that lets
+        // media keep flowing across the restart.
+        let candidates = match ice_creds.as_ref() {
+            Some(creds) => {
+                self.gather_leg_candidates(
+                    &near,
+                    &IceConfig {
+                        local_ufrag: creds.ufrag.clone(),
+                        local_pwd: creds.pwd.clone(),
+                    },
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
+
+        // Rebuild the near leg's agent against the new session. Crucially the datapath's adopted
+        // source is left alone: under the layer-4 gate media keeps flowing on the previously selected
+        // pair until the new agent selects one and calls `adopt_source` again (RFC 8445 §9.3 — an
+        // agent continues using the old session's pair until the new one completes).
+        if let (Some(agents), Some(creds), Some(remote)) = (
+            self.ice_agents.as_ref(),
+            ice_creds.as_ref(),
+            new_remote_ice.as_ref(),
+        ) {
+            if ice_restart && !info.candidates.is_empty() {
+                let config = IceConfig {
+                    local_ufrag: creds.ufrag.clone(),
+                    local_pwd: creds.pwd.clone(),
+                };
+                for endpoint in near.endpoint_ids() {
+                    let Some(local_addr) = self.endpoint_address(endpoint) else {
+                        continue;
+                    };
+                    let component = if endpoint == near.rtp.id { 1 } else { 2 };
+                    let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
+                        siphon_rtp_ice::agent::Credentials::new(
+                            creds.ufrag.clone(),
+                            creds.pwd.clone(),
+                        ),
+                        siphon_rtp_ice::agent::Credentials::new(
+                            remote.ufrag.clone(),
+                            remote.pwd.clone(),
+                        ),
+                        // §6.1.1: the offerer controls, and here the peer re-offered — unless it is a
+                        // lite agent, which can never control.
+                        info.ice_lite,
+                        ice_tie_breaker(),
+                    )
+                    .with_candidates(
+                        filter_component(&candidates, component),
+                        filter_component(&info.candidates, component),
+                    );
+                    self.datapath.set_ice_agent(
+                        endpoint,
+                        config.clone(),
+                        IceAgentMode::ForwardOnly,
+                        agents.events(),
+                    );
+                    agents.register(endpoint, call_id, local_addr, agent_config, 0);
+                }
+            }
+        }
+
+        // Record the new peer state.
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.near.remote_rtp = Some(info.remote_rtp);
+            call.near.remote_rtcp = Some(info.remote_rtcp);
+            call.near_remote_ice = new_remote_ice;
+            call.near_remote_candidates = info.candidates.clone();
+            call.near_peer_is_lite = info.ice_lite;
+            call.ice = ice_creds.clone();
+        }
+
+        // Re-advertise the *same* endpoints — the ports do not move on a re-offer.
+        let engine = EngineMedia {
+            rtp: near.rtp.local_addr,
+            rtcp: near.rtcp.map(|endpoint| endpoint.local_addr),
+            advertised_ip,
+        };
+        let ice_rewrite = match ice_creds.as_ref() {
+            Some(creds) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+                ufrag: creds.ufrag.as_str(),
+                pwd: creds.pwd.as_str(),
+                candidates: &candidates,
+            }),
+            None => IceRewrite::Keep,
+        };
+        let _ = profile;
+        match sdp::rewrite(sdp, engine, ice_rewrite, None, None) {
+            Ok(rewritten) => ok_sdp(rewritten.sdp, None),
+            Err(error) => error_result("re-offer rewrite", &error),
         }
     }
 
@@ -7060,6 +7257,7 @@ fn leg_summary(
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Offer { .. } => "offer",
+        Command::Reoffer { .. } => "reoffer",
         Command::Answer { .. } => "answer",
         Command::AnswerLocal { .. } => "answer_local",
         Command::Delete { .. } => "delete",
@@ -7104,6 +7302,7 @@ fn command_name(command: &Command) -> &'static str {
 fn command_call_id(command: &Command) -> Option<&str> {
     match command {
         Command::Offer { call_id, .. }
+        | Command::Reoffer { call_id, .. }
         | Command::Answer { call_id, .. }
         | Command::AnswerLocal { call_id, .. }
         | Command::Delete { call_id, .. }
@@ -7229,6 +7428,10 @@ fn supported_features() -> Vec<String> {
         "ng".to_string(),
         "hep".to_string(),
         "ice".to_string(),
+        // A controller can tell, without trying it, whether this node understands `reoffer` — and
+        // therefore whether it can renegotiate on the existing ports and restart ICE (RFC 8445 §9)
+        // rather than replacing the call.
+        "reoffer".to_string(),
         "turn".to_string(),
     ]
 }
@@ -15279,6 +15482,322 @@ mod tests {
             .expect("B's media reaches A — the far leg is not ICE-gated")
             .expect("recv");
         assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+    }
+
+    // ---- re-offer + RFC 8445 §9 ICE restart ------------------------------------------------------
+
+    /// A re-offer from A carrying the given ICE credentials and its host candidate.
+    fn reoffer_sdp(addr: SocketAddr, ufrag: &str, pwd: &str) -> String {
+        format!(
+            "v=0\r\no=- 1 2 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{ufrag}\r\na=ice-pwd:{pwd}\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 {ip} {port} typ host\r\n",
+            ip = addr.ip(),
+            port = addr.port()
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_keeps_the_media_ports_where_a_repeated_offer_would_move_them() {
+        // The distinction the verb exists for. A repeated `Offer` replaces the call on fresh ports;
+        // a `Reoffer` renegotiates in place, so the dialog's media path is undisturbed.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "re".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "re".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let before = sdp::parse(&ok_sdp_text(&answer)).expect("parse").remote_rtp;
+
+        let reoffer = engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "re".into(),
+                    from_tag: "a".into(),
+                    sdp: reoffer_sdp(addr_a, A_UFRAG, A_PWD),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let after = sdp::parse(&ok_sdp_text(&reoffer))
+            .expect("parse")
+            .remote_rtp;
+
+        assert_eq!(
+            after, before,
+            "the re-offer re-advertises the same media port"
+        );
+        assert_eq!(
+            engine.session_count(),
+            1,
+            "and does not create a second call"
+        );
+
+        // Media still relays across the renegotiation, in both directions.
+        let far_rtp = engine
+            .calls
+            .get("re")
+            .map(|call| call.far.rtp.local_addr)
+            .expect("call");
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), far_rtp)
+            .await
+            .expect("send from B");
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("media survives the re-offer")
+            .expect("recv");
+        assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_peer_credentials_on_a_reoffer_restart_ice_with_fresh_local_ones() {
+        // RFC 8445 §9.1.1.1: a restart is detected from new credentials, and the restarting agent
+        // MUST advertise new ones of its own.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "restart".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "restart".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let first = sdp::parse(&ok_sdp_text(&answer)).expect("parse");
+        let first_ufrag = first.ice_ufrag.clone().expect("engine ufrag");
+
+        // Same credentials again ⇒ not a restart: our own must not churn.
+        let same = engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "restart".into(),
+                    from_tag: "a".into(),
+                    sdp: reoffer_sdp(addr_a, A_UFRAG, A_PWD),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert_eq!(
+            sdp::parse(&ok_sdp_text(&same))
+                .expect("parse")
+                .ice_ufrag
+                .as_deref(),
+            Some(first_ufrag.as_str()),
+            "an unchanged re-offer is not a restart"
+        );
+
+        // New peer credentials ⇒ restart, and we mint new ones.
+        let restarted = engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "restart".into(),
+                    from_tag: "a".into(),
+                    sdp: reoffer_sdp(addr_a, "NEWUFRAG", "newpasswordnewpassword"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let restarted = sdp::parse(&ok_sdp_text(&restarted)).expect("parse");
+        assert_ne!(
+            restarted.ice_ufrag.as_deref(),
+            Some(first_ufrag.as_str()),
+            "a restart advertises fresh local credentials (RFC 8445 §9.1.1.1)"
+        );
+        assert!(restarted.ice_pwd.is_some());
+        // The ports are unchanged even across a restart — that is what keeps media flowing.
+        assert_eq!(restarted.remote_rtp, first.remote_rtp);
+        // And the peer's new credentials are what the leg now expects.
+        let stored = engine
+            .calls
+            .get("restart")
+            .and_then(|call| call.near_remote_ice.clone())
+            .expect("peer creds stored");
+        assert_eq!(stored.ufrag, "NEWUFRAG");
+        let _ = phone_a;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn media_keeps_flowing_on_the_old_pair_across_an_ice_restart() {
+        // RFC 8445 §9.3: an agent keeps using the previously selected pair until the new session
+        // completes. Concretely, the datapath's adopted source must survive the restart — if the
+        // restart cleared it, every call would go silent for the length of a new ICE exchange.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "continuity".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "continuity".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_rtp = engine
+            .calls
+            .get("continuity")
+            .map(|call| call.near.rtp.id)
+            .expect("call");
+        // Stand in for a completed ICE session: a pair has been selected and adopted.
+        engine.datapath().adopt_source(near_rtp, addr_a);
+        assert_eq!(
+            engine.datapath().ice_validated_source(near_rtp),
+            Some(addr_a)
+        );
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "continuity".into(),
+                    from_tag: "a".into(),
+                    sdp: reoffer_sdp(addr_a, "NEWUFRAG", "newpasswordnewpassword"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            engine.datapath().ice_validated_source(near_rtp),
+            Some(addr_a),
+            "the previously selected pair is still adopted across the restart (§9.3)"
+        );
+        // Which means media really does keep moving while the new session runs.
+        let far_rtp = engine
+            .calls
+            .get("continuity")
+            .map(|call| call.far.rtp.local_addr)
+            .expect("call");
+        phone_b
+            .send_to(&rtp(0x0C0C_0C0C), far_rtp)
+            .await
+            .expect("send from B");
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("media does not stop for the restart")
+            .expect("recv");
+        assert_eq!(&buffer[..len], rtp(0x0C0C_0C0C).as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_is_owner_only_and_refuses_a_codec_change() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "guarded".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "guarded".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        // Another client cannot renegotiate someone else's call.
+        let intruder = engine
+            .handle(
+                ClientId(99),
+                Command::Reoffer {
+                    call_id: "guarded".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(matches!(intruder, CmdResult::Error { .. }));
+
+        // Nor can the owner silently switch codec mid-call: rebuilding a live pipeline is not done
+        // here, and answering "ok" while still running PCMU would be worse than refusing.
+        let switched = engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "guarded".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_single_codec(addr_a, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        match switched {
+            CmdResult::Error { reason } => {
+                assert!(reason.contains("codec"), "explains why: {reason}")
+            }
+            other => panic!("a codec change must be refused, got {other:?}"),
+        }
     }
 
     // ---- duplicate offer on a live call-id -------------------------------------------------------
