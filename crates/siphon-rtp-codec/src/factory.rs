@@ -63,12 +63,13 @@ pub const OPUS_RTPMAP_CHANNELS: u8 = 2;
 pub struct OpusParams {
     /// `maxaveragebitrate` (RFC 7587 §6.1): the peer's maximum average **receive** bitrate in bit/s,
     /// valid 6000..=510000. `None` when unstated — the RFC default is mode-dependent, not a number.
-    /// Bounds the Opus encoder's rate control; **no consumer in the engine until the Opus encoder
-    /// lands** (it is carried through SDP and the HA snapshot so nothing is lost meanwhile).
+    /// Consumed by [`encoder_for`] as the Opus encoder's target bitrate (`OPUS_SET_BITRATE`), which
+    /// sets the packet size and, through the rate-driven decisions, the coded mode and bandwidth.
     pub max_average_bitrate: Option<u32>,
     /// `maxplaybackrate` (RFC 7587 §6.1): the maximum output sampling rate the peer can render, in
-    /// Hz, valid 8000..=48000, RFC default 48000. Caps the audio bandwidth the engine encodes toward
-    /// it; **no consumer in the engine until the Opus encoder lands.**
+    /// Hz, valid 8000..=48000, RFC default 48000. Consumed by [`encoder_for`] as the Opus encoder's
+    /// maximum coded bandwidth (`OPUS_SET_MAX_BANDWIDTH`, per the §3.1.1 rate↔bandwidth table), so
+    /// the engine never spends bits on audio the peer cannot render.
     pub max_playback_rate_hz: u32,
     /// `maxptime` (RFC 7587 §6.1, carried in SDP as `a=maxptime` per §7): the longest packetization
     /// the peer accepts, in ms, RFC default 120. Consumed today — it clamps the leg's egress
@@ -83,13 +84,17 @@ pub struct OpusParams {
     /// decoder is built for the right layout and the media path folds it to mono.
     pub sprop_stereo: bool,
     /// `cbr` (RFC 7587 §6.1, receive-only): the peer asks for constant bitrate, default 0 (VBR).
-    /// Selects the Opus encoder's rate-control mode; **no consumer until the Opus encoder lands.**
+    /// Consumed by [`encoder_for`] as the Opus encoder's rate-control mode (`OPUS_SET_VBR`): set, it
+    /// pads every packet to one constant length; clear, the packet is whatever the frame needs.
     pub cbr: bool,
     /// `useinbandfec` (RFC 7587 §6.1, receive-only): the peer's decoder will use in-band FEC (LBRR),
-    /// default 0. Enables FEC generation in the Opus encoder; **no consumer until it lands.**
+    /// default 0. Consumed by [`encoder_for`], which turns on FEC generation *and* hands the encoder
+    /// the loss figure libopus needs before it will spend bits on an LBRR copy, so each SILK/hybrid
+    /// packet then carries a redundant copy of the previous frame.
     pub use_inband_fec: bool,
     /// `usedtx` (RFC 7587 §6.1, receive-only): the peer accepts discontinuous transmission, default
-    /// 0. Enables DTX in the Opus encoder; **no consumer until it lands.**
+    /// 0. Consumed by [`encoder_for`] as the Opus encoder's DTX switch (`OPUS_SET_DTX`), which
+    /// collapses a silent run to bare one-byte TOC packets.
     pub use_dtx: bool,
 }
 
@@ -388,7 +393,7 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         // nominal frame is the negotiated ptime. Every other Opus fmtp parameter
         // (`maxaveragebitrate`, `maxplaybackrate`, `cbr`, `useinbandfec`, `usedtx`) constrains what
         // the engine *sends*, so it belongs to the encoder, not here.
-        OPUS_ENCODING_NAME => Ok(Box::new(OpusCodec::new(
+        OPUS_ENCODING_NAME => Ok(Box::new(OpusCodec::new_decoder(
             spec.clock_rate_hz,
             spec.decode_channels(),
             spec.ptime_ms,
@@ -448,6 +453,25 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
                 )),
             },
         },
+        // Opus encode is complete and conformant (RFC 6716: SILK, CELT and Hybrid, every bandwidth
+        // and frame duration, mono and stereo, VBR/CVBR/CBR, LBRR/FEC and DTX — gated by encoding
+        // the full configuration matrix and holding the result up to libopus' own decoder and
+        // `opus_compare`). Royalty-free, so no build feature.
+        //
+        // Four spec-driven inputs: the PCM rate is the clock rate RFC 7587 §4.1 pins at 48 kHz; the
+        // channel count is `encode_channels` (always 1 — the engine's media path is mono, and §7.1
+        // makes the peer's `stereo` a ceiling, never an obligation); the frame is the negotiated
+        // ptime, already clamped by the peer's `maxptime` in `with_opus_params` and snapped inside
+        // the codec to a duration Opus can emit; and the peer's remaining §6.1 `a=fmtp` parameters
+        // (`maxaveragebitrate`, `maxplaybackrate`, `cbr`, `useinbandfec`, `usedtx`) each become a
+        // real encoder setting — see `OpusCodec::new_encoder` for the mapping and what each changes
+        // on the wire. A leg that declared no fmtp reads the RFC 7587 §6.1 defaults.
+        OPUS_ENCODING_NAME => Ok(Box::new(OpusCodec::new_encoder(
+            spec.clock_rate_hz,
+            spec.encode_channels(),
+            spec.ptime_ms,
+            spec.opus_params(),
+        )?)),
         _ => Err(CodecError::Unsupported(unsupported_name(
             &spec.encoding_name,
         ))),
@@ -472,13 +496,9 @@ fn unsupported_name(encoding_name: &str) -> &'static str {
             "AMR transcoding requires the `amr` build feature (patent-licensed — see \
              docs/codec-licensing.md); AMR passthrough/relay is always available"
         }
-        // Decode-side Opus is wired in `decoder_for`, so this is only ever reached from
-        // `encoder_for`: the RFC 6716 encoder is still being built. Say which direction is missing
-        // rather than "not implemented" — a controller reading this needs to know that transcoding
-        // *from* Opus works today and only *toward* Opus does not.
-        OPUS_ENCODING_NAME => {
-            "Opus encode is not implemented yet; Opus decode (transcoding from an Opus leg) is wired"
-        }
+        // Opus is wired in *both* directions and carries no build feature (it is royalty-free), so
+        // an Opus spec never reaches here from either `decoder_for` or `encoder_for` — there is
+        // deliberately no entry for it.
         "TELEPHONE-EVENT" => "telephone-event is not an audio codec",
         _ => "unknown or unsupported codec",
     }
@@ -487,6 +507,7 @@ fn unsupported_name(encoding_name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opus::packet::{Bandwidth, Mode, Toc};
 
     #[test]
     fn builds_g711_ulaw_from_static_payload_type() {
@@ -584,22 +605,337 @@ mod tests {
         assert!(CodecSpec::from_static_payload_type(101, 20).is_none());
     }
 
+    /// Deterministic speech-like 48 kHz PCM: a pitch pulse train through a resonance plus noise, so
+    /// the Opus encoder's mode / bandwidth / VAD decisions take realistic branches.
+    fn opus_speech(samples: usize) -> Vec<i16> {
+        let mut state = 24_680u32;
+        let mut history = [0.0f32; 2];
+        (0..samples)
+            .map(|index| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((state >> 20) as i32 - 2048) as f32 * 1.5;
+                let pulse = if index % 240 == 0 { 6000.0 } else { 0.0 };
+                let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+                history[1] = history[0];
+                history[0] = value;
+                value.clamp(-24_000.0, 24_000.0) as i16
+            })
+            .collect()
+    }
+
+    /// Build an Opus encoder **through the factory** with `params` and run `frames` of `pcm` through
+    /// it, returning the packets. The factory path is the point: it is what the media slow path,
+    /// the WS bridge and the conference all call.
+    fn opus_encode_frames(params: OpusParams, pcm: &[i16], frames: usize) -> Vec<Vec<u8>> {
+        let spec = CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(params));
+        let mut encoder = encoder_for(&spec).expect("Opus encoder");
+        let frame = encoder.frame_samples();
+        let mut buffer = vec![0u8; 1500];
+        (0..frames)
+            .map(|index| {
+                let written = encoder
+                    .encode(&pcm[index * frame..(index + 1) * frame], &mut buffer)
+                    .expect("encode");
+                buffer[..written].to_vec()
+            })
+            .collect()
+    }
+
+    /// Mean packet length over `packets`, the coarsest observable of "the bitstream changed".
+    fn mean_length(packets: &[Vec<u8>]) -> f64 {
+        packets.iter().map(Vec::len).sum::<usize>() as f64 / packets.len() as f64
+    }
+
     #[test]
-    fn opus_decodes_but_has_no_encoder_yet() {
-        // The decode half of Opus is wired (RFC 6716 §4, conformant against all 12 official
-        // vectors), so Opus → G.711 / AMR-WB transcode builds; the encoder is still being written,
-        // so the encode direction must decline — cleanly, never a panic.
+    fn opus_builds_both_directions() {
+        // Both halves of RFC 6716 are wired and Opus is royalty-free, so no build feature gates it:
+        // Opus ↔ G.711 / AMR-WB transcode builds in either direction.
         let spec = CodecSpec::new(96, "opus", 48000, 2, 20);
         let decoder = decoder_for(&spec).expect("Opus decodes");
-        // RFC 7587 §4.1: Opus clocks RTP at 48 kHz in every mode, whatever it decodes to.
+        let encoder = encoder_for(&spec).expect("Opus encodes");
+        // RFC 7587 §4.1: Opus clocks RTP at 48 kHz in every mode, in both directions.
         assert_eq!(decoder.rtp_clock_rate_hz(), 48_000);
-        let Err(CodecError::Unsupported(reason)) = encoder_for(&spec) else {
-            panic!("Opus encode is not implemented yet");
-        };
-        assert!(
-            reason.contains("encode"),
-            "the Unsupported message must name the direction that is missing, got {reason:?}"
+        assert_eq!(encoder.rtp_clock_rate_hz(), 48_000);
+        assert_eq!(encoder.params().channels, 1, "the engine's egress is mono");
+        assert_eq!(encoder.frame_samples(), 960, "48 kHz × 20 ms");
+        // Opus is stateful in every layer, so the conference shared-encode fan-out must never take
+        // its payload — see the trait docs and `opus::codec`'s own regression test.
+        assert!(!encoder.is_stateless());
+    }
+
+    #[test]
+    fn opus_maxaveragebitrate_sets_the_encoder_target_rate() {
+        // RFC 7587 §6.1: `maxaveragebitrate` is the peer's maximum average receive bitrate, so it is
+        // the rate the engine encodes at. It has to reach the bitstream, not just the struct.
+        let pcm = opus_speech(960 * 30);
+        let low = opus_encode_frames(
+            OpusParams {
+                max_average_bitrate: Some(12_000),
+                ..OpusParams::default()
+            },
+            &pcm,
+            25,
         );
+        let high = opus_encode_frames(
+            OpusParams {
+                max_average_bitrate: Some(64_000),
+                ..OpusParams::default()
+            },
+            &pcm,
+            25,
+        );
+        // 12 kbit/s × 20 ms = 30 bytes/packet; 64 kbit/s × 20 ms = 160. Compare against the nominal
+        // budget rather than against each other, so the test states the *rate*, not just "bigger".
+        assert!(
+            (mean_length(&low) - 30.0).abs() < 12.0,
+            "12 kbit/s should average ≈30 bytes per 20 ms packet, got {:.1}",
+            mean_length(&low)
+        );
+        assert!(
+            (mean_length(&high) - 160.0).abs() < 45.0,
+            "64 kbit/s should average ≈160 bytes per 20 ms packet, got {:.1}",
+            mean_length(&high)
+        );
+        // The rate also drives the mode/bandwidth decision, which is coded in the TOC (RFC 6716
+        // §3.1, Table 2): 12 kbit/s cannot afford fullband, 64 kbit/s does not need SILK.
+        let low_toc = Toc::parse(low[20][0]);
+        let high_toc = Toc::parse(high[20][0]);
+        assert_eq!(low_toc.mode(), Mode::Silk, "12 kbit/s is a speech rate");
+        assert!(
+            matches!(
+                low_toc.bandwidth(),
+                Bandwidth::Narrowband | Bandwidth::Mediumband | Bandwidth::Wideband
+            ),
+            "12 kbit/s cannot afford SWB/FB, got {:?}",
+            low_toc.bandwidth()
+        );
+        assert_eq!(high_toc.bandwidth(), Bandwidth::Fullband, "64 kbit/s is FB");
+    }
+
+    #[test]
+    fn opus_maxplaybackrate_caps_the_coded_bandwidth() {
+        // RFC 7587 §6.1 / §3.1.1: `maxplaybackrate` is the peer's maximum output sampling rate, so
+        // it caps the audio bandwidth the engine spends bits on — and the bandwidth is coded in the
+        // TOC byte (RFC 6716 §3.1, Table 2), so it is directly observable on the wire.
+        let pcm = opus_speech(960 * 30);
+        for (playback_rate, expected) in [
+            (8_000u32, Bandwidth::Narrowband),
+            (12_000, Bandwidth::Mediumband),
+            (16_000, Bandwidth::Wideband),
+        ] {
+            let packets = opus_encode_frames(
+                OpusParams {
+                    max_playback_rate_hz: playback_rate,
+                    ..OpusParams::default()
+                },
+                &pcm,
+                25,
+            );
+            for (index, packet) in packets.iter().enumerate().skip(2) {
+                assert_eq!(
+                    Toc::parse(packet[0]).bandwidth(),
+                    expected,
+                    "maxplaybackrate={playback_rate} must cap the TOC bandwidth (packet {index})"
+                );
+            }
+        }
+        // The RFC 7587 §6.1 default (48000) leaves the encoder free to go fullband, which at the
+        // default rate it does — so the cap above is a real change, not the encoder's own choice.
+        let unlimited = opus_encode_frames(OpusParams::default(), &pcm, 25);
+        assert_eq!(
+            Toc::parse(unlimited[20][0]).bandwidth(),
+            Bandwidth::Fullband,
+            "an uncapped Opus leg codes fullband"
+        );
+    }
+
+    #[test]
+    fn opus_cbr_makes_every_packet_the_same_length() {
+        // RFC 7587 §6.1 `cbr=1`: "the decoder prefers the use of ... constant bitrate". CBR pads
+        // every packet to exactly the rate's byte budget; VBR (the default) does not.
+        let pcm = opus_speech(960 * 30);
+        let constant = opus_encode_frames(
+            OpusParams {
+                cbr: true,
+                max_average_bitrate: Some(32_000),
+                ..OpusParams::default()
+            },
+            &pcm,
+            25,
+        );
+        let variable = opus_encode_frames(
+            OpusParams {
+                cbr: false,
+                max_average_bitrate: Some(32_000),
+                ..OpusParams::default()
+            },
+            &pcm,
+            25,
+        );
+        let first = constant[0].len();
+        assert!(
+            constant.iter().all(|packet| packet.len() == first),
+            "cbr=1 must pad every packet to one length, got {:?}",
+            constant.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        // 32 kbit/s × 20 ms = 80 bytes.
+        assert_eq!(first, 80, "the constant length is the rate's byte budget");
+        // The default (VBR) genuinely varies, so the assertion above is not vacuous.
+        assert!(
+            variable
+                .iter()
+                .any(|packet| packet.len() != variable[0].len()),
+            "cbr=0 must let the packet size follow the content, got {:?}",
+            variable.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn opus_useinbandfec_puts_a_recoverable_copy_of_the_previous_frame_in_each_packet() {
+        // RFC 7587 §6.1 `useinbandfec=1`: the peer's decoder will use Opus in-band FEC, so the
+        // engine must actually generate the LBRR copy (RFC 6716 §2.1.7 / §4.4). The proof is the
+        // recovery itself: lose a packet, ask the *next* packet's FEC for the frame that was lost,
+        // and see how close it lands to the frame the sender really encoded.
+        const FRAMES: usize = 20;
+        const LOST: usize = 12;
+        let pcm = opus_speech(960 * (FRAMES + 2));
+
+        /// Decode `packets` cleanly, then replay them with `LOST` dropped and recover it from the
+        /// following packet's FEC. Returns (mean packet length, correlation of the recovered frame
+        /// with the true one).
+        fn recover(packets: &[Vec<u8>]) -> (f64, f64) {
+            use crate::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
+
+            let mut scratch = vec![0i16; MAX_PACKET_SAMPLES];
+            let mut truth = OpusDecoder::new(48_000, 1).expect("decoder");
+            let mut lost_frame = Vec::new();
+            for (index, packet) in packets.iter().enumerate() {
+                let written = truth
+                    .decode(Some(packet), &mut scratch, MAX_PACKET_SAMPLES, false)
+                    .expect("decode");
+                if index == LOST {
+                    lost_frame = scratch[..written].to_vec();
+                }
+            }
+            // The lossy receiver: everything up to the gap, then the packet after it, FEC-decoded.
+            let mut lossy = OpusDecoder::new(48_000, 1).expect("decoder");
+            for packet in packets.iter().take(LOST) {
+                lossy
+                    .decode(Some(packet), &mut scratch, MAX_PACKET_SAMPLES, false)
+                    .expect("decode");
+            }
+            let written = lossy
+                .decode(Some(&packets[LOST + 1]), &mut scratch, 960, true)
+                .expect("fec decode");
+            let recovered = &scratch[..written];
+
+            let dot: f64 = recovered
+                .iter()
+                .zip(&lost_frame)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum();
+            let energy =
+                |frame: &[i16]| -> f64 { frame.iter().map(|&x| f64::from(x) * f64::from(x)).sum() };
+            let (left, right) = (energy(recovered), energy(&lost_frame));
+            let correlation = if left <= 0.0 || right <= 0.0 {
+                0.0
+            } else {
+                dot / (left.sqrt() * right.sqrt())
+            };
+            (
+                packets.iter().map(Vec::len).sum::<usize>() as f64 / packets.len() as f64,
+                correlation,
+            )
+        }
+
+        let (fec_bytes, fec_correlation) = recover(&opus_encode_frames(
+            OpusParams {
+                use_inband_fec: true,
+                ..OpusParams::default()
+            },
+            &pcm,
+            FRAMES + 2,
+        ));
+        let (plain_bytes, plain_correlation) =
+            recover(&opus_encode_frames(OpusParams::default(), &pcm, FRAMES + 2));
+
+        // With FEC the "lost" frame comes back recognisably; without it, all the decoder can do is
+        // extrapolate, and the result bears no resemblance to what was actually sent.
+        assert!(
+            fec_correlation > 0.4,
+            "useinbandfec=1 must let the next packet reconstruct the lost frame, correlation {fec_correlation:.3}"
+        );
+        assert!(
+            plain_correlation < 0.25,
+            "without FEC there is nothing to reconstruct from, yet correlation was {plain_correlation:.3} — the test is not measuring FEC"
+        );
+        // And the LBRR copy is paid for in bytes, which is the other half of the evidence.
+        assert!(
+            fec_bytes > plain_bytes * 1.05,
+            "the LBRR copy must cost bits: {fec_bytes:.1} vs {plain_bytes:.1} bytes/packet"
+        );
+    }
+
+    #[test]
+    fn opus_usedtx_collapses_a_silent_run_to_bare_toc_packets() {
+        // RFC 7587 §6.1 `usedtx=1`: the peer accepts discontinuous transmission. Fed digital
+        // silence, the encoder must stop spending bits and emit the one-byte TOC RFC 6716 §3.1
+        // defines as a frame with no compressed data — and must *not* when the peer did not ask.
+        let silence = vec![0i16; 960 * 30];
+        let with_dtx = opus_encode_frames(
+            OpusParams {
+                use_dtx: true,
+                ..OpusParams::default()
+            },
+            &silence,
+            25,
+        );
+        let without_dtx = opus_encode_frames(OpusParams::default(), &silence, 25);
+
+        // libopus only enters DTX after ~10 frames of inactivity (`NB_SPEECH_FRAMES_BEFORE_DTX`),
+        // so score the tail.
+        assert!(
+            with_dtx[15..].iter().all(|packet| packet.len() == 1),
+            "usedtx=1 must collapse sustained silence to bare TOC packets, got {:?}",
+            with_dtx.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(
+            without_dtx.iter().all(|packet| packet.len() > 1),
+            "usedtx=0 must keep sending real packets through silence, got {:?}",
+            without_dtx.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        // A bare TOC is a legal packet, not a truncation: this crate's decoder reads it as "no data"
+        // and conceals, exactly as the peer's will.
+        let mut decoder =
+            decoder_for(&CodecSpec::new(111, "opus", 48_000, 2, 20)).expect("decoder");
+        let mut pcm = vec![0i16; 5760];
+        assert_eq!(
+            decoder.decode(&with_dtx[20], &mut pcm).expect("decode DTX"),
+            960
+        );
+    }
+
+    #[test]
+    fn opus_fmtp_defaults_leave_the_encoder_at_the_rfc_7587_posture() {
+        // No `a=fmtp` at all must behave exactly like the explicit RFC 7587 §6.1 default set — the
+        // parameters are honoured through one path, not two.
+        let pcm = opus_speech(960 * 12);
+        let implicit = {
+            let spec = CodecSpec::new(111, "opus", 48_000, 2, 20);
+            assert!(spec.opus.is_none(), "no fmtp was attached");
+            let mut encoder = encoder_for(&spec).expect("encoder");
+            let mut buffer = vec![0u8; 1500];
+            (0..10)
+                .map(|index| {
+                    let written = encoder
+                        .encode(&pcm[index * 960..(index + 1) * 960], &mut buffer)
+                        .expect("encode");
+                    buffer[..written].to_vec()
+                })
+                .collect::<Vec<_>>()
+        };
+        let explicit = opus_encode_frames(OpusParams::default(), &pcm, 10);
+        assert_eq!(implicit, explicit);
     }
 
     #[test]
