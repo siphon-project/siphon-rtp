@@ -128,8 +128,32 @@ advertised. A STUN server that is down costs one bounded delay and a host-only
 candidate list, logged as a warning. It never fails the call. Both components
 gather concurrently, so that delay is paid once per leg.
 
-Since there is no trickle yet, the offer or answer carries the complete list and
-says so with `a=end-of-candidates` (RFC 8838 §14).
+## Trickle (RFC 8838)
+
+Browsers trickle: they send the offer immediately and stream candidates as they
+are gathered. The engine **accepts** those — it advertises `a=ice-options:trickle`
+and takes late candidates through the control plane:
+
+```json
+{"id": 7, "command": "ice_candidate",
+ "call_id": "web-7f3a@203.0.113.40", "from_tag": "as8c1f",
+ "candidates": ["a=candidate:3 1 UDP 1694498815 198.51.100.7 45000 typ srflx raddr 10.0.0.5 rport 45000"],
+ "end_of_candidates": false}
+```
+
+Each one is paired against our local candidates and queued as a *triggered* check,
+so it is probed promptly rather than waiting its turn — including a candidate that
+arrives after every earlier pair has already failed, which reopens the session
+instead of arriving too late to matter. Omit `to_tag` for the offerer's leg,
+include it for the answerer's. Requires `--ice-full`: an ICE-lite responder has no
+checklist to add a pair to, so the engine refuses rather than accepting and
+discarding. Candidates it cannot use (mDNS, another family, another component) are
+skipped individually — a browser mixes those in with usable ones.
+
+The engine does **not** trickle candidates of its own. It gathers to completion
+before it answers, which is why its SDP also carries `a=end-of-candidates`
+(RFC 8838 §14) — a complete set plus a willingness to receive more, which is the
+half of trickle that matters against a browser.
 
 Incoming Binding requests on the media port are
 answered per RFC 8445 §7.3: the USERNAME must address our ufrag and the

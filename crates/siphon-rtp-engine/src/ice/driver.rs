@@ -624,6 +624,27 @@ impl AgentSupervisor {
         self.agents.get(&endpoint).map(|entry| entry.agent.state())
     }
 
+    /// How many pairs `endpoint`'s checklist holds — diagnostics and tests.
+    #[must_use]
+    pub fn checklist_len(&self, endpoint: EndpointId) -> Option<usize> {
+        self.agents
+            .get(&endpoint)
+            .map(|entry| entry.agent.checklist().len())
+    }
+
+    /// Hand a trickled remote candidate to `endpoint`'s agent (RFC 8838 §4.2). Returns how many
+    /// pairs it created — `0` for an endpoint with no agent, or a candidate its component/family
+    /// cannot pair with.
+    pub fn add_remote_candidate(
+        &self,
+        endpoint: EndpointId,
+        candidate: &siphon_rtp_ice::Candidate,
+    ) -> usize {
+        self.agents
+            .get_mut(&endpoint)
+            .map_or(0, |mut entry| entry.agent.add_remote_candidate(candidate))
+    }
+
     /// Feed the datapath's forwarded STUN into the agents. MUST run before [`Self::poll`], so a check
     /// that arrived this tick is answered on this tick rather than the next.
     pub fn drain_events(&self, now_ms: u64) -> Vec<AgentOutcome> {

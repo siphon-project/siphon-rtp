@@ -980,6 +980,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.reoffer(client, &call_id, &from_tag, &sdp, &profile)
                     .await
             }
+            Command::IceCandidate {
+                call_id,
+                from_tag,
+                to_tag,
+                candidates,
+                end_of_candidates,
+            } => self.ice_candidate(
+                client,
+                &call_id,
+                &from_tag,
+                to_tag.as_deref(),
+                &candidates,
+                end_of_candidates,
+            ),
             Command::Ping => CmdResult::Pong,
             Command::List => self.list(client),
             Command::Statistics => self.statistics(),
@@ -2079,6 +2093,87 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             self.release_client_call(call.owner);
         }
+    }
+
+    /// Accept a peer's **trickled** ICE candidates (RFC 8838 §4.2) and put them to work immediately.
+    ///
+    /// Each line is parsed, handed to the leg's agent, paired against our local candidates and queued
+    /// as a triggered check — so a path that only becomes known after the offer/answer is probed
+    /// promptly rather than waiting for the ordinary checklist order, and a candidate that arrives
+    /// after every earlier pair has failed reopens the session instead of arriving too late.
+    ///
+    /// Owner-only (A3). `to_tag` selects the side: absent ⇒ the offerer's (near) leg, present ⇒ the
+    /// answerer's (far) leg.
+    ///
+    /// A candidate we cannot pair with — a different family or component, an unresolvable mDNS name,
+    /// a transport we do not check — is skipped and counted, never fatal: a browser mixes those in
+    /// with usable ones, and rejecting the batch would cost us the usable ones too.
+    fn ice_candidate(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: Option<&str>,
+        candidates: &[String],
+        end_of_candidates: bool,
+    ) -> CmdResult {
+        let Some(endpoints) = self.calls.get(call_id).and_then(|call| {
+            (call.owner == client && call.from_tag == from_tag).then(|| {
+                let leg = if to_tag.is_some() {
+                    call.far
+                } else {
+                    call.near
+                };
+                leg.endpoint_ids().collect::<Vec<_>>()
+            })
+        }) else {
+            return unknown_call(call_id);
+        };
+        let Some(agents) = self.ice_agents.as_ref() else {
+            // Trickle only means something to a full agent: the ICE-lite responder has no checklist
+            // to add a pair to. Say so rather than silently accepting and discarding.
+            return CmdResult::Error {
+                reason: "trickled ICE candidates require full ICE (--ice-full)".to_string(),
+            };
+        };
+
+        let mut paired = 0usize;
+        let mut skipped = 0usize;
+        for line in candidates {
+            match siphon_rtp_ice::Candidate::parse(line) {
+                Ok(candidate) => {
+                    // Each endpoint runs the agent for its own component, so only the matching one
+                    // takes the candidate; the rest report 0 pairs.
+                    let added: usize = endpoints
+                        .iter()
+                        .map(|endpoint| agents.add_remote_candidate(*endpoint, &candidate))
+                        .sum();
+                    if added == 0 {
+                        skipped += 1;
+                    } else {
+                        paired += added;
+                    }
+                }
+                Err(error) => {
+                    skipped += 1;
+                    tracing::debug!(
+                        target: "siphon_rtp::control",
+                        %call_id, candidate = %line.trim(), %error,
+                        "skipping a trickled ICE candidate we cannot use"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            target: "siphon_rtp::control",
+            %call_id,
+            leg = if to_tag.is_some() { "far" } else { "near" },
+            paired,
+            skipped,
+            end_of_candidates,
+            "accepted trickled ICE candidates (RFC 8838)"
+        );
+        ok_empty()
     }
 
     /// Handle a **re-offer** on a live call (RFC 3264 §8 — a SIP re-INVITE): renegotiate on the
@@ -7352,6 +7447,7 @@ fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Offer { .. } => "offer",
         Command::Reoffer { .. } => "reoffer",
+        Command::IceCandidate { .. } => "ice_candidate",
         Command::Answer { .. } => "answer",
         Command::AnswerLocal { .. } => "answer_local",
         Command::Delete { .. } => "delete",
@@ -7397,6 +7493,7 @@ fn command_call_id(command: &Command) -> Option<&str> {
     match command {
         Command::Offer { call_id, .. }
         | Command::Reoffer { call_id, .. }
+        | Command::IceCandidate { call_id, .. }
         | Command::Answer { call_id, .. }
         | Command::AnswerLocal { call_id, .. }
         | Command::Delete { call_id, .. }
@@ -7526,6 +7623,9 @@ fn supported_features() -> Vec<String> {
         // therefore whether it can renegotiate on the existing ports and restart ICE (RFC 8445 §9)
         // rather than replacing the call.
         "reoffer".to_string(),
+        // We accept trickled candidates (RFC 8838); we do not send them, because gathering finishes
+        // before we answer.
+        "trickle".to_string(),
         "turn".to_string(),
     ]
 }
@@ -15928,6 +16028,168 @@ mod tests {
             .expect("B's media reaches A — the far leg is not ICE-gated")
             .expect("recv");
         assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+    }
+
+    // ---- RFC 8838 trickle ------------------------------------------------------------------------
+
+    /// Stand up a full-ICE call and return its near RTP endpoint id.
+    async fn full_ice_call(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) -> EndpointId {
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .calls
+            .get(call_id)
+            .map(|call| call.near.rtp.id)
+            .expect("call")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trickled_candidate_is_paired_and_checked() {
+        // RFC 8838: a browser sends its offer immediately and streams candidates afterwards. Each one
+        // has to enter the checklist and be probed, or the path it describes is never used.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        let near_rtp = full_ice_call(&engine, "trickle").await;
+        let before = engine
+            .ice_agents
+            .as_ref()
+            .and_then(|agents| agents.checklist_len(near_rtp))
+            .expect("an agent runs on the near leg");
+
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::IceCandidate {
+                    call_id: "trickle".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                    candidates: vec![
+                        "a=candidate:late 1 UDP 1694498815 127.0.0.1 45999 typ host".to_string()
+                    ],
+                    end_of_candidates: false,
+                },
+            )
+            .await;
+        assert!(matches!(result, CmdResult::Ok { .. }), "{result:?}");
+
+        let after = engine
+            .ice_agents
+            .as_ref()
+            .and_then(|agents| agents.checklist_len(near_rtp))
+            .expect("agent");
+        assert_eq!(after, before + 1, "the trickled candidate became a pair");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unusable_trickled_candidates_do_not_cost_the_usable_one() {
+        // A browser mixes mDNS and cross-family candidates in with routable ones. Rejecting the batch
+        // would throw away the candidate that actually works.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        let near_rtp = full_ice_call(&engine, "mixed-trickle").await;
+        let before = engine
+            .ice_agents
+            .as_ref()
+            .and_then(|agents| agents.checklist_len(near_rtp))
+            .expect("agent");
+
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::IceCandidate {
+                    call_id: "mixed-trickle".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                    candidates: vec![
+                        // mDNS — unresolvable.
+                        "a=candidate:m 1 UDP 2130706431 abc-def.local 5000 typ host".to_string(),
+                        // Cross-family — cannot pair with a v4 leg.
+                        "a=candidate:v6 1 UDP 2130706431 2001:db8::5 5000 typ host".to_string(),
+                        // Garbage.
+                        "a=candidate:broken 1 UDP zzz 127.0.0.1 5000 typ host".to_string(),
+                        // The one that works.
+                        "a=candidate:good 1 UDP 1694498815 127.0.0.1 46001 typ host".to_string(),
+                    ],
+                    end_of_candidates: true,
+                },
+            )
+            .await;
+        assert!(matches!(result, CmdResult::Ok { .. }), "{result:?}");
+        assert_eq!(
+            engine
+                .ice_agents
+                .as_ref()
+                .and_then(|agents| agents.checklist_len(near_rtp))
+                .expect("agent"),
+            before + 1,
+            "exactly the usable candidate was paired"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trickle_is_owner_only_and_needs_full_ice() {
+        // Without a full agent there is no checklist to add to. Accepting and discarding would look
+        // like it worked.
+        let lite = Engine::new(UdpLoopbackDatapath::new());
+        let _ = full_ice_call(&lite, "lite").await;
+        let refused = lite
+            .handle(
+                CLIENT,
+                Command::IceCandidate {
+                    call_id: "lite".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                    candidates: vec![
+                        "a=candidate:x 1 UDP 1694498815 127.0.0.1 46002 typ host".to_string()
+                    ],
+                    end_of_candidates: false,
+                },
+            )
+            .await;
+        match refused {
+            CmdResult::Error { reason } => assert!(reason.contains("full ICE"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // And another client cannot inject candidates into someone else's call.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        let _ = full_ice_call(&engine, "owned-trickle").await;
+        let intruder = engine
+            .handle(
+                ClientId(77),
+                Command::IceCandidate {
+                    call_id: "owned-trickle".into(),
+                    from_tag: "a".into(),
+                    to_tag: None,
+                    candidates: vec![
+                        "a=candidate:x 1 UDP 1694498815 127.0.0.1 46003 typ host".to_string()
+                    ],
+                    end_of_candidates: false,
+                },
+            )
+            .await;
+        assert!(matches!(intruder, CmdResult::Error { .. }));
     }
 
     // ---- re-offer + RFC 8445 §9 ICE restart ------------------------------------------------------
