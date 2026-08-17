@@ -24,17 +24,30 @@
 //! encoders have to agree on the entropy state to the bit. That is also what makes the packet
 //! checkable — libopus' decoder must end it on exactly the range value ours did.
 //!
+//! # Two switches, and why they are not the same switch
+//!
+//! * A **mode** switch (SILK ↔ CELT) is this layer's own decision, taken from the rate
+//!   ([`decision::choose_mode`](super::decision::choose_mode)) and signalled with `celt_to_silk`.
+//! * A **bandwidth** switch is *SILK's* decision. SILK owns its internal rate: this layer states a
+//!   desired rate and a legal window, and SILK moves between rates on its own schedule, because a
+//!   step between them has to have the input band-limited into it first (256 frames of ramp) and has
+//!   to be covered on both sides. When it is ready it raises `switchReady`; this layer answers by
+//!   emitting a 5 ms redundancy frame **after** that packet's payload and arming
+//!   `silk_bandwidth_switch`, which puts another one **before** the next packet's payload — the
+//!   packet where the new rate actually starts.
+//!
+//! Both crossings additionally **prefill** SILK (`opus_encoder.c:2013-2036`): the encoder is reset
+//! and then run over 10 ms of the already-filtered audio in the delay buffer, faded in over the MDCT
+//! overlap, so the frame that matters starts with a real analysis history and a primed resampler
+//! rather than zeros. On a bandwidth switch the prefill keeps the rate-control state
+//! (`prefillFlag == 2`), because otherwise the state machine would forget which rate it was
+//! switching from and the move would never complete.
+//!
 //! # What this layer deliberately does not do
 //!
 //! * **The tonality analysis** (`src/analysis.c`). Absent, not stubbed; see
 //!   [`decision`](super::decision) for what that changes and why it is a supported libopus
 //!   configuration rather than a gap invented here.
-//! * **The SILK prefill** (`opus_encoder.c:2013-2036`). Entering SILK from CELT-only, libopus feeds
-//!   SILK 10 ms of gain-faded history so its analysis starts warm. Here the SILK encoder is
-//!   reconfigured instead, which re-seeds it exactly as `silk_setup_fs` does and leaves the first
-//!   frame after the switch with `first_frame_after_reset` set — the constraint that keeps a cold
-//!   predictor stable. The redundancy frame below covers the seam. This is a quality refinement that
-//!   is not implemented, and no knob claims otherwise.
 
 use crate::opus::celt::encoder::{CeltEncoder, RateControl as CeltRateControl, SilkInfo};
 use crate::opus::celt::tables::{OVERLAP, WINDOW120};
@@ -49,7 +62,8 @@ use crate::opus::enc::packer::{PacketBuilder, MAX_PACKET_BYTES};
 use crate::opus::packet::{Bandwidth, Mode};
 use crate::opus::range_coder::RangeEncoder;
 use crate::opus::silk::enc::encoder::{
-    EncoderConfig as SilkConfig, RateMode as SilkRateMode, SilkEncoder,
+    ControlOutcome as SilkControlOutcome, EncoderConfig as SilkConfig, RateMode as SilkRateMode,
+    SilkEncoder,
 };
 use crate::opus::silk::resampler::Resampler;
 use crate::opus::silk::types::InternalRate;
@@ -134,9 +148,6 @@ pub struct OpusEncoder {
     // ── The two codec layers ─────────────────────────────────────────────────────────────────────
     silk: SilkEncoder,
     celt: CeltEncoder,
-    /// Whether `silk` has ever been driven since the last mode entry, so a mode switch can tell a
-    /// cold encoder from a warm one.
-    silk_configured: Option<SilkConfig>,
     /// One API-rate resampler per API channel (`state_Fxx[n].sCmn.resampler_state`).
     resamplers: [Resampler; 2],
     high_pass: VariableHighPass,
@@ -154,7 +165,13 @@ pub struct OpusEncoder {
     /// latch the transition never completes: the rule that holds the second channel for one more
     /// packet would re-arm every packet and the stream would stay stereo forever.
     to_mono: bool,
+    /// `st->silk_bw_switch` — SILK moved to a new internal rate on the previous packet, so this one
+    /// opens with a redundancy frame at the *new* rate (`opus_encoder.c:1765-1772`).
     silk_bandwidth_switch: bool,
+    /// `st->silk_mode.opusCanSwitch` — carried from the previous packet's `switchReady`. It is both
+    /// the answer to SILK's request (it is what lets `silk_control_audio_bandwidth` actually move
+    /// the rate) and the trigger for this packet's prefill.
+    silk_can_switch: bool,
     width_state: StereoWidthState,
     previous_hb_gain: f32,
     hybrid_stereo_width_q14: i32,
@@ -191,7 +208,10 @@ impl OpusEncoder {
         if channels == 0 || channels > 2 {
             return Err(CodecError::Unsupported("opus enc: channels must be 1 or 2"));
         }
-        let silk = SilkEncoder::new(SilkConfig::new(InternalRate::Wide16k, 20, 25_000))?;
+        // `silk_InitEncoder` (`opus_encoder.c:747`) — deliberately *not* a configured encoder: SILK's
+        // internal rate must stay unresolved until the first packet has decided a bandwidth, or the
+        // very first `control` would read as a mid-call rate change and get gated behind a ramp.
+        let silk = SilkEncoder::init();
         let mut celt = CeltEncoder::with_channels(channels)?;
         // CELT has one mode, at 48 kHz; a lower API rate rides it zero-stuffed.
         celt.set_sample_rate(sample_rate_hz)?;
@@ -214,7 +234,6 @@ impl OpusEncoder {
             lsb_depth: 24,
             silk,
             celt,
-            silk_configured: None,
             resamplers: [Resampler::new(), Resampler::new()],
             high_pass: VariableHighPass::new(),
             stream_channels: channels,
@@ -227,6 +246,7 @@ impl OpusEncoder {
             lbrr_coded: false,
             to_mono: false,
             silk_bandwidth_switch: false,
+            silk_can_switch: false,
             width_state: StereoWidthState::default(),
             previous_hb_gain: 1.0,
             hybrid_stereo_width_q14: 1 << 14,
@@ -578,8 +598,21 @@ impl OpusEncoder {
             self.packet_loss_percent,
         );
 
+        // Entering SILK from CELT-only, its whole state describes audio from before the CELT
+        // stretch: reset it and walk 10 ms of real history through it instead
+        // (`opus_encoder.c:1433-1438`).
+        let prefill = if self.mode != Mode::Celt && self.previous_mode == Some(Mode::Celt) {
+            Prefill::FullReset
+        } else {
+            Prefill::None
+        };
+
         // ── Bandwidth (`opus_encoder.c:1440-1550`) ──────────────────────────────────────────────
-        if self.mode == Mode::Celt || self.first {
+        // `allowBandwidthSwitch` is why this runs at all once SILK is going: without it the
+        // bandwidth would be decided on the first packet and then frozen for the rest of the call,
+        // because every later packet takes the `mode != CELT && !first` path. SILK raises it only
+        // while the talker is quiet enough for a bandwidth step to go unheard.
+        if self.mode == Mode::Celt || self.first || self.silk.allow_bandwidth_switch() {
             let chosen = choose_bandwidth(
                 equiv_rate,
                 voice_estimate,
@@ -700,6 +733,8 @@ impl OpusEncoder {
                     frame_redundancy,
                     celt_to_silk,
                     is_silence,
+                    prefill,
+                    index < count - 1,
                 )?;
                 match toc {
                     None => toc = Some(frame.toc),
@@ -741,6 +776,8 @@ impl OpusEncoder {
             redundancy,
             celt_to_silk,
             is_silence,
+            prefill,
+            false,
         )?;
         self.packer.commit_frame(frame.length)?;
         let pad_to =
@@ -788,6 +825,8 @@ impl OpusEncoder {
         mut redundancy: bool,
         mut celt_to_silk: bool,
         is_silence: bool,
+        mut prefill: Prefill,
+        nonfinal_frame: bool,
     ) -> Result<EncodedFrame, CodecError> {
         let frame_rate = self.sample_rate_hz / frame_size as i32;
         let vbr = self.rate_control != RateControl::Constant;
@@ -806,6 +845,8 @@ impl OpusEncoder {
             redundancy = true;
             celt_to_silk = true;
             self.silk_bandwidth_switch = false;
+            // "Do a prefill without resetting the sampling rate control."
+            prefill = Prefill::KeepRateControl;
         }
         // "If we decided to go with CELT, make sure redundancy is off, no matter what we decided
         // earlier."
@@ -868,7 +909,7 @@ impl OpusEncoder {
                 total_bitrate
             };
 
-            let internal_rate = self.silk_internal_rate(curr_bandwidth, max_data_bytes, frame_rate);
+            let rate_window = self.silk_rate_window(curr_bandwidth, max_data_bytes, frame_rate);
             let silk_max_bits = self.silk_max_bits(
                 max_data_bytes,
                 redundancy,
@@ -878,7 +919,11 @@ impl OpusEncoder {
                 vbr,
             );
             let config = SilkConfig {
-                internal_rate,
+                internal_rate: rate_window.desired,
+                min_internal_rate: rate_window.minimum,
+                max_internal_rate: rate_window.maximum,
+                api_rate_hz: self.sample_rate_hz,
+                opus_can_switch: self.silk_can_switch,
                 duration_ms: 1000 * frame_size / self.sample_rate_hz as usize,
                 channels: self.stream_channels,
                 bitrate_bps: silk_bitrate.max(1),
@@ -902,7 +947,18 @@ impl OpusEncoder {
                 packet_loss_percent: self.packet_loss_percent,
                 to_mono: self.to_mono,
             };
-            self.configure_silk(config)?;
+            // The prefill has to run *before* the real control call, because it resets the state the
+            // rate is resolved from (`opus_encoder.c:2013-2036`).
+            if prefill != Prefill::None {
+                self.run_silk_prefill(prefill, config, total_buffer, encoder_buffer)?;
+                // "Prevent a second switch in the real encode call."
+                self.silk_can_switch = false;
+            }
+            let outcome = self.configure_silk(SilkConfig {
+                opus_can_switch: self.silk_can_switch,
+                ..config
+            })?;
+            let internal_rate = outcome.internal_rate;
 
             silk_target_bitrate = silk_bitrate;
             let result = self.run_silk(frame_size, total_buffer, internal_rate, &mut enc)?;
@@ -921,6 +977,10 @@ impl OpusEncoder {
                 };
             }
 
+            // `opus_encoder.c:2065`. A non-final frame of a repacketized packet must not ask for the
+            // switch: the redundancy that covers it can only ride the packet's last frame.
+            self.silk_can_switch = outcome.switch_ready && !nonfinal_frame;
+
             if silk_bytes == 0 {
                 // DTX: the packet is the TOC alone (`opus_encoder.c:2067-2073`).
                 self.final_range = 0;
@@ -928,6 +988,22 @@ impl OpusEncoder {
                     toc: generate_toc(self.mode, frame_rate, curr_bandwidth, self.stream_channels),
                     length: 0,
                 });
+            }
+
+            // SILK has finished a bandwidth ramp and is asking to move rate. Answer with a
+            // redundancy frame *after* this packet's payload — it covers the far side of the seam —
+            // and arm `silk_bandwidth_switch`, which puts a second one *before* the next packet's
+            // payload, where the new rate actually starts (`opus_encoder.c:2076-2082`).
+            if self.silk_can_switch {
+                redundancy_bytes = compute_redundancy_bytes(
+                    max_data_bytes,
+                    bitrate_bps,
+                    frame_rate,
+                    self.stream_channels,
+                );
+                redundancy = redundancy_bytes != 0;
+                celt_to_silk = false;
+                self.silk_bandwidth_switch = true;
             }
         } else {
             // SILK is not running, so its cutoff tracker is stale: pin the high-pass to the floor
@@ -1273,13 +1349,21 @@ impl OpusEncoder {
         }
     }
 
-    /// The SILK internal rate this bandwidth and budget allow (`opus_encoder.c:1939-1970`).
-    fn silk_internal_rate(
+    /// The SILK internal-rate *request* this bandwidth and budget imply
+    /// (`opus_encoder.c:1939-1970`).
+    ///
+    /// Only a request: SILK owns its own rate and moves between rates on its own schedule, because
+    /// a step between them has to be band-limited into and covered by a redundancy frame. What this
+    /// layer states is where it would like to be (`desired`) and what it can live with
+    /// (`minimum`/`maximum`) — and the two bounds are enforced *immediately*, without a transition,
+    /// because a rate outside them is not merely suboptimal: below 16 kHz in hybrid, the CELT half
+    /// would be coding a band SILK never filled.
+    fn silk_rate_window(
         &self,
         curr_bandwidth: Bandwidth,
         max_data_bytes: i32,
         frame_rate: i32,
-    ) -> InternalRate {
+    ) -> SilkRateWindow {
         let mut desired = match curr_bandwidth {
             Bandwidth::Narrowband => 8_000,
             Bandwidth::Mediumband => 12_000,
@@ -1306,11 +1390,10 @@ impl OpusEncoder {
                 desired = desired.min(8_000);
             }
         }
-        let rate = desired.clamp(minimum, maximum);
-        match rate {
-            8_000 => InternalRate::Narrow8k,
-            12_000 => InternalRate::Medium12k,
-            _ => InternalRate::Wide16k,
+        SilkRateWindow {
+            desired: internal_rate_for(desired),
+            minimum: internal_rate_for(minimum),
+            maximum: internal_rate_for(maximum),
         }
     }
 
@@ -1354,14 +1437,84 @@ impl OpusEncoder {
         max_bits.max(64)
     }
 
-    /// Apply a SILK configuration, building or retuning as required.
-    fn configure_silk(&mut self, config: SilkConfig) -> Result<(), CodecError> {
-        match self.silk_configured {
-            Some(_) => self.silk.reconfigure(config)?,
-            None => self.silk = SilkEncoder::new(config)?,
+    /// Apply a SILK configuration and learn the internal rate it resolved to.
+    fn configure_silk(&mut self, config: SilkConfig) -> Result<SilkControlOutcome, CodecError> {
+        self.silk.control(config)
+    }
+
+    /// The SILK prefill (`opus_encoder.c:2013-2036`) — enter SILK warm.
+    ///
+    /// SILK is reset and then run over the 10 ms of already-filtered input sitting in the delay
+    /// buffer, so the frame that is about to be coded starts with a real analysis history, a primed
+    /// resampler and a settled VAD rather than zeros. Nothing is coded and nothing is emitted.
+    ///
+    /// The ramp is the subtle part. The 2.5 ms immediately before the delay compensation is faded in
+    /// from silence over the MDCT overlap and everything before it is zeroed, so the prefill sees a
+    /// smooth onset instead of the discontinuity a hard cut into mid-signal would give it — and the
+    /// onset is placed exactly where the redundant CELT frame's own cross-fade lands, so the two
+    /// leave no gap between them. Overwriting the delay buffer is safe here for the reason the C
+    /// gives: the only later reader is the CELT prefill window, which is inside the ramp.
+    fn run_silk_prefill(
+        &mut self,
+        prefill: Prefill,
+        config: SilkConfig,
+        total_buffer: usize,
+        encoder_buffer: usize,
+    ) -> Result<(), CodecError> {
+        let channels = self.channels;
+        let quarter = self.sample_rate_hz as usize / 400;
+        let offset = (encoder_buffer - total_buffer - quarter) * channels;
+        gain_fade(
+            &mut self.delay_buffer[offset..offset + quarter * channels],
+            0.0,
+            1.0,
+            quarter,
+            channels,
+            self.sample_rate_hz,
+        );
+        self.delay_buffer[..offset].fill(0.0);
+
+        let internal_rate = self
+            .silk
+            .control_for_prefill(config, prefill == Prefill::KeepRateControl)?;
+        let internal_hz = internal_rate.khz() as u32 * 1000;
+        let api_hz = self.sample_rate_hz as u32;
+        let internal_channels = config.channels;
+        let produced = encoder_buffer * internal_rate.khz() / (self.sample_rate_hz as usize / 1000);
+
+        let Self {
+            delay_buffer,
+            resamplers,
+            resample_in,
+            resample_out,
+            silk_pcm,
+            silk,
+            ..
+        } = self;
+        for channel in 0..internal_channels {
+            // The reset above cleared SILK's rate, which is what makes `silk_setup_resamplers` take
+            // its `fs_kHz == 0` branch and re-initialise rather than keep the filter memory
+            // (`control_codec.c:142-146`).
+            resamplers[channel].reinitialize_for_encoder(api_hz, internal_hz)?;
+            for index in 0..encoder_buffer {
+                let sample = if channels == 2 && internal_channels == 1 {
+                    let left = float_to_int16(delay_buffer[2 * index]);
+                    let right = float_to_int16(delay_buffer[2 * index + 1]);
+                    ((i32::from(left) + i32::from(right) + 1) >> 1) as i16
+                } else {
+                    float_to_int16(delay_buffer[index * channels + channel])
+                };
+                resample_in[index] = sample;
+            }
+            let written = resamplers[channel].process(
+                &mut resample_out[..produced],
+                &resample_in[..encoder_buffer],
+            )?;
+            for index in 0..written {
+                silk_pcm[index * internal_channels + channel] = resample_out[index];
+            }
         }
-        self.silk_configured = Some(config);
-        Ok(())
+        silk.prefill(&silk_pcm[..produced * internal_channels])
     }
 
     /// Resample this frame down to the SILK internal rate and encode it into `enc`.
@@ -1420,6 +1573,39 @@ impl OpusEncoder {
             signal_type: i32::from(result.active),
             offset: if result.active { 80 } else { 120 },
         })
+    }
+}
+
+/// Whether this frame enters SILK warm, and how much of SILK's state survives it
+/// (`opus_encoder.c:1433-1438`, `:1765-1772`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prefill {
+    /// SILK was already running at the right rate; nothing to do.
+    None,
+    /// Entering SILK from CELT-only. `silk_InitEncoder` wipes the whole SILK encoder first — the
+    /// reservoir and stereo memory describe audio from before the CELT stretch and are worthless.
+    FullReset,
+    /// The frame that *is* a bandwidth switch. The rate-control state has to survive the reset or
+    /// the state machine forgets which rate it is switching from (`prefillFlag == 2`).
+    KeepRateControl,
+}
+
+/// The internal-rate request the Opus layer hands SILK (`silk_EncControlStruct`'s
+/// desired/min/maxInternalSampleRate).
+#[derive(Debug, Clone, Copy)]
+struct SilkRateWindow {
+    desired: InternalRate,
+    minimum: InternalRate,
+    maximum: InternalRate,
+}
+
+/// 8000/12000/16000 as an [`InternalRate`]. Anything else is out of SILK's domain and is clamped up
+/// to wideband, which is the only rate every configuration can code at.
+fn internal_rate_for(hz: i32) -> InternalRate {
+    match hz {
+        8_000 => InternalRate::Narrow8k,
+        12_000 => InternalRate::Medium12k,
+        _ => InternalRate::Wide16k,
     }
 }
 

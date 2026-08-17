@@ -301,6 +301,26 @@ SIPHON_RTP_OPUS_COMPARE=$PWD/reference/opus/build/opus_compare \
 7. **A liveness check.** One byte of one packet is corrupted and libopus *must* reject the stream, so
    check 1 cannot pass because the harness wrote a file nothing actually verified.
 
+A **bandwidth**-switching stream is a different mechanism again and has its own harness,
+`opus_bandwidth_switch_conformance`:
+
+```sh
+cargo test -p siphon-rtp-codec --release --test opus_bandwidth_switch_conformance -- --nocapture
+```
+
+A mode switch is decided at the Opus layer; a bandwidth switch is decided *inside SILK*, which owns
+its internal rate, ramps its input bandwidth down over 256 frames before it will move, and then asks
+the Opus layer for cover by raising `switchReady` (`silk/control_audio_bandwidth.c:88`, `:116`). The
+answer is **two** redundancy frames, in opposite positions: one appended after the payload of the
+packet that asked, one prepended to the payload of the packet that switches
+(`opus_encoder.c:2065-2082`, `:1765-1772`). The harness sweeps `set_max_bandwidth` and the forced
+bandwidth over four streams and holds all of it to exact `final_range` through `opus_demo -d`, to
+sample agreement between our decoder and libopus', and — the point of the file — to a **non-zero
+count of redundancy-bearing packets on a stream whose TOC mode never changes**, so the count cannot
+have come from the mode-switch path. It also reports segmental SNR over the whole stream and over a
+±200 ms window anchored at each *requested* change; anchoring on the request rather than on the
+encoder's response is what makes those numbers comparable against a build that responds differently.
+
 Three traps specific to this layer:
 
 - **`opus_compare` reads its reference as 2-channel and its test file at the `-s` channel count**
@@ -507,6 +527,55 @@ One more oracle is worth knowing about for the tables rather than the decode pat
 `silk_nlsf_tables_vs_libopus` re-parses `reference/opus/opus-1.5.2/silk/tables_NLSF_CB_*.c` and diffs
 all 2569 ported NLSF codebook entries against the C element by element. It needs only the unpacked
 libopus source, not a build.
+
+#### Validating the SILK **bandwidth-switch** state: prefill and the transition filter
+
+Two pieces of the encoder leave **state** rather than bits, so neither the bitstream gates nor the
+per-kernel trace can see them at all:
+
+- **`silk_LP_variable_cutoff`**, the elliptic low-pass that walks the input bandwidth down over 256
+  frames before SILK will move to a lower internal rate. It never appears in the bitstream — it only
+  changes what the quantiser was handed.
+- **The prefill** (`silk_Encode(..., prefillFlag)`), which resets the encoder and then runs 10 ms of
+  already-elapsed audio through it so the next real frame starts warm. It emits nothing at all: its
+  entire product is the analysis history, the resampler memory, the VAD and the transition schedule.
+
+Both are pinned the same way `celt_stereo_golden` pins the CELT stereo kernels — a generator that
+links straight against the **unmodified** `build/libopus.a`, reaches into the encoder struct, and
+prints literals that are then baked into the Rust tests. It deliberately does *not* extend
+`silk_trace.patch`: nothing here needs instrumented source, and the patch is shared with every other
+SILK harness.
+
+```sh
+cd reference/opus
+gcc -O2 -DHAVE_CONFIG_H -I build -I opus-1.5.2/include -I opus-1.5.2/celt \
+    -I opus-1.5.2/silk -I opus-1.5.2/silk/float \
+    silk_lp_transition_golden.c build/libopus.a -lm -o build/silk_lp_transition_golden
+gcc -O2 -DHAVE_CONFIG_H -I build -I opus-1.5.2/include -I opus-1.5.2/celt \
+    -I opus-1.5.2/silk -I opus-1.5.2/silk/float \
+    silk_prefill_golden.c build/libopus.a -lm -o build/silk_prefill_golden
+./build/silk_lp_transition_golden          # first-frame samples + whole-sweep digests, both directions
+./build/silk_prefill_golden 1 16000 0      # prefillFlag 1: a CELT->SILK entry
+./build/silk_prefill_golden 2 16000 0      # prefillFlag 2, no rate change
+./build/silk_prefill_golden 2 12000 1      # prefillFlag 2 on the switching frame, 16 -> 12 kHz
+```
+
+The inputs are a plain LCG, regenerated identically on the Rust side, so only the outputs cross over
+and the tests need no reference tree — they run in CI unconditionally
+(`opus::silk::enc::lp_transition::tests`, `opus::silk::enc::encoder::tests`). Two notes:
+
+- The prefill generator drives `silk_Encode` with `API_sampleRate` equal to the internal rate, but the
+  resampler is still in the path on both sides: even an identity rate pair carries a 10-sample encoder
+  delay (`delay_matrix_enc[16k][16k]`), so leaving it out would compare against a differently aligned
+  signal.
+- `prefillFlag == 1` is issued *after* `silk_InitEncoder` (`opus_encoder.c:1435-1437`), which wipes the
+  whole `silk_encoder` and not just the per-channel states — the generator reproduces that, and the
+  difference from `prefillFlag == 2` is visible as the first sample of the analysis history.
+
+The prefill diff is exact: the surviving analysis history is compared as a digest over its raw
+IEEE-754 bit patterns, alongside the transition state, the high-pass tracker, the VAD's measures and
+`first_frame_after_reset`. There is no tolerance, because there is no float reordering in that path —
+everything from the resampler to the `int16 -> float` conversion is integer or exact.
 
 #### Per-kernel goldens for the CELT stereo kernels
 
