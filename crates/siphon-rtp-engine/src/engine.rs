@@ -2627,8 +2627,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ),
                     gate_on_ice: agent_endpoints.contains(&far.rtp.id),
                 },
-                self.media.clone(),
-                call_id.to_string(),
+                crate::dtls_bridge::PipelineTarget::Call {
+                    media: self.media.clone(),
+                    call_id: call_id.to_string(),
+                },
             );
         } else if pipeline == PipelineKind::SrtpMedia {
             // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
@@ -4140,12 +4142,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(info) => info,
             Err(error) => return error_result("conference_join: SDP parse", &error),
         };
-        // Plain RTP/AVP and SDES RTP/SAVP conference legs are supported; ICE / DTLS-SRTP (WebRTC)
-        // conference legs are a follow-up (the SDES secure leg is wired below).
+        // Plain RTP/AVP, SDES RTP/SAVP and DTLS-SRTP (`UDP/TLS/RTP/SAVPF`) conference legs are
+        // supported. Full ICE on a conference leg is still a follow-up: the room owns the
+        // participant's endpoint, so there is no agent driving candidate selection for it.
         if info.is_ice() {
             return error_result(
                 "conference_join",
-                &"ICE / DTLS-SRTP conference legs are not supported yet (use plain RTP/AVP or SDES RTP/SAVP)",
+                &"ICE conference legs are not supported yet (use plain RTP/AVP, SDES RTP/SAVP, or DTLS-SRTP without ICE)",
             );
         }
         let Some(codec) = info.primary_codec() else {
@@ -4198,7 +4201,44 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // SDES-SRTP (RTP/SAVP): the participant offered a secure leg + its a=crypto. Mint our own key,
         // build the secure leg (decrypt inbound with theirs, encrypt outbound with ours), and answer
         // RTP/SAVP + a=crypto. (DTLS-SRTP / ICE WebRTC legs remain a follow-up — see the is_ice() guard.)
-        let (secure, security) = if info.secure {
+        // DTLS-SRTP (`UDP/TLS/RTP/SAVPF`): there is no key to build here — the RFC 5764 handshake
+        // produces it after this command returns — so the seat is taken **pending** and keyed later
+        // over `ConferenceControl::AttachSecureLeg`. Until then the room drops its ingress and sends
+        // it nothing, so an unkeyed seat can neither inject noise into the mix nor receive the other
+        // participants in the clear.
+        let dtls_leg = info.dtls;
+        if dtls_leg {
+            if self.dtls_certificate.is_none() {
+                self.free(&[endpoint]).await;
+                return error_result("conference_join", &"engine has no DTLS certificate");
+            }
+            if info.fingerprint.is_none() {
+                self.free(&[endpoint]).await;
+                return error_result(
+                    "conference_join",
+                    &"UDP/TLS/RTP/SAVPF offer without an a=fingerprint",
+                );
+            }
+        }
+        let (secure, security) = if dtls_leg {
+            // The answer advertises the engine's fingerprint and its DTLS role — the complement of the
+            // offerer's `a=setup` (RFC 5763 §5): an `active` peer makes the engine passive (server).
+            let certificate = self.dtls_certificate.clone().expect("checked above");
+            let setup = match info.setup {
+                Some(sdp::Setup::Active) => sdp::Setup::Passive,
+                _ => sdp::Setup::Active,
+            };
+            (
+                None,
+                Some(SecurityAdvertisement::Dtls {
+                    fingerprint: sdp::Fingerprint {
+                        hash_function: certificate.fingerprint().hash_function,
+                        bytes: certificate.fingerprint().bytes,
+                    },
+                    setup,
+                }),
+            )
+        } else if info.secure {
             let Some(remote) = info.crypto.first().copied() else {
                 self.free(&[endpoint]).await;
                 return error_result(
@@ -4231,6 +4271,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             latch: true,
             egress_ssrc: random_ssrc(),
             egress_payload_type: codec.payload_type,
+            secure_pending: dtls_leg,
             mos_codec: crate::conference::hep_codec_for_name(&codec.encoding_name),
             telephone_event_in: info.telephone_event_payload_type(),
             secure,
@@ -4250,6 +4291,55 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         self.endpoint_calls
             .insert(endpoint.id, conference_id.to_string());
+
+        // A DTLS seat needs the handshake in front of its endpoint: the bridge keeps the RFC 7983
+        // demux (DTLS records drive the handshake) and forwards accepted media to the room actor
+        // still encrypted, which decrypts it on the seat's own `SecureLeg` once keyed. The seat was
+        // taken `secure_pending`, so until then it is neither mixed nor sent to.
+        if dtls_leg {
+            let certificate = self.dtls_certificate.clone().expect("checked above");
+            let peer_fingerprint = info.fingerprint.clone().expect("checked above");
+            // The offerer picks; the engine takes the complement (RFC 5763 §5), matching the
+            // `a=setup` advertised in the answer above.
+            let role = match info.setup {
+                Some(sdp::Setup::Active) => DtlsRole::Server,
+                _ => DtlsRole::Client,
+            };
+            if let Err(error) = self
+                .datapath
+                .install_flow(endpoint.id, FlowAction::Redirect)
+            {
+                self.conference.leave(conference_id, &from_tag);
+                self.free(&[endpoint]).await;
+                return error_result("conference_join: install DTLS redirect", &error);
+            }
+            self.dtls_bridge().register_for_pipeline(
+                DtlsCallPlan {
+                    // A conference seat is one muxed endpoint; the "plain" side is unused in
+                    // pipeline mode (the room owns egress), so it mirrors the secure one.
+                    plain_endpoint: endpoint.id,
+                    plain_source: accepted_source,
+                    plain_dst: info.remote_rtp,
+                    secure_endpoint: endpoint.id,
+                    secure_source: accepted_source,
+                    secure_dst: info.remote_rtp,
+                    secure_local: endpoint.local_addr,
+                    certificate,
+                    role,
+                    peer_fingerprint: DtlsFingerprint::new(
+                        peer_fingerprint.hash_function,
+                        peer_fingerprint.bytes,
+                    ),
+                    // Full ICE on a conference leg is refused above, so nothing gates the handshake.
+                    gate_on_ice: false,
+                },
+                crate::dtls_bridge::PipelineTarget::Conference {
+                    conference: self.conference.clone(),
+                    conference_id: conference_id.to_string(),
+                    tag: from_tag.clone(),
+                },
+            );
+        }
 
         // Answer: advertise the engine endpoint (the interface's advertised IP), keep the participant's
         // codec, sendrecv, and (for a secure leg) RTP/SAVP + the engine's a=crypto.
@@ -14002,6 +14092,64 @@ mod tests {
         leg
     }
 
+    /// Like [`peer_dtls_handshake`], but the peer drives the **server** side — used where the engine
+    /// took the client role from the `a=setup` complement.
+    async fn peer_dtls_handshake_server(
+        socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+        engine_far: SocketAddr,
+        peer_cert: &siphon_rtp_dtls::DtlsCertificate,
+        engine_fingerprint: &sdp::Fingerprint,
+    ) -> siphon_rtp_srtp::leg::SecureLeg {
+        use bytes::Bytes;
+        use siphon_rtp_dtls::{handshake, DtlsRole, DtlsTransport};
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (transport, channels) = DtlsTransport::new(peer_addr, engine_far);
+        let reader = {
+            let socket = socket.clone();
+            let inbound = channels.inbound;
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 2048];
+                while let Ok((len, _)) = socket.recv_from(&mut buffer).await {
+                    if inbound
+                        .send_async(Bytes::copy_from_slice(&buffer[..len]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+        let writer = {
+            let socket = socket.clone();
+            let outbound = channels.outbound;
+            tokio::spawn(async move {
+                while let Ok(record) = outbound.recv_async().await {
+                    if socket.send_to(&record, engine_far).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let expected = siphon_rtp_dtls::Fingerprint::new(
+            engine_fingerprint.hash_function.clone(),
+            engine_fingerprint.bytes.clone(),
+        );
+        let leg = timeout(
+            Duration::from_secs(5),
+            handshake(Arc::new(transport), peer_cert, DtlsRole::Server, &expected),
+        )
+        .await
+        .expect("handshake did not time out")
+        .expect("peer handshake");
+        reader.abort();
+        writer.abort();
+        leg
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_dtls_leg_is_transcoded_to_a_plain_leg_with_a_different_codec_each_side() {
         // WP-R4's headline, and the thing a WebRTC leg could not do before: a DTLS-SRTP (WebRTC-shaped)
@@ -14289,6 +14437,149 @@ mod tests {
             ),
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dtls_participant_joins_a_conference_and_is_mixed_once_its_handshake_keys_the_seat() {
+        // The last WP-R4 acceptance criterion: `conference_join` used to refuse a DTLS leg outright.
+        // Now the seat is taken **pending** — neither mixed nor sent to — and the RFC 5764 handshake
+        // keys it, after which the participant hears the room as SRTP it can decrypt.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_dtls::DtlsCertificate;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        // A plain participant to give the room something to mix.
+        let (plain, plain_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let plain_answer = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "dtls-room".into(),
+                    from_tag: "tag-plain".into(),
+                    sdp: sdp_for(plain_addr, true),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let plain_engine_addr = sdp::parse(&ok_sdp_text(&plain_answer))
+            .expect("plain answer")
+            .remote_rtp;
+
+        // The WebRTC-shaped participant: UDP/TLS/RTP/SAVPF with a fingerprint, no ICE.
+        let webrtc = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind webrtc"),
+        );
+        let webrtc_addr = webrtc.local_addr().expect("webrtc addr");
+        let peer_cert = DtlsCertificate::generate().expect("peer cert");
+        let peer_fingerprint = peer_cert.fingerprint();
+        let peer_hex = peer_fingerprint
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let offer = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+             a=setup:actpass\r\na=fingerprint:{hash} {peer_hex}\r\n",
+            ip = webrtc_addr.ip(),
+            port = webrtc_addr.port(),
+            hash = peer_fingerprint.hash_function,
+        );
+        let joined = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "dtls-room".into(),
+                    from_tag: "tag-webrtc".into(),
+                    sdp: offer,
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(joined, CmdResult::Ok { .. }),
+            "a DTLS conference leg must be seated, not refused: {joined:?}"
+        );
+        let answer = sdp::parse(&ok_sdp_text(&joined)).expect("dtls answer");
+        assert!(answer.dtls, "the answer advertises UDP/TLS/RTP/SAVPF");
+        let engine_fingerprint = answer.fingerprint.clone().expect("engine a=fingerprint");
+        let engine_seat = answer.remote_rtp;
+
+        // Before the handshake the seat is inert: the plain participant talking must produce nothing
+        // toward the unkeyed WebRTC peer (the room mix would otherwise go out in the clear).
+        for sequence in 0..15u16 {
+            plain
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), plain_engine_addr)
+                .await
+                .expect("plain send");
+        }
+        // The seat *will* receive DTLS handshake records — the engine is driving the handshake on this
+        // same muxed endpoint (RFC 7983 §7). What it must never receive is **media**: an RTP/SRTP
+        // first byte (128..=191) before the leg is keyed would be the room mix going out in the clear.
+        for _ in 0..12 {
+            let mut buffer = [0u8; 2048];
+            match timeout(Duration::from_millis(120), webrtc.recv_from(&mut buffer)).await {
+                Ok(Ok((len, _))) if len > 0 => assert!(
+                    (20..=63).contains(&buffer[0]),
+                    "an unkeyed DTLS seat received a non-DTLS packet (first byte {}) — the room mix \
+                     must not reach it before the handshake keys the leg",
+                    buffer[0]
+                ),
+                _ => break, // nothing more pending
+            }
+        }
+
+        // Complete the handshake (the engine advertised actpass → our peer answered, so the engine is
+        // the DTLS client here and the peer is the server side of the exchange).
+        let mut peer_leg = peer_dtls_handshake_server(
+            webrtc.clone(),
+            webrtc_addr,
+            engine_seat,
+            &peer_cert,
+            &engine_fingerprint,
+        )
+        .await;
+
+        // Now the room reaches it, encrypted: keep the plain leg talking and decrypt what arrives.
+        let mut mixed = None;
+        for sequence in 100..400u16 {
+            plain
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), plain_engine_addr)
+                .await
+                .expect("plain send");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(60), webrtc.recv_from(&mut buffer)).await
+            {
+                let mut plain_rtp = Vec::new();
+                if peer_leg.unprotect(&buffer[..len], &mut plain_rtp).is_ok() {
+                    mixed = Some(plain_rtp);
+                    break;
+                }
+            }
+        }
+        let mixed = mixed.expect("the keyed DTLS seat receives the room mix as decryptable SRTP");
+        assert_eq!(
+            mixed[1] & 0x7f,
+            0,
+            "the mix reaches the seat in its negotiated PCMU"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

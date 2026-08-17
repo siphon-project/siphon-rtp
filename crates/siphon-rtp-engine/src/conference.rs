@@ -152,6 +152,12 @@ pub struct ParticipantConfig {
     /// SDES-SRTP crypto for a secure (`RTP/SAVP`) participant: decrypt ingress / encrypt egress with
     /// this leg's keys. `None` for a plain `RTP/AVP` participant.
     pub secure: Option<SecureLeg>,
+    /// This seat is a **DTLS-SRTP** leg (RFC 5764) whose handshake has not completed, so `secure` is
+    /// still `None` but the participant is *not* plaintext. While set, the room drops the seat's
+    /// ingress and sends it nothing — decoding SRTP as if it were plaintext would mix noise into the
+    /// room, and sending the mix in the clear would leak every other participant to a peer that
+    /// negotiated encryption. Cleared when the handshake delivers the key.
+    pub secure_pending: bool,
     /// Initial role / routing.
     pub routing: Routing,
 }
@@ -219,6 +225,8 @@ struct Participant {
     dtmf: DtmfDetector,
     /// SDES-SRTP state for a secure participant (decrypt ingress / encrypt egress); `None` if plain.
     secure: Option<SecureLeg>,
+    /// Awaiting a DTLS handshake — drop ingress and emit nothing until keyed (see the config field).
+    secure_pending: bool,
     routing: Routing,
     /// Whether the first egress packet has been emitted (sets the RTP marker bit, RFC 3550 §5.1).
     started: bool,
@@ -505,6 +513,7 @@ impl Conference {
             vad: EnergyVad::new(VAD_THRESHOLD, VAD_HANGOVER_FRAMES),
             dtmf: DtmfDetector::new(),
             secure: config.secure,
+            secure_pending: config.secure_pending,
             routing: config.routing,
             started: false,
         });
@@ -541,6 +550,28 @@ impl Conference {
         }
     }
 
+    /// Install a participant's DTLS-derived [`SecureLeg`] and clear its pending gate, so its ingress
+    /// joins the mix and the mix starts reaching it. A no-op for an unknown tag (the seat left while
+    /// its handshake was still running), which leaves nothing keyed and nothing sent.
+    fn attach_secure_leg(&mut self, tag: &str, leg: SecureLeg) {
+        let Some(participant) = self.participants.iter_mut().find(|seat| seat.tag == tag) else {
+            tracing::warn!(
+                conference = %self.conference_id,
+                tag,
+                "DTLS handshake completed for a participant that already left; key discarded"
+            );
+            return;
+        };
+        participant.secure = Some(leg);
+        participant.secure_pending = false;
+        tracing::info!(
+            target: "siphon_rtp::media",
+            conference = %self.conference_id,
+            tag,
+            "DTLS-SRTP handshake complete; conference seat keyed"
+        );
+    }
+
     /// Ingress one datagram for a participant endpoint: gate its source, decrypt (secure legs), then
     /// SSRC-latch its reply address, drop RTCP / telephone-event, and buffer the audio for the next
     /// room tick. Never mixes a packet from an unsignalled source (RTPBleed defence), and only an
@@ -564,6 +595,11 @@ impl Conference {
                 conference = %conference_id,
                 "conference dropped packet from unsignalled source"
             );
+            return false;
+        }
+        // A DTLS seat whose handshake has not keyed it yet: drop. Decoding SRTP as if it were
+        // plaintext would mix noise into the room for every other participant.
+        if participant.secure_pending {
             return false;
         }
         // SRTP: decrypt a secure participant's packet first (the auth tag also proves authenticity —
@@ -750,6 +786,11 @@ impl Conference {
             ) else {
                 continue;
             };
+            // An unkeyed DTLS seat gets no RTCP either — a plaintext SR toward a peer expecting
+            // SRTCP leaks the room's SSRC/timing and is unreadable to it anyway.
+            if self.participants[index].secure_pending {
+                continue;
+            }
             // SRTCP-encrypt the report for a secure participant; plain legs send it as is.
             let wire: &[u8] = if let Some(secure) = self.participants[index].secure.as_mut() {
                 self.secure_out.clear();
@@ -952,6 +993,12 @@ impl Conference {
         egress_endpoint: EndpointId,
         out: &mut Vec<Outbound>,
     ) {
+        // Never send the room mix to a peer whose DTLS handshake has not keyed the leg: that would put
+        // every other participant's audio on the wire in the clear. `emit` is the one point every
+        // egress packet passes through, so the guard cannot be bypassed by a new caller.
+        if self.participants[index].secure_pending {
+            return;
+        }
         let marker = !self.participants[index].started;
         let rtp_len = match self.participants[index].leg.packetize(
             &self.payload[..payload_len],
@@ -1360,6 +1407,9 @@ pub enum ConferenceControl {
     AddBridgeIn(flume::Receiver<BridgeFrame>),
     /// Attach an outbound bridge channel — feed this room's participant mix to another room.
     AddBridgeOut(flume::Sender<BridgeFrame>),
+    /// Deliver a participant's [`SecureLeg`] once its DTLS handshake completed (RFC 5764), keying the
+    /// seat and clearing its pending gate so its audio joins the mix and the mix reaches it.
+    AttachSecureLeg { tag: String, leg: Box<SecureLeg> },
     /// Tear the room down.
     Stop,
 }
@@ -1428,6 +1478,9 @@ async fn run_conference<D>(
                     }
                     ConferenceInput::Control(ConferenceControl::AddBridgeOut(sender)) => {
                         conference.add_bridge_out(sender);
+                    }
+                    ConferenceInput::Control(ConferenceControl::AttachSecureLeg { tag, leg }) => {
+                        conference.attach_secure_leg(&tag, *leg);
                     }
                     ConferenceInput::Control(ConferenceControl::Stop) => break,
                 }
@@ -1618,6 +1671,18 @@ impl ConferenceRegistry {
         true
     }
 
+    /// Send a control op to a room's actor, returning `false` when there is no such room (it was torn
+    /// down while the op was in flight). The generic seam the DTLS handshake uses to key a seat.
+    pub fn control(&self, conference_id: &str, control: ConferenceControl) -> bool {
+        match self.rooms.get(conference_id) {
+            Some(handle) => handle
+                .mailbox
+                .try_send(ConferenceInput::Control(control))
+                .is_ok(),
+            None => false,
+        }
+    }
+
     /// Remove a participant. Returns its freed ingress endpoint (for the engine to release), and tears
     /// the room down once its last participant leaves.
     pub fn leave(&self, conference_id: &str, tag: &str) -> Option<EndpointId> {
@@ -1788,6 +1853,7 @@ mod tests {
             mos_codec: siphon_rtp_hep::mos::Codec::G711,
             telephone_event_in: Some(101),
             secure: None,
+            secure_pending: false,
             routing: Routing::default(),
         }
     }
@@ -1986,6 +2052,7 @@ mod tests {
             mos_codec: siphon_rtp_hep::mos::Codec::Opus,
             telephone_event_in: None,
             secure: None,
+            secure_pending: false,
             routing: Routing::default(),
         };
         (config, encoded)
@@ -2019,6 +2086,7 @@ mod tests {
             mos_codec: siphon_rtp_hep::mos::Codec::Opus,
             telephone_event_in: None,
             secure: None,
+            secure_pending: false,
             routing: Routing::default(),
         };
         (config, encoded)
@@ -2177,6 +2245,7 @@ mod tests {
             mos_codec: siphon_rtp_hep::mos::Codec::Opus,
             telephone_event_in: None,
             secure: None,
+            secure_pending: false,
             routing: Routing::default(),
         };
         (config, encoded)
