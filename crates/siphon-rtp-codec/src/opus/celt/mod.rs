@@ -1,4 +1,5 @@
-//! CELT decoder (RFC 6716 §4.3) — the MDCT-domain "music / low-delay" layer of Opus.
+//! CELT codec (RFC 6716 §4.3) — the MDCT-domain "music / low-delay" layer of Opus, mono and stereo,
+//! decode and encode.
 //!
 //! **Phase 3** of the pure-Rust Opus port. CELT (Constrained-Energy Lapped Transform) decodes the
 //! CELT-only Opus configs (16–31) and the high band of Hybrid. Pipeline (RFC 6716 §4.3 / libopus
@@ -15,13 +16,20 @@
 //! (the `#ifndef FIXED_POINT` branches). The `ENABLE_QEXT` (quality-extension) and `ENABLE_DEEP_PLC`
 //! (neural PLC) paths are not part of RFC 6716 and are omitted.
 
+pub mod analysis;
 pub mod anti_collapse;
-pub mod band_decode;
+pub mod band_analysis;
+pub mod band_coder;
 pub mod bands;
 pub mod decoder;
+pub mod encoder;
 pub mod energy;
+pub mod entropy;
 pub mod laplace;
+pub mod mathops;
 pub mod mdct;
+pub mod pitch;
+pub mod plc;
 pub mod postfilter;
 pub mod pvq;
 pub mod rate;

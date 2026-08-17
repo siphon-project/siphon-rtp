@@ -76,8 +76,14 @@ pub fn denormalise_bands(
 }
 
 /// Apply the output de-emphasis 1-pole to one channel, writing interleaved float PCM (libopus
-/// `deemphasis`, standard `downsample==1`, `coef[1]==0` path): `tmp = sig + VERY_SMALL + mem;
+/// `deemphasis`, the standard `coef[1] == 0` path): `tmp = sig + VERY_SMALL + mem;
 /// mem = coef0·tmp; pcm = tmp / 32768`. `mem` persists across frames in the decoder state.
+///
+/// `downsample` is 48000 / the API rate (`celt_decoder.c:302`). The 1-pole always runs at the full
+/// 48 kHz synthesis rate — only the *output* is decimated, keeping every `downsample`-th sample, so
+/// `n / downsample` samples per channel are written. A lower API rate therefore changes which
+/// samples come out, never the filter state.
+#[allow(clippy::too_many_arguments)]
 pub fn deemphasis(
     sig: &[f32],
     pcm: &mut [f32],
@@ -85,15 +91,29 @@ pub fn deemphasis(
     channels: usize,
     channel: usize,
     coef0: f32,
+    downsample: usize,
     mem: &mut f32,
 ) {
     const VERY_SMALL: f32 = 1e-30;
     const CELT_SIG_SCALE: f32 = 32768.0;
     let mut m = *mem;
+    if downsample == 1 {
+        for j in 0..n {
+            let tmp = sig[j] + VERY_SMALL + m;
+            m = coef0 * tmp;
+            pcm[j * channels + channel] = tmp / CELT_SIG_SCALE;
+        }
+        *mem = m;
+        return;
+    }
+    // The C runs the filter into a scratch buffer and then decimates it; keeping the running index
+    // instead writes the same samples without the scratch (and without a per-frame allocation).
     for j in 0..n {
         let tmp = sig[j] + VERY_SMALL + m;
         m = coef0 * tmp;
-        pcm[j * channels + channel] = tmp / CELT_SIG_SCALE;
+        if j % downsample == 0 {
+            pcm[(j / downsample) * channels + channel] = tmp / CELT_SIG_SCALE;
+        }
     }
     *mem = m;
 }
@@ -178,7 +198,7 @@ mod tests {
         let sig = [32768.0f32, 0.0, 0.0, 0.0];
         let mut pcm = [0.0f32; 4];
         let mut mem = 0.0f32;
-        deemphasis(&sig, &mut pcm, 4, 1, 0, coef0, &mut mem);
+        deemphasis(&sig, &mut pcm, 4, 1, 0, coef0, 1, &mut mem);
         // Independent reference recurrence.
         let mut m = 0.0f32;
         let mut expected = [0.0f32; 4];
@@ -192,6 +212,27 @@ mod tests {
         // Impulse decays geometrically by 0.85 in the SIG domain.
         assert!((pcm[1] / pcm[0] - 0.85).abs() < 1e-4);
         assert!((pcm[2] / pcm[1] - 0.85).abs() < 1e-4);
+    }
+
+    /// `celt_decoder.c:302` — a lower API rate decimates the *output* only: the 1-pole still runs at
+    /// 48 kHz, so the kept samples and the carried filter memory are identical to the full-rate run.
+    #[test]
+    fn deemphasis_downsamples_the_output_without_changing_the_filter() {
+        let coef0 = 0.85f32;
+        let sig: Vec<f32> = (0..12).map(|j| (j as f32) * 100.0).collect();
+
+        let mut full = [0.0f32; 12];
+        let mut mem_full = 0.0f32;
+        deemphasis(&sig, &mut full, 12, 1, 0, coef0, 1, &mut mem_full);
+
+        let mut third = [0.0f32; 4];
+        let mut mem_third = 0.0f32;
+        deemphasis(&sig, &mut third, 12, 1, 0, coef0, 3, &mut mem_third);
+
+        for j in 0..4 {
+            assert_eq!(third[j], full[j * 3], "kept sample {j}");
+        }
+        assert_eq!(mem_third, mem_full, "filter memory is rate-independent");
     }
 
     #[test]

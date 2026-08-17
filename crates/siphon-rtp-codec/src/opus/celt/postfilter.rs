@@ -62,12 +62,8 @@ pub fn comb_filter(
     }
     t0 = t0.max(COMBFILTER_MINPERIOD);
     t1 = t1.max(COMBFILTER_MINPERIOD);
-    let g00 = g0 * POSTFILTER_TAPS[tapset0][0];
-    let g01 = g0 * POSTFILTER_TAPS[tapset0][1];
-    let g02 = g0 * POSTFILTER_TAPS[tapset0][2];
-    let g10 = g1 * POSTFILTER_TAPS[tapset1][0];
-    let g11 = g1 * POSTFILTER_TAPS[tapset1][1];
-    let g12 = g1 * POSTFILTER_TAPS[tapset1][2];
+    let (g00, g01, g02) = comb_taps(g0, tapset0);
+    let (g10, g11, g12) = comb_taps(g1, tapset1);
 
     let mut x1 = buf[base - t1 + 1];
     let mut x2 = buf[base - t1];
@@ -97,6 +93,83 @@ pub fn comb_filter(
         return; // rest unchanged (in place).
     }
     comb_filter_const(buf, base + ov, n - ov, t1, g10, g11, g12);
+}
+
+/// Out-of-place 5-tap comb, `dst[i] = src[base+i] + taps·src[base+i-T]` (libopus `comb_filter` with
+/// `x != y`, `celt.c:112`) — the **encoder's prefilter** form.
+///
+/// This is a separate function from [`comb_filter`] and not a wrapper, because the two are different
+/// filters: the decoder runs in place (`x == y`), so its taps read the *already filtered* history and
+/// it is recursive, while the encoder's prefilter reads the untouched input and is feed-forward.
+/// Rust's aliasing rules make one body serving both impossible anyway; the shared part — the tap
+/// gains — is factored into the private `comb_taps` helper.
+///
+/// `src[..base]` must hold at least [`COMBFILTER_MAXPERIOD`] + 2 history samples. Passing
+/// `g0 == g1 == 0` copies `src` to `dst` unchanged, exactly as the C does for `x != y`.
+#[allow(clippy::too_many_arguments)]
+// `dst[i]` and `src[base+i]` advance together, so the index is the clearer form here.
+#[allow(clippy::needless_range_loop)]
+pub fn comb_filter_out_of_place(
+    dst: &mut [f32],
+    src: &[f32],
+    base: usize,
+    n: usize,
+    mut t0: usize,
+    mut t1: usize,
+    g0: f32,
+    g1: f32,
+    tapset0: usize,
+    tapset1: usize,
+    window: &[f32],
+    overlap: usize,
+) {
+    if g0 == 0.0 && g1 == 0.0 {
+        dst[..n].copy_from_slice(&src[base..base + n]);
+        return;
+    }
+    t0 = t0.max(COMBFILTER_MINPERIOD);
+    t1 = t1.max(COMBFILTER_MINPERIOD);
+    let (g00, g01, g02) = comb_taps(g0, tapset0);
+    let (g10, g11, g12) = comb_taps(g1, tapset1);
+
+    // No crossfade needed when the parameters are unchanged.
+    let ov = if g0 == g1 && t0 == t1 && tapset0 == tapset1 {
+        0
+    } else {
+        overlap.min(n)
+    };
+    for i in 0..ov {
+        let f = window[i] * window[i];
+        let b = base + i;
+        dst[i] = src[b]
+            + (1.0 - f) * g00 * src[b - t0]
+            + (1.0 - f) * g01 * (src[b - t0 + 1] + src[b - t0 - 1])
+            + (1.0 - f) * g02 * (src[b - t0 + 2] + src[b - t0 - 2])
+            + f * g10 * src[b - t1]
+            + f * g11 * (src[b - t1 + 1] + src[b - t1 - 1])
+            + f * g12 * (src[b - t1 + 2] + src[b - t1 - 2]);
+    }
+    if g1 == 0.0 {
+        dst[ov..n].copy_from_slice(&src[base + ov..base + n]);
+        return;
+    }
+    for i in ov..n {
+        let b = base + i;
+        dst[i] = src[b]
+            + g10 * src[b - t1]
+            + g11 * (src[b - t1 + 1] + src[b - t1 - 1])
+            + g12 * (src[b - t1 + 2] + src[b - t1 - 2]);
+    }
+}
+
+/// The three tap gains for a `(gain, tapset)` pair (libopus `comb_filter`, `celt.c:127`).
+#[inline]
+fn comb_taps(gain: f32, tapset: usize) -> (f32, f32, f32) {
+    (
+        gain * POSTFILTER_TAPS[tapset][0],
+        gain * POSTFILTER_TAPS[tapset][1],
+        gain * POSTFILTER_TAPS[tapset][2],
+    )
 }
 
 #[cfg(test)]
@@ -166,5 +239,83 @@ mod tests {
         );
         comb_filter_const(&mut want, BASE, n, t, g10, g11, g12);
         assert_eq!(got, want);
+    }
+
+    /// The out-of-place prefilter form is feed-forward: the taps read the untouched source, so it
+    /// must equal a direct evaluation against `src` (and *not* the recursive in-place result).
+    #[test]
+    fn out_of_place_comb_is_feed_forward() {
+        let t = 60usize;
+        let g = 0.4f32;
+        let tapset = 2usize;
+        let n = 300usize;
+        let src: Vec<f32> = (0..BASE + n)
+            .map(|i| (i as f32 * 0.19).sin() * 0.6)
+            .collect();
+
+        let mut got = vec![0f32; n];
+        comb_filter_out_of_place(
+            &mut got, &src, BASE, n, t, t, g, g, tapset, tapset, &WINDOW120, 120,
+        );
+        let (g10, g11, g12) = comb_taps(g, tapset);
+        for (i, &value) in got.iter().enumerate().take(n) {
+            let b = BASE + i;
+            let want = src[b]
+                + g10 * src[b - t]
+                + g11 * (src[b - t + 1] + src[b - t - 1])
+                + g12 * (src[b - t + 2] + src[b - t - 2]);
+            assert!((value - want).abs() < 1e-5, "sample {i}: {value} vs {want}");
+        }
+
+        // The recursive in-place form must give a *different* answer — proving the two are not
+        // interchangeable and that the prefilter really is reading the unfiltered source.
+        let mut in_place = src.clone();
+        comb_filter(
+            &mut in_place,
+            BASE,
+            n,
+            t,
+            t,
+            g,
+            g,
+            tapset,
+            tapset,
+            &WINDOW120,
+            120,
+        );
+        assert_ne!(
+            in_place[BASE + n - 1].to_bits(),
+            got[n - 1].to_bits(),
+            "in-place and out-of-place combs agreed, so one of them is wrong"
+        );
+    }
+
+    #[test]
+    fn out_of_place_comb_zero_gain_copies() {
+        let n = 64usize;
+        let src: Vec<f32> = (0..BASE + n).map(|i| i as f32 * 0.5).collect();
+        let mut dst = vec![9f32; n];
+        comb_filter_out_of_place(
+            &mut dst, &src, BASE, n, 30, 30, 0.0, 0.0, 0, 0, &WINDOW120, 120,
+        );
+        assert_eq!(dst[..], src[BASE..BASE + n]);
+    }
+
+    /// With `g1 == 0` the tail must be a plain copy while the crossfade region still filters.
+    #[test]
+    fn out_of_place_comb_fades_out_then_copies() {
+        let n = 200usize;
+        let overlap = 120usize;
+        let src: Vec<f32> = (0..BASE + n).map(|i| (i as f32 * 0.07).cos()).collect();
+        let mut dst = vec![0f32; n];
+        comb_filter_out_of_place(
+            &mut dst, &src, BASE, n, 40, 40, 0.5, 0.0, 1, 1, &WINDOW120, overlap,
+        );
+        assert_eq!(dst[overlap..], src[BASE + overlap..BASE + n]);
+        assert_ne!(
+            dst[0].to_bits(),
+            src[BASE].to_bits(),
+            "crossfade did nothing"
+        );
     }
 }

@@ -13,7 +13,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use siphon_rtp_codec::factory::CodecSpec;
+use siphon_rtp_codec::factory::{CodecSpec, OpusParams, OPUS_MAX_PTIME_MS};
 use siphon_rtp_ice::{Candidate, IceOptions, END_OF_CANDIDATES_ATTRIBUTE, ICE_MISMATCH_ATTRIBUTE};
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
@@ -90,8 +90,16 @@ pub struct MediaInfo {
     /// codecs (RFC 4867 §8.1). The engine clamps its egress encode mode into this set so it never
     /// sends a mode the peer disallowed. Empty when no `mode-set` was offered.
     pub mode_sets: Vec<(u8, Vec<u8>)>,
+    /// `a=fmtp` Opus parameters (payload type → RFC 7587 §6.1 parameter set), for each payload type
+    /// whose fmtp carried at least one recognised Opus parameter. Only read for a payload type that
+    /// resolves to Opus; an Opus stream that declared no fmtp is absent here and reads the RFC
+    /// defaults ([`OpusParams::default`]).
+    pub opus_params: Vec<(u8, OpusParams)>,
     /// The stream's `a=ptime` in milliseconds, if present (else the 20 ms telephony default).
     pub ptime_ms: u8,
+    /// The stream's `a=maxptime` in milliseconds, if present (RFC 4566 §6): the longest packet the
+    /// peer will accept. Caps every codec's egress `ptime_ms` on this stream.
+    pub maxptime_ms: Option<u8>,
 }
 
 /// A DTLS certificate fingerprint (RFC 8122), carried in `a=fingerprint`. In DTLS-SRTP the SDP does
@@ -249,8 +257,21 @@ impl MediaInfo {
         None
     }
 
+    /// The egress packetization for this stream: the negotiated `a=ptime`, capped by `a=maxptime`
+    /// when the peer set one (RFC 4566 §6 — `maxptime` is "the maximum amount of media that can be
+    /// encapsulated in each packet", so sending a longer packet is sending one the peer said it
+    /// would not take). Applies to every codec; RFC 7587 §7 is what makes it matter for Opus, whose
+    /// frame durations range up to 120 ms.
+    fn effective_ptime_ms(&self) -> u8 {
+        match self.maxptime_ms {
+            Some(maxptime) if maxptime >= 1 => self.ptime_ms.min(maxptime),
+            _ => self.ptime_ms,
+        }
+    }
+
     /// Resolve a payload type to a [`CodecSpec`] via its rtpmap, else the static table.
     fn codec_spec(&self, payload_type: u8) -> Option<CodecSpec> {
+        let ptime_ms = self.effective_ptime_ms();
         if let Some(map) = self
             .rtpmaps
             .iter()
@@ -261,7 +282,7 @@ impl MediaInfo {
                 &map.encoding_name,
                 map.clock_rate_hz,
                 map.channels,
-                self.ptime_ms,
+                ptime_ms,
             );
             // Honour an AMR-WB `mode-set` (RFC 4867 §8.1) by clamping the egress encode mode into
             // the allowed set, so the engine never sends the peer a mode it disallowed. The full set
@@ -275,9 +296,26 @@ impl MediaInfo {
                     );
                 }
             }
+            // Carry the peer's RFC 7587 §6.1 Opus parameters onto the spec: `sprop-stereo` decides
+            // the ingress channel layout the decoder is built for, `maxptime` caps the egress ptime,
+            // and the rest are the rate-control/FEC/DTX limits the Opus encoder honours. An `a=maxptime`
+            // attribute (RFC 7587 §7 maps `maxptime` to it, not to fmtp) overrides an fmtp copy.
+            if spec.is_opus() {
+                let mut params = self
+                    .opus_params
+                    .iter()
+                    .find(|(pt, _)| *pt == payload_type)
+                    .map(|(_, params)| *params);
+                if let Some(maxptime) = self.maxptime_ms {
+                    let mut resolved = params.unwrap_or_default();
+                    resolved.max_ptime_ms = OpusParams::clamp_ptime_ms(maxptime);
+                    params = Some(resolved);
+                }
+                return Some(spec.with_opus_params(params));
+            }
             return Some(spec);
         }
-        CodecSpec::from_static_payload_type(payload_type, self.ptime_ms)
+        CodecSpec::from_static_payload_type(payload_type, ptime_ms)
     }
 }
 
@@ -337,8 +375,12 @@ struct AudioScan {
     rtpmaps: Vec<RtpMap>,
     /// `a=fmtp` `mode-set` constraints in the audio section (payload type → allowed AMR modes).
     fmtp_mode_sets: Vec<(u8, Vec<u8>)>,
+    /// `a=fmtp` RFC 7587 Opus parameters in the audio section (payload type → parameter set).
+    fmtp_opus: Vec<(u8, OpusParams)>,
     /// The audio stream's `a=ptime`, if present.
     ptime_ms: Option<u8>,
+    /// The audio stream's `a=maxptime`, if present (RFC 4566 §6).
+    maxptime_ms: Option<u8>,
     /// Parsed `a=crypto` lines in the audio section, in order (RFC 4568).
     crypto: Vec<CryptoAttribute>,
     /// The peer's DTLS fingerprint / setup role (`a=fingerprint` / `a=setup`), session- or media-level.
@@ -379,24 +421,97 @@ fn parse_rtpmap(value: &str) -> Option<RtpMap> {
     })
 }
 
+/// Split an `a=fmtp:<pt> <params>` attribute body into its payload type and its parameter list.
+/// `None` when the prefix, the payload type, or the parameter list is missing. Shared by every fmtp
+/// parser so the payload-type split lives in one place (RFC 4566 §6).
+fn split_fmtp(value: &str) -> Option<(u8, &str)> {
+    let body = value.strip_prefix("fmtp:")?;
+    let (payload_type, params) = body.split_once(char::is_whitespace)?;
+    Some((payload_type.trim().parse::<u8>().ok()?, params))
+}
+
+/// Look up one `key=value` fmtp parameter (case-insensitive key, `;`-separated list in any order —
+/// RFC 4566 §6). Returns the trimmed value, or `None` when the key is absent.
+fn fmtp_param<'a>(params: &'a str, key: &str) -> Option<&'a str> {
+    params.split(';').map(str::trim).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim().eq_ignore_ascii_case(key).then(|| value.trim())
+    })
+}
+
+/// Parse an RFC 7587 §6.1 `0`/`1` fmtp flag. Any other token (including an empty value or a
+/// non-numeric one) leaves the RFC default in place rather than guessing — a garbled flag must not
+/// silently turn a feature on.
+fn fmtp_flag(params: &str, key: &str, default: bool) -> bool {
+    match fmtp_param(params, key) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => default,
+    }
+}
+
 /// Parse an `a=fmtp:<pt> ...mode-set=<m0,m1,...>...` body into `(payload_type, allowed_modes)`.
 /// Returns `None` when the line carries no parseable payload type or no `mode-set` parameter — the
 /// engine only acts on `mode-set`; every other fmtp parameter is passed through untouched.
 fn parse_fmtp_mode_set(value: &str) -> Option<(u8, Vec<u8>)> {
-    let body = value.strip_prefix("fmtp:")?;
-    let (payload_type, params) = body.split_once(char::is_whitespace)?;
-    let payload_type = payload_type.trim().parse::<u8>().ok()?;
+    let (payload_type, params) = split_fmtp(value)?;
     // fmtp params are `;`-separated `key=value` pairs in any order (RFC 4867 §8.1).
-    let modes_field = params
-        .split(';')
-        .map(str::trim)
-        .find_map(|param| param.strip_prefix("mode-set="))?;
+    let modes_field = fmtp_param(params, "mode-set")?;
     let modes: Vec<u8> = modes_field
         .split(',')
         .filter_map(|token| token.trim().parse::<u8>().ok())
         .filter(|&mode| mode <= 8)
         .collect();
     (!modes.is_empty()).then_some((payload_type, modes))
+}
+
+/// Parse an `a=fmtp:<pt> …` body into `(payload_type, OpusParams)` (RFC 7587 §6.1).
+///
+/// Returns `None` when the line has no parseable payload type, or when it carries **no** recognised
+/// Opus parameter — an fmtp for some other codec (an AMR `mode-set`, say) must not be recorded as an
+/// all-defaults Opus parameter set. Every parameter is independently optional: an absent, empty, or
+/// malformed value leaves the RFC 7587 §6.1 default in place, and an out-of-range numeric value is
+/// clamped into the range the RFC permits. Nothing here can panic — the whole body is untrusted.
+fn parse_fmtp_opus(value: &str) -> Option<(u8, OpusParams)> {
+    const KEYS: [&str; 8] = [
+        "maxaveragebitrate",
+        "maxplaybackrate",
+        "maxptime",
+        "stereo",
+        "sprop-stereo",
+        "cbr",
+        "useinbandfec",
+        "usedtx",
+    ];
+    let (payload_type, params) = split_fmtp(value)?;
+    if !KEYS.iter().any(|key| fmtp_param(params, key).is_some()) {
+        return None;
+    }
+    let default = OpusParams::default();
+    let parsed = OpusParams {
+        max_average_bitrate: fmtp_param(params, "maxaveragebitrate")
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(OpusParams::clamp_average_bitrate),
+        max_playback_rate_hz: fmtp_param(params, "maxplaybackrate")
+            .and_then(|value| value.parse::<u32>().ok())
+            .map_or(default.max_playback_rate_hz, |rate| {
+                OpusParams::clamp_playback_rate_hz(rate)
+            }),
+        // RFC 7587 §7 maps `maxptime` to the SDP `a=maxptime` attribute; some UAs also put it in the
+        // fmtp (§6.1 registers it as a media-type parameter, so it is legal there for non-SDP
+        // transports). Accept both — `MediaInfo::codec_spec` lets the attribute win.
+        max_ptime_ms: fmtp_param(params, "maxptime")
+            .and_then(|value| value.parse::<u16>().ok())
+            .map_or(default.max_ptime_ms, |ptime| {
+                OpusParams::clamp_ptime_ms(u8::try_from(ptime).unwrap_or(u8::MAX))
+            }),
+        stereo: fmtp_flag(params, "stereo", default.stereo),
+        sprop_stereo: fmtp_flag(params, "sprop-stereo", default.sprop_stereo),
+        cbr: fmtp_flag(params, "cbr", default.cbr),
+        use_inband_fec: fmtp_flag(params, "useinbandfec", default.use_inband_fec),
+        use_dtx: fmtp_flag(params, "usedtx", default.use_dtx),
+    };
+    Some((payload_type, parsed))
 }
 
 /// Choose the AMR-WB egress encode mode from an `allowed` `mode-set`: the engine default (mode 2 /
@@ -470,7 +585,9 @@ fn scan(sdp: &str) -> AudioScan {
         payload_types: Vec::new(),
         rtpmaps: Vec::new(),
         fmtp_mode_sets: Vec::new(),
+        fmtp_opus: Vec::new(),
         ptime_ms: None,
+        maxptime_ms: None,
         crypto: Vec::new(),
         fingerprint: None,
         setup: None,
@@ -595,9 +712,19 @@ fn scan(sdp: &str) -> AudioScan {
                             scan.rtpmaps.push(rtpmap);
                         }
                     } else if value.starts_with("fmtp:") {
+                        // One fmtp line can only belong to one codec, but the codec it belongs to is
+                        // not known until the rtpmaps are resolved (SDP attribute order is free —
+                        // RFC 4566 §5), so parse it for every parameter set the engine understands
+                        // and let `MediaInfo::codec_spec` pick the one its codec cares about.
                         if let Some(mode_set) = parse_fmtp_mode_set(value) {
                             scan.fmtp_mode_sets.push(mode_set);
                         }
+                        if let Some(opus) = parse_fmtp_opus(value) {
+                            scan.fmtp_opus.push(opus);
+                        }
+                    } else if let Some(maxptime) = value.strip_prefix("maxptime:") {
+                        // RFC 4566 §6 / RFC 7587 §7: the longest packet the peer will accept.
+                        scan.maxptime_ms = maxptime.trim().parse::<u8>().ok();
                     } else if let Some(ptime) = value.strip_prefix("ptime:") {
                         scan.ptime_ms = ptime.trim().parse::<u8>().ok();
                     }
@@ -653,7 +780,9 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         payload_types: scan.payload_types.clone(),
         rtpmaps: scan.rtpmaps.clone(),
         mode_sets: scan.fmtp_mode_sets.clone(),
+        opus_params: scan.fmtp_opus.clone(),
         ptime_ms: scan.ptime_ms.unwrap_or(DEFAULT_PTIME_MS),
+        maxptime_ms: scan.maxptime_ms,
     })
 }
 
@@ -1089,11 +1218,10 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
                 formats.join(" ")
             ));
             // Insert `a=rtpmap` for each added codec right after the media line (RFC 4566 — order-free).
+            // Emitted through the shared `rtpmap_line`, so an added Opus codec gets the mandatory
+            // `/2` channel suffix (RFC 7587 §7) rather than the illegal bare `opus/48000`.
             for spec in &added {
-                out.push(format!(
-                    "a=rtpmap:{} {}/{}",
-                    spec.payload_type, spec.encoding_name, spec.clock_rate_hz
-                ));
+                out.push(rtpmap_line(spec));
             }
             continue;
         }
@@ -1120,29 +1248,69 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
     rewritten
 }
 
-/// The `a=rtpmap` line for a codec (`a=rtpmap:<pt> <name>/<clock>[/<channels>]`, RFC 4566 §6). The
-/// `/<channels>` suffix is emitted only for multi-channel audio — mono telephony omits it (matching
-/// [`rewrite_codec_list`]'s rtpmap emission).
-fn rtpmap_line(codec: &CodecSpec) -> String {
+/// The optional `/<channels>` suffix of an `a=rtpmap` line (RFC 4566 §6), or an empty string when it
+/// is omitted. **The** source of truth for the suffix — every rtpmap the engine emits goes through
+/// it, so the Opus rule below cannot be honoured in one emitter and forgotten in another.
+///
+/// RFC 4566 §6 makes the suffix optional and defaults it to 1, so mono telephony omits it. Opus is
+/// the exception: RFC 7587 §7 requires `opus/48000/2` **unconditionally**, mono included, because the
+/// count names the *RTP* channel count rather than the audio channel count (mono is signalled by the
+/// fmtp `stereo` / `sprop-stereo` parameters instead). `opus/48000` is therefore not a legal line.
+/// `CodecSpec::new` pins an Opus spec's `channels` at 2 (`OPUS_RTPMAP_CHANNELS`), so the single
+/// `> 1` test covers Opus as well as genuine multi-channel audio.
+pub(crate) fn rtpmap_channel_suffix(codec: &CodecSpec) -> String {
     if codec.channels > 1 {
-        format!(
-            "a=rtpmap:{} {}/{}/{}",
-            codec.payload_type, codec.encoding_name, codec.clock_rate_hz, codec.channels
-        )
+        format!("/{}", codec.channels)
     } else {
-        format!(
-            "a=rtpmap:{} {}/{}",
-            codec.payload_type, codec.encoding_name, codec.clock_rate_hz
-        )
+        String::new()
     }
 }
 
-/// The `a=fmtp` line describing the engine's egress framing for a variable-rate codec, or `None` for
-/// a codec that needs none. AMR-WB: the engine's encoder emits **octet-aligned** single-frame
-/// payloads (RFC 4867 §4.4 — see `siphon_rtp_codec::amr`), so the answer must advertise
-/// `octet-align=1`; when a `mode-set` was negotiated it also advertises the single mode the engine
-/// actually sends (RFC 4867 §8.1). (Bandwidth-efficient AMR-WB egress is a separate follow-up.)
+/// The `a=rtpmap` line for a codec (`a=rtpmap:<pt> <name>/<clock>[/<channels>]`, RFC 4566 §6), with
+/// the channel suffix decided by [`rtpmap_channel_suffix`].
+fn rtpmap_line(codec: &CodecSpec) -> String {
+    format!(
+        "a=rtpmap:{} {}/{}{}",
+        codec.payload_type,
+        codec.encoding_name,
+        codec.clock_rate_hz,
+        rtpmap_channel_suffix(codec)
+    )
+}
+
+/// The `a=fmtp` line describing the engine's egress framing for a codec that needs one, or `None`.
+///
+/// **AMR-WB:** the engine's encoder emits **octet-aligned** single-frame payloads (RFC 4867 §4.4 —
+/// see `siphon_rtp_codec::amr`), so the answer must advertise `octet-align=1`; when a `mode-set` was
+/// negotiated it also advertises the single mode the engine actually sends (RFC 4867 §8.1).
+/// (Bandwidth-efficient AMR-WB egress is a separate follow-up.)
+///
+/// **Opus:** every RFC 7587 §6.1 parameter is *declarative and unidirectional* (§7.1) — there is no
+/// negotiation, each side states its own posture — so this line is the **engine's** statement, not an
+/// echo of the peer's. The engine's media path is mono end to end, so it declares exactly that, in
+/// both directions the RFC gives it a parameter for:
+///
+/// - `stereo=0` — receive-only (§6.1): "do not send me stereo". True, and it saves the peer the
+///   bitrate: a stereo ingress would be folded to mono at the codec trait boundary anyway.
+/// - `sprop-stereo=0` — sender-only (§6.1): "what I send you is mono". Emitted explicitly even
+///   though 0 is the default, because `a=rtpmap:… opus/48000/2` invites the opposite assumption.
+///
+/// The remaining receive-only parameters (`maxaveragebitrate`, `maxplaybackrate`, `cbr`,
+/// `useinbandfec`, `usedtx`) are deliberately **omitted**, which per §6.1 declares their defaults —
+/// no bitrate cap, full-band, VBR, no FEC, no DTX. That is the engine's true posture today: it places
+/// no constraint on the peer's encoder and its own decoder is not yet in the factory. When the Opus
+/// decoder lands with in-band FEC (LBRR), `useinbandfec=1` belongs here.
+///
+/// `maxptime` is not an fmtp parameter in SDP — RFC 7587 §7 maps it to the `a=maxptime` attribute,
+/// which [`force_answer_codec`] emits alongside `a=ptime`.
 fn egress_fmtp_line(codec: &CodecSpec) -> Option<String> {
+    if codec.is_opus() {
+        // RFC 7587 §6.1 / §7.1 — the engine's own declaration; see the doc comment above.
+        return Some(format!(
+            "a=fmtp:{} stereo=0;sprop-stereo=0",
+            codec.payload_type
+        ));
+    }
     if codec.encoding_name != "AMR-WB" {
         return None;
     }
@@ -1151,6 +1319,20 @@ fn egress_fmtp_line(codec: &CodecSpec) -> Option<String> {
         params.push_str(&format!(";mode-set={mode}"));
     }
     Some(format!("a=fmtp:{} {params}", codec.payload_type))
+}
+
+/// The `a=maxptime` line the engine advertises for a codec, or `None` when it advertises none.
+///
+/// Only Opus needs one: it is the only codec here whose frame duration is variable and can exceed the
+/// engine's scratch ceiling, and RFC 7587 §7 maps its `maxptime` parameter to this attribute (RFC
+/// 4566 §6). The advertised value is the engine's real ceiling — [`OPUS_MAX_PTIME_MS`], which is both
+/// the RFC 7587 §6.1 maximum and the duration the media path's frame buffers are sized for — so it is
+/// a statement the engine can keep. Fixed-frame codecs (G.711 at any ptime, AMR's native 20 ms)
+/// advertise nothing, exactly as before.
+fn egress_maxptime_line(codec: &CodecSpec) -> Option<String> {
+    codec
+        .is_opus()
+        .then(|| format!("a=maxptime:{OPUS_MAX_PTIME_MS}"))
 }
 
 /// Force an answer SDP's audio codec presentation to `primary` (plus the negotiated `telephone_event`
@@ -1217,10 +1399,17 @@ pub fn force_answer_codec(sdp: &str, primary: &CodecSpec, telephone_event: Optio
             // re-frames the egress to exactly this (the repacketizer), so the SDP must present our own
             // ptime, never leak the far side's.
             out.push(format!("a=ptime:{}", primary.ptime_ms));
+            // …and, for a codec with a variable frame duration (Opus), the longest packet the engine
+            // will accept back (RFC 7587 §7 maps `maxptime` here, not into fmtp).
+            if let Some(maxptime) = egress_maxptime_line(primary) {
+                out.push(maxptime);
+            }
             continue;
         }
-        // Drop the far side's `a=ptime` — we re-emit our own effective ptime above.
-        if line.starts_with("a=ptime:") {
+        // Drop the far side's `a=ptime` / `a=maxptime` — we re-emit our own effective ptime and our
+        // own frame-duration ceiling above. Leaking the far side's would advertise a packetization
+        // this leg never receives.
+        if line.starts_with("a=ptime:") || line.starts_with("a=maxptime:") {
             continue;
         }
         // Drop the far side's per-payload-type codec attributes; we re-emit our own above.
@@ -1485,6 +1674,248 @@ mod tests {
         assert_eq!(amr_wb_encode_mode(None), None);
         // Out-of-range tokens are ignored; an all-invalid set leaves no constraint.
         assert_eq!(amr_wb_encode_mode(Some("9,42")), None);
+    }
+
+    /// An Opus offer (PT 111, RFC 7587 `opus/48000/2`) at 203.0.113.9, with optional `a=fmtp` /
+    /// `a=ptime` / `a=maxptime` attribute lines appended verbatim.
+    fn opus_offer(attributes: &str) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n\
+             m=audio 5004 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n{attributes}"
+        )
+    }
+
+    fn opus_codec(attributes: &str) -> CodecSpec {
+        parse(&opus_offer(attributes))
+            .expect("parse")
+            .primary_codec()
+            .expect("opus codec")
+    }
+
+    #[test]
+    fn opus_fmtp_parses_every_rfc_7587_parameter() {
+        // RFC 7587 §6.1, in the order of the §7 example, plus `cbr` (which that example omits).
+        let spec = opus_codec(
+            "a=fmtp:111 maxplaybackrate=16000;maxaveragebitrate=20000;stereo=1;\
+             sprop-stereo=1;cbr=1;useinbandfec=1;usedtx=1\r\n",
+        );
+        let params = spec.opus_params();
+        assert_eq!(params.max_playback_rate_hz, 16_000);
+        assert_eq!(params.max_average_bitrate, Some(20_000));
+        assert!(params.stereo);
+        assert!(params.sprop_stereo);
+        assert!(params.cbr);
+        assert!(params.use_inband_fec);
+        assert!(params.use_dtx);
+        // `sprop-stereo=1` is the one that reaches a codec constructor: the peer sends stereo, so
+        // the decoder is built 2-channel; the engine's own egress stays mono.
+        assert_eq!(spec.decode_channels(), 2);
+        assert_eq!(spec.encode_channels(), 1);
+    }
+
+    #[test]
+    fn opus_fmtp_tolerates_whitespace_case_and_reordering() {
+        // RFC 4566 §6: the parameter list is `;`-separated in any order; RFC 7587's own §7 example
+        // puts a space after each `;`. Parameter names are matched case-insensitively.
+        let params = opus_codec(
+            "a=fmtp:111 UseInbandFEC=1; STEREO=0; maxaveragebitrate = 32000 ;usedtx=1\r\n",
+        )
+        .opus_params();
+        assert!(params.use_inband_fec);
+        assert!(!params.stereo);
+        assert_eq!(params.max_average_bitrate, Some(32_000));
+        assert!(params.use_dtx);
+    }
+
+    #[test]
+    fn opus_fmtp_absent_leaves_the_rfc_7587_defaults() {
+        // No fmtp at all: every parameter reads its RFC 7587 §6.1 default, and nothing panics.
+        let spec = opus_codec("");
+        assert_eq!(spec.opus, None, "nothing was declared");
+        assert_eq!(
+            spec.opus_params(),
+            siphon_rtp_codec::factory::OpusParams::default()
+        );
+        assert_eq!(spec.decode_channels(), 1, "sprop-stereo defaults to mono");
+    }
+
+    #[test]
+    fn opus_fmtp_garbage_never_panics_and_keeps_the_defaults() {
+        let default = siphon_rtp_codec::factory::OpusParams::default();
+        // Non-numeric, empty, negative, overflowing, and value-less parameters are all ignored
+        // (an unparseable flag must not be read as "on").
+        let params = opus_codec(
+            "a=fmtp:111 stereo=yes;usedtx=;maxaveragebitrate=-1;maxplaybackrate=99999999999;\
+             useinbandfec;cbr=2\r\n",
+        )
+        .opus_params();
+        assert!(!params.stereo);
+        assert!(!params.use_dtx);
+        assert!(!params.use_inband_fec);
+        assert!(!params.cbr);
+        assert_eq!(params.max_average_bitrate, None);
+        assert_eq!(params.max_playback_rate_hz, default.max_playback_rate_hz);
+        // Out-of-range but parseable values are clamped into the RFC 7587 §6.1 ranges.
+        let clamped = opus_codec("a=fmtp:111 maxplaybackrate=4000;maxaveragebitrate=999999\r\n")
+            .opus_params();
+        assert_eq!(clamped.max_playback_rate_hz, 8000);
+        assert_eq!(clamped.max_average_bitrate, Some(510_000));
+        // A body with no recognised Opus parameter is not recorded as an all-defaults Opus set.
+        let info = parse(&opus_offer("a=fmtp:111 octet-align=1\r\n")).expect("parse");
+        assert!(info.opus_params.is_empty());
+    }
+
+    #[test]
+    fn opus_fmtp_on_another_payload_type_is_not_applied() {
+        // The fmtp names PT 96, the Opus stream is PT 111 — the parameters must not leak across.
+        let spec = opus_codec("a=fmtp:96 stereo=1;sprop-stereo=1\r\n");
+        assert_eq!(spec.opus, None);
+        assert_eq!(spec.decode_channels(), 1);
+    }
+
+    #[test]
+    fn opus_rtpmap_out_of_spec_clock_and_channels_are_corrected() {
+        // RFC 7587 §4.1/§7.1 pin the clock at 48000 and §7 pins the rtpmap channel count at 2. A
+        // peer signalling otherwise is out of spec — the spec wins (a believed 16 kHz clock would
+        // mis-scale every RTP timestamp and the RFC 3550 §6.4.1 jitter estimate).
+        let sdp = "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n\
+                   m=audio 5004 RTP/AVP 111\r\na=rtpmap:111 opus/16000\r\n";
+        let spec = parse(sdp)
+            .expect("parse")
+            .primary_codec()
+            .expect("opus codec");
+        assert_eq!(spec.clock_rate_hz, 48_000);
+        assert_eq!(spec.channels, 2);
+    }
+
+    #[test]
+    fn maxptime_caps_the_negotiated_ptime() {
+        // RFC 4566 §6 / RFC 7587 §7: `a=maxptime` is the longest packet the peer will accept, so an
+        // advertised 60 ms ptime against `maxptime:40` must produce a 40 ms egress frame.
+        let capped = opus_codec("a=ptime:60\r\na=maxptime:40\r\n");
+        assert_eq!(capped.ptime_ms, 40);
+        assert_eq!(capped.opus_params().max_ptime_ms, 40);
+        // A maxptime above the ptime is a ceiling, not a target — the ptime stands.
+        let uncapped = opus_codec("a=ptime:60\r\na=maxptime:120\r\n");
+        assert_eq!(uncapped.ptime_ms, 60);
+        assert_eq!(uncapped.opus_params().max_ptime_ms, 120);
+        // The `a=maxptime` attribute wins over an fmtp copy (RFC 7587 §7 maps it to the attribute).
+        let attribute_wins = opus_codec("a=fmtp:111 maxptime=120;stereo=0\r\na=maxptime:40\r\n");
+        assert_eq!(attribute_wins.opus_params().max_ptime_ms, 40);
+        assert_eq!(
+            attribute_wins.ptime_ms, 20,
+            "no a=ptime ⇒ the 20 ms default"
+        );
+        // It applies to every codec, not just Opus (RFC 4566 §6 is codec-independent).
+        let g711 = "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n\
+                    m=audio 5004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=ptime:40\r\n\
+                    a=maxptime:20\r\n";
+        assert_eq!(
+            parse(g711)
+                .expect("parse")
+                .primary_codec()
+                .expect("pcmu")
+                .ptime_ms,
+            20
+        );
+    }
+
+    #[test]
+    fn opus_ptime_60_survives_negotiation() {
+        // The 60 ms case the media path's frame ceiling used to truncate: 48 kHz × 60 ms = 2880
+        // samples. It must reach the spec intact, since the egress frame size is derived from it.
+        let spec = opus_codec("a=ptime:60\r\n");
+        assert_eq!(spec.ptime_ms, 60);
+        assert_eq!(spec.clock_rate_hz, 48_000);
+    }
+
+    #[test]
+    fn opus_rtpmap_always_carries_the_channel_count() {
+        // RFC 7587 §7: `a=rtpmap:<pt> opus/48000/2` is mandatory, mono included — `opus/48000` is
+        // not a legal line. Assert the exact bytes emitted, from both emitters.
+        let opus = CodecSpec::new(111, "opus", 48_000, 2, 20);
+        assert_eq!(rtpmap_line(&opus), "a=rtpmap:111 OPUS/48000/2");
+        // …even when the spec was built from a peer's non-conformant mono rtpmap.
+        let from_mono = CodecSpec::new(111, "opus", 48_000, 1, 20);
+        assert_eq!(rtpmap_line(&from_mono), "a=rtpmap:111 OPUS/48000/2");
+        // Mono telephony still omits the suffix (RFC 4566 §6 defaults it to 1).
+        assert_eq!(
+            rtpmap_line(&CodecSpec::new(0, "PCMU", 8000, 1, 20)),
+            "a=rtpmap:0 PCMU/8000"
+        );
+
+        // `apply_codec_policy`'s added-codec rtpmap goes through the same emitter.
+        let sdp = "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n\
+                   m=audio 5004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let rewritten = rewrite_codec_list(sdp, &[], std::slice::from_ref(&opus));
+        assert!(
+            rewritten.contains("a=rtpmap:111 OPUS/48000/2"),
+            "added Opus codec must carry /2: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("a=rtpmap:111 OPUS/48000\r"),
+            "the illegal bare form must not be emitted: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn opus_answer_declares_the_engine_mono_posture() {
+        // RFC 7587 §6.1/§7.1: the fmtp is declarative and unidirectional, so the answer states the
+        // engine's own posture — mono in, mono out — rather than echoing the peer's.
+        let opus = CodecSpec::new(111, "opus", 48_000, 2, 20);
+        assert_eq!(
+            egress_fmtp_line(&opus).as_deref(),
+            Some("a=fmtp:111 stereo=0;sprop-stereo=0")
+        );
+        assert_eq!(
+            egress_maxptime_line(&opus).as_deref(),
+            Some("a=maxptime:120")
+        );
+        // The peer's own parameters do not change what the engine declares about itself.
+        let with_peer_params = opus.clone().with_opus_params(Some(OpusParams {
+            stereo: true,
+            sprop_stereo: true,
+            use_dtx: true,
+            ..OpusParams::default()
+        }));
+        assert_eq!(
+            egress_fmtp_line(&with_peer_params).as_deref(),
+            Some("a=fmtp:111 stereo=0;sprop-stereo=0")
+        );
+        // Non-Opus codecs are untouched: AMR-WB keeps its own line, G.711 has none, and neither
+        // advertises a maxptime (their frame duration is fixed).
+        let g711 = CodecSpec::new(0, "PCMU", 8000, 1, 20);
+        assert_eq!(egress_fmtp_line(&g711), None);
+        assert_eq!(egress_maxptime_line(&g711), None);
+        let amr = CodecSpec::new(96, "AMR-WB", 16_000, 1, 20).with_encode_mode(Some(2));
+        assert_eq!(
+            egress_fmtp_line(&amr).as_deref(),
+            Some("a=fmtp:96 octet-align=1;mode-set=2")
+        );
+        assert_eq!(egress_maxptime_line(&amr), None);
+    }
+
+    #[test]
+    fn force_answer_codec_emits_the_full_opus_attribute_set() {
+        // The whole answer presentation for an Opus leg, byte for byte: the mandatory `/2` rtpmap
+        // (RFC 7587 §7), the engine's declarative fmtp, our own ptime, and our maxptime ceiling.
+        let answer =
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\n\
+             m=audio 5004 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=ptime:20\r\na=maxptime:40\r\n";
+        let opus = CodecSpec::new(111, "opus", 48_000, 2, 60);
+        let forced = force_answer_codec(answer, &opus, None);
+        assert!(forced.contains("m=audio 5004 RTP/AVP 111\r\n"), "{forced}");
+        assert!(forced.contains("a=rtpmap:111 OPUS/48000/2\r\n"), "{forced}");
+        assert!(
+            forced.contains("a=fmtp:111 stereo=0;sprop-stereo=0\r\n"),
+            "{forced}"
+        );
+        assert!(forced.contains("a=ptime:60\r\n"), "{forced}");
+        assert!(forced.contains("a=maxptime:120\r\n"), "{forced}");
+        // The far side's own ptime/maxptime are dropped, not leaked.
+        assert!(!forced.contains("a=ptime:20\r\n"), "{forced}");
+        assert!(!forced.contains("a=maxptime:40\r\n"), "{forced}");
+        assert!(!forced.contains("PCMA"), "{forced}");
     }
 
     #[test]

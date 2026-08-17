@@ -28,7 +28,7 @@ codec is free, running it is not. See [Codec licensing](codec-licensing.md).
 | Comfort noise | `CN` (13) | generate only | no | RFC 3389 (a generator, not a codec) | none |
 | AMR-WB | `AMR-WB` (dynamic) | all 9 modes | all 9 modes | 3GPP TS 26.174 vectors, per mode | `amr` |
 | AMR-NB | `AMR` (dynamic) | all 8 modes | all 8 modes | 3GPP TS 26.074 vectors | `amr` |
-| Opus | `OPUS` | in progress | in progress | RFC 6716 test vectors (targeted) | not wired |
+| Opus | `opus` (dynamic, `opus/48000/2`) | yes — SILK, CELT and Hybrid, mono and stereo, all bandwidths and frame durations, PLC and in-band FEC | in progress | all 12 official RFC 6716 vectors (mono + stereo), plus exact per-packet `final_range` | none (royalty-free) |
 | EVS | | no | no | | absent |
 
 The engine resolves a codec from the `a=rtpmap` encoding name (case-insensitive, RFC
@@ -74,9 +74,83 @@ a gain adaptor, then a modified codebook-gain search) and is the only mode that 
 gain indices per subframe. This is a full AMR-NB encoder for G.711 transcoding in both
 directions; only DTX/SID (comfort-noise generation) is out of scope.
 
-**Opus.** An implementation is under way with RFC 6716 conformance gating, but it is
-**not wired into the codec factory**: a call that requires Opus transcoding fails at
-setup with a clean error. Opus passthrough relays fine, like everything else.
+**Opus.** The **decoder is complete and wired into the codec factory**, so transcoding
+*from* an Opus leg — Opus → G.711 / AMR-WB, the WebRTC-trunk and voice-AI cases — works
+end to end. It covers everything RFC 6716 §4 defines: SILK-only, CELT-only and Hybrid
+including mid-packet mode switching and redundancy frames, all five bandwidths, every
+frame duration from 2.5 ms to a 120 ms multi-frame packet, full stereo, all five output
+rates, PLC, in-band FEC (LBRR) and DTX. It is gated on all 12 official RFC 6716 test
+vectors in both the mono and the stereo pass, and additionally on exact `final_range`
+equality for every packet of every vector — bitstream-exactness, which the §6
+`opus_compare` tolerance metric cannot see.
+
+The **encoder is still being built**, so transcoding *toward* an Opus leg fails at setup
+with a clean error naming the missing direction, and Opus is not advertised in the
+`node_info` capability list (that list requires both directions — see below). Opus
+passthrough relays fine either way, like everything else.
+
+Three things the negotiated SDP contributes to the decoder, and nothing else does: the
+output sample rate (the RFC 7587 §4.1 clock rate, 48 kHz), the ingress channel count (the
+peer's `sprop-stereo`, §6.1 — *not* the rtpmap `/2`, which §7 mandates even for mono), and
+the nominal frame (the negotiated `ptime`). A packet carrying more than the negotiated
+ptime still decodes in full: the media path's decode buffer is sized for the 120 ms
+ceiling, which is exactly why a 60 ms Opus sender does not lose audio.
+
+The rest of the engine surface is in place. The engine parses and honours the RFC 7587
+payload format:
+
+- `a=rtpmap:<pt> opus/48000/2` is emitted **unconditionally**, mono included — RFC 7587 §7
+  requires the channel count, and it names the RTP channel count, not the audio one. A
+  peer that signals a different clock rate or channel count is corrected to 48000/2
+  (RFC 7587 §4.1 — Opus clocks RTP at 48 kHz in every mode).
+- The `a=fmtp` parameters of RFC 7587 §6.1 are parsed onto the negotiated codec:
+  `maxaveragebitrate`, `maxplaybackrate`, `stereo`, `sprop-stereo`, `cbr`, `useinbandfec`,
+  `usedtx`, `maxptime`. An absent or malformed parameter falls back to its RFC default and
+  an out-of-range value is clamped into the range the RFC permits; nothing there can panic.
+  Of those, `sprop-stereo` and `maxptime` change engine behaviour today (the ingress channel
+  layout and the egress packetization); the rest are the rate-control / FEC / DTX limits the
+  Opus **encoder** will honour, carried through offer/answer and HA checkpoints meanwhile.
+- Frame durations up to 120 ms are carried end to end. RFC 7587 §6.1 allows a ptime that
+  long and RFC 6716 §3.2 lets a single packet carry 120 ms whatever ptime was negotiated,
+  so the media path's frame buffers are sized for 48 kHz × 120 ms × 2 channels.
+- Every parameter the engine declares back is its own posture, not an echo of the peer's:
+  the answer carries `a=fmtp:<pt> stereo=0;sprop-stereo=0` (the engine's media path is
+  mono — see "Channels and PCM layout" below) plus `a=ptime` and `a=maxptime:120`.
+
+Because Opus is royalty-free (RFC 6716 is an IETF royalty-free design), it gets **no Cargo
+feature** — see [Codec licensing](codec-licensing.md). It appears in the `node_info`
+capability list only once the factory can build a decoder *and* an encoder for it, so a
+dispatcher is never told about a transcode this build cannot perform.
+
+## Channels and PCM layout
+
+Every telephony codec here is mono. Opus is the first that need not be (RFC 7587 §6.1
+signals mono or stereo through the `stereo` / `sprop-stereo` fmtp parameters), so the
+`Decoder`/`Encoder` trait boundary fixes the layout once, for all codecs:
+
+- **PCM is interleaved.** A multi-channel frame is `L, R, L, R, …` — channel-major within a
+  sample instant, never planar. That is the layout `opus_decode` produces and the layout
+  RIFF/WAVE stores, so no repacking happens at either edge.
+- `CodecParams::frame_samples()` is the frame length in **samples per channel** (i.e. in
+  time); `CodecParams::frame_values()` is the **`i16` count of one interleaved frame**. A
+  buffer is sized by `frame_values`, a duration or RTP-timestamp step by `frame_samples`.
+  `Decoder::frame_samples()` / `Encoder::frame_samples()` are the *buffer* contract, so they
+  are interleaved counts. For every mono codec the two numbers are identical.
+- **The media path itself is mono.** The mixer, resampler, jitter buffer, echo canceller,
+  noise suppressor, and RTP timestamp arithmetic are all single-channel. A multi-channel
+  decoded frame is therefore folded to mono once, immediately after `decode`, by
+  `siphon_rtp_codec::downmix_to_mono` (the arithmetic mean of the channels at each instant),
+  and everything downstream — including the recorder, which stays a 1-channel WAV — sees
+  mono. The fold is driven by `params().channels`, not by the codec's identity, so it applies
+  to any future multi-channel codec without a special case.
+- **The engine's own egress is mono**, and it says so: `sprop-stereo=0` on every Opus answer.
+  That is spec-clean — RFC 7587 §7.1 makes `stereo` a ceiling ("MUST NOT send stereo" when
+  0), never an obligation to use it — and it saves the peer the bitrate of a channel the
+  engine would discard. A stereo Opus stream still **relays** untouched, since passthrough
+  never runs a codec.
+
+Going genuinely multi-channel end to end (a stereo mixer, a two-channel resampler, a stereo
+WAV) is a separate change; nothing in the codec work depends on it.
 
 **EVS.** Not implemented, and gated by an active patent pool besides; see
 [Codec licensing](codec-licensing.md). EVS passthrough relays fine.

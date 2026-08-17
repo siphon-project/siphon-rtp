@@ -21,6 +21,14 @@ use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::g722::G722;
 use siphon_rtp_codec::g726::{Rate, G726};
 use siphon_rtp_codec::gsm_fr::GsmFr;
+use siphon_rtp_codec::opus::celt::band_analysis::compute_band_energies;
+use siphon_rtp_codec::opus::celt::decoder::CeltDecoder;
+use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
+use siphon_rtp_codec::opus::celt::mdct::{clt_mdct_forward, MdctLookup};
+use siphon_rtp_codec::opus::celt::tables::{NB_BANDS, OVERLAP, WINDOW120};
+use siphon_rtp_codec::opus::celt::vq::op_pvq_search;
+use siphon_rtp_codec::opus::enc::decision::Application as OpusApplication;
+use siphon_rtp_codec::opus::enc::encoder::{OpusEncoder, RateControl as OpusRateControl};
 use siphon_rtp_codec::{Decoder, Encoder};
 
 #[cfg(feature = "amr")]
@@ -531,6 +539,1400 @@ fn bench_amrwb_encode_cmr(criterion: &mut Criterion) {
     });
 }
 
+/// A deterministic 48 kHz test signal in `[-1, 1)` — a few harmonics plus a little noise, so the
+/// encoder's analysis has real decisions to make (a pure tone would take unrealistically cheap paths).
+fn celt_signal(samples: usize) -> Vec<f32> {
+    let mut state = 0x5EED_u32;
+    (0..samples)
+        .map(|i| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((state >> 16) as f32 / 32768.0 - 1.0) * 0.02;
+            let t = i as f32;
+            0.35 * (t * 0.031).sin() + 0.18 * (t * 0.097).sin() + 0.07 * (t * 0.21).cos() + noise
+        })
+        .collect()
+}
+
+/// Speech-like 16-bit input for the top-level encoder: a pitch pulse train through a resonance plus
+/// noise, so the mode and bandwidth decisions have something real to decide about.
+fn opus_signal(samples: usize, channels: usize) -> Vec<i16> {
+    let mut state = 0x2468_u32;
+    let mut history = [0.0f32; 2];
+    let mut out = Vec::with_capacity(samples * channels);
+    for index in 0..samples {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let noise = ((state >> 20) as i32 - 2048) as f32 * 1.5;
+        let pulse = if index % 240 == 0 { 6000.0 } else { 0.0 };
+        let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+        history[1] = history[0];
+        history[0] = value;
+        let sample = value.clamp(-24_000.0, 24_000.0) as i16;
+        out.push(sample);
+        if channels == 2 {
+            out.push((i32::from(sample) * 2 / 3) as i16);
+        }
+    }
+    out
+}
+
+/// The **top-level Opus encoder**, one 20 ms frame per iteration, per mode — the whole per-packet
+/// cost a transcoding leg pays: the decisions, the high-pass, the API-rate resampler, whichever
+/// codec layers the mode uses, and the packing.
+///
+/// The modes are reached the way a real stream reaches them (rate and application) rather than by
+/// forcing, so each number is what that operating point actually costs.
+fn bench_opus_encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("opus_encode");
+    const FRAME: usize = 960;
+    for &(label, channels, bitrate, application) in &[
+        (
+            "silk_mono_20ms_16k",
+            1usize,
+            16_000i32,
+            OpusApplication::Voip,
+        ),
+        ("hybrid_mono_20ms_32k", 1, 32_000, OpusApplication::Voip),
+        (
+            "celt_mono_20ms_64k",
+            1,
+            64_000,
+            OpusApplication::RestrictedLowdelay,
+        ),
+        ("hybrid_stereo_20ms_64k", 2, 64_000, OpusApplication::Voip),
+        ("celt_stereo_20ms_128k", 2, 128_000, OpusApplication::Audio),
+    ] {
+        let signal = opus_signal(FRAME * 64, channels);
+        group.bench_function(label, |b| {
+            let mut encoder =
+                OpusEncoder::new(48_000, channels, application).expect("build Opus encoder");
+            encoder.set_bitrate(Some(bitrate)).expect("bitrate");
+            encoder.set_rate_control(OpusRateControl::ConstrainedVariable);
+            encoder.set_complexity(9).expect("complexity");
+            let mut payload = vec![0u8; 1500];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let lo = (frame % 64) * FRAME * channels;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(
+                            black_box(&signal[lo..lo + FRAME * channels]),
+                            FRAME,
+                            &mut payload,
+                        )
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+    // The durations that need several Opus frames in one packet, and the CBR path that pads.
+    let signal = opus_signal(2880 * 24, 1);
+    for &(label, frame_size, rate_control) in &[
+        (
+            "silk_mono_60ms_24k",
+            2880usize,
+            OpusRateControl::ConstrainedVariable,
+        ),
+        ("hybrid_mono_20ms_cbr_32k", 960, OpusRateControl::Constant),
+    ] {
+        group.bench_function(label, |b| {
+            let mut encoder =
+                OpusEncoder::new(48_000, 1, OpusApplication::Voip).expect("build Opus encoder");
+            encoder.set_bitrate(Some(32_000)).expect("bitrate");
+            encoder.set_rate_control(rate_control);
+            encoder.set_complexity(9).expect("complexity");
+            let mut payload = vec![0u8; 1500];
+            let mut frame = 0usize;
+            let frames = signal.len() / frame_size;
+            b.iter(|| {
+                let lo = (frame % frames) * frame_size;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(
+                            black_box(&signal[lo..lo + frame_size]),
+                            frame_size,
+                            &mut payload,
+                        )
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
+/// The CELT **encoder** hot path, one frame per iteration — criterion's time-per-iteration is
+/// therefore directly the µs/frame this repo gates on.
+fn bench_celt_encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("celt_encode");
+    for &(label, frame_size) in &[
+        ("2.5ms_120", 120usize),
+        ("5ms_240", 240),
+        ("10ms_480", 480),
+        ("20ms_960", 960),
+    ] {
+        let signal = celt_signal(frame_size * 64);
+        group.bench_function(label, |b| {
+            let mut encoder = CeltEncoder::new().expect("build CELT encoder");
+            encoder.set_bitrate(64_000);
+            encoder.set_rate_control(RateControl::ConstrainedVbr);
+            let mut payload = vec![0u8; 1275];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let lo = (frame % 64) * frame_size;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(
+                            black_box(&signal[lo..lo + frame_size]),
+                            frame_size,
+                            &mut payload,
+                        )
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+    // The rate-control extremes, at the frame size RTP actually uses.
+    let signal = celt_signal(960 * 64);
+    for &(label, bitrate, rate_control) in &[
+        ("20ms_cbr_32k", 32_000i32, RateControl::ConstantBitrate),
+        ("20ms_vbr_128k", 128_000, RateControl::Vbr),
+    ] {
+        group.bench_function(label, |b| {
+            let mut encoder = CeltEncoder::new().expect("build");
+            encoder.set_bitrate(bitrate);
+            encoder.set_rate_control(rate_control);
+            let mut payload = vec![0u8; 1275];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let lo = (frame % 64) * 960;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(black_box(&signal[lo..lo + 960]), 960, &mut payload)
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+
+    // Stereo: two channels of analysis and MDCT plus the mid/side band coder. `complexity_10` adds
+    // the theta rate-distortion trial, which encodes each stereo band twice.
+    for &(label, frame_size) in &[
+        ("stereo_2.5ms_120", 120usize),
+        ("stereo_5ms_240", 240),
+        ("stereo_10ms_480", 480),
+        ("stereo_20ms_960", 960),
+    ] {
+        let signal = celt_stereo_signal(frame_size * 64);
+        group.bench_function(label, |b| {
+            let mut encoder = CeltEncoder::with_channels(2).expect("build stereo CELT encoder");
+            encoder.set_bitrate(96_000);
+            encoder.set_rate_control(RateControl::ConstrainedVbr);
+            let mut payload = vec![0u8; 1275];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let lo = (frame % 64) * frame_size * 2;
+                frame += 1;
+                black_box(
+                    encoder
+                        .encode(
+                            black_box(&signal[lo..lo + 2 * frame_size]),
+                            frame_size,
+                            &mut payload,
+                        )
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+    let stereo_signal = celt_stereo_signal(960 * 64);
+    group.bench_function("stereo_20ms_complexity_10", |b| {
+        let mut encoder = CeltEncoder::with_channels(2).expect("build");
+        encoder.set_bitrate(96_000);
+        encoder.set_rate_control(RateControl::ConstrainedVbr);
+        encoder.set_complexity(10).expect("complexity");
+        let mut payload = vec![0u8; 1275];
+        let mut frame = 0usize;
+        b.iter(|| {
+            let lo = (frame % 64) * 1920;
+            frame += 1;
+            black_box(
+                encoder
+                    .encode(black_box(&stereo_signal[lo..lo + 1920]), 960, &mut payload)
+                    .expect("encode"),
+            )
+        });
+    });
+    group.finish();
+}
+
+/// Interleave a mono signal with a decorrelated copy of itself, so the stereo band coder faces a
+/// real mid/side decision rather than the degenerate "both channels identical" one.
+fn celt_stereo_signal(samples: usize) -> Vec<f32> {
+    let left = celt_signal(samples);
+    let right = celt_signal(samples + 7);
+    (0..samples)
+        .flat_map(|i| [left[i], 0.6 * left[i] + 0.4 * right[i + 7]])
+        .collect()
+}
+
+/// The CELT **decoder** hot path, one frame per iteration — the cost a relay/transcode leg pays on
+/// ingress. The packets are encoded up front so only the decode is measured.
+fn bench_celt_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("celt_decode");
+    for &(label, channels, frame_size, bitrate) in &[
+        ("mono_2.5ms_120", 1usize, 120usize, 64_000i32),
+        ("mono_5ms_240", 1, 240, 64_000),
+        ("mono_10ms_480", 1, 480, 64_000),
+        ("mono_20ms_960", 1, 960, 64_000),
+        ("stereo_2.5ms_120", 2, 120, 96_000),
+        ("stereo_5ms_240", 2, 240, 96_000),
+        ("stereo_10ms_480", 2, 480, 96_000),
+        ("stereo_20ms_960", 2, 960, 96_000),
+    ] {
+        let frames = 64usize;
+        let block = frame_size * channels;
+        let signal = if channels == 2 {
+            celt_stereo_signal(frame_size * frames)
+        } else {
+            celt_signal(frame_size * frames)
+        };
+        let mut encoder = CeltEncoder::with_channels(channels).expect("build CELT encoder");
+        encoder.set_bitrate(bitrate);
+        encoder.set_rate_control(RateControl::ConstrainedVbr);
+        let mut payload = vec![0u8; 1275];
+        let packets: Vec<Vec<u8>> = (0..frames)
+            .map(|frame| {
+                let lo = frame * block;
+                let written = encoder
+                    .encode(&signal[lo..lo + block], frame_size, &mut payload)
+                    .expect("encode");
+                payload[..written].to_vec()
+            })
+            .collect();
+
+        group.bench_function(label, |b| {
+            let mut decoder = CeltDecoder::with_channels(channels).expect("build CELT decoder");
+            let mut pcm = vec![0i16; block];
+            let mut frame = 0usize;
+            b.iter(|| {
+                let packet = &packets[frame % frames];
+                frame += 1;
+                black_box(
+                    decoder
+                        .decode(black_box(packet), &mut pcm, frame_size)
+                        .expect("decode"),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
+/// The CELT encoder's per-frame sub-kernels, so a regression can be localised.
+fn bench_celt_kernels(c: &mut Criterion) {
+    let mut group = c.benchmark_group("celt_kernels");
+    let lookup = MdctLookup::new(1920, 3).expect("build 48 kHz MDCT lookup");
+
+    // Forward MDCT: one long block per frame size (shift = maxLM - LM).
+    for &(label, shift, n) in &[
+        ("mdct_forward_2.5ms", 3usize, 120usize),
+        ("mdct_forward_5ms", 2, 240),
+        ("mdct_forward_10ms", 1, 480),
+        ("mdct_forward_20ms", 0, 960),
+    ] {
+        let input = celt_signal(n + OVERLAP);
+        group.bench_function(label, |b| {
+            let mut out = vec![0f32; n];
+            b.iter(|| {
+                clt_mdct_forward(
+                    &lookup,
+                    black_box(&input),
+                    &mut out,
+                    &WINDOW120,
+                    OVERLAP,
+                    shift,
+                    1,
+                );
+                black_box(out[0])
+            });
+        });
+    }
+
+    // Band energies over a full 20 ms spectrum.
+    let spectrum: Vec<f32> = celt_signal(960).iter().map(|v| v * 4000.0).collect();
+    group.bench_function("compute_band_energies_20ms", |b| {
+        let mut band_e = vec![0f32; 2 * NB_BANDS];
+        b.iter(|| {
+            compute_band_energies(black_box(&spectrum), &mut band_e, NB_BANDS, 1, 3);
+            black_box(band_e[0])
+        });
+    });
+
+    // The PVQ search: the encoder's most expensive inner loop. Two representative band shapes.
+    for &(label, n, k) in &[
+        ("pvq_search_n16_k8", 16usize, 8usize),
+        ("pvq_search_n48_k6", 48, 6),
+    ] {
+        let shape: Vec<f32> = (0..n).map(|i| (i as f32 * 0.41).sin()).collect();
+        group.bench_function(label, |b| {
+            let mut x = shape.clone();
+            let mut iy = vec![0i32; n];
+            b.iter(|| {
+                x.copy_from_slice(&shape);
+                black_box(op_pvq_search(&mut x, &mut iy, k, n))
+            });
+        });
+    }
+    group.finish();
+}
+
+/// SILK's synthesis-side per-frame costs: the §4.2.7.9 LTP + LPC filters, the §4.2.8 stereo
+/// unmixing, the §4.2.9 resampler and the §4.4 concealment path.
+///
+/// None of these read a bitstream, so they bench anywhere with no reference data. Together with
+/// [`bench_silk_frame`] (which needs a vector) they cover everything a SILK packet pays per 20 ms.
+fn bench_silk_synthesis(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::silk::decoder::{ChannelState, StereoState};
+    use siphon_rtp_codec::opus::silk::plc::{self, PlcScratch};
+    use siphon_rtp_codec::opus::silk::resampler::Resampler;
+    use siphon_rtp_codec::opus::silk::stereo_unmix::mid_side_to_left_right;
+    use siphon_rtp_codec::opus::silk::synthesis::{decode_core, CoreScratch, DecoderControl};
+    use siphon_rtp_codec::opus::silk::types::{
+        InternalRate, SignalType, SubframeLayout, LTP_ORDER, MAX_FRAME_LENGTH, MAX_NB_SUBFR,
+    };
+
+    /// A channel primed with a plausible history and excitation, as a real decode would leave it.
+    fn primed_channel(rate: InternalRate) -> ChannelState {
+        let mut channel = ChannelState::new();
+        let layout = SubframeLayout::from_duration_ms(20).expect("20 ms");
+        channel.set_internal_rate(rate, layout);
+        channel.first_frame_after_reset = false;
+        for (index, slot) in channel.out_buf.iter_mut().enumerate() {
+            *slot = (7000.0 * ((index as f64) * 0.06).sin()) as i16;
+        }
+        for (index, slot) in channel.excitation_q14.iter_mut().enumerate() {
+            *slot = (((index * 7919) % 4001) as i32 - 2000) << 6;
+        }
+        channel
+    }
+
+    /// A voiced control block with a mid-range gain and a real pitch.
+    fn voiced_control(rate: InternalRate) -> DecoderControl {
+        let mut control = DecoderControl::new();
+        control.gains_q16 = [1 << 18, 1 << 19, 1 << 18, 1 << 17];
+        control.pitch_lags = [(6 * rate.khz()) as i32; MAX_NB_SUBFR];
+        control.ltp_scale_q14 = 15_565;
+        for subframe in 0..MAX_NB_SUBFR {
+            for tap in 0..LTP_ORDER {
+                control.ltp_coef_q14[subframe * LTP_ORDER + tap] = 1_600 + (tap as i16) * 200;
+            }
+        }
+        for order in 0..rate.lpc_order() {
+            let value = 1_800 - (order as i16) * 90;
+            control.pred_coef_q12[0][order] = value;
+            control.pred_coef_q12[1][order] = value;
+        }
+        control
+    }
+
+    let mut group = c.benchmark_group("silk_synthesis");
+
+    for (label, rate) in [
+        ("nb_8k", InternalRate::Narrow8k),
+        ("wb_16k", InternalRate::Wide16k),
+    ] {
+        for (voiced, signal_type) in [
+            ("voiced", SignalType::Voiced),
+            ("unvoiced", SignalType::Unvoiced),
+        ] {
+            let mut channel = primed_channel(rate);
+            let mut control = voiced_control(rate);
+            let mut scratch = CoreScratch::new();
+            let mut output = [0i16; MAX_FRAME_LENGTH];
+            group.bench_function(format!("decode_core_20ms_{label}_{voiced}"), |b| {
+                b.iter(|| {
+                    decode_core(
+                        &mut channel,
+                        &mut control,
+                        signal_type,
+                        false,
+                        black_box(&mut output),
+                        &mut scratch,
+                    )
+                    .expect("synthesis");
+                    black_box(output[0])
+                });
+            });
+        }
+    }
+
+    // §4.2.8 stereo unmixing, 20 ms wideband.
+    {
+        let mut state = StereoState::new();
+        let mut mid = vec![0i16; 322];
+        let mut side = vec![0i16; 322];
+        for index in 0..322 {
+            mid[index] = (6000.0 * ((index as f64) * 0.04).sin()) as i16;
+            side[index] = (1500.0 * ((index as f64) * 0.11).cos()) as i16;
+        }
+        group.bench_function("stereo_unmix_20ms_wb", |b| {
+            b.iter(|| {
+                mid_side_to_left_right(
+                    &mut state,
+                    black_box(&mut mid),
+                    black_box(&mut side),
+                    [4096, -2048],
+                    InternalRate::Wide16k,
+                    320,
+                )
+                .expect("unmix");
+                black_box(mid[1])
+            });
+        });
+    }
+
+    // §4.2.9 resampling to the API rate, one 20 ms frame per call.
+    for (label, input_hz, samples) in [
+        ("8k_to_48k", 8_000u32, 160usize),
+        ("12k_to_48k", 12_000, 240),
+        ("16k_to_48k", 16_000, 320),
+        ("16k_to_8k", 16_000, 320),
+    ] {
+        let output_hz = if label.ends_with("8k") && input_hz == 16_000 {
+            8_000
+        } else {
+            48_000
+        };
+        let mut resampler = Resampler::new();
+        resampler.configure(input_hz, output_hz).expect("configure");
+        let input: Vec<i16> = (0..samples)
+            .map(|n| (8000.0 * ((n as f64) * 0.07).sin()) as i16)
+            .collect();
+        let mut output = vec![0i16; resampler.output_length(samples)];
+        group.bench_function(format!("resample_20ms_{label}"), |b| {
+            b.iter(|| {
+                resampler
+                    .process(black_box(&mut output), black_box(&input))
+                    .expect("resample");
+                black_box(output[0])
+            });
+        });
+    }
+
+    // §4.4 concealment: one lost 20 ms wideband frame.
+    {
+        let mut channel = primed_channel(InternalRate::Wide16k);
+        let mut control = voiced_control(InternalRate::Wide16k);
+        let mut scratch = PlcScratch::new();
+        let mut frame = [0i16; MAX_FRAME_LENGTH];
+        // One good-frame update first, so the concealer has real parameters to work from.
+        plc::run(
+            &mut channel,
+            &mut control,
+            SignalType::Voiced,
+            false,
+            &mut frame,
+            &mut scratch,
+        )
+        .expect("plc update");
+        group.bench_function("plc_conceal_20ms_wb", |b| {
+            b.iter(|| {
+                plc::run(
+                    &mut channel,
+                    &mut control,
+                    SignalType::Voiced,
+                    true,
+                    black_box(&mut frame),
+                    &mut scratch,
+                )
+                .expect("conceal");
+                black_box(frame[0])
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Whole-frame SILK decode — one Opus frame of a real SILK-only stream, from the range decoder all
+/// the way to interleaved 48 kHz stereo PCM.
+///
+/// This is the number that matters for a transcoding leg: everything else in `silk_*` is a component
+/// of it. It needs a real bitstream, so it reads the first packet of a `reference/opus/silk_only`
+/// stream and is skipped (with a notice) when the vectors are absent — the same skip-when-absent rule
+/// the conformance harnesses follow.
+fn bench_silk_frame(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::packet;
+    use siphon_rtp_codec::opus::range_coder::RangeDecoder;
+    use siphon_rtp_codec::opus::silk::decoder::SilkDecoder;
+    use siphon_rtp_codec::opus::silk::frame::LossFlag;
+    use siphon_rtp_codec::opus::silk::types::InternalRate;
+    use std::path::Path;
+
+    /// First packet payload of an `opus_demo` `.bit` file.
+    fn first_packet(path: &Path) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.len() < 8 {
+            return None;
+        }
+        let length = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        // The first packet of a silence lead-in is tiny; take the first one with real content.
+        let mut offset = 0usize;
+        let mut best: Option<Vec<u8>> = None;
+        let mut length = length;
+        while offset + 8 + length <= bytes.len() {
+            let payload = bytes[offset + 8..offset + 8 + length].to_vec();
+            if payload.len() > 20 {
+                best = Some(payload);
+                break;
+            }
+            offset += 8 + length;
+            if offset + 8 > bytes.len() {
+                break;
+            }
+            length = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+        }
+        best
+    }
+
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/opus/silk_only");
+    let cases = [
+        ("nb_20ms_mono", "s01_NB_20_10000.bit"),
+        ("wb_20ms_mono", "s01_WB_20_18000.bit"),
+        ("wb_20ms_stereo", "s01_WB_20_18000_st.bit"),
+        ("wb_60ms_mono", "s01_WB_60_18000.bit"),
+    ];
+
+    let mut group = c.benchmark_group("silk_frame");
+    let mut benched = 0usize;
+    for (label, file) in cases {
+        let Some(payload) = first_packet(&directory.join(file)) else {
+            continue;
+        };
+        let Ok(parsed) = packet::parse(&payload) else {
+            continue;
+        };
+        let frame = parsed.frames()[0].to_vec();
+        let channels = usize::from(parsed.toc.channels());
+        let rate = InternalRate::from_bandwidth(parsed.toc.bandwidth());
+        let duration_ms = parsed.toc.samples_per_frame(48_000) / 48;
+        let mut silk = SilkDecoder::new(48_000, 2).expect("decoder");
+        let mut output = vec![0i16; 2880 * 2];
+        group.bench_function(format!("decode_{label}"), |b| {
+            b.iter(|| {
+                silk.configure(channels, rate, duration_ms)
+                    .expect("configure");
+                let mut decoder = RangeDecoder::new(black_box(&frame));
+                let produced = silk
+                    .decode(Some(&mut decoder), LossFlag::Normal, black_box(&mut output))
+                    .expect("decode");
+                black_box(produced)
+            });
+        });
+        benched += 1;
+    }
+    if benched == 0 {
+        eprintln!(
+            "silk_frame bench: no vectors in {} — run reference/opus/gen_silk_only.sh (see CONTRIBUTING.md)",
+            directory.display()
+        );
+    }
+    group.finish();
+}
+
+/// SILK's §4.2.7.6-8 side-info stages: the LTP indices, the shell coder and the §4.2.7.8.6
+/// reconstruction. These are per-frame costs on every SILK and hybrid packet, so they are benched
+/// separately from the whole-frame decode that sits on top of them.
+///
+/// The payloads are built with our own range *encoder* rather than read from a vector file, so the
+/// bench runs anywhere (no reference data) and the symbol mix is fixed and reproducible.
+fn bench_silk_excitation(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::range_coder::{RangeDecoder, RangeEncoder};
+    use siphon_rtp_codec::opus::silk::excitation::{
+        self, PULSES_PER_BLOCK_ICDF, PULSE_BUFFER_LENGTH, RATE_LEVELS_ICDF, SHELL_BLOCK_LENGTH,
+        SHELL_CODE_TABLE0, SHELL_CODE_TABLE1, SHELL_CODE_TABLE2, SHELL_CODE_TABLE3,
+        SHELL_CODE_TABLE_OFFSETS, SIGN_ICDF,
+    };
+    use siphon_rtp_codec::opus::silk::ltp;
+    use siphon_rtp_codec::opus::silk::types::{
+        CondCoding, InternalRate, QuantOffsetType, SignalType, SubframeLayout, MAX_FRAME_LENGTH,
+    };
+
+    const FTB: u32 = 8;
+    /// The sub-table for `pulse_count` inside a shell-code table (RFC 6716 Tables 47-50).
+    fn split(table: &[u8; 152], pulse_count: usize) -> &[u8] {
+        let start = SHELL_CODE_TABLE_OFFSETS[pulse_count] as usize;
+        &table[start..start + pulse_count + 1]
+    }
+
+    let mut group = c.benchmark_group("silk_excitation");
+
+    // ── The excitation stage, at each frame length RFC 6716 Table 44 lists ─────────────────────
+    for &(label, frame_length) in &[
+        ("decode_nb_10ms", 80usize),
+        ("decode_nb_20ms", 160),
+        ("decode_wb_10ms", 160),
+        ("decode_wb_20ms", 320),
+    ] {
+        let block_count = frame_length.div_ceil(SHELL_BLOCK_LENGTH);
+        let rate_level = 5usize;
+        let signal_type = SignalType::Voiced;
+        let quant_offset_type = QuantOffsetType::High;
+
+        // A realistic block mix: a few pulses spread over the block, one loud block per frame.
+        let blocks: Vec<[u16; SHELL_BLOCK_LENGTH]> = (0..block_count)
+            .map(|block| {
+                let mut pulses = [0u16; SHELL_BLOCK_LENGTH];
+                pulses[block % SHELL_BLOCK_LENGTH] = 3;
+                pulses[(block * 5 + 1) % SHELL_BLOCK_LENGTH] += 2;
+                pulses[(block * 11 + 7) % SHELL_BLOCK_LENGTH] += 1;
+                pulses
+            })
+            .collect();
+
+        let mut payload = vec![0u8; 2048];
+        let written = {
+            let mut encoder = RangeEncoder::new(&mut payload);
+            encoder.enc_icdf(rate_level, &RATE_LEVELS_ICDF[1], FTB);
+            for block in &blocks {
+                let total: u16 = block.iter().sum();
+                encoder.enc_icdf(usize::from(total), &PULSES_PER_BLOCK_ICDF[rate_level], FTB);
+            }
+            for block in &blocks {
+                // libopus' `silk_shell_encoder` symbol order (shell_coder.c:78-115).
+                let combine = |input: &[u16]| -> Vec<u16> {
+                    input.chunks_exact(2).map(|p| p[0] + p[1]).collect()
+                };
+                let level0 = block.to_vec();
+                let level1 = combine(&level0);
+                let level2 = combine(&level1);
+                let level3 = combine(&level2);
+                let level4 = combine(&level3);
+                let mut emit = |child: u16, parent: u16, table: &[u8; 152]| {
+                    if parent > 0 {
+                        encoder.enc_icdf(
+                            usize::from(child),
+                            split(table, usize::from(parent)),
+                            FTB,
+                        );
+                    }
+                };
+                emit(level3[0], level4[0], &SHELL_CODE_TABLE3);
+                emit(level2[0], level3[0], &SHELL_CODE_TABLE2);
+                emit(level1[0], level2[0], &SHELL_CODE_TABLE1);
+                emit(level0[0], level1[0], &SHELL_CODE_TABLE0);
+                emit(level0[2], level1[1], &SHELL_CODE_TABLE0);
+                emit(level1[2], level2[1], &SHELL_CODE_TABLE1);
+                emit(level0[4], level1[2], &SHELL_CODE_TABLE0);
+                emit(level0[6], level1[3], &SHELL_CODE_TABLE0);
+                emit(level2[2], level3[1], &SHELL_CODE_TABLE2);
+                emit(level1[4], level2[2], &SHELL_CODE_TABLE1);
+                emit(level0[8], level1[4], &SHELL_CODE_TABLE0);
+                emit(level0[10], level1[5], &SHELL_CODE_TABLE0);
+                emit(level1[6], level2[3], &SHELL_CODE_TABLE1);
+                emit(level0[12], level1[6], &SHELL_CODE_TABLE0);
+                emit(level0[14], level1[7], &SHELL_CODE_TABLE0);
+            }
+            // Signs: voiced / high offset is row 5 of Table 52.
+            for block in &blocks {
+                let total: u16 = block.iter().sum();
+                let icdf = [SIGN_ICDF[35 + usize::from(total).min(6)], 0];
+                for (sample, &magnitude) in block.iter().enumerate() {
+                    if magnitude > 0 {
+                        encoder.enc_icdf(sample & 1, &icdf, FTB);
+                    }
+                }
+            }
+            encoder.done() as usize
+        };
+        payload.truncate(written.max(1));
+
+        group.bench_function(label, |b| {
+            let mut pulses = [0i16; PULSE_BUFFER_LENGTH];
+            let mut excitation_q14 = [0i32; MAX_FRAME_LENGTH];
+            b.iter(|| {
+                let mut decoder = RangeDecoder::new(black_box(&payload));
+                let summary = excitation::decode(
+                    &mut decoder,
+                    signal_type,
+                    quant_offset_type,
+                    frame_length,
+                    2,
+                    &mut pulses,
+                    &mut excitation_q14[..frame_length],
+                )
+                .expect("decode");
+                black_box(summary.total_pulses())
+            });
+        });
+    }
+
+    // ── The §4.2.7.8.6 reconstruction alone, so a regression can be localised to it ────────────
+    {
+        let mut pulses = [0i16; MAX_FRAME_LENGTH];
+        for (index, slot) in pulses.iter_mut().enumerate() {
+            *slot = match index % 7 {
+                0 => 0,
+                1 => 1,
+                2 => -2,
+                3 => 5,
+                _ => 0,
+            };
+        }
+        group.bench_function("reconstruct_20ms_wb", |b| {
+            let mut excitation_q14 = [0i32; MAX_FRAME_LENGTH];
+            b.iter(|| {
+                excitation::reconstruct(
+                    black_box(&pulses),
+                    SignalType::Voiced,
+                    QuantOffsetType::Low,
+                    3,
+                    &mut excitation_q14,
+                )
+                .expect("reconstruct");
+                black_box(excitation_q14[0])
+            });
+        });
+    }
+
+    // ── The LTP side info: index decode plus the codebook lookups synthesis consumes ───────────
+    {
+        let layout = SubframeLayout::from_duration_ms(20).expect("20 ms");
+        let rate = InternalRate::Wide16k;
+        let contour = ltp::PitchContourCodebook::select(rate, layout.subframe_count);
+        let filter = ltp::LtpFilterCodebook::select(2);
+        let mut payload = vec![0u8; 64];
+        let written = {
+            let mut encoder = RangeEncoder::new(&mut payload);
+            encoder.enc_icdf(17, &ltp::PITCH_LAG_ICDF, FTB);
+            encoder.enc_icdf(5, ltp::lag_low_bits_icdf(rate), FTB);
+            encoder.enc_icdf(20, contour.icdf(), FTB);
+            encoder.enc_icdf(2, &ltp::LTP_PERIODICITY_ICDF, FTB);
+            for index in 0..layout.subframe_count {
+                encoder.enc_icdf(index * 3, filter.icdf(), FTB);
+            }
+            encoder.enc_icdf(1, &ltp::LTP_SCALE_ICDF, FTB);
+            encoder.done() as usize
+        };
+        payload.truncate(written.max(1));
+
+        group.bench_function("ltp_indices_20ms_wb", |b| {
+            b.iter(|| {
+                let mut decoder = RangeDecoder::new(black_box(&payload));
+                let indices = ltp::decode_indices(
+                    &mut decoder,
+                    rate,
+                    layout,
+                    CondCoding::Independently,
+                    SignalType::Unvoiced,
+                    0,
+                );
+                black_box(ltp::dequantize(&indices, rate).pitch_lags[0])
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// SILK **encoder** analysis front end: the whole per-frame chain, plus each of the kernels that
+/// dominates it (`silk/float/`, RFC 6716 §4.2 is decoder-normative so these are libopus-equivalent
+/// decisions rather than a spec requirement).
+///
+/// The frame-level number is the one that matters for a real transcode — 20 ms of audio has to
+/// analyse in well under 20 ms of CPU, and this runs once per frame per channel. The kernel numbers
+/// are what say *where* a regression landed: the pitch search is the expensive one (three stages,
+/// two of them over a decimated copy of the frame), Burg is quadratic in the LPC order, and the NLSF
+/// trellis is linear in the survivor count, which is the knob complexity actually turns.
+fn bench_silk_encoder_analysis(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::silk::enc::frame::{
+        analyze_frame, AnalysisConfig, AnalysisState, ComplexitySettings,
+    };
+    use siphon_rtp_codec::opus::silk::enc::lpc_analysis::burg_modified;
+    use siphon_rtp_codec::opus::silk::enc::nlsf_quant::{nlsf_encode, nlsf_vq_weights_laroia};
+    use siphon_rtp_codec::opus::silk::enc::noise_shape::{
+        noise_shape_analysis, NoiseShapeConfig, ShapeState,
+    };
+    use siphon_rtp_codec::opus::silk::enc::pitch::pitch_analysis_core;
+    use siphon_rtp_codec::opus::silk::enc::SignalMeasures;
+    use siphon_rtp_codec::opus::silk::nlsf::{NlsfIndices, MAX_NLSF_INDICES, NO_INTERPOLATION_Q2};
+    use siphon_rtp_codec::opus::silk::nlsf_tables::{NB_MB, WB};
+    use siphon_rtp_codec::opus::silk::types::{
+        CondCoding, InternalRate, SignalType, SubframeLayout, MAX_LPC_ORDER, MAX_NB_SUBFR,
+        SUB_FRAME_LENGTH_MS,
+    };
+
+    /// A deterministic voiced-like input at a known pitch. Logical sample clock only.
+    fn voiced_signal(length: usize, period: usize) -> Vec<f32> {
+        let mut state = 24_680u32;
+        let mut signal = vec![0.0f32; length];
+        let mut history = [0.0f32; 2];
+        for (index, slot) in signal.iter_mut().enumerate() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((state >> 20) as i32 - 2048) as f32 * 0.5;
+            let pulse = if index % period == 0 { 4000.0 } else { 0.0 };
+            let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+            history[1] = history[0];
+            history[0] = value;
+            *slot = value.clamp(-30_000.0, 30_000.0);
+        }
+        signal
+    }
+
+    let measures = SignalMeasures {
+        speech_activity_q8: 220,
+        input_quality_bands_q15: [22_000; 4],
+        input_tilt_q15: 1000,
+        previous_signal_type: SignalType::Voiced,
+    };
+
+    let mut group = c.benchmark_group("silk_encoder_analysis");
+
+    // ---- Whole-frame analysis, per rate and complexity ----
+    for (rate, label) in [
+        (InternalRate::Narrow8k, "nb_8k"),
+        (InternalRate::Wide16k, "wb_16k"),
+    ] {
+        for complexity in [0u8, 5, 10] {
+            let config = AnalysisConfig {
+                internal_rate: rate,
+                layout: SubframeLayout::from_duration_ms(20).expect("20 ms"),
+                settings: ComplexitySettings::for_complexity(complexity),
+                snr_db_q7: 2600,
+                use_cbr: false,
+                packet_loss_percent: 10,
+                frames_per_packet: 1,
+                lbrr_enabled: false,
+            };
+            let history = config.required_history();
+            let total = history + config.frame_length() + config.required_lookahead();
+            let signal = voiced_signal(total, 5 * rate.khz());
+            let mut state = AnalysisState {
+                first_frame_after_reset: false,
+                ..AnalysisState::default()
+            };
+
+            group.bench_function(format!("frame_{label}_c{complexity}_20ms"), |b| {
+                b.iter(|| {
+                    let analysis = analyze_frame(
+                        &mut state,
+                        black_box(&signal),
+                        history,
+                        SignalType::Unvoiced,
+                        CondCoding::Independently,
+                        &measures,
+                        &config,
+                    );
+                    black_box(analysis.map(|value| value.control.lambda))
+                });
+            });
+        }
+    }
+
+    // ---- Open-loop pitch search, the dominant kernel ----
+    for (fs_khz, label) in [(8usize, "8k"), (16, "16k")] {
+        let frame = voiced_signal(40 * fs_khz, 5 * fs_khz);
+        for complexity in [0usize, 2] {
+            group.bench_function(format!("pitch_core_{label}_c{complexity}"), |b| {
+                b.iter(|| {
+                    black_box(pitch_analysis_core(
+                        black_box(&frame),
+                        0.5,
+                        5 * fs_khz as i32,
+                        0.8,
+                        0.4,
+                        fs_khz,
+                        complexity,
+                        MAX_NB_SUBFR,
+                    ))
+                });
+            });
+        }
+    }
+
+    // ---- Burg AR analysis, at both LPC orders ----
+    for (order, subframe_length, label) in [(10usize, 40usize, "order10"), (16, 80, "order16")] {
+        let stacked = voiced_signal((order + subframe_length) * MAX_NB_SUBFR, subframe_length);
+        group.bench_function(format!("burg_{label}"), |b| {
+            let mut coefficients = [0.0f32; MAX_LPC_ORDER];
+            b.iter(|| {
+                black_box(burg_modified(
+                    &mut coefficients[..order],
+                    black_box(&stacked),
+                    1.0 / 1e4,
+                    order + subframe_length,
+                    MAX_NB_SUBFR,
+                ))
+            });
+        });
+    }
+
+    // ---- Noise-shaping analysis, warped and unwarped ----
+    for (warping_q16, label) in [(0i32, "flat"), (16 * 983, "warped")] {
+        let config = NoiseShapeConfig {
+            fs_khz: 16,
+            subframe_count: MAX_NB_SUBFR,
+            subframe_length: 80,
+            la_shape: 80,
+            shape_window_length: SUB_FRAME_LENGTH_MS * 16 + 160,
+            shaping_lpc_order: 24,
+            warping_q16,
+            snr_db_q7: 2600,
+            use_cbr: false,
+        };
+        let signal = voiced_signal(1200, 80);
+        let residual = voiced_signal(1200, 80);
+        group.bench_function(format!("noise_shape_{label}"), |b| {
+            let mut state = ShapeState::default();
+            b.iter(|| {
+                black_box(noise_shape_analysis(
+                    &mut state,
+                    black_box(&signal),
+                    400,
+                    &residual,
+                    SignalType::Voiced,
+                    &[80; MAX_NB_SUBFR],
+                    50.0,
+                    0.6,
+                    &measures,
+                    &config,
+                ))
+            });
+        });
+    }
+
+    // ---- NLSF quantisation, at the survivor-count extremes ----
+    for (codebook, label) in [(&NB_MB, "nb_mb"), (&WB, "wb")] {
+        let order = codebook.order;
+        let step = (1 << 15) / (order as i32 + 1);
+        let mut source: Vec<i16> = (1..=order).map(|k| (k as i32 * step) as i16).collect();
+        source[order / 2] = source[order / 2 - 1] + 60;
+        let mut weights = vec![0i16; order];
+        nlsf_vq_weights_laroia(&mut weights, &source);
+
+        for survivors in [2usize, 16] {
+            group.bench_function(format!("nlsf_quant_{label}_s{survivors}"), |b| {
+                b.iter(|| {
+                    let mut quantized = [0i16; MAX_LPC_ORDER];
+                    quantized[..order].copy_from_slice(&source);
+                    let mut indices = NlsfIndices {
+                        indices: [0i8; MAX_NLSF_INDICES],
+                        order,
+                        interpolation_factor_q2: NO_INTERPOLATION_Q2,
+                    };
+                    black_box(nlsf_encode(
+                        &mut indices,
+                        &mut quantized[..order],
+                        codebook,
+                        black_box(&weights),
+                        3146,
+                        survivors,
+                        2,
+                    ))
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
+/// The SILK **encoder**: the whole packet path, and the two stages that dominate it.
+///
+/// Reported per *frame* so the numbers sit next to the decoder's. The three sub-benches say where
+/// the time goes: the noise-shaping quantiser is the hot inner loop (and its delayed-decision
+/// variant is `nStatesDelayedDecision` times the work), the bitstream writer is pure table lookup,
+/// and the whole-packet number includes the rate loop, which may run the quantiser and the writer
+/// up to seven times for one frame.
+fn bench_silk_encode(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::range_coder::RangeEncoder;
+    use siphon_rtp_codec::opus::silk::enc::bitstream::{
+        encode_indices, encode_pulses, EntropyContext,
+    };
+    use siphon_rtp_codec::opus::silk::enc::encoder::{EncoderConfig, RateMode, SilkEncoder};
+    use siphon_rtp_codec::opus::silk::enc::frame::{
+        analyze_frame, AnalysisConfig, AnalysisState, ComplexitySettings,
+    };
+    use siphon_rtp_codec::opus::silk::enc::nsq::{quantize, NsqConfig, NsqInput, NsqState};
+    use siphon_rtp_codec::opus::silk::enc::SignalMeasures;
+    use siphon_rtp_codec::opus::silk::types::{
+        CondCoding, InternalRate, SignalType, SubframeLayout, MAX_FRAME_LENGTH,
+    };
+
+    /// A deterministic voiced-like input at a known pitch. Logical sample clock only.
+    fn voiced(length: usize, period: usize) -> Vec<f32> {
+        let mut state = 24_680u32;
+        let mut signal = vec![0.0f32; length];
+        let mut history = [0.0f32; 2];
+        for (index, slot) in signal.iter_mut().enumerate() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((state >> 20) as i32 - 2048) as f32 * 0.5;
+            let pulse = if index % period == 0 { 4000.0 } else { 0.0 };
+            let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+            history[1] = history[0];
+            history[0] = value;
+            *slot = value.clamp(-30_000.0, 30_000.0);
+        }
+        signal
+    }
+
+    let mut group = c.benchmark_group("silk_encode");
+
+    // ── The noise-shaping quantiser, per frame, at each survivor depth ────────────────────────
+    for (label, rate, states, warping) in [
+        ("nsq_wb_20ms_plain", InternalRate::Wide16k, 1usize, 0i32),
+        ("nsq_wb_20ms_deldec2", InternalRate::Wide16k, 2, 0),
+        ("nsq_wb_20ms_deldec4", InternalRate::Wide16k, 4, 983 * 16),
+        ("nsq_nb_20ms_deldec4", InternalRate::Narrow8k, 4, 983 * 8),
+    ] {
+        let settings = ComplexitySettings::for_complexity(10);
+        let layout = SubframeLayout::from_duration_ms(20).expect("20 ms");
+        let configuration = AnalysisConfig {
+            internal_rate: rate,
+            layout,
+            settings,
+            snr_db_q7: 2600,
+            use_cbr: false,
+            packet_loss_percent: 0,
+            frames_per_packet: 1,
+            lbrr_enabled: false,
+        };
+        let history = configuration.required_history();
+        let frame_length = configuration.frame_length();
+        let signal = voiced(
+            history + frame_length + configuration.required_lookahead(),
+            5 * rate.khz(),
+        );
+        let mut state = AnalysisState {
+            first_frame_after_reset: false,
+            ..AnalysisState::default()
+        };
+        let measures = SignalMeasures {
+            speech_activity_q8: 220,
+            input_quality_bands_q15: [22_000; 4],
+            input_tilt_q15: 1000,
+            previous_signal_type: SignalType::Voiced,
+        };
+        let analysis = analyze_frame(
+            &mut state,
+            &signal,
+            history,
+            SignalType::Unvoiced,
+            CondCoding::Independently,
+            &measures,
+            &configuration,
+        )
+        .expect("analysis");
+
+        let nsq_config = NsqConfig {
+            subframe_length: configuration.subframe_length(),
+            subframe_count: layout.subframe_count,
+            ltp_memory_length: configuration.ltp_memory_length(),
+            predict_lpc_order: rate.lpc_order(),
+            shaping_lpc_order: settings.shaping_lpc_order,
+            warping_q16: warping,
+            delayed_decision_states: states,
+        };
+        let input = NsqInput::from_analysis(&analysis.control, &analysis.indices, 1, &nsq_config);
+        let mut x16 = [0i16; MAX_FRAME_LENGTH];
+        for (slot, &sample) in x16.iter_mut().zip(signal[history..].iter()) {
+            *slot = sample as i16;
+        }
+
+        group.bench_function(label, |bencher| {
+            let mut nsq = NsqState::default();
+            let mut pulses = [0i8; MAX_FRAME_LENGTH];
+            bencher.iter(|| {
+                black_box(quantize(
+                    &mut nsq,
+                    black_box(&input),
+                    black_box(&x16),
+                    &mut pulses,
+                    &nsq_config,
+                ))
+            });
+        });
+
+        // ── The bitstream writer, per frame, on the same frame's output ───────────────────────
+        if label == "nsq_wb_20ms_deldec4" {
+            let mut nsq = NsqState::default();
+            let mut pulses = [0i8; MAX_FRAME_LENGTH];
+            let seed = quantize(&mut nsq, &input, &x16, &mut pulses, &nsq_config);
+            group.bench_function("writer_wb_20ms", |bencher| {
+                let mut buffer = [0u8; 1275];
+                bencher.iter(|| {
+                    let mut range = RangeEncoder::new(&mut buffer);
+                    let mut context = EntropyContext::default();
+                    let mut scratch = pulses;
+                    encode_indices(
+                        &mut range,
+                        black_box(&analysis.indices),
+                        seed,
+                        rate,
+                        layout.subframe_count,
+                        CondCoding::Independently,
+                        false,
+                        &mut context,
+                    );
+                    encode_pulses(
+                        &mut range,
+                        analysis.indices.signal_type,
+                        analysis.indices.quant_offset_type,
+                        &mut scratch,
+                        frame_length,
+                    );
+                    black_box(range.tell())
+                });
+            });
+        }
+    }
+
+    // ── The whole packet path, including the rate loop, per SILK frame ────────────────────────
+    for (label, rate, duration_ms, channels, bitrate, mode) in [
+        (
+            "packet_wb_20ms_mono_vbr",
+            InternalRate::Wide16k,
+            20usize,
+            1usize,
+            24_000i32,
+            RateMode::Variable,
+        ),
+        (
+            "packet_wb_20ms_mono_cbr",
+            InternalRate::Wide16k,
+            20,
+            1,
+            24_000,
+            RateMode::Constant,
+        ),
+        (
+            "packet_wb_20ms_stereo_vbr",
+            InternalRate::Wide16k,
+            20,
+            2,
+            48_000,
+            RateMode::Variable,
+        ),
+        (
+            "packet_nb_20ms_mono_vbr",
+            InternalRate::Narrow8k,
+            20,
+            1,
+            10_000,
+            RateMode::Variable,
+        ),
+        (
+            "packet_wb_60ms_mono_vbr",
+            InternalRate::Wide16k,
+            60,
+            1,
+            24_000,
+            RateMode::Variable,
+        ),
+    ] {
+        let mut config = EncoderConfig::new(rate, duration_ms, bitrate);
+        config.channels = channels;
+        config.rate_mode = mode;
+        config.max_bytes = 250;
+        let per_packet = duration_ms * rate.khz() * channels;
+        let float_signal = voiced(per_packet * 4, 5 * rate.khz());
+        let input: Vec<i16> = float_signal.iter().map(|&value| value as i16).collect();
+
+        group.bench_function(label, |bencher| {
+            let mut encoder = SilkEncoder::new(config).expect("encoder");
+            let mut buffer = vec![0u8; 1275];
+            let mut offset = 0usize;
+            bencher.iter(|| {
+                let start = offset % (input.len() - per_packet);
+                offset += per_packet;
+                let mut range = RangeEncoder::new(&mut buffer);
+                black_box(
+                    encoder
+                        .encode(black_box(&input[start..start + per_packet]), &mut range)
+                        .expect("encode"),
+                )
+            });
+        });
+    }
+}
+
+/// Whole-**packet** Opus decode through [`OpusDecoder`], one bench per mode.
+///
+/// The per-layer benches above (`silk_frame`, `celt_decode`) measure what SILK and CELT each cost.
+/// This measures what a *packet* costs: TOC dispatch, the layer(s) it selects, the redundancy and
+/// mode-transition work in between, and the output conversion. A Hybrid packet pays both layers on
+/// one payload, so it is the expensive case and the one an IMS leg bridging Opus to AMR-WB will hit.
+///
+/// Driven from the official RFC 6716 vectors, which are the only source of real SILK and Hybrid
+/// packets the tree has (there is no SILK encoder yet). Skipped with a notice when they are absent,
+/// the same skip-when-absent rule the conformance harnesses follow.
+fn bench_opus_decode(c: &mut Criterion) {
+    use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
+    use siphon_rtp_codec::opus::packet::{self, Mode};
+    use std::path::Path;
+
+    /// The first packet of `path` whose TOC selects `mode` and which carries real content.
+    fn packet_of_mode(path: &Path, mode: Mode) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(path).ok()?;
+        let mut offset = 0usize;
+        while offset + 8 <= bytes.len() {
+            let length = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+            offset += 8;
+            if offset + length > bytes.len() {
+                return None;
+            }
+            let payload = &bytes[offset..offset + length];
+            offset += length;
+            if payload.len() < 20 {
+                continue;
+            }
+            if let Ok(parsed) = packet::parse(payload) {
+                if parsed.toc.mode() == mode {
+                    return Some(payload.to_vec());
+                }
+            }
+        }
+        None
+    }
+
+    let directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/opus/opus_testvectors");
+    // Vector 03 is SILK throughout, 05 Hybrid throughout, 11 CELT throughout.
+    let cases = [
+        ("silk", Mode::Silk, "testvector03.bit"),
+        ("hybrid", Mode::Hybrid, "testvector05.bit"),
+        ("celt", Mode::Celt, "testvector11.bit"),
+    ];
+
+    let mut group = c.benchmark_group("opus_decode");
+    let mut benched = 0usize;
+    for (label, mode, file) in cases {
+        let Some(payload) = packet_of_mode(&directory.join(file), mode) else {
+            continue;
+        };
+        let Ok(parsed) = packet::parse(&payload) else {
+            continue;
+        };
+        let frame_ms = parsed.toc.samples_per_frame(48_000) * parsed.frame_count() / 48;
+        for channels in [1usize, 2] {
+            let mut decoder = OpusDecoder::new(48_000, channels).expect("decoder");
+            let mut output = vec![0i16; MAX_PACKET_SAMPLES * channels];
+            group.bench_function(format!("{label}_{frame_ms}ms_{channels}ch"), |b| {
+                b.iter(|| {
+                    let produced = decoder
+                        .decode(
+                            Some(black_box(&payload)),
+                            black_box(&mut output),
+                            MAX_PACKET_SAMPLES,
+                            false,
+                        )
+                        .expect("decode");
+                    black_box(produced)
+                });
+            });
+        }
+        // Concealment costs what the previous mode's PLC costs, and is on the hot path of any lossy
+        // leg, so it is measured next to the decode it stands in for.
+        let mut decoder = OpusDecoder::new(48_000, 1).expect("decoder");
+        let mut output = vec![0i16; MAX_PACKET_SAMPLES];
+        decoder
+            .decode(Some(&payload), &mut output, MAX_PACKET_SAMPLES, false)
+            .expect("prime the decoder");
+        let conceal_samples = 960usize;
+        group.bench_function(format!("{label}_conceal_20ms_1ch"), |b| {
+            b.iter(|| {
+                let produced = decoder
+                    .decode(None, black_box(&mut output), conceal_samples, false)
+                    .expect("conceal");
+                black_box(produced)
+            });
+        });
+        benched += 1;
+    }
+    if benched == 0 {
+        eprintln!(
+            "opus_decode bench: no vectors in {} — see the Opus conformance oracle section of \
+             CONTRIBUTING.md",
+            directory.display()
+        );
+    }
+    group.finish();
+}
+
+/// The **factory / [`Decoder`] trait** path an Opus leg actually runs — µs per 20 ms packet through
+/// `decoder_for`'s trait object, plus the `conceal` a lost packet costs.
+///
+/// `bench_opus_decode` above measures `OpusDecoder` directly and needs the (gitignored) vectors for
+/// real SILK/Hybrid content. This one measures the transcode leg's boundary — trait dispatch, the
+/// per-channel↔interleaved conversion, the capacity arithmetic — and is self-contained: a CELT-only
+/// packet is a TOC byte plus one frame from this crate's own (vector-gated) CELT encoder, so it
+/// always runs, including on a bare checkout.
+fn bench_opus_codec(c: &mut Criterion) {
+    use siphon_rtp_codec::factory::{decoder_for, CodecSpec, OpusParams};
+    use siphon_rtp_codec::opus::decoder::MAX_PACKET_SAMPLES;
+
+    const FRAME: usize = 960; // 20 ms at 48 kHz
+    let mut encoder = CeltEncoder::new().expect("celt encoder");
+    encoder.set_bitrate(64_000);
+    encoder.set_rate_control(RateControl::ConstrainedVbr);
+    let signal = celt_signal(3 * FRAME);
+    let mut payload = vec![0u8; 1275];
+    for index in 0..2 {
+        let _ = encoder.encode(
+            &signal[index * FRAME..(index + 1) * FRAME],
+            FRAME,
+            &mut payload,
+        );
+    }
+    let written = encoder
+        .encode(&signal[2 * FRAME..], FRAME, &mut payload)
+        .expect("encode");
+    // RFC 6716 §3.2.2 code-0 packet: config 31 (CELT-only, fullband, 20 ms) TOC, then the frame.
+    let mut packet = Vec::with_capacity(1 + written);
+    packet.push(31 << 3);
+    packet.extend_from_slice(&payload[..written]);
+
+    let mut group = c.benchmark_group("opus_codec");
+    for (label, sprop_stereo) in [("mono", false), ("stereo", true)] {
+        let spec = CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(OpusParams {
+            sprop_stereo,
+            ..OpusParams::default()
+        }));
+        let mut decoder = decoder_for(&spec).expect("Opus decoder from the factory");
+        let mut output = vec![0i16; MAX_PACKET_SAMPLES * 2];
+        let _ = decoder.decode(&packet, &mut output);
+        group.bench_function(format!("decode_20ms_{label}"), |b| {
+            b.iter(|| {
+                let produced = decoder
+                    .decode(black_box(&packet), black_box(&mut output))
+                    .expect("decode");
+                black_box(produced)
+            });
+        });
+        group.bench_function(format!("conceal_20ms_{label}"), |b| {
+            b.iter(|| {
+                let produced = decoder.conceal(black_box(&mut output)).expect("conceal");
+                black_box(produced)
+            });
+        });
+    }
+    group.finish();
+}
+
 // AMR-WB/NB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
 #[cfg(feature = "amr")]
 criterion_group!(
@@ -540,6 +1942,17 @@ criterion_group!(
     bench_g726,
     bench_gsm_fr,
     bench_cn,
+    bench_celt_encode,
+    bench_opus_encode,
+    bench_celt_decode,
+    bench_celt_kernels,
+    bench_silk_excitation,
+    bench_silk_encoder_analysis,
+    bench_silk_synthesis,
+    bench_silk_frame,
+    bench_silk_encode,
+    bench_opus_decode,
+    bench_opus_codec,
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
@@ -556,6 +1969,17 @@ criterion_group!(
     bench_g722,
     bench_g726,
     bench_gsm_fr,
-    bench_cn
+    bench_cn,
+    bench_celt_encode,
+    bench_opus_encode,
+    bench_celt_decode,
+    bench_celt_kernels,
+    bench_silk_excitation,
+    bench_silk_encoder_analysis,
+    bench_silk_synthesis,
+    bench_silk_frame,
+    bench_silk_encode,
+    bench_opus_decode,
+    bench_opus_codec
 );
 criterion_main!(benches);

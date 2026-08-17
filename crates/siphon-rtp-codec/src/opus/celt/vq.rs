@@ -6,9 +6,10 @@
 //! point that chains these. The spreading rotation is an orthogonal (norm-preserving) transform, so
 //! it is validated by forward∘inverse = identity.
 
-use crate::opus::celt::pvq::decode_pulses;
+use crate::opus::celt::mathops::{celt_inner_prod, fast_atan2f};
+use crate::opus::celt::pvq::{decode_pulses, encode_pulses};
 use crate::opus::celt::tables::SPREAD_NONE;
-use crate::opus::range_coder::RangeDecoder;
+use crate::opus::range_coder::{RangeDecoder, RangeEncoder};
 
 /// Maximum band dimension passed to [`alg_unquant`] (largest 48 kHz band, 22 bins × M=8 = 176;
 /// rounded up for safety). The pulse-vector scratch is this size — no per-band heap allocation.
@@ -114,6 +115,164 @@ fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
         }
     }
     mask
+}
+
+/// Pyramid-VQ nearest-neighbour search (libopus `op_pvq_search_c`, `vq.c:165`, float path): pick
+/// the `k`-pulse integer vector `iy` maximising `⟨X,y⟩ / ‖y‖` for the (sign-stripped) input `x`.
+/// Returns `Σ y_i²` (`yy`), which the shape normalisation needs.
+///
+/// `x` is **modified in place** to its absolute value, matching the C ("Get rid of the sign"); the
+/// signs are put back into `iy` at the end. The search is greedy: a projection pre-pass places most
+/// pulses when `k > n/2`, then each remaining pulse goes to the position with the best
+/// `Rxy²/Ryy` ratio — the same argmax libopus computes, cross-multiplied so no division is needed.
+pub fn op_pvq_search(x: &mut [f32], iy: &mut [i32], k: usize, n: usize) -> f32 {
+    /// `EPSILON` from the float `arch.h`.
+    const EPSILON: f32 = 1e-15;
+    debug_assert!(n <= MAX_BAND);
+    let mut y = [0f32; MAX_BAND];
+    let mut signx = [0i32; MAX_BAND];
+
+    // Get rid of the sign (vq.c:180).
+    for j in 0..n {
+        signx[j] = i32::from(x[j] < 0.0);
+        x[j] = x[j].abs();
+        iy[j] = 0;
+        y[j] = 0.0;
+    }
+
+    let mut xy = 0f32;
+    let mut yy = 0f32;
+    let mut pulses_left = k as i32;
+
+    // Pre-search by projecting onto the pyramid (vq.c:194) — only worth it when the pulse count is
+    // comparable to the dimension.
+    if k > (n >> 1) {
+        let mut sum = x[..n].iter().sum::<f32>();
+        // "Prevents infinities and NaNs from causing too many pulses to be allocated. 64 is an
+        // approximation of infinity here." (vq.c:206)
+        if !(sum > EPSILON && sum < 64.0) {
+            x[..n].fill(0.0);
+            x[0] = 1.0;
+            sum = 1.0;
+        }
+        // "Using K+e with e < 1 guarantees we cannot get more than K pulses." (vq.c:220)
+        let rcp = (k as f32 + 0.8) * (1.0 / sum);
+        for j in 0..n {
+            iy[j] = (rcp * x[j]).floor() as i32;
+            y[j] = iy[j] as f32;
+            yy += y[j] * y[j];
+            xy += x[j] * y[j];
+            y[j] *= 2.0; // y is kept pre-doubled so the inner loop needs no multiply
+            pulses_left -= iy[j];
+        }
+    }
+
+    // "This should never happen, but just in case it does (e.g. on silence) we fill the first bin
+    // with pulses." (vq.c:239)
+    if pulses_left > n as i32 + 3 {
+        let tmp = pulses_left as f32;
+        yy += tmp * tmp;
+        yy += tmp * y[0];
+        iy[0] += pulses_left;
+        pulses_left = 0;
+    }
+
+    for _ in 0..pulses_left {
+        // "The squared magnitude term gets added anyway, so we might as well add it outside the
+        // loop" (vq.c:266)
+        yy += 1.0;
+        // Position 0 out of the loop, exactly as the C does.
+        let rxy = xy + x[0];
+        let mut best_num = rxy * rxy;
+        let mut best_den = yy + y[0];
+        let mut best_id = 0usize;
+        for (j, (&xj, &yj)) in x[..n].iter().zip(y[..n].iter()).enumerate().skip(1) {
+            let rxy = xy + xj;
+            let ryy = yy + yj;
+            let rxy2 = rxy * rxy;
+            // `num/den >= best_num/best_den` without a division.
+            if best_den * rxy2 > ryy * best_num {
+                best_den = ryy;
+                best_num = rxy2;
+                best_id = j;
+            }
+        }
+        xy += x[best_id];
+        yy += y[best_id];
+        y[best_id] += 2.0;
+        iy[best_id] += 1;
+    }
+
+    // Put the original sign back (vq.c:318).
+    for j in 0..n {
+        iy[j] = (iy[j] ^ -signx[j]) + signx[j];
+    }
+    yy
+}
+
+/// Quantise one band's normalised shape and write it to the range coder (libopus `alg_quant`,
+/// `vq.c:330`): forward `exp_rotation` → [`op_pvq_search`] → [`encode_pulses`], then — when
+/// `resynth` is set — reconstruct exactly what the decoder will produce so the folding reference
+/// and the stereo merge see the *quantised* spectrum. Returns the anti-collapse mask.
+///
+/// `x` is overwritten with the reconstruction (or left as the rotated absolute values when
+/// `resynth` is false, which the caller must then not read).
+#[allow(clippy::too_many_arguments)]
+pub fn alg_quant(
+    x: &mut [f32],
+    n: usize,
+    k: usize,
+    spread: u32,
+    b: usize,
+    enc: &mut RangeEncoder,
+    gain: f32,
+    resynth: bool,
+) -> u32 {
+    debug_assert!(n <= MAX_BAND);
+    debug_assert!(k > 0, "alg_quant() needs at least one pulse");
+    debug_assert!(n > 1, "alg_quant() needs at least two dimensions");
+    let mut iy = [0i32; MAX_BAND];
+
+    exp_rotation(x, n, 1, b, k, spread);
+    let yy = op_pvq_search(x, &mut iy[..n], k, n);
+    encode_pulses(&iy[..n], n, k, enc);
+    if resynth {
+        normalise_residual(&iy[..n], x, n, yy, gain);
+        exp_rotation(x, n, -1, b, k, spread);
+    }
+    extract_collapse_mask(&iy[..n], n, b)
+}
+
+/// The quantised mid/side split angle for a band, in the `0..16384` (`0..π/2`) scale the bitstream
+/// uses before division by `qn` (libopus `stereo_itheta`, `vq.c:410`, float path).
+///
+/// `stereo` selects between a true L/R pair (where mid/side are formed first) and a *time* split of
+/// one channel (where `x`/`y` are already the two halves). Note that the float build's `SHR16` is
+/// the identity, so the mid/side pair is `x+y` / `x-y` rather than the halved form the fixed-point
+/// build computes — `atan2` is scale-invariant, so the angle is the same either way.
+#[must_use]
+// libopus spells 2/pi as the *truncated* literal `0.63662f`, which is a different f32 from
+// `FRAC_2_PI`; `itheta` feeds the bit allocation, so the reference's exact constant is required.
+#[allow(clippy::approx_constant)]
+pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
+    const EPSILON: f32 = 1e-15;
+    let mut e_mid = EPSILON;
+    let mut e_side = EPSILON;
+    if stereo {
+        for i in 0..n {
+            let m = x[i] + y[i];
+            let s = x[i] - y[i];
+            e_mid += m * m;
+            e_side += s * s;
+        }
+    } else {
+        e_mid += celt_inner_prod(x, x, n);
+        e_side += celt_inner_prod(y, y, n);
+    }
+    let mid = e_mid.sqrt();
+    let side = e_side.sqrt();
+    // `0.63662` ~ 2/pi (`vq.c:438`), so the result spans 0..16384 for an angle of 0..pi/2.
+    (0.5 + 16384.0 * 0.63662 * fast_atan2f(side, mid)).floor() as i32
 }
 
 /// Decode one band's normalised shape into `x` (libopus `alg_unquant`, baseline non-QEXT path):
@@ -257,5 +416,287 @@ mod tests {
                 "n={n} k={k}: energy {energy} != 1"
             );
         }
+    }
+
+    // ── Encoder side ────────────────────────────────────────────────────────────────────────────
+
+    /// Exhaustive optimality check: for small `(n, k)` the greedy search must land on the *globally*
+    /// best codeword, i.e. the one maximising `⟨|x|,y⟩² / ‖y‖²` over every `k`-pulse vector. The
+    /// brute-force enumerator here is independent of the PVQ codebook, so this validates the search
+    /// against the definition rather than against itself.
+    #[test]
+    fn pvq_search_finds_the_globally_optimal_codeword() {
+        fn enumerate(n: usize, k: i32, prefix: &mut Vec<i32>, out: &mut Vec<Vec<i32>>) {
+            if n == 1 {
+                let mut v = prefix.clone();
+                v.push(k);
+                out.push(v.clone());
+                if k > 0 {
+                    v.pop();
+                    v.push(-k);
+                    out.push(v);
+                }
+                return;
+            }
+            for m in -k..=k {
+                prefix.push(m);
+                enumerate(n - 1, k - m.abs(), prefix, out);
+                prefix.pop();
+            }
+        }
+
+        // The greedy search is only *guaranteed* optimal for the small (n,k) cases; libopus relies
+        // on that, and these are the exhaustively checkable ones anyway.
+        for &(n, k) in &[
+            (2usize, 1usize),
+            (2, 3),
+            (3, 1),
+            (3, 2),
+            (4, 1),
+            (4, 2),
+            (5, 2),
+        ] {
+            let mut candidates = Vec::new();
+            enumerate(n, k as i32, &mut Vec::new(), &mut candidates);
+
+            for trial in 0..12u32 {
+                let x: Vec<f32> = (0..n)
+                    .map(|i| {
+                        let s = (trial * 31 + i as u32 * 17) as f32;
+                        (s * 0.37).sin() * (1.0 + (s * 0.11).cos())
+                    })
+                    .collect();
+                let mut xs = x.clone();
+                let mut iy = vec![0i32; n];
+                let yy = op_pvq_search(&mut xs, &mut iy, k, n);
+
+                // Score of the chosen vector, computed from the *signed* input.
+                let score = |v: &[i32]| -> f32 {
+                    let xy: f32 = x.iter().zip(v).map(|(&a, &b)| a * b as f32).sum();
+                    let e: f32 = v.iter().map(|&b| (b * b) as f32).sum();
+                    if xy <= 0.0 {
+                        return -1.0;
+                    }
+                    xy * xy / e
+                };
+                let got = score(&iy);
+                let best = candidates
+                    .iter()
+                    .map(|c| score(c))
+                    .fold(f32::MIN, |a, b| a.max(b));
+                assert!(
+                    got >= best - 1e-4 * best.abs().max(1.0),
+                    "n={n} k={k} trial={trial}: greedy score {got} < optimum {best} (iy={iy:?})"
+                );
+                assert_eq!(
+                    iy.iter().map(|v| v.abs()).sum::<i32>(),
+                    k as i32,
+                    "n={n} k={k}: wrong pulse count"
+                );
+                let energy: i32 = iy.iter().map(|&v| v * v).sum();
+                assert_eq!(yy as i32, energy, "n={n} k={k}: yy mismatch");
+            }
+        }
+    }
+
+    /// The search must always produce exactly `k` pulses and a `yy` equal to `Σ y²`, including on
+    /// the projection pre-pass path (`k > n/2`) and on the degenerate inputs the C guards against.
+    #[test]
+    fn pvq_search_always_spends_every_pulse() {
+        for &(n, k) in &[
+            (2usize, 1usize),
+            (4, 8),
+            (8, 40),
+            (16, 128),
+            (24, 3),
+            (48, 24),
+            (176, 4),
+        ] {
+            // (The search itself has no codebook-size limit; these exercise every guard, including
+            // pulse counts far past what `encode_pulses` could index.)
+            for case in 0..4 {
+                let mut x: Vec<f32> = match case {
+                    0 => (0..n).map(|i| (i as f32 * 0.21).sin()).collect(),
+                    1 => vec![0.0; n], // all-zero: the `sum <= EPSILON` guard
+                    2 => vec![f32::INFINITY; n], // the `sum < 64` guard
+                    _ => (0..n).map(|i| if i == 0 { -1.0 } else { 0.0 }).collect(),
+                };
+                let mut iy = vec![0i32; n];
+                let yy = op_pvq_search(&mut x, &mut iy, k, n);
+                assert_eq!(
+                    iy.iter().map(|v| v.abs()).sum::<i32>(),
+                    k as i32,
+                    "n={n} k={k} case={case}: pulse count"
+                );
+                assert!(
+                    yy.is_finite() && yy > 0.0,
+                    "n={n} k={k} case={case}: yy {yy}"
+                );
+                let energy: i32 = iy.iter().map(|&v| v * v).sum();
+                assert_eq!(yy as i32, energy, "n={n} k={k} case={case}");
+            }
+        }
+    }
+
+    /// The sign of every non-zero output coordinate must follow the sign of the input.
+    #[test]
+    fn pvq_search_preserves_input_signs() {
+        let n = 16usize;
+        let mut x: Vec<f32> = (0..n)
+            .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 } * (1.0 + i as f32 * 0.1))
+            .collect();
+        let original = x.clone();
+        let mut iy = vec![0i32; n];
+        op_pvq_search(&mut x, &mut iy, 10, n);
+        for j in 0..n {
+            if iy[j] != 0 {
+                assert_eq!(
+                    iy[j] > 0,
+                    original[j] > 0.0,
+                    "coordinate {j}: sign {} for input {}",
+                    iy[j],
+                    original[j]
+                );
+            }
+        }
+    }
+
+    /// `alg_quant` then `alg_unquant` must recover the *identical* shape — the encoder's resynth
+    /// and the decoder's reconstruction are the same reconstruction, so a mismatch here means the
+    /// two sides would disagree on the folding reference.
+    #[test]
+    fn alg_quant_resynth_matches_alg_unquant_exactly() {
+        use crate::opus::celt::tables::{SPREAD_AGGRESSIVE, SPREAD_LIGHT, SPREAD_NORMAL};
+        // Every `(N, K)` here has `V(N,K) < 2^32` — the range coder's `ft` limit, which is also the
+        // bound the CELT allocator respects (`bits2pulses` never asks for more).
+        for &(n, k, b) in &[
+            (16usize, 3usize, 1usize),
+            (24, 6, 1),
+            (16, 4, 2),
+            (32, 5, 4),
+            (8, 2, 1),
+            (48, 6, 8),
+            (16, 8, 2),
+        ] {
+            for spread in [SPREAD_NONE, SPREAD_LIGHT, SPREAD_NORMAL, SPREAD_AGGRESSIVE] {
+                let shape: Vec<f32> = (0..n)
+                    .map(|i| (i as f32 * 0.41).sin() + 0.3 * (i as f32 * 0.13).cos())
+                    .collect();
+                let norm = shape.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let shape: Vec<f32> = shape.iter().map(|v| v / norm).collect();
+
+                let mut buf = vec![0u8; 512];
+                let mut enc_x = shape.clone();
+                let enc_cm;
+                {
+                    let mut enc = RangeEncoder::new(&mut buf);
+                    enc_cm = alg_quant(&mut enc_x, n, k, spread, b, &mut enc, 1.0, true);
+                    enc.done();
+                    assert!(!enc.error());
+                }
+                let mut dec_x = vec![0f32; n];
+                let mut dec = RangeDecoder::new(&buf);
+                let dec_cm = alg_unquant(&mut dec_x, n, k, spread, b, &mut dec, 1.0);
+
+                assert_eq!(enc_cm, dec_cm, "n={n} k={k} b={b} spread={spread}: mask");
+                for j in 0..n {
+                    assert_eq!(
+                        enc_x[j].to_bits(),
+                        dec_x[j].to_bits(),
+                        "n={n} k={k} b={b} spread={spread} coord {j}: enc {} != dec {}",
+                        enc_x[j],
+                        dec_x[j]
+                    );
+                }
+                // The reconstruction must be closer to the target than a random codeword would be.
+                let corr: f32 = shape.iter().zip(&dec_x).map(|(a, b)| a * b).sum();
+                assert!(
+                    corr > 0.4,
+                    "n={n} k={k} spread={spread}: reconstruction correlation only {corr}"
+                );
+            }
+        }
+    }
+
+    /// More pulses must mean a better reconstruction — the property that makes the rate allocation
+    /// meaningful.
+    #[test]
+    fn alg_quant_accuracy_improves_with_more_pulses() {
+        use crate::opus::celt::tables::SPREAD_NORMAL;
+        let n = 16usize;
+        let shape: Vec<f32> = (0..n).map(|i| (i as f32 * 0.29).sin()).collect();
+        let norm = shape.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let shape: Vec<f32> = shape.iter().map(|v| v / norm).collect();
+
+        // K is capped at 10 because `V(16,K)` must stay under 2^32 (the range coder's `ft` limit).
+        let mut prev = -1.0f32;
+        for k in [1usize, 2, 4, 6, 8, 10] {
+            let mut buf = vec![0u8; 512];
+            let mut x = shape.clone();
+            {
+                let mut enc = RangeEncoder::new(&mut buf);
+                alg_quant(&mut x, n, k, SPREAD_NORMAL, 1, &mut enc, 1.0, true);
+                enc.done();
+            }
+            let corr: f32 = shape.iter().zip(&x).map(|(a, b)| a * b).sum();
+            assert!(
+                corr >= prev - 0.02,
+                "k={k}: correlation {corr} regressed from {prev}"
+            );
+            prev = corr;
+        }
+        assert!(prev > 0.9, "k=10 correlation only {prev}");
+    }
+
+    /// `stereo_itheta` must map a pure-mid pair to 0, a pure-side pair to 16384, and an equal-energy
+    /// orthogonal pair to the midpoint — the three anchors the bit split depends on.
+    #[test]
+    fn stereo_itheta_anchors() {
+        let n = 16usize;
+        let ones = vec![0.25f32; n];
+        // Identical channels: side is zero, so theta = 0.
+        assert_eq!(stereo_itheta(&ones, &ones, true, n), 0);
+        // Anti-phase channels: mid is zero, so theta = 16384 (pi/2).
+        let neg: Vec<f32> = ones.iter().map(|v| -v).collect();
+        assert_eq!(stereo_itheta(&ones, &neg, true, n), 16384);
+        // Orthogonal, equal energy: mid and side have equal norm, so theta = 8192 (pi/4).
+        let mut a = vec![0f32; n];
+        let mut b = vec![0f32; n];
+        for i in 0..n {
+            if i % 2 == 0 {
+                a[i] = 0.35;
+            } else {
+                b[i] = 0.35;
+            }
+        }
+        let t = stereo_itheta(&a, &b, true, n);
+        assert!((t - 8192).abs() <= 32, "orthogonal pair gave theta {t}");
+        // Monotonic in the side/mid ratio.
+        let mut prev = -1;
+        for step in 0..=8 {
+            let g = step as f32 / 8.0;
+            let y: Vec<f32> = ones.iter().map(|v| v * (1.0 - 2.0 * g)).collect();
+            let t = stereo_itheta(&ones, &y, true, n);
+            assert!(
+                t >= prev,
+                "theta not monotonic at step {step}: {t} < {prev}"
+            );
+            prev = t;
+        }
+    }
+
+    /// The non-stereo (time-split) form measures the two halves' own energies.
+    #[test]
+    fn stereo_itheta_time_split_uses_raw_energies() {
+        let n = 8usize;
+        let lo = vec![0.5f32; n];
+        let hi = vec![0.0f32; n];
+        // All energy in the first half → theta 0.
+        assert_eq!(stereo_itheta(&lo, &hi, false, n), 0);
+        // All energy in the second half → theta 16384.
+        assert_eq!(stereo_itheta(&hi, &lo, false, n), 16384);
+        // Equal energy → pi/4.
+        let t = stereo_itheta(&lo, &lo, false, n);
+        assert!((t - 8192).abs() <= 32, "equal halves gave {t}");
     }
 }

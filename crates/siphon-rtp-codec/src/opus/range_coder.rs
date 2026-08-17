@@ -72,6 +72,24 @@ pub struct RangeDecoder<'a> {
     error: i32,
 }
 
+/// A rollback point for [`RangeDecoder`] — every scalar field of libopus' `ec_dec`. Unlike the
+/// encoder's, this is a *complete* snapshot: the packet a decoder reads is immutable, so restoring
+/// the scalars rewinds the decoder exactly.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeDecoderState {
+    storage: u32,
+    offs: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: i32,
+    nbits_total: i32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: i32,
+    error: i32,
+}
+
 impl<'a> RangeDecoder<'a> {
     /// Initialize a decoder over `buf` (libopus `ec_dec_init`).
     #[must_use]
@@ -130,6 +148,74 @@ impl<'a> RangeDecoder<'a> {
     #[must_use]
     pub fn storage_bits(&self) -> u32 {
         self.storage * 8
+    }
+
+    /// Account the whole packet as already read (libopus `celt_decoder.c:1327`:
+    /// "Pretend we've read all the remaining bits", `dec->nbits_total += tell - ec_tell(dec)`).
+    ///
+    /// A silent CELT frame codes only its silence flag; both sides then pin `nbits_total` to the
+    /// packet size so every `tell + X <= total_bits` gate fails and neither reads nor writes another
+    /// symbol. Without it a decoder consumes phantom symbols the encoder never wrote and the two
+    /// end the packet on different `rng` values.
+    pub fn declare_bits_used(&mut self, total_bits: i32) {
+        self.nbits_total += total_bits - self.tell();
+    }
+
+    /// Bytes read from the front of the buffer so far (libopus `dec->offs`), the mirror of
+    /// [`RangeEncoder::range_bytes`].
+    #[must_use]
+    pub fn range_bytes(&self) -> u32 {
+        self.offs
+    }
+
+    /// Hide the last `bytes` of the buffer from this decoder (libopus
+    /// `dec->storage -= redundancy_bytes`, `opus_decoder.c:479`).
+    ///
+    /// A packet that carries an Opus-layer redundancy frame stores it at the **end** of the payload,
+    /// where [`Self::dec_bits`] reads its raw bits from. Shrinking the storage is what stops the main
+    /// frame's raw-bit reader from walking into the redundancy frame's bytes; the redundancy frame
+    /// itself is then decoded by a *separate* range decoder over those trailing bytes.
+    ///
+    /// Shrinking below what has already been consumed is refused (the storage never moves behind the
+    /// read cursor), which is the "sanity check" the C performs one line earlier.
+    pub fn shrink_storage(&mut self, bytes: u32) {
+        let floor = self.offs.max(self.end_offs);
+        self.storage = self.storage.saturating_sub(bytes).max(floor);
+    }
+
+    /// Snapshot the decoder so a speculative decode can be rewound (the mirror of
+    /// [`RangeEncoder::save_state`]).
+    #[must_use]
+    pub fn save_state(&self) -> RangeDecoderState {
+        RangeDecoderState {
+            storage: self.storage,
+            offs: self.offs,
+            end_offs: self.end_offs,
+            end_window: self.end_window,
+            nend_bits: self.nend_bits,
+            nbits_total: self.nbits_total,
+            rng: self.rng,
+            val: self.val,
+            ext: self.ext,
+            rem: self.rem,
+            error: self.error,
+        }
+    }
+
+    /// Restore a [`Self::save_state`] snapshot. The buffer is borrowed read-only and never changes,
+    /// so this alone rewinds the decoder completely.
+    pub fn restore_state(&mut self, state: &RangeDecoderState) {
+        self.storage = state.storage;
+        self.offs = state.offs;
+        self.end_offs = state.end_offs;
+        self.end_window = state.end_window;
+        self.nend_bits = state.nend_bits;
+        self.nbits_total = state.nbits_total;
+        self.rng = state.rng;
+        self.val = state.val;
+        self.ext = state.ext;
+        self.rem = state.rem;
+        self.error = state.error;
     }
 
     #[inline]
@@ -319,6 +405,24 @@ pub struct RangeEncoder<'a> {
     error: i32,
 }
 
+/// A rollback point for [`RangeEncoder`] — every scalar field of libopus' `ec_enc`, so a trial
+/// encode can be undone (`quant_bands.c:296,333`). The output *bytes* are deliberately excluded:
+/// they are large and the caller only ever needs the range it actually touched.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeEncoderState {
+    storage: u32,
+    offs: u32,
+    end_offs: u32,
+    end_window: u32,
+    nend_bits: i32,
+    nbits_total: i32,
+    rng: u32,
+    val: u32,
+    ext: u32,
+    rem: i32,
+    error: i32,
+}
+
 impl<'a> RangeEncoder<'a> {
     /// Initialize an encoder writing into `buf` (libopus `ec_enc_init`).
     #[must_use]
@@ -356,6 +460,82 @@ impl<'a> RangeEncoder<'a> {
     #[must_use]
     pub fn tell_frac(&self) -> u32 {
         ec_tell_frac(self.nbits_total, self.rng)
+    }
+
+    /// The current range value (libopus `ec_ctx.rng` / `OPUS_GET_FINAL_RANGE` after
+    /// [`Self::done`]) — the exact per-packet conformance oracle a decoder must reproduce.
+    #[must_use]
+    pub fn rng(&self) -> u32 {
+        self.rng
+    }
+
+    /// The output buffer's capacity in bits (libopus `enc->storage*8`, the budget every
+    /// `tell + X <= budget` gate in the CELT encoder compares against).
+    #[must_use]
+    pub fn storage_bits(&self) -> u32 {
+        self.storage * 8
+    }
+
+    /// Bytes the range coder has written from the front of the buffer (libopus `ec_range_bytes`).
+    /// The two-pass coarse-energy trial uses it to bound the byte range it must save and restore.
+    #[must_use]
+    pub fn range_bytes(&self) -> u32 {
+        self.offs
+    }
+
+    /// Read-only view of the output buffer (libopus `ec_get_buffer`).
+    #[must_use]
+    pub fn buffer(&self) -> &[u8] {
+        self.buf
+    }
+
+    /// Mutable view of the output buffer, for restoring a trial encode's bytes
+    /// (`quant_bands.c:342`). Prefer the `enc_*` methods for everything else.
+    pub fn buffer_mut(&mut self) -> &mut [u8] {
+        self.buf
+    }
+
+    /// Account the whole packet as already written (libopus `celt_encoder.c:1673`,
+    /// `enc->nbits_total += tell - ec_tell(enc)` on a silent frame): every later
+    /// `tell + X <= total_bits` budget gate then fails, so no further symbols get coded and the
+    /// remaining bytes stay the zeros the initialiser left.
+    pub fn declare_bits_used(&mut self, total_bits: i32) {
+        self.nbits_total += total_bits - self.tell();
+    }
+
+    /// Snapshot the scalar coder state so a trial encode can be rolled back
+    /// (libopus copies the whole struct: `quant_bands.c:296` `enc_start_state = *enc`).
+    #[must_use]
+    pub fn save_state(&self) -> RangeEncoderState {
+        RangeEncoderState {
+            storage: self.storage,
+            offs: self.offs,
+            end_offs: self.end_offs,
+            end_window: self.end_window,
+            nend_bits: self.nend_bits,
+            nbits_total: self.nbits_total,
+            rng: self.rng,
+            val: self.val,
+            ext: self.ext,
+            rem: self.rem,
+            error: self.error,
+        }
+    }
+
+    /// Restore a [`Self::save_state`] snapshot. The buffer bytes are **not** restored — the caller
+    /// saves and replays the affected byte range itself, exactly as `quant_coarse_energy` does.
+    pub fn restore_state(&mut self, state: &RangeEncoderState) {
+        self.storage = state.storage;
+        self.offs = state.offs;
+        self.end_offs = state.end_offs;
+        self.end_window = state.end_window;
+        self.nend_bits = state.nend_bits;
+        self.nbits_total = state.nbits_total;
+        self.rng = state.rng;
+        self.val = state.val;
+        self.ext = state.ext;
+        self.rem = state.rem;
+        self.error = state.error;
     }
 
     #[inline]
@@ -600,6 +780,35 @@ impl<'a> RangeEncoder<'a> {
 mod tests {
     use super::*;
 
+    /// `opus_decoder.c:479` — hiding the trailing redundancy bytes must stop [`RangeDecoder::dec_bits`]
+    /// (which reads from the *end* of the buffer) from reaching into them.
+    #[test]
+    fn shrink_storage_hides_the_trailing_bytes_from_the_raw_bit_reader() {
+        let buf = [0x00u8, 0x00, 0x00, 0x00, 0xAB, 0xCD];
+        let mut full = RangeDecoder::new(&buf);
+        let mut shrunk = RangeDecoder::new(&buf);
+        shrunk.shrink_storage(2);
+        assert_eq!(shrunk.storage_bits(), 4 * 8);
+        // The full decoder reads the real trailing byte; the shrunk one reads the byte two earlier.
+        assert_eq!(full.dec_bits(8), 0xCD);
+        assert_eq!(shrunk.dec_bits(8), 0x00);
+        // Shrinking further than the buffer holds clamps instead of wrapping.
+        shrunk.shrink_storage(1_000);
+        assert!(shrunk.storage_bits() <= 4 * 8);
+    }
+
+    /// The storage must never move behind the read cursor, whatever the caller asks for.
+    #[test]
+    fn shrink_storage_never_moves_behind_the_read_cursor() {
+        let buf = [0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0];
+        let mut dec = RangeDecoder::new(&buf);
+        let _ = dec.dec_uint(1000); // consume a few bytes from the front
+        let consumed = dec.range_bytes();
+        assert!(consumed > 0);
+        dec.shrink_storage(8);
+        assert!(dec.storage_bits() >= consumed * 8);
+    }
+
     #[test]
     fn ilog_matches_definition() {
         assert_eq!(ec_ilog(0), 0);
@@ -719,6 +928,45 @@ mod tests {
         assert!(!enc.error());
         enc.done();
         assert_eq!(buf[0] >> 6, 0b11, "top 2 bits patched to 3");
+    }
+
+    /// Decoder rollback must be exact: rewinding to a snapshot has to replay the identical symbol
+    /// sequence, `tell_frac` and `rng`. The CELT stereo theta trial relies on this being a complete
+    /// rollback (the packet itself is immutable, so the scalars are the whole state).
+    #[test]
+    fn decoder_state_snapshot_rewinds_exactly() {
+        let icdf = [25u8, 23, 2, 0];
+        let mut buf = vec![0u8; 512];
+        {
+            let mut enc = RangeEncoder::new(&mut buf);
+            for k in 0..40u32 {
+                enc.enc_uint(k % 13, 13);
+                enc.enc_icdf((k % 3) as usize, &icdf, 5);
+                enc.enc_bits(k & 0x3f, 6);
+            }
+            enc.done();
+            assert!(!enc.error());
+        }
+        let mut dec = RangeDecoder::new(&buf);
+        for _ in 0..10u32 {
+            let _ = dec.dec_uint(13);
+            let _ = dec.dec_icdf(&icdf, 5);
+            let _ = dec.dec_bits(6);
+        }
+        let snapshot = dec.save_state();
+        let (tell, rng, offs) = (dec.tell_frac(), dec.rng(), dec.range_bytes());
+        let first: Vec<(u32, usize, u32)> = (0..30)
+            .map(|_| (dec.dec_uint(13), dec.dec_icdf(&icdf, 5), dec.dec_bits(6)))
+            .collect();
+        dec.restore_state(&snapshot);
+        assert_eq!(
+            (dec.tell_frac(), dec.rng(), dec.range_bytes()),
+            (tell, rng, offs)
+        );
+        let second: Vec<(u32, usize, u32)> = (0..30)
+            .map(|_| (dec.dec_uint(13), dec.dec_icdf(&icdf, 5), dec.dec_bits(6)))
+            .collect();
+        assert_eq!(first, second, "rollback did not replay the same symbols");
     }
 
     #[test]

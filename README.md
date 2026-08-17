@@ -80,7 +80,8 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **Observability & QoS (Prometheus, RTCP jitter/loss, G.107 MOS, HEP/Homer)** | RFC 3550 / ITU-T G.107 / HEP3 | Implemented — RR + `call_quality` events ([docs](docs/observability.md)) |
 | **Recording (runtime raw-RTP pcap)** | — | Implemented |
 | **Clustering + warm-standby HA (checkpoint / restore)** | — | Implemented — plain / SDES-SRTP / transcode / secure-transcode restore (WS restore pending) |
-| **Opus / EVS** | RFC 6716 | Planned |
+| **Opus** | RFC 6716 / RFC 7587 | Decode implemented and wired — transcoding *from* an Opus leg (SILK / CELT / Hybrid, mono + stereo, PLC + in-band FEC), gated on all 12 official vectors plus exact per-packet `final_range`; the encoder is in progress, so transcoding *toward* Opus is not available yet |
+| **EVS** | 3GPP TS 26.441 | Planned |
 
 ## Performance
 

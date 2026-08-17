@@ -60,8 +60,26 @@ const COMFORT_NOISE_LEVEL_DBOV: u8 = 75;
 
 /// Largest RTP packet the egress scratch buffers accommodate.
 const MAX_RTP: usize = 1500;
-/// Largest decoded PCM frame (48 kHz × 40 ms mono, a safe ceiling for any telephony frame).
-const MAX_PCM: usize = 1920;
+
+/// Highest native PCM sample rate any codec in the factory decodes to, in Hz — Opus full-band
+/// (RFC 6716 §2 / RFC 7587 §4.1: Opus always clocks RTP at 48 kHz).
+const MAX_SAMPLE_RATE_HZ: usize = 48_000;
+/// Longest packetization one payload may carry, in milliseconds. RFC 7587 §6.1 caps Opus
+/// `ptime`/`maxptime` at 120 ms, and RFC 6716 §3.2 lets a code-3 packet carry up to 120 ms of audio
+/// (48 × 2.5 ms frames) *whatever* ptime was negotiated — so a conformant decoder must be able to
+/// emit that much from one packet, negotiated ptime or not.
+const MAX_PTIME_MS: usize = siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS as usize;
+/// Samples **per channel** in the longest frame: 48 kHz × 120 ms = 5760. Sizes every mono buffer —
+/// the egress frame, the repacketizer drain, the echo reference, injected prompt audio.
+const MAX_FRAME_SAMPLES: usize = MAX_SAMPLE_RATE_HZ / 1000 * MAX_PTIME_MS;
+/// Audio channels in the longest **decoded** frame. RFC 7587 §6.1 makes an Opus RTP stream mono or
+/// stereo; Opus multistream / surround (RFC 7845) is out of scope, and every other codec is mono.
+const MAX_CHANNELS: usize = 2;
+/// Largest decoded PCM frame in **interleaved `i16` values** — 5760 × 2 = 11520 (see the channel
+/// contract in `siphon_rtp_codec`). Sizes the decode scratch only: the media path folds a
+/// multi-channel frame to mono immediately (`downmix_to_mono`), so everything after the decode is
+/// bounded by `MAX_FRAME_SAMPLES`.
+const MAX_PCM: usize = MAX_FRAME_SAMPLES * MAX_CHANNELS;
 
 /// Echo-canceller adaptive-filter tail, in milliseconds at the near-end codec rate. 64 ms (512 taps
 /// @ 8 kHz / 1024 @ 16 kHz) spans the line/acoustic residual impulse-response *after* the GCC-PHAT
@@ -303,6 +321,31 @@ pub struct Direction {
     raw_tee: Vec<RawTee>,
     decoder: Box<dyn Decoder>,
     encoder: Box<dyn Encoder>,
+    /// Audio channels the decoder emits per frame (`decoder.params().channels`) — 1 for every
+    /// telephony codec, 2 for a stereo Opus ingress (RFC 7587 §6.1 `sprop-stereo=1`). When > 1 the
+    /// decoded interleaved frame is folded to mono right after decode
+    /// ([`siphon_rtp_codec::downmix_to_mono`]) so the rest of this direction — noise suppression, echo
+    /// cancellation, recorder, forks, resampler, repacketizer, encoder — stays single-channel. Driven
+    /// by the channel count, not by the codec's identity.
+    ingress_channels: u8,
+    /// Ingress frames this direction's decoder rejected. Counted so a persistently undecodable stream
+    /// is visible rather than silent; the first failure is logged at `error!` and the rest at `debug!`
+    /// (a per-packet `error!` would be a log-flood vector on a hostile stream).
+    decode_errors: u64,
+    /// Preallocated decode buffer: the interleaved PCM one ingress frame decodes into, [`MAX_PCM`]
+    /// long so the longest frame any codec can produce fits (48 kHz × 120 ms × 2 channels). Allocated
+    /// **once**, here, rather than being a per-packet stack array — clearing 23 KB on every packet
+    /// would cost more than the decode itself and would evict the codec's own working set from L1.
+    /// [`Direction::handle`] moves it out of `self` for the frame (a pointer swap) so the pipeline can
+    /// still borrow `self` mutably, and puts it back before returning.
+    decode_scratch: Vec<i16>,
+    /// Preallocated far-end reference frame for [`Direction::echo_canceller`], the same length as
+    /// `decode_scratch` (the near-end frame it is subtracted from), so a read is always in bounds.
+    /// Empty when the direction does not cancel — the buffer costs nothing on a leg without AEC.
+    echo_scratch: Vec<i16>,
+    /// Preallocated egress frame the repacketizer drains into — exactly `egress_frame_samples` long
+    /// (one encoder frame), so the drain neither allocates nor zeroes per packet.
+    egress_scratch: Vec<i16>,
     /// Sample-rate converter when the ingress codec rate differs from the egress codec rate.
     resampler: Option<Resampler>,
     /// Single-channel noise suppression on this direction's decoded ingress audio, applied in place
@@ -715,7 +758,11 @@ impl RtcpRelay {
 
 impl Direction {
     fn new(config: DirectionConfig) -> Self {
-        let ingress_rate = config.decoder.params().sample_rate_hz;
+        let ingress_params = config.decoder.params();
+        let ingress_rate = ingress_params.sample_rate_hz;
+        // Channels the decoder emits (interleaved). > 1 only for a stereo Opus ingress; the decoded
+        // frame is folded to mono in `handle` so nothing downstream is multi-channel.
+        let ingress_channels = ingress_params.channels.max(1);
         // The RTP clock the ingress interarrival jitter is measured in (RFC 3550 §6.4.1) — not always
         // the sample rate (G.722 clocks RTP at 8 kHz while sampling 16 kHz; RFC 3551 §4.5.2). Read it
         // before the decoder is moved into the struct.
@@ -750,7 +797,9 @@ impl Direction {
         // cancels. Sized to a couple of the largest possible frames so a single decoded frame always
         // fits, while an interleave/rate skew is bounded by drop-oldest.
         let echo_reference = if config.produce_echo_reference {
-            Some(EchoReference::new(2 * MAX_PCM, egress_rate))
+            // Mono egress PCM (the media path is single-channel), so the longest frame is
+            // `MAX_FRAME_SAMPLES`; two of them bound a producer/consumer interleave skew.
+            Some(EchoReference::new(2 * MAX_FRAME_SAMPLES, egress_rate))
         } else {
             None
         };
@@ -759,10 +808,32 @@ impl Direction {
         // the encoder exactly one frame's worth. A ptime override reaches this via the egress
         // `CodecSpec.ptime_ms` the encoder was built with (sample-based codecs honour it; a frame-based
         // codec such as AMR keeps its native 20 ms frame — the override is inert there by construction).
+        //
         // Bound it to the scratch ceiling so an adversarial `a=ptime` can never overflow the fixed
         // egress frame buffer; the timestamp step is recomputed from the same bounded count so drain
-        // and RTP clock stay in lock-step.
-        let egress_frame_samples = (egress_params.frame_samples() as u32).min(MAX_PCM as u32);
+        // and RTP clock stay in lock-step. `MAX_FRAME_SAMPLES` covers every in-spec combination
+        // (48 kHz × 120 ms, the RFC 7587 §6.1 ceiling), so the clamp only ever bites on an out-of-spec
+        // `a=ptime` — and when it does it re-frames the egress away from what the SDP advertised, so
+        // it is logged rather than applied silently.
+        //
+        // The engine's egress is always mono (`CodecSpec::encode_channels`), so the per-channel
+        // sample count is also the interleaved value count and one number serves the buffer size, the
+        // repacketizer drain quantum, and the RTP timestamp step. Should a multi-channel egress ever
+        // land, those three separate: buffers scale by `frame_values`, the timestamp step does not.
+        let egress_frame_values = egress_params.frame_samples();
+        if egress_frame_values > MAX_FRAME_SAMPLES {
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                egress_ptime_ms = egress_params.ptime_ms,
+                egress_rate_hz = egress_rate,
+                egress_channels = egress_params.channels,
+                requested_samples = egress_frame_values,
+                capped_samples = MAX_FRAME_SAMPLES,
+                "egress frame exceeds the media-path frame ceiling — capping the egress ptime \
+                 (the advertised a=ptime cannot be honoured)"
+            );
+        }
+        let egress_frame_samples = (egress_frame_values as u32).min(MAX_FRAME_SAMPLES as u32);
         // RFC 3551 §4.5.2: the synthesized-egress RTP timestamp advances at the codec's RTP clock,
         // which is not always the native sample rate — G.722 clocks RTP at 8 kHz while sampling
         // 16 kHz audio. So the per-packet step is native-samples × RTP-clock ÷ native-rate (= the
@@ -788,6 +859,17 @@ impl Direction {
             raw_tee: Vec::new(),
             decoder: config.decoder,
             encoder: config.encoder,
+            ingress_channels,
+            decode_errors: 0,
+            decode_scratch: vec![0i16; MAX_PCM],
+            // Only a cancelling direction ever reads a far-end frame; sized to match the near-end
+            // (decode) frame so `read_into`/`cancel` are always in bounds.
+            echo_scratch: if echo_canceller.is_some() {
+                vec![0i16; MAX_PCM]
+            } else {
+                Vec::new()
+            },
+            egress_scratch: vec![0i16; egress_frame_samples as usize],
             resampler,
             noise_suppressor,
             echo_canceller,
@@ -840,6 +922,13 @@ impl Direction {
             raw_tee: Vec::new(),
             decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             encoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
+            // A relay-only direction never decodes, so the channel fold and the decode-error counter
+            // are both inert (the stand-in G.711 codec is mono anyway) and every PCM scratch is empty.
+            ingress_channels: 1,
+            decode_errors: 0,
+            decode_scratch: Vec::new(),
+            echo_scratch: Vec::new(),
+            egress_scratch: Vec::new(),
             resampler: None,
             // A relay-only leg forwards verbatim (never decodes), so there is nothing to suppress or
             // cancel, and it produces no reference for the opposite direction.
@@ -922,8 +1011,9 @@ impl Direction {
                 ..
             }) => {
                 let source_rate = player.sample_rate_hz() as usize;
-                let source_frame = (source_rate * ptime / 1000).clamp(1, MAX_PCM);
-                let mut source = [0i16; MAX_PCM];
+                // Injected prompt audio is mono, so `MAX_FRAME_SAMPLES` bounds one frame of it.
+                let source_frame = (source_rate * ptime / 1000).clamp(1, MAX_FRAME_SAMPLES);
+                let mut source = [0i16; MAX_FRAME_SAMPLES];
                 match player.next_frame(&mut source[..source_frame]) {
                     Some(written) => {
                         // Count this frame's ptime toward the played duration reported on completion.
@@ -1071,7 +1161,7 @@ impl Direction {
         let frame = self.egress_frame_samples as usize;
         // Hold/mute (silence_media): digital silence, still a continuous stream on the audio codec.
         if self.silenced {
-            let mut pcm = [0i16; MAX_PCM];
+            let mut pcm = [0i16; MAX_FRAME_SAMPLES];
             pcm[..frame].fill(0);
             self.emit_encoded(&pcm[..frame], out);
             return;
@@ -1082,7 +1172,7 @@ impl Direction {
             return;
         }
         // CN was not negotiated: audio-encoded low-level noise on the leg's own codec.
-        let mut pcm = [0i16; MAX_PCM];
+        let mut pcm = [0i16; MAX_FRAME_SAMPLES];
         if let Some(comfort) = self.comfort.as_mut() {
             comfort
                 .generator
@@ -1342,11 +1432,69 @@ impl Direction {
             return Some(stream_ssrc);
         }
 
-        // Decode → (noise suppression) → record → (silence) → resample → encode → transmit.
-        let mut decoded = [0i16; MAX_PCM];
-        let Ok(samples) = self.decoder.decode(parsed.payload, &mut decoded) else {
-            return Some(stream_ssrc); // authentic stream member, just undecodable — still latches
+        // Decode → fold to mono → (noise suppression) → echo cancel → record/fork → (silence) →
+        // resample → encode → transmit, on this direction's preallocated decode scratch. The buffer is
+        // moved out of `self` for the frame so the pipeline below can borrow `self` mutably, and put
+        // back before returning — a pointer swap, not a copy.
+        let mut scratch = std::mem::take(&mut self.decode_scratch);
+        self.transcode_frame(&mut scratch, &parsed, stream_ssrc, echo_reference, out);
+        self.decode_scratch = scratch;
+        Some(stream_ssrc)
+    }
+
+    /// The decode → fold → NS → AEC → record/fork → resample → repacketize tail of
+    /// [`Direction::handle`], run on `scratch` — this direction's preallocated decode buffer, handed in
+    /// so it is not borrowed from `self` while the rest of the pipeline needs `&mut self`.
+    ///
+    /// `scratch` is [`MAX_PCM`] long, sized for the largest **interleaved** frame any codec produces
+    /// (48 kHz × 120 ms × 2 channels), so a 60 ms or 120 ms Opus packet decodes instead of being
+    /// rejected with `OutputTooSmall`. A decode failure is logged and counted, never swallowed.
+    fn transcode_frame(
+        &mut self,
+        scratch: &mut [i16],
+        parsed: &RtpPacket<'_>,
+        stream_ssrc: u32,
+        echo_reference: Option<&mut EchoReference>,
+        out: &mut Vec<Outbound>,
+    ) {
+        let decoded = scratch;
+        let samples = match self.decoder.decode(parsed.payload, decoded) {
+            Ok(samples) => samples,
+            Err(error) => {
+                // An undecodable frame is a real loss of audio, not a no-op: log it (first occurrence
+                // at `error!`, the rest at `debug!` so a hostile stream cannot flood the log) and
+                // count it. Still an authentic stream member, so the latch below still applies.
+                self.decode_errors += 1;
+                if self.decode_errors == 1 {
+                    tracing::error!(
+                        target: "siphon_rtp::media",
+                        %error,
+                        payload_type = parsed.payload_type,
+                        payload_len = parsed.payload.len(),
+                        ssrc = stream_ssrc,
+                        "ingress frame failed to decode — audio dropped (further failures at debug)"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "siphon_rtp::media",
+                        %error,
+                        payload_type = parsed.payload_type,
+                        payload_len = parsed.payload.len(),
+                        ssrc = stream_ssrc,
+                        decode_errors = self.decode_errors,
+                        "ingress frame failed to decode — audio dropped"
+                    );
+                }
+                return;
+            }
         };
+        // A multi-channel decoder (a stereo Opus ingress — RFC 7587 §6.1 `sprop-stereo=1`) hands back
+        // interleaved PCM; the whole media path below is single-channel, so fold it here, once, at the
+        // codec boundary. A no-op for every mono codec (`ingress_channels == 1`), and driven by the
+        // channel count rather than the codec's identity — see the channel contract in
+        // `siphon_rtp_codec`.
+        let samples =
+            siphon_rtp_codec::downmix_to_mono(&mut decoded[..samples], self.ingress_channels);
         // Suppress noise in place first, so the recorder, SIPREC forks, and the peer all receive the
         // cleaned audio. Streaming/WOLA — one ingress frame in, the same count out (delayed).
         if let Some(suppressor) = self.noise_suppressor.as_mut() {
@@ -1365,9 +1513,11 @@ impl Direction {
                 canceller.sample_rate_hz(),
                 "far-end reference and near-end must share the party's codec rate"
             );
-            let mut far_end = [0i16; MAX_PCM];
-            reference.read_into(&mut far_end[..samples]);
-            canceller.cancel(&mut decoded[..samples], &far_end[..samples]);
+            // The preallocated far-end frame is the same length as the decode scratch the near-end came
+            // from, so this read is always in bounds; nothing is allocated or zeroed per packet.
+            let far_end = &mut self.echo_scratch[..samples];
+            reference.read_into(far_end);
+            canceller.cancel(&mut decoded[..samples], far_end);
         }
         let decoded = &decoded[..samples];
         if let Some(recorder) = self.recorder.as_mut() {
@@ -1388,7 +1538,7 @@ impl Direction {
         // egress is a continuous comfort-noise stream driven by the playout tick instead (see
         // `tick_egress`). A player overrides it; the `echo` verb reflects via `echo_into`.
         if self.comfort.is_some() {
-            return Some(stream_ssrc);
+            return;
         }
 
         let silence;
@@ -1416,7 +1566,6 @@ impl Direction {
         // stream, and accumulating in the egress domain makes the drain quantum exactly the encoder's
         // frame size.
         self.repacketize(egress_pcm, parsed.marker, out);
-        Some(stream_ssrc)
     }
 
     /// Re-frame decoded egress-domain PCM to this direction's egress `ptime` and emit one RTP packet
@@ -1438,12 +1587,15 @@ impl Direction {
             return;
         }
         self.repacketizer.push(egress_pcm);
-        // `egress_frame_samples` is bounded to `MAX_PCM` in `Direction::new`, so one frame always fits.
-        let mut frame = [0i16; MAX_PCM];
+        // Drain into the preallocated egress frame — exactly one encoder frame long, so the drain
+        // neither allocates nor zeroes per packet. Moved out of `self` for the loop (a pointer swap) so
+        // `emit_pcm` can borrow `self` mutably, and put back after.
+        let mut frame = std::mem::take(&mut self.egress_scratch);
         while let Some(count) = self.repacketizer.next_frame(&mut frame) {
             let marker = std::mem::take(&mut self.pending_marker);
             self.emit_pcm(&frame[..count], marker, out);
         }
+        self.egress_scratch = frame;
     }
 
     /// Append one egress datagram toward this direction's peer, encrypting it (SRTP/SRTCP, auto-
@@ -1545,11 +1697,41 @@ impl Direction {
             }
             return Some(stream_ssrc);
         }
-        let mut decoded = [0i16; MAX_PCM];
-        let Ok(samples) = self.decoder.decode(parsed.payload, &mut decoded) else {
-            return Some(stream_ssrc);
+        // The same preallocated decode scratch `handle` uses (`egress` is a different `Direction`, so no
+        // move out of `self` is needed here — the borrows are already disjoint).
+        let channels = self.ingress_channels;
+        let samples = match self
+            .decoder
+            .decode(parsed.payload, &mut self.decode_scratch)
+        {
+            Ok(samples) => samples,
+            Err(error) => {
+                self.decode_errors += 1;
+                if self.decode_errors == 1 {
+                    tracing::error!(
+                        target: "siphon_rtp::media",
+                        %error,
+                        payload_type = parsed.payload_type,
+                        payload_len = parsed.payload.len(),
+                        ssrc = stream_ssrc,
+                        "echo-path ingress frame failed to decode — audio dropped \
+                         (further failures at debug)"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "siphon_rtp::media",
+                        %error,
+                        decode_errors = self.decode_errors,
+                        "echo-path ingress frame failed to decode — audio dropped"
+                    );
+                }
+                return Some(stream_ssrc);
+            }
         };
-        egress.emit_pcm(&decoded[..samples], parsed.marker, out);
+        // Same single fold at the codec boundary as `handle` — the echo reflect re-encodes mono PCM.
+        let samples =
+            siphon_rtp_codec::downmix_to_mono(&mut self.decode_scratch[..samples], channels);
+        egress.emit_pcm(&self.decode_scratch[..samples], parsed.marker, out);
         Some(stream_ssrc)
     }
 
@@ -2896,6 +3078,326 @@ mod tests {
         }
     }
 
+    /// A stand-in for a wideband, long-frame, possibly-stereo codec — what Opus is on the wire, with
+    /// none of the codec. One payload byte expands to a whole frame of that value (interleaved across
+    /// `channels`, so a stereo frame carries `frame × channels` values), and encode compresses a frame
+    /// back to a single byte while recording exactly what PCM it was handed.
+    ///
+    /// Everything the media path cares about is faithful: the native rate, the frame duration, the
+    /// channel count, and the interleaved layout of `Decoder::decode`'s output (the channel contract
+    /// in `siphon_rtp_codec`). A real 48 kHz / 60 ms payload is a few hundred bytes, so a compact
+    /// payload keeps the fixture inside the 1500-byte RTP scratch just as Opus would.
+    #[derive(Clone)]
+    struct WidebandCodec {
+        sample_rate_hz: u32,
+        ptime_ms: u8,
+        channels: u8,
+        /// Every PCM frame handed to `encode`, for the assertions.
+        encoded: Arc<Mutex<Vec<Vec<i16>>>>,
+    }
+
+    impl WidebandCodec {
+        fn new(sample_rate_hz: u32, ptime_ms: u8, channels: u8) -> Self {
+            Self {
+                sample_rate_hz,
+                ptime_ms,
+                channels,
+                encoded: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn codec_params(&self) -> siphon_rtp_codec::CodecParams {
+            siphon_rtp_codec::CodecParams {
+                sample_rate_hz: self.sample_rate_hz,
+                channels: self.channels,
+                ptime_ms: self.ptime_ms,
+            }
+        }
+
+        /// The interleaved `i16` count of one frame, per the channel contract.
+        fn values(&self) -> usize {
+            self.codec_params().frame_values()
+        }
+    }
+
+    impl Decoder for WidebandCodec {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            self.codec_params()
+        }
+        fn frame_samples(&self) -> usize {
+            self.values()
+        }
+        fn decode(
+            &mut self,
+            payload: &[u8],
+            out: &mut [i16],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            let values = self.values();
+            if out.len() < values {
+                return Err(siphon_rtp_codec::CodecError::OutputTooSmall {
+                    needed: values,
+                    have: out.len(),
+                });
+            }
+            // A hostile / truncated payload errors, exactly as a real codec's bitstream parse does.
+            let Some(&first) = payload.first() else {
+                return Err(siphon_rtp_codec::CodecError::Malformed("empty payload"));
+            };
+            let base = i16::from(first) * 100;
+            // Interleaved: channel 0 carries `base`, channel 1 carries `-base`, so a correct
+            // stereo→mono fold is visibly 0 and an incorrect one is not.
+            for (index, sample) in out[..values].iter_mut().enumerate() {
+                *sample = if index % self.channels as usize == 0 {
+                    base
+                } else {
+                    -base
+                };
+            }
+            Ok(values)
+        }
+        fn conceal(&mut self, out: &mut [i16]) -> Result<usize, siphon_rtp_codec::CodecError> {
+            let values = self.values();
+            out[..values].fill(0);
+            Ok(values)
+        }
+    }
+
+    impl Encoder for WidebandCodec {
+        fn params(&self) -> siphon_rtp_codec::CodecParams {
+            self.codec_params()
+        }
+        fn frame_samples(&self) -> usize {
+            self.values()
+        }
+        fn encode(
+            &mut self,
+            pcm: &[i16],
+            out: &mut [u8],
+        ) -> Result<usize, siphon_rtp_codec::CodecError> {
+            if pcm.len() != self.values() {
+                return Err(siphon_rtp_codec::CodecError::BadFrameSize {
+                    expected: self.values(),
+                    got: pcm.len(),
+                });
+            }
+            if out.is_empty() {
+                return Err(siphon_rtp_codec::CodecError::OutputTooSmall { needed: 1, have: 0 });
+            }
+            if let Ok(mut log) = self.encoded.lock() {
+                log.push(pcm.to_vec());
+            }
+            out[0] = 0x42;
+            Ok(1)
+        }
+    }
+
+    /// A one-direction (A→B) call between two [`WidebandCodec`]s, returning the call plus the egress
+    /// encoder's PCM log. The B→A direction mirrors it so the struct is complete; only A→B is driven.
+    fn wideband_call(
+        ingress: WidebandCodec,
+        egress: WidebandCodec,
+    ) -> (MediaCall, Arc<Mutex<Vec<Vec<i16>>>>) {
+        let encoded = egress.encoded.clone();
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            decoder: Box::new(ingress.clone()),
+            encoder: Box::new(egress.clone()),
+            egress_ssrc: 0xB000_0001,
+            egress_payload_type: 111,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::Opus,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: Box::new(egress),
+            encoder: Box::new(ingress),
+            egress_ssrc: 0xA000_0001,
+            egress_payload_type: 111,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::Opus,
+        };
+        let call = MediaCall::new(
+            "wideband",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        );
+        (call, encoded)
+    }
+
+    /// One RTP packet on payload type 111 whose timestamp advances by `frame_samples` at 48 kHz.
+    fn wideband_rtp(sequence: u16, frame_samples: u32, payload_byte: u8) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 111,
+            sequence,
+            timestamp: u32::from(sequence) * frame_samples,
+            ssrc: 0x0111_0111,
+        };
+        let mut buffer = vec![0u8; 13];
+        let len = write_packet(&header, &[payload_byte], &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    #[test]
+    fn long_48khz_frames_survive_the_pipeline() {
+        // RFC 7587 §6.1 allows ptime up to 120 ms, and RFC 6716 §3.2 lets one packet carry 120 ms
+        // regardless of the negotiated ptime: 48 kHz × 60 ms = 2880 samples, × 120 ms = 5760. Both
+        // exceeded the old 1920-sample (48 kHz × 40 ms) frame ceiling, so `decode` answered
+        // `OutputTooSmall` and the frame was dropped with no error, while `egress_frame_samples` was
+        // clamped to 1920 — de-syncing the egress RTP timestamp step from real time.
+        for ptime_ms in [20u8, 40, 60, 120] {
+            let frame = 48u32 * u32::from(ptime_ms);
+            let (mut call, encoded) = wideband_call(
+                WidebandCodec::new(48_000, ptime_ms, 1),
+                WidebandCodec::new(48_000, ptime_ms, 1),
+            );
+            // The egress framing follows the codec, not the ceiling.
+            assert_eq!(
+                call.a_to_b.egress_frame_samples, frame,
+                "{ptime_ms} ms egress frame"
+            );
+            assert_eq!(
+                call.a_to_b.egress_timestamp_increment, frame,
+                "{ptime_ms} ms timestamp step must advance one real frame at 48 kHz"
+            );
+            assert_eq!(call.a_to_b.egress_ptime_ms(), u32::from(ptime_ms));
+
+            let mut out = Vec::new();
+            let mut events = Vec::new();
+            for sequence in 0..3u16 {
+                call.process(
+                    &rx(1, A_ADDR, wideband_rtp(sequence, frame, 3)),
+                    &mut out,
+                    &mut events,
+                );
+            }
+            // Three ingress frames in, three egress packets out — nothing silently dropped.
+            assert_eq!(out.len(), 3, "{ptime_ms} ms: every frame must be relayed");
+            let timestamps: Vec<u32> = out
+                .iter()
+                .map(|datagram| {
+                    RtpPacket::parse(&datagram.data)
+                        .expect("parse egress")
+                        .timestamp
+                })
+                .collect();
+            assert_eq!(
+                timestamps,
+                vec![0, frame, 2 * frame],
+                "{ptime_ms} ms: the egress timestamp must advance one frame per packet"
+            );
+            // The encoder saw whole frames of the decoded value (base = 3 × 100).
+            let log = encoded.lock().expect("log");
+            assert_eq!(log.len(), 3);
+            for pcm in log.iter() {
+                assert_eq!(pcm.len(), frame as usize, "{ptime_ms} ms encode frame");
+                assert!(pcm.iter().all(|&sample| sample == 300));
+            }
+        }
+    }
+
+    #[test]
+    fn stereo_ingress_is_folded_to_mono_at_the_codec_boundary() {
+        // A multi-channel decoder (a stereo Opus ingress — RFC 7587 §6.1 `sprop-stereo=1`) hands back
+        // interleaved PCM; the media path is mono, so the frame is folded once, right after decode.
+        // The fixture's channels carry +base and -base, so a correct fold is exactly 0 and a missing
+        // one would leave the raw interleaved values (and twice the sample count).
+        let (mut call, encoded) = wideband_call(
+            WidebandCodec::new(48_000, 20, 2),
+            WidebandCodec::new(48_000, 20, 1),
+        );
+        assert_eq!(call.a_to_b.ingress_channels, 2);
+        // 20 ms at 48 kHz is 960 samples per channel — the mono egress frame, not the 1920
+        // interleaved values the decoder produced.
+        assert_eq!(call.a_to_b.egress_frame_samples, 960);
+        assert_eq!(call.a_to_b.egress_timestamp_increment, 960);
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for sequence in 0..2u16 {
+            call.process(
+                &rx(1, A_ADDR, wideband_rtp(sequence, 960, 5)),
+                &mut out,
+                &mut events,
+            );
+        }
+        assert_eq!(out.len(), 2, "both stereo frames must be relayed");
+        let log = encoded.lock().expect("log");
+        assert_eq!(log.len(), 2);
+        for pcm in log.iter() {
+            assert_eq!(pcm.len(), 960, "the egress frame is mono, 960 samples");
+            assert!(
+                pcm.iter().all(|&sample| sample == 0),
+                "the +base/-base channels must fold to 0"
+            );
+        }
+    }
+
+    #[test]
+    fn an_undecodable_frame_is_counted_not_silently_dropped() {
+        // A decode failure loses audio, so it must be visible: the first is logged at `error!` and
+        // every one is counted (the fixture decoder rejects an empty payload, as a real codec's
+        // bitstream parse rejects a hostile packet). Before this, `handle` swallowed the error.
+        let (mut call, encoded) = wideband_call(
+            WidebandCodec::new(48_000, 20, 1),
+            WidebandCodec::new(48_000, 20, 1),
+        );
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 111,
+            sequence: 1,
+            timestamp: 960,
+            ssrc: 0x0111_0111,
+        };
+        let mut buffer = vec![0u8; 12];
+        let len = write_packet(&header, &[], &mut buffer).expect("write");
+        buffer.truncate(len);
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        assert_eq!(call.a_to_b.decode_errors, 0);
+        call.process(&rx(1, A_ADDR, buffer.clone()), &mut out, &mut events);
+        call.process(&rx(1, A_ADDR, buffer), &mut out, &mut events);
+        assert_eq!(
+            call.a_to_b.decode_errors, 2,
+            "every undecodable frame must be counted"
+        );
+        assert!(out.is_empty(), "an undecodable frame emits nothing");
+        assert!(
+            encoded.lock().expect("log").is_empty(),
+            "nothing reaches the encoder"
+        );
+        // A good frame after the failures still transcodes — the counter is observability, not a gate.
+        call.process(
+            &rx(1, A_ADDR, wideband_rtp(2, 960, 7)),
+            &mut out,
+            &mut events,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(call.a_to_b.decode_errors, 2);
+    }
+
     /// A µ-law RTP packet with a caller-chosen SSRC (RFC 3550 §5.1) — drives the SSRC-consistent
     /// symmetric-latch tests, which must distinguish a NAT rebind from a hijack by SSRC.
     fn ulaw_rtp_with_ssrc(sequence: u16, ssrc: u32) -> Vec<u8> {
@@ -3843,6 +4345,262 @@ mod tests {
             (packet.payload[1] >> 3) & 0x0F,
             0,
             "toward-A egress adapted to the CMR-requested mode 0"
+        );
+    }
+
+    /// The conventional dynamic payload type a WebRTC peer offers Opus on (RFC 7587 §7 makes it
+    /// dynamic; 111 is what browsers use).
+    const OPUS_PT: u8 = 111;
+
+    /// An Opus RTP packet (PT 111) carrying `payload`. RFC 7587 §4.1: the RTP timestamp advances at
+    /// 48 kHz for every mode and every sample rate, so a 20 ms frame steps it by 960.
+    fn opus_rtp(sequence: u16, payload: &[u8]) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type: OPUS_PT,
+            sequence,
+            timestamp: u32::from(sequence) * 960,
+            ssrc: 0x0111_0111,
+        };
+        let mut buffer = vec![0u8; 12 + payload.len()];
+        let len = write_packet(&header, payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    /// A one-way Opus (48 kHz) → G.711a (8 kHz) transcoding call: the WebRTC-trunk / voice-AI shape
+    /// the Opus decode half exists for. The reverse direction is G.711a→G.711a (the Opus *encoder*
+    /// is not built yet, so nothing may ask the factory for one).
+    fn opus_to_g711a_call(ptime_ms: u8) -> MediaCall {
+        use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
+
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            // Exactly what the engine builds for a negotiated Opus leg — `CodecSpec::new` pins the
+            // clock at 48 kHz and the rtpmap channel count at 2 (RFC 7587 §4.1/§7); the audio
+            // channel count comes from `sprop-stereo`, which is absent here, i.e. mono.
+            decoder: decoder_for(&CodecSpec::new(OPUS_PT, "opus", 48_000, 2, ptime_ms))
+                .expect("opus decoder"),
+            encoder: encoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma encoder"),
+            egress_ssrc: 0xB000_0111,
+            egress_payload_type: 8,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::Opus,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: decoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma decoder"),
+            encoder: encoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma encoder"),
+            egress_ssrc: 0xA000_0008,
+            egress_payload_type: 8,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+        };
+        MediaCall::new(
+            "opus-call",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        )
+    }
+
+    /// Build `frames` real Opus packets carrying a deterministic 48 kHz signal.
+    ///
+    /// CELT-only, fullband, code 0 (RFC 6716 §3.2.2): a config-31 TOC byte followed by one CELT
+    /// frame *is* a complete Opus packet, and this crate's CELT encoder is vector-gated, so the
+    /// fixture is real Opus audio without needing the (gitignored) official vectors or an Opus
+    /// encoder that does not exist yet.
+    fn opus_packets(frames: usize) -> Vec<Vec<u8>> {
+        use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
+
+        const CELT_FB_20MS: usize = 960;
+        let mut encoder = CeltEncoder::new().expect("celt encoder");
+        encoder.set_bitrate(64_000);
+        encoder.set_rate_control(RateControl::ConstrainedVbr);
+        let mut state = 0x5EED_u32;
+        let pcm: Vec<f32> = (0..CELT_FB_20MS * frames)
+            .map(|index| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((state >> 16) as f32 / 32768.0 - 1.0) * 0.02;
+                let time = index as f32;
+                0.35 * (time * 0.031).sin() + 0.18 * (time * 0.097).sin() + noise
+            })
+            .collect();
+        let mut payload = vec![0u8; 1275];
+        (0..frames)
+            .map(|index| {
+                let written = encoder
+                    .encode(
+                        &pcm[index * CELT_FB_20MS..(index + 1) * CELT_FB_20MS],
+                        CELT_FB_20MS,
+                        &mut payload,
+                    )
+                    .expect("encode");
+                let mut packet = Vec::with_capacity(1 + written);
+                packet.push(31 << 3); // config 31 (CELT fullband 20 ms), mono, code 0
+                packet.extend_from_slice(&payload[..written]);
+                packet
+            })
+            .collect()
+    }
+
+    /// The WebRTC-trunk / voice-AI core: an Opus (48 kHz) leg transcoded to a PSTN G.711a (8 kHz)
+    /// leg through the media slow path — decode → 48→8 kHz resample → re-encode. Drives the real
+    /// `process()`, the same call the live actor makes, so it proves the Opus decoder is genuinely
+    /// wired into the datapath and not merely constructible.
+    #[test]
+    fn transcodes_opus_to_g711a_with_resampling() {
+        let packets = opus_packets(6);
+        let mut call = opus_to_g711a_call(20);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for (index, packet) in packets.iter().enumerate() {
+            call.process(
+                &rx(1, A_ADDR, opus_rtp(index as u16 + 1, packet)),
+                &mut out,
+                &mut events,
+            );
+        }
+
+        assert!(
+            out.len() >= packets.len() - 1,
+            "each 20 ms Opus packet yields a 20 ms G.711a packet (± the resampler's first frame), \
+             got {} for {} packets",
+            out.len(),
+            packets.len()
+        );
+        let mut audible = 0usize;
+        for datagram in &out {
+            assert_eq!(
+                datagram.endpoint,
+                endpoint(2),
+                "sent from B's engine socket"
+            );
+            assert_eq!(datagram.dst, addr(B_ADDR));
+            let packet = RtpPacket::parse(&datagram.data).expect("parse");
+            assert_eq!(packet.payload_type, 8, "re-encoded as G.711a (PT 8)");
+            assert_eq!(packet.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
+            assert_eq!(packet.ssrc, 0xB000_0111, "stamped with the A→B egress SSRC");
+            // 0xD5 is A-law digital silence; anything else is decoded Opus audio.
+            if packet.payload.iter().any(|&byte| byte != 0xD5) {
+                audible += 1;
+            }
+        }
+        assert!(
+            audible >= out.len() - 1,
+            "the transcoded G.711a must carry the decoded Opus audio, not silence ({audible} of \
+             {} packets had signal)",
+            out.len()
+        );
+    }
+
+    /// Packet loss on the Opus leg: the far side must still receive a full 20 ms G.711a frame,
+    /// synthesized by the Opus PLC (RFC 6716 §4.4) rather than by a gap or a mute. Exercises the
+    /// same `Decoder::conceal` the jitter buffer drives.
+    #[test]
+    fn conceals_a_lost_opus_frame_into_the_g711a_egress() {
+        use siphon_rtp_codec::factory::{decoder_for, CodecSpec};
+
+        let packets = opus_packets(4);
+        let mut decoder =
+            decoder_for(&CodecSpec::new(OPUS_PT, "opus", 48_000, 2, 20)).expect("opus decoder");
+        let mut pcm = vec![0i16; decoder.frame_samples()];
+        for packet in &packets {
+            decoder.decode(packet, &mut pcm).expect("decode");
+        }
+        let mut concealed = vec![0i16; decoder.frame_samples()];
+        let written = decoder.conceal(&mut concealed).expect("conceal");
+        assert_eq!(written, 960, "one 20 ms frame at 48 kHz");
+        let energy: i64 = concealed[..written]
+            .iter()
+            .map(|&sample| i64::from(sample) * i64::from(sample))
+            .sum();
+        assert!(
+            energy > 1_000_000,
+            "concealment must extrapolate the signal, not emit silence (energy {energy})"
+        );
+    }
+
+    /// The official RFC 6716 test vectors (gitignored, see CONTRIBUTING.md) pushed through the same
+    /// transcoding `Direction` — real libopus-encoded SILK / Hybrid / CELT packets, not our own
+    /// encode. Skips with a notice when the vector set is absent, like every other vector gate.
+    #[test]
+    fn transcodes_an_official_opus_vector_to_g711a() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../reference/opus/opus_testvectors/testvector01.bit");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!(
+                "skipping: {} absent (the RFC 6716 vectors are gitignored — see CONTRIBUTING.md)",
+                path.display()
+            );
+            return;
+        };
+        // `opus_demo` `.bit` framing: repeated [u32 BE length][u32 BE reference range][payload].
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let mut offset = 0usize;
+        while offset + 8 <= bytes.len() {
+            let length = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+            offset += 8;
+            if offset + length > bytes.len() {
+                break;
+            }
+            payloads.push(bytes[offset..offset + length].to_vec());
+            offset += length;
+        }
+        assert!(!payloads.is_empty(), "the vector file carried no packets");
+
+        let mut call = opus_to_g711a_call(20);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for (index, payload) in payloads.iter().take(200).enumerate() {
+            call.process(
+                &rx(1, A_ADDR, opus_rtp(index as u16 + 1, payload)),
+                &mut out,
+                &mut events,
+            );
+        }
+
+        assert!(
+            !out.is_empty(),
+            "the official vector must transcode to G.711a packets"
+        );
+        let mut audible = 0usize;
+        for datagram in &out {
+            let packet = RtpPacket::parse(&datagram.data).expect("parse");
+            assert_eq!(packet.payload_type, 8);
+            assert_eq!(packet.payload.len(), 160);
+            if packet.payload.iter().any(|&byte| byte != 0xD5) {
+                audible += 1;
+            }
+        }
+        assert!(
+            audible * 2 > out.len(),
+            "most of the transcoded vector must be audio, not silence ({audible} of {} packets)",
+            out.len()
         );
     }
 

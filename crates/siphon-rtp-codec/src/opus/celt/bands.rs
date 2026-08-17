@@ -7,6 +7,8 @@
 //! `theta` is quantised to). Each is exercised by its algebraic property (Haar is an involution; the
 //! Hadamard interleavers are mutual inverses; the stereo split preserves energy).
 
+use crate::opus::celt::tables::NB_BANDS;
+
 /// Bit-resolution shift (libopus `BITRES`).
 const BITRES: i32 = 3;
 /// 1/√2, the rotation/Haar coefficient (libopus `QCONST32(.70710678f, 31)`, float).
@@ -38,6 +40,67 @@ pub fn stereo_split(x: &mut [f32], y: &mut [f32], n: usize) {
         x[j] = l + r;
         y[j] = r - l;
     }
+}
+
+/// Collapse a stereo band pair into its intensity-stereo mono representation (libopus
+/// `intensity_stereo`, `bands.c:388`, float path): `X = a1·L + a2·R` with the mixing weights taken
+/// from the two channels' band amplitudes, so the louder channel dominates. The side is not coded,
+/// so `y` is left untouched.
+///
+/// `band_e` is the `2*NB_BANDS` amplitude buffer; `band` indexes it (`band` for left,
+/// `band + NB_BANDS` for right).
+pub fn intensity_stereo(x: &mut [f32], y: &[f32], band_e: &[f32], band: usize, n: usize) {
+    const EPSILON: f32 = 1e-15;
+    let left = band_e[band];
+    let right = band_e[band + NB_BANDS];
+    let norm = EPSILON + (EPSILON + left * left + right * right).sqrt();
+    let a1 = left / norm;
+    let a2 = right / norm;
+    for j in 0..n {
+        x[j] = a1 * x[j] + a2 * y[j];
+    }
+}
+
+/// Undo the mid/side split after both halves have been quantised (libopus `stereo_merge`,
+/// `bands.c:426`, float path): recover L/R from the reconstructed mid (`x`, scaled by `mid`) and
+/// side (`y`), renormalising each channel to unit norm.
+///
+/// Degenerate case: if either reconstructed channel has (near-)zero energy the merge would blow up,
+/// so libopus copies mid into both channels instead — reproduced exactly.
+pub fn stereo_merge(x: &mut [f32], y: &mut [f32], mid: f32, n: usize) {
+    // `dual_inner_prod(Y, X, Y, N, &xp, &side)`: xp = <Y,X>, side = <Y,Y>.
+    let mut xp = 0f32;
+    let mut side = 0f32;
+    for j in 0..n {
+        xp += y[j] * x[j];
+        side += y[j] * y[j];
+    }
+    // Compensate for the mid normalisation.
+    let xp = mid * xp;
+    let mid2 = mid; // `SHR16(mid,1)` is the identity in the float build
+    let e_left = mid2 * mid2 + side - 2.0 * xp;
+    let e_right = mid2 * mid2 + side + 2.0 * xp;
+    if e_right < 6e-4 || e_left < 6e-4 {
+        y[..n].copy_from_slice(&x[..n]);
+        return;
+    }
+    let lgain = 1.0 / e_left.sqrt();
+    let rgain = 1.0 / e_right.sqrt();
+    for j in 0..n {
+        let l = mid * x[j];
+        let r = y[j];
+        x[j] = lgain * (l - r);
+        y[j] = rgain * (l + r);
+    }
+}
+
+/// Per-channel distortion weights for the stereo theta rate-distortion trial (libopus
+/// `compute_channel_weights`, `bands.c:371`): the band amplitudes, each nudged up by a third of the
+/// quieter one so the weighting stays conservative.
+#[must_use]
+pub fn compute_channel_weights(energy_left: f32, energy_right: f32) -> [f32; 2] {
+    let min_e = energy_left.min(energy_right);
+    [energy_left + min_e / 3.0, energy_right + min_e / 3.0]
 }
 
 /// In-place Haar transform over `stride`-interleaved pairs (libopus `haar1`): for each pair
@@ -255,6 +318,96 @@ mod tests {
             assert!(c <= prev, "non-monotonic at x={x}: {c} > {prev}");
             prev = c;
         }
+    }
+
+    /// Intensity stereo must reduce to the louder channel when the other is silent, and to the
+    /// normalised sum when both are equally loud.
+    #[test]
+    fn intensity_stereo_weights_by_band_amplitude() {
+        let n = 8usize;
+        let mut band_e = [0f32; 2 * NB_BANDS];
+
+        // Right channel silent → X stays the left channel.
+        band_e[3] = 1.0;
+        band_e[3 + NB_BANDS] = 0.0;
+        let mut x = vec![0.5f32; n];
+        let y = vec![-0.5f32; n];
+        intensity_stereo(&mut x, &y, &band_e, 3, n);
+        assert!(x.iter().all(|&v| (v - 0.5).abs() < 1e-4), "{x:?}");
+
+        // Equal amplitudes → (L+R)/sqrt(2).
+        band_e[3] = 1.0;
+        band_e[3 + NB_BANDS] = 1.0;
+        let mut x = vec![0.5f32; n];
+        let y = vec![0.5f32; n];
+        intensity_stereo(&mut x, &y, &band_e, 3, n);
+        let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2 + 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            x.iter().all(|&v| (v - want).abs() < 1e-3),
+            "{x:?} vs {want}"
+        );
+    }
+
+    /// `stereo_split` then `stereo_merge` with the matching `mid` must recover the original L/R
+    /// pair up to each channel's normalisation — the encode/decode pair the stereo path relies on.
+    #[test]
+    fn stereo_split_then_merge_recovers_the_channel_directions() {
+        let n = 16usize;
+        let left: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3).sin() * 0.25).collect();
+        let right: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.3 + 0.7).sin() * 0.25)
+            .collect();
+        let mut x = left.clone();
+        let mut y = right.clone();
+        stereo_split(&mut x, &mut y, n);
+        // `mid` is the norm of the split mid channel, which `compute_theta` derives from itheta;
+        // here we take it directly so the merge is the exact inverse.
+        let mid = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        // The merge expects a unit-norm mid and the (already scaled) side.
+        for v in x.iter_mut() {
+            *v /= mid;
+        }
+        stereo_merge(&mut x, &mut y, mid, n);
+        // Directions must match the originals (each channel is renormalised, so compare cosines).
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(p, q)| p * q).sum();
+            let na = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+        assert!(cos(&x, &left) > 0.999, "left cos {}", cos(&x, &left));
+        assert!(cos(&y, &right) > 0.999, "right cos {}", cos(&y, &right));
+    }
+
+    /// The degenerate guard: a merge whose reconstructed channel energy collapses must copy mid
+    /// into both channels rather than divide by ~0.
+    #[test]
+    fn stereo_merge_falls_back_on_degenerate_energy() {
+        let n = 4usize;
+        // A zero side and a zero mid gain collapse both El and Er to 0.
+        let mut x = vec![0.5f32; n];
+        let mut y = vec![0.0f32; n];
+        let original_x = x.clone();
+        stereo_merge(&mut x, &mut y, 0.0, n);
+        assert_eq!(x, original_x, "mid must be left untouched on the fallback");
+        assert_eq!(y, original_x, "side must be replaced by mid");
+
+        // A healthy pair must *not* take the fallback (both channels get rewritten).
+        let mut x = vec![0.5f32; n];
+        let mut y: Vec<f32> = (0..n).map(|i| 0.2 * (i as f32 - 1.5)).collect();
+        stereo_merge(&mut x, &mut y, 1.0, n);
+        assert_ne!(x, y, "a non-degenerate merge must separate the channels");
+    }
+
+    #[test]
+    fn channel_weights_favour_the_louder_channel_but_stay_conservative() {
+        let w = compute_channel_weights(9.0, 3.0);
+        assert!((w[0] - 10.0).abs() < 1e-5, "{w:?}");
+        assert!((w[1] - 4.0).abs() < 1e-5, "{w:?}");
+        assert!(w[0] > w[1]);
+        // Equal energies give equal weights.
+        let w = compute_channel_weights(2.0, 2.0);
+        assert!((w[0] - w[1]).abs() < 1e-6);
     }
 
     #[test]

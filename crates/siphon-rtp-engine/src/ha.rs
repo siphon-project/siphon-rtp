@@ -159,6 +159,64 @@ pub struct CodecSnapshot {
     /// transcode call re-encodes at the same rate. `None` = the codec default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encode_mode: Option<u8>,
+    /// The full negotiated AMR `mode-set` (RFC 4867 §8.1), preserved so a restored call still clamps
+    /// per-frame CMR adaptation into the set the peer permitted (without it the restored encoder
+    /// would be free to answer a CMR with a mode the peer disallowed). Empty when unconstrained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_modes: Vec<u8>,
+    /// The negotiated RFC 7587 Opus `a=fmtp` parameters, preserved so a restored Opus leg keeps the
+    /// channel layout, packetization ceiling, and rate-control/FEC/DTX limits it negotiated. `None`
+    /// for a non-Opus codec, and for an Opus leg whose peer declared nothing (the RFC defaults apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus: Option<OpusSnapshot>,
+}
+
+/// The RFC 7587 §6.1 Opus `a=fmtp` parameters (mirror of `siphon_rtp_codec::factory::OpusParams`,
+/// which is serde-free — the codec crate carries no serialization dependency).
+///
+/// Every field is `#[serde(default)]` and skipped when it holds its RFC 7587 default, so a snapshot
+/// of a plain Opus leg stays compact and a snapshot written by an older node still restores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpusSnapshot {
+    /// `maxaveragebitrate` in bit/s (RFC 7587 §6.1); `None` = unstated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_average_bitrate: Option<u32>,
+    /// `maxplaybackrate` in Hz; RFC default 48000.
+    #[serde(default = "default_opus_playback_rate_hz")]
+    pub max_playback_rate_hz: u32,
+    /// `maxptime` in ms; RFC default 120.
+    #[serde(default = "default_opus_max_ptime_ms")]
+    pub max_ptime_ms: u8,
+    /// `stereo` — the peer can render stereo (RFC default 0).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stereo: bool,
+    /// `sprop-stereo` — the peer sends stereo (RFC default 0).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sprop_stereo: bool,
+    /// `cbr` — constant bitrate requested (RFC default 0).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cbr: bool,
+    /// `useinbandfec` — the peer's decoder uses in-band FEC (RFC default 0).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_inband_fec: bool,
+    /// `usedtx` — the peer accepts DTX (RFC default 0).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_dtx: bool,
+}
+
+/// RFC 7587 §6.1 `maxplaybackrate` default, for the serde `default` of a missing field.
+fn default_opus_playback_rate_hz() -> u32 {
+    siphon_rtp_codec::factory::OpusParams::default().max_playback_rate_hz
+}
+
+/// RFC 7587 §6.1 `maxptime` default, for the serde `default` of a missing field.
+fn default_opus_max_ptime_ms() -> u8 {
+    siphon_rtp_codec::factory::OpusParams::default().max_ptime_ms
+}
+
+/// `skip_serializing_if` predicate for a flag at its RFC 7587 default (off).
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// Which of a call's four possible endpoints a rule refers to — the node-independent stand-in for a
@@ -369,6 +427,8 @@ mod tests {
                 channels: 1,
                 ptime_ms: 20,
                 encode_mode: None,
+                allowed_modes: Vec::new(),
+                opus: None,
             }),
             far_codec: None,
             near_telephone_event: Some(101),
