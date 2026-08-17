@@ -1873,6 +1873,66 @@ fn bench_opus_decode(c: &mut Criterion) {
     group.finish();
 }
 
+/// The **factory / [`Decoder`] trait** path an Opus leg actually runs — µs per 20 ms packet through
+/// `decoder_for`'s trait object, plus the `conceal` a lost packet costs.
+///
+/// `bench_opus_decode` above measures `OpusDecoder` directly and needs the (gitignored) vectors for
+/// real SILK/Hybrid content. This one measures the transcode leg's boundary — trait dispatch, the
+/// per-channel↔interleaved conversion, the capacity arithmetic — and is self-contained: a CELT-only
+/// packet is a TOC byte plus one frame from this crate's own (vector-gated) CELT encoder, so it
+/// always runs, including on a bare checkout.
+fn bench_opus_codec(c: &mut Criterion) {
+    use siphon_rtp_codec::factory::{decoder_for, CodecSpec, OpusParams};
+    use siphon_rtp_codec::opus::decoder::MAX_PACKET_SAMPLES;
+
+    const FRAME: usize = 960; // 20 ms at 48 kHz
+    let mut encoder = CeltEncoder::new().expect("celt encoder");
+    encoder.set_bitrate(64_000);
+    encoder.set_rate_control(RateControl::ConstrainedVbr);
+    let signal = celt_signal(3 * FRAME);
+    let mut payload = vec![0u8; 1275];
+    for index in 0..2 {
+        let _ = encoder.encode(
+            &signal[index * FRAME..(index + 1) * FRAME],
+            FRAME,
+            &mut payload,
+        );
+    }
+    let written = encoder
+        .encode(&signal[2 * FRAME..], FRAME, &mut payload)
+        .expect("encode");
+    // RFC 6716 §3.2.2 code-0 packet: config 31 (CELT-only, fullband, 20 ms) TOC, then the frame.
+    let mut packet = Vec::with_capacity(1 + written);
+    packet.push(31 << 3);
+    packet.extend_from_slice(&payload[..written]);
+
+    let mut group = c.benchmark_group("opus_codec");
+    for (label, sprop_stereo) in [("mono", false), ("stereo", true)] {
+        let spec = CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(OpusParams {
+            sprop_stereo,
+            ..OpusParams::default()
+        }));
+        let mut decoder = decoder_for(&spec).expect("Opus decoder from the factory");
+        let mut output = vec![0i16; MAX_PACKET_SAMPLES * 2];
+        let _ = decoder.decode(&packet, &mut output);
+        group.bench_function(format!("decode_20ms_{label}"), |b| {
+            b.iter(|| {
+                let produced = decoder
+                    .decode(black_box(&packet), black_box(&mut output))
+                    .expect("decode");
+                black_box(produced)
+            });
+        });
+        group.bench_function(format!("conceal_20ms_{label}"), |b| {
+            b.iter(|| {
+                let produced = decoder.conceal(black_box(&mut output)).expect("conceal");
+                black_box(produced)
+            });
+        });
+    }
+    group.finish();
+}
+
 // AMR-WB/NB kernel benches are compiled only when the patent-gated `amr` feature is enabled.
 #[cfg(feature = "amr")]
 criterion_group!(
@@ -1892,6 +1952,7 @@ criterion_group!(
     bench_silk_frame,
     bench_silk_encode,
     bench_opus_decode,
+    bench_opus_codec,
     bench_basic_ops,
     bench_amrwb_dsp,
     bench_amrwb_codebook,
@@ -1918,6 +1979,7 @@ criterion_group!(
     bench_silk_synthesis,
     bench_silk_frame,
     bench_silk_encode,
-    bench_opus_decode
+    bench_opus_decode,
+    bench_opus_codec
 );
 criterion_main!(benches);

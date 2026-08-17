@@ -8,6 +8,9 @@
 //! into the allocator, and allocate-then-free churn (invisible to a live-bytes delta) is exactly the
 //! kind of regression a `Vec` slipped into `decode_frame` would cause.
 //!
+//! Both entry points are gated: [`OpusDecoder`] directly, and the [`siphon_rtp_codec::Decoder`]
+//! trait object [`decoder_for`] builds for a negotiated leg — the one the media slow path runs.
+//!
 //! [`OpusDecoder`] allocates exactly once, at construction, for the whole-packet float scratch the
 //! 16-bit entry point needs; everything else — the SILK PCM staging buffer, the redundancy frame,
 //! the mode-transition cross-fade buffer, both layers' state — is a fixed-size array on the stack or
@@ -19,6 +22,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use siphon_rtp_codec::factory::{decoder_for, CodecSpec, OpusParams};
 use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
 
 /// A pass-through allocator that counts allocations, so a test can assert a hot loop made none.
@@ -231,6 +235,83 @@ fn mode_switching_allocates_nothing() {
         allocations, 0,
         "{allocations} allocations across 8 passes over 6 mode switches"
     );
+}
+
+/// A real RFC 6716 §3.2.2 code-0 packet: a config-31 TOC (CELT-only, fullband, 20 ms) followed by
+/// one CELT frame of deterministic audio. Unlike [`packet`] this decodes to genuine samples, so the
+/// trait-path gate below measures the branches a live leg takes rather than a degenerate parse.
+fn celt_audio_packet() -> Vec<u8> {
+    use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
+
+    const FRAME: usize = 960;
+    let mut encoder = CeltEncoder::new().expect("celt encoder");
+    encoder.set_bitrate(64_000);
+    encoder.set_rate_control(RateControl::ConstrainedVbr);
+    let mut state = 0x5EED_u32;
+    let pcm: Vec<f32> = (0..FRAME)
+        .map(|index| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((state >> 16) as f32 / 32768.0 - 1.0) * 0.02;
+            let time = index as f32;
+            0.35 * (time * 0.031).sin() + 0.18 * (time * 0.097).sin() + noise
+        })
+        .collect();
+    let mut payload = vec![0u8; 1275];
+    let written = encoder.encode(&pcm, FRAME, &mut payload).expect("encode");
+    let mut packet = Vec::with_capacity(1 + written);
+    packet.push(31 << 3);
+    packet.extend_from_slice(&payload[..written]);
+    packet
+}
+
+/// The **[`Decoder`] trait path** — the one the media slow path actually runs, built through
+/// [`decoder_for`] exactly as a negotiated Opus leg is. `OpusDecoder` allocating nothing is
+/// necessary but not sufficient: the bridge on top of it must not stage a frame through a `Vec`
+/// either, in `decode` or in `conceal`.
+#[test]
+fn the_decoder_trait_path_allocates_nothing_per_frame() {
+    for sprop_stereo in [false, true] {
+        let spec = CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(OpusParams {
+            sprop_stereo,
+            ..OpusParams::default()
+        }));
+        let mut decoder = decoder_for(&spec).expect("Opus decoder from the factory");
+        let packet = celt_audio_packet();
+        // The size `Direction` hands the decoder: the 120 ms / stereo ceiling, not the ptime frame.
+        let mut pcm = vec![0i16; MAX_PACKET_SAMPLES * 2];
+        // Warm up outside the window: the first packet configures both layers, and construction is
+        // allowed to allocate.
+        decoder.decode(&packet, &mut pcm).expect("warm-up decode");
+        decoder.decode(&packet, &mut pcm).expect("warm-up decode");
+        decoder.conceal(&mut pcm).expect("warm-up conceal");
+
+        let allocations = count_allocations(32, || {
+            decoder.decode(&packet, &mut pcm).expect("decode");
+        });
+        assert_eq!(
+            allocations, 0,
+            "sprop-stereo={sprop_stereo}: {allocations} allocations across 32 decoded frames"
+        );
+
+        // Concealment is the lossy-leg path — the one under load, when an allocator round-trip is
+        // least affordable.
+        let allocations = count_allocations(32, || {
+            decoder.conceal(&mut pcm).expect("conceal");
+        });
+        assert_eq!(
+            allocations, 0,
+            "sprop-stereo={sprop_stereo}: {allocations} allocations across 32 concealed frames"
+        );
+
+        // A zero-length payload (Opus DTX) routes through the same PLC and must be just as free.
+        let allocations = count_allocations(32, || {
+            decoder.decode(&[], &mut pcm).expect("dtx");
+        });
+        assert_eq!(
+            allocations, 0,
+            "sprop-stereo={sprop_stereo}: {allocations} allocations across 32 DTX frames"
+        );
+    }
 }
 
 /// The counting allocator must actually see allocations, or every assertion above is vacuous.

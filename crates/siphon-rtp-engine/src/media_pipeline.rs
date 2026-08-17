@@ -4263,6 +4263,262 @@ mod tests {
         );
     }
 
+    /// The conventional dynamic payload type a WebRTC peer offers Opus on (RFC 7587 §7 makes it
+    /// dynamic; 111 is what browsers use).
+    const OPUS_PT: u8 = 111;
+
+    /// An Opus RTP packet (PT 111) carrying `payload`. RFC 7587 §4.1: the RTP timestamp advances at
+    /// 48 kHz for every mode and every sample rate, so a 20 ms frame steps it by 960.
+    fn opus_rtp(sequence: u16, payload: &[u8]) -> Vec<u8> {
+        let header = RtpHeader {
+            marker: false,
+            payload_type: OPUS_PT,
+            sequence,
+            timestamp: u32::from(sequence) * 960,
+            ssrc: 0x0111_0111,
+        };
+        let mut buffer = vec![0u8; 12 + payload.len()];
+        let len = write_packet(&header, payload, &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    /// A one-way Opus (48 kHz) → G.711a (8 kHz) transcoding call: the WebRTC-trunk / voice-AI shape
+    /// the Opus decode half exists for. The reverse direction is G.711a→G.711a (the Opus *encoder*
+    /// is not built yet, so nothing may ask the factory for one).
+    fn opus_to_g711a_call(ptime_ms: u8) -> MediaCall {
+        use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
+
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            // Exactly what the engine builds for a negotiated Opus leg — `CodecSpec::new` pins the
+            // clock at 48 kHz and the rtpmap channel count at 2 (RFC 7587 §4.1/§7); the audio
+            // channel count comes from `sprop-stereo`, which is absent here, i.e. mono.
+            decoder: decoder_for(&CodecSpec::new(OPUS_PT, "opus", 48_000, 2, ptime_ms))
+                .expect("opus decoder"),
+            encoder: encoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma encoder"),
+            egress_ssrc: 0xB000_0111,
+            egress_payload_type: 8,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::Opus,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: decoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma decoder"),
+            encoder: encoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma encoder"),
+            egress_ssrc: 0xA000_0008,
+            egress_payload_type: 8,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+        };
+        MediaCall::new(
+            "opus-call",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        )
+    }
+
+    /// Build `frames` real Opus packets carrying a deterministic 48 kHz signal.
+    ///
+    /// CELT-only, fullband, code 0 (RFC 6716 §3.2.2): a config-31 TOC byte followed by one CELT
+    /// frame *is* a complete Opus packet, and this crate's CELT encoder is vector-gated, so the
+    /// fixture is real Opus audio without needing the (gitignored) official vectors or an Opus
+    /// encoder that does not exist yet.
+    fn opus_packets(frames: usize) -> Vec<Vec<u8>> {
+        use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
+
+        const CELT_FB_20MS: usize = 960;
+        let mut encoder = CeltEncoder::new().expect("celt encoder");
+        encoder.set_bitrate(64_000);
+        encoder.set_rate_control(RateControl::ConstrainedVbr);
+        let mut state = 0x5EED_u32;
+        let pcm: Vec<f32> = (0..CELT_FB_20MS * frames)
+            .map(|index| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((state >> 16) as f32 / 32768.0 - 1.0) * 0.02;
+                let time = index as f32;
+                0.35 * (time * 0.031).sin() + 0.18 * (time * 0.097).sin() + noise
+            })
+            .collect();
+        let mut payload = vec![0u8; 1275];
+        (0..frames)
+            .map(|index| {
+                let written = encoder
+                    .encode(
+                        &pcm[index * CELT_FB_20MS..(index + 1) * CELT_FB_20MS],
+                        CELT_FB_20MS,
+                        &mut payload,
+                    )
+                    .expect("encode");
+                let mut packet = Vec::with_capacity(1 + written);
+                packet.push(31 << 3); // config 31 (CELT fullband 20 ms), mono, code 0
+                packet.extend_from_slice(&payload[..written]);
+                packet
+            })
+            .collect()
+    }
+
+    /// The WebRTC-trunk / voice-AI core: an Opus (48 kHz) leg transcoded to a PSTN G.711a (8 kHz)
+    /// leg through the media slow path — decode → 48→8 kHz resample → re-encode. Drives the real
+    /// `process()`, the same call the live actor makes, so it proves the Opus decoder is genuinely
+    /// wired into the datapath and not merely constructible.
+    #[test]
+    fn transcodes_opus_to_g711a_with_resampling() {
+        let packets = opus_packets(6);
+        let mut call = opus_to_g711a_call(20);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for (index, packet) in packets.iter().enumerate() {
+            call.process(
+                &rx(1, A_ADDR, opus_rtp(index as u16 + 1, packet)),
+                &mut out,
+                &mut events,
+            );
+        }
+
+        assert!(
+            out.len() >= packets.len() - 1,
+            "each 20 ms Opus packet yields a 20 ms G.711a packet (± the resampler's first frame), \
+             got {} for {} packets",
+            out.len(),
+            packets.len()
+        );
+        let mut audible = 0usize;
+        for datagram in &out {
+            assert_eq!(
+                datagram.endpoint,
+                endpoint(2),
+                "sent from B's engine socket"
+            );
+            assert_eq!(datagram.dst, addr(B_ADDR));
+            let packet = RtpPacket::parse(&datagram.data).expect("parse");
+            assert_eq!(packet.payload_type, 8, "re-encoded as G.711a (PT 8)");
+            assert_eq!(packet.payload.len(), 160, "20 ms at 8 kHz, 1 byte/sample");
+            assert_eq!(packet.ssrc, 0xB000_0111, "stamped with the A→B egress SSRC");
+            // 0xD5 is A-law digital silence; anything else is decoded Opus audio.
+            if packet.payload.iter().any(|&byte| byte != 0xD5) {
+                audible += 1;
+            }
+        }
+        assert!(
+            audible >= out.len() - 1,
+            "the transcoded G.711a must carry the decoded Opus audio, not silence ({audible} of \
+             {} packets had signal)",
+            out.len()
+        );
+    }
+
+    /// Packet loss on the Opus leg: the far side must still receive a full 20 ms G.711a frame,
+    /// synthesized by the Opus PLC (RFC 6716 §4.4) rather than by a gap or a mute. Exercises the
+    /// same `Decoder::conceal` the jitter buffer drives.
+    #[test]
+    fn conceals_a_lost_opus_frame_into_the_g711a_egress() {
+        use siphon_rtp_codec::factory::{decoder_for, CodecSpec};
+
+        let packets = opus_packets(4);
+        let mut decoder =
+            decoder_for(&CodecSpec::new(OPUS_PT, "opus", 48_000, 2, 20)).expect("opus decoder");
+        let mut pcm = vec![0i16; decoder.frame_samples()];
+        for packet in &packets {
+            decoder.decode(packet, &mut pcm).expect("decode");
+        }
+        let mut concealed = vec![0i16; decoder.frame_samples()];
+        let written = decoder.conceal(&mut concealed).expect("conceal");
+        assert_eq!(written, 960, "one 20 ms frame at 48 kHz");
+        let energy: i64 = concealed[..written]
+            .iter()
+            .map(|&sample| i64::from(sample) * i64::from(sample))
+            .sum();
+        assert!(
+            energy > 1_000_000,
+            "concealment must extrapolate the signal, not emit silence (energy {energy})"
+        );
+    }
+
+    /// The official RFC 6716 test vectors (gitignored, see CONTRIBUTING.md) pushed through the same
+    /// transcoding `Direction` — real libopus-encoded SILK / Hybrid / CELT packets, not our own
+    /// encode. Skips with a notice when the vector set is absent, like every other vector gate.
+    #[test]
+    fn transcodes_an_official_opus_vector_to_g711a() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../reference/opus/opus_testvectors/testvector01.bit");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!(
+                "skipping: {} absent (the RFC 6716 vectors are gitignored — see CONTRIBUTING.md)",
+                path.display()
+            );
+            return;
+        };
+        // `opus_demo` `.bit` framing: repeated [u32 BE length][u32 BE reference range][payload].
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let mut offset = 0usize;
+        while offset + 8 <= bytes.len() {
+            let length = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+            offset += 8;
+            if offset + length > bytes.len() {
+                break;
+            }
+            payloads.push(bytes[offset..offset + length].to_vec());
+            offset += length;
+        }
+        assert!(!payloads.is_empty(), "the vector file carried no packets");
+
+        let mut call = opus_to_g711a_call(20);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for (index, payload) in payloads.iter().take(200).enumerate() {
+            call.process(
+                &rx(1, A_ADDR, opus_rtp(index as u16 + 1, payload)),
+                &mut out,
+                &mut events,
+            );
+        }
+
+        assert!(
+            !out.is_empty(),
+            "the official vector must transcode to G.711a packets"
+        );
+        let mut audible = 0usize;
+        for datagram in &out {
+            let packet = RtpPacket::parse(&datagram.data).expect("parse");
+            assert_eq!(packet.payload_type, 8);
+            assert_eq!(packet.payload.len(), 160);
+            if packet.payload.iter().any(|&byte| byte != 0xD5) {
+                audible += 1;
+            }
+        }
+        assert!(
+            audible * 2 > out.len(),
+            "most of the transcoded vector must be audio, not silence ({audible} of {} packets)",
+            out.len()
+        );
+    }
+
     /// A minimal RTCP sender-report-shaped datagram (version 2, PT 200) carrying `ssrc` — the shape
     /// [`is_rtcp`] classifies as RTCP and the SRTCP contexts (de)crypt.
     fn rtcp_sr(ssrc: u32) -> Vec<u8> {

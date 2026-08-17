@@ -11,6 +11,7 @@
 //! | [`silk`] | The linear-prediction speech layer (§4.2), plus concealment and comfort noise (§4.4) |
 //! | [`celt`] | The MDCT/PVQ transform layer (§4.3), plus its own concealment |
 //! | [`decoder`] | Mode dispatch, Hybrid, redundancy, mode transitions, FEC, rate and channel conversion (§4.5) |
+//! | [`codec`] | [`codec::OpusCodec`], the crate's [`crate::Decoder`] over [`decoder::OpusDecoder`] — what [`crate::factory`] builds for a leg |
 //!
 //! The **decoder is complete**: all three modes, all five bandwidths, every frame duration from
 //! 2.5 ms to 120 ms multi-frame packets, full stereo, all five output rates, PLC, in-band FEC and
@@ -33,6 +34,7 @@
 //! extensions. None is part of RFC 6716.
 
 pub mod celt;
+pub mod codec;
 pub mod decoder;
 pub mod enc;
 pub mod packet;
