@@ -15,12 +15,19 @@ use tokio::time::interval;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::bridge::audio::MAX_FRAME_SAMPLES;
 use crate::bridge::protocol::ControlMessage;
 use crate::bridge::session::BridgeSession;
+use crate::leg::MAX_RTP_PACKET;
 
-/// Scratch buffer sizes: uplink L16 (48 kHz × 20 ms × 2 B) and a downlink RTP packet.
-const UPLINK_CAP: usize = 4096;
-const DOWNLINK_CAP: usize = 1600;
+/// Uplink scratch: the longest L16 frame [`BridgeSession::tick`] can emit. The core folds a
+/// multi-channel decode to mono at the codec boundary, so this is mono — 48 kHz × the engine's ptime
+/// ceiling × 2 B ([`MAX_FRAME_SAMPLES`]) = 11520 B. Derived, not chosen: a fixed 4096 here silently
+/// truncated (and, with the staging slot, muted) every leg past 42 ms at 48 kHz.
+const UPLINK_CAP: usize = MAX_FRAME_SAMPLES * 2;
+/// Downlink scratch: one rendered RTP packet — header plus the largest payload the leg will emit,
+/// which is an MTU bound rather than a ptime one (see [`MAX_RTP_PACKET`]).
+const DOWNLINK_CAP: usize = MAX_RTP_PACKET;
 
 /// Errors from the WebSocket bridge transport.
 #[derive(Debug, thiserror::Error)]
