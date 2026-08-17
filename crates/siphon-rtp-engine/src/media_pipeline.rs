@@ -426,6 +426,13 @@ pub struct Direction {
     /// on a plaintext leg — the existing transcode path is unchanged.
     secure_ingress: Option<Arc<Mutex<SecureLeg>>>,
     secure_egress: Option<Arc<Mutex<SecureLeg>>>,
+    /// This direction faces a peer whose key is still being negotiated — a DTLS-SRTP leg (RFC 5764)
+    /// whose handshake has not completed. **All** media on it is dropped while set: an unkeyed secure
+    /// ingress would otherwise be decoded as if it were plaintext (turning ciphertext into noise at
+    /// the far end), and an unkeyed secure egress would put the other party's cleartext on the wire.
+    /// Cleared by [`MediaCall::attach_secure_leg`] when the handshake delivers the key; always `false`
+    /// on a plaintext or SDES leg, whose key is known at answer time.
+    secure_pending: bool,
     /// Receiver-side reception statistics for this direction's inbound stream (RFC 3550 §6.4.1): the
     /// loss / jitter (and RTT, when measured) feeding the periodic [`Event::CallQuality`] a 2-party
     /// transcode call reports on the control channel — the transcode counterpart to the conference
@@ -683,6 +690,19 @@ pub struct RtcpRelay {
     secure_ingress: Option<Arc<Mutex<SecureLeg>>>,
     /// Encrypt RTCP→SRTCP when the egress faces the secure peer.
     secure_egress: Option<Arc<Mutex<SecureLeg>>>,
+    /// Which side of this relay a *pending* DTLS key belongs to, for a leg whose handshake has not
+    /// completed. `None` on a plaintext or SDES relay (keyed at answer time). While set, the relay
+    /// drops — same reasoning as [`Direction::secure_pending`], applied to SRTCP.
+    secure_pending: Option<SecureSide>,
+}
+
+/// Which side of a relay an as-yet-undelivered DTLS key will be installed on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SecureSide {
+    /// The ingress faces the secure peer — decrypt SRTCP→RTCP once keyed.
+    Ingress,
+    /// The egress faces the secure peer — encrypt RTCP→SRTCP once keyed.
+    Egress,
 }
 
 impl RtcpRelay {
@@ -701,6 +721,7 @@ impl RtcpRelay {
             egress_dst,
             secure_ingress: None,
             secure_egress: None,
+            secure_pending: None,
         }
     }
 
@@ -718,10 +739,34 @@ impl RtcpRelay {
         self
     }
 
+    /// Mark this relay as awaiting a DTLS key on `side` — it drops until
+    /// the call's `attach_secure_leg` delivers one (RFC 5764: no key, no traffic).
+    #[must_use]
+    pub fn with_pending_secure(mut self, side: SecureSide) -> Self {
+        self.secure_pending = Some(side);
+        self
+    }
+
+    /// Install the DTLS handshake's [`SecureLeg`] on whichever side [`RtcpRelay::with_pending_secure`]
+    /// flagged, and start relaying. A no-op on a relay that was never pending (a plaintext or SDES
+    /// leg), so the caller can hand the key to every relay without tracking which need it.
+    fn attach_secure_leg(&mut self, leg: &Arc<Mutex<SecureLeg>>) {
+        match self.secure_pending.take() {
+            Some(SecureSide::Ingress) => self.secure_ingress = Some(leg.clone()),
+            Some(SecureSide::Egress) => self.secure_egress = Some(leg.clone()),
+            None => {}
+        }
+    }
+
     /// Relay one RTCP datagram: SRTCP-decrypt (if the ingress is secure) → SRTCP-encrypt (if the
     /// egress is secure — [`SecureLeg`] auto-demuxes RTCP) → transmit toward the peer's RTCP address.
     /// Drops on any (de)crypt failure — never forward garbage RTCP.
     fn relay(&self, data: &[u8], out: &mut Vec<Outbound>) {
+        // Awaiting the DTLS handshake: drop rather than relay SRTCP verbatim (to a peer that cannot
+        // read it) or RTCP in the clear (to one that must not receive it unencrypted).
+        if self.secure_pending.is_some() {
+            return;
+        }
         let decrypted;
         let plaintext: &[u8] = if let Some(leg) = &self.secure_ingress {
             let mut buffer = Vec::new();
@@ -899,6 +944,7 @@ impl Direction {
             comfort: None,
             secure_ingress: None,
             secure_egress: None,
+            secure_pending: false,
             // The ingress interarrival jitter is measured at the ingress codec's RTP clock (RFC 3550
             // §6.4.1), which the decoder exposes — 8 kHz for G.711, 16 kHz for AMR-WB, etc.
             ingress: IngressStats::new(ingress_rtp_clock_rate_hz),
@@ -962,6 +1008,7 @@ impl Direction {
             comfort: None,
             secure_ingress: None,
             secure_egress: None,
+            secure_pending: false,
             // A relay-only direction never builds a quality report (a promoted passthrough is spawned
             // with no control-event sink, and its quality is reported off the in-kernel relay's RTCP
             // via `Engine::run_rtcp_export`), so its reception estimator stays inert — never fed.
@@ -1144,6 +1191,14 @@ impl Direction {
         comfort_enabled: bool,
         out: &mut Vec<Outbound>,
     ) -> Option<FinishedPlay> {
+        // A peer whose DTLS handshake has not keyed the leg gets nothing — and, crucially, an
+        // injection is **held** rather than advanced. `push_egress` would drop each rendered frame
+        // anyway, so ticking the player on would silently burn a prompt down to nothing while the
+        // handshake ran, and the caller would hear a `PlayFinished{Completed}` for audio no one ever
+        // received. Holding it means a prompt queued at answer time plays in full once the key lands.
+        if self.secure_pending {
+            return None;
+        }
         if self.injection.is_some() {
             return self.tick_injection(out);
         }
@@ -1303,6 +1358,12 @@ impl Direction {
         events: &mut Vec<Event>,
     ) -> Option<u32> {
         if data.len() < 2 {
+            return None;
+        }
+        // A DTLS leg whose handshake has not keyed it yet: drop, never interpret. Decoding SRTP as
+        // plaintext would emit noise at the peer, and forwarding it verbatim would leak the encrypted
+        // stream to a party that never negotiated it (docs/security-and-nat.md §4).
+        if self.secure_pending {
             return None;
         }
         // Secure ingress (SDES-SRTP): decrypt before anything else, so the tee / relay / RFC 5761
@@ -1602,6 +1663,12 @@ impl Direction {
     /// demuxed by [`SecureLeg`]) first when the egress faces a secure peer. `plaintext` is a complete
     /// RTP or RTCP packet; on a plaintext leg it is forwarded verbatim. A failed protect drops it.
     fn push_egress(&self, plaintext: &[u8], out: &mut Vec<Outbound>) {
+        // Unkeyed secure peer: emit nothing rather than send it cleartext. This is the one choke point
+        // every egress datagram passes through — transcode, injected prompt, comfort noise, relayed
+        // telephone-event and echo reflect alike — so the guard cannot be bypassed by a new caller.
+        if self.secure_pending {
+            return;
+        }
         let data = if let Some(leg) = self.secure_egress.as_ref() {
             let mut sealed = Vec::new();
             let Ok(mut guard) = leg.lock() else { return };
@@ -1816,6 +1883,33 @@ impl MediaCall {
         self.a_to_b.secure_egress = Some(leg.clone());
         self.b_to_a.secure_ingress = Some(leg);
         self
+    }
+
+    /// Mark this call's far (B) leg as **DTLS-keyed-later**: the topology is the same as
+    /// [`MediaCall::with_far_secure_leg`], but the [`SecureLeg`] does not exist yet because the DTLS
+    /// handshake (RFC 5764) has not completed. Until [`MediaCall::attach_secure_leg`] delivers it,
+    /// both directions facing B **drop** media rather than treat SRTP as plaintext — decoding
+    /// ciphertext as G.711 would emit noise at the peer and leak keystream-shaped audio, so an unkeyed
+    /// secure direction must be inert, not permissive.
+    #[must_use]
+    pub fn with_far_secure_pending(mut self) -> Self {
+        self.a_to_b.secure_pending = true;
+        self.b_to_a.secure_pending = true;
+        self
+    }
+
+    /// Install the far (B) leg's [`SecureLeg`] once the DTLS handshake has produced it
+    /// ([`MediaControl::AttachSecureLeg`]), keying the same two directions
+    /// [`MediaCall::with_far_secure_leg`] does and clearing the pending gate so media starts flowing.
+    /// Also keys any companion (non-muxed) RTCP relays, which share the one leg.
+    pub fn attach_secure_leg(&mut self, leg: Arc<Mutex<SecureLeg>>) {
+        self.a_to_b.secure_egress = Some(leg.clone());
+        self.a_to_b.secure_pending = false;
+        self.b_to_a.secure_ingress = Some(leg.clone());
+        self.b_to_a.secure_pending = false;
+        for relay in &mut self.rtcp {
+            relay.attach_secure_leg(&leg);
+        }
     }
 
     /// The call's shared SDES-SRTP leg, when this is a secure-transcode (`SrtpMedia`) call — so the
@@ -2554,6 +2648,10 @@ pub enum MediaControl {
     Report {
         reply: tokio::sync::oneshot::Sender<FinalCallQuality>,
     },
+    /// Deliver the far (B) leg's [`SecureLeg`] once its DTLS handshake completed (RFC 5764), keying
+    /// the directions that face B and clearing the pending gate so media starts flowing. Sent by the
+    /// handshake task, which cannot key the pipeline at answer time because no key exists yet.
+    AttachSecureLeg { leg: Arc<Mutex<SecureLeg>> },
     /// Tear the call down: flush recordings and exit the actor loop.
     Stop,
 }
@@ -2849,6 +2947,10 @@ async fn run_media_call<D>(
                         call.start_recording(capture);
                     }
                     MediaInput::Control(MediaControl::StopRecording) => call.stop_recording(),
+                    MediaInput::Control(MediaControl::AttachSecureLeg { leg }) => {
+                        call.attach_secure_leg(leg);
+                        tracing::debug!(target: "siphon_rtp::media", "DTLS-SRTP key installed on the media pipeline");
+                    }
                     MediaInput::Control(MediaControl::Report { reply }) => {
                         // Read-only snapshot for the engine's CDR; the actor keeps running.
                         let _ = reply.send(call.final_quality());
@@ -3000,6 +3102,42 @@ mod tests {
             true,
             None,
         )
+    }
+
+    /// The pending-key gate must cover **egress that the pipeline synthesises itself**, not just
+    /// relayed ingress. A prompt, comfort noise, a relayed telephone-event or an echo reflect all
+    /// reach the wire through `push_egress`, so an unkeyed DTLS peer must receive none of them —
+    /// otherwise the engine puts the other party's cleartext on a link that negotiated encryption.
+    #[test]
+    fn an_unkeyed_dtls_leg_emits_nothing_even_from_an_injected_prompt() {
+        let mut call = ulaw_alaw_call().with_far_secure_pending();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // A prompt toward the still-unkeyed secure party B, then many playout ticks.
+        call.start_play_audio(false, prompt_player(50), 1, &mut events);
+        for _ in 0..50 {
+            call.tick(&mut out, &mut events);
+        }
+        assert!(
+            out.is_empty(),
+            "an injected prompt must not reach a peer whose DTLS handshake has not keyed the leg: \
+             {} datagram(s) escaped",
+            out.len()
+        );
+
+        // Once the key lands, the same call emits normally — the gate is a hold, not a mute.
+        let key = siphon_rtp_srtp::sdes::SrtpKeyMaterial::from_inline_bytes(&[3u8; 30])
+            .expect("30 bytes");
+        call.attach_secure_leg(Arc::new(Mutex::new(SecureLeg::new(&key, &key))));
+        out.clear();
+        for _ in 0..5 {
+            call.tick(&mut out, &mut events);
+        }
+        assert!(
+            !out.is_empty(),
+            "after AttachSecureLeg the prompt must play out to the now-keyed peer"
+        );
     }
 
     /// Re-registering a call id must **retire** the displaced actor, not detach it. Dropping a
