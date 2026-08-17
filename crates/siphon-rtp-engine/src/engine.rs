@@ -18,7 +18,7 @@ use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use siphon_rtp_codec::factory::{self, CodecSpec};
+use siphon_rtp_codec::factory::{self, CodecSpec, OPUS_MAX_PTIME_MS};
 use siphon_rtp_datapath::{
     AddressFamily, Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceAgentMode,
     IceConfig, LatchPolicy, ObservedRtcp, SourceFilter,
@@ -6300,20 +6300,42 @@ fn answer_codec_candidates(info: &sdp::MediaInfo, policy: &sdp::CodecPolicy) -> 
     candidates
 }
 
-/// Upper bound on a control-`ptime` override, in milliseconds. A sane telephony ceiling (the common
-/// values are 10 / 20 / 30 / 40 ms); it also keeps the egress frame within the transcode scratch
-/// buffer at every codec rate the engine encodes, so an absurd value can never overflow it.
-const MAX_PTIME_OVERRIDE_MS: u8 = 40;
+/// Upper bound on a control-`ptime` override, in milliseconds.
+///
+/// The **same** ceiling the negotiated (SDP `a=ptime`) path uses, deliberately: the engine must not
+/// answer one number to `a=ptime:60` and a different one to `ptime=60` on the control flag. It was
+/// previously 40, justified by keeping the egress frame inside the transcode scratch buffer — that
+/// rationale went away when those buffers were sized from [`OPUS_MAX_PTIME_MS`] (48 kHz × 120 ms ×
+/// 2 channels), so all that remained was a second, lower, silent ceiling.
+///
+/// 120 ms is RFC 7587 §6.1's `maxptime` default for Opus and comfortably legal elsewhere (G.711 at
+/// 120 ms is a 960-byte payload, well inside an MTU). RFC 4566 §6 makes ptime advisory in any case,
+/// and how much one-way latency to trade for packet-rate is the operator's call — which is what the
+/// control flag exists to express.
+const MAX_PTIME_OVERRIDE_MS: u8 = OPUS_MAX_PTIME_MS;
 
 /// Parse rtpengine's `ptime=<N>` flag into an egress packetization override in milliseconds, clamped
 /// to `1..=MAX_PTIME_OVERRIDE_MS`. `None` when the flag is absent or unparseable — the negotiated
 /// (SDP `a=ptime`) packetization then stands. The first well-formed `ptime=` flag wins.
+///
+/// A clamp is logged rather than applied silently: a controller that asked for 200 ms and got 120
+/// otherwise has no way to tell its request was not honoured.
 fn parse_ptime_override(flags: &[String]) -> Option<u8> {
     flags.iter().find_map(|flag| {
         flag.strip_prefix("ptime=")
             .and_then(|value| value.trim().parse::<u16>().ok())
             .filter(|&value| value >= 1)
-            .map(|value| (value.min(u16::from(MAX_PTIME_OVERRIDE_MS))) as u8)
+            .map(|value| {
+                if value > u16::from(MAX_PTIME_OVERRIDE_MS) {
+                    tracing::warn!(
+                        target: "siphon_rtp::control",
+                        requested_ms = value,
+                        clamped_ms = MAX_PTIME_OVERRIDE_MS,
+                        "ptime override above the ceiling; clamping"
+                    );
+                }
+                (value.min(u16::from(MAX_PTIME_OVERRIDE_MS))) as u8
+            })
     })
 }
 
@@ -8068,6 +8090,20 @@ mod tests {
             Some(MAX_PTIME_OVERRIDE_MS),
             "an absurd ptime is clamped to the ceiling"
         );
+        // The control flag and the negotiated `a=ptime` must answer the same request the same way.
+        // These were two different ceilings (40 vs 120), so `a=ptime:60` was honoured while
+        // `ptime=60` was silently clamped to 40 — the same call, two answers, one of them invisible.
+        assert_eq!(
+            MAX_PTIME_OVERRIDE_MS, OPUS_MAX_PTIME_MS,
+            "the control-flag ceiling must equal the negotiated one, or the two paths disagree"
+        );
+        for requested in [60u8, 80, 100, 120] {
+            assert_eq!(
+                parse_ptime_override(&[format!("ptime={requested}")]),
+                Some(requested),
+                "a long ptime the negotiated path accepts must not be clamped on the control flag"
+            );
+        }
         assert_eq!(
             parse_ptime_override(&["ptime=0".into()]),
             None,
