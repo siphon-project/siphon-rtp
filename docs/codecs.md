@@ -104,7 +104,10 @@ defines 2.5/5/10/20/40/60 ms frames and §3.2 extends that to 80/100/120 ms mult
 packets, so `a=ptime:30` (legal SDP, and common on G.711 trunks) is sent as 20 ms rather
 than failing every encode. RFC 4566 §6 makes `ptime` a recommendation, so this is within
 spec; the decode side snaps identically, which keeps both halves of one leg describing the
-same frame. The application is `VoIP` (libopus `OPUS_APPLICATION_VOIP`) — every Opus leg the
+same frame. (The `a=ptime` the engine *advertises* is still the negotiated value, so on an
+off-grid ptime the advertisement rounds up on what is sent — harmless, since a shorter
+packet than advertised is always acceptable, but worth knowing when reading a trace.)
+The application is `VoIP` (libopus `OPUS_APPLICATION_VOIP`) — every Opus leg the
 engine encodes toward is a telephony leg. Egress is mono; Opus is **stateful**, so it never
 joins the conference's shared-encode fan-out (each listener gets its own encode).
 
