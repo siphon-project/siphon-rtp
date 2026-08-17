@@ -3989,8 +3989,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let Some(codec) = info.primary_codec() else {
             return error_result("conference_join", &"offer has no audio codec");
         };
-        // Build the participant's codecs. `encoder_for` rejects a decode-only codec (AMR-WB): we can
-        // mix in such a leg's audio but cannot encode the room back to it yet, so the seat is refused.
+        // Build the participant's codecs. `encoder_for` rejects a decode-only codec: we can mix in
+        // such a leg's audio but cannot encode the room back to it, so the seat is refused.
         let decoder = match factory::decoder_for(&codec) {
             Ok(decoder) => decoder,
             Err(error) => return error_result("conference_join: decoder", &error),
@@ -4001,10 +4001,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return error_result(
                     "conference_join",
                     &format!(
-                        "codec {} has no encoder, so the room mix cannot be sent to this participant \
-                         (AMR-WB / AMR-NB need the `amr` build feature; Opus encode is not implemented)",
-                        codec.encoding_name
-                    ),
+                    "codec {} has no encoder, so the room mix cannot be sent to this participant \
+                         (AMR-WB / AMR-NB need the `amr` build feature)",
+                    codec.encoding_name
+                ),
                 )
             }
         };
@@ -6346,8 +6346,8 @@ const OPUS_DYNAMIC_PAYLOAD_TYPE: u8 = 111;
 /// `None` for an unknown name, and — crucially — for a *known* name the codec factory cannot actually
 /// build an encoder for. That is enforced by probing [`factory::encoder_for`] rather than by a
 /// hand-maintained list, so this table can never drift into advertising a transcode target that fails
-/// at answer: AMR-WB without the `amr` build feature, or Opus before its encoder lands, simply drop
-/// out, and light up on their own once the factory can serve them.
+/// at answer: AMR-WB without the `amr` build feature simply drops out, and lights up on its own once
+/// the factory can serve it (which is exactly how Opus arrived, with no edit here).
 fn transcode_codec_spec(name: &str) -> Option<CodecSpec> {
     let upper = name.to_ascii_uppercase();
     // (payload type, RTP clock, rtpmap channels, ptime): the last two are per-codec, not universal —
@@ -7362,6 +7362,18 @@ mod tests {
             advertised,
             opus_is_transcodable(),
             "the node_info codec list must track the factory, not a static list"
+        );
+        // Both halves of RFC 6716 are wired and Opus carries no build feature (royalty-free), so
+        // this build is on the true side of that relationship: the dispatcher must see `opus`.
+        assert!(
+            opus_is_transcodable(),
+            "Opus decode and encode are both wired, so the probe must say so"
+        );
+        assert!(advertised, "node_info must advertise opus");
+        // And the transcode-target table resolves it too, so `codec-transcode-opus` can be forced.
+        assert!(
+            transcode_codec_spec("OPUS").is_some(),
+            "a bidirectionally transcodable Opus must be a usable transcode target"
         );
     }
 

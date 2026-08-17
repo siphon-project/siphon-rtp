@@ -54,7 +54,7 @@ status on the right (passthrough of every codec is always available, per the rul
 | CN (RFC 3389) | free | generate/decode only |
 | iLBC | royalty-free (Google/WebRTC, BSD) | not implemented (passthrough only) |
 | Speex | royalty-free (Xiph, patent-free by design, BSD) | not implemented (passthrough only) |
-| Opus | royalty-free (IETF RF by design, RFC 6716) | decode wired into the factory (transcoding *from* Opus works; the encoder is still in progress, so transcoding *toward* Opus declines and passthrough is always available) — and **no Cargo feature**, since it is royalty-free |
+| Opus | royalty-free (IETF RF by design, RFC 6716) | decode **and** encode wired into the factory, so an Opus leg transcodes in both directions (passthrough is always available too) — and **no Cargo feature**, since it is royalty-free |
 
 **Patent-encumbered — transcoding gated behind an opt-in feature:**
 
@@ -84,7 +84,7 @@ headers document function by function. Who each was ported from, and under what 
 | AMR-NB (encode + decode) | 3GPP TS 26.073 fixed-point reference C (ANSI-C: TS 26.104) | 3GPP Organizational Partners' reference-software terms + AMR patent pool |
 | AMR-WB (encode + decode) | 3GPP TS 26.173 / TS 26.190 reference C (ANSI-C: TS 26.204) | 3GPP Organizational Partners' reference-software terms + AMR patent pool |
 | G.722 | ITU-T G.722 reference | ITU-T reference-software terms |
-| Opus (decoder complete and factory-wired; encoder in progress) | libopus float build (Xiph.Org) | BSD-3-Clause |
+| Opus (decoder and encoder complete and factory-wired) | libopus float build (Xiph.Org) | BSD-3-Clause |
 
 G.711 is a clean-room implementation of the companding law (not a port), validated against the
 ITU-T G.191 STL vectors. The full copyright/licence notices for every upstream above are

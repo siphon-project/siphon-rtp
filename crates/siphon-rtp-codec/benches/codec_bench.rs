@@ -1873,16 +1873,18 @@ fn bench_opus_decode(c: &mut Criterion) {
     group.finish();
 }
 
-/// The **factory / [`Decoder`] trait** path an Opus leg actually runs — µs per 20 ms packet through
-/// `decoder_for`'s trait object, plus the `conceal` a lost packet costs.
+/// The **factory / [`Decoder`] + [`Encoder`] trait** path an Opus leg actually runs — µs per 20 ms
+/// packet through `decoder_for`'s / `encoder_for`'s trait objects, plus the `conceal` a lost packet
+/// costs.
 ///
-/// `bench_opus_decode` above measures `OpusDecoder` directly and needs the (gitignored) vectors for
-/// real SILK/Hybrid content. This one measures the transcode leg's boundary — trait dispatch, the
-/// per-channel↔interleaved conversion, the capacity arithmetic — and is self-contained: a CELT-only
-/// packet is a TOC byte plus one frame from this crate's own (vector-gated) CELT encoder, so it
-/// always runs, including on a bare checkout.
+/// `bench_opus_decode` / `bench_opus_encode` above measure `OpusDecoder` / `OpusEncoder` directly
+/// (and the decode one needs the gitignored vectors for real SILK/Hybrid content). This one measures
+/// the transcode leg's boundary — trait dispatch, the per-channel↔interleaved conversion, the
+/// capacity and frame-length arithmetic — and is self-contained: a CELT-only packet is a TOC byte
+/// plus one frame from this crate's own (vector-gated) CELT encoder, so it always runs, including on
+/// a bare checkout.
 fn bench_opus_codec(c: &mut Criterion) {
-    use siphon_rtp_codec::factory::{decoder_for, CodecSpec, OpusParams};
+    use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec, OpusParams};
     use siphon_rtp_codec::opus::decoder::MAX_PACKET_SAMPLES;
 
     const FRAME: usize = 960; // 20 ms at 48 kHz
@@ -1926,6 +1928,52 @@ fn bench_opus_codec(c: &mut Criterion) {
         group.bench_function(format!("conceal_20ms_{label}"), |b| {
             b.iter(|| {
                 let produced = decoder.conceal(black_box(&mut output)).expect("conceal");
+                black_box(produced)
+            });
+        });
+    }
+
+    // The egress side of the same boundary: µs per 20 ms frame through `encoder_for`'s trait object,
+    // per RFC 7587 §6.1 fmtp posture — each one puts the encoder at a different operating point
+    // (FEC adds the LBRR pass, a narrowband cap drops CELT, CBR takes the padding path), so the
+    // default alone would not bound what a transcode toward a real peer costs.
+    let speech = opus_signal(4 * FRAME, 1);
+    for (label, fmtp) in [
+        ("default", OpusParams::default()),
+        (
+            "inband_fec",
+            OpusParams {
+                use_inband_fec: true,
+                ..OpusParams::default()
+            },
+        ),
+        (
+            "narrowband",
+            OpusParams {
+                max_playback_rate_hz: 8_000,
+                ..OpusParams::default()
+            },
+        ),
+        (
+            "cbr",
+            OpusParams {
+                cbr: true,
+                ..OpusParams::default()
+            },
+        ),
+    ] {
+        let spec = CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(fmtp));
+        let mut leg_encoder = encoder_for(&spec).expect("Opus encoder from the factory");
+        let mut wire = vec![0u8; 1500];
+        // Warm the mode / bandwidth / rate decisions, as a live leg's are after the first packets.
+        for index in 0..3 {
+            let _ = leg_encoder.encode(&speech[index * FRAME..(index + 1) * FRAME], &mut wire);
+        }
+        group.bench_function(format!("encode_20ms_{label}"), |b| {
+            b.iter(|| {
+                let produced = leg_encoder
+                    .encode(black_box(&speech[..FRAME]), black_box(&mut wire))
+                    .expect("encode");
                 black_box(produced)
             });
         });

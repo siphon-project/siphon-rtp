@@ -1,8 +1,9 @@
 //! Pure-Rust Opus (RFC 6716) — a SILK (speech) + CELT (music/wideband) hybrid over a shared
 //! range/entropy coder.
 //!
-//! [`decoder::OpusDecoder`] is the entry point: hand it a packet, get PCM at whatever rate and
-//! channel count you asked for. Everything else here is a layer beneath it:
+//! [`decoder::OpusDecoder`] and [`enc::encoder::OpusEncoder`] are the entry points: hand the first a
+//! packet and get PCM at whatever rate and channel count you asked for, hand the second a frame and
+//! get a packet. Everything else here is a layer beneath them:
 //!
 //! | Layer | What it does |
 //! |---|---|
@@ -11,12 +12,13 @@
 //! | [`silk`] | The linear-prediction speech layer (§4.2), plus concealment and comfort noise (§4.4) |
 //! | [`celt`] | The MDCT/PVQ transform layer (§4.3), plus its own concealment |
 //! | [`decoder`] | Mode dispatch, Hybrid, redundancy, mode transitions, FEC, rate and channel conversion (§4.5) |
-//! | [`codec`] | [`codec::OpusCodec`], the crate's [`crate::Decoder`] over [`decoder::OpusDecoder`] — what [`crate::factory`] builds for a leg |
+//! | [`enc`] | The encode-side Opus layer: mode/bandwidth/rate decisions, the hybrid split, packing |
+//! | [`codec`] | [`codec::OpusCodec`], the crate's [`crate::Decoder`] / [`crate::Encoder`] over those two — what [`crate::factory`] builds for a leg |
 //!
-//! The **decoder is complete**: all three modes, all five bandwidths, every frame duration from
-//! 2.5 ms to 120 ms multi-frame packets, full stereo, all five output rates, PLC, in-band FEC and
-//! DTX. On the encode side CELT is complete and SILK's analysis front end has landed; the rest of
-//! the encoder is still being built.
+//! **Both directions are complete**: all three modes, all five bandwidths, every frame duration from
+//! 2.5 ms to 120 ms multi-frame packets, full stereo, all five sample rates, PLC, in-band FEC and
+//! DTX; and on the encode side, real rate-driven mode and bandwidth decisions plus VBR, constrained
+//! VBR and CBR rate control.
 //!
 //! # Conformance
 //!
