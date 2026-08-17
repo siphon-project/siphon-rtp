@@ -327,6 +327,16 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 - **Note:** for non-ICE legacy VoLTE/PSTN UAs (the common case), layers 1–3 are the whole story; ICE
   applies to ICE-capable peers (RCS, WebRTC bridges, modern clients).
 
+- **ICE restart (RFC 8445 §9) rides the `reoffer` verb, and does not interrupt media.** A re-offer
+  renegotiates on the *existing* ports (unlike a repeated `offer`, which replaces the call on fresh
+  ones), so there is a session to restart in the first place. A re-offer whose `a=ice-ufrag`/`a=ice-pwd`
+  differ from the current ones is a restart (§9.1.1.1): the engine mints fresh credentials of its own,
+  re-gathers, and rebuilds the leg's agent against the new session — while **leaving the adopted
+  source untouched**, so under the layer-4 gate media keeps flowing on the previously selected pair
+  until the new session selects one (§9.3). Clearing it instead would silence every call for the
+  length of a fresh ICE exchange. Owner-only; a re-offer that changes the negotiated codec is
+  *rejected* rather than accepted-and-ignored, because rebuilding a live transcode pipeline is not
+  done here.
 - **A repeated `offer` on a live call-id is owner-only, and replaces cleanly.** Another client
   offering an existing call-id gets `unknown_call` and the live call is untouched — it cannot be
   destroyed, and its existence is not disclosed (A3, §5). For the owner the offer *replaces* the call:
