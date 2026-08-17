@@ -5023,7 +5023,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 },
             );
         }
+        // Abort **and wait**. `abort()` only schedules cancellation, so returning here would leave the
+        // transport task alive for an unbounded moment still holding its WebSocket socket, the queued
+        // wire frames (up to the channel depth) and the recycle pool — memory and a file descriptor
+        // that teardown is supposed to have released. Awaiting the handle makes detach deterministic,
+        // which the project's structured-concurrency rule asks for ("tearing down a leg frees its
+        // actor, its sockets and its datapath flow — zero orphan tasks") and which a caller that
+        // deletes a call and immediately re-offers on the same ports depends on. The task is a
+        // cancel-safe select loop, so this resolves promptly with `JoinError::Cancelled`.
         tee.transport.abort();
+        let _ = tee.transport.await;
         let events = self.events.get(&tee.owner).map(|sink| sink.value().clone());
         emit_ws_tee_ended(
             events.as_ref(),
