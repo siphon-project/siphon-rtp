@@ -2198,6 +2198,147 @@ mod tests {
         buffer
     }
 
+    /// A real Opus participant, built exactly as `conference_join` builds one — both halves through
+    /// the codec factory from a negotiated RFC 7587 spec.
+    fn opus_config(index: usize) -> ParticipantConfig {
+        use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
+
+        let spec = CodecSpec::new(111, "opus", 48_000, 2, 20);
+        ParticipantConfig {
+            tag: format!("opus-{index}"),
+            decoder: decoder_for(&spec).expect("opus decoder"),
+            encoder: encoder_for(&spec).expect("opus encoder"),
+            egress_payload_type: 111,
+            mos_codec: siphon_rtp_hep::mos::Codec::Opus,
+            ..ulaw_config(
+                index,
+                &format!("10.0.0.{}", index + 1),
+                &format!("10.0.0.{}:4000", index + 1),
+            )
+        }
+    }
+
+    #[test]
+    fn an_all_opus_room_mixes_at_48_khz_and_encodes_the_mix_back_to_opus() {
+        // The Phase 7 gate with the real codec in both directions: two Opus participants, the room
+        // at the 48 kHz tier with no resampler anywhere, one talker's speech mixed and re-encoded to
+        // the listener as genuine Opus — decoded back here with this crate's own `OpusDecoder`, so
+        // "it emitted something" cannot pass for "it emitted Opus".
+        use siphon_rtp_codec::factory::{encoder_for, CodecSpec};
+        use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
+        use siphon_rtp_codec::opus::packet::Toc;
+
+        const FRAME: usize = 960; // 48 kHz × 20 ms
+
+        let mut conference = Conference::new("opus-room".into(), DEFAULT_TOP_M);
+        assert!(
+            conference.add_participant(opus_config(0)),
+            "a full-band Opus talker must be seated"
+        );
+        assert!(
+            conference.add_participant(opus_config(1)),
+            "a full-band Opus listener must be seated"
+        );
+
+        // The room picks the full-band tier and nothing resamples: an Opus room stays 48 kHz end to
+        // end, which is the whole point of the tier.
+        assert_eq!(conference.room_rate(), FULLBAND_RATE_HZ);
+        assert_eq!(conference.room_frame(), FRAME);
+        for participant in &conference.participants {
+            assert!(participant.to_room.is_none(), "no ingress resampler");
+            assert!(participant.from_room.is_none(), "no egress resampler");
+            assert!(
+                !participant.stateless,
+                "Opus is stateful, so it must take the per-leg encode, never the shared-encode \
+                 fan-out that would hand one encoder's bytes to several legs"
+            );
+        }
+
+        // Seat 0 speaks: real Opus RTP, from the same factory encoder a live peer's stack would use.
+        let mut talker_encoder =
+            encoder_for(&CodecSpec::new(111, "opus", 48_000, 2, 20)).expect("opus encoder");
+        let speech = speech_pcm(FRAME * 12);
+        let mut payload = vec![0u8; 1500];
+        for sequence in 0..12u16 {
+            let written = talker_encoder
+                .encode(
+                    &speech[usize::from(sequence) * FRAME..usize::from(sequence + 1) * FRAME],
+                    &mut payload,
+                )
+                .expect("encode");
+            let header = RtpHeader {
+                marker: false,
+                payload_type: 111,
+                sequence,
+                timestamp: u32::from(sequence) * FRAME as u32,
+                ssrc: 0x2000_0000,
+            };
+            let mut buffer = vec![0u8; 12 + written];
+            let length = write_packet(&header, &payload[..written], &mut buffer).expect("write");
+            buffer.truncate(length);
+            assert!(conference.ingest(&rx(1, "10.0.0.1:5000", buffer)));
+        }
+
+        // Tick the room and collect what seat 1 (the listener) was sent.
+        let mut listener_payloads = Vec::new();
+        for _ in 0..10 {
+            let mut out = Vec::new();
+            conference.tick(&mut out);
+            for datagram in out {
+                if datagram.endpoint == EndpointId(2) {
+                    let packet = RtpPacket::parse(&datagram.data).expect("parse");
+                    assert_eq!(packet.payload_type, 111, "the room encodes Opus back");
+                    let toc = Toc::parse(packet.payload[0]);
+                    assert_eq!(toc.channels(), 1, "the mix bus is mono");
+                    assert_eq!(toc.frame_code, 0, "one 20 ms frame per packet");
+                    listener_payloads.push(packet.payload.to_vec());
+                }
+            }
+        }
+        assert!(
+            listener_payloads.len() >= 8,
+            "the listener must be sent the room mix every tick, got {}",
+            listener_payloads.len()
+        );
+
+        // The proof: decode the room's own egress and find the talker's speech in it.
+        let mut decoder = OpusDecoder::new(48_000, 1).expect("decoder");
+        let mut pcm = vec![0i16; MAX_PACKET_SAMPLES];
+        let mut energy = 0i64;
+        for packet in &listener_payloads {
+            let written = decoder
+                .decode(Some(packet), &mut pcm, MAX_PACKET_SAMPLES, false)
+                .expect("the room's Opus egress must decode");
+            assert_eq!(written, FRAME, "one 20 ms frame at 48 kHz");
+            energy += pcm[..written]
+                .iter()
+                .map(|&sample| i64::from(sample) * i64::from(sample))
+                .sum::<i64>();
+        }
+        assert!(
+            energy > 1_000_000,
+            "the listener must hear the talker, not silence (energy {energy})"
+        );
+    }
+
+    /// Deterministic speech-like 48 kHz PCM — a pitch pulse train through a resonance plus noise, so
+    /// the Opus mode / bandwidth / VAD decisions take realistic branches.
+    fn speech_pcm(samples: usize) -> Vec<i16> {
+        let mut state = 24_680u32;
+        let mut history = [0.0f32; 2];
+        (0..samples)
+            .map(|index| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((state >> 20) as i32 - 2048) as f32 * 1.5;
+                let pulse = if index % 240 == 0 { 6000.0 } else { 0.0 };
+                let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+                history[1] = history[0];
+                history[0] = value;
+                value.clamp(-24_000.0, 24_000.0) as i16
+            })
+            .collect()
+    }
+
     #[test]
     fn a_long_frame_wideband_participant_is_seated_not_rejected() {
         // 48 kHz × 60 ms = 2880 samples and × 120 ms = 5760 both exceeded the old 1920-sample scratch

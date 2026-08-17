@@ -4368,9 +4368,10 @@ mod tests {
         buffer
     }
 
-    /// A one-way Opus (48 kHz) → G.711a (8 kHz) transcoding call: the WebRTC-trunk / voice-AI shape
-    /// the Opus decode half exists for. The reverse direction is G.711a→G.711a (the Opus *encoder*
-    /// is not built yet, so nothing may ask the factory for one).
+    /// A **bidirectional** Opus (48 kHz) ↔ G.711a (8 kHz) transcoding call: the WebRTC-trunk /
+    /// voice-AI shape Opus exists for, with both halves of RFC 6716 in the path. A→B decodes Opus
+    /// and re-encodes G.711a; B→A decodes G.711a and re-encodes Opus, so the same `MediaCall` proves
+    /// each direction independently of the other.
     fn opus_to_g711a_call(ptime_ms: u8) -> MediaCall {
         use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
 
@@ -4401,9 +4402,12 @@ mod tests {
             egress_endpoint: endpoint(1),
             egress_dst: addr(A_ADDR),
             decoder: decoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma decoder"),
-            encoder: encoder_for(&CodecSpec::new(8, "PCMA", 8000, 1, 20)).expect("pcma encoder"),
-            egress_ssrc: 0xA000_0008,
-            egress_payload_type: 8,
+            // The other half: the PSTN side's 8 kHz audio re-encoded as Opus at 48 kHz, so this
+            // direction also exercises the 8→48 kHz resample the engine does for a WebRTC peer.
+            encoder: encoder_for(&CodecSpec::new(OPUS_PT, "opus", 48_000, 2, ptime_ms))
+                .expect("opus encoder"),
+            egress_ssrc: 0xA000_0111,
+            egress_payload_type: OPUS_PT,
             telephone_event_in: None,
             telephone_event_out: None,
             recorder: None,
@@ -4421,6 +4425,66 @@ mod tests {
             true,
             None,
         )
+    }
+
+    /// Deterministic speech-like PCM at `rate_hz`: a pitch pulse train through a resonance plus
+    /// noise, so a codec's mode / bandwidth / VAD decisions take realistic branches.
+    fn speech_pcm(samples: usize, rate_hz: u32) -> Vec<i16> {
+        let period = (rate_hz / 200) as usize; // 5 ms pitch period
+        let mut state = 24_680u32;
+        let mut history = [0.0f32; 2];
+        (0..samples)
+            .map(|index| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((state >> 20) as i32 - 2048) as f32 * 1.5;
+                let pulse = if index % period == 0 { 6000.0 } else { 0.0 };
+                let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+                history[1] = history[0];
+                history[0] = value;
+                value.clamp(-24_000.0, 24_000.0) as i16
+            })
+            .collect()
+    }
+
+    /// A G.711a RTP packet (PT 8) carrying one 20 ms frame of `pcm` (160 samples at 8 kHz).
+    fn alaw_speech_rtp(sequence: u16, pcm: &[i16]) -> Vec<u8> {
+        let mut encoder = G711::alaw();
+        let mut payload = [0u8; 160];
+        let written = encoder.encode(pcm, &mut payload).expect("encode A-law");
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 8,
+            sequence,
+            timestamp: u32::from(sequence) * 160,
+            ssrc: 0x0888_0888,
+        };
+        let mut buffer = vec![0u8; 12 + written];
+        let len = write_packet(&header, &payload[..written], &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    /// Decode `packets` with this crate's own [`OpusDecoder`], returning the total sample count and
+    /// the summed energy — proof that what the pipeline emitted is real, decodable Opus audio rather
+    /// than a well-sized blob.
+    fn decode_opus_stream(packets: &[Vec<u8>]) -> (usize, i64) {
+        use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
+
+        let mut decoder = OpusDecoder::new(48_000, 1).expect("opus decoder");
+        let mut pcm = vec![0i16; MAX_PACKET_SAMPLES];
+        let mut samples = 0usize;
+        let mut energy = 0i64;
+        for packet in packets {
+            let written = decoder
+                .decode(Some(packet), &mut pcm, MAX_PACKET_SAMPLES, false)
+                .expect("decode the engine's own Opus egress");
+            samples += written;
+            energy += pcm[..written]
+                .iter()
+                .map(|&sample| i64::from(sample) * i64::from(sample))
+                .sum::<i64>();
+        }
+        (samples, energy)
     }
 
     /// Build `frames` real Opus packets carrying a deterministic 48 kHz signal.
@@ -4601,6 +4665,183 @@ mod tests {
             audible * 2 > out.len(),
             "most of the transcoded vector must be audio, not silence ({audible} of {} packets)",
             out.len()
+        );
+    }
+
+    /// The other direction of the WebRTC-trunk / voice-AI case: a PSTN G.711a (8 kHz) leg re-encoded
+    /// toward an Opus (48 kHz) peer through the real `process()` — decode → 8→48 kHz resample →
+    /// Opus encode. Validated by decoding the engine's own egress with this crate's `OpusDecoder`
+    /// and reading the TOC, not by counting bytes: a well-sized blob that is not Opus would pass a
+    /// length check and fail a real peer.
+    #[test]
+    fn transcodes_g711a_to_opus_with_resampling() {
+        let pcm = speech_pcm(160 * 12, 8_000);
+        let mut call = opus_to_g711a_call(20);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for index in 0..12u16 {
+            call.process(
+                &rx(
+                    2,
+                    B_ADDR,
+                    alaw_speech_rtp(
+                        index + 1,
+                        &pcm[usize::from(index) * 160..usize::from(index + 1) * 160],
+                    ),
+                ),
+                &mut out,
+                &mut events,
+            );
+        }
+
+        assert!(
+            out.len() >= 11,
+            "each 20 ms G.711a packet yields a 20 ms Opus packet (± the resampler's first frame), \
+             got {} for 12 packets",
+            out.len()
+        );
+        let mut payloads = Vec::new();
+        let mut previous_timestamp = None;
+        for datagram in &out {
+            assert_eq!(
+                datagram.endpoint,
+                endpoint(1),
+                "sent from A's engine socket"
+            );
+            assert_eq!(datagram.dst, addr(A_ADDR));
+            let packet = RtpPacket::parse(&datagram.data).expect("parse");
+            assert_eq!(packet.payload_type, OPUS_PT, "re-encoded as Opus (PT 111)");
+            assert_eq!(packet.ssrc, 0xA000_0111, "stamped with the B→A egress SSRC");
+            // RFC 7587 §4.1: the RTP timestamp advances at 48 kHz whatever the PCM rate, so a 20 ms
+            // packet steps it by 960 — not by the 160 the 8 kHz ingress leg used.
+            if let Some(previous) = previous_timestamp {
+                assert_eq!(
+                    packet.timestamp.wrapping_sub(previous),
+                    960,
+                    "a 20 ms Opus packet steps the RTP clock by 960 (RFC 7587 §4.1)"
+                );
+            }
+            previous_timestamp = Some(packet.timestamp);
+
+            // RFC 6716 §3.1: the TOC must describe a mono, single-frame packet.
+            let toc = siphon_rtp_codec::opus::packet::Toc::parse(packet.payload[0]);
+            assert_eq!(toc.channels(), 1, "the engine's Opus egress is mono");
+            assert_eq!(toc.frame_code, 0, "one 20 ms frame per packet");
+            payloads.push(packet.payload.to_vec());
+        }
+
+        // The decisive check: our own RFC 6716 decoder reads the engine's egress back as audio.
+        let (samples, energy) = decode_opus_stream(&payloads);
+        assert_eq!(
+            samples,
+            payloads.len() * 960,
+            "every emitted packet must decode to a full 20 ms frame at 48 kHz"
+        );
+        assert!(
+            energy > 1_000_000,
+            "the transcoded Opus must carry the G.711a speech, not silence (energy {energy})"
+        );
+    }
+
+    /// The VoLTE→WebRTC leg of the same story: an AMR-WB (16 kHz) leg re-encoded toward an Opus
+    /// (48 kHz) peer through the real `process()` — decode → 16→48 kHz resample → Opus encode.
+    /// Feature-gated on `amr` (patent-licensed — docs/codec-licensing.md).
+    #[cfg(feature = "amr")]
+    #[test]
+    fn transcodes_amr_wb_to_opus_with_resampling() {
+        use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
+
+        // Real RFC 4867 octet-aligned AMR-WB payloads, from this crate's bit-exact encoder.
+        let pcm = speech_pcm(320 * 12, 16_000);
+        let mut amr_encoder =
+            encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20)).expect("amr-wb encoder");
+        let mut amr_payload = vec![0u8; 256];
+        let payloads: Vec<Vec<u8>> = (0..12)
+            .map(|index| {
+                let written = amr_encoder
+                    .encode(&pcm[index * 320..(index + 1) * 320], &mut amr_payload)
+                    .expect("encode amr-wb");
+                amr_payload[..written].to_vec()
+            })
+            .collect();
+
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            decoder: decoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20))
+                .expect("amr-wb decoder"),
+            encoder: encoder_for(&CodecSpec::new(OPUS_PT, "opus", 48_000, 2, 20))
+                .expect("opus encoder"),
+            egress_ssrc: 0xB000_0111,
+            egress_payload_type: OPUS_PT,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::AmrWb,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: decoder_for(&CodecSpec::new(OPUS_PT, "opus", 48_000, 2, 20))
+                .expect("opus decoder"),
+            encoder: encoder_for(&CodecSpec::new(96, "AMR-WB", 16000, 1, 20))
+                .expect("amr-wb encoder"),
+            egress_ssrc: 0xA000_0060,
+            egress_payload_type: 96,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo_cancellation: false,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::Opus,
+        };
+        let mut call = MediaCall::new(
+            "amr-opus-call",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        );
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for (index, payload) in payloads.iter().enumerate() {
+            call.process(
+                &rx(1, A_ADDR, amr_wb_rtp(index as u16 + 1, payload)),
+                &mut out,
+                &mut events,
+            );
+        }
+
+        assert!(
+            out.len() >= payloads.len() - 1,
+            "each 20 ms AMR-WB packet yields a 20 ms Opus packet, got {} for {}",
+            out.len(),
+            payloads.len()
+        );
+        let mut opus_payloads = Vec::new();
+        for datagram in &out {
+            let packet = RtpPacket::parse(&datagram.data).expect("parse");
+            assert_eq!(packet.payload_type, OPUS_PT, "re-encoded as Opus (PT 111)");
+            let toc = siphon_rtp_codec::opus::packet::Toc::parse(packet.payload[0]);
+            assert_eq!(toc.channels(), 1);
+            assert_eq!(toc.frame_code, 0);
+            opus_payloads.push(packet.payload.to_vec());
+        }
+        let (samples, energy) = decode_opus_stream(&opus_payloads);
+        assert_eq!(samples, opus_payloads.len() * 960);
+        assert!(
+            energy > 1_000_000,
+            "the transcoded Opus must carry the AMR-WB speech, not silence (energy {energy})"
         );
     }
 

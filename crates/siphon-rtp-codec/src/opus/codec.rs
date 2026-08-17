@@ -143,7 +143,11 @@ impl OpusCodec {
     /// negotiated `ptime_ms`.
     ///
     /// `ptime_ms` sets only the *nominal* frame: a packet carrying more is still decoded in full
-    /// when the caller's buffer allows it (see the module docs). Errors — never panics — on a rate
+    /// when the caller's buffer allows it (see the module docs). It is snapped to a duration Opus
+    /// can produce ([`snap_ptime_ms`]) for the same reason the encode side is — an Opus leg's frame
+    /// only ever *is* one of those, so a nominal 30 ms would describe a packet no Opus sender can
+    /// send, and the two halves of one leg would then disagree about the leg's frame (which the
+    /// conference's decoder/encoder invariant refuses outright). Errors — never panics — on a rate
     /// or channel count Opus does not define.
     pub fn new_decoder(
         sample_rate_hz: u32,
@@ -157,7 +161,7 @@ impl OpusCodec {
             params: CodecParams {
                 sample_rate_hz,
                 channels,
-                ptime_ms: ptime_ms.max(1),
+                ptime_ms: snap_ptime_ms(ptime_ms),
             },
             quantum: sample_rate_hz as usize / QUANTUM_DIVISOR,
         })
@@ -516,13 +520,23 @@ mod tests {
             OpusCodec::new_decoder(48_000, 3, 20),
             Err(CodecError::Unsupported(_))
         ));
-        // A degenerate ptime is clamped, not rejected (mirrors `CodecSpec::new`).
+        // A degenerate ptime is snapped, not rejected: RFC 6716 has no 0 ms (or 1 ms) frame, so the
+        // shortest whole-millisecond one it does have stands in.
         assert_eq!(
             OpusCodec::new_decoder(48_000, 1, 0)
-                .expect("clamped")
+                .expect("snapped")
                 .params()
                 .ptime_ms,
-            1
+            5
+        );
+        // And a legal-SDP-but-not-Opus ptime snaps on the decode side too, so both halves of one leg
+        // always describe the same frame (the conference invariant depends on it).
+        assert_eq!(
+            OpusCodec::new_decoder(48_000, 1, 30)
+                .expect("snapped")
+                .params()
+                .ptime_ms,
+            20
         );
     }
 
