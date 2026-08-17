@@ -12,7 +12,7 @@
 //!   [`MediaLeg`] encode → RTP to the call.
 //! - **Barge-in**: `clear` (or the local VAD) drops the queued playout within one tick.
 
-use crate::bridge::audio::BridgeCore;
+use crate::bridge::audio::{BridgeCore, MAX_FRAME_VALUES};
 use crate::bridge::protocol::{ControlMessage, Direction, MediaFormat};
 use crate::leg::{MediaLeg, PcmFrame};
 use siphon_rtp_dsp::EchoCanceller;
@@ -151,12 +151,15 @@ impl BridgeSession {
     /// arrives — while the server hears nothing at all.
     pub fn tick(&mut self, uplink_out: &mut [u8], downlink_rtp_out: &mut [u8]) -> TickResult {
         // Uplink: decode one PCM frame off the leg's jitter buffer straight into the core's staging
-        // slot — no intermediate frame buffer, so the split costs the per-tick path nothing. The slot
-        // is asked for the decoder's own buffer size (an interleaved value count); `uplink_slot`
-        // covers every ptime up to the engine's ceiling, so a short slot is a real fault, not a
-        // routine long frame.
-        let frame_values = self.leg.frame_samples();
-        match self.leg.next_pcm(self.core.uplink_slot(frame_values)) {
+        // slot — no intermediate frame buffer, so the split costs the per-tick path nothing.
+        //
+        // The slot is the **ceiling**, not this leg's nominal frame, for the same reason the media
+        // pipeline hands its decoder a ceiling-sized scratch: what a packet carries is the peer's
+        // choice, not the negotiated `a=ptime`. RFC 6716 §3.2 lets an Opus packet hold up to 120 ms
+        // whatever was signalled, and RFC 4566 §6 makes `ptime` a recommendation rather than a
+        // constraint — sizing the slot at the leg's nominal frame would fail the decode of a longer
+        // packet, which is exactly the silent uplink this path already had once.
+        match self.leg.next_pcm(self.core.uplink_slot(MAX_FRAME_VALUES)) {
             Ok(PcmFrame::Decoded(written) | PcmFrame::Concealed(written)) => {
                 self.core.commit_uplink(written, self.decode_channels);
             }
@@ -169,7 +172,7 @@ impl BridgeSession {
                     tracing::error!(
                         target: "siphon_rtp::media",
                         %error,
-                        frame_values,
+                        nominal_frame_values = self.leg.frame_samples(),
                         channels = self.decode_channels,
                         "ws bridge uplink frame failed to decode — no audio reaches the server \
                          (further failures at debug)"
@@ -916,6 +919,82 @@ mod tests {
         assert!(
             energy > 0.25 * input_energy,
             "the uplink is silent or gutted: {energy:.1} vs {input_energy:.1} in"
+        );
+    }
+
+    /// What a packet *carries* is the sender's choice, not the negotiated `a=ptime`: RFC 4566 §6
+    /// makes `ptime` "the recommended length", and RFC 6716 §3.2 lets an Opus packet hold up to
+    /// 120 ms whatever was signalled (which is also why `OpusCodec` snaps a signalled ptime down to a
+    /// frame duration it can emit, so a leg's nominal frame can be shorter than what arrives). A
+    /// 60 ms packet on a leg negotiated at 20 ms must therefore still decode.
+    #[test]
+    fn a_packet_longer_than_the_negotiated_ptime_still_reaches_the_uplink() {
+        use siphon_rtp_codec::factory::CodecSpec;
+
+        const SENT: usize = 2880; // 48 kHz × 60 ms actually on the wire
+        let negotiated = CodecSpec::new(111, "opus", 48_000, 2, 20);
+        let decoder = siphon_rtp_codec::factory::decoder_for(&negotiated).expect("opus decoder");
+        let encoder = siphon_rtp_codec::factory::encoder_for(&negotiated).expect("opus encoder");
+        assert_eq!(
+            decoder.frame_samples(),
+            960,
+            "the leg's nominal frame is 20 ms"
+        );
+
+        let leg = MediaLeg::new(decoder, encoder, JitterBuffer::new(1, 16), 0x5555_6666, 111);
+        let mut session = BridgeSession::new(
+            leg,
+            MediaFormat {
+                encoding: Encoding::L16,
+                sample_rate: 48_000,
+                channels: 1,
+                bit_depth: 16,
+                endianness: Endianness::Little,
+                ptime: 20,
+            },
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        );
+
+        // The peer packetizes at 60 ms even though 20 ms was negotiated.
+        let long_spec = CodecSpec::new(111, "opus", 48_000, 2, 60);
+        let mut peer = siphon_rtp_codec::factory::encoder_for(&long_spec).expect("opus encoder");
+        let tone: Vec<i16> = (0..SENT)
+            .map(|index| {
+                (8000.0 * (std::f64::consts::TAU * 500.0 * index as f64 / 48_000.0).sin()) as i16
+            })
+            .collect();
+        let mut payload = [0u8; 1500];
+        let payload_len = peer.encode(&tone, &mut payload).expect("encode");
+
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 111,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 1,
+        };
+        let mut packet = vec![0u8; FIXED_HEADER_LEN + payload_len];
+        let written =
+            write_packet(&header, &payload[..payload_len], &mut packet).expect("write packet");
+        packet.truncate(written);
+        session.on_rtp(&packet);
+
+        let mut uplink = vec![0u8; 4 * SENT];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+
+        assert_eq!(
+            session.uplink_decode_errors(),
+            0,
+            "a longer-than-negotiated packet is legal, not a decode failure"
+        );
+        assert_eq!(
+            result.uplink_bytes,
+            2 * SENT,
+            "the whole 60 ms the peer actually sent must reach the uplink"
         );
     }
 
