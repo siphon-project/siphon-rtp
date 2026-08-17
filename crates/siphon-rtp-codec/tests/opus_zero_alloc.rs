@@ -8,8 +8,11 @@
 //! into the allocator, and allocate-then-free churn (invisible to a live-bytes delta) is exactly the
 //! kind of regression a `Vec` slipped into `decode_frame` would cause.
 //!
-//! Both entry points are gated: [`OpusDecoder`] directly, and the [`siphon_rtp_codec::Decoder`]
-//! trait object [`decoder_for`] builds for a negotiated leg — the one the media slow path runs.
+//! Both entry points are gated on each side: [`OpusDecoder`] directly, and the
+//! [`siphon_rtp_codec::Decoder`] / [`siphon_rtp_codec::Encoder`] trait objects [`decoder_for`] /
+//! [`encoder_for`] build for a negotiated leg — the ones the media slow path runs. (The bare
+//! [`siphon_rtp_codec::opus::enc::encoder::OpusEncoder`] has its own file,
+//! `opus_encode_zero_alloc.rs`, for the same one-`#[global_allocator]`-per-binary reason.)
 //!
 //! [`OpusDecoder`] allocates exactly once, at construction, for the whole-packet float scratch the
 //! 16-bit entry point needs; everything else — the SILK PCM staging buffer, the redundancy frame,
@@ -22,7 +25,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use siphon_rtp_codec::factory::{decoder_for, CodecSpec, OpusParams};
+use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec, OpusParams};
 use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
 
 /// A pass-through allocator that counts allocations, so a test can assert a hot loop made none.
@@ -312,6 +315,142 @@ fn the_decoder_trait_path_allocates_nothing_per_frame() {
             "sprop-stereo={sprop_stereo}: {allocations} allocations across 32 DTX frames"
         );
     }
+}
+
+/// Deterministic speech-like 48 kHz PCM — a pitch pulse train through a resonance plus noise, so the
+/// encoder's mode / bandwidth / VAD decisions take realistic branches rather than the degenerate
+/// ones a tone or silence would (and so the FEC and DTX paths below are actually reached).
+fn speech(samples: usize) -> Vec<i16> {
+    let mut state = 24_680u32;
+    let mut history = [0.0f32; 2];
+    (0..samples)
+        .map(|index| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = ((state >> 20) as i32 - 2048) as f32 * 1.5;
+            let pulse = if index % 240 == 0 { 6000.0 } else { 0.0 };
+            let value = pulse + noise + 1.5 * history[0] - 0.85 * history[1];
+            history[1] = history[0];
+            history[0] = value;
+            value.clamp(-24_000.0, 24_000.0) as i16
+        })
+        .collect()
+}
+
+/// The **[`Encoder`] trait path** — the one a transcode toward an Opus leg runs, built through
+/// [`encoder_for`] exactly as a negotiated Opus leg is.
+///
+/// `OpusEncoder` allocating nothing is necessary but not sufficient (that is
+/// `opus_encode_zero_alloc.rs`): the bridge on top of it must not stage a frame through a `Vec`
+/// either. Every RFC 7587 §6.1 posture is measured, because each selects a different operating point
+/// inside the encoder — FEC adds the LBRR pass, a narrowband cap drops CELT entirely, and CBR takes
+/// the padding path — and a `Vec` on any one of them is a per-packet allocator round-trip on a live
+/// leg.
+#[test]
+fn the_encoder_trait_path_allocates_nothing_per_frame() {
+    for (label, fmtp) in [
+        ("default", OpusParams::default()),
+        (
+            "maxaveragebitrate",
+            OpusParams {
+                max_average_bitrate: Some(24_000),
+                ..OpusParams::default()
+            },
+        ),
+        (
+            "maxplaybackrate",
+            OpusParams {
+                max_playback_rate_hz: 8_000,
+                ..OpusParams::default()
+            },
+        ),
+        (
+            "cbr",
+            OpusParams {
+                cbr: true,
+                ..OpusParams::default()
+            },
+        ),
+        (
+            "useinbandfec",
+            OpusParams {
+                use_inband_fec: true,
+                ..OpusParams::default()
+            },
+        ),
+        (
+            "usedtx",
+            OpusParams {
+                use_dtx: true,
+                ..OpusParams::default()
+            },
+        ),
+    ] {
+        let spec = CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(fmtp));
+        let mut encoder = encoder_for(&spec).expect("Opus encoder from the factory");
+        let frame = encoder.frame_samples();
+        let pcm = speech(frame * 4);
+        // The buffer `Direction::emit_encoded` hands the encoder.
+        let mut payload = vec![0u8; 1500];
+        // Warm up outside the window: construction is allowed to allocate, and the first frames are
+        // what settle the mode / bandwidth / rate decisions.
+        for index in 0..4 {
+            encoder
+                .encode(&pcm[index * frame..(index + 1) * frame], &mut payload)
+                .expect("warm-up encode");
+        }
+
+        let allocations = count_allocations(32, || {
+            encoder.encode(&pcm[..frame], &mut payload).expect("encode");
+        });
+        assert_eq!(
+            allocations, 0,
+            "{label}: {allocations} allocations across 32 encoded frames"
+        );
+    }
+}
+
+/// The DTX path specifically: a silent run collapses to a bare TOC through a different branch of
+/// `opus_encode_native`, and that branch must be just as allocation-free — it is the one a leg takes
+/// while nobody is talking, i.e. most of a call.
+#[test]
+fn the_encoder_trait_dtx_path_allocates_nothing_per_frame() {
+    let spec = CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(OpusParams {
+        use_dtx: true,
+        ..OpusParams::default()
+    }));
+    let mut encoder = encoder_for(&spec).expect("Opus encoder from the factory");
+    let frame = encoder.frame_samples();
+    let silence = vec![0i16; frame];
+    let mut payload = vec![0u8; 1500];
+    // libopus only enters DTX after ~10 frames of inactivity (`NB_SPEECH_FRAMES_BEFORE_DTX`), so
+    // drive past that before measuring.
+    let mut entered_dtx = false;
+    for _ in 0..12 {
+        entered_dtx |= encoder.encode(&silence, &mut payload).expect("encode") == 1;
+    }
+    assert!(
+        entered_dtx,
+        "the encoder must be in DTX before the window opens"
+    );
+
+    // Count inside the window with a plain counter rather than a `Vec`, which would itself allocate.
+    let mut dtx_frames = 0usize;
+    let allocations = count_allocations(32, || {
+        if encoder.encode(&silence, &mut payload).expect("encode") == 1 {
+            dtx_frames += 1;
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "{allocations} allocations across 32 DTX frames"
+    );
+    // Not every frame is a bare TOC: libopus refreshes with a real packet after
+    // `MAX_CONSECUTIVE_DTX` (20) silent ones, so ~1 in 21 is full-size. The window must still be
+    // overwhelmingly DTX, or it measured the ordinary encode path instead.
+    assert!(
+        dtx_frames >= 24,
+        "only {dtx_frames} of 32 frames were DTX — the window is not measuring the DTX path"
+    );
 }
 
 /// The counting allocator must actually see allocations, or every assertion above is vacuous.

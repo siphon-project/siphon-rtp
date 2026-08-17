@@ -28,7 +28,7 @@ codec is free, running it is not. See [Codec licensing](codec-licensing.md).
 | Comfort noise | `CN` (13) | generate only | no | RFC 3389 (a generator, not a codec) | none |
 | AMR-WB | `AMR-WB` (dynamic) | all 9 modes | all 9 modes | 3GPP TS 26.174 vectors, per mode | `amr` |
 | AMR-NB | `AMR` (dynamic) | all 8 modes | all 8 modes | 3GPP TS 26.074 vectors | `amr` |
-| Opus | `opus` (dynamic, `opus/48000/2`) | yes — SILK, CELT and Hybrid, mono and stereo, all bandwidths and frame durations, PLC and in-band FEC | in progress | all 12 official RFC 6716 vectors (mono + stereo), plus exact per-packet `final_range` | none (royalty-free) |
+| Opus | `opus` (dynamic, `opus/48000/2`) | yes — SILK, CELT and Hybrid, mono and stereo, all bandwidths and frame durations, PLC and in-band FEC | yes — SILK, CELT and Hybrid, mono and stereo, VBR / constrained VBR / CBR, LBRR/FEC and DTX | all 12 official RFC 6716 vectors (mono + stereo), plus exact per-packet `final_range`; the encoder against libopus' own decoder over the full configuration matrix | none (royalty-free) |
 | EVS | | no | no | | absent |
 
 The engine resolves a codec from the `a=rtpmap` encoding name (case-insensitive, RFC
@@ -74,20 +74,22 @@ a gain adaptor, then a modified codebook-gain search) and is the only mode that 
 gain indices per subframe. This is a full AMR-NB encoder for G.711 transcoding in both
 directions; only DTX/SID (comfort-noise generation) is out of scope.
 
-**Opus.** The **decoder is complete and wired into the codec factory**, so transcoding
-*from* an Opus leg — Opus → G.711 / AMR-WB, the WebRTC-trunk and voice-AI cases — works
-end to end. It covers everything RFC 6716 §4 defines: SILK-only, CELT-only and Hybrid
-including mid-packet mode switching and redundancy frames, all five bandwidths, every
-frame duration from 2.5 ms to a 120 ms multi-frame packet, full stereo, all five output
-rates, PLC, in-band FEC (LBRR) and DTX. It is gated on all 12 official RFC 6716 test
-vectors in both the mono and the stereo pass, and additionally on exact `final_range`
-equality for every packet of every vector — bitstream-exactness, which the §6
-`opus_compare` tolerance metric cannot see.
+**Opus.** **Both directions are complete and wired into the codec factory**, so an Opus leg
+transcodes either way — Opus ↔ G.711 and Opus ↔ AMR-WB, the WebRTC-trunk and voice-AI
+cases — end to end, and Opus is advertised in the `node_info` capability list.
 
-The **encoder is still being built**, so transcoding *toward* an Opus leg fails at setup
-with a clean error naming the missing direction, and Opus is not advertised in the
-`node_info` capability list (that list requires both directions — see below). Opus
-passthrough relays fine either way, like everything else.
+*Decode* covers everything RFC 6716 §4 defines: SILK-only, CELT-only and Hybrid including
+mid-packet mode switching and redundancy frames, all five bandwidths, every frame duration
+from 2.5 ms to a 120 ms multi-frame packet, full stereo, all five output rates, PLC,
+in-band FEC (LBRR) and DTX. It is gated on all 12 official RFC 6716 test vectors in both
+the mono and the stereo pass, and additionally on exact `final_range` equality for every
+packet of every vector — bitstream-exactness, which the §6 `opus_compare` tolerance metric
+cannot see.
+
+*Encode* covers the same ground: real mode / bandwidth / channel decisions driven by the
+target rate and the signal (not a fixed mode), VBR, constrained VBR and CBR, LBRR/FEC
+generation and DTX. It is gated by encoding the configuration matrix and holding the result
+up to libopus' own decoder and `opus_compare`.
 
 Three things the negotiated SDP contributes to the decoder, and nothing else does: the
 output sample rate (the RFC 7587 §4.1 clock rate, 48 kHz), the ingress channel count (the
@@ -96,6 +98,16 @@ the nominal frame (the negotiated `ptime`). A packet carrying more than the nego
 ptime still decodes in full: the media path's decode buffer is sized for the 120 ms
 ceiling, which is exactly why a 60 ms Opus sender does not lose audio.
 
+The encoder takes the same three plus the peer's remaining `a=fmtp` limits (below). Its
+frame is the negotiated `ptime` **snapped down to a duration Opus can emit** — RFC 6716 §2
+defines 2.5/5/10/20/40/60 ms frames and §3.2 extends that to 80/100/120 ms multi-frame
+packets, so `a=ptime:30` (legal SDP, and common on G.711 trunks) is sent as 20 ms rather
+than failing every encode. RFC 4566 §6 makes `ptime` a recommendation, so this is within
+spec; the decode side snaps identically, which keeps both halves of one leg describing the
+same frame. The application is `VoIP` (libopus `OPUS_APPLICATION_VOIP`) — every Opus leg the
+engine encodes toward is a telephony leg. Egress is mono; Opus is **stateful**, so it never
+joins the conference's shared-encode fan-out (each listener gets its own encode).
+
 The rest of the engine surface is in place. The engine parses and honours the RFC 7587
 payload format:
 
@@ -103,13 +115,28 @@ payload format:
   requires the channel count, and it names the RTP channel count, not the audio one. A
   peer that signals a different clock rate or channel count is corrected to 48000/2
   (RFC 7587 §4.1 — Opus clocks RTP at 48 kHz in every mode).
-- The `a=fmtp` parameters of RFC 7587 §6.1 are parsed onto the negotiated codec:
-  `maxaveragebitrate`, `maxplaybackrate`, `stereo`, `sprop-stereo`, `cbr`, `useinbandfec`,
-  `usedtx`, `maxptime`. An absent or malformed parameter falls back to its RFC default and
-  an out-of-range value is clamped into the range the RFC permits; nothing there can panic.
-  Of those, `sprop-stereo` and `maxptime` change engine behaviour today (the ingress channel
-  layout and the egress packetization); the rest are the rate-control / FEC / DTX limits the
-  Opus **encoder** will honour, carried through offer/answer and HA checkpoints meanwhile.
+- The `a=fmtp` parameters of RFC 7587 §6.1 are parsed onto the negotiated codec and **every
+  one of them is honoured**. An absent or malformed parameter falls back to its RFC default
+  and an out-of-range value is clamped into the range the RFC permits; nothing there can
+  panic.
+
+  | Parameter | What it drives | Observable on the wire as |
+  |---|---|---|
+  | `sprop-stereo` | the ingress channel count the decoder is built for | — (it describes the peer's stream) |
+  | `maxptime` | caps the leg's egress `ptime` | shorter packets, `a=ptime` in the answer |
+  | `maxaveragebitrate` | the encoder's target bitrate (`OPUS_SET_BITRATE`) | packet size, and the mode/bandwidth the rate then selects in the TOC |
+  | `maxplaybackrate` | the encoder's maximum bandwidth (`OPUS_SET_MAX_BANDWIDTH`), per the §3.1.1 rate↔bandwidth table | the bandwidth coded in the TOC byte |
+  | `cbr` | rate control: CBR vs constrained VBR (`OPUS_SET_VBR`) | every packet padded to one constant length |
+  | `useinbandfec` | LBRR generation (`OPUS_SET_INBAND_FEC`) | each SILK/hybrid packet carries a recoverable copy of the previous frame |
+  | `usedtx` | discontinuous transmission (`OPUS_SET_DTX`) | a silent run collapses to bare one-byte TOC packets |
+  | `stereo` | nothing — it is a *ceiling* (§7.1), and the engine's egress is mono regardless | — |
+
+  One wrinkle worth stating: libopus will not spend bits on an LBRR copy while its packet-loss
+  figure is 0 (`decide_fec`, `opus_encoder.c:811`), so `useinbandfec=1` alone would generate no
+  FEC at all. The engine therefore also hands the encoder a conservative 5 % loss assumption when
+  the peer declares it — 5 % being the highest figure at which libopus will *not* trade audio
+  bandwidth away to afford FEC, so the peer keeps the bandwidth its `maxplaybackrate` bought.
+  When per-leg RTCP loss feedback reaches the encoder that assumption becomes the measured figure.
 - Frame durations up to 120 ms are carried end to end. RFC 7587 §6.1 allows a ptime that
   long and RFC 6716 §3.2 lets a single packet carry 120 ms whatever ptime was negotiated,
   so the media path's frame buffers are sized for 48 kHz × 120 ms × 2 channels.
@@ -119,8 +146,9 @@ payload format:
 
 Because Opus is royalty-free (RFC 6716 is an IETF royalty-free design), it gets **no Cargo
 feature** — see [Codec licensing](codec-licensing.md). It appears in the `node_info`
-capability list only once the factory can build a decoder *and* an encoder for it, so a
-dispatcher is never told about a transcode this build cannot perform.
+capability list only when the factory can build a decoder *and* an encoder for it — which it
+now can, so a dispatcher may route Opus calls here, and could never have been told about a
+transcode this build cannot perform.
 
 ## Channels and PCM layout
 

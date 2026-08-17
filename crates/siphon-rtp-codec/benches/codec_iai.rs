@@ -13,7 +13,7 @@ use iai_callgrind::{
 };
 use std::hint::black_box;
 
-use siphon_rtp_codec::factory::{decoder_for, CodecSpec, OpusParams};
+use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec, OpusParams};
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::opus::celt::decoder::CeltDecoder;
 use siphon_rtp_codec::opus::celt::encoder::{CeltEncoder, RateControl};
@@ -437,6 +437,66 @@ fn opus_codec_conceal(input: OpusCodecInput) {
     let _ = black_box(decoder.conceal(&mut pcm));
 }
 
+type OpusCodecEncodeInput = (Box<dyn Encoder>, Vec<i16>, Vec<u8>);
+
+/// The **factory** encode path: a `Box<dyn Encoder>` built exactly as the media slow path builds one
+/// for a negotiated Opus leg, warmed on two frames, plus the PCM and packet buffers a leg hands it.
+///
+/// Distinct from `opus_encode` above, which drives `OpusEncoder` directly: this one also covers the
+/// trait dispatch, the interleaved-count arithmetic and the frame-length guard the leg pays per
+/// packet — i.e. the number a G.711/AMR-WB→Opus transcode actually costs at the trait boundary. The
+/// decode side needed its own kernel for the same reason.
+///
+/// `fmtp` is the peer's RFC 7587 §6.1 declaration, which selects the encoder's whole operating point
+/// (rate, bandwidth, rate control, FEC), so each posture is measured separately rather than assuming
+/// the default one bounds them.
+fn opus_codec_encode_setup(fmtp: OpusParams) -> OpusCodecEncodeInput {
+    let spec = CodecSpec::new(111, "opus", 48_000, 2, 20).with_opus_params(Some(fmtp));
+    let mut encoder = encoder_for(&spec).expect("build Opus encoder through the factory");
+    let signal = opus_signal(3 * OPUS_FRAME, 1);
+    let mut payload = vec![0u8; 1500];
+    // Two frames so the measured call runs with warm state, as a live leg does.
+    for index in 0..2 {
+        let _ = encoder.encode(
+            &signal[index * OPUS_FRAME..(index + 1) * OPUS_FRAME],
+            &mut payload,
+        );
+    }
+    (encoder, signal[2 * OPUS_FRAME..].to_vec(), payload)
+}
+
+/// The RFC 7587 §6.1 default posture — no `a=fmtp` at all, which is what most peers send.
+fn opus_codec_encode_default_setup() -> OpusCodecEncodeInput {
+    opus_codec_encode_setup(OpusParams::default())
+}
+
+/// A WebRTC-shaped peer: `useinbandfec=1`, so every packet also carries the LBRR copy.
+fn opus_codec_encode_fec_setup() -> OpusCodecEncodeInput {
+    opus_codec_encode_setup(OpusParams {
+        use_inband_fec: true,
+        ..OpusParams::default()
+    })
+}
+
+/// A narrowband peer (`maxplaybackrate=8000`): SILK only, the cheapest operating point.
+fn opus_codec_encode_narrowband_setup() -> OpusCodecEncodeInput {
+    opus_codec_encode_setup(OpusParams {
+        max_playback_rate_hz: 8_000,
+        ..OpusParams::default()
+    })
+}
+
+// One 20 ms frame through the `Encoder` trait object the media path holds — the per-packet egress
+// cost of a G.711/AMR-WB→Opus transcode leg, per RFC 7587 fmtp posture.
+#[library_benchmark]
+#[bench::default_20ms(setup = opus_codec_encode_default_setup)]
+#[bench::inband_fec_20ms(setup = opus_codec_encode_fec_setup)]
+#[bench::narrowband_20ms(setup = opus_codec_encode_narrowband_setup)]
+fn opus_codec_encode(input: OpusCodecEncodeInput) {
+    let (mut encoder, signal, mut payload) = input;
+    let _ = black_box(encoder.encode(black_box(&signal[..OPUS_FRAME]), &mut payload));
+}
+
 library_benchmark_group!(
     name = codec;
     benchmarks =
@@ -452,7 +512,8 @@ library_benchmark_group!(
         opus_decode,
         opus_conceal,
         opus_codec_decode,
-        opus_codec_conceal
+        opus_codec_conceal,
+        opus_codec_encode
 );
 
 // Fail the run (non-zero exit) if any measured kernel executes >10% more instructions than the

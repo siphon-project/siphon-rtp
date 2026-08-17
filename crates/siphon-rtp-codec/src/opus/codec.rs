@@ -17,7 +17,7 @@
 //!   therefore decodes in full instead of being rejected — the media path's decode scratch is sized
 //!   for the 120 ms ceiling precisely so this works. The encode side has no such freedom: it emits
 //!   exactly the frame it was built for, so the negotiated ptime is **snapped** to a duration Opus
-//!   can actually produce ([`snap_ptime_ms`]).
+//!   can actually produce (`snap_ptime_ms`).
 //! * **The RTP clock.** RFC 7587 §4.1: "the RTP timestamp is incremented with a 48000 Hz clock rate
 //!   for all modes of Opus and all sampling rates". It is therefore fixed at 48 kHz in **both**
 //!   directions and is *not* derived from the codec's PCM rate — the one thing the traits' default
@@ -144,7 +144,7 @@ impl OpusCodec {
     ///
     /// `ptime_ms` sets only the *nominal* frame: a packet carrying more is still decoded in full
     /// when the caller's buffer allows it (see the module docs). It is snapped to a duration Opus
-    /// can produce ([`snap_ptime_ms`]) for the same reason the encode side is — an Opus leg's frame
+    /// can produce (`snap_ptime_ms`) for the same reason the encode side is — an Opus leg's frame
     /// only ever *is* one of those, so a nominal 30 ms would describe a packet no Opus sender can
     /// send, and the two halves of one leg would then disagree about the leg's frame (which the
     /// conference's decoder/encoder invariant refuses outright). Errors — never panics — on a rate
@@ -170,7 +170,7 @@ impl OpusCodec {
     /// Build an Opus **encode** side for `sample_rate_hz`, `channels` and `ptime_ms`, configured by
     /// the peer's RFC 7587 §6.1 `a=fmtp` declaration.
     ///
-    /// `ptime_ms` is snapped to a duration Opus can emit ([`snap_ptime_ms`]) and becomes this
+    /// `ptime_ms` is snapped to a duration Opus can emit (`snap_ptime_ms`) and becomes this
     /// codec's frame for good: [`Encoder::frame_samples`] reports it and the media path repacketizes
     /// to it, so the datapath and the codec can never disagree about a frame length.
     ///
@@ -185,7 +185,7 @@ impl OpusCodec {
     /// | `maxaveragebitrate` | `set_bitrate` (`OPUS_SET_BITRATE`) | packet size, and through the rate-driven decisions the mode and bandwidth in the TOC |
     /// | `maxplaybackrate` | `set_max_bandwidth` (`OPUS_SET_MAX_BANDWIDTH`) | the bandwidth coded in the TOC (RFC 6716 §3.1, Table 2) |
     /// | `cbr` | `set_rate_control` (`OPUS_SET_VBR`) | every packet padded to one constant length |
-    /// | `useinbandfec` | `set_in_band_fec` + [`ASSUMED_PACKET_LOSS_PERCENT`] | an LBRR copy of the previous frame inside each SILK/hybrid packet (RFC 6716 §2.1.7) |
+    /// | `useinbandfec` | `set_in_band_fec` + `ASSUMED_PACKET_LOSS_PERCENT` | an LBRR copy of the previous frame inside each SILK/hybrid packet (RFC 6716 §2.1.7) |
     /// | `usedtx` | `set_dtx` (`OPUS_SET_DTX`) | a silent run collapses to bare one-byte TOC packets |
     ///
     /// `stereo` and `sprop-stereo` are not consumed here: the engine's media path is mono end to end
