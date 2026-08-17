@@ -81,6 +81,7 @@ pub mod fixed;
 pub mod float;
 pub mod frame;
 pub mod gains;
+pub mod lp_transition;
 pub mod lpc_analysis;
 pub mod nlsf_quant;
 pub mod noise_shape;
