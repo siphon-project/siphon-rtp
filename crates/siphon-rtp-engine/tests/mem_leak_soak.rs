@@ -8,6 +8,9 @@
 //! retains freed pages, so RSS is too noisy to gate on. A rising `allocated` at steady state is a
 //! real leak (a stranded `Call`, a recv task whose socket/buffer never freed).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_engine::{ClientId, Engine};
 use siphon_rtp_proto::{CmdResult, Command, ConferenceRole, WsTeeDirection};
@@ -302,24 +305,47 @@ async fn conference_join_leave_does_not_leak() {
 
 /// A local WebSocket server that accepts connection after connection and drains every frame — the
 /// consumer side of the tee soak. Returns its `ws://` URI; the task lives for the test.
-async fn tee_sink_server() -> String {
+async fn tee_sink_server() -> (String, Arc<AtomicUsize>) {
     use futures_util::StreamExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind tee ws");
     let addr = listener.local_addr().expect("tee ws addr");
+    // Connections currently being served. Each cycle of the soak dials a real TCP + WebSocket
+    // connection, and the task serving it exits *asynchronously* after the engine drops its end — so
+    // without waiting for this to drain, `allocated` is sampled while an unknown number of the
+    // harness's own server tasks and socket buffers are still alive. That made the soak read its own
+    // teardown as an engine leak (flaky, and the drift varied by ~2x run to run, which is the
+    // signature of a race rather than a real per-cycle leak).
+    let live = Arc::new(AtomicUsize::new(0));
+    let accept_live = live.clone();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
+            let live = accept_live.clone();
+            live.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
-                let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
-                    return;
-                };
-                let (_sink, mut source) = socket.split();
-                while let Some(Ok(_frame)) = source.next().await {}
+                if let Ok(socket) = tokio_tungstenite::accept_async(stream).await {
+                    let (_sink, mut source) = socket.split();
+                    while let Some(Ok(_frame)) = source.next().await {}
+                }
+                live.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
-    format!("ws://{addr}/tee")
+    (format!("ws://{addr}/tee"), live)
+}
+
+/// Wait until the tee server has finished tearing down every connection it accepted, so a following
+/// `allocated` sample measures the engine and not the harness. Bounded, so a genuine hang fails the
+/// test on its assertion rather than spinning forever.
+async fn drain_tee_server(live: &Arc<AtomicUsize>) {
+    for _ in 0..2_000 {
+        if live.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    quiesce().await;
 }
 
 /// One tee churn cycle: offer → answer → attach a WS tee (which promotes the relay into the userspace
@@ -400,16 +426,21 @@ async fn ws_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, i
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_tee_attach_detach_does_not_leak() {
     let _serialized = SOAK.lock().await;
-    let uri = tee_sink_server().await;
+    let (uri, live) = tee_sink_server().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let _prime = allocated_bytes();
 
     // Warm up: the promote/demote paths, the dialled TCP+WebSocket stack, the tee's preallocated
     // buffer pool and jemalloc's arenas all settle into steady state.
-    for index in 0..60 {
+    // The longest warmup in this file, because this is by far the heaviest cycle in it: each one
+    // dials a TCP + WebSocket connection, promotes a relay into a processing actor with two tee
+    // sinks, then detaches and demotes it. That touches many more jemalloc size classes than the
+    // other soaks, so the arenas need proportionally longer to reach the steady state `before` is
+    // meant to sample — undersized, the measured delta is arena growth rather than engine state.
+    for index in 0..200 {
         ws_tee_attach_detach(&engine, &uri, index).await;
     }
-    quiesce().await;
+    drain_tee_server(&live).await;
     assert_eq!(engine.session_count(), 0, "registry empty after warmup");
     assert_eq!(engine.ws_tee_count(), 0, "no tee retained after warmup");
     let before = allocated_bytes();
@@ -417,10 +448,10 @@ async fn ws_tee_attach_detach_does_not_leak() {
     // Each cycle dials a WebSocket, promotes a relay into a processing media actor with two tee sinks,
     // then detaches and demotes it. Across 300 cycles live bytes must not climb — no stranded mixer,
     // sink, transport task or promoted actor.
-    for index in 60..360 {
+    for index in 200..500 {
         ws_tee_attach_detach(&engine, &uri, index).await;
     }
-    quiesce().await;
+    drain_tee_server(&live).await;
     let after = allocated_bytes();
 
     assert_eq!(engine.session_count(), 0, "registry drained after soak");
