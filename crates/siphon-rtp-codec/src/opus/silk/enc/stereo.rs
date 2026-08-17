@@ -422,11 +422,15 @@ pub fn left_right_to_mid_side(
         denominator_q16,
     ) << 10;
 
-    for (index, slot) in right.iter_mut().enumerate().take(interpolation_length) {
+    // The residual lands at `index + 1`, which is the C's `x2[n-1]` written through a pointer that
+    // is already two samples into the buffer (`stereo_LR_to_MS.c:210`, `:218`). Both channels are
+    // then handed to the frame encoder from offset 1 of this buffer, so the residual is aligned with
+    // the mid sample it was predicted from and neither channel carries a spurious delay.
+    for index in 0..interpolation_length {
         predictor0_q13 += delta0_q13;
         predictor1_q13 += delta1_q13;
         width_q24 += width_delta_q24;
-        *slot = predict_side(
+        right[index + 1] = predict_side(
             left,
             &side,
             index,
@@ -438,13 +442,8 @@ pub fn left_right_to_mid_side(
     let predictor0_q13 = -predictors_q13[0];
     let predictor1_q13 = -predictors_q13[1];
     let width_q24 = width_q14 << 10;
-    for (index, slot) in right
-        .iter_mut()
-        .enumerate()
-        .take(frame_length)
-        .skip(interpolation_length)
-    {
-        *slot = predict_side(
+    for index in interpolation_length..frame_length {
+        right[index + 1] = predict_side(
             left,
             &side,
             index,
@@ -591,11 +590,13 @@ mod tests {
             16,
             frame_length,
         );
-        let side_energy: i64 = right[..frame_length]
+        // Both channels are read from index 1, which is where the frame encoder reads them
+        // (`inputBuf + 1`): the residual is written from `right[1]` and the mid from `left[1]`.
+        let side_energy: i64 = right[1..frame_length + 1]
             .iter()
             .map(|&s| i64::from(s) * i64::from(s))
             .sum();
-        let mid_energy: i64 = left[2..frame_length]
+        let mid_energy: i64 = left[1..frame_length + 1]
             .iter()
             .map(|&s| i64::from(s) * i64::from(s))
             .sum();

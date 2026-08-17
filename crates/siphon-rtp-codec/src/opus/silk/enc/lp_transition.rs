@@ -81,8 +81,9 @@ const TRANSITION_LP_A_Q28: [[i32; TRANSITION_NA]; TRANSITION_INT_NUM] = [
 pub struct LowPassState {
     /// `In_LP_State` — the biquad's two Q12 state words.
     pub state: [i32; 2],
-    /// `transition_frame_no`, 0..=[`TRANSITION_FRAMES`]. 0 is the widest cutoff (the filter is at
-    /// design point 4, the *narrowest* — see [`taps_for`]); [`TRANSITION_FRAMES`] is design point 0.
+    /// `transition_frame_no`, 0..=[`TRANSITION_FRAMES`]. The counter runs *backwards* against the
+    /// cutoff: 0 selects the narrowest of the five design points and [`TRANSITION_FRAMES`] the
+    /// widest, because a downward transition counts down from the wide end towards the narrow one.
     pub transition_frame_no: i32,
     /// `mode` — 0 off, 1 walk up (one frame per frame), -2 walk down (two per frame).
     pub mode: i32,

@@ -287,6 +287,23 @@ impl Resampler {
         self.configure_direction(input_hz, output_hz, Direction::Encode)
     }
 
+    /// Re-initialise the **encode**-side kernel for a rate pair, clearing the filter state even when
+    /// the pair has not changed (libopus `silk_setup_resamplers` reaching `silk_resampler_init`
+    /// with `psEnc->sCmn.fs_kHz == 0`, `control_codec.c:144-146`).
+    ///
+    /// That is the state a SILK encoder reset leaves behind, and it is the *only* place the guard on
+    /// [`Resampler::configure_for_encoder`] has to be defeated: the prefill that follows such a reset
+    /// re-primes this filter from real audio, so carrying the old memory across would mix the tail of
+    /// one configuration into the head of the next.
+    pub fn reinitialize_for_encoder(
+        &mut self,
+        input_hz: u32,
+        output_hz: u32,
+    ) -> Result<(), CodecError> {
+        self.configured = None;
+        self.configure_direction(input_hz, output_hz, Direction::Encode)
+    }
+
     /// The shared body of both `configure*` entry points.
     fn configure_direction(
         &mut self,

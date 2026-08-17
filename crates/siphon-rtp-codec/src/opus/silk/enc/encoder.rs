@@ -49,6 +49,9 @@ use crate::opus::range_coder::RangeEncoder;
 use crate::opus::silk::enc::bitstream::{encode_indices, encode_pulses};
 use crate::opus::silk::enc::fixed::lin2log;
 use crate::opus::silk::enc::frame::{AnalysisConfig, ComplexitySettings};
+use crate::opus::silk::enc::lp_transition::{
+    low_pass_variable_cutoff, LowPassState, TRANSITION_FRAMES,
+};
 use crate::opus::silk::enc::rate_control::{
     control_snr, encode_frame, FrameEncodeRequest, FrameEncoderState, LbrrFrame,
 };
@@ -96,8 +99,31 @@ pub enum RateMode {
 /// What the encoder is configured to produce.
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderConfig {
-    /// The SILK internal rate the input is supplied at.
+    /// `desiredInternalSampleRate` — the internal rate the Opus layer *wants*
+    /// (`opus_encoder.c:1939-1946`).
+    ///
+    /// **This is a request, not a setting.** SILK owns its own rate and moves to a new one only
+    /// when the bandwidth state machine says it may — see [`SilkEncoder::control`] and
+    /// [`SilkEncoder::internal_rate`], which is the rate the input must actually be supplied at.
     pub internal_rate: InternalRate,
+    /// `minInternalSampleRate` (`opus_encoder.c:1947-1952`) — 16 kHz in hybrid, where the CELT half
+    /// assumes SILK covers the whole low band, and 8 kHz otherwise. Unlike
+    /// [`EncoderConfig::internal_rate`] this is a *bound*: a current rate below it changes at once,
+    /// with no transition and no redundancy, because the alternative is an illegal stream.
+    pub min_internal_rate: InternalRate,
+    /// `maxInternalSampleRate` (`opus_encoder.c:1954-1970`) — 16 kHz, dropped to 12 or 8 when the
+    /// packet budget cannot carry a wider band. A bound, like
+    /// [`EncoderConfig::min_internal_rate`].
+    pub max_internal_rate: InternalRate,
+    /// `API_sampleRate` — the rate the Opus layer's own resampler feeds from. SILK never resamples
+    /// here (the Opus layer owns that), but the rate still bounds the internal one: coding above
+    /// the input's own Nyquist is wasted bits (`control_audio_bandwidth.c:56-61`).
+    pub api_rate_hz: i32,
+    /// `opusCanSwitch` — the Opus layer's answer to the previous packet's
+    /// [`ControlOutcome::switch_ready`]: it has committed to covering the seam with a redundancy
+    /// frame, so SILK may now actually move to the new rate
+    /// (`opus_encoder.c:2065`, `control_audio_bandwidth.c:68`).
+    pub opus_can_switch: bool,
     /// Opus frame duration in ms — 10, 20, 40 or 60.
     pub duration_ms: usize,
     /// Internal channels: 1 (mono) or 2 (mid/side).
@@ -131,6 +157,10 @@ impl EncoderConfig {
     pub fn new(internal_rate: InternalRate, duration_ms: usize, bitrate_bps: i32) -> Self {
         Self {
             internal_rate,
+            min_internal_rate: InternalRate::Narrow8k,
+            max_internal_rate: InternalRate::Wide16k,
+            api_rate_hz: 48_000,
+            opus_can_switch: false,
             duration_ms,
             channels: 1,
             bitrate_bps,
@@ -147,11 +177,6 @@ impl EncoderConfig {
     /// `nFramesPerPacket` and `nb_subfr` for this duration.
     fn layout(&self) -> Result<SubframeLayout, CodecError> {
         SubframeLayout::from_duration_ms(self.duration_ms)
-    }
-
-    /// Samples per SILK frame at the internal rate.
-    fn frame_length(&self) -> Result<usize, CodecError> {
-        Ok(self.layout()?.subframe_count * 5 * self.internal_rate.khz())
     }
 }
 
@@ -188,6 +213,14 @@ struct ChannelState {
     /// all four fields (see [`SignalMeasures`]), and `silk_HP_variable_cutoff` reads the activity
     /// and the lowest input-quality band.
     measures: SignalMeasures,
+    /// `fs_kHz` — this channel's *current* internal rate in kHz, or 0 before it has ever been
+    /// controlled. Per channel because that is where libopus keeps it
+    /// (`silk_encoder_state.fs_kHz`); the two are held equal by `force_fs_kHz`
+    /// (`enc_API.c:251-253`).
+    fs_khz: i32,
+    /// `sLP` — the bandwidth-transition low-pass. Per channel, and it survives the rate reset that
+    /// `silk_setup_fs` performs, because it is what carries the transition *schedule*.
+    low_pass: LowPassState,
 }
 
 impl Default for ChannelState {
@@ -208,8 +241,24 @@ impl Default for ChannelState {
             lbrr_gain_increase: 7,
             lbrr_was_enabled: false,
             measures: SignalMeasures::default(),
+            fs_khz: 0,
+            low_pass: LowPassState::default(),
         }
     }
+}
+
+/// What [`SilkEncoder::control`] resolved for the packet about to be encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlOutcome {
+    /// The rate SILK will actually code at, which is the rate the caller must resample its input to.
+    /// It is **not** necessarily [`EncoderConfig::internal_rate`]: a move between rates is gated on
+    /// the Opus layer covering the seam.
+    pub internal_rate: InternalRate,
+    /// `encControl->switchReady` (`control_audio_bandwidth.c:88`, `:116`) — SILK wants a different
+    /// internal rate and has finished whatever ramp that needs, so it is asking the Opus layer to
+    /// emit a redundancy frame and set [`EncoderConfig::opus_can_switch`] on the next packet. Room
+    /// for that frame has already been taken out of this packet's SILK budget.
+    pub switch_ready: bool,
 }
 
 /// What one `encode` call produced.
@@ -245,6 +294,21 @@ pub struct SilkEncoder {
     /// (`silk_HP_variable_cutoff`). The filter itself is the Opus layer's; only the tracking state
     /// belongs here, because it is driven by SILK's own pitch and quality measures.
     high_pass_smth1_q15: i32,
+    /// The rate SILK is currently coding at — `state_Fxx[0].sCmn.fs_kHz`, resolved by
+    /// [`SilkEncoder::control`] and **not** simply whatever the Opus layer asked for.
+    internal_rate: InternalRate,
+    /// `allowBandwidthSwitch` (`enc_API.c:548-557`) — whether the last completed packet was quiet
+    /// enough for a rate change to be worth starting. Read back by the Opus layer, which uses it to
+    /// decide whether to re-run its own bandwidth choice at all (`opus_encoder.c:1441`).
+    allow_bandwidth_switch: bool,
+    /// `timeSinceSwitchAllowed_ms` — how long the stream has been too active to allow a switch. The
+    /// activity threshold relaxes with it, so a permanently loud talker is not stuck at one
+    /// bandwidth for ever (`enc_API.c:549-556`).
+    time_since_switch_allowed_ms: i32,
+    /// `encControl->maxBits` after [`SilkEncoder::control`] has taken out whatever a pending
+    /// bandwidth switch reserves. Bits, not bytes, because the reservation the C applies
+    /// (`control_audio_bandwidth.c:90`) is a fraction of the whole budget.
+    max_bits: i32,
 }
 
 impl SilkEncoder {
@@ -259,7 +323,25 @@ impl SilkEncoder {
             ));
         }
         config.layout()?;
-        Ok(Self {
+        let mut encoder = Self::init();
+        encoder.control(config)?;
+        Ok(encoder)
+    }
+
+    /// `silk_InitEncoder` (`init_encoder.c:46-68`) — a SILK encoder with **no resolved internal
+    /// rate**.
+    ///
+    /// That is not an oversight, it is the state the reference starts in: `fs_kHz == 0` is what
+    /// tells `silk_control_audio_bandwidth` that the first `control` may go straight to whatever the
+    /// Opus layer asks for, rather than treating it as a mid-call bandwidth change that has to be
+    /// ramped and covered by a redundancy frame. An encoder built with [`SilkEncoder::new`] has
+    /// already been controlled once and is past that point, which is why the Opus layer — which does
+    /// not know its own starting bandwidth until it has seen a frame — builds one this way instead.
+    ///
+    /// Crate-visible: `control` **must** run before `encode`, and inside this crate it always does.
+    pub(crate) fn init() -> Self {
+        let config = EncoderConfig::new(InternalRate::Wide16k, 20, 25_000);
+        Self {
             config,
             channels: [ChannelState::default(); 2],
             stereo: StereoEncoderState::default(),
@@ -267,38 +349,74 @@ impl SilkEncoder {
             previous_mid_only: false,
             bits_exceeded: 0,
             lbrr_bits_used: 0,
-            // `silk_init_encoder` (`init_encoder.c:58`): start at the minimum cutoff. The C reaches
-            // it through the Q16 form and the `-(16<<7)` correction rather than `lin2log(60)`
-            // directly, and the two are not quite identical — keep its arithmetic.
+            // `init_encoder.c:58`: start at the minimum cutoff. The C reaches it through the Q16
+            // form and the `-(16<<7)` correction rather than `lin2log(60)` directly, and the two are
+            // not quite identical — keep its arithmetic.
             high_pass_smth1_q15: (lin2log(MIN_CUTOFF_HZ << 16) - (16 << 7)) << 8,
-        })
+            internal_rate: config.internal_rate,
+            allow_bandwidth_switch: false,
+            time_since_switch_allowed_ms: 0,
+            max_bits: config.max_bytes as i32 * 8,
+        }
     }
 
-    /// The configuration this encoder was built with.
+    /// The configuration this encoder was last controlled with.
+    ///
+    /// [`EncoderConfig::internal_rate`] in it is the rate that was *requested*; the rate SILK is
+    /// coding at is [`SilkEncoder::internal_rate`].
     #[must_use]
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }
 
-    /// Retune a live encoder (libopus `silk_control_encoder`, `control_codec.c:56-150`).
+    /// The internal rate SILK is currently coding at — `state_Fxx[0].sCmn.fs_kHz`, reported to the
+    /// Opus layer as `encControl->internalSampleRate` (`enc_API.c:573`).
     ///
-    /// The Opus layer calls this every packet, because the bitrate, the reported loss and the FEC
-    /// and DTX flags can all move without anything else changing. Those are pure retunes and reset
-    /// nothing. Two changes are **not** retunes and reset the state the reference resets:
+    /// This is the rate [`SilkEncoder::encode`] expects its input at, and for a SILK-only packet it
+    /// is also what the TOC's bandwidth field must be derived from (`opus_encoder.c:2052-2060`).
+    #[must_use]
+    pub fn internal_rate(&self) -> InternalRate {
+        self.internal_rate
+    }
+
+    /// `encControl->allowBandwidthSwitch` (`enc_API.c:571`) — whether SILK considers the stream
+    /// quiet enough right now to start moving between internal rates.
+    #[must_use]
+    pub fn allow_bandwidth_switch(&self) -> bool {
+        self.allow_bandwidth_switch
+    }
+
+    /// Apply a configuration and resolve the internal rate for the packet about to be encoded
+    /// (libopus `silk_control_encoder`, `control_codec.c:64-132`).
     ///
-    /// * **The internal rate** (`silk_setup_fs`, `control_codec.c:187-297`): every filter in the
-    ///   analysis, the noise-shaping quantiser and the NLSF predictor is defined at one rate, so
-    ///   carrying their state across is meaningless. The C clears the shaping state, the NSQ, the
-    ///   previous NLSFs and the LP state and re-seeds `prevLag = 100`, `LastGainIndex = 10`,
-    ///   `prevSignalType = inactive`, `first_frame_after_reset = 1` — which is exactly
-    ///   [`FrameEncoderState::default`] as this encoder builds it. The VAD, the stereo state and the
-    ///   bit reservoir survive, as they do in the C.
+    /// The Opus layer calls this every packet, before it resamples: the bitrate, the reported loss
+    /// and the FEC and DTX flags can all move without anything else changing, and those are pure
+    /// retunes that reset nothing. Two things are **not** retunes:
+    ///
+    /// * **The internal rate.** It is not set here, it is *negotiated*: the caller states a desired
+    ///   rate and a legal window, and `silk_control_audio_bandwidth`
+    ///   (`silk_control_audio_bandwidth`, ported below) decides whether it may move to it now,
+    ///   has to ramp its input bandwidth first, or must ask the Opus layer for a redundancy frame
+    ///   before it can. When it does move, `silk_setup_fs` (`control_codec.c:243-299`) clears the
+    ///   shaping state, the NSQ, the previous NLSFs and the transition filter's memory and re-seeds
+    ///   `prevLag = 100`, `LastGainIndex = 10`, `prevSignalType = inactive`,
+    ///   `first_frame_after_reset = 1` — every filter below is defined at one rate, so carrying
+    ///   their state across is meaningless. The VAD, the stereo state and the bit reservoir survive,
+    ///   as they do in the C.
     /// * **A frame-duration or channel-count change** (`transition`, `enc_API.c:198`): the pending
     ///   LBRR frames were generated for a layout this packet no longer has, so their flags are
     ///   cleared rather than written into a packet that cannot carry them.
     ///
+    /// One deliberate deviation: on a rate change the C resamples the float analysis history
+    /// `x_buf` through the API rate into the new internal rate (`control_codec.c:148-189`) so the
+    /// first frame at the new rate still has real history. Here it is cleared instead. The gated
+    /// path — the one this whole state machine exists for — reaches a rate change through
+    /// [`SilkEncoder::prefill`], which resets and refills that history from real audio anyway, so
+    /// the deviation is confined to the ungated path where the rate is forced out of range, and
+    /// there `first_frame_after_reset` already constrains the predictor.
+    ///
     /// Errors on a configuration SILK does not define, leaving the encoder untouched.
-    pub fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), CodecError> {
+    pub fn control(&mut self, config: EncoderConfig) -> Result<ControlOutcome, CodecError> {
         if config.channels == 0 || config.channels > 2 {
             return Err(CodecError::Unsupported(
                 "silk enc: internal channels must be 1 or 2",
@@ -306,31 +424,56 @@ impl SilkEncoder {
         }
         config.layout()?;
 
-        let rate_changed = config.internal_rate != self.config.internal_rate;
-        if rate_changed {
-            for channel in self.channels.iter_mut() {
-                let mut frame = FrameEncoderState::default();
-                // `silk_control_encoder`'s re-seed (`control_codec.c:246-258`).
-                frame.analysis.shape.last_gain_index = 10;
-                frame.analysis.previous_lag = 100;
-                channel.frame = frame;
-                channel.input = [0.0; INPUT_BUFFER];
-            }
-        }
-        // `silk_setup_fs` sets `first_frame_after_reset`, and `enc_API.c:259-263` clears the pending
-        // LBRR flags on either that or a layout transition. Both matter for the same reason: those
-        // redundant frames were generated at the *old* rate and layout, and writing them into a
-        // packet coded at the new one desynchronises the decoder outright — which is exactly what it
-        // did, at the second packet of a rate-switching FEC stream.
-        let transition = rate_changed
-            || config.duration_ms != self.config.duration_ms
+        // `silk_Encode` clears it once per call, before any channel is controlled
+        // (`enc_API.c:179`).
+        let mut switch_ready = false;
+        // `enc_API.c:198` — computed against the *previous* packet's geometry.
+        let transition = config.duration_ms != self.config.duration_ms
             || config.channels != self.config.channels;
         if config.channels > self.config.channels {
             // Mono to stereo: the side channel has no history at all (`enc_API.c:181-196`).
             self.channels[1] = ChannelState::default();
             self.stereo = StereoEncoderState::default();
         }
-        if transition {
+
+        self.max_bits = config.max_bytes as i32 * 8;
+        let allow = self.allow_bandwidth_switch;
+        let mut resolved_khz = 0i32;
+        for channel_index in 0..config.channels {
+            // "Force the side channel to the same rate as the mid" (`enc_API.c:252-253`). The state
+            // machine still runs for it: it owns that channel's own transition filter, and libopus
+            // lets it take its own share of the redundancy reservation out of `maxBits` too.
+            let forced = (channel_index == 1).then_some(resolved_khz);
+            let mut max_bits = self.max_bits;
+            let khz = Self::control_audio_bandwidth(
+                &mut self.channels[channel_index],
+                &config,
+                allow,
+                &mut switch_ready,
+                &mut max_bits,
+            );
+            self.max_bits = max_bits;
+            let khz = forced.unwrap_or(khz);
+            if channel_index == 0 {
+                resolved_khz = khz;
+            }
+            self.setup_fs(channel_index, khz);
+        }
+
+        let internal_rate = match resolved_khz {
+            8 => InternalRate::Narrow8k,
+            12 => InternalRate::Medium12k,
+            _ => InternalRate::Wide16k,
+        };
+        let rate_changed = internal_rate != self.internal_rate;
+        self.internal_rate = internal_rate;
+
+        // `silk_setup_fs` sets `first_frame_after_reset`, and `enc_API.c:259-263` clears the pending
+        // LBRR flags on either that or a layout transition. Both matter for the same reason: those
+        // redundant frames were generated at the *old* rate and layout, and writing them into a
+        // packet coded at the new one desynchronises the decoder outright — which is exactly what it
+        // did, at the second packet of a rate-switching FEC stream.
+        if transition || rate_changed {
             for channel in self.channels.iter_mut() {
                 channel.lbrr_flags = [false; MAX_FRAMES_PER_PACKET];
             }
@@ -338,13 +481,131 @@ impl SilkEncoder {
             self.previous_mid_only = false;
         }
         self.config = config;
-        Ok(())
+        Ok(ControlOutcome {
+            internal_rate,
+            switch_ready,
+        })
     }
 
-    /// Samples per channel one [`SilkEncoder::encode`] call consumes.
+    /// `silk_control_audio_bandwidth` (`control_audio_bandwidth.c:36-132`) — the internal-rate state
+    /// machine, for one channel.
+    ///
+    /// Three outcomes, and the difference between them is the whole point of the function:
+    ///
+    /// * **Out of the legal window** (or above the API rate). The rate changes *now*, with no ramp
+    ///   and no redundancy, because staying is not an option — a hybrid packet whose SILK half is
+    ///   below 16 kHz is not a legal stream.
+    /// * **`opus_can_switch`.** The Opus layer has already committed to a redundancy frame, so the
+    ///   rate moves this frame and any ramp in progress is stopped.
+    /// * **Neither.** The rate stays. Going *down* needs the input band-limited first, so a
+    ///   transition is armed and `switch_ready` waits until it has run out; going *up* needs no
+    ///   ramp, so `switch_ready` is raised immediately. Either way the caller is asked for
+    ///   redundancy and this packet's SILK budget gives up room for it.
+    fn control_audio_bandwidth(
+        channel: &mut ChannelState,
+        config: &EncoderConfig,
+        allow_bandwidth_switch: bool,
+        switch_ready: &mut bool,
+        max_bits: &mut i32,
+    ) -> i32 {
+        // "Handle a bandwidth-switching reset where we need to be aware what the last sampling rate
+        // was" — after a prefill the channel's own rate is gone and only `sLP` remembers it.
+        let mut original_khz = channel.fs_khz;
+        if original_khz == 0 {
+            original_khz = channel.low_pass.saved_fs_khz;
+        }
+        let mut rate_khz = original_khz;
+        let rate_hz = rate_khz * 1000;
+        let desired_hz = config.internal_rate.hz() as i32;
+        let minimum_hz = config.min_internal_rate.hz() as i32;
+        let maximum_hz = config.max_internal_rate.hz() as i32;
+
+        if rate_hz == 0 {
+            // "Encoder has just been initialized."
+            rate_khz = desired_hz.min(config.api_rate_hz) / 1000;
+        } else if rate_hz > config.api_rate_hz || rate_hz > maximum_hz || rate_hz < minimum_hz {
+            // "Make sure internal rate is not higher than external rate or maximum allowed, or
+            // lower than minimum allowed."
+            rate_khz = config.api_rate_hz.min(maximum_hz).max(minimum_hz) / 1000;
+        } else {
+            // The state machine proper.
+            if channel.low_pass.transition_frame_no >= TRANSITION_FRAMES {
+                // "Stop transition phase."
+                channel.low_pass.mode = 0;
+            }
+            if !(allow_bandwidth_switch || config.opus_can_switch) {
+                return rate_khz;
+            }
+            if rate_khz * 1000 > desired_hz {
+                // Switch down.
+                if channel.low_pass.mode == 0 {
+                    // "New transition."
+                    channel.low_pass.transition_frame_no = TRANSITION_FRAMES;
+                    channel.low_pass.reset_memory();
+                }
+                if config.opus_can_switch {
+                    channel.low_pass.mode = 0;
+                    rate_khz = if original_khz == 16 { 12 } else { 8 };
+                } else if channel.low_pass.transition_frame_no <= 0 {
+                    *switch_ready = true;
+                    // "Make room for redundancy."
+                    *max_bits -= *max_bits * 5 / (config.duration_ms as i32 + 5);
+                } else {
+                    // "Direction: down (at double speed)."
+                    channel.low_pass.mode = -2;
+                }
+            } else if rate_khz * 1000 < desired_hz {
+                // Switch up.
+                if config.opus_can_switch {
+                    rate_khz = if original_khz == 8 { 12 } else { 16 };
+                    // "New transition" — from the *narrowest* cutoff, walked back open.
+                    channel.low_pass.transition_frame_no = 0;
+                    channel.low_pass.reset_memory();
+                    channel.low_pass.mode = 1;
+                } else if channel.low_pass.mode == 0 {
+                    *switch_ready = true;
+                    *max_bits -= *max_bits * 5 / (config.duration_ms as i32 + 5);
+                } else {
+                    channel.low_pass.mode = 1;
+                }
+            } else if channel.low_pass.mode < 0 {
+                // The target moved back to where we already are: unwind the ramp instead of
+                // finishing it.
+                channel.low_pass.mode = 1;
+            }
+        }
+        rate_khz
+    }
+
+    /// `silk_setup_fs` (`control_codec.c:199-305`) for one channel — the reset a rate change forces.
+    ///
+    /// A no-op when the rate has not moved, which is every packet of a stream that never switches.
+    fn setup_fs(&mut self, channel_index: usize, rate_khz: i32) {
+        let channel = &mut self.channels[channel_index];
+        if channel.fs_khz == rate_khz {
+            return;
+        }
+        let mut frame = FrameEncoderState::default();
+        // `control_codec.c:253-259`'s non-zero re-seeds.
+        frame.analysis.shape.last_gain_index = 10;
+        frame.analysis.previous_lag = 100;
+        channel.frame = frame;
+        // See the deviation note on `control`: the C resamples this history into the new rate.
+        channel.input = [0.0; INPUT_BUFFER];
+        channel.low_pass.reset_memory();
+        channel.fs_khz = rate_khz;
+    }
+
+    /// Samples per channel one [`SilkEncoder::encode`] call consumes, at the *resolved* internal
+    /// rate.
     #[must_use]
     pub fn samples_per_packet(&self) -> usize {
-        self.config.duration_ms * self.config.internal_rate.khz()
+        self.config.duration_ms * self.internal_rate.khz()
+    }
+
+    /// Samples per SILK frame at the resolved internal rate.
+    fn frame_length(&self) -> Result<usize, CodecError> {
+        Ok(self.config.layout()?.subframe_count * 5 * self.internal_rate.khz())
     }
 
     /// Encode one Opus frame's worth of SILK.
@@ -359,9 +620,9 @@ impl SilkEncoder {
         encoder: &mut RangeEncoder<'_>,
     ) -> Result<EncodeResult, CodecError> {
         let layout = self.config.layout()?;
-        let frame_length = self.config.frame_length()?;
+        let frame_length = self.frame_length()?;
         let channels = self.config.channels;
-        let rate_khz = self.config.internal_rate.khz();
+        let rate_khz = self.internal_rate.khz();
         let required = self.samples_per_packet() * channels;
         if input.len() < required {
             return Err(CodecError::Unsupported(
@@ -415,6 +676,7 @@ impl SilkEncoder {
 
         self.previous_mid_only = self.stereo_indices[layout.frames_per_packet - 1].mid_only;
         self.update_lbrr_gain_increase();
+        self.update_allow_bandwidth_switch(payload_bytes > 0);
 
         Ok(EncodeResult {
             payload_bytes,
@@ -488,7 +750,7 @@ impl SilkEncoder {
                     encoder,
                     &redundant.indices,
                     redundant.seed,
-                    self.config.internal_rate,
+                    self.internal_rate,
                     layout.subframe_count,
                     cond_coding,
                     true,
@@ -500,7 +762,7 @@ impl SilkEncoder {
                     redundant.indices.signal_type,
                     redundant.indices.quant_offset_type,
                     &mut pulses[..],
-                    self.config.frame_length()?,
+                    self.frame_length()?,
                 );
             }
         }
@@ -566,15 +828,19 @@ impl SilkEncoder {
         // ── The VAD, per channel ──────────────────────────────────────────────────────────────
         // Order matters: the side channel is analysed first when it is coded at all, because the
         // stereo decision for the *next* interval reads the mid's activity from this one.
+        // Every read of the frame is from index 1, which is what `inputBuf + 1`
+        // (`enc_API.c:469`, `encode_frame_FLP.c:129`) means: the coded frame lags the resampler's
+        // output by one sample and starts on the previous frame's carry, so it is continuous across
+        // the boundary.
         let mid_only = self.stereo_indices[interval].mid_only;
         if channels == 2 {
             if mid_only {
                 self.channels[1].vad_flags[interval] = false;
             } else {
-                self.run_vad(1, &side[..frame_length], interval);
+                self.run_vad(1, &side[1..frame_length + 1], interval);
             }
         }
-        self.run_vad(0, &mid[..frame_length], interval);
+        self.run_vad(0, &mid[1..frame_length + 1], interval);
 
         if channels == 2 {
             encode_predictors(encoder, &self.stereo_indices[interval].indices);
@@ -606,14 +872,17 @@ impl SilkEncoder {
                 CondCoding::Conditionally
             };
 
-            let samples = if channel_index == 0 { &mid } else { &side };
+            let samples = if channel_index == 0 {
+                &mut mid[1..frame_length + 1]
+            } else {
+                &mut side[1..frame_length + 1]
+            };
             self.encode_channel_frame(
                 encoder,
                 channel_index,
                 interval,
-                &samples[..frame_length],
+                samples,
                 layout,
-                frame_length,
                 channel_bps,
                 cond_coding,
             )?;
@@ -647,6 +916,15 @@ impl SilkEncoder {
             {
                 *slot = sample;
             }
+            // "Buffering" (`enc_API.c:465-467`): the two samples in front of the frame are the
+            // previous frame's last two, and this frame's last two become the next one's. Dropping
+            // that carry would put two zeros into the signal at every frame boundary — the same
+            // state the stereo path keeps in `sMid`, which is why it lives on the stereo state even
+            // in mono.
+            mid[..2].copy_from_slice(&self.stereo.mid_history);
+            self.stereo
+                .mid_history
+                .copy_from_slice(&mid[frame_length..frame_length + 2]);
             self.stereo_indices[interval] = StereoIndices::default();
             return (target_bps, 0);
         }
@@ -667,15 +945,12 @@ impl SilkEncoder {
             frame_length,
         );
         self.stereo_indices[interval] = indices;
-        // `silk_stereo_LR_to_MS` leaves the side residual at `x2[n - 1]`, i.e. starting at index 0
-        // of the buffer it was handed; shift it up so both channels index alike from 2.
-        side.copy_within(0..frame_length, 2);
         (rates.mid_bps, rates.side_bps)
     }
 
     /// Run the VAD for one channel and record its verdict.
     fn run_vad(&mut self, channel_index: usize, frame: &[i16], interval: usize) {
-        let rate = self.config.internal_rate;
+        let rate = self.internal_rate;
         let use_dtx = self.config.use_dtx;
         let channel = &mut self.channels[channel_index];
         let previous_type = channel.frame.analysis.previous_signal_type;
@@ -700,8 +975,7 @@ impl SilkEncoder {
         }
         let previous_lag = channel.frame.analysis.previous_lag.max(1);
         // Estimate the low end of the pitch frequency range, in the log domain.
-        let pitch_freq_hz_q16 =
-            ((self.config.internal_rate.khz() as i32 * 1000) << 16) / previous_lag;
+        let pitch_freq_hz_q16 = ((self.internal_rate.khz() as i32 * 1000) << 16) / previous_lag;
         let mut pitch_freq_log_q7 = lin2log(pitch_freq_hz_q16) - (16 << 7);
 
         // Adjustment based on quality: a noisy input pulls the estimate back down towards the
@@ -742,6 +1016,67 @@ impl SilkEncoder {
         self.high_pass_smth1_q15
     }
 
+    /// Band-limit one channel's frame for a bandwidth transition, slide its float input buffer along
+    /// and stage the frame into it (`encode_frame_FLP.c:123-139`).
+    ///
+    /// The low-pass runs here and not at the packet level because that is where the C puts it: after
+    /// the VAD and the stereo conversion have read the unfiltered signal, and only for a channel
+    /// that is actually being coded this frame.
+    fn stage_analysis_input(&mut self, channel_index: usize, samples: &mut [i16]) {
+        let (history, lookahead) = self.analysis_buffer_geometry();
+        let frame_length = samples.len();
+
+        let channel = &mut self.channels[channel_index];
+        // "Ensure smooth bandwidth transitions" (`encode_frame_FLP.c:126-129`). A no-op unless a
+        // transition is in flight.
+        low_pass_variable_cutoff(&mut channel.low_pass, samples);
+
+        // The encoder codes a frame that ends `lookahead` samples before the newest input, which is
+        // how the noise-shaping analysis gets its look-ahead (`encode_frame_FLP.c:123-134`).
+        for (slot, &sample) in channel.input[history + lookahead..]
+            .iter_mut()
+            .zip(samples.iter())
+            .take(frame_length)
+        {
+            *slot = f32::from(sample);
+        }
+        // "Add tiny signal to avoid high CPU load from denormalized floating point numbers"
+        // (`encode_frame_FLP.c:136-139`).
+        for step in 0..8 {
+            channel.input[history + lookahead + step * (frame_length >> 3)] +=
+                (1 - (step as i32 & 2)) as f32 * 1e-6;
+        }
+    }
+
+    /// Slide the analysis history down by one frame (`encode_frame_FLP.c:353-355`).
+    ///
+    /// Deliberately at the **end** of the frame rather than folded into the staging at the start of
+    /// the next one, because the two are not the same thing: the slide is by *this* frame's length,
+    /// and the next frame may not have the same length. A prefill is exactly that case — it runs as
+    /// 10 ms whatever the packet duration is — so a deferred slide would move the history by the
+    /// wrong amount on the very frame the prefill exists to prepare.
+    fn slide_analysis_input(&mut self, channel_index: usize, frame_length: usize) {
+        let (history, lookahead) = self.analysis_buffer_geometry();
+        self.channels[channel_index]
+            .input
+            .copy_within(frame_length..frame_length + history + lookahead, 0);
+    }
+
+    /// Where the frame being coded sits inside `x_buf`, as `(history, lookahead)`
+    /// (`encode_frame_FLP.c:123`, `:134`, `:354-355`).
+    ///
+    /// Both are the **constants** `ltp_mem_length` and `LA_SHAPE_MS`, not the complexity-dependent
+    /// `la_shape`. That distinction is load-bearing: `la_shape` is how much look-ahead the
+    /// noise-shaping analysis chooses to *look at* (3 ms below complexity 3, 5 ms above), while the
+    /// buffer always *carries* 5 ms. Tying the geometry to the complexity instead would move the
+    /// coded frame 2 ms against the input the moment the complexity changed — and a prefill changes
+    /// it to 0 for one frame (`enc_API.c:230-231`), so the frame after every mode switch would read
+    /// its own history from the wrong offset.
+    fn analysis_buffer_geometry(&self) -> (usize, usize) {
+        let khz = self.internal_rate.khz();
+        (self.internal_rate.ltp_memory_length(), LA_SHAPE_MS * khz)
+    }
+
     /// Slide one channel's float input buffer along and encode its frame.
     #[allow(clippy::too_many_arguments)]
     fn encode_channel_frame(
@@ -749,58 +1084,32 @@ impl SilkEncoder {
         encoder: &mut RangeEncoder<'_>,
         channel_index: usize,
         interval: usize,
-        samples: &[i16],
+        samples: &mut [i16],
         layout: SubframeLayout,
-        frame_length: usize,
         channel_bps: i32,
         cond_coding: CondCoding,
     ) -> Result<(), CodecError> {
         let settings = ComplexitySettings::for_complexity(self.config.complexity);
-        let la_shape = settings.la_shape_ms * self.config.internal_rate.khz();
-        let memory = self.config.internal_rate.ltp_memory_length();
-        let history = memory.max(la_shape);
+        let (history, _) = self.analysis_buffer_geometry();
 
         let config = AnalysisConfig {
-            internal_rate: self.config.internal_rate,
+            internal_rate: self.internal_rate,
             layout,
             settings,
-            snr_db_q7: control_snr(
-                channel_bps,
-                self.config.internal_rate,
-                layout.subframe_count,
-            ),
+            snr_db_q7: control_snr(channel_bps, self.internal_rate, layout.subframe_count),
             use_cbr: self.config.rate_mode == RateMode::Constant,
             packet_loss_percent: self.config.packet_loss_percent,
             frames_per_packet: layout.frames_per_packet as i32,
             lbrr_enabled: self.config.use_in_band_fec,
         };
 
-        // The encoder codes a frame that ends `la_shape` samples before the newest input, which is
-        // how the noise-shaping analysis gets its lookahead (`encode_frame_FLP.c:123-134`).
-        {
-            let channel = &mut self.channels[channel_index];
-            channel
-                .input
-                .copy_within(frame_length..frame_length + history + la_shape, 0);
-            for (slot, &sample) in channel.input[history + la_shape..]
-                .iter_mut()
-                .zip(samples.iter())
-                .take(frame_length)
-            {
-                *slot = f32::from(sample);
-            }
-            // "Add tiny signal to avoid high CPU load from denormalized floating point numbers"
-            // (`encode_frame_FLP.c:136-139`).
-            for step in 0..8 {
-                channel.input[history + la_shape + step * (frame_length >> 3)] +=
-                    (1 - (step as i32 & 2)) as f32 * 1e-6;
-            }
-        }
+        self.stage_analysis_input(channel_index, samples);
 
         // The frame's own budget. Constrained VBR and CBR both clamp against the packet cap; plain
         // VBR gets the packet cap as a ceiling only, so a frame it wants to spend on is not
-        // truncated by an arbitrary per-frame share.
-        let packet_cap_bits = (self.config.max_bytes as i32) * 8 - encoder.tell();
+        // truncated by an arbitrary per-frame share. `max_bits` is the packet cap the Opus layer set
+        // *minus* whatever `control` reserved for a bandwidth-switch redundancy frame.
+        let packet_cap_bits = self.max_bits - encoder.tell();
         let share = packet_cap_bits.max(0) / (layout.frames_per_packet - interval).max(1) as i32;
         let target_bits =
             channel_bps * self.config.duration_ms as i32 / (1000 * layout.frames_per_packet as i32);
@@ -853,6 +1162,196 @@ impl SilkEncoder {
             channel.lbrr[interval] = redundant;
             channel.lbrr_flags[interval] = true;
         }
+        let frame_length = samples.len();
+        self.slide_analysis_input(channel_index, frame_length);
+        Ok(())
+    }
+
+    /// `enc_API.c:336`, `:548-557` — decide whether the *next* packet may start a rate change.
+    ///
+    /// The rule is "only while the talker is quiet enough that a bandwidth step will not be heard",
+    /// with the threshold relaxing linearly from `SPEECH_ACTIVITY_DTX_THRES` towards 1 over
+    /// `MAX_BANDWIDTH_SWITCH_DELAY_MS` of continuous activity — otherwise a stream that is never
+    /// quiet would be stuck at whatever bandwidth it started on for the whole call.
+    ///
+    /// A DTXed packet produces no bytes and leaves the flag at the "default" 0 the C sets before
+    /// every frame, so a silent stretch does not itself authorise a switch.
+    fn update_allow_bandwidth_switch(&mut self, produced_payload: bool) {
+        self.allow_bandwidth_switch = false;
+        if !produced_payload {
+            return;
+        }
+        // SILK_FIX_CONST( SPEECH_ACTIVITY_DTX_THRES, 8 ) and
+        // SILK_FIX_CONST( ( 1 - SPEECH_ACTIVITY_DTX_THRES ) / MAX_BANDWIDTH_SWITCH_DELAY_MS, 24 ).
+        const ACTIVITY_THRESHOLD_Q8: i32 = 13;
+        const THRESHOLD_RELAXATION_Q24: i32 = 3_188;
+        let threshold_q8 = smlawb(
+            ACTIVITY_THRESHOLD_Q8,
+            THRESHOLD_RELAXATION_Q24,
+            self.time_since_switch_allowed_ms,
+        );
+        if self.channels[0].measures.speech_activity_q8 < threshold_q8 {
+            self.allow_bandwidth_switch = true;
+            self.time_since_switch_allowed_ms = 0;
+        } else {
+            self.time_since_switch_allowed_ms += self.config.duration_ms as i32;
+        }
+    }
+
+    /// Reset for a **prefill** and resolve the internal rate it will run at
+    /// (`enc_API.c:206-235`, `:251-265`).
+    ///
+    /// A prefill is how libopus enters SILK warm rather than cold: the encoder is reset and then run
+    /// over 10 ms of the audio that has already gone past, so the frame that matters starts with
+    /// real history instead of zeros. Because that reset destroys `fs_kHz`, the rate has to be
+    /// resolved here — and the caller has to know it, since it owns the resampler that feeds
+    /// [`SilkEncoder::prefill`].
+    ///
+    /// `keep_rate_control` is the C's `prefillFlag == 2` (`opus_encoder.c:1771`): on the frame that
+    /// *is* the bandwidth switch, the transition state must survive the reset or the state machine
+    /// would forget which rate it was switching from and never complete the move. On a plain
+    /// CELT→SILK entry (`prefillFlag == 1`) it is cleared with everything else.
+    ///
+    /// Returns the rate the 10 ms of `prefill` input must be supplied at.
+    pub fn control_for_prefill(
+        &mut self,
+        config: EncoderConfig,
+        keep_rate_control: bool,
+    ) -> Result<InternalRate, CodecError> {
+        let mut saved = [LowPassState::default(); 2];
+        for (slot, channel) in saved.iter_mut().zip(self.channels.iter()) {
+            *slot = LowPassState {
+                // "Save the sampling rate so the bandwidth switching code can keep handling
+                // transitions" (`enc_API.c:216-217`).
+                saved_fs_khz: channel.fs_khz,
+                ..channel.low_pass
+            };
+        }
+
+        // `silk_init_encoder` for every channel — and *only* the per-channel state. The bit
+        // reservoir, the LBRR cost average, the stereo predictor memory and the bandwidth-switch
+        // permission live on `silk_encoder`, one level up, and libopus does not reset them here
+        // (`enc_API.c:220-227`).
+        self.reset_channel_states();
+        if keep_rate_control {
+            for (channel, restored) in self.channels.iter_mut().zip(saved) {
+                channel.low_pass = restored;
+            }
+        } else {
+            // A plain CELT→SILK entry is always preceded by `silk_InitEncoder`
+            // (`opus_encoder.c:1435-1437`), which memsets the *whole* `silk_encoder` — one level
+            // above what `silk_init_encoder` reaches. There is nothing to carry over: SILK has not
+            // been running, so its reservoir and stereo memory describe audio from before the CELT
+            // stretch.
+            self.stereo = StereoEncoderState::default();
+            self.stereo_indices = [StereoIndices::default(); MAX_FRAMES_PER_PACKET];
+            self.previous_mid_only = false;
+            self.bits_exceeded = 0;
+            self.lbrr_bits_used = 0;
+            self.allow_bandwidth_switch = false;
+            self.time_since_switch_allowed_ms = 0;
+        }
+
+        // "encControl->payloadSize_ms = 10" and "complexity = 0" (`enc_API.c:228-231`): a prefill
+        // runs no analysis, so its complexity only has to be legal.
+        let outcome = self.control(EncoderConfig {
+            duration_ms: 10,
+            complexity: 0,
+            ..config
+        })?;
+        Ok(outcome.internal_rate)
+    }
+
+    /// `silk_init_encoder` for both channels (`init_encoder.c:46-68`) — everything in
+    /// `silk_encoder_state_Fxx`, and nothing above it.
+    fn reset_channel_states(&mut self) {
+        self.channels = [ChannelState::default(); 2];
+        self.high_pass_smth1_q15 = (lin2log(MIN_CUTOFF_HZ << 16) - (16 << 7)) << 8;
+    }
+
+    /// Run the 10 ms of history a [`SilkEncoder::control_for_prefill`] asked for
+    /// (`silk_Encode` with `prefillFlag`, `enc_API.c:398-521` under `encode_frame_FLP.c:141`).
+    ///
+    /// Nothing is coded and nothing is returned: the analysis, the quantiser and the bitstream are
+    /// all skipped. What runs is exactly what leaves *state* behind — the high-pass tracker, the
+    /// stereo mid/side conversion, the VAD, the transition low-pass and the analysis history buffer.
+    /// That is the difference between a warm and a cold encoder, and it is why this cannot be
+    /// replaced by "encode a throwaway frame": a throwaway frame would also advance the quantiser
+    /// and the entropy predictors, which libopus deliberately leaves at their reset values.
+    ///
+    /// `input` is interleaved PCM at the rate `control_for_prefill` returned, 10 ms of it.
+    pub fn prefill(&mut self, input: &[i16]) -> Result<(), CodecError> {
+        let layout = self.config.layout()?;
+        let frame_length = self.frame_length()?;
+        let channels = self.config.channels;
+        let rate_khz = self.internal_rate.khz();
+        if input.len() < 10 * rate_khz * channels {
+            return Err(CodecError::Unsupported(
+                "silk enc: a prefill needs exactly 10 ms of input",
+            ));
+        }
+
+        self.update_high_pass_smoother();
+
+        // The same per-frame target the real path computes, minus the two terms the C skips while
+        // prefilling: the LBRR average (`enc_API.c:403`) and the in-packet bit balance
+        // (`:426`, guarded on `nFramesEncoded > 0`, which is 0 here).
+        let frame_bits = self.config.bitrate_bps * self.config.duration_ms as i32 / 1000;
+        let mut target_bps = frame_bits * 100;
+        target_bps -= self.bits_exceeded * 1000 / BIT_RESERVOIR_DECAY_MS;
+        target_bps = target_bps.clamp(5_000, self.config.bitrate_bps.max(5_000));
+
+        let mut mid = [0i16; MAX_FRAME_LENGTH + 2];
+        let mut side = [0i16; MAX_FRAME_LENGTH + 2];
+        let (mid_bps, side_bps) = self.prepare_interval(
+            input,
+            0,
+            frame_length,
+            rate_khz,
+            channels,
+            target_bps,
+            &mut mid,
+            &mut side,
+        );
+
+        let mid_only = self.stereo_indices[0].mid_only;
+        if channels == 2 {
+            if mid_only {
+                self.channels[1].vad_flags[0] = false;
+            } else {
+                self.run_vad(1, &side[1..frame_length + 1], 0);
+            }
+        }
+        self.run_vad(0, &mid[1..frame_length + 1], 0);
+
+        for channel_index in 0..channels {
+            let channel_bps = if channels == 1 {
+                target_bps
+            } else if channel_index == 0 {
+                mid_bps
+            } else {
+                side_bps
+            };
+            if channel_bps <= 0 {
+                continue;
+            }
+            let samples = if channel_index == 0 {
+                &mut mid[1..frame_length + 1]
+            } else {
+                &mut side[1..frame_length + 1]
+            };
+            self.stage_analysis_input(channel_index, samples);
+            self.slide_analysis_input(channel_index, frame_length);
+        }
+
+        // "Exit without entropy coding" — and put the real geometry back
+        // (`enc_API.c:575-582`). `controlled_since_last_payload` is cleared there too, which for
+        // this port is implicit: the caller's next `control` always runs in full.
+        self.previous_mid_only = self.stereo_indices[layout.frames_per_packet - 1].mid_only;
+        // `enc_API.c:336` clears the permission before every frame and only the *completed packet*
+        // branch at `:548` puts it back — which a prefill never reaches, because it produces no
+        // bytes. So a prefill always leaves the next packet needing to earn the permission again.
+        self.allow_bandwidth_switch = false;
         Ok(())
     }
 
@@ -878,6 +1377,25 @@ impl SilkEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same deterministic LCG the libopus prefill oracle was driven with — a plain linear
+    /// congruential generator whose top bits are recentred on zero. Broadband noise rather than
+    /// speech, deliberately: a prefill runs no analysis, so what matters is that both sides see the
+    /// identical sample stream, not that it sounds like anything.
+    struct Source(u32);
+
+    impl Source {
+        fn new() -> Self {
+            Self(12_345)
+        }
+
+        fn fill(&mut self, frame: &mut [i16]) {
+            for slot in frame.iter_mut() {
+                self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *slot = ((self.0 >> 18) as i32 - 8_192) as i16;
+            }
+        }
+    }
 
     /// A deterministic voiced-ish mono signal at a known pitch.
     fn voiced(samples: usize, period: usize) -> Vec<i16> {
@@ -1202,7 +1720,7 @@ mod tests {
     /// A retune must not disturb the stream; an internal-rate change must reset the rate-dependent
     /// state and nothing else.
     #[test]
-    fn reconfiguring_resets_exactly_what_the_rate_depends_on() {
+    fn controlling_resets_exactly_what_the_rate_depends_on() {
         let config = EncoderConfig::new(InternalRate::Wide16k, 20, 24_000);
         let mut encoder = SilkEncoder::new(config).expect("config");
         let per_packet = encoder.samples_per_packet();
@@ -1222,13 +1740,14 @@ mod tests {
             encode(&mut encoder, packet);
         }
 
-        // A pure retune: the bitrate moves, nothing resets, so the next packet must differ from what
-        // the *original* rate would have produced but must still carry the previous frames' history.
+        // A pure retune: the bitrate moves and nothing resets.
         let before_lag = encoder.channels[0].frame.analysis.previous_lag;
         let mut retuned = config;
         retuned.bitrate_bps = 32_000;
         retuned.packet_loss_percent = 10;
-        encoder.reconfigure(retuned).expect("retune");
+        let outcome = encoder.control(retuned).expect("retune");
+        assert_eq!(outcome.internal_rate, InternalRate::Wide16k);
+        assert!(!outcome.switch_ready);
         assert_eq!(
             encoder.channels[0].frame.analysis.previous_lag, before_lag,
             "a retune must not reset the analysis"
@@ -1236,10 +1755,15 @@ mod tests {
         assert_eq!(encoder.config().bitrate_bps, 32_000);
         assert_eq!(encoder.config().packet_loss_percent, 10);
 
-        // An internal-rate change resets the rate-dependent state to its documented seeds.
+        // A rate forced *outside* the legal window is the one change that happens on the spot: 16
+        // kHz is no longer allowed, so there is nothing to negotiate and the rate-dependent state
+        // is reset to its documented seeds.
         let mut narrowed = retuned;
         narrowed.internal_rate = InternalRate::Narrow8k;
-        encoder.reconfigure(narrowed).expect("rate change");
+        narrowed.max_internal_rate = InternalRate::Narrow8k;
+        let outcome = encoder.control(narrowed).expect("rate change");
+        assert_eq!(outcome.internal_rate, InternalRate::Narrow8k);
+        assert_eq!(encoder.internal_rate(), InternalRate::Narrow8k);
         assert_eq!(encoder.channels[0].frame.analysis.previous_lag, 100);
         assert_eq!(encoder.channels[0].frame.analysis.shape.last_gain_index, 10);
         assert!(encoder.channels[0].frame.analysis.first_frame_after_reset);
@@ -1252,19 +1776,491 @@ mod tests {
         let mut range = RangeEncoder::new(&mut buffer);
         let result = encoder
             .encode(&vec![0i16; encoder.samples_per_packet()], &mut range)
-            .expect("encode after reconfigure");
+            .expect("encode after control");
         range.done();
         assert!(result.payload_bytes > 0);
 
         // An illegal configuration must be refused without disturbing the encoder.
         let mut illegal = narrowed;
         illegal.duration_ms = 30;
-        assert!(encoder.reconfigure(illegal).is_err());
+        assert!(encoder.control(illegal).is_err());
         assert_eq!(encoder.config().duration_ms, 20);
         illegal.duration_ms = 20;
         illegal.channels = 3;
-        assert!(encoder.reconfigure(illegal).is_err());
+        assert!(encoder.control(illegal).is_err());
         assert_eq!(encoder.config().channels, 1);
+    }
+
+    /// Drive `packets` packets through an encoder, re-controlling with `config` each time and
+    /// returning every [`ControlOutcome`]. `config.opus_can_switch` is fed from the previous
+    /// packet's `switch_ready`, which is exactly what the Opus layer does.
+    ///
+    /// The input is silence: `allow_bandwidth_switch` is gated on speech activity, and a loud
+    /// source would make these tests measure the activity threshold rather than the state machine.
+    fn run_with_switching(
+        encoder: &mut SilkEncoder,
+        mut config: EncoderConfig,
+        packets: usize,
+    ) -> Vec<ControlOutcome> {
+        let mut outcomes = Vec::new();
+        let mut can_switch = false;
+        for _ in 0..packets {
+            config.opus_can_switch = can_switch;
+            let outcome = encoder.control(config).expect("control");
+            let per_packet = encoder.samples_per_packet() * config.channels;
+            let mut buffer = vec![0u8; config.max_bytes];
+            let mut range = RangeEncoder::new(&mut buffer);
+            encoder
+                .encode(&vec![0i16; per_packet], &mut range)
+                .expect("encode");
+            range.done();
+            can_switch = outcome.switch_ready;
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    /// The core of the bandwidth state machine: a rate change *inside* the legal window never
+    /// happens on its own. SILK raises `switch_ready`, and only once the Opus layer answers with
+    /// `opus_can_switch` — its promise that a redundancy frame will cover the seam — does the rate
+    /// actually move.
+    #[test]
+    fn a_rate_inside_the_window_moves_only_once_the_opus_layer_covers_the_seam() {
+        let mut config = EncoderConfig::new(InternalRate::Narrow8k, 20, 24_000);
+        let mut encoder = SilkEncoder::new(config).expect("config");
+        assert_eq!(encoder.internal_rate(), InternalRate::Narrow8k);
+
+        // One rung of the ladder: the state machine only ever steps to the adjacent rate
+        // (`control_audio_bandwidth.c:104`), so ask for the adjacent one.
+        config.internal_rate = InternalRate::Medium12k;
+        let outcomes = run_with_switching(&mut encoder, config, 8);
+
+        let asked = outcomes
+            .iter()
+            .position(|outcome| outcome.switch_ready)
+            .expect("SILK never asked to switch up over 8 packets");
+        for outcome in &outcomes[..=asked] {
+            assert_eq!(
+                outcome.internal_rate,
+                InternalRate::Narrow8k,
+                "the rate moved before the Opus layer had agreed to cover the seam"
+            );
+        }
+        assert_eq!(
+            outcomes[asked + 1].internal_rate,
+            InternalRate::Medium12k,
+            "the packet after the request is answered must be the one that switches"
+        );
+        assert!(
+            !outcomes[asked + 1].switch_ready,
+            "the request must not repeat once it has been satisfied"
+        );
+        assert_eq!(encoder.internal_rate(), InternalRate::Medium12k);
+    }
+
+    /// The two directions are not symmetric, and the asymmetry is the whole reason the transition
+    /// filter exists. Going **up** needs no ramp — there is nothing above the old Nyquist to
+    /// remove — so the request is raised on the first opportunity. Going **down** has to band-limit
+    /// the input first, so the request waits out a `TRANSITION_FRAMES` sweep at two frames a frame.
+    #[test]
+    fn switching_up_asks_at_once_while_switching_down_ramps_first() {
+        let mut up = EncoderConfig::new(InternalRate::Narrow8k, 20, 24_000);
+        let mut encoder = SilkEncoder::new(up).expect("config");
+        up.internal_rate = InternalRate::Medium12k;
+        let outcomes = run_with_switching(&mut encoder, up, 8);
+        let first_up = outcomes
+            .iter()
+            .position(|outcome| outcome.switch_ready)
+            .expect("no upward request");
+        assert!(
+            first_up <= 1,
+            "the upward request took {first_up} packets — the first is only spent earning \
+             `allow_bandwidth_switch`, and anything beyond that is a ramp it should not be running"
+        );
+
+        let mut down = EncoderConfig::new(InternalRate::Wide16k, 20, 24_000);
+        let mut encoder = SilkEncoder::new(down).expect("config");
+        down.internal_rate = InternalRate::Medium12k;
+        // The ramp is armed on the packet that earns the permission and then walked down two per
+        // frame, so the request cannot arrive before `TRANSITION_FRAMES / 2` packets have gone by.
+        let held = (TRANSITION_FRAMES / 2) as usize - 8;
+        let outcomes = run_with_switching(&mut encoder, down, held);
+        assert!(
+            outcomes.iter().all(|outcome| !outcome.switch_ready),
+            "a downward switch asked before its ramp had run out"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.internal_rate == InternalRate::Wide16k),
+            "and the rate must not have moved either"
+        );
+        assert_eq!(encoder.channels[0].low_pass.mode, -2);
+
+        // Run out the rest of the sweep and the request finally arrives.
+        let rest = run_with_switching(&mut encoder, down, 24);
+        assert!(
+            rest.iter().any(|outcome| outcome.switch_ready),
+            "the downward request never arrived even after the ramp finished"
+        );
+        assert_eq!(encoder.internal_rate(), InternalRate::Medium12k);
+    }
+
+    /// The packet that asks for a switch gives up part of its own budget, so the redundancy frame
+    /// the Opus layer is about to append has somewhere to go (`control_audio_bandwidth.c:90`).
+    #[test]
+    fn asking_to_switch_reserves_room_for_the_redundancy_frame() {
+        let mut config = EncoderConfig::new(InternalRate::Narrow8k, 20, 24_000);
+        config.max_bytes = 100;
+        let mut encoder = SilkEncoder::new(config).expect("config");
+        assert_eq!(encoder.max_bits, 800);
+
+        config.internal_rate = InternalRate::Wide16k;
+        let mut can_switch = false;
+        let source = voiced(encoder.samples_per_packet() * 64, 80);
+        let mut consumed = 0usize;
+        for _ in 0..40 {
+            config.opus_can_switch = can_switch;
+            let outcome = encoder.control(config).expect("control");
+            if outcome.switch_ready {
+                // 800 - 800 * 5 / 25.
+                assert_eq!(encoder.max_bits, 640);
+                return;
+            }
+            assert_eq!(encoder.max_bits, 800);
+            let per_packet = encoder.samples_per_packet();
+            let mut buffer = vec![0u8; config.max_bytes];
+            let mut range = RangeEncoder::new(&mut buffer);
+            encoder
+                .encode(&source[consumed..consumed + per_packet], &mut range)
+                .expect("encode");
+            range.done();
+            consumed += per_packet;
+            can_switch = outcome.switch_ready;
+        }
+        panic!("SILK never asked to switch, so the reservation went untested");
+    }
+
+    /// A prefill leaves the encoder *warm*: the analysis history holds the audio it was fed, and the
+    /// per-channel state is otherwise at its reset seeds. The `prefillFlag == 2` form additionally
+    /// keeps the rate-control state, which is what lets a switch complete.
+    #[test]
+    fn a_prefill_fills_the_analysis_history_without_coding_anything() {
+        let config = EncoderConfig::new(InternalRate::Wide16k, 20, 24_000);
+        let mut encoder = SilkEncoder::new(config).expect("config");
+        let source = voiced(encoder.samples_per_packet() * 8, 80);
+        let mut buffer = vec![0u8; 1275];
+        let mut range = RangeEncoder::new(&mut buffer);
+        encoder
+            .encode(&source[..encoder.samples_per_packet()], &mut range)
+            .expect("encode");
+        range.done();
+
+        let rate = encoder
+            .control_for_prefill(config, false)
+            .expect("control_for_prefill");
+        assert_eq!(rate, InternalRate::Wide16k);
+        assert_eq!(
+            encoder.config().duration_ms,
+            10,
+            "a prefill always runs as a single 10 ms frame"
+        );
+        assert!(
+            encoder.channels[0]
+                .input
+                .iter()
+                .all(|&sample| sample == 0.0),
+            "the reset must have cleared the analysis history before it is refilled"
+        );
+
+        encoder
+            .prefill(&source[..10 * rate.khz()])
+            .expect("prefill");
+        assert!(
+            encoder.channels[0]
+                .input
+                .iter()
+                .any(|&sample| sample != 0.0),
+            "the prefill left no history behind, which is the one thing it exists to do"
+        );
+        // Nothing was coded: the quantiser and the entropy predictors are still at their seeds.
+        assert!(encoder.channels[0].frame.analysis.first_frame_after_reset);
+        assert_eq!(encoder.channels[0].frame.analysis.previous_lag, 100);
+        assert_eq!(encoder.channels[0].frame.analysis.shape.last_gain_index, 10);
+
+        // Too little audio is an error, not a short prefill.
+        assert!(encoder.prefill(&source[..10 * rate.khz() - 1]).is_err());
+    }
+
+    /// `prefillFlag == 2` exists so a bandwidth switch survives the reset that goes with it: the
+    /// transition schedule and the rate it is switching *from* have to outlive
+    /// `silk_init_encoder`.
+    #[test]
+    fn a_rate_control_preserving_prefill_still_knows_which_rate_it_came_from() {
+        let mut config = EncoderConfig::new(InternalRate::Wide16k, 20, 24_000);
+        let mut encoder = SilkEncoder::new(config).expect("config");
+        assert_eq!(encoder.internal_rate(), InternalRate::Wide16k);
+
+        // Pretend the Opus layer has just agreed to cover a downward switch.
+        config.internal_rate = InternalRate::Medium12k;
+        config.opus_can_switch = true;
+        let rate = encoder
+            .control_for_prefill(config, true)
+            .expect("control_for_prefill");
+        assert_eq!(
+            rate,
+            InternalRate::Medium12k,
+            "the prefill must land on the *new* rate; forgetting the old one strands the switch"
+        );
+        assert_eq!(encoder.internal_rate(), InternalRate::Medium12k);
+
+        // The same prefill without keeping the rate control has nothing to switch from, so it falls
+        // back to whatever was asked for outright.
+        let mut encoder = SilkEncoder::new(EncoderConfig::new(InternalRate::Wide16k, 20, 24_000))
+            .expect("config");
+        let rate = encoder
+            .control_for_prefill(config, false)
+            .expect("control_for_prefill");
+        assert_eq!(rate, InternalRate::Medium12k);
+        assert_eq!(
+            encoder.channels[0].low_pass,
+            LowPassState::default(),
+            "a full reset must leave no transition state behind"
+        );
+    }
+
+    /// What a prefill left behind, in the shape the libopus oracle prints it.
+    ///
+    /// See [`a_prefill_leaves_the_state_libopus_leaves`] for how the reference values were produced.
+    #[derive(Debug, PartialEq)]
+    struct PrefillState {
+        internal_khz: usize,
+        low_pass: LowPassState,
+        high_pass_smth1_q15: i32,
+        speech_activity_q8: i32,
+        input_tilt_q15: i32,
+        input_quality_bands_q15: [i32; 4],
+        first_frame_after_reset: bool,
+        analysis_history_digest: u64,
+        analysis_history_head: [f32; 4],
+        analysis_history_tail: [f32; 4],
+    }
+
+    /// FNV-1a over the raw little-endian IEEE-754 bytes, byte for byte with the C oracle's.
+    fn fnv_f32(values: &[f32]) -> u64 {
+        let mut hash = 14_695_981_039_346_656_037u64;
+        for &value in values {
+            for byte in value.to_bits().to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(1_099_511_628_211);
+            }
+        }
+        hash
+    }
+
+    /// Drive four ordinary 20 ms packets and then one prefill, exactly as the C oracle does, and
+    /// report what the prefill left behind.
+    ///
+    /// The API rate is the internal rate so the sequence is short, but the resampler is still in the
+    /// path on both sides — even an identity rate pair carries a 10-sample encoder delay
+    /// (`delay_matrix_enc[16k][16k]`), so leaving it out would compare against a differently aligned
+    /// signal.
+    fn prefill_state(
+        keep_rate_control: bool,
+        desired_after: InternalRate,
+        opus_can_switch: bool,
+    ) -> PrefillState {
+        use crate::opus::silk::resampler::Resampler;
+
+        const API_HZ: u32 = 16_000;
+        let mut config = EncoderConfig::new(InternalRate::Wide16k, 20, 24_000);
+        config.complexity = 6;
+        config.max_bytes = 100;
+        config.api_rate_hz = API_HZ as i32;
+
+        let mut source = Source::new();
+        let mut resampler = Resampler::new();
+        resampler
+            .configure_for_encoder(API_HZ, API_HZ)
+            .expect("identity resampler");
+
+        let mut encoder = SilkEncoder::new(config).expect("config");
+        let mut raw = [0i16; 320];
+        let mut resampled = [0i16; 320];
+        for packet in 0..4 {
+            if packet > 0 {
+                encoder.control(config).expect("control");
+            }
+            source.fill(&mut raw);
+            let written = resampler
+                .process(&mut resampled, &raw)
+                .expect("identity resample");
+            assert_eq!(written, 320);
+            let mut buffer = [0u8; 100];
+            let mut range = RangeEncoder::new(&mut buffer);
+            encoder.encode(&resampled, &mut range).expect("encode");
+            range.done();
+        }
+
+        let prefill_config = EncoderConfig {
+            internal_rate: desired_after,
+            opus_can_switch,
+            ..config
+        };
+        let rate = encoder
+            .control_for_prefill(prefill_config, keep_rate_control)
+            .expect("control_for_prefill");
+        // `silk_setup_resamplers` re-initialises after the reset (`control_codec.c:142-146`).
+        resampler
+            .reinitialize_for_encoder(API_HZ, rate.khz() as u32 * 1_000)
+            .expect("prefill resampler");
+        let mut prefill_in = [0i16; 160];
+        source.fill(&mut prefill_in);
+        let produced = 10 * rate.khz();
+        let mut prefill_out = [0i16; 160];
+        let written = resampler
+            .process(&mut prefill_out[..produced], &prefill_in)
+            .expect("prefill resample");
+        assert_eq!(written, produced);
+        encoder.prefill(&prefill_out[..produced]).expect("prefill");
+
+        let (history, lookahead) = encoder.analysis_buffer_geometry();
+        let surviving = &encoder.channels[0].input[..history + lookahead];
+        PrefillState {
+            internal_khz: encoder.internal_rate().khz(),
+            low_pass: encoder.channels[0].low_pass,
+            high_pass_smth1_q15: encoder.high_pass_smth1_q15(),
+            speech_activity_q8: encoder.channels[0].measures.speech_activity_q8,
+            input_tilt_q15: encoder.channels[0].measures.input_tilt_q15,
+            input_quality_bands_q15: encoder.channels[0].measures.input_quality_bands_q15,
+            first_frame_after_reset: encoder.channels[0].frame.analysis.first_frame_after_reset,
+            analysis_history_digest: fnv_f32(surviving),
+            analysis_history_head: [surviving[0], surviving[1], surviving[2], surviving[3]],
+            analysis_history_tail: [
+                surviving[surviving.len() - 4],
+                surviving[surviving.len() - 3],
+                surviving[surviving.len() - 2],
+                surviving[surviving.len() - 1],
+            ],
+        }
+    }
+
+    /// **The prefill state, diffed against libopus.**
+    ///
+    /// "Sounds fine" is not a bar for a prefill: its whole purpose is to leave *state* behind, and
+    /// state that is subtly wrong produces audio that is subtly wrong for the next several frames
+    /// and is invisible in any single packet. So the reference values below are what the real
+    /// `silk_Encode(..., prefillFlag)` leaves in a `silk_encoder`, read straight out of the struct
+    /// after driving four ordinary packets and then a prefill through libopus itself — the same LCG
+    /// input, the same control structure, the same resampler.
+    ///
+    /// Three cases, because the two prefill forms and the switching one differ in exactly the state
+    /// this is checking:
+    ///
+    /// * `prefillFlag == 1` — a plain CELT→SILK entry. Everything resets; `sLP` included, so it
+    ///   comes back all zeros.
+    /// * `prefillFlag == 2` with no rate change — the same, except `sLP.saved_fs_kHz` remembers the
+    ///   rate the encoder was at. Nothing else may differ, and this case is what proves the "keep"
+    ///   is narrow rather than a general state carry-over.
+    /// * `prefillFlag == 2` with `opusCanSwitch` — the real bandwidth switch. The rate moves to 12
+    ///   kHz, the transition counter is parked at its ceiling with the filter switched off, and the
+    ///   analysis history is 300 samples of the *new* rate rather than 400 of the old.
+    #[test]
+    fn a_prefill_leaves_the_state_libopus_leaves() {
+        // `prefillFlag == 1`, staying at 16 kHz.
+        assert_eq!(
+            prefill_state(false, InternalRate::Wide16k, false),
+            PrefillState {
+                internal_khz: 16,
+                low_pass: LowPassState::default(),
+                high_pass_smth1_q15: 193_536,
+                speech_activity_q8: 255,
+                input_tilt_q15: -32_768,
+                input_quality_bands_q15: [23_731, 23_731, 24_261, 25_179],
+                first_frame_after_reset: true,
+                analysis_history_digest: 0x854b_4186_e756_e617,
+                analysis_history_head: [0.0, 0.0, 0.0, 0.0],
+                analysis_history_tail: [-385.0, -792.0, 6802.0, -4211.0],
+            }
+        );
+
+        // `prefillFlag == 2`, no rate change: the same signal, but `saved_fs_kHz` remembers the
+        // rate and the stereo carry survives — which is why the history digest differs by exactly
+        // its first sample.
+        assert_eq!(
+            prefill_state(true, InternalRate::Wide16k, false),
+            PrefillState {
+                internal_khz: 16,
+                low_pass: LowPassState {
+                    saved_fs_khz: 16,
+                    ..LowPassState::default()
+                },
+                high_pass_smth1_q15: 193_536,
+                speech_activity_q8: 255,
+                input_tilt_q15: -32_768,
+                input_quality_bands_q15: [23_731, 23_731, 24_261, 25_179],
+                first_frame_after_reset: true,
+                analysis_history_digest: 0xe714_4de6_26c4_d2b8,
+                analysis_history_head: [0.0, 0.0, 0.0, 0.0],
+                analysis_history_tail: [-385.0, -792.0, 6802.0, -4211.0],
+            }
+        );
+
+        // `prefillFlag == 2` on the switching frame: 16 kHz down to 12 kHz.
+        assert_eq!(
+            prefill_state(true, InternalRate::Medium12k, true),
+            PrefillState {
+                internal_khz: 12,
+                low_pass: LowPassState {
+                    state: [0, 0],
+                    transition_frame_no: TRANSITION_FRAMES,
+                    mode: 0,
+                    saved_fs_khz: 16,
+                },
+                high_pass_smth1_q15: 193_536,
+                speech_activity_q8: 255,
+                input_tilt_q15: -32_768,
+                input_quality_bands_q15: [23_731, 23_731, 24_108, 24_567],
+                first_frame_after_reset: true,
+                analysis_history_digest: 0xd379_ed40_8245_f257,
+                analysis_history_head: [0.0, 0.0, 0.0, 0.0],
+                analysis_history_tail: [6082.0, -237.0, 1486.0, 2645.0],
+            }
+        );
+    }
+
+    /// The permission to start a switch tracks speech activity: silence grants it, a loud talker
+    /// does not — until the threshold has relaxed far enough that the stream is not stuck for ever.
+    #[test]
+    fn the_switch_permission_follows_speech_activity() {
+        let config = EncoderConfig::new(InternalRate::Wide16k, 20, 24_000);
+        let mut encoder = SilkEncoder::new(config).expect("config");
+        let per_packet = encoder.samples_per_packet();
+        let speech = voiced(per_packet * 4, 80);
+
+        let encode = |encoder: &mut SilkEncoder, samples: &[i16]| {
+            let mut buffer = vec![0u8; 1275];
+            let mut range = RangeEncoder::new(&mut buffer);
+            let result = encoder.encode(samples, &mut range).expect("encode");
+            range.done();
+            result
+        };
+
+        encode(&mut encoder, &speech[..per_packet]);
+        assert!(
+            !encoder.allow_bandwidth_switch(),
+            "a loud frame must not authorise a bandwidth step"
+        );
+        assert!(encoder.time_since_switch_allowed_ms > 0);
+
+        for _ in 0..4 {
+            encode(&mut encoder, &vec![0i16; per_packet]);
+        }
+        assert!(
+            encoder.allow_bandwidth_switch(),
+            "silence must authorise one"
+        );
+        assert_eq!(encoder.time_since_switch_allowed_ms, 0);
     }
 
     /// A configuration SILK does not define must be rejected rather than silently coerced.
