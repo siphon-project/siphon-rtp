@@ -47,7 +47,7 @@ use crate::ice::{self, IceCredentials};
 use crate::interface::{Interface, InterfaceTable};
 use crate::media_pipeline::{
     DirectionConfig, DirectionQuality, FinalCallQuality, MediaCall, MediaControl, MediaRegistry,
-    PcapCapture, RawTee, RelayConfig, RtcpRelay,
+    PcapCapture, RawTee, RelayConfig, RtcpRelay, SecureSide,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement};
@@ -388,7 +388,7 @@ fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSnapshot {
         PipelineKind::Media => PipelineSnapshot::Media,
         PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
         PipelineKind::Ws => PipelineSnapshot::Ws,
-        PipelineKind::Dtls => PipelineSnapshot::Dtls,
+        PipelineKind::Dtls | PipelineKind::DtlsMedia => PipelineSnapshot::Dtls,
     }
 }
 
@@ -530,6 +530,12 @@ enum PipelineKind {
     /// Userspace DTLS-SRTP bridge (an `RTP/AVP` ↔ `UDP/TLS/RTP/SAVPF` secure leg, RFC 5764): like
     /// [`PipelineKind::Srtp`] but the far leg is keyed by a DTLS handshake, not SDES.
     Dtls,
+    /// DTLS-SRTP **and** media-processing: the DTLS analogue of [`PipelineKind::SrtpMedia`]. The
+    /// far (`UDP/TLS/RTP/SAVPF`) leg's media reaches the [`MediaCall`] actor instead of being relayed
+    /// opaquely, so a WebRTC leg can be transcoded, recorded, noise-suppressed, WS-bridged or teed.
+    /// The [`crate::dtls_bridge::DtlsBridge`] keeps the RFC 7983 demux and the handshake; the actor
+    /// owns the crypto and is keyed asynchronously when the handshake completes.
+    DtlsMedia,
 }
 
 /// The session engine, generic over a [`Datapath`] backend.
@@ -2468,6 +2474,162 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // leg that works perfectly well against its signalled address.
                 gate_on_ice: agent_endpoints.contains(&far.rtp.id),
             });
+        } else if pipeline == PipelineKind::DtlsMedia {
+            // DTLS-SRTP far (B) leg whose media the pipeline must actually see — a different codec
+            // per side, or recording / NS / AEC. The DTLS analogue of `SrtpMedia`, with one
+            // difference that shapes the whole arm: the `SecureLeg` does not exist yet. SDES hands
+            // the key over in the answer; DTLS produces it only when the RFC 5764 handshake finishes,
+            // which is after this control command has returned.
+            //
+            // So the actor is built **pending**: both directions facing B drop media until the
+            // handshake delivers the key over `MediaControl::AttachSecureLeg`. The
+            // `DtlsBridge` keeps B's endpoint for the RFC 7983 demux (STUN → ICE, DTLS → handshake)
+            // and forwards accepted media to the actor still encrypted, so the actor stays the single
+            // owner of the crypto exactly as it is for SDES.
+            let Some(certificate) = self.dtls_certificate.clone() else {
+                return error_result("DTLS media pipeline", &"engine has no DTLS certificate");
+            };
+            let Some(peer_fingerprint) = info.fingerprint.clone() else {
+                return error_result(
+                    "DTLS media pipeline",
+                    &"missing a=fingerprint in the answer",
+                );
+            };
+            let Some(a_rtp) = near.remote_rtp else {
+                return error_result("DTLS media pipeline", &"near leg has no signalled address");
+            };
+            let Some(near_codec) = near_codec.clone() else {
+                return error_result(
+                    "DTLS media pipeline",
+                    &"offer carried no usable audio codec",
+                );
+            };
+            let Some(far_codec) = info
+                .primary_codec()
+                .map(|codec| with_ptime_override(&codec, ptime_override))
+            else {
+                return error_result(
+                    "DTLS media pipeline",
+                    &"answer carried no usable audio codec",
+                );
+            };
+            // The answerer picks the DTLS role; the engine takes the complement (RFC 5763 §5).
+            let role = match info.setup {
+                Some(sdp::Setup::Passive) => DtlsRole::Client,
+                _ => DtlsRole::Server,
+            };
+            let record_path = profile
+                .record_call
+                .then(|| profile.record_path.clone())
+                .flatten();
+            let a_to_b = match build_direction(
+                near.rtp.id,
+                bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
+                far.rtp.id,
+                info.remote_rtp,
+                &near_codec,
+                &far_codec,
+                near_telephone_event,
+                info.telephone_event_payload_type(),
+                record_path.as_deref(),
+                profile.noise_suppression,
+                profile.echo_cancellation,
+            ) {
+                Ok(direction) => direction,
+                Err(reason) => return error_result("DTLS media pipeline (A→B)", &reason),
+            };
+            let b_to_a = match build_direction(
+                far.rtp.id,
+                bridge_source_filter(profile, far_gate_rtp),
+                near.rtp.id,
+                a_rtp,
+                &far_codec,
+                &near_codec,
+                info.telephone_event_payload_type(),
+                near_telephone_event,
+                record_path.as_deref(),
+                profile.noise_suppression,
+                profile.echo_cancellation,
+            ) {
+                Ok(direction) => direction,
+                Err(reason) => return error_result("DTLS media pipeline (B→A)", &reason),
+            };
+            // Both endpoints go to `Redirect`. The dispatcher checks the bridge first, so B's
+            // datagrams reach the DTLS demux; A's fall through to the media registry.
+            for endpoint in [near.rtp.id, far.rtp.id] {
+                if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                    return error_result("install DTLS media redirect", &error);
+                }
+            }
+
+            // Non-muxed companion RTCP, keyed with the same deferred leg (RFC 3711 SRTCP on its own
+            // port, RFC 5761). Pending until the handshake lands, like the RTP directions.
+            let mut rtcp_relays = Vec::new();
+            if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp)) =
+                (near.rtcp, far.rtcp, near.remote_rtcp)
+            {
+                for endpoint in [near_rtcp.id, far_rtcp.id] {
+                    if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                        return error_result("install DTLS media RTCP redirect", &error);
+                    }
+                }
+                rtcp_relays.push(
+                    RtcpRelay::new(
+                        near_rtcp.id,
+                        bridge_source_filter(profile, near_gate_rtcp.unwrap_or(a_rtcp)),
+                        far_rtcp.id,
+                        info.remote_rtcp,
+                    )
+                    .with_pending_secure(SecureSide::Egress),
+                );
+                rtcp_relays.push(
+                    RtcpRelay::new(
+                        far_rtcp.id,
+                        bridge_source_filter(profile, far_gate_rtcp),
+                        near_rtcp.id,
+                        a_rtcp,
+                    )
+                    .with_pending_secure(SecureSide::Ingress),
+                );
+            }
+
+            let latch = !profile.flags.iter().any(|flag| flag == "no-latch");
+            let call = MediaCall::new(
+                call_id.to_string(),
+                from_tag.to_string(),
+                Some(to_tag.clone()),
+                a_to_b,
+                b_to_a,
+                latch,
+                record_path,
+            )
+            .with_far_secure_pending()
+            .with_rtcp_relays(rtcp_relays);
+            self.media
+                .register(call, self.datapath.clone(), owner_events);
+
+            // Now the handshake half: the bridge owns B's endpoint for the demux and keys the actor
+            // when it completes.
+            self.dtls_bridge().register_for_pipeline(
+                DtlsCallPlan {
+                    plain_endpoint: near.rtp.id,
+                    plain_source: bridge_source_filter(profile, a_rtp),
+                    plain_dst: a_rtp,
+                    secure_endpoint: far.rtp.id,
+                    secure_source: bridge_source_filter(profile, info.remote_rtp),
+                    secure_dst: info.remote_rtp,
+                    secure_local: far.rtp.local_addr,
+                    certificate,
+                    role,
+                    peer_fingerprint: DtlsFingerprint::new(
+                        peer_fingerprint.hash_function,
+                        peer_fingerprint.bytes,
+                    ),
+                    gate_on_ice: agent_endpoints.contains(&far.rtp.id),
+                },
+                self.media.clone(),
+                call_id.to_string(),
+            );
         } else if pipeline == PipelineKind::SrtpMedia {
             // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
             // the media actor decrypts B's SRTP, transcodes, and encrypts toward B (and the reverse),
@@ -4518,10 +4680,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .to_string(),
             );
         }
-        if pipeline == PipelineKind::Srtp {
+        if matches!(pipeline, PipelineKind::Srtp | PipelineKind::Dtls) {
+            // The crypto *bridges* relay ciphertext without ever decoding it, so there is no
+            // post-decode fan-out to tap. Note this rejects only the bridge kinds: a secure call that
+            // runs through the media pipeline (`SrtpMedia` / `DtlsMedia`) decodes like any other and
+            // tees fine — for DTLS that is exactly what WP-R4 unlocked.
             return Err(
-                "teeing a secure (SRTP-bridge) call is not supported yet — the bridge relays \
-                 ciphertext without decoding"
+                "teeing a secure crypto-bridge call is not supported — the bridge relays \
+                 ciphertext without decoding; a transcoded secure call can be teed"
                     .to_string(),
             );
         }
@@ -6495,9 +6661,19 @@ fn resolve_pipeline(
         _ => false,
     };
     if far_dtls {
-        // DTLS-SRTP far leg → the userspace DTLS bridge (codec passthrough). Secure transcode over
-        // DTLS (the DTLS analogue of `SrtpMedia`) is a follow-up, so a codec mismatch still bridges.
-        return PipelineKind::Dtls;
+        // DTLS-SRTP far leg. Route it through the media pipeline when something actually needs the
+        // decoded audio — a codec mismatch, recording, noise suppression or echo cancellation —
+        // and through the plain crypto bridge otherwise, which stays cheaper (no decode/re-encode)
+        // and is all a same-codec WebRTC↔SIP call needs.
+        return if transcode
+            || profile.record_call
+            || profile.noise_suppression
+            || profile.echo_cancellation
+        {
+            PipelineKind::DtlsMedia
+        } else {
+            PipelineKind::Dtls
+        };
     }
     if far_local_crypto.is_some() {
         // Secure far leg: the plain SRTP bridge when both legs share a codec (crypto only), or the
@@ -13755,6 +13931,355 @@ mod tests {
             media,
             "B's DTLS-SRTP media is decrypted and relayed to A"
         );
+    }
+
+    /// Drive a DTLS peer's client-side handshake against `engine_far` over `socket`, returning its
+    /// keyed `SecureLeg`. Factored out of the DTLS end-to-end tests, which otherwise repeat 40 lines
+    /// of transport pumping apiece.
+    async fn peer_dtls_handshake(
+        socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+        engine_far: SocketAddr,
+        peer_cert: &siphon_rtp_dtls::DtlsCertificate,
+        engine_fingerprint: &sdp::Fingerprint,
+    ) -> siphon_rtp_srtp::leg::SecureLeg {
+        use bytes::Bytes;
+        use siphon_rtp_dtls::{handshake, DtlsRole, DtlsTransport};
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (transport, channels) = DtlsTransport::new(peer_addr, engine_far);
+        let reader = {
+            let socket = socket.clone();
+            let inbound = channels.inbound;
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 2048];
+                while let Ok((len, _)) = socket.recv_from(&mut buffer).await {
+                    if inbound
+                        .send_async(Bytes::copy_from_slice(&buffer[..len]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+        let writer = {
+            let socket = socket.clone();
+            let outbound = channels.outbound;
+            tokio::spawn(async move {
+                while let Ok(record) = outbound.recv_async().await {
+                    if socket.send_to(&record, engine_far).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let expected = siphon_rtp_dtls::Fingerprint::new(
+            engine_fingerprint.hash_function.clone(),
+            engine_fingerprint.bytes.clone(),
+        );
+        let leg = timeout(
+            Duration::from_secs(5),
+            handshake(Arc::new(transport), peer_cert, DtlsRole::Client, &expected),
+        )
+        .await
+        .expect("handshake did not time out")
+        .expect("peer handshake");
+        // The pump only carries the handshake; stop it so the test owns the socket for media.
+        reader.abort();
+        writer.abort();
+        leg
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dtls_leg_is_transcoded_to_a_plain_leg_with_a_different_codec_each_side() {
+        // WP-R4's headline, and the thing a WebRTC leg could not do before: a DTLS-SRTP (WebRTC-shaped)
+        // far leg whose codec differs from the plaintext near leg is carried by the **media pipeline**,
+        // not relayed opaquely — so it is decoded, transcoded and re-encrypted. A offers PCMU, B
+        // answers PCMA over UDP/TLS/RTP/SAVPF with rtcp-mux, and media is verified in BOTH directions
+        // (each arriving in the *receiver's* codec, which is what proves a transcode actually ran).
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_dtls::DtlsCertificate;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let peer_b = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind b"),
+        );
+        let addr_b = peer_b.local_addr().expect("addr b");
+
+        // A offers plaintext PCMU; the profile asks for a DTLS-SRTP far leg.
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dtls-transcode".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("offer reply");
+        let engine_fingerprint = offer_reply.fingerprint.clone().expect("engine fingerprint");
+        let engine_far = offer_reply.remote_rtp;
+
+        // B answers DTLS with PCMA — a *different* codec, which is what selects the media pipeline.
+        let peer_cert = DtlsCertificate::generate().expect("peer cert");
+        let peer_fingerprint = peer_cert.fingerprint();
+        let peer_hex = peer_fingerprint
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVPF 8\r\na=rtpmap:8 PCMA/8000\r\na=rtcp-mux\r\n\
+             a=setup:active\r\na=fingerprint:{hash} {peer_hex}\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+            hash = peer_fingerprint.hash_function,
+        );
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dtls-transcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        assert!(matches!(answer, CmdResult::Ok { .. }), "answer: {answer:?}");
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        assert!(
+            engine.media().is_media_call("dtls-transcode"),
+            "a DTLS leg with a codec mismatch must run through the media pipeline, not the bridge"
+        );
+
+        // Before the handshake there is no key: A's media must be dropped, never forwarded to B in
+        // the clear. (B cannot read it, and putting A's cleartext on the wire would be the leak.)
+        for sequence in 0..5u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let mut buffer = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(300), peer_b.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "media before the DTLS handshake must be dropped, not leaked to the secure peer"
+        );
+
+        // Complete B's handshake; the engine keys the pipeline asynchronously.
+        let mut peer_leg = peer_dtls_handshake(
+            peer_b.clone(),
+            addr_b,
+            engine_far,
+            &peer_cert,
+            &engine_fingerprint,
+        )
+        .await;
+
+        // A → B: plaintext PCMU in, SRTP out, decrypting to PCMA (payload type 8).
+        let mut to_b = None;
+        for sequence in 10..60u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(150), peer_b.recv_from(&mut buffer)).await
+            {
+                let mut plain = Vec::new();
+                peer_leg
+                    .unprotect(&buffer[..len], &mut plain)
+                    .expect("B decrypts the engine's SRTP");
+                to_b = Some(plain);
+                break;
+            }
+        }
+        let to_b = to_b.expect("B received transcoded, encrypted media from A");
+        assert_eq!(
+            to_b[1] & 0x7f,
+            8,
+            "A's PCMU was transcoded into B's negotiated PCMA before encryption"
+        );
+
+        // B → A: SRTP PCMA in, plaintext PCMU out.
+        let mut to_a = None;
+        for sequence in 100..150u16 {
+            let mut sealed = Vec::new();
+            peer_leg
+                .protect(&g711_rtp(8, sequence, 0x0B0B_0B0B, 0xD5), &mut sealed)
+                .expect("B protects");
+            peer_b.send_to(&sealed, engine_far).await.expect("b send");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                to_a = Some(buffer[..len].to_vec());
+                break;
+            }
+        }
+        let to_a = to_a.expect("A received decrypted, transcoded media from B");
+        assert_eq!(
+            to_a[1] & 0x7f,
+            0,
+            "B's PCMA was decrypted and transcoded into A's negotiated PCMU"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dtls_media_leg_can_be_ws_teed_but_a_dtls_bridge_leg_cannot() {
+        // The second half of what WP-R4 unlocks: once a DTLS leg's media reaches the pipeline it is an
+        // ordinary media call, so the post-decode fan-out works and a WS tee attaches. The plain DTLS
+        // *bridge* (same codec both sides, no pipeline) still cannot be teed — it relays ciphertext it
+        // never decodes — and must say so rather than attach a sink that would never fire.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_dtls::DtlsCertificate;
+
+        async fn dtls_call(
+            engine: &Engine<UdpLoopbackDatapath>,
+            call_id: &str,
+            answer_codec: (u8, &str),
+        ) {
+            let (_phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+            let peer_b = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind b");
+            let addr_b = peer_b.local_addr().expect("addr b");
+            engine
+                .handle(
+                    CLIENT,
+                    Command::Offer {
+                        call_id: call_id.into(),
+                        from_tag: "tag-a".into(),
+                        sdp: sdp_for(addr_a, true),
+                        profile: ProfileFlags {
+                            transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                            ..Default::default()
+                        },
+                    },
+                )
+                .await;
+            let peer_cert = DtlsCertificate::generate().expect("peer cert");
+            let peer_fingerprint = peer_cert.fingerprint();
+            let peer_hex = peer_fingerprint
+                .bytes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(":");
+            let (payload_type, name) = answer_codec;
+            let answer_sdp = format!(
+                "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+                 m=audio {port} UDP/TLS/RTP/SAVPF {payload_type}\r\n\
+                 a=rtpmap:{payload_type} {name}/8000\r\na=rtcp-mux\r\n\
+                 a=setup:active\r\na=fingerprint:{hash} {peer_hex}\r\n",
+                ip = addr_b.ip(),
+                port = addr_b.port(),
+                hash = peer_fingerprint.hash_function,
+            );
+            let answer = engine
+                .handle(
+                    CLIENT,
+                    Command::Answer {
+                        call_id: call_id.into(),
+                        from_tag: "tag-a".into(),
+                        to_tag: "tag-b".into(),
+                        sdp: answer_sdp,
+                        profile: ProfileFlags::default(),
+                    },
+                )
+                .await;
+            assert!(matches!(answer, CmdResult::Ok { .. }), "answer: {answer:?}");
+        }
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        // PCMA answer against a PCMU offer → a codec mismatch → the media pipeline → teeable.
+        dtls_call(&engine, "dtls-teeable", (8, "PCMA")).await;
+        assert!(engine.media().is_media_call("dtls-teeable"));
+        let (uri, frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "dtls-teeable".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "a transcoded DTLS leg must be teeable: {attached:?}"
+        );
+        expect_tee_start(&frames).await;
+
+        // PCMU answer against a PCMU offer → same codec → the plain crypto bridge → not teeable.
+        dtls_call(&engine, "dtls-bridged", (0, "PCMU")).await;
+        assert!(
+            !engine.media().is_media_call("dtls-bridged"),
+            "a same-codec DTLS call stays on the cheaper crypto bridge"
+        );
+        let (uri, _frames) = tee_server().await;
+        let refused = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "dtls-bridged".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        match refused {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("ciphertext"),
+                "expected the crypto-bridge refusal, got {reason}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
