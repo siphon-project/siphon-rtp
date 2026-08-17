@@ -11,6 +11,13 @@ pub trait MediaSink: Send {
 
     /// Flush/finalize the sink at end of stream (close a file, send a final WS frame, …).
     fn finish(&mut self) {}
+
+    /// An optional caller-assigned label, so one sink can be detached without disturbing the others on
+    /// the same tap. A SIPREC fork leaves it `None` (its lifetime is the subscription's); a WS tee
+    /// carries its stream id, so detaching the tee never tears down a subscription forking the same leg.
+    fn tag(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Distributes each PCM frame to every attached sink.

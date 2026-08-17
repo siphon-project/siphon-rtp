@@ -2,8 +2,9 @@
 
 > Design + threat model for the media plane. Status: **implemented and wired.** The gated latch, the
 > source-consistency checks, symmetric-RTP NAT traversal, SDP address rewrite, ICE-lite + STUN, the
-> built-in TURN server, SRTP-SDES (RFC 3711 / 4568), and DTLS-SRTP (RFC 5764) all ship today. The main
-> remaining item is full ICE (state machine + consent freshness, RFC 8445 / 7675); ICE-lite is the
+> built-in TURN server, SRTP-SDES (RFC 3711 / 4568), and DTLS-SRTP (RFC 5764) all ship today, as does
+> RFC 7675 consent freshness (opt-in, `--ice-consent` — §4.4). The main remaining item is the full ICE
+> state machine (RFC 8445: gathering, checklists, nomination, controlling agent); ICE-lite is the
 > current server posture. Crypto posture: secure legs stay secure end to end, and a plaintext leg can
 > still run behind network-layer security (IPsec / SBC / private bearer) where a deployment prefers
 > that. Order as built: **latch hardening, then SRTP/DTLS keying, then ICE/TURN, then DoS /
@@ -220,14 +221,65 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > mints credentials from the OS CSPRNG, and at offer/answer the engine re-originates ICE as
 > **ICE-lite** — advertising `a=ice-lite` + its own ufrag/pwd + a host candidate and calling
 > `set_ice` on the ICE legs, which then answer checks and adopt the validated source; end-to-end
-> tested. **Remaining:** full (non-lite) ICE for cases where the engine must *send* connectivity
-> checks (the engine as ICE controlling agent). Consent loss is handled — a valid check stamps
-> activity, so the media-timeout sweep reaps an ICE path that stops receiving checks — and RTCP-port
-> ICE under non-mux is wired.
+> tested. **Consent freshness (RFC 7675) is now wired and runnable** — see the bullet below.
+> **Candidate gathering (RFC 8445 §5.1.1) is wired**: the advertised candidate list is gathered per
+> leg and per component rather than being one hardcoded host line — host always, plus a
+> server-reflexive candidate per `--stun-server` that answers. **The full RFC 8445 agent is wired too**
+> (`--ice-full`, off by default): checklists, connectivity checks, both roles with 487 conflict
+> resolution, peer-reflexive discovery, and regular nomination — with media gated on the selected
+> pair. **Remaining:** ICE restart (§9), trickle (RFC 8838), and relayed candidates.
+> RTCP-port ICE under non-mux is wired.
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
   never saw. The validated candidate pair, not "first packet wins", becomes the path.
+- **Candidate gathering** (RFC 8445 §5.1.1) decides what we advertise as reachable, so it is part of
+  the same story:
+  - **Host** candidates come from the leg's own endpoints — one per component (RTP, plus RTCP when the
+    leg is not muxed, RFC 8445 §4.1.1.1) — and carry the leg's *advertised* address, so a 1:1-NAT
+    deployment offers the routable IP rather than the bound private one.
+  - **Server-reflexive** candidates are gathered by probing each `--stun-server` from the media
+    endpoint itself. A reflexive address equal to the base (or to the advertised address) is pruned as
+    redundant (RFC 8445 §5.1.3), which is exactly what a directly-addressable engine sees — so the
+    default deployment gathers host-only and pays **no** round trip at call setup. The built-in TURN
+    server answers plain Binding requests (RFC 8656 §12), so it can be its own STUN server.
+  - A gathering response is accepted only when its transaction id matches an outstanding probe **and**
+    it came from the server that probe was sent to. Without the source check, anyone able to guess a
+    transaction id could plant a reflexive candidate in our offer.
+  - Gathering is **bounded**: it runs on the offer/answer control path, retransmits per RFC 8489
+    §6.2.1, and gives up at a deadline, advertising what it has and logging which servers went quiet.
+    A dead STUN server costs one bounded delay and a host-only list — never a failed call. Components
+    gather concurrently, so that delay is paid once per leg, not once per component.
+  - Because there is no trickle yet, the offer/answer *is* the complete list, and it is marked
+    `a=end-of-candidates` (RFC 8838 §14).
+  - **Enforcement:** `siphon-rtp-ice/src/gather.rs` (the pure plan), `Engine::gather_leg_candidates` /
+    `run_gatherer` (its I/O), `sdp::IceAdvertisement` (emission).
+- **The full agent (`--ice-full`) changes who decides the media path**, which is why it belongs in this
+  document rather than only in the cookbook:
+  - **The datapath stops answering checks on a full-agent leg** (`IceAgentMode::ForwardOnly`). It
+    forwards STUN to the engine and answers nothing, because answering correctly needs state the
+    datapath does not have: the role and tie-breaker for the §7.3.1.1 conflict check, the checklist for
+    §7.3.1.3 peer-reflexive discovery, and the nomination flag for §7.3.1.5.
+  - **The agent becomes the only writer of the latch**, through the new `Datapath::adopt_source`. It
+    is called when ICE selects a pair (§8.1.1), and only for a pair whose check the agent
+    authenticated with the negotiated credentials — the same authority the responder had, relocated
+    to the component that owns the checklist.
+  - **Media therefore does not start until ICE has chosen.** Under the layer-4 gate an ICE endpoint
+    forwards media only from the adopted source, so with nothing adopted, nothing flows. An early
+    media sender cannot pre-empt the choice, and neither can an attacker who simply sends first.
+  - **The forward rule follows for free.** The datapath already prefers an endpoint's adopted source
+    over the signalled `out_dst`, so adopting both gates ingress and re-points the sibling's egress.
+    RFC 7675 consent, which resolves its target from the same adopted source each tick, follows the
+    selection without being told.
+  - **A DTLS-SRTP leg keys the selected pair, not the signalled address** (RFC 8445 §12). Its
+    handshake is held until ICE selects, then released and pointed at the chosen pair; records and
+    media follow it. Gated only when a full agent is actually running on that leg — otherwise no
+    selection is coming and waiting would hang a working leg.
+  - **A failed checklist tears the call down** (§8.1.2, CDR reason `ice_failed`): if no pair works,
+    there is no path, and holding the call open would only wait for a timeout.
+  - **Enforcement:** `siphon-rtp-ice/src/{checklist,agent}.rs` (the pure state machine),
+    `ice/driver.rs` `AgentSupervisor` + `Engine::drive_ice_agents` (its I/O), `IceAgentMode` and
+    `adopt_source` in `datapath`.
 - **No blind pre-check latch on a plaintext-RTP + ICE relay leg.** On the `Forward` fast path an ICE
   endpoint's media is gated to the STUN-validated latch: the connectivity-check responder
   (`handle_stun`) is the **only** writer of an ICE endpoint's latch, so media arriving *before* any
@@ -238,13 +290,53 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
   from its first packet — no first-source race. Secure ICE (DTLS-SRTP / SDES) legs run on the
   `Redirect` path and are unaffected. Enforcement: `Inner::dispatch` (the Forward-path ICE branch) in
   [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs); the rule + `set_ice` ordering in `engine::answer`.
-- **Consent freshness** (RFC 7675): periodic STUN keepalives; on consent loss, stop forwarding and
-  tear down. This is also the anti-hijack *and* the dead-path detector.
+- **Consent freshness** (RFC 7675): periodic STUN checks on the established pair; on consent loss the
+  call is torn down. This is also the anti-hijack *and* the dead-path detector.
+  - **Responder half (always on).** A valid inbound check stamps the endpoint's activity, so the
+    media-timeout sweep (layer 6) already reaps an ICE path whose peer stops checking. Nothing to
+    enable; this is what an ICE-lite agent is required to do.
+  - **Initiator half (`--ice-consent`, off by default).** With it enabled, every ICE leg is promoted
+    to the datapath's **full-agent seam** (`Datapath::set_ice_agent`: the responder plus forwarding of
+    every STUN datagram — crucially the Binding *responses* the responder drops) and gets a
+    `ConsentChecker` driven once per sweep tick by `Engine::drive_consent`. A check is addressed
+    `<peer-ufrag>:<our-ufrag>` and signed with the **peer's** password (RFC 8445 §7.1.2), so each leg
+    of a call is probed with the credentials of the peer *it* faces. After
+    `--consent-timeout-secs` (30 s per RFC 7675 §5.1) with no correlated, MI-verified response, the
+    call is torn down: CDR reason `consent_failed`, `Event::MediaTimeout` to the owner.
+  - **Where the check is sent is the security-relevant part.** It goes to
+    `Datapath::ice_validated_source` — the address the peer proved it can receive on by answering a
+    signed check — **never** the signalled `c=`. For a NATed peer the `c=` address is its private
+    address, so probing it would fail consent on healthy calls and reap them. An endpoint on which no
+    check has validated a source yet is not probed at all (there is no pair to keep alive, and layer 6
+    still covers a leg that never comes up). A *media* latch on a non-ICE endpoint is never reported
+    as validated — only an authenticated check moves that source.
+  - **Off by default, deliberately.** RFC 7675 §4 states that an ICE-lite agent does not generate
+    consent checks, only responds to them, and `a=ice-lite` is what the engine advertises today.
+    Initiating them while claiming lite is a deviation, so it is an operator opt-in; the full-agent
+    work turns it on for legs that no longer claim lite.
+  - **Backend support.** The UDP datapath implements the seam. A backend that does not (the XDP fast
+    path takes the defaulted `set_ice_agent`) **logs a warning per endpoint** and keeps responder-only
+    behaviour — the degradation is loud, never silent. An HA-restored ICE call likewise runs no
+    consent and says so: the snapshot carries the engine's own credentials but not the peer's, so a
+    check cannot be addressed.
+  - **Enforcement:** `ice/driver.rs` (`ConsentSupervisor`), `ice/consent.rs` (`ConsentChecker`),
+    `Engine::drive_consent` + the daemon sweeper, `ice_validated_source` in `udp.rs`.
 - **Spec:** RFC 8445 (ICE), RFC 8839 (SDP for ICE), RFC 8489 (STUN), RFC 7675 (consent).
 - **Enforcement:** `profile.ice` (`force` / `remove`; `force-relay` degrades to `force`) now
   overrides the SDP-derived ICE posture; STUN served on the media socket via the layer-1 demux.
 - **Note:** for non-ICE legacy VoLTE/PSTN UAs (the common case), layers 1–3 are the whole story; ICE
   applies to ICE-capable peers (RCS, WebRTC bridges, modern clients).
+
+- **A repeated `offer` on a live call-id is owner-only, and replaces cleanly.** Another client
+  offering an existing call-id gets `unknown_call` and the live call is untouched — it cannot be
+  destroyed, and its existence is not disclosed (A3, §5). For the owner the offer *replaces* the call:
+  the previous one is torn down through the same path as `delete` (CDR emitted, endpoints, pipelines,
+  subscriptions and the quota slot all released) before the replacement is built. Previously the
+  registry entry was simply overwritten and the old `Call` dropped unfreed, leaking its media ports
+  and its quota slot on every repeat — a client re-offering in a loop could exhaust both. Note this is
+  replacement, not re-negotiation: the replacement binds fresh ports, so the peer must be told the new
+  address. A true re-offer on the existing ports (a SIP re-INVITE, and the trigger an RFC 8445 §9 ICE
+  restart needs) is a separate control verb that does not exist yet.
 
 ### Layer 5 — SRTP / DTLS-SRTP
 The cryptographic fix: authenticated media cannot be injected or silently hijacked even if the latch

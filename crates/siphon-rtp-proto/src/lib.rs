@@ -280,9 +280,62 @@ pub enum Command {
         #[serde(default)]
         direction: BridgeDirection,
     },
+    /// Attach a **WebSocket tee** to a live call: stream its decoded audio to `ws_uri` while the call
+    /// keeps relaying. Unlike `ProfileFlags::ws_uri` (takeover — the WS server *becomes* leg A's far
+    /// side and A↔B is not wired), a tee is send-only and additive: the relay/transcode path, any
+    /// SIPREC subscription, and the recording all continue untouched. A plain in-kernel relay is
+    /// promoted to the userspace media pipeline for the tee's lifetime and demoted again on detach.
+    /// A native siphon-rtp extension — the NG/bencode front-end does not carry it.
+    AttachWsTee {
+        call_id: String,
+        from_tag: String,
+        /// `ws://` or `wss://` URI of the media server the engine dials as a client.
+        ws_uri: String,
+        /// Which leg(s) to stream (default: both).
+        #[serde(default)]
+        direction: WsTeeDirection,
+        /// Wire channel count: `2` interleaves caller/callee as stereo, `1` mixes them to mono. Only
+        /// meaningful with `direction = both`; a single-leg tee is always mono. `None` ⇒ 2 for both
+        /// legs, 1 for one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channels: Option<u8>,
+    },
+    /// Detach the WebSocket tee from a call, closing its stream. Idempotent: detaching a call with no
+    /// tee is not an error.
+    DetachWsTee { call_id: String, from_tag: String },
     /// Authenticate the control connection with the server's shared secret. Handled by the control
     /// server (not the session engine); required as the first command when a secret is configured.
     Authenticate { token: String },
+}
+
+/// Which leg(s) of a call a [`Command::AttachWsTee`] streams. "Caller" is the offerer (leg A, the
+/// `from_tag` side); "callee" is the answerer (leg B).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WsTeeDirection {
+    /// Both legs — stereo (channel 0 = caller, channel 1 = callee) unless `channels = 1` mixes them.
+    #[default]
+    Both,
+    /// Only the caller's (offerer's) audio, as a mono monologue.
+    Caller,
+    /// Only the callee's (answerer's) audio, as a mono monologue.
+    Callee,
+}
+
+/// Why a WebSocket tee stream ended, carried by [`Event::WsTeeEnded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WsTeeEndReason {
+    /// The controller detached it ([`Command::DetachWsTee`]) or the call was torn down.
+    Detached,
+    /// The WS server closed the connection.
+    ServerClosed,
+    /// The WS server sent a `stop` control frame.
+    ServerStopped,
+    /// The call's media path went away, so no further audio can be teed.
+    CallEnded,
+    /// A WebSocket/transport error ended the stream.
+    TransportError,
 }
 
 /// A participant's role in a conference — the audio routing matrix (call-centre / PBX). Tagged on
@@ -425,6 +478,21 @@ pub struct ProfileFlags {
     /// from the signalling port, so the port is never gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub received_from: Option<std::net::IpAddr>,
+    /// Attach a **WebSocket tee** to this call at offer/answer time — the declarative twin of
+    /// [`Command::AttachWsTee`], so a controller does not need a second round-trip. Unlike `ws_uri`
+    /// (takeover), a tee is send-only and leaves the A↔B relay/transcode path wired: the call relays
+    /// normally *and* streams its decoded audio to this URI. Applied once the call's media path exists
+    /// (i.e. on `answer` / `answer_local`), and torn down with the call. A native siphon-rtp extension
+    /// — the NG/bencode front-end does not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_tee: Option<String>,
+    /// Which leg(s) `ws_tee` streams. `None` ⇒ both. Inert without `ws_tee`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_tee_direction: Option<WsTeeDirection>,
+    /// Wire channel count for `ws_tee`: `2` = stereo caller/callee, `1` = mixed mono. `None` ⇒ 2 when
+    /// both legs are teed, 1 for a single leg. Inert without `ws_tee`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_tee_channels: Option<u8>,
     /// rtpengine `rtcp-mux` directive list (`offer` | `require` | `demux` | `accept` | `reject` |
     /// `remove`), letting the controller override the mux decision derived from the offered SDP
     /// (RFC 5761). Empty ⇒ mirror the offer (the default). See [`crate`] callers / the engine's
@@ -720,6 +788,37 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         legs: Vec<LegSummary>,
     },
+    /// A WebSocket tee started streaming ([`Command::AttachWsTee`] or `ProfileFlags::ws_tee`): the
+    /// engine dialled the server, sent `start`, and the call's decoded audio is now flowing. Carries
+    /// the negotiated wire shape so a controller can decode the binary frames without guessing.
+    WsTeeStarted {
+        call_id: String,
+        from_tag: String,
+        /// The tee's `streamId`, matching the `start` frame on the WebSocket — the correlator between
+        /// this control event and the media stream.
+        stream_id: String,
+        ws_uri: String,
+        direction: WsTeeDirection,
+        /// Wire channels: 1 = mono/mixed, 2 = caller/callee interleaved.
+        channels: u8,
+        /// Wire sample rate in Hz (L16, little-endian).
+        sample_rate: u32,
+    },
+    /// A WebSocket tee stopped. Emitted exactly once per started tee — including when the *server*
+    /// ends it — so a controller learns the stream died rather than silently losing audio.
+    WsTeeEnded {
+        call_id: String,
+        from_tag: String,
+        stream_id: String,
+        reason: WsTeeEndReason,
+        /// Wire frames handed to the transport over the tee's lifetime.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frames_sent: Option<u64>,
+        /// Frames dropped because the server stalled (bounded queue full) or a channel ring overflowed.
+        /// A non-zero value means the consumer could not keep up — the call itself was never affected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frames_dropped: Option<u64>,
+    },
     /// Unknown / future event kind (forward-compat).
     #[serde(other)]
     Unknown,
@@ -931,6 +1030,114 @@ mod tests {
         assert!(!profile.ws_barge_in);
         assert_eq!(profile.ws_vad_threshold, None);
         assert_eq!(profile.ws_vad_hangover_ms, None);
+    }
+
+    #[test]
+    fn attach_ws_tee_wire_shape_and_defaults() {
+        // `direction` defaults to both and `channels` is optional, so the minimal form is three fields.
+        let json =
+            r#"{"command":"attach_ws_tee","call_id":"c","from_tag":"f","ws_uri":"ws://h/s"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::AttachWsTee {
+                call_id,
+                from_tag,
+                ws_uri,
+                direction,
+                channels,
+            } => {
+                assert_eq!(call_id, "c");
+                assert_eq!(from_tag, "f");
+                assert_eq!(ws_uri, "ws://h/s");
+                assert_eq!(direction, WsTeeDirection::Both, "both legs by default");
+                assert_eq!(channels, None);
+            }
+            other => panic!("expected attach_ws_tee, got {other:?}"),
+        }
+
+        let explicit = Command::AttachWsTee {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            ws_uri: "wss://h/s".into(),
+            direction: WsTeeDirection::Caller,
+            channels: Some(1),
+        };
+        let value = serde_json::to_value(&explicit).expect("to_value");
+        assert_eq!(value["command"], "attach_ws_tee");
+        assert_eq!(value["direction"], "caller");
+        assert_eq!(value["channels"], 1);
+
+        match serde_json::from_str::<Command>(
+            r#"{"command":"detach_ws_tee","call_id":"c","from_tag":"f"}"#,
+        )
+        .expect("deserialize")
+        {
+            Command::DetachWsTee { call_id, from_tag } => {
+                assert_eq!((call_id.as_str(), from_tag.as_str()), ("c", "f"));
+            }
+            other => panic!("expected detach_ws_tee, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ws_tee_profile_flags_are_additive_and_omitted_when_unset() {
+        let serialized = serde_json::to_value(ProfileFlags::default()).expect("to_value");
+        for field in ["ws_tee", "ws_tee_direction", "ws_tee_channels"] {
+            assert!(
+                serialized.get(field).is_none(),
+                "{field} omitted when unset"
+            );
+        }
+        let json = concat!(
+            r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n",""#,
+            r#"profile":{"ws_tee":"ws://h/tee","ws_tee_direction":"callee","ws_tee_channels":1}}"#
+        );
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::Offer { profile, .. } => {
+                assert_eq!(profile.ws_tee.as_deref(), Some("ws://h/tee"));
+                assert_eq!(profile.ws_tee_direction, Some(WsTeeDirection::Callee));
+                assert_eq!(profile.ws_tee_channels, Some(1));
+                // A tee is additive: it never implies takeover.
+                assert_eq!(profile.ws_uri, None);
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ws_tee_events_wire_shape() {
+        let started = Event::WsTeeStarted {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            stream_id: "tee-c".into(),
+            ws_uri: "ws://h/s".into(),
+            direction: WsTeeDirection::Both,
+            channels: 2,
+            sample_rate: 8000,
+        };
+        let value = serde_json::to_value(&started).expect("to_value");
+        assert_eq!(value["event"], "ws_tee_started");
+        assert_eq!(value["stream_id"], "tee-c");
+        assert_eq!(value["channels"], 2);
+        assert_eq!(
+            serde_json::from_value::<Event>(value).expect("roundtrip"),
+            started
+        );
+
+        let ended = Event::WsTeeEnded {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            stream_id: "tee-c".into(),
+            reason: WsTeeEndReason::ServerClosed,
+            frames_sent: Some(1500),
+            frames_dropped: Some(0),
+        };
+        let value = serde_json::to_value(&ended).expect("to_value");
+        assert_eq!(value["event"], "ws_tee_ended");
+        assert_eq!(value["reason"], "server_closed");
+        assert_eq!(
+            serde_json::from_value::<Event>(value).expect("roundtrip"),
+            ended
+        );
     }
 
     #[test]

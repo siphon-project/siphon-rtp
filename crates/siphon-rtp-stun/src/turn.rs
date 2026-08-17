@@ -20,6 +20,10 @@ use super::{decode_xor_mapped_address, encode_xor_mapped_address, StunMessage};
 
 // --- Methods (RFC 5766 §13) -------------------------------------------------------------------
 
+/// STUN Binding method (RFC 8489 §5). Not a TURN method, but a TURN server is required to answer it
+/// (RFC 8656 §12: *"a TURN server MUST support Binding requests"*), which is also what lets one
+/// server act as both the TURN and the STUN server for candidate gathering.
+pub const METHOD_BINDING: u16 = 0x001;
 /// TURN Allocate method.
 pub const METHOD_ALLOCATE: u16 = 0x003;
 /// TURN Refresh method.

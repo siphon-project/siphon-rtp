@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_datapath::{
-    AddressFamily, Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceConfig, LatchPolicy,
-    ObservedRtcp, SourceFilter,
+    AddressFamily, Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceAgentMode,
+    IceConfig, LatchPolicy, ObservedRtcp, SourceFilter,
 };
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_hep::exporter::HepExporter;
@@ -33,7 +33,7 @@ use siphon_rtp_media::player::{PcmPlayer, WavSource};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    PlayMediaSource, ProfileFlags, SessionStats,
+    PlayMediaSource, ProfileFlags, SessionStats, WsTeeDirection, WsTeeEndReason,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
@@ -42,6 +42,7 @@ use siphon_rtp_srtp::StreamRollover;
 use crate::cluster::ClusterState;
 use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
 use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
+use crate::ice::driver::{AgentOutcome, AgentSupervisor, ConsentOutcome, ConsentSupervisor};
 use crate::ice::{self, IceCredentials};
 use crate::interface::{Interface, InterfaceTable};
 use crate::media_pipeline::{
@@ -52,6 +53,8 @@ use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement};
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
 use crate::ws_bridge::WsRegistry;
+use siphon_rtp_ice::{GatherAction, GatherConfig, Gatherer};
+use std::net::SocketAddr;
 
 use siphon_rtp_media::bridge::protocol::{Direction as WsDirection, MediaFormat};
 use siphon_rtp_media::bridge::{run_bridge, BridgeSession};
@@ -99,6 +102,23 @@ struct Call {
     /// The engine's own ICE-lite credentials for this call (its identity as the ICE server), or
     /// `None` for a non-ICE call.
     ice: Option<IceCredentials>,
+    /// The **near** (offerer, A) peer's ICE credentials, from its offer's `a=ice-ufrag`/`a=ice-pwd`.
+    /// Kept because an outbound check is signed with the *peer's* password and addressed
+    /// `<peer-ufrag>:<our-ufrag>` (RFC 8445 §7.1.2) — our own credentials are not enough to talk to
+    /// it. `None` when A offered no ICE.
+    near_remote_ice: Option<IceCredentials>,
+    /// The **far** (answerer, B) peer's ICE credentials, from its answer. Same purpose as
+    /// [`Self::near_remote_ice`], for the other leg; `None` until a B answer carrying ICE lands.
+    far_remote_ice: Option<IceCredentials>,
+    /// A's ICE candidates from its offer — the remote set the near leg's agent pairs against
+    /// (RFC 8445 §6.1.2.2). Empty for a non-ICE offer.
+    near_remote_candidates: Vec<siphon_rtp_ice::Candidate>,
+    /// Whether A advertised `a=ice-lite`. A lite agent can never be controlling (RFC 8445 §6.1.1), so
+    /// this decides our role on the near leg.
+    near_peer_is_lite: bool,
+    /// The candidates gathered for the **far** leg at offer time, kept because the far agent is only
+    /// started at answer (when B's own set arrives) and re-gathering would change what we advertised.
+    far_local_candidates: Vec<siphon_rtp_ice::Candidate>,
     from_tag: String,
     to_tag: Option<String>,
     near: Leg,
@@ -167,6 +187,10 @@ enum PromotionReason {
     /// actor can decode each party's ingress and re-emit it back to the sender (a relay-only promotion
     /// forwards opaque payloads to the peer and cannot loop them home).
     Echo,
+    /// A WebSocket **tee** is streaming this call's audio (`attach_ws_tee`). The tee taps the
+    /// post-decode fan-out, so a plain relay must be held in a **processing** MediaCall — a relay-only
+    /// promotion forwards RTP verbatim and never decodes, which would leave the tee with nothing.
+    WsTee,
     /// A userspace media op (`play_media`) needs a **processing** MediaCall to synthesize egress
     /// audio on an offer-only single-leg IVR call (or a plain relay). Unlike `Echo`, this hold is
     /// never released on its own — once a prompt has played, the call is a media-processing call for
@@ -566,6 +590,45 @@ pub struct Engine<D: Datapath> {
     /// in the accept's `play_id` and in the matching [`Event::PlayFinished`], so a controller
     /// correlates a completion with the specific prompt it started (a leg may play several in sequence).
     play_id_counter: std::sync::atomic::AtomicU64,
+    /// RFC 7675 consent freshness, when the operator enabled it (`--ice-consent`). `None` ⇒ the
+    /// engine only *answers* checks (the RFC 7675 §4 ICE-lite posture) and dead paths are caught by
+    /// the media-timeout sweep alone. Shared with the sweeper task, which drives it once per tick.
+    consent: Option<Arc<ConsentSupervisor>>,
+    /// The full RFC 8445 agents, when the operator enabled `--ice full`. `None` ⇒ the ICE-lite
+    /// responder posture. Shared with the driver task, which polls them on a sub-second clock.
+    ice_agents: Option<Arc<AgentSupervisor>>,
+    /// STUN servers asked for a server-reflexive candidate during gathering (RFC 8445 §5.1.1.2).
+    /// Empty (the default) ⇒ host-only gathering, which is correct for a directly-addressable engine
+    /// and costs no network round trip at call setup.
+    stun_servers: Vec<SocketAddr>,
+    /// Live WebSocket **tees**, keyed by call-id — the send-only audio streams riding a relaying call
+    /// (`attach_ws_tee` / `ProfileFlags::ws_tee`). One per call; attaching again replaces the previous
+    /// one. Held here (not in the media actor) because the transport task, the WS socket and the
+    /// dropped/forwarded counters outlive individual control ops and must be torn down on `delete`.
+    ws_tees: DashMap<String, WsTee>,
+}
+
+/// A live WebSocket tee on one call: the shared mixer (for its counters), its transport task, and the
+/// per-leg fork tags so a detach removes exactly this tee's sinks and nothing else.
+struct WsTee {
+    /// The tee's stream id — also the fork tag on every leg it taps, and the event correlator.
+    stream_id: String,
+    /// The call's offerer tag and owning control client, copied here at attach time: teardown runs
+    /// *after* `delete` has already removed the call from the registry, so the end event cannot look
+    /// them up any more.
+    from_tag: String,
+    owner: ClientId,
+    /// Shared frame assembler; read at teardown for the `frames_sent` / `frames_dropped` on
+    /// [`Event::WsTeeEnded`].
+    mixer: Arc<std::sync::Mutex<siphon_rtp_media::bridge::tee::TeeMixer>>,
+    /// Which legs carry a sink for this tee (`true` = leg A / caller), so detach targets exactly them.
+    tapped_legs: Vec<bool>,
+    /// The transport task (dial → `start` → drain). Aborted on detach; it emits
+    /// [`Event::WsTeeEnded`] itself when the *server* ends the stream first.
+    transport: tokio::task::JoinHandle<()>,
+    /// Set once an end event has been emitted for this tee, so the controller sees exactly one
+    /// `ws_tee_ended` whether the server or the detach won the race.
+    ended: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
@@ -616,7 +679,72 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             )),
             // Start at 1 so a `play_id` of 0 never appears (a controller can treat 0 as "no play").
             play_id_counter: std::sync::atomic::AtomicU64::new(1),
+            // Off unless the operator opts in — see `with_consent`.
+            consent: None,
+            ice_agents: None,
+            // Host-only gathering unless the operator names a STUN server.
+            stun_servers: Vec::new(),
+            ws_tees: DashMap::new(),
         }
+    }
+
+    /// Ask these STUN servers for a server-reflexive candidate when gathering (RFC 8445 §5.1.1.2).
+    ///
+    /// Only useful when the engine itself sits behind a NAT it cannot be addressed through — the
+    /// normal deployment is a routable media address, where the host candidate is the whole story and
+    /// a reflexive probe would only return the address we already advertise (and be pruned as
+    /// redundant, RFC 8445 §5.1.3). Leaving this empty keeps call setup free of any network round
+    /// trip. Builder-style consuming setter, mirroring [`Self::with_cluster`].
+    #[must_use]
+    pub fn with_stun_servers(mut self, servers: Vec<SocketAddr>) -> Self {
+        self.stun_servers = servers;
+        self
+    }
+
+    /// The bound local address of one of a call's endpoints — where that leg's agent sources its
+    /// checks from, and the local side of every pair it forms.
+    fn endpoint_address(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        self.calls.iter().find_map(|entry| {
+            let call = entry.value();
+            [
+                Some(call.near.rtp),
+                call.near.rtcp,
+                Some(call.far.rtp),
+                call.far.rtcp,
+            ]
+            .into_iter()
+            .flatten()
+            .find(|candidate| candidate.id == endpoint)
+            .map(|candidate| candidate.local_addr)
+        })
+    }
+
+    /// Run a full RFC 8445 ICE agent on every ICE leg instead of the ICE-lite responder: the engine
+    /// forms checklists, sends connectivity checks, resolves role conflicts, discovers peer-reflexive
+    /// candidates, and nominates a pair — and media only starts once a pair is selected.
+    ///
+    /// Off by default: `a=ice-lite` is what the engine advertises, and a lite agent is a valid and
+    /// simpler posture for a server on a routable address. Builder-style consuming setter.
+    #[must_use]
+    pub fn with_full_ice(mut self) -> Self {
+        self.ice_agents = Some(Arc::new(AgentSupervisor::new()));
+        self
+    }
+
+    /// Enable RFC 7675 consent freshness with the given cadence: every ICE leg is promoted to the
+    /// datapath's full-agent seam and actively probed on its validated pair, and a peer that stops
+    /// answering has its call torn down.
+    ///
+    /// **Off by default, deliberately.** RFC 7675 §4 is explicit that an ICE-**lite** agent does not
+    /// generate consent checks, it only responds to them — and ice-lite is what the engine advertises
+    /// (`a=ice-lite`) until the full agent lands. Initiating checks while advertising lite is a
+    /// deviation, so it is the operator's opt-in rather than the default; the full-agent work turns it
+    /// on unconditionally for legs that no longer claim lite. Builder-style consuming setter,
+    /// mirroring [`Self::with_cluster`].
+    #[must_use]
+    pub fn with_consent(mut self, config: crate::ice::driver::ConsentConfig) -> Self {
+        self.consent = Some(Arc::new(ConsentSupervisor::new(config)));
+        self
     }
 
     /// Build (once) and return the ring-backed rustls client configuration for `wss://` WebSocket
@@ -743,6 +871,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Live WebSocket tees — one per teed call (the `siphon_rtp_ws_tees` gauge).
+    #[must_use]
+    pub fn ws_tee_count(&self) -> usize {
+        self.ws_tees.len()
+    }
+
+    /// Audio frames handed to the live tees' transports so far. Read across every live tee; a tee that
+    /// has already ended has been removed, so this is a *live* sum rather than a process total.
+    #[must_use]
+    pub fn ws_tee_frames_sent(&self) -> u64 {
+        self.ws_tees
+            .iter()
+            .filter_map(|tee| tee.mixer.lock().ok().map(|mixer| mixer.forwarded()))
+            .sum()
+    }
+
+    /// Frames the live tees dropped because a consumer stalled. Non-zero means a WS server could not
+    /// keep up — by design that costs tee frames and never the call.
+    #[must_use]
+    pub fn ws_tee_frames_dropped(&self) -> u64 {
+        self.ws_tees
+            .iter()
+            .filter_map(|tee| tee.mixer.lock().ok().map(|mixer| mixer.dropped()))
+            .sum()
+    }
+
+    /// Push an asynchronous event to whichever client owns `call_id` (a no-op for an unknown call).
+    fn emit_call_event(&self, call_id: &str, event: Event) {
+        if let Some(owner) = self.owned_call_internal(call_id, |call| call.owner) {
+            self.push_event(owner, event);
+        }
+    }
+
     /// Handle one control command from `client`, producing the result to return to the caller.
     ///
     /// Increments the operational counters as a side effect: per-command totals (offer/answer/
@@ -832,8 +993,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp,
                 profile,
             } => {
-                self.answer(client, &call_id, &from_tag, to_tag, &sdp, &profile)
-                    .await
+                let result = self
+                    .answer(client, &call_id, &from_tag, to_tag, &sdp, &profile)
+                    .await;
+                self.apply_profile_ws_tee(&call_id, &profile, result).await
             }
             Command::AnswerLocal {
                 call_id,
@@ -841,8 +1004,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp,
                 profile,
             } => {
-                self.answer_local(client, &call_id, from_tag, &sdp, &profile)
-                    .await
+                let result = self
+                    .answer_local(client, &call_id, from_tag, &sdp, &profile)
+                    .await;
+                self.apply_profile_ws_tee(&call_id, &profile, result).await
             }
             Command::Delete { call_id, .. } => self.delete(client, &call_id).await,
             Command::Query { call_id, .. } => self.query(client, &call_id),
@@ -970,6 +1135,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 conference_id_b,
                 direction,
             } => self.conference_bridge(&conference_id_a, &conference_id_b, direction),
+            Command::AttachWsTee {
+                call_id,
+                ws_uri,
+                direction,
+                channels,
+                ..
+            } => {
+                self.attach_ws_tee(client, &call_id, &ws_uri, direction, channels)
+                    .await
+            }
+            Command::DetachWsTee { call_id, .. } => self.detach_ws_tee(client, &call_id).await,
             other => CmdResult::Error {
                 reason: format!("unsupported command: {}", command_name(&other)),
             },
@@ -1063,6 +1239,42 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: "per-client call quota exceeded".to_string(),
             };
         }
+        // An offer for a call-id that already exists.
+        //
+        // Ownership first (A3 — docs/security-and-nat.md §5): only the client that created a call may
+        // affect it. Another client offering the same id must not be able to disturb it, and must not
+        // learn that it exists — so it gets the same `unknown_call` any other cross-client reference
+        // does, and the live call is left completely untouched.
+        //
+        // For the owner, this replaces the call. That was already the effect (the registry entry was
+        // overwritten), but the previous `Call` was dropped without freeing anything: its 2-4 datapath
+        // endpoints leaked their ports and FDs, and its quota slot was never released, so a client
+        // repeating an offer bled both until the node refused new calls. Tear the old one down
+        // properly first — same path as `delete`, so the CDR is emitted and every resource is
+        // released — then build the replacement.
+        //
+        // Note this is *replacement*, not re-negotiation: the new call gets fresh ports, so the peer
+        // must be told the new address. A true re-offer (SIP re-INVITE — renegotiating codecs or
+        // addresses on the *existing* ports, and the trigger an RFC 8445 §9 ICE restart needs) is a
+        // separate control verb that does not exist yet.
+        if let Some(existing) = self.calls.get(&call_id) {
+            if existing.owner != client {
+                drop(existing);
+                return unknown_call(&call_id);
+            }
+            drop(existing);
+            tracing::info!(
+                target: "siphon_rtp::control",
+                %call_id,
+                "offer replaces an existing call with the same id — tearing the old one down first"
+            );
+            if let Some((_, previous)) = self.calls.remove(&call_id) {
+                // `finish_call` emits the CDR and frees endpoints, pipelines, subscriptions and the
+                // quota slot. No `MediaTimeout` event: the controller caused this, it is not a dead
+                // path, and telling it otherwise would be a lie.
+                self.finish_call(&call_id, &previous, "replaced").await;
+            }
+        }
         let info = match sdp::parse(sdp) {
             Ok(info) => info,
             Err(error) => {
@@ -1078,7 +1290,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // overrides the SDP-derived default (RFC 8445): `force`/`force-relay` mint them regardless of
         // the offer, `remove` suppresses them, otherwise mirror whether the offer carried ICE.
         let ice_directive = ice_directive(profile);
+        // RFC 8839 §5.3: the offer carried candidates but its default destination is none of them, so
+        // the SDP was rewritten in transit (a SIP ALG). ICE describes a topology that no longer
+        // matches where media actually goes, so it must not be used — we say `a=ice-mismatch` and both
+        // sides fall back to the signalled address. An explicit `ICE=force` still wins: an operator
+        // who forces ICE has said they know better than the heuristic.
+        let ice_mismatch = siphon_rtp_ice::is_ice_mismatch(info.remote_rtp, &info.candidates)
+            && ice_directive != Some(IceDirective::Force);
+        if ice_mismatch {
+            tracing::info!(
+                target: "siphon_rtp::control",
+                %call_id,
+                signalled = %info.remote_rtp,
+                candidates = info.candidates.len(),
+                "ICE mismatch (RFC 8839 §5.3): the offer's default destination matches none of its \
+                 candidates — the SDP was altered in transit; falling back to non-ICE"
+            );
+        }
         let want_ice = match ice_directive {
+            _ if ice_mismatch => false,
             Some(IceDirective::Force) => true,
             Some(IceDirective::Remove) => false,
             None => info.is_ice(),
@@ -1152,11 +1382,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // ICE rewrite mode (RFC 8839 §5): re-originate ICE-lite when we minted creds; on `ice: remove`
         // with none minted, strip the peer's ICE without advertising our own; otherwise pass it
         // through. `IceAdvertisement` borrows `ice_creds`, so it is built here and kept alive to rewrite.
+        // Gather the far leg's candidates before the offer is written — the offer *is* the candidate
+        // list, and without trickle there is no second chance to add to it (RFC 8445 §5.1.1). Host-only
+        // gathering (the default) is instant and touches no socket; with a STUN server configured this
+        // costs one bounded round trip on the control path.
+        let far_ice_candidates = match ice_creds.as_ref() {
+            Some(creds) => {
+                let far_leg = Leg {
+                    rtp: far_rtp,
+                    rtcp: far_rtcp,
+                    remote_rtp: None,
+                    remote_rtcp: None,
+                    advertised_ip: far_advertised,
+                };
+                self.gather_leg_candidates(
+                    &far_leg,
+                    &IceConfig {
+                        local_ufrag: creds.ufrag.clone(),
+                        local_pwd: creds.pwd.clone(),
+                    },
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
         let ice_rewrite = match (ice_creds.as_ref(), ice_directive) {
             (Some(creds), _) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
                 ufrag: creds.ufrag.as_str(),
                 pwd: creds.pwd.as_str(),
+                candidates: &far_ice_candidates,
             }),
+            // Say why ICE is absent rather than dropping it silently, so the offerer stops waiting
+            // for connectivity checks that will never come (RFC 8839 §5.3).
+            (None, _) if ice_mismatch => IceRewrite::Mismatch,
             (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
             (None, _) => IceRewrite::Keep,
         };
@@ -1288,6 +1546,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
                 ice: ice_creds,
+                // A's own credentials, from the offer — needed to *address* checks to A later
+                // (RFC 8445 §7.1.2); B's arrive with its answer.
+                near_remote_ice: peer_ice_credentials(&info),
+                far_remote_ice: None,
+                near_remote_candidates: info.candidates.clone(),
+                near_peer_is_lite: info.ice_lite,
+                far_local_candidates: far_ice_candidates.clone(),
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -1467,6 +1732,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
                 ice: None,
+                // A single-leg local answer mints no ICE of its own, so there is no pair to keep
+                // consent on either side.
+                near_remote_ice: None,
+                far_remote_ice: None,
+                near_remote_candidates: Vec::new(),
+                near_peer_is_lite: false,
+                far_local_candidates: Vec::new(),
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -1702,9 +1974,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Free any SIPREC subscriptions first (detach forks, abort drains, free subscriber ports)
             // before the media actor is deregistered.
             self.drop_subscriptions(call_id).await;
+            // …and any WS tee riding the same fan-out, so its transport closes and the controller
+            // gets its `ws_tee_ended` rather than a silently dead stream.
+            self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
             self.bridge.deregister(endpoints.iter().copied());
             self.media.deregister(call_id);
             self.ws.deregister(call_id);
+            if let Some(consent) = &self.consent {
+                consent.unregister_call(call_id);
+            }
+            if let Some(agents) = &self.ice_agents {
+                agents.unregister_call(call_id);
+            }
             for endpoint in endpoints {
                 self.datapath.remove_endpoint(endpoint).await;
                 self.endpoint_calls.remove(&endpoint);
@@ -1728,6 +2009,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near,
             far,
             ice_creds,
+            near_remote_ice,
+            near_remote_candidates,
+            near_peer_is_lite,
+            far_local_candidates,
             far_local_crypto,
             far_dtls,
             near_codec,
@@ -1745,6 +2030,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.near,
                     call.far,
                     call.ice.clone(),
+                    call.near_remote_ice.clone(),
+                    call.near_remote_candidates.clone(),
+                    call.near_peer_is_lite,
+                    call.far_local_candidates.clone(),
                     call.far_local_crypto,
                     call.far_dtls,
                     call.near_codec.clone(),
@@ -1790,10 +2079,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         // The A-facing near leg re-originates ICE-lite iff the offer minted engine creds (the ICE
         // posture was decided at offer); otherwise the peer's ICE (if any) passes through unchanged.
+        // The near leg's candidates, gathered now for the same reason the far leg's were at offer:
+        // this answer is the complete candidate list A will ever see from us.
+        let near_ice_candidates = match ice_creds.as_ref() {
+            Some(creds) => {
+                self.gather_leg_candidates(
+                    &near,
+                    &IceConfig {
+                        local_ufrag: creds.ufrag.clone(),
+                        local_pwd: creds.pwd.clone(),
+                    },
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
         let ice_rewrite = match ice_creds.as_ref() {
             Some(creds) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
                 ufrag: creds.ufrag.as_str(),
                 pwd: creds.pwd.as_str(),
+                candidates: &near_ice_candidates,
             }),
             None => IceRewrite::Keep,
         };
@@ -1879,20 +2184,158 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // any relay flow is installed, so an ICE leg is STUN-gated from its first packet — the
         // datapath's layer-4 gate then forwards media only from a validated source and a Forward flow
         // is never live with a blind-latch window (docs/security-and-nat.md §4 layer 4; RFC 8445).
+        // Endpoints on which a full ICE agent ends up running — consulted later by the DTLS plan,
+        // which must hold its handshake for a selection only when one is actually coming.
+        let mut agent_endpoints: Vec<EndpointId> = Vec::new();
         if let Some(creds) = &ice_creds {
             let config = IceConfig {
                 local_ufrag: creds.ufrag.clone(),
                 local_pwd: creds.pwd.clone(),
             };
             // `near` faces A (which offered ICE); enable the responder on its RTP and, under
-            // non-mux, its companion RTCP endpoint.
-            for endpoint in near.endpoint_ids() {
-                self.datapath.set_ice(endpoint, Some(config.clone()));
-            }
-            // `far` faces B; enable only when B also offered ICE.
-            if info.is_ice() {
+            // non-mux, its companion RTCP endpoint. `far` faces B; enable only when B also offered
+            // ICE. With consent freshness on, each side is promoted to the datapath's **full-agent**
+            // seam instead (responder + STUN forwarding) and registered with the credentials of the
+            // peer *that* side faces — an outbound check is signed with the peer's password, so the
+            // two legs are not interchangeable (RFC 8445 §7.1.2).
+            let far_remote_ice = if info.ice_mismatch {
+                // RFC 8839 §5.3: B says our offer's ICE reached it altered, so ICE is unusable on that
+                // leg. Treat B as non-ICE — the endpoints below are cleared and the leg falls back to
+                // the signalled-source gate.
+                tracing::info!(
+                    target: "siphon_rtp::control",
+                    %call_id,
+                    "peer answered a=ice-mismatch (RFC 8839 §5.3) — running the far leg without ICE"
+                );
+                None
+            } else {
+                peer_ice_credentials(&info)
+            };
+            if !info.is_ice() || info.ice_mismatch {
+                // B answered without ICE. Gathering at offer time installed the responder on the far
+                // endpoints (that is how it received its own Binding responses), and leaving it there
+                // would arm the layer-4 gate — which forwards media *only* from a STUN-validated
+                // source — on a leg that will never send a check, blackholing B's media. Clear it, so
+                // the far leg falls back to the signalled-source gate like any non-ICE leg.
                 for endpoint in far.endpoint_ids() {
-                    self.datapath.set_ice(endpoint, Some(config.clone()));
+                    self.datapath.set_ice(endpoint, None);
+                }
+            }
+            let sides = [
+                (near.endpoint_ids().collect::<Vec<_>>(), &near_remote_ice),
+                (
+                    if info.is_ice() && !info.ice_mismatch {
+                        far.endpoint_ids().collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    },
+                    &far_remote_ice,
+                ),
+            ];
+            // Full RFC 8445 agent, when the operator enabled it and this side's peer gave us both
+            // credentials and candidates. It supersedes consent on that side: a full agent runs its
+            // own checks, and RFC 7675 consent is what a *lite* agent does instead.
+            let full_ice_sides = [
+                (
+                    near.endpoint_ids().collect::<Vec<_>>(),
+                    &near_remote_ice,
+                    &near_remote_candidates,
+                    &near_ice_candidates,
+                    // RFC 8445 §6.1.1: the offerer controls. We answered A, so A controls — unless A
+                    // is a lite agent, which can never control (§6.1.1), leaving it to us.
+                    near_peer_is_lite,
+                ),
+                (
+                    if info.is_ice() && !info.ice_mismatch {
+                        far.endpoint_ids().collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    },
+                    &far_remote_ice,
+                    &info.candidates,
+                    &far_local_candidates,
+                    // We offered to B, so we control this leg either way.
+                    true,
+                ),
+            ];
+            if let Some(agents) = &self.ice_agents {
+                for (endpoints, remote, remote_candidates, local_candidates, controlling) in
+                    full_ice_sides
+                {
+                    let (Some(remote), false) = (remote, remote_candidates.is_empty()) else {
+                        continue;
+                    };
+                    for endpoint in endpoints {
+                        let Some(local_addr) = self.endpoint_address(endpoint) else {
+                            continue;
+                        };
+                        // Only this endpoint's own component takes part in its checklist.
+                        let component = if endpoint == near.rtp.id || endpoint == far.rtp.id {
+                            1
+                        } else {
+                            2
+                        };
+                        let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
+                            siphon_rtp_ice::agent::Credentials::new(
+                                creds.ufrag.clone(),
+                                creds.pwd.clone(),
+                            ),
+                            siphon_rtp_ice::agent::Credentials::new(
+                                remote.ufrag.clone(),
+                                remote.pwd.clone(),
+                            ),
+                            controlling,
+                            ice_tie_breaker(),
+                        )
+                        .with_candidates(
+                            filter_component(local_candidates, component),
+                            filter_component(remote_candidates, component),
+                        );
+                        self.datapath.set_ice_agent(
+                            endpoint,
+                            config.clone(),
+                            // The agent owns request handling: answering needs the role (§7.3.1.1),
+                            // the checklist (§7.3.1.3) and the nomination flag (§7.3.1.5), none of
+                            // which the datapath has. It is also then the only thing that may adopt a
+                            // source, so media cannot start before ICE has chosen a pair.
+                            IceAgentMode::ForwardOnly,
+                            agents.events(),
+                        );
+                        agents.register(endpoint, call_id, local_addr, agent_config, 0);
+                        agent_endpoints.push(endpoint);
+                    }
+                }
+            }
+
+            for (endpoints, remote) in sides {
+                for endpoint in endpoints {
+                    if agent_endpoints.contains(&endpoint) {
+                        continue; // a full agent already owns this endpoint
+                    }
+                    match (&self.consent, remote) {
+                        (Some(consent), Some(remote)) => {
+                            self.datapath.set_ice_agent(
+                                endpoint,
+                                config.clone(),
+                                // Consent is a lite-agent behaviour: the datapath keeps answering
+                                // checks, and the sink exists only so Binding *responses* reach the
+                                // checker (RFC 7675 §4).
+                                IceAgentMode::RespondAndForward,
+                                consent.events(),
+                            );
+                            consent.register(
+                                endpoint,
+                                call_id,
+                                &creds.ufrag,
+                                &remote.ufrag,
+                                &remote.pwd,
+                            );
+                        }
+                        // Consent is off, or this peer signalled ICE without usable credentials:
+                        // the ice-lite responder alone (RFC 7675 §4 — a lite agent answers checks
+                        // and never initiates them).
+                        _ => self.datapath.set_ice(endpoint, Some(config.clone())),
+                    }
                 }
             }
         }
@@ -2020,6 +2463,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     peer_fingerprint.hash_function,
                     peer_fingerprint.bytes,
                 ),
+                // Hold the handshake for ICE only when a full agent is actually running on this leg
+                // (RFC 8445 §12). Without one there is no selection coming, and gating would hang a
+                // leg that works perfectly well against its signalled address.
+                gate_on_ice: agent_endpoints.contains(&far.rtp.id),
             });
         } else if pipeline == PipelineKind::SrtpMedia {
             // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
@@ -2324,6 +2771,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.relay_flows = relay_flows;
             // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
             call.far_remote_crypto = info.crypto.first().copied();
+            // B's ICE credentials from its answer — what an outbound consent check to B is addressed
+            // and signed with (RFC 8445 §7.1.2).
+            call.far_remote_ice = peer_ice_credentials(&info);
         }
         // Answer-side codec presentation: on a transcoding call (Media / SrtpMedia) the engine sends
         // A its *own* negotiated codec, so the answer relayed to A must advertise A's codec, never
@@ -2459,9 +2909,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .chain(call.far.endpoint_ids())
             .collect();
         self.drop_subscriptions(call_id).await;
+        // Any WS tee riding the same fan-out closes with the call, so its controller gets a final
+        // `ws_tee_ended` (with the lifetime frame counters) rather than a silently dead stream.
+        self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
         self.bridge.deregister(endpoints.iter().copied());
         self.media.deregister(call_id);
         self.ws.deregister(call_id);
+        // Consent state dies with the call — otherwise a torn-down leg keeps a checker (and its
+        // credentials) alive forever and the registry never drains to zero.
+        if let Some(consent) = &self.consent {
+            consent.unregister_call(call_id);
+        }
+        if let Some(agents) = &self.ice_agents {
+            agents.unregister_call(call_id);
+        }
         for endpoint in endpoints {
             self.datapath.remove_endpoint(endpoint).await;
             self.endpoint_calls.remove(&endpoint);
@@ -3152,6 +3613,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.endpoint_calls
                 .insert(endpoint.id, snapshot.call_id.clone());
         }
+        // Read before the snapshot's credentials are moved into the call below.
+        let restored_ice = snapshot.ice.is_some();
         self.calls.insert(
             snapshot.call_id.clone(),
             Call {
@@ -3161,6 +3624,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ufrag: ice.ufrag,
                     pwd: ice.pwd,
                 }),
+                // The HA snapshot carries only the engine's *own* ICE credentials, never the peer's,
+                // so a restored leg cannot address a check to it (RFC 8445 §7.1.2 needs the peer's
+                // ufrag + password). A restored ICE call therefore runs no consent freshness — it
+                // falls back to the media-timeout sweep — and says so loudly below. Carrying the peer
+                // credentials in the snapshot belongs with the full-agent HA work, not here.
+                near_remote_ice: None,
+                far_remote_ice: None,
+                near_remote_candidates: Vec::new(),
+                near_peer_is_lite: false,
+                far_local_candidates: Vec::new(),
                 from_tag: snapshot.from_tag,
                 to_tag: snapshot.to_tag,
                 near,
@@ -3192,6 +3665,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
+        // Be loud about the gap rather than let a restored ICE call look fully covered: consent
+        // freshness needs the peer's credentials, which the snapshot does not carry.
+        if restored_ice && self.consent.is_some() {
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                call_id = %snapshot.call_id,
+                "restored ICE call runs WITHOUT RFC 7675 consent freshness — the HA snapshot carries \
+                 no peer ICE credentials; dead-path detection falls back to the media-timeout sweep"
+            );
+        }
         ok_empty()
     }
 
@@ -3976,6 +4459,419 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ok_empty()
     }
 
+    /// Attach a **WebSocket tee** to an established call ([`Command::AttachWsTee`]): stream the call's
+    /// decoded audio to a WS server *while it keeps relaying*.
+    ///
+    /// The tee is a [`siphon_rtp_media::fanout::MediaSink`] on the same post-decode tap SIPREC forking
+    /// uses, so one decode of each stream feeds the peer, the recorder, any SIPREC fork **and** the WS
+    /// consumer — never a second [`siphon_rtp_media::leg::MediaLeg`] (two jitter buffers on one stream
+    /// make two different concealment decisions, and the consumer would hear artefacts the call never
+    /// had). A plain in-kernel relay is promoted to a **processing** media call for the tee's lifetime
+    /// (a relay-only promotion never decodes, so it would tee nothing) and demoted again on detach.
+    ///
+    /// This is *not* `ProfileFlags::ws_uri`: takeover makes the WS server leg A's far side and leaves
+    /// A↔B unwired, while a tee is send-only and additive. A takeover call therefore cannot be teed —
+    /// its media never reaches the media pipeline — and is rejected rather than silently ignored.
+    async fn attach_ws_tee(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        ws_uri: &str,
+        direction: WsTeeDirection,
+        channels: Option<u8>,
+    ) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        match self
+            .start_ws_tee(call_id, ws_uri, direction, channels)
+            .await
+        {
+            Ok(()) => ok_empty(),
+            Err(reason) => error_result("attach_ws_tee", &reason),
+        }
+    }
+
+    /// Stand a tee up on `call_id` (shared by [`Self::attach_ws_tee`] and the `ProfileFlags::ws_tee`
+    /// answer-time path, which has already validated ownership).
+    async fn start_ws_tee(
+        &self,
+        call_id: &str,
+        ws_uri: &str,
+        direction: WsTeeDirection,
+        channels: Option<u8>,
+    ) -> Result<(), String> {
+        use siphon_rtp_media::bridge::protocol::{Encoding, Endianness};
+        use siphon_rtp_media::bridge::tee::{
+            plan_ws_tee, tee_start_message, TeeChannel, WsTeeSink,
+        };
+
+        // A WS-takeover call's media is bridged to its own server and never reaches the pipeline, and a
+        // secure (SRTP-bridge) call's Redirect path is crypto-only — neither has a fan-out to tap.
+        // Reject clearly instead of attaching a sink that would never fire (mirrors `subscribe_request`).
+        let pipeline = self
+            .owned_call_internal(call_id, |call| call.pipeline)
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        if self.ws.is_ws_call(call_id) || pipeline == PipelineKind::Ws {
+            return Err(
+                "a WebSocket-takeover call (ws_uri) has no relay path to tee; use one or the other"
+                    .to_string(),
+            );
+        }
+        if pipeline == PipelineKind::Srtp {
+            return Err(
+                "teeing a secure (SRTP-bridge) call is not supported yet — the bridge relays \
+                 ciphertext without decoding"
+                    .to_string(),
+            );
+        }
+
+        // Which legs feed the tee. A single-leg (offer-only / local-answer) call has no callee, so a
+        // `both` request degrades to the caller's monologue rather than stalling on a channel that
+        // will never produce a frame (a stereo frame needs *both* rings full).
+        // A single-leg local answer (`answer_local`) has no answered far party, so its `far.remote_rtp`
+        // is `None` — the discriminator that works *before* promotion (the media registry's
+        // equal-endpoints test only exists once an actor is up).
+        let (near_codec, far_codec, two_leg) = self
+            .owned_call_internal(call_id, |call| {
+                (
+                    call.near_codec.clone(),
+                    call.far_codec.clone(),
+                    call.far.remote_rtp.is_some(),
+                )
+            })
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        let (tap_caller, tap_callee) = match direction {
+            WsTeeDirection::Caller => (true, false),
+            WsTeeDirection::Callee => (false, true),
+            WsTeeDirection::Both => (true, two_leg),
+        };
+        if tap_callee && !two_leg {
+            return Err("the call has no callee leg to tee".to_string());
+        }
+        let stereo_source = tap_caller && tap_callee;
+
+        // The wire rate is the *caller* leg's decoded PCM rate (the RTP clock is not it — G.722 samples
+        // at 16 kHz and clocks RTP at 8 kHz, RFC 3551 §4.5.2), so the common case (both legs on one
+        // codec) needs no conversion at all. A callee-only tee follows the callee's rate instead.
+        let caller_rate = near_codec.as_ref().map(pcm_rate_of).transpose()?;
+        let callee_rate = far_codec.as_ref().map(pcm_rate_of).transpose()?;
+        let wire_rate = if tap_caller {
+            caller_rate.ok_or_else(|| "the caller leg has no negotiated codec".to_string())?
+        } else {
+            callee_rate.ok_or_else(|| "the callee leg has no negotiated codec".to_string())?
+        };
+        let ptime = near_codec
+            .as_ref()
+            .map_or(20, |codec| codec.ptime_ms.max(1));
+        let wire_channels = match channels {
+            Some(requested) if stereo_source => requested.clamp(1, 2),
+            Some(_) => 1, // a single-leg tee is mono whatever was asked for
+            None if stereo_source => 2,
+            None => 1,
+        };
+
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: wire_rate,
+            channels: wire_channels,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime,
+        };
+        let plan = plan_ws_tee(format, stereo_source, !tap_caller);
+        let stream_id = format!("tee-{call_id}");
+
+        // Dial before attaching anything, so a bad URI fails cleanly with nothing to unwind.
+        let connector = tokio_tungstenite::Connector::Rustls(self.ws_tls_client_config());
+        let (socket, _response) =
+            tokio_tungstenite::connect_async_tls_with_config(ws_uri, None, false, Some(connector))
+                .await
+                .map_err(|error| format!("dial {ws_uri}: {error}"))?;
+
+        // A SIPREC subscription (or a pcap recording / DTMF block) may already hold this relay in
+        // userspace with a **relay-only** actor, which forwards RTP verbatim and never decodes — the
+        // post-decode fan-out a tee taps would stay dry. Rebuild it as a processing actor first. The
+        // raw SIPREC tee is copied in `Direction::handle` *before* the relay/transcode split, so it is
+        // unaffected by the decode; the subscriptions' tees are re-attached to the new actor.
+        if self.media.is_relay_call(call_id) {
+            self.upgrade_relay_to_processing(call_id).await?;
+        }
+        // Hold the call in a *processing* media pipeline for the tee's lifetime.
+        self.hold_in_userspace(call_id, PromotionReason::WsTee, PromoteMode::Processing)
+            .await?;
+
+        // Attach one sink per tapped leg, each resampling into the wire rate when its own codec differs.
+        let mut tapped_legs = Vec::new();
+        for (source_a, channel, leg_rate) in [
+            (true, TeeChannel::Caller, caller_rate),
+            (false, TeeChannel::Callee, callee_rate),
+        ] {
+            let wanted = if source_a { tap_caller } else { tap_callee };
+            if !wanted {
+                continue;
+            }
+            let resampler = match leg_rate {
+                Some(rate) if rate != wire_rate => Some(
+                    siphon_rtp_dsp::resample::Resampler::new(rate, wire_rate)
+                        .map_err(|error| format!("tee resampler {rate}→{wire_rate}: {error}"))?,
+                ),
+                _ => None,
+            };
+            let sink = WsTeeSink::new(channel, plan.mixer.clone(), stream_id.clone(), resampler);
+            if !self.media.control(
+                call_id,
+                MediaControl::AddFork {
+                    source_a,
+                    sink: Box::new(sink),
+                },
+            ) {
+                // Unwind: drop whatever we already attached and release the hold.
+                for attached in &tapped_legs {
+                    self.media.control(
+                        call_id,
+                        MediaControl::RemoveForkTagged {
+                            source_a: *attached,
+                            tag: stream_id.clone(),
+                        },
+                    );
+                }
+                self.release_userspace_hold(call_id, PromotionReason::WsTee)
+                    .await;
+                return Err("media actor unavailable".to_string());
+            }
+            tapped_legs.push(source_a);
+        }
+
+        // Replacing an existing tee: detach the old one first so its sinks and task go away.
+        if self.ws_tees.contains_key(call_id) {
+            self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+        }
+
+        let (owner, from_tag) = self
+            .owned_call_internal(call_id, |call| (call.owner, call.from_tag.clone()))
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let start = tee_start_message(&stream_id, call_id, plan.format, plan.tracks.clone());
+        let transport = {
+            let events = self.events.get(&owner).map(|sink| sink.value().clone());
+            let frames = plan.frames;
+            let recycle = plan.recycle;
+            let mixer = plan.mixer.clone();
+            let call_id = call_id.to_string();
+            let from_tag = from_tag.clone();
+            let stream_id = stream_id.clone();
+            let ended = ended.clone();
+            tokio::spawn(async move {
+                let outcome =
+                    siphon_rtp_media::bridge::run_ws_tee(socket, start, frames, recycle).await;
+                let reason = match outcome {
+                    Ok(siphon_rtp_media::bridge::TeeEndReason::ServerClosed) => {
+                        WsTeeEndReason::ServerClosed
+                    }
+                    Ok(siphon_rtp_media::bridge::TeeEndReason::ServerStopped) => {
+                        WsTeeEndReason::ServerStopped
+                    }
+                    Ok(siphon_rtp_media::bridge::TeeEndReason::CallEnded) => {
+                        WsTeeEndReason::CallEnded
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, call_id, "ws tee transport ended with an error");
+                        WsTeeEndReason::TransportError
+                    }
+                };
+                // The server (or the transport) ended it first — report that, once.
+                emit_ws_tee_ended(
+                    events.as_ref(),
+                    &ended,
+                    &call_id,
+                    &from_tag,
+                    &stream_id,
+                    reason,
+                    &mixer,
+                );
+            })
+        };
+
+        self.ws_tees.insert(
+            call_id.to_string(),
+            WsTee {
+                stream_id: stream_id.clone(),
+                from_tag: from_tag.clone(),
+                owner,
+                mixer: plan.mixer,
+                tapped_legs,
+                transport,
+                ended,
+            },
+        );
+        self.emit_call_event(
+            call_id,
+            Event::WsTeeStarted {
+                call_id: call_id.to_string(),
+                from_tag,
+                stream_id,
+                ws_uri: ws_uri.to_string(),
+                direction,
+                channels: wire_channels,
+                sample_rate: wire_rate,
+            },
+        );
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id,
+            ws_uri,
+            channels = wire_channels,
+            sample_rate = wire_rate,
+            "ws tee attached"
+        );
+        Ok(())
+    }
+
+    /// Rebuild a **relay-only** promoted call as a **processing** one, keeping every SIPREC raw tee it
+    /// carries. A relay-only actor (the promotion `start recording` / `block DTMF` / `subscribe_request`
+    /// take) forwards ingress RTP verbatim and never decodes, so nothing reaches the post-decode
+    /// fan-out a WS tee taps; a processing actor decodes and re-encodes, and still copies each raw tee
+    /// **before** the relay/transcode split, so the SRS keeps receiving the leg's original bytes.
+    ///
+    /// The old actor is deregistered first so its task is aborted rather than orphaned, and each
+    /// answered subscription's tee is re-installed on the new one. The call stays processing for the
+    /// rest of its life (a detach releases the tee's hold but does not rebuild the cheaper relay-only
+    /// actor) — the extra decode is the price of having asked for both features at once.
+    async fn upgrade_relay_to_processing(&self, call_id: &str) -> Result<(), String> {
+        // Rebuilding the actor rebuilds its *state*, and only the SIPREC raw tees can be reconstructed
+        // from what the engine still holds. A live pcap capture's channel (whose drain task owns the
+        // file) and a per-direction `block DTMF` gate would both be silently lost, so refuse instead of
+        // quietly turning either off — the same posture `echo` already takes on a relay-only promotion.
+        let blocking = self
+            .owned_call_internal(call_id, |call| {
+                let mut blocking = Vec::new();
+                if call.promotion_reasons.contains(&PromotionReason::Recording) {
+                    blocking.push("a pcap recording");
+                }
+                if call.promotion_reasons.contains(&PromotionReason::DtmfBlock) {
+                    blocking.push("a DTMF block");
+                }
+                blocking
+            })
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        if !blocking.is_empty() {
+            return Err(format!(
+                "a WebSocket tee needs the call decoded, but {} holds this relay in a \
+                 forward-only pipeline; stop it first",
+                blocking.join(" and ")
+            ));
+        }
+        self.media.deregister(call_id);
+        self.promote_to_processing(call_id).await?;
+        // Re-attach every answered subscription's raw tee to the new actor.
+        let tees: Vec<(bool, RawTee)> = self
+            .subscriptions
+            .get(call_id)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|subscription| {
+                        // A subscription still awaiting its `subscribe_answer` has no SRS address yet —
+                        // nothing to re-attach; `subscribe_answer` will install it on the new actor.
+                        let srs_dst = subscription.srs_rtp?;
+                        let tee = RawTee {
+                            subscriber_endpoint: subscription.subscriber_endpoint.id,
+                            srs_dst,
+                        };
+                        Some(
+                            subscription
+                                .taps
+                                .iter()
+                                .map(move |source_a| (*source_a, tee))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .flatten()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (source_a, tee) in tees {
+            self.media
+                .control(call_id, MediaControl::AddRawTee { source_a, tee });
+        }
+        Ok(())
+    }
+
+    /// Apply `ProfileFlags::ws_tee` after an `answer` / `answer_local` succeeded — the declarative twin
+    /// of [`Command::AttachWsTee`], so a controller gets a teed call in one round-trip. Attaching only
+    /// *after* the answer means the call's media path (and therefore the fan-out to tap) exists.
+    ///
+    /// A failing tee fails the answer, rather than returning a call that silently is not being streamed:
+    /// the controller asked for both, so half of it is not success. The answer's own SDP is preserved on
+    /// the success path untouched.
+    async fn apply_profile_ws_tee(
+        &self,
+        call_id: &str,
+        profile: &ProfileFlags,
+        result: CmdResult,
+    ) -> CmdResult {
+        let Some(ws_tee) = profile.ws_tee.as_deref() else {
+            return result;
+        };
+        if matches!(result, CmdResult::Error { .. }) {
+            return result;
+        }
+        match self
+            .start_ws_tee(
+                call_id,
+                ws_tee,
+                profile.ws_tee_direction.unwrap_or_default(),
+                profile.ws_tee_channels,
+            )
+            .await
+        {
+            Ok(()) => result,
+            Err(reason) => error_result("ws_tee", &reason),
+        }
+    }
+
+    /// Detach a call's WebSocket tee ([`Command::DetachWsTee`]). Idempotent — detaching a call with no
+    /// tee succeeds, so a controller may call it unconditionally on hangup.
+    async fn detach_ws_tee(&self, client: ClientId, call_id: &str) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+        ok_empty()
+    }
+
+    /// Tear a call's tee down: remove exactly this tee's sinks (by tag, so a SIPREC subscription on the
+    /// same leg is untouched), abort the transport, emit [`Event::WsTeeEnded`] if the transport has not
+    /// already, and release the userspace hold — demoting a promoted relay back to the kernel fast path
+    /// when nothing else holds it. A no-op when the call has no tee.
+    async fn stop_ws_tee(&self, call_id: &str, reason: WsTeeEndReason) {
+        let Some((_, tee)) = self.ws_tees.remove(call_id) else {
+            return;
+        };
+        for source_a in &tee.tapped_legs {
+            self.media.control(
+                call_id,
+                MediaControl::RemoveForkTagged {
+                    source_a: *source_a,
+                    tag: tee.stream_id.clone(),
+                },
+            );
+        }
+        tee.transport.abort();
+        let events = self.events.get(&tee.owner).map(|sink| sink.value().clone());
+        emit_ws_tee_ended(
+            events.as_ref(),
+            &tee.ended,
+            call_id,
+            &tee.from_tag,
+            &tee.stream_id,
+            reason,
+            &tee.mixer,
+        );
+        self.release_userspace_hold(call_id, PromotionReason::WsTee)
+            .await;
+    }
+
     /// SIPREC / monitor `subscribe_request` (RFC 7866): the engine **offers** one or more source
     /// legs' media to a send-only subscriber (a Session Recording Server, SRS). It resolves the source
     /// legs from `from_tags` (an MPTY subscription taps every named leg), allocates one subscriber
@@ -4671,24 +5567,279 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 stale.push(entry.key().clone());
             }
         }
-        // Second pass: tear each idle call down (no map guard held across the awaits).
+        // Second pass: tear each idle call down (no map guard held across the awaits). Shared with
+        // consent failure — both are dead-path detections and must free identical state.
         let mut reaped = Vec::new();
         for call_id in stale {
-            if let Some((_, call)) = self.calls.remove(&call_id) {
-                // Emit the CDR + free every resource the call held (shared with `delete`), then notify
-                // the owner it was reaped.
-                self.finish_call(&call_id, &call, "media_timeout").await;
-                self.push_event(
-                    call.owner,
-                    Event::MediaTimeout {
-                        call_id: call_id.clone(),
-                        from_tag: call.from_tag,
-                    },
-                );
+            if self.reap_call(&call_id, "media_timeout").await {
                 reaped.push(call_id);
             }
         }
         reaped
+    }
+
+    /// Gather the ICE candidates to advertise for one leg (RFC 8445 §5.1.1): the host candidate for
+    /// its RTP endpoint, a server-reflexive one per configured STUN server that answers, and — when
+    /// the leg is not muxed — the same for its companion RTCP endpoint as component 2 (RFC 8445
+    /// §4.1.1.1).
+    ///
+    /// Runs on the offer/answer control path, so it is **bounded by construction**: with no STUN
+    /// server configured it completes without a single packet, and with one it gives up at the
+    /// gatherer's deadline and advertises what it has. A dead STUN server costs one bounded delay and
+    /// a host-only candidate list; it never fails the call.
+    ///
+    /// Wall time, deliberately: this is a network deadline on the control path, not a media clock, and
+    /// the datapath's logical clock only advances once per second. The *decisions* (pacing,
+    /// retransmission, pruning, completion) all live in the pure [`Gatherer`], which the crate's own
+    /// tests drive on a logical millisecond clock — nothing here re-implements them.
+    async fn gather_leg_candidates(
+        &self,
+        leg: &Leg,
+        ice_config: &IceConfig,
+    ) -> Vec<siphon_rtp_ice::Candidate> {
+        let components = [(leg.rtp, 1u16), (leg.rtcp.unwrap_or(leg.rtp), 2u16)];
+        let component_count = if leg.rtcp.is_some() { 2 } else { 1 };
+        // Gather both components **concurrently**: they probe independent endpoints, and running them
+        // in sequence would make a dead STUN server cost two deadlines on the control path instead of
+        // one. `join_all` preserves order, so component 1's candidates still come first.
+        let gathers = components
+            .into_iter()
+            .take(component_count)
+            .map(|(endpoint, component)| {
+                let config = GatherConfig {
+                    component,
+                    // The advertised address keeps the leg's interface policy (1:1 NAT) — the bound
+                    // address is the base, the advertised one is what a peer must be able to reach.
+                    advertised: SocketAddr::new(leg.advertised_ip, endpoint.local_addr.port()),
+                    ..GatherConfig::host_only(endpoint.local_addr)
+                        .with_stun_servers(self.stun_servers.clone())
+                };
+                self.run_gatherer(endpoint.id, config, ice_config)
+            });
+        futures_util::future::join_all(gathers)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Drive one endpoint's [`Gatherer`] to completion, doing its I/O.
+    async fn run_gatherer(
+        &self,
+        endpoint: EndpointId,
+        config: GatherConfig,
+        ice_config: &IceConfig,
+    ) -> Vec<siphon_rtp_ice::Candidate> {
+        let mut gatherer = Gatherer::new(config, 0);
+        // Host-only: the answer is already known, so never touch the socket or the clock.
+        if gatherer.is_complete() {
+            return gatherer.candidates().to_vec();
+        }
+        // Reflexive gathering needs the datapath's full-agent seam to hand back the Binding
+        // *responses* the ICE responder drops. The sink is replaced at answer time by the consent
+        // supervisor's (or cleared, if the peer turns out not to speak ICE).
+        let (events_tx, events_rx) = flume::bounded(GATHER_EVENT_QUEUE_DEPTH);
+        // Gathering only needs its own Binding responses back; the datapath keeps answering inbound
+        // checks meanwhile, so an early peer check is not lost while we gather.
+        self.datapath.set_ice_agent(
+            endpoint,
+            ice_config.clone(),
+            IceAgentMode::RespondAndForward,
+            events_tx,
+        );
+
+        let started = tokio::time::Instant::now();
+        let elapsed_ms = |start: tokio::time::Instant| start.elapsed().as_millis() as u64;
+        loop {
+            match gatherer.poll(elapsed_ms(started)) {
+                GatherAction::Complete => break,
+                GatherAction::Probe { server, datagram } => {
+                    if let Err(error) = self.datapath.send(endpoint, server, &datagram).await {
+                        // A send failure is not fatal: the retransmission schedule tries again and
+                        // the deadline still bounds the whole thing.
+                        tracing::debug!(
+                            target: "siphon_rtp::control",
+                            ?endpoint, %server, %error,
+                            "failed to transmit ICE gathering probe"
+                        );
+                    }
+                }
+                GatherAction::Idle => {}
+            }
+            // Wait for a response, but never longer than the pacing slot — so a silent server still
+            // gets its retransmissions on schedule.
+            if let Ok(Ok(event)) = tokio::time::timeout(
+                std::time::Duration::from_millis(GATHER_POLL_INTERVAL_MS),
+                events_rx.recv_async(),
+            )
+            .await
+            {
+                gatherer.on_datagram(event.source, &event.datagram, elapsed_ms(started));
+            }
+        }
+        let unanswered = gatherer.unanswered_servers();
+        if !unanswered.is_empty() {
+            // Say it out loud: the advertised set is smaller than it was meant to be.
+            tracing::warn!(
+                target: "siphon_rtp::control",
+                ?endpoint,
+                servers = ?unanswered,
+                elapsed_ms = elapsed_ms(started),
+                "ICE gathering: STUN server(s) did not answer — advertising without a server-reflexive candidate"
+            );
+        }
+        gatherer.candidates().to_vec()
+    }
+
+    /// Drive the full RFC 8445 agents one tick at `now_ms`: hand them the STUN the datapath
+    /// forwarded, let them emit checks, and act on what they decide.
+    ///
+    /// A no-op unless `--ice full` is set. Called on a sub-second clock (the RFC's `Ta` pacing is
+    /// 50 ms and its initial RTO 500 ms — far finer than the 1 Hz media sweep), which is why it takes
+    /// an explicit millisecond rather than reading the datapath's logical tick.
+    pub async fn drive_ice_agents(&self, now_ms: u64) -> Vec<String> {
+        let Some(agents) = self.ice_agents.clone() else {
+            return Vec::new();
+        };
+        // Ingest first, so a check that arrived this tick is answered on this tick.
+        let mut outcomes = agents.drain_events(now_ms);
+        outcomes.extend(agents.poll(now_ms));
+
+        let mut failed = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                AgentOutcome::Send {
+                    endpoint,
+                    dst,
+                    datagram,
+                } => {
+                    if let Err(error) = self.datapath.send(endpoint, dst, &datagram).await {
+                        // Transient: the RFC 8489 retransmission covers it, and the checklist's own
+                        // failure path covers a pair that never works.
+                        tracing::debug!(
+                            target: "siphon_rtp::media",
+                            ?endpoint, %dst, %error,
+                            "failed to transmit ICE connectivity check"
+                        );
+                    }
+                }
+                AgentOutcome::Selected {
+                    endpoint,
+                    call_id,
+                    remote,
+                } => {
+                    // The one write that opens the media path. The datapath's forward rule already
+                    // prefers an endpoint's adopted source over the signalled `out_dst`, so this both
+                    // gates ingress to the selected pair and re-points the sibling's egress at it —
+                    // and RFC 7675 consent, which resolves its target from the same adopted source,
+                    // follows the selection without being told.
+                    self.datapath.adopt_source(endpoint, remote);
+                    // A DTLS-SRTP leg keys the path ICE chose: this releases a gated handshake and
+                    // re-points its records and media at the selected pair (RFC 8445 §12). A no-op
+                    // for a leg with no DTLS bridge.
+                    self.dtls_bridge().set_ice_selected(endpoint, remote);
+                    tracing::info!(
+                        target: "siphon_rtp::media",
+                        %call_id, ?endpoint, %remote,
+                        "ICE selected a candidate pair (RFC 8445 §8.1.1) — media path open"
+                    );
+                }
+                AgentOutcome::Failed { endpoint, call_id } => {
+                    // RFC 8445 §8.1.2: every pair failed, so there is no path to this peer at all.
+                    if self.reap_call(&call_id, "ice_failed").await {
+                        tracing::warn!(
+                            target: "siphon_rtp::media",
+                            %call_id, ?endpoint,
+                            "ICE failed — no candidate pair succeeded; call torn down"
+                        );
+                        failed.push(call_id);
+                    }
+                }
+            }
+        }
+        failed
+    }
+
+    /// Drive RFC 7675 consent freshness one tick: correlate the STUN the datapath forwarded since the
+    /// last tick, emit each due connectivity check on its endpoint's **validated** path, and tear down
+    /// any call whose peer has stopped answering. Returns the call-ids torn down (for the sweeper's
+    /// log). A no-op when consent is disabled (the ICE-lite posture, RFC 7675 §4).
+    ///
+    /// Deterministic: driven by the datapath's logical clock, exactly like [`Self::reap_idle`], so
+    /// tests advance it with `advance_clock` instead of waiting on wall time.
+    pub async fn drive_consent(&self) -> Vec<String> {
+        let Some(consent) = self.consent.clone() else {
+            return Vec::new();
+        };
+        let now = self.datapath.now_ticks();
+        // Ingest first: a response that arrived this tick must refresh consent *before* expiry is
+        // evaluated, or a live path could be failed by a check answered moments ago.
+        consent.drain_events();
+        let outcomes = consent.poll(|endpoint| self.datapath.ice_validated_source(endpoint), now);
+
+        let mut failed = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                ConsentOutcome::Send {
+                    endpoint,
+                    dst,
+                    datagram,
+                } => {
+                    // Checks egress the media endpoint itself, so the peer sees them from the same
+                    // transport address it validated (RFC 8445 §7.1: a check is sent from the base of
+                    // the local candidate). A send failure is transient — the retransmit schedule
+                    // covers it; only the RFC 7675 window declares the pair dead.
+                    if let Err(error) = self.datapath.send(endpoint, dst, &datagram).await {
+                        tracing::debug!(
+                            target: "siphon_rtp::media",
+                            ?endpoint,
+                            %dst,
+                            %error,
+                            "failed to transmit ICE consent check"
+                        );
+                    }
+                }
+                ConsentOutcome::Failed { endpoint, call_id } => {
+                    // Only tear the call down once, even though both its legs may fail on the same
+                    // tick: `reap_call` removes it from the registry, so the second attempt is a
+                    // no-op and must not double-count.
+                    consent.unregister(endpoint);
+                    if self.reap_call(&call_id, "consent_failed").await {
+                        tracing::warn!(
+                            target: "siphon_rtp::media",
+                            %call_id,
+                            ?endpoint,
+                            "ICE consent freshness lost (RFC 7675) — peer stopped answering checks; call torn down"
+                        );
+                        failed.push(call_id);
+                    }
+                }
+            }
+        }
+        failed
+    }
+
+    /// Tear down one call as a **dead path**: emit its CDR with `reason`, free every resource it
+    /// holds, and notify its owner with [`Event::MediaTimeout`]. Returns whether the call was still
+    /// live (so a caller can avoid double-reporting). Shared by the media-timeout sweep and consent
+    /// failure so both dead-path detectors free exactly the same state.
+    ///
+    /// The event is `MediaTimeout` for a consent failure too: the control contract has no dedicated
+    /// ICE-state event yet, and to a controller both mean the same thing — this call's media path is
+    /// gone, tear the dialog down. The distinction is preserved in the CDR `reason` and the log.
+    async fn reap_call(&self, call_id: &str, reason: &str) -> bool {
+        let Some((_, call)) = self.calls.remove(call_id) else {
+            return false;
+        };
+        self.finish_call(call_id, &call, reason).await;
+        self.push_event(
+            call.owner,
+            Event::MediaTimeout {
+                call_id: call_id.to_string(),
+                from_tag: call.from_tag,
+            },
+        );
+        true
     }
 
     /// Propagate each in-kernel-learned peer source into the sibling leg's forward destination — the
@@ -4997,6 +6148,57 @@ fn ok_sdp(sdp: String, to_tag: Option<String>) -> CmdResult {
     }
 }
 
+/// The decoded-PCM sample rate of `codec` — what the media pipeline's fan-out actually hands a sink.
+/// This is **not** the RTP clock rate: G.722 samples at 16 kHz while clocking RTP at 8 kHz (RFC 3551
+/// §4.5.2), so reading `clock_rate_hz` would size a tee's wire frame wrong. Built by asking the codec
+/// factory for a decoder, exactly as the WS-takeover bridge does.
+fn pcm_rate_of(codec: &CodecSpec) -> Result<u32, String> {
+    factory::decoder_for(codec)
+        .map(|decoder| decoder.params().sample_rate_hz)
+        .map_err(|error| format!("no decoder for {}: {error}", codec.encoding_name))
+}
+
+/// Emit a tee's [`Event::WsTeeEnded`] **exactly once**, whichever of the transport task or a detach
+/// gets there first (`ended` is the shared latch they race on). Carries the mixer's lifetime counters
+/// so a controller can see whether the consumer kept up.
+fn emit_ws_tee_ended(
+    events: Option<&flume::Sender<Event>>,
+    ended: &std::sync::atomic::AtomicBool,
+    call_id: &str,
+    from_tag: &str,
+    stream_id: &str,
+    reason: WsTeeEndReason,
+    mixer: &std::sync::Mutex<siphon_rtp_media::bridge::tee::TeeMixer>,
+) {
+    use std::sync::atomic::Ordering;
+    if ended.swap(true, Ordering::SeqCst) {
+        return; // already reported
+    }
+    let (frames_sent, frames_dropped) = match mixer.lock() {
+        Ok(guard) => (Some(guard.forwarded()), Some(guard.dropped())),
+        Err(_) => (None, None),
+    };
+    tracing::info!(
+        target: "siphon_rtp::media",
+        call_id,
+        stream_id,
+        ?reason,
+        frames_sent = frames_sent.unwrap_or(0),
+        frames_dropped = frames_dropped.unwrap_or(0),
+        "ws tee ended"
+    );
+    if let Some(sender) = events {
+        let _ = sender.try_send(Event::WsTeeEnded {
+            call_id: call_id.to_string(),
+            from_tag: from_tag.to_string(),
+            stream_id: stream_id.to_string(),
+            reason,
+            frames_sent,
+            frames_dropped,
+        });
+    }
+}
+
 /// A bare success (no SDP/stats) — the reply to control verbs like block/silence.
 fn ok_empty() -> CmdResult {
     CmdResult::Ok {
@@ -5202,6 +6404,45 @@ fn ice_directive(profile: &ProfileFlags) -> Option<IceDirective> {
     match profile.ice.as_deref()?.trim().to_ascii_lowercase().as_str() {
         "force" | "force-relay" => Some(IceDirective::Force),
         "remove" => Some(IceDirective::Remove),
+        _ => None,
+    }
+}
+
+/// The candidates of one ICE component, for the checklist that component's agent forms.
+fn filter_component(
+    candidates: &[siphon_rtp_ice::Candidate],
+    component: u16,
+) -> Vec<siphon_rtp_ice::Candidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.component == component)
+        .cloned()
+        .collect()
+}
+
+/// A fresh RFC 8445 §5.2 tie-breaker from the OS CSPRNG. Unlike the consent driver's derived value
+/// this one really is security-relevant — it decides who wins a role conflict — so it must not be
+/// predictable from the endpoint id. Falls back to a fixed value only if the RNG is unavailable, in
+/// which case a conflict resolves deterministically rather than not at all.
+fn ice_tie_breaker() -> u64 {
+    let mut bytes = [0u8; 8];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u64::from_be_bytes(bytes),
+        Err(_) => 1,
+    }
+}
+
+/// The peer's own ICE credentials from a parsed offer/answer — what an outbound connectivity check
+/// toward that peer is addressed with and signed by (RFC 8445 §7.1.2), as opposed to
+/// [`Call::ice`], which is the engine's identity. Both attributes are mandatory together (RFC 8839
+/// §5.4), so a peer that signalled only one of them has no usable credential and is treated as
+/// having offered none — the leg keeps the responder and simply runs no consent.
+fn peer_ice_credentials(info: &sdp::MediaInfo) -> Option<IceCredentials> {
+    match (info.ice_ufrag.as_ref(), info.ice_pwd.as_ref()) {
+        (Some(ufrag), Some(pwd)) => Some(IceCredentials {
+            ufrag: ufrag.clone(),
+            pwd: pwd.clone(),
+        }),
         _ => None,
     }
 }
@@ -5564,6 +6805,14 @@ async fn run_pcap_recorder(
 /// must never stall call teardown, so beyond this the CDR is logged with the byte/packet counters only.
 const CDR_QUALITY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Depth of the per-endpoint STUN queue used while gathering. Gathering sends a handful of probes and
+/// drains continuously, so this only has to absorb a burst; drop-on-full costs at most one refresh.
+const GATHER_EVENT_QUEUE_DEPTH: usize = 32;
+
+/// How long the gathering loop waits for a response before re-polling the plan. Shorter than the
+/// RFC 8445 §14.2 `Ta` pacing slot, so a silent STUN server still gets its retransmissions on time.
+const GATHER_POLL_INTERVAL_MS: u64 = 10;
+
 /// Format a MOS value to two decimals, or `-` when no sample was taken on the leg.
 fn format_optional_mos(mos: Option<f64>) -> String {
     mos.map_or_else(|| "-".to_string(), |value| format!("{value:.2}"))
@@ -5667,6 +6916,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::ConferenceLeave { .. } => "conference_leave",
         Command::ConferenceRoute { .. } => "conference_route",
         Command::ConferenceBridge { .. } => "conference_bridge",
+        Command::AttachWsTee { .. } => "attach_ws_tee",
+        Command::DetachWsTee { .. } => "detach_ws_tee",
         Command::Authenticate { .. } => "authenticate",
     }
 }
@@ -5696,7 +6947,9 @@ fn command_call_id(command: &Command) -> Option<&str> {
         | Command::StopRecording { call_id, .. }
         | Command::SubscribeRequest { call_id, .. }
         | Command::SubscribeAnswer { call_id, .. }
-        | Command::Unsubscribe { call_id, .. } => Some(call_id),
+        | Command::Unsubscribe { call_id, .. }
+        | Command::AttachWsTee { call_id, .. }
+        | Command::DetachWsTee { call_id, .. } => Some(call_id),
         Command::ConferenceJoin { conference_id, .. }
         | Command::ConferenceLeave { conference_id, .. }
         | Command::ConferenceRoute { conference_id, .. } => Some(conference_id),
@@ -13243,6 +14496,1128 @@ mod tests {
         ));
     }
 
+    // ---- RFC 8445 §5.1.1 candidate gathering (end-to-end over the real datapath) -----------------
+
+    /// A stand-in STUN server that reports `mapped` as the source it saw — a NAT the loopback test
+    /// network cannot otherwise produce (on loopback the real reflexive address *is* the base, which
+    /// the gatherer correctly prunes as redundant). Answers every Binding request it receives.
+    async fn fake_stun_server(mapped: SocketAddr) -> SocketAddr {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind stun server");
+        let address = socket.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 2048];
+            while let Ok((len, from)) = socket.recv_from(&mut buffer).await {
+                let Ok(request) = siphon_rtp_stun::parse(&buffer[..len]) else {
+                    continue;
+                };
+                if !request.is_binding_request() {
+                    continue;
+                }
+                let response = siphon_rtp_stun::binding_success_response(
+                    &request.transaction_id,
+                    mapped,
+                    None,
+                );
+                let _ = socket.send_to(&response, from).await;
+            }
+        });
+        address
+    }
+
+    /// The `a=candidate` lines of an SDP, parsed.
+    fn candidates_of(sdp: &str) -> Vec<siphon_rtp_ice::Candidate> {
+        sdp.lines()
+            .filter(|line| line.starts_with("a=candidate:"))
+            .map(|line| siphon_rtp_ice::Candidate::parse(line).expect("our own candidate parses"))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gathering_advertises_a_server_reflexive_candidate_from_a_stun_server() {
+        // The end-to-end proof that gathering is wired, not just implemented: the engine probes the
+        // configured STUN server from its own media endpoint, correlates the response through the
+        // datapath's full-agent seam, and puts the resulting candidate in the SDP it hands the peer.
+        let mapped: SocketAddr = "203.0.113.5:52000".parse().expect("addr");
+        let stun_server = fake_stun_server(mapped).await;
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_stun_servers(vec![stun_server]);
+        let (_phone_a, addr_a) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "gather".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let offer_out = ok_sdp_text(&offer);
+
+        // The offer is not muxed, so the leg has an RTCP endpoint too and gathers for both components
+        // (RFC 8445 §4.1.1.1): host + srflx for component 1 (RTP) and for component 2 (RTCP).
+        let all = candidates_of(&offer_out);
+        assert_eq!(all.len(), 4, "host + srflx per component: {offer_out}");
+        let candidates: Vec<_> = all
+            .iter()
+            .filter(|candidate| candidate.component == 1)
+            .cloned()
+            .collect();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].kind, siphon_rtp_ice::CandidateKind::Host);
+        assert!(
+            all.iter().any(|candidate| candidate.component == 2
+                && candidate.kind == siphon_rtp_ice::CandidateKind::Host),
+            "a non-muxed leg advertises its RTCP component too"
+        );
+
+        let reflexive = &candidates[1];
+        assert_eq!(
+            reflexive.kind,
+            siphon_rtp_ice::CandidateKind::ServerReflexive
+        );
+        assert_eq!(reflexive.address, mapped, "the address the server reported");
+        assert_eq!(
+            reflexive.related,
+            Some(candidates[0].address),
+            "RFC 8839 §5.1: raddr is the base it was discovered from"
+        );
+        assert!(
+            reflexive.priority < candidates[0].priority,
+            "srflx ranks below host (RFC 8445 §5.1.2.2)"
+        );
+        assert_ne!(
+            reflexive.foundation, candidates[0].foundation,
+            "different type and server ⇒ different foundation (RFC 8445 §5.1.1.3)"
+        );
+        assert!(
+            offer_out.contains("a=end-of-candidates"),
+            "the list is complete when the offer is written (RFC 8838 §14)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_stun_server_still_yields_a_usable_offer() {
+        // Gathering runs on the control path, so it must be bounded: a STUN server that never answers
+        // costs one deadline and a host-only candidate list — never a failed call.
+        let dead = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let dead_addr = dead.local_addr().expect("addr");
+        drop(dead); // nothing is listening on that port now
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_stun_servers(vec![dead_addr]);
+        let (_phone_a, addr_a) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dead-stun".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let offer_out = ok_sdp_text(&offer);
+        let candidates = candidates_of(&offer_out);
+        // Host only, one per component — no reflexive candidate, and no failure either.
+        assert_eq!(candidates.len(), 2, "host only: {offer_out}");
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.kind == siphon_rtp_ice::CandidateKind::Host));
+        assert_eq!(engine.session_count(), 1, "and the call was still set up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_only_gathering_adds_no_round_trip_and_no_candidate_change() {
+        // The default deployment (no STUN server): exactly the one host candidate the engine has
+        // always advertised, gathered without touching the network.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "host-only".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let candidates = candidates_of(&ok_sdp_text(&offer));
+        // One host candidate per component — the offer is not muxed, so RTP and RTCP both get one.
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.kind == siphon_rtp_ice::CandidateKind::Host));
+        let rtp = &candidates[0];
+        assert_eq!(rtp.component, 1);
+        assert_eq!(rtp.priority, 2_130_706_431);
+        // RFC 8445 §5.1.2.1: the RTCP component ranks exactly one below the RTP component.
+        assert_eq!(candidates[1].component, 2);
+        assert_eq!(candidates[1].priority, 2_130_706_430);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_muxed_leg_gathers_only_the_rtp_component() {
+        // Under RFC 5761 rtcp-mux there is no second component to gather for.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let muxed = format!("{}a=rtcp-mux\r\n", ice_offer_from(addr_a));
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "muxed".into(),
+                    from_tag: "a".into(),
+                    sdp: muxed,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let candidates = candidates_of(&ok_sdp_text(&offer));
+        assert_eq!(candidates.len(), 1, "one component under mux");
+        assert_eq!(candidates[0].component, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_ice_answer_clears_the_ice_gate_gathering_installed_on_the_far_leg() {
+        // Regression guard for the gathering wiring: gathering installs the ICE responder on the far
+        // endpoints at *offer* time (that is how it receives its own Binding responses). If B then
+        // answers without ICE, leaving it there would arm the layer-4 gate — media only from a
+        // STUN-validated source — on a leg that will never send a check, and B's media would be
+        // dropped forever. The answer must clear it.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mixed".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "mixed".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    // B answers plain RTP — no ICE at all.
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("parse answer");
+
+        // B's media must reach A even though B never ran a connectivity check.
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), near.remote_rtcp)
+            .await
+            .ok();
+        let far_rtp = engine
+            .calls
+            .get("mixed")
+            .map(|call| call.far.rtp.local_addr)
+            .expect("call exists");
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), far_rtp)
+            .await
+            .expect("send from B");
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("B's media reaches A — the far leg is not ICE-gated")
+            .expect("recv");
+        assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+    }
+
+    // ---- duplicate offer on a live call-id -------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_offer_replaces_the_call_without_leaking_ports_or_quota() {
+        // A repeated offer used to overwrite the registry entry and drop the old `Call` on the floor:
+        // its endpoints were never freed and its quota slot never released, so a client repeating an
+        // offer (what a SIP re-INVITE looks like from here) bled ports and quota until the node
+        // refused calls.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(21);
+        let events = engine.register_client(client);
+        let (_phone, addr) = phone().await;
+
+        let first = engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: "dup".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let first_port = sdp::parse(&ok_sdp_text(&first))
+            .expect("parse")
+            .remote_rtp
+            .port();
+        let first_endpoints: Vec<EndpointId> = engine
+            .calls
+            .get("dup")
+            .map(|call| {
+                call.near
+                    .endpoint_ids()
+                    .chain(call.far.endpoint_ids())
+                    .collect()
+            })
+            .expect("call exists");
+
+        let second = engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: "dup".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let second_port = sdp::parse(&ok_sdp_text(&second))
+            .expect("parse")
+            .remote_rtp
+            .port();
+
+        assert_eq!(engine.session_count(), 1, "one call, not two");
+        assert_eq!(
+            engine.client_calls.get(&client).map(|count| *count),
+            Some(1),
+            "the quota slot of the replaced call is released, not leaked"
+        );
+        // The old endpoints are gone from the datapath, not merely forgotten by the engine.
+        for endpoint in first_endpoints {
+            assert_eq!(
+                engine.datapath().stats(endpoint),
+                None,
+                "the replaced call's endpoint {endpoint:?} was freed"
+            );
+        }
+        assert_ne!(first_port, second_port, "the replacement bound fresh ports");
+
+        // The replaced call is reported as ended, with its own reason — and not as a dead path.
+        let mut summary_reason = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::CallSummary { reason, .. } => summary_reason = Some(reason),
+                Event::MediaTimeout { .. } => {
+                    panic!("a controller-driven replacement is not a media timeout")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(summary_reason.as_deref(), Some("replaced"));
+
+        // And the surviving call still works end to end.
+        let (_phone_b, addr_b) = phone().await;
+        let answer = engine
+            .handle(
+                client,
+                Command::Answer {
+                    call_id: "dup".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(matches!(answer, CmdResult::Ok { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_client_cannot_replace_a_call_it_does_not_own() {
+        // A3 (docs/security-and-nat.md §5): only the owning client may affect a call. Before this,
+        // any client could offer an existing call-id and destroy someone else's call.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let owner = ClientId(31);
+        let intruder = ClientId(32);
+        let (_phone, addr) = phone().await;
+
+        let first = engine
+            .handle(
+                owner,
+                Command::Offer {
+                    call_id: "owned".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let owner_port = sdp::parse(&ok_sdp_text(&first))
+            .expect("parse")
+            .remote_rtp
+            .port();
+
+        let stolen = engine
+            .handle(
+                intruder,
+                Command::Offer {
+                    call_id: "owned".into(),
+                    from_tag: "x".into(),
+                    sdp: sdp_for(addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stolen, CmdResult::Error { .. }),
+            "an unrelated client is refused: {stolen:?}"
+        );
+
+        // The owner's call is untouched: same ports, same owner, still answerable.
+        assert_eq!(engine.session_count(), 1);
+        let call = engine.calls.get("owned").expect("still there");
+        assert_eq!(call.owner, owner);
+        assert_eq!(call.far.rtp.local_addr.port(), owner_port);
+        drop(call);
+        // And the intruder was charged nothing.
+        assert_eq!(engine.client_calls.get(&intruder).map(|count| *count), None);
+    }
+
+    // ---- RFC 8839 §5.3 ice-mismatch --------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rewritten_offer_is_answered_with_ice_mismatch_and_no_ice() {
+        // A SIP ALG rewrote `c=`/`m=` to its own address but left the candidates alone, so the
+        // candidates describe a topology that no longer matches where media goes. RFC 8839 §5.3: say
+        // `a=ice-mismatch` and fall back to the signalled address rather than running ICE on a lie.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let mangled = format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 198.51.100.77 5555 typ host\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port()
+        );
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "alg".into(),
+                    from_tag: "a".into(),
+                    sdp: mangled,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far = ok_sdp_text(&offer);
+
+        assert!(far.contains("a=ice-mismatch"), "{far}");
+        assert!(
+            !far.contains("a=ice-lite"),
+            "no ICE is re-originated: {far}"
+        );
+        assert!(!far.contains("a=ice-ufrag"), "and no credentials: {far}");
+        // The peer's stale candidate is not forwarded either.
+        assert!(!far.contains("198.51.100.77"), "{far}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consistent_ice_offer_is_not_treated_as_a_mismatch() {
+        // The candidate matches the default destination, so the SDP reached us intact — ICE runs.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "intact".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far = ok_sdp_text(&offer);
+        assert!(!far.contains("a=ice-mismatch"), "{far}");
+        assert!(far.contains("a=ice-lite"), "ICE is re-originated: {far}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_force_overrides_the_mismatch_heuristic() {
+        // An operator who forces ICE has said they know better than the §5.3 heuristic.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let mangled = format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 198.51.100.77 5555 typ host\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port()
+        );
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "forced".into(),
+                    from_tag: "a".into(),
+                    sdp: mangled,
+                    profile: ProfileFlags {
+                        ice: Some("force".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let far = ok_sdp_text(&offer);
+        assert!(!far.contains("a=ice-mismatch"), "{far}");
+        assert!(
+            far.contains("a=ice-lite"),
+            "forced ICE still re-originates: {far}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_answering_ice_mismatch_disables_ice_on_that_leg() {
+        // B tells us our offer's ICE arrived altered (RFC 8839 §5.3). The far leg must then run
+        // without ICE — leaving the responder armed would gate media on checks B will never send.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "mismatch-answer".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:BBBBBB\r\na=ice-pwd:bpasswordbpasswordbpas\r\na=ice-mismatch\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port()
+        );
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "mismatch-answer".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: answer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_rtp = engine
+            .calls
+            .get("mismatch-answer")
+            .map(|call| call.far.rtp.id)
+            .expect("call");
+        assert_eq!(
+            engine.datapath().ice_validated_source(far_rtp),
+            None,
+            "the far leg carries no ICE credentials at all"
+        );
+
+        // And B's media relays to A on the plain signalled-source path.
+        let far_addr = engine
+            .calls
+            .get("mismatch-answer")
+            .map(|call| call.far.rtp.local_addr)
+            .expect("call");
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), far_addr)
+            .await
+            .expect("send from B");
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("B's media reaches A without ICE")
+            .expect("recv");
+        assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+    }
+
+    // ---- RFC 8445 full agent (end-to-end over the real datapath) ---------------------------------
+
+    /// Build the peer-side ICE agent for a phone at `local`, from the engine's own advertised SDP.
+    /// The peer is **controlling**: it offered ICE, and RFC 8445 §6.1.1 gives the offerer that role.
+    fn peer_agent(engine_sdp: &sdp::MediaInfo, local: SocketAddr) -> siphon_rtp_ice::IceAgent {
+        use siphon_rtp_ice::agent::{AgentConfig, Credentials};
+        let local_candidate = siphon_rtp_ice::Candidate::new(
+            "peer".to_string(),
+            1,
+            local,
+            siphon_rtp_ice::CandidateKind::Host,
+            65535,
+        );
+        siphon_rtp_ice::IceAgent::new(
+            AgentConfig::new(
+                Credentials::new(A_UFRAG, A_PWD),
+                Credentials::new(
+                    engine_sdp.ice_ufrag.clone().expect("engine ufrag"),
+                    engine_sdp.ice_pwd.clone().expect("engine pwd"),
+                ),
+                true,
+                0xFFFF_0000_FFFF_0000,
+            )
+            .with_candidates(
+                vec![local_candidate],
+                engine_sdp
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.component == 1)
+                    .cloned()
+                    .collect(),
+            ),
+            0,
+        )
+    }
+
+    /// An ICE offer from A that also carries its host candidate, so the engine's agent has something
+    /// to pair against.
+    fn ice_offer_with_candidate(addr: SocketAddr) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=candidate:peer 1 UDP 2130706431 {ip} {port} typ host\r\n\
+             a=end-of-candidates\r\n",
+            ip = addr.ip(),
+            port = addr.port()
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_ice_leg_opens_its_media_path_only_after_a_pair_is_selected() {
+        // The end-to-end proof that the agent is wired: a real peer agent runs against the engine's
+        // over the loopback datapath, and media is gated on ICE's decision rather than on arrival.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "full".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "full".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answer)).expect("parse answer");
+        let engine_near = near.remote_rtp;
+        let near_rtp = engine
+            .calls
+            .get("full")
+            .map(|call| call.near.rtp.id)
+            .expect("call");
+
+        // Before ICE runs, nothing has been adopted — so A's media would be dropped.
+        assert_eq!(engine.datapath().ice_validated_source(near_rtp), None);
+
+        // Drive both agents until the engine selects a pair.
+        let mut peer = peer_agent(&near, addr_a);
+        let mut buffer = [0u8; 2048];
+        let mut now = 0u64;
+        while now < 4_000 && engine.datapath().ice_validated_source(near_rtp).is_none() {
+            for action in peer.poll(now) {
+                if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                    phone_a.send_to(&datagram, to).await.expect("peer send");
+                }
+            }
+            engine.drive_ice_agents(now).await;
+            // Drain whatever the engine sent back into the peer agent.
+            while let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(20), phone_a.recv_from(&mut buffer)).await
+            {
+                for action in peer.on_datagram(addr_a, from, &buffer[..len], now) {
+                    if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                        phone_a.send_to(&datagram, to).await.expect("peer send");
+                    }
+                }
+                engine.drive_ice_agents(now).await;
+            }
+            now += 20;
+        }
+
+        // ICE selected A's real transport address, and the datapath adopted it.
+        assert_eq!(
+            engine.datapath().ice_validated_source(near_rtp),
+            Some(addr_a),
+            "the agent adopted the selected pair's remote"
+        );
+        assert_eq!(engine_near.ip(), addr_a.ip(), "same loopback family");
+
+        // And now media flows A -> engine -> B.
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), engine_near)
+            .await
+            .expect("send media");
+        let (len, _) = timeout(Duration::from_secs(1), phone_b.recv_from(&mut buffer))
+            .await
+            .expect("media reaches B once ICE has chosen a pair")
+            .expect("recv");
+        assert_eq!(&buffer[..len], rtp(0x0A0A_0A0A).as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_ice_is_off_by_default_and_keeps_the_lite_responder() {
+        // Without `--ice full` the datapath still answers checks itself and adopts the validated
+        // source, exactly as before — no behaviour change for existing deployments.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        ice_call_with_validated_a(
+            &engine,
+            CLIENT,
+            "lite-default",
+            &phone_a,
+            ice_offer_with_candidate(addr_a),
+            addr_b,
+        )
+        .await;
+        let near_rtp = engine
+            .calls
+            .get("lite-default")
+            .map(|call| call.near.rtp.id)
+            .expect("call");
+        assert_eq!(
+            engine.datapath().ice_validated_source(near_rtp),
+            Some(addr_a),
+            "the datapath responder adopted the source, as an ice-lite agent does"
+        );
+        // And the driver is inert.
+        assert!(engine.drive_ice_agents(0).await.is_empty());
+    }
+
+    // ---- RFC 7675 consent freshness (end-to-end over the real datapath) --------------------------
+
+    /// A's ICE credentials in the consent tests.
+    const A_UFRAG: &str = "AAAAAA";
+    const A_PWD: &str = "apasswordapasswordapas";
+
+    /// Consent tuned for a short test: probe every tick, declare death after 6 ticks.
+    fn test_consent() -> crate::ice::driver::ConsentConfig {
+        crate::ice::driver::ConsentConfig {
+            interval_ticks: 1,
+            timeout_ticks: 6,
+            rto_ticks: 1,
+        }
+    }
+
+    /// An ICE offer from A at the socket it will actually send from.
+    fn ice_offer_from(addr: SocketAddr) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             a=ice-ufrag:{A_UFRAG}\r\na=ice-pwd:{A_PWD}\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            ip = addr.ip(),
+            port = addr.port()
+        )
+    }
+
+    /// Offer + answer an ICE call (A offers ICE, B answers plain), then have A run one valid
+    /// connectivity check so the datapath adopts its source as the validated path. Returns the
+    /// engine's A-facing address (where A sends) and the engine's own advertised credentials.
+    async fn ice_call_with_validated_a(
+        engine: &Engine<UdpLoopbackDatapath>,
+        client: ClientId,
+        call_id: &str,
+        phone_a: &UdpSocket,
+        offer_sdp: String,
+        answer_addr: SocketAddr,
+    ) -> SocketAddr {
+        let offer = engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let _ = ok_sdp_text(&offer);
+        let answer = engine
+            .handle(
+                client,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(answer_addr, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer_out = ok_sdp_text(&answer);
+        let near = sdp::parse(&answer_out).expect("parse engine answer");
+        let engine_ufrag = near.ice_ufrag.clone().expect("engine ufrag");
+        let engine_pwd = near.ice_pwd.clone().expect("engine pwd");
+
+        // A's connectivity check: this is what makes its source the *validated* path.
+        let username = format!("{engine_ufrag}:{A_UFRAG}");
+        let check = siphon_rtp_stun::binding_request(&[7u8; 12], &username, engine_pwd.as_bytes());
+        phone_a
+            .send_to(&check, near.remote_rtp)
+            .await
+            .expect("send check");
+        // Await the engine's answer, so adoption has certainly happened before the test proceeds.
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("no timeout")
+            .expect("recv response");
+        assert_eq!(
+            siphon_rtp_stun::parse(&buffer[..len])
+                .expect("parse")
+                .message_type,
+            siphon_rtp_stun::BINDING_SUCCESS
+        );
+        near.remote_rtp
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_probes_the_validated_source_not_the_signalled_address() {
+        // The whole reason consent was not wired before: a NATed peer's `c=` is unusable. A signals
+        // 127.0.0.2:5000 but really sends from 127.0.0.50 — checks must follow the validated source.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 50)).await;
+        let (_phone_b, addr_b) = phone().await;
+        assert_ne!(addr_a.ip().to_string(), "127.0.0.2");
+
+        let mut lying = ice_offer_from(addr_a);
+        lying = lying.replace(&format!("c=IN IP4 {}", addr_a.ip()), "c=IN IP4 127.0.0.2");
+        let engine_near =
+            ice_call_with_validated_a(&engine, CLIENT, "nat", &phone_a, lying, addr_b).await;
+
+        engine.datapath().advance_clock(1);
+        assert!(
+            engine.drive_consent().await.is_empty(),
+            "a freshly validated pair is not failed"
+        );
+
+        // The check arrives at A's *real* socket, from the engine's A-facing endpoint.
+        let mut buffer = [0u8; 2048];
+        let (len, from) = timeout(Duration::from_secs(1), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("a consent check is sent")
+            .expect("recv");
+        assert_eq!(from, engine_near, "sourced from the leg's own media port");
+        let check = siphon_rtp_stun::parse(&buffer[..len]).expect("parse check");
+        assert!(check.is_binding_request());
+        // RFC 8445 §7.1.2: addressed to A, signed with A's password (not the engine's).
+        assert_eq!(
+            check.username(),
+            Some(format!("{A_UFRAG}:{}", engine_ufrag_of(&engine, "nat")).as_str())
+        );
+        assert!(
+            siphon_rtp_stun::verify_message_integrity(&buffer[..len], A_PWD.as_bytes()),
+            "the check is keyed by the peer's password"
+        );
+    }
+
+    /// The engine's own ufrag for `call_id` (its ICE identity), for asserting check USERNAMEs.
+    fn engine_ufrag_of(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) -> String {
+        engine
+            .calls
+            .get(call_id)
+            .and_then(|call| call.ice.as_ref().map(|ice| ice.ufrag.clone()))
+            .expect("the call has ICE credentials")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_tears_the_call_down_when_the_peer_stops_answering() {
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let client = ClientId(11);
+        let events = engine.register_client(client);
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        ice_call_with_validated_a(
+            &engine,
+            client,
+            "dead",
+            &phone_a,
+            ice_offer_from(addr_a),
+            addr_b,
+        )
+        .await;
+        assert_eq!(engine.session_count(), 1);
+
+        // A never answers another check. Drive the sweep tick by tick; the pair dies at the timeout.
+        let mut failed = Vec::new();
+        for _ in 0..12 {
+            engine.datapath().advance_clock(1);
+            failed = engine.drive_consent().await;
+            if !failed.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(failed, vec!["dead".to_string()], "consent expired");
+        assert_eq!(engine.session_count(), 0, "the call's resources are freed");
+        assert!(
+            engine.consent.as_ref().expect("consent on").is_empty(),
+            "no consent state outlives the call"
+        );
+
+        // The owner is told, on the same dead-path contract the media-timeout sweep uses, and the CDR
+        // records the distinct reason.
+        let mut got_timeout = false;
+        let mut cdr_reason = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::MediaTimeout { call_id, .. } => {
+                    assert_eq!(call_id, "dead");
+                    got_timeout = true;
+                }
+                Event::CallSummary { reason, .. } => cdr_reason = Some(reason),
+                _ => {}
+            }
+        }
+        assert!(got_timeout, "the owner is notified the path is dead");
+        assert_eq!(cdr_reason.as_deref(), Some("consent_failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answering_peer_keeps_consent_fresh_past_the_timeout() {
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let engine_near = ice_call_with_validated_a(
+            &engine,
+            CLIENT,
+            "alive",
+            &phone_a,
+            ice_offer_from(addr_a),
+            addr_b,
+        )
+        .await;
+
+        // Run well past the 6-tick window, answering every check exactly as a real ICE agent would
+        // (Binding success signed with A's own password — RFC 8445 §7.3).
+        for tick in 0..20 {
+            engine.datapath().advance_clock(1);
+            assert!(
+                engine.drive_consent().await.is_empty(),
+                "consent must not fail while the peer answers (tick {tick})"
+            );
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+            {
+                let check = siphon_rtp_stun::parse(&buffer[..len]).expect("parse check");
+                if check.is_binding_request() {
+                    let response = siphon_rtp_stun::binding_success_response(
+                        &check.transaction_id,
+                        addr_a,
+                        Some(A_PWD.as_bytes()),
+                    );
+                    phone_a
+                        .send_to(&response, engine_near)
+                        .await
+                        .expect("answer the check");
+                    // Let the datapath forward it through the full-agent seam before the next tick.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        assert_eq!(engine.session_count(), 1, "the call is still up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_is_off_by_default_and_never_probes() {
+        // The RFC 7675 §4 ICE-lite posture: answer checks, never initiate them.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        ice_call_with_validated_a(
+            &engine,
+            CLIENT,
+            "lite",
+            &phone_a,
+            ice_offer_from(addr_a),
+            addr_b,
+        )
+        .await;
+
+        for _ in 0..12 {
+            engine.datapath().advance_clock(1);
+            assert!(engine.drive_consent().await.is_empty());
+        }
+        let mut buffer = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "an ice-lite agent must not send consent checks"
+        );
+        assert_eq!(engine.session_count(), 1, "and the call stays up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_is_not_started_for_a_leg_whose_peer_never_checks() {
+        // No validated pair ⇒ nothing to probe, and crucially nothing to *fail*: a leg the peer has
+        // not yet checked must never be torn down by consent (the media-timeout sweep owns that).
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "silent".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "silent".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        for _ in 0..20 {
+            engine.datapath().advance_clock(1);
+            assert!(
+                engine.drive_consent().await.is_empty(),
+                "an unvalidated leg is never failed by consent"
+            );
+        }
+        assert_eq!(engine.session_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_ice_leg_is_probed_with_its_own_peer_credentials() {
+        // Both sides ICE: the near leg's checks are signed with A's password and the far leg's with
+        // B's. Signing either with the wrong side's password would be rejected by that peer.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_consent(test_consent());
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        const B_UFRAG: &str = "BBBBBB";
+        const B_PWD: &str = "bpasswordbpasswordbpas";
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "both".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_from(addr_a),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_offer = sdp::parse(&ok_sdp_text(&offer)).expect("parse far offer");
+        let engine_pwd = far_offer.ice_pwd.clone().expect("engine pwd");
+        let engine_ufrag = far_offer.ice_ufrag.clone().expect("engine ufrag");
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "both".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: format!(
+                        "v=0\r\no=- 1 1 IN IP4 host.invalid\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+                         a=ice-ufrag:{B_UFRAG}\r\na=ice-pwd:{B_PWD}\r\n\
+                         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+                        ip = addr_b.ip(),
+                        port = addr_b.port()
+                    ),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_answer = sdp::parse(&ok_sdp_text(&answer)).expect("parse near answer");
+
+        // Both peers validate their own leg.
+        for (phone, engine_addr, ufrag) in [
+            (&phone_a, near_answer.remote_rtp, A_UFRAG),
+            (&phone_b, far_offer.remote_rtp, B_UFRAG),
+        ] {
+            let check = siphon_rtp_stun::binding_request(
+                &[8u8; 12],
+                &format!("{engine_ufrag}:{ufrag}"),
+                engine_pwd.as_bytes(),
+            );
+            phone.send_to(&check, engine_addr).await.expect("check");
+            let mut buffer = [0u8; 2048];
+            timeout(Duration::from_secs(1), phone.recv_from(&mut buffer))
+                .await
+                .expect("no timeout")
+                .expect("response");
+        }
+
+        engine.datapath().advance_clock(1);
+        assert!(engine.drive_consent().await.is_empty());
+
+        for (phone, peer_ufrag, peer_pwd) in
+            [(&phone_a, A_UFRAG, A_PWD), (&phone_b, B_UFRAG, B_PWD)]
+        {
+            let mut buffer = [0u8; 2048];
+            let (len, _) = timeout(Duration::from_secs(1), phone.recv_from(&mut buffer))
+                .await
+                .expect("each ICE leg is probed")
+                .expect("recv");
+            let check = siphon_rtp_stun::parse(&buffer[..len]).expect("parse");
+            assert_eq!(
+                check.username(),
+                Some(format!("{peer_ufrag}:{engine_ufrag}").as_str())
+            );
+            assert!(
+                siphon_rtp_stun::verify_message_integrity(&buffer[..len], peer_pwd.as_bytes()),
+                "each leg's check is keyed by the password of the peer it faces"
+            );
+        }
+    }
+
     /// An SDP whose `c=` claims `ip` (not necessarily where its media actually arrives from).
     fn sdp_claiming(ip: &str, port: u16) -> String {
         format!(
@@ -13833,5 +16208,833 @@ mod tests {
         let far = call.far_codec.as_ref().expect("far codec chosen");
         assert_eq!(far.encoding_name, "AMR-WB");
         assert_eq!(far.payload_type, 96);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // WebSocket tee (send-only audio streaming on a *relaying* call)
+    // ---------------------------------------------------------------------------------------------
+
+    /// A local WebSocket server for tee tests: accepts one connection and republishes every frame it
+    /// receives on the returned channel. Returns `(uri, frames)`.
+    async fn tee_server() -> (
+        String,
+        flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+    ) {
+        use futures_util::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tee ws");
+        let addr = listener.local_addr().expect("tee ws addr");
+        let (sender, receiver) = flume::unbounded();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept tee ws");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("tee ws handshake");
+            let (_sink, mut source) = socket.split();
+            while let Some(Ok(message)) = source.next().await {
+                if sender.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        (format!("ws://{addr}/tee"), receiver)
+    }
+
+    /// Drain the tee stream until the first binary (audio) frame, returning its bytes.
+    async fn next_tee_audio(
+        frames: &flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+    ) -> Vec<u8> {
+        use tokio_tungstenite::tungstenite::Message;
+        for _ in 0..40 {
+            let message = timeout(Duration::from_secs(3), frames.recv_async())
+                .await
+                .expect("no timeout")
+                .expect("a frame");
+            if let Message::Binary(bytes) = message {
+                return bytes.to_vec();
+            }
+        }
+        panic!("no binary tee frame arrived");
+    }
+
+    /// Assert the tee's first frame is a send-only `start`, and return its announced format.
+    async fn expect_tee_start(
+        frames: &flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+    ) -> siphon_rtp_media::bridge::protocol::StartData {
+        use siphon_rtp_media::bridge::protocol::{ControlMessage, Direction as WsProtoDirection};
+        use tokio_tungstenite::tungstenite::Message;
+        let first = timeout(Duration::from_secs(3), frames.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("a frame");
+        match first {
+            Message::Text(text) => match ControlMessage::from_json(text.as_str()) {
+                Ok(ControlMessage::Start(data)) => {
+                    assert_eq!(
+                        data.direction,
+                        WsProtoDirection::Send,
+                        "a tee announces itself send-only"
+                    );
+                    data
+                }
+                other => panic!("expected start, got {other:?}"),
+            },
+            other => panic!("expected a start text frame, got {other:?}"),
+        }
+    }
+
+    /// Stand up a plain two-party G.711 relay through the control plane and return both phones, both
+    /// engine-facing addresses, and a live engine with the redirect dispatcher running.
+    async fn two_party_relay(
+        call_id: &str,
+    ) -> (
+        Engine<UdpLoopbackDatapath>,
+        (UdpSocket, SocketAddr),
+        (UdpSocket, SocketAddr),
+    ) {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        (engine, (phone_a, near_addr), (phone_b, far_addr))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ws_tee_streams_both_legs_as_stereo_while_the_relay_keeps_running() {
+        // The headline: a tee is *additive*. A plain two-party G.711 relay is promoted to userspace,
+        // both legs' decoded audio is interleaved as stereo L16 to the WS server, AND each peer keeps
+        // receiving the other's media — asserted on both the WS frames and the peers' received RTP.
+        let (engine, (phone_a, near_addr), (phone_b, far_addr)) =
+            two_party_relay("tee-stereo").await;
+        assert!(
+            !engine.media().is_media_call("tee-stereo"),
+            "a plain relay starts on the in-kernel fast path"
+        );
+
+        let (uri, frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-stereo".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Both,
+                    channels: Some(2),
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "attach: {attached:?}"
+        );
+        assert!(
+            engine.media().is_media_call("tee-stereo"),
+            "attaching a tee promotes the relay into the userspace media pipeline"
+        );
+
+        let start = expect_tee_start(&frames).await;
+        assert_eq!(start.media.channels, 2, "stereo caller/callee");
+        assert_eq!(start.media.sample_rate, 8000);
+        assert_eq!(start.tracks, vec!["inbound", "outbound"]);
+
+        // Both parties talk. Each peer must still receive the other's media (the relay is untouched),
+        // and the tee must produce interleaved stereo frames.
+        let mut stereo_frame = None;
+        for sequence in 0..12u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+            phone_b
+                .send_to(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0xFF), far_addr)
+                .await
+                .expect("b send");
+            if stereo_frame.is_none() {
+                if let Ok(Ok(bytes)) = timeout(Duration::from_millis(300), async {
+                    Ok::<_, ()>(next_tee_audio(&frames).await)
+                })
+                .await
+                {
+                    stereo_frame = Some(bytes);
+                }
+            }
+        }
+        let bytes = stereo_frame.expect("a stereo tee frame arrived");
+        assert_eq!(
+            bytes.len(),
+            640,
+            "8 kHz / 20 ms stereo L16 = 2 channels x 160 samples x 2 bytes"
+        );
+
+        // The relay itself never stopped: each peer receives the other's stream.
+        let (to_b, _) = recv(&phone_b).await;
+        assert!(
+            !to_b.is_empty(),
+            "B still receives A's media through the tee'd call"
+        );
+        let (to_a, _) = recv(&phone_a).await;
+        assert!(
+            !to_a.is_empty(),
+            "A still receives B's media through the tee'd call"
+        );
+
+        // Detach demotes the relay back to the in-kernel fast path, and media keeps flowing.
+        let detached = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: "tee-stereo".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(detached, CmdResult::Ok { .. }),
+            "detach: {detached:?}"
+        );
+        assert!(
+            !engine.media().is_media_call("tee-stereo"),
+            "detaching the last tee demotes the relay back to the kernel Forward path"
+        );
+        phone_a
+            .send_to(&g711_rtp(0, 99, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let (after_detach, _) = recv(&phone_b).await;
+        assert!(
+            !after_detach.is_empty(),
+            "the call keeps relaying after the tee is gone"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_caller_only_ws_tee_streams_the_monologue_as_mono() {
+        let (engine, (phone_a, near_addr), _b) = two_party_relay("tee-mono").await;
+        let (uri, frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-mono".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "attach: {attached:?}"
+        );
+
+        let start = expect_tee_start(&frames).await;
+        assert_eq!(start.media.channels, 1, "a single-leg tee is mono");
+        assert_eq!(start.tracks, vec!["inbound"], "only the caller's track");
+
+        // Only A talks — a caller-only tee must still produce frames (no waiting on the silent callee).
+        for sequence in 0..6u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let bytes = next_tee_audio(&frames).await;
+        assert_eq!(bytes.len(), 320, "8 kHz / 20 ms mono L16");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ws_tee_and_a_siprec_subscription_coexist_on_the_same_leg() {
+        // A tee attaches where SIPREC attaches (the post-decode fan-out). Detaching the tee must remove
+        // *only* the tee's sink: the SRS keeps receiving the subscribed monologue afterwards.
+        let (engine, (phone_a, near_addr), _b) = two_party_relay("tee-siprec").await;
+        let (srs, srs_addr) = phone().await;
+
+        let subscribe = engine
+            .handle(
+                CLIENT,
+                Command::SubscribeRequest {
+                    call_id: "tee-siprec".into(),
+                    from_tags: vec!["tag-a".into()],
+                    sdp: None,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let subscription_tag = match subscribe {
+            CmdResult::Ok {
+                to_tag: Some(to_tag),
+                ..
+            } => to_tag,
+            other => panic!("expected a subscription to_tag, got {other:?}"),
+        };
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::SubscribeAnswer {
+                    call_id: "tee-siprec".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: subscription_tag,
+                    sdp: sdp_single_codec(srs_addr, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(answered, CmdResult::Ok { .. }),
+            "subscribe_answer: {answered:?}"
+        );
+
+        let (uri, frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-siprec".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "attach: {attached:?}"
+        );
+        expect_tee_start(&frames).await;
+
+        // A talks: the SRS gets the SIPREC copy and the WS server gets the teed PCM.
+        for sequence in 0..6u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let (to_srs, _) = recv(&srs).await;
+        assert!(!to_srs.is_empty(), "the SRS receives the SIPREC fork");
+        assert_eq!(
+            next_tee_audio(&frames).await.len(),
+            320,
+            "and the tee streams too"
+        );
+
+        // Detach the tee only — the subscription's fork must survive (tagged removal).
+        let detached = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: "tee-siprec".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(detached, CmdResult::Ok { .. }),
+            "detach: {detached:?}"
+        );
+        assert!(
+            engine.media().is_media_call("tee-siprec"),
+            "the subscription still holds the relay in userspace"
+        );
+        for sequence in 10..16u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let (still_recording, _) = recv(&srs).await;
+        assert!(
+            !still_recording.is_empty(),
+            "detaching the tee must not tear down the SIPREC fork on the same leg"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ws_tee_server_that_never_reads_does_not_stall_the_call() {
+        // The hot-path contract: a stalled consumer drops tee frames, it never blocks the media actor.
+        // The server here completes the WebSocket handshake and then never reads a byte.
+        let (engine, (phone_a, near_addr), (phone_b, _far)) = two_party_relay("tee-stall").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled ws");
+        let stalled_addr = listener.local_addr().expect("addr");
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            // Hold the socket open forever without reading a single frame.
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-stall".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: format!("ws://{stalled_addr}/tee"),
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "attach: {attached:?}"
+        );
+
+        // Push far more frames than any buffer holds; B must keep receiving every one of them.
+        let mut relayed = 0;
+        for sequence in 0..200u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+            if timeout(Duration::from_millis(200), async {
+                let mut buffer = [0u8; 2048];
+                phone_b.recv_from(&mut buffer).await
+            })
+            .await
+            .is_ok()
+            {
+                relayed += 1;
+            }
+        }
+        assert!(
+            relayed >= 190,
+            "the call must keep relaying at full rate past a stalled tee consumer (relayed {relayed}/200)"
+        );
+        stalled.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn attaching_a_ws_tee_to_a_websocket_takeover_call_is_rejected() {
+        // Takeover (`ws_uri`) routes leg A's media to its own server and never wires A<->B, so there is
+        // no relay path to tee. Reject clearly rather than attaching a sink that would never fire.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
+        let ws_addr = listener.local_addr().expect("ws addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            std::future::pending::<()>().await;
+        });
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (_phone_a, addr_a) = phone().await;
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "tee-takeover".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some(format!("ws://{ws_addr}/stream")),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        assert!(matches!(offer, CmdResult::Ok { .. }), "ws offer: {offer:?}");
+
+        let (uri, _frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-takeover".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        match attached {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("takeover"),
+                "expected a takeover-conflict error, got {reason}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ws_tee_is_refused_while_a_pcap_recording_holds_the_relay_forward_only() {
+        // A pcap recording promotes the relay *forward-only* (no decode). Attaching a tee would have to
+        // rebuild the actor, which cannot carry the live capture channel across — so refuse rather than
+        // silently stop recording. (Attaching the tee first works: `start_recording` then reuses the
+        // already-decoding actor.)
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (engine, (_phone_a, _near), _b) = two_party_relay("tee-vs-pcap").await;
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "tee-vs-pcap".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(directory.path().to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(started, CmdResult::Ok { .. }),
+            "start_recording: {started:?}"
+        );
+
+        let (uri, _frames) = tee_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-vs-pcap".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                },
+            )
+            .await;
+        match attached {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("pcap recording"),
+                "expected the recording conflict to be named, got {reason}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert_eq!(
+            engine.ws_tee_count(),
+            0,
+            "the refused attach left no tee behind"
+        );
+        assert!(
+            engine.media().is_relay_call("tee-vs-pcap"),
+            "the recording's forward-only actor is untouched by the refusal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_on_a_ws_takeover_call_does_not_wire_the_relay_to_leg_b() {
+        // Establishes the single-leg -> two-party question rather than assuming it: a WS-takeover call
+        // allocates leg B's endpoints at offer/answer, so it *looks* like a later `answer` might bridge
+        // the caller to a second party. It does not. `answer` short-circuits on `PipelineKind::Ws` and
+        // returns the rewritten SDP without installing any A<->B path, so the caller's media continues
+        // to the WS server only and B receives nothing.
+        //
+        // Handing a WS-bridged caller to a real leg B therefore needs a new transition (detach the
+        // bridge, wire the relay, keep leg A's ports and SSRC continuous so no re-INVITE is required) —
+        // it is not an emergent property of the current answer path.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
+        let ws_addr = ws_listener.local_addr().expect("ws addr");
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let (stream, _) = ws_listener.accept().await.expect("accept");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("handshake");
+            let (_sink, mut source) = socket.split();
+            while let Some(Ok(_frame)) = source.next().await {}
+        });
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-then-answer".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some(format!("ws://{ws_addr}/stream")),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ws-then-answer".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("the answer still returns SDP")
+            .remote_rtp;
+        assert!(
+            engine.ws().is_ws_call("ws-then-answer"),
+            "the call is still WS-bridged after the answer"
+        );
+        assert!(
+            !engine.media().is_media_call("ws-then-answer"),
+            "no media pipeline was stood up, so there is no A<->B path"
+        );
+
+        // A's media goes to the WS server; B — although its ports are allocated and its answer was
+        // accepted — receives nothing.
+        for sequence in 0..10u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let mut buffer = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(300), phone_b.recv_from(&mut buffer))
+                .await
+                .is_err(),
+            "a WS-takeover call must not relay to leg B (the transition is unimplemented, not implicit)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn detaching_a_ws_tee_on_a_call_without_one_is_a_noop() {
+        let (engine, _a, _b) = two_party_relay("tee-none").await;
+        let detached = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: "tee-none".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(detached, CmdResult::Ok { .. }),
+            "idempotent detach"
+        );
+        let unknown = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsTee {
+                    call_id: "nope".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(unknown, CmdResult::Error { .. }),
+            "unknown call still errors"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_ws_tee_attach_detach_cycles_leave_no_residue() {
+        // Leak soak: every attach/detach cycle must return the engine to its starting shape — no tee
+        // rows retained, the relay demoted back to the kernel fast path, and media still flowing.
+        let (engine, (phone_a, near_addr), (phone_b, _far)) = two_party_relay("tee-soak").await;
+        for cycle in 0..8 {
+            let (uri, frames) = tee_server().await;
+            let attached = engine
+                .handle(
+                    CLIENT,
+                    Command::AttachWsTee {
+                        call_id: "tee-soak".into(),
+                        from_tag: "tag-a".into(),
+                        ws_uri: uri,
+                        direction: WsTeeDirection::Caller,
+                        channels: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(attached, CmdResult::Ok { .. }),
+                "cycle {cycle} attach: {attached:?}"
+            );
+            assert_eq!(engine.ws_tee_count(), 1, "exactly one tee per call");
+            expect_tee_start(&frames).await;
+
+            phone_a
+                .send_to(&g711_rtp(0, cycle as u16, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+
+            let detached = engine
+                .handle(
+                    CLIENT,
+                    Command::DetachWsTee {
+                        call_id: "tee-soak".into(),
+                        from_tag: "tag-a".into(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(detached, CmdResult::Ok { .. }),
+                "cycle {cycle} detach: {detached:?}"
+            );
+            assert_eq!(
+                engine.ws_tee_count(),
+                0,
+                "cycle {cycle} left a tee row behind"
+            );
+            assert!(
+                !engine.media().is_media_call("tee-soak"),
+                "cycle {cycle} left the relay promoted in userspace"
+            );
+        }
+
+        // The call is untouched by the churn.
+        phone_a
+            .send_to(&g711_rtp(0, 500, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let (relayed, _) = recv(&phone_b).await;
+        assert!(
+            !relayed.is_empty(),
+            "the relay survived every attach/detach cycle"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_ws_tee_profile_flag_attaches_at_answer_time() {
+        // The declarative twin of attach_ws_tee: `profile.ws_tee` on the answer stands the tee up in
+        // one round-trip, and the call is teed the moment it is answered.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let (uri, frames) = tee_server().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "tee-profile".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "tee-profile".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: ProfileFlags {
+                        ws_tee: Some(uri),
+                        ws_tee_direction: Some(WsTeeDirection::Caller),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("the answer still returns SDP")
+            .remote_rtp;
+        let start = expect_tee_start(&frames).await;
+        assert_eq!(start.call_id, "tee-profile");
+        assert_eq!(start.media.channels, 1);
+
+        for sequence in 0..6u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        assert_eq!(next_tee_audio(&frames).await.len(), 320);
+
+        // Deleting the call closes the tee.
+        engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "tee-profile".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            engine.ws_tee_count(),
+            0,
+            "delete tore the tee down with the call"
+        );
     }
 }

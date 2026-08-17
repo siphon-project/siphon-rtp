@@ -48,6 +48,54 @@ control = "127.0.0.1:8080"
 # Default: 30.
 # media_timeout_secs = 30
 
+# --- ICE candidate gathering (RFC 8445 §5.1.1) --------------------------------------------------
+#
+# STUN servers to probe for a server-reflexive candidate (CLI: --stun-server, repeatable). Default:
+# none, i.e. host-only gathering, which costs no network round trip at call setup.
+#
+# Only useful when the engine itself sits behind a NAT it cannot be addressed through. On a routable
+# media address the probe reports back the address already advertised, and it is pruned as redundant
+# (RFC 8445 §5.1.3) — a round trip per call to learn nothing. The built-in TURN server answers plain
+# STUN Binding requests (RFC 8656 §12), so `turn_udp`'s address may be used here.
+#
+# A server that does not answer costs one bounded delay (logged) and a host-only candidate list; it
+# never fails a call.
+# stun_server = ["198.51.100.1:3478"]
+
+# --- Full ICE (RFC 8445) ------------------------------------------------------------------------
+#
+# Run a full ICE agent on ICE legs — checklists, connectivity checks, role-conflict resolution,
+# peer-reflexive discovery, nomination (CLI: --ice-full). Default: false (the ICE-lite responder).
+#
+# NOTE the behaviour change: on a full-agent leg the datapath answers no checks and adopts no source;
+# the agent adopts the pair ICE selects, and media only flows after that. A peer that never completes
+# ICE gets no media and the call is reaped with CDR reason `ice_failed`. See docs/security-and-nat.md
+# §4 layer 4. Supersedes consent freshness on the legs it runs on (consent is the lite-agent
+# behaviour; a full agent runs its own checks).
+# ice_full = false
+
+# --- ICE consent freshness (RFC 7675) -----------------------------------------------------------
+#
+# Actively probe ICE legs on their validated candidate pair and tear a call down when the peer stops
+# answering (CLI: --ice-consent). Default: false.
+#
+# Off by default on purpose: RFC 7675 §4 says an ICE-LITE agent responds to consent checks and does
+# not generate them, and `a=ice-lite` is what the engine advertises today — so initiating them is a
+# deviation you opt into. Checks are always sent to the STUN-VALIDATED source, never to the peer's
+# signalled c= address (which for a NATed peer is unusable, and probing it would reap live calls).
+# Needs a datapath with the full-agent seam: the UDP backend has it; the XDP fast path logs a warning
+# per endpoint and stays responder-only. See docs/security-and-nat.md §4 layer 4.
+# ice_consent = false
+
+# Seconds between consent checks on a validated pair; RFC 7675 §5.1 recommends ~5 s, randomised
+# (CLI: --consent-interval-secs). Default: 5.
+# consent_interval_secs = 5
+
+# Seconds with no correlated, MESSAGE-INTEGRITY-verified response before the pair is declared dead
+# and the call is torn down — CDR reason `consent_failed` (CLI: --consent-timeout-secs). RFC 7675
+# §5.1 specifies 30 s. Default: 30.
+# consent_timeout_secs = 30
+
 # --- Advertised address & named interfaces (rtpengine-style) ------------------------------------
 #
 # The engine separates the IP it BINDS media sockets to (relay_bind_ip / an interface `address`) from

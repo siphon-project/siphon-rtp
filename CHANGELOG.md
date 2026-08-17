@@ -7,7 +7,7 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
-The initial public surface. The workspace version is `0.1.2` (a single number across
+The initial public surface. The workspace version is `0.1.5` (a single number across
 every crate, see [VERSIONING.md](VERSIONING.md)); this is what the first public tag ships.
 
 ### Control plane
@@ -17,9 +17,10 @@ every crate, see [VERSIONING.md](VERSIONING.md)); this is what the first public 
   statistics, load, node_info, drain/undrain, checkpoint, restore, play_media,
   stop_media, play_dtmf, silence/unsilence_media, block/unblock_media,
   block/unblock_dtmf, echo, start/stop_recording, subscribe_request/answer,
-  unsubscribe, conference_join/leave/route/bridge. `play_media` accepts immediately
-  with a `play_id` and reports its end asynchronously (below). Events: dtmf,
-  media_timeout, play_finished, active_speaker, call_quality.
+  unsubscribe, conference_join/leave/route/bridge, attach/detach_ws_tee.
+  `play_media` accepts immediately with a `play_id` and reports its end
+  asynchronously (below). Events: dtmf, media_timeout, play_finished,
+  active_speaker, call_quality, call_summary, ws_tee_started, ws_tee_ended.
 - **rtpengine NG/bencode front-end** (`--ng`, `siphon-rtp-ngcompat`) — drop-in for
   existing Kamailio / OpenSIPS + `mod_rtpengine` deployments, plus siphon-rtp
   extensions (cluster load/node-info/drain, HA checkpoint/restore).
@@ -33,7 +34,9 @@ every crate, see [VERSIONING.md](VERSIONING.md)); this is what the first public 
   (decode and encode all 8 modes; DTX/SID out of scope).
 - **SRTP-SDES** (RFC 3711 / 4568) with anti-replay, and **DTLS-SRTP** (RFC 5764),
   both pure RustCrypto.
-- **ICE-lite + STUN**, and a **built-in TURN server** (RFC 5766 / 8656, coturn REST
+- **ICE-lite + STUN**, with opt-in **consent freshness** (RFC 7675, `--ice-consent`:
+  probes the validated candidate pair and tears the call down when the peer stops
+  answering), and a **built-in TURN server** (RFC 5766 / 8656, coturn REST
   credentials, `turn:` / `turns:` over UDP/TCP/TLS).
 - **RTCP** SR/RR (parse and construct), **jitter buffer + PLC**, **resampler** (AVX2),
   an energy **VAD**, single-channel **noise suppression**, and **echo cancellation**
@@ -41,10 +44,16 @@ every crate, see [VERSIONING.md](VERSIONING.md)); this is what the first public 
 - **Conferencing MCU** — N-party mixer with mix-minus-self, active-speaker selection,
   whisper/monitor roles, and room bridging.
 - **SIPREC forking** (raw-RTP tee) and **runtime pcap recording**.
-- **RTP↔WebSocket bridge** (`ws://` / `wss://`, raw L16 PCM) for voice-AI, with
-  engine-side turn-taking: a local uplink VAD (`ws_vad`) emitting `speech_started` /
-  `speech_stopped` control frames, same-tick barge-in (`ws_barge_in`), and echo
-  cancellation of the phone's echo of the AI (`echo_cancellation`).
+- **RTP↔WebSocket bridge** (`ws://` / `wss://`, raw L16 PCM) for voice-AI, in two
+  modes. **Takeover** (`ws_uri`) makes the WS server leg A's far side (duplex; the
+  A↔B path is not wired), with engine-side turn-taking: a local uplink VAD
+  (`ws_vad`) emitting `speech_started` / `speech_stopped` control frames, same-tick
+  barge-in (`ws_barge_in`), and echo cancellation of the phone's echo of the AI
+  (`echo_cancellation`). **Tee** (`ws_tee` / `attach_ws_tee`) streams a call's audio
+  send-only *while it keeps relaying* — one leg's monologue, both legs mixed to mono,
+  or both interleaved as stereo L16 — for live transcription, monitoring and
+  analytics. The tee taps the same post-decode fan-out SIPREC forks from, so a stream
+  is decoded once; a stalled consumer drops tee frames and never the call.
 - **Advertised media address + named interfaces** — advertise a public IP in SDP
   decoupled from the bound socket (`--advertise-ip`, for a single-homed host behind
   1:1 NAT such as an Elastic IP: bind private, advertise public, same port), and

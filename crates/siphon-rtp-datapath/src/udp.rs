@@ -19,7 +19,8 @@ use siphon_rtp_stun as stun;
 
 use crate::{
     classify, AddressFamily, Datapath, DatapathError, Endpoint, EndpointId, EndpointStats,
-    FlowAction, IceConfig, IceDatapathEvent, LatchPolicy, ObservedRtcp, PacketClass, RxPacket,
+    FlowAction, IceAgentMode, IceConfig, IceDatapathEvent, LatchPolicy, ObservedRtcp, PacketClass,
+    RxPacket,
 };
 
 /// Receive buffer size. RTP/RTCP/STUN/DTLS media datagrams sit well under a 1500-byte MTU; this
@@ -195,6 +196,9 @@ struct Inner {
     /// correlate Binding responses — which the responder path drops. Bounded per-sink; a full sink
     /// drops the event (a lost consent response only delays the refresh, never blocks the reactor).
     ice_events: DashMap<EndpointId, flume::Sender<IceDatapathEvent>>,
+    /// Endpoints whose STUN the datapath forwards **without answering** — a full RFC 8445 agent owns
+    /// request handling there (see [`IceAgentMode::ForwardOnly`]). Absent ⇒ the responder still runs.
+    ice_forward_only: DashMap<EndpointId, ()>,
     redirect_tx: flume::Sender<RxPacket>,
     redirect_rx: flume::Receiver<RxPacket>,
     /// Telemetry tap: when enabled, relayed RTCP is copied here (bounded, dropped on backpressure).
@@ -464,6 +468,7 @@ impl UdpLoopbackDatapath {
                 latched: DashMap::new(),
                 ice: DashMap::new(),
                 ice_events: DashMap::new(),
+                ice_forward_only: DashMap::new(),
                 redirect_tx,
                 redirect_rx,
                 observe_enabled: AtomicBool::new(false),
@@ -755,6 +760,14 @@ async fn recv_loop(
                     datagram: Bytes::copy_from_slice(&buffer[..len]),
                 });
             }
+            // A full-agent endpoint answers nothing here: the engine's RFC 8445 agent owns request
+            // handling (it needs the role, the checklist, and the nomination state to answer
+            // correctly) and is the only thing that may adopt a source. Forwarding above already
+            // handed it the datagram; stop, so the responder cannot also answer and latch behind the
+            // agent's back.
+            if inner.ice_forward_only.contains_key(&endpoint) {
+                continue;
+            }
             if let Some(ice) = inner.ice.get(&endpoint).map(|config| config.clone()) {
                 handle_stun(
                     &socket,
@@ -907,6 +920,7 @@ impl Datapath for UdpLoopbackDatapath {
             None => {
                 self.inner.ice.remove(&endpoint);
                 self.inner.ice_events.remove(&endpoint);
+                self.inner.ice_forward_only.remove(&endpoint);
             }
         }
     }
@@ -915,12 +929,47 @@ impl Datapath for UdpLoopbackDatapath {
         &self,
         endpoint: EndpointId,
         config: IceConfig,
+        mode: IceAgentMode,
         events: flume::Sender<IceDatapathEvent>,
     ) {
-        // Keep the responder (so inbound checks are still answered) and add the forwarding sink so
-        // Binding responses reach the engine's consent checker (RFC 7675).
+        // The credentials stay installed either way: they arm the layer-4 media gate, which forwards
+        // media only from the adopted source. What `mode` decides is who answers checks (and so who
+        // may adopt) — the datapath's ice-lite responder, or the engine's full agent.
         self.inner.ice.insert(endpoint, config);
         self.inner.ice_events.insert(endpoint, events);
+        match mode {
+            IceAgentMode::RespondAndForward => {
+                self.inner.ice_forward_only.remove(&endpoint);
+            }
+            IceAgentMode::ForwardOnly => {
+                self.inner.ice_forward_only.insert(endpoint, ());
+            }
+        }
+    }
+
+    fn adopt_source(&self, endpoint: EndpointId, source: SocketAddr) {
+        // Same write the responder performs on a validated check — relocated to the agent, which on a
+        // full-agent endpoint is the only thing entitled to make it.
+        self.inner.latched.insert(
+            endpoint,
+            LatchState {
+                addr: source,
+                ssrc: None,
+            },
+        );
+    }
+
+    fn ice_validated_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        // Only an ICE endpoint has a *validated* source. On one, `handle_stun` is the sole writer of
+        // `latched` — media never creates or moves it (`Inner::dispatch`, layer 4) — so the latch is
+        // exactly the check-validated path. On a non-ICE endpoint the same map holds a media latch
+        // that no connectivity check ever authenticated; reporting that as validated would let a
+        // consent check (and, later, the full agent) treat an unauthenticated source as a selected
+        // pair. Gate on the credentials, not on the latch alone.
+        if !self.inner.ice.contains_key(&endpoint) {
+            return None;
+        }
+        self.inner.latched.get(&endpoint).map(|state| state.addr)
     }
 
     fn observe_rtcp(&self) -> flume::Receiver<ObservedRtcp> {
@@ -1960,6 +2009,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_validated_source_reports_only_a_check_validated_peer() {
+        // The RFC 7675 consent target: the address a MESSAGE-INTEGRITY-verified check adopted
+        // (RFC 8445 §7.3) — nothing before that, and nothing a forgery claims.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        datapath.set_ice(
+            leg.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            None,
+            "no check has validated a source yet"
+        );
+
+        // A forgery must not become the consent target.
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let forged = stun::binding_request(&[3u8; 12], "ENG:remote", b"WRONG");
+        attacker
+            .send_to(&forged, leg.local_addr)
+            .await
+            .expect("send forged");
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, attacker.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "the forged check is dropped"
+        );
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            None,
+            "a check failing MESSAGE-INTEGRITY never adopts a source"
+        );
+
+        // The real peer's valid check does.
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let check = stun::binding_request(&[4u8; 12], "ENG:remote", b"engpass");
+        peer.send_to(&check, leg.local_addr)
+            .await
+            .expect("send check");
+        let _ = recv(&peer).await;
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            Some(peer_addr),
+            "the validated check's source is the selected path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_validated_source_never_reports_a_plain_media_latch() {
+        // A non-ICE endpoint latches on media (layer 3). That latch is not authenticated by any
+        // connectivity check, so it must never be offered as an ICE-validated path.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (phone_a, _) = phone().await;
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule {
+                    out_endpoint: leg_b.id,
+                    out_dst: None,
+                    accepted_source: SourceFilter::Any,
+                    latch: LatchPolicy::SignalledOnly,
+                }),
+            )
+            .expect("flow a");
+
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A, 1), leg_a.local_addr)
+            .await
+            .expect("send a");
+        // Let the datagram be processed (it latches; with no out_dst resolved it goes nowhere else).
+        tokio::time::sleep(NEGATIVE).await;
+        assert_eq!(
+            datapath.ice_validated_source(leg_a.id),
+            None,
+            "a media latch on a non-ICE endpoint is not an ICE-validated source"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_agent_forwards_a_stun_response_the_responder_would_drop() {
         // The full-agent seam (RFC 7675 consent) delivers Binding *responses* — which the ice-lite
         // responder drops (they are not requests) — to the engine's checker via the events sink.
@@ -1972,6 +2107,7 @@ mod tests {
                 local_ufrag: "ENG".into(),
                 local_pwd: "engpass".into(),
             },
+            IceAgentMode::RespondAndForward,
             events_tx,
         );
         datapath.advance_clock(5);
@@ -2005,6 +2141,7 @@ mod tests {
                 local_ufrag: "ENG".into(),
                 local_pwd: "engpass".into(),
             },
+            IceAgentMode::RespondAndForward,
             events_tx,
         );
 
@@ -2028,6 +2165,112 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forward_only_endpoint_answers_nothing_and_adopts_nothing() {
+        // A full RFC 8445 agent owns request handling. If the datapath also answered, it would adopt
+        // the source behind the agent's back — the agent could then never keep media on the pair it
+        // actually selected.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        let (events_tx, events_rx) = flume::bounded(16);
+        datapath.set_ice_agent(
+            leg.id,
+            IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            },
+            IceAgentMode::ForwardOnly,
+            events_tx,
+        );
+
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        // A perfectly valid check — one the responder would have answered and latched.
+        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        peer.send_to(&check, leg.local_addr)
+            .await
+            .expect("send check");
+
+        // It reaches the agent...
+        let event = timeout(SHORT, events_rx.recv_async())
+            .await
+            .expect("forwarded")
+            .expect("open");
+        assert_eq!(event.datagram.as_ref(), check.as_slice());
+        // ...and the datapath itself stays silent and adopts nothing.
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, peer.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "the datapath must not answer on a forward-only endpoint"
+        );
+        assert_eq!(
+            datapath.ice_validated_source(leg.id),
+            None,
+            "and must not adopt a source the agent has not selected"
+        );
+
+        // The agent's own decision is what opens the path.
+        datapath.adopt_source(leg.id, peer_addr);
+        assert_eq!(datapath.ice_validated_source(leg.id), Some(peer_addr));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn media_flows_only_after_the_agent_adopts_a_source() {
+        // The behavioural consequence of forward-only: until ICE selects a pair, nothing is forwarded
+        // — media follows ICE's decision, not the first sender to arrive.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
+        let leg_b = datapath.alloc_endpoint().await.expect("alloc b");
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone().await;
+        let (events_tx, _events_rx) = flume::bounded(16);
+        datapath.set_ice_agent(
+            leg_a.id,
+            IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            },
+            IceAgentMode::ForwardOnly,
+            events_tx,
+        );
+        datapath
+            .install_flow(
+                leg_a.id,
+                FlowAction::Forward(ForwardRule {
+                    out_endpoint: leg_b.id,
+                    out_dst: Some(addr_b),
+                    accepted_source: SourceFilter::Any,
+                    latch: LatchPolicy::Off,
+                }),
+            )
+            .expect("flow a");
+
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A, 1), leg_a.local_addr)
+            .await
+            .expect("send a");
+        let mut scratch = [0u8; MAX_DATAGRAM];
+        assert!(
+            timeout(NEGATIVE, phone_b.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "no media before ICE selects a pair"
+        );
+
+        datapath.adopt_source(leg_a.id, addr_a);
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A, 2), leg_a.local_addr)
+            .await
+            .expect("send a again");
+        let (data, _) = recv(&phone_b).await;
+        assert_eq!(
+            data,
+            rtp(0x0A0A_0A0A, 2),
+            "media flows on the selected pair"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clearing_ice_removes_the_full_agent_forwarding_sink() {
         // `set_ice(_, None)` tears down both the responder creds and the full-agent sink.
         let datapath = UdpLoopbackDatapath::new();
@@ -2042,6 +2285,7 @@ mod tests {
                 local_ufrag: "ENG".into(),
                 local_pwd: "engpass".into(),
             },
+            IceAgentMode::RespondAndForward,
             events_tx,
         );
         datapath.set_ice(leg.id, None);

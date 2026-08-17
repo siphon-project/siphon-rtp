@@ -9,14 +9,17 @@ Rust, at different levels of maturity. This page says exactly which level.
 
 - DTLS-SRTP termination on a call leg: the offer advertises `a=fingerprint` +
   `a=setup:actpass`, the handshake keys the leg (webrtc-dtls, pure RustCrypto).
-- ICE-lite server posture: per-call credentials, `a=ice-lite` plus one host
-  candidate in the rewritten SDP, and a STUN Binding responder on the media port
-  (MESSAGE-INTEGRITY + FINGERPRINT validated and returned).
+- ICE-lite server posture: per-call credentials, `a=ice-lite` plus a gathered
+  candidate list in the rewritten SDP (host per component, and a server-reflexive
+  candidate per `--stun-server` that answers), and a STUN Binding responder on the
+  media port (MESSAGE-INTEGRITY + FINGERPRINT validated and returned).
 - A full built-in TURN server, `turn:` and `turns:`, with coturn REST
   credentials. A coturn replacement, not a shim.
+- RFC 7675 consent freshness, opt-in with `--ice-consent`: the engine probes the
+  validated pair and tears the call down when the peer stops answering.
 
-**Planned, not shipped:** the full ICE state machine (candidate pairs,
-checklists, acting as a controlling agent) and RFC 7675 consent freshness;
+**Planned, not shipped:** the full ICE state machine (candidate gathering,
+candidate pairs, checklists, nomination, acting as a controlling agent);
 transcoding on a DTLS leg (today a DTLS leg is bridged as-is, so both sides must
 share a codec); HA checkpoint/restore of a DTLS leg; DTLS or ICE legs into a
 conference (`conference_join` rejects them, plain `RTP/AVP` or SDES `RTP/SAVP`
@@ -98,9 +101,37 @@ a=ice-pwd:H7f2kQ91bXcR3sT8wLpZv0Ay
 a=candidate:1 1 UDP 2130706431 203.0.113.10 40002 typ host
 ```
 
-One host candidate, because the engine sits on a public (or routable) address by
-design (`--relay-bind-ip`); an ICE-lite agent never gathers reflexive or relayed
-candidates (RFC 8445 §2.5). Incoming Binding requests on the media port are
+The candidate list is **gathered** (RFC 8445 §5.1.1), not hardcoded: a host
+candidate per component — RTP, plus RTCP when the leg is not muxed — carrying the
+leg's advertised address, so a 1:1-NAT deployment offers its routable IP rather
+than the bound private one.
+
+Point `--stun-server` at a STUN server and the engine also probes it from each
+media endpoint for a **server-reflexive** candidate:
+
+```
+siphon-rtp --stun-server 198.51.100.1:3478
+```
+
+The built-in TURN server answers plain Binding requests (RFC 8656 §12), so its
+own address works there and you do not need a second service.
+
+Most deployments should leave it unset. On a routable media address the probe
+comes back reporting the address already advertised, which is pruned as redundant
+(RFC 8445 §5.1.3) — so you would pay a round trip on every call setup to learn
+nothing. It earns its keep only when the engine itself sits behind a NAT it cannot
+be addressed through.
+
+Gathering runs on the offer/answer path and is bounded: probes retransmit per RFC
+8489 §6.2.1, the plan gives up at a deadline, and whatever was gathered is
+advertised. A STUN server that is down costs one bounded delay and a host-only
+candidate list, logged as a warning. It never fails the call. Both components
+gather concurrently, so that delay is paid once per leg.
+
+Since there is no trickle yet, the offer or answer carries the complete list and
+says so with `a=end-of-candidates` (RFC 8838 §14).
+
+Incoming Binding requests on the media port are
 answered per RFC 8445 §7.3: the USERNAME must address our ufrag and the
 MESSAGE-INTEGRITY must verify against our password, then the response carries
 XOR-MAPPED-ADDRESS, MESSAGE-INTEGRITY, and FINGERPRINT. An invalid check is
@@ -111,12 +142,78 @@ the peer's media path. That is deliberate. An ICE check is cryptographically
 bound to the SDP exchange, so it is a stronger latch signal than "first packet
 wins" ever could be (see [Security & NAT](../security-and-nat.md), layer 4).
 
-Be honest about the boundary: this is the responder half of ICE. The engine does
-not run checklists, does not pair candidates, does not nominate, and does not
-yet verify consent freshness (RFC 7675). For the server-side role against
-browsers this is normally sufficient (the browser, as full agent, drives the
-checks), but if you need the engine to be an ICE *client* (outbound WebRTC
-trunking), that work is planned and not in this release.
+## Full ICE (`--ice-full`)
+
+The default above is the responder half of ICE. Turn on the full agent and the
+engine runs the other half too:
+
+```
+siphon-rtp --ice-full
+```
+
+It forms a checklist from both candidate sets (RFC 8445 §6.1.2), sends
+connectivity checks paced at `Ta`, resolves a role conflict by tie-breaker with a
+487 response (§7.3.1.1), discovers peer-reflexive candidates in both directions
+(§7.3.1.3, §7.2.5.3.1), and nominates a pair with USE-CANDIDATE (§8.1.1).
+
+The behaviour change worth planning for: **media does not flow until ICE selects a
+pair.** On a full-agent leg the datapath answers nothing and adopts nothing; the
+agent adopts the selected pair, and only then does the layer-4 gate let media
+through. That is the correct posture — the path is the one ICE chose, not the one
+that sent first — but on a leg whose peer never completes ICE, media never starts
+and the call is torn down with CDR reason `ice_failed` instead of relaying.
+
+Off by default because ICE-lite is a valid, simpler posture for a server on a
+routable address, and it is what the engine advertises in its SDP.
+
+On a DTLS-SRTP leg the handshake waits for ICE too (RFC 8445 §12): it starts
+against the address ICE selected, not the signalled one. That matters for a NATed
+browser, where the signalled address cannot answer — handshaking against it would
+burn the DTLS retransmissions and fail a call ICE would have completed. Without
+`--ice-full` the handshake starts immediately at the signalled address, exactly as
+before.
+
+Still the responder half only in one respect: the engine does not yet perform an
+ICE restart (§9) or trickle (RFC 8838). If you need the engine to be an ICE
+*client* for outbound WebRTC trunking, that is the same agent driven from the
+offerer side and is a follow-up.
+
+## Consent freshness (RFC 7675)
+
+A validated pair can go stale: the peer walks out of coverage, its NAT binding
+dies, or it simply stops caring. Consent freshness is the ICE-native answer, and
+it is opt-in:
+
+```
+siphon-rtp --ice-consent --consent-interval-secs 5 --consent-timeout-secs 30
+```
+
+With it on, every ICE leg is promoted to the datapath's full-agent seam (the
+responder plus forwarding of the Binding *responses* the responder would drop)
+and probed once per sweep tick. Checks go to the address the peer proved it can
+receive on, never to its signalled `c=` — for a NATed peer that is a private
+address, and probing it would kill healthy calls. Each leg is addressed
+`<peer-ufrag>:<our-ufrag>` and signed with that peer's password (RFC 8445
+§7.1.2), so the two legs of one call use different credentials. After the timeout
+with no verified response the call is torn down: CDR reason `consent_failed`, and
+the controller gets the same `Event::MediaTimeout` it already handles for a dead
+path.
+
+Why off by default: RFC 7675 §4 says an ICE-lite agent responds to consent checks
+and does not generate them, and `a=ice-lite` is what the engine advertises. So
+initiating them is a deliberate deviation you opt into, not something we do
+behind your back. It becomes the default for legs that stop claiming lite.
+
+Two limits worth knowing. A datapath backend without the full-agent seam (the XDP
+fast path) logs a warning per endpoint and stays responder-only — no silent
+downgrade. And an HA-restored ICE call runs without consent, because the snapshot
+carries the engine's own credentials but not the peer's, so no check can be
+addressed; it also says so in the log.
+
+Even with consent off, an ICE path that stops receiving checks is still reaped —
+a valid inbound check stamps the endpoint's activity, so the media-timeout sweep
+catches it. Consent shortens the detection window and makes it active rather than
+passive.
 
 ## TURN: the built-in relay
 

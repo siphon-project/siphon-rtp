@@ -23,6 +23,13 @@ use tokio::task::JoinHandle;
 /// A shared secure leg that is `None` until the DTLS handshake installs it.
 type SharedSecureLeg = Arc<Mutex<Option<SecureLeg>>>;
 
+/// Where a DTLS leg's encrypted traffic goes, published so it can change under the tasks reading it.
+///
+/// `None` means **not yet decided**: on a full-ICE leg the destination is not known until ICE selects
+/// a candidate pair, and the handshake must not start before then. On a non-ICE leg it is `Some` from
+/// registration and never changes.
+type SecureDestination = Arc<tokio::sync::watch::Sender<Option<SocketAddr>>>;
+
 /// Which direction of the bridge a redirected endpoint carries.
 #[derive(Clone)]
 enum Direction {
@@ -41,9 +48,26 @@ struct Flow {
     direction: Direction,
     accepted_source: SourceFilter,
     out_endpoint: EndpointId,
-    out_dst: SocketAddr,
+    /// Fixed for the decrypt direction (the plain peer's address). For the encrypt direction it is
+    /// `None` and [`Flow::secure_dst`] is consulted instead, because that destination follows ICE.
+    out_dst: Option<SocketAddr>,
+    /// The DTLS peer's current address, when this flow forwards toward it.
+    secure_dst: Option<SecureDestination>,
     /// Shared with the call's other direction; `None` until the handshake completes.
     secure: SharedSecureLeg,
+}
+
+/// Block until the leg's destination is decided. Returns `Err` if the leg is torn down first (every
+/// sender dropped), so the handshake task exits instead of waiting forever.
+async fn wait_for_destination(
+    mut gate: tokio::sync::watch::Receiver<Option<SocketAddr>>,
+) -> Result<SocketAddr, tokio::sync::watch::error::RecvError> {
+    loop {
+        if let Some(destination) = *gate.borrow_and_update() {
+            return Ok(destination);
+        }
+        gate.changed().await?;
+    }
 }
 
 /// A whole call's DTLS-SRTP bridge plan: the two endpoint flows plus the handshake parameters.
@@ -68,6 +92,14 @@ pub struct DtlsCallPlan {
     pub role: DtlsRole,
     /// The DTLS peer's certificate fingerprint (from its SDP `a=fingerprint`), verified per RFC 5763 §5.
     pub peer_fingerprint: Fingerprint,
+    /// Hold the handshake until ICE selects a candidate pair, and then use the selected address.
+    ///
+    /// `true` on a leg running the full ICE agent: RFC 8445 §12 has media (and therefore the DTLS
+    /// handshake that keys it) use the selected pair, and starting earlier means handshaking against
+    /// the signalled address — which for a NATed or symmetric-NAT peer is not where it can be
+    /// reached, so the handshake would burn its retransmissions and fail a call ICE could have
+    /// completed. `false` keeps the pre-ICE behaviour: start immediately at `secure_dst`.
+    pub gate_on_ice: bool,
 }
 
 /// The DTLS bridge registry: redirected endpoint → its `Flow`, plus the per-call handshake/drain
@@ -77,6 +109,8 @@ pub struct DtlsBridge<D: Datapath> {
     datapath: D,
     flows: DashMap<EndpointId, Flow>,
     sessions: DashMap<EndpointId, Vec<JoinHandle<()>>>,
+    /// Per secure endpoint, the published DTLS destination — how ICE releases and re-points a leg.
+    destinations: DashMap<EndpointId, SecureDestination>,
 }
 
 impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
@@ -87,6 +121,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             datapath,
             flows: DashMap::new(),
             sessions: DashMap::new(),
+            destinations: DashMap::new(),
         }
     }
 
@@ -95,19 +130,28 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
     /// tears them down on delete via [`Self::deregister`].
     pub fn register(&self, plan: DtlsCallPlan) {
         let secure: SharedSecureLeg = Arc::new(Mutex::new(None));
+        // Undecided until ICE selects a pair on a gated leg; fixed from the start otherwise.
+        let initial = (!plan.gate_on_ice).then_some(plan.secure_dst);
+        let destination: SecureDestination = Arc::new(tokio::sync::watch::Sender::new(initial));
         let (transport, channels) = DtlsTransport::new(plan.secure_local, plan.secure_dst);
         let dtls_in = channels.inbound;
 
         // Drain outbound DTLS records to the peer via the secure endpoint. Ends when the transport is
-        // dropped (post-handshake) or the session is aborted.
+        // dropped (post-handshake) or the session is aborted. The destination is read per record, so
+        // records emitted after ICE re-points the leg go to the selected pair.
         let drain = {
             let datapath = self.datapath.clone();
             let outbound = channels.outbound;
             let secure_endpoint = plan.secure_endpoint;
-            let secure_dst = plan.secure_dst;
+            let destination = destination.clone();
             tokio::spawn(async move {
                 while let Ok(record) = outbound.recv_async().await {
-                    if let Err(error) = datapath.send(secure_endpoint, secure_dst, &record).await {
+                    let Some(dst) = *destination.borrow() else {
+                        // No pair yet: a record produced before ICE decided has nowhere legitimate to
+                        // go. Dropping it is correct — the handshake has not started either.
+                        continue;
+                    };
+                    if let Err(error) = datapath.send(secure_endpoint, dst, &record).await {
                         tracing::debug!(%error, "DTLS record send failed");
                     }
                 }
@@ -120,7 +164,13 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             let certificate = plan.certificate;
             let role = plan.role;
             let peer_fingerprint = plan.peer_fingerprint;
+            let gate = destination.subscribe();
             tokio::spawn(async move {
+                // RFC 8445 §12: wait for ICE to choose the path before keying it.
+                if let Err(error) = wait_for_destination(gate).await {
+                    tracing::debug!(%error, "DTLS leg torn down before ICE selected a pair");
+                    return;
+                }
                 match handshake(Arc::new(transport), &certificate, role, &peer_fingerprint).await {
                     Ok(leg) => {
                         if let Ok(mut guard) = secure.lock() {
@@ -141,7 +191,9 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 direction: Direction::Encrypt,
                 accepted_source: plan.plain_source,
                 out_endpoint: plan.secure_endpoint,
-                out_dst: plan.secure_dst,
+                // Toward the DTLS peer — follows ICE, so it is read from `secure_dst`.
+                out_dst: None,
+                secure_dst: Some(destination.clone()),
                 secure: secure.clone(),
             },
         );
@@ -151,12 +203,33 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 direction: Direction::Decrypt { dtls_in },
                 accepted_source: plan.secure_source,
                 out_endpoint: plan.plain_endpoint,
-                out_dst: plan.plain_dst,
+                // Toward the plain peer — the signalled address, unaffected by the secure leg's ICE.
+                out_dst: Some(plan.plain_dst),
+                secure_dst: None,
                 secure,
             },
         );
         self.sessions
             .insert(plan.secure_endpoint, vec![drain, shake]);
+        self.destinations.insert(plan.secure_endpoint, destination);
+    }
+
+    /// Tell a gated DTLS leg which address ICE selected: releases its handshake and re-points every
+    /// path toward the peer at the chosen pair (RFC 8445 §8.1.1 / §12).
+    ///
+    /// Idempotent, and a no-op for an endpoint with no DTLS leg — the engine calls it for every
+    /// selection without needing to know which legs are secure.
+    pub fn set_ice_selected(&self, secure_endpoint: EndpointId, selected: SocketAddr) {
+        if let Some(destination) = self.destinations.get(&secure_endpoint) {
+            // `send_if_modified` so an unchanged selection does not wake the watchers.
+            destination.send_if_modified(|current| {
+                if *current == Some(selected) {
+                    return false;
+                }
+                *current = Some(selected);
+                true
+            });
+        }
     }
 
     /// Drop the flows for `endpoints` and abort their handshake/drain tasks — the bridge half of call
@@ -164,6 +237,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
     pub fn deregister(&self, endpoints: impl IntoIterator<Item = EndpointId>) {
         for endpoint in endpoints {
             self.flows.remove(&endpoint);
+            self.destinations.remove(&endpoint);
             if let Some((_, tasks)) = self.sessions.remove(&endpoint) {
                 for task in tasks {
                     task.abort();
@@ -187,12 +261,20 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                     flow.direction.clone(),
                     flow.accepted_source,
                     flow.out_endpoint,
-                    flow.out_dst,
+                    // Toward the DTLS peer the destination follows ICE, so read the published one;
+                    // toward the plain peer it is the signalled address.
+                    flow.out_dst
+                        .or_else(|| flow.secure_dst.as_ref().and_then(|dst| *dst.borrow())),
                     flow.secure.clone(),
                 )
             })
         else {
             return; // not a DTLS-bridge endpoint
+        };
+        let Some(out_dst) = out_dst else {
+            // A gated leg with no pair selected yet: there is nowhere to send that ICE has approved,
+            // and the leg is unkeyed anyway. (docs/security-and-nat.md §4 layer 4.)
+            return;
         };
 
         // RTPBleed gate: Redirect skips the datapath's source check, so re-enforce it here.
@@ -241,6 +323,101 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gated leg must publish nothing until ICE speaks, then exactly the selected address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ice_gated_leg_holds_its_handshake_until_a_pair_is_selected() {
+        // RFC 8445 §12 / RFC 8445 §8.1.1: the handshake keys the path ICE chose. Starting it against
+        // the signalled address on a NATed peer would burn the DTLS retransmissions against an
+        // address that cannot answer, failing a call ICE would have completed.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        let signalled: SocketAddr = "192.0.2.7:30000".parse().expect("addr");
+        let selected: SocketAddr = "203.0.113.9:41000".parse().expect("addr");
+
+        let bridge = DtlsBridge::new(datapath.clone());
+        bridge.register(DtlsCallPlan {
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Any,
+            plain_dst: "192.0.2.1:20000".parse().expect("addr"),
+            secure_endpoint: secure.id,
+            secure_source: SourceFilter::Any,
+            secure_dst: signalled,
+            secure_local: secure.local_addr,
+            certificate: DtlsCertificate::generate().expect("cert"),
+            role: DtlsRole::Server,
+            peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
+            gate_on_ice: true,
+        });
+
+        // Nothing decided yet: the leg has no destination, so the handshake has not begun and the
+        // encrypt direction has nowhere approved to send.
+        let published = bridge
+            .destinations
+            .get(&secure.id)
+            .map(|entry| *entry.borrow())
+            .expect("the leg is registered");
+        assert_eq!(published, None, "gated: no destination before ICE selects");
+
+        // ICE selects a pair — note it is *not* the signalled address, which is the whole point.
+        bridge.set_ice_selected(secure.id, selected);
+        let published = bridge
+            .destinations
+            .get(&secure.id)
+            .map(|entry| *entry.borrow())
+            .expect("still registered");
+        assert_eq!(
+            published,
+            Some(selected),
+            "the leg keys and sends on the pair ICE chose, not the signalled address"
+        );
+
+        // Idempotent, and unrelated endpoints are untouched.
+        bridge.set_ice_selected(secure.id, selected);
+        bridge.set_ice_selected(plain.id, selected);
+        assert_eq!(
+            bridge
+                .destinations
+                .get(&secure.id)
+                .map(|entry| *entry.borrow()),
+            Some(Some(selected))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_gated_leg_has_its_destination_from_registration() {
+        // The pre-ICE behaviour is preserved exactly: without a full agent there is no selection
+        // coming, and gating would hang a leg that works fine against its signalled address.
+        let datapath = UdpLoopbackDatapath::new();
+        let plain = datapath.alloc_endpoint().await.expect("alloc plain");
+        let secure = datapath.alloc_endpoint().await.expect("alloc secure");
+        let signalled: SocketAddr = "192.0.2.7:30000".parse().expect("addr");
+
+        let bridge = DtlsBridge::new(datapath.clone());
+        bridge.register(DtlsCallPlan {
+            plain_endpoint: plain.id,
+            plain_source: SourceFilter::Any,
+            plain_dst: "192.0.2.1:20000".parse().expect("addr"),
+            secure_endpoint: secure.id,
+            secure_source: SourceFilter::Any,
+            secure_dst: signalled,
+            secure_local: secure.local_addr,
+            certificate: DtlsCertificate::generate().expect("cert"),
+            role: DtlsRole::Server,
+            peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
+            gate_on_ice: false,
+        });
+        assert_eq!(
+            bridge
+                .destinations
+                .get(&secure.id)
+                .map(|entry| *entry.borrow()),
+            Some(Some(signalled)),
+            "ungated legs start immediately at the signalled address"
+        );
+    }
+
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
@@ -334,6 +511,7 @@ mod tests {
             certificate: engine_cert.clone(),
             role: DtlsRole::Server,
             peer_fingerprint: peer_cert.fingerprint(),
+            gate_on_ice: false,
         });
 
         // Dispatch the datapath's redirect stream into the bridge.
@@ -437,6 +615,8 @@ mod tests {
             certificate: DtlsCertificate::generate().expect("cert"),
             role: DtlsRole::Server,
             peer_fingerprint: DtlsCertificate::generate().expect("cert").fingerprint(),
+            // The non-ICE path: the destination is known at registration.
+            gate_on_ice: false,
         });
 
         // An SRTP-shaped packet from the signalled secure source, but no handshake has happened → the

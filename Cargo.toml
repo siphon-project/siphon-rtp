@@ -7,6 +7,7 @@ members = [
     "crates/siphon-rtp-simd",
     "crates/siphon-rtp-codec",
     "crates/siphon-rtp-stun",
+    "crates/siphon-rtp-ice",
     "crates/siphon-rtp-datapath",
     "crates/siphon-rtp-dsp",
     "crates/siphon-rtp-ebpf-common",
@@ -24,7 +25,7 @@ members = [
 exclude = ["crates/siphon-rtp-xdp"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -65,7 +66,7 @@ getrandom = "0.3"
 # WebSocket bridges (pure-Rust: rustls/ring only, no native-tls/OpenSSL). The `wss://` client
 # trust store is the Mozilla CA bundle; version-matched to what tokio-tungstenite's
 # `rustls-tls-webpki-roots` feature pulls, so only one copy is compiled.
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 webpki-roots = "1.0"
 futures-util = "0.3"
 # Control protocol (JSON over TCP) + serde

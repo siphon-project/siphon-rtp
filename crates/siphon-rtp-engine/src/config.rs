@@ -108,6 +108,16 @@ pub struct FileConfig {
     pub media_timeout_secs: Option<u64>,
     /// Bounded SIGTERM/SIGINT drain grace period, seconds (`--shutdown-grace-secs`).
     pub shutdown_grace_secs: Option<u64>,
+    /// STUN servers asked for a server-reflexive ICE candidate when gathering (`--stun-server`).
+    pub stun_server: Option<Vec<SocketAddr>>,
+    /// Run a full RFC 8445 ICE agent on ICE legs (`--ice-full`).
+    pub ice_full: Option<bool>,
+    /// Actively run RFC 7675 consent freshness on ICE legs (`--ice-consent`).
+    pub ice_consent: Option<bool>,
+    /// Seconds between ICE consent checks (`--consent-interval-secs`).
+    pub consent_interval_secs: Option<u64>,
+    /// Seconds without a consent response before the pair is dead (`--consent-timeout-secs`).
+    pub consent_timeout_secs: Option<u64>,
     /// TURN UDP listen address (`--turn-udp`).
     pub turn_udp: Option<SocketAddr>,
     /// TURN TCP listen address (`--turn-tcp`).

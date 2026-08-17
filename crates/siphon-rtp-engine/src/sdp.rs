@@ -14,6 +14,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use siphon_rtp_codec::factory::{CodecSpec, OpusParams, OPUS_MAX_PTIME_MS};
+use siphon_rtp_ice::{Candidate, IceOptions, END_OF_CANDIDATES_ATTRIBUTE, ICE_MISMATCH_ATTRIBUTE};
 use siphon_rtp_srtp::sdes::CryptoAttribute;
 
 /// Default packetization when the SDP carries no `a=ptime` (RFC 3551: 20 ms for telephony codecs).
@@ -64,6 +65,23 @@ pub struct MediaInfo {
     pub ice_ufrag: Option<String>,
     /// The peer's ICE password (`a=ice-pwd`), if it offered ICE.
     pub ice_pwd: Option<String>,
+    /// The peer's ICE candidates for the audio stream (RFC 8839 §5.1), in offered order.
+    /// Unresolvable (mDNS `.local`) and malformed lines are skipped rather than failing the parse,
+    /// so one bad candidate never costs us the peer's whole list.
+    pub candidates: Vec<Candidate>,
+    /// The peer's `a=ice-options` tokens (RFC 8839 §5.6); `trickle` (RFC 8838) is the one that
+    /// changes behaviour.
+    pub ice_options: IceOptions,
+    /// Whether the peer declared its candidate list complete with `a=end-of-candidates`
+    /// (RFC 8838 §14). False means more candidates may still trickle in.
+    pub end_of_candidates: bool,
+    /// Whether the peer advertised `a=ice-lite` (RFC 8839 §5.2). A full agent facing a lite peer is
+    /// always the **controlling** agent (RFC 8445 §6.1.1).
+    pub ice_lite: bool,
+    /// Whether the peer sent `a=ice-mismatch` (RFC 8839 §5.3) — it saw our offer's ICE as altered in
+    /// transit, so ICE must not be used on this stream and both sides fall back to the signalled
+    /// address.
+    pub ice_mismatch: bool,
     /// The `m=audio` payload-type list, in offered order (the codec priority order).
     pub payload_types: Vec<u8>,
     /// `a=rtpmap` entries for the audio stream (payload type → encoding name / clock / channels).
@@ -371,6 +389,16 @@ struct AudioScan {
     /// Peer ICE credentials (`a=ice-ufrag` / `a=ice-pwd`), session- or media-level.
     ice_ufrag: Option<String>,
     ice_pwd: Option<String>,
+    /// The peer's `a=candidate` lines for the audio stream (RFC 8839 §5.1), in offered order.
+    candidates: Vec<Candidate>,
+    /// The peer's `a=ice-options` tokens (RFC 8839 §5.6) — `trickle` above all.
+    ice_options: IceOptions,
+    /// Whether the peer sent `a=end-of-candidates` (RFC 8838 §14).
+    end_of_candidates: bool,
+    /// Whether the peer advertised `a=ice-lite` (RFC 8839 §5.2).
+    ice_lite: bool,
+    /// Whether the peer sent `a=ice-mismatch` (RFC 8839 §5.3).
+    ice_mismatch: bool,
 }
 
 /// Parse an `a=rtpmap` attribute body (`rtpmap:<pt> <encoding>/<clock>[/<channels>]`).
@@ -549,6 +577,11 @@ fn scan(sdp: &str) -> AudioScan {
         rtcp_mux: false,
         audio_rtcp: None,
         transport: None,
+        candidates: Vec::new(),
+        ice_options: IceOptions::default(),
+        end_of_candidates: false,
+        ice_lite: false,
+        ice_mismatch: false,
         payload_types: Vec::new(),
         rtpmaps: Vec::new(),
         fmtp_mode_sets: Vec::new(),
@@ -607,6 +640,48 @@ fn scan(sdp: &str) -> AudioScan {
                 } else if let Some(pwd) = value.strip_prefix("ice-pwd:") {
                     if in_audio || scan.ice_pwd.is_none() {
                         scan.ice_pwd = Some(pwd.trim().to_string());
+                    }
+                } else if value == "ice-lite" {
+                    // RFC 8839 §5.2: the peer is an ICE-lite agent. A full agent facing a lite peer
+                    // is always the controlling one (RFC 8445 §6.1.1), so this drives role selection.
+                    scan.ice_lite = true;
+                } else if value.starts_with("ice-options:") {
+                    // RFC 8839 §5.6, session- or media-level; media-level wins (like the credentials).
+                    if in_audio || scan.ice_options.is_empty() {
+                        scan.ice_options = IceOptions::parse(value);
+                    }
+                } else if value.starts_with("ice-mismatch") {
+                    // RFC 8839 §5.3: the peer could not use our ICE because the SDP was rewritten
+                    // in transit (a SIP ALG). Session- or media-level.
+                    scan.ice_mismatch = true;
+                } else if value.starts_with("end-of-candidates") {
+                    // RFC 8838 §14: the peer's candidate list is complete — no more will trickle in.
+                    scan.end_of_candidates = true;
+                } else if let Some(candidate) = value.strip_prefix("candidate:") {
+                    // RFC 8839 §5.1. Only the audio stream's candidates matter to us (one m= section
+                    // is anchored per leg), and a candidate is skipped — never fatal — when it names
+                    // something we cannot use: an mDNS `.local` name (we do not resolve those;
+                    // connectivity still succeeds via peer-reflexive discovery from the peer's own
+                    // checks, RFC 8445 §7.3.1.3) or a malformed line from a broken UA.
+                    if in_audio {
+                        match Candidate::parse(value) {
+                            Ok(candidate) => scan.candidates.push(candidate),
+                            Err(error) if error.is_unresolved_hostname() => {
+                                tracing::debug!(
+                                    target: "siphon_rtp::control",
+                                    candidate = %candidate.trim(),
+                                    "skipping mDNS ICE candidate (not resolved)"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    target: "siphon_rtp::control",
+                                    candidate = %candidate.trim(),
+                                    %error,
+                                    "skipping malformed ICE candidate"
+                                );
+                            }
+                        }
                     }
                 } else if value.starts_with("fingerprint:") {
                     // RFC 8122 `a=fingerprint` — session- or media-level; media-level wins (like ICE).
@@ -697,6 +772,11 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         setup: scan.setup,
         ice_ufrag: scan.ice_ufrag.clone(),
         ice_pwd: scan.ice_pwd.clone(),
+        candidates: scan.candidates.clone(),
+        ice_options: scan.ice_options.clone(),
+        end_of_candidates: scan.end_of_candidates,
+        ice_lite: scan.ice_lite,
+        ice_mismatch: scan.ice_mismatch,
         payload_types: scan.payload_types.clone(),
         rtpmaps: scan.rtpmaps.clone(),
         mode_sets: scan.fmtp_mode_sets.clone(),
@@ -711,14 +791,18 @@ pub fn parse(sdp: &str) -> Result<MediaInfo, SdpError> {
     media_info(&scan(sdp))
 }
 
-/// ICE-lite credentials to advertise in a rewritten SDP: `a=ice-lite` (session-level) plus
-/// `a=ice-ufrag` / `a=ice-pwd` and a host `a=candidate` for the engine's media address.
+/// The engine's ICE identity to advertise in a rewritten SDP: `a=ice-lite` (session-level) plus
+/// `a=ice-ufrag` / `a=ice-pwd` and the **gathered** candidate set.
 #[derive(Debug, Clone, Copy)]
 pub struct IceAdvertisement<'a> {
     /// The engine's local ICE username fragment.
     pub ufrag: &'a str,
     /// The engine's local ICE password.
     pub pwd: &'a str,
+    /// The candidates gathered for this leg (RFC 8445 §5.1.1), emitted in order as `a=candidate`
+    /// lines. Always at least the host candidate — gathering produces that without touching the
+    /// network — plus a server-reflexive one per STUN server that answered.
+    pub candidates: &'a [Candidate],
 }
 
 /// How [`rewrite`] treats the audio stream's ICE attributes (RFC 8445 / RFC 8839 §5). Decouples the
@@ -735,6 +819,10 @@ pub enum IceRewrite<'a> {
     /// Strip the peer's ICE and re-originate ICE-lite with the engine's own credentials plus a host
     /// `a=candidate` (rtpengine `ICE=force`, or mirroring a peer's ICE offer; RFC 8445 §2.7 ICE-lite).
     Reoriginate(IceAdvertisement<'a>),
+    /// Strip the peer's ICE and advertise `a=ice-mismatch` (RFC 8839 §5.3): its offer carried
+    /// candidates but its default destination matched none of them, so the SDP was altered in transit
+    /// and ICE cannot be used on this stream. The leg falls back to the signalled address.
+    Mismatch,
 }
 
 /// How to advertise the audio stream's security on rewrite (RFC 3264 transport + RFC 4568 SDES /
@@ -769,7 +857,9 @@ impl SecurityAdvertisement {
 }
 
 /// Host-candidate priority (RFC 8445 §5.1.2): type-pref 126, local-pref 65535, component 1 (RTP).
-const HOST_CANDIDATE_PRIORITY: u32 = (126 << 24) | (65535 << 8) | 255;
+/// Shared with the consent driver, whose checks must advertise the same PRIORITY they would carry in
+/// a connectivity check for this candidate (RFC 8445 §7.1.1) — one definition, not two.
+pub(crate) const HOST_CANDIDATE_PRIORITY: u32 = (126 << 24) | (65535 << 8) | 255;
 
 /// The SDP `addrtype` token for an IP address family (RFC 4566 §5.7): `IP4` for IPv4, `IP6` for
 /// IPv6. Used to emit the `c=` connection line (and the ICE `a=candidate`) in the family of the
@@ -829,8 +919,12 @@ pub fn rewrite(
         .ok_or(SdpError::ConnectionAddress)?;
     let rtcp_index = scan.audio_rtcp.map(|(index, _)| index);
 
-    // Both `Strip` and `Reoriginate` drop the peer's ICE attributes; only `Reoriginate` re-adds ours.
-    let strip_peer_ice = matches!(ice, IceRewrite::Strip | IceRewrite::Reoriginate(_));
+    // `Strip`, `Reoriginate` and `Mismatch` all drop the peer's ICE attributes; only `Reoriginate`
+    // re-adds ours, and only `Mismatch` says why they are gone (RFC 8839 §5.3).
+    let strip_peer_ice = matches!(
+        ice,
+        IceRewrite::Strip | IceRewrite::Reoriginate(_) | IceRewrite::Mismatch
+    );
     let mut lines: Vec<String> = Vec::new();
     for (index, raw_line) in sdp.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -887,18 +981,24 @@ pub fn rewrite(
                 }
                 Some(SecurityAdvertisement::Plain) | None => {}
             }
+            if matches!(ice, IceRewrite::Mismatch) {
+                // RFC 8839 §5.3: say why ICE is absent rather than silently dropping it, so the
+                // offerer knows its SDP was rewritten and does not keep waiting for checks.
+                lines.push(ICE_MISMATCH_ATTRIBUTE.to_string());
+            }
             if let IceRewrite::Reoriginate(ice) = ice {
                 lines.push(format!("a=ice-ufrag:{}", ice.ufrag));
                 lines.push(format!("a=ice-pwd:{}", ice.pwd));
                 // RFC 8839 §5.1: the candidate's connection-address is a bare IP literal in either
                 // family — `IpAddr`'s Display emits a v6 literal without brackets, exactly as the
-                // `a=candidate` grammar requires (brackets are an `m=`/`c=`-line concern only). The
-                // advertised (public) IP is emitted, the bound port; they share a family by construction.
-                lines.push(format!(
-                    "a=candidate:1 1 UDP {HOST_CANDIDATE_PRIORITY} {} {} typ host",
-                    engine.advertised_ip,
-                    engine.rtp.port()
-                ));
+                // `a=candidate` grammar requires (brackets are an `m=`/`c=`-line concern only).
+                for candidate in ice.candidates {
+                    lines.push(candidate.to_attribute_line());
+                }
+                // RFC 8838 §14: our list is complete before the SDP is built (gathering runs to
+                // completion, or to its deadline, on the control path), so say so — a trickle-capable
+                // peer can stop waiting for more instead of holding its checklist open.
+                lines.push(END_OF_CANDIDATES_ATTRIBUTE.to_string());
             }
         } else if index == conn_index {
             // RFC 4566 §5.7: emit the addrtype of the engine endpoint's own family (`IP4`/`IP6`),
@@ -1450,6 +1550,90 @@ mod tests {
         )
     }
 
+    #[test]
+    fn parses_the_peers_ice_candidates_and_options() {
+        // Until now the engine recognised `a=candidate` only in order to strip it. Pairing needs the
+        // parsed list, so an offer's candidates, options, lite posture, and end-of-candidates marker
+        // all have to survive the scan (RFC 8839 §5.1/§5.2/§5.6, RFC 8838 §14).
+        let sdp = concat!(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n",
+            "a=ice-lite\r\n",
+            "a=ice-ufrag:PEERUF\r\na=ice-pwd:peerpassword01234567\r\n",
+            "a=ice-options:trickle ice2\r\n",
+            "m=audio 30000 RTP/AVP 0\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=candidate:1 1 UDP 2130706431 203.0.113.7 30000 typ host\r\n",
+            "a=candidate:2 1 UDP 1694498815 198.51.100.7 45000 typ srflx raddr 10.0.0.5 rport 45000\r\n",
+            "a=end-of-candidates\r\n",
+        );
+        let info = parse(sdp).expect("parse");
+        assert!(info.is_ice());
+        assert!(info.ice_lite, "the peer advertised a=ice-lite");
+        assert!(info.ice_options.supports_trickle());
+        assert!(info.ice_options.has("ice2"));
+        assert!(info.end_of_candidates);
+        assert_eq!(info.candidates.len(), 2);
+        assert_eq!(info.candidates[0].kind, siphon_rtp_ice::CandidateKind::Host);
+        assert_eq!(info.candidates[0].priority, 2_130_706_431);
+        assert_eq!(
+            info.candidates[1].kind,
+            siphon_rtp_ice::CandidateKind::ServerReflexive
+        );
+        assert_eq!(
+            info.candidates[1].related,
+            Some("10.0.0.5:45000".parse().expect("addr")),
+            "the srflx base survives"
+        );
+    }
+
+    #[test]
+    fn an_unusable_candidate_never_costs_the_peers_whole_list() {
+        // A browser mixes mDNS candidates in with routable ones, and a broken UA can emit a garbage
+        // line. Either must be skipped individually — dropping the rest would leave us unable to pair
+        // with a peer we *can* reach.
+        let sdp = concat!(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n",
+            "a=ice-ufrag:PEERUF\r\na=ice-pwd:peerpassword01234567\r\n",
+            "m=audio 30000 RTP/AVP 0\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=candidate:1 1 UDP 2130706431 f3b1e2c4-0000-4000-8000-abcdefabcdef.local 30000 typ host\r\n",
+            "a=candidate:2 1 UDP not-a-number 203.0.113.7 30001 typ host\r\n",
+            "a=candidate:3 1 UDP 2130706430 203.0.113.7 30002 typ host\r\n",
+        );
+        let info = parse(sdp).expect("parse");
+        assert_eq!(
+            info.candidates.len(),
+            1,
+            "only the usable candidate is kept"
+        );
+        assert_eq!(info.candidates[0].address.port(), 30002);
+        assert!(!info.end_of_candidates, "none was signalled");
+        assert!(!info.ice_lite);
+        assert!(info.ice_options.is_empty());
+    }
+
+    #[test]
+    fn session_level_ice_options_are_overridden_by_the_media_level() {
+        // RFC 8839 §5.4: media-level ICE attributes take precedence over session-level ones — the
+        // same rule the credentials already follow.
+        let sdp = concat!(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n",
+            "a=ice-options:ice2\r\n",
+            "a=ice-ufrag:SESSUF\r\na=ice-pwd:sessionpassword012345\r\n",
+            "m=audio 30000 RTP/AVP 0\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=ice-ufrag:MEDIAUF\r\na=ice-pwd:mediapassword01234567\r\n",
+            "a=ice-options:trickle\r\n",
+        );
+        let info = parse(sdp).expect("parse");
+        assert_eq!(info.ice_ufrag.as_deref(), Some("MEDIAUF"));
+        assert!(info.ice_options.supports_trickle());
+        assert!(
+            !info.ice_options.has("ice2"),
+            "the media-level list replaces the session-level one"
+        );
+    }
+
     /// An AMR-WB offer (PT 96, 16 kHz) at `addr`, optionally carrying an `a=fmtp` `mode-set`.
     fn amr_wb_offer(mode_set: Option<&str>) -> String {
         let fmtp = match mode_set {
@@ -1987,19 +2171,27 @@ mod tests {
              a=ice-ufrag:PEERUF\r\na=ice-pwd:peerpassword01234567\r\n\
              m=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
         let engine = EngineMedia::new("[::1]:40000".parse().unwrap(), None);
+        let candidates = gathered_host_candidates("[::1]:40000");
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
+            candidates: &candidates,
         };
         let result = rewrite(sdp, engine, IceRewrite::Reoriginate(advert), None, None)
             .expect("rewrite v6 ice");
         assert!(result.sdp.contains("c=IN IP6 ::1"));
+        let emitted = result
+            .sdp
+            .lines()
+            .find(|line| line.starts_with("a=candidate:"))
+            .expect("a candidate line");
         assert!(
-            result
-                .sdp
-                .contains("a=candidate:1 1 UDP 2130706431 ::1 40000 typ host"),
-            "v6 host candidate as a bare literal: {}",
-            result.sdp
+            emitted.contains(" ::1 40000 typ host"),
+            "v6 host candidate as a bare literal: {emitted}"
+        );
+        assert_eq!(
+            Candidate::parse(emitted).expect("parses").address,
+            "[::1]:40000".parse::<SocketAddr>().expect("addr")
         );
         assert!(
             !result.sdp.contains("2001:db8::7"),
@@ -2071,13 +2263,25 @@ mod tests {
         assert!(info.ice_ufrag.is_none());
     }
 
+    /// The candidate set a host-only gather produces for `address` — what the engine now hands the
+    /// rewriter instead of a hardcoded line.
+    fn gathered_host_candidates(address: &str) -> Vec<Candidate> {
+        let address: SocketAddr = address.parse().expect("addr");
+        let mut gatherer =
+            siphon_rtp_ice::Gatherer::new(siphon_rtp_ice::GatherConfig::host_only(address), 0);
+        let _ = gatherer.poll(0);
+        gatherer.candidates().to_vec()
+    }
+
     #[test]
     fn rewrite_re_originates_ice_as_ice_lite() {
         let sdp = ice_offer("203.0.113.7", 49170);
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let candidates = gathered_host_candidates("127.0.0.1:40000");
         let advert = IceAdvertisement {
             ufrag: "ENGUF",
             pwd: "engpassword01234567",
+            candidates: &candidates,
         };
         let result =
             rewrite(&sdp, engine, IceRewrite::Reoriginate(advert), None, None).expect("rewrite");
@@ -2086,9 +2290,21 @@ mod tests {
         assert!(result.sdp.contains("a=ice-lite"));
         assert!(result.sdp.contains("a=ice-ufrag:ENGUF"));
         assert!(result.sdp.contains("a=ice-pwd:engpassword01234567"));
-        assert!(result
+        // The host candidate is emitted from the gathered set. Its foundation is now derived per
+        // RFC 8445 §5.1.1.3 (an arbitrary string that tracks type/base/protocol/server) rather than
+        // the literal `1` every candidate used to carry, so assert the fields the spec constrains.
+        let emitted = result
             .sdp
-            .contains("a=candidate:1 1 UDP 2130706431 127.0.0.1 40000 typ host"));
+            .lines()
+            .find(|line| line.starts_with("a=candidate:"))
+            .expect("a candidate line");
+        let candidate = Candidate::parse(emitted).expect("our own candidate parses");
+        assert_eq!(candidate.component, 1);
+        assert_eq!(candidate.kind, siphon_rtp_ice::CandidateKind::Host);
+        assert_eq!(candidate.priority, 2_130_706_431);
+        assert_eq!(candidate.address, "127.0.0.1:40000".parse().expect("addr"));
+        // Gathering is complete before the SDP is written, so we say so (RFC 8838 §14).
+        assert!(result.sdp.contains("a=end-of-candidates"));
         // The peer's ICE attributes are gone.
         assert!(!result.sdp.contains("PEERUF"));
         assert!(!result.sdp.contains("peerpassword01234567"));

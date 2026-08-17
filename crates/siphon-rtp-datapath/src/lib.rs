@@ -293,6 +293,29 @@ pub struct IceConfig {
     pub local_pwd: String,
 }
 
+/// Who answers inbound STUN checks on an endpoint promoted via [`Datapath::set_ice_agent`].
+///
+/// The distinction matters because whoever answers a check also decides whether its source becomes
+/// the media path — and there can only be one such decision-maker per endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IceAgentMode {
+    /// The datapath keeps its ICE-lite responder: it validates and answers inbound checks itself and
+    /// adopts the validated source, *and* forwards every STUN datagram to the engine. This is the
+    /// posture for a lite agent that additionally wants to see Binding responses — RFC 7675 consent
+    /// freshness, which initiates checks but does not run a checklist.
+    RespondAndForward,
+    /// The datapath **only forwards**: it answers nothing and adopts nothing. A full RFC 8445 agent
+    /// must own request handling, because answering correctly requires state the datapath does not
+    /// have — the role and tie-breaker for the §7.3.1.1 conflict check, the checklist for
+    /// §7.3.1.3 peer-reflexive discovery, and the nomination flag for §7.3.1.5.
+    ///
+    /// Consequently the media path stays closed until the agent calls
+    /// [`adopt_source`](Datapath::adopt_source): under the layer-4 gate an ICE endpoint forwards media
+    /// only from the adopted source, so with nothing adopted, nothing flows. That is the intended
+    /// behaviour — media follows ICE's decision, not the first packet to arrive.
+    ForwardOnly,
+}
+
 /// A raw STUN datagram the datapath forwarded to the engine's ICE agent on a **full-agent**
 /// endpoint (see [`Datapath::set_ice_agent`]). The ice-lite responder answers inbound checks in the
 /// datapath as before; a full-agent endpoint *additionally* forwards every STUN datagram it sees —
@@ -462,19 +485,61 @@ pub trait Datapath: Send + Sync {
     /// it — including the Binding *responses* the responder drops — to `events`, so the engine's
     /// consent checker (RFC 7675) can correlate its own outbound checks and detect a dead peer.
     ///
+    /// Who answers the STUN connectivity checks arriving on a full-agent endpoint.
+    ///
+    /// This is not a style choice — it decides who owns the ICE state. See [`IceAgentMode`].
+    ///
     /// Additive to `set_ice`; clear via `set_ice(endpoint, None)` or [`remove_endpoint`](Self::remove_endpoint).
-    /// The **default** installs the responder only (no forwarding) via `set_ice`, so a backend without
-    /// the seam (the XDP fast path) keeps compiling and answering checks — full-agent consent is a
-    /// UDP-datapath capability the loopback backend overrides to provide.
+    /// The **default** installs the responder only (no forwarding) via `set_ice` and **warns**, because
+    /// a backend that takes it cannot do consent at all: no Binding response ever reaches the checker,
+    /// so the caller silently gets ice-lite behaviour where it asked for a full agent. The warning is
+    /// the point — this degradation used to be invisible. A backend without the seam keeps compiling
+    /// and keeps answering inbound checks; it just says so.
     fn set_ice_agent(
         &self,
         endpoint: EndpointId,
         config: IceConfig,
+        mode: IceAgentMode,
         events: flume::Sender<IceDatapathEvent>,
     ) {
-        let _ = events;
+        let _ = (events, mode);
+        tracing::warn!(
+            target: "siphon_rtp::datapath",
+            ?endpoint,
+            "datapath backend has no full-agent ICE seam — installing the responder only; RFC 7675 \
+             consent freshness is DISABLED on this endpoint (Binding responses cannot be correlated)"
+        );
         self.set_ice(endpoint, Some(config));
     }
+
+    /// The peer transport address a **validated** ICE connectivity check adopted for `endpoint`
+    /// (RFC 8445 §7.3), or `None` when no check has validated a source yet — or when the endpoint
+    /// carries no ICE credentials at all.
+    ///
+    /// This is the path an RFC 7675 consent check must probe: the address the peer proved it can
+    /// receive on by answering a MESSAGE-INTEGRITY-signed check, **never** the signalled `c=` address
+    /// (for a NATed peer that is its unusable private address, so probing it would declare live calls
+    /// dead). Distinct from [`learned_source`](Self::learned_source), which reports a *media*-latched
+    /// source: on an ICE endpoint only an authenticated check ever moves this one.
+    ///
+    /// Default `None` — a backend with no ICE responder never adopts a source.
+    fn ice_validated_source(&self, _endpoint: EndpointId) -> Option<SocketAddr> {
+        None
+    }
+
+    /// Adopt `source` as `endpoint`'s media path, on the authority of the engine's ICE agent.
+    ///
+    /// This is the write side of [`ice_validated_source`](Self::ice_validated_source) and the only
+    /// way a [`IceAgentMode::ForwardOnly`] endpoint ever gets a path: the agent calls it when ICE
+    /// selects a pair (RFC 8445 §8.1.1), and the layer-4 gate then forwards media from that source
+    /// and no other.
+    ///
+    /// Safe by construction: the agent only selects a pair whose check it authenticated with the
+    /// negotiated credentials, so this cannot adopt an unvalidated source — it relocates the same
+    /// decision from the datapath's responder to the agent that owns the checklist.
+    ///
+    /// Default: no-op, for a backend with no ICE support at all.
+    fn adopt_source(&self, _endpoint: EndpointId, _source: SocketAddr) {}
 
     /// A receiver for datagrams delivered by [`FlowAction::Redirect`] flows — the userspace slow path
     /// (SRTP/transcode/WS, and the built-in TURN relay, docs/security-and-nat.md §11). Clone-per-
