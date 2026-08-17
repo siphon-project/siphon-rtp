@@ -995,6 +995,11 @@ pub fn rewrite(
                 for candidate in ice.candidates {
                     lines.push(candidate.to_attribute_line());
                 }
+                // RFC 8839 §5.6 / RFC 8838 §4.1: we *accept* trickled candidates, so say so — that is
+                // what lets a browser send its offer immediately and stream candidates afterwards.
+                // We never trickle our own: gathering finishes before we answer, which is why the
+                // end-of-candidates marker below is also true.
+                lines.push("a=ice-options:trickle".to_string());
                 // RFC 8838 §14: our list is complete before the SDP is built (gathering runs to
                 // completion, or to its deadline, on the control path), so say so — a trickle-capable
                 // peer can stop waiting for more instead of holding its checklist open.

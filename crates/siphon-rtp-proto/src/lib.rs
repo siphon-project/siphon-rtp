@@ -65,6 +65,32 @@ pub enum Command {
         #[serde(default)]
         profile: ProfileFlags,
     },
+    /// A **trickled** ICE candidate from a peer, arriving after its offer or answer (RFC 8838).
+    ///
+    /// Browsers trickle: they send an offer immediately and stream candidates as they are gathered,
+    /// rather than holding the offer until gathering finishes. Each one is paired against our local
+    /// candidates and checked promptly (as a triggered check), so a path that only becomes known
+    /// late is still used — including one that arrives after every earlier pair has failed.
+    ///
+    /// `to_tag` selects the side: absent for the offerer's (near) leg, present for the answerer's
+    /// (far) leg — the same keying [`Command::Answer`] uses. Owner-only.
+    ///
+    /// The engine does not trickle candidates of its own: it gathers to completion before it answers
+    /// (see `a=end-of-candidates` in its SDP), so there are none to send afterwards. It advertises
+    /// `a=ice-options:trickle` because it *accepts* them — which is the half of RFC 8838 that
+    /// matters against a browser.
+    IceCandidate {
+        call_id: String,
+        from_tag: String,
+        #[serde(default)]
+        to_tag: Option<String>,
+        /// The peer's `a=candidate:` lines, as they appeared in its signalling.
+        #[serde(default)]
+        candidates: Vec<String>,
+        /// The peer signalled `a=end-of-candidates` — no more are coming.
+        #[serde(default)]
+        end_of_candidates: bool,
+    },
     /// SDP answer (B→A). Completes negotiation; returns the rewritten SDP.
     Answer {
         call_id: String,

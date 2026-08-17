@@ -234,6 +234,19 @@ impl IceAgent {
         })
     }
 
+    /// Mutable checklist access, tests only — for driving a state the wire would take a while to
+    /// produce.
+    #[cfg(test)]
+    pub(crate) fn checklist_mut_for_test(&mut self) -> &mut [CandidatePair] {
+        self.checklist.pairs_mut()
+    }
+
+    /// Force the agent state, tests only.
+    #[cfg(test)]
+    pub(crate) fn force_state_for_test(&mut self, state: IceState) {
+        self.state = state;
+    }
+
     /// Read-only access to the checklist (diagnostics and tests).
     #[must_use]
     pub fn checklist(&self) -> &Checklist {
@@ -363,6 +376,49 @@ impl IceAgent {
         } else {
             IceRole::Controlled(self.config.tie_breaker)
         }
+    }
+
+    /// Add a remote candidate learned after the offer/answer — a **trickled** candidate
+    /// (RFC 8838 §4.2).
+    ///
+    /// Pairs it with every compatible local candidate, starts those pairs `Waiting`, and queues them
+    /// as triggered checks so the next `poll` probes them rather than waiting for their turn in the
+    /// ordinary list. Returns how many pairs it created; `0` means nothing was compatible (a
+    /// cross-family or cross-component candidate, or a transport we do not check), which is not an
+    /// error — a peer may trickle candidates we cannot use.
+    ///
+    /// Ignores a duplicate: a peer that re-sends a candidate must not double the checklist.
+    pub fn add_remote_candidate(&mut self, remote: &Candidate) -> usize {
+        if !remote.transport.is_supported() {
+            return 0;
+        }
+        let mut added = 0;
+        // Pair against our own candidates, honouring the same §6.1.2.2 rules the initial checklist
+        // used — same component, same address family.
+        for local in &self.config.local_candidates {
+            if local.component != remote.component
+                || local.address.is_ipv4() != remote.address.is_ipv4()
+                || !local.transport.is_supported()
+            {
+                continue;
+            }
+            if self.checklist.find(local.address, remote.address).is_some() {
+                continue; // already known
+            }
+            let mut pair =
+                CandidatePair::new(local.clone(), remote.clone(), self.config.controlling);
+            pair.state = PairState::Waiting;
+            let index = self.checklist.push(pair);
+            if !self.triggered.contains(&index) {
+                self.triggered.push(index);
+            }
+            added += 1;
+        }
+        // A checklist that had failed can come back to life on a late candidate.
+        if added > 0 && self.state == IceState::Failed {
+            self.state = IceState::Running;
+        }
+        added
     }
 
     /// Feed a datagram that arrived on `local` from `source`.
@@ -1120,6 +1176,76 @@ mod tests {
         let mut wire = Wire::new(agents(true, false).0, right, direct);
         wire.run(2_000);
         assert_eq!(wire.right.state(), IceState::Completed);
+    }
+
+    #[test]
+    fn a_trickled_candidate_is_paired_and_checked_ahead_of_the_ordinary_list() {
+        // RFC 8838 §4.2: a candidate that arrives after the offer/answer is paired and checked, not
+        // dropped. It becomes a triggered check so it is probed promptly.
+        let (mut left, _right) = agents(true, false);
+        let before = left.checklist().len();
+        let late = host("203.0.113.50:7000", "late");
+        assert_eq!(
+            left.add_remote_candidate(&late),
+            1,
+            "one local to pair with"
+        );
+        assert_eq!(left.checklist().len(), before + 1);
+
+        // The very next check goes to the trickled candidate, ahead of the rest.
+        let actions = left.poll(0);
+        let Some(AgentAction::Send { to, .. }) = actions.first() else {
+            panic!("expected a check, got {actions:?}");
+        };
+        assert_eq!(*to, address("203.0.113.50:7000"));
+
+        // Re-trickling the same candidate does not grow the checklist.
+        assert_eq!(left.add_remote_candidate(&late), 0);
+        assert_eq!(left.checklist().len(), before + 1);
+    }
+
+    #[test]
+    fn an_incompatible_trickled_candidate_is_ignored_without_error() {
+        // A peer may trickle things we cannot pair with — a different family, a different component,
+        // or a transport we do not check. None of those is a failure.
+        let (mut left, _right) = agents(true, false);
+        let before = left.checklist().len();
+
+        assert_eq!(
+            left.add_remote_candidate(&host("[2001:db8::99]:7000", "v6")),
+            0,
+            "cross-family"
+        );
+        let mut other_component = host("203.0.113.51:7000", "c2");
+        other_component.component = 2;
+        assert_eq!(left.add_remote_candidate(&other_component), 0);
+        let mut tcp = host("203.0.113.52:7000", "tcp");
+        tcp.transport = crate::candidate::Transport::Other("TCP".into());
+        assert_eq!(left.add_remote_candidate(&tcp), 0);
+
+        assert_eq!(left.checklist().len(), before, "checklist untouched");
+    }
+
+    #[test]
+    fn a_late_candidate_revives_a_failed_checklist() {
+        // Trickle's real payoff: the initial set can all fail before a usable candidate arrives.
+        // Declaring the call dead and then receiving a working path would be the wrong order.
+        let (mut left, _right) = agents(true, false);
+        for pair in left.checklist_mut_for_test() {
+            pair.state = PairState::Failed;
+        }
+        left.force_state_for_test(IceState::Failed);
+        assert_eq!(left.state(), IceState::Failed);
+
+        assert_eq!(
+            left.add_remote_candidate(&host("203.0.113.50:7000", "late")),
+            1
+        );
+        assert_eq!(
+            left.state(),
+            IceState::Running,
+            "a late candidate reopens the session"
+        );
     }
 
     #[test]
