@@ -35,17 +35,19 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::bridge::audio::{MAX_FRAME_SAMPLES, MAX_PTIME_MS};
 use crate::bridge::pcm_to_l16_le;
 use crate::bridge::protocol::{ControlMessage, Direction, MediaFormat, StartData};
 use crate::bridge::ws::BridgeError;
 use crate::fanout::MediaSink;
 
-/// Largest per-channel frame the scratch buffers hold (48 kHz × 20 ms).
-const MAX_FRAME_SAMPLES: usize = 960;
-
 /// How many wire frames the tee buffers between the sink and the socket. Bounded: a stalled server
 /// drops frames rather than growing a queue (late media is worthless).
 const CHANNEL_DEPTH: usize = 16;
+
+/// Headroom on the resample scratch for the polyphase filter's fractional remainder, which can put
+/// one extra sample in a frame when the rate ratio is not an integer.
+const RESAMPLE_SLACK_SAMPLES: usize = 8;
 
 /// How many wire frames' worth of samples each channel's ring holds before dropping the oldest. Sized
 /// so a modest producer/consumer skew (one leg quiet for a few frames) is absorbed, while a
@@ -173,6 +175,12 @@ impl TeeMixer {
         stereo_source: bool,
         callee_only: bool,
     ) -> (Self, flume::Receiver<Vec<u8>>, flume::Sender<Vec<u8>>) {
+        // The ceiling is 48 kHz × the engine's ptime cap, shared with the takeover bridge so the two
+        // shells around the same PCM core cannot disagree about "the longest frame". It bounds the
+        // *negotiated* length only — everything below sizes itself from the tee's own frame, so a
+        // 20 ms tee allocates exactly what a 20 ms tee needs. Clamping at one 20 ms frame (as this
+        // did) silently halved the wire frame of any tee that negotiated a longer `a=ptime`, so the
+        // server received frames that did not match the `start` message's format.
         let frame_samples = frame_samples.clamp(1, MAX_FRAME_SAMPLES);
         let channels = channels.clamp(1, 2);
         let frame_bytes = frame_samples * usize::from(channels) * 2;
@@ -340,12 +348,22 @@ impl WsTeeSink {
         tag: impl Into<String>,
         resampler: Option<siphon_rtp_dsp::resample::Resampler>,
     ) -> Self {
+        // The scratch only ever holds one converted frame, so size it from the *output* rate and the
+        // ptime ceiling — 960 samples for an 8 kHz tee, not the 48 kHz worst case — plus a sample of
+        // slack for the polyphase remainder. A sink with no resampler never touches it, so it stays
+        // empty rather than reserving for a conversion that will not happen.
+        let resampled = match resampler.as_ref() {
+            Some(resampler) => Vec::with_capacity(
+                resampler.output_rate() as usize / 1000 * MAX_PTIME_MS + RESAMPLE_SLACK_SAMPLES,
+            ),
+            None => Vec::new(),
+        };
         Self {
             channel,
             mixer,
             tag: tag.into(),
             resampler,
-            resampled: Vec::with_capacity(2 * MAX_FRAME_SAMPLES),
+            resampled,
         }
     }
 }
@@ -517,6 +535,31 @@ mod tests {
         let frame = plan.frames.try_recv().expect("one wire frame");
         assert_eq!(frame.len(), 320, "8k/20ms mono L16");
         assert_eq!(samples(&frame)[0], 1234);
+        assert!(plan.frames.try_recv().is_err(), "exactly one frame");
+    }
+
+    /// A tee that negotiated a long `a=ptime` must assemble the wire frame it announced in `start`.
+    /// The mixer used to clamp the frame at one 20 ms frame at 48 kHz, so a 48 kHz / 60 ms tee sent
+    /// 960-sample frames while telling the server they were 2880 — a framing mismatch on every frame.
+    #[test]
+    fn a_long_ptime_tee_assembles_the_frame_length_it_announced() {
+        let mut wire = format(48_000, 1);
+        wire.ptime = 60;
+        let plan = plan_ws_tee(wire, false, false);
+        assert_eq!(
+            plan.format.frame_bytes(),
+            2 * 2880,
+            "48 kHz × 60 ms mono L16"
+        );
+
+        let mut sink = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
+        sink.write_pcm(&[321i16; 2880]);
+        let frame = plan.frames.try_recv().expect("one wire frame");
+        assert_eq!(
+            frame.len(),
+            plan.format.frame_bytes(),
+            "the wire frame must match the announced format"
+        );
         assert!(plan.frames.try_recv().is_err(), "exactly one frame");
     }
 

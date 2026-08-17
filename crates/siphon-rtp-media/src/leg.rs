@@ -13,7 +13,17 @@ use crate::jitter::{JitterBuffer, JitterOutput, PushResult};
 use crate::rtp::{write_packet, RtpError, RtpHeader, RtpPacket};
 
 /// Largest codec payload the egress buffer accommodates (AMR-WB 23.85k ≈ 60 B; G.711 ≤ 160 B).
-const MAX_PAYLOAD: usize = 1500;
+///
+/// This is an **MTU** bound, not a packetization one: an RTP/UDP/IP datagram past ~1500 B would be
+/// IP-fragmented on the wire, so a codec frame that does not fit here must fail loudly rather than be
+/// emitted. It therefore does **not** scale with `a=ptime` — a long-ptime leg is fine as long as its
+/// coded frame stays inside an MTU (Opus at 120 ms does; raw `L16/48000` at 120 ms would not, and is
+/// not a transmittable RTP payload in the first place).
+pub const MAX_PAYLOAD: usize = 1500;
+
+/// Largest RTP packet [`MediaLeg::encode_rtp`] can produce: the RFC 3550 §5.1 fixed header plus
+/// [`MAX_PAYLOAD`]. Sizes a caller's egress buffer without it having to guess.
+pub const MAX_RTP_PACKET: usize = crate::rtp::FIXED_HEADER_LEN + MAX_PAYLOAD;
 
 /// Errors from the leg pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -47,6 +57,11 @@ pub struct MediaLeg {
     egress_ssrc: u32,
     egress_payload_type: u8,
     frame_samples: usize,
+    /// Audio channels the decoder emits per frame (`decoder.params().channels`) — 1 for every
+    /// telephony codec, 2 for a stereo Opus ingress (RFC 7587 §6.1 `sprop-stereo=1`). Cached so a
+    /// consumer folding the decoded frame to mono does not pay a virtual call per frame. Note this
+    /// is *not* the rtpmap channel count, which RFC 7587 §7 pins at 2 even for a mono Opus stream.
+    decode_channels: u8,
     /// Egress RTP timestamp step per packet, in **RTP-clock** units. Equals the egress codec frame
     /// size for every codec whose RTP clock matches its sample rate, but not for G.722 (16 kHz audio
     /// clocked at 8 kHz, RFC 3551 §4.5.2 — there it is half the sample count).
@@ -86,6 +101,7 @@ impl MediaLeg {
         egress_payload_type: u8,
     ) -> Self {
         let frame_samples = decoder.frame_samples();
+        let decode_channels = decoder.params().channels.max(1);
         let ingress_clock_rate_hz = decoder.rtp_clock_rate_hz();
         // RFC 3551 §4.5.2: the egress RTP timestamp advances at the codec's RTP clock, which is not
         // always its sample rate (G.722 clocks RTP at 8 kHz while sampling 16 kHz). Derive the step
@@ -108,6 +124,7 @@ impl MediaLeg {
             egress_ssrc,
             egress_payload_type,
             frame_samples,
+            decode_channels,
             egress_timestamp_increment,
             egress_packets: 0,
             egress_octets: 0,
@@ -119,10 +136,21 @@ impl MediaLeg {
         }
     }
 
-    /// Samples in one nominal codec frame at the native rate.
+    /// `i16` values in one nominal decoded frame at the native rate — the **interleaved** count
+    /// (`decoder.frame_samples()`), so it is directly the length [`MediaLeg::next_pcm`]'s output
+    /// buffer must have. Equal to the per-channel sample count for every mono codec; see the channel
+    /// contract in `siphon_rtp_codec`.
     #[must_use]
     pub fn frame_samples(&self) -> usize {
         self.frame_samples
+    }
+
+    /// Audio channels in the PCM [`MediaLeg::next_pcm`] writes (interleaved). 1 for every telephony
+    /// codec, 2 for a stereo Opus ingress (RFC 7587 §6.1 `sprop-stereo=1`) — a consumer with a mono
+    /// downstream folds the frame with [`siphon_rtp_codec::downmix_to_mono`] using this count.
+    #[must_use]
+    pub fn decode_channels(&self) -> u8 {
+        self.decode_channels
     }
 
     /// Depacketize an inbound RTP packet and buffer its payload for playout.

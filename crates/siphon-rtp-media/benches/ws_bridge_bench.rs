@@ -1,11 +1,15 @@
 //! Criterion perf gate for the WS voice-AI bridge tick (`BridgeSession::tick`) — the per-frame cost a
 //! bridged leg pays. Benches the same tick with local-VAD turn-taking **off vs on** at 8 kHz (µ-law),
-//! so the delta is exactly the added energy-VAD + turn-edge logic. `cargo bench -p siphon-rtp-media`.
+//! so the delta is exactly the added energy-VAD + turn-edge logic, plus the echo-cancelling tick
+//! (whose far-end reference is preallocated on the core) and a **long-ptime** leg at 48 kHz / 60 ms,
+//! the frame shape a WebRTC/Opus peer produces. `cargo bench -p siphon-rtp-media`.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_codec::g711::G711;
+use siphon_rtp_codec::l16::L16;
 use siphon_rtp_codec::Encoder as _;
-use siphon_rtp_media::bridge::protocol::{Direction, MediaFormat};
+use siphon_rtp_dsp::EchoCanceller;
+use siphon_rtp_media::bridge::protocol::{Direction, Encoding, Endianness, MediaFormat};
 use siphon_rtp_media::bridge::BridgeSession;
 use siphon_rtp_media::jitter::JitterBuffer;
 use siphon_rtp_media::leg::MediaLeg;
@@ -13,6 +17,8 @@ use siphon_rtp_media::rtp::{write_packet, RtpHeader, FIXED_HEADER_LEN};
 
 /// 8 kHz / 20 ms frame.
 const FRAME_SAMPLES: usize = 160;
+/// 48 kHz / 60 ms frame — three 48 kHz 20 ms frames, the long-ptime shape.
+const LONG_FRAME_SAMPLES: usize = 2880;
 
 /// A µ-law RTP packet carrying `pcm` (12-byte header + 160-byte payload).
 fn ulaw_packet(sequence: u16, pcm: &[i16]) -> Vec<u8> {
@@ -78,6 +84,119 @@ fn bench_tick(criterion: &mut Criterion) {
         });
     }
     group.finish();
+}
+
+/// The echo-cancelling tick: the same 8 kHz path with an `EchoCanceller` on the uplink. Its far-end
+/// reference lives on the core (preallocated), so the only per-tick work here is the zero-fill of the
+/// reference tail plus the cancellation itself — no ceiling-sized stack array to clear.
+fn bench_tick_with_echo_canceller(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("ws_bridge_tick_8k_20ms");
+    let loud = [4000i16; FRAME_SAMPLES];
+    group.bench_function("aec_on", |bencher| {
+        let leg = MediaLeg::new(
+            Box::new(G711::ulaw()),
+            Box::new(G711::ulaw()),
+            JitterBuffer::new(1, 16),
+            0x5555_6666,
+            0,
+        );
+        let mut session = BridgeSession::new(
+            leg,
+            MediaFormat::telephony_default(),
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        )
+        .with_echo_canceller(Some(
+            EchoCanceller::with_mdf_delay_estimation(8_000, 512, 1_024)
+                .expect("build 8k aec")
+                .with_two_path_dtd(),
+        ));
+        let mut packet = ulaw_packet(0, &loud);
+        let mut sequence: u16 = 0;
+        let mut uplink = [0u8; 1024];
+        let mut downlink = [0u8; 1024];
+        bencher.iter(|| {
+            sequence = sequence.wrapping_add(1);
+            packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+            session.on_rtp(&packet);
+            let result = session.tick(&mut uplink, &mut downlink);
+            black_box(result)
+        });
+    });
+    group.finish();
+}
+
+/// The **long-ptime** tick: an `L16/48000` leg at `a=ptime:60`, 2880 samples per frame. This shape
+/// used to produce nothing at all (the staging slot was one 48 kHz 20 ms frame, so every decode
+/// failed and the uplink was silent), so there is no older number to compare against — it is a new
+/// floor for the path a WebRTC-shaped leg takes.
+fn bench_long_ptime_tick(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("ws_bridge_tick_48k_60ms");
+    let loud = [4000i16; LONG_FRAME_SAMPLES];
+    for (label, vad) in [("vad_off", false), ("vad_on", true)] {
+        group.bench_function(label, |bencher| {
+            let leg = MediaLeg::new(
+                Box::new(L16::new(48_000, 60)),
+                Box::new(L16::new(48_000, 60)),
+                JitterBuffer::new(1, 16),
+                0x5555_6666,
+                11,
+            );
+            let session = BridgeSession::new(
+                leg,
+                MediaFormat {
+                    encoding: Encoding::L16,
+                    sample_rate: 48_000,
+                    channels: 1,
+                    bit_depth: 16,
+                    endianness: Endianness::Little,
+                    ptime: 60,
+                },
+                "str_1",
+                "call_1",
+                Direction::Duplex,
+                8,
+            );
+            let mut session = if vad {
+                session.with_vad(1_000_000, 5, true)
+            } else {
+                session
+            };
+            let mut packet = l16_packet(0, &loud);
+            let mut sequence: u16 = 0;
+            let mut uplink = vec![0u8; 2 * LONG_FRAME_SAMPLES];
+            let mut downlink = vec![0u8; 1600];
+            bencher.iter(|| {
+                sequence = sequence.wrapping_add(1);
+                packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+                session.on_rtp(&packet);
+                let result = session.tick(&mut uplink, &mut downlink);
+                black_box(result)
+            });
+        });
+    }
+    group.finish();
+}
+
+/// An RTP packet carrying `pcm` as an L16 payload (RFC 3551 §4.5.11: network byte order).
+fn l16_packet(sequence: u16, pcm: &[i16]) -> Vec<u8> {
+    let mut payload = vec![0u8; pcm.len() * 2];
+    for (sample, chunk) in pcm.iter().zip(payload.chunks_exact_mut(2)) {
+        chunk.copy_from_slice(&sample.to_be_bytes());
+    }
+    let header = RtpHeader {
+        marker: false,
+        payload_type: 11,
+        sequence,
+        timestamp: u32::from(sequence) * pcm.len() as u32,
+        ssrc: 1,
+    };
+    let mut buffer = vec![0u8; FIXED_HEADER_LEN + payload.len()];
+    let written = write_packet(&header, &payload, &mut buffer).expect("write");
+    buffer.truncate(written);
+    buffer
 }
 
 /// The WS **tee**'s per-frame cost — what a relaying call pays per decoded ingress frame for having a
@@ -147,5 +266,44 @@ fn bench_tee(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_tick, bench_tee);
+/// The **long-ptime tee**: a 48 kHz / 60 ms wire frame, whose length used to be clamped to one 20 ms
+/// frame at 48 kHz — so this is the cost of assembling the frame the tee actually announced.
+fn bench_long_ptime_tee(criterion: &mut Criterion) {
+    use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
+    use siphon_rtp_media::fanout::MediaSink;
+
+    let mut group = criterion.benchmark_group("ws_tee_write_pcm_60ms");
+    let frame = [4321i16; LONG_FRAME_SAMPLES];
+    group.bench_function("mono_48k", |bencher| {
+        let plan = plan_ws_tee(
+            MediaFormat {
+                encoding: Encoding::L16,
+                sample_rate: 48_000,
+                channels: 1,
+                bit_depth: 16,
+                endianness: Endianness::Little,
+                ptime: 60,
+            },
+            false,
+            false,
+        );
+        let mut sink = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee", None);
+        bencher.iter(|| {
+            sink.write_pcm(black_box(&frame));
+            if let Ok(buffer) = plan.frames.try_recv() {
+                let _ = plan.recycle.send(buffer);
+            }
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_tick,
+    bench_tick_with_echo_canceller,
+    bench_long_ptime_tick,
+    bench_tee,
+    bench_long_ptime_tee
+);
 criterion_main!(benches);

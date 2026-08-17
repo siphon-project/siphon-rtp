@@ -45,13 +45,17 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 fn format(sample_rate: u32, channels: u8) -> MediaFormat {
+    format_at(sample_rate, channels, 20)
+}
+
+fn format_at(sample_rate: u32, channels: u8, ptime: u8) -> MediaFormat {
     MediaFormat {
         encoding: Encoding::L16,
         sample_rate,
         channels,
         bit_depth: 16,
         endianness: Endianness::Little,
-        ptime: 20,
+        ptime,
     }
 }
 
@@ -121,6 +125,86 @@ fn a_stereo_tee_write_pcm_makes_no_heap_allocation() {
         after,
         before,
         "stereo tee allocated {} times across {FRAMES} frames (must be zero)",
+        after - before
+    );
+}
+
+/// The same invariant on a **long-ptime** tee: 48 kHz at `a=ptime:60` (2880 samples per frame), the
+/// shape a WebRTC/Opus peer produces. The rings and scratch are sized from the negotiated frame, not
+/// from a 20 ms assumption, so a longer frame is still assembled without touching the heap.
+#[test]
+fn a_long_ptime_tee_write_pcm_makes_no_heap_allocation() {
+    const FRAMES: usize = 500;
+    const FRAME_SAMPLES: usize = 2880; // 48 kHz × 60 ms
+    let plan = plan_ws_tee(format_at(48_000, 1, 60), false, false);
+    let mut sink = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
+    let pcm = [4321i16; FRAME_SAMPLES];
+
+    for _ in 0..64 {
+        sink.write_pcm(&pcm);
+        let frame = plan.frames.try_recv().expect("drained");
+        assert_eq!(frame.len(), 2 * FRAME_SAMPLES, "the whole 60 ms frame");
+        plan.recycle.send(frame).expect("recycle");
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..FRAMES {
+        sink.write_pcm(&pcm);
+        let frame = plan.frames.try_recv().expect("drained");
+        std::hint::black_box(frame.len());
+        plan.recycle.send(frame).expect("recycle");
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(
+        after,
+        before,
+        "long-ptime tee allocated {} times across {FRAMES} frames (must be zero)",
+        after - before
+    );
+}
+
+/// A **resampling** long-ptime sink: a 48 kHz leg feeding a 16 kHz tee at 60 ms. The resample scratch
+/// is sized from the tee's output rate and the ptime ceiling, so the conversion never grows it on the
+/// hot path.
+#[test]
+fn a_resampling_long_ptime_tee_write_pcm_makes_no_heap_allocation() {
+    const FRAMES: usize = 500;
+    let plan = plan_ws_tee(format_at(16_000, 1, 60), false, false);
+    let resampler = siphon_rtp_dsp::resample::Resampler::new(48_000, 16_000).expect("resampler");
+    let mut sink = WsTeeSink::new(
+        TeeChannel::Caller,
+        plan.mixer.clone(),
+        "tee-1",
+        Some(resampler),
+    );
+    let pcm = [4321i16; 2880]; // 48 kHz × 60 ms in, 960 samples out
+
+    for _ in 0..64 {
+        sink.write_pcm(&pcm);
+        while let Ok(frame) = plan.frames.try_recv() {
+            plan.recycle.send(frame).expect("recycle");
+        }
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..FRAMES {
+        sink.write_pcm(&pcm);
+        while let Ok(frame) = plan.frames.try_recv() {
+            std::hint::black_box(frame.len());
+            plan.recycle.send(frame).expect("recycle");
+        }
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(
+        after,
+        before,
+        "resampling long-ptime tee allocated {} times across {FRAMES} frames (must be zero)",
         after - before
     );
 }

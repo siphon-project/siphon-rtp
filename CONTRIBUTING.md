@@ -59,6 +59,7 @@ Fetch the vectors from their sources and drop them under `reference/<codec>/test
 | Opus (CELT layer) | generated locally — see "Opus conformance oracle" below | `reference/opus/celt_only` |
 | Opus (SILK layer) | generated locally — see "Opus conformance oracle" below | `reference/opus/silk_only` |
 | Opus (SILK encoder analysis) | generated locally — see "Opus conformance oracle" below | `reference/opus/silk_enc` |
+| Opus (SILK noise-shaping quantiser) | generated locally — see "Opus conformance oracle" below | `reference/opus/silk_nsq` |
 
 (G.711 and L16 need no external vectors: G.711 is validated exhaustively over all 256 code points,
 L16 is an exact byte-order transform.)
@@ -439,6 +440,68 @@ Three things about this build differ from the decoder recipe and all three matte
   tolerance (documented at the top of the harness). Every **discrete** field — a codebook index, a
   pitch lag, a gain index, a voicing verdict — must match exactly; a tolerance on one of those is a
   bug, not a relaxation.
+
+#### Validating the SILK **noise-shaping quantiser**
+
+The analysis front end decides *how* to code a frame; the NSQ decides the one thing that is actually
+coded per sample. `silk_encode_conformance` covers it end to end — 6 396 packets sample-exact through
+both decoders — but that gate cannot **localise**: every stage above the quantiser feeds into it, so a
+mis-set shaping coefficient, a drifted gain and a genuine quantiser bug all look identical from the
+outside. `silk_nsq_conformance` is the localising check, and it is the same shape as the analysis one:
+re-run the ported kernel on exactly the state and parameters libopus ran it on, and diff everything it
+produced.
+
+`silk_trace.patch` instruments `silk/float/wrappers_FLP.c`, which is where libopus converts the float
+control struct into the quantiser's fixed-point domains and then dispatches. Four lines per call:
+
+| Line | What it pins down |
+|---|---|
+| `ENSQSTATE` | the quantiser's entry state — `xq`, `sLTP_shp_Q14`, `sLPC_Q14`, `sAR2_Q14` and every scalar — plus the frame geometry and search depth |
+| `ENSQIN` | the fixed-point parameters the wrapper derived, and the integer input signal |
+| `ENSQFLT` | the float control values they were derived from, as raw IEEE-754 bit patterns |
+| `ENSQ` | the pulse signal, the coded seed, and the state the call leaves behind |
+
+Every line carries **`u=<frame> i=<call within that frame>`**, and the `i=` is not decoration: the
+gain-multiplier loop runs the quantiser up to seven times per frame — once for the LBRR copy and once
+per iteration that misses the `gainsID` cache (`encode_frame_FLP.c:167-350`) — each time from the same
+restored entry state but with different gains and sometimes a different `Lambda`. A dump tagged only
+by the frame cannot be aligned at all. The dumps here reach seven calls in one frame.
+
+```sh
+patch -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch
+cmake -S reference/opus/opus-1.5.2 -B reference/opus/build-trace \
+      -DCMAKE_BUILD_TYPE=Release -DOPUS_BUILD_PROGRAMS=ON \
+      -DOPUS_DISABLE_INTRINSICS=ON -DCMAKE_C_FLAGS=-DSILK_TRACE
+cmake --build reference/opus/build-trace -j
+patch -R -d reference/opus/opus-1.5.2 -p0 < reference/opus/silk_trace.patch
+SILK_NSQ_TRACE_MAX_FRAMES=24 sh reference/opus/dump_silk_nsq_trace.sh
+cargo test -p siphon-rtp-codec --release --test silk_nsq_conformance -- --nocapture
+```
+
+Three things about this dump differ from the analysis one:
+
+- **It skips ahead before it starts recording** (`SILK_NSQ_TRACE_SKIP_MS`, default 2200). The vectors
+  open on ~2 s of near-silence which never reaches the voiced path, so a dump starting at frame 0
+  would never exercise the LTP predictor, the rewhitening filter or the harmonic shaping.
+- **Part of the sweep runs `-cbr`.** VBR keeps the first encode whenever it fits, so most frames call
+  the quantiser exactly once; CBR suppresses that early exit and drives the bisection to convergence,
+  which is what makes the `i=` tag load-bearing. Two configurations run `-inbandfec` so the LBRR
+  quantisation (a second, independent quantisation of the same frame on a *copy* of the state) is
+  covered too.
+- **There are no tolerances, and adding one would be a bug.** The quantiser is integer end to end —
+  that is the point of it, since it has to compute bit for bit the same prediction the decoder will —
+  so every pulse, every seed and every state word is compared for exact equality. The one float in
+  scope is the input to `silk_float2int`, and it is carried as raw bit patterns rather than decimal so
+  that round-half-to-even provably lands on the same integer.
+
+`dump_silk_nsq_trace.sh` suppresses the analysis groups (`SILK_ENC_TRACE_MAX_FRAMES=0`) and writes to
+its own `reference/opus/silk_nsq/*.nsqtrace`, so it neither reads nor invalidates
+`reference/opus/silk_enc` — the two dumps are regenerated independently.
+
+The harness refuses to pass vacuously: it requires both quantiser variants (the plain `silk_NSQ` and the
+delayed-decision search), the warped *and* unwarped shaping filters, both codebook orders, both frame
+durations, voiced and unvoiced frames, the interpolated two-filter path, an LBRR call, and at least
+one frame whose quantiser ran more than once.
 
 One more oracle is worth knowing about for the tables rather than the decode path:
 `silk_nlsf_tables_vs_libopus` re-parses `reference/opus/opus-1.5.2/silk/tables_NLSF_CB_*.c` and diffs
