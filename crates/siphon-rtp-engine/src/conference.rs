@@ -34,7 +34,11 @@ use siphon_rtp_media::jitter::JitterBuffer;
 use siphon_rtp_media::leg::{MediaLeg, PcmFrame};
 use siphon_rtp_media::mixer::{MixInputs, Mixer, Monitor, Role, Whisper, MAX_PARTICIPANTS};
 use siphon_rtp_media::rtcp;
-use siphon_rtp_media::rtp::RtpPacket;
+use siphon_rtp_media::rtp::{write_packet_with_csrcs, RtpHeader, RtpPacket};
+use siphon_rtp_media::t140::T140Reassembler;
+use siphon_rtp_media::text_mixer::{
+    TextMixer, TextSourceConfig, MAX_PENDING_TEXT_BYTES, MAX_TEXT_REDUNDANCY,
+};
 use siphon_rtp_proto::Event;
 use siphon_rtp_srtp::leg::SecureLeg;
 
@@ -96,6 +100,20 @@ const VAD_HANGOVER_FRAMES: u32 = 5;
 const DEFAULT_TOP_M: usize = 0;
 /// Room ticks between per-participant RTCP Sender Reports (250 × 20 ms = 5 s, RFC 3550 §6.2 default).
 const SR_INTERVAL_TICKS: u64 = 250;
+/// The RFC 9071 conference text flush cadence, in milliseconds. RFC 4103 §5.2 caps T.140 buffering at
+/// 300 ms, so each participant's pending text is distributed to the room at least this often. This is a
+/// **second cadence**, independent of the 20 ms audio [`ROOM_TICK`] — text never touches the audio-rate
+/// machinery (`room_rate`, the active-speaker mask); RFC 9071 source ids are the CSRC list, kept apart.
+const TEXT_FLUSH_INTERVAL_MS: u32 = 300;
+/// The conference text flush interval as a [`std::time::Duration`] (the async actor's text timer).
+pub const TEXT_FLUSH: std::time::Duration =
+    std::time::Duration::from_millis(TEXT_FLUSH_INTERVAL_MS as u64);
+/// Largest egress text RTP packet — the RFC 3550 §5.1 fixed header (12), one CSRC (4), and the
+/// worst-case RED/T.140 payload: [`MAX_TEXT_REDUNDANCY`] redundant blocks plus the primary, each at
+/// most [`MAX_PENDING_TEXT_BYTES`]. Sized from those constants so the buffer always holds a flush's
+/// packet (which stays under a 1500-byte MTU — see [`MAX_PENDING_TEXT_BYTES`]).
+const MAX_TEXT_RTP: usize =
+    12 + 4 + MAX_TEXT_REDUNDANCY * (4 + MAX_PENDING_TEXT_BYTES) + 1 + MAX_PENDING_TEXT_BYTES;
 
 /// A participant's role plus its routing-matrix targets, named by leg tag (resolved to mixer indices
 /// each tick, so the routes survive membership changes).
@@ -118,6 +136,30 @@ impl Default for Routing {
             monitor_target: None,
         }
     }
+}
+
+/// A participant's RFC 4103 Real-Time Text leg, resolved from its `m=text` section (RFC 9071
+/// multiparty RTT). Present only when the participant offered a **plaintext** text stream — secure
+/// (`RTP/SAVP`) conference text is a follow-up (declined at join, never downgraded).
+pub struct ParticipantTextConfig {
+    /// The engine socket this participant's T.140/RED RTP arrives on (a separate `m=text` port).
+    pub ingress_endpoint: EndpointId,
+    /// The engine socket the mixed text is transmitted from (muxed onto the same text endpoint).
+    pub egress_endpoint: EndpointId,
+    /// The participant's text RTP address (latched to its observed source when `latch`).
+    pub egress_dst: SocketAddr,
+    /// Signalled-source gate for the text stream (its own RTPBleed defence, per-stream — §4).
+    pub accepted_source: SourceFilter,
+    /// Whether to latch the text reply address to the observed source (symmetric RTP).
+    pub latch: bool,
+    /// The negotiated T.140 payload type this participant sends and expects (`t140/1000`, RFC 4103).
+    pub t140_payload_type: u8,
+    /// The negotiated RFC 2198 RED payload type wrapping the T.140 blocks, or `None` for bare T.140.
+    pub red_payload_type: Option<u8>,
+    /// The synthesized text egress SSRC stamped on this participant's mixed text stream — also its
+    /// stable **source identifier** (the CSRC the mixer labels its text with toward others, RFC 9071
+    /// §4.2 / RFC 3550 §5.1).
+    pub egress_ssrc: u32,
 }
 
 /// Everything the engine resolves from a participant's SDP offer/answer to seat them in a room.
@@ -158,8 +200,33 @@ pub struct ParticipantConfig {
     /// room, and sending the mix in the clear would leak every other participant to a peer that
     /// negotiated encryption. Cleared when the handshake delivers the key.
     pub secure_pending: bool,
+    /// The participant's plaintext RFC 4103 text leg (RFC 9071 multiparty RTT), if it offered one.
+    /// `None` for an audio-only participant or a declined secure-text section.
+    pub text: Option<ParticipantTextConfig>,
     /// Initial role / routing.
     pub routing: Routing,
+}
+
+/// One seated participant's RFC 4103 text leg: its own endpoint/gate/latch, the negotiated payload
+/// types, its T.140 reassembler, and its text egress SSRC/sequence (the 1000 Hz T.140 clock is owned
+/// by the [`TextMixer`], not this leg). Wholly separate from the audio [`MediaLeg`] — a second,
+/// independently-anchored stream (RFC 3264 §5/§6).
+struct ParticipantText {
+    ingress_endpoint: EndpointId,
+    egress_endpoint: EndpointId,
+    egress_dst: SocketAddr,
+    accepted_source: SourceFilter,
+    latch: bool,
+    /// SSRC-consistent symmetric latch for the text stream (its own, per-stream — §4 layer 3).
+    reverse_latch: SymmetricLatch,
+    t140_payload_type: u8,
+    red_payload_type: Option<u8>,
+    /// The text egress SSRC (also this participant's source-identifier CSRC toward others).
+    egress_ssrc: u32,
+    /// The next text egress RTP sequence number (this leg owns sequence; the mixer owns timestamp).
+    egress_sequence: u16,
+    /// Reassembles the participant's inbound T.140/RED into deduplicated increments (RFC 4103 / 2198).
+    reassembler: T140Reassembler,
 }
 
 /// One seated participant: its leg, resamplers to/from the room rate, VAD, and ingress security state.
@@ -227,6 +294,8 @@ struct Participant {
     secure: Option<SecureLeg>,
     /// Awaiting a DTLS handshake — drop ingress and emit nothing until keyed (see the config field).
     secure_pending: bool,
+    /// The participant's plaintext RFC 4103 text leg (RFC 9071 multiparty RTT), if it negotiated one.
+    text: Option<ParticipantText>,
     routing: Routing,
     /// Whether the first egress packet has been emitted (sets the RTP marker bit, RFC 3550 §5.1).
     started: bool,
@@ -303,6 +372,17 @@ pub struct Conference {
     secure_out: Vec<u8>,
     /// The dominant speaker's tag as of the previous tick (for change detection).
     last_dominant_tag: Option<String>,
+    /// RFC 9071 multiparty real-time text mix bus, kept **index-aligned** with `participants` (a text
+    /// participant carries its [`TextSourceConfig`]; an audio-only one an empty slot). Driven on the
+    /// [`TEXT_FLUSH`] cadence by [`Conference::text_tick`], never the 20 ms audio tick.
+    text_mixer: TextMixer,
+    /// Logical flush counter for the text mixer's 1000 Hz clock — deterministic (never a wall clock).
+    text_flush_counter: u64,
+    /// Reused scratch for a reassembled inbound text increment (so ingest copies once, off the
+    /// reassembler borrow, before queueing it in the mixer).
+    text_ingress_buf: String,
+    /// Reused egress text RTP packet buffer (header + CSRC + RED payload).
+    text_rtp: Vec<u8>,
 }
 
 impl Conference {
@@ -344,6 +424,10 @@ impl Conference {
             clear_in: Vec::with_capacity(MAX_RTP),
             secure_out: Vec::with_capacity(MAX_RTP),
             last_dominant_tag: None,
+            text_mixer: TextMixer::new(TEXT_FLUSH_INTERVAL_MS),
+            text_flush_counter: 0,
+            text_ingress_buf: String::with_capacity(256),
+            text_rtp: vec![0u8; MAX_TEXT_RTP],
         }
     }
 
@@ -486,6 +570,34 @@ impl Conference {
             config.egress_ssrc,
             config.egress_payload_type,
         );
+        // RFC 9071 text leg: seat the text-mixer source (index-aligned with `participants`) and build
+        // the per-participant text-stream state. An audio-only participant takes an empty mixer slot so
+        // the two vectors stay aligned across joins/leaves.
+        let (participant_text, text_source) = match config.text {
+            Some(text) => {
+                let source = Some(TextSourceConfig {
+                    source_id: text.egress_ssrc,
+                    t140_payload_type: text.t140_payload_type,
+                    red_payload_type: text.red_payload_type,
+                });
+                let leg = ParticipantText {
+                    ingress_endpoint: text.ingress_endpoint,
+                    egress_endpoint: text.egress_endpoint,
+                    egress_dst: text.egress_dst,
+                    accepted_source: text.accepted_source,
+                    latch: text.latch,
+                    reverse_latch: SymmetricLatch::default(),
+                    t140_payload_type: text.t140_payload_type,
+                    red_payload_type: text.red_payload_type,
+                    egress_ssrc: text.egress_ssrc,
+                    egress_sequence: 0,
+                    reassembler: T140Reassembler::new(),
+                };
+                (Some(leg), source)
+            }
+            None => (None, None),
+        };
+        self.text_mixer.add_participant(text_source);
         self.participants.push(Participant {
             tag: config.tag,
             leg,
@@ -514,6 +626,7 @@ impl Conference {
             dtmf: DtmfDetector::new(),
             secure: config.secure,
             secure_pending: config.secure_pending,
+            text: participant_text,
             routing: config.routing,
             started: false,
         });
@@ -529,6 +642,8 @@ impl Conference {
             .position(|participant| participant.tag == tag)
         {
             self.participants.remove(position);
+            // Keep the text mixer index-aligned with `participants` (removed at the same position).
+            self.text_mixer.remove_participant(position);
             self.recompute_room_rate();
             true
         } else {
@@ -579,6 +694,16 @@ impl Conference {
     /// if the packet passed the signalled-source gate (so the caller can stamp media activity for the
     /// timeout sweep) — RTCP and telephone-events count as activity even though they are not mixed.
     pub fn ingest(&mut self, packet: &RxPacket) -> bool {
+        // RFC 4103 text arrives on a separate `m=text` endpoint. Route it to the T.140 path before the
+        // audio lookup, so a T.140/RED packet is reassembled — never mis-decoded as an audio frame.
+        if let Some(index) = self.participants.iter().position(|participant| {
+            participant
+                .text
+                .as_ref()
+                .is_some_and(|text| text.ingress_endpoint == packet.endpoint)
+        }) {
+            return self.ingest_text(index, packet);
+        }
         let conference_id = &self.conference_id;
         let Some(participant) = self
             .participants
@@ -690,8 +815,133 @@ impl Conference {
         true
     }
 
-    /// Drain the DTMF events detected since the last call (the actor forwards them to the control
-    /// channel).
+    /// Ingress one datagram for a participant's **text** endpoint (RFC 4103): gate its source, latch
+    /// its reply address, reassemble the T.140/RED into a deduplicated increment, and queue that
+    /// increment for the next text flush (RFC 9071). Surfaces the increment on the control channel as
+    /// [`Event::Text`]. Never mixes a packet from an unsignalled source (RTPBleed defence, §4); only an
+    /// SSRC-consistent stream moves the reply address (§4 layer 3). Returns `true` if the packet passed
+    /// the source gate (so the actor stamps media activity for the timeout sweep). Plaintext only —
+    /// secure conference text is a follow-up, declined at join.
+    fn ingest_text(&mut self, index: usize, packet: &RxPacket) -> bool {
+        let mut recovered = false;
+        let mut from_tag = String::new();
+        {
+            let participant = &mut self.participants[index];
+            let Some(text) = participant.text.as_mut() else {
+                return false;
+            };
+            // Layer 2 — signalled-source gate (§4): an unsignalled source never enters the room.
+            if !text.accepted_source.accepts(packet.source.ip()) {
+                tracing::debug!(
+                    source = %packet.source,
+                    conference = %self.conference_id,
+                    "conference dropped text packet from unsignalled source"
+                );
+                return false;
+            }
+            let Ok(parsed) = RtpPacket::parse(&packet.data) else {
+                return true; // gated in; not a parseable RTP packet
+            };
+            // Layer 3 — constrained, SSRC-consistent latch (§4 layer 3; RFC 3550 §8): only an
+            // SSRC-consistent stream re-points the text reply address.
+            if text.latch {
+                if let Some(dst) = text.reverse_latch.observe(packet.source, parsed.ssrc) {
+                    text.egress_dst = dst;
+                }
+            }
+            // Classify the payload: RED (RFC 2198) vs bare T.140 (RFC 4103 §4). Anything else on this
+            // endpoint is gated-in but not distributed (it is not text).
+            let is_red = Some(parsed.payload_type) == text.red_payload_type;
+            let is_t140 = parsed.payload_type == text.t140_payload_type;
+            if !is_red && !is_t140 {
+                return true;
+            }
+            match text.reassembler.on_packet(
+                parsed.sequence,
+                parsed.timestamp,
+                parsed.payload,
+                is_red,
+            ) {
+                Ok(output) if !output.text.is_empty() => {
+                    // Copy the increment off the reassembler borrow so the mixer can be queued next.
+                    self.text_ingress_buf.clear();
+                    self.text_ingress_buf.push_str(output.text);
+                    recovered = true;
+                    from_tag = participant.tag.clone();
+                }
+                Ok(_) => {} // duplicate / reordered / idle keepalive / split char: nothing new
+                Err(_) => return true,
+            }
+        }
+        if recovered {
+            // RFC 9071: queue the source's increment for the next flush, keyed to this participant so
+            // the mixer labels its egress with this participant's CSRC.
+            self.text_mixer.push_text(index, &self.text_ingress_buf);
+            // Surface the decoded text on the control channel (observability), reusing PR 2's variant.
+            self.pending_events.push(Event::Text {
+                call_id: self.conference_id.clone(),
+                from_tag,
+                to_tag: None,
+                text: self.text_ingress_buf.clone(),
+                direction: None,
+            });
+        }
+        true
+    }
+
+    /// Advance the RFC 9071 text mix one flush (~300 ms — the second, text-only cadence): drain every
+    /// participant's queued T.140 into per-receiver RED packets (mix-minus-self, each labelled with the
+    /// contributing source's CSRC), frame each with the receiver leg's own SSRC/sequence, and append
+    /// the egress datagrams to `out`. Independent of the 20 ms audio [`Conference::tick`] — it touches
+    /// neither the room rate nor the active-speaker mask. Deterministic: the RTP timestamp comes from
+    /// the logical flush counter, never a wall clock.
+    pub fn text_tick(&mut self, out: &mut Vec<Outbound>) {
+        let emit_count = self.text_mixer.flush(self.text_flush_counter);
+        self.text_flush_counter = self.text_flush_counter.wrapping_add(1);
+        for emit_index in 0..emit_count {
+            let emit = self.text_mixer.emits()[emit_index];
+            // Resolve the receiver's text leg (destination, endpoint, SSRC, next sequence).
+            let (dst, egress_endpoint, egress_ssrc, sequence) =
+                match self.participants[emit.receiver].text.as_ref() {
+                    Some(text) if destination_usable(text.egress_dst) => (
+                        text.egress_dst,
+                        text.egress_endpoint,
+                        text.egress_ssrc,
+                        text.egress_sequence,
+                    ),
+                    _ => continue, // never transmit to an unresolved destination
+                };
+            let header = RtpHeader {
+                marker: emit.marker,
+                payload_type: emit.payload_type,
+                sequence,
+                timestamp: emit.timestamp,
+                ssrc: egress_ssrc,
+            };
+            // RFC 9071 §4.2: stamp the contributing source as CSRC 0 so the receiver can attribute the
+            // text and present each source separately. Frame straight from the mixer arena into the
+            // reused text RTP buffer (disjoint fields — the arena borrow does not touch `text_rtp`).
+            let csrcs = [emit.source_csrc];
+            let payload = self.text_mixer.payload_of(&emit);
+            let rtp_len =
+                match write_packet_with_csrcs(&header, &csrcs, payload, &mut self.text_rtp) {
+                    Ok(len) => len,
+                    Err(_) => continue,
+                };
+            out.push(Outbound {
+                endpoint: egress_endpoint,
+                dst,
+                data: Bytes::copy_from_slice(&self.text_rtp[..rtp_len]),
+            });
+            // Advance the receiver leg's egress sequence only on a framed packet (RFC 3550 §5.1).
+            if let Some(text) = self.participants[emit.receiver].text.as_mut() {
+                text.egress_sequence = text.egress_sequence.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Drain the DTMF / text events detected since the last call (the actor forwards them to the
+    /// control channel).
     pub fn drain_events(&mut self) -> std::vec::Drain<'_, Event> {
         self.pending_events.drain(..)
     }
@@ -1438,6 +1688,9 @@ async fn run_conference<D>(
     let mut ticks_since_report = 0u64;
     let mut ticker = tokio::time::interval(ROOM_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The RFC 9071 text flush runs on its own ~300 ms cadence, independent of the 20 ms audio tick.
+    let mut text_ticker = tokio::time::interval(TEXT_FLUSH);
+    text_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             input = inbox.recv_async() => {
@@ -1498,6 +1751,7 @@ async fn run_conference<D>(
                         tracing::debug!("conference active-speaker event dropped (sink full or closed)");
                     }
                 }
+                // RFC 9071 multiparty text flush is on its own timer arm below.
                 // Periodic per-participant RTCP Sender Reports (lip-sync + liveness, RFC 3550 §6.4.1).
                 ticks_since_report += 1;
                 if ticks_since_report >= SR_INTERVAL_TICKS {
@@ -1519,6 +1773,13 @@ async fn run_conference<D>(
                         }
                     }
                 }
+            }
+            _ = text_ticker.tick() => {
+                // RFC 9071 multiparty text flush: distribute each participant's queued T.140 to the
+                // room (mix-minus-self, CSRC-labelled) and transmit. Separate cadence, own datagrams.
+                outbound.clear();
+                conference.text_tick(&mut outbound);
+                send_all(&datapath, &mut outbound).await;
             }
         }
     }
@@ -1557,6 +1818,9 @@ async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
 struct ConferenceMember {
     tag: String,
     endpoint: EndpointId,
+    /// The participant's RFC 4103 text endpoint, when it negotiated a text leg — routed to the same
+    /// room actor and freed alongside the audio endpoint on leave/reap/teardown.
+    text_endpoint: Option<EndpointId>,
     /// The logical tick at which this participant joined — the idle-reap baseline before it has sent
     /// any media (a just-joined silent leg is not reaped until `idle_ticks` elapse).
     joined_tick: u64,
@@ -1635,6 +1899,9 @@ impl ConferenceRegistry {
         D: Datapath + Clone + Send + 'static,
     {
         let endpoint = config.ingress_endpoint;
+        // A text leg's endpoint is routed to the same room actor (RFC 9071 multiparty text), so a
+        // T.140/RED datagram redirected for it reaches this room's `ingest`.
+        let text_endpoint = config.text.as_ref().map(|text| text.ingress_endpoint);
         let tag = config.tag.clone();
         let mailbox = self
             .rooms
@@ -1660,11 +1927,15 @@ impl ConferenceRegistry {
         {
             return false;
         }
-        self.routes.insert(endpoint, mailbox);
+        self.routes.insert(endpoint, mailbox.clone());
+        if let Some(text_endpoint) = text_endpoint {
+            self.routes.insert(text_endpoint, mailbox);
+        }
         if let Some(mut handle) = self.rooms.get_mut(conference_id) {
             handle.members.push(ConferenceMember {
                 tag,
                 endpoint,
+                text_endpoint,
                 joined_tick,
             });
         }
@@ -1683,21 +1954,30 @@ impl ConferenceRegistry {
         }
     }
 
-    /// Remove a participant. Returns its freed ingress endpoint (for the engine to release), and tears
-    /// the room down once its last participant leaves.
-    pub fn leave(&self, conference_id: &str, tag: &str) -> Option<EndpointId> {
-        let (endpoint, empty) = {
-            let mut handle = self.rooms.get_mut(conference_id)?;
-            let position = handle.members.iter().position(|member| member.tag == tag)?;
-            let endpoint = handle.members.remove(position).endpoint;
+    /// Remove a participant. Returns its freed endpoints — the audio endpoint plus its text endpoint
+    /// when it had a text leg (RFC 9071) — for the engine to release, or an empty vector when there is
+    /// no such participant. Tears the room down once its last participant leaves.
+    pub fn leave(&self, conference_id: &str, tag: &str) -> Vec<EndpointId> {
+        let (endpoints, empty) = {
+            let Some(mut handle) = self.rooms.get_mut(conference_id) else {
+                return Vec::new();
+            };
+            let Some(position) = handle.members.iter().position(|member| member.tag == tag) else {
+                return Vec::new();
+            };
+            let member = handle.members.remove(position);
+            let mut endpoints = vec![member.endpoint];
+            endpoints.extend(member.text_endpoint);
             let _ = handle
                 .mailbox
                 .try_send(ConferenceInput::Control(ConferenceControl::Remove(
                     tag.to_string(),
                 )));
-            (endpoint, handle.members.is_empty())
+            (endpoints, handle.members.is_empty())
         };
-        self.routes.remove(&endpoint);
+        for endpoint in &endpoints {
+            self.routes.remove(endpoint);
+        }
         if empty {
             if let Some((_, handle)) = self.rooms.remove(conference_id) {
                 let _ = handle
@@ -1706,7 +1986,7 @@ impl ConferenceRegistry {
                 handle.task.abort();
             }
         }
-        Some(endpoint)
+        endpoints
     }
 
     /// Live-update a participant's role / routing. Returns `false` if the room is gone.
@@ -1764,7 +2044,7 @@ impl ConferenceRegistry {
         let endpoints: Vec<EndpointId> = handle
             .members
             .iter()
-            .map(|member| member.endpoint)
+            .flat_map(|member| std::iter::once(member.endpoint).chain(member.text_endpoint))
             .collect();
         for endpoint in &endpoints {
             self.routes.remove(endpoint);
@@ -1791,14 +2071,21 @@ impl ConferenceRegistry {
             let handle = room.value_mut();
             let mut kept = Vec::with_capacity(handle.members.len());
             for member in std::mem::take(&mut handle.members) {
-                let last = last_activity(member.endpoint)
-                    .unwrap_or(member.joined_tick)
-                    .max(member.joined_tick);
+                // A participant is live if either its audio or its text endpoint saw recent activity
+                // (RFC 9071: a text-only talker keeps its seat), never before it has had a chance to
+                // send (the join baseline).
+                let last_audio = last_activity(member.endpoint).unwrap_or(member.joined_tick);
+                let last_text = member
+                    .text_endpoint
+                    .and_then(&last_activity)
+                    .unwrap_or(member.joined_tick);
+                let last = last_audio.max(last_text).max(member.joined_tick);
                 if now.saturating_sub(last) >= idle_ticks {
                     let _ = handle.mailbox.try_send(ConferenceInput::Control(
                         ConferenceControl::Remove(member.tag.clone()),
                     ));
                     freed.push(member.endpoint);
+                    freed.extend(member.text_endpoint);
                 } else {
                     kept.push(member);
                 }
@@ -1829,9 +2116,13 @@ mod tests {
     use super::*;
     use siphon_rtp_codec::g711::G711;
     use siphon_rtp_media::rtp::{write_packet, RtpHeader};
+    use siphon_rtp_media::t140::{RedBuilder, RedGeneration, RedPacket};
     use std::sync::{Arc, Mutex};
 
     const PCMU: u8 = 0;
+    /// Dynamic payload types for a conference text leg (RFC 4103 t140/1000 + its RFC 2198 RED wrap).
+    const T140_PT: u8 = 98;
+    const RED_PT: u8 = 99;
 
     fn addr(text: &str) -> SocketAddr {
         text.parse().expect("addr")
@@ -1854,6 +2145,7 @@ mod tests {
             telephone_event_in: Some(101),
             secure: None,
             secure_pending: false,
+            text: None,
             routing: Routing::default(),
         }
     }
@@ -2053,6 +2345,7 @@ mod tests {
             telephone_event_in: None,
             secure: None,
             secure_pending: false,
+            text: None,
             routing: Routing::default(),
         };
         (config, encoded)
@@ -2087,6 +2380,7 @@ mod tests {
             telephone_event_in: None,
             secure: None,
             secure_pending: false,
+            text: None,
             routing: Routing::default(),
         };
         (config, encoded)
@@ -2246,6 +2540,7 @@ mod tests {
             telephone_event_in: None,
             secure: None,
             secure_pending: false,
+            text: None,
             routing: Routing::default(),
         };
         (config, encoded)
@@ -2576,6 +2871,286 @@ mod tests {
 
     fn frame_energy(pcm: &[i16]) -> i64 {
         EnergyVad::energy(pcm)
+    }
+
+    // ----- RFC 9071 multiparty real-time text -----
+
+    /// The text ingress/egress endpoint id for participant `index` — distinct from its audio endpoint
+    /// (`index + 1`), since `m=text` is a separate stream/port.
+    fn text_endpoint(index: usize) -> u64 {
+        index as u64 + 101
+    }
+
+    /// A G.711 audio participant that ALSO carries a plaintext RFC 4103 text leg (t140=98 / red=99),
+    /// its text source-identifier CSRC = `0x7000_0000 + index`.
+    fn ulaw_text_config(index: usize, source_ip: &str, dst: &str) -> ParticipantConfig {
+        let mut config = ulaw_config(index, source_ip, dst);
+        config.text = Some(ParticipantTextConfig {
+            ingress_endpoint: EndpointId(text_endpoint(index)),
+            egress_endpoint: EndpointId(text_endpoint(index)),
+            egress_dst: addr(dst),
+            accepted_source: SourceFilter::Exact(source_ip.parse().expect("ip")),
+            latch: false,
+            t140_payload_type: T140_PT,
+            red_payload_type: Some(RED_PT),
+            egress_ssrc: 0x7000_0000 + index as u32,
+        });
+        config
+    }
+
+    /// Build a T.140/RED (RFC 2198) RTP packet from `source_ssrc`: primary text at `primary_ts`, with
+    /// the given oldest-first redundant `(timestamp, data)` generations, framed on the RED PT.
+    fn text_red_rtp(
+        source_ssrc: u32,
+        sequence: u16,
+        primary_ts: u32,
+        primary: &[u8],
+        redundant: &[(u32, &[u8])],
+    ) -> Vec<u8> {
+        let generations: Vec<RedGeneration> = redundant
+            .iter()
+            .map(|(timestamp, data)| RedGeneration {
+                payload_type: T140_PT,
+                rtp_timestamp: *timestamp,
+                data,
+            })
+            .collect();
+        let builder = RedBuilder {
+            primary_payload_type: T140_PT,
+            primary_rtp_timestamp: primary_ts,
+            primary_data: primary,
+            redundant: &generations,
+        };
+        let mut red = Vec::new();
+        builder.write_into(&mut red).expect("build RED");
+        let header = RtpHeader {
+            marker: false,
+            payload_type: RED_PT,
+            sequence,
+            timestamp: primary_ts,
+            ssrc: source_ssrc,
+        };
+        let mut buffer = vec![0u8; 12 + red.len()];
+        let written = write_packet(&header, &red, &mut buffer).expect("write");
+        buffer.truncate(written);
+        buffer
+    }
+
+    /// (receiver-SSRC, CSRC 0, primary text) for one egress text datagram.
+    fn decode_text_egress(datagram: &Outbound) -> (u32, u32, String) {
+        let packet = RtpPacket::parse(&datagram.data).expect("valid egress RTP");
+        assert_eq!(packet.payload_type, RED_PT, "text egress is RED-framed");
+        assert_eq!(
+            packet.csrc_count, 1,
+            "RFC 9071 §4.2: one contributing source"
+        );
+        let csrc = packet.csrc(0).expect("CSRC 0 present");
+        let red = RedPacket::parse(packet.payload).expect("RED payload parses");
+        let text = String::from_utf8(red.primary().data.to_vec()).expect("utf8");
+        (packet.ssrc, csrc, text)
+    }
+
+    #[test]
+    fn two_text_talkers_each_receiver_gets_both_sources_csrc_labelled() {
+        // A three-party room; A and B each type one T.140 packet. On the text flush each receiver must
+        // get the OTHER talkers' text, labelled with the source's CSRC (RFC 9071 §4.2), never its own.
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000")));
+        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference.add_participant(ulaw_text_config(2, "10.0.0.3", "10.0.0.3:4000")));
+
+        // A (source id 0x7000_0000) types "Hi"; B (0x7000_0001) types "Yo". C stays silent.
+        assert!(conference.ingest(&rx(
+            text_endpoint(0),
+            "10.0.0.1:6000",
+            text_red_rtp(0x1111, 1, 1000, b"Hi", &[]),
+        )));
+        assert!(conference.ingest(&rx(
+            text_endpoint(1),
+            "10.0.0.2:6000",
+            text_red_rtp(0x2222, 1, 1000, b"Yo", &[]),
+        )));
+
+        let mut out = Vec::new();
+        conference.text_tick(&mut out);
+
+        // A → B,C ; B → A,C : four text datagrams.
+        assert_eq!(out.len(), 4, "two talkers × two other receivers");
+        let decoded: Vec<(u32, u32, String)> = out.iter().map(decode_text_egress).collect();
+
+        // A's "Hi" (CSRC 0x7000_0000) reaches B and C — framed with their egress SSRCs — never A.
+        assert!(decoded.contains(&(0x7000_0001, 0x7000_0000, "Hi".to_string())));
+        assert!(decoded.contains(&(0x7000_0002, 0x7000_0000, "Hi".to_string())));
+        assert!(!decoded
+            .iter()
+            .any(|(ssrc, csrc, _)| *ssrc == 0x7000_0000 && *csrc == 0x7000_0000));
+        // B's "Yo" (CSRC 0x7000_0001) reaches A and C, never B.
+        assert!(decoded.contains(&(0x7000_0000, 0x7000_0001, "Yo".to_string())));
+        assert!(decoded.contains(&(0x7000_0002, 0x7000_0001, "Yo".to_string())));
+        assert!(!decoded
+            .iter()
+            .any(|(ssrc, csrc, _)| *ssrc == 0x7000_0001 && *csrc == 0x7000_0001));
+
+        // Receiver C's two packets are separable by CSRC into the two distinct sources.
+        let to_c: Vec<(u32, String)> = decoded
+            .iter()
+            .filter(|(ssrc, ..)| *ssrc == 0x7000_0002)
+            .map(|(_, csrc, text)| (*csrc, text.clone()))
+            .collect();
+        assert_eq!(
+            to_c.len(),
+            2,
+            "C hears both A and B, de-interleaved by CSRC"
+        );
+        assert!(to_c.contains(&(0x7000_0000, "Hi".to_string())));
+        assert!(to_c.contains(&(0x7000_0001, "Yo".to_string())));
+    }
+
+    #[test]
+    fn text_ingest_emits_a_control_event_and_survives_a_dropped_packet() {
+        // The reassembler recovers a lost packet from RED redundancy, and each recovered increment is
+        // surfaced as Event::Text for observability (RFC 9071 + RFC 4103 §4.2).
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000")));
+        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+
+        // A sends "H" then (packet 2 lost) "l" carrying "e" as redundancy: the receiver recovers "el".
+        conference.ingest(&rx(
+            text_endpoint(0),
+            "10.0.0.1:6000",
+            text_red_rtp(0x1111, 1, 1000, b"H", &[]),
+        ));
+        conference.ingest(&rx(
+            text_endpoint(0),
+            "10.0.0.1:6000",
+            text_red_rtp(0x1111, 3, 1200, b"l", &[(1100, b"e")]),
+        ));
+        let events: Vec<String> = conference
+            .drain_events()
+            .filter_map(|event| match event {
+                Event::Text { text, from_tag, .. } => {
+                    assert_eq!(from_tag, "party-0");
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, vec!["H".to_string(), "el".to_string()]);
+
+        // The distributed text to B reflects the recovered stream "Hel".
+        let mut out = Vec::new();
+        conference.text_tick(&mut out);
+        assert_eq!(out.len(), 1, "A → B");
+        let (_, csrc, text) = decode_text_egress(&out[0]);
+        assert_eq!(csrc, 0x7000_0000);
+        assert_eq!(text, "Hel");
+    }
+
+    #[test]
+    fn text_packet_from_an_unsignalled_source_is_dropped() {
+        // RTPBleed: a text packet from an address the SDP never signalled never enters the room.
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000")));
+        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(
+            !conference.ingest(&rx(
+                text_endpoint(0),
+                "10.9.9.9:6000", // not the signalled 10.0.0.1
+                text_red_rtp(0x1111, 1, 1000, b"attack", &[]),
+            )),
+            "unsignalled source is gated out"
+        );
+        let mut out = Vec::new();
+        conference.text_tick(&mut out);
+        assert!(out.is_empty(), "nothing distributed from a dropped packet");
+    }
+
+    #[test]
+    fn text_mixing_does_not_disturb_the_audio_mix() {
+        // The audio path must be byte-for-byte what it is with no text at all. Two identical rooms —
+        // one with text legs, one without — driven with the same audio must produce identical audio
+        // egress; and the text flush produces its own datagrams without touching the audio ones.
+        fn audio_egress(with_text: bool) -> Vec<(u32, Vec<u8>)> {
+            let mut conference = Conference::new("room".into(), 0);
+            for index in 0..3 {
+                let source_ip = format!("10.0.0.{}", index + 1);
+                let dst = format!("10.0.0.{}:4000", index + 1);
+                let config = if with_text {
+                    ulaw_text_config(index, &source_ip, &dst)
+                } else {
+                    ulaw_config(index, &source_ip, &dst)
+                };
+                assert!(conference.add_participant(config));
+            }
+            let loud = [6000i16; 160];
+            for sequence in 0..10 {
+                conference.ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, sequence, &loud)));
+                conference.ingest(&rx(2, "10.0.0.2:5000", ulaw_rtp(1, sequence, &loud)));
+                conference.ingest(&rx(3, "10.0.0.3:5000", ulaw_rtp(2, sequence, &loud)));
+                if with_text {
+                    // Interleave text ingest — it must not perturb the audio pipeline at all.
+                    conference.ingest(&rx(
+                        text_endpoint(0),
+                        "10.0.0.1:6000",
+                        text_red_rtp(
+                            0x1111,
+                            sequence,
+                            1000 + u32::from(sequence) * 300,
+                            b"x",
+                            &[],
+                        ),
+                    ));
+                }
+            }
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                out.clear();
+                conference.tick(&mut out);
+            }
+            let mut egress: Vec<(u32, Vec<u8>)> = out
+                .iter()
+                .map(|datagram| {
+                    let packet = RtpPacket::parse(&datagram.data).expect("audio rtp");
+                    // No CSRC on the audio mix — text CSRCs must never bleed onto the audio stream.
+                    assert_eq!(packet.csrc_count, 0, "audio egress carries no CSRC");
+                    (packet.ssrc, packet.payload.to_vec())
+                })
+                .collect();
+            egress.sort_by_key(|(ssrc, _)| *ssrc);
+            egress
+        }
+
+        assert_eq!(
+            audio_egress(false),
+            audio_egress(true),
+            "adding text legs leaves the audio mix byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_text_leaver_frees_its_text_route_and_endpoint() {
+        // The registry must return BOTH the audio and text endpoints on leave so neither leaks.
+        let registry = ConferenceRegistry::default();
+        let datapath = siphon_rtp_datapath::udp::UdpLoopbackDatapath::new();
+        assert!(registry.join(
+            "room",
+            ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000"),
+            0,
+            datapath.clone(),
+            None,
+        ));
+        assert!(registry.owns(EndpointId(1)), "audio endpoint routed");
+        assert!(
+            registry.owns(EndpointId(text_endpoint(0))),
+            "text endpoint routed"
+        );
+        let freed = registry.leave("room", "party-0");
+        assert!(freed.contains(&EndpointId(1)));
+        assert!(freed.contains(&EndpointId(text_endpoint(0))));
+        assert!(
+            !registry.owns(EndpointId(text_endpoint(0))),
+            "text route released"
+        );
     }
 
     #[test]

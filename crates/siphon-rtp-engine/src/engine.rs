@@ -40,7 +40,7 @@ use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
 use siphon_rtp_srtp::StreamRollover;
 
 use crate::cluster::ClusterState;
-use crate::conference::{ConferenceRegistry, ParticipantConfig, Routing};
+use crate::conference::{ConferenceRegistry, ParticipantConfig, ParticipantTextConfig, Routing};
 use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
 use crate::ice::driver::{AgentOutcome, AgentSupervisor, ConsentOutcome, ConsentSupervisor};
 use crate::ice::{self, IceCredentials};
@@ -5161,6 +5161,61 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             (None, None)
         };
+        // RFC 9071 conference text: anchor a *plaintext* `m=text` (RFC 4103) stream when the
+        // participant offered one with a usable `t140` rtpmap — its own redirected endpoint, its own
+        // per-stream RTPBleed gate + latch. A *secure* (`RTP/SAVP`) text section is declined
+        // (`m=text 0`, RFC 3264 §6), never downgraded — secure conference text is a follow-up. The
+        // room mixes each participant's text across the others with per-source CSRC identification.
+        // Allocated after the SDES/DTLS block so an audio-keying failure above never leaks a text port.
+        let symmetric = profile.flags.iter().any(|flag| flag == "symmetric");
+        let (text_config, text_rewrite, text_endpoint) = match info.text.as_ref() {
+            Some(text) if !text.secure => match text.t140_payload_type {
+                Some(t140_pt) => {
+                    let text_endpoint = match self.alloc_endpoints(1, family, bind).await {
+                        Ok(mut endpoints) => endpoints.remove(0),
+                        Err(reason) => {
+                            self.free(&[endpoint]).await;
+                            return error_result("conference_join: text endpoint", &reason);
+                        }
+                    };
+                    if let Err(error) = self
+                        .datapath
+                        .install_flow(text_endpoint.id, FlowAction::Redirect)
+                    {
+                        self.free(&[endpoint, text_endpoint]).await;
+                        return error_result("conference_join: install text redirect", &error);
+                    }
+                    let text_source = if symmetric {
+                        SourceFilter::Any
+                    } else {
+                        SourceFilter::Exact(text.remote_rtp.ip())
+                    };
+                    let text_engine = EngineMedia {
+                        rtp: text_endpoint.local_addr,
+                        rtcp: None,
+                        advertised_ip: advertised,
+                    };
+                    (
+                        Some(ParticipantTextConfig {
+                            ingress_endpoint: text_endpoint.id,
+                            egress_endpoint: text_endpoint.id,
+                            egress_dst: text.remote_rtp,
+                            accepted_source: text_source,
+                            latch: true,
+                            t140_payload_type: t140_pt,
+                            red_payload_type: text.red_payload_type,
+                            egress_ssrc: random_ssrc(),
+                        }),
+                        TextRewrite::Anchor(text_engine),
+                        Some(text_endpoint),
+                    )
+                }
+                // An `m=text` with no usable `t140` rtpmap is left untouched (nothing to anchor).
+                None => (None, TextRewrite::None, None),
+            },
+            Some(_) => (None, TextRewrite::Decline, None),
+            None => (None, TextRewrite::None, None),
+        };
         let config = ParticipantConfig {
             tag: from_tag.clone(),
             decoder,
@@ -5176,6 +5231,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             mos_codec: crate::conference::hep_codec_for_name(&codec.encoding_name),
             telephone_event_in: info.telephone_event_payload_type(),
             secure,
+            text: text_config,
             routing: routing_of(role),
         };
         let events = self.events.get(&client).map(|sink| sink.value().clone());
@@ -5187,11 +5243,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.datapath.clone(),
             events,
         ) {
-            self.free(&[endpoint]).await;
+            let mut to_free = vec![endpoint];
+            to_free.extend(text_endpoint);
+            self.free(&to_free).await;
             return error_result("conference_join", &"failed to seat participant");
         }
         self.endpoint_calls
             .insert(endpoint.id, conference_id.to_string());
+        // The text endpoint is correlated to the same conference, so RTCP telemetry / reap accounting
+        // and teardown treat it as this room's (RFC 9071).
+        if let Some(text_endpoint) = text_endpoint {
+            self.endpoint_calls
+                .insert(text_endpoint.id, conference_id.to_string());
+        }
 
         // A DTLS seat needs the handshake in front of its endpoint: the bridge keeps the RFC 7983
         // demux (DTLS records drive the handshake) and forwards accepted media to the room actor
@@ -5211,7 +5275,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .install_flow(endpoint.id, FlowAction::Redirect)
             {
                 self.conference.leave(conference_id, &from_tag);
-                self.free(&[endpoint]).await;
+                let mut to_free = vec![endpoint];
+                to_free.extend(text_endpoint);
+                if let Some(text_endpoint) = text_endpoint {
+                    self.endpoint_calls.remove(&text_endpoint.id);
+                }
+                self.free(&to_free).await;
                 return error_result("conference_join: install DTLS redirect", &error);
             }
             self.dtls_bridge().register_for_pipeline(
@@ -5251,38 +5320,35 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         // A conference leg is always RTP/RTCP-muxed onto the one participant endpoint; the mux
         // presentation mirrors the participant's offer (`None`) — the `rtcp-mux` directive is an
-        // offer/answer relay concern, not a conference one.
-        // Conference text (RFC 9071 multiparty RTT) is a later phase — a join does not anchor a text
-        // stream yet (PR 1 scope).
-        match sdp::rewrite(
-            sdp,
-            engine,
-            IceRewrite::Keep,
-            security,
-            None,
-            TextRewrite::None,
-        ) {
+        // offer/answer relay concern, not a conference one. `text_rewrite` anchors (or declines) the
+        // participant's `m=text` section (RFC 9071 multiparty RTT) resolved above.
+        match sdp::rewrite(sdp, engine, IceRewrite::Keep, security, None, text_rewrite) {
             Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);
                 self.endpoint_calls.remove(&endpoint.id);
                 self.datapath.remove_endpoint(endpoint.id).await;
+                if let Some(text_endpoint) = text_endpoint {
+                    self.endpoint_calls.remove(&text_endpoint.id);
+                    self.datapath.remove_endpoint(text_endpoint.id).await;
+                }
                 error_result("conference_join: SDP rewrite", &error)
             }
         }
     }
 
-    /// Remove a participant from a conference ([`Command::ConferenceLeave`]), freeing its endpoint and
-    /// tearing the room down once empty.
+    /// Remove a participant from a conference ([`Command::ConferenceLeave`]), freeing its endpoints —
+    /// audio plus its text endpoint when it had one (RFC 9071) — and tearing the room down once empty.
     async fn conference_leave(&self, conference_id: &str, from_tag: &str) -> CmdResult {
-        match self.conference.leave(conference_id, from_tag) {
-            Some(endpoint) => {
-                self.endpoint_calls.remove(&endpoint);
-                self.datapath.remove_endpoint(endpoint).await;
-                ok_empty()
-            }
-            None => error_result("conference_leave", &"no such conference participant"),
+        let endpoints = self.conference.leave(conference_id, from_tag);
+        if endpoints.is_empty() {
+            return error_result("conference_leave", &"no such conference participant");
         }
+        for endpoint in endpoints {
+            self.endpoint_calls.remove(&endpoint);
+            self.datapath.remove_endpoint(endpoint).await;
+        }
+        ok_empty()
     }
 
     /// Live-update a participant's conference role / routing ([`Command::ConferenceRoute`]).
