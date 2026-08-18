@@ -229,6 +229,13 @@ struct Call {
     /// the local key the far text `SecureLeg` encrypts egress toward B with (RFC 4568). `None` for a
     /// plaintext / audio-only call. Minted at offer, consumed at answer.
     far_text_local_crypto: Option<CryptoAttribute>,
+    /// The engine's own SDES key advertised to the near (offerer, A) leg in the secure `m=text` **answer**
+    /// — the local key the near text `SecureLeg` encrypts egress toward A with (RFC 4568), minted at
+    /// `answer()`. Kept so an RFC 8839 §5.4 ICE-restart re-offer re-advertises the SAME `a=crypto` to A (a
+    /// re-offer re-presents the existing key, it never mints a new one). `None` for a plaintext /
+    /// audio-only call. (HA follow-up: the HA `CallSnapshot` does not yet carry this — secure-text HA
+    /// restore is deferred.)
+    near_text_local_crypto: Option<CryptoAttribute>,
 }
 
 /// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off
@@ -1815,6 +1822,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 text_secure: false,
                 near_text_remote_crypto,
                 far_text_local_crypto,
+                // The near text key is minted at answer (advertised to A), not at offer.
+                near_text_local_crypto: None,
             },
         );
 
@@ -2031,6 +2040,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 text_secure: false,
                 near_text_remote_crypto: None,
                 far_text_local_crypto: None,
+                near_text_local_crypto: None,
             },
         );
 
@@ -2436,19 +2446,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
 
-        // Snapshot what we need under the guard, enforcing ownership and dialog identity first.
-        let Some((near, ice_creds, previous_remote_ice, previous_codec, advertised_ip)) =
-            self.calls.get(call_id).and_then(|call| {
-                (call.owner == client && call.from_tag == from_tag).then(|| {
-                    (
-                        call.near,
-                        call.ice.clone(),
-                        call.near_remote_ice.clone(),
-                        call.near_codec.clone(),
-                        call.near.advertised_ip,
-                    )
-                })
+        // Snapshot what we need under the guard, enforcing ownership and dialog identity first. The text
+        // state (`near.text`, `text_secure`, and the engine's own near text SDES key) is carried so the
+        // re-offer re-anchors any negotiated `m=text` stream to its existing engine endpoint below.
+        let Some((
+            near,
+            ice_creds,
+            previous_remote_ice,
+            previous_codec,
+            advertised_ip,
+            text_secure,
+            near_text_local_crypto,
+        )) = self.calls.get(call_id).and_then(|call| {
+            (call.owner == client && call.from_tag == from_tag).then(|| {
+                (
+                    call.near,
+                    call.ice.clone(),
+                    call.near_remote_ice.clone(),
+                    call.near_codec.clone(),
+                    call.near.advertised_ip,
+                    call.text_secure,
+                    call.near_text_local_crypto,
+                )
             })
+        })
         else {
             return unknown_call(call_id);
         };
@@ -2585,10 +2606,42 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None => IceRewrite::Keep,
         };
         let _ = profile;
-        // RFC 8839 §5.4 ICE-restart re-offer re-advertises the same endpoints. An RFC 4103 text stream
-        // does not use ICE, so it is not re-anchored on this path (a follow-up); leave any `m=text`
-        // section untouched, which is the pre-text behaviour of this re-offer path.
-        match sdp::rewrite(sdp, engine, ice_rewrite, None, None, TextRewrite::None) {
+        // RFC 8839 §5.4: a re-offer re-advertises the SAME endpoints (the ports do not move), so an RFC
+        // 4103 `m=text` stream is re-anchored to its EXISTING engine text port — exactly as the audio leg
+        // is re-advertised above — never passed through pointing at the UE's own (often private) address
+        // (the leak the offer/answer path already closes). A secure (SDES-SRTP) text stream re-presents
+        // the engine's OWN stored near text `a=crypto` (the key minted at answer, RFC 4568): a re-offer
+        // re-presents the same key, it never mints a new one. A call with no text stream leaves any
+        // `m=text` section untouched.
+        let text_rewrite = match near.text {
+            None => TextRewrite::None,
+            Some(near_text) => {
+                let near_text_engine = EngineMedia {
+                    rtp: near_text.local_addr,
+                    rtcp: None,
+                    advertised_ip,
+                };
+                if text_secure {
+                    // `near_text_local_crypto` is always present once the secure text leg registered at
+                    // answer; fail closed rather than silently downgrade a secure text stream to plaintext
+                    // if it is somehow absent (docs/security-and-nat.md Layer 5d — never bridge/present
+                    // secure↔insecure).
+                    let Some(crypto) = near_text_local_crypto else {
+                        return error_result(
+                            "re-offer secure text",
+                            &"secure text stream has no stored near a=crypto to re-advertise",
+                        );
+                    };
+                    TextRewrite::AnchorSecure {
+                        engine: near_text_engine,
+                        crypto,
+                    }
+                } else {
+                    TextRewrite::Anchor(near_text_engine)
+                }
+            }
+        };
+        match sdp::rewrite(sdp, engine, ice_rewrite, None, None, text_rewrite) {
             Ok(rewritten) => ok_sdp(rewritten.sdp, None),
             Err(error) => error_result("re-offer rewrite", &error),
         }
@@ -3787,6 +3840,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.text_secure = secure_text_registered;
             if secure_text_registered {
                 call.text_promotion_reasons.insert(PromotionReason::Secure);
+                // Keep the engine's own near text SDES key (the one advertised to A in this answer) so an
+                // RFC 8839 §5.4 ICE-restart re-offer re-presents the SAME `a=crypto` to A, never minting a
+                // new one (RFC 4568). `near_text_local_crypto` is always `Some` once the secure text leg
+                // registered.
+                call.near_text_local_crypto = near_text_local_crypto;
             }
             // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
             call.far_remote_crypto = info.crypto.first().copied();
@@ -4718,7 +4776,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // noise. 2-leg (relay/bridge/transcode) restores never use this.
                 comfort_noise_payload_type: None,
                 // RTT text stream: not carried in the HA snapshot (restore deferred) — a restored call
-                // is audio-only, so no text flows / promotion / events / secure keying either.
+                // is audio-only, so no text flows / promotion / events / secure keying either. The near
+                // text SDES key is likewise absent, so a re-offer after a secure-text restore cannot yet
+                // re-present it (secure-text HA restore is a follow-up).
                 text_t140_payload_type: None,
                 text_red_payload_type: None,
                 text_relay_flows: Vec::new(),
@@ -4727,6 +4787,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 text_secure: false,
                 near_text_remote_crypto: None,
                 far_text_local_crypto: None,
+                near_text_local_crypto: None,
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
@@ -17416,6 +17477,260 @@ mod tests {
             .expect("media survives the re-offer")
             .expect("recv");
         assert_eq!(&buffer[..len], rtp(0x0B0B_0B0B).as_slice());
+    }
+
+    /// An `m=audio` (PCMU) + plaintext RFC 4103 `m=text` (RED pt 98 wrapping T.140 pt 99) SDP — audio
+    /// and text on their own ports, sharing the loopback connection address.
+    fn audio_plaintext_text_sdp(audio: SocketAddr, text: SocketAddr) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {aport} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             m=text {tport} RTP/AVP 98 99\r\na=rtpmap:98 red/1000\r\na=rtpmap:99 t140/1000\r\n",
+            ip = audio.ip(),
+            aport = audio.port(),
+            tport = text.port(),
+        )
+    }
+
+    /// The same, but a **secure** (SDES-SRTP) text stream: `RTP/SAVP` carrying the peer's own text
+    /// `a=crypto` (RFC 4568). Audio stays plaintext `RTP/AVP`.
+    fn audio_secure_text_sdp(
+        audio: SocketAddr,
+        text: SocketAddr,
+        text_key: &CryptoAttribute,
+    ) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {aport} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+             m=text {tport} RTP/SAVP 98 99\r\na=rtpmap:98 red/1000\r\na=rtpmap:99 t140/1000\r\n\
+             a={crypto}\r\n",
+            ip = audio.ip(),
+            aport = audio.port(),
+            tport = text.port(),
+            crypto = text_key.to_attribute_value(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_reanchors_a_plaintext_rfc4103_text_stream_to_the_engine_text_port() {
+        // RFC 8839 §5.4 / RFC 4103: a re-offer re-advertises the SAME endpoints (ports do not move), so a
+        // negotiated `m=text` stream MUST be re-anchored to the engine's existing text port — never passed
+        // through pointing at the UE's own (often private) address, the exact leak the offer/answer path
+        // already closes.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a_audio, addr_a_audio) = phone().await;
+        let (_phone_a_text, addr_a_text) = phone().await;
+        let (_phone_b_audio, addr_b_audio) = phone().await;
+        let (_phone_b_text, addr_b_text) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "rtt-reoffer".into(),
+                    from_tag: "a".into(),
+                    sdp: audio_plaintext_text_sdp(addr_a_audio, addr_a_text),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "rtt-reoffer".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: audio_plaintext_text_sdp(addr_b_audio, addr_b_text),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        // Ground truth: the engine text port advertised back to A in the answer.
+        let engine_near_text = sdp::parse(&ok_sdp_text(&answer))
+            .expect("parse answer")
+            .text
+            .expect("answer anchored an m=text")
+            .remote_rtp;
+
+        // A re-offers with its `m=text` still pointing at A's own (private) text address.
+        let reoffer = engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "rtt-reoffer".into(),
+                    from_tag: "a".into(),
+                    sdp: audio_plaintext_text_sdp(addr_a_audio, addr_a_text),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let text = sdp::parse(&ok_sdp_text(&reoffer))
+            .expect("parse reoffer")
+            .text
+            .expect("re-offer re-anchored the m=text");
+        assert_eq!(
+            text.remote_rtp, engine_near_text,
+            "the re-offer re-anchors m=text to the engine text port"
+        );
+        assert_ne!(
+            text.remote_rtp, addr_a_text,
+            "and never re-advertises A's own (private) text address"
+        );
+        assert!(
+            !text.secure,
+            "a plaintext text stream stays RTP/AVP on the re-offer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_reanchors_a_secure_text_stream_re_presenting_the_same_engine_crypto() {
+        // RFC 8839 §5.4 / RFC 4568: a secure (SDES-SRTP) `m=text` re-offer re-anchors to the engine text
+        // port AND re-advertises the engine's OWN stored near text `a=crypto` (the key minted at answer) —
+        // the same key A already holds, never a freshly minted one.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a_audio, addr_a_audio) = phone().await;
+        let (_phone_a_text, addr_a_text) = phone().await;
+        let (_phone_b_audio, addr_b_audio) = phone().await;
+        let (_phone_b_text, addr_b_text) = phone().await;
+
+        // A and B each mint their OWN text SDES key (their leg's inbound key).
+        let a_text_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen a");
+        let b_text_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen b");
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "sec-rtt-reoffer".into(),
+                    from_tag: "a".into(),
+                    sdp: audio_secure_text_sdp(addr_a_audio, addr_a_text, &a_text_key),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "sec-rtt-reoffer".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: audio_secure_text_sdp(addr_b_audio, addr_b_text, &b_text_key),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer_text = sdp::parse(&ok_sdp_text(&answer))
+            .expect("parse answer")
+            .text
+            .expect("answer anchored a secure m=text");
+        assert!(answer_text.secure, "the answer advertised RTP/SAVP text");
+        // The engine's own near text key advertised to A in the answer (never A's or B's).
+        let engine_near_text = answer_text.remote_rtp;
+        let engine_near_text_key = answer_text
+            .crypto
+            .first()
+            .copied()
+            .expect("answer advertised the engine's near text a=crypto");
+
+        // A re-offers the secure text stream with its own key + private address again.
+        let reoffer = engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "sec-rtt-reoffer".into(),
+                    from_tag: "a".into(),
+                    sdp: audio_secure_text_sdp(addr_a_audio, addr_a_text, &a_text_key),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let text = sdp::parse(&ok_sdp_text(&reoffer))
+            .expect("parse reoffer")
+            .text
+            .expect("re-offer re-anchored the secure m=text");
+        assert!(text.secure, "the re-offer re-advertises RTP/SAVP text");
+        assert_eq!(
+            text.remote_rtp, engine_near_text,
+            "the re-offer re-anchors secure m=text to the engine text port"
+        );
+        let reoffer_text_key = text
+            .crypto
+            .first()
+            .copied()
+            .expect("re-offer advertised a text a=crypto");
+        assert_eq!(
+            reoffer_text_key.key, engine_near_text_key.key,
+            "the re-offer re-presents the SAME engine near text key, not a freshly minted one"
+        );
+        assert_ne!(
+            reoffer_text_key.key, a_text_key.key,
+            "and never forwards A's own key"
+        );
+        assert_ne!(reoffer_text_key.key, b_text_key.key, "nor B's");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_audio_only_reoffer_carries_no_text_section() {
+        // The text re-anchor must not synthesize an `m=text` where the call negotiated none — an
+        // audio-only re-offer is left exactly as the pre-text path handled it.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "audio-reoffer".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "audio-reoffer".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            engine
+                .calls
+                .get("audio-reoffer")
+                .and_then(|call| call.near.text)
+                .is_none(),
+            "an audio-only call has no engine text endpoint"
+        );
+
+        let reoffer = engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "audio-reoffer".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            sdp::parse(&ok_sdp_text(&reoffer))
+                .expect("parse reoffer")
+                .text
+                .is_none(),
+            "an audio-only re-offer carries no m=text section"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
