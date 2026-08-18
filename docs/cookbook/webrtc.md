@@ -17,13 +17,20 @@ Rust, at different levels of maturity. This page says exactly which level.
   credentials. A coturn replacement, not a shim.
 - RFC 7675 consent freshness, opt-in with `--ice-consent`: the engine probes the
   validated pair and tears the call down when the peer stops answering.
+- The full ICE state machine, opt-in with `--ice-full`: candidate gathering,
+  candidate pairs and checklists, connectivity checks in both roles with 487
+  role-conflict resolution, peer-reflexive discovery, nomination, ICE restart
+  (RFC 8445 §9) and trickle-receive (RFC 8838). Media is gated on the selected
+  pair, and a DTLS leg keys that pair rather than the signalled address.
+- DTLS-SRTP **and** full-ICE legs into a conference. Both are seated *pending*
+  and open only once the handshake keys them / ICE selects a pair; a full-ICE
+  seat's egress and source gate follow the selected pair.
 
-**Planned, not shipped:** the full ICE state machine (candidate gathering,
-candidate pairs, checklists, nomination, acting as a controlling agent);
-transcoding on a DTLS leg (today a DTLS leg is bridged as-is, so both sides must
-share a codec); HA checkpoint/restore of a DTLS leg; DTLS or ICE legs into a
-conference (`conference_join` rejects them, plain `RTP/AVP` or SDES `RTP/SAVP`
-only).
+**Planned, not shipped:** relayed (TURN) candidates in our own gathering — the
+built-in TURN *server* ships, but the engine is not yet a TURN *client*, so it
+advertises host and server-reflexive candidates only; transcoding on a DTLS leg
+(today a DTLS leg is bridged as-is, so both sides must share a codec); HA
+checkpoint/restore of a DTLS leg.
 
 ## One port, three protocols: the RFC 7983 demux
 

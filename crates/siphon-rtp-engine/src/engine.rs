@@ -5357,13 +5357,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(info) => info,
             Err(error) => return error_result("conference_join: SDP parse", &error),
         };
-        // Plain RTP/AVP, SDES RTP/SAVP and DTLS-SRTP (`UDP/TLS/RTP/SAVPF`) conference legs are
-        // supported. Full ICE on a conference leg is still a follow-up: the room owns the
-        // participant's endpoint, so there is no agent driving candidate selection for it.
-        if info.is_ice() {
+        // ICE on a conference leg (RFC 8445). Unlike a relay leg, the room — not a datapath forward
+        // rule — owns the seat's egress, so a selection has to reach the room actor as well as the
+        // datapath; that is `ConferenceRegistry::ice_selected`, driven from `drive_ice_agents`.
+        //
+        // RFC 8839 §5.3: an offer whose default destination matches none of its own candidates was
+        // rewritten in transit, so ICE describes a topology media no longer follows. Fall back to the
+        // signalled address rather than negotiate ICE we cannot trust.
+        let ice_mismatch = siphon_rtp_ice::is_ice_mismatch(info.remote_rtp, &info.candidates)
+            && ice_directive(profile) != Some(IceDirective::Force);
+        let want_ice = match ice_directive(profile) {
+            _ if ice_mismatch => false,
+            Some(IceDirective::Force) => true,
+            Some(IceDirective::Remove) => false,
+            None => info.is_ice(),
+        };
+        let ice_creds = if want_ice {
+            ice::generate_credentials()
+        } else {
+            None
+        };
+        if want_ice && ice_creds.is_none() {
             return error_result(
                 "conference_join",
-                &"ICE conference legs are not supported yet (use plain RTP/AVP, SDES RTP/SAVP, or DTLS-SRTP without ICE)",
+                &"could not mint ICE credentials (OS RNG unavailable)",
             );
         }
         let Some(codec) = info.primary_codec() else {
@@ -5408,11 +5425,96 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         // RTPBleed gate: exact signalled-source by default; accept-any only for an explicit symmetric
         // leg. The constrained latch then learns the reply address from the gated source.
-        let accepted_source = if profile.flags.iter().any(|flag| flag == "symmetric") {
+        //
+        // An ICE seat starts with the gate open (`Any`): a connectivity check legitimately arrives
+        // from a peer-reflexive transport the SDP never carried (RFC 8445 §7.3.1.3), and the room's
+        // `ice_pending` gate below drops *all* media until the agent selects, at which point
+        // `ice_selected` narrows this to the selected pair. So the window is not permissive — nothing
+        // is mixed or sent during it.
+        let accepted_source = if want_ice || profile.flags.iter().any(|flag| flag == "symmetric") {
             SourceFilter::Any
         } else {
             SourceFilter::Exact(info.remote_rtp.ip())
         };
+
+        // Gather this seat's candidates before the answer is written — the answer *is* the candidate
+        // list. A conference leg is always RTP/RTCP-muxed onto one endpoint, so it has exactly one
+        // component (RFC 8445 §4.1.1.1).
+        let (ice_candidates, ice_config) = match ice_creds.as_ref() {
+            Some(creds) => {
+                let config = IceConfig {
+                    local_ufrag: creds.ufrag.clone(),
+                    local_pwd: creds.pwd.clone(),
+                };
+                let leg = Leg {
+                    rtp: endpoint,
+                    rtcp: None,
+                    remote_rtp: None,
+                    remote_rtcp: None,
+                    advertised_ip: advertised,
+                    // A conference seat anchors audio only — RFC 9071 multiparty text is a later
+                    // phase — so there is no text component to gather candidates for.
+                    text: None,
+                    text_remote_rtp: None,
+                };
+                let candidates = self.gather_leg_candidates(&leg, &config).await;
+                (candidates, Some(config))
+            }
+            None => (Vec::new(), None),
+        };
+
+        // A full RFC 8445 agent runs when the operator enabled it and the peer gave us both
+        // credentials and candidates; otherwise the datapath's ice-lite responder answers checks and
+        // adopts the validated source, exactly as on a 2-party leg. Only a full agent gates the seat:
+        // an ice-lite seat is already covered by the datapath's own layer-4 gate, and there is no
+        // selection coming that would ever clear a pending flag.
+        let peer_ice = peer_ice_credentials(&info);
+        let mut ice_pending = false;
+        if let Some(config) = ice_config.as_ref() {
+            let full_agent = self.ice_agents.as_ref().and_then(|agents| {
+                let peer = peer_ice.as_ref()?;
+                (!info.candidates.is_empty()).then(|| (agents.clone(), peer.clone()))
+            });
+            match full_agent {
+                Some((agents, peer)) => {
+                    let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
+                        siphon_rtp_ice::agent::Credentials::new(
+                            config.local_ufrag.clone(),
+                            config.local_pwd.clone(),
+                        ),
+                        siphon_rtp_ice::agent::Credentials::new(
+                            peer.ufrag.clone(),
+                            peer.pwd.clone(),
+                        ),
+                        // RFC 8445 §6.1.1: the offerer controls. The participant offered, so it
+                        // controls — unless it is a lite agent, which can never control.
+                        info.ice_lite,
+                        ice_tie_breaker(),
+                    )
+                    .with_candidates(
+                        filter_component(&ice_candidates, 1),
+                        filter_component(&info.candidates, 1),
+                    );
+                    self.datapath.set_ice_agent(
+                        endpoint.id,
+                        config.clone(),
+                        // The agent owns request handling and is the only thing that may select a
+                        // pair; the datapath answers nothing on this endpoint.
+                        IceAgentMode::ForwardOnly,
+                        agents.events(),
+                    );
+                    agents.register(
+                        endpoint.id,
+                        conference_id,
+                        endpoint.local_addr,
+                        agent_config,
+                        0,
+                    );
+                    ice_pending = true;
+                }
+                None => self.datapath.set_ice(endpoint.id, Some(config.clone())),
+            }
+        }
         // SDES-SRTP (RTP/SAVP): the participant offered a secure leg + its a=crypto. Mint our own key,
         // build the secure leg (decrypt inbound with theirs, encrypt outbound with ours), and answer
         // RTP/SAVP + a=crypto. (DTLS-SRTP / ICE WebRTC legs remain a follow-up — see the is_ice() guard.)
@@ -5583,6 +5685,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             egress_ssrc: random_ssrc(),
             egress_payload_type: codec.payload_type,
             secure_pending: dtls_leg,
+            ice_pending,
             mos_codec: crate::conference::hep_codec_for_name(&codec.encoding_name),
             telephone_event_in: info.telephone_event_payload_type(),
             secure,
@@ -5655,8 +5758,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         peer_fingerprint.hash_function,
                         peer_fingerprint.bytes,
                     ),
-                    // Full ICE on a conference leg is refused above, so nothing gates the handshake.
-                    gate_on_ice: false,
+                    // RFC 8445 §12: a DTLS-SRTP seat keys the pair ICE chose, so hold the handshake
+                    // until there is a selection — but only when a full agent is actually running on
+                    // this seat, since otherwise no selection is coming and waiting would hang it.
+                    gate_on_ice: ice_pending,
                 },
                 crate::dtls_bridge::PipelineTarget::Conference {
                     conference: self.conference.clone(),
@@ -5675,9 +5780,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         // A conference leg is always RTP/RTCP-muxed onto the one participant endpoint; the mux
         // presentation mirrors the participant's offer (`None`) — the `rtcp-mux` directive is an
-        // offer/answer relay concern, not a conference one. `text_rewrite` anchors (or declines) the
-        // participant's `m=text` section (RFC 9071 multiparty RTT) resolved above.
-        match sdp::rewrite(sdp, engine, IceRewrite::Keep, security, None, text_rewrite) {
+        // offer/answer relay concern, not a conference one.
+        //
+        // ICE (RFC 8839 §5): re-originate with our own credentials and gathered candidates when we
+        // minted them; say `a=ice-mismatch` when the offer's ICE was altered in transit, so the peer
+        // stops waiting for checks that will never come; strip on `ICE=remove`; else pass through.
+        // `text_rewrite` anchors (or declines) the participant's `m=text` section
+        // (RFC 9071 multiparty RTT) resolved above.
+        let ice_rewrite = match (ice_creds.as_ref(), ice_directive(profile)) {
+            (Some(creds), _) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+                ufrag: creds.ufrag.as_str(),
+                pwd: creds.pwd.as_str(),
+                candidates: &ice_candidates,
+            }),
+            (None, _) if ice_mismatch => IceRewrite::Mismatch,
+            (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
+            (None, _) => IceRewrite::Keep,
+        };
+        match sdp::rewrite(sdp, engine, ice_rewrite, security, None, text_rewrite) {
             Ok(rewritten) => ok_sdp(rewritten.sdp, Some(from_tag)),
             Err(error) => {
                 let _ = self.conference.leave(conference_id, &from_tag);
@@ -7558,6 +7678,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // and RFC 7675 consent, which resolves its target from the same adopted source,
                     // follows the selection without being told.
                     self.datapath.adopt_source(endpoint, remote);
+                    // A conference seat is not a relay leg — the room, not a forward rule, owns its
+                    // egress — so adopting the source is not enough: the room must be told, or it
+                    // would keep sending the mix to the signalled `c=` address (for a NATed ICE peer,
+                    // one it cannot receive on) and keep dropping ingress on its pending gate.
+                    // A no-op for the common case of a 2-party leg.
+                    self.conference.ice_selected(endpoint, remote);
                     // A DTLS-SRTP leg keys the path ICE chose: this releases a gated handshake and
                     // re-points its records and media at the selected pair (RFC 8445 §12). A no-op
                     // for a leg with no DTLS bridge.
@@ -7570,6 +7696,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
                 AgentOutcome::Failed { endpoint, call_id } => {
                     // RFC 8445 §8.1.2: every pair failed, so there is no path to this peer at all.
+                    // A conference seat is dropped rather than reaped as a call: it has no `MediaCall`
+                    // to tear down, and leaving it seated would hold a room open around a participant
+                    // that can never be reached — its gate would stay pending forever.
+                    if let Some((conference_id, tag)) = self.conference.participant_at(endpoint) {
+                        // A seat can own more than one endpoint (audio plus an RFC 9071 text leg),
+                        // so free every one `leave` hands back — not just the ICE one that failed.
+                        for seat_endpoint in self.conference.leave(&conference_id, &tag) {
+                            self.endpoint_calls.remove(&seat_endpoint);
+                            self.datapath.remove_endpoint(seat_endpoint).await;
+                        }
+                        tracing::warn!(
+                            target: "siphon_rtp::media",
+                            conference = %conference_id, tag, ?endpoint,
+                            "ICE failed for a conference seat — no candidate pair succeeded; \
+                             participant removed"
+                        );
+                        failed.push(conference_id);
+                        continue;
+                    }
                     if self.reap_call(&call_id, "ice_failed").await {
                         tracing::warn!(
                             target: "siphon_rtp::media",
@@ -18798,6 +18943,150 @@ mod tests {
             .expect("media reaches B once ICE has chosen a pair")
             .expect("recv");
         assert_eq!(&buffer[..len], rtp(0x0A0A_0A0A).as_slice());
+    }
+
+    // ---- Full ICE on a conference seat (RFC 8445 + the room actor) ------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_conference_join_carrying_ice_is_accepted_and_answers_with_our_own_ice() {
+        // It used to be refused outright. The answer must re-originate ICE — our credentials and our
+        // gathered candidate — not echo the participant's.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr_a) = phone().await;
+
+        let joined = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "ice-room".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    role: Default::default(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = ok_sdp_text(&joined);
+        let parsed = sdp::parse(&answer).expect("parse conference answer");
+        assert!(parsed.is_ice(), "the answer carries ICE: {answer}");
+        assert!(
+            !answer.contains(A_UFRAG),
+            "the seat advertises its own credentials, never the participant's: {answer}"
+        );
+        assert!(
+            answer.contains("a=candidate:"),
+            "the seat advertises a gathered candidate: {answer}"
+        );
+        assert_eq!(engine.conference().participant_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_ice_conference_seat_opens_its_media_path_only_after_a_pair_is_selected() {
+        // The end-to-end proof for a *room* seat: a real peer agent runs against the engine's, and
+        // the room neither mixes the seat's audio nor sends it the mix until ICE has chosen. The
+        // room — not a forward rule — owns this seat's egress, so the selection has to reach the
+        // room actor as well as the datapath.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        let (phone_a, addr_a) = phone().await;
+
+        let joined = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "ice-room".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(addr_a),
+                    role: Default::default(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = sdp::parse(&ok_sdp_text(&joined)).expect("parse conference answer");
+        let seat_endpoint = engine
+            .conference()
+            .participant_at_tag("ice-room", "a")
+            .expect("the seat is registered");
+
+        // Nothing adopted yet: the seat is gated shut on both directions.
+        assert_eq!(engine.datapath().ice_validated_source(seat_endpoint), None);
+
+        // Drive both agents until the engine selects a pair.
+        let mut peer = peer_agent(&answer, addr_a);
+        let mut buffer = [0u8; 2048];
+        let mut now = 0u64;
+        while now < 4_000
+            && engine
+                .datapath()
+                .ice_validated_source(seat_endpoint)
+                .is_none()
+        {
+            for action in peer.poll(now) {
+                if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                    phone_a.send_to(&datagram, to).await.expect("peer send");
+                }
+            }
+            engine.drive_ice_agents(now).await;
+            while let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(20), phone_a.recv_from(&mut buffer)).await
+            {
+                for action in peer.on_datagram(addr_a, from, &buffer[..len], now) {
+                    if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                        phone_a.send_to(&datagram, to).await.expect("peer send");
+                    }
+                }
+                engine.drive_ice_agents(now).await;
+            }
+            now += 20;
+        }
+
+        assert_eq!(
+            engine.datapath().ice_validated_source(seat_endpoint),
+            Some(addr_a),
+            "the seat's agent selected the participant's real transport"
+        );
+        // The seat is still seated (ICE succeeded, so nothing tore it down).
+        assert_eq!(engine.conference().participant_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_conference_seat_whose_ice_fails_is_removed_rather_than_left_seated() {
+        // RFC 8445 §8.1.2. A seat has no `MediaCall` to reap, so the 2-party teardown path does not
+        // cover it — leaving it would hold a room open around a participant that can never be
+        // reached, with its gate pending forever.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        // A candidate nothing answers on: TEST-NET-1 (RFC 5737), unroutable from here.
+        let unreachable: SocketAddr = "192.0.2.1:40000".parse().expect("addr");
+        engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "doomed-room".into(),
+                    from_tag: "a".into(),
+                    sdp: ice_offer_with_candidate(unreachable),
+                    role: Default::default(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert_eq!(engine.conference().participant_count(), 1);
+
+        // Drive past the checklist's failure deadline without ever answering a check.
+        let mut now = 0u64;
+        while now < 120_000 && engine.conference().participant_count() > 0 {
+            engine.drive_ice_agents(now).await;
+            now += 500;
+        }
+
+        assert_eq!(
+            engine.conference().participant_count(),
+            0,
+            "the unreachable seat is dropped when its checklist fails"
+        );
+        assert_eq!(
+            engine.conference().room_count(),
+            0,
+            "and the room it was alone in is torn down with it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

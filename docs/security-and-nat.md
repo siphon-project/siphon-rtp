@@ -518,9 +518,30 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
   out in the clear would leak every other participant to a peer that negotiated encryption. Both the
   mix egress (`Conference::emit`) and the periodic RTCP SR carry the gate. The room, not the bridge,
   owns the seat's `SecureLeg`, exactly as the 2-party actor does.
-- **Not yet on this path.** *Full ICE* on a conference leg: the room owns the participant's endpoint,
-  so no agent is driving candidate selection for it. `conference_join` refuses an ICE offer rather
-  than seating one whose media could not be steered — a DTLS leg without ICE is accepted.
+- **Full ICE on a conference seat takes the same pending shape.** A seat whose agent has not yet
+  selected a pair is seated `ice_pending` and is treated exactly like an unkeyed DTLS one: the room
+  drops its ingress and sends it nothing (both `Conference::emit` and the periodic RTCP SR carry the
+  gate). The difference from a 2-party leg is *who* must be told when ICE chooses. A relay leg needs
+  only `Datapath::adopt_source`, because the datapath's forward rule already prefers an adopted source
+  over the signalled `out_dst`. A conference seat has no forward rule — the **room** owns its egress —
+  so the selection is additionally routed to the room actor as `ConferenceControl::IceSelected`
+  (`ConferenceRegistry::ice_selected`, driven from `Engine::drive_ice_agents`), which re-points
+  `egress_dst` at the selected pair and narrows the source gate to it. Without that second half the
+  seat would keep sending the mix to the signalled `c=` address, which for a NATed ICE peer is one it
+  cannot receive on.
+  - **The pre-selection window is not a permissive one.** An ICE seat starts with
+    `SourceFilter::Any`, because a peer-reflexive check legitimately arrives from a transport the SDP
+    never carried (RFC 8445 §7.3.1.3). Nothing is mixed or transmitted during that window — the
+    `ice_pending` gate drops all media — and selection replaces the open gate with
+    `SourceFilter::Exact` on the chosen remote. The symmetric latch is re-armed at the same moment, so
+    a stale pre-ICE observation cannot move the reply back off the selected pair.
+  - **A failed checklist removes the seat** (§8.1.2). A participant has no `MediaCall` for the
+    2-party `ice_failed` teardown to reap, so `drive_ice_agents` drops it from the room (and tears the
+    room down if it was the last member) rather than leaving it seated behind a gate that can never
+    open.
+  - **A DTLS-SRTP seat under full ICE holds its handshake for the selection** (RFC 8445 §12,
+    `gate_on_ice`) — but only when an agent is actually running on it, since otherwise no selection is
+    coming and waiting would hang a working seat.
 
 ### Layer 5c — The conference (MCU) Redirect path
 The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,
@@ -547,8 +568,8 @@ so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the 
   `SecureLeg` (the same primitive Layer 5a uses): `conference_join` mints the engine's key, answers
   `RTP/SAVP` + its own `a=crypto`, and the room **decrypts each inbound packet before it enters the
   mix** (the auth tag also proves authenticity — a forged/replayed packet fails and is dropped) and
-  **encrypts the mix (and the SR) back out** as SRTP/SRTCP. DTLS-SRTP / ICE (WebRTC) conference legs
-  remain a follow-up — `conference_join` rejects an ICE offer rather than half-securing it.
+  **encrypts the mix (and the SR) back out** as SRTP/SRTCP. DTLS-SRTP and full-ICE conference legs are
+  wired too — see Layer 5d for the pending-seat shape both use.
 - **Never into the void.** A participant whose destination is not yet resolved is **not transmitted
   to** (`destination_usable` gate) — the room drops that egress rather than guessing.
 - **Idle reap.** A gated-in packet stamps the endpoint's activity (`Datapath::note_activity` — the
