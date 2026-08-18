@@ -366,8 +366,9 @@ is wrong, and encryption defeats A2 eavesdrop.
 > `engine/src/dtls_bridge.rs`: the offer advertises `a=fingerprint` + `a=setup:actpass`, and the
 > handshake keys the same `SecureLeg` through the same profile flags below.
 >
-> **A DTLS leg reaches the media pipeline** (`PipelineKind::DtlsMedia`), so a WebRTC leg can be
-> transcoded, recorded, noise-suppressed or WS-teed rather than only relayed — see Layer 5d.
+> **A DTLS leg reaches the media pipeline** (`PipelineKind::DtlsMedia`) and can be seated in a
+> conference, so a WebRTC leg can be transcoded, recorded, noise-suppressed, WS-teed or mixed rather
+> than only relayed — see Layer 5d.
 
 - **Source gate on the bridge path (RTPBleed, restated for `Redirect`).** The SRTP bridge runs on the
   `FlowAction::Redirect` slow path, which **bypasses** the datapath's Forward-path layer-2 gate. The
@@ -485,10 +486,16 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
   and the actor re-enforces it again per direction before any decode. The SSRC-consistent latch still
   only ever follows an **authenticated** packet — on this path the SRTP `unprotect` inside the actor
   is what authenticates, so a forged packet cannot move the reply direction (Layer 3).
-- **Not yet on this path.** Conference (MCU) legs still reject DTLS: a room stores each participant's
-  `SecureLeg` by value rather than behind a shared handle, so deferred keying needs its own control
-  message into the room actor. Tracked, not silently degraded — `conference_join` refuses a DTLS leg
-  rather than seating it unencrypted.
+- **Conference (MCU) seats take the same shape.** A DTLS participant is seated **pending**
+  (`ParticipantConfig::secure_pending`) and keyed by `ConferenceControl::AttachSecureLeg` when its
+  handshake completes. Until then the room drops its ingress — unkeyed SRTP decoded as plaintext would
+  mix noise into the room for *every other* participant — and sends it nothing, because the mix going
+  out in the clear would leak every other participant to a peer that negotiated encryption. Both the
+  mix egress (`Conference::emit`) and the periodic RTCP SR carry the gate. The room, not the bridge,
+  owns the seat's `SecureLeg`, exactly as the 2-party actor does.
+- **Not yet on this path.** *Full ICE* on a conference leg: the room owns the participant's endpoint,
+  so no agent is driving candidate selection for it. `conference_join` refuses an ICE offer rather
+  than seating one whose media could not be steered — a DTLS leg without ICE is accepted.
 
 ### Layer 5c — The conference (MCU) Redirect path
 The N-party conference mixer (`engine/src/conference.rs`) is another `FlowAction::Redirect` consumer,

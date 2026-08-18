@@ -53,14 +53,66 @@ enum Direction {
     Pipeline {
         /// Sends inbound DTLS records to the handshake task.
         dtls_in: flume::Sender<Bytes>,
-        /// Where an accepted media datagram goes — the per-call media actor's route table.
-        media: Arc<crate::media_pipeline::MediaRegistry>,
+        /// Where an accepted media datagram goes once the leg is keyed.
+        target: PipelineTarget,
         /// Set once the handshake has keyed the pipeline. Media before that is dropped: the actor has
         /// no key yet, and handing it ciphertext it would treat as plaintext is exactly the bug the
         /// pipeline's own `secure_pending` gate exists to prevent. Published *after* the key is sent
         /// to the actor, so the mailbox already holds `AttachSecureLeg` ahead of any media.
         keyed: Arc<std::sync::atomic::AtomicBool>,
     },
+}
+
+/// Which slow-path owner a keyed DTLS leg's media belongs to. Both own the `SecureLeg` themselves and
+/// decrypt on their own ingress, so the bridge forwards the datagram untouched either way — the only
+/// difference is which mailbox it lands in and which control message keys it.
+#[derive(Clone)]
+pub enum PipelineTarget {
+    /// A 2-party call's [`crate::media_pipeline::MediaCall`] actor (`PipelineKind::DtlsMedia`).
+    Call {
+        media: Arc<crate::media_pipeline::MediaRegistry>,
+        call_id: String,
+    },
+    /// A conference seat — the room actor mixes this participant once its handshake keys the seat.
+    Conference {
+        conference: Arc<crate::conference::ConferenceRegistry>,
+        conference_id: String,
+        tag: String,
+    },
+}
+
+impl PipelineTarget {
+    /// Route one accepted media datagram to the owning actor.
+    fn dispatch(&self, packet: RxPacket) {
+        match self {
+            Self::Call { media, .. } => media.dispatch(packet),
+            Self::Conference { conference, .. } => conference.dispatch(packet),
+        }
+    }
+
+    /// Hand the handshake's key to the owning actor. Returns `false` when it is already gone, in
+    /// which case the caller leaves the leg unkeyed so media keeps being dropped.
+    fn key(&self, leg: SecureLeg) -> bool {
+        match self {
+            Self::Call { media, call_id } => media.control(
+                call_id,
+                crate::media_pipeline::MediaControl::AttachSecureLeg {
+                    leg: Arc::new(Mutex::new(leg)),
+                },
+            ),
+            Self::Conference {
+                conference,
+                conference_id,
+                tag,
+            } => conference.control(
+                conference_id,
+                crate::conference::ConferenceControl::AttachSecureLeg {
+                    tag: tag.clone(),
+                    leg: Box::new(leg),
+                },
+            ),
+        }
+    }
 }
 
 /// One redirected endpoint's flow: how to gate it, which crypto direction, and where to forward.
@@ -247,12 +299,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
     /// ([`crate::media_pipeline::MediaControl::AttachSecureLeg`]) and only then published here, so the
     /// actor's FIFO mailbox is guaranteed to hold the key ahead of the first media packet this bridge
     /// releases — no window in which media arrives at an unkeyed pipeline.
-    pub fn register_for_pipeline(
-        &self,
-        plan: DtlsCallPlan,
-        media: Arc<crate::media_pipeline::MediaRegistry>,
-        call_id: String,
-    ) {
+    pub fn register_for_pipeline(&self, plan: DtlsCallPlan, target: PipelineTarget) {
         let initial = (!plan.gate_on_ice).then_some(plan.secure_dst);
         let destination: SecureDestination = Arc::new(tokio::sync::watch::Sender::new(initial));
         let (transport, channels) = DtlsTransport::new(plan.secure_local, plan.secure_dst);
@@ -282,7 +329,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             let peer_fingerprint = plan.peer_fingerprint;
             let gate = destination.subscribe();
             let keyed = keyed.clone();
-            let media = media.clone();
+            let target = target.clone();
             tokio::spawn(async move {
                 // RFC 8445 §12: key the path ICE chose, not the signalled one.
                 if let Err(error) = wait_for_destination(gate).await {
@@ -291,25 +338,19 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 }
                 match handshake(Arc::new(transport), &certificate, role, &peer_fingerprint).await {
                     Ok(leg) => {
-                        let leg = Arc::new(Mutex::new(leg));
                         // Key the actor before releasing media, so its mailbox holds the key first.
-                        if media.control(
-                            &call_id,
-                            crate::media_pipeline::MediaControl::AttachSecureLeg { leg },
-                        ) {
+                        if target.key(leg) {
                             keyed.store(true, std::sync::atomic::Ordering::SeqCst);
                             tracing::info!(
                                 target: "siphon_rtp::media",
-                                call_id,
-                                "DTLS-SRTP handshake complete; media pipeline keyed"
+                                "DTLS-SRTP handshake complete; slow path keyed"
                             );
                         } else {
-                            // The call went away mid-handshake: leave the leg unkeyed so media keeps
-                            // being dropped rather than reaching a pipeline that never got the key.
+                            // The owner went away mid-handshake: leave the leg unkeyed so media keeps
+                            // being dropped rather than reaching a consumer that never got the key.
                             tracing::warn!(
                                 target: "siphon_rtp::media",
-                                call_id,
-                                "DTLS-SRTP handshake completed but the media actor is gone; media stays dropped"
+                                "DTLS-SRTP handshake completed but its actor is gone; media stays dropped"
                             );
                         }
                     }
@@ -325,7 +366,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             Flow {
                 direction: Direction::Pipeline {
                     dtls_in,
-                    media,
+                    target,
                     keyed,
                 },
                 accepted_source: plan.secure_source,
@@ -433,11 +474,11 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         // `SecureLeg` and decrypts it on its own `secure_ingress` — the same path SDES secure
         // transcode takes. Before the handshake keys it, drop (the actor could not decrypt anyway,
         // and its own `secure_pending` gate would drop it a second time).
-        if let Direction::Pipeline { media, keyed, .. } = &direction {
+        if let Direction::Pipeline { target, keyed, .. } = &direction {
             if !keyed.load(std::sync::atomic::Ordering::SeqCst) {
                 return; // handshake not complete — no key, drop the media
             }
-            media.dispatch(packet);
+            target.dispatch(packet);
             return;
         }
         let Some(out_dst) = out_dst else { return };
