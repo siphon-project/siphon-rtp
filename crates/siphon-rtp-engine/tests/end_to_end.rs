@@ -10,6 +10,7 @@ use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::Datapath;
 use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher_with_text;
 use siphon_rtp_engine::{sdp, server, Engine};
+use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_proto::{
     frame, CmdResult, Command, ConferenceRole, Event, ProfileFlags, Request, Response,
 };
@@ -756,6 +757,208 @@ async fn text_events_promotes_only_text_emits_events_and_carries_cdr_counters() 
         summary_text_chars,
         Some(2),
         "the CallSummary carried the RFC 4103 text counters"
+    );
+}
+
+/// True when `haystack` contains the contiguous `needle` (a HEP payload substring match).
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// With HEP export enabled, tearing down an audio+text call whose text stream was promoted ships the
+/// per-leg RFC 4103 Real-Time Text content QoS to the HEP collector as a type-35 report capture,
+/// correlated by call-id — the wire complement to the `CallSummary`'s `text` field. Proves the
+/// end-of-call `finish_call` → `export_text_qos` path emits the documented `"report":"rtt-text"` JSON.
+/// NIC-free (UDP-loopback datapath, loopback HEP collector).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_call_exports_rfc4103_text_qos_to_the_hep_collector() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    // The redirect dispatcher must run so the promoted text stream's Redirect datagrams reach the actor.
+    tokio::spawn(run_redirect_dispatcher_with_text(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.text(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+
+    // Stand in for VoIPmonitor / Homer with a loopback UDP socket, and enable HEP export on the engine.
+    let collector = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind collector");
+    let collector_addr = collector.local_addr().expect("collector addr");
+    let exporter = HepExporter::connect(collector_addr).await.expect("connect");
+    engine.set_hep_export(exporter, 7);
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    let serve_engine = engine.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(serve_engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    let (_phone_a_audio, addr_a_audio) = phone().await;
+    let (phone_a_text, addr_a_text) = phone().await;
+    let (_phone_b_audio, addr_b_audio) = phone().await;
+    let (_phone_b_text, addr_b_text) = phone().await;
+
+    // Offer + answer an audio+text call with text observability, so the text stream is promoted and its
+    // content counters are measured (an in-kernel-only text stream reports no content QoS).
+    let offer = control
+        .request(Command::Offer {
+            call_id: "rtt-hep".into(),
+            from_tag: "tag-a".into(),
+            sdp: audio_text_sdp(addr_a_audio, addr_a_text),
+            profile: ProfileFlags {
+                text_events: true,
+                ..Default::default()
+            },
+        })
+        .await;
+    let _far_text = text_engine_addr(&offer);
+    let answer = control
+        .request(Command::Answer {
+            call_id: "rtt-hep".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: audio_text_sdp(addr_b_audio, addr_b_text),
+            profile: Default::default(),
+        })
+        .await;
+    let near_text = text_engine_addr(&answer);
+
+    // A types "hi": one accepted text packet, two characters delivered A→B.
+    let text_packet = red_text_rtp(1, 1000, 0x0A0A_7E77, b"hi");
+    phone_a_text
+        .send_to(&text_packet, near_text)
+        .await
+        .expect("send text a");
+    // Drain the Event::Text so the counters are surely applied before teardown.
+    match control.recv_event().await {
+        Event::Text { text, .. } => assert_eq!(text, "hi"),
+        other => panic!("expected Event::Text, got {other:?}"),
+    }
+
+    // Delete → finish_call → export_text_qos ships the HEP text QoS report.
+    let delete = control
+        .request(Command::Delete {
+            call_id: "rtt-hep".into(),
+            from_tag: "tag-a".into(),
+            to_tag: None,
+        })
+        .await;
+    assert!(matches!(delete, CmdResult::Ok { .. }));
+
+    // Both legs of a text call ship a report (the far B→A leg's counters are all zero — B typed
+    // nothing — but it was still a text call). Collect the two per-leg datagrams as owned buffers.
+    let mut datagrams: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..2 {
+        let mut buffer = [0u8; 4096];
+        let (len, _) = timeout(Duration::from_secs(2), collector.recv_from(&mut buffer))
+            .await
+            .expect("no timeout on the text QoS report")
+            .expect("recv hep");
+        datagrams.push(buffer[..len].to_vec());
+    }
+
+    for packet in &datagrams {
+        assert_eq!(&packet[..4], b"HEP3", "a HEP3 packet reaches the collector");
+        assert!(
+            contains_bytes(packet, b"rtt-hep"),
+            "correlation id = call-id, so the collector groups it with the call"
+        );
+        assert!(
+            contains_bytes(packet, br#"{"report":"rtt-text","#),
+            "the documented RFC 4103 text-QoS discriminator leads the payload"
+        );
+    }
+
+    // The A→B report carries the measured counters (one packet, two characters).
+    let saw_a_to_b = datagrams.iter().any(|packet| {
+        contains_bytes(packet, br#""direction":"a_to_b""#)
+            && contains_bytes(packet, br#""packets":1"#)
+            && contains_bytes(packet, br#""characters":2"#)
+    });
+    assert!(
+        saw_a_to_b,
+        "the A→B text QoS report carried packets=1, characters=2"
+    );
+    // The B→A report is present too (B sent no text ⇒ zero counters).
+    let saw_b_to_a = datagrams
+        .iter()
+        .any(|packet| contains_bytes(packet, br#""direction":"b_to_a""#));
+    assert!(
+        saw_b_to_a,
+        "the far leg's B→A text QoS report is emitted too"
+    );
+}
+
+/// An **audio-only** call ships NO RFC 4103 text-QoS HEP report on teardown — the text export is
+/// gated on the call actually having carried a (promoted) text stream. With no `run_rtcp_export` task
+/// and no RTCP sent, the collector sees nothing at all. NIC-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audio_only_call_exports_no_text_qos_hep_report() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    let collector = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind collector");
+    let collector_addr = collector.local_addr().expect("collector addr");
+    let exporter = HepExporter::connect(collector_addr).await.expect("connect");
+    engine.set_hep_export(exporter, 7);
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    let serve_engine = engine.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(serve_engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    let (_phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    control
+        .request(Command::Offer {
+            call_id: "audio-only".into(),
+            from_tag: "tag-a".into(),
+            sdp: sdp_for(addr_a),
+            profile: Default::default(),
+        })
+        .await;
+    control
+        .request(Command::Answer {
+            call_id: "audio-only".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: sdp_for(addr_b),
+            profile: Default::default(),
+        })
+        .await;
+
+    // Delete → finish_call runs, but the audio-only call has no text stats, so no HEP report ships.
+    let delete = control
+        .request(Command::Delete {
+            call_id: "audio-only".into(),
+            from_tag: "tag-a".into(),
+            to_tag: None,
+        })
+        .await;
+    assert!(matches!(delete, CmdResult::Ok { .. }));
+
+    let mut buffer = [0u8; 4096];
+    let got = timeout(Duration::from_millis(300), collector.recv_from(&mut buffer)).await;
+    assert!(
+        got.is_err(),
+        "an audio-only call emits no RFC 4103 text-QoS HEP report"
     );
 }
 

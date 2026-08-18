@@ -68,7 +68,8 @@ impl QosReport {
 }
 
 /// Minimal JSON string escaping (RFC 8259 §7) — the call-id can carry `@`, quotes, or control bytes.
-fn escape(value: &str) -> String {
+/// Shared with [`crate::text_report`] so both report kinds escape their string fields identically.
+pub(crate) fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for character in value.chars() {
         match character {

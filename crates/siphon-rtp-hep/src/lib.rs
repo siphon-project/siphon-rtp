@@ -13,6 +13,7 @@
 pub mod exporter;
 pub mod mos;
 pub mod report;
+pub mod text_report;
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -157,6 +158,33 @@ impl Capture {
         timestamp_micros: u32,
         capture_agent_id: u32,
         report: &report::QosReport,
+    ) -> Self {
+        Capture {
+            src,
+            dst,
+            timestamp_secs,
+            timestamp_micros,
+            protocol_type: protocol_type::REPORT_JSON,
+            capture_agent_id,
+            correlation_id: Some(report.correlation_id.clone()),
+            payload: report.to_json().into_bytes(),
+        }
+    }
+
+    /// Build a HEP3 **report** capture (`protocol_type` = [`protocol_type::REPORT_JSON`], type 35)
+    /// carrying a [`text_report::TextQosReport`]'s JSON — the RFC 4103 Real-Time Text content QoS the
+    /// engine ships at end-of-call. Mirrors [`Capture::from_qos_report`] exactly (same protocol type,
+    /// same PAYLOAD-chunk-carries-JSON shape, same [`chunk::CORRELATION_ID`] = call-id); only the JSON
+    /// schema differs, and it self-describes with a `"report":"rtt-text"` discriminator (see
+    /// [`text_report`]). `src`/`dst` are the text stream's media addresses.
+    #[must_use]
+    pub fn from_text_qos_report(
+        src: SocketAddr,
+        dst: SocketAddr,
+        timestamp_secs: u32,
+        timestamp_micros: u32,
+        capture_agent_id: u32,
+        report: &text_report::TextQosReport,
     ) -> Self {
         Capture {
             src,
@@ -352,5 +380,103 @@ mod tests {
         let json = std::str::from_utf8(payload).expect("utf8 payload");
         assert!(json.contains(r#""codec":"G711""#));
         assert!(json.contains(r#""mos":"#));
+    }
+
+    #[test]
+    fn text_qos_report_capture_carries_the_text_counters_correlated_by_call_id() {
+        let report = text_report::TextQosReport {
+            correlation_id: "call-rtt@host".into(),
+            tag: "tag-a".into(),
+            direction: "a_to_b",
+            packets: 7,
+            characters: 21,
+            missing_markers: 1,
+            recovered_from_redundancy: 2,
+        };
+        let capture = Capture::from_text_qos_report(
+            "198.51.100.5:6100".parse().unwrap(),
+            "203.0.113.5:6100".parse().unwrap(),
+            9,
+            0,
+            13,
+            &report,
+        );
+        // Same report-capture shape as the voice QoS report: protocol_type 35, correlated by call-id.
+        assert_eq!(capture.protocol_type, protocol_type::REPORT_JSON);
+        assert_eq!(capture.correlation_id.as_deref(), Some("call-rtt@host"));
+        let chunks = decode_chunks(&capture.encode());
+        assert_eq!(
+            value(&chunks, chunk::CORRELATION_ID),
+            Some(b"call-rtt@host".as_slice()),
+            "HEP correlation id = call-id, so the collector groups it with the call"
+        );
+        let payload = value(&chunks, chunk::PAYLOAD).expect("payload");
+        let json = std::str::from_utf8(payload).expect("utf8 payload");
+        assert!(
+            json.starts_with(r#"{"report":"rtt-text","#),
+            "discriminator leads"
+        );
+        assert!(json.contains(r#""packets":7"#));
+        assert!(json.contains(r#""characters":21"#));
+        assert!(json.contains(r#""missing_markers":1"#));
+        assert!(json.contains(r#""recovered_from_redundancy":2"#));
+    }
+
+    #[test]
+    fn text_qos_report_encodes_a_byte_exact_hep3_packet() {
+        // Pin the whole wire image so the HEP3 framing (magic + total length + every generic TLV chunk)
+        // for an RFC 4103 text QoS report is fixed byte-for-byte — the acceptance gate for the format.
+        let report = text_report::TextQosReport {
+            correlation_id: "c1".into(),
+            tag: "a".into(),
+            direction: "a_to_b",
+            packets: 1,
+            characters: 2,
+            missing_markers: 0,
+            recovered_from_redundancy: 0,
+        };
+        // Deterministic 5-tuple / timestamp / agent id so the bytes are stable.
+        let capture = Capture::from_text_qos_report(
+            SocketAddr::from(([192, 0, 2, 1], 0x1770)), // 6000
+            SocketAddr::from(([192, 0, 2, 2], 0x1772)), // 6002
+            0x0000_0001,
+            0x0000_0000,
+            0x0000_0007,
+            &report,
+        );
+        let payload = report.to_json().into_bytes();
+
+        let chunk = |type_id: u16, value: &[u8]| -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&VENDOR_GENERIC.to_be_bytes());
+            out.extend_from_slice(&type_id.to_be_bytes());
+            out.extend_from_slice(&((CHUNK_HEADER_LEN + value.len()) as u16).to_be_bytes());
+            out.extend_from_slice(value);
+            out
+        };
+        let mut chunks = Vec::new();
+        chunks.extend(chunk(chunk::IP_FAMILY, &[2])); // AF_INET
+        chunks.extend(chunk(chunk::IP_PROTOCOL, &[17])); // UDP
+        chunks.extend(chunk(chunk::IPV4_SRC, &[192, 0, 2, 1]));
+        chunks.extend(chunk(chunk::IPV4_DST, &[192, 0, 2, 2]));
+        chunks.extend(chunk(chunk::SRC_PORT, &6000u16.to_be_bytes()));
+        chunks.extend(chunk(chunk::DST_PORT, &6002u16.to_be_bytes()));
+        chunks.extend(chunk(chunk::TIMESTAMP_SECS, &1u32.to_be_bytes()));
+        chunks.extend(chunk(chunk::TIMESTAMP_MICROS, &0u32.to_be_bytes()));
+        chunks.extend(chunk(chunk::PROTOCOL_TYPE, &[protocol_type::REPORT_JSON]));
+        chunks.extend(chunk(chunk::CAPTURE_AGENT_ID, &7u32.to_be_bytes()));
+        chunks.extend(chunk(chunk::CORRELATION_ID, b"c1"));
+        chunks.extend(chunk(chunk::PAYLOAD, &payload));
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(MAGIC);
+        expected.extend_from_slice(&((PACKET_HEADER_LEN + chunks.len()) as u16).to_be_bytes());
+        expected.extend_from_slice(&chunks);
+
+        assert_eq!(
+            capture.encode(),
+            expected,
+            "byte-exact HEP3 text QoS report packet"
+        );
     }
 }

@@ -27,6 +27,7 @@ use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint}
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::mos::Impairments;
 use siphon_rtp_hep::report::QosReport;
+use siphon_rtp_hep::text_report::TextQosReport;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
 use siphon_rtp_media::player::{PcmPlayer, WavSource};
@@ -692,6 +693,20 @@ pub struct Engine<D: Datapath> {
     /// one. Held here (not in the media actor) because the transport task, the WS socket and the
     /// dropped/forwarded counters outlive individual control ops and must be torn down on `delete`.
     ws_tees: DashMap<String, WsTee>,
+    /// The HEP telemetry export (VoIPmonitor / Homer), when the daemon enabled it via
+    /// `SIPHON_RTP_HEP_COLLECTOR`. Set once at startup (after the engine is `Arc`-wrapped, so interior
+    /// mutability), then shared read-only by the [`Self::run_rtcp_export`] task (per-interval RTCP/QoS)
+    /// **and** the `finish_call` teardown path (end-of-call RFC 4103 text content QoS). `None`/unset ⇒
+    /// HEP export disabled. Held so both the live RTCP loop and the teardown path reach the one exporter.
+    hep_export: std::sync::OnceLock<HepExport>,
+}
+
+/// The HEP telemetry sink and its capture-agent id, shared across the RTCP-export task and the
+/// end-of-call text-QoS export. The exporter owns a connected UDP socket, so it is held behind an
+/// `Arc` and never re-created per capture.
+struct HepExport {
+    exporter: Arc<HepExporter>,
+    capture_agent_id: u32,
 }
 
 /// A live WebSocket tee on one call: the shared mixer (for its counters), its transport task, and the
@@ -772,6 +787,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // Host-only gathering unless the operator names a STUN server.
             stun_servers: Vec::new(),
             ws_tees: DashMap::new(),
+            // HEP export off unless the daemon calls `set_hep_export` from `SIPHON_RTP_HEP_COLLECTOR`.
+            hep_export: std::sync::OnceLock::new(),
         }
     }
 
@@ -4005,6 +4022,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             },
         );
 
+        // RFC 4103 Real-Time Text content QoS on the HEP wire (VoIPmonitor / Homer), when the call
+        // carried a *promoted* text stream and HEP export is enabled. Correlated by call-id, exactly
+        // like the per-interval RTCP/voice QoS the same collector already sees, so a passive collector
+        // groups the text report with the rest of the call. A per-call summary (not per-interval like
+        // RTCP), because the T.140 content counters are only final at teardown. Fire-and-forget.
+        self.export_text_qos(call, call_id, near_text, far_text)
+            .await;
+
         // Free everything the call held (the steps `delete` and `reap_idle` previously duplicated) —
         // including the RFC 4103 text endpoints (`all_endpoint_ids`), so a text stream's ports are
         // released with the call.
@@ -4034,6 +4059,68 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.endpoint_calls.remove(&endpoint);
         }
         self.release_client_call(call.owner);
+    }
+
+    /// Ship this call's per-leg RFC 4103 Real-Time Text content QoS to the HEP collector as a report
+    /// capture (`protocol_type` = REPORT_JSON, type 35), correlated by call-id — the wire complement to
+    /// the [`Event::CallSummary`]'s `text` field. One capture per leg that carried a measured text
+    /// stream: the near leg is party A's inbound A→B stream (offerer sent), the far leg party B's
+    /// inbound B→A stream (answerer sent), matching the CDR's per-direction attribution. A no-op when
+    /// the call had no promoted text stream (`near`/`far` both `None`, e.g. an audio-only call) or HEP
+    /// export is disabled. Fire-and-forget: an export error is logged, never propagated (telemetry must
+    /// never disturb teardown).
+    async fn export_text_qos(
+        &self,
+        call: &Call,
+        call_id: &str,
+        near: Option<siphon_rtp_proto::TextStreamStats>,
+        far: Option<siphon_rtp_proto::TextStreamStats>,
+    ) {
+        // Audio-only call, or a text stream left on the in-kernel relay (never measured) ⇒ nothing to
+        // emit. Skip before touching the exporter so an audio-only call ships no RTT capture at all.
+        if near.is_none() && far.is_none() {
+            return;
+        }
+        let Some(export) = self.hep_export.get() else {
+            return; // HEP export disabled (`SIPHON_RTP_HEP_COLLECTOR` unset).
+        };
+        let (timestamp_secs, timestamp_micros) = wall_clock_now();
+        // (leg, this-leg's inbound stats, sending tag, direction) for each measured direction.
+        let legs = [
+            (&call.near, near, call.from_tag.as_str(), "a_to_b"),
+            (
+                &call.far,
+                far,
+                call.to_tag.as_deref().unwrap_or("-"),
+                "b_to_a",
+            ),
+        ];
+        for (leg, stats, tag, direction) in legs {
+            let Some(stats) = stats else {
+                continue;
+            };
+            let (src, dst) = text_stream_addresses(leg);
+            let report = TextQosReport {
+                correlation_id: call_id.to_string(),
+                tag: tag.to_string(),
+                direction,
+                packets: stats.packets,
+                characters: stats.characters,
+                missing_markers: stats.missing_markers,
+                recovered_from_redundancy: stats.recovered_from_redundancy,
+            };
+            let capture = Capture::from_text_qos_report(
+                src,
+                dst,
+                timestamp_secs,
+                timestamp_micros,
+                export.capture_agent_id,
+                &report,
+            );
+            if let Err(error) = export.exporter.export(&capture).await {
+                tracing::debug!(%error, direction, "HEP RFC 4103 text QoS export failed");
+            }
+        }
     }
 
     /// Sum the datapath byte/packet counters across every endpoint a leg owns (RTP + optional RTCP) —
@@ -7447,8 +7534,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .map(|entry| entry.value().clone())
     }
 
-    /// Drain observed relayed RTCP and export it as HEP captures to `exporter` (a VoIPmonitor / Homer
-    /// collector), correlated by call-id. Each observed datagram ships **twice**: once as the raw RTCP
+    /// Install the HEP telemetry export (VoIPmonitor / Homer) for this engine — the connected
+    /// [`HepExporter`] and its capture-agent id. Called once at daemon startup from
+    /// `SIPHON_RTP_HEP_COLLECTOR`; both [`Self::run_rtcp_export`] (per-interval RTCP/QoS) and the
+    /// end-of-call teardown path (`finish_call`, RFC 4103 text QoS) read it from here, so a single
+    /// connected socket serves both. Idempotent: a second call is ignored (the first export wins).
+    pub fn set_hep_export(&self, exporter: HepExporter, capture_agent_id: u32) {
+        let _ = self.hep_export.set(HepExport {
+            exporter: Arc::new(exporter),
+            capture_agent_id,
+        });
+    }
+
+    /// Drain observed relayed RTCP and export it as HEP captures to the configured collector (a
+    /// VoIPmonitor / Homer node via [`Self::set_hep_export`]), correlated by call-id. Returns
+    /// immediately if no exporter is configured. Each observed datagram ships **twice**: once as the raw RTCP
     /// (`protocol_type` = RTCP) for a passive collector, and once — per reception report block it
     /// carries — as a QoS/MOS report (`protocol_type` = REPORT_JSON, HEP3 type 35) built from the
     /// block's loss/jitter through the G.107 E-model (RFC 3550 §6.4.1, ITU-T G.107). Runs until the
@@ -7458,7 +7558,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Note: `observe_rtcp` taps only the plain-relay (in-kernel `Forward`) path, where the engine
     /// originates no Sender Report of its own, so the QoS report carries no measured RTT (one-way delay
     /// 0). Transcode/conference legs measure RTT on their own path and surface it via `CallQuality`.
-    pub async fn run_rtcp_export(self: Arc<Self>, exporter: HepExporter, capture_agent_id: u32) {
+    pub async fn run_rtcp_export(self: Arc<Self>) {
+        let Some(export) = self.hep_export.get() else {
+            tracing::debug!("HEP RTCP export task started without a configured exporter; idle");
+            return;
+        };
+        let exporter = &export.exporter;
+        let capture_agent_id = export.capture_agent_id;
         let observations = self.datapath.observe_rtcp();
         while let Ok(observed) = observations.recv_async().await {
             let Some(call_id) = self.call_for_endpoint(observed.endpoint) else {
@@ -7650,6 +7756,24 @@ fn rtcp_capture(
         correlation_id: Some(call_id),
         payload: observed.payload.to_vec(),
     }
+}
+
+/// The `(source, destination)` media addresses for a leg's RFC 4103 text-stream HEP report capture:
+/// the peer's signalled text RTP address as the source (the stream's sender) and the engine's bound
+/// text port as the destination — mirroring how an observed RTCP capture attributes source/destination
+/// (sender → engine). Falls back to the leg's audio addresses when the text transport is not (yet)
+/// both-ends known, so a family-consistent 5-tuple is always produced; the capture is grouped at the
+/// collector by its correlation id (call-id), not the 5-tuple, so the fallback never mis-correlates.
+fn text_stream_addresses(leg: &Leg) -> (std::net::SocketAddr, std::net::SocketAddr) {
+    let destination = leg
+        .text
+        .map(|endpoint| endpoint.local_addr)
+        .unwrap_or(leg.rtp.local_addr);
+    let source = leg
+        .text_remote_rtp
+        .or(leg.remote_rtp)
+        .unwrap_or(leg.rtp.local_addr);
+    (source, destination)
 }
 
 /// Wall-clock seconds + microseconds since the Unix epoch, for HEP capture timestamps (a genuine
@@ -18908,7 +19032,8 @@ mod tests {
             .expect("bind collector");
         let collector_addr = collector.local_addr().expect("collector addr");
         let exporter = HepExporter::connect(collector_addr).await.expect("connect");
-        tokio::spawn(engine.clone().run_rtcp_export(exporter, 7));
+        engine.set_hep_export(exporter, 7);
+        tokio::spawn(engine.clone().run_rtcp_export());
         // Let the export task enable the RTCP observation tap before any media flows.
         tokio::task::yield_now().await;
 
@@ -18982,7 +19107,8 @@ mod tests {
         let exporter = HepExporter::connect(collector.local_addr().expect("addr"))
             .await
             .expect("connect");
-        tokio::spawn(engine.clone().run_rtcp_export(exporter, 7));
+        engine.set_hep_export(exporter, 7);
+        tokio::spawn(engine.clone().run_rtcp_export());
         tokio::task::yield_now().await;
 
         let (phone_a, addr_a) = phone().await;

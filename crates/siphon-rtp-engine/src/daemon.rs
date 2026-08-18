@@ -652,7 +652,10 @@ where
                         .and_then(|value| value.parse().ok())
                         .unwrap_or(0);
                     tracing::info!(collector = %addr, "HEP RTCP export enabled");
-                    tokio::spawn(engine.clone().run_rtcp_export(exporter, agent_id));
+                    // Share the one connected exporter with both the live RTCP loop and the
+                    // end-of-call RFC 4103 text-QoS export in `finish_call`.
+                    engine.set_hep_export(exporter, agent_id);
+                    tokio::spawn(engine.clone().run_rtcp_export());
                 }
                 Err(error) => tracing::warn!(%error, "HEP export disabled: connect failed"),
             },
