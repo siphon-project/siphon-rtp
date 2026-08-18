@@ -67,3 +67,7 @@ harness = false
 [[bench]]
 name = "t140_red_bench"
 harness = false
+
+[[bench]]
+name = "text_mixer_bench"
+harness = false

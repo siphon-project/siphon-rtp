@@ -24,6 +24,14 @@ pub enum RtpError {
         /// Bytes available.
         have: usize,
     },
+    /// More contributing sources than the 4-bit CC field can carry (RFC 3550 §5.1).
+    #[error("too many CSRCs: {count} exceeds the {max} the CC field holds")]
+    TooManyCsrcs {
+        /// The CSRC count requested.
+        count: usize,
+        /// The enforced ceiling ([`MAX_CSRC_COUNT`]).
+        max: usize,
+    },
 }
 
 /// RTP version this implementation speaks.
@@ -46,6 +54,10 @@ pub struct RtpPacket<'a> {
     pub ssrc: u32,
     /// Number of contributing sources present in the header (their values are skipped).
     pub csrc_count: u8,
+    /// The contributing-source (CSRC) list bytes, immediately after the fixed header — `csrc_count`
+    /// big-endian `u32`s (RFC 3550 §5.1). An RTP mixer stamps these to identify the sources of the
+    /// payload; read one with [`RtpPacket::csrc`]. Empty when `csrc_count == 0`.
+    pub csrcs: &'a [u8],
     /// The media payload (header, CSRCs, extension, and any padding removed).
     pub payload: &'a [u8],
 }
@@ -72,10 +84,12 @@ impl<'a> RtpPacket<'a> {
         let timestamp = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
         let ssrc = u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
 
-        let mut offset = FIXED_HEADER_LEN + 4 * csrc_count as usize;
+        let csrc_bytes = 4 * csrc_count as usize;
+        let mut offset = FIXED_HEADER_LEN + csrc_bytes;
         if buffer.len() < offset {
             return Err(RtpError::TooShort);
         }
+        let csrcs = &buffer[FIXED_HEADER_LEN..offset];
         if has_extension {
             if buffer.len() < offset + 4 {
                 return Err(RtpError::TooShort);
@@ -103,8 +117,19 @@ impl<'a> RtpPacket<'a> {
             timestamp,
             ssrc,
             csrc_count,
+            csrcs,
             payload: &buffer[offset..end],
         })
+    }
+
+    /// The `index`-th contributing source (CSRC), or `None` past [`RtpPacket::csrc_count`]
+    /// (RFC 3550 §5.1). A multiparty RTT receiver reads CSRC 0 to attribute the packet to its source
+    /// (RFC 9071 §4.2).
+    #[must_use]
+    pub fn csrc(&self, index: usize) -> Option<u32> {
+        let start = index.checked_mul(4)?;
+        let bytes = self.csrcs.get(start..start + 4)?;
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
 
@@ -123,21 +148,54 @@ pub struct RtpHeader {
     pub ssrc: u32,
 }
 
+/// The largest CSRC count the 4-bit CC field can carry (RFC 3550 §5.1).
+pub const MAX_CSRC_COUNT: usize = 15;
+
 /// Write `header` + `payload` as a 12-byte-header RTP packet into `out`, returning its length.
 pub fn write_packet(header: &RtpHeader, payload: &[u8], out: &mut [u8]) -> Result<usize, RtpError> {
-    let total = FIXED_HEADER_LEN + payload.len();
+    write_packet_with_csrcs(header, &[], payload, out)
+}
+
+/// Write `header` + a CSRC list + `payload` as an RTP packet into `out`, returning its length
+/// (RFC 3550 §5.1). The CSRC list carries the contributing sources' SSRCs — an RTP **mixer** stamps
+/// it so a receiver can attribute the payload to its originating source(s); this is exactly the
+/// source-identification RFC 9071 §4.2 requires for multiparty real-time text (the mixer relabels its
+/// egress stream with the contributing participant's SSRC as a CSRC). `write_packet` is the CC=0 case.
+///
+/// # Errors
+/// [`RtpError::OutputTooSmall`] if `out` cannot hold the header + CSRCs + payload;
+/// [`RtpError::TooManyCsrcs`] if `csrcs` exceeds the [`MAX_CSRC_COUNT`] the 4-bit CC field holds.
+pub fn write_packet_with_csrcs(
+    header: &RtpHeader,
+    csrcs: &[u32],
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, RtpError> {
+    if csrcs.len() > MAX_CSRC_COUNT {
+        return Err(RtpError::TooManyCsrcs {
+            count: csrcs.len(),
+            max: MAX_CSRC_COUNT,
+        });
+    }
+    let csrc_bytes = csrcs.len() * 4;
+    let total = FIXED_HEADER_LEN + csrc_bytes + payload.len();
     if out.len() < total {
         return Err(RtpError::OutputTooSmall {
             needed: total,
             have: out.len(),
         });
     }
-    out[0] = RTP_VERSION << 6; // V=2, P=0, X=0, CC=0
+    // V=2, P=0, X=0, CC=csrcs.len() (RFC 3550 §5.1: CC counts the contributing sources present).
+    out[0] = (RTP_VERSION << 6) | (csrcs.len() as u8 & 0x0F);
     out[1] = ((header.marker as u8) << 7) | (header.payload_type & 0x7F);
     out[2..4].copy_from_slice(&header.sequence.to_be_bytes());
     out[4..8].copy_from_slice(&header.timestamp.to_be_bytes());
     out[8..12].copy_from_slice(&header.ssrc.to_be_bytes());
-    out[FIXED_HEADER_LEN..total].copy_from_slice(payload);
+    for (index, csrc) in csrcs.iter().enumerate() {
+        let start = FIXED_HEADER_LEN + index * 4;
+        out[start..start + 4].copy_from_slice(&csrc.to_be_bytes());
+    }
+    out[FIXED_HEADER_LEN + csrc_bytes..total].copy_from_slice(payload);
     Ok(total)
 }
 
@@ -195,6 +253,73 @@ mod tests {
         let packet = RtpPacket::parse(&buffer).expect("parse");
         assert_eq!(packet.csrc_count, 2);
         assert_eq!(packet.payload, &[0x77, 0x88]);
+        assert_eq!(packet.csrc(0), Some(0xAAAA_AAAA));
+        assert_eq!(packet.csrc(1), Some(0xAAAA_AAAA));
+        assert_eq!(packet.csrc(2), None, "past the CSRC count");
+    }
+
+    #[test]
+    fn writes_and_parses_a_single_csrc() {
+        // An RTP mixer stamps the contributing source's SSRC as CSRC 0 (RFC 3550 §5.1 / RFC 9071 §4.2).
+        let header = RtpHeader {
+            marker: true,
+            payload_type: 98,
+            sequence: 7,
+            timestamp: 3000,
+            ssrc: 0xFEED_F00D,
+        };
+        let mut out = [0u8; 64];
+        let len = write_packet_with_csrcs(&header, &[0x1234_5678], b"Hi", &mut out).expect("write");
+        // Fixed header (12) + one CSRC (4) + payload (2).
+        assert_eq!(len, FIXED_HEADER_LEN + 4 + 2);
+        assert_eq!(out[0] & 0x0F, 1, "CC field counts the one CSRC");
+
+        let packet = RtpPacket::parse(&out[..len]).expect("parse");
+        assert!(packet.marker);
+        assert_eq!(packet.payload_type, 98);
+        assert_eq!(packet.ssrc, 0xFEED_F00D);
+        assert_eq!(packet.csrc_count, 1);
+        assert_eq!(
+            packet.csrc(0),
+            Some(0x1234_5678),
+            "source identity preserved"
+        );
+        assert_eq!(packet.payload, b"Hi");
+    }
+
+    #[test]
+    fn write_packet_is_the_zero_csrc_case() {
+        // `write_packet` must be byte-identical to `write_packet_with_csrcs(.., &[], ..)`.
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 0,
+            sequence: 42,
+            timestamp: 160,
+            ssrc: 0xABCD_1234,
+        };
+        let mut plain = [0u8; 32];
+        let mut via_csrc = [0u8; 32];
+        let plain_len = write_packet(&header, &[9, 8, 7], &mut plain).expect("plain");
+        let csrc_len =
+            write_packet_with_csrcs(&header, &[], &[9, 8, 7], &mut via_csrc).expect("csrc");
+        assert_eq!(&plain[..plain_len], &via_csrc[..csrc_len]);
+    }
+
+    #[test]
+    fn write_rejects_more_than_fifteen_csrcs() {
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 0,
+            sequence: 0,
+            timestamp: 0,
+            ssrc: 0,
+        };
+        let csrcs = [0u32; MAX_CSRC_COUNT + 1];
+        let mut out = [0u8; 128];
+        assert!(matches!(
+            write_packet_with_csrcs(&header, &csrcs, &[1], &mut out),
+            Err(RtpError::TooManyCsrcs { count, max }) if count == MAX_CSRC_COUNT + 1 && max == MAX_CSRC_COUNT
+        ));
     }
 
     #[test]

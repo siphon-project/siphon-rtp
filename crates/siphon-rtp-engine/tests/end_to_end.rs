@@ -10,7 +10,9 @@ use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
 use siphon_rtp_datapath::Datapath;
 use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher_with_text;
 use siphon_rtp_engine::{sdp, server, Engine};
-use siphon_rtp_proto::{frame, CmdResult, Command, Event, ProfileFlags, Request, Response};
+use siphon_rtp_proto::{
+    frame, CmdResult, Command, ConferenceRole, Event, ProfileFlags, Request, Response,
+};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 use siphon_rtp_srtp::SrtpContext;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1071,6 +1073,123 @@ async fn without_observability_text_stays_in_kernel_and_still_relays() {
 
     // Keep the audio phones alive for the duration.
     drop((phone_a_audio, phone_b_audio));
+}
+
+/// RFC 9071 multiparty real-time text in the conference: three participants join a room, each with an
+/// `m=audio` + `m=text` leg. When one types, the room distributes its T.140 to **both** other
+/// participants (mix-minus-self) on the text flush, each packet labelled with the typing source's
+/// identity in the RTP CSRC list — so a receiver can present each source separately. Driven over the
+/// real control connection + UDP-loopback datapath (NIC-free); the ~300 ms text flush is a live timer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conference_distributes_multiparty_text_with_per_source_csrc() {
+    use siphon_rtp_media::rtp::RtpPacket;
+    use siphon_rtp_media::t140::RedPacket;
+
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    // The redirect dispatcher routes each participant's text endpoint to the conference actor.
+    tokio::spawn(run_redirect_dispatcher_with_text(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.text(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    let serve_engine = engine.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(serve_engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    // Three participants, each with an audio + a text phone.
+    let (_a_audio, a_audio_addr) = phone().await;
+    let (a_text, a_text_addr) = phone().await;
+    let (_b_audio, b_audio_addr) = phone().await;
+    let (b_text, _b_text_addr) = phone().await;
+    let (_c_audio, c_audio_addr) = phone().await;
+    let (c_text, _c_text_addr) = phone().await;
+
+    // A joins first, so its answer's `m=text` is where A sends its own text.
+    let a_join = control
+        .request(Command::ConferenceJoin {
+            conference_id: "room".into(),
+            from_tag: "tag-a".into(),
+            sdp: audio_text_sdp(a_audio_addr, a_text_addr),
+            role: ConferenceRole::Talker,
+            profile: Default::default(),
+        })
+        .await;
+    let a_engine_text = text_engine_addr(&a_join);
+
+    for (tag, audio, text) in [
+        ("tag-b", b_audio_addr, _b_text_addr),
+        ("tag-c", c_audio_addr, _c_text_addr),
+    ] {
+        let join = control
+            .request(Command::ConferenceJoin {
+                conference_id: "room".into(),
+                from_tag: tag.into(),
+                sdp: audio_text_sdp(audio, text),
+                role: ConferenceRole::Talker,
+                profile: Default::default(),
+            })
+            .await;
+        // Every join anchors an `m=text` stream to the engine (RFC 9071 conference text).
+        let _ = text_engine_addr(&join);
+    }
+
+    // A types "hi" (a primary-only RED/T.140 packet) toward the engine's text endpoint for A.
+    a_text
+        .send_to(&red_text_rtp(1, 1000, 0x0A0A_7E77, b"hi"), a_engine_text)
+        .await
+        .expect("send text a");
+
+    // On the text flush, B and C each receive A's text — RED-framed, CSRC-labelled with A's source.
+    let (b_data, _) = recv(&b_text).await;
+    let (c_data, _) = recv(&c_text).await;
+
+    let parse = |data: &[u8]| -> (u32, String) {
+        let packet = RtpPacket::parse(data).expect("egress text RTP");
+        assert_eq!(
+            packet.csrc_count, 1,
+            "RFC 9071 §4.2: one contributing source"
+        );
+        let csrc = packet.csrc(0).expect("CSRC 0 present");
+        let red = RedPacket::parse(packet.payload).expect("RED payload");
+        (
+            csrc,
+            String::from_utf8(red.primary().data.to_vec()).expect("utf8"),
+        )
+    };
+    let (b_csrc, b_text_out) = parse(&b_data);
+    let (c_csrc, c_text_out) = parse(&c_data);
+
+    assert_eq!(b_text_out, "hi", "B receives A's text");
+    assert_eq!(c_text_out, "hi", "C receives A's text");
+    assert_eq!(
+        b_csrc, c_csrc,
+        "both receivers see the SAME source identity for A's text (RFC 9071 §4.2)"
+    );
+
+    // Leaving frees every participant (audio + text endpoints) and tears the room down.
+    for tag in ["tag-a", "tag-b", "tag-c"] {
+        let left = control
+            .request(Command::ConferenceLeave {
+                conference_id: "room".into(),
+                from_tag: tag.into(),
+            })
+            .await;
+        assert!(matches!(left, CmdResult::Ok { .. }));
+    }
+    assert!(
+        !engine.conference().contains("room"),
+        "empty room torn down"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
