@@ -63,3 +63,7 @@ harness = false
 [[bench]]
 name = "ws_bridge_bench"
 harness = false
+
+[[bench]]
+name = "t140_red_bench"
+harness = false

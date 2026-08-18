@@ -80,6 +80,14 @@ test = false
 doc = false
 bench = false
 
+# RFC 2198/4103 — RED depacketizer + T.140 reassembler (hostile real-time-text payload off the wire).
+[[bin]]
+name = "red_parse"
+path = "fuzz_targets/red_parse.rs"
+test = false
+doc = false
+bench = false
+
 # 3GPP TS 26.171 / RFC 4867 — AMR-WB RTP payload parse + ACELP decode (hostile codec bitstream).
 [[bin]]
 name = "amr_wb_decode_fuzz"
