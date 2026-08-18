@@ -39,6 +39,8 @@
 //! scored, and the run must have covered every internal rate, every frame duration, both channel
 //! counts and at least one LBRR-bearing stream.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -233,15 +235,9 @@ fn to_bytes(samples: &[i16]) -> Vec<u8> {
 
 /// Run `opus_compare -s` over two in-memory PCM buffers. `Ok(())` on a pass.
 ///
-/// The locally built, test-only C reference. Its location is `$SIPHON_RTP_OPUS_COMPARE`, falling
-/// back to `/tmp/opus_compare` — the override matters because each worktree has its own untracked
-/// `reference/` tree, so the oracle is normally built once and shared.
+/// The locally built, test-only C reference; see [`common::oracle`] for how it is located.
 fn run_opus_compare(reference: &[i16], decoded: &[i16], label: &str) -> Result<(), String> {
-    let compare = std::env::var_os("SIPHON_RTP_OPUS_COMPARE")
-        .map_or_else(|| PathBuf::from("/tmp/opus_compare"), PathBuf::from);
-    if !compare.exists() {
-        return Err(format!("{} not built", compare.display()));
-    }
+    let compare = common::opus_compare_or_reason()?;
     let stem = label.replace(['/', '.'], "_");
     let reference_path =
         std::env::temp_dir().join(format!("silk_only_ref_{}_{stem}.sw", std::process::id()));

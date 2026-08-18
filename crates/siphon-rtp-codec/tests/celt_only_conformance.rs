@@ -19,6 +19,8 @@
 //! `opus_compare` are absent, so it never breaks CI on a machine without them. It does *not* pass
 //! vacuously: with vectors present, at least one stream must actually have been scored.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use siphon_rtp_codec::opus::celt::decoder::CeltDecoder;
@@ -75,14 +77,10 @@ fn parse_bit_stream(bytes: &[u8]) -> Result<Vec<BitPacket>, String> {
 
 /// The locally built, test-only `opus_compare`, if it exists.
 ///
-/// `$SIPHON_RTP_OPUS_COMPARE`, falling back to `/tmp/opus_compare`. The override matters because each
-/// git worktree has its own untracked `reference/` tree, so the oracle is normally built once and
-/// shared. Absent is a legitimate state — a fresh checkout has the vectors but no libopus build, and
-/// CONTRIBUTING promises such a checkout still goes green.
+/// Located by [`common::oracle`]. Absent is a legitimate state — a fresh checkout has the vectors
+/// but no libopus build, and CONTRIBUTING promises such a checkout still goes green.
 fn opus_compare_path() -> Option<PathBuf> {
-    let path = std::env::var_os("SIPHON_RTP_OPUS_COMPARE")
-        .map_or_else(|| PathBuf::from("/tmp/opus_compare"), PathBuf::from);
-    path.exists().then_some(path)
+    common::oracle("opus_compare")
 }
 
 /// A CELT-only vector directory under `reference/opus`, if present.
@@ -163,9 +161,7 @@ fn decode_celt_only(packets: &[BitPacket], channels: usize) -> Result<Vec<u8>, S
 /// mono and reads the test file as mono, with `-s` both stay stereo. The `.dec` is therefore always
 /// the two-channel decode (`opus_demo -d 48000 2`), for both the mono and the stereo vectors.
 ///
-/// The locally built, test-only C reference. Its location is `$SIPHON_RTP_OPUS_COMPARE`, falling back
-/// to `/tmp/opus_compare` — an override matters because each worktree has its own untracked
-/// `reference/` tree, so the oracle is normally built once and shared.
+/// The locally built, test-only C reference; see [`common::oracle`] for how it is located.
 fn run_opus_compare(reference_dec: &Path, decoded_pcm: &[u8], stereo: bool) -> Result<(), String> {
     let Some(compare) = opus_compare_path() else {
         return Err("opus_compare not built".to_string());

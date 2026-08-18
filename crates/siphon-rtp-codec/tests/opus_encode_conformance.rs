@@ -55,6 +55,8 @@
 //! all three modes, every frame duration, both channel counts, all three rate modes, and a
 //! non-trivial packet count.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -127,10 +129,7 @@ fn opus_demo() -> Option<PathBuf> {
 }
 
 fn opus_compare() -> Option<PathBuf> {
-    let path = std::env::var_os("SIPHON_RTP_OPUS_COMPARE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/opus_compare"));
-    path.is_file().then_some(path)
+    common::oracle("opus_compare")
 }
 
 /// The 48 kHz mono source `gen_silk_only.sh` writes.
