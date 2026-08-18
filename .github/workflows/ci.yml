@@ -100,15 +100,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # Enforces the #1 hard rule (pure Rust, ZERO C library deps) via deny.toml's ban list, plus the
-      # crates.io source allow-list. Time-varying RustSec advisories live in audit.yml so a new
-      # advisory never turns a green PR red on unchanged code. cargo-deny is installed pinned and run
-      # directly (not the cargo-deny-action, whose injected --log-level flag broke on the cargo-deny
-      # 0.19 CLI, which removed that global flag).
+      # The deterministic half of cargo-deny: bans (the #1 hard rule — pure Rust, ZERO C library
+      # deps), licenses (OSI-permissive allow-list) and sources (crates.io only). All three are a
+      # pure function of the dependency graph, so their verdict only changes when a PR changes the
+      # graph — a PR that pulls in a GPL crate, a git source or a duplicate-version blowup fails
+      # right here. Time-varying RustSec advisories deliberately live in audit.yml (weekly + on
+      # main) so a new advisory against unchanged code never turns a green PR red. cargo-deny is
+      # installed pinned and run directly (not the cargo-deny-action, whose injected --log-level
+      # flag broke on the cargo-deny 0.19 CLI, which removed that global flag).
       - name: Install cargo-deny (pinned)
         run: cargo install cargo-deny --version 0.19.9 --locked
-      - name: Check bans + sources
-        run: cargo deny --all-features check bans sources
+      - name: Check bans + licenses + sources
+        run: cargo deny --all-features check bans licenses sources
 
   # ── SBOM (SPDX 2.3 + CycloneDX 1.4) — supply-chain inventory, uploaded as an artifact ─────
   sbom:

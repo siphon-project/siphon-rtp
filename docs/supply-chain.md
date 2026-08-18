@@ -28,8 +28,9 @@ The rule is enforced at the dependency-graph level by
 C-FFI codec/DSP/TLS/SRTP crates (`openssl`, `openssl-sys`, `native-tls`, `opus`/`audiopus`,
 `ffmpeg-sys*`, `spandsp-sys`, `srtp2-sys`, `speexdsp-sys`, `samplerate`, ...) are on a hard ban
 list, so none can sneak in transitively. The **`deny` CI job runs
-`cargo deny check bans sources` on every pull request**; a PR that pulls a banned crate, or any
-crate from outside crates.io (unknown registries and git sources are denied), fails before review.
+`cargo deny check bans licenses sources` on every pull request**; a PR that pulls a banned crate,
+a crate outside the OSI-permissive licence allow-list, or any crate from outside crates.io
+(unknown registries and git sources are denied), fails before review.
 
 Two vendored exceptions, stated so the claim stays honest: the jemalloc allocator
 (`tikv-jemallocator`, the one accepted `-sys` dependency) and ring's crypto primitives contain
@@ -107,8 +108,10 @@ An SBOM is a snapshot; advisories are continuous. A crate that was clean at rele
 a RustSec advisory filed a week later without a line of code changing. siphon-rtp splits the
 [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) checks accordingly:
 
-- **Per-PR (`ci.yml`, the `deny` job):** `cargo deny check bans sources`. The time-invariant
-  policy: the zero-C ban list and the crates.io-only source rule gate every change.
+- **Per-PR (`ci.yml`, the `deny` job):** `cargo deny check bans licenses sources`. The
+  time-invariant policy: the zero-C ban list, the OSI-permissive licence allow-list and the
+  crates.io-only source rule. All three read only the dependency graph, so their verdict changes
+  only when a PR changes that graph — no unrelated PR is ever failed by them.
 - **Scheduled (`audit.yml`):** `cargo deny check advisories` runs **weekly (Mondays 06:00 UTC)**,
   on any push that touches the dependency set (`Cargo.toml`, `Cargo.lock`, `deny.toml`), and on
   demand. Time-varying RustSec advisories live here so a new advisory never turns a green PR red
@@ -124,8 +127,8 @@ Run the same checks on your own checkout:
 
 ```sh
 cargo install cargo-deny
-cargo deny check bans sources     # the per-PR gate
-cargo deny check advisories       # the scheduled audit
+cargo deny check bans licenses sources   # the per-PR gate
+cargo deny check advisories              # the scheduled audit
 ```
 
 Beyond dependencies, CI also fuzzes the RTP/RTCP parser with `cargo-fuzz` (libFuzzer) on every
@@ -159,9 +162,6 @@ measured against is [Security & NAT design](security-and-nat.md).
 
 Stated plainly, because a supply-chain page that overclaims is worse than none:
 
-- **The license allow-list is not yet in the CI gate.** `deny.toml` carries an OSI-permissive
-  allow-list, but the per-PR job runs `check bans sources` only; the license check flips on once
-  the full tree is license-audited. Until then, audit licenses from the SPDX document.
 - **No container-image SBOM or SLSA provenance yet.** The published SBOM describes the Rust crate
   graph, not image layers. Since the runtime image is distroless-static plus the one binary, the
   crate SBOM covers nearly everything, but scan the image with your registry scanner as usual.

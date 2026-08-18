@@ -652,7 +652,7 @@ the relevant licence in your jurisdiction. See [docs/codec-licensing.md](docs/co
 
 ## Pure Rust, zero C library dependencies
 
-A hard rule, enforced in CI by `cargo-deny` (`check bans sources`): no `-sys` codec crates, no
+A hard rule, enforced in CI by `cargo-deny` (`check bans licenses sources`): no `-sys` codec crates, no
 ffmpeg / libopus / spandsp / libsrtp. Codecs are hand-written Rust; SRTP/DTLS ride RustCrypto; the
 XDP path rides `aya`. Do not add a C-linking dependency.
 

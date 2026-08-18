@@ -1,6 +1,6 @@
 # cargo-deny — enforces siphon-rtp's hard rules at the dependency-graph level.
-# Local: `cargo deny check`  ·  CI: bans+sources gate every PR (ci.yml); advisories run weekly
-# (audit.yml). Docs: https://embarkstudios.github.io/cargo-deny/
+# Local: `cargo deny check`  ·  CI: bans+licenses+sources gate every PR (ci.yml); advisories run
+# weekly + on main (audit.yml). Docs: https://embarkstudios.github.io/cargo-deny/
 
 [graph]
 # Evaluate the graph for the Linux media-plane targets we actually ship on.
@@ -57,9 +57,13 @@ deny = [
 ]
 
 [licenses]
-# The crate is MIT; keep dependencies OSI-permissive. Not yet wired into the CI gate (the deny job
-# runs `check bans sources`) until the dependency tree is license-audited — flip it on by adding
-# `licenses` to the ci.yml deny command once green locally.
+# The crate is MIT; keep dependencies OSI-permissive. Gated per-PR by the ci.yml deny job
+# (`check bans licenses sources`) — the verdict is a pure function of the dependency graph, so a PR
+# that pulls in a copyleft or unknown-licence crate fails there rather than at release time.
+# Deliberately NOT allowed: MPL-2.0 and every other copyleft licence. MPL's file-level copyleft is
+# mild enough to be waved through by reflex, which is exactly why it stays off the list — an MPL
+# dependency must be an explicit decision on a red PR, not a silent pass. Do not re-add it to make a
+# build go green.
 version = 2
 allow = [
     "MIT",
@@ -71,10 +75,13 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
-    "MPL-2.0",
     "CDLA-Permissive-2.0", # webpki-roots — permissive data licence for the bundled Mozilla CA set.
 ]
 confidence-threshold = 0.9
+# The three allowances above that no current crate uses (LLVM-exception, Unicode-DFS-2016, Zlib)
+# are kept on purpose as pre-approved permissive licences; an unused *permissive* allowance carries
+# no signal, so do not let it spam the CI log.
+unused-allowed-license = "allow"
 
 [sources]
 unknown-registry = "deny"
