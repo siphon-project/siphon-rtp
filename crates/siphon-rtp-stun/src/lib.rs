@@ -21,6 +21,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 pub mod client;
 pub mod turn;
+pub mod turn_client;
 
 /// The STUN magic cookie (RFC 5389 §6).
 pub const MAGIC_COOKIE: u32 = 0x2112_A442;
