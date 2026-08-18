@@ -29,6 +29,7 @@ pub mod sdp;
 pub mod server;
 pub mod shutdown;
 pub mod srtp_bridge;
+pub mod text_pipeline;
 pub mod ws_bridge;
 
 pub use daemon::{run_with_datapath, EngineArgs, RunConfig};

@@ -515,6 +515,16 @@ pub struct ProfileFlags {
     /// with `ws_vad` / `ws_barge_in`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_vad_hangover_ms: Option<u32>,
+    /// Observe this call's RFC 4103 Real-Time Text (`m=text`) stream at the control plane: when set (and
+    /// the call negotiated a plaintext text stream and the owner has an event sink), the engine promotes
+    /// **only** the low-rate text stream to a userspace processor that RED-depacketizes + reassembles it
+    /// and emits [`Event::Text`] per recovered increment, plus per-leg [`TextStreamStats`] in the
+    /// end-of-call [`Event::CallSummary`]. The audio relay/transcode path is untouched — text
+    /// observability never promotes audio. Inert on an audio-only call. Recording (`start recording`)
+    /// promotes the text stream too, independently of this flag. A native siphon-rtp extension — the
+    /// NG/bencode front-end does not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub text_events: bool,
     /// The real post-NAT source IP the SIP proxy saw this request arrive from (rtpengine's
     /// `received-from`). When a NATed UA advertises a private `c=` address, its media actually
     /// originates from its NAT's *public* IP — this is that IP. The engine gates the leg's ingress to
@@ -725,6 +735,31 @@ pub struct LegSummary {
     /// `"full"` (MOS includes the G.107 delay term) or `"loss+jitter"` — how the MOS was derived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mos_basis: Option<String>,
+    /// RFC 4103 Real-Time Text reception counters for this leg's **inbound** T.140 stream, present only
+    /// when the call negotiated a plaintext `m=text` stream *and* a text-observability feature promoted
+    /// it to the userspace text processor (recording, or `text_events`). `None` for an audio-only call,
+    /// or a text stream left on the in-kernel relay (which contributes datapath packet/byte counts but
+    /// no content-level text QoS — that is only measured when text is promoted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextStreamStats>,
+}
+
+/// RFC 4103 Real-Time Text reception counters for one leg's inbound T.140 stream, measured by the
+/// userspace text processor (RED depacketization + T.140 reassembly) when text observability is active.
+/// A content-level QoS surface distinct from the datapath's packet/byte counters: it reports what the
+/// receiver actually recovered, including redundancy recovery and unrecoverable-loss markers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextStreamStats {
+    /// RTP packets accepted on this leg's inbound text stream (post source-gate).
+    pub packets: u64,
+    /// UTF-8 characters delivered to the far side after reassembly — includes characters recovered from
+    /// RED redundancy and the U+FFFD missing-text markers (a consumer sees where loss occurred).
+    pub characters: u64,
+    /// Missing-text markers (U+FFFD) inserted for gaps redundancy could not recover (RFC 4103 §5.3).
+    pub missing_markers: u64,
+    /// Generations recovered from RFC 2198 RED redundancy (RFC 4103 §4.2 / §5) — loss the redundant
+    /// copies repaired before it reached the receiver.
+    pub recovered_from_redundancy: u64,
 }
 
 /// How a [`Command::PlayMedia`] playback ended, carried by [`Event::PlayFinished`]. Only
@@ -762,6 +797,22 @@ pub enum Event {
         volume: i32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+    },
+    /// Newly-recovered RFC 4103 Real-Time Text (T.140) on a call's `m=text` stream, emitted by the
+    /// userspace text processor as it RED-depacketizes + reassembles the stream. `text` is the UTF-8
+    /// increment newly delivered by *this* packet ([`crate`] emits only non-empty increments, so a
+    /// duplicate/reordered packet or idle keepalive produces no event); any U+FFFD marker stays in the
+    /// text so a consumer sees where loss occurred (RFC 4103 §5.3). `from_tag` identifies the leg that
+    /// *sent* the text; `direction` is `"a_to_b"` / `"b_to_a"` for the observed direction. Additive,
+    /// snake_case-tagged, forward-compatible — the same `Vec<Event>` plumbing as [`Event::Dtmf`].
+    Text {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<String>,
     },
     /// A call's media went silent past the timeout and the engine tore it down (dead-path
     /// detection). Lets SIPhon release its own per-call state.
@@ -1001,6 +1052,7 @@ mod tests {
                     mos_min: Some(4.21),
                     mos_max: Some(4.40),
                     mos_basis: Some("full".to_string()),
+                    text: None,
                 },
                 // A counters-only leg (no media actor) omits every quality field.
                 LegSummary {
@@ -1020,6 +1072,12 @@ mod tests {
                     mos_min: None,
                     mos_max: None,
                     mos_basis: None,
+                    text: Some(TextStreamStats {
+                        packets: 5,
+                        characters: 11,
+                        missing_markers: 1,
+                        recovered_from_redundancy: 2,
+                    }),
                 },
             ],
         };
@@ -1033,6 +1091,14 @@ mod tests {
             json["legs"][1].get("mos_average").is_none(),
             "a counters-only leg omits its quality fields on the wire"
         );
+        // The RFC 4103 text QoS rides the far leg (it received text); an audio-only leg omits it.
+        assert!(
+            json["legs"][0].get("text").is_none(),
+            "a leg with no text stream omits the text QoS block"
+        );
+        assert_eq!(json["legs"][1]["text"]["characters"], 11);
+        assert_eq!(json["legs"][1]["text"]["missing_markers"], 1);
+        assert_eq!(json["legs"][1]["text"]["recovered_from_redundancy"], 2);
 
         // Forward-compat (the property that lets a not-yet-updated SIPhon tolerate this new event): an
         // unrecognized event tag decodes to `Unknown` via `#[serde(other)]`, never a hard error.
@@ -1743,6 +1809,39 @@ mod tests {
             volume: -8,
             source: Some("rtp".into()),
         });
+    }
+
+    #[test]
+    fn text_event_roundtrip_and_snake_case_tagged() {
+        let event = Event::Text {
+            call_id: "c@host".into(),
+            from_tag: "ft-a".into(),
+            to_tag: Some("tt-b".into()),
+            text: "Hi \u{FFFD}there".into(),
+            direction: Some("a_to_b".into()),
+        };
+        roundtrip(&event);
+
+        let json = serde_json::to_value(&event).expect("to_value");
+        assert_eq!(json["event"], "text", "snake_case event tag");
+        assert_eq!(json["call_id"], "c@host");
+        assert_eq!(json["from_tag"], "ft-a");
+        assert_eq!(json["to_tag"], "tt-b");
+        assert_eq!(json["text"], "Hi \u{FFFD}there");
+        assert_eq!(json["direction"], "a_to_b");
+
+        // The optional fields are omitted on the wire when absent (forward-compatible minimal form).
+        let minimal = Event::Text {
+            call_id: "c".into(),
+            from_tag: "ft".into(),
+            to_tag: None,
+            text: "x".into(),
+            direction: None,
+        };
+        roundtrip(&minimal);
+        let minimal_json = serde_json::to_value(&minimal).expect("to_value");
+        assert!(minimal_json.get("to_tag").is_none(), "to_tag omitted");
+        assert!(minimal_json.get("direction").is_none(), "direction omitted");
     }
 
     #[test]

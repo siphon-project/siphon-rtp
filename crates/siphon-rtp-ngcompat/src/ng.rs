@@ -418,6 +418,9 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         ws_tee: None,
         ws_tee_direction: None,
         ws_tee_channels: None,
+        // Text-event observability is a native siphon-rtp (JSON control) extension; the NG/bencode
+        // front-end never requests it (a rtpengine-NG text relay still works, just without Event::Text).
+        text_events: false,
         // rtpengine spells it `received from`; accept the hyphenated form too.
         received_from: parse_received_from(request),
         // rtpengine `rtcp-mux` directive list; accept the dotted `rtcp.mux` spelling too.

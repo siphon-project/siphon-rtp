@@ -52,6 +52,7 @@ use crate::media_pipeline::{
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp, SrtpBridge};
+use crate::text_pipeline::{TextCall, TextControl, TextDirectionConfig, TextRegistry};
 use crate::ws_bridge::WsRegistry;
 use siphon_rtp_ice::{GatherAction, GatherConfig, Gatherer};
 use std::net::SocketAddr;
@@ -197,6 +198,23 @@ struct Call {
     /// The negotiated RFC 2198 redundancy payload type of a relayed text stream
     /// (`a=rtpmap:<pt> red/1000`), when the offer wrapped T.140 in RED. `None` otherwise.
     text_red_payload_type: Option<u8>,
+    /// The two in-kernel text `Forward` flows installed at `answer()` (near text, then far text),
+    /// mirroring `relay_flows` for the audio relay — kept so a text-observability feature can promote
+    /// the text stream to the userspace [`crate::text_pipeline`] (reconstructing the exact gate/latch)
+    /// and demote it back to these in-kernel flows when the last feature clears. Empty for a call with
+    /// no plaintext text stream.
+    text_relay_flows: Vec<(EndpointId, FlowAction)>,
+    /// Runtime reasons the RFC 4103 text stream is promoted to the userspace text processor — parallel
+    /// to `promotion_reasons`, which governs the *audio* relay. Text-only: promoting text never promotes
+    /// audio (the maintainer's hard constraint). Empty ⇒ text stays on the PR-1 in-kernel `Forward`
+    /// relay. Populated by `text_events` (at answer) and/or a runtime recording.
+    text_promotion_reasons: HashSet<PromotionReason>,
+    /// Whether the controller asked to observe this call's text at the control plane
+    /// (`ProfileFlags.text_events`), captured at offer. When set (and a plaintext text stream is
+    /// negotiated and the owner has an event sink), `answer()` promotes the text stream so it emits
+    /// [`Event::Text`] for the call's life. `false` ⇒ no control-plane text events (recording can still
+    /// promote text independently).
+    text_events: bool,
 }
 
 /// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off
@@ -209,6 +227,10 @@ enum PromotionReason {
     /// A per-leg RFC 4733 telephone-event (DTMF) relay block is active (`block DTMF`) — the relay is
     /// held in userspace so the actor can gate the telephone-event PT per direction.
     DtmfBlock,
+    /// Control-plane RFC 4103 text-event observability is on (`ProfileFlags.text_events`) — holds the
+    /// **text** stream (never audio) in the userspace [`crate::text_pipeline`] so it emits
+    /// [`Event::Text`]. Only ever appears in a call's `text_promotion_reasons`, never `promotion_reasons`.
+    TextEvents,
     /// Echo-test mode is on (`Command::Echo`) — the relay is held in a **processing** MediaCall so the
     /// actor can decode each party's ingress and re-emit it back to the sender (a relay-only promotion
     /// forwards opaque payloads to the peer and cannot loop them home).
@@ -593,6 +615,12 @@ pub struct Engine<D: Datapath> {
     /// The conference (MCU) slow path: per-room N-party mixers. Shared with the redirect dispatcher,
     /// which routes conference-owned participant endpoints' datagrams here (see [`crate::conference`]).
     conference: Arc<ConferenceRegistry>,
+    /// The RFC 4103 Real-Time Text observability slow path: per-call text processors that RED/T.140
+    /// observe a promoted `m=text` stream (recording / `text_events`) then forward it verbatim. Shared
+    /// with the redirect dispatcher, which routes text-owned endpoints' datagrams here (see
+    /// [`crate::text_pipeline`]). Only the low-rate text stream is ever promoted here — audio is never
+    /// promoted for text observability.
+    text: Arc<TextRegistry>,
     /// SIPREC / monitor media subscriptions, keyed by call-id (RFC 7866). Each entry's source leg is
     /// forked to a send-only subscriber endpoint; freed alongside the parent call on delete/reap.
     subscriptions: DashMap<String, Vec<Subscription>>,
@@ -698,6 +726,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             media: Arc::new(MediaRegistry::default()),
             ws: Arc::new(WsRegistry::default()),
             conference: Arc::new(ConferenceRegistry::default()),
+            text: Arc::new(TextRegistry::default()),
             subscriptions: DashMap::new(),
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(ClusterState::new("siphon-rtp".to_string(), 0, Vec::new())),
@@ -868,6 +897,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// conference-owned participant endpoints' datagrams to the per-room mixer actors.
     pub fn conference(&self) -> Arc<ConferenceRegistry> {
         self.conference.clone()
+    }
+
+    /// The shared RFC 4103 text registry — handed to the redirect dispatcher so it can route
+    /// text-owned endpoints' datagrams to the per-call text observers (see [`crate::text_pipeline`]).
+    pub fn text(&self) -> Arc<TextRegistry> {
+        self.text.clone()
     }
 
     /// Number of live calls in the session registry.
@@ -1713,6 +1748,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 comfort_noise_payload_type: None,
                 text_t140_payload_type,
                 text_red_payload_type,
+                // No text flows until `answer()` installs them; no text promotion yet.
+                text_relay_flows: Vec::new(),
+                text_promotion_reasons: HashSet::new(),
+                // Captured at offer, applied at answer (when the text stream is fully negotiated).
+                text_events: profile.text_events,
             },
         );
 
@@ -1922,6 +1962,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 comfort_noise_payload_type: None,
                 text_t140_payload_type: None,
                 text_red_payload_type: None,
+                // A single-leg local answer negotiates no text stream.
+                text_relay_flows: Vec::new(),
+                text_promotion_reasons: HashSet::new(),
+                text_events: false,
             },
         );
 
@@ -3442,6 +3486,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // gate is per-stream, docs/security-and-nat.md §4). Text is forwarded verbatim (RED/T.140 is
         // not parsed in PR 1). Text does not use ICE here (`ice = false`).
         let mut far_text_remote = None;
+        // The two installed text `Forward` flows (near text, then far text), kept so a text-observability
+        // feature can promote the text stream to userspace and demote it back to these (mirrors the audio
+        // `relay_flows`). Empty when no plaintext text stream was negotiated.
+        let mut text_relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
         if let (Some(near_text), Some(far_text), Some(b_text)) =
             (near.text, far.text, info.text.as_ref())
         {
@@ -3473,6 +3521,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 if let Err(error) = self.datapath.install_flow(far_text.id, far_text_action) {
                     return error_result("install far->near text flow", &error);
                 }
+                text_relay_flows.push((near_text.id, near_text_action));
+                text_relay_flows.push((far_text.id, far_text_action));
             }
         }
 
@@ -3494,12 +3544,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.far_telephone_event = info.telephone_event_payload_type();
             call.pipeline = pipeline;
             call.relay_flows = relay_flows;
+            // The in-kernel text `Forward` flows, kept so text observability can promote/demote the
+            // text stream while the audio relay stays on its own fast path.
+            call.text_relay_flows = text_relay_flows;
             // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
             call.far_remote_crypto = info.crypto.first().copied();
             // B's ICE credentials from its answer — what an outbound consent check to B is addressed
             // and signed with (RFC 8445 §7.1.2).
             call.far_remote_ice = peer_ice_credentials(&info);
         }
+
+        // Text observability trigger: if the controller asked for control-plane text events and a
+        // plaintext text stream was negotiated, promote ONLY the text stream to the userspace text
+        // processor now (the audio relay/transcode/SRTP path is untouched). Recording promotes text
+        // independently at `start recording`. Best-effort — a promotion failure is logged and the call
+        // still relays text in-kernel (PR-1 behaviour).
+        self.maybe_promote_text_for_events(call_id).await;
         // Answer-side codec presentation: on a transcoding call (Media / SrtpMedia) the engine sends
         // A its *own* negotiated codec, so the answer relayed to A must advertise A's codec, never
         // leak B's (RFC 3264 §6). A plain relay / SRTP bridge / WS leg shares one codec across both
@@ -3568,6 +3628,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let near_counters = self.leg_counters(&call.near);
         let far_counters = self.leg_counters(&call.far);
         let quality = self.media.final_quality(call_id, CDR_QUALITY_TIMEOUT).await;
+        // RFC 4103 content QoS from the userspace text processor, when the text stream was promoted for
+        // observability. `None` for an audio-only call, or a text stream left on the in-kernel relay
+        // (which contributes only the datapath packet/byte counts, no content-level text QoS). The near
+        // leg carries the A→B reassembler's counters, the far leg the B→A — mirroring the audio CDR's
+        // per-direction attribution.
+        let text_counters = self.text.final_counters(call_id, CDR_QUALITY_TIMEOUT).await;
+        let near_text = text_counters.map(|counters| counters.near);
+        let far_text = text_counters.map(|counters| counters.far);
         let duration_s = self.datapath.now_ticks().saturating_sub(call.created_tick);
 
         tracing::info!(
@@ -3582,6 +3650,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // payload types, `-` for an audio-only call.
             text_t140 = call.text_t140_payload_type.map_or_else(|| "-".to_string(), |pt| pt.to_string()),
             text_red = call.text_red_payload_type.map_or_else(|| "-".to_string(), |pt| pt.to_string()),
+            // RFC 4103 content QoS, present only when the text stream was promoted (recording /
+            // `text_events`); `-` when text stayed on the in-kernel relay or the call had no text.
+            text_chars = text_counters.map_or_else(|| "-".to_string(), |counters| (counters.near.characters + counters.far.characters).to_string()),
+            text_missing_markers = text_counters.map_or_else(|| "-".to_string(), |counters| (counters.near.missing_markers + counters.far.missing_markers).to_string()),
+            text_recovered = text_counters.map_or_else(|| "-".to_string(), |counters| (counters.near.recovered_from_redundancy + counters.far.recovered_from_redundancy).to_string()),
             "call finished"
         );
         // The near leg is party A (offerer, `from_tag`); the stream it *sent* is measured by the media
@@ -3620,12 +3693,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         call.near_codec.as_ref(),
                         &near_counters,
                         quality.as_ref().map(|quality| &quality.a_to_b),
+                        near_text,
                     ),
                     leg_summary(
                         call.to_tag.as_deref().unwrap_or("-"),
                         call.far_codec.as_ref(),
                         &far_counters,
                         quality.as_ref().map(|quality| &quality.b_to_a),
+                        far_text,
                     ),
                 ],
             },
@@ -3645,6 +3720,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
         self.bridge.deregister(endpoints.iter().copied());
         self.media.deregister(call_id);
+        self.text.deregister(call_id);
         self.ws.deregister(call_id);
         // Consent state dies with the call — otherwise a torn-down leg keeps a checker (and its
         // credentials) alive forever and the registry never drains to zero.
@@ -4401,9 +4477,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // noise. 2-leg (relay/bridge/transcode) restores never use this.
                 comfort_noise_payload_type: None,
                 // RTT text stream: not carried in the HA snapshot (restore deferred) — a restored call
-                // is audio-only.
+                // is audio-only, so no text flows / promotion / events either.
                 text_t140_payload_type: None,
                 text_red_payload_type: None,
+                text_relay_flows: Vec::new(),
+                text_promotion_reasons: HashSet::new(),
+                text_events: false,
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
@@ -5225,14 +5304,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         call_id: &str,
         recording_dir: Option<String>,
     ) -> CmdResult {
-        // Snapshot the pipeline + each leg's engine-local RTP address under the ownership guard (A3).
-        let Some((pipeline, a_local, b_local)) = self.owned_call(client, call_id, |call| {
-            (
-                call.pipeline,
-                call.near.rtp.local_addr,
-                call.far.rtp.local_addr,
-            )
-        }) else {
+        // Snapshot the pipeline + each leg's engine-local RTP address under the ownership guard (A3),
+        // plus each leg's text endpoint local address (for the text pcap capture) when text was
+        // negotiated — recording captures the RFC 4103 text stream too.
+        let Some((pipeline, a_local, b_local, text_locals)) =
+            self.owned_call(client, call_id, |call| {
+                let text_locals = (!call.text_relay_flows.is_empty())
+                    .then(|| {
+                        call.near
+                            .text
+                            .zip(call.far.text)
+                            .map(|(near, far)| (near.local_addr, far.local_addr))
+                    })
+                    .flatten();
+                (
+                    call.pipeline,
+                    call.near.rtp.local_addr,
+                    call.far.rtp.local_addr,
+                    text_locals,
+                )
+            })
+        else {
             return unknown_call(call_id);
         };
         if matches!(
@@ -5266,7 +5358,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Hand the actor the capture sink; the engine owns the drain task that frames + streams to disk.
         let (sender, receiver) = flume::bounded::<CapturedPacket>(PCAP_CAPTURE_QUEUE);
         let capture = PcapCapture {
-            sender,
+            sender: sender.clone(),
             a_local,
             b_local,
         };
@@ -5278,6 +5370,43 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.release_userspace_hold(call_id, PromotionReason::Recording)
                 .await;
             return error_result("start_recording", &"media actor unavailable");
+        }
+        // Capture the RFC 4103 text stream too, into the SAME pcap sink: promote only the text endpoints
+        // to the userspace text processor (the audio path is already promoted for its own recording) and
+        // hand it a capture keyed on the text endpoints' local addresses. Best-effort — a text-promotion
+        // failure leaves audio recording intact; the text stream keeps relaying in-kernel.
+        if let Some((text_a_local, text_b_local)) = text_locals {
+            if let Err(reason) = self
+                .hold_text_in_userspace(call_id, PromotionReason::Recording)
+                .await
+            {
+                tracing::warn!(
+                    target: "siphon_rtp::text",
+                    call_id,
+                    reason,
+                    "recording could not promote the text stream; text is not captured"
+                );
+            } else {
+                let text_capture = PcapCapture {
+                    sender,
+                    a_local: text_a_local,
+                    b_local: text_b_local,
+                };
+                if !self.text.control(
+                    call_id,
+                    TextControl::StartRecording {
+                        capture: text_capture,
+                    },
+                ) {
+                    self.release_text_hold(call_id, PromotionReason::Recording)
+                        .await;
+                    tracing::warn!(
+                        target: "siphon_rtp::text",
+                        call_id,
+                        "text actor unavailable for recording; text is not captured"
+                    );
+                }
+            }
         }
         tokio::spawn(run_pcap_recorder(file, receiver, path));
         ok_empty()
@@ -5294,6 +5423,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // No-op in the actor if not recording; ignored if the call has no actor (never promoted).
         self.media.control(call_id, MediaControl::StopRecording);
         self.release_userspace_hold(call_id, PromotionReason::Recording)
+            .await;
+        // Stop capturing the text stream too; the text leg stays promoted only if `text_events` still
+        // holds it, else it demotes back to the in-kernel relay.
+        self.text.control(call_id, TextControl::StopRecording);
+        self.release_text_hold(call_id, PromotionReason::Recording)
             .await;
         ok_empty()
     }
@@ -6252,6 +6386,155 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// demotion, which already validated ownership via the public verb). Returns `None` if unknown.
     fn owned_call_internal<T>(&self, call_id: &str, f: impl FnOnce(&Call) -> T) -> Option<T> {
         self.calls.get(call_id).map(|call| f(&call))
+    }
+
+    // ---- RFC 4103 text-observability promotion (parallel to the audio hold machinery above) ----
+    //
+    // A call's `m=text` stream defaults to the in-kernel `Forward` relay (PR 1). A text-observability
+    // feature — control-plane `text_events`, or a runtime recording — promotes ONLY the text endpoints
+    // to the userspace [`crate::text_pipeline`], leaving the audio relay/transcode/SRTP path exactly as
+    // it was (the maintainer's hard constraint). These functions never touch the audio flows.
+
+    /// Promote a call's text stream for control-plane events if the controller asked for them
+    /// (`ProfileFlags.text_events`) and a plaintext text stream was negotiated. Called at the end of
+    /// `answer()`. A no-op when text was not negotiated, `text_events` is unset, or the owner has no
+    /// event sink (nothing to deliver to). Best-effort — a promotion failure is logged; the text stream
+    /// keeps relaying in-kernel (PR-1 behaviour).
+    async fn maybe_promote_text_for_events(&self, call_id: &str) {
+        let Some((wants_events, has_text)) = self.owned_call_internal(call_id, |call| {
+            (call.text_events, !call.text_relay_flows.is_empty())
+        }) else {
+            return;
+        };
+        if !wants_events || !has_text {
+            return;
+        }
+        if let Err(reason) = self
+            .hold_text_in_userspace(call_id, PromotionReason::TextEvents)
+            .await
+        {
+            tracing::warn!(
+                target: "siphon_rtp::text",
+                call_id,
+                reason,
+                "failed to promote the text stream for events; it stays on the in-kernel relay"
+            );
+        }
+    }
+
+    /// Ensure `call_id`'s text stream runs in the userspace text processor so a text-observability
+    /// feature (`text_events` or recording) can attach, and record `reason` so it is not demoted while
+    /// the feature is active. Idempotent — a second hold on an already-promoted text stream just records
+    /// the reason. A no-op (with the reason still recorded) when the call negotiated no text stream.
+    async fn hold_text_in_userspace(
+        &self,
+        call_id: &str,
+        reason: PromotionReason,
+    ) -> Result<(), String> {
+        let has_text = self
+            .owned_call_internal(call_id, |call| !call.text_relay_flows.is_empty())
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        if has_text && !self.text.is_text_call(call_id) {
+            self.promote_text_to_userspace(call_id).await?;
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.text_promotion_reasons.insert(reason);
+        }
+        Ok(())
+    }
+
+    /// Release a text hold taken by [`Self::hold_text_in_userspace`] and demote the text stream back to
+    /// the in-kernel `Forward` relay if nothing else holds it (no remaining `text_promotion_reasons`).
+    async fn release_text_hold(&self, call_id: &str, reason: PromotionReason) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.text_promotion_reasons.remove(&reason);
+        }
+        let idle = self
+            .owned_call_internal(call_id, |call| call.text_promotion_reasons.is_empty())
+            .unwrap_or(true);
+        if idle {
+            self.demote_text_to_kernel(call_id).await;
+        }
+    }
+
+    /// Promote the text stream off the in-kernel `Forward` relay to the userspace text processor: switch
+    /// both text endpoints from `Forward` to `Redirect`, reconstruct the two userspace [`TextDirection`]s
+    /// from the stored text `Forward` rules (the exact same RTPBleed source-gate + symmetric latch —
+    /// `Redirect` bypasses the datapath gate, docs/security-and-nat.md §4), and register the text actor
+    /// with the owner's event sink. The audio relay is untouched.
+    async fn promote_text_to_userspace(&self, call_id: &str) -> Result<(), String> {
+        let Some((owner, from_tag, to_tag, text_relay_flows, t140_pt, red_pt)) = self
+            .owned_call_internal(call_id, |call| {
+                (
+                    call.owner,
+                    call.from_tag.clone(),
+                    call.to_tag.clone(),
+                    call.text_relay_flows.clone(),
+                    call.text_t140_payload_type,
+                    call.text_red_payload_type,
+                )
+            })
+        else {
+            return Err("call no longer exists".to_string());
+        };
+        // Reconstruct the A→B and B→A wiring from the two stored text `Forward` rules (near then far),
+        // exactly as the audio promotion does from `relay_flows`.
+        let layout = relay_layout_from_flows(&text_relay_flows)?;
+        let a_to_b = TextDirectionConfig {
+            ingress_endpoint: layout.near_endpoint,
+            accepted_source: layout.near_rule.accepted_source,
+            egress_endpoint: layout.near_rule.out_endpoint,
+            egress_dst: layout.b_dst,
+            t140_payload_type: t140_pt,
+            red_payload_type: red_pt,
+        };
+        let b_to_a = TextDirectionConfig {
+            ingress_endpoint: layout.far_endpoint,
+            accepted_source: layout.far_rule.accepted_source,
+            egress_endpoint: layout.far_rule.out_endpoint,
+            egress_dst: layout.a_dst,
+            t140_payload_type: t140_pt,
+            red_payload_type: red_pt,
+        };
+        // Switch both text endpoints to Redirect so the dispatcher routes them to the text actor.
+        for endpoint in [layout.near_endpoint, layout.far_endpoint] {
+            self.datapath
+                .install_flow(endpoint, FlowAction::Redirect)
+                .map_err(|error| format!("install text redirect: {error}"))?;
+        }
+        let call = TextCall::new(call_id, from_tag, to_tag, a_to_b, b_to_a, layout.latch);
+        let owner_events = self.events.get(&owner).map(|sink| sink.value().clone());
+        self.text
+            .register(call, self.datapath.clone(), owner_events);
+        Ok(())
+    }
+
+    /// Demote a promoted text stream back to the in-kernel `Forward` relay once no text-observability
+    /// feature holds it: deregister the text actor (drops its routes) and reinstall the two stored text
+    /// `Forward` rules (the ones promotion redirected away from). Best-effort — on an install error the
+    /// text leg is left redirected (still relaying + observing through the actor), which is correct if
+    /// heavier, and logged.
+    async fn demote_text_to_kernel(&self, call_id: &str) {
+        if !self.text.is_text_call(call_id) {
+            return;
+        }
+        let Some(text_relay_flows) =
+            self.owned_call_internal(call_id, |call| call.text_relay_flows.clone())
+        else {
+            return;
+        };
+        self.text.deregister(call_id);
+        for (endpoint, action) in &text_relay_flows {
+            if let Err(error) = self.datapath.install_flow(*endpoint, *action) {
+                tracing::warn!(
+                    target: "siphon_rtp::text",
+                    %error,
+                    call_id,
+                    "demote text: failed to reinstall Forward rule; text leg stays redirected"
+                );
+                return;
+            }
+        }
     }
 
     /// SIPREC `subscribe_answer` (RFC 7866): the SRS's answer brings its RTP address. Parse it, then
@@ -7721,6 +8004,7 @@ fn leg_summary(
     codec: Option<&CodecSpec>,
     counters: &siphon_rtp_datapath::EndpointStats,
     quality: Option<&DirectionQuality>,
+    text: Option<siphon_rtp_proto::TextStreamStats>,
 ) -> LegSummary {
     let mut summary = LegSummary {
         tag: tag.to_string(),
@@ -7739,6 +8023,8 @@ fn leg_summary(
         mos_min: None,
         mos_max: None,
         mos_basis: None,
+        // RFC 4103 content QoS, present only when the call promoted the text stream for observability.
+        text,
     };
     if let Some(quality) =
         quality.filter(|quality| quality.ssrc.is_some() || quality.packets_received > 0)

@@ -30,7 +30,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{resolve_defaulted, resolve_optional, FileConfig, InterfaceConfig};
 use crate::interface::{InterfaceEntry, InterfaceTable};
-use crate::srtp_bridge::run_redirect_dispatcher;
+use crate::srtp_bridge::run_redirect_dispatcher_with_text;
 use crate::{cluster, metrics, server, shutdown, ClientId, Engine};
 
 /// The engine's shared CLI surface, common to every datapath binary. Kept a **flattenable**
@@ -534,10 +534,11 @@ where
     // The single redirect dispatcher: own `datapath.rx()` and route each redirected datagram by
     // EndpointId to the SRTP bridge or (when running) the TURN relay — the sole consumer of the
     // shared Redirect stream (docs/security-and-nat.md §11; the datapath's single-dispatcher rule).
-    tokio::spawn(run_redirect_dispatcher(
+    tokio::spawn(run_redirect_dispatcher_with_text(
         datapath.rx(),
         engine.bridge(),
         engine.media(),
+        engine.text(),
         engine.ws(),
         engine.conference(),
         turn_relay,
