@@ -540,20 +540,33 @@ so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the 
 - **Room bridging** crosses the only actor boundary in the design: a bounded, drop-oldest `flume`
   channel carries one room's *participant-only* mix (never its full mix, so a bridge cannot echo a
   room back to itself) to another room — no shared state between room actors (single-owner rule).
-- **RFC 9071 multiparty text (plaintext).** A participant that offers a *plaintext* `m=text` (RFC 4103)
-  stream gets a **second** redirected engine endpoint (its own, distinct from audio), seated in the same
-  room actor. That text endpoint is a full inbound surface and carries its **own** copy of Layers 1–3:
-  `Conference::ingest_text` runs the per-stream `SourceFilter` gate before reassembly and moves the text
-  reply address only for an SSRC-consistent stream (`ParticipantText::reverse_latch`) — a spoofed text
-  packet neither enters the room's text mix nor moves the text latch, and the audio and text gates are
-  wholly independent. The room mixes each participant's T.140 across the others **mix-minus-self**
-  (`TextMixer`, a sibling to the audio `Mixer` — text is tagged, never summed), labelling every emitted
-  packet with the contributing source's identity in the RTP **CSRC** list (RFC 9071 §4.2) so a receiver
-  presents each source separately, on a **second, ~300 ms cadence** independent of the 20 ms audio tick.
-  A *secure* (`RTP/SAVP`) conference text section is **declined** (`m=text 0`), never downgraded —
-  secure conference text (a per-participant `SecureLeg` for text) is a follow-up. The text endpoint is
-  part of the room's endpoint set for the idle reap (text activity keeps the seat) and is freed with the
-  participant on leave/teardown.
+- **RFC 9071 multiparty text (plaintext and secure).** A participant that offers an `m=text` (RFC 4103)
+  stream — `RTP/AVP` **or** secure `RTP/SAVP` — gets a **second** redirected engine endpoint (its own,
+  distinct from audio), seated in the same room actor. That text endpoint is a full inbound surface and
+  carries its **own** copy of Layers 1–3: `Conference::ingest_text` runs the per-stream `SourceFilter`
+  gate on the wire source before anything else and moves the text reply address only for an
+  SSRC-consistent stream (`ParticipantText::reverse_latch`) — a spoofed text packet neither enters the
+  room's text mix nor moves the text latch, and the audio and text gates are wholly independent. The
+  room mixes each participant's T.140 across the others **mix-minus-self** (`TextMixer`, a sibling to the
+  audio `Mixer` — text is tagged, never summed), labelling every emitted packet with the contributing
+  source's identity in the RTP **CSRC** list (RFC 9071 §4.2) so a receiver presents each source
+  separately, on a **second, ~300 ms cadence** independent of the 20 ms audio tick.
+- **SDES-SRTP secure conference text — per-participant, independently keyed.** A participant offering a
+  secure (`RTP/SAVP` + `a=crypto`) `m=text` section gets a per-participant text `SecureLeg`, keyed
+  exactly like its secure audio leg: `conference_join` mints the engine's own text SDES key, answers
+  `RTP/SAVP` + its own text `a=crypto` (`TextRewrite::AnchorSecure`), and stores the `SecureLeg` on the
+  participant's text config. On ingress (`Conference::ingest_text`) the SRTP text packet is **decrypted
+  first — fail-closed**: a packet failing SRTP auth/replay is dropped before it is reassembled, mixed,
+  observed, or allowed to move the latch (the auth tag proves authenticity, so a forged/replayed packet
+  never steers the reply), so the whole reassembly/mix/latch runs on plaintext — the same order the
+  secure **audio** leg uses. On egress (`Conference::text_tick`) each distributed increment is
+  **re-encrypted with the receiving participant's own key** (a plaintext receiver gets it in the clear);
+  the room's text mix itself stays **internal plaintext**, exactly as the audio mix does in a room that
+  mixes secure and plaintext legs together. A secure text section the engine cannot key/anchor (no usable
+  `t140`, or no usable `a=crypto`) is **declined** (`m=text 0`, RFC 3264 §6), never downgraded. DTLS-SRTP
+  conference text (like DTLS conference audio) remains a follow-up. The text endpoint is part of the
+  room's endpoint set for the idle reap (text activity keeps the seat) and is freed with the participant
+  on leave/teardown.
 
 ### Layer 5d — The RFC 4103 Real-Time Text (RTT) relay path
 A VoLTE/IMS call may carry a second media stream: an `m=text` line (RFC 4103, T.140 over RTP, usually
