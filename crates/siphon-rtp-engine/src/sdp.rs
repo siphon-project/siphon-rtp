@@ -100,6 +100,37 @@ pub struct MediaInfo {
     /// The stream's `a=maxptime` in milliseconds, if present (RFC 4566 §6): the longest packet the
     /// peer will accept. Caps every codec's egress `ptime_ms` on this stream.
     pub maxptime_ms: Option<u8>,
+    /// The first RFC 4103 Real-Time Text stream (`m=text ... RTP/AVP` carrying T.140/RED), if the
+    /// offer/answer carried one alongside the audio. `None` for an audio-only SDP. Parsed but relayed
+    /// transparently (PR 1 does not decode RED/T.140 — RFC 2198 / RFC 4103 payload parsing lands later).
+    pub text: Option<TextMediaInfo>,
+}
+
+/// The remote RFC 4103 text (T.140-over-RTP) transport advertised by an SDP `m=text` section, parsed
+/// alongside the audio [`MediaInfo`]. The engine anchors and transparently relays this stream; the
+/// T.140/RED payload (RFC 4103 / RFC 2198) is not decoded here — only its transport, security posture,
+/// and the negotiated T.140/RED payload types are captured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextMediaInfo {
+    /// Remote RTP address of the text stream (its media-level `c=` else the session `c=`, with the
+    /// `m=text` port).
+    pub remote_rtp: SocketAddr,
+    /// Remote RTCP address: the text `a=rtcp:` port if present, else RTP port + 1 (RFC 3550); equal to
+    /// `remote_rtp` when the text stream offered `a=rtcp-mux` (RFC 5761).
+    pub remote_rtcp: SocketAddr,
+    /// Whether the text stream offered `a=rtcp-mux` (RTP and RTCP share one port, RFC 5761).
+    pub rtcp_mux: bool,
+    /// Whether the `m=text` transport is a secure profile (`RTP/SAVP[F]`) — SRTP-keyed text. A secure
+    /// text stream is declined in PR 1 (answered `m=text 0`, never downgraded); secure text relay is a
+    /// follow-up.
+    pub secure: bool,
+    /// The negotiated T.140 payload type (`a=rtpmap:<pt> t140/1000`, RFC 4103 §5), if the section
+    /// carried one. Case-insensitive on the encoding name; the 1000 Hz clock is the RFC 4103 T.140 rate.
+    pub t140_payload_type: Option<u8>,
+    /// The negotiated RFC 2198 redundancy payload type (`a=rtpmap:<pt> red/1000`) wrapping the T.140
+    /// blocks, if the section offered redundancy. Case-insensitive; PR 1 relays the RED packets
+    /// verbatim (the redundant-block decode is a follow-up).
+    pub red_payload_type: Option<u8>,
 }
 
 /// A DTLS certificate fingerprint (RFC 8122), carried in `a=fingerprint`. In DTLS-SRTP the SDP does
@@ -198,6 +229,19 @@ pub struct RtpMap {
     pub clock_rate_hz: u32,
     /// Channel count (defaults to 1 when the optional `/channels` suffix is absent).
     pub channels: u8,
+}
+
+/// The media type of an SDP `m=` section, so [`rewrite`] can tell which section any line belongs to
+/// and scope the audio-only ICE/crypto/fingerprint/rtcp-mux strips to the session + audio regions —
+/// never corrupting a text or video (`Other`) section (RFC 4566 §5.14 multi-`m=` SDP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaKind {
+    /// `m=audio` — the (single) audio stream this engine anchors/transcodes.
+    Audio,
+    /// `m=text` — an RFC 4103 Real-Time Text stream.
+    Text,
+    /// Any other media (`m=video`, `m=application`, …) — passed through verbatim.
+    Other,
 }
 
 impl MediaInfo {
@@ -399,6 +443,23 @@ struct AudioScan {
     ice_lite: bool,
     /// Whether the peer sent `a=ice-mismatch` (RFC 8839 §5.3).
     ice_mismatch: bool,
+    /// Every `m=` section in order: (line index of the `m=` line, its media kind). Lets [`rewrite`]
+    /// map any line to the section it belongs to, so the audio-only attribute strips never touch a
+    /// text/other section (fixes the multi-`m=` strip-scoping bug).
+    sections: Vec<(usize, MediaKind)>,
+    /// The FIRST `m=text` (RFC 4103) section: (line index, port). `None` for an audio-only SDP.
+    text_media: Option<(usize, u16)>,
+    /// The `m=text` transport profile (3rd field, e.g. `RTP/AVP` or `RTP/SAVP`).
+    text_transport: Option<String>,
+    /// The text section's media-level `c=` connection: (line index, address). Falls back to the
+    /// session `c=` when absent.
+    text_conn: Option<(usize, IpAddr)>,
+    /// The text section's `a=rtcp:` line: (line index, port).
+    text_rtcp: Option<(usize, u16)>,
+    /// Whether the text section offered `a=rtcp-mux` (RFC 5761).
+    text_rtcp_mux: bool,
+    /// `a=rtpmap` entries in the text section — resolves the `t140`/`red` payload types (RFC 4103).
+    text_rtpmaps: Vec<RtpMap>,
 }
 
 /// Parse an `a=rtpmap` attribute body (`rtpmap:<pt> <encoding>/<clock>[/<channels>]`).
@@ -551,12 +612,18 @@ fn parse_connection_addr(value: &str) -> Option<IpAddr> {
     }
 }
 
-fn parse_media_port(value: &str) -> Option<u16> {
+/// Parse an `m=<media> <port> …` line body into its media kind and port (RFC 4566 §5.14). Returns the
+/// [`MediaKind`] for every section (so the scan can record it) and the port when it parses — `None`
+/// port for a malformed/`0`-less field. Generalises the old audio-only `parse_media_port`.
+fn parse_media_line(value: &str) -> (MediaKind, Option<u16>) {
     let mut parts = value.split_whitespace();
-    match parts.next() {
-        Some("audio") => parts.next().and_then(|port| port.parse::<u16>().ok()),
-        _ => None,
-    }
+    let kind = match parts.next() {
+        Some("audio") => MediaKind::Audio,
+        Some("text") => MediaKind::Text,
+        _ => MediaKind::Other,
+    };
+    let port = parts.next().and_then(|port| port.parse::<u16>().ok());
+    (kind, port)
 }
 
 /// Parse the port from an `a=rtcp:<port> [...]` attribute body (`rtcp:<port> ...`).
@@ -593,9 +660,17 @@ fn scan(sdp: &str) -> AudioScan {
         setup: None,
         ice_ufrag: None,
         ice_pwd: None,
+        sections: Vec::new(),
+        text_media: None,
+        text_transport: None,
+        text_conn: None,
+        text_rtcp: None,
+        text_rtcp_mux: false,
+        text_rtpmaps: Vec::new(),
     };
     let mut seen_media = false;
     let mut in_audio = false;
+    let mut in_text = false;
 
     for (index, raw_line) in sdp.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
@@ -604,23 +679,40 @@ fn scan(sdp: &str) -> AudioScan {
         };
         match key {
             "m" => {
-                if scan.audio_media.is_none() {
-                    if let Some(port) = parse_media_port(value) {
-                        scan.audio_media = Some((index, port));
-                        // `audio <port> <proto> <pt> <pt> …`: the transport is field 2, payload types
-                        // follow it (the codec priority order).
-                        let mut fields = value.split_whitespace();
-                        scan.transport = fields.nth(2).map(str::to_string);
-                        scan.payload_types = fields
-                            .filter_map(|field| field.parse::<u8>().ok())
-                            .collect();
-                        in_audio = true;
-                        seen_media = true;
-                        continue;
-                    }
-                }
-                in_audio = false;
                 seen_media = true;
+                let (kind, port) = parse_media_line(value);
+                // Record every section (index + kind) so `rewrite` can scope its edits per section.
+                scan.sections.push((index, kind));
+                // Leaving one section always resets both "in-section" flags; the arms below re-set the
+                // one that applies when this m-line opens the audio or text section we capture.
+                in_audio = false;
+                in_text = false;
+                match kind {
+                    MediaKind::Audio if scan.audio_media.is_none() => {
+                        if let Some(port) = port {
+                            scan.audio_media = Some((index, port));
+                            // `audio <port> <proto> <pt> <pt> …`: the transport is field 2, payload
+                            // types follow it (the codec priority order).
+                            let mut fields = value.split_whitespace();
+                            scan.transport = fields.nth(2).map(str::to_string);
+                            scan.payload_types = fields
+                                .filter_map(|field| field.parse::<u8>().ok())
+                                .collect();
+                            in_audio = true;
+                        }
+                    }
+                    MediaKind::Text if scan.text_media.is_none() => {
+                        if let Some(port) = port {
+                            scan.text_media = Some((index, port));
+                            // `text <port> <proto> <pt> …`: transport is field 2 (secure = a SAVP
+                            // profile), the T.140/RED payload types follow.
+                            scan.text_transport =
+                                value.split_whitespace().nth(2).map(str::to_string);
+                            in_text = true;
+                        }
+                    }
+                    _ => {}
+                }
             }
             "c" => {
                 if let Some(addr) = parse_connection_addr(value) {
@@ -628,17 +720,24 @@ fn scan(sdp: &str) -> AudioScan {
                         scan.session_conn = Some((index, addr));
                     } else if in_audio && scan.audio_conn.is_none() {
                         scan.audio_conn = Some((index, addr));
+                    } else if in_text && scan.text_conn.is_none() {
+                        scan.text_conn = Some((index, addr));
                     }
                 }
             }
             "a" => {
-                // ICE credentials may be session- or media-level; media-level overrides.
+                // ICE / DTLS credentials apply to the audio stream only here: capture them in the
+                // session region (before any `m=`) or inside the audio section, media-level winning.
+                // Scoping to session-or-audio keeps a text/video section's own `a=ice-*`/`a=fingerprint`
+                // /`a=setup` from bleeding into the audio [`MediaInfo`] (the parse side of the multi-`m=`
+                // bug the rewrite scoping fixes).
+                let session_or_audio = !seen_media || in_audio;
                 if let Some(ufrag) = value.strip_prefix("ice-ufrag:") {
-                    if in_audio || scan.ice_ufrag.is_none() {
+                    if session_or_audio && (in_audio || scan.ice_ufrag.is_none()) {
                         scan.ice_ufrag = Some(ufrag.trim().to_string());
                     }
                 } else if let Some(pwd) = value.strip_prefix("ice-pwd:") {
-                    if in_audio || scan.ice_pwd.is_none() {
+                    if session_or_audio && (in_audio || scan.ice_pwd.is_none()) {
                         scan.ice_pwd = Some(pwd.trim().to_string());
                     }
                 } else if value == "ice-lite" {
@@ -685,16 +784,28 @@ fn scan(sdp: &str) -> AudioScan {
                     }
                 } else if value.starts_with("fingerprint:") {
                     // RFC 8122 `a=fingerprint` — session- or media-level; media-level wins (like ICE).
-                    if in_audio || scan.fingerprint.is_none() {
+                    if session_or_audio && (in_audio || scan.fingerprint.is_none()) {
                         if let Some(fingerprint) = Fingerprint::parse(value) {
                             scan.fingerprint = Some(fingerprint);
                         }
                     }
                 } else if value.starts_with("setup:") {
                     // RFC 4145 `a=setup` — session- or media-level; media-level wins.
-                    if in_audio || scan.setup.is_none() {
+                    if session_or_audio && (in_audio || scan.setup.is_none()) {
                         if let Some(setup) = Setup::parse(value) {
                             scan.setup = Some(setup);
+                        }
+                    }
+                } else if in_text {
+                    // Text section attributes needed to anchor + relay the RFC 4103 stream: its RTCP
+                    // multiplexing intent, explicit RTCP port, and the `t140`/`red` rtpmaps.
+                    if value == "rtcp-mux" {
+                        scan.text_rtcp_mux = true;
+                    } else if let Some(port) = parse_rtcp_attr(value) {
+                        scan.text_rtcp = Some((index, port));
+                    } else if value.starts_with("rtpmap:") {
+                        if let Some(rtpmap) = parse_rtpmap(value) {
+                            scan.text_rtpmaps.push(rtpmap);
                         }
                     }
                 } else if in_audio {
@@ -783,7 +894,56 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         opus_params: scan.fmtp_opus.clone(),
         ptime_ms: scan.ptime_ms.unwrap_or(DEFAULT_PTIME_MS),
         maxptime_ms: scan.maxptime_ms,
+        text: text_media_info(scan),
     })
+}
+
+/// Resolve the [`TextMediaInfo`] for the first `m=text` section, if the SDP carried one with a usable
+/// connection address (its own media-level `c=`, else the session `c=`). A text section without any
+/// connection address is treated as absent — audio is what the parse must yield, and a text stream we
+/// cannot address is not relayable.
+fn text_media_info(scan: &AudioScan) -> Option<TextMediaInfo> {
+    let (_, text_port) = scan.text_media?;
+    let ip = scan
+        .text_conn
+        .map(|(_, addr)| addr)
+        .or_else(|| scan.session_conn.map(|(_, addr)| addr))?;
+    let remote_rtp = SocketAddr::new(ip, text_port);
+    let rtcp_mux = scan.text_rtcp_mux;
+    let remote_rtcp = if rtcp_mux {
+        remote_rtp
+    } else {
+        let rtcp_port = scan
+            .text_rtcp
+            .map(|(_, port)| port)
+            .unwrap_or(text_port.wrapping_add(1));
+        SocketAddr::new(ip, rtcp_port)
+    };
+    Some(TextMediaInfo {
+        remote_rtp,
+        remote_rtcp,
+        rtcp_mux,
+        // RFC 4103 text over a secure profile (`RTP/SAVP[F]`) is SRTP-keyed; declined in PR 1.
+        secure: scan
+            .text_transport
+            .as_deref()
+            .is_some_and(|transport| transport.contains("SAVP")),
+        // RFC 4103 §5: T.140 is `t140/1000`; RFC 2198 redundancy is `red/1000`. Match the encoding
+        // name case-insensitively at the 1000 Hz text clock (RFC 4566 §6 names are case-insensitive).
+        t140_payload_type: text_payload_type(&scan.text_rtpmaps, "t140"),
+        red_payload_type: text_payload_type(&scan.text_rtpmaps, "red"),
+    })
+}
+
+/// Find the payload type of a text-stream rtpmap by encoding name (case-insensitive) at the RFC 4103
+/// 1000 Hz text clock. The clock check rejects a same-named map at another rate.
+fn text_payload_type(rtpmaps: &[RtpMap], encoding_name: &str) -> Option<u8> {
+    rtpmaps
+        .iter()
+        .find(|map| {
+            map.encoding_name.eq_ignore_ascii_case(encoding_name) && map.clock_rate_hz == 1000
+        })
+        .map(|map| map.payload_type)
 }
 
 /// Parse the remote audio transport info from an SDP without rewriting it.
@@ -856,6 +1016,25 @@ impl SecurityAdvertisement {
     }
 }
 
+/// How [`rewrite`] treats the SDP's first `m=text` (RFC 4103) section. The audio directives above are
+/// unchanged; this adds the text stream as a second, independently-anchored stream (RFC 3264 §5/§6).
+#[derive(Debug, Clone, Copy)]
+pub enum TextRewrite {
+    /// No text section to act on — leave any `m=text` section's lines untouched. Used when the SDP
+    /// carried no text stream, or for every caller that does not (yet) anchor text.
+    None,
+    /// Anchor a plaintext text stream to the engine: rewrite its `m=text` port and connection to the
+    /// engine's text endpoint (`EngineMedia.rtp` / `advertised_ip`) so the relay owns the media path,
+    /// never leaking the UE's (often private) address (RFC 3264 §5). Text RTCP is not separately
+    /// anchored in PR 1 — any text `a=rtcp:` is dropped (single text port; text RTCP relay is a
+    /// follow-up).
+    Anchor(EngineMedia),
+    /// Reject the text stream: set its `m=text` port to `0` (RFC 3264 §6 — a rejected media stream).
+    /// Used for a secure (`RTP/SAVP`) text section this build will not bridge yet — declined, never
+    /// downgraded to plaintext.
+    Decline,
+}
+
 /// Host-candidate priority (RFC 8445 §5.1.2): type-pref 126, local-pref 65535, component 1 (RTP).
 /// Shared with the consent driver, whose checks must advertise the same PRIORITY they would carry in
 /// a connectivity check for this candidate (RFC 8445 §7.1.1) — one definition, not two.
@@ -903,12 +1082,21 @@ fn is_ice_attribute(line: &str) -> bool {
 /// [`IceRewrite::Reoriginate`] drops the peer's ICE and re-originates ICE-lite with `a=ice-lite`
 /// plus the engine's own `a=ice-ufrag`/`a=ice-pwd` and a host `a=candidate` for the engine RTP
 /// address (rtpengine `ICE=force` / mirroring a peer's ICE offer).
+///
+/// `text` handles a second `m=text` (RFC 4103) stream: [`TextRewrite::None`] leaves it untouched,
+/// [`TextRewrite::Anchor`] rewrites its port/connection to a separate engine text endpoint (plaintext
+/// relay), and [`TextRewrite::Decline`] rejects it (`m=text 0`, RFC 3264 §6). The rewrite is
+/// **section-scoped**: the audio ICE/crypto/fingerprint/rtcp-mux strips above run only over the
+/// session region and the audio section, never a text or other (`m=video`, …) section — so a
+/// secure-audio rewrite no longer corrupts a text section's own keying/ICE, and a non-audio section is
+/// passed through verbatim (fixes the two latent multi-`m=` bugs).
 pub fn rewrite(
     sdp: &str,
     engine: EngineMedia,
     ice: IceRewrite<'_>,
     security: Option<SecurityAdvertisement>,
     mux_override: Option<bool>,
+    text: TextRewrite,
 ) -> Result<Rewritten, SdpError> {
     let scan = scan(sdp);
     let media = media_info(&scan)?;
@@ -925,30 +1113,94 @@ pub fn rewrite(
         ice,
         IceRewrite::Strip | IceRewrite::Reoriginate(_) | IceRewrite::Mismatch
     );
+    // Text section line indices (all `None` for an audio-only SDP or `TextRewrite::None`).
+    let text_media_index = scan.text_media.map(|(index, _)| index);
+    let text_rtcp_index = scan.text_rtcp.map(|(index, _)| index);
+    // Connection lines to rewrite to an engine advertised IP, and to which IP. The audio stream's `c=`
+    // (its media-level, else the session `c=`) always maps to the audio engine IP. When anchoring text,
+    // its own media-level `c=` (else the session `c=` it falls back to) maps to the text engine IP —
+    // this is what stops a text section from leaking the UE address when audio carries its own `c=`
+    // (bug 2). Audio + text share the interface's advertised IP in this PR, so a shared session `c=`
+    // rewritten to it is correct for both.
+    let mut conn_rewrites: std::collections::HashMap<usize, IpAddr> =
+        std::collections::HashMap::new();
+    conn_rewrites.insert(conn_index, engine.advertised_ip);
+    if let TextRewrite::Anchor(text_engine) = text {
+        let text_conn_index = scan
+            .text_conn
+            .map(|(index, _)| index)
+            .or_else(|| scan.session_conn.map(|(index, _)| index));
+        if let Some(index) = text_conn_index {
+            conn_rewrites.insert(index, text_engine.advertised_ip);
+        }
+    }
+
+    // Track which section each line belongs to so the audio-only strips below never touch a text/other
+    // section. `current_kind = None` is the session region (before the first `m=`).
+    let mut section_iter = scan.sections.iter().peekable();
+    let mut current_kind: Option<MediaKind> = None;
+
     let mut lines: Vec<String> = Vec::new();
     for (index, raw_line) in sdp.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        // Drop the peer's ICE attributes when stripping or re-originating (RFC 8839 §5); we advertise
-        // our own below only when re-originating.
-        if strip_peer_ice && is_ice_attribute(line) {
-            continue;
+        // Advance the section as we reach each `m=` line (the m-line belongs to the section it opens).
+        if let Some((m_index, kind)) = section_iter.peek() {
+            if *m_index == index {
+                current_kind = Some(*kind);
+                section_iter.next();
+            }
         }
-        // Re-originating secure keying: drop the peer's `a=crypto` (SDES) and `a=fingerprint`/`a=setup`
-        // (DTLS); we advertise our own below (or none, for a plaintext downgrade).
-        if security.is_some()
-            && (line.starts_with("a=crypto:")
-                || line.starts_with("a=fingerprint:")
-                || line.starts_with("a=setup:"))
-        {
-            continue;
+        // The audio-plane attribute strips apply only to the session region + the audio section — never
+        // a text/other section (RFC 4566 §5.14). This is the scoping that keeps a secure-audio rewrite
+        // from stripping a text/video section's own crypto/ICE (bug 1).
+        let session_or_audio = current_kind.is_none() || current_kind == Some(MediaKind::Audio);
+        if session_or_audio {
+            // Drop the peer's ICE attributes when stripping or re-originating (RFC 8839 §5); we
+            // advertise our own below only when re-originating.
+            if strip_peer_ice && is_ice_attribute(line) {
+                continue;
+            }
+            // Re-originating secure keying: drop the peer's `a=crypto` (SDES) and
+            // `a=fingerprint`/`a=setup` (DTLS); we advertise our own below (or none, for a downgrade).
+            if security.is_some()
+                && (line.starts_with("a=crypto:")
+                    || line.starts_with("a=fingerprint:")
+                    || line.starts_with("a=setup:"))
+            {
+                continue;
+            }
+            // RFC 5761 rtcp-mux override: strip the peer's `a=rtcp-mux` when forcing demux
+            // (`Some(false)`) or when forcing mux (`Some(true)` — we re-emit exactly one after the media
+            // line, so drop any input copy to avoid a duplicate). `None` leaves the line untouched.
+            if line == "a=rtcp-mux" && matches!(mux_override, Some(false) | Some(true)) {
+                continue;
+            }
         }
-        // RFC 5761 rtcp-mux override: strip the peer's `a=rtcp-mux` when forcing demux
-        // (`Some(false)`) or when forcing mux (`Some(true)` — we re-emit exactly one after the media
-        // line, so drop any input copy to avoid a duplicate). `None` leaves the line untouched.
-        if line == "a=rtcp-mux" && matches!(mux_override, Some(false) | Some(true)) {
-            continue;
-        }
-        if index == media_index {
+        if Some(index) == text_media_index {
+            // The `m=text` line: anchor its port to the engine text endpoint, or decline it (port 0).
+            match text {
+                TextRewrite::Anchor(text_engine) => {
+                    // Keep the text transport + format list; only the port is anchored.
+                    lines.push(rewrite_media_line(
+                        line,
+                        text_engine.rtp.port(),
+                        Option::None,
+                    ));
+                }
+                TextRewrite::Decline => {
+                    // RFC 3264 §6: a rejected stream keeps its formats but advertises port 0.
+                    lines.push(rewrite_media_line(line, 0, Option::None));
+                }
+                TextRewrite::None => lines.push(line.to_string()),
+            }
+        } else if Some(index) == text_rtcp_index {
+            // Text RTCP is not separately anchored in PR 1: drop an anchored text section's `a=rtcp:`
+            // (single text port; text RTCP relay is a follow-up). Leave it in place otherwise.
+            match text {
+                TextRewrite::Anchor(_) => { /* drop the text a=rtcp line */ }
+                TextRewrite::None | TextRewrite::Decline => lines.push(line.to_string()),
+            }
+        } else if index == media_index {
             // `a=ice-lite` is session-level — emit it just before the media line (end of session).
             if matches!(ice, IceRewrite::Reoriginate(_)) {
                 lines.push("a=ice-lite".to_string());
@@ -1005,11 +1257,12 @@ pub fn rewrite(
                 // peer can stop waiting for more instead of holding its checklist open.
                 lines.push(END_OF_CANDIDATES_ATTRIBUTE.to_string());
             }
-        } else if index == conn_index {
+        } else if let Some(&ip) = conn_rewrites.get(&index) {
             // RFC 4566 §5.7: emit the addrtype of the engine endpoint's own family (`IP4`/`IP6`),
             // so a v6 engine endpoint is advertised as `c=IN IP6` and a v4 one as `c=IN IP4`. The IP
-            // is the interface's advertised (public) address, not the bound one — same family.
-            let ip = engine.advertised_ip;
+            // is the interface's advertised (public) address, not the bound one — same family. Both the
+            // audio and an anchored text stream's connection lines resolve here (they share the
+            // advertised IP in this PR).
             lines.push(format!("c=IN {} {}", addrtype(ip), ip));
         } else if Some(index) == rtcp_index {
             match engine.rtcp {
@@ -1955,7 +2208,15 @@ mod tests {
             "127.0.0.1:40000".parse().unwrap(),
             Some("127.0.0.1:40001".parse().unwrap()),
         );
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
             "203.0.113.7:49170".parse().unwrap()
@@ -1980,7 +2241,15 @@ mod tests {
             "127.0.0.1:40000".parse().unwrap(),
             Some("127.0.0.1:40001".parse().unwrap()),
         );
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
         assert!(result.sdp.contains("a=rtcp:40001"));
         assert!(!result.sdp.contains("53000"));
         assert_eq!(
@@ -1996,7 +2265,15 @@ mod tests {
         sdp.push_str("a=rtcp:53000\r\n");
         sdp.push_str("a=rtcp-mux\r\n");
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
         assert!(
             !result.sdp.contains("a=rtcp:"),
             "explicit a=rtcp dropped under mux"
@@ -2009,7 +2286,15 @@ mod tests {
         // RFC 5761: `mux_override = Some(true)` emits `a=rtcp-mux` even though the offer carried none.
         let sdp = offer("203.0.113.7", 49170); // no a=rtcp-mux
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(true)).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            Some(true),
+            TextRewrite::None,
+        )
+        .expect("rewrite");
         assert_eq!(
             result.sdp.matches("a=rtcp-mux").count(),
             1,
@@ -2025,7 +2310,15 @@ mod tests {
         let mut sdp = offer("203.0.113.7", 49170);
         sdp.push_str("a=rtcp-mux\r\n");
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(true)).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            Some(true),
+            TextRewrite::None,
+        )
+        .expect("rewrite");
         assert_eq!(
             result.sdp.matches("a=rtcp-mux").count(),
             1,
@@ -2044,7 +2337,15 @@ mod tests {
             "127.0.0.1:40000".parse().unwrap(),
             Some("127.0.0.1:40001".parse().unwrap()),
         );
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, Some(false)).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            Some(false),
+            TextRewrite::None,
+        )
+        .expect("rewrite");
         assert!(
             !result.sdp.contains("a=rtcp-mux"),
             "a=rtcp-mux stripped under demux: {}",
@@ -2061,27 +2362,42 @@ mod tests {
         let mut muxed = offer("203.0.113.7", 49170);
         muxed.push_str("a=rtcp-mux\r\n");
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        assert!(rewrite(&muxed, engine, IceRewrite::Keep, None, None)
-            .expect("rewrite")
-            .sdp
-            .contains("a=rtcp-mux"));
+        assert!(rewrite(
+            &muxed,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None
+        )
+        .expect("rewrite")
+        .sdp
+        .contains("a=rtcp-mux"));
         // A non-muxed offer stays non-muxed under `None`.
         let plain = offer("203.0.113.7", 49170);
         let engine = EngineMedia::new(
             "127.0.0.1:40000".parse().unwrap(),
             Some("127.0.0.1:40001".parse().unwrap()),
         );
-        assert!(!rewrite(&plain, engine, IceRewrite::Keep, None, None)
-            .expect("rewrite")
-            .sdp
-            .contains("a=rtcp-mux"));
+        assert!(!rewrite(
+            &plain,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None
+        )
+        .expect("rewrite")
+        .sdp
+        .contains("a=rtcp-mux"));
     }
 
     #[test]
     fn media_level_connection_overrides_session_level() {
         let sdp = "v=0\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\nc=IN IP4 198.51.100.9\r\n";
         let engine = EngineMedia::new("127.0.0.1:41000".parse().unwrap(), None);
-        let result = rewrite(sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
+        let result =
+            rewrite(sdp, engine, IceRewrite::Keep, None, None, TextRewrite::None).expect("rewrite");
         assert_eq!(
             result.media.remote_rtp,
             "198.51.100.9:5000".parse().unwrap()
@@ -2143,7 +2459,15 @@ mod tests {
             "[::1]:40000".parse().unwrap(),
             Some("[::1]:40001".parse().unwrap()),
         );
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite v6");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite v6");
         assert_eq!(
             result.media.remote_rtp,
             "[2001:db8::1]:49170".parse().unwrap()
@@ -2182,8 +2506,15 @@ mod tests {
             pwd: "engpassword01234567",
             candidates: &candidates,
         };
-        let result = rewrite(sdp, engine, IceRewrite::Reoriginate(advert), None, None)
-            .expect("rewrite v6 ice");
+        let result = rewrite(
+            sdp,
+            engine,
+            IceRewrite::Reoriginate(advert),
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite v6 ice");
         assert!(result.sdp.contains("c=IN IP6 ::1"));
         let emitted = result
             .sdp
@@ -2210,7 +2541,15 @@ mod tests {
         // proving the addrtype is picked from the endpoint, not hardcoded either way.
         let sdp = offer("203.0.113.7", 49170);
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite v4");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite v4");
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(
             !result.sdp.contains("IP6"),
@@ -2239,7 +2578,7 @@ mod tests {
         fn parsers_never_panic(text in "(?s).{0,400}") {
             let _ = parse(&text);
             let engine = EngineMedia::new("192.0.2.1:10000".parse().expect("addr"), None);
-            let _ = rewrite(&text, engine, IceRewrite::Keep, None, None);
+            let _ = rewrite(&text, engine, IceRewrite::Keep, None, None, TextRewrite::None);
             let _ = force_answer_codec(&text, &CodecSpec::new(0, "PCMU", 8000, 1, 20), Some(96));
         }
     }
@@ -2288,8 +2627,15 @@ mod tests {
             pwd: "engpassword01234567",
             candidates: &candidates,
         };
-        let result =
-            rewrite(&sdp, engine, IceRewrite::Reoriginate(advert), None, None).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Reoriginate(advert),
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
 
         // Our credentials and posture are advertised.
         assert!(result.sdp.contains("a=ice-lite"));
@@ -2322,7 +2668,15 @@ mod tests {
     fn rewrite_without_ice_leaves_no_ice_lines() {
         let sdp = offer("203.0.113.7", 49170);
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
         assert!(!result.sdp.contains("a=ice-lite"));
         assert!(!result.sdp.contains("a=ice-ufrag"));
     }
@@ -2333,7 +2687,15 @@ mod tests {
         // decoupled counterpart of `Strip`, which removes them.
         let sdp = ice_offer("203.0.113.7", 49170);
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let result = rewrite(&sdp, engine, IceRewrite::Keep, None, None).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
         assert!(result.sdp.contains("a=ice-ufrag:PEERUF"));
         assert!(result.sdp.contains("a=ice-pwd:peerpassword01234567"));
         assert!(result.sdp.contains("typ host"), "peer candidate preserved");
@@ -2349,7 +2711,15 @@ mod tests {
         // our own — the leg falls back to the signalled media address.
         let sdp = ice_offer("203.0.113.7", 49170);
         let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
-        let result = rewrite(&sdp, engine, IceRewrite::Strip, None, None).expect("rewrite");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Strip,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
         // The peer's ICE attributes are gone.
         assert!(!result.sdp.contains("a=ice-ufrag"), "{}", result.sdp);
         assert!(!result.sdp.contains("a=ice-pwd"), "{}", result.sdp);
@@ -2504,6 +2874,7 @@ mod tests {
                 setup: Setup::Passive,
             }),
             None,
+            TextRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -2541,6 +2912,7 @@ mod tests {
             IceRewrite::Keep,
             Some(SecurityAdvertisement::Secure(ours)),
             None,
+            TextRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -2564,6 +2936,7 @@ mod tests {
             IceRewrite::Keep,
             Some(SecurityAdvertisement::Plain),
             None,
+            TextRewrite::None,
         )
         .expect("rewrite");
         assert!(
@@ -2987,5 +3360,279 @@ mod tests {
     fn origin_rewrite_is_a_noop_without_a_wellformed_o_line() {
         let sdp = "v=0\r\ns=-\r\nt=0 0\r\n";
         assert_eq!(rewrite_origin(sdp, "203.0.113.5".parse().unwrap()), sdp);
+    }
+
+    // ---- RFC 4103 Real-Time Text (`m=text`) section-aware parse + rewrite ----
+
+    /// An audio (`m=audio` PCMU) + RFC 4103 text (`m=text`, RED pt 98 wrapping T.140 pt 99) offer at
+    /// RFC-documentation addresses. `text_transport` selects the text profile (`RTP/AVP` plaintext or
+    /// `RTP/SAVP` secure). Both streams share the session-level `c=`.
+    fn audio_text_offer(text_transport: &str) -> String {
+        format!(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 198.51.100.1\r\n\
+             s=-\r\n\
+             c=IN IP4 198.51.100.1\r\n\
+             t=0 0\r\n\
+             m=audio 5000 RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             m=text 5002 {text_transport} 98 99\r\n\
+             a=rtpmap:98 red/1000\r\n\
+             a=rtpmap:99 t140/1000\r\n\
+             a=fmtp:98 99/99/99\r\n"
+        )
+    }
+
+    #[test]
+    fn parses_audio_and_text_offer() {
+        // RFC 4103: the `m=text` stream is parsed alongside audio, with its t140/red payload types.
+        let info = parse(&audio_text_offer("RTP/AVP")).expect("parse");
+        assert_eq!(info.remote_rtp, "198.51.100.1:5000".parse().unwrap());
+        let text = info.text.expect("text stream parsed");
+        assert_eq!(text.remote_rtp, "198.51.100.1:5002".parse().unwrap());
+        assert_eq!(text.t140_payload_type, Some(99));
+        assert_eq!(text.red_payload_type, Some(98));
+        assert!(!text.secure, "RTP/AVP text is plaintext");
+        // RFC 3550: default RTCP is RTP port + 1 when neither `a=rtcp` nor mux is present.
+        assert_eq!(text.remote_rtcp, "198.51.100.1:5003".parse().unwrap());
+        // An audio-only offer has no text stream.
+        assert!(parse(&offer("203.0.113.7", 49170))
+            .expect("parse")
+            .text
+            .is_none());
+    }
+
+    #[test]
+    fn parses_secure_text_as_secure() {
+        // RFC 4103 text over `RTP/SAVP` is a secure (SRTP-keyed) stream — flagged for decline in PR 1.
+        let info = parse(&audio_text_offer("RTP/SAVP")).expect("parse");
+        assert!(info.text.expect("text").secure);
+    }
+
+    #[test]
+    fn rewrite_anchor_rewrites_audio_and_text_to_engine() {
+        // TextRewrite::Anchor anchors BOTH the audio and the text stream to their engine endpoints, so
+        // neither leaks the UE's address (RFC 3264 §5).
+        let sdp = audio_text_offer("RTP/AVP");
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let text_engine = EngineMedia::new("127.0.0.1:40002".parse().unwrap(), None);
+        let result = rewrite(
+            &sdp,
+            audio_engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::Anchor(text_engine),
+        )
+        .expect("rewrite");
+        assert!(
+            result.sdp.contains("m=audio 40000 RTP/AVP 0"),
+            "audio anchored: {}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("m=text 40002 RTP/AVP 98 99"),
+            "text anchored: {}",
+            result.sdp
+        );
+        // The UE address is gone from the connection line (the `o=` origin is `rewrite_origin`'s job,
+        // not `rewrite`'s), and the engine's advertised IP is present.
+        assert!(
+            !result.sdp.contains("c=IN IP4 198.51.100.1"),
+            "{}",
+            result.sdp
+        );
+        assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
+        // The t140/red rtpmaps are preserved (the stream is relayed transparently in PR 1).
+        assert!(result.sdp.contains("a=rtpmap:99 t140/1000"));
+        assert!(result.sdp.contains("a=rtpmap:98 red/1000"));
+        // Reparse: both streams now resolve to the engine endpoints.
+        let reparsed = parse(&result.sdp).expect("reparse");
+        assert_eq!(reparsed.remote_rtp, "127.0.0.1:40000".parse().unwrap());
+        assert_eq!(
+            reparsed.text.expect("text").remote_rtp,
+            "127.0.0.1:40002".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn rewrite_decline_zeroes_the_text_port_and_leaves_audio() {
+        // TextRewrite::Decline rejects the text stream (`m=text 0`, RFC 3264 §6) while anchoring audio.
+        let sdp = audio_text_offer("RTP/SAVP");
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let result = rewrite(
+            &sdp,
+            audio_engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::Decline,
+        )
+        .expect("rewrite");
+        assert!(
+            result.sdp.contains("m=text 0 RTP/SAVP 98 99"),
+            "text declined: {}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("m=audio 40000 RTP/AVP 0"),
+            "audio still anchored: {}",
+            result.sdp
+        );
+    }
+
+    #[test]
+    fn rewrite_none_leaves_the_text_section_untouched() {
+        // TextRewrite::None passes the text section through verbatim (the default for callers that do
+        // not anchor text) while still anchoring audio.
+        let sdp = audio_text_offer("RTP/AVP");
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let result = rewrite(
+            &sdp,
+            audio_engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0"));
+        // The text section keeps the UE's original port (untouched).
+        assert!(
+            result.sdp.contains("m=text 5002 RTP/AVP 98 99"),
+            "text untouched: {}",
+            result.sdp
+        );
+    }
+
+    /// A SECURE audio (`RTP/SAVP` + `a=crypto`) offer that ALSO carries a plaintext `m=text` section
+    /// with its OWN media-level `c=`, `a=crypto`, and `a=ice-ufrag` — the multi-`m=` corruption case.
+    fn secure_audio_plaintext_text_offer() -> String {
+        concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 198.51.100.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 198.51.100.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 5000 RTP/SAVP 0\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AUDIOKEYaudiokeyAUDIOKEYaudiokeyAUDIOKEYaud\r\n",
+            "m=text 5002 RTP/AVP 98 99\r\n",
+            "c=IN IP4 198.51.100.9\r\n",
+            "a=rtpmap:98 red/1000\r\n",
+            "a=rtpmap:99 t140/1000\r\n",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:TEXTKEYtextkeyTEXTKEYtextkeyTEXTKEYtextkeyTE\r\n",
+            "a=ice-ufrag:TEXTUFRAG\r\n"
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn secure_audio_rewrite_does_not_strip_or_mangle_the_text_section() {
+        use siphon_rtp_srtp::sdes::CryptoSuite;
+        // REGRESSION: a secure-audio rewrite (force RTP/SAVP + our crypto, strip peer ICE) must scope
+        // its crypto/ICE strips to the audio section — never touching the plaintext text section.
+        let sdp = secure_audio_plaintext_text_offer();
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Strip,
+            Some(SecurityAdvertisement::Secure(ours)),
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        // The text section's OWN crypto + ICE + rtpmaps survive (they belong to a different m= section).
+        assert!(
+            result.sdp.contains("TEXTKEY"),
+            "text crypto stripped: {}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("a=ice-ufrag:TEXTUFRAG"),
+            "text ICE stripped: {}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("a=rtpmap:99 t140/1000"),
+            "{}",
+            result.sdp
+        );
+        // The text section keeps its OWN connection address — not reparented onto the engine/audio.
+        assert!(
+            result.sdp.contains("c=IN IP4 198.51.100.9"),
+            "text c= mangled: {}",
+            result.sdp
+        );
+        // The audio section is anchored + re-keyed: engine port, our crypto, the peer's audio key gone.
+        assert!(
+            result.sdp.contains("m=audio 40000 RTP/SAVP 0"),
+            "{}",
+            result.sdp
+        );
+        assert!(
+            result
+                .sdp
+                .contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"),
+            "{}",
+            result.sdp
+        );
+        assert!(
+            !result.sdp.contains("AUDIOKEY"),
+            "audio peer crypto kept: {}",
+            result.sdp
+        );
+        // Parse side: the text section's ICE must not bleed into the audio MediaInfo.
+        assert!(
+            result.media.ice_ufrag.is_none(),
+            "text ICE bled into audio parse"
+        );
+        let text = result.media.text.expect("text parsed");
+        assert!(!text.secure);
+        assert_eq!(text.remote_rtp, "198.51.100.9:5002".parse().unwrap());
+    }
+
+    #[test]
+    fn video_section_passed_through_on_a_secure_audio_rewrite() {
+        use siphon_rtp_srtp::sdes::CryptoSuite;
+        // An `m=video` (Other) section is passed through verbatim — the audio-only strips never reach it.
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 198.51.100.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 198.51.100.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 5000 RTP/SAVP 0\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:AUDIOKEYaudiokeyAUDIOKEYaudiokeyAUDIOKEYaud\r\n",
+            "m=video 6000 RTP/SAVP 96\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:VIDEOKEYvideokeyVIDEOKEYvideokeyVIDEOKEYvid\r\n"
+        );
+        let engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let result = rewrite(
+            sdp,
+            engine,
+            IceRewrite::Strip,
+            Some(SecurityAdvertisement::Secure(ours)),
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        assert!(
+            result.sdp.contains("m=video 6000 RTP/SAVP 96"),
+            "video port mangled: {}",
+            result.sdp
+        );
+        assert!(
+            result.sdp.contains("VIDEOKEY"),
+            "video crypto stripped: {}",
+            result.sdp
+        );
+        assert!(result.sdp.contains("a=rtpmap:96 VP8/90000"));
+        assert!(!result.sdp.contains("AUDIOKEY"), "{}", result.sdp);
     }
 }
