@@ -11,6 +11,8 @@ use siphon_rtp_datapath::Datapath;
 use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher_with_text;
 use siphon_rtp_engine::{sdp, server, Engine};
 use siphon_rtp_proto::{frame, CmdResult, Command, Event, ProfileFlags, Request, Response};
+use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+use siphon_rtp_srtp::SrtpContext;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -752,6 +754,245 @@ async fn text_events_promotes_only_text_emits_events_and_carries_cdr_counters() 
         summary_text_chars,
         Some(2),
         "the CallSummary carried the RFC 4103 text counters"
+    );
+}
+
+/// A secure (SDES-SRTP) `m=text` stream alongside a **plaintext** `m=audio` relay: audio is `RTP/AVP`,
+/// text is `RTP/SAVP` carrying its own `a=crypto`. The engine terminates SRTP on the text leg (a per-leg
+/// `SecureLeg`), so the phones do real SRTP on the text port and plain RTP on the audio port.
+fn secure_text_sdp(audio: SocketAddr, text: SocketAddr, text_key: &CryptoAttribute) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {aport} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
+         m=text {tport} RTP/SAVP 98 99\r\na=rtpmap:98 red/1000\r\na=rtpmap:99 t140/1000\r\na={crypto}\r\n",
+        ip = audio.ip(),
+        aport = audio.port(),
+        tport = text.port(),
+        crypto = text_key.to_attribute_value(),
+    )
+}
+
+/// The engine's own SDES text `a=crypto` advertised in a rewritten SDP's `m=text` section.
+fn text_engine_crypto(result: &CmdResult) -> CryptoAttribute {
+    match result {
+        CmdResult::Ok {
+            sdp: Some(text), ..
+        } => sdp::parse(text)
+            .expect("parse engine text crypto")
+            .text
+            .expect("text stream anchored")
+            .crypto
+            .first()
+            .copied()
+            .expect("engine advertised a text a=crypto"),
+        other => panic!("expected Ok with sdp, got {other:?}"),
+    }
+}
+
+/// A **secure** SDES-SRTP `m=text` stream is anchored + relayed end-to-end with per-leg keys: A and B
+/// each key their own text leg, the engine decrypts each side's ingress and **re-encrypts** it with the
+/// peer leg's own key (a secure↔secure re-key), the decrypted increment surfaces as `Event::Text`, and
+/// the plaintext audio relay is unaffected. Proves the whole PR 2c wiring over the control connection.
+/// Deterministic + NIC-free (UDP-loopback datapath + loopback control socket).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secure_sdes_text_bridge_rekeys_end_to_end_with_audio_unaffected() {
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    // The redirect dispatcher must run — a secure text stream runs on `Redirect` from the start.
+    tokio::spawn(run_redirect_dispatcher_with_text(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.text(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    let serve_engine = engine.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(serve_engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    let (phone_a_audio, addr_a_audio) = phone().await;
+    let (phone_a_text, addr_a_text) = phone().await;
+    let (phone_b_audio, addr_b_audio) = phone().await;
+    let (phone_b_text, addr_b_text) = phone().await;
+
+    // A and B each mint their OWN text SDES key (their leg's inbound key).
+    let a_text_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen a");
+    let b_text_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen b");
+
+    // Offer A: plaintext audio + secure text, with control-plane text events requested.
+    let offer = control
+        .request(Command::Offer {
+            call_id: "sec-rtt".into(),
+            from_tag: "tag-a".into(),
+            sdp: secure_text_sdp(addr_a_audio, addr_a_text, &a_text_key),
+            profile: ProfileFlags {
+                text_events: true,
+                ..Default::default()
+            },
+        })
+        .await;
+    let far_audio = engine_addr(&offer);
+    let far_text = text_engine_addr(&offer);
+    // The offer to B advertises `RTP/SAVP` text + the ENGINE's own far text key (not A's).
+    assert!(
+        sdp_text(&offer).contains(&format!("m=text {} RTP/SAVP", far_text.port())),
+        "offer to B advertises secure text: {}",
+        sdp_text(&offer)
+    );
+    let engine_far_text_key = text_engine_crypto(&offer);
+    assert_ne!(
+        engine_far_text_key.key, a_text_key.key,
+        "the engine mints its own far text key, never forwarding A's"
+    );
+
+    // Answer B: secure text with B's own key.
+    let answer = control
+        .request(Command::Answer {
+            call_id: "sec-rtt".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: secure_text_sdp(addr_b_audio, addr_b_text, &b_text_key),
+            profile: Default::default(),
+        })
+        .await;
+    let near_audio = engine_addr(&answer);
+    let near_text = text_engine_addr(&answer);
+    // The answer to A advertises `RTP/SAVP` text + the ENGINE's own near text key (not B's).
+    assert!(
+        sdp_text(&answer).contains(&format!("m=text {} RTP/SAVP", near_text.port())),
+        "answer to A advertises secure text: {}",
+        sdp_text(&answer)
+    );
+    let engine_near_text_key = text_engine_crypto(&answer);
+    assert_ne!(
+        engine_near_text_key.key, b_text_key.key,
+        "the engine mints its own near text key, never forwarding B's"
+    );
+
+    // The secure text stream runs in the userspace text processor; audio stays a plain in-kernel relay.
+    assert!(
+        engine.text().is_text_call("sec-rtt"),
+        "secure text is registered on the userspace text processor"
+    );
+    assert!(
+        !engine.media().is_media_call("sec-rtt"),
+        "audio was NOT promoted — the plaintext audio path is unaffected"
+    );
+
+    // Audio A → B (plaintext) relays untouched, unaffected by the secure text stream.
+    phone_a_audio
+        .send_to(&rtp(0x0A0A_0A0A), near_audio)
+        .await
+        .expect("send audio a");
+    let (data, from) = recv(&phone_b_audio).await;
+    assert_eq!(
+        data,
+        rtp(0x0A0A_0A0A),
+        "audio relayed in the clear, unaffected"
+    );
+    assert_eq!(
+        from, far_audio,
+        "audio arrives from the engine far audio port"
+    );
+
+    // Text A → B: A encrypts a RED/T.140 "hi" with its own key; the engine decrypts on the near leg and
+    // re-encrypts on the far leg — B decrypts it with the ENGINE's far key, recovering the exact bytes.
+    let plaintext = red_text_rtp(1, 1000, 0x0A0A_7E77, b"hi");
+    let mut a_encrypt = SrtpContext::from_key_material(&a_text_key.key);
+    let mut a_srtp = Vec::new();
+    a_encrypt
+        .protect(&plaintext, &mut a_srtp)
+        .expect("A encrypt");
+    phone_a_text
+        .send_to(&a_srtp, near_text)
+        .await
+        .expect("send secure text a");
+
+    let (wire, from) = recv(&phone_b_text).await;
+    assert_eq!(
+        from, far_text,
+        "secure text arrives from the engine far text port"
+    );
+    assert_ne!(
+        wire, plaintext,
+        "never forwarded in the clear to the secure peer"
+    );
+    assert_ne!(
+        wire, a_srtp,
+        "re-encrypted with the engine's far key, not relayed as A's ciphertext"
+    );
+    let mut b_decrypt = SrtpContext::from_key_material(&engine_far_text_key.key);
+    let mut recovered = Vec::new();
+    b_decrypt
+        .unprotect(&wire, &mut recovered)
+        .expect("B decrypts the re-keyed text with the engine's far key");
+    assert_eq!(
+        recovered, plaintext,
+        "B recovers the exact T.140/RED bytes A sent"
+    );
+
+    // The DECRYPTED increment surfaces as Event::Text (sender = A, a_to_b) — observed after decrypt.
+    match control.recv_event().await {
+        Event::Text {
+            call_id,
+            from_tag,
+            text,
+            direction,
+            ..
+        } => {
+            assert_eq!(call_id, "sec-rtt");
+            assert_eq!(from_tag, "tag-a");
+            assert_eq!(text, "hi");
+            assert_eq!(direction.as_deref(), Some("a_to_b"));
+        }
+        other => panic!("expected Event::Text, got {other:?}"),
+    }
+
+    // Text B → A (reverse): B encrypts with its own key; A decrypts with the engine's near key.
+    let plaintext_b = red_text_rtp(1, 2000, 0x0B0B_7E77, b"yo");
+    let mut b_encrypt = SrtpContext::from_key_material(&b_text_key.key);
+    let mut b_srtp = Vec::new();
+    b_encrypt
+        .protect(&plaintext_b, &mut b_srtp)
+        .expect("B encrypt");
+    phone_b_text
+        .send_to(&b_srtp, far_text)
+        .await
+        .expect("send secure text b");
+    let (wire_a, from_a) = recv(&phone_a_text).await;
+    assert_eq!(
+        from_a, near_text,
+        "reverse secure text arrives from the engine near text port"
+    );
+    let mut a_decrypt = SrtpContext::from_key_material(&engine_near_text_key.key);
+    let mut recovered_a = Vec::new();
+    a_decrypt
+        .unprotect(&wire_a, &mut recovered_a)
+        .expect("A decrypts the reverse re-keyed text with the engine's near key");
+    assert_eq!(
+        recovered_a, plaintext_b,
+        "A recovers B's exact T.140/RED bytes"
+    );
+
+    // Teardown frees the secure text ports (and their SecureLegs) alongside the audio ports.
+    let delete = control
+        .request(Command::Delete {
+            call_id: "sec-rtt".into(),
+            from_tag: "tag-a".into(),
+            to_tag: None,
+        })
+        .await;
+    assert!(matches!(delete, CmdResult::Ok { .. }));
+    assert!(
+        !engine.text().is_text_call("sec-rtt"),
+        "the secure text actor is deregistered on delete"
     );
 }
 

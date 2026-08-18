@@ -549,8 +549,9 @@ not a special case of the audio gate — it is a full inbound surface in its own
 copy of Layers 1–3.
 
 > **Status (landed — plaintext RTT relay):** `sdp::parse` yields `MediaInfo.text`
-> (`TextMediaInfo`: remote RTP/RTCP, `secure`, `t140`/`red` payload types); the section-scoped
-> `sdp::rewrite` takes a `TextRewrite` directive (`None` / `Anchor` / `Decline`). `offer`/`answer`
+> (`TextMediaInfo`: remote RTP/RTCP, `secure`, `t140`/`red` payload types, and the text section's own
+> `crypto` for a secure stream); the section-scoped `sdp::rewrite` takes a `TextRewrite` directive
+> (`None` / `Anchor` / `AnchorSecure` (SDES text) / `Decline`). `offer`/`answer`
 > allocate one text RTP endpoint per leg and install the in-datapath `FlowAction::Forward` flows
 > `near.text ↔ far.text` — independent of the audio pipeline kind (the text endpoints are distinct, so
 > text relays whether audio is a plain relay, a transcode, or an SRTP bridge). The T.140/RED payload is
@@ -562,10 +563,19 @@ copy of Layers 1–3.
   before it can move the text latch, exactly as on the audio port, and the two streams' gates/latches
   are wholly independent (a hijack of one cannot move the other). The `received-from` public-IP hint
   (Layer 2) tightens the text gate too.
-- **Secure text is declined, never downgraded.** An `m=text` offered over a secure profile
-  (`RTP/SAVP`) is answered `m=text 0` (RFC 3264 §6) rather than bridged or silently downgraded to
-  plaintext — the same "never silently bridge secure↔insecure" rule as Layer 5. Secure RTT (a
-  per-leg `SecureLeg` for text, mirroring Layer 5a) is a follow-up.
+- **Secure text (SDES-SRTP) is anchored, never downgraded or mixed.** An `m=text` offered over a
+  secure profile (`RTP/SAVP` + `a=crypto`, RFC 4568) is anchored as a **per-leg `SecureLeg` bridge**
+  (mirroring the Layer 5a audio SDES bridge): the engine mints its own SDES key for each text leg,
+  answers `RTP/SAVP` + its own `a=crypto`, and decrypts each side's ingress / re-encrypts each side's
+  egress with that leg's own key — text is re-keyed A↔B, and no plaintext ever crosses to a secure
+  peer (RFC 3711). A **secure text stream cannot relay in-kernel** (SRTP must be terminated in
+  userspace), so it runs in the text processor from the start — both text endpoints `Redirect`ed, held
+  there for the call's life (a permanent `Secure` promotion hold, never demoted). Decrypt is
+  **fail-closed**: a text packet that fails SRTP auth/replay is dropped — never forwarded, observed, or
+  latched. A secure text stream with no usable `a=crypto`, or a **mixed** secure/plaintext text bridge
+  (one side `RTP/SAVP`, the other `RTP/AVP`), is refused (`m=text 0`, RFC 3264 §6) rather than bridged
+  or downgraded — the same "never silently bridge secure↔insecure" rule as Layer 5. DTLS-SRTP text
+  (like DTLS conference legs) remains a follow-up; only SDES text is anchored here.
 - **Section scoping fixes two latent multi-`m=` bugs.** The audio-plane strips (ICE / crypto /
   fingerprint / `rtcp-mux`, Layers 4–5) are scoped to the session region and the audio section only, so
   a secure-audio rewrite can no longer strip a text (or video) section's own keying/ICE, and a text
@@ -595,9 +605,13 @@ copy of Layers 1–3.
   only an authentic, SSRC-consistent packet re-points the reverse egress (Layer 3). A spoofed source on
   the promoted text port is dropped with no forward, no `Event::Text`, and no latch movement — identical
   to the in-kernel posture. Demotion (the last feature clears) reinstalls the same `Forward` rules.
-- **Secure text is still out of scope on this path.** Only a plaintext text stream is promoted;
-  secure (`RTP/SAVP`) text is still declined at `answer` (above). Secure-text observability rides the
-  deferred per-leg `SecureLeg`-for-text follow-up.
+- **Secure (SDES-SRTP) text observability rides the same processor.** A secure text stream is already
+  running in the text processor (it has to — SRTP is terminated in userspace), so `Event::Text`, the
+  per-leg content QoS, and the raw-RTP recording all attach to it exactly as they do for a promoted
+  plaintext stream. Everything observed is **decrypted** (observe after decrypt, before encrypt); the
+  pcap recording tees the on-the-wire **ciphertext** (matching the audio pcap recorder, which also
+  captures pre-decrypt). The one difference from the plaintext path: a secure text stream is never
+  demoted back to the kernel (it holds a permanent `Secure` promotion reason).
 
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.

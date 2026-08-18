@@ -120,10 +120,14 @@ pub struct TextMediaInfo {
     pub remote_rtcp: SocketAddr,
     /// Whether the text stream offered `a=rtcp-mux` (RTP and RTCP share one port, RFC 5761).
     pub rtcp_mux: bool,
-    /// Whether the `m=text` transport is a secure profile (`RTP/SAVP[F]`) — SRTP-keyed text. A secure
-    /// text stream is declined in PR 1 (answered `m=text 0`, never downgraded); secure text relay is a
-    /// follow-up.
+    /// Whether the `m=text` transport is a secure profile (`RTP/SAVP[F]`) — SRTP-keyed text. When set,
+    /// the engine anchors the text stream as an SDES-SRTP leg (`crypto` carries the peer's key), keying a
+    /// per-leg `SecureLeg` that decrypts ingress / encrypts egress, exactly as the audio SDES bridge does.
     pub secure: bool,
+    /// The `a=crypto` lines offered in the text section (RFC 4568 SDES), in order — the peer's SRTP key
+    /// candidates for the text stream. Present only on a secure (`RTP/SAVP`) text section; empty for a
+    /// plaintext one. The engine takes the first usable one to key the text leg's inbound context.
+    pub crypto: Vec<CryptoAttribute>,
     /// The negotiated T.140 payload type (`a=rtpmap:<pt> t140/1000`, RFC 4103 §5), if the section
     /// carried one. Case-insensitive on the encoding name; the 1000 Hz clock is the RFC 4103 T.140 rate.
     pub t140_payload_type: Option<u8>,
@@ -460,6 +464,10 @@ struct AudioScan {
     text_rtcp_mux: bool,
     /// `a=rtpmap` entries in the text section — resolves the `t140`/`red` payload types (RFC 4103).
     text_rtpmaps: Vec<RtpMap>,
+    /// Parsed `a=crypto` lines in the text section, in order (RFC 4568) — the SDES key candidates for a
+    /// secure (`RTP/SAVP`) text stream. Empty for a plaintext text section. Scoped to the text section
+    /// exactly as `crypto` is to the audio section (the same section scoping that fixes the multi-`m=` bug).
+    text_crypto: Vec<CryptoAttribute>,
 }
 
 /// Parse an `a=rtpmap` attribute body (`rtpmap:<pt> <encoding>/<clock>[/<channels>]`).
@@ -667,6 +675,7 @@ fn scan(sdp: &str) -> AudioScan {
         text_rtcp: None,
         text_rtcp_mux: false,
         text_rtpmaps: Vec::new(),
+        text_crypto: Vec::new(),
     };
     let mut seen_media = false;
     let mut in_audio = false;
@@ -807,6 +816,13 @@ fn scan(sdp: &str) -> AudioScan {
                         if let Some(rtpmap) = parse_rtpmap(value) {
                             scan.text_rtpmaps.push(rtpmap);
                         }
+                    } else if value.starts_with("crypto:") {
+                        // RFC 4568 SDES key for a secure (`RTP/SAVP`) text stream — parsed here (scoped to
+                        // the text section) so the engine can key the text `SecureLeg`. Ignore lines we
+                        // cannot parse (unknown suite, bad key), exactly as the audio section does.
+                        if let Ok(crypto) = CryptoAttribute::parse(value) {
+                            scan.text_crypto.push(crypto);
+                        }
                     }
                 } else if in_audio {
                     if value == "rtcp-mux" {
@@ -923,11 +939,13 @@ fn text_media_info(scan: &AudioScan) -> Option<TextMediaInfo> {
         remote_rtp,
         remote_rtcp,
         rtcp_mux,
-        // RFC 4103 text over a secure profile (`RTP/SAVP[F]`) is SRTP-keyed; declined in PR 1.
+        // RFC 4103 text over a secure profile (`RTP/SAVP[F]`) is SRTP-keyed; the engine anchors it as an
+        // SDES-SRTP text leg (per-leg `SecureLeg`), keyed from `crypto` below.
         secure: scan
             .text_transport
             .as_deref()
             .is_some_and(|transport| transport.contains("SAVP")),
+        crypto: scan.text_crypto.clone(),
         // RFC 4103 §5: T.140 is `t140/1000`; RFC 2198 redundancy is `red/1000`. Match the encoding
         // name case-insensitively at the 1000 Hz text clock (RFC 4566 §6 names are case-insensitive).
         t140_payload_type: text_payload_type(&scan.text_rtpmaps, "t140"),
@@ -1026,13 +1044,38 @@ pub enum TextRewrite {
     /// Anchor a plaintext text stream to the engine: rewrite its `m=text` port and connection to the
     /// engine's text endpoint (`EngineMedia.rtp` / `advertised_ip`) so the relay owns the media path,
     /// never leaking the UE's (often private) address (RFC 3264 §5). Text RTCP is not separately
-    /// anchored in PR 1 — any text `a=rtcp:` is dropped (single text port; text RTCP relay is a
-    /// follow-up).
+    /// anchored — any text `a=rtcp:` is dropped (single text port; text RTCP rides the muxed port).
     Anchor(EngineMedia),
+    /// Anchor a **secure** (SDES-SRTP) text stream: like [`TextRewrite::Anchor`], but also force the
+    /// text section's transport to `RTP/SAVP`, strip the peer's own text `a=crypto`, and advertise the
+    /// engine's own SDES key (`crypto`) for the text leg (RFC 4568). The engine terminates SRTP on the
+    /// text leg with a per-leg `SecureLeg`, exactly as the audio SDES bridge re-originates keying.
+    /// Carries the engine's `CryptoAttribute` directly (not the whole [`SecurityAdvertisement`]) so the
+    /// directive stays `Copy` — text SDES is the only secure text profile this engine anchors (DTLS-SRTP
+    /// text, like DTLS conference legs, is a follow-up).
+    AnchorSecure {
+        /// The engine text endpoint the `m=text` port/connection is anchored to.
+        engine: EngineMedia,
+        /// The engine's own SDES `a=crypto` advertised for the text leg (the peer decrypts our egress
+        /// with it; we encrypt outbound with the matching local key).
+        crypto: CryptoAttribute,
+    },
     /// Reject the text stream: set its `m=text` port to `0` (RFC 3264 §6 — a rejected media stream).
-    /// Used for a secure (`RTP/SAVP`) text section this build will not bridge yet — declined, never
-    /// downgraded to plaintext.
+    /// Used for a text section this build will not relay (e.g. a mixed secure/plaintext bridge, or a
+    /// secure text offer with no usable `a=crypto`) — declined, never silently bridged or downgraded.
     Decline,
+}
+
+impl TextRewrite {
+    /// The engine text endpoint a text section is anchored to, for either anchor variant
+    /// ([`TextRewrite::Anchor`] / [`TextRewrite::AnchorSecure`]); `None` for `None`/`Decline`. Lets the
+    /// connection-line rewrite treat both anchors alike.
+    fn anchor_engine(&self) -> Option<EngineMedia> {
+        match self {
+            TextRewrite::Anchor(engine) | TextRewrite::AnchorSecure { engine, .. } => Some(*engine),
+            TextRewrite::None | TextRewrite::Decline => Option::None,
+        }
+    }
 }
 
 /// Host-candidate priority (RFC 8445 §5.1.2): type-pref 126, local-pref 65535, component 1 (RTP).
@@ -1085,7 +1128,9 @@ fn is_ice_attribute(line: &str) -> bool {
 ///
 /// `text` handles a second `m=text` (RFC 4103) stream: [`TextRewrite::None`] leaves it untouched,
 /// [`TextRewrite::Anchor`] rewrites its port/connection to a separate engine text endpoint (plaintext
-/// relay), and [`TextRewrite::Decline`] rejects it (`m=text 0`, RFC 3264 §6). The rewrite is
+/// relay), [`TextRewrite::AnchorSecure`] does the same but forces `RTP/SAVP` and re-originates the
+/// text section's SDES `a=crypto` (SRTP text leg), and [`TextRewrite::Decline`] rejects it
+/// (`m=text 0`, RFC 3264 §6). The rewrite is
 /// **section-scoped**: the audio ICE/crypto/fingerprint/rtcp-mux strips above run only over the
 /// session region and the audio section, never a text or other (`m=video`, …) section — so a
 /// secure-audio rewrite no longer corrupts a text section's own keying/ICE, and a non-audio section is
@@ -1125,7 +1170,7 @@ pub fn rewrite(
     let mut conn_rewrites: std::collections::HashMap<usize, IpAddr> =
         std::collections::HashMap::new();
     conn_rewrites.insert(conn_index, engine.advertised_ip);
-    if let TextRewrite::Anchor(text_engine) = text {
+    if let Some(text_engine) = text.anchor_engine() {
         let text_conn_index = scan
             .text_conn
             .map(|(index, _)| index)
@@ -1176,6 +1221,16 @@ pub fn rewrite(
                 continue;
             }
         }
+        // Secure-text anchor: drop the peer's own text `a=crypto` (we advertise the engine's below on
+        // the `m=text` line), scoped to the text section so it never touches the audio/other sections —
+        // exactly the section scoping that keeps a secure-audio rewrite from stripping a text section's
+        // keying (RFC 4568 SDES; docs/security-and-nat.md Layer 5d).
+        if matches!(text, TextRewrite::AnchorSecure { .. })
+            && current_kind == Some(MediaKind::Text)
+            && line.starts_with("a=crypto:")
+        {
+            continue;
+        }
         if Some(index) == text_media_index {
             // The `m=text` line: anchor its port to the engine text endpoint, or decline it (port 0).
             match text {
@@ -1187,6 +1242,19 @@ pub fn rewrite(
                         Option::None,
                     ));
                 }
+                TextRewrite::AnchorSecure {
+                    engine: text_engine,
+                    crypto,
+                } => {
+                    // Anchor the port AND force `RTP/SAVP` (the engine terminates SRTP on the text leg),
+                    // then advertise the engine's own SDES key for the text stream (RFC 4568).
+                    lines.push(rewrite_media_line(
+                        line,
+                        text_engine.rtp.port(),
+                        Some("RTP/SAVP"),
+                    ));
+                    lines.push(format!("a={}", crypto.to_attribute_value()));
+                }
                 TextRewrite::Decline => {
                     // RFC 3264 §6: a rejected stream keeps its formats but advertises port 0.
                     lines.push(rewrite_media_line(line, 0, Option::None));
@@ -1194,10 +1262,12 @@ pub fn rewrite(
                 TextRewrite::None => lines.push(line.to_string()),
             }
         } else if Some(index) == text_rtcp_index {
-            // Text RTCP is not separately anchored in PR 1: drop an anchored text section's `a=rtcp:`
-            // (single text port; text RTCP relay is a follow-up). Leave it in place otherwise.
+            // Text RTCP is not separately anchored: drop an anchored text section's `a=rtcp:` (single
+            // text port; text RTCP/SRTCP rides the muxed port). Leave it in place otherwise.
             match text {
-                TextRewrite::Anchor(_) => { /* drop the text a=rtcp line */ }
+                TextRewrite::Anchor(_) | TextRewrite::AnchorSecure { .. } => {
+                    /* drop the text a=rtcp line */
+                }
                 TextRewrite::None | TextRewrite::Decline => lines.push(line.to_string()),
             }
         } else if index == media_index {
@@ -3404,9 +3474,98 @@ mod tests {
 
     #[test]
     fn parses_secure_text_as_secure() {
-        // RFC 4103 text over `RTP/SAVP` is a secure (SRTP-keyed) stream — flagged for decline in PR 1.
+        // RFC 4103 text over `RTP/SAVP` is a secure (SRTP-keyed) stream — anchored as an SDES-SRTP leg.
         let info = parse(&audio_text_offer("RTP/SAVP")).expect("parse");
         assert!(info.text.expect("text").secure);
+    }
+
+    /// A secure `m=text` (`RTP/SAVP` + `a=crypto`) offer alongside plaintext audio — the SDES-SRTP text
+    /// case this PR anchors. The text section carries its own RFC 4568 key.
+    fn secure_text_offer() -> String {
+        concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 198.51.100.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 198.51.100.1\r\n",
+            "t=0 0\r\n",
+            "m=audio 5000 RTP/AVP 0\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "m=text 5002 RTP/SAVP 98 99\r\n",
+            "a=rtpmap:98 red/1000\r\n",
+            "a=rtpmap:99 t140/1000\r\n",
+            // RFC 4568 §6.1 example inline key (40 base64 chars = 30 bytes).
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n"
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn parses_secure_text_crypto() {
+        // The text section's own `a=crypto` (RFC 4568) is parsed, scoped to the text section, so the
+        // engine can key the text `SecureLeg`.
+        let info = parse(&secure_text_offer()).expect("parse");
+        let text = info.text.expect("text");
+        assert!(text.secure, "RTP/SAVP text is secure");
+        assert_eq!(text.crypto.len(), 1, "the text a=crypto is parsed");
+        assert_eq!(text.crypto[0].tag, 1);
+        // The audio section (plaintext) carries no crypto — the text key did not bleed onto it.
+        assert!(info.crypto.is_empty(), "audio section has no crypto");
+    }
+
+    #[test]
+    fn rewrite_anchor_secure_forces_savp_and_readvertises_text_crypto() {
+        use siphon_rtp_srtp::sdes::CryptoSuite;
+        // TextRewrite::AnchorSecure anchors the text port, forces `RTP/SAVP`, strips the peer's own text
+        // key, and advertises the engine's own SDES `a=crypto` for the text leg (RFC 4568). The audio
+        // section is untouched (its own security is a separate directive).
+        let sdp = secure_text_offer();
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let text_engine = EngineMedia::new("127.0.0.1:40002".parse().unwrap(), None);
+        let our_text_key =
+            CryptoAttribute::generate(7, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let result = rewrite(
+            &sdp,
+            audio_engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::AnchorSecure {
+                engine: text_engine,
+                crypto: our_text_key,
+            },
+        )
+        .expect("rewrite");
+        // The text `m=` line is anchored to the engine port AND forced to `RTP/SAVP`.
+        assert!(
+            result.sdp.contains("m=text 40002 RTP/SAVP 98 99"),
+            "secure text anchored: {}",
+            result.sdp
+        );
+        // The peer's own text key is stripped; the engine's own key is advertised instead.
+        assert!(
+            !result.sdp.contains("TEXTKEY"),
+            "peer text key not stripped: {}",
+            result.sdp
+        );
+        assert!(
+            result
+                .sdp
+                .contains(&format!("a={}", our_text_key.to_attribute_value())),
+            "engine text crypto advertised: {}",
+            result.sdp
+        );
+        // The audio section is a plain relay here — untouched, no crypto injected onto it.
+        assert!(
+            result.sdp.contains("m=audio 40000 RTP/AVP 0"),
+            "audio unaffected: {}",
+            result.sdp
+        );
+        // Reparse: the text stream now resolves to the engine endpoint and reports secure + our key.
+        let reparsed = parse(&result.sdp).expect("reparse");
+        let text = reparsed.text.expect("text");
+        assert_eq!(text.remote_rtp, "127.0.0.1:40002".parse().unwrap());
+        assert!(text.secure);
+        assert_eq!(text.crypto.first().map(|crypto| crypto.tag), Some(7));
     }
 
     #[test]

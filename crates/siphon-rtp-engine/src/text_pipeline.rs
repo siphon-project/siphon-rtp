@@ -9,14 +9,22 @@
 //! 1. enforces the *same* RTPBleed source-gate + SSRC-consistent symmetric latch the in-kernel
 //!    `Forward` flow did (docs/security-and-nat.md §4 — the `Redirect` path bypasses the datapath's
 //!    Forward-path gate, so it is re-enforced here);
-//! 2. RED-depacketizes (RFC 2198) + reassembles the T.140 stream ([`siphon_rtp_media::t140`]),
+//! 2. for a **secure** (SDES-SRTP, `RTP/SAVP`) text leg, decrypts the ingress SRTP packet **first**
+//!    (fail-closed: a packet that fails auth/replay is dropped, never forwarded), so everything below
+//!    operates on plaintext (RFC 3711; docs/security-and-nat.md Layer 5d) — this is what a secure text
+//!    stream runs on *from the start* (SRTP cannot relay in-kernel, so it is never on the `Forward`
+//!    fast path);
+//! 3. RED-depacketizes (RFC 2198) + reassembles the T.140 stream ([`siphon_rtp_media::t140`]),
 //!    accruing per-leg content QoS ([`TextStreamStats`]: packets / characters / unrecoverable
 //!    missing-text markers / redundancy-recovered generations) for the end-of-call CDR / `CallSummary`;
-//! 3. emits [`Event::Text`] to the control plane for each newly-recovered, non-empty UTF-8 increment;
-//! 4. folds the raw text RTP into the recording (the same pcap capture sink the audio recorder uses);
-//! 5. forwards the received text RTP **verbatim** to the peer text endpoint — the relay is transparent
-//!    (RFC 4103 relay: observe, don't transform; the sender's sequence/timestamp/1000 Hz clock pass
-//!    through untouched).
+//! 4. emits [`Event::Text`] to the control plane for each newly-recovered, non-empty UTF-8 increment;
+//! 5. folds the raw (on-the-wire) text RTP into the recording (the same pcap capture sink the audio
+//!    recorder uses — ciphertext on a secure leg, matching the audio pcap recorder);
+//! 6. forwards the text RTP to the peer text endpoint — verbatim for a plaintext relay, or **re-encrypted
+//!    with the peer leg's own key** for a secure↔secure bridge (RFC 4103 relay: observe, don't transform;
+//!    the sender's sequence/timestamp/1000 Hz clock pass through untouched). A secure↔insecure text bridge
+//!    is never keyed here — the `secure_ingress`/`secure_egress` pairing is fixed at negotiation, which
+//!    refuses a mixed case rather than leak.
 //!
 //! It mirrors [`crate::media_pipeline::MediaRegistry`]'s "registry + dispatcher" shape so the single
 //! redirect dispatcher routes text-owned endpoints here by [`EndpointId`]. Deterministic and NIC-free
@@ -24,6 +32,7 @@
 //! the (best-effort) event/capture already require.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -32,6 +41,7 @@ use siphon_rtp_media::pcap::CapturedPacket;
 use siphon_rtp_media::rtp::RtpPacket;
 use siphon_rtp_media::t140::T140Reassembler;
 use siphon_rtp_proto::{Event, TextStreamStats};
+use siphon_rtp_srtp::leg::SecureLeg;
 
 use crate::media_pipeline::{rtp_source_ssrc, Outbound, PcapCapture, SymmetricLatch};
 
@@ -65,6 +75,19 @@ struct TextDirection {
     direction_label: &'static str,
     /// Accrued content QoS for the CDR / `CallSummary`.
     counters: TextStreamStats,
+    /// Secure (SDES-SRTP) ingress: when the *sending* party's text leg is `RTP/SAVP`, this is the
+    /// **sending leg's** [`SecureLeg`] — the ingress datagram is decrypted (fail-closed on auth/replay)
+    /// before it is observed or forwarded, exactly as the audio SDES leg decrypts before the tee/relay
+    /// (RFC 3711; docs/security-and-nat.md Layer 5d). `None` for a plaintext text stream. The `Mutex`
+    /// is uncontended in practice — the single owner is this call's actor — and never held across an
+    /// `.await` (all crypto happens inside the synchronous [`TextCall::process`]).
+    secure_ingress: Option<Arc<Mutex<SecureLeg>>>,
+    /// Secure (SDES-SRTP) egress: when the *receiving* party's text leg is `RTP/SAVP`, this is the
+    /// **receiving leg's** [`SecureLeg`] — the (decrypted) T.140 RTP is re-encrypted with that leg's own
+    /// key before transmit, so a secure↔secure text bridge re-keys per leg. `None` for a plaintext peer.
+    /// Invariant: `secure_ingress` and `secure_egress` are set together (a secure text bridge is
+    /// secure↔secure) — a mixed secure/plaintext text bridge is refused at negotiation, never keyed here.
+    secure_egress: Option<Arc<Mutex<SecureLeg>>>,
 }
 
 impl TextDirection {
@@ -136,6 +159,14 @@ pub struct TextDirectionConfig {
     pub t140_payload_type: Option<u8>,
     /// The negotiated RFC 2198 RED payload type, if any.
     pub red_payload_type: Option<u8>,
+    /// The sending leg's [`SecureLeg`] when this direction's ingress is SDES-SRTP — decrypts ingress
+    /// (fail-closed on auth/replay) before it is observed or forwarded. `None` for a plaintext text
+    /// stream.
+    pub secure_ingress: Option<Arc<Mutex<SecureLeg>>>,
+    /// The receiving leg's [`SecureLeg`] when the peer's text leg is SDES-SRTP — re-encrypts egress with
+    /// the peer leg's own key (a secure↔secure re-key). `None` for a plaintext peer. Set together with
+    /// `secure_ingress` — a secure text bridge is secure↔secure; a mixed case is refused at negotiation.
+    pub secure_egress: Option<Arc<Mutex<SecureLeg>>>,
 }
 
 /// A promoted RFC 4103 text stream running in userspace: two directions (A→B and B→A) plus the
@@ -182,6 +213,8 @@ impl TextCall {
                 receiver_tag: to_tag.clone(),
                 direction_label: "a_to_b",
                 counters: TextStreamStats::default(),
+                secure_ingress: a_to_b.secure_ingress,
+                secure_egress: a_to_b.secure_egress,
             },
             b_to_a: TextDirection {
                 ingress_endpoint: b_to_a.ingress_endpoint,
@@ -197,6 +230,8 @@ impl TextCall {
                 receiver_tag: Some(from_tag),
                 direction_label: "b_to_a",
                 counters: TextStreamStats::default(),
+                secure_ingress: b_to_a.secure_ingress,
+                secure_egress: b_to_a.secure_egress,
             },
             latch,
             capture: None,
@@ -270,8 +305,10 @@ impl TextCall {
         }
 
         // Recording: copy the accepted text RTP byte-for-byte to the shared pcap sink (RFC 7866-style
-        // raw tee), post source-gate, before the verbatim forward — the same capture the audio recorder
-        // drains to `{call}.pcap`, keyed on the text endpoint's engine-local address.
+        // raw tee), post source-gate, before any decrypt/forward — the same capture the audio recorder
+        // (`MediaCall::capture_ingress`) drains to `{call}.pcap`, keyed on the text endpoint's
+        // engine-local address. On a secure leg this records the on-the-wire **ciphertext** (the SRTP
+        // packet), matching the audio pcap recorder, which also captures pre-decrypt.
         if let Some(capture) = capture.as_ref() {
             let destination = if from_a {
                 capture.a_local
@@ -292,23 +329,83 @@ impl TextCall {
             }
         }
 
-        // Transparent relay (RFC 4103): forward the received text RTP verbatim to the peer text
-        // endpoint — RED payload and all, sender's sequence/timestamp untouched (observe, don't
-        // transform; the 1000 Hz clock passes through).
+        // Secure (SDES-SRTP) ingress: decrypt before anything observes or forwards it, so the RED/T.140
+        // reassembler, the peer forward, and the latch all operate on plaintext (RFC 3711;
+        // docs/security-and-nat.md Layer 5d). `SecureLeg` auto-demuxes SRTP vs SRTCP. A failed unprotect
+        // (bad auth / replay / wrong key) is **fail-closed**: drop the datagram — never forward garbage
+        // to the peer, never observe it, never move the latch — but keep the path alive (the source is
+        // the authentic, signalled one; a transient reorder/rekey must not reap a live text call),
+        // mirroring the audio SDES leg (`MediaCall::process`).
+        let mut decrypted = Vec::new();
+        let plaintext: &[u8] = if let Some(leg) = direction.secure_ingress.as_ref() {
+            let Ok(mut guard) = leg.lock() else {
+                tracing::error!(
+                    target: "siphon_rtp::text",
+                    "secure text ingress leg mutex poisoned; dropping packet"
+                );
+                return true;
+            };
+            if guard.unprotect(&packet.data, &mut decrypted).is_err() {
+                drop(guard);
+                tracing::debug!(
+                    target: "siphon_rtp::text",
+                    source = %packet.source,
+                    "secure text ingress failed SRTP auth/replay; dropped (never forwarded)"
+                );
+                return true;
+            }
+            drop(guard);
+            &decrypted
+        } else {
+            &packet.data
+        };
+
+        // Egress toward the peer text endpoint: encrypt with the *receiving* leg's own key when that
+        // side is secure (a secure↔secure text bridge re-keys per leg), else forward the plaintext
+        // verbatim (RFC 4103 transparent relay — observe, don't transform; the 1000 Hz clock passes
+        // through). Never forward plaintext to a secure peer, never forward decrypted media to an
+        // insecure peer: the `secure_egress`/`secure_ingress` pairing (both set, or both unset) is fixed
+        // at negotiation, so this branch can only encrypt-for-secure or relay-plaintext — a mixed bridge
+        // is refused before it is keyed. A failed protect drops the datagram (fail-closed).
+        let mut encrypted = Vec::new();
+        let wire: &[u8] = if let Some(leg) = direction.secure_egress.as_ref() {
+            let Ok(mut guard) = leg.lock() else {
+                tracing::error!(
+                    target: "siphon_rtp::text",
+                    "secure text egress leg mutex poisoned; dropping packet"
+                );
+                return true;
+            };
+            if guard.protect(plaintext, &mut encrypted).is_err() {
+                drop(guard);
+                tracing::debug!(
+                    target: "siphon_rtp::text",
+                    "secure text egress SRTP protect failed; dropped"
+                );
+                return true;
+            }
+            drop(guard);
+            &encrypted
+        } else {
+            plaintext
+        };
         out.push(Outbound {
             endpoint: direction.egress_endpoint,
             dst: direction.egress_dst,
-            data: Bytes::copy_from_slice(&packet.data),
+            data: Bytes::copy_from_slice(wire),
         });
 
-        // Observe: RED-parse + T.140 reassemble → Event::Text + content QoS.
-        direction.observe(&packet.data, call_id, events);
+        // Observe on the DECRYPTED plaintext: RED-parse + T.140 reassemble → Event::Text + content QoS.
+        // (Event::Text, the CDR counters, and the recording all see cleartext text — observe after
+        // decrypt, before encrypt.)
+        direction.observe(plaintext, call_id, events);
 
         // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3; RFC 3550 §8): only an authentic,
-        // SSRC-consistent packet re-points the reverse direction's egress to the observed source. RTCP
-        // / non-RTP yields `None` and never moves the latch.
+        // SSRC-consistent packet re-points the reverse direction's egress to the observed source — for a
+        // secure leg that means *after* SRTP auth succeeded (a forged packet returned above), so a
+        // spoofed source can never move the latch. RTCP / non-RTP yields `None` and never moves it.
         if *latch {
-            if let Some(ssrc) = rtp_source_ssrc(&packet.data) {
+            if let Some(ssrc) = rtp_source_ssrc(plaintext) {
                 if let Some(new_dst) = direction.source_latch.observe(packet.source, ssrc) {
                     reverse.egress_dst = new_dst;
                 }
@@ -589,6 +686,8 @@ mod tests {
             egress_dst: addr(B_ADDR),
             t140_payload_type: Some(T140_PT),
             red_payload_type: Some(RED_PT),
+            secure_ingress: None,
+            secure_egress: None,
         };
         let b_to_a = TextDirectionConfig {
             ingress_endpoint: EndpointId(FAR_TEXT),
@@ -597,6 +696,8 @@ mod tests {
             egress_dst: addr(A_ADDR),
             t140_payload_type: Some(T140_PT),
             red_payload_type: Some(RED_PT),
+            secure_ingress: None,
+            secure_egress: None,
         };
         TextCall::new(
             "call-1",
@@ -810,6 +911,8 @@ mod tests {
             egress_dst: addr("127.0.0.3:9999"), // stale signalled dst toward B
             t140_payload_type: Some(T140_PT),
             red_payload_type: Some(RED_PT),
+            secure_ingress: None,
+            secure_egress: None,
         };
         let b_to_a = TextDirectionConfig {
             ingress_endpoint: EndpointId(FAR_TEXT),
@@ -818,6 +921,8 @@ mod tests {
             egress_dst: addr(A_ADDR),
             t140_payload_type: Some(T140_PT),
             red_payload_type: Some(RED_PT),
+            secure_ingress: None,
+            secure_egress: None,
         };
         let mut call = TextCall::new("c", "ft-a", Some("tt-b".to_string()), a_to_b, b_to_a, true);
         let mut out = Vec::new();
@@ -866,6 +971,219 @@ mod tests {
             events.is_empty(),
             "no text emitted from a malformed RED payload"
         );
+    }
+
+    // ---- Secure (SDES-SRTP) text path ----------------------------------------------------------
+
+    use siphon_rtp_srtp::leg::SecureLeg;
+    use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
+    use siphon_rtp_srtp::SrtpContext;
+
+    fn key(seed: u8) -> SrtpKeyMaterial {
+        SrtpKeyMaterial::from_inline_bytes(&[seed; 30]).expect("30-byte key")
+    }
+
+    /// A secure↔secure text call: the near (A) leg is keyed with `(near_local, near_remote)` and the far
+    /// (B) leg with `(far_local, far_remote)`, exactly as `engine::answer` wires it. Each direction
+    /// decrypts with the sending leg's `SecureLeg` and encrypts with the receiving leg's, so text is
+    /// re-keyed A↔B. Returns the call plus the four keys the test's stand-in peers use.
+    #[allow(clippy::type_complexity)]
+    fn secure_text_call() -> (
+        TextCall,
+        (
+            SrtpKeyMaterial,
+            SrtpKeyMaterial,
+            SrtpKeyMaterial,
+            SrtpKeyMaterial,
+        ),
+    ) {
+        let (near_local, near_remote) = (key(0x11), key(0x22)); // engine→A, A→engine
+        let (far_local, far_remote) = (key(0x33), key(0x44)); // engine→B, B→engine
+        let near_leg = Arc::new(Mutex::new(SecureLeg::new(&near_local, &near_remote)));
+        let far_leg = Arc::new(Mutex::new(SecureLeg::new(&far_local, &far_remote)));
+        let a_to_b = TextDirectionConfig {
+            ingress_endpoint: EndpointId(NEAR_TEXT),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: EndpointId(FAR_TEXT),
+            egress_dst: addr(B_ADDR),
+            t140_payload_type: Some(T140_PT),
+            red_payload_type: Some(RED_PT),
+            secure_ingress: Some(near_leg.clone()), // decrypt A
+            secure_egress: Some(far_leg.clone()),   // encrypt to B
+        };
+        let b_to_a = TextDirectionConfig {
+            ingress_endpoint: EndpointId(FAR_TEXT),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: EndpointId(NEAR_TEXT),
+            egress_dst: addr(A_ADDR),
+            t140_payload_type: Some(T140_PT),
+            red_payload_type: Some(RED_PT),
+            secure_ingress: Some(far_leg), // decrypt B
+            secure_egress: Some(near_leg), // encrypt to A
+        };
+        let call = TextCall::new(
+            "sec-1",
+            "ft-a",
+            Some("tt-b".to_string()),
+            a_to_b,
+            b_to_a,
+            false,
+        );
+        (call, (near_local, near_remote, far_local, far_remote))
+    }
+
+    #[test]
+    fn secure_text_decrypts_observes_reencrypts_and_forwards() {
+        let (mut call, (near_local, near_remote, far_local, _far_remote)) = secure_text_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // A builds a plaintext RED/T.140 "Hi" packet and encrypts it with its own key (A→engine).
+        let plaintext = red_rtp(1, 1000, b"Hi", &[]);
+        let mut a_encrypt = SrtpContext::from_key_material(&near_remote);
+        let mut srtp_in = Vec::new();
+        a_encrypt
+            .protect(&plaintext, &mut srtp_in)
+            .expect("A encrypt");
+
+        assert!(call.process(
+            &rx(NEAR_TEXT, A_ADDR, srtp_in.clone()),
+            &mut out,
+            &mut events
+        ));
+
+        // Event::Text carries the DECRYPTED increment (observe after decrypt).
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Text {
+                text, direction, ..
+            } => {
+                assert_eq!(text, "Hi");
+                assert_eq!(direction.as_deref(), Some("a_to_b"));
+            }
+            other => panic!("expected Event::Text, got {other:?}"),
+        }
+
+        // The datagram forwarded to B is SRTP (re-encrypted with the FAR leg's key), not the A-side
+        // ciphertext and not plaintext — a secure↔secure bridge re-keys per leg.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].endpoint, EndpointId(FAR_TEXT));
+        assert_eq!(out[0].dst, addr(B_ADDR));
+        assert_ne!(
+            &out[0].data[..],
+            &plaintext[..],
+            "not forwarded in the clear"
+        );
+        assert_ne!(
+            &out[0].data[..],
+            &srtp_in[..],
+            "re-encrypted with B's key, not A's ciphertext"
+        );
+
+        // B, holding the engine's far offered key, decrypts the forwarded packet back to the original.
+        let mut b_decrypt = SrtpContext::from_key_material(&far_local);
+        let mut recovered = Vec::new();
+        b_decrypt
+            .unprotect(&out[0].data, &mut recovered)
+            .expect("B decrypts the re-keyed text");
+        assert_eq!(
+            recovered, plaintext,
+            "B recovers the exact T.140/RED bytes A sent"
+        );
+
+        // The engine never handed A's offered key onward (defence-in-depth: distinct per-leg keys).
+        assert_ne!(near_local, far_local);
+    }
+
+    #[test]
+    fn secure_text_failing_srtp_auth_is_dropped_not_forwarded() {
+        let (mut call, _keys) = secure_text_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // A datagram from A's signalled source but encrypted under the WRONG key (an attacker who cannot
+        // key the leg, or a corrupted packet) fails the leg's SRTP auth — fail-closed: dropped, never
+        // forwarded to B, never observed.
+        let plaintext = red_rtp(1, 1000, b"steal", &[]);
+        let mut wrong = SrtpContext::from_key_material(&key(0x99));
+        let mut forged = Vec::new();
+        wrong
+            .protect(&plaintext, &mut forged)
+            .expect("encrypt with wrong key");
+
+        call.process(&rx(NEAR_TEXT, A_ADDR, forged), &mut out, &mut events);
+        assert!(
+            out.is_empty(),
+            "an inauthentic SRTP packet is never forwarded to the peer"
+        );
+        assert!(
+            events.is_empty(),
+            "no Event::Text for a packet that failed SRTP auth"
+        );
+        assert_eq!(call.final_counters().near, TextStreamStats::default());
+    }
+
+    #[test]
+    fn secure_text_off_source_packet_is_gated_before_any_crypto() {
+        let (mut call, (_nl, near_remote, _fl, _fr)) = secure_text_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        // A validly-keyed packet, but from an unsignalled source IP (RTPBleed): the source gate drops it
+        // before any decrypt happens — the secure leg is protected by the same per-stream gate.
+        let plaintext = red_rtp(1, 1000, b"Hi", &[]);
+        let mut a_encrypt = SrtpContext::from_key_material(&near_remote);
+        let mut srtp = Vec::new();
+        a_encrypt.protect(&plaintext, &mut srtp).expect("encrypt");
+        let accepted = call.process(
+            &rx(NEAR_TEXT, "127.0.0.9:6000", srtp),
+            &mut out,
+            &mut events,
+        );
+        assert!(!accepted, "off-source secure packet rejected at the gate");
+        assert!(out.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn secure_text_both_directions_rekey_with_their_own_legs() {
+        let (mut call, (near_local, near_remote, _far_local, far_remote)) = secure_text_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        // B→A: B encrypts with its own key; the engine decrypts on the far leg and re-encrypts on the
+        // near leg, so A decrypts with the engine's near offered key.
+        let plaintext = red_rtp(1, 2000, b"Yo", &[]);
+        let mut b_encrypt = SrtpContext::from_key_material(&far_remote);
+        let mut srtp_in = Vec::new();
+        b_encrypt
+            .protect(&plaintext, &mut srtp_in)
+            .expect("B encrypt");
+        call.process(&rx(FAR_TEXT, B_ADDR, srtp_in), &mut out, &mut events);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].endpoint, EndpointId(NEAR_TEXT));
+        assert_eq!(out[0].dst, addr(A_ADDR));
+        let mut a_decrypt = SrtpContext::from_key_material(&near_local);
+        let mut recovered = Vec::new();
+        a_decrypt
+            .unprotect(&out[0].data, &mut recovered)
+            .expect("A decrypts the re-keyed B→A text");
+        assert_eq!(recovered, plaintext);
+        match &events[0] {
+            Event::Text {
+                text,
+                direction,
+                from_tag,
+                ..
+            } => {
+                assert_eq!(text, "Yo");
+                assert_eq!(from_tag, "tt-b");
+                assert_eq!(direction.as_deref(), Some("b_to_a"));
+            }
+            other => panic!("expected Event::Text, got {other:?}"),
+        }
+        // The two legs use distinct keys in both directions (no key reuse across legs).
+        assert_ne!(near_remote, far_remote);
     }
 
     #[tokio::test]
