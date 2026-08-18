@@ -2327,10 +2327,21 @@ mod tests {
         peer.send_to(&report, leg_a.local_addr).await.expect("rtcp");
         assert_eq!(recv(&callee).await.0, report);
 
-        let observed = observations.try_recv().expect("the RTCP was observed");
+        // Await the observation rather than `try_recv`ing it. The tap deliberately runs *after* the
+        // relay's `send_to` so it can never delay forwarding, which means the relayed packet
+        // arriving at the callee does NOT imply the tap has run yet — the relay task can be
+        // descheduled at that await point. Polling for it once raced the relay under load and made
+        // this test intermittently fail in CI.
+        let observed = timeout(Duration::from_secs(1), observations.recv_async())
+            .await
+            .expect("the RTCP was observed within the timeout")
+            .expect("the observation stream is open");
         assert_eq!(observed.endpoint, leg_a.id);
         assert_eq!(observed.destination, callee_addr);
         assert_eq!(&observed.payload[..], &report[..]);
+        // Now sound as a `try_recv`: the RTP was relayed *before* the RTCP and one endpoint's
+        // packets are dispatched serially, so had the RTP been tapped its observation would already
+        // be queued ahead of the one just taken.
         assert!(observations.try_recv().is_err(), "the RTP was not observed");
     }
 }
