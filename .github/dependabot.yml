@@ -17,11 +17,18 @@ updates:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
 
-  # The fuzz crate is its own (detached) workspace, so it needs a separate cargo entry.
+  # The fuzz crate is its own (detached) workspace, so it needs a separate cargo entry. Grouped for
+  # the same reason as "/", and more so: every bump here touches the one file fuzz/Cargo.lock, so
+  # ungrouped PRs conflict with each other the moment one merges and each survivor needs a rebase
+  # plus a full CI round.
   - package-ecosystem: cargo
     directory: "/fuzz"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
 
   # Pinned action versions in the workflows (checkout, rust-cache, docker/*, cargo-deny, …).
   - package-ecosystem: github-actions
