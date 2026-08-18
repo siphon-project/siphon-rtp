@@ -215,6 +215,20 @@ struct Call {
     /// [`Event::Text`] for the call's life. `false` ⇒ no control-plane text events (recording can still
     /// promote text independently).
     text_events: bool,
+    /// Whether the negotiated RFC 4103 text stream is **secure** (SDES-SRTP, `RTP/SAVP`). A secure text
+    /// stream is anchored as a per-leg `SecureLeg` bridge and runs in the userspace text processor
+    /// **from the start** (SRTP cannot relay on the in-kernel `Forward` fast path), so it has no
+    /// `text_relay_flows` and is never demoted back to the kernel. `false` for a plaintext text stream
+    /// or an audio-only call. Set at `answer()` once both legs' keys are known.
+    text_secure: bool,
+    /// The near (offerer, A) leg's SDES key from its secure `m=text` offer — the peer key the near text
+    /// `SecureLeg` decrypts A's ingress with (RFC 4568). `None` for a plaintext / audio-only call.
+    /// Captured at offer, consumed at answer to build the near text leg.
+    near_text_remote_crypto: Option<CryptoAttribute>,
+    /// The engine's own SDES key advertised to the far (answerer, B) leg in the secure `m=text` offer —
+    /// the local key the far text `SecureLeg` encrypts egress toward B with (RFC 4568). `None` for a
+    /// plaintext / audio-only call. Minted at offer, consumed at answer.
+    far_text_local_crypto: Option<CryptoAttribute>,
 }
 
 /// A runtime reason a plain passthrough relay is held in the userspace media pipeline (promoted off
@@ -231,6 +245,11 @@ enum PromotionReason {
     /// **text** stream (never audio) in the userspace [`crate::text_pipeline`] so it emits
     /// [`Event::Text`]. Only ever appears in a call's `text_promotion_reasons`, never `promotion_reasons`.
     TextEvents,
+    /// The RFC 4103 text stream is **secure** (SDES-SRTP) — it must terminate SRTP in the userspace
+    /// text processor (SRTP cannot relay in-kernel), so it is held there for the call's whole life and
+    /// never demoted. A permanent hold, inserted at `answer()` and never released (unlike `TextEvents` /
+    /// `Recording`). Only ever appears in a call's `text_promotion_reasons`.
+    Secure,
     /// Echo-test mode is on (`Command::Echo`) — the relay is held in a **processing** MediaCall so the
     /// actor can decode each party's ingress and re-emit it back to the sender (a relay-only promotion
     /// forwards opaque payloads to the peer and cannot loop them home).
@@ -1463,48 +1482,86 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .copied()
             .collect();
 
-        // RFC 4103 Real-Time Text: when the offer carries a *plaintext* `m=text` stream (and this is
-        // not a WS bridge, which has no B leg to relay to), anchor + transparently relay it as a second
-        // stream — allocate one text RTP endpoint per leg, sharing each leg's family/interface. A
-        // *secure* (`RTP/SAVP`) text stream is declined to B (`m=text 0`, RFC 3264 §6), never
-        // downgraded to plaintext (secure text is a follow-up). Text RTCP is not separately endpointed
-        // (single text port; text RTCP relay is a follow-up — docs/security-and-nat.md).
-        let text_secure = info.text.as_ref().is_some_and(|text| text.secure);
-        let anchor_text = info.text.is_some() && !text_secure && profile.ws_uri.is_none();
-        let (near_text_endpoint, far_text_endpoint, text_rewrite) = if anchor_text {
-            let near_text = match self.alloc_endpoints(1, near_family, near_bind).await {
-                Ok(mut allocated) => allocated.remove(0),
-                Err(reason) => {
-                    self.free(&endpoints).await;
-                    return CmdResult::Error { reason };
+        // RFC 4103 Real-Time Text: when the offer carries an `m=text` stream (and this is not a WS
+        // bridge, which has no B leg to relay to), anchor + relay it as a second stream — one text RTP
+        // endpoint per leg, sharing each leg's family/interface. A **plaintext** (`RTP/AVP`) stream is a
+        // second in-kernel relay. A **secure** (`RTP/SAVP` + `a=crypto`) stream is anchored as an
+        // SDES-SRTP text leg: the engine mints its own far text SDES key, advertises `RTP/SAVP` + our
+        // `a=crypto` to B, and terminates SRTP in the userspace text processor (docs/security-and-nat.md
+        // Layer 5d — mirrors the audio SDES bridge). A secure text stream we cannot key (no usable
+        // `a=crypto`) is declined (`m=text 0`, RFC 3264 §6), never downgraded to plaintext. Text RTCP is
+        // not separately endpointed (single text port; text SRTCP rides the muxed port).
+        let text_offered_secure = info.text.as_ref().is_some_and(|text| text.secure);
+        // The near (A) leg's own text SDES key, from a secure text offer — decrypts A's text ingress.
+        let near_text_remote_crypto = info
+            .text
+            .as_ref()
+            .filter(|_| text_offered_secure)
+            .and_then(|text| text.crypto.first().copied());
+        let anchor_plain_text =
+            info.text.is_some() && !text_offered_secure && profile.ws_uri.is_none();
+        let anchor_secure_text =
+            text_offered_secure && near_text_remote_crypto.is_some() && profile.ws_uri.is_none();
+        let anchor_text = anchor_plain_text || anchor_secure_text;
+        let (near_text_endpoint, far_text_endpoint, text_rewrite, far_text_local_crypto) =
+            if anchor_text {
+                let near_text = match self.alloc_endpoints(1, near_family, near_bind).await {
+                    Ok(mut allocated) => allocated.remove(0),
+                    Err(reason) => {
+                        self.free(&endpoints).await;
+                        return CmdResult::Error { reason };
+                    }
+                };
+                let far_text = match self.alloc_endpoints(1, far_family, far_bind).await {
+                    Ok(mut allocated) => allocated.remove(0),
+                    Err(reason) => {
+                        self.datapath.remove_endpoint(near_text.id).await;
+                        self.free(&endpoints).await;
+                        return CmdResult::Error { reason };
+                    }
+                };
+                endpoints.push(near_text);
+                endpoints.push(far_text);
+                // The rewritten offer advertises the FAR text endpoint to B (same interface as far audio).
+                let far_text_engine = EngineMedia {
+                    rtp: far_text.local_addr,
+                    rtcp: None,
+                    advertised_ip: far_advertised,
+                };
+                if anchor_secure_text {
+                    // Mint the engine's own far text SDES key (advertised to B); the near text key is minted
+                    // at answer, when the near answer advertises `RTP/SAVP` + our `a=crypto` to A.
+                    let far_text_key =
+                        match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+                            Ok(crypto) => crypto,
+                            Err(error) => {
+                                self.free(&endpoints).await;
+                                return error_result("generate text SDES key", &error);
+                            }
+                        };
+                    (
+                        Some(near_text),
+                        Some(far_text),
+                        TextRewrite::AnchorSecure {
+                            engine: far_text_engine,
+                            crypto: far_text_key,
+                        },
+                        Some(far_text_key),
+                    )
+                } else {
+                    (
+                        Some(near_text),
+                        Some(far_text),
+                        TextRewrite::Anchor(far_text_engine),
+                        None,
+                    )
                 }
+            } else if text_offered_secure {
+                // A secure text stream we cannot key (no usable `a=crypto`) → decline it, never downgrade.
+                (None, None, TextRewrite::Decline, None)
+            } else {
+                (None, None, TextRewrite::None, None)
             };
-            let far_text = match self.alloc_endpoints(1, far_family, far_bind).await {
-                Ok(mut allocated) => allocated.remove(0),
-                Err(reason) => {
-                    self.datapath.remove_endpoint(near_text.id).await;
-                    self.free(&endpoints).await;
-                    return CmdResult::Error { reason };
-                }
-            };
-            endpoints.push(near_text);
-            endpoints.push(far_text);
-            // The rewritten offer advertises the FAR text endpoint to B (same interface as far audio).
-            let far_text_engine = EngineMedia {
-                rtp: far_text.local_addr,
-                rtcp: None,
-                advertised_ip: far_advertised,
-            };
-            (
-                Some(near_text),
-                Some(far_text),
-                TextRewrite::Anchor(far_text_engine),
-            )
-        } else if text_secure {
-            (None, None, TextRewrite::Decline)
-        } else {
-            (None, None, TextRewrite::None)
-        };
 
         // The rewritten offer is delivered to B, so it advertises the `far` leg.
         let engine = EngineMedia {
@@ -1672,7 +1729,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             codec = near_codec.as_ref().map(|codec| codec.encoding_name.as_str()).unwrap_or("-"),
             secure = far_local_crypto.is_some() || far_dtls,
             text = anchor_text,
-            text_secure,
+            text_secure = anchor_secure_text,
             "call created"
         );
 
@@ -1753,6 +1810,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 text_promotion_reasons: HashSet::new(),
                 // Captured at offer, applied at answer (when the text stream is fully negotiated).
                 text_events: profile.text_events,
+                // Secure text: `text_secure` is confirmed at answer (both legs' keys known); the offer
+                // captures A's own text key + the engine's far text key so answer can build both legs.
+                text_secure: false,
+                near_text_remote_crypto,
+                far_text_local_crypto,
             },
         );
 
@@ -1966,6 +2028,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 text_relay_flows: Vec::new(),
                 text_promotion_reasons: HashSet::new(),
                 text_events: false,
+                text_secure: false,
+                near_text_remote_crypto: None,
+                far_text_local_crypto: None,
             },
         );
 
@@ -2554,6 +2619,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_telephone_event,
             offer_pipeline,
             offer_received_from,
+            near_text_remote_crypto,
+            far_text_local_crypto,
+            text_t140_payload_type,
+            text_red_payload_type,
+            text_events,
         ) = match self.calls.get(call_id) {
             Some(call) if call.owner == client => {
                 if call.from_tag != from_tag {
@@ -2575,12 +2645,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.near_telephone_event,
                     call.pipeline,
                     call.offer_received_from,
+                    call.near_text_remote_crypto,
+                    call.far_text_local_crypto,
+                    call.text_t140_payload_type,
+                    call.text_red_payload_type,
+                    call.text_events,
                 )
             }
             _ => return unknown_call(call_id),
         };
         // The owner's async event sink (DTMF events flow here from the media actor), if registered.
         let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
+        // Cloned up front for the secure text actor: `owner_events` is moved into the audio pipeline's
+        // actor registration below, so the secure-text branch (which registers its own text actor after
+        // that) takes its event sink here. `Event::Text` flows only when the controller asked for it.
+        let secure_text_events_sink = if text_events {
+            owner_events.clone()
+        } else {
+            None
+        };
 
         let info = match sdp::parse(sdp) {
             Ok(info) => info,
@@ -2656,22 +2739,62 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // call turning into a WS leg here declines any text anchored at offer rather than advertising a
         // text port it will not serve.
         let becoming_ws = offer_pipeline == PipelineKind::Ws || profile.ws_uri.is_some();
+        // Whether A offered a secure (SDES-SRTP) text stream we anchored: both its own text key (A's,
+        // from the offer) and the engine's far text key (minted at offer) are present iff we did.
+        let a_offered_secure_text =
+            near_text_remote_crypto.is_some() && far_text_local_crypto.is_some();
+        // Secure text is accepted only when A offered it AND B answered a secure text stream carrying a
+        // usable `a=crypto` on a non-zero port. A mixed case (A secure / B plaintext, or A plaintext / B
+        // secure) is refused below (declined), never bridged — the "never silently bridge
+        // secure↔insecure" rule (docs/security-and-nat.md Layer 5/5d).
+        let secure_text_accepted = !becoming_ws
+            && a_offered_secure_text
+            && near.text.is_some()
+            && far.text.is_some()
+            && info.text.as_ref().is_some_and(|text| {
+                text.secure && !text.crypto.is_empty() && text.remote_rtp.port() != 0
+            });
+        // Plaintext text is accepted only when A did NOT offer secure text (else it would be a downgrade
+        // of A's secure offer) and B answered a plaintext stream on a non-zero port.
         let text_accepted = !becoming_ws
+            && !a_offered_secure_text
             && info
                 .text
                 .as_ref()
                 .is_some_and(|text| !text.secure && text.remote_rtp.port() != 0);
-        let text_rewrite = match near.text {
-            Some(near_text) if far.text.is_some() && text_accepted => {
-                TextRewrite::Anchor(EngineMedia {
-                    rtp: near_text.local_addr,
-                    rtcp: None,
-                    advertised_ip: near.advertised_ip,
-                })
+        // The engine's own near text SDES key, minted for the near answer to A (advertised as
+        // `RTP/SAVP` + `a=crypto`), and reused below to build the near text `SecureLeg`.
+        let near_text_local_crypto = if secure_text_accepted {
+            match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+                Ok(crypto) => Some(crypto),
+                Err(error) => return error_result("answer: generate text SDES key", &error),
             }
-            // A was offered text but B did not accept a plaintext stream — decline it back to A.
-            Some(_) => TextRewrite::Decline,
-            None => TextRewrite::None,
+        } else {
+            None
+        };
+        let text_rewrite = if let Some(near_text) = near.text {
+            let near_text_engine = EngineMedia {
+                rtp: near_text.local_addr,
+                rtcp: None,
+                advertised_ip: near.advertised_ip,
+            };
+            if let Some(crypto) = near_text_local_crypto {
+                // Secure text accepted: the near answer advertises `RTP/SAVP` + the engine's own text
+                // `a=crypto` to A (SDES-SRTP text leg). `near_text_local_crypto` is `Some` only when
+                // both near.text and far.text are present (see `secure_text_accepted`).
+                TextRewrite::AnchorSecure {
+                    engine: near_text_engine,
+                    crypto,
+                }
+            } else if far.text.is_some() && text_accepted {
+                TextRewrite::Anchor(near_text_engine)
+            } else {
+                // A was offered text but B did not accept a matching stream (declined, mixed, or WS) —
+                // decline it back to A (`m=text 0`, RFC 3264 §6), never downgraded or mixed.
+                TextRewrite::Decline
+            }
+        } else {
+            TextRewrite::None
         };
         let mut rewritten = match sdp::rewrite(
             sdp,
@@ -3493,7 +3616,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let (Some(near_text), Some(far_text), Some(b_text)) =
             (near.text, far.text, info.text.as_ref())
         {
-            if !b_text.secure && b_text.remote_rtp.port() != 0 {
+            // `text_accepted` already excludes a secure-text offer (no plaintext downgrade) and a WS
+            // takeover; only a genuine plaintext↔plaintext stream installs the in-kernel `Forward` relay.
+            if text_accepted && !b_text.secure && b_text.remote_rtp.port() != 0 {
                 let b_text_rtp = b_text.remote_rtp;
                 far_text_remote = Some(b_text_rtp);
                 // Gate each side's text ingress to its signalled source, tightened to the
@@ -3526,6 +3651,114 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
+        // RFC 4103 SECURE text (SDES-SRTP) — the per-leg `SecureLeg` bridge. Unlike the plaintext relay
+        // it cannot run in-kernel (SRTP must be terminated in userspace), so it is registered on the
+        // text processor from the start: both text endpoints `Redirect`ed, one `SecureLeg` per leg with
+        // its OWN SDES keys (near = engine↔A, far = engine↔B), and held there for the call's life
+        // (docs/security-and-nat.md Layer 5d — mirrors the audio SDES bridge). A→B text is decrypted on
+        // the near leg and re-encrypted on the far leg (and B→A the reverse), so the two sides re-key
+        // independently and no plaintext ever crosses to a secure peer. A mixed secure/plaintext text
+        // bridge was refused above (declined), never keyed here.
+        let mut secure_text_registered = false;
+        if secure_text_accepted {
+            if let (
+                Some(near_text),
+                Some(far_text),
+                Some(b_text),
+                Some(near_local),
+                Some(near_remote),
+                Some(far_local),
+                Some(a_text_dst),
+            ) = (
+                near.text,
+                far.text,
+                info.text.as_ref(),
+                near_text_local_crypto,
+                near_text_remote_crypto,
+                far_text_local_crypto,
+                near.text_remote_rtp,
+            ) {
+                if let Some(far_remote) = b_text.crypto.first().copied() {
+                    let b_text_rtp = b_text.remote_rtp;
+                    far_text_remote = Some(b_text_rtp);
+                    // Same per-stream source gate + symmetric-latch posture as the plaintext text relay
+                    // and the audio SDES bridge: gate each side to its signalled source, tightened to the
+                    // `received-from` public IP when the proxy supplied one (docs/security-and-nat.md §4).
+                    let near_text_gate =
+                        apply_received_from(near.text_remote_rtp, offer_received_from);
+                    let far_text_gate =
+                        apply_received_from(Some(b_text_rtp), profile.received_from)
+                            .unwrap_or(b_text_rtp);
+                    let near_rule = ingress_rule(
+                        far_text.id,
+                        Some(b_text_rtp),
+                        near_text_gate,
+                        profile,
+                        false,
+                    );
+                    let far_rule = ingress_rule(
+                        near_text.id,
+                        Some(a_text_dst),
+                        Some(far_text_gate),
+                        profile,
+                        false,
+                    );
+                    let latch =
+                        near_rule.latch != LatchPolicy::Off || far_rule.latch != LatchPolicy::Off;
+                    // One `SecureLeg` per text leg (its own SDES keys), each shared by both directions —
+                    // exactly as the audio bridge shares a leg's contexts (single-owner actor ⇒ the
+                    // `Mutex` is uncontended).
+                    let near_leg = Arc::new(Mutex::new(SecureLeg::new(
+                        &near_local.key,
+                        &near_remote.key,
+                    )));
+                    let far_leg =
+                        Arc::new(Mutex::new(SecureLeg::new(&far_local.key, &far_remote.key)));
+                    // Redirect both text endpoints so the dispatcher routes them to the text actor.
+                    for endpoint in [near_text.id, far_text.id] {
+                        if let Err(error) =
+                            self.datapath.install_flow(endpoint, FlowAction::Redirect)
+                        {
+                            return error_result("install secure text redirect", &error);
+                        }
+                    }
+                    let a_to_b = TextDirectionConfig {
+                        ingress_endpoint: near_text.id,
+                        accepted_source: near_rule.accepted_source,
+                        egress_endpoint: far_text.id,
+                        egress_dst: b_text_rtp,
+                        t140_payload_type: text_t140_payload_type,
+                        red_payload_type: text_red_payload_type,
+                        secure_ingress: Some(near_leg.clone()), // decrypt A's ingress
+                        secure_egress: Some(far_leg.clone()),   // encrypt egress toward B
+                    };
+                    let b_to_a = TextDirectionConfig {
+                        ingress_endpoint: far_text.id,
+                        accepted_source: far_rule.accepted_source,
+                        egress_endpoint: near_text.id,
+                        egress_dst: a_text_dst,
+                        t140_payload_type: text_t140_payload_type,
+                        red_payload_type: text_red_payload_type,
+                        secure_ingress: Some(far_leg), // decrypt B's ingress
+                        secure_egress: Some(near_leg), // encrypt egress toward A
+                    };
+                    let text_call = TextCall::new(
+                        call_id,
+                        from_tag,
+                        Some(to_tag.clone()),
+                        a_to_b,
+                        b_to_a,
+                        latch,
+                    );
+                    // Event::Text flows only when the controller asked for it (parity with the plaintext
+                    // path); the CDR content QoS accrues regardless (read via `final_counters`).
+                    self.text
+                        .register(text_call, self.datapath.clone(), secure_text_events_sink);
+                    secure_text_registered = true;
+                }
+            }
+        }
+
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.to_tag = Some(to_tag.clone());
             call.far.remote_rtp = Some(info.remote_rtp);
@@ -3545,8 +3778,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.pipeline = pipeline;
             call.relay_flows = relay_flows;
             // The in-kernel text `Forward` flows, kept so text observability can promote/demote the
-            // text stream while the audio relay stays on its own fast path.
+            // text stream while the audio relay stays on its own fast path. Empty for a secure text
+            // stream (it never runs in-kernel).
             call.text_relay_flows = text_relay_flows;
+            // A secure (SDES-SRTP) text stream is now registered on the userspace text processor and
+            // stays there for the call's life (SRTP cannot relay in-kernel): mark it and take a
+            // permanent promotion hold so `release_text_hold` never demotes it back to the kernel.
+            call.text_secure = secure_text_registered;
+            if secure_text_registered {
+                call.text_promotion_reasons.insert(PromotionReason::Secure);
+            }
             // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
             call.far_remote_crypto = info.crypto.first().copied();
             // B's ICE credentials from its answer — what an outbound consent check to B is addressed
@@ -4477,12 +4718,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // noise. 2-leg (relay/bridge/transcode) restores never use this.
                 comfort_noise_payload_type: None,
                 // RTT text stream: not carried in the HA snapshot (restore deferred) — a restored call
-                // is audio-only, so no text flows / promotion / events either.
+                // is audio-only, so no text flows / promotion / events / secure keying either.
                 text_t140_payload_type: None,
                 text_red_payload_type: None,
                 text_relay_flows: Vec::new(),
                 text_promotion_reasons: HashSet::new(),
                 text_events: false,
+                text_secure: false,
+                near_text_remote_crypto: None,
+                far_text_local_crypto: None,
             },
         );
         tracing::info!(call_id = %snapshot.call_id, "restored call from HA snapshot");
@@ -6487,6 +6731,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             egress_dst: layout.b_dst,
             t140_payload_type: t140_pt,
             red_payload_type: red_pt,
+            // Plaintext promotion (from an in-kernel `Forward` relay) — no SRTP on either side.
+            secure_ingress: None,
+            secure_egress: None,
         };
         let b_to_a = TextDirectionConfig {
             ingress_endpoint: layout.far_endpoint,
@@ -6495,6 +6742,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             egress_dst: layout.a_dst,
             t140_payload_type: t140_pt,
             red_payload_type: red_pt,
+            secure_ingress: None,
+            secure_egress: None,
         };
         // Switch both text endpoints to Redirect so the dispatcher routes them to the text actor.
         for endpoint in [layout.near_endpoint, layout.far_endpoint] {
@@ -6516,6 +6765,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// heavier, and logged.
     async fn demote_text_to_kernel(&self, call_id: &str) {
         if !self.text.is_text_call(call_id) {
+            return;
+        }
+        // A secure (SDES-SRTP) text stream can never run in-kernel (SRTP is terminated in userspace), so
+        // it is never demoted — it has no `text_relay_flows` to reinstall and its `SecureLeg`s live in
+        // the text actor. Bail rather than deregister the actor and strand the redirected endpoints.
+        if self
+            .owned_call_internal(call_id, |call| call.text_secure)
+            .unwrap_or(false)
+        {
             return;
         }
         let Some(text_relay_flows) =
