@@ -96,9 +96,14 @@ pub struct FlowAction {
     pub latched_port: u16,
     /// Whether the latch fields hold a learned source.
     pub latch_valid: u8,
-    /// Padding.
-    pub _pad: u8,
-    /// AF_XDP queue index for `action::REDIRECT`.
+    /// Non-zero when this endpoint runs ICE (RFC 8445), which changes two things in the kernel:
+    /// STUN is **redirected to userspace** instead of being dropped by the layer-1 demux (the agent
+    /// owns every connectivity check), and media is gated on the *adopted* source alone — see
+    /// [`ice_media_allowed`](crate::rewrite::ice_media_allowed). Occupies the byte that used to be
+    /// padding, so the ABI layout is unchanged.
+    pub ice: u8,
+    /// AF_XDP queue index for `action::REDIRECT`. Also the queue a STUN datagram on an
+    /// `action::FORWARD` **ICE** flow is redirected to.
     pub redirect_queue: u32,
 }
 

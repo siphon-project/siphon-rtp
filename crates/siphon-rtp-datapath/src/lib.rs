@@ -293,6 +293,55 @@ pub struct IceConfig {
     pub local_pwd: String,
 }
 
+/// What the ice-lite responder decided about one inbound STUN datagram — the outcome of
+/// [`respond_to_stun_check`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StunCheckOutcome {
+    /// Not a valid connectivity check addressed to us: drop it silently. Either it is not a Binding
+    /// request, its USERNAME does not lead with our ufrag, or its MESSAGE-INTEGRITY does not verify
+    /// with our local password.
+    Drop,
+    /// A check that authenticated: adopt the datagram's source as the media path and send these
+    /// response bytes back to it.
+    Respond(Vec<u8>),
+}
+
+/// The ice-lite STUN responder (RFC 8445 §7.3, RFC 5389), as a pure function of the datagram and the
+/// endpoint's credentials — no socket, no state.
+///
+/// Both backends run *this* code rather than their own copy, so the loopback and XDP datapaths can
+/// never drift on what authenticates a check. The caller does the two side-effects: adopt `source` as
+/// the media path, and transmit the returned bytes to it.
+///
+/// The check must be a Binding **request** whose USERNAME leads with our local ufrag (RFC 8445
+/// §7.3: `<local>:<remote>`) and whose MESSAGE-INTEGRITY verifies under our local password — a
+/// challenge an off-path attacker cannot forge without having seen the SDP.
+#[must_use]
+pub fn respond_to_stun_check(
+    datagram: &[u8],
+    ice: &IceConfig,
+    source: SocketAddr,
+) -> StunCheckOutcome {
+    let request = match siphon_rtp_stun::parse(datagram) {
+        Ok(message) if message.is_binding_request() => message,
+        _ => return StunCheckOutcome::Drop,
+    };
+    let addressed_to_us = request
+        .username()
+        .and_then(|username| username.split(':').next())
+        .is_some_and(|ufrag| ufrag == ice.local_ufrag);
+    if !addressed_to_us
+        || !siphon_rtp_stun::verify_message_integrity(datagram, ice.local_pwd.as_bytes())
+    {
+        return StunCheckOutcome::Drop;
+    }
+    StunCheckOutcome::Respond(siphon_rtp_stun::binding_success_response(
+        &request.transaction_id,
+        source,
+        Some(ice.local_pwd.as_bytes()),
+    ))
+}
+
 /// Who answers inbound STUN checks on an endpoint promoted via [`Datapath::set_ice_agent`].
 ///
 /// The distinction matters because whoever answers a check also decides whether its source becomes
@@ -652,5 +701,94 @@ mod tests {
     #[test]
     fn classify_treats_an_empty_datagram_as_other() {
         assert_eq!(classify(&[]), PacketClass::Other);
+    }
+
+    // --- The shared ice-lite responder (both backends run this) ----------------------------------
+
+    fn responder_config() -> IceConfig {
+        IceConfig {
+            local_ufrag: "engineUfrag".to_string(),
+            local_pwd: "enginePasswordThatIsLongEnough".to_string(),
+        }
+    }
+
+    fn responder_peer() -> SocketAddr {
+        "198.51.100.10:5000".parse().expect("addr")
+    }
+
+    #[test]
+    fn responder_answers_a_check_signed_with_our_password() {
+        let config = responder_config();
+        let check = siphon_rtp_stun::binding_request(
+            &[1u8; 12],
+            &format!("{}:peerUfrag", config.local_ufrag),
+            config.local_pwd.as_bytes(),
+        );
+        let StunCheckOutcome::Respond(response) =
+            respond_to_stun_check(&check, &config, responder_peer())
+        else {
+            panic!("a valid check must be answered");
+        };
+        // The response is itself signed, so the peer can authenticate us in turn (RFC 5389 §15.4).
+        assert!(siphon_rtp_stun::verify_message_integrity(
+            &response,
+            config.local_pwd.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn responder_drops_a_check_signed_with_the_wrong_password() {
+        // An off-path attacker who never saw the SDP cannot forge MESSAGE-INTEGRITY — this is the
+        // gate that makes ICE adoption safe (docs/security-and-nat.md §4 layer 4).
+        let config = responder_config();
+        let forged = siphon_rtp_stun::binding_request(
+            &[1u8; 12],
+            &format!("{}:peerUfrag", config.local_ufrag),
+            b"not-our-password",
+        );
+        assert_eq!(
+            respond_to_stun_check(&forged, &config, responder_peer()),
+            StunCheckOutcome::Drop
+        );
+    }
+
+    #[test]
+    fn responder_drops_a_check_addressed_to_a_different_ufrag() {
+        // RFC 8445 §7.3: the USERNAME is `<local>:<remote>`, so a check whose first half is not our
+        // ufrag is not addressed to this endpoint even if it somehow verifies.
+        let config = responder_config();
+        let misaddressed = siphon_rtp_stun::binding_request(
+            &[1u8; 12],
+            "someoneElse:peerUfrag",
+            config.local_pwd.as_bytes(),
+        );
+        assert_eq!(
+            respond_to_stun_check(&misaddressed, &config, responder_peer()),
+            StunCheckOutcome::Drop
+        );
+    }
+
+    #[test]
+    fn responder_drops_non_requests_and_garbage() {
+        let config = responder_config();
+        // A Binding *response* is not a check to answer — answering one would be a reflection loop.
+        let response = siphon_rtp_stun::binding_success_response(
+            &[1u8; 12],
+            responder_peer(),
+            Some(config.local_pwd.as_bytes()),
+        );
+        assert_eq!(
+            respond_to_stun_check(&response, &config, responder_peer()),
+            StunCheckOutcome::Drop
+        );
+        // Truncated / non-STUN bytes must not panic.
+        assert_eq!(
+            respond_to_stun_check(&[], &config, responder_peer()),
+            StunCheckOutcome::Drop
+        );
+        assert_eq!(
+            respond_to_stun_check(&[0x00, 0x01, 0xFF], &config, responder_peer()),
+            StunCheckOutcome::Drop
+        );
     }
 }

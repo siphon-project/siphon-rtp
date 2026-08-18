@@ -193,6 +193,37 @@ pub fn is_rtp_or_rtcp(payload: &[u8]) -> bool {
     matches!(payload.first(), Some(&byte0) if (128..=191).contains(&byte0))
 }
 
+/// Whether the RFC 7983 first-byte demux classifies `payload` as STUN (0..=3) — an ICE connectivity
+/// check or its response. On an ICE flow these are redirected to userspace for the RFC 8445 agent
+/// instead of being dropped by the layer-1 demux; on every other flow they are still dropped.
+#[inline(always)]
+#[must_use]
+pub fn is_stun(payload: &[u8]) -> bool {
+    matches!(payload.first(), Some(&byte0) if byte0 <= 3)
+}
+
+/// Layer 4 — whether an **ICE** flow may forward this media datagram (docs/security-and-nat.md §4
+/// layer 4; RFC 8445 §7).
+///
+/// On an ICE endpoint the authenticated connectivity check is the *only* thing that may adopt a
+/// media source, so this subsumes both the signalled-source gate (layer 2) and the SSRC re-latch
+/// (layer 3): media is forwarded only from the source ICE adopted, and media itself never creates or
+/// moves that adoption. Before any check has validated a source (`current == None`) nothing is
+/// forwarded at all — an ICE leg that blind-latched the first RTP sender would be exactly the
+/// RTPbleed hole ICE exists to close.
+///
+/// The SSRC field of `current` is deliberately not consulted: on an ICE endpoint the adoption is
+/// written by the agent in userspace (`Datapath::adopt_source`), which authenticates with
+/// MESSAGE-INTEGRITY rather than SSRC continuity. Mirrors the loopback backend's layer-4 gate.
+#[inline(always)]
+#[must_use]
+pub fn ice_media_allowed(current: Option<Latched>, source_ipv4: u32, source_port: u16) -> bool {
+    match current {
+        Some(latched) => latched.ipv4 == source_ipv4 && latched.port == source_port,
+        None => false,
+    }
+}
+
 /// Apply the SSRC-consistent latch policy to one datagram that has already passed the RFC 7983 demux
 /// (layer 1) and the signalled-source gate (layer 2). `current` is the flow's latch state (`None`
 /// when not yet latched), `source_*` is the datagram's L3/L4 source (host order — the kernel reads the
@@ -515,5 +546,75 @@ mod tests {
         assert!(!is_rtp_or_rtcp(&[20])); // DTLS
         assert!(!is_rtp_or_rtcp(&[64])); // TURN channel
         assert!(!is_rtp_or_rtcp(&[])); // empty
+    }
+
+    #[test]
+    fn stun_demux_accepts_only_the_rfc_7983_stun_range() {
+        // RFC 7983: STUN is 0..=3. A Binding request's first byte is 0x00, a response's 0x01.
+        assert!(is_stun(&[0x00])); // Binding request
+        assert!(is_stun(&[0x01])); // Binding response
+        assert!(is_stun(&[0x03])); // top of the range
+        assert!(!is_stun(&[0x04])); // just past it
+        assert!(!is_stun(&[20])); // DTLS
+        assert!(!is_stun(&[64])); // TURN channel
+        assert!(!is_stun(&[0x80])); // RTP
+        assert!(!is_stun(&[])); // empty
+    }
+
+    /// The two demux predicates must never both claim a byte, or a datagram's handling would depend
+    /// on which is tested first. Exhaustive over the whole byte range.
+    #[test]
+    fn stun_and_media_demux_ranges_are_disjoint() {
+        for byte in 0u8..=255 {
+            assert!(
+                !(is_stun(&[byte]) && is_rtp_or_rtcp(&[byte])),
+                "byte {byte} claimed by both demux classes"
+            );
+        }
+    }
+
+    #[test]
+    fn ice_media_gate_forwards_only_the_adopted_source() {
+        let adopted = Latched {
+            ipv4: 0xC000_0201, // 192.0.2.1
+            port: 40000,
+            ssrc: 0x1122_3344,
+        };
+        // The adopted transport, and only it, is forwarded.
+        assert!(ice_media_allowed(Some(adopted), 0xC000_0201, 40000));
+        // Same address, different port — a different transport, so not the adopted path.
+        assert!(!ice_media_allowed(Some(adopted), 0xC000_0201, 40001));
+        // Same port, different address.
+        assert!(!ice_media_allowed(Some(adopted), 0xC000_0202, 40000));
+    }
+
+    #[test]
+    fn ice_media_gate_drops_everything_before_a_check_validates_a_source() {
+        // The RTPbleed case ICE exists to close: with nothing adopted, the first RTP sender to
+        // arrive must NOT become the media path. Nothing is forwarded at all.
+        assert!(!ice_media_allowed(None, 0xC000_0201, 40000));
+        assert!(!ice_media_allowed(None, 0x0A00_0001, 1));
+    }
+
+    /// An SSRC that matches the adopted latch buys a foreign transport nothing on an ICE flow — the
+    /// re-latch escape hatch that layer 3 grants a plain relay is deliberately absent here, because
+    /// on an ICE endpoint only an authenticated check may move the path (RFC 8445 §7.3).
+    #[test]
+    fn ice_media_gate_ignores_a_matching_ssrc_from_a_foreign_source() {
+        let adopted = Latched {
+            ipv4: 0xC000_0201,
+            port: 40000,
+            ssrc: 0x1122_3344,
+        };
+        // Layer 3 would re-latch this (same SSRC = a NAT rebind); layer 4 must not.
+        assert_eq!(
+            latch_decision(Some(adopted), 0xC000_02FF, 50000, Some(0x1122_3344)),
+            LatchVerdict::Learn(Latched {
+                ipv4: 0xC000_02FF,
+                port: 50000,
+                ssrc: 0x1122_3344,
+            })
+        );
+        assert!(!ice_media_allowed(Some(adopted), 0xC000_02FF, 50000));
     }
 }

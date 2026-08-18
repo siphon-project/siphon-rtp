@@ -156,7 +156,7 @@ fn run_smoke() -> Result<SmokeOutcome, String> {
         latched_ssrc: 0,
         latched_port: 0,
         latch_valid: 0,
-        _pad: 0,
+        ice: 0,
         redirect_queue: 0,
     };
     loader

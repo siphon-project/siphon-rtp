@@ -72,6 +72,9 @@ tikv-jemallocator = "0.6"
 [dev-dependencies]
 criterion = "0.5"
 libc = "0.2"
+# Builds the MESSAGE-INTEGRITY-signed Binding requests the ICE demux tests feed the responder, so a
+# check is authenticated by the real STUN encoder rather than a hand-rolled fixture.
+siphon-rtp-stun = { path = "../siphon-rtp-stun" }
 
 # The TX-path next-hop-MAC cache-hit microbench (µs/frame gate; the Stage-1 neighbour resolver).
 [[bench]]
