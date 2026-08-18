@@ -99,4 +99,44 @@ legs (keyed by `call_id`); exactly one identifier is present, matching the
   captures. The G.107 MOS now rides BOTH the `call_quality` control events AND the exported HEP
   type-35 QoS report (alongside the raw RTCP capture).
 
+## 4. RFC 4103 Real-Time Text content QoS on HEP
+
+When a call negotiated a plaintext `m=text` (RFC 4103) stream **and** a text-observability feature
+promoted it to the userspace processor (recording, or `text_events`), the engine ships that leg's
+**text content QoS** to the same HEP collector at **end of call** — the wire complement to the
+`CallSummary` event's per-leg `text` field. One report per direction that carried a measured stream:
+the near leg is the offerer's A→B stream, the far leg the answerer's B→A stream.
+
+HEP3 has **no** standard field or chunk for Real-Time Text QoS, so rather than invent a vendor chunk
+(uningestable, and a collision risk against the generic chunk ids) this rides the **existing**
+report-capture transport that the voice MOS report already uses: the **same** `protocol_type` **35**
+(`REPORT_JSON`), the **same** `PAYLOAD` chunk (`0x000f`) carrying a JSON document, correlated by the
+**same** `CORRELATION_ID` chunk (`0x0011`) = call-id — so a passive collector groups the text report
+with the rest of the call, exactly as it does the raw-RTCP and voice-QoS captures. This does not alter
+the wire shape of any existing HEP packet; a text report is its own datagram.
+
+Only the **JSON schema** is a siphon-rtp extension, and it self-describes: the first field is a
+discriminator `"report":"rtt-text"`, so a collector routes it without a full parse and never confuses
+it with the voice report (which has no `report` field and instead carries `mos`/`codec`). The payload:
+
+```json
+{"report":"rtt-text","correlation_id":"<call-id>","tag":"<leg-tag>","direction":"a_to_b",
+ "packets":7,"characters":21,"missing_markers":1,"recovered_from_redundancy":2}
+```
+
+- **direction** — `"a_to_b"` (offerer → answerer) or `"b_to_a"`; **tag** is the tag of the leg that
+  *sent* the text (mirrors the CDR's per-direction attribution).
+- **packets** — RTP packets accepted on this leg's inbound T.140 stream (post source-gate).
+- **characters** — UTF-8 characters delivered after RED depacketization + T.140 reassembly, including
+  redundancy-recovered characters and the U+FFFD missing-text markers.
+- **missing_markers** — U+FFFD markers inserted for gaps redundancy could not recover (RFC 4103 §5.3):
+  the unrecoverable-loss signal.
+- **recovered_from_redundancy** — generations recovered from RFC 2198 RED redundancy (RFC 4103 §4.2).
+
+An audio-only call, or a text stream left on the in-kernel relay (never measured), ships no such
+report. The exact HEP3 byte layout (magic + total length + every generic TLV chunk) is pinned by a
+byte-exact test in [`siphon-rtp-hep`](../crates/siphon-rtp-hep/src/lib.rs); the JSON schema lives in
+that crate's [`text_report`](../crates/siphon-rtp-hep/src/text_report.rs) module. To eyeball a capture,
+Wireshark's HEP dissector decodes the chunks and shows the JSON payload verbatim.
+
 See also [`security-and-nat.md`](security-and-nat.md) for the relay's accept/latch/forward model.
