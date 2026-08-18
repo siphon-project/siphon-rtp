@@ -1395,6 +1395,134 @@ async fn conference_distributes_multiparty_text_with_per_source_csrc() {
     );
 }
 
+/// RFC 9071 **secure** (SDES-SRTP) multiparty real-time text: two participants join a room, each with
+/// a plaintext `m=audio` and a **secure** (`RTP/SAVP` + `a=crypto`) `m=text` leg. The engine seats each
+/// with a per-participant text `SecureLeg`, decrypts the typing participant's SRTP text into the room's
+/// plaintext text mix, and re-encrypts the distributed increment with the RECEIVER's own key — so the
+/// receiver decrypts it with the engine's offered key and never sees another leg's key. Each text leg
+/// is secured independently, exactly like the conference audio in a mixed room. Driven over the real
+/// control connection + UDP-loopback datapath; the ~300 ms text flush is a live timer. NIC-free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conference_secures_multiparty_text_per_participant() {
+    use siphon_rtp_media::rtp::RtpPacket;
+    use siphon_rtp_media::t140::RedPacket;
+
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    // A secure text stream runs on `Redirect` from the start, so the dispatcher must be running.
+    tokio::spawn(run_redirect_dispatcher_with_text(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.text(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    let serve_engine = engine.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(serve_engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    let (_a_audio, a_audio_addr) = phone().await;
+    let (a_text, a_text_addr) = phone().await;
+    let (_b_audio, b_audio_addr) = phone().await;
+    let (b_text, b_text_addr) = phone().await;
+
+    // A and B each mint their OWN text SDES key (their leg's inbound key).
+    let a_text_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen a");
+    let b_text_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen b");
+
+    // A joins with plaintext audio + secure text; its answer anchors `RTP/SAVP` text on a non-zero port.
+    let a_join = control
+        .request(Command::ConferenceJoin {
+            conference_id: "room".into(),
+            from_tag: "tag-a".into(),
+            sdp: secure_text_sdp(a_audio_addr, a_text_addr, &a_text_key),
+            role: ConferenceRole::Talker,
+            profile: Default::default(),
+        })
+        .await;
+    let a_engine_text = text_engine_addr(&a_join);
+    let engine_a_text_key = text_engine_crypto(&a_join);
+    assert!(
+        sdp_text(&a_join).contains(&format!("m=text {} RTP/SAVP", a_engine_text.port())),
+        "A's answer anchors secure text: {}",
+        sdp_text(&a_join)
+    );
+    assert_ne!(
+        engine_a_text_key.key, a_text_key.key,
+        "the engine mints its own text key for A, never echoing A's"
+    );
+
+    // B joins with plaintext audio + secure text.
+    let b_join = control
+        .request(Command::ConferenceJoin {
+            conference_id: "room".into(),
+            from_tag: "tag-b".into(),
+            sdp: secure_text_sdp(b_audio_addr, b_text_addr, &b_text_key),
+            role: ConferenceRole::Talker,
+            profile: Default::default(),
+        })
+        .await;
+    let engine_b_text_key = text_engine_crypto(&b_join);
+    assert_ne!(
+        engine_b_text_key.key, engine_a_text_key.key,
+        "each participant's text leg carries a distinct engine key"
+    );
+
+    // A types "hi": build a plaintext RED/T.140 packet and encrypt it with A's own text key (A→engine).
+    let plaintext = red_text_rtp(1, 1000, 0x0A0A_7E77, b"hi");
+    let mut a_encrypt = SrtpContext::from_key_material(&a_text_key.key);
+    let mut srtp = Vec::new();
+    a_encrypt.protect(&plaintext, &mut srtp).expect("A encrypt");
+    a_text
+        .send_to(&srtp, a_engine_text)
+        .await
+        .expect("send secure text a");
+
+    // B receives A's text as SRTP under B's own leg key; B decrypts it with the engine's offered key.
+    let (b_data, _) = recv(&b_text).await;
+    let mut b_decrypt = SrtpContext::from_key_material(&engine_b_text_key.key);
+    let mut clear = Vec::new();
+    b_decrypt
+        .unprotect(&b_data, &mut clear)
+        .expect("B decrypts the conference text with the engine's offered key");
+    assert_ne!(
+        b_data, clear,
+        "B's conference text egress is SRTP on the wire, not plaintext"
+    );
+    let packet = RtpPacket::parse(&clear).expect("egress text RTP");
+    assert_eq!(
+        packet.csrc_count, 1,
+        "RFC 9071 §4.2: one contributing source, survives the re-encrypt"
+    );
+    let red = RedPacket::parse(packet.payload).expect("RED payload");
+    assert_eq!(
+        String::from_utf8(red.primary().data.to_vec()).expect("utf8"),
+        "hi",
+        "B recovers A's decrypted-then-re-encrypted text"
+    );
+
+    for tag in ["tag-a", "tag-b"] {
+        let left = control
+            .request(Command::ConferenceLeave {
+                conference_id: "room".into(),
+                from_tag: tag.into(),
+            })
+            .await;
+        assert!(matches!(left, CmdResult::Ok { .. }));
+    }
+    assert!(
+        !engine.conference().contains("room"),
+        "empty room torn down"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transcoded_answer_advertises_the_offerers_own_codec() {
     // A offers PCMU only; `codec-transcode-PCMA` adds PCMA to the offer to B; B answers PCMA. The

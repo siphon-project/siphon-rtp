@@ -139,8 +139,10 @@ impl Default for Routing {
 }
 
 /// A participant's RFC 4103 Real-Time Text leg, resolved from its `m=text` section (RFC 9071
-/// multiparty RTT). Present only when the participant offered a **plaintext** text stream — secure
-/// (`RTP/SAVP`) conference text is a follow-up (declined at join, never downgraded).
+/// multiparty RTT). A **plaintext** (`RTP/AVP`) leg leaves `secure` unset; a **secure**
+/// (SDES-SRTP, `RTP/SAVP`) leg carries its own [`SecureLeg`], keyed exactly like the participant's
+/// secure audio leg — each participant's text is secured independently, while the room's text mix
+/// stays internal plaintext (the same model as the conference audio; docs/security-and-nat.md §4).
 pub struct ParticipantTextConfig {
     /// The engine socket this participant's T.140/RED RTP arrives on (a separate `m=text` port).
     pub ingress_endpoint: EndpointId,
@@ -160,6 +162,11 @@ pub struct ParticipantTextConfig {
     /// stable **source identifier** (the CSRC the mixer labels its text with toward others, RFC 9071
     /// §4.2 / RFC 3550 §5.1).
     pub egress_ssrc: u32,
+    /// SDES-SRTP crypto for a secure (`RTP/SAVP`) text leg: decrypt this participant's text ingress /
+    /// encrypt its text egress with this leg's own keys (RFC 3711 / RFC 4568). `None` for a plaintext
+    /// (`RTP/AVP`) text leg. Independent of the audio leg's [`ParticipantConfig::secure`] — a
+    /// participant may run plaintext audio with secure text, or the reverse.
+    pub secure: Option<SecureLeg>,
 }
 
 /// Everything the engine resolves from a participant's SDP offer/answer to seat them in a room.
@@ -227,6 +234,12 @@ struct ParticipantText {
     egress_sequence: u16,
     /// Reassembles the participant's inbound T.140/RED into deduplicated increments (RFC 4103 / 2198).
     reassembler: T140Reassembler,
+    /// SDES-SRTP state for a secure (`RTP/SAVP`) text leg (decrypt ingress / encrypt egress with this
+    /// leg's own keys); `None` for a plaintext text leg. The room owns this `SecureLeg` outright, just
+    /// as [`Participant::secure`] owns the audio one — one owner, no `Arc<Mutex>` (RFC 3711;
+    /// docs/security-and-nat.md §4). Decrypt is **fail-closed**: a packet failing auth is dropped
+    /// before it can be reassembled, mixed, or move the latch.
+    secure: Option<SecureLeg>,
 }
 
 /// One seated participant: its leg, resamplers to/from the room rate, VAD, and ingress security state.
@@ -592,6 +605,7 @@ impl Conference {
                     egress_ssrc: text.egress_ssrc,
                     egress_sequence: 0,
                     reassembler: T140Reassembler::new(),
+                    secure: text.secure,
                 };
                 (Some(leg), source)
             }
@@ -815,13 +829,16 @@ impl Conference {
         true
     }
 
-    /// Ingress one datagram for a participant's **text** endpoint (RFC 4103): gate its source, latch
-    /// its reply address, reassemble the T.140/RED into a deduplicated increment, and queue that
-    /// increment for the next text flush (RFC 9071). Surfaces the increment on the control channel as
-    /// [`Event::Text`]. Never mixes a packet from an unsignalled source (RTPBleed defence, §4); only an
-    /// SSRC-consistent stream moves the reply address (§4 layer 3). Returns `true` if the packet passed
-    /// the source gate (so the actor stamps media activity for the timeout sweep). Plaintext only —
-    /// secure conference text is a follow-up, declined at join.
+    /// Ingress one datagram for a participant's **text** endpoint (RFC 4103): gate its source, decrypt
+    /// (secure legs), latch its reply address, reassemble the T.140/RED into a deduplicated increment,
+    /// and queue that increment for the next text flush (RFC 9071). Surfaces the increment on the
+    /// control channel as [`Event::Text`]. Never mixes a packet from an unsignalled source (RTPBleed
+    /// defence, §4); only an SSRC-consistent stream moves the reply address (§4 layer 3). For a secure
+    /// (`RTP/SAVP`) text leg the SRTP packet is decrypted **first** (fail-closed: a packet failing
+    /// auth/replay is dropped before it is reassembled, mixed, or moves the latch), so the whole
+    /// reassembly/mix/latch runs on plaintext — exactly as the audio SDES leg decrypts before it mixes
+    /// (RFC 3711; docs/security-and-nat.md §4). Returns `true` if the packet passed the source gate (so
+    /// the actor stamps media activity for the timeout sweep).
     fn ingest_text(&mut self, index: usize, packet: &RxPacket) -> bool {
         let mut recovered = false;
         let mut from_tag = String::new();
@@ -830,7 +847,9 @@ impl Conference {
             let Some(text) = participant.text.as_mut() else {
                 return false;
             };
-            // Layer 2 — signalled-source gate (§4): an unsignalled source never enters the room.
+            // Layer 2 — signalled-source gate (§4): an unsignalled source never enters the room. The
+            // gate runs on the wire source before any decrypt (a spoofed source never reaches the
+            // crypto), exactly as the audio path gates before `unprotect`.
             if !text.accepted_source.accepts(packet.source.ip()) {
                 tracing::debug!(
                     source = %packet.source,
@@ -839,7 +858,27 @@ impl Conference {
                 );
                 return false;
             }
-            let Ok(parsed) = RtpPacket::parse(&packet.data) else {
+            // Secure (SDES-SRTP) text ingress: decrypt the SRTP packet first — the auth tag also proves
+            // authenticity, so a forged/replayed packet fails here and is dropped fail-closed (never
+            // reassembled, mixed, or allowed to move the latch below), exactly as `ingest` does for
+            // secure audio (RFC 3711; docs/security-and-nat.md §4). A failed unprotect keeps the path
+            // alive (the source is the authentic, gated one; a transient reorder/rekey must not reap a
+            // live text leg). Plaintext legs pass through untouched.
+            let plaintext: &[u8] = if let Some(secure) = text.secure.as_mut() {
+                self.clear_in.clear();
+                if secure.unprotect(&packet.data, &mut self.clear_in).is_err() {
+                    tracing::debug!(
+                        source = %packet.source,
+                        conference = %self.conference_id,
+                        "conference dropped secure text packet failing SRTP auth/replay (fail-closed)"
+                    );
+                    return true;
+                }
+                &self.clear_in
+            } else {
+                &packet.data
+            };
+            let Ok(parsed) = RtpPacket::parse(plaintext) else {
                 return true; // gated in; not a parseable RTP packet
             };
             // Layer 3 — constrained, SSRC-consistent latch (§4 layer 3; RFC 3550 §8): only an
@@ -891,10 +930,12 @@ impl Conference {
 
     /// Advance the RFC 9071 text mix one flush (~300 ms — the second, text-only cadence): drain every
     /// participant's queued T.140 into per-receiver RED packets (mix-minus-self, each labelled with the
-    /// contributing source's CSRC), frame each with the receiver leg's own SSRC/sequence, and append
-    /// the egress datagrams to `out`. Independent of the 20 ms audio [`Conference::tick`] — it touches
-    /// neither the room rate nor the active-speaker mask. Deterministic: the RTP timestamp comes from
-    /// the logical flush counter, never a wall clock.
+    /// contributing source's CSRC), frame each with the receiver leg's own SSRC/sequence, SRTP-encrypt
+    /// it with the receiver leg's own key when that participant is secure (a plaintext receiver gets it
+    /// verbatim — each leg secured independently, the mix internal plaintext, docs/security-and-nat.md
+    /// §4), and append the egress datagrams to `out`. Independent of the 20 ms audio
+    /// [`Conference::tick`] — it touches neither the room rate nor the active-speaker mask.
+    /// Deterministic: the RTP timestamp comes from the logical flush counter, never a wall clock.
     pub fn text_tick(&mut self, out: &mut Vec<Outbound>) {
         let emit_count = self.text_mixer.flush(self.text_flush_counter);
         self.text_flush_counter = self.text_flush_counter.wrapping_add(1);
@@ -928,10 +969,33 @@ impl Conference {
                     Ok(len) => len,
                     Err(_) => continue,
                 };
+            // Egress toward the receiver's text endpoint: SRTP-encrypt the framed RED/T.140 packet with
+            // the RECEIVER leg's own key when that participant negotiated a secure (`RTP/SAVP`) text
+            // stream — each participant's text is secured independently with its own key, exactly as the
+            // conference AUDIO encrypts each secure participant's egress mix with its own `SecureLeg`
+            // (the mix stays internal plaintext; RFC 3711; docs/security-and-nat.md §4). A plaintext
+            // receiver gets the framed packet verbatim. A failed protect drops this receiver's packet
+            // (fail-closed) without advancing its sequence.
+            let wire: &[u8] = if let Some(secure) = self.participants[emit.receiver]
+                .text
+                .as_mut()
+                .and_then(|text| text.secure.as_mut())
+            {
+                self.secure_out.clear();
+                if secure
+                    .protect(&self.text_rtp[..rtp_len], &mut self.secure_out)
+                    .is_err()
+                {
+                    continue;
+                }
+                &self.secure_out
+            } else {
+                &self.text_rtp[..rtp_len]
+            };
             out.push(Outbound {
                 endpoint: egress_endpoint,
                 dst,
-                data: Bytes::copy_from_slice(&self.text_rtp[..rtp_len]),
+                data: Bytes::copy_from_slice(wire),
             });
             // Advance the receiver leg's egress sequence only on a framed packet (RFC 3550 §5.1).
             if let Some(text) = self.participants[emit.receiver].text.as_mut() {
@@ -2894,7 +2958,26 @@ mod tests {
             t140_payload_type: T140_PT,
             red_payload_type: Some(RED_PT),
             egress_ssrc: 0x7000_0000 + index as u32,
+            secure: None,
         });
+        config
+    }
+
+    /// A G.711 audio participant with a **secure** (SDES-SRTP, `RTP/SAVP`) RFC 4103 text leg — its
+    /// audio stays plaintext, exactly as a mixed room seats it. The engine's leg is keyed with
+    /// `(engine_local, peer_remote)`: outbound (engine→peer) text encrypts with `engine_local`, inbound
+    /// (peer→engine) decrypts with `peer_remote` (the [`SecureLeg`] key-direction contract).
+    fn secure_ulaw_text_config(
+        index: usize,
+        source_ip: &str,
+        dst: &str,
+        engine_local: &siphon_rtp_srtp::sdes::CryptoAttribute,
+        peer_remote: &siphon_rtp_srtp::sdes::CryptoAttribute,
+    ) -> ParticipantConfig {
+        let mut config = ulaw_text_config(index, source_ip, dst);
+        if let Some(text) = config.text.as_mut() {
+            text.secure = Some(SecureLeg::new(&engine_local.key, &peer_remote.key));
+        }
         config
     }
 
@@ -2936,9 +3019,9 @@ mod tests {
         buffer
     }
 
-    /// (receiver-SSRC, CSRC 0, primary text) for one egress text datagram.
-    fn decode_text_egress(datagram: &Outbound) -> (u32, u32, String) {
-        let packet = RtpPacket::parse(&datagram.data).expect("valid egress RTP");
+    /// (receiver-SSRC, CSRC 0, primary text) parsed from a plaintext RED-framed text RTP packet.
+    fn decode_text_rtp(data: &[u8]) -> (u32, u32, String) {
+        let packet = RtpPacket::parse(data).expect("valid text RTP");
         assert_eq!(packet.payload_type, RED_PT, "text egress is RED-framed");
         assert_eq!(
             packet.csrc_count, 1,
@@ -2948,6 +3031,11 @@ mod tests {
         let red = RedPacket::parse(packet.payload).expect("RED payload parses");
         let text = String::from_utf8(red.primary().data.to_vec()).expect("utf8");
         (packet.ssrc, csrc, text)
+    }
+
+    /// (receiver-SSRC, CSRC 0, primary text) for one egress text datagram.
+    fn decode_text_egress(datagram: &Outbound) -> (u32, u32, String) {
+        decode_text_rtp(&datagram.data)
     }
 
     #[test]
@@ -3124,6 +3212,282 @@ mod tests {
             audio_egress(false),
             audio_egress(true),
             "adding text legs leaves the audio mix byte-identical"
+        );
+    }
+
+    // ----- Secure (SDES-SRTP) RFC 9071 multiparty text -----
+
+    #[test]
+    fn secure_text_participant_decrypts_ingress_and_encrypts_per_recipient() {
+        // A secure (SDES-SRTP) text participant's SRTP text is decrypted into the room's plaintext text
+        // mix, then re-encrypted per recipient with THAT recipient's own key — a plaintext recipient
+        // gets it in the clear, a secure recipient gets SRTP it can decrypt with the engine's offered
+        // key. Same model as secure AUDIO in a mixed room: the mix is internal plaintext, each leg
+        // secured on its own (docs/security-and-nat.md §4).
+        use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+        use siphon_rtp_srtp::SrtpContext;
+
+        let generate =
+            || CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("key");
+        let (a_local, a_remote) = (generate(), generate()); // engine↔A text keys
+        let (c_local, c_remote) = (generate(), generate()); // engine↔C text keys
+
+        let mut conference = Conference::new("room".into(), 0);
+        // Index 0: secure text source A; index 1: plaintext text B; index 2: secure text C.
+        assert!(conference.add_participant(secure_ulaw_text_config(
+            0,
+            "10.0.0.1",
+            "10.0.0.1:4000",
+            &a_local,
+            &a_remote,
+        )));
+        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        assert!(conference.add_participant(secure_ulaw_text_config(
+            2,
+            "10.0.0.3",
+            "10.0.0.3:4000",
+            &c_local,
+            &c_remote,
+        )));
+
+        // A builds a plaintext RED/T.140 "Hi" and encrypts it with its own key (A→engine).
+        let plaintext = text_red_rtp(0x1111, 1, 1000, b"Hi", &[]);
+        let mut a_encrypt = SrtpContext::from_key_material(&a_remote.key);
+        let mut srtp_in = Vec::new();
+        a_encrypt
+            .protect(&plaintext, &mut srtp_in)
+            .expect("A encrypt");
+        assert!(conference.ingest(&rx(text_endpoint(0), "10.0.0.1:6000", srtp_in)));
+
+        // The decrypted increment surfaces on the control channel (observe after decrypt).
+        let text_events: Vec<String> = conference
+            .drain_events()
+            .filter_map(|event| match event {
+                Event::Text { text, from_tag, .. } => {
+                    assert_eq!(from_tag, "party-0");
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_events,
+            vec!["Hi".to_string()],
+            "decrypted text observed"
+        );
+
+        let mut out = Vec::new();
+        conference.text_tick(&mut out);
+        assert_eq!(out.len(), 2, "A → B (plaintext) and A → C (secure)");
+
+        // B (plaintext recipient) receives A's text in the clear, labelled with A's source CSRC.
+        let to_b = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(text_endpoint(1)))
+            .expect("egress to B");
+        let (_, csrc_b, text_b) = decode_text_rtp(&to_b.data);
+        assert_eq!(csrc_b, 0x7000_0000, "A's source CSRC");
+        assert_eq!(text_b, "Hi");
+
+        // C (secure recipient) receives SRTP; C decrypts with the engine's offered key → the same RED.
+        let to_c = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(text_endpoint(2)))
+            .expect("egress to C");
+        let mut c_decrypt = SrtpContext::from_key_material(&c_local.key);
+        let mut clear_c = Vec::new();
+        c_decrypt
+            .unprotect(&to_c.data, &mut clear_c)
+            .expect("C decrypts its text egress with the engine's offered key");
+        assert_ne!(
+            &to_c.data[..],
+            &clear_c[..],
+            "C's text egress is SRTP, not plaintext"
+        );
+        let (_, csrc_c, text_c) = decode_text_rtp(&clear_c);
+        assert_eq!(
+            csrc_c, 0x7000_0000,
+            "A's source CSRC survives the re-encrypt"
+        );
+        assert_eq!(text_c, "Hi");
+
+        // The engine never handed A's offered key onward (distinct per-leg keys, defence-in-depth).
+        assert_ne!(a_local.key, c_local.key);
+    }
+
+    #[test]
+    fn secure_text_failing_srtp_auth_is_dropped_not_mixed_or_latched() {
+        // Fail-closed: a text packet from the secure participant's signalled source but encrypted under
+        // the WRONG key (an attacker who cannot key the leg, or a corrupted packet) fails the leg's SRTP
+        // auth — it is dropped before it is reassembled, mixed, observed, or allowed to move the latch,
+        // exactly as `forged_srtp_packet_does_not_move_a_participant_reply` proves for audio.
+        use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+        use siphon_rtp_srtp::SrtpContext;
+
+        let generate =
+            || CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("key");
+        let (a_local, a_remote) = (generate(), generate());
+
+        let mut conference = Conference::new("room".into(), 0);
+        // A's secure text leg latches, so a forgery moving the reply would be visible.
+        let mut config =
+            secure_ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000", &a_local, &a_remote);
+        if let Some(text) = config.text.as_mut() {
+            text.latch = true;
+        }
+        assert!(conference.add_participant(config));
+        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+
+        // Encrypt "steal" under a key the engine never negotiated, from the gated IP but a fresh port.
+        let plaintext = text_red_rtp(0x1111, 1, 1000, b"steal", &[]);
+        let mut wrong = SrtpContext::from_key_material(&generate().key);
+        let mut forged = Vec::new();
+        wrong
+            .protect(&plaintext, &mut forged)
+            .expect("encrypt wrong");
+        let accepted = conference.ingest(&rx(text_endpoint(0), "10.0.0.1:9999", forged));
+        assert!(
+            accepted,
+            "the source is authentic + gated, so the path stays alive (no reap)"
+        );
+
+        // Nothing was reassembled/mixed and nothing was observed.
+        assert!(
+            conference.drain_events().next().is_none(),
+            "no Event::Text from a packet that failed SRTP auth"
+        );
+        let mut out = Vec::new();
+        conference.text_tick(&mut out);
+        assert!(
+            out.is_empty(),
+            "an inauthentic secure text packet is never distributed to any recipient"
+        );
+
+        // The forged packet never moved the text reply address (latch runs only after decrypt).
+        assert_eq!(
+            conference.participants[0]
+                .text
+                .as_ref()
+                .expect("text leg")
+                .egress_dst,
+            addr("10.0.0.1:4000"),
+            "a forged, auth-failing packet must not steal the text reply direction"
+        );
+    }
+
+    #[test]
+    fn mixed_secure_and_plaintext_text_room_secures_each_leg_independently() {
+        // A two-party mixed room: A secure, B plaintext, both typing. Each receives the other's text
+        // with its own leg's security — B gets A's text in the clear, A gets B's text as SRTP under A's
+        // own key. Proves the mix is correct across a mixed room, each leg secured independently.
+        use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+        use siphon_rtp_srtp::SrtpContext;
+
+        let generate =
+            || CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("key");
+        let (a_local, a_remote) = (generate(), generate());
+
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(secure_ulaw_text_config(
+            0,
+            "10.0.0.1",
+            "10.0.0.1:4000",
+            &a_local,
+            &a_remote,
+        )));
+        assert!(conference.add_participant(ulaw_text_config(1, "10.0.0.2", "10.0.0.2:4000")));
+
+        // A (secure) types "Hi": encrypt under A's key. B (plaintext) types "Yo": plain RED.
+        let a_plain = text_red_rtp(0x1111, 1, 1000, b"Hi", &[]);
+        let mut a_encrypt = SrtpContext::from_key_material(&a_remote.key);
+        let mut a_srtp = Vec::new();
+        a_encrypt.protect(&a_plain, &mut a_srtp).expect("A encrypt");
+        assert!(conference.ingest(&rx(text_endpoint(0), "10.0.0.1:6000", a_srtp)));
+        assert!(conference.ingest(&rx(
+            text_endpoint(1),
+            "10.0.0.2:6000",
+            text_red_rtp(0x2222, 1, 2000, b"Yo", &[]),
+        )));
+
+        let mut out = Vec::new();
+        conference.text_tick(&mut out);
+        assert_eq!(out.len(), 2, "A → B and B → A");
+
+        // B (plaintext) receives A's decrypted "Hi", labelled with A's source CSRC, in the clear.
+        let to_b = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(text_endpoint(1)))
+            .expect("egress to B");
+        let (_, csrc_b, text_b) = decode_text_rtp(&to_b.data);
+        assert_eq!(csrc_b, 0x7000_0000);
+        assert_eq!(text_b, "Hi");
+
+        // A (secure) receives B's "Yo" as SRTP under A's own key; decrypting recovers the RED with B's
+        // CSRC — the plaintext B leg's text was encrypted for the secure A leg.
+        let to_a = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(text_endpoint(0)))
+            .expect("egress to A");
+        let mut a_decrypt = SrtpContext::from_key_material(&a_local.key);
+        let mut clear_a = Vec::new();
+        a_decrypt
+            .unprotect(&to_a.data, &mut clear_a)
+            .expect("A decrypts its text egress with the engine's offered key");
+        assert_ne!(&to_a.data[..], &clear_a[..], "A's text egress is SRTP");
+        let (_, csrc_a, text_a) = decode_text_rtp(&clear_a);
+        assert_eq!(csrc_a, 0x7000_0001, "B's source CSRC");
+        assert_eq!(text_a, "Yo");
+    }
+
+    #[test]
+    fn secure_text_leaves_the_audio_mix_byte_identical() {
+        // The audio path must be byte-for-byte what it is with no text at all — securing the text legs
+        // (a wholly separate stream/actor path) must not perturb the audio mix. Mirrors
+        // `text_mixing_does_not_disturb_the_audio_mix`, but with SDES-SRTP text legs.
+        fn audio_egress(with_secure_text: bool) -> Vec<(u32, Vec<u8>)> {
+            use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
+            let generate =
+                || CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("key");
+
+            let mut conference = Conference::new("room".into(), 0);
+            for index in 0..3 {
+                let source_ip = format!("10.0.0.{}", index + 1);
+                let dst = format!("10.0.0.{}:4000", index + 1);
+                let config = if with_secure_text {
+                    let (local, remote) = (generate(), generate());
+                    secure_ulaw_text_config(index, &source_ip, &dst, &local, &remote)
+                } else {
+                    ulaw_config(index, &source_ip, &dst)
+                };
+                assert!(conference.add_participant(config));
+            }
+            let loud = [6000i16; 160];
+            for sequence in 0..10 {
+                conference.ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, sequence, &loud)));
+                conference.ingest(&rx(2, "10.0.0.2:5000", ulaw_rtp(1, sequence, &loud)));
+                conference.ingest(&rx(3, "10.0.0.3:5000", ulaw_rtp(2, sequence, &loud)));
+            }
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                out.clear();
+                conference.tick(&mut out);
+            }
+            let mut egress: Vec<(u32, Vec<u8>)> = out
+                .iter()
+                .map(|datagram| {
+                    let packet = RtpPacket::parse(&datagram.data).expect("audio rtp");
+                    assert_eq!(packet.csrc_count, 0, "audio egress carries no CSRC");
+                    (packet.ssrc, packet.payload.to_vec())
+                })
+                .collect();
+            egress.sort_by_key(|(ssrc, _)| *ssrc);
+            egress
+        }
+
+        assert_eq!(
+            audio_egress(false),
+            audio_egress(true),
+            "securing the text legs leaves the audio mix byte-identical"
         );
     }
 

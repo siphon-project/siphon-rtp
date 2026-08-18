@@ -5309,59 +5309,100 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             (None, None)
         };
-        // RFC 9071 conference text: anchor a *plaintext* `m=text` (RFC 4103) stream when the
-        // participant offered one with a usable `t140` rtpmap — its own redirected endpoint, its own
-        // per-stream RTPBleed gate + latch. A *secure* (`RTP/SAVP`) text section is declined
-        // (`m=text 0`, RFC 3264 §6), never downgraded — secure conference text is a follow-up. The
-        // room mixes each participant's text across the others with per-source CSRC identification.
-        // Allocated after the SDES/DTLS block so an audio-keying failure above never leaks a text port.
+        // RFC 9071 conference text: anchor a participant's `m=text` (RFC 4103) stream — its own
+        // redirected endpoint, its own per-stream RTPBleed gate + latch — for a **plaintext**
+        // (`RTP/AVP`) leg *or* a **secure** (SDES-SRTP, `RTP/SAVP` + `a=crypto`) one. A secure text leg
+        // is keyed exactly like the secure audio leg above: mint the engine's own per-participant text
+        // SDES key, answer `RTP/SAVP` + our `a=crypto`, and terminate SRTP on a per-participant
+        // `SecureLeg` — each participant's text is secured independently while the room's text mix stays
+        // internal plaintext, the same model as the conference audio (docs/security-and-nat.md §4). A
+        // secure text section we cannot key/anchor (no usable `t140`, or no usable `a=crypto`) is
+        // declined (`m=text 0`, RFC 3264 §6), never downgraded to plaintext. The room mixes each
+        // participant's text across the others with per-source CSRC identification. Allocated after the
+        // audio SDES/DTLS block so an audio-keying failure above never leaks a text port.
         let symmetric = profile.flags.iter().any(|flag| flag == "symmetric");
         let (text_config, text_rewrite, text_endpoint) = match info.text.as_ref() {
-            Some(text) if !text.secure => match text.t140_payload_type {
-                Some(t140_pt) => {
-                    let text_endpoint = match self.alloc_endpoints(1, family, bind).await {
-                        Ok(mut endpoints) => endpoints.remove(0),
-                        Err(reason) => {
-                            self.free(&[endpoint]).await;
-                            return error_result("conference_join: text endpoint", &reason);
+            Some(text) => {
+                let text_remote_crypto = text.crypto.first().copied();
+                // Anchorable iff it has a usable `t140` PT and — for a secure leg — a usable peer key.
+                match text.t140_payload_type {
+                    Some(t140_pt) if !text.secure || text_remote_crypto.is_some() => {
+                        let text_endpoint = match self.alloc_endpoints(1, family, bind).await {
+                            Ok(mut endpoints) => endpoints.remove(0),
+                            Err(reason) => {
+                                self.free(&[endpoint]).await;
+                                return error_result("conference_join: text endpoint", &reason);
+                            }
+                        };
+                        if let Err(error) = self
+                            .datapath
+                            .install_flow(text_endpoint.id, FlowAction::Redirect)
+                        {
+                            self.free(&[endpoint, text_endpoint]).await;
+                            return error_result("conference_join: install text redirect", &error);
                         }
-                    };
-                    if let Err(error) = self
-                        .datapath
-                        .install_flow(text_endpoint.id, FlowAction::Redirect)
-                    {
-                        self.free(&[endpoint, text_endpoint]).await;
-                        return error_result("conference_join: install text redirect", &error);
+                        let text_source = if symmetric {
+                            SourceFilter::Any
+                        } else {
+                            SourceFilter::Exact(text.remote_rtp.ip())
+                        };
+                        let text_engine = EngineMedia {
+                            rtp: text_endpoint.local_addr,
+                            rtcp: None,
+                            advertised_ip: advertised,
+                        };
+                        // Secure text: mint the engine's own text SDES key, build the participant's text
+                        // `SecureLeg` (decrypt its ingress with theirs, encrypt its egress with ours),
+                        // and answer `RTP/SAVP` + our text `a=crypto` (RFC 4568). Plaintext: anchor
+                        // plainly.
+                        let (text_secure, text_rewrite) = match text_remote_crypto {
+                            Some(remote) if text.secure => {
+                                let local = match CryptoAttribute::generate(
+                                    1,
+                                    CryptoSuite::AesCm128HmacSha1_80,
+                                ) {
+                                    Ok(local) => local,
+                                    Err(error) => {
+                                        self.free(&[endpoint, text_endpoint]).await;
+                                        return error_result(
+                                            "conference_join: generate text SDES key",
+                                            &error,
+                                        );
+                                    }
+                                };
+                                (
+                                    Some(SecureLeg::new(&local.key, &remote.key)),
+                                    TextRewrite::AnchorSecure {
+                                        engine: text_engine,
+                                        crypto: local,
+                                    },
+                                )
+                            }
+                            _ => (None, TextRewrite::Anchor(text_engine)),
+                        };
+                        (
+                            Some(ParticipantTextConfig {
+                                ingress_endpoint: text_endpoint.id,
+                                egress_endpoint: text_endpoint.id,
+                                egress_dst: text.remote_rtp,
+                                accepted_source: text_source,
+                                latch: true,
+                                t140_payload_type: t140_pt,
+                                red_payload_type: text.red_payload_type,
+                                egress_ssrc: random_ssrc(),
+                                secure: text_secure,
+                            }),
+                            text_rewrite,
+                            Some(text_endpoint),
+                        )
                     }
-                    let text_source = if symmetric {
-                        SourceFilter::Any
-                    } else {
-                        SourceFilter::Exact(text.remote_rtp.ip())
-                    };
-                    let text_engine = EngineMedia {
-                        rtp: text_endpoint.local_addr,
-                        rtcp: None,
-                        advertised_ip: advertised,
-                    };
-                    (
-                        Some(ParticipantTextConfig {
-                            ingress_endpoint: text_endpoint.id,
-                            egress_endpoint: text_endpoint.id,
-                            egress_dst: text.remote_rtp,
-                            accepted_source: text_source,
-                            latch: true,
-                            t140_payload_type: t140_pt,
-                            red_payload_type: text.red_payload_type,
-                            egress_ssrc: random_ssrc(),
-                        }),
-                        TextRewrite::Anchor(text_engine),
-                        Some(text_endpoint),
-                    )
+                    // A secure text section we cannot key/anchor (no usable `t140`, or no usable
+                    // `a=crypto`) is declined (`m=text 0`), never downgraded to plaintext.
+                    _ if text.secure => (None, TextRewrite::Decline, None),
+                    // A plaintext `m=text` with no usable `t140` rtpmap is left untouched.
+                    _ => (None, TextRewrite::None, None),
                 }
-                // An `m=text` with no usable `t140` rtpmap is left untouched (nothing to anchor).
-                None => (None, TextRewrite::None, None),
-            },
-            Some(_) => (None, TextRewrite::Decline, None),
+            }
             None => (None, TextRewrite::None, None),
         };
         let config = ParticipantConfig {
@@ -11577,6 +11618,63 @@ mod tests {
             !answer.crypto.is_empty(),
             "the engine advertises its own a=crypto"
         );
+    }
+
+    #[tokio::test]
+    async fn conference_join_accepts_a_secure_text_participant() {
+        // A participant offering plaintext audio + a SECURE (RTP/SAVP + a=crypto) `m=text` (RFC 4103)
+        // section is seated with a per-participant text `SecureLeg`, and the answer anchors the text
+        // stream as `RTP/SAVP` on a non-zero port carrying the engine's OWN text a=crypto (never the
+        // participant's) — RFC 9071 secure conference text, no longer declined.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_audio, audio_addr) = phone().await;
+        let (_phone_text, text_addr) = phone().await;
+        let text_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen text key");
+        let offer = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {aport} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+             m=text {tport} RTP/SAVP 98 99\r\na=rtpmap:98 red/1000\r\na=rtpmap:99 t140/1000\r\na={crypto}\r\n",
+            ip = audio_addr.ip(),
+            aport = audio_addr.port(),
+            tport = text_addr.port(),
+            crypto = text_key.to_attribute_value(),
+        );
+        let joined = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "secure-text-room".into(),
+                    from_tag: "alice".into(),
+                    sdp: offer,
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let answer_sdp = ok_sdp_text(&joined);
+        let answer = sdp::parse(&answer_sdp).expect("answer");
+        let text = answer.text.expect("the answer anchors an m=text section");
+        assert!(
+            text.secure,
+            "the engine answers RTP/SAVP for the text stream"
+        );
+        assert_ne!(
+            text.remote_rtp.port(),
+            0,
+            "secure conference text is accepted (non-zero m=text port), not declined"
+        );
+        let engine_text_crypto = text
+            .crypto
+            .first()
+            .copied()
+            .expect("the engine advertises its own text a=crypto");
+        assert_ne!(
+            engine_text_crypto.key, text_key.key,
+            "the engine mints its own text key, never echoing the participant's"
+        );
+        // The audio stays plaintext (RTP/AVP) — the two streams are secured independently.
+        assert!(!answer.secure, "the audio leg stays plaintext RTP/AVP");
     }
 
     /// A G.711 RTP packet (160-sample frame) for transcode tests.
