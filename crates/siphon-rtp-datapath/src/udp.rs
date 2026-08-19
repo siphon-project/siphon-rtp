@@ -2327,7 +2327,15 @@ mod tests {
         peer.send_to(&report, leg_a.local_addr).await.expect("rtcp");
         assert_eq!(recv(&callee).await.0, report);
 
-        let observed = observations.try_recv().expect("the RTCP was observed");
+        // The telemetry tap publishes *after* the forward's `send_to` resolves (see
+        // `FlowAction::Forward`), so the callee can hold the datagram before the observation is
+        // queued. A non-blocking `try_recv` here races that window and fails under load; wait for
+        // the observation instead. The negative assertion below stays non-blocking: the RTP was
+        // relayed first, so had the tap observed it, it would already sit ahead of this one.
+        let observed = timeout(SHORT, observations.recv_async())
+            .await
+            .expect("the RTCP was observed")
+            .expect("the observation channel stays open");
         assert_eq!(observed.endpoint, leg_a.id);
         assert_eq!(observed.destination, callee_addr);
         assert_eq!(&observed.payload[..], &report[..]);
