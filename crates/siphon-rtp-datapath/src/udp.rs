@@ -15,8 +15,6 @@ use dashmap::{DashMap, DashSet};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
-use siphon_rtp_stun as stun;
-
 use crate::{
     classify, AddressFamily, Datapath, DatapathError, Endpoint, EndpointId, EndpointStats,
     FlowAction, IceAgentMode, IceConfig, IceDatapathEvent, LatchPolicy, ObservedRtcp, PacketClass,
@@ -678,23 +676,16 @@ async fn handle_stun(
     inner: &Inner,
     stats: &StatsAtomic,
 ) {
-    let request = match stun::parse(datagram) {
-        Ok(message) if message.is_binding_request() => message,
-        _ => {
+    // The USERNAME must address us (our ufrag first) and MESSAGE-INTEGRITY must verify with our
+    // local password — a challenge an off-path attacker cannot forge without the SDP it never saw.
+    // Shared with the XDP backend so the two datapaths cannot drift on what authenticates a check.
+    let response = match crate::respond_to_stun_check(datagram, ice, source) {
+        crate::StunCheckOutcome::Respond(response) => response,
+        crate::StunCheckOutcome::Drop => {
             stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
     };
-    // The USERNAME must address us (our ufrag first) and MESSAGE-INTEGRITY must verify with our
-    // local password — a challenge an off-path attacker cannot forge without the SDP it never saw.
-    let addressed_to_us = request
-        .username()
-        .and_then(|username| username.split(':').next())
-        .is_some_and(|ufrag| ufrag == ice.local_ufrag);
-    if !addressed_to_us || !stun::verify_message_integrity(datagram, ice.local_pwd.as_bytes()) {
-        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
     // Valid check: ICE supersedes blind latching — adopt the validated source, and count the check
     // as activity so the media-timeout sweep treats the path as alive.
     inner.latched.insert(
@@ -707,11 +698,6 @@ async fn handle_stun(
     stats
         .last_seen
         .store(inner.clock.load(Ordering::Relaxed), Ordering::Relaxed);
-    let response = stun::binding_success_response(
-        &request.transaction_id,
-        source,
-        Some(ice.local_pwd.as_bytes()),
-    );
     match socket.send_to(&response, source).await {
         Ok(sent) => {
             stats.packets_out.fetch_add(1, Ordering::Relaxed);
@@ -985,6 +971,10 @@ impl Datapath for UdpLoopbackDatapath {
 
 #[cfg(test)]
 mod tests {
+    // The responder itself now lives in the parent module (shared with the XDP backend), so the STUN
+    // codec is only needed here, to build the checks these tests feed it.
+    use siphon_rtp_stun as stun;
+
     use super::*;
     use crate::{ForwardRule, IceConfig, SourceFilter};
     use std::time::Duration;

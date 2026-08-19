@@ -227,8 +227,9 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > server-reflexive candidate per `--stun-server` that answers. **The full RFC 8445 agent is wired too**
 > (`--ice-full`, off by default): checklists, connectivity checks, both roles with 487 conflict
 > resolution, peer-reflexive discovery, and regular nomination — with media gated on the selected
-> pair. **Remaining:** ICE restart (§9), trickle (RFC 8838), and relayed candidates.
-> RTCP-port ICE under non-mux is wired.
+> pair. **ICE restart (§9) and trickle-receive (RFC 8838) are wired**, and the **XDP kernel datapath
+> now enforces the same layer-4 gate** as the userspace one (see the bullet below).
+> **Remaining:** relayed candidates (a TURN client). RTCP-port ICE under non-mux is wired.
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
@@ -290,6 +291,27 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
   from its first packet — no first-source race. Secure ICE (DTLS-SRTP / SDES) legs run on the
   `Redirect` path and are unaffected. Enforcement: `Inner::dispatch` (the Forward-path ICE branch) in
   [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs); the rule + `set_ice` ordering in `engine::answer`.
+- **The kernel datapath enforces the same gate** (XDP `Forward` fast path). An ICE endpoint sets the
+  flow's `ice` byte, which changes two things in the classifier:
+  - **STUN is redirected to userspace instead of dropped.** The layer-1 demux drops everything that
+    is not RTP/RTCP on a `Forward` leg, which on an ICE leg would silently swallow every connectivity
+    check and leave it unable to connect. The source gate is deliberately *not* applied first: a
+    peer-reflexive check legitimately arrives from a transport the SDP never carried (RFC 8445
+    §7.3.1.3), and MESSAGE-INTEGRITY — which the agent verifies — is a stronger gate than the address.
+  - **Layers 2 and 3 are replaced by the adopted-source gate** (`rewrite::ice_media_allowed`): media
+    is forwarded only from the source ICE adopted, and nothing at all before a check has validated
+    one. Without this an ICE leg on XDP would blind-latch the first RTP sender through
+    `LatchPolicy::Symmetric` — exactly the RTPbleed hole ICE exists to close. The same-SSRC re-latch
+    escape hatch layer 3 grants a plain relay is absent here on purpose: only an authenticated check
+    may move an ICE path.
+  - The adopted source is written into the kernel flow by `Datapath::adopt_source` (full agent) or by
+    the userspace ice-lite responder on the datapath thread, and is **re-stamped on every flow
+    install** — a rebuilt rule would otherwise drop the flag mid-call and quietly revert the leg to
+    the signalled-source gate.
+  - **Enforcement:** `rewrite::{is_stun, ice_media_allowed}` (the pure, host-tested decisions),
+    `forward_in_kernel` in the eBPF classifier, `IceDemux` + `apply_ice_posture` in
+    `siphon-rtp-xdp`. Both backends share one responder (`datapath::respond_to_stun_check`), so what
+    authenticates a check cannot drift between them.
 - **Consent freshness** (RFC 7675): periodic STUN checks on the established pair; on consent loss the
   call is torn down. This is also the anti-hijack *and* the dead-path detector.
   - **Responder half (always on).** A valid inbound check stamps the endpoint's activity, so the
@@ -314,13 +336,16 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     consent checks, only responds to them, and `a=ice-lite` is what the engine advertises today.
     Initiating them while claiming lite is a deviation, so it is an operator opt-in; the full-agent
     work turns it on for legs that no longer claim lite.
-  - **Backend support.** The UDP datapath implements the seam. A backend that does not (the XDP fast
-    path takes the defaulted `set_ice_agent`) **logs a warning per endpoint** and keeps responder-only
-    behaviour — the degradation is loud, never silent. An HA-restored ICE call likewise runs no
+  - **Backend support.** Both datapaths implement the seam — the UDP one in its `recv_loop`, the XDP
+    one in the datapath thread's ICE demux, on STUN the kernel redirects up for exactly this purpose.
+    A backend that did not would take the defaulted `set_ice_agent`, which **logs a warning per
+    endpoint** and keeps responder-only behaviour — the degradation stays loud, never silent, for any
+    future backend. An HA-restored ICE call likewise runs no
     consent and says so: the snapshot carries the engine's own credentials but not the peer's, so a
     check cannot be addressed.
   - **Enforcement:** `ice/driver.rs` (`ConsentSupervisor`), `ice/consent.rs` (`ConsentChecker`),
-    `Engine::drive_consent` + the daemon sweeper, `ice_validated_source` in `udp.rs`.
+    `Engine::drive_consent` + the daemon sweeper, `ice_validated_source` in `udp.rs` and
+    `siphon-rtp-xdp`.
 - **Spec:** RFC 8445 (ICE), RFC 8839 (SDP for ICE), RFC 8489 (STUN), RFC 7675 (consent).
 - **Enforcement:** `profile.ice` (`force` / `remove`; `force-relay` degrades to `force`) now
   overrides the SDP-derived ICE posture; STUN served on the media socket via the layer-1 demux.

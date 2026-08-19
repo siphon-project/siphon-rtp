@@ -8,7 +8,8 @@
 //!   then `XDP_REDIRECT` to the AF_XDP socket for the owning userspace actor (SRTP / decode /
 //!   transcode / WS / TURN-control legs live there),
 //! - **Forward** → relay the datagram **entirely in the kernel** (the `XDP_TX` fast path): enforce
-//!   the source-gate + the SSRC-consistent symmetric-RTP latch (RTPBleed, RFC 3550 §8), rewrite
+//!   the source-gate + the SSRC-consistent symmetric-RTP latch (RTPBleed, RFC 3550 §8) — or, on an
+//!   ICE flow, the adopted-source gate, redirecting STUN to the userspace agent — rewrite
 //!   L3/L4 in place with an incremental checksum fixup (RFC 1624), resolve the next hop with
 //!   `bpf_fib_lookup`, rewrite L2, and `XDP_TX` / `bpf_redirect`. A plain `rtp_passthrough` relay
 //!   never touches userspace.
@@ -60,8 +61,8 @@ use siphon_rtp_ebpf_common::{
     action, latch,
     loss::{rtp_loss_update, RTP_SEQ_NONE},
     rewrite::{
-        ipv4_checksum_after_addr_rewrite, is_rtp_or_rtcp, latch_decision, rtp_media_ssrc,
-        udp_checksum_after_rewrite, LatchVerdict, Latched,
+        ice_media_allowed, ipv4_checksum_after_addr_rewrite, is_rtp_or_rtcp, is_stun,
+        latch_decision, rtp_media_ssrc, udp_checksum_after_rewrite, LatchVerdict, Latched,
     },
     source, FlowAction, FlowKey, FlowStats, RtcpTapRecord, RTCP_TAP_MAX_PAYLOAD,
 };
@@ -399,10 +400,16 @@ fn tap_rtcp(
 ///
 /// Enforces the layered secure symmetric-RTP posture before it forwards a single byte:
 /// 1. **layer 1 — demux** (RFC 7983): only RTP/RTCP (first byte 128..=191) drives the relay or moves
-///    the latch; STUN/DTLS/garbage on a Forward leg is dropped;
+///    the latch; DTLS/garbage on a Forward leg is dropped, and so is STUN unless the flow runs ICE,
+///    in which case it is redirected to the userspace agent (below);
 /// 2. **layer 2 — signalled-source gate** (RFC 3264): drop a source the SDP did not signal;
 /// 3. **layer 3 — SSRC-consistent latch** (RFC 3550 §8): learn the peer's real source, re-latch a
 ///    new source only on a matching SSRC (a genuine NAT rebind), drop an SSRC-mismatched spray.
+///
+/// On an **ICE** flow (`FlowAction::ice`) layers 2 and 3 are replaced by **layer 4** (RFC 8445 §7):
+/// media is forwarded only from the source the agent adopted over `Datapath::adopt_source`, and
+/// nothing at all before a check has validated one. STUN is redirected to userspace rather than
+/// dropped, because the agent — not the kernel — answers connectivity checks.
 ///
 /// It then resolves the forward destination (the userspace-maintained `out_*`, rtpengine `dst_addr`
 /// parity — never a flow's *own* ingress latch, which would echo), rewrites L3/L4 with the RFC 1624
@@ -433,24 +440,64 @@ fn forward_in_kernel(
             return Ok(xdp_action::XDP_DROP);
         }
     };
+    // On an ICE flow the RFC 8445 agent in userspace owns every STUN datagram: it runs the
+    // checklist, answers the checks, and is the only thing that may adopt a media source. So hand
+    // STUN up the AF_XDP socket instead of dropping it at the demux — without it, a kernelized ICE
+    // leg would silently answer nothing and never connect.
+    //
+    // The source gate below is deliberately *not* applied first. A peer-reflexive check legitimately
+    // arrives from a transport the SDP never carried (RFC 8445 §7.3.1.3) — that is the discovery ICE
+    // exists for — and MESSAGE-INTEGRITY, which the agent verifies, is a far stronger gate than the
+    // address. Only the STUN class gets this; everything else on the flow still faces every layer.
+    if rule.ice != 0 && is_stun(&[first_byte]) {
+        return match XSKS.redirect(rule.redirect_queue, 0) {
+            Ok(redirect) => Ok(redirect),
+            Err(_) => {
+                account(stats_entry, |s| s.packets_dropped += 1);
+                Ok(xdp_action::XDP_DROP)
+            }
+        };
+    }
     if !is_rtp_or_rtcp(&[first_byte]) {
         account(stats_entry, |s| s.packets_dropped += 1);
         return Ok(xdp_action::XDP_DROP);
     }
 
+    // The datagram source in host order (used by the gates below and — as old_src — for the
+    // checksum fixup further down). Kernel-private latch state uses this representation throughout.
+    let src_ip_host = load_be_u32(ctx, ip_offset + 12)?;
+    let src_port_host = load_be_u16(ctx, udp_offset)?;
+
+    // --- Layer 4: ICE supersedes layers 2 and 3 (RFC 8445 §7; §4 layer 4). ----------------------
+    // On an ICE flow the adopted source *is* the gate: `Datapath::adopt_source` writes the latch
+    // fields from userspace when the agent selects a pair, and media is forwarded from that source
+    // and no other. Media never creates or moves the adoption, so an ICE leg cannot blind-latch the
+    // first RTP sender the way a plain relay's layer 3 may.
+    if rule.ice != 0 {
+        let adopted = if rule.latch_valid != 0 {
+            Some(Latched {
+                ipv4: rule.latched_ipv4,
+                port: rule.latched_port,
+                ssrc: rule.latched_ssrc,
+            })
+        } else {
+            None
+        };
+        if !ice_media_allowed(adopted, src_ip_host, src_port_host) {
+            account(stats_entry, |s| s.packets_dropped += 1);
+            return Ok(xdp_action::XDP_DROP);
+        }
+    }
+
     // --- Layer 2: signalled-source gate (RTPBleed, RFC 3264). ----------------------------------
-    if !source_allowed(rule, source_ipv4) {
+    if rule.ice == 0 && !source_allowed(rule, source_ipv4) {
         account(stats_entry, |s| s.packets_dropped += 1);
         return Ok(xdp_action::XDP_DROP);
     }
 
-    // The datagram source in host order (used both for the latch and — as old_src — for the
-    // checksum fixup below). Kernel-private latch state uses this same representation throughout.
-    let src_ip_host = load_be_u32(ctx, ip_offset + 12)?;
-    let src_port_host = load_be_u16(ctx, udp_offset)?;
-
-    // --- Layer 3: SSRC-consistent latch (RFC 3550 §8). Only for a latching policy. --------------
-    if rule.latch_policy != latch::OFF {
+    // --- Layer 3: SSRC-consistent latch (RFC 3550 §8). Only for a latching policy, and never on an
+    // ICE flow — layer 4 above already pinned the path to what the agent adopted. ----------------
+    if rule.ice == 0 && rule.latch_policy != latch::OFF {
         // The RTP SSRC (bytes 8..12 of the payload), or None for RTCP / a too-short datagram.
         let ssrc = match load::<[u8; 12]>(ctx, payload_offset) {
             Ok(rtp_header) => rtp_media_ssrc(&rtp_header),
