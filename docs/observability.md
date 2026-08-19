@@ -156,8 +156,10 @@ it with the voice report (which has no `report` field and instead carries `mos`/
 
 An audio-only call, or a text stream left on the in-kernel relay (never measured), ships no such
 report. The exact HEP3 byte layout (magic + total length + every generic TLV chunk) is pinned by a
-byte-exact test in [`siphon-rtp-hep`](../crates/siphon-rtp-hep/src/lib.rs); the JSON schema lives in
-that crate's [`text_report`](../crates/siphon-rtp-hep/src/text_report.rs) module. To eyeball a capture,
+byte-exact test in [`siphon-rtp-hep`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-hep/src/lib.rs);
+the JSON schema lives in that crate's
+[`text_report`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-hep/src/text_report.rs)
+module. To eyeball a capture,
 Wireshark's HEP dissector decodes the chunks and shows the JSON payload verbatim.
 
 See also [`security-and-nat.md`](security-and-nat.md) for the relay's accept/latch/forward model.
