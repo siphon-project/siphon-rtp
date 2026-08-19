@@ -65,7 +65,7 @@ control exchange and how to verify it:
 - **[Security & NAT design](security-and-nat.md)**: the threat model and the layered secure-latch
   design. The source of truth for why the relay accepts, latches, and forwards a packet.
 - **[Observability & call quality](observability.md)**: Prometheus metrics, RTCP reception reports,
-  G.107 MOS, and the `call_quality` events.
+  G.107 MOS, the `call_quality` events, and the end-of-call CDR.
 - **[Codec licensing & patents](codec-licensing.md)**: why passthrough is always free, and why AMR
   transcoding sits behind an opt-in feature.
 

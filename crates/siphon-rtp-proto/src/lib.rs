@@ -697,7 +697,8 @@ pub struct SessionStats {
 /// (No `Eq`: the MOS / loss / jitter figures are `f64`. `PartialEq` still derives.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LegSummary {
-    /// The leg's tag: the offerer's `from_tag` (near) or the answerer's `to_tag` (far).
+    /// The leg's tag: the offerer's `from_tag` (near) or the answerer's `to_tag` (far). On a
+    /// single-leg call the sole entry carries the caller's `from_tag`.
     pub tag: String,
     /// The leg's negotiated audio codec name, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -880,7 +881,12 @@ pub enum Event {
         reason: String,
         /// Call lifetime in milliseconds (logical-clock resolution, ~1 s granularity).
         duration_ms: u64,
-        /// One entry per leg — index 0 is the near (offerer) leg, index 1 the far (answerer) leg.
+        /// One entry per **party**, not per socket. A two-party call has two: index 0 the near
+        /// (offerer, `from_tag`) leg, index 1 the far (answerer, `to_tag`) leg. A **single-leg** call —
+        /// one answered by the engine itself with no far party (IVR / announcement / echo / voice-AI,
+        /// i.e. `answer_local` or an offer the controller answered itself) — has exactly **one**: the
+        /// caller, carrying that call's whole packet/byte total and its measured quality. Match on
+        /// `tag`, and iterate rather than indexing.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         legs: Vec<LegSummary>,
     },

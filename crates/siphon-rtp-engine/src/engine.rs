@@ -113,7 +113,28 @@ impl Leg {
     }
 }
 
-/// A negotiated (or half-negotiated) call: its owner and its two legs.
+/// Which leg the **caller's** media rides on a call with no far party. `offer` must allocate both legs
+/// before it knows whether a B side will ever answer, and its rewritten SDP — the one a UAS puts in its
+/// own 200 OK — advertises the far leg, so an offer-only IVR/echo call reaches the engine on `far`
+/// while `near` holds the caller's signalled address. A WebSocket takeover on the same verb instead
+/// bridges `near_rtp`. [`Engine::answer_local`], which knows from the start that no B leg is coming,
+/// allocates one leg and is always [`CallerMediaLeg::Near`].
+///
+/// The single source of truth for "where the one stream is", consumed by
+/// [`Engine::promote_to_processing`] (which reflects on that endpoint) and by [`Engine::finish_call`]
+/// (which books the caller's counters against the caller's own leg record). Meaningless — and never
+/// read — once a call is answered: a 2-leg call's parties each own their own leg.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CallerMediaLeg {
+    /// The caller reaches the **near** socket: every [`Engine::answer_local`] call, and the `offer` +
+    /// `ws_uri` WebSocket takeover, whose bridge redirects `near_rtp`.
+    Near,
+    /// The caller reaches the **far** socket — the offer-only UAS shape, where the controller answers
+    /// the caller with the engine's rewritten *offer*, and that advertises the far leg.
+    Far,
+}
+
+/// A negotiated (or half-negotiated) call: its owner and its leg(s).
 #[derive(Debug)]
 struct Call {
     /// The control client that created the call; only it may answer/query/delete it.
@@ -143,7 +164,15 @@ struct Call {
     from_tag: String,
     to_tag: Option<String>,
     near: Leg,
-    far: Leg,
+    /// The B-facing leg, or `None` when this call has no second party *and never will*: an
+    /// [`Engine::answer_local`] call is a UAS answer the engine itself wrote (IVR / announcement /
+    /// echo / voice-AI), so it allocates the caller's leg alone rather than binding a second socket
+    /// pair that nothing is ever told about. `offer` still allocates both — a B side may yet answer —
+    /// so an unanswered offer keeps a far leg it may never use.
+    far: Option<Leg>,
+    /// Which leg the caller's media rides while this call is single-leg (see [`CallerMediaLeg`]).
+    /// Read only when [`Call::is_single_leg`] holds; a 2-leg call's parties own a leg each.
+    caller_media_leg: CallerMediaLeg,
     /// When the far (answerer) leg is offered as secure (`RTP/SAVP`), the engine's own SDES key
     /// advertised to B — kept to key the SRTP bridge once B's answer brings its key. `None` for a
     /// plain relay. (Scenario 1: AVP near ↔ SAVP far; the reverse, a secure near, is a follow-up.)
@@ -287,6 +316,50 @@ enum PromoteMode {
 }
 
 impl Call {
+    /// Whether this call has **one** RTP party rather than two: no `answer` ever arrived, so there is
+    /// no far peer and no `to_tag` (RFC 3264 — a dialog's answerer tag is what makes the second party
+    /// real). True for `answer_local` (IVR / announcement / echo / voice-AI: the engine *is* the far
+    /// side) and for an offer-only call the controller answered itself; false the moment `answer`
+    /// records a `to_tag`. `to_tag` alone is sufficient — it is only ever set together with the far
+    /// leg's `remote_rtp`, and never cleared.
+    fn is_single_leg(&self) -> bool {
+        self.to_tag.is_none()
+    }
+
+    /// The leg whose socket the caller actually reaches on a single-leg call — the one the engine
+    /// advertised and the one the media rides (see [`CallerMediaLeg`]). Falls back to the near leg if
+    /// a call somehow claims `Far` without owning one, which cannot happen: only `offer` records
+    /// `Far`, and `offer` always allocates both legs. Meaningless on an answered call; guard with
+    /// [`Call::is_single_leg`].
+    fn caller_leg(&self) -> &Leg {
+        match (self.caller_media_leg, self.far.as_ref()) {
+            (CallerMediaLeg::Far, Some(far)) => far,
+            _ => &self.near,
+        }
+    }
+
+    /// Every audio endpoint this call owns, near leg first — the CDR counters, the media-timeout
+    /// sweep, and teardown all walk this rather than assuming two legs exist.
+    fn endpoint_ids(&self) -> impl Iterator<Item = EndpointId> + '_ {
+        self.near
+            .endpoint_ids()
+            .chain(self.far.iter().flat_map(Leg::endpoint_ids))
+    }
+
+    /// As [`Call::endpoint_ids`], including each leg's RFC 4103 text endpoint — teardown and the
+    /// call-id index, which must free text ports and let text activity keep the call alive.
+    fn all_endpoint_ids(&self) -> impl Iterator<Item = EndpointId> + '_ {
+        self.near
+            .all_endpoint_ids()
+            .chain(self.far.iter().flat_map(Leg::all_endpoint_ids))
+    }
+
+    /// The far leg of a call a test has already driven through `answer`, so it has one.
+    #[cfg(test)]
+    fn far_leg(&self) -> &Leg {
+        self.far.as_ref().expect("an answered call has a far leg")
+    }
+
     /// The role of one of this call's four possible endpoints, or `None` if the id is not one of
     /// them. Used to snapshot flows by role (the node-independent stand-in for a datapath id).
     fn endpoint_role(&self, id: EndpointId) -> Option<crate::ha::EndpointRole> {
@@ -295,9 +368,15 @@ impl Call {
             Some(EndpointRole::NearRtp)
         } else if self.near.rtcp.map(|endpoint| endpoint.id) == Some(id) {
             Some(EndpointRole::NearRtcp)
-        } else if id == self.far.rtp.id {
+        } else if self.far.as_ref().is_some_and(|far| id == far.rtp.id) {
             Some(EndpointRole::FarRtp)
-        } else if self.far.rtcp.map(|endpoint| endpoint.id) == Some(id) {
+        } else if self
+            .far
+            .as_ref()
+            .and_then(|far| far.rtcp)
+            .map(|endpoint| endpoint.id)
+            == Some(id)
+        {
             Some(EndpointRole::FarRtcp)
         } else {
             None
@@ -312,9 +391,11 @@ impl Call {
         if let Some(endpoint) = self.near.rtcp {
             roles.push((endpoint.id, EndpointRole::NearRtcp));
         }
-        roles.push((self.far.rtp.id, EndpointRole::FarRtp));
-        if let Some(endpoint) = self.far.rtcp {
-            roles.push((endpoint.id, EndpointRole::FarRtcp));
+        if let Some(far) = &self.far {
+            roles.push((far.rtp.id, EndpointRole::FarRtp));
+            if let Some(endpoint) = far.rtcp {
+                roles.push((endpoint.id, EndpointRole::FarRtcp));
+            }
         }
         roles
     }
@@ -323,8 +404,13 @@ impl Call {
     /// HA failover. Node-local handles (sockets, ids) and ephemeral media state are excluded; a secure
     /// call's live SRTP state (rollover + bridge flows) lives in the bridge, so the checkpoint handler
     /// folds it in afterwards (this method only sees the `Call`).
-    fn to_snapshot(&self) -> crate::ha::CallSnapshot {
+    ///
+    /// `None` for a single-leg call: the snapshot format is a two-leg record, and a single-leg IVR /
+    /// echo / voice-AI call has no far leg to fill it with. Refusing beats emitting a blob a standby
+    /// would "restore" into a two-party relay that never existed — the caller is told plainly instead.
+    fn to_snapshot(&self) -> Option<crate::ha::CallSnapshot> {
         use crate::ha;
+        let far = self.far.as_ref()?;
         let flows = self
             .relay_flows
             .iter()
@@ -342,7 +428,7 @@ impl Call {
                 })
             })
             .collect();
-        ha::CallSnapshot {
+        Some(ha::CallSnapshot {
             version: ha::SNAPSHOT_VERSION,
             call_id: String::new(), // filled by the caller, which holds the registry key
             from_tag: self.from_tag.clone(),
@@ -357,12 +443,12 @@ impl Call {
             far_codec: self.far_codec.as_ref().map(codec_snapshot),
             near_telephone_event: self.near_telephone_event,
             near: leg_snapshot(&self.near),
-            far: leg_snapshot(&self.far),
+            far: leg_snapshot(far),
             flows,
             // Populated by the checkpoint handler for a secure call (it has the SRTP bridge);
             // `to_snapshot` only sees the `Call`, which does not hold the live crypto state.
             secure: None,
-        }
+        })
     }
 }
 
@@ -813,8 +899,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             [
                 Some(call.near.rtp),
                 call.near.rtcp,
-                Some(call.far.rtp),
-                call.far.rtcp,
+                call.far.as_ref().map(|far| far.rtp),
+                call.far.as_ref().and_then(|far| far.rtcp),
             ]
             .into_iter()
             .flatten()
@@ -1804,7 +1890,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     text: near_text_endpoint,
                     text_remote_rtp: near_text_remote,
                 },
-                far: Leg {
+                // An offer always allocates a B-facing leg: a B side may still answer, and the offer
+                // being rewritten right here is what would be delivered to it.
+                far: Some(Leg {
                     rtp: far_rtp,
                     rtcp: far_rtcp,
                     remote_rtp: None,
@@ -1813,6 +1901,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     text: far_text_endpoint,
                     // The far side's text address is unknown until its answer.
                     text_remote_rtp: None,
+                }),
+                // Where the caller's media lands if this call never gets an `answer`. A WS takeover
+                // bridges `near_rtp` (below), so the caller reaches the near socket; otherwise the
+                // offer-only UAS shape applies — the controller puts this rewritten offer, which
+                // advertises the far leg, into its own 200 OK, so the caller reaches the far socket
+                // (the same endpoint `promote_to_processing`'s single-leg arm reflects on). Unread
+                // once `answer` lands and both legs face a real party.
+                caller_media_leg: if ws_uri.is_some() {
+                    CallerMediaLeg::Near
+                } else {
+                    CallerMediaLeg::Far
                 },
                 far_local_crypto,
                 far_remote_crypto: None,
@@ -1876,14 +1975,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Single-leg UAS answer ([`Command::AnswerLocal`]): the engine *is* the far side (IVR / echo /
-    /// announcement). Given the offerer's SDP and **no** peer, it allocates media exactly as
-    /// [`Self::offer`] does, synthesises an RFC 3264 answer that advertises **one** audio codec chosen
-    /// from the offer (plus the telephone-event PT), and engages the transcoder now so a later PCM
-    /// prompt / echo encodes to the chosen codec — rather than waiting for an answer that never comes.
-    /// When no offered codec is encodable in this build it tears the half-built session down and
-    /// returns [`CmdResult::Error`] with reason `"no-encodable-codec"` (the controller renders SIP
-    /// 488) — RFC 3264 §6.1: the answer selects only from the **offered** formats, never a codec the
-    /// engine cannot produce. Unlike [`Self::answer`] there is no `to_tag`: there is no far leg.
+    /// announcement). Given the offerer's SDP and **no** peer, it synthesises an RFC 3264 answer that
+    /// advertises **one** audio codec chosen from the offer (plus the telephone-event PT), and engages
+    /// the transcoder now so a later PCM prompt / echo encodes to the chosen codec — rather than
+    /// waiting for an answer that never comes. When no offered codec is encodable in this build it
+    /// tears the half-built session down and returns [`CmdResult::Error`] with reason
+    /// `"no-encodable-codec"` (the controller renders SIP 488) — RFC 3264 §6.1: the answer selects only
+    /// from the **offered** formats, never a codec the engine cannot produce.
+    ///
+    /// **One leg, not two.** Unlike [`Self::offer`], which binds a B-facing leg because a B side may
+    /// still answer, this verb *is* the answer: there is no `to_tag`, no far party, and no second
+    /// socket pair. The call holds only the caller-facing (`near`) leg — the socket this answer
+    /// advertises, the source-gate anchor, the endpoint the single-leg pipeline reflects on, and the
+    /// one leg its CDR reports. A later [`Self::answer`] on such a call is refused rather than served
+    /// from an invented leg, and [`Command::Checkpoint`] likewise (there is no two-party state to
+    /// replicate).
+    ///
+    /// Two profile flags therefore have nothing to act on here and are ignored: `address family`
+    /// (which picks the *far* leg's family for v4↔v6 interworking — the answer must reach the caller,
+    /// so it stays in the offer's family per RFC 4566 §5.7) and `direction[1]` (the far leg's named
+    /// interface). `direction[0]` still selects the caller-facing interface, and the `rtcp-mux`
+    /// directive is applied with its near-side meaning: this SDP is an *answer*, and RFC 5761 §5.1.1
+    /// only mixes RTCP into the RTP port when both ends agreed.
     ///
     /// When the profile carries [`ProfileFlags::ws_uri`] the *far side is the WebSocket server* rather
     /// than the local prompt/echo pipeline: the engine dials it and bridges the caller's audio to it
@@ -1913,20 +2026,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
 
-        // Allocate the two legs exactly as `offer` does: `near` faces the offerer (its signalled
-        // address is the source-gate / reflect target) and `far` is the engine's caller-facing
-        // endpoint — the one the answer advertises and the offerer actually sends to (the single-leg
-        // `promote_to_processing` branch keys on `far.rtp.id`). No ICE / DTLS / SDES here: a single-leg
-        // IVR/echo leg is plaintext (the processing pipeline decodes/re-encodes clear audio), so the
-        // answer advertises no crypto the media path cannot back.
+        // ONE leg, not two. `offer` allocates a near *and* a far because a B side may still answer it;
+        // this verb knows from the start that none is coming, so it binds only the socket pair the
+        // caller is told about. That leg is `near`, the caller-facing side by the same convention
+        // `answer` follows (its SDP goes to A and advertises `near`), and it holds both halves of the
+        // one party: the caller's signalled address — the source-gate / reflect target — and the socket
+        // the caller sends to. Binding a second, never-advertised pair would idle two ports (four
+        // unmuxed) per IVR / announcement / echo / voice-AI call for a leg no packet can ever reach.
+        //
+        // No ICE / DTLS / SDES here: a single-leg IVR/echo leg is plaintext (the processing pipeline
+        // decodes/re-encodes clear audio), so the answer advertises no crypto the media path cannot back.
         let near_family = AddressFamily::of(info.remote_rtp.ip());
-        let far_family = far_address_family(profile).unwrap_or(near_family);
-        let (near_mux, far_mux) = resolve_rtcp_mux(info.rtcp_mux, &profile.rtcp_mux);
+        let (near_mux, _) = resolve_rtcp_mux(info.rtcp_mux, &profile.rtcp_mux);
         let near_per_leg = if near_mux { 1 } else { 2 };
-        let far_per_leg = if far_mux { 1 } else { 2 };
-        let (near_interface, far_interface) = self.interfaces.resolve_direction(&profile.direction);
+        // `direction[0]` names the caller-facing interface, exactly as it does on a 2-leg call; the
+        // second slot has no leg to select here and is ignored.
+        let (near_interface, _) = self.interfaces.resolve_direction(&profile.direction);
         let (near_bind, near_advertised_override) = Self::leg_binding(near_interface, near_family);
-        let (far_bind, far_advertised_override) = Self::leg_binding(far_interface, far_family);
         let near_endpoints = match self
             .alloc_endpoints(near_per_leg, near_family, near_bind)
             .await
@@ -1934,37 +2050,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Ok(endpoints) => endpoints,
             Err(reason) => return CmdResult::Error { reason },
         };
-        let far_endpoints = match self
-            .alloc_endpoints(far_per_leg, far_family, far_bind)
-            .await
-        {
-            Ok(endpoints) => endpoints,
-            Err(reason) => {
-                self.free(&near_endpoints).await;
-                return CmdResult::Error { reason };
-            }
-        };
         let near_rtp = near_endpoints[0];
-        let far_rtp = far_endpoints[0];
         let near_rtcp = (!near_mux).then(|| near_endpoints[1]);
-        let far_rtcp = (!far_mux).then(|| far_endpoints[1]);
         let near_advertised = near_advertised_override.unwrap_or_else(|| near_rtp.local_addr.ip());
-        let far_advertised = far_advertised_override.unwrap_or_else(|| far_rtp.local_addr.ip());
-        let endpoints: Vec<_> = near_endpoints
-            .iter()
-            .chain(far_endpoints.iter())
-            .copied()
-            .collect();
+        let endpoints: Vec<_> = near_endpoints.to_vec();
 
-        // The answer is delivered back to the offerer, but — like `offer` — it advertises the `far`
-        // leg: the offerer sends its media there, which is where the single-leg processing pipeline
-        // listens (see `promote_to_processing`'s single-leg branch).
+        // The answer goes back to the offerer and advertises the leg it was allocated for — the socket
+        // the caller sends to, and the one the single-leg pipeline listens on.
         let engine = EngineMedia {
-            rtp: far_rtp.local_addr,
-            rtcp: far_rtcp.map(|endpoint| endpoint.local_addr),
-            advertised_ip: far_advertised,
+            rtp: near_rtp.local_addr,
+            rtcp: near_rtcp.map(|endpoint| endpoint.local_addr),
+            advertised_ip: near_advertised,
         };
-        let far_mux_override = (!profile.rtcp_mux.is_empty()).then_some(far_mux);
+        let mux_override = (!profile.rtcp_mux.is_empty()).then_some(near_mux);
         let mut rewritten =
             // A single-leg local answer (IVR/echo) does not relay a text stream — leave any `m=text`
             // section untouched (text anchoring/relay is a 2-leg concern; PR 1 scope).
@@ -1973,7 +2071,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 engine,
                 IceRewrite::Keep,
                 None,
-                far_mux_override,
+                mux_override,
                 TextRewrite::None,
             ) {
                 Ok(rewritten) => rewritten,
@@ -1994,10 +2092,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // teardown as a live call (frees the ports + releases the client quota). `to_tag: None` — there
         // is no far leg. `near_codec` is set to the chosen codec below, right before promotion.
         *self.client_calls.entry(client).or_insert(0) += 1;
-        for endpoint in [Some(near_rtp), near_rtcp, Some(far_rtp), far_rtcp]
-            .into_iter()
-            .flatten()
-        {
+        for endpoint in [Some(near_rtp), near_rtcp].into_iter().flatten() {
             self.endpoint_calls.insert(endpoint.id, call_id.to_string());
         }
         self.calls.insert(
@@ -2025,15 +2120,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     text: None,
                     text_remote_rtp: None,
                 },
-                far: Leg {
-                    rtp: far_rtp,
-                    rtcp: far_rtcp,
-                    remote_rtp: None,
-                    remote_rtcp: None,
-                    advertised_ip: far_advertised,
-                    text: None,
-                    text_remote_rtp: None,
-                },
+                // No B-facing leg, and never will be: this verb *is* the answer (see the allocation
+                // comment above). `answer` refuses to run on such a call rather than inventing one.
+                far: None,
+                caller_media_leg: CallerMediaLeg::Near,
                 far_local_crypto: None,
                 far_remote_crypto: None,
                 far_dtls: false,
@@ -2093,7 +2183,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         );
 
         // Narrow the answer's `m=audio` to the single chosen codec (+ telephone-event) on the already
-        // far-advertised address (RFC 3264 §6.1 — the answer offers exactly one format back).
+        // rewritten address (RFC 3264 §6.1 — the answer offers exactly one format back).
         let mut answer_sdp =
             sdp::force_answer_codec(&rewritten.sdp, &chosen, info.telephone_event_payload_type());
 
@@ -2105,12 +2195,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // first — and the answer above already picked exactly ONE encodable codec, so the L16 bridge
         // format is unambiguous here in a way it is not on the offer path.
         //
-        // The bridge redirects the **far** endpoint, not the near one: this answer advertises the far
-        // leg (see the allocation comment above), so that is the socket the caller sends to and the one
-        // its media must be reflected from — the same endpoint `promote_to_processing`'s single-leg
-        // branch keys on (`far.rtp.id`). `offer` bridges `near_rtp` because *its* rewritten SDP goes to
-        // B and advertises the near leg; the legs are mirrored, the rule ("bridge what the peer was
-        // told to send to") is the same.
+        // It bridges the call's only endpoint, which is also the one this answer advertised — the same
+        // rule `offer` follows ("bridge what the peer was told to send to") and the same endpoint
+        // `promote_to_processing`'s single-leg branch reflects on.
         //
         // A dial failure fails the command: returning `ok` while the requested bridge is not up would
         // connect a caller to nothing and give the controller no way to notice, so it is torn down and
@@ -2128,7 +2215,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .setup_ws_bridge(
                     call_id,
                     &ws_uri,
-                    far_rtp,
+                    near_rtp,
                     info.remote_rtp,
                     Some(&chosen),
                     // Gate the caller's ingress to its `received-from` public IP when the control
@@ -2321,11 +2408,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// for a half-built call). Frees the sockets and drops any bridge / media / WS registration.
     async fn teardown_call(&self, call_id: &str) {
         if let Some((_, call)) = self.calls.remove(call_id) {
-            let endpoints: Vec<EndpointId> = call
-                .near
-                .all_endpoint_ids()
-                .chain(call.far.all_endpoint_ids())
-                .collect();
+            let endpoints: Vec<EndpointId> = call.all_endpoint_ids().collect();
             // Free any SIPREC subscriptions first (detach forks, abort drains, free subscriber ports)
             // before the media actor is deregistered.
             self.drop_subscriptions(call_id).await;
@@ -2372,14 +2455,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         end_of_candidates: bool,
     ) -> CmdResult {
         let Some(endpoints) = self.calls.get(call_id).and_then(|call| {
-            (call.owner == client && call.from_tag == from_tag).then(|| {
-                let leg = if to_tag.is_some() {
-                    call.far
-                } else {
-                    call.near
-                };
-                leg.endpoint_ids().collect::<Vec<_>>()
-            })
+            (call.owner == client && call.from_tag == from_tag)
+                .then(|| {
+                    // A `to_tag` selects the answerer's leg — which a locally-answered call does not
+                    // have, and neither does it run ICE, so there is nothing to trickle into.
+                    let leg = if to_tag.is_some() {
+                        call.far.as_ref()?
+                    } else {
+                        &call.near
+                    };
+                    Some(leg.endpoint_ids().collect::<Vec<_>>())
+                })
+                .flatten()
         }) else {
             return unknown_call(call_id);
         };
@@ -2701,9 +2788,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         reason: "from_tag mismatch on answer".to_string(),
                     };
                 }
+                // A call the engine answered itself (`answer_local`) has no B-facing leg and no second
+                // party to answer *with* — the caller is already talking to the single-leg pipeline on
+                // the engine's only socket. Refuse plainly: relaying B's media onto that socket would
+                // point leg B at the caller's own endpoint and break the live call.
+                let Some(far) = call.far else {
+                    return CmdResult::Error {
+                        reason:
+                            "call was answered locally (answer_local) and has no far leg to answer"
+                                .to_string(),
+                    };
+                };
                 (
                     call.near,
-                    call.far,
+                    far,
                     call.ice.clone(),
                     call.near_remote_ice.clone(),
                     call.near_remote_candidates.clone(),
@@ -2927,8 +3025,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             if let Some(mut call) = self.calls.get_mut(call_id) {
                 call.to_tag = Some(to_tag.clone());
-                call.far.remote_rtp = Some(info.remote_rtp);
-                call.far.remote_rtcp = Some(info.remote_rtcp);
+                // The far leg is present — this path ran only because the guard above unwrapped it.
+                if let Some(far) = call.far.as_mut() {
+                    far.remote_rtp = Some(info.remote_rtp);
+                    far.remote_rtcp = Some(info.remote_rtcp);
+                }
                 call.pipeline = PipelineKind::Ws;
             }
             return ok_sdp(rewritten.sdp, Some(to_tag));
@@ -3831,11 +3932,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.to_tag = Some(to_tag.clone());
-            call.far.remote_rtp = Some(info.remote_rtp);
-            call.far.remote_rtcp = Some(info.remote_rtcp);
-            // The far side's signalled text address (its answer's `m=text`/`c=`), for the text relay's
-            // reverse forward destination + gate anchor. `None` when no text was relayed.
-            call.far.text_remote_rtp = far_text_remote;
+            // The far leg is present — this path ran only because the guard above unwrapped it.
+            if let Some(far) = call.far.as_mut() {
+                far.remote_rtp = Some(info.remote_rtp);
+                far.remote_rtcp = Some(info.remote_rtcp);
+                // The far side's signalled text address (its answer's `m=text`/`c=`), for the text
+                // relay's reverse forward destination + gate anchor. `None` when no text was relayed.
+                far.text_remote_rtp = far_text_remote;
+            }
             // Store the *effective* (ptime-overridden) codecs so an HA checkpoint captures the override
             // and a restore rebuilds the transcode at the same packetization (inert for a plain relay).
             call.near_codec = near_codec.clone();
@@ -3942,7 +4046,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// snapshotted, and the actor is queried, **before** the endpoints and actor are torn down below.
     async fn finish_call(&self, call_id: &str, call: &Call, reason: &str) {
         let near_counters = self.leg_counters(&call.near);
-        let far_counters = self.leg_counters(&call.far);
+        let far_counters = call
+            .far
+            .as_ref()
+            .map(|far| self.leg_counters(far))
+            .unwrap_or_default();
         let quality = self.media.final_quality(call_id, CDR_QUALITY_TIMEOUT).await;
         // RFC 4103 content QoS from the userspace text processor, when the text stream was promoted for
         // observability. `None` for an audio-only call, or a text stream left on the in-kernel relay
@@ -3973,52 +4081,95 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text_recovered = text_counters.map_or_else(|| "-".to_string(), |counters| (counters.near.recovered_from_redundancy + counters.far.recovered_from_redundancy).to_string()),
             "call finished"
         );
-        // The near leg is party A (offerer, `from_tag`); the stream it *sent* is measured by the media
-        // actor's `a_to_b` ingress. The far leg is party B (answerer, `to_tag`) ⇒ the `b_to_a` ingress.
-        self.log_cdr_leg(
-            call_id,
-            "near",
-            &call.from_tag,
-            &call.near,
-            &near_counters,
-            quality
-                .as_ref()
-                .map(|quality: &FinalCallQuality| &quality.a_to_b),
-        );
-        self.log_cdr_leg(
-            call_id,
-            "far",
-            call.to_tag.as_deref().unwrap_or("-"),
-            &call.far,
-            &far_counters,
-            quality.as_ref().map(|quality| &quality.b_to_a),
-        );
-
-        // Structured twin of the CDR for the SBC: SIPhon merges this per-leg media summary with its own
-        // SIP-side record into one CDR. Additive `Event::CallSummary` — a consumer predating the variant
-        // decodes it as `Event::Unknown` and ignores it. Same assembly as the log block above.
-        self.push_event(
-            call.owner,
-            Event::CallSummary {
-                call_id: call_id.to_string(),
-                reason: reason.to_string(),
-                duration_ms: duration_s.saturating_mul(1000),
-                legs: vec![
+        // One record per **party**. A two-party call has two: the near leg is party A (offerer,
+        // `from_tag`), whose sent stream is the media actor's `a_to_b` ingress, and the far leg is party
+        // B (answerer, `to_tag`) ⇒ the `b_to_a` ingress.
+        //
+        // A **single-leg** call (IVR / announcement / echo / voice-AI — no `answer`, so no far party)
+        // has one. `answer_local` owns a single leg outright, but an offer-only call still holds the far
+        // leg its offer allocated, and the caller may be reaching *either* socket (see
+        // [`CallerMediaLeg`]) — so the counters are summed rather than picked. Whichever leg is idle
+        // contributes 0, so the sum is exactly the caller's traffic either way, and it lands on the
+        // record that also carries the caller's tag, address and measured quality.
+        let a_to_b = quality
+            .as_ref()
+            .map(|quality: &FinalCallQuality| &quality.a_to_b);
+        let b_to_a = quality.as_ref().map(|quality| &quality.b_to_a);
+        let legs = match call.far.as_ref().filter(|_| !call.is_single_leg()) {
+            Some(far) => {
+                self.log_cdr_leg(
+                    call_id,
+                    "near",
+                    &call.from_tag,
+                    call.near.rtp.local_addr,
+                    call.near.remote_rtp,
+                    &near_counters,
+                    a_to_b,
+                );
+                self.log_cdr_leg(
+                    call_id,
+                    "far",
+                    call.to_tag.as_deref().unwrap_or("-"),
+                    far.rtp.local_addr,
+                    far.remote_rtp,
+                    &far_counters,
+                    b_to_a,
+                );
+                vec![
                     leg_summary(
                         &call.from_tag,
                         call.near_codec.as_ref(),
                         &near_counters,
-                        quality.as_ref().map(|quality| &quality.a_to_b),
+                        a_to_b,
                         near_text,
                     ),
                     leg_summary(
                         call.to_tag.as_deref().unwrap_or("-"),
                         call.far_codec.as_ref(),
                         &far_counters,
-                        quality.as_ref().map(|quality| &quality.b_to_a),
+                        b_to_a,
                         far_text,
                     ),
-                ],
+                ]
+            }
+            None => {
+                let mut caller_counters = near_counters;
+                caller_counters.packets_in += far_counters.packets_in;
+                caller_counters.packets_out += far_counters.packets_out;
+                caller_counters.bytes_in += far_counters.bytes_in;
+                caller_counters.bytes_out += far_counters.bytes_out;
+                caller_counters.packets_dropped += far_counters.packets_dropped;
+                caller_counters.packets_lost += far_counters.packets_lost;
+                self.log_cdr_leg(
+                    call_id,
+                    "near",
+                    &call.from_tag,
+                    call.caller_leg().rtp.local_addr,
+                    call.near.remote_rtp,
+                    &caller_counters,
+                    a_to_b,
+                );
+                vec![leg_summary(
+                    &call.from_tag,
+                    call.near_codec.as_ref(),
+                    &caller_counters,
+                    a_to_b,
+                    near_text,
+                )]
+            }
+        };
+
+        // Structured twin of the CDR for the SBC: SIPhon merges this per-leg media summary with its own
+        // SIP-side record into one CDR. Additive `Event::CallSummary` — a consumer predating the variant
+        // decodes it as `Event::Unknown` and ignores it. Same assembly as the log block above, so a
+        // single-leg call carries exactly one entry here too.
+        self.push_event(
+            call.owner,
+            Event::CallSummary {
+                call_id: call_id.to_string(),
+                reason: reason.to_string(),
+                duration_ms: duration_s.saturating_mul(1000),
+                legs,
             },
         );
 
@@ -4033,11 +4184,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Free everything the call held (the steps `delete` and `reap_idle` previously duplicated) —
         // including the RFC 4103 text endpoints (`all_endpoint_ids`), so a text stream's ports are
         // released with the call.
-        let endpoints: Vec<EndpointId> = call
-            .near
-            .all_endpoint_ids()
-            .chain(call.far.all_endpoint_ids())
-            .collect();
+        let endpoints: Vec<EndpointId> = call.all_endpoint_ids().collect();
         self.drop_subscriptions(call_id).await;
         // Any WS tee riding the same fan-out closes with the call, so its controller gets a final
         // `ws_tee_ended` (with the lifetime frame counters) rather than a silently dead stream.
@@ -4085,18 +4232,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return; // HEP export disabled (`SIPHON_RTP_HEP_COLLECTOR` unset).
         };
         let (timestamp_secs, timestamp_micros) = wall_clock_now();
-        // (leg, this-leg's inbound stats, sending tag, direction) for each measured direction.
+        // (leg, this-leg's inbound stats, sending tag, direction) for each measured direction. A
+        // single-leg call has no far leg — and never relays text, which is a 2-leg concern — so only
+        // the near entry can ever carry stats there.
         let legs = [
-            (&call.near, near, call.from_tag.as_str(), "a_to_b"),
+            (Some(&call.near), near, call.from_tag.as_str(), "a_to_b"),
             (
-                &call.far,
+                call.far.as_ref(),
                 far,
                 call.to_tag.as_deref().unwrap_or("-"),
                 "b_to_a",
             ),
         ];
         for (leg, stats, tag, direction) in legs {
-            let Some(stats) = stats else {
+            let (Some(leg), Some(stats)) = (leg, stats) else {
                 continue;
             };
             let (src, dst) = text_stream_addresses(leg);
@@ -4144,19 +4293,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// G.107 MOS shape across the call. `rtt_ms` is `n/a` on the relay/transcode path (no measured
     /// RTT), and `mos_basis` states whether the MOS includes the G.107 delay term (`full`) or is
     /// loss/jitter-only (`loss+jitter`) — the honest marker, never a fabricated zero RTT.
+    ///
+    /// `local` is the engine socket this party talks to and `remote` its signalled address; they are
+    /// passed in rather than read off one [`Leg`] because a single-leg call splits them — the caller's
+    /// address is on the near leg while the socket it reaches may be the far one (see
+    /// [`CallerMediaLeg`]).
     fn log_cdr_leg(
         &self,
         call_id: &str,
         leg: &str,
         tag: &str,
-        endpoints: &Leg,
+        local: std::net::SocketAddr,
+        remote: Option<std::net::SocketAddr>,
         counters: &siphon_rtp_datapath::EndpointStats,
         quality: Option<&DirectionQuality>,
     ) {
-        let local = endpoints.rtp.local_addr;
-        let remote = endpoints
-            .remote_rtp
-            .map_or_else(|| "-".to_string(), |addr| addr.to_string());
+        let remote = remote.map_or_else(|| "-".to_string(), |addr| addr.to_string());
         match quality {
             Some(quality) if quality.ssrc.is_some() || quality.packets_received > 0 => {
                 let ssrc = quality
@@ -4234,7 +4386,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return unknown_call(call_id);
         }
         let mut stats = SessionStats::default();
-        for endpoint in call.near.endpoint_ids().chain(call.far.endpoint_ids()) {
+        for endpoint in call.endpoint_ids() {
             let leg = self.datapath.stats(endpoint).unwrap_or_default();
             stats.packets_in += leg.packets_in;
             stats.packets_out += leg.packets_out;
@@ -4259,7 +4411,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // component — the SRTP bridge for a plain secure leg (`Srtp`), the media actor for a secure
         // *transcode* leg (`SrtpMedia`) — so the closure also hands back what that later query needs
         // (the peer's SDES key, plus the endpoint roles the bridge query maps its flow ids through).
-        let Some((mut snapshot, secure_ctx)) = self.owned_call(client, call_id, |call| {
+        let Some((snapshot, secure_ctx)) = self.owned_call(client, call_id, |call| {
             let snapshot = call.to_snapshot();
             let secure_ctx = call
                 .far_remote_crypto
@@ -4276,6 +4428,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             (snapshot, secure_ctx)
         }) else {
             return unknown_call(call_id);
+        };
+        // A single-leg call has no far leg to put in the two-leg snapshot record, and nothing a standby
+        // could resume: the far side of an IVR / echo / voice-AI call is this engine's own pipeline, not
+        // replicable state. Say so rather than handing back a blob that would restore as a two-party
+        // relay that never existed (`restore` documents the same limit from the other side).
+        let Some(mut snapshot) = snapshot else {
+            return CmdResult::Error {
+                reason: "checkpoint is unsupported for a single-leg call (no far leg to replicate)"
+                    .to_string(),
+            };
         };
         // The registry key is the authoritative call-id (the snapshot builder left it blank).
         snapshot.call_id = call_id.to_string();
@@ -4837,7 +4999,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 from_tag: snapshot.from_tag,
                 to_tag: snapshot.to_tag,
                 near,
-                far,
+                // A snapshot is only ever taken of a 2-leg call — `checkpoint` refuses a single-leg one
+                // — so a restored call always has both.
+                far: Some(far),
+                // Both parties own a leg on a restored (2-leg) call, so this is never read there.
+                caller_media_leg: CallerMediaLeg::Near,
                 far_local_crypto,
                 far_remote_crypto,
                 // A DTLS-SRTP call is never restored (rejected above), so it is always plaintext/SDES here.
@@ -5808,18 +5974,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // negotiated — recording captures the RFC 4103 text stream too.
         let Some((pipeline, a_local, b_local, text_locals)) =
             self.owned_call(client, call_id, |call| {
+                // A text stream is relayed only between two legs, so `text_relay_flows` is empty (and
+                // this `None`) whenever there is no far leg.
                 let text_locals = (!call.text_relay_flows.is_empty())
                     .then(|| {
                         call.near
                             .text
-                            .zip(call.far.text)
+                            .zip(call.far.as_ref().and_then(|far| far.text))
                             .map(|(near, far)| (near.local_addr, far.local_addr))
                     })
                     .flatten();
+                // The pcap stamps each direction's capture destination with the engine socket that
+                // datagram arrived on. A single-leg call has one socket carrying both directions, so
+                // both stamps are that socket — which is what the wire actually looks like.
+                let caller_local = call.caller_leg().rtp.local_addr;
                 (
                     call.pipeline,
                     call.near.rtp.local_addr,
-                    call.far.rtp.local_addr,
+                    call.far
+                        .as_ref()
+                        .map_or(caller_local, |far| far.rtp.local_addr),
                     text_locals,
                 )
             })
@@ -6004,16 +6178,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // Which legs feed the tee. A single-leg (offer-only / local-answer) call has no callee, so a
         // `both` request degrades to the caller's monologue rather than stalling on a channel that
-        // will never produce a frame (a stereo frame needs *both* rings full).
-        // A single-leg local answer (`answer_local`) has no answered far party, so its `far.remote_rtp`
-        // is `None` — the discriminator that works *before* promotion (the media registry's
-        // equal-endpoints test only exists once an actor is up).
+        // will never produce a frame (a stereo frame needs *both* rings full). A callee exists only
+        // once a far leg has an answered peer address — the discriminator that works *before* promotion
+        // (the media registry's equal-endpoints test only exists once an actor is up), and it covers
+        // both single-leg shapes: `answer_local` has no far leg at all, an unanswered offer has one
+        // with no peer.
         let (near_codec, far_codec, two_leg) = self
             .owned_call_internal(call_id, |call| {
                 (
                     call.near_codec.clone(),
                     call.far_codec.clone(),
-                    call.far.remote_rtp.is_some(),
+                    call.far
+                        .as_ref()
+                        .is_some_and(|far| far.remote_rtp.is_some()),
                 )
             })
             .ok_or_else(|| "call no longer exists".to_string())?;
@@ -6603,11 +6780,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 call.far_codec.clone(),
                 call.near_telephone_event,
                 call.far_telephone_event,
-                // The engine socket the caller reaches for a single-leg (offer-only) echo: the offer's
-                // rewritten SDP advertises the *far* leg (it is normally forwarded to B; see the offer
-                // path — "the rewritten offer is delivered to B, so it advertises the `far` leg"), and a
-                // UAS IVR puts that SDP in its 200 OK, so the caller sends here. Unused by the 2-leg arm.
-                call.far.rtp.id,
+                // The engine socket the caller reaches for a single-leg (offer-only) echo — recorded on
+                // the call when its legs were allocated, because only the verb that wrote the SDP knows
+                // which socket it advertised (see [`CallerMediaLeg`]). Unused by the 2-leg arm.
+                call.caller_leg().rtp.id,
                 // The caller's own signalled RTP address (the near/offerer leg's remote) — what the
                 // single-leg source gate keys on and reflects back toward.
                 call.near.remote_rtp,
@@ -7206,11 +7382,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         for entry in self.calls.iter() {
             let call = entry.value();
             let mut last_activity = call.created_tick;
-            for endpoint in call
-                .near
-                .all_endpoint_ids()
-                .chain(call.far.all_endpoint_ids())
-            {
+            for endpoint in call.all_endpoint_ids() {
                 if let Some(seen) = self.datapath.last_activity(endpoint) {
                     last_activity = last_activity.max(seen);
                 }
@@ -9508,7 +9680,7 @@ mod tests {
 
         let (near_rtp, far_rtp) = {
             let call = engine.calls.get("nat-call").expect("call present");
-            (call.near.rtp.id, call.far.rtp.id)
+            (call.near.rtp.id, call.far_leg().rtp.id)
         };
         // Before the sweep: near→far forwards to B's signalled address; far→near to A's.
         assert_eq!(
@@ -17436,7 +17608,7 @@ mod tests {
         let far_rtp = engine
             .calls
             .get("mixed")
-            .map(|call| call.far.rtp.local_addr)
+            .map(|call| call.far_leg().rtp.local_addr)
             .expect("call exists");
         phone_b
             .send_to(&rtp(0x0B0B_0B0B), far_rtp)
@@ -17687,7 +17859,7 @@ mod tests {
         let far_rtp = engine
             .calls
             .get("re")
-            .map(|call| call.far.rtp.local_addr)
+            .map(|call| call.far_leg().rtp.local_addr)
             .expect("call");
         phone_b
             .send_to(&rtp(0x0B0B_0B0B), far_rtp)
@@ -18104,7 +18276,7 @@ mod tests {
         let far_rtp = engine
             .calls
             .get("continuity")
-            .map(|call| call.far.rtp.local_addr)
+            .map(|call| call.far_leg().rtp.local_addr)
             .expect("call");
         phone_b
             .send_to(&rtp(0x0C0C_0C0C), far_rtp)
@@ -18213,12 +18385,7 @@ mod tests {
         let first_endpoints: Vec<EndpointId> = engine
             .calls
             .get("dup")
-            .map(|call| {
-                call.near
-                    .endpoint_ids()
-                    .chain(call.far.endpoint_ids())
-                    .collect()
-            })
+            .map(|call| call.endpoint_ids().collect())
             .expect("call exists");
 
         let second = engine
@@ -18328,7 +18495,7 @@ mod tests {
         assert_eq!(engine.session_count(), 1);
         let call = engine.calls.get("owned").expect("still there");
         assert_eq!(call.owner, owner);
-        assert_eq!(call.far.rtp.local_addr.port(), owner_port);
+        assert_eq!(call.far_leg().rtp.local_addr.port(), owner_port);
         drop(call);
         // And the intruder was charged nothing.
         assert_eq!(engine.client_calls.get(&intruder).map(|count| *count), None);
@@ -18470,7 +18637,7 @@ mod tests {
         let far_rtp = engine
             .calls
             .get("mismatch-answer")
-            .map(|call| call.far.rtp.id)
+            .map(|call| call.far_leg().rtp.id)
             .expect("call");
         assert_eq!(
             engine.datapath().ice_validated_source(far_rtp),
@@ -18482,7 +18649,7 @@ mod tests {
         let far_addr = engine
             .calls
             .get("mismatch-answer")
-            .map(|call| call.far.rtp.local_addr)
+            .map(|call| call.far_leg().rtp.local_addr)
             .expect("call");
         phone_b
             .send_to(&rtp(0x0B0B_0B0B), far_addr)
@@ -19356,6 +19523,342 @@ mod tests {
     }
 
     // ---- AnswerLocal: single-leg UAS answer (RFC 3264 §6.1) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_leg_cdr_books_the_callers_media_on_the_callers_own_leg() {
+        // A single-leg call has ONE party, so its CDR has one leg record — the caller's — carrying the
+        // call's whole packet/byte total *and* its measured quality. It used to emit two: the caller's
+        // tag, signalled address and RFC 3550 quality on `near` with `packets_in=0`, and every counter
+        // on an untagged `far` with `remote="-"`. `answer_local` advertises the far socket, so all the
+        // media lands there while the near leg holds the caller's identity — a consumer joining media
+        // CDRs to SIP CDRs could not tell which party the packets belonged to.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let events = engine.register_client(CLIENT);
+        let (phone_a, addr_a) = phone().await;
+
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "cdr-single".into(),
+                    from_tag: "caller".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let advertised = sdp::parse(&ok_sdp_text(&result))
+            .expect("answer parses")
+            .remote_rtp;
+
+        // The caller streams to the socket the answer advertised and reads the echo back, so both
+        // directions of the one stream are accounted. Asymmetric counts would be better still, but the
+        // single-leg reflect is 1:1 by construction.
+        const FRAMES: u64 = 5;
+        for sequence in 0..FRAMES as u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0000_2222, 0xFF), advertised)
+                .await
+                .expect("caller sends");
+            let (_echo, from) = recv(&phone_a).await;
+            assert_eq!(
+                from, advertised,
+                "the echo returns off the advertised socket"
+            );
+        }
+
+        let deleted = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "cdr-single".into(),
+                    from_tag: "caller".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+
+        let mut legs = None;
+        while let Ok(event) = events.try_recv() {
+            if let Event::CallSummary { legs: summary, .. } = event {
+                legs = Some(summary);
+            }
+        }
+        let legs = legs.expect("CallSummary emitted on delete");
+        assert_eq!(
+            legs.len(),
+            1,
+            "one party ⇒ one leg record, not a tagged empty leg plus an untagged full one: {legs:?}"
+        );
+        let caller = &legs[0];
+        assert_eq!(caller.tag, "caller", "the sole leg is the caller's");
+        assert_eq!(
+            caller.packets_in, FRAMES,
+            "the caller's sent packets are booked against the caller"
+        );
+        assert_eq!(
+            caller.packets_out, FRAMES,
+            "so are the packets the engine sent back to it"
+        );
+        assert!(caller.bytes_in > 0 && caller.bytes_out > 0, "{caller:?}");
+        // The quality half was always attributed correctly — it must stay on the same record as the
+        // counters now that there is only one.
+        assert_eq!(
+            caller.ssrc,
+            Some(0x0000_2222),
+            "the caller's own SSRC (RFC 3550) rides the same record"
+        );
+        assert!(caller.jitter_ms.is_some(), "as does its measured jitter");
+        assert_eq!(
+            caller.codec.as_deref(),
+            Some("PCMU"),
+            "and the codec the answer negotiated"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_leg_cdr_collapses_even_when_no_media_ever_flowed() {
+        // The collapse keys on "no far party was negotiated" (no `to_tag`), not on where the counters
+        // happen to be — so an unanswered call that never saw a packet also reports one leg, the
+        // caller's, rather than a phantom second party with an empty tag.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        let (_phone_a, addr_a) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "cdr-unanswered".into(),
+                    from_tag: "caller".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "cdr-unanswered".into(),
+                    from_tag: "caller".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+
+        let mut legs = None;
+        while let Ok(event) = events.try_recv() {
+            if let Event::CallSummary { legs: summary, .. } = event {
+                legs = Some(summary);
+            }
+        }
+        let legs = legs.expect("CallSummary emitted on delete");
+        assert_eq!(legs.len(), 1, "an unanswered call has one party: {legs:?}");
+        assert_eq!(legs[0].tag, "caller");
+        assert_eq!(legs[0].packets_in, 0, "no media ever arrived");
+    }
+
+    #[tokio::test]
+    async fn answer_local_binds_one_leg_and_advertises_the_socket_it_bound() {
+        // A locally-answered call has one party, so it binds one socket pair — not a second,
+        // never-advertised pair that no packet can reach. `offer`, which may still get a B side, keeps
+        // both. Left unchecked this idled half of every IVR / announcement / echo / voice-AI call's
+        // ports, halving the capacity of a `--port-min`/`--port-max` range on such a node.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+
+        // Muxed: one port for the whole call.
+        let muxed = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "one-leg-mux".into(),
+                    from_tag: "caller".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let advertised = sdp::parse(&ok_sdp_text(&muxed)).expect("answer").remote_rtp;
+        {
+            let call = engine.calls.get("one-leg-mux").expect("call present");
+            assert!(call.far.is_none(), "no B-facing leg is allocated");
+            assert_eq!(
+                call.endpoint_ids().count(),
+                1,
+                "one muxed leg ⇒ exactly one bound endpoint"
+            );
+            assert_eq!(
+                call.near.rtp.local_addr, advertised,
+                "and it is the socket the answer told the caller to send to"
+            );
+            assert_eq!(
+                call.near.remote_rtp,
+                Some(addr_a),
+                "that same leg carries the caller's signalled address"
+            );
+        }
+
+        // Non-muxed: RTP + a companion RTCP port, still for one leg only.
+        engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "one-leg-demux".into(),
+                    from_tag: "caller".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let call = engine.calls.get("one-leg-demux").expect("call present");
+        assert!(call.far.is_none());
+        assert_eq!(
+            call.endpoint_ids().count(),
+            2,
+            "one non-muxed leg ⇒ RTP + RTCP, and nothing else"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_local_never_multiplexes_rtcp_the_offer_did_not_ask_for() {
+        // RFC 5761 §5.1.1: multiplexing happens only where both ends agreed, and this SDP is an
+        // *answer* — so the `rtcp-mux` directive applies with its near-side meaning. `require` used to
+        // be read with its far-side meaning here (force mux on the leg we generate), which advertised
+        // `a=rtcp-mux` back to a caller that had not offered it: that caller keeps sending RTCP to
+        // `port + 1`, which the muxed leg never bound.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "mux".into(),
+                    from_tag: "caller".into(),
+                    // A non-muxed offer (`sdp_for(.., false)` omits `a=rtcp-mux`).
+                    sdp: sdp_for(addr_a, false),
+                    profile: ProfileFlags {
+                        rtcp_mux: vec!["require".to_string()],
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = ok_sdp_text(&result);
+        assert!(
+            !answer.contains("a=rtcp-mux"),
+            "the answer must not offer mux back to a caller that did not offer it: {answer}"
+        );
+        // And the leg really did bind the companion RTCP port the caller will use.
+        let call = engine.calls.get("mux").expect("call present");
+        assert!(
+            call.near.rtcp.is_some(),
+            "a non-muxed leg binds RTP + a companion RTCP port"
+        );
+        assert_eq!(
+            call.endpoint_ids().count(),
+            2,
+            "and still only one leg's worth"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_is_refused_on_a_locally_answered_call() {
+        // `answer_local` already sent the answer and the caller is talking to the engine's only socket.
+        // Serving an `answer` on top would have to invent a B leg — and pointing B's relay at the
+        // caller's own endpoint would break the live call. Refuse, and say why.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "local".into(),
+                    from_tag: "caller".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "local".into(),
+                    from_tag: "caller".into(),
+                    to_tag: "callee".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let CmdResult::Error { reason } = answered else {
+            panic!("expected an error, got {answered:?}");
+        };
+        assert!(
+            reason.contains("answered locally"),
+            "the reason names the cause: {reason}"
+        );
+        // And the live call is untouched — same single leg, still no to_tag.
+        let call = engine
+            .calls
+            .get("local")
+            .expect("call survives the refusal");
+        assert!(call.far.is_none());
+        assert!(call.to_tag.is_none());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_is_refused_on_a_single_leg_call() {
+        // The HA snapshot is a two-leg record and a standby resumes a two-party relay from it. A
+        // single-leg call's "far side" is this engine's own pipeline — not replicable state — so
+        // refuse rather than hand back a blob that would restore as a call that never existed.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "ivr".into(),
+                    from_tag: "caller".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "ivr".into(),
+                    from_tag: "caller".into(),
+                },
+            )
+            .await;
+        let CmdResult::Error { reason } = result else {
+            panic!("expected an error, got {result:?}");
+        };
+        assert!(
+            reason.contains("single-leg"),
+            "the reason names the cause: {reason}"
+        );
+    }
 
     /// VoLTE-shaped offer: AMR-WB (96) and AMR (97) are the caller's preferred codecs, then G.711
     /// (PCMU 0 / PCMA 8), plus the RFC 4733 telephone-event (101). Used to prove the answer selects
