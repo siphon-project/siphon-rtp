@@ -525,6 +525,17 @@ pub enum AgentOutcome {
         /// The peer transport address media must use.
         remote: SocketAddr,
     },
+    /// A datagram from this endpoint's TURN server (RFC 5766), not from an ICE peer. The allocation
+    /// shares the endpoint's 5-tuple with the checks, so the two are told apart by source: only the
+    /// server's own address lands here, and it goes to the `TurnClient` rather than the checklist —
+    /// an Allocate/Refresh response fed to the agent would simply be dropped as uncorrelated, and
+    /// the allocation would never come up.
+    TurnDatagram {
+        /// The endpoint whose allocation it belongs to.
+        endpoint: EndpointId,
+        /// The raw STUN/TURN bytes.
+        datagram: Vec<u8>,
+    },
     /// Every candidate pair failed (RFC 8445 §8.1.2): there is no usable path. Tear the call down.
     Failed {
         /// The endpoint whose checklist was exhausted.
@@ -543,6 +554,9 @@ struct AgentEntry {
     agent: IceAgent,
     /// Whether a `Selected` outcome has already been reported (so it is reported exactly once).
     announced: bool,
+    /// The TURN server this endpoint relays through, when it gathered a relayed candidate. Traffic
+    /// from this address is the allocation's, not a peer's.
+    turn_server: Option<SocketAddr>,
 }
 
 /// The per-engine registry of full ICE agents, one per ICE-enabled endpoint.
@@ -609,6 +623,7 @@ impl AgentSupervisor {
                 local,
                 agent: IceAgent::new(config, now_ms),
                 announced: false,
+                turn_server: None,
             },
         );
     }
@@ -647,12 +662,51 @@ impl AgentSupervisor {
 
     /// Feed the datapath's forwarded STUN into the agents. MUST run before [`Self::poll`], so a check
     /// that arrived this tick is answered on this tick rather than the next.
+    /// Every remote transport address this endpoint's checklist may probe.
+    ///
+    /// A relayed candidate can only reach a peer the TURN server holds a permission for (RFC 5766
+    /// §9), so the allocation needs exactly this set: the remotes of every pair, including the
+    /// peer-reflexive ones discovered mid-session, which is why it is read each tick rather than once
+    /// from the offer.
+    #[must_use]
+    pub fn remote_addresses(&self, endpoint: EndpointId) -> Vec<SocketAddr> {
+        let Some(entry) = self.agents.get(&endpoint) else {
+            return Vec::new();
+        };
+        let mut seen: Vec<SocketAddr> = Vec::new();
+        for pair in entry.agent.checklist().pairs() {
+            if !seen.contains(&pair.remote.address) {
+                seen.push(pair.remote.address);
+            }
+        }
+        seen
+    }
+
+    /// Declare the TURN server `endpoint` relays through, so its datagrams are routed to the
+    /// allocation instead of the checklist. Called once the allocation is live; a no-op for an
+    /// endpoint with no registered agent.
+    pub fn set_turn_server(&self, endpoint: EndpointId, server: Option<SocketAddr>) {
+        if let Some(mut entry) = self.agents.get_mut(&endpoint) {
+            entry.turn_server = server;
+        }
+    }
+
     pub fn drain_events(&self, now_ms: u64) -> Vec<AgentOutcome> {
         let mut outcomes = Vec::new();
         while let Ok(event) = self.events_rx.try_recv() {
             let Some(mut entry) = self.agents.get_mut(&event.endpoint) else {
                 continue;
             };
+            // RFC 5766: the allocation shares this 5-tuple with the connectivity checks, so tell them
+            // apart by source. The TURN server's own responses drive the `TurnClient`; feeding them
+            // to the checklist would drop them as uncorrelated and the allocation would never come up.
+            if entry.turn_server == Some(event.source) {
+                outcomes.push(AgentOutcome::TurnDatagram {
+                    endpoint: event.endpoint,
+                    datagram: event.datagram.to_vec(),
+                });
+                continue;
+            }
             let local = entry.local;
             let actions = entry
                 .agent
