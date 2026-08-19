@@ -2002,7 +2002,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "webrtc-dtls",
- "webrtc-util",
+ "webrtc-util 0.17.2",
 ]
 
 [[package]]
@@ -2713,7 +2713,7 @@ dependencies = [
  "subtle",
  "thiserror 1.0.69",
  "tokio",
- "webrtc-util",
+ "webrtc-util 0.11.0",
  "x25519-dalek",
  "x509-parser",
 ]
@@ -2734,6 +2734,26 @@ dependencies = [
  "nix",
  "portable-atomic",
  "rand 0.8.6",
+ "thiserror 1.0.69",
+ "tokio",
+ "winapi",
+]
+
+[[package]]
+name = "webrtc-util"
+version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1beae0b4f24969741c26ca282a257dc5823bd9cbe608f7e3ca3775102d323ad9"
+dependencies = [
+ "async-trait",
+ "bitflags 1.3.2",
+ "bytes",
+ "ipnet",
+ "lazy_static",
+ "log",
+ "nix",
+ "portable-atomic",
+ "rand 0.9.4",
  "thiserror 1.0.69",
  "tokio",
  "winapi",
