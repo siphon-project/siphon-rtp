@@ -32,6 +32,8 @@
 //! pass vacuously: with the reference present, at least one configuration must actually have been
 //! scored.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use siphon_rtp_codec::opus::celt::decoder::CeltDecoder;
@@ -62,19 +64,6 @@ const SNR_MARGIN_DB: f32 = 1.0;
 fn reference_dir() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/opus");
     dir.is_dir().then_some(dir)
-}
-
-/// Path to one of the locally built oracle binaries, honouring the env override used for
-/// `opus_compare` so a shared build can serve every worktree.
-fn oracle(reference: &Path, name: &str) -> Option<PathBuf> {
-    if name == "opus_compare" {
-        if let Some(path) = std::env::var_os("SIPHON_RTP_OPUS_COMPARE") {
-            let path = PathBuf::from(path);
-            return path.exists().then_some(path);
-        }
-    }
-    let candidate = reference.join("build").join(name);
-    candidate.exists().then_some(candidate)
 }
 
 /// The TOC byte for a CELT-only frame (RFC 6716 §3.1, Table 2): configs 16..31 are CELT-only, four
@@ -422,11 +411,11 @@ fn our_celt_encoder_streams_pass_libopus_and_opus_compare() {
         eprintln!("celt encode conformance: reference/opus not present — skipping");
         return;
     };
-    let Some(opus_demo) = oracle(&reference, "opus_demo") else {
+    let Some(opus_demo) = common::oracle("opus_demo") else {
         eprintln!("celt encode conformance: opus_demo not built — skipping");
         return;
     };
-    let Some(opus_compare) = oracle(&reference, "opus_compare") else {
+    let Some(opus_compare) = common::oracle("opus_compare") else {
         eprintln!("celt encode conformance: opus_compare not built — skipping");
         return;
     };

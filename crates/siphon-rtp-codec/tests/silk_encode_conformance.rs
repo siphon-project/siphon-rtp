@@ -61,6 +61,8 @@
 //! Skips gracefully when the reference tree is absent, and refuses to pass vacuously: it requires
 //! every internal rate, every frame duration, both channel counts, and a non-trivial sample count.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -105,12 +107,9 @@ fn opus_demo() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// `opus_compare`, honouring `SIPHON_RTP_OPUS_COMPARE`.
+/// `opus_compare`, located by [`common::oracle`].
 fn opus_compare() -> Option<PathBuf> {
-    let path = std::env::var_os("SIPHON_RTP_OPUS_COMPARE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/opus_compare"));
-    path.is_file().then_some(path)
+    common::oracle("opus_compare")
 }
 
 /// The 48 kHz mono source `gen_silk_only.sh` uses, if it has been generated.

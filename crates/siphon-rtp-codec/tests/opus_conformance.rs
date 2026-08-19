@@ -43,6 +43,8 @@
 //! refuses to pass *vacuously*: with everything present, every vector must have been decoded, every
 //! packet's range compared, and at least one vector scored by `opus_compare` in each pass.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use siphon_rtp_codec::opus::decoder::{OpusDecoder, MAX_PACKET_SAMPLES};
@@ -207,16 +209,7 @@ fn decode_vector_to_pcm(packets: &[BitPacket], channels: u8) -> Result<Decoded, 
 
 /// Path to the locally built `opus_compare`, or `Err` with the reason it is unusable.
 fn opus_compare_path() -> Result<PathBuf, String> {
-    let compare = std::env::var_os("SIPHON_RTP_OPUS_COMPARE")
-        .map_or_else(|| PathBuf::from("/tmp/opus_compare"), PathBuf::from);
-    if compare.exists() {
-        Ok(compare)
-    } else {
-        Err(format!(
-            "{} not built (test-only C reference)",
-            compare.display()
-        ))
-    }
+    common::opus_compare_or_reason()
 }
 
 /// Path to the locally built `opus_demo`, which is what produces libopus' own decode of a vector.
