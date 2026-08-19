@@ -210,6 +210,13 @@ pub struct ParticipantConfig {
     /// The participant's plaintext RFC 4103 text leg (RFC 9071 multiparty RTT), if it offered one.
     /// `None` for an audio-only participant or a declined secure-text section.
     pub text: Option<ParticipantTextConfig>,
+    /// This seat runs a **full RFC 8445 ICE agent** that has not yet selected a candidate pair. While
+    /// set, the room drops the seat's ingress and sends it nothing: media follows ICE's decision, not
+    /// the first packet to arrive, and the signalled `c=` address a NATed ICE peer offers is usually
+    /// not where it can actually receive. Cleared by [`ConferenceControl::IceSelected`], which also
+    /// re-points egress at the selected pair. Never set for an ice-lite seat — there the datapath's
+    /// own layer-4 responder gate already covers it.
+    pub ice_pending: bool,
     /// Initial role / routing.
     pub routing: Routing,
 }
@@ -309,6 +316,9 @@ struct Participant {
     secure_pending: bool,
     /// The participant's plaintext RFC 4103 text leg (RFC 9071 multiparty RTT), if it negotiated one.
     text: Option<ParticipantText>,
+    /// Awaiting an RFC 8445 pair selection — drop ingress and emit nothing until ICE chooses (see
+    /// the config field).
+    ice_pending: bool,
     routing: Routing,
     /// Whether the first egress packet has been emitted (sets the RTP marker bit, RFC 3550 §5.1).
     started: bool,
@@ -641,6 +651,7 @@ impl Conference {
             secure: config.secure,
             secure_pending: config.secure_pending,
             text: participant_text,
+            ice_pending: config.ice_pending,
             routing: config.routing,
             started: false,
         });
@@ -701,6 +712,40 @@ impl Conference {
         );
     }
 
+    /// Open a seat's media path on the pair its ICE agent selected (RFC 8445 §8.1.1).
+    ///
+    /// This is the conference counterpart of `Datapath::adopt_source` on a 2-party leg: the selected
+    /// pair's remote transport becomes both the reply address and the source gate, replacing whatever
+    /// the offer signalled — for a NATed ICE peer the signalled `c=` is typically an address it can
+    /// never receive on, so keeping it would send the mix into the void.
+    ///
+    /// The gate is *narrowed* to the selected address, never widened: only a pair whose check the
+    /// agent authenticated with the negotiated credentials reaches here.
+    fn ice_selected(&mut self, tag: &str, remote: SocketAddr) {
+        let conference_id = self.conference_id.clone();
+        let Some(participant) = self.participants.iter_mut().find(|seat| seat.tag == tag) else {
+            tracing::warn!(
+                conference = %conference_id,
+                tag,
+                "ICE selected a pair for a participant that already left; selection discarded"
+            );
+            return;
+        };
+        participant.egress_dst = remote;
+        participant.accepted_source = SourceFilter::Exact(remote.ip());
+        // The reply address is now ICE's decision. Re-arm the symmetric latch so a stale pre-ICE
+        // observation cannot immediately move it back off the selected pair.
+        participant.reverse_latch = SymmetricLatch::default();
+        participant.ice_pending = false;
+        tracing::info!(
+            target: "siphon_rtp::media",
+            conference = %conference_id,
+            tag,
+            %remote,
+            "ICE selected a candidate pair for a conference seat — media path open"
+        );
+    }
+
     /// Ingress one datagram for a participant endpoint: gate its source, decrypt (secure legs), then
     /// SSRC-latch its reply address, drop RTCP / telephone-event, and buffer the audio for the next
     /// room tick. Never mixes a packet from an unsignalled source (RTPBleed defence), and only an
@@ -739,6 +784,13 @@ impl Conference {
         // A DTLS seat whose handshake has not keyed it yet: drop. Decoding SRTP as if it were
         // plaintext would mix noise into the room for every other participant.
         if participant.secure_pending {
+            return false;
+        }
+        // A full-ICE seat before its agent has selected a pair: drop. Media must follow ICE's
+        // decision, not race it — mixing in whatever arrives first is exactly the blind latch the
+        // connectivity check exists to replace (RFC 8445 §7; docs/security-and-nat.md §4 layer 4).
+        // Not counted as activity either: an unselected path is not a live one.
+        if participant.ice_pending {
             return false;
         }
         // SRTP: decrypt a secure participant's packet first (the auth tag also proves authenticity —
@@ -1101,8 +1153,10 @@ impl Conference {
                 continue;
             };
             // An unkeyed DTLS seat gets no RTCP either — a plaintext SR toward a peer expecting
-            // SRTCP leaks the room's SSRC/timing and is unreadable to it anyway.
-            if self.participants[index].secure_pending {
+            // SRTCP leaks the room's SSRC/timing and is unreadable to it anyway. Nor does a seat
+            // whose ICE has not selected: there is no agreed path to send it on yet, and the
+            // signalled address may be one the peer cannot receive at.
+            if self.participants[index].secure_pending || self.participants[index].ice_pending {
                 continue;
             }
             // SRTCP-encrypt the report for a secure participant; plain legs send it as is.
@@ -1308,9 +1362,11 @@ impl Conference {
         out: &mut Vec<Outbound>,
     ) {
         // Never send the room mix to a peer whose DTLS handshake has not keyed the leg: that would put
-        // every other participant's audio on the wire in the clear. `emit` is the one point every
-        // egress packet passes through, so the guard cannot be bypassed by a new caller.
-        if self.participants[index].secure_pending {
+        // every other participant's audio on the wire in the clear. Nor to a full-ICE seat before its
+        // agent selects a pair — the signalled address a NATed ICE peer offers is usually not where it
+        // can receive, so the mix would go to a third party or nowhere. `emit` is the one point every
+        // egress packet passes through, so neither guard can be bypassed by a new caller.
+        if self.participants[index].secure_pending || self.participants[index].ice_pending {
             return;
         }
         let marker = !self.participants[index].started;
@@ -1724,6 +1780,9 @@ pub enum ConferenceControl {
     /// Deliver a participant's [`SecureLeg`] once its DTLS handshake completed (RFC 5764), keying the
     /// seat and clearing its pending gate so its audio joins the mix and the mix reaches it.
     AttachSecureLeg { tag: String, leg: Box<SecureLeg> },
+    /// A participant's ICE agent selected a candidate pair (RFC 8445 §8.1.1): open its media path on
+    /// that pair, re-pointing egress and narrowing the source gate to the selected remote transport.
+    IceSelected { tag: String, remote: SocketAddr },
     /// Tear the room down.
     Stop,
 }
@@ -1798,6 +1857,9 @@ async fn run_conference<D>(
                     }
                     ConferenceInput::Control(ConferenceControl::AttachSecureLeg { tag, leg }) => {
                         conference.attach_secure_leg(&tag, *leg);
+                    }
+                    ConferenceInput::Control(ConferenceControl::IceSelected { tag, remote }) => {
+                        conference.ice_selected(&tag, remote);
                     }
                     ConferenceInput::Control(ConferenceControl::Stop) => break,
                 }
@@ -2053,6 +2115,49 @@ impl ConferenceRegistry {
         endpoints
     }
 
+    /// The room and participant tag owning `endpoint`, if any. The ICE agent knows only the endpoint
+    /// it drives, so this is how a selection or a failure finds the seat it belongs to.
+    #[must_use]
+    pub fn participant_at(&self, endpoint: EndpointId) -> Option<(String, String)> {
+        self.rooms.iter().find_map(|room| {
+            room.value()
+                .members
+                .iter()
+                .find(|member| member.endpoint == endpoint)
+                .map(|member| (room.key().clone(), member.tag.clone()))
+        })
+    }
+
+    /// The endpoint seating `tag` in `conference_id`, if it is still a member.
+    #[must_use]
+    pub fn participant_at_tag(&self, conference_id: &str, tag: &str) -> Option<EndpointId> {
+        self.rooms.get(conference_id).and_then(|room| {
+            room.members
+                .iter()
+                .find(|member| member.tag == tag)
+                .map(|member| member.endpoint)
+        })
+    }
+
+    /// Open the media path of the seat on `endpoint` on the candidate pair its ICE agent selected
+    /// (RFC 8445 §8.1.1). Returns `false` when the endpoint is not a conference participant — which is
+    /// the common case, since most ICE endpoints are 2-party legs.
+    pub fn ice_selected(&self, endpoint: EndpointId, remote: SocketAddr) -> bool {
+        let Some((conference_id, tag)) = self.participant_at(endpoint) else {
+            return false;
+        };
+        match self.rooms.get(&conference_id) {
+            Some(handle) => handle
+                .mailbox
+                .try_send(ConferenceInput::Control(ConferenceControl::IceSelected {
+                    tag,
+                    remote,
+                }))
+                .is_ok(),
+            None => false,
+        }
+    }
+
     /// Live-update a participant's role / routing. Returns `false` if the room is gone.
     pub fn route(&self, conference_id: &str, tag: &str, routing: Routing) -> bool {
         match self.rooms.get(conference_id) {
@@ -2210,6 +2315,7 @@ mod tests {
             secure: None,
             secure_pending: false,
             text: None,
+            ice_pending: false,
             routing: Routing::default(),
         }
     }
@@ -2410,6 +2516,7 @@ mod tests {
             secure: None,
             secure_pending: false,
             text: None,
+            ice_pending: false,
             routing: Routing::default(),
         };
         (config, encoded)
@@ -2445,6 +2552,7 @@ mod tests {
             secure: None,
             secure_pending: false,
             text: None,
+            ice_pending: false,
             routing: Routing::default(),
         };
         (config, encoded)
@@ -2605,6 +2713,7 @@ mod tests {
             secure: None,
             secure_pending: false,
             text: None,
+            ice_pending: false,
             routing: Routing::default(),
         };
         (config, encoded)
@@ -4878,6 +4987,123 @@ mod tests {
             addr("10.0.0.1:7000"),
             "a forged, auth-failing packet must not steal the reply direction (B2)"
         );
+    }
+
+    // --- Full-ICE conference seats (RFC 8445) ---------------------------------------------------
+
+    /// A seat that runs a full ICE agent: gate open on the source (a peer-reflexive check arrives
+    /// from a transport the SDP never carried), but `ice_pending` until the agent selects a pair.
+    fn ice_config_pending(index: usize, dst: &str) -> ParticipantConfig {
+        let mut config = ulaw_config(index, "10.0.0.1", dst);
+        config.accepted_source = SourceFilter::Any;
+        config.ice_pending = true;
+        config
+    }
+
+    fn loud_frame() -> Vec<i16> {
+        vec![8_000i16; 160]
+    }
+
+    #[test]
+    fn a_full_ice_seat_mixes_nothing_before_its_agent_selects_a_pair() {
+        // Media must follow ICE's decision, not race it. Without this gate the room would mix
+        // whatever arrived first — the blind latch the connectivity check exists to replace.
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
+        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+
+        let gated_in = conference.ingest(&rx(1, "10.0.0.1:5000", ulaw_rtp(0, 1, &loud_frame())));
+        assert!(
+            !gated_in,
+            "a pending ICE seat's media is neither mixed nor counted as activity"
+        );
+    }
+
+    #[test]
+    fn a_full_ice_seat_is_sent_nothing_before_its_agent_selects_a_pair() {
+        // The signalled c= address of a NATed ICE peer is typically one it cannot receive on, so
+        // sending the mix there before selection would leak the room to a third party or nowhere.
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
+        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+        // Give the room something to mix, from the *other* (non-ICE) participant.
+        conference.ingest(&rx(2, "10.0.0.2:5000", ulaw_rtp(1, 1, &loud_frame())));
+
+        let mut out = Vec::new();
+        conference.tick(&mut out);
+        assert!(
+            out.iter().all(|packet| packet.endpoint != EndpointId(1)),
+            "nothing may be transmitted to a seat whose ICE has not selected"
+        );
+    }
+
+    #[test]
+    fn ice_selection_opens_the_path_and_repoints_egress_at_the_selected_pair() {
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
+        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+
+        // The agent selects a peer-reflexive transport — deliberately neither the signalled address
+        // nor its port, which is the whole point of ICE for a NATed peer.
+        conference.ice_selected("party-0", addr("203.0.113.9:60000"));
+
+        assert!(!conference.participants[0].ice_pending);
+        assert_eq!(
+            conference.participants[0].egress_dst,
+            addr("203.0.113.9:60000"),
+            "egress follows the selected pair, not the signalled c="
+        );
+        assert_eq!(
+            conference.participants[0].accepted_source,
+            SourceFilter::Exact("203.0.113.9".parse().expect("ip")),
+            "the gate narrows to the selected pair — it is never left open after selection"
+        );
+
+        // And media now flows in.
+        assert!(conference.ingest(&rx(1, "203.0.113.9:60000", ulaw_rtp(0, 1, &loud_frame()))));
+    }
+
+    #[test]
+    fn ice_selection_narrows_the_gate_so_the_pre_selection_source_is_shut_out() {
+        // The window before selection runs with SourceFilter::Any so a peer-reflexive check is not
+        // dropped by address. Selection must close that window, not leave it open.
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
+        conference.ice_selected("party-0", addr("203.0.113.9:60000"));
+
+        assert!(
+            !conference.ingest(&rx(1, "198.51.100.7:5000", ulaw_rtp(0, 1, &loud_frame()))),
+            "a source ICE did not select must not reach the mix once a pair is chosen"
+        );
+    }
+
+    #[test]
+    fn ice_selection_for_a_departed_participant_is_discarded() {
+        // A selection can race a leave; it must not panic or resurrect a seat.
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
+        conference.remove_participant("party-0");
+        conference.ice_selected("party-0", addr("203.0.113.9:60000"));
+        assert!(conference.is_empty());
+    }
+
+    #[test]
+    fn an_ice_pending_seat_gets_no_rtcp_sender_report() {
+        // There is no agreed path to send one on yet, and the signalled address may be unreachable.
+        let mut conference = Conference::new("room".into(), 0);
+        assert!(conference.add_participant(ice_config_pending(0, "10.0.0.1:4000")));
+        assert!(conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000")));
+
+        let mut out = Vec::new();
+        // The per-participant SR goes out every RTCP_INTERVAL_TICKS ticks; drive well past one.
+        for _ in 0..300 {
+            out.clear();
+            conference.tick(&mut out);
+            assert!(
+                out.iter().all(|packet| packet.endpoint != EndpointId(1)),
+                "no RTP and no RTCP may reach a seat whose ICE has not selected"
+            );
+        }
     }
 
     #[test]
