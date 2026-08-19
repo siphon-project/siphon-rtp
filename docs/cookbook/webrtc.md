@@ -26,9 +26,12 @@ Rust, at different levels of maturity. This page says exactly which level.
   and open only once the handshake keys them / ICE selects a pair; a full-ICE
   seat's egress and source gate follow the selected pair.
 
-**Planned, not shipped:** relayed (TURN) candidates in our own gathering — the
-built-in TURN *server* ships, but the engine is not yet a TURN *client*, so it
-advertises host and server-reflexive candidates only; transcoding on a DTLS leg
+- Relayed (TURN) candidates, with `--turn-server`: the engine is a TURN *client*
+  as well as a server, and media on a relayed candidate is ChannelData-framed
+  through the allocation by the datapath. Advertised only when the allocation
+  came up and the backend can carry it.
+
+**Planned, not shipped:** transcoding on a DTLS leg
 (today a DTLS leg is bridged as-is, so both sides must share a codec); HA
 checkpoint/restore of a DTLS leg.
 

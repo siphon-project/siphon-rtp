@@ -229,7 +229,9 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > resolution, peer-reflexive discovery, and regular nomination — with media gated on the selected
 > pair. **ICE restart (§9) and trickle-receive (RFC 8838) are wired**, and the **XDP kernel datapath
 > now enforces the same layer-4 gate** as the userspace one (see the bullet below).
-> **Remaining:** relayed candidates (a TURN client). RTCP-port ICE under non-mux is wired.
+> **Relayed candidates are wired too** (`--turn-server`): the engine is now a TURN *client* as well as
+> a server, and a relayed candidate is advertised only when the allocation actually came up and the
+> datapath can relay through it. RTCP-port ICE under non-mux is wired.
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
   `ice-ufrag`/`ice-pwd` (MESSAGE-INTEGRITY) — a challenge/response A1 cannot forge without the SDP it
@@ -312,6 +314,32 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     `forward_in_kernel` in the eBPF classifier, `IceDemux` + `apply_ice_posture` in
     `siphon-rtp-xdp`. Both backends share one responder (`datapath::respond_to_stun_check`), so what
     authenticates a check cannot drift between them.
+- **Relayed candidates carry traffic, they are not just advertised** (RFC 5766). A relayed candidate's
+  transport address lives on the TURN server, so nothing sent from the endpoint reaches the peer
+  directly. The datapath therefore wraps egress to a **bound** peer in ChannelData and addresses it to
+  the server, and unwraps inbound ChannelData **rewriting the source back to the peer** — so the ICE
+  responder, the source gate, the latch and the relay all keep working in terms of the peer's own
+  address and never learn a relay is in the path (`Datapath::set_turn_relay`, `TurnRelay`).
+  - **Only the allocation's own server is trusted for de-encapsulation.** ChannelData-shaped bytes
+    from any other source are left untouched, so the seam cannot be used to forge a peer address; a
+    message on a channel this allocation never bound is dropped rather than passed up as if it came
+    from the server.
+  - **A destination with no channel is sent directly and untouched** — that is what keeps the
+    allocation's own requests (addressed to the server) and any peer reached over a host or
+    server-reflexive candidate on the direct path.
+  - **The candidate is not advertised unless it can be carried.** Gathering consults
+    `Datapath::supports_turn_relay` and the allocation's actual state; a backend without the seam, or
+    a TURN server that never answers, yields no relayed candidate at all. An advertised relay the peer
+    nominates and we then cannot carry is worse than never offering one — it turns a call that would
+    have failed over into one that connects and has no audio.
+  - **The allocation is kept alive for the life of the leg**, not just long enough to gather: it is
+    refreshed before its lifetime lapses, and every remote candidate the checklist may probe (including
+    peer-reflexive ones discovered mid-session) gets a permission and a channel, because the server
+    drops traffic from a peer it holds no permission for (§9). An allocation that dies is torn out and
+    the datapath's relay cleared, so the leg falls back to its direct candidates.
+  - **Enforcement:** `siphon-rtp-stun/src/turn_client.rs` (the pure allocation state machine),
+    `Engine::gather_relayed_candidate` + `Engine::drive_turn_allocations` (its I/O), `set_turn_relay`
+    and the `relay_unwrap` ingress hook in `udp.rs`.
 - **Consent freshness** (RFC 7675): periodic STUN checks on the established pair; on consent loss the
   call is torn down. This is also the anti-hijack *and* the dead-path detector.
   - **Responder half (always on).** A valid inbound check stamps the endpoint's activity, so the

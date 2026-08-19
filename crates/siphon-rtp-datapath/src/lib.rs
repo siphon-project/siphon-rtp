@@ -342,6 +342,52 @@ pub fn respond_to_stun_check(
     ))
 }
 
+/// A live TURN allocation an endpoint relays through (RFC 5766), installed by
+/// [`Datapath::set_turn_relay`].
+///
+/// This is what makes an ICE **relayed** candidate carry traffic rather than just appear in the SDP.
+/// A relayed candidate's transport address lives on the TURN server, not on us, so nothing we send
+/// from this endpoint reaches the peer directly: it must be wrapped and addressed to the server,
+/// which unwraps it and forwards from the relayed address. Inbound traffic makes the same trip in
+/// reverse. Without this the candidate would be advertised, possibly nominated, and then blackhole
+/// media — worse than never offering it.
+///
+/// Only **ChannelData** framing (§11) is carried here, not Send/Data indications (§10): the client
+/// binds a channel for every peer before it sends, and 4 bytes of per-packet overhead on a 20 ms
+/// audio stream is the difference worth having over 36.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnRelay {
+    /// The TURN server's transport address — where every wrapped datagram is actually sent, and the
+    /// only source inbound relayed traffic is accepted from.
+    pub server: SocketAddr,
+    /// Bound peer → channel number (RFC 5766 §11, `0x4000`..=`0x7FFF`). A destination absent from
+    /// this list is **not** relayed: it is sent directly, which is correct for the TURN server itself
+    /// (allocation requests) and for a peer we reach over a host or server-reflexive candidate.
+    pub channels: Vec<(SocketAddr, u16)>,
+}
+
+impl TurnRelay {
+    /// The channel bound for `peer`, if any — i.e. whether traffic to it must be relay-wrapped.
+    #[must_use]
+    pub fn channel_for(&self, peer: SocketAddr) -> Option<u16> {
+        self.channels
+            .iter()
+            .find(|(bound, _)| *bound == peer)
+            .map(|(_, channel)| *channel)
+    }
+
+    /// The peer a bound channel belongs to — how an inbound `ChannelData` message's source is
+    /// rewritten back to the peer that actually sent it, so everything above this layer sees the
+    /// peer's address and never the TURN server's.
+    #[must_use]
+    pub fn peer_for_channel(&self, channel: u16) -> Option<SocketAddr> {
+        self.channels
+            .iter()
+            .find(|(_, bound)| *bound == channel)
+            .map(|(peer, _)| *peer)
+    }
+}
+
 /// Who answers inbound STUN checks on an endpoint promoted via [`Datapath::set_ice_agent`].
 ///
 /// The distinction matters because whoever answers a check also decides whether its source becomes
@@ -589,6 +635,41 @@ pub trait Datapath: Send + Sync {
     ///
     /// Default: no-op, for a backend with no ICE support at all.
     fn adopt_source(&self, _endpoint: EndpointId, _source: SocketAddr) {}
+
+    /// Install (or clear with `None`) the TURN allocation `endpoint` relays through (RFC 5766).
+    ///
+    /// While installed, traffic to a **bound peer** is wrapped in ChannelData and sent to the TURN
+    /// server instead of the peer, and inbound ChannelData from that server is unwrapped with its
+    /// source rewritten back to the peer — so every layer above this one, from the ICE agent's
+    /// connectivity checks to the media relay, keeps working in terms of the peer's own address and
+    /// never learns a relay is in the path.
+    ///
+    /// A destination **not** in [`TurnRelay::channels`] is sent directly and untouched. That is what
+    /// keeps the allocation's own requests (addressed to the server) and any peer reached over a host
+    /// or server-reflexive candidate on the direct path.
+    ///
+    /// Default: a no-op that **warns**, for a backend with no relay seam. The warning is the point —
+    /// a backend that silently ignored this would advertise a relayed candidate it cannot carry, and
+    /// a peer that nominated it would get a call that connects and then has no audio.
+    fn set_turn_relay(&self, endpoint: EndpointId, relay: Option<TurnRelay>) {
+        if relay.is_some() {
+            tracing::warn!(
+                target: "siphon_rtp::datapath",
+                ?endpoint,
+                "datapath backend has no TURN relay seam — a relayed ICE candidate cannot carry \
+                 media on this backend and must not be advertised"
+            );
+        }
+    }
+
+    /// Whether this backend can actually relay through a TURN allocation ([`Self::set_turn_relay`]).
+    ///
+    /// Gathering consults this **before** it advertises a relayed candidate: on a backend that
+    /// cannot, the candidate is not offered at all, so a peer can never nominate a path that would
+    /// blackhole. Default `false` — a backend opts in by implementing the seam.
+    fn supports_turn_relay(&self) -> bool {
+        false
+    }
 
     /// A receiver for datagrams delivered by [`FlowAction::Redirect`] flows — the userspace slow path
     /// (SRTP/transcode/WS, and the built-in TURN relay, docs/security-and-nat.md §11). Clone-per-
