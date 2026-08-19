@@ -16,6 +16,20 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
+    ignore:
+      # aes/ctr are deliberately held below the RustCrypto 0.9 wave (aes 0.9 / ctr 0.10 / cipher 0.5):
+      # it regresses the SRTP AES-CTR hot path 20-60% (the batched AES-NI block path is lost). Not a
+      # security bump — see crates/siphon-rtp-srtp/Cargo.toml and the perf-investigation notes.
+      # Patch updates on the held line still come through.
+      - dependency-name: "aes"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "ctr"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # webrtc-util is version-locked to webrtc-dtls (0.12 requires webrtc-util 0.11); bumping it on
+      # its own breaks the Conn/KeyingMaterialExporter trait match. It moves only in lockstep with the
+      # webrtc-rs stack, never as a standalone PR.
+      - dependency-name: "webrtc-util"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   # The fuzz crate is its own (detached) workspace, so it needs a separate cargo entry. Grouped for
   # the same reason as "/", and more so: every bump here touches the one file fuzz/Cargo.lock, so

@@ -32,18 +32,18 @@ name = "siphon_rtp_engine"
 path = "src/lib.rs"
 
 [dependencies]
-siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.1.0" }
-siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
-siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }
-siphon-rtp-ice = { path = "../siphon-rtp-ice", version = "0.1.0" }
-siphon-rtp-srtp = { path = "../siphon-rtp-srtp", version = "0.1.0" }
-siphon-rtp-dtls = { path = "../siphon-rtp-dtls", version = "0.1.0" }
-siphon-rtp-turn = { path = "../siphon-rtp-turn", version = "0.1.0" }
-siphon-rtp-hep = { path = "../siphon-rtp-hep", version = "0.1.0" }
-siphon-rtp-ngcompat = { path = "../siphon-rtp-ngcompat", version = "0.1.0" }
-siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.1.0" }
-siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.1.0" }
-siphon-rtp-dsp = { path = "../siphon-rtp-dsp", version = "0.1.0" }
+siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.2.0" }
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.2.0" }
+siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.2.0" }
+siphon-rtp-ice = { path = "../siphon-rtp-ice", version = "0.2.0" }
+siphon-rtp-srtp = { path = "../siphon-rtp-srtp", version = "0.2.0" }
+siphon-rtp-dtls = { path = "../siphon-rtp-dtls", version = "0.2.0" }
+siphon-rtp-turn = { path = "../siphon-rtp-turn", version = "0.2.0" }
+siphon-rtp-hep = { path = "../siphon-rtp-hep", version = "0.2.0" }
+siphon-rtp-ngcompat = { path = "../siphon-rtp-ngcompat", version = "0.2.0" }
+siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.2.0" }
+siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.2.0" }
+siphon-rtp-dsp = { path = "../siphon-rtp-dsp", version = "0.2.0" }
 tokio = { workspace = true }
 # `rustls-tls-webpki-roots` gives the WebSocket bridge a `wss://` client (RFC 6455 over RFC 8446).
 # Pure Rust: it pulls tokio-rustls/rustls with `default-features = false`, so no aws-lc-rs — the
@@ -76,13 +76,13 @@ tikv-jemalloc-ctl = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.1.0" }
-siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.1.0" }
+siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.2.0" }
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath", version = "0.2.0" }
 # Construct a `MediaCall`'s two `DirectionConfig`s directly (codecs, MOS class) and build RTP fixtures
 # for the media-pipeline echo-cancellation zero-allocation soak (tests/media_aec_zero_alloc.rs).
-siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.1.0" }
-siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.1.0" }
-siphon-rtp-hep = { path = "../siphon-rtp-hep", version = "0.1.0" }
+siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.2.0" }
+siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.2.0" }
+siphon-rtp-hep = { path = "../siphon-rtp-hep", version = "0.2.0" }
 bytes = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }

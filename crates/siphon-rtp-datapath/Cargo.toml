@@ -17,8 +17,8 @@ categories = ["network-programming"]
 # The pure `no_std` XDP-ABI + relay-math crate. Depended on unconditionally (not only under the xdp
 # backend) so the UDP-loopback datapath reuses its RFC 7983 RTP demux (`rewrite::rtp_media_ssrc`) and
 # the RFC 3550 §A.1 forward-gap loss estimate (`loss::rtp_loss_update`) on the plain-relay hot path.
-siphon-rtp-ebpf-common = { path = "../siphon-rtp-ebpf-common", version = "0.1.0" }
-siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.1.0" }
+siphon-rtp-ebpf-common = { path = "../siphon-rtp-ebpf-common", version = "0.2.0" }
+siphon-rtp-stun = { path = "../siphon-rtp-stun", version = "0.2.0" }
 tokio = { workspace = true }
 flume = { workspace = true }
 bytes = { workspace = true }

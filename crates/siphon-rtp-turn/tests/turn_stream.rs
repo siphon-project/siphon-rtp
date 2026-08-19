@@ -254,8 +254,9 @@ fn tls_pair() -> (TlsAcceptor, TlsConnector) {
     let certified =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
     let cert_der = CertificateDer::from(certified.cert.der().to_vec());
-    let key_der =
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.signing_key.serialize_der(),
+    ));
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
