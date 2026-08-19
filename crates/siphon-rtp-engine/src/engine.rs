@@ -13762,7 +13762,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("gen cert");
         let cert_der = rustls_pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key_der = rustls_pki_types::PrivateKeyDer::Pkcs8(
-            rustls_pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
+            rustls_pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()),
         );
         let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
