@@ -99,7 +99,28 @@ legs (keyed by `call_id`); exactly one identifier is present, matching the
   captures. The G.107 MOS now rides BOTH the `call_quality` control events AND the exported HEP
   type-35 QoS report (alongside the raw RTCP capture).
 
-## 4. RFC 4103 Real-Time Text content QoS on HEP
+## 4. End-of-call CDR (`call_summary` / the `siphon_rtp::cdr` log block)
+
+At teardown — controller `delete` or the media-timeout reap — the engine emits one CDR per call: a
+`siphon_rtp::cdr` log block, and its structured twin `Event::CallSummary` on the control channel, so
+the SBC merges the media figures with its own SIP record. Both carry the datapath packet/byte counters
+plus, where a userspace media actor measured it, the RFC 3550 loss/jitter and the G.107 MOS shape.
+
+**One entry per party, not per socket.** A two-party call has two: the near (offerer, `from_tag`) leg
+and the far (answerer, `to_tag`) leg, each with its own counters and its own inbound quality. A
+**single-leg** call — one the engine answered itself, with no far party (IVR, announcement, echo, and
+every voice-AI call: `answer_local`, or an offer the controller put in its own 200 OK) — has exactly
+**one**: the caller. It carries the call's whole packet/byte total and the caller's measured quality.
+
+So a consumer should iterate `legs` and key on `tag`; one that assumes `legs[1]` exists breaks on every
+IVR and voice-AI call.
+
+An `answer_local` call binds one socket pair, on the leg the answer advertises — there is no second
+party and so no second leg. An *unanswered* `offer` is the one single-leg shape that still holds two:
+the offer allocated a B-facing leg in case a B side answered, and none did. Its idle leg contributes
+zero to the totals above.
+
+## 5. RFC 4103 Real-Time Text content QoS on HEP
 
 When a call negotiated a plaintext `m=text` (RFC 4103) stream **and** a text-observability feature
 promoted it to the userspace processor (recording, or `text_events`), the engine ships that leg's
@@ -135,8 +156,10 @@ it with the voice report (which has no `report` field and instead carries `mos`/
 
 An audio-only call, or a text stream left on the in-kernel relay (never measured), ships no such
 report. The exact HEP3 byte layout (magic + total length + every generic TLV chunk) is pinned by a
-byte-exact test in [`siphon-rtp-hep`](../crates/siphon-rtp-hep/src/lib.rs); the JSON schema lives in
-that crate's [`text_report`](../crates/siphon-rtp-hep/src/text_report.rs) module. To eyeball a capture,
+byte-exact test in [`siphon-rtp-hep`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-hep/src/lib.rs);
+the JSON schema lives in that crate's
+[`text_report`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-hep/src/text_report.rs)
+module. To eyeball a capture,
 Wireshark's HEP dissector decodes the chunks and shows the JSON payload verbatim.
 
 See also [`security-and-nat.md`](security-and-nat.md) for the relay's accept/latch/forward model.

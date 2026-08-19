@@ -160,6 +160,7 @@ Those restart fresh on the standby, so expect at most a brief glitch at takeover
 | Secure transcode (`SrtpMedia`) | **Yes** | Now supported and integration-tested: restore rebuilds the SRTP keys + per-SSRC rollover and the transcode actor. |
 | WebSocket bridge (`Ws`) | **No** | Same reason; additionally the WS client connection cannot be resumed. |
 | DTLS-SRTP (RFC 5764) | **No** | Cannot even be checkpointed: the keys are derived from the DTLS handshake and cannot be exported into a snapshot. A restored leg would need a full re-handshake, which requires signalling. |
+| Single-leg calls (`answer_local`: IVR, announcement, echo, voice-AI) | **No** | `checkpoint` refuses them. The "far side" of such a call is this engine's own pipeline — a prompt, an echo reflect, a WebSocket session — not state a standby could rebuild from a blob. The snapshot is a two-leg record and there is no second leg to fill it with. |
 | Conferences | **No** | `checkpoint` operates on calls; conference rooms and participants are not covered. |
 
 Each supported pipeline's takeover is integration-tested end to end (checkpoint, kill the owner,
