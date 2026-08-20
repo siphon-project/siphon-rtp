@@ -56,7 +56,10 @@ use siphon_rtp_srtp::leg::{is_rtcp, SecureLeg};
 /// then every packet in both directions is dropped.
 pub struct WsSecureLeg {
     leg: Mutex<Option<SecureLeg>>,
-    /// Mirrors `leg.is_some()` without taking the lock, for the cheap gate on the drop path.
+    /// Mirrors `leg.is_some()` so the control plane can ask whether the handshake has landed without
+    /// contending with the per-packet crypto for the mutex. Published only *after* the key is in
+    /// place, so it never advertises a leg that cannot crypt. Not consulted on the packet path —
+    /// there the `Option` check happens under the lock the crypto needs anyway.
     keyed: AtomicBool,
 }
 
