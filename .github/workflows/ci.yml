@@ -188,9 +188,22 @@ jobs:
   # to gate on a shared runner). We build the baseline from the PR's base (main) in this same runner,
   # so the two instruction counts are directly comparable, then re-run the PR against it; the bench's
   # `soft_limits([(Ir, 10.0)])` makes iai-callgrind exit non-zero on a >10% regression. PR-only.
+  #
+  # Runs on a **hosted** runner, deliberately. It used to ask for `[self-hosted, linux, x64]` for
+  # speed (it builds base and head), but that is wrong on two counts now the repository is public:
+  #
+  #  1. It silently stopped running. The org runner group sets `allows_public_repositories=false`, so
+  #     from the moment this repo went public the self-hosted runners refused every job it queued —
+  #     the gate sat queued forever and nothing enforced the 10% rule.
+  #  2. It is the same hazard `xdp-integration` below already refuses by name: a self-hosted runner
+  #     must not execute untrusted PR code, and this job *is* PR-triggered.
+  #
+  # Nothing is lost by moving. Callgrind counts instructions, not wall-clock, so the numbers are just
+  # as valid on a shared runner — the beefy box only ever bought build time. Both sides of the
+  # comparison still run in this one job, which is what makes them comparable.
   perf-gate:
     name: perf regression (iai-callgrind)
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v7
