@@ -1735,3 +1735,177 @@ async fn media_timeout_event_is_pushed_over_the_control_connection() {
     assert!(got_summary, "the CallSummary CDR event was pushed");
     assert!(got_timeout, "the MediaTimeout event was pushed");
 }
+
+/// A minimal WebSocket tee consumer on an ephemeral loopback port: it accepts one connection and
+/// republishes every frame it receives, so a test can read the `start` envelope and the audio frames.
+async fn tee_consumer() -> (
+    String,
+    flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+) {
+    use futures_util::StreamExt;
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind tee ws");
+    let addr = listener.local_addr().expect("tee ws addr");
+    let (sender, receiver) = flume::unbounded();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept tee ws");
+        let socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("tee ws handshake");
+        let (_sink, mut source) = socket.split();
+        while let Some(Ok(message)) = source.next().await {
+            if sender.send(message).is_err() {
+                break;
+            }
+        }
+    });
+    (format!("ws://{addr}/tee"), receiver)
+}
+
+/// A controller asking for a WebSocket tee at an explicit wire rate must be told, on the control
+/// plane, the rate it actually got: `ws_tee_started.sample_rate` is the negotiated wire rate, not the
+/// 8 kHz codec rate the G.711 legs run at. Driven over the real JSON-over-TCP connection so the whole
+/// contract — profile flag in, async event out — is exercised end to end, and cross-checked against
+/// the `start` envelope the WS consumer itself receives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_teed_call_reports_the_negotiated_wire_sample_rate_on_the_control_plane() {
+    use siphon_rtp_media::bridge::protocol::ControlMessage;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let engine = Arc::new(Engine::new(UdpLoopbackDatapath::new()));
+    // The tee promotes the relay into the userspace pipeline, whose Redirect datagrams the dispatcher
+    // routes to the media actor that feeds the tee's sink.
+    tokio::spawn(run_redirect_dispatcher_with_text(
+        engine.datapath().rx(),
+        engine.bridge(),
+        engine.media(),
+        engine.text(),
+        engine.ws(),
+        engine.conference(),
+        None,
+    ));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind control");
+    let control_addr = listener.local_addr().expect("control addr");
+    let serve_engine = engine.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(serve_engine, listener).await;
+    });
+    let mut control = Control::connect(control_addr).await;
+
+    let (phone_a, addr_a) = phone().await;
+    let (_phone_b, addr_b) = phone().await;
+    let (tee_uri, tee_frames) = tee_consumer().await;
+
+    let offer = control
+        .request(Command::Offer {
+            call_id: "tee-rate".into(),
+            from_tag: "tag-a".into(),
+            sdp: pcmu_offer(addr_a),
+            profile: Default::default(),
+        })
+        .await;
+    assert!(matches!(offer, CmdResult::Ok { .. }), "{offer:?}");
+
+    // `ws_tee` + `ws_tee_sample_rate` in one round-trip: the tee attaches at answer time at 16 kHz,
+    // even though both legs are 8 kHz PCMU.
+    let answer = control
+        .request(Command::Answer {
+            call_id: "tee-rate".into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: pcmu_answer(addr_b),
+            profile: ProfileFlags {
+                ws_tee: Some(tee_uri),
+                ws_tee_direction: Some(siphon_rtp_proto::WsTeeDirection::Caller),
+                ws_tee_sample_rate: Some(16_000),
+                ..Default::default()
+            },
+        })
+        .await;
+    let near_addr = engine_addr(&answer);
+
+    // The control plane reports the rate it negotiated.
+    let mut reported = None;
+    for _ in 0..8 {
+        if let Event::WsTeeStarted {
+            call_id,
+            channels,
+            sample_rate,
+            ..
+        } = control.recv_event().await
+        {
+            assert_eq!(call_id, "tee-rate");
+            assert_eq!(channels, 1, "a caller-only tee is mono");
+            reported = Some(sample_rate);
+            break;
+        }
+    }
+    assert_eq!(
+        reported,
+        Some(16_000),
+        "ws_tee_started must carry the negotiated wire rate, not the 8 kHz codec rate"
+    );
+
+    // …and the consumer's own `start` envelope agrees, so the two can never drift.
+    let first = timeout(Duration::from_secs(3), tee_frames.recv_async())
+        .await
+        .expect("no timeout")
+        .expect("a frame");
+    match first {
+        Message::Text(text) => match ControlMessage::from_json(text.as_str()) {
+            Ok(ControlMessage::Start(data)) => {
+                assert_eq!(data.media.sample_rate, 16_000);
+                assert_eq!(data.call_id, "tee-rate");
+            }
+            other => panic!("expected start, got {other:?}"),
+        },
+        other => panic!("expected a start text frame, got {other:?}"),
+    }
+
+    // And the audio really is framed at that rate: 16 kHz x 20 ms mono L16 = 640 bytes.
+    for sequence in 0..8u16 {
+        phone_a
+            .send_to(&pcmu_rtp(sequence), near_addr)
+            .await
+            .expect("a send");
+    }
+    let mut audio_bytes = None;
+    for _ in 0..40 {
+        let message = timeout(Duration::from_secs(3), tee_frames.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("a frame");
+        if let Message::Binary(bytes) = message {
+            audio_bytes = Some(bytes.len());
+            break;
+        }
+    }
+    assert_eq!(
+        audio_bytes,
+        Some(640),
+        "the teed frames must match the rate the start envelope announced"
+    );
+}
+
+/// A far-side answer selecting PCMU (PT 0), so both legs run at the same 8 kHz codec.
+fn pcmu_answer(addr: SocketAddr) -> String {
+    format!(
+        "v=0\r\no=- 2 2 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+        ip = addr.ip(),
+        port = addr.port()
+    )
+}
+
+/// A 20 ms PCMU RTP packet (silence, 0xFF decodes to 0) at `sequence`.
+fn pcmu_rtp(sequence: u16) -> Vec<u8> {
+    let mut packet = vec![0x80, 0x00];
+    packet.extend_from_slice(&sequence.to_be_bytes());
+    packet.extend_from_slice(&(u32::from(sequence) * 160).to_be_bytes());
+    packet.extend_from_slice(&0x0A0A_0A0Au32.to_be_bytes());
+    packet.extend_from_slice(&[0xFFu8; 160]);
+    packet
+}

@@ -1406,9 +1406,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ws_uri,
                 direction,
                 channels,
+                sample_rate,
                 ..
             } => {
-                self.attach_ws_tee(client, &call_id, &ws_uri, direction, channels)
+                self.attach_ws_tee(client, &call_id, &ws_uri, direction, channels, sample_rate)
                     .await
             }
             Command::DetachWsTee { call_id, .. } => self.detach_ws_tee(client, &call_id).await,
@@ -2010,6 +2011,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     profile.noise_suppression,
                     profile.echo_cancellation,
                     WsVadConfig::from_profile(profile),
+                    profile.ws_sample_rate,
                 )
                 .await
             {
@@ -2276,6 +2278,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     profile.noise_suppression,
                     profile.echo_cancellation,
                     WsVadConfig::from_profile(profile),
+                    profile.ws_sample_rate,
                 )
                 .await
             {
@@ -2338,6 +2341,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// bridge + the rtp_out→datapath drain task, registering both in the [`WsRegistry`]. The bridge's
     /// `rtp_in` is fed by the redirect dispatcher (gated by `accepted_source` — RTPBleed defence,
     /// `Redirect` skips the datapath gate). Dials both `ws://` and `wss://` (TLS on ring/rustls).
+    ///
+    /// `wire_sample_rate` is the controller's `ProfileFlags::ws_sample_rate`: the L16 rate the server
+    /// exchanges, independent of A's codec rate and applied in **both** directions. `None` keeps the
+    /// historical behaviour (follow A's codec). It is validated **before** anything is installed or
+    /// dialled, so an unserviceable rate is a clean rejection with no redirect, no socket and no
+    /// half-attached leg.
+    #[allow(clippy::too_many_arguments)]
     async fn setup_ws_bridge(
         &self,
         call_id: &str,
@@ -2349,7 +2359,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         noise_suppression: bool,
         echo_cancellation: bool,
         vad_config: Option<WsVadConfig>,
+        wire_sample_rate: Option<u32>,
     ) -> Result<(), String> {
+        use siphon_rtp_media::bridge::wire_rate::{validate_wire_sample_rate, wire_resampler};
+
         let Some(codec) = codec else {
             return Err("offer carried no usable audio codec for the WS bridge".to_string());
         };
@@ -2357,6 +2370,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let decoder = factory::decoder_for(codec).map_err(|error| error.to_string())?;
         let encoder = factory::encoder_for(codec).map_err(|error| error.to_string())?;
         let ptime = std::time::Duration::from_millis(u64::from(codec.ptime_ms.max(1)));
+
+        // The leg's PCM rate is what the *decoder* emits, which is not the RTP clock for G.722
+        // (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2). Read it before the decoder moves into the
+        // leg — and before the redirect is installed, because the wire rate is resolved against it and
+        // a rejection here must leave the call exactly as it found it.
+        let leg_pcm_rate = decoder.params().sample_rate_hz;
+        let wire_rate = match wire_sample_rate {
+            Some(requested) => {
+                validate_wire_sample_rate(requested).map_err(|error| error.to_string())?
+            }
+            None => leg_pcm_rate,
+        };
+        // Uplink converts the leg into the wire (what the server hears); downlink converts the wire
+        // back into the leg (what the call hears). Both are `None` when the rates already match, so a
+        // bridge that did not ask for a rate takes the exact path it always took.
+        let uplink_resampler =
+            wire_resampler(leg_pcm_rate, wire_rate).map_err(|error| error.to_string())?;
+        let downlink_resampler =
+            wire_resampler(wire_rate, leg_pcm_rate).map_err(|error| error.to_string())?;
 
         // Redirect A's RTP so the dispatcher routes it here (the WS bridge owns leg A's media).
         self.datapath
@@ -2374,10 +2406,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // A jitter buffer shallow enough for low-latency voice-AI (target 1, cap 16 — the bridge
         // pops one frame per ptime tick, the consumer's cadence being the sample-tick clock).
-        // The WS uplink PCM is at the codec's *native* sample rate (what the decoder emits), which is
-        // not the RTP clock for G.722 (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2). Capture it
-        // before the decoder is moved into the leg.
-        let bridge_pcm_rate = decoder.params().sample_rate_hz;
         let leg = MediaLeg::new(
             decoder,
             encoder,
@@ -2385,10 +2413,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             random_ssrc(),
             codec.payload_type,
         );
-        // The WS media format advertised in `start`: L16 at the leg's native PCM rate, mono, LE.
+        // The WS media format advertised in `start`: L16 at the **negotiated wire rate**, mono, LE.
+        // This is authoritative — the server frames binary audio against it in both directions, so it
+        // must be the rate the session actually converts to, never the leg's codec rate.
         let format = MediaFormat {
             encoding: siphon_rtp_media::bridge::protocol::Encoding::L16,
-            sample_rate: bridge_pcm_rate,
+            sample_rate: wire_rate,
             channels: 1,
             bit_depth: 16,
             endianness: siphon_rtp_media::bridge::protocol::Endianness::Little,
@@ -2402,14 +2432,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             WsDirection::Duplex,
             8, // playout cap (drop-oldest): late audio is worthless
         )
+        // Convert between A's codec rate and the wire rate in both directions (no-ops when equal).
+        .with_rate_conversion(uplink_resampler, downlink_resampler)
         // Clean leg A's uplink audio toward the voice-AI server when requested (rate-gated inside).
         .with_noise_suppression(noise_suppression)
         // Cancel leg A's uplink echo toward the voice-AI server, referenced against the downlink the
         // bridge plays toward the call — so the model does not hear its own speech reflected by the
-        // phone. Single-sourced from the same `build_echo_canceller` the transcode path uses (an
-        // unsupported rate keeps the uplink uncancelled rather than failing the bridge).
+        // phone. Built at the **wire** rate, because that is the domain both of its inputs are in
+        // once the conversion sits in the RTP shell: the near end is the converted uplink and the
+        // far-end reference is the server's own downlink frame. Single-sourced from the same
+        // `build_echo_canceller` the transcode path uses (an unsupported rate keeps the uplink
+        // uncancelled rather than failing the bridge).
         .with_echo_canceller(if echo_cancellation {
-            crate::media_pipeline::build_echo_canceller(bridge_pcm_rate)
+            crate::media_pipeline::build_echo_canceller(wire_rate)
         } else {
             None
         });
@@ -2447,6 +2482,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             rtp_in_tx,
             bridge_task,
             drain_task,
+        );
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id,
+            ws_uri,
+            leg_sample_rate = leg_pcm_rate,
+            wire_sample_rate = wire_rate,
+            converted = wire_rate != leg_pcm_rate,
+            "ws bridge attached"
         );
         Ok(())
     }
@@ -3063,6 +3107,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             profile.noise_suppression,
                             profile.echo_cancellation,
                             WsVadConfig::from_profile(profile),
+                            profile.ws_sample_rate,
                         )
                         .await
                     {
@@ -6302,12 +6347,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ws_uri: &str,
         direction: WsTeeDirection,
         channels: Option<u8>,
+        sample_rate: Option<u32>,
     ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
         match self
-            .start_ws_tee(call_id, ws_uri, direction, channels)
+            .start_ws_tee(call_id, ws_uri, direction, channels, sample_rate)
             .await
         {
             Ok(()) => ok_empty(),
@@ -6317,17 +6363,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
     /// Stand a tee up on `call_id` (shared by [`Self::attach_ws_tee`] and the `ProfileFlags::ws_tee`
     /// answer-time path, which has already validated ownership).
+    ///
+    /// `sample_rate` is the requested L16 wire rate, independent of either leg's codec rate; `None`
+    /// follows the tapped leg's own PCM rate. It is validated before the call is promoted, before the
+    /// server is dialled and before a single sink is attached, so a bad rate leaves the relay exactly
+    /// as it was.
     async fn start_ws_tee(
         &self,
         call_id: &str,
         ws_uri: &str,
         direction: WsTeeDirection,
         channels: Option<u8>,
+        sample_rate: Option<u32>,
     ) -> Result<(), String> {
         use siphon_rtp_media::bridge::protocol::{Encoding, Endianness};
         use siphon_rtp_media::bridge::tee::{
             plan_ws_tee, tee_start_message, TeeChannel, WsTeeSink,
         };
+        use siphon_rtp_media::bridge::wire_rate::{validate_wire_sample_rate, wire_resampler};
 
         // A WS-takeover call's media is bridged to its own server and never reaches the pipeline, and a
         // secure (SRTP-bridge) call's Redirect path is crypto-only — neither has a fan-out to tap.
@@ -6381,15 +6434,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
         let stereo_source = tap_caller && tap_callee;
 
-        // The wire rate is the *caller* leg's decoded PCM rate (the RTP clock is not it — G.722 samples
-        // at 16 kHz and clocks RTP at 8 kHz, RFC 3551 §4.5.2), so the common case (both legs on one
-        // codec) needs no conversion at all. A callee-only tee follows the callee's rate instead.
+        // The default wire rate is the *caller* leg's decoded PCM rate (the RTP clock is not it —
+        // G.722 samples at 16 kHz and clocks RTP at 8 kHz, RFC 3551 §4.5.2), so the common case (both
+        // legs on one codec) needs no conversion at all. A callee-only tee follows the callee's rate
+        // instead. A controller-requested `sample_rate` overrides both: it is the rate the consumer
+        // wants to receive, and every tapped leg is resampled into it.
         let caller_rate = near_codec.as_ref().map(pcm_rate_of).transpose()?;
         let callee_rate = far_codec.as_ref().map(pcm_rate_of).transpose()?;
-        let wire_rate = if tap_caller {
+        let default_wire_rate = if tap_caller {
             caller_rate.ok_or_else(|| "the caller leg has no negotiated codec".to_string())?
         } else {
             callee_rate.ok_or_else(|| "the callee leg has no negotiated codec".to_string())?
+        };
+        let wire_rate = match sample_rate {
+            Some(requested) => {
+                validate_wire_sample_rate(requested).map_err(|error| error.to_string())?
+            }
+            None => default_wire_rate,
         };
         let ptime = near_codec
             .as_ref()
@@ -6409,6 +6470,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             endianness: Endianness::Little,
             ptime,
         };
+
+        // Build every conversion **before** the dial and the promotion, so a rate this engine cannot
+        // serve fails while the call is still untouched — no socket to close, no promoted pipeline to
+        // demote, no sink to unwind. A leg already at the wire rate yields `None` and costs nothing.
+        let mut tap_plan: Vec<(
+            bool,
+            TeeChannel,
+            Option<siphon_rtp_dsp::resample::Resampler>,
+        )> = Vec::new();
+        for (source_a, channel, leg_rate, wanted) in [
+            (true, TeeChannel::Caller, caller_rate, tap_caller),
+            (false, TeeChannel::Callee, callee_rate, tap_callee),
+        ] {
+            if !wanted {
+                continue;
+            }
+            let resampler = match leg_rate {
+                Some(rate) => wire_resampler(rate, wire_rate).map_err(|error| error.to_string())?,
+                None => None,
+            };
+            tap_plan.push((source_a, channel, resampler));
+        }
+
         let plan = plan_ws_tee(format, stereo_source, !tap_caller);
         let stream_id = format!("tee-{call_id}");
 
@@ -6431,23 +6515,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.hold_in_userspace(call_id, PromotionReason::WsTee, PromoteMode::Processing)
             .await?;
 
-        // Attach one sink per tapped leg, each resampling into the wire rate when its own codec differs.
+        // Attach one sink per tapped leg, carrying the conversion into the wire rate built above.
         let mut tapped_legs = Vec::new();
-        for (source_a, channel, leg_rate) in [
-            (true, TeeChannel::Caller, caller_rate),
-            (false, TeeChannel::Callee, callee_rate),
-        ] {
-            let wanted = if source_a { tap_caller } else { tap_callee };
-            if !wanted {
-                continue;
-            }
-            let resampler = match leg_rate {
-                Some(rate) if rate != wire_rate => Some(
-                    siphon_rtp_dsp::resample::Resampler::new(rate, wire_rate)
-                        .map_err(|error| format!("tee resampler {rate}→{wire_rate}: {error}"))?,
-                ),
-                _ => None,
-            };
+        for (source_a, channel, resampler) in tap_plan {
             let sink = WsTeeSink::new(channel, plan.mixer.clone(), stream_id.clone(), resampler);
             if !self.media.control(
                 call_id,
@@ -6652,6 +6722,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 ws_tee,
                 profile.ws_tee_direction.unwrap_or_default(),
                 profile.ws_tee_channels,
+                profile.ws_tee_sample_rate,
             )
             .await
         {
@@ -16886,6 +16957,7 @@ mod tests {
                     ws_uri: uri,
                     direction: WsTeeDirection::Caller,
                     channels: None,
+                    sample_rate: None,
                 },
             )
             .await;
@@ -16911,6 +16983,7 @@ mod tests {
                     ws_uri: uri,
                     direction: WsTeeDirection::Caller,
                     channels: None,
+                    sample_rate: None,
                 },
             )
             .await;
@@ -21318,6 +21391,7 @@ mod tests {
                     ws_uri: uri,
                     direction: WsTeeDirection::Both,
                     channels: Some(2),
+                    sample_rate: None,
                 },
             )
             .await;
@@ -21418,6 +21492,7 @@ mod tests {
                     ws_uri: uri,
                     direction: WsTeeDirection::Caller,
                     channels: None,
+                    sample_rate: None,
                 },
             )
             .await;
@@ -21493,6 +21568,7 @@ mod tests {
                     ws_uri: uri,
                     direction: WsTeeDirection::Caller,
                     channels: None,
+                    sample_rate: None,
                 },
             )
             .await;
@@ -21576,6 +21652,7 @@ mod tests {
                     ws_uri: format!("ws://{stalled_addr}/tee"),
                     direction: WsTeeDirection::Caller,
                     channels: None,
+                    sample_rate: None,
                 },
             )
             .await;
@@ -21661,6 +21738,7 @@ mod tests {
                     ws_uri: uri,
                     direction: WsTeeDirection::Caller,
                     channels: None,
+                    sample_rate: None,
                 },
             )
             .await;
@@ -21706,6 +21784,7 @@ mod tests {
                     ws_uri: uri,
                     direction: WsTeeDirection::Caller,
                     channels: None,
+                    sample_rate: None,
                 },
             )
             .await;
@@ -21867,6 +21946,7 @@ mod tests {
                         ws_uri: uri,
                         direction: WsTeeDirection::Caller,
                         channels: None,
+                        sample_rate: None,
                     },
                 )
                 .await;
@@ -21993,6 +22073,456 @@ mod tests {
             engine.ws_tee_count(),
             0,
             "delete tore the tee down with the call"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tee_at_a_requested_wire_rate_upsamples_an_8k_call() {
+        // The selectable wire rate: an 8 kHz G.711 call teed at 16 kHz must stream 16 kHz frames, and
+        // both the `start` envelope and the `ws_tee_started` event must report the rate the consumer
+        // actually receives — not the codec rate the leg happens to run at.
+        let (engine, (phone_a, near_addr), _phone_b) = two_party_relay("tee-16k").await;
+        let (uri, frames) = tee_server().await;
+
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-16k".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                    sample_rate: Some(16_000),
+                },
+            )
+            .await;
+        assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+
+        let start = expect_tee_start(&frames).await;
+        assert_eq!(
+            start.media.sample_rate, 16_000,
+            "the start envelope announces the negotiated wire rate, not the 8 kHz codec rate"
+        );
+        assert_eq!(start.media.channels, 1);
+
+        for sequence in 0..8u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        assert_eq!(
+            next_tee_audio(&frames).await.len(),
+            640,
+            "16 kHz × 20 ms mono L16 = 320 samples = 640 bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stereo_tee_at_a_requested_wire_rate_frames_both_upsampled_legs() {
+        // Both 8 kHz legs upsampled into one 16 kHz interleaved wire frame: 2 × 320 samples × 2 bytes.
+        let (engine, (phone_a, near_addr), (phone_b, far_addr)) =
+            two_party_relay("tee-16k-stereo").await;
+        let (uri, frames) = tee_server().await;
+
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "tee-16k-stereo".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: uri,
+                    direction: WsTeeDirection::Both,
+                    channels: None,
+                    sample_rate: Some(16_000),
+                },
+            )
+            .await;
+        assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+
+        let start = expect_tee_start(&frames).await;
+        assert_eq!(start.media.sample_rate, 16_000);
+        assert_eq!(start.media.channels, 2, "both legs ⇒ stereo");
+
+        for sequence in 0..8u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+            phone_b
+                .send_to(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x7F), far_addr)
+                .await
+                .expect("b send");
+        }
+        assert_eq!(
+            next_tee_audio(&frames).await.len(),
+            1280,
+            "2 channels × 320 samples × 2 bytes at the negotiated 16 kHz"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unserviceable_tee_wire_rate_is_rejected_and_the_call_keeps_relaying() {
+        // A rate the engine cannot frame must be a clean typed rejection at attach time — never a
+        // silent clamp, never a half-attached tee, and never a disturbance to the relay underneath.
+        let (engine, (phone_a, near_addr), (phone_b, _far)) = two_party_relay("tee-bad-rate").await;
+        let (uri, _frames) = tee_server().await;
+
+        for (rate, expected) in [
+            (0u32, "must not be zero"),
+            (44_100, "whole number of samples per millisecond"),
+            (96_000, "outside the supported"),
+        ] {
+            let rejected = engine
+                .handle(
+                    CLIENT,
+                    Command::AttachWsTee {
+                        call_id: "tee-bad-rate".into(),
+                        from_tag: "tag-a".into(),
+                        ws_uri: uri.clone(),
+                        direction: WsTeeDirection::Caller,
+                        channels: None,
+                        sample_rate: Some(rate),
+                    },
+                )
+                .await;
+            match rejected {
+                CmdResult::Error { reason } => assert!(
+                    reason.contains(expected),
+                    "{rate} Hz must be rejected with its own reason, got: {reason}"
+                ),
+                other => panic!("{rate} Hz must be rejected, got {other:?}"),
+            }
+            assert_eq!(engine.ws_tee_count(), 0, "{rate} Hz left a tee attached");
+            assert!(
+                !engine.media().is_media_call("tee-bad-rate"),
+                "{rate} Hz promoted the relay it then failed to tee"
+            );
+        }
+
+        // …and the relay is exactly as it was.
+        phone_a
+            .send_to(&g711_rtp(0, 100, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let (relayed, _) = recv(&phone_b).await;
+        assert!(!relayed.is_empty(), "the call keeps relaying untouched");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_ws_tee_sample_rate_profile_flag_is_honoured_at_answer_time() {
+        // The declarative twin: `ws_tee_sample_rate` alongside `ws_tee` on the answer.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let (uri, frames) = tee_server().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "tee-profile-rate".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "tee-profile-rate".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: ProfileFlags {
+                        ws_tee: Some(uri),
+                        ws_tee_direction: Some(WsTeeDirection::Caller),
+                        ws_tee_sample_rate: Some(16_000),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("the answer still returns SDP")
+            .remote_rtp;
+
+        let start = expect_tee_start(&frames).await;
+        assert_eq!(start.media.sample_rate, 16_000);
+
+        for sequence in 0..8u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        assert_eq!(next_tee_audio(&frames).await.len(), 640);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unserviceable_tee_wire_rate_in_the_profile_fails_the_answer() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let (uri, _frames) = tee_server().await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "tee-profile-bad".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "tee-profile-bad".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile: ProfileFlags {
+                        ws_tee: Some(uri),
+                        ws_tee_sample_rate: Some(44_100),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        match answer {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("whole number of samples per millisecond"),
+                "the answer must carry the rate's own reason, got: {reason}"
+            ),
+            other => panic!("an unserviceable tee rate must fail the answer, got {other:?}"),
+        }
+        assert_eq!(engine.ws_tee_count(), 0, "no tee attached");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ws_takeover_bridge_streams_at_the_requested_wire_rate_in_both_directions() {
+        // The takeover half: an 8 kHz G.711 leg with `ws_sample_rate: 16000` must announce 16 kHz,
+        // send 16 kHz uplink frames, AND render a 16 kHz downlink frame back into the call as one
+        // 20 ms µ-law packet — the downlink conversion that did not exist before.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use futures_util::{SinkExt, StreamExt};
+        use siphon_rtp_media::bridge::pcm_to_l16_le;
+        use siphon_rtp_media::bridge::protocol::ControlMessage;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
+        let ws_addr = ws_listener.local_addr().expect("ws addr");
+        let (ws_tx, ws_rx) = flume::unbounded::<Message>();
+        let (down_tx, down_rx) = flume::unbounded::<Vec<u8>>();
+        tokio::spawn(async move {
+            let (stream, _) = ws_listener.accept().await.expect("accept ws");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws handshake");
+            let (mut sink, mut source) = socket.split();
+            loop {
+                tokio::select! {
+                    incoming = source.next() => match incoming {
+                        Some(Ok(message)) => {
+                            if ws_tx.send(message).is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    },
+                    downlink = down_rx.recv_async() => match downlink {
+                        Ok(bytes) => {
+                            if sink.send(Message::binary(bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                }
+            }
+        });
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-16k".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some(format!("ws://{ws_addr}/stream")),
+                        ws_sample_rate: Some(16_000),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        assert!(matches!(offer, CmdResult::Ok { .. }), "{offer:?}");
+        // The offer reply is the *far*-facing endpoint; the answer returns A's own, which is the one
+        // the bridge redirected and the one phone A must send to.
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ws-16k".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+
+        // 1. `start` announces the negotiated wire rate, not the leg's 8 kHz codec rate.
+        let first = timeout(Duration::from_secs(3), ws_rx.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("a frame");
+        match first {
+            Message::Text(text) => match ControlMessage::from_json(text.as_str()) {
+                Ok(ControlMessage::Start(data)) => assert_eq!(
+                    data.media.sample_rate, 16_000,
+                    "the start envelope is authoritative for the wire rate"
+                ),
+                other => panic!("expected start, got {other:?}"),
+            },
+            other => panic!("expected a start text frame, got {other:?}"),
+        }
+
+        // 2. Uplink: an 8 kHz µ-law packet surfaces as a 16 kHz L16 frame (640 bytes).
+        for sequence in 0..6u16 {
+            phone_a
+                .send_to(&ulaw_rtp_packet(sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        let mut uplink_bytes = 0;
+        for _ in 0..30 {
+            let frame = timeout(Duration::from_secs(2), ws_rx.recv_async())
+                .await
+                .expect("no timeout")
+                .expect("a frame");
+            if let Message::Binary(bytes) = frame {
+                uplink_bytes = bytes.len();
+                break;
+            }
+        }
+        assert_eq!(
+            uplink_bytes, 640,
+            "16 kHz × 20 ms mono L16 uplink = 320 samples = 640 bytes"
+        );
+
+        // 3. Downlink: a 16 kHz wire frame renders back into the call as ONE 20 ms µ-law packet.
+        //    Without the wire→leg conversion the encoder would be handed 320 samples for an 8 kHz
+        //    frame and the call would hear double speed.
+        let mut l16 = vec![0u8; 640];
+        pcm_to_l16_le(&[2000i16; 320], &mut l16);
+        for _ in 0..4 {
+            down_tx.send(l16.clone()).expect("queue downlink");
+        }
+        let mut rendered = None;
+        for _ in 0..40 {
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+            {
+                let packet =
+                    siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).expect("parse rtp");
+                rendered = Some((packet.payload_type, packet.payload.len()));
+                break;
+            }
+        }
+        assert_eq!(
+            rendered,
+            Some((0, 160)),
+            "one 20 ms µ-law frame at the leg's own 8 kHz rate"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unserviceable_ws_bridge_wire_rate_fails_the_offer_without_a_half_built_call() {
+        // The rate is validated before the redirect is installed and before the server is dialled, so
+        // a bad one leaves no WS route, no promoted call and no socket — it is simply refused.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (_phone_a, addr_a) = phone().await;
+
+        // A deliberately dead address: the dial would fail too, so a rejection that mentions the
+        // *rate* proves validation ran first, before anything was installed or dialled.
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-bad-rate".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some("ws://192.0.2.1:9/stream".to_string()),
+                        ws_sample_rate: Some(44_100),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        match offer {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("whole number of samples per millisecond"),
+                "the rate must be rejected before the dial, got: {reason}"
+            ),
+            other => panic!("an unserviceable wire rate must fail the offer, got {other:?}"),
+        }
+        assert!(
+            !engine.ws().is_ws_call("ws-bad-rate"),
+            "no WS route left behind"
         );
     }
 }
