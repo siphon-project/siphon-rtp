@@ -89,9 +89,12 @@ pub fn parse_command(request: &Value) -> Result<Command, NgError> {
             from_tag: required_str(request, "from-tag")?,
             to_tag: optional_str(request, "to-tag"),
         }),
+        // rtpengine's `stop media` has no per-playback handle, so it always means "stop everything
+        // on the call" — the native contract's `play_id`-targeted stop is a native-only extension.
         "stop media" => Ok(Command::StopMedia {
             call_id: required_str(request, "call-id")?,
             from_tag: required_str(request, "from-tag")?,
+            play_id: None,
         }),
         "silence media" => Ok(Command::SilenceMedia {
             call_id: required_str(request, "call-id")?,
@@ -358,6 +361,11 @@ fn parse_play_media(request: &Value) -> Result<Command, NgError> {
         repeat_times: optional_u64(request, "repeat-times"),
         start_pos_ms: optional_u64(request, "start-pos"),
         duration_ms: optional_u64(request, "duration"),
+        // Overlay mixing, playout gain and the synthesised/URL sources are native-contract
+        // extensions with no rtpengine NG spelling, so an NG `play media` keeps the rtpengine
+        // semantics exactly: one superseding prompt at the source's own level.
+        overlay: false,
+        gain_decibels: None,
         to_tag: optional_str(request, "to-tag"),
     })
 }

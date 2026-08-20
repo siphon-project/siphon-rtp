@@ -31,7 +31,9 @@ use siphon_rtp_hep::report::QosReport;
 use siphon_rtp_hep::text_report::TextQosReport;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
-use siphon_rtp_media::player::{PcmPlayer, WavSource};
+use siphon_rtp_media::playback::Gain;
+use siphon_rtp_media::player::{PcmPlayer, WavError, WavSource};
+use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
@@ -49,7 +51,7 @@ use crate::ice::{self, IceCredentials};
 use crate::interface::{Interface, InterfaceTable};
 use crate::media_pipeline::{
     DirectionConfig, DirectionQuality, FinalCallQuality, MediaCall, MediaControl, MediaRegistry,
-    PcapCapture, RawTee, RelayConfig, RtcpRelay, SecureSide,
+    PcapCapture, PlayRequest, RawTee, RelayConfig, RtcpRelay, SecureSide,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
@@ -1304,22 +1306,41 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 source,
                 repeat_times,
                 start_pos_ms,
+                duration_ms,
+                overlay,
+                gain_decibels,
                 to_tag,
-                ..
             } => {
                 self.play_media(
                     client,
                     &call_id,
                     &from_tag,
                     source,
-                    repeat_times,
-                    start_pos_ms,
+                    PlayOptions {
+                        repeat_times,
+                        start_pos_ms,
+                        duration_ms,
+                        overlay,
+                        gain_decibels,
+                    },
                     to_tag.as_deref(),
                 )
                 .await
             }
-            Command::StopMedia { call_id, from_tag } => {
-                self.stop_media(client, &call_id, &from_tag)
+            Command::StopMedia {
+                call_id,
+                from_tag,
+                play_id,
+            } => self.stop_media(client, &call_id, &from_tag, play_id).await,
+            Command::SetPlayGain {
+                call_id,
+                from_tag,
+                play_id,
+                gain_decibels,
+                ..
+            } => {
+                self.set_play_gain(client, &call_id, &from_tag, play_id, gain_decibels)
+                    .await
             }
             Command::PlayDtmf {
                 call_id,
@@ -6049,10 +6070,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         call_id: &str,
         from_tag: &str,
         source: PlayMediaSource,
-        repeat_times: Option<u64>,
-        start_pos_ms: Option<u64>,
+        options: PlayOptions,
         to_tag: Option<&str>,
-    ) -> Result<(u64, u64), Box<CmdResult>> {
+    ) -> Result<(Option<u64>, u64), Box<CmdResult>> {
         let Some(call_to) = self.owned_call(client, call_id, |call| call.to_tag.clone()) else {
             return Err(Box::new(unknown_call(call_id)));
         };
@@ -6068,12 +6088,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return Err(Box::new(error_result("play_media: promote call", &reason)));
             }
         }
-        let bytes = match source {
-            PlayMediaSource::Blob { data } => data,
+        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
+        let repeat = options.repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        let start = options.start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        // Resolve the source into something the media actor can play. A recorded prompt is decoded
+        // here (the source rate is a property of the file, not of the leg); a tone is only *parsed*
+        // here — it is synthesised at the leg's egress rate inside the actor, which is the only place
+        // that knows it, so a tone is never resampled.
+        let resolved = match source {
+            PlayMediaSource::Blob { data } => parse_prompt_wav(&data)
+                .map_err(|error| error_result("play_media: parse WAV", &error))?,
             PlayMediaSource::File { path } => match tokio::fs::read(&path).await {
-                Ok(bytes) => bytes,
+                Ok(bytes) => parse_prompt_wav(&bytes)
+                    .map_err(|error| Box::new(error_result("play_media: parse WAV", &error)))?,
                 Err(error) => return Err(Box::new(error_result("play_media: read file", &error))),
             },
+            PlayMediaSource::Tone { tone } => match ToneSpec::resolve(&tone) {
+                Ok(spec) => ResolvedPlaySource::Tone(spec),
+                Err(error) => return Err(Box::new(error_result("play_media: tone", &error))),
+            },
+            PlayMediaSource::Http { url } => {
+                return Err(Box::new(error_result(
+                    "play_media",
+                    &format!("http media source is not wired yet ({url})"),
+                )))
+            }
             PlayMediaSource::DbId { .. } => {
                 return Err(Box::new(error_result(
                     "play_media",
@@ -6081,15 +6120,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 )))
             }
         };
-        let wav = match WavSource::parse(&bytes) {
-            Ok(wav) => wav,
-            Err(error) => return Err(Box::new(error_result("play_media: parse WAV", &error))),
+        let (request, source_duration_ms) = match resolved {
+            ResolvedPlaySource::Wav(wav) => {
+                let player = PcmPlayer::new(&wav, repeat, start);
+                let duration = player.duration_ms();
+                (PlayRequest::Pcm(Box::new(player)), Some(duration))
+            }
+            ResolvedPlaySource::Tone(spec) => {
+                let duration = spec.total_duration_ms();
+                (PlayRequest::Tone(spec), duration)
+            }
         };
-        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
-        let repeat = repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
-        let start = start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
-        let player = PcmPlayer::new(&wav, repeat, start);
-        let duration_ms = player.duration_ms();
+        // The accepted duration is the source's own length bounded by the `duration_ms` cap; a cap
+        // on an endless tone *is* the duration, and an uncapped endless tone reports none.
+        let duration_ms = match (source_duration_ms, options.duration_ms) {
+            (Some(source), Some(cap)) => Some(source.min(cap)),
+            (Some(source), None) => Some(source),
+            (None, cap) => cap,
+        };
         // Offer-only single-leg call: both directions face the caller on one endpoint and `process`
         // always runs the `a_to_b` branch, so inject on `a_to_b` (toward_a = false) — see the doc
         // comment. A normal 2-leg call resolves the target leg from `from_tag` as usual.
@@ -6099,47 +6147,75 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             resolve_toward_a(from_tag, call_to.as_deref(), to_tag)
         };
         let play_id = self.next_play_id();
-        self.media.control(
+        let gain = Gain::from_decibels(options.gain_decibels.unwrap_or(0));
+        // An overlay start can be rejected (all four slots busy), and that rejection has to reach the
+        // controller — so it waits for the actor's answer. A superseding start cannot be rejected on
+        // capacity grounds, so it stays fire-and-forget exactly as it always was.
+        let mut receiver = None;
+        let sender = if options.overlay {
+            let (sender, reply) = tokio::sync::oneshot::channel();
+            receiver = Some(reply);
+            Some(sender)
+        } else {
+            None
+        };
+        if !self.media.control(
             call_id,
             MediaControl::PlayAudio {
                 toward_a,
-                player: Box::new(player),
+                request: Box::new(request),
+                overlay: options.overlay,
+                gain,
+                duration_cap_ms: options.duration_ms,
                 play_id,
+                reply: sender,
             },
-        );
+        ) {
+            return Err(Box::new(error_result(
+                "play_media",
+                &"call has no media-processing actor",
+            )));
+        }
+        if let Some(receiver) = receiver {
+            match receiver.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(Box::new(error_result("play_media: overlay", &error))),
+                Err(_) => {
+                    return Err(Box::new(error_result(
+                        "play_media",
+                        &"media actor closed before the overlay started",
+                    )))
+                }
+            }
+        }
         Ok((duration_ms, play_id))
     }
 
-    /// Inject a prompt / announcement toward a leg ([`Command::PlayMedia`]). Answers immediately
-    /// (accept-on-start) with the playback's `play_id` and total `duration_ms`; the prompt's end is
-    /// reported asynchronously as an [`Event::PlayFinished`] carrying the same `play_id`. A controller
-    /// that wants to sequence a following action awaits that event's `Completed` reason. The NG
-    /// front-end takes this same entry and never consumes the event (fire-and-forget).
+    /// Inject a prompt / announcement / tone toward a leg ([`Command::PlayMedia`]). Answers
+    /// immediately (accept-on-start) with the playback's `play_id` and total `duration_ms`; the
+    /// playback's end is reported asynchronously as an [`Event::PlayFinished`] carrying the same
+    /// `play_id`. A controller that wants to sequence a following action awaits that event's
+    /// `Completed` reason. The NG front-end takes this same entry and never consumes the event
+    /// (fire-and-forget).
+    ///
+    /// `duration_ms` is absent from the accept only when the source is endless and no cap was given
+    /// (an `*inf` tone) — there is no finite length to report.
     async fn play_media(
         &self,
         client: ClientId,
         call_id: &str,
         from_tag: &str,
         source: PlayMediaSource,
-        repeat_times: Option<u64>,
-        start_pos_ms: Option<u64>,
+        options: PlayOptions,
         to_tag: Option<&str>,
     ) -> CmdResult {
         match self
-            .start_play(
-                client,
-                call_id,
-                from_tag,
-                source,
-                repeat_times,
-                start_pos_ms,
-                to_tag,
-            )
+            .start_play(client, call_id, from_tag, source, options, to_tag)
             .await
         {
             Ok((duration_ms, play_id)) => CmdResult::Ok {
                 sdp: None,
-                duration_ms: Some(duration_ms),
+                duration_ms,
                 play_id: Some(play_id),
                 to_tag: None,
                 stats: None,
@@ -6148,15 +6224,86 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// Stop any prompt / DTMF playback on a call ([`Command::StopMedia`]).
-    fn stop_media(&self, client: ClientId, call_id: &str, _from_tag: &str) -> CmdResult {
+    /// Stop playback on a call ([`Command::StopMedia`]).
+    ///
+    /// With no `play_id` this stops everything — the superseding prompt, any DTMF burst and every
+    /// overlay — which is the original behaviour. With one, it stops only that playback and leaves
+    /// the rest running, and an id no playback holds is an error rather than a hollow success.
+    async fn stop_media(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        _from_tag: &str,
+        play_id: Option<u64>,
+    ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
-        if self.media.control(call_id, MediaControl::StopPlay) {
-            ok_empty()
-        } else {
-            error_result("stop_media", &"call has no active media playback")
+        let Some(play_id) = play_id else {
+            return if self.media.control(call_id, MediaControl::StopPlay) {
+                ok_empty()
+            } else {
+                error_result("stop_media", &"call has no active media playback")
+            };
+        };
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.media.control(
+            call_id,
+            MediaControl::StopPlayId {
+                play_id,
+                reply: sender,
+            },
+        ) {
+            return error_result("stop_media", &"call has no active media playback");
+        }
+        match receiver.await {
+            Ok(true) => ok_empty(),
+            Ok(false) => error_result(
+                "stop_media",
+                &format!("no playback {play_id} is running on this call"),
+            ),
+            Err(_) => error_result(
+                "stop_media",
+                &"media actor closed before the stop was applied",
+            ),
+        }
+    }
+
+    /// Retune a running playback's playout gain ([`Command::SetPlayGain`]) — how a controller ducks
+    /// an overlay bed under a prompt and lifts it again. Addressed by the `play_id` the playback's
+    /// accept returned; an id no playback holds is an error, never a hollow success.
+    async fn set_play_gain(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        _from_tag: &str,
+        play_id: u64,
+        gain_decibels: i32,
+    ) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.media.control(
+            call_id,
+            MediaControl::SetPlayGain {
+                play_id,
+                gain: Gain::from_decibels(gain_decibels),
+                reply: sender,
+            },
+        ) {
+            return error_result("set_play_gain", &"call has no active media playback");
+        }
+        match receiver.await {
+            Ok(true) => ok_empty(),
+            Ok(false) => error_result(
+                "set_play_gain",
+                &format!("no playback {play_id} is running on this call"),
+            ),
+            Err(_) => error_result(
+                "set_play_gain",
+                &"media actor closed before the gain was applied",
+            ),
         }
     }
 
@@ -9418,6 +9565,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Restore { .. } => "restore",
         Command::PlayMedia { .. } => "play_media",
         Command::StopMedia { .. } => "stop_media",
+        Command::SetPlayGain { .. } => "set_play_gain",
         Command::PlayDtmf { .. } => "play_dtmf",
         Command::SilenceMedia { .. } => "silence_media",
         Command::UnsilenceMedia { .. } => "unsilence_media",
@@ -9456,6 +9604,7 @@ fn command_call_id(command: &Command) -> Option<&str> {
         | Command::Checkpoint { call_id, .. }
         | Command::PlayMedia { call_id, .. }
         | Command::StopMedia { call_id, .. }
+        | Command::SetPlayGain { call_id, .. }
         | Command::PlayDtmf { call_id, .. }
         | Command::SilenceMedia { call_id, .. }
         | Command::UnsilenceMedia { call_id, .. }
@@ -9589,6 +9738,39 @@ fn unknown_call(call_id: &str) -> CmdResult {
     CmdResult::Error {
         reason: format!("unknown call: {call_id}"),
     }
+}
+
+/// The optional knobs on [`Command::PlayMedia`], grouped so the play path carries one parameter
+/// rather than six positional ones (and so a new knob is an added field, not another argument to
+/// thread through three call sites).
+#[derive(Debug, Clone, Copy, Default)]
+struct PlayOptions {
+    /// Total play count for a recorded prompt; `0`/`None` plays it once.
+    repeat_times: Option<u64>,
+    /// Seek into a recorded prompt before the first frame (and the point each loop rewinds to).
+    start_pos_ms: Option<u64>,
+    /// Hard playout cap. The only bound on an endless tone short of a stop.
+    duration_ms: Option<u64>,
+    /// Mix under the party's live egress instead of replacing it.
+    overlay: bool,
+    /// Playout gain in whole decibels; `None` ⇒ 0 dB (the source's own level).
+    gain_decibels: Option<i32>,
+}
+
+/// A `play_media` source after it has been fetched/read and validated, but before the media actor
+/// has turned it into a playback on the leg's egress clock.
+enum ResolvedPlaySource {
+    /// Decoded linear PCM from a WAV (inline blob, host file, or fetched body).
+    Wav(WavSource),
+    /// A parsed tone cadence, synthesised later at the leg's own rate.
+    Tone(ToneSpec),
+}
+
+/// Parse a WAV buffer for playback. Every source that yields bytes — inline blob, host file,
+/// fetched body — validates through this one point, so a malformed buffer is a typed error rather
+/// than something each source handles its own way.
+fn parse_prompt_wav(bytes: &[u8]) -> Result<ResolvedPlaySource, WavError> {
+    WavSource::parse(bytes).map(ResolvedPlaySource::Wav)
 }
 
 /// Map a control-plane [`ConferenceRole`] to the conference's internal [`Routing`]. A whisperer stays
@@ -16109,6 +16291,8 @@ mod tests {
                     repeat_times: None,
                     start_pos_ms: None,
                     duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
                     to_tag: None,
                 },
             )
@@ -16177,6 +16361,251 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlay_tone_playback_runs_end_to_end_through_the_control_plane() {
+        // Every new control-plane surface on one call: an overlay tone start, a second overlay, a
+        // gain retune, a `play_id`-targeted stop, and the four-slot cap. Proves each field reaches
+        // the code that acts on it — a field parsed and dropped would pass none of these.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events_rx = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let offered = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&offered))
+            .expect("engine near SDP")
+            .remote_rtp;
+
+        /// One `play_media` overlay start with a tone source.
+        fn overlay_tone(tone: &str, gain_decibels: i32, duration_ms: Option<u64>) -> Command {
+            Command::PlayMedia {
+                call_id: "overlay-call".into(),
+                from_tag: "tag-a".into(),
+                source: PlayMediaSource::Tone { tone: tone.into() },
+                repeat_times: None,
+                start_pos_ms: None,
+                duration_ms,
+                overlay: true,
+                gain_decibels: Some(gain_decibels),
+                to_tag: None,
+            }
+        }
+
+        // A preset ringback overlay: accepted with a play_id and, being endless, no duration.
+        let first = engine
+            .handle(CLIENT, overlay_tone("ringback_eu", -6, None))
+            .await;
+        let first_id = match first {
+            CmdResult::Ok {
+                play_id: Some(id),
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(
+                    duration_ms, None,
+                    "an endless tone with no cap reports no duration"
+                );
+                id
+            }
+            other => panic!("overlay accept expected, got {other:?}"),
+        };
+        assert!(
+            engine.media().is_transcoding_call("overlay-call"),
+            "the overlay promoted the offer-only relay into a processing MediaCall"
+        );
+
+        // A second overlay from an explicit cadence spec, this one capped: the cap is the duration.
+        let second = engine
+            .handle(
+                CLIENT,
+                overlay_tone("425/1000,0/4000*inf", -18, Some(2_000)),
+            )
+            .await;
+        let second_id = match second {
+            CmdResult::Ok {
+                play_id: Some(id),
+                duration_ms: Some(2_000),
+                ..
+            } => id,
+            other => panic!("capped overlay accept expected, got {other:?}"),
+        };
+        assert_ne!(first_id, second_id, "each playback gets its own id");
+
+        // The party hears the overlay even though nothing is flowing toward it yet.
+        let mut heard = false;
+        for _ in 0..25u16 {
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                assert_eq!(
+                    from, engine_near,
+                    "the overlay comes from the engine's port"
+                );
+                assert!(len > 12, "an RTP packet, not an empty datagram");
+                heard = true;
+                break;
+            }
+        }
+        assert!(
+            heard,
+            "an overlay with no live audio still reaches the party"
+        );
+
+        // Retune the first overlay in flight; an id no playback holds is an error, not a hollow ok.
+        let retuned = engine
+            .handle(
+                CLIENT,
+                Command::SetPlayGain {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: first_id,
+                    gain_decibels: -20,
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(retuned, CmdResult::Ok { .. }), "gain accepted");
+        let unknown = engine
+            .handle(
+                CLIENT,
+                Command::SetPlayGain {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: 999_999,
+                    gain_decibels: 0,
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(unknown, CmdResult::Error { .. }),
+            "an unknown play_id is an error, got {unknown:?}"
+        );
+
+        // Fill the remaining two slots, then prove the fifth is rejected.
+        for _ in 0..2 {
+            let filled = engine
+                .handle(CLIENT, overlay_tone("busy_eu", -12, None))
+                .await;
+            assert!(matches!(filled, CmdResult::Ok { .. }), "slot accepted");
+        }
+        let over_cap = engine
+            .handle(CLIENT, overlay_tone("busy_eu", -12, None))
+            .await;
+        match over_cap {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("no free overlay slot"),
+                "the over-cap rejection must name the cap, got {reason:?}"
+            ),
+            other => panic!("a fifth overlay must be rejected, got {other:?}"),
+        }
+
+        // Stop just the second overlay: it reports Stopped, the others keep running.
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopMedia {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: Some(second_id),
+                },
+            )
+            .await;
+        assert!(matches!(stopped, CmdResult::Ok { .. }), "targeted stop ok");
+        let mut finished = None;
+        for _ in 0..40u16 {
+            match timeout(Duration::from_millis(200), events_rx.recv_async()).await {
+                Ok(Ok(Event::PlayFinished {
+                    play_id, reason, ..
+                })) => {
+                    finished = Some((play_id, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            finished,
+            Some((second_id, siphon_rtp_proto::PlayEndReason::Stopped)),
+            "only the stopped overlay reports, under its own play_id"
+        );
+        // A second stop of the same id finds nothing.
+        let again = engine
+            .handle(
+                CLIENT,
+                Command::StopMedia {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: Some(second_id),
+                },
+            )
+            .await;
+        assert!(
+            matches!(again, CmdResult::Error { .. }),
+            "stopping an id twice is an error, got {again:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_media_rejects_a_malformed_tone_spec() {
+        // The tone string is controller-supplied and untrusted: a malformed one is a clean control
+        // error, never a panic and never a silently-started playback.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr_a) = phone().await;
+        let _ = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "bad-tone".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        for tone in ["", "425", "425/0", "9000/100", "not_a_preset", "425/100*0"] {
+            let result = engine
+                .handle(
+                    CLIENT,
+                    Command::PlayMedia {
+                        call_id: "bad-tone".into(),
+                        from_tag: "tag-a".into(),
+                        source: PlayMediaSource::Tone { tone: tone.into() },
+                        repeat_times: None,
+                        start_pos_ms: None,
+                        duration_ms: None,
+                        overlay: false,
+                        gain_decibels: None,
+                        to_tag: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, CmdResult::Error { .. }),
+                "tone {tone:?} must be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn play_media_on_an_unknown_call_returns_an_error() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let result = engine
@@ -16189,6 +16618,8 @@ mod tests {
                     repeat_times: None,
                     start_pos_ms: None,
                     duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
                     to_tag: None,
                 },
             )
@@ -16599,6 +17030,7 @@ mod tests {
                 Command::StopMedia {
                     call_id: "nope".into(),
                     from_tag: "f".into(),
+                    play_id: None,
                 },
             )
             .await;

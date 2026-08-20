@@ -175,6 +175,12 @@ pub enum Command {
     /// `Completed` reason — the accept alone means "started", not "finished". The rtpengine NG
     /// front-end never consumes the event (fire-and-forget). Whether to await the completion is a
     /// controller-side concern; there is no on-the-wire "wait" flag.
+    ///
+    /// By default a prompt **supersedes** the party's egress: it replaces what that party hears, and
+    /// starting a second one reports the first as [`PlayEndReason::Superseded`]. Set `overlay` to mix
+    /// it *under* the live stream instead — ringback beneath a ringing leg, hold music beneath
+    /// silence, a background bed beneath a conversation. Several overlays can run at once on one leg
+    /// (see `overlay`); a superseding prompt is still one at a time.
     PlayMedia {
         call_id: String,
         from_tag: String,
@@ -183,13 +189,62 @@ pub enum Command {
         repeat_times: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start_pos_ms: Option<u64>,
+        /// Hard playout cap in milliseconds. The playback ends with [`PlayEndReason::Completed`]
+        /// when the cap is reached, whichever comes first with the source running out. The only
+        /// bound, short of a stop, on an endless ([`PlayMediaSource::Tone`] `*inf`) source.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// Mix this playback **under** the party's live egress instead of replacing it.
+        ///
+        /// Up to four overlays run concurrently per direction, each addressed by its own `play_id`
+        /// for [`Command::StopMedia`] and [`Command::SetPlayGain`], and each ending with its own
+        /// [`Event::PlayFinished`]. Starting a fifth is rejected with [`CmdResult::Error`] rather
+        /// than displacing one — a controller that loses a playback it believes is running has no
+        /// way to notice. An overlay never supersedes anything, including another overlay.
+        #[serde(default, skip_serializing_if = "is_false")]
+        overlay: bool,
+        /// Playout gain in whole decibels, relative to the source's own level. Clamped to
+        /// −60..=+12 dB; omitted means 0 dB (the source plays at its own level). Applies to
+        /// superseding and overlay playback alike, and is adjustable in flight with
+        /// [`Command::SetPlayGain`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gain_decibels: Option<i32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
     },
     /// Stop prompt playback on a leg.
-    StopMedia { call_id: String, from_tag: String },
+    ///
+    /// With no `play_id`, stops **everything** playing on the call — the superseding prompt, any
+    /// DTMF burst, and every overlay — which is the original behaviour. With a `play_id`, stops only
+    /// that one playback and leaves the others running, which is how one overlay is taken down
+    /// without disturbing the bed underneath it. Each stopped playback reports
+    /// [`PlayEndReason::Stopped`] on its own [`Event::PlayFinished`].
+    StopMedia {
+        call_id: String,
+        from_tag: String,
+        /// Stop only this playback (from a [`Command::PlayMedia`] accept). Absent ⇒ stop all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        play_id: Option<u64>,
+    },
+    /// Retune the playout gain of a playback that is already running, addressed by the `play_id` its
+    /// [`Command::PlayMedia`] accept returned — how a controller ducks a music bed under a prompt
+    /// and lifts it again afterwards.
+    ///
+    /// A separate verb rather than a field on `play_media` because `play_media` is a *start*: reusing
+    /// it would mean "start another playback", not "change this one". `play_id` is already the
+    /// contract's handle on a running playback (it is what [`Event::PlayFinished`] correlates and
+    /// what [`Command::StopMedia`] targets), so gain is addressed the same way. Answered with
+    /// [`CmdResult::Ok`], or [`CmdResult::Error`] when no playback on the call holds that id.
+    SetPlayGain {
+        call_id: String,
+        from_tag: String,
+        /// The running playback to retune.
+        play_id: u64,
+        /// New gain in whole decibels, clamped to −60..=+12 the same way the start value is.
+        gain_decibels: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+    },
     /// Inject DTMF (RFC 4733 telephone-events) toward a leg. `code` is played in full as a sequence,
     /// one telephone-event per digit (`0`-`9`, `*`, `#`, `A`-`D`), each `duration_ms` long at
     /// `volume_dbm0`, separated by `pause_ms` of inter-digit silence (each digit is a distinct event
@@ -457,6 +512,28 @@ pub enum PlayMediaSource {
     },
     /// A prompt id in the engine's media database.
     DbId { id: u64 },
+    /// A synthesised call-progress tone — no audio file to ship or provision.
+    ///
+    /// `tone` is either a **preset name** (`ringback_eu`, `busy_na`, `dial_uk`, …) or an explicit
+    /// **cadence spec** in the engine's tone grammar, e.g. `425/1000,0/4000*inf` for 425 Hz one
+    /// second on, four seconds off, forever. The two are told apart by the `/`: a preset name never
+    /// contains one and a cadence spec is never valid without one. A tone is rendered directly at
+    /// the leg's codec rate, so it is never resampled. See `docs/control/json.md` for the preset
+    /// table (with the standard each entry comes from) and the grammar.
+    Tone { tone: String },
+    /// A WAV fetched over HTTP or HTTPS by the **engine**, from the engine's own network position.
+    ///
+    /// The fetch is bounded — connect timeout, first-byte timeout, overall deadline, response-size
+    /// cap and a redirect cap, all configurable on the daemon — and runs off the media path, so a
+    /// URL that never answers can never stall the leg. `play_media` accepts immediately with a
+    /// `play_id` and `duration_ms` absent (the length is not known until the body has arrived); a
+    /// fetch that fails for any reason ends the playback with
+    /// [`Event::PlayFinished`]`{ reason: error }` carrying that `play_id`.
+    ///
+    /// Only `http://` and `https://` are accepted. The engine fetches from wherever it sits, so an
+    /// operator who does not fully trust the controller should restrict the reachable hosts — see
+    /// the security note in `docs/control/json.md`.
+    Http { url: String },
 }
 
 /// Per-leg media-handling flags. JSON twin of SIPhon's `NgFlags` (rtpengine profile).
@@ -1586,11 +1663,52 @@ mod tests {
                 repeat_times: Some(2),
                 start_pos_ms: None,
                 duration_ms: Some(5000),
+                overlay: false,
+                gain_decibels: None,
+                to_tag: None,
+            },
+            Command::PlayMedia {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                source: PlayMediaSource::Tone {
+                    tone: "ringback_eu".into(),
+                },
+                repeat_times: None,
+                start_pos_ms: None,
+                duration_ms: Some(30_000),
+                overlay: true,
+                gain_decibels: Some(-9),
+                to_tag: None,
+            },
+            Command::PlayMedia {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                source: PlayMediaSource::Http {
+                    url: "https://example.invalid/hold.wav".into(),
+                },
+                repeat_times: Some(0),
+                start_pos_ms: None,
+                duration_ms: None,
+                overlay: true,
+                gain_decibels: Some(-15),
                 to_tag: None,
             },
             Command::StopMedia {
                 call_id: "c".into(),
                 from_tag: "f".into(),
+                play_id: None,
+            },
+            Command::StopMedia {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                play_id: Some(3),
+            },
+            Command::SetPlayGain {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                play_id: 3,
+                gain_decibels: -6,
+                to_tag: Some("t".into()),
             },
             Command::PlayDtmf {
                 call_id: "c".into(),
@@ -1733,6 +1851,8 @@ mod tests {
                 repeat_times: None,
                 start_pos_ms: None,
                 duration_ms: None,
+                overlay: false,
+                gain_decibels: None,
                 to_tag: None,
             },
         };
@@ -1749,6 +1869,177 @@ mod tests {
             Command::PlayMedia { call_id, .. } => assert_eq!(call_id, "c"),
             other => panic!("expected play_media, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn play_media_without_the_overlay_extensions_keeps_its_original_wire_shape() {
+        // The overlay/gain/tone additions are strictly additive: a controller that does not use them
+        // must serialize byte-for-byte what it serialized before. `overlay` is `skip_serializing_if`
+        // false and `gain_decibels` is an `Option`, so neither key appears; and a frame written by an
+        // older controller still deserializes with the new fields at their defaults.
+        let request = Request {
+            id: 11,
+            command: Command::PlayMedia {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                source: PlayMediaSource::File {
+                    path: "/prompt.wav".into(),
+                },
+                repeat_times: None,
+                start_pos_ms: None,
+                duration_ms: None,
+                overlay: false,
+                gain_decibels: None,
+                to_tag: None,
+            },
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"id":11,"command":"play_media","call_id":"c","from_tag":"f","#,
+                r#""source":{"source":"file","path":"/prompt.wav"}}"#
+            ),
+            "an unset overlay/gain must not appear on the wire"
+        );
+        // The pre-extension frame, verbatim, still parses — with the new fields defaulted.
+        let legacy = r#"{"id":11,"command":"play_media","call_id":"c","from_tag":"f","source":{"source":"file","path":"/prompt.wav"}}"#;
+        let parsed: Request = serde_json::from_str(legacy).expect("deserialize");
+        assert_eq!(parsed, request);
+        match parsed.command {
+            Command::PlayMedia {
+                overlay,
+                gain_decibels,
+                ..
+            } => {
+                assert!(
+                    !overlay,
+                    "overlay defaults off — supersede stays the default"
+                );
+                assert_eq!(
+                    gain_decibels, None,
+                    "gain defaults to the source's own level"
+                );
+            }
+            other => panic!("expected play_media, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn play_media_overlay_and_gain_appear_only_when_set() {
+        let request = Request {
+            id: 12,
+            command: Command::PlayMedia {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                source: PlayMediaSource::Tone {
+                    tone: "ringback_eu".into(),
+                },
+                repeat_times: None,
+                start_pos_ms: None,
+                duration_ms: Some(30_000),
+                overlay: true,
+                gain_decibels: Some(-12),
+                to_tag: Some("t".into()),
+            },
+        };
+        roundtrip(&request);
+        let value = serde_json::to_value(&request).expect("to_value");
+        assert_eq!(value["command"], "play_media");
+        assert_eq!(value["overlay"], true);
+        assert_eq!(value["gain_decibels"], -12);
+        assert_eq!(value["duration_ms"], 30_000);
+        assert_eq!(value["source"]["source"], "tone");
+        assert_eq!(value["source"]["tone"], "ringback_eu");
+    }
+
+    #[test]
+    fn play_media_sources_keep_their_tags() {
+        // Every source variant, so a rename or a re-tag is caught here rather than by a controller.
+        for (source, expected_tag) in [
+            (
+                PlayMediaSource::File {
+                    path: "/p.wav".into(),
+                },
+                "file",
+            ),
+            (PlayMediaSource::Blob { data: vec![1, 2] }, "blob"),
+            (PlayMediaSource::DbId { id: 9 }, "db_id"),
+            (
+                PlayMediaSource::Tone {
+                    tone: "425/1000,0/4000*inf".into(),
+                },
+                "tone",
+            ),
+            (
+                PlayMediaSource::Http {
+                    url: "https://example.invalid/p.wav".into(),
+                },
+                "http",
+            ),
+        ] {
+            roundtrip(&source);
+            let value = serde_json::to_value(&source).expect("to_value");
+            assert_eq!(value["source"], expected_tag);
+        }
+    }
+
+    #[test]
+    fn stop_media_targets_one_playback_only_when_a_play_id_is_given() {
+        // No `play_id` ⇒ the original call-wide stop, and the original wire shape.
+        let all = Request {
+            id: 13,
+            command: Command::StopMedia {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                play_id: None,
+            },
+        };
+        let json = serde_json::to_string(&all).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"id":13,"command":"stop_media","call_id":"c","from_tag":"f"}"#
+        );
+        let legacy: Request = serde_json::from_str(
+            r#"{"id":13,"command":"stop_media","call_id":"c","from_tag":"f"}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(legacy, all);
+
+        let one = Request {
+            id: 14,
+            command: Command::StopMedia {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                play_id: Some(4),
+            },
+        };
+        roundtrip(&one);
+        let value = serde_json::to_value(&one).expect("to_value");
+        assert_eq!(value["play_id"], 4);
+    }
+
+    #[test]
+    fn set_play_gain_roundtrip_and_wire_shape() {
+        let request = Request {
+            id: 15,
+            command: Command::SetPlayGain {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                play_id: 4,
+                gain_decibels: -18,
+                to_tag: None,
+            },
+        };
+        roundtrip(&request);
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"id":15,"command":"set_play_gain","call_id":"c","from_tag":"f","#,
+                r#""play_id":4,"gain_decibels":-18}"#
+            )
+        );
     }
 
     #[test]

@@ -275,6 +275,8 @@ async fn play_blob(control: &mut Control, call_id: &str, samples: usize) -> (u64
             repeat_times: None,
             start_pos_ms: None,
             duration_ms: None,
+            overlay: false,
+            gain_decibels: None,
             to_tag: None,
         })
         .await;
@@ -329,6 +331,7 @@ async fn stop_media_emits_play_finished_stopped() {
         .request(Command::StopMedia {
             call_id: "ivr".into(),
             from_tag: "tag-a".into(),
+            play_id: None,
         })
         .await;
     assert!(matches!(stopped, CmdResult::Ok { .. }), "stop accepted");

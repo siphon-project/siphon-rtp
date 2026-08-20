@@ -35,9 +35,13 @@ use siphon_rtp_media::dtmf::{DtmfDetector, DtmfSequence, DtmfStep};
 use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::ingress::IngressStats;
 use siphon_rtp_media::pcap::CapturedPacket;
+use siphon_rtp_media::playback::{
+    FinishedPlayback, Gain, OverlayBus, Playback, PlaybackError, PlaybackSource, MAX_OVERLAY_SLOTS,
+};
 use siphon_rtp_media::player::PcmPlayer;
 use siphon_rtp_media::repacketize::Repacketizer;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
+use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{Event, PlayEndReason};
 
@@ -450,6 +454,30 @@ pub struct Direction {
     /// An active prompt / DTMF injection on this egress direction (PlayMedia / PlayDtmf). While set,
     /// transcoded audio toward this party is suppressed and the injected media plays instead.
     injection: Option<Injection>,
+    /// Overlay playbacks mixed *under* this egress rather than replacing it (`play_media` with
+    /// `overlay`) — ringback beneath a ringing leg, hold music beneath silence, a background bed
+    /// beneath a conversation. Independent of `injection`: an overlay rides whatever the egress is
+    /// already carrying, including a superseding prompt, and when nothing else is producing it keeps
+    /// the stream alive on its own (see [`Direction::tick_egress`]).
+    overlay: OverlayBus,
+    /// Overlays that ended since the last drain, staged here because the egress mix happens deep in
+    /// [`Direction::emit_pcm`] / [`Direction::emit_encoded`] where the event vector is not in scope.
+    /// Drained into [`Event::PlayFinished`]s by [`MediaCall::process`] / [`MediaCall::tick`].
+    /// Preallocated to the slot cap, so pushing a completion allocates nothing.
+    overlay_finished: Vec<FinishedPlayback>,
+    /// One egress frame of scratch for the overlay blend, so mixing never allocates and never
+    /// mutates the caller's buffer (the transcode path's frame is borrowed from `egress_scratch`).
+    overlay_scratch: Vec<i16>,
+    /// One egress frame of scratch the superseding [`Injection::Audio`] playback renders into, and
+    /// the buffer an overlay-only tick fills with silence before the overlays are mixed over it.
+    /// Distinct from `overlay_scratch` because the blend runs *inside* the emit path, on the frame
+    /// this one holds.
+    inject_scratch: Vec<i16>,
+    /// Egress frames the *packet-driven* path (transcode / echo) emitted since the last playout
+    /// tick. An overlay advances one frame per emitted egress frame, so when this is zero the tick
+    /// knows nothing is carrying the overlay and emits an overlay-only frame instead — which is what
+    /// lets ringback play toward a party that is receiving no media at all.
+    transcode_frames_since_tick: u32,
     /// Idle-egress comfort noise for a **single-leg** local-answer / IVR leg (`Some` only on that
     /// leg's caller-facing egress — [`MediaCall::with_comfort_idle`]). When set, [`Direction::handle`]
     /// must not loop the caller's own audio back (self-echo): it decodes for recording / DTMF but
@@ -611,8 +639,9 @@ pub struct FinalCallQuality {
 
 /// One playout tick's egress action, computed while the injection is borrowed and applied after.
 enum InjectStep {
-    /// Encode + send this prompt PCM frame at the egress rate.
-    Audio(Vec<i16>),
+    /// Encode + send this many samples of the prompt frame already rendered into the direction's
+    /// `overlay_scratch` (the [`Playback`] writes straight into it — no per-tick buffer).
+    Audio(usize),
     /// Send this telephone-event packet (bytes already framed by the generator).
     Dtmf {
         bytes: [u8; 4],
@@ -638,19 +667,52 @@ struct FinishedPlay {
     played_ms: u64,
 }
 
+/// What the control plane asked to play, before the actor knows the target direction's egress
+/// clock. A tone must be built at the egress rate (a synthesised source is never resampled) and a
+/// prompt needs the egress rate to decide whether it needs a resampler, so both are resolved into a
+/// [`Playback`] inside the actor rather than by the engine that sent the request.
+pub enum PlayRequest {
+    /// Recorded audio, already decoded to PCM at its own native rate.
+    Pcm(Box<PcmPlayer>),
+    /// A synthesised call-progress tone, rendered at whatever rate the target direction runs at.
+    Tone(ToneSpec),
+}
+
+impl PlayRequest {
+    /// Turn the request into a [`Playback`] on `direction`'s egress clock.
+    fn into_playback(
+        self,
+        direction: &Direction,
+        gain: Gain,
+        play_id: u64,
+        duration_cap_ms: Option<u64>,
+    ) -> Result<Playback, PlaybackError> {
+        let egress_rate = direction.egress_sample_rate;
+        let packetization_time_ms = direction.egress_ptime_ms();
+        let source = match self {
+            PlayRequest::Pcm(player) => PlaybackSource::Pcm(player),
+            PlayRequest::Tone(spec) => {
+                PlaybackSource::Tone(Box::new(ToneGenerator::new(spec, egress_rate)))
+            }
+        };
+        Playback::new(
+            source,
+            egress_rate,
+            packetization_time_ms,
+            gain,
+            play_id,
+            duration_cap_ms,
+        )
+    }
+}
+
 /// Media injected onto an egress direction by a control verb.
 enum Injection {
-    /// A prompt / announcement from [`super::engine`]'s `PlayMedia`, resampled to the egress rate.
-    Audio {
-        player: PcmPlayer,
-        resampler: Option<Resampler>,
-        /// The accept's playback id; the [`Event::PlayFinished`] emitted when this prompt ends
-        /// (drains / is stopped / superseded / aborted) carries it so a controller correlates the
-        /// completion with the accept it holds.
-        play_id: u64,
-        /// Milliseconds played so far (one ptime per emitted frame), reported as `played_ms`.
-        played_ms: u64,
-    },
+    /// A prompt / announcement / tone from [`super::engine`]'s `PlayMedia` **without** `overlay`:
+    /// it supersedes this party's egress audio for as long as it runs. The [`Playback`] owns the
+    /// resampler onto the egress rate, the playout gain, the `play_id` the eventual
+    /// [`Event::PlayFinished`] carries, and the milliseconds played.
+    Audio(Playback),
     /// An RFC 4733 DTMF sequence from `PlayDtmf` (`code`, one event per digit), sharing the egress
     /// stream's SSRC. Each digit event carries its own start timestamp (`base_timestamp` plus the
     /// sequence step's offset), holding it constant across that event's packets (RFC 4733 §2.5.1.2).
@@ -994,6 +1056,13 @@ impl Direction {
             dtmf_blocked: false,
             egress_sample_rate: egress_rate,
             injection: None,
+            // Overlay scratch is sized to one egress frame here, so the mix path never allocates and
+            // never grows mid-stream (the egress frame size is fixed for the life of the direction).
+            overlay: OverlayBus::new(egress_frame_samples as usize),
+            overlay_finished: Vec::with_capacity(MAX_OVERLAY_SLOTS),
+            overlay_scratch: vec![0i16; egress_frame_samples as usize],
+            inject_scratch: vec![0i16; egress_frame_samples as usize],
+            transcode_frames_since_tick: 0,
             // A comfort-idle single-leg egress is opted in after construction via `enable_comfort_idle`
             // (offer-only local answer / IVR); a normal 2-party direction never idles on comfort noise.
             comfort: None,
@@ -1061,6 +1130,14 @@ impl Direction {
             dtmf_blocked: false,
             egress_sample_rate: 0,
             injection: None,
+            // A relay-only direction forwards opaque payloads and never synthesizes egress, so there
+            // is nothing for an overlay to ride and no frame to mix it into. The bus stays empty;
+            // `play_media` promotes the call to a processing one before it can reach here.
+            overlay: OverlayBus::new(0),
+            overlay_finished: Vec::new(),
+            overlay_scratch: Vec::new(),
+            inject_scratch: Vec::new(),
+            transcode_frames_since_tick: 0,
             // A relay-only direction forwards opaque payloads and never synthesizes egress, so it is
             // never comfort-idle (that is only a decode/re-encode single-leg IVR).
             comfort: None,
@@ -1105,37 +1182,15 @@ impl Direction {
     /// `play_media` prompt drained naturally (all repeats / the duration cap) so the caller emits the
     /// [`Event::PlayFinished`]. A drained DTMF burst reports nothing (it carries no `play_id`).
     fn tick_injection(&mut self, out: &mut Vec<Outbound>) -> Option<FinishedPlay> {
-        let ptime = self.egress_ptime_ms() as usize;
         // Produce this tick's egress step while holding the injection borrow, then act on it after
-        // the borrow ends (the encode/packetize path needs `&mut self` again).
+        // the borrow ends (the encode/packetize path needs `&mut self` again). The prompt renders
+        // straight into the direction's preallocated scratch — nothing is allocated per tick.
+        let mut scratch = std::mem::take(&mut self.inject_scratch);
         let step = match self.injection.as_mut() {
-            Some(Injection::Audio {
-                player,
-                resampler,
-                played_ms,
-                ..
-            }) => {
-                let source_rate = player.sample_rate_hz() as usize;
-                // Injected prompt audio is mono, so `MAX_FRAME_SAMPLES` bounds one frame of it.
-                let source_frame = (source_rate * ptime / 1000).clamp(1, MAX_FRAME_SAMPLES);
-                let mut source = [0i16; MAX_FRAME_SAMPLES];
-                match player.next_frame(&mut source[..source_frame]) {
-                    Some(written) => {
-                        // Count this frame's ptime toward the played duration reported on completion.
-                        *played_ms += ptime as u64;
-                        let frame = match resampler.as_mut() {
-                            Some(resampler) => {
-                                let mut buffer = Vec::new();
-                                resampler.process(&source[..written], &mut buffer);
-                                buffer
-                            }
-                            None => source[..written].to_vec(),
-                        };
-                        InjectStep::Audio(frame)
-                    }
-                    None => InjectStep::Exhausted,
-                }
-            }
+            Some(Injection::Audio(playback)) => match playback.next_frame(&mut scratch) {
+                Some(written) => InjectStep::Audio(written),
+                None => InjectStep::Exhausted,
+            },
             Some(Injection::Dtmf {
                 sequence,
                 payload_type,
@@ -1157,9 +1212,9 @@ impl Direction {
             None => InjectStep::Idle,
         };
 
-        match step {
-            InjectStep::Audio(frame) => {
-                self.emit_encoded(&frame, out);
+        let finished = match step {
+            InjectStep::Audio(written) => {
+                self.emit_encoded(&scratch[..written], out);
                 None
             }
             InjectStep::Dtmf {
@@ -1188,25 +1243,60 @@ impl Direction {
                 // The prompt / DTMF burst drained naturally. Clear it and, for a `play_media` prompt,
                 // report it as `Completed` so the actor emits the matching `Event::PlayFinished`.
                 match self.injection.take() {
-                    Some(Injection::Audio {
-                        play_id, played_ms, ..
-                    }) => Some(FinishedPlay {
-                        play_id,
+                    Some(Injection::Audio(playback)) => Some(FinishedPlay {
+                        play_id: playback.play_id(),
                         reason: PlayEndReason::Completed,
-                        played_ms,
+                        played_ms: playback.played_ms(),
                     }),
                     _ => None,
                 }
             }
             InjectStep::Idle => None,
+        };
+        self.inject_scratch = scratch;
+        finished
+    }
+
+    /// Mix any active overlay playbacks into one egress-rate frame, just before it is encoded.
+    ///
+    /// The single choke point every synthesised egress frame passes through — transcode, injected
+    /// prompt, comfort noise and the overlay-only tick alike — so an overlay cannot be bypassed by a
+    /// new caller, and so an overlay advances **exactly one frame per emitted egress frame** (its
+    /// playout clock is the stream it rides, never a second clock racing it).
+    ///
+    /// Returns the frame to encode: the caller's own slice when no overlay is active (the common
+    /// case pays one boolean), else the blended copy in `scratch`. Completions are staged on
+    /// `overlay_finished` for [`MediaCall`] to turn into [`Event::PlayFinished`]s — the emit path
+    /// has no event vector in scope.
+    fn blend_overlays<'frame>(
+        &mut self,
+        pcm: &'frame [i16],
+        scratch: &'frame mut [i16],
+    ) -> &'frame [i16] {
+        if !self.overlay.is_active() || pcm.is_empty() {
+            return pcm;
         }
+        let length = pcm.len().min(scratch.len());
+        if length == 0 {
+            return pcm;
+        }
+        scratch[..length].copy_from_slice(&pcm[..length]);
+        self.overlay
+            .mix_into(&mut scratch[..length], &mut self.overlay_finished);
+        &scratch[..length]
     }
 
     /// Encode one PCM frame and append it as an egress packet, advancing the egress counters. Shared
     /// by the prompt-injection path; the transcode path in [`Direction::handle`] inlines the same.
     fn emit_encoded(&mut self, pcm: &[i16], out: &mut Vec<Outbound>) {
+        // Overlay mixing happens on the direction's own scratch, moved out for the frame (a pointer
+        // swap) so `blend_overlays` can borrow `self` mutably, and put back before returning.
+        let mut scratch = std::mem::take(&mut self.overlay_scratch);
+        let mixed = self.blend_overlays(pcm, &mut scratch);
         let mut payload = [0u8; MAX_RTP];
-        let Ok(payload_len) = self.encoder.encode(pcm, &mut payload) else {
+        let encoded = self.encoder.encode(mixed, &mut payload);
+        self.overlay_scratch = scratch;
+        let Ok(payload_len) = encoded else {
             return;
         };
         let header = RtpHeader {
@@ -1254,16 +1344,49 @@ impl Direction {
         // anyway, so ticking the player on would silently burn a prompt down to nothing while the
         // handshake ran, and the caller would hear a `PlayFinished{Completed}` for audio no one ever
         // received. Holding it means a prompt queued at answer time plays in full once the key lands.
+        //
+        // Read and reset the packet-driven emit counter every tick, whether or not it is used, so a
+        // direction that starts an overlay later does not inherit a stale count.
+        let transcode_frames = std::mem::take(&mut self.transcode_frames_since_tick);
         if self.secure_pending {
             return None;
         }
         if self.injection.is_some() {
+            // The superseding prompt is tick-clocked and mixes any overlay in on the way out.
             return self.tick_injection(out);
         }
         if comfort_enabled && !self.blocked && self.comfort.is_some() {
             self.emit_comfort(out);
+            return None;
+        }
+        // Nothing else is producing this party's egress. If an overlay is running and the
+        // packet-driven path emitted nothing during the last tick, the overlay carries the stream by
+        // itself — which is exactly the ringback-under-a-ringing-leg case, where there is no live
+        // audio to ride. When the transcode path *did* emit, it already carried the overlay
+        // (`emit_pcm` blends), so emitting here too would put two frames on one SSRC in one ptime.
+        if transcode_frames == 0 && !self.blocked && self.overlay.is_active() {
+            self.emit_overlay_only(out);
         }
         None
+    }
+
+    /// Emit one egress frame carrying **only** the overlay mix, over digital silence.
+    ///
+    /// Goes through [`Direction::emit_encoded`] like every other synthesised frame, so the overlay
+    /// blend, the SRTP protect and the sequence/timestamp advance are the shared ones — the stream
+    /// stays continuous and a later transcode frame hands over with no gap.
+    fn emit_overlay_only(&mut self, out: &mut Vec<Outbound>) {
+        let frame = self.egress_frame_samples as usize;
+        if frame == 0 {
+            return;
+        }
+        let mut silence = std::mem::take(&mut self.inject_scratch);
+        if silence.len() < frame {
+            silence.resize(frame, 0);
+        }
+        silence[..frame].fill(0);
+        self.emit_encoded(&silence[..frame], out);
+        self.inject_scratch = silence;
     }
 
     /// Emit one idle comfort-noise egress frame (RFC 3389), advancing the egress sequence/timestamp so
@@ -1822,6 +1945,15 @@ impl Direction {
     /// direction's egress sequence/timestamp. Shared by the transcode path ([`Direction::handle`])
     /// and the echo path ([`Direction::echo_into`]); `pcm` must already be at the egress codec's rate.
     fn emit_pcm(&mut self, pcm: &[i16], marker: bool, out: &mut Vec<Outbound>) {
+        // An overlay rides whatever the egress is already carrying, so it is mixed in here, before
+        // the reference capture and the encode — the party's echo canceller must reference what the
+        // party actually hears, overlay included. The scratch is moved out for the frame (a pointer
+        // swap) so the blend can borrow `self` mutably, and put back before returning.
+        let mut scratch = std::mem::take(&mut self.overlay_scratch);
+        let pcm = self.blend_overlays(pcm, &mut scratch);
+        // This is the packet-driven egress clock; the playout tick reads the counter to decide
+        // whether an overlay still needs a frame of its own this tick.
+        self.transcode_frames_since_tick = self.transcode_frames_since_tick.saturating_add(1);
         // Capture the egress PCM as the far-end reference for the *opposite* direction's echo canceller
         // (present iff that direction cancels): this is exactly what the engine sends toward this party,
         // whose echo the reverse direction cancels off that party's uplink. Whatever the egress source
@@ -1830,7 +1962,9 @@ impl Direction {
             reference.push(pcm);
         }
         let mut payload = [0u8; MAX_RTP];
-        let Ok(payload_len) = self.encoder.encode(pcm, &mut payload) else {
+        let encoded = self.encoder.encode(pcm, &mut payload);
+        self.overlay_scratch = scratch;
+        let Ok(payload_len) = encoded else {
             return;
         };
         let header = RtpHeader {
@@ -2169,6 +2303,21 @@ impl MediaCall {
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
     ) -> bool {
+        let accepted = self.process_packet(packet, out, events);
+        // An overlay that drained inside the egress emit path reports its own completion. Done here
+        // rather than at each emit site because the emit path has no event vector in scope.
+        self.drain_overlay_finishes(events);
+        accepted
+    }
+
+    /// The body of [`MediaCall::process`], split out so the overlay-completion drain wraps every
+    /// return path rather than being repeated at each one.
+    fn process_packet(
+        &mut self,
+        packet: &RxPacket,
+        out: &mut Vec<Outbound>,
+        events: &mut Vec<Event>,
+    ) -> bool {
         // The call identity is the same whichever direction the packet arrived on; the *leg* identity
         // is not, so `near_tag` / `far_tag` are flipped per branch below. A single-leg call (no
         // to-tag) has only the offerer, so both sides fall back to its tag.
@@ -2433,39 +2582,146 @@ impl MediaCall {
         }
     }
 
-    /// Start a prompt / announcement toward a party (`Command::PlayMedia`). The player carries the
-    /// source-rate PCM; a resampler is built when it differs from the egress codec rate. `play_id` is
-    /// the accept's playback id, carried on the eventual [`Event::PlayFinished`]. If a prior prompt is
-    /// still playing on this direction it is superseded now — a `PlayFinished{Superseded}` for its
-    /// `play_id` is pushed onto `events`, so a controller awaiting the old prompt resolves (not
-    /// completed) rather than hanging.
+    /// Start a prompt / announcement / tone toward a party (`Command::PlayMedia`), **superseding**
+    /// that party's egress audio for as long as it runs.
+    ///
+    /// The request carries the source at its own rate (or, for a tone, the cadence to synthesise);
+    /// the [`Playback`] is built here because only the direction knows the egress clock — a tone
+    /// renders at that rate directly, a prompt gets a resampler when it differs. `play_id` is the
+    /// accept's playback id, carried on the eventual [`Event::PlayFinished`]; `gain` and
+    /// `duration_cap_ms` are the control plane's `gain_decibels` and `duration_ms`.
+    ///
+    /// If a prior prompt is still playing on this direction it is superseded now — a
+    /// `PlayFinished{Superseded}` for its `play_id` is pushed onto `events`, so a controller awaiting
+    /// the old prompt resolves (not completed) rather than hanging. Overlays are untouched: an
+    /// overlay is not a prompt on the same slot, it rides whatever the egress carries.
     pub fn start_play_audio(
         &mut self,
         toward_a: bool,
-        player: PcmPlayer,
+        request: PlayRequest,
+        gain: Gain,
+        duration_cap_ms: Option<u64>,
         play_id: u64,
         events: &mut Vec<Event>,
-    ) {
-        let superseded = {
+    ) -> Result<(), PlaybackError> {
+        let (superseded, result) = {
             let direction = self.direction_toward(toward_a);
-            // Taking the prior injection stops any in-flight prompt / DTMF on this direction; only a
-            // prompt (with a `play_id`) is reported, as `Superseded`.
-            let superseded = Self::take_finished_play(direction, PlayEndReason::Superseded);
-            let resampler = if player.sample_rate_hz() == direction.egress_sample_rate {
-                None
-            } else {
-                Resampler::new(player.sample_rate_hz(), direction.egress_sample_rate).ok()
-            };
-            direction.injection = Some(Injection::Audio {
-                player,
-                resampler,
-                play_id,
-                played_ms: 0,
-            });
-            superseded
+            let playback = request.into_playback(direction, gain, play_id, duration_cap_ms);
+            match playback {
+                // Build first, replace second: a request that cannot be built (a rate the resampler
+                // refuses) must not kill the prompt that is already playing.
+                Ok(playback) => {
+                    // Taking the prior injection stops any in-flight prompt / DTMF on this
+                    // direction; only a prompt (with a `play_id`) is reported, as `Superseded`.
+                    let superseded = Self::take_finished_play(direction, PlayEndReason::Superseded);
+                    direction.injection = Some(Injection::Audio(playback));
+                    (superseded, Ok(()))
+                }
+                Err(error) => (None, Err(error)),
+            }
         };
         if let Some(finished) = superseded {
             events.push(self.play_finished_event(finished));
+        }
+        result
+    }
+
+    /// Start an **overlay** playback toward a party (`Command::PlayMedia` with `overlay`): mixed
+    /// under whatever that party's egress is already carrying, rather than replacing it.
+    ///
+    /// Rejects with [`PlaybackError::NoFreeOverlaySlot`] when the direction's four slots are all in
+    /// use — the existing overlays keep running untouched, because displacing one would leave the
+    /// controller holding a `play_id` for audio that silently stopped.
+    pub fn start_play_overlay(
+        &mut self,
+        toward_a: bool,
+        request: PlayRequest,
+        gain: Gain,
+        duration_cap_ms: Option<u64>,
+        play_id: u64,
+    ) -> Result<(), PlaybackError> {
+        let direction = self.direction_toward(toward_a);
+        let playback = request.into_playback(direction, gain, play_id, duration_cap_ms)?;
+        direction.overlay.start(playback)
+    }
+
+    /// Stop exactly one playback by its `play_id` — the superseding prompt or a single overlay, on
+    /// either direction — leaving everything else running. Pushes that playback's
+    /// `PlayFinished{Stopped}` onto `events`. Returns whether any playback held the id.
+    pub fn stop_play_id(&mut self, play_id: u64, events: &mut Vec<Event>) -> bool {
+        let mut finished = None;
+        for toward_a in [true, false] {
+            let direction = self.direction_toward(toward_a);
+            // The superseding prompt first: it is the one a controller is most likely to name.
+            if matches!(&direction.injection, Some(Injection::Audio(playback)) if playback.play_id() == play_id)
+            {
+                finished = Self::take_finished_play(direction, PlayEndReason::Stopped);
+                break;
+            }
+            if let Some(overlay) = direction.overlay.stop(play_id) {
+                finished = Some(FinishedPlay {
+                    play_id: overlay.play_id,
+                    reason: PlayEndReason::Stopped,
+                    played_ms: overlay.played_ms,
+                });
+                break;
+            }
+        }
+        match finished {
+            Some(finished) => {
+                events.push(self.play_finished_event(finished));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Retune a running playback's playout gain (`Command::SetPlayGain`), on either direction and
+    /// whether it supersedes or overlays. Returns whether any playback held the id.
+    pub fn set_play_gain(&mut self, play_id: u64, gain: Gain) -> bool {
+        for toward_a in [true, false] {
+            let direction = self.direction_toward(toward_a);
+            if let Some(Injection::Audio(playback)) = direction.injection.as_mut() {
+                if playback.play_id() == play_id {
+                    playback.set_gain(gain);
+                    return true;
+                }
+            }
+            if direction.overlay.set_gain(play_id, gain) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Turn every overlay that drained during the last packet / tick into its own
+    /// [`Event::PlayFinished`]`{ Completed }`.
+    ///
+    /// Overlays end deep inside the egress emit path, where the event vector is not in scope, so
+    /// they are staged on the direction and drained here — once per processed packet and once per
+    /// playout tick, which is every path that can emit an egress frame.
+    fn drain_overlay_finishes(&mut self, events: &mut Vec<Event>) {
+        for toward_a in [true, false] {
+            let staged = {
+                let direction = self.direction_toward(toward_a);
+                if direction.overlay_finished.is_empty() {
+                    continue;
+                }
+                std::mem::take(&mut direction.overlay_finished)
+            };
+            for overlay in &staged {
+                events.push(self.play_finished_event(FinishedPlay {
+                    play_id: overlay.play_id,
+                    reason: PlayEndReason::Completed,
+                    played_ms: overlay.played_ms,
+                }));
+            }
+            // Hand the (now drained) buffer back so its capacity is reused and the next completion
+            // still costs no allocation.
+            let direction = self.direction_toward(toward_a);
+            let mut staged = staged;
+            staged.clear();
+            direction.overlay_finished = staged;
         }
     }
 
@@ -2516,15 +2772,30 @@ impl MediaCall {
         self.end_all_plays(PlayEndReason::Error, events);
     }
 
-    /// Take (stop) any injection on both directions, emitting a `PlayFinished{reason}` for each that
-    /// was a `play_media` prompt. Shared by [`Self::stop_play`] and [`Self::finish_pending_plays`].
+    /// Take (stop) every injection **and every overlay** on both directions, emitting a
+    /// `PlayFinished{reason}` for each that was a `play_media` playback. Shared by
+    /// [`Self::stop_play`] and [`Self::finish_pending_plays`], so a call-wide stop and a teardown
+    /// both release a controller awaiting any of them — an overlay left unreported would hang an
+    /// await exactly as an unreported prompt would.
     fn end_all_plays(&mut self, reason: PlayEndReason, events: &mut Vec<Event>) {
-        let a = Self::take_finished_play(&mut self.a_to_b, reason);
-        let b = Self::take_finished_play(&mut self.b_to_a, reason);
-        if let Some(finished) = a {
-            events.push(self.play_finished_event(finished));
+        let mut ended: Vec<FinishedPlay> = Vec::new();
+        for toward_a in [true, false] {
+            let direction = self.direction_toward(toward_a);
+            if let Some(finished) = Self::take_finished_play(direction, reason) {
+                ended.push(finished);
+            }
+            let mut overlays = std::mem::take(&mut direction.overlay_finished);
+            direction.overlay.stop_all(&mut overlays);
+            for overlay in overlays.drain(..) {
+                ended.push(FinishedPlay {
+                    play_id: overlay.play_id,
+                    reason,
+                    played_ms: overlay.played_ms,
+                });
+            }
+            self.direction_toward(toward_a).overlay_finished = overlays;
         }
-        if let Some(finished) = b {
+        for finished in ended {
             events.push(self.play_finished_event(finished));
         }
     }
@@ -2537,12 +2808,10 @@ impl MediaCall {
         reason: PlayEndReason,
     ) -> Option<FinishedPlay> {
         match direction.injection.take() {
-            Some(Injection::Audio {
-                play_id, played_ms, ..
-            }) => Some(FinishedPlay {
-                play_id,
+            Some(Injection::Audio(playback)) => Some(FinishedPlay {
+                play_id: playback.play_id(),
                 reason,
-                played_ms,
+                played_ms: playback.played_ms(),
             }),
             _ => None,
         }
@@ -2655,6 +2924,8 @@ impl MediaCall {
         if let Some(finished) = self.b_to_a.tick_egress(comfort_enabled, out) {
             events.push(self.play_finished_event(finished));
         }
+        // An overlay that drained inside the emit path above reports its own completion.
+        self.drain_overlay_finishes(events);
     }
 
     /// Append this call's periodic per-leg [`Event::CallQuality`] reports (RFC 3550 §6.4.1 loss/jitter
@@ -2700,12 +2971,32 @@ impl MediaCall {
         self.a_to_b.injection.is_some() || self.b_to_a.injection.is_some()
     }
 
-    /// Whether the actor must run the playout tick this cycle: an active injection, or a comfort-idle
-    /// single-leg leg that is not currently reflecting (`echo` off) — the latter emits a continuous
-    /// comfort-noise stream, so the tick fires every cycle for the life of the leg.
+    /// Whether either direction has an overlay playback running. The playout tick must keep running
+    /// while so: an overlay under a *silent* party (ringback toward a leg that is receiving nothing)
+    /// has no packet clock of its own and is carried entirely by the tick.
+    #[must_use]
+    pub fn has_overlay(&self) -> bool {
+        self.a_to_b.overlay.is_active() || self.b_to_a.overlay.is_active()
+    }
+
+    /// How many overlay slots a direction currently holds (test / observability helper).
+    #[must_use]
+    pub fn overlay_count(&self, toward_a: bool) -> usize {
+        if toward_a {
+            self.b_to_a.overlay.active_count()
+        } else {
+            self.a_to_b.overlay.active_count()
+        }
+    }
+
+    /// Whether the actor must run the playout tick this cycle: an active injection, an active
+    /// overlay, or a comfort-idle single-leg leg that is not currently reflecting (`echo` off) — the
+    /// latter emits a continuous comfort-noise stream, so the tick fires every cycle for the life of
+    /// the leg. An overlay must keep the tick alive even on an otherwise silent direction, because
+    /// that is the only clock carrying it.
     #[must_use]
     pub fn needs_egress_tick(&self) -> bool {
-        self.has_injection() || (!self.echo && self.a_to_b.comfort.is_some())
+        self.has_injection() || self.has_overlay() || (!self.echo && self.a_to_b.comfort.is_some())
     }
 
     /// Mark this call as a **single-leg** local-answer / IVR call whose caller-facing egress idles on
@@ -2758,12 +3049,24 @@ pub enum MediaControl {
     /// (`block DTMF`). `source_a` selects the blocked source leg (`true` ⇒ leg A). Detection still
     /// fires while blocked, so the controller sees the digit — only the peer-bound relay is dropped.
     BlockDtmf { source_a: bool, blocked: bool },
-    /// Play a prompt toward a party (`toward_a`): the player owns its source-rate PCM. `play_id` is
-    /// the accept's playback id, carried on the [`Event::PlayFinished`] emitted when the prompt ends.
+    /// Play a prompt / announcement / tone toward a party (`toward_a`).
+    ///
+    /// The request carries the source at its own rate (or a tone cadence to synthesise); the actor
+    /// resolves it against the target direction's egress clock, which is the only place that knows
+    /// it. `play_id` is the accept's playback id, carried on the [`Event::PlayFinished`] emitted
+    /// when the playback ends. `overlay` mixes it under the party's live egress instead of
+    /// superseding it, in which case `reply` carries the accept/reject — an over-cap overlay is a
+    /// controller-visible error, not a silent drop.
     PlayAudio {
         toward_a: bool,
-        player: Box<PcmPlayer>,
+        request: Box<PlayRequest>,
+        overlay: bool,
+        gain: Gain,
+        duration_cap_ms: Option<u64>,
         play_id: u64,
+        /// Present only for an overlay start, whose rejection the control plane must answer with.
+        /// A superseding start stays fire-and-forget, exactly as it has always been.
+        reply: Option<tokio::sync::oneshot::Sender<Result<(), PlaybackError>>>,
     },
     /// Play a DTMF sequence toward a party: `digits` is the (validated) multi-digit code, each digit
     /// played `duration_ms` long with `pause_ms` of inter-digit silence (RFC 4733 telephone-events).
@@ -2774,8 +3077,22 @@ pub enum MediaControl {
         volume: u8,
         pause_ms: u32,
     },
-    /// Stop any prompt / DTMF injection on both directions.
+    /// Stop every prompt / DTMF injection **and every overlay** on both directions.
     StopPlay,
+    /// Stop exactly one playback by its `play_id` (a superseding prompt or a single overlay),
+    /// leaving the rest running. `reply` carries whether any playback held that id, so the control
+    /// plane can answer an unknown id with an error rather than a hollow success.
+    StopPlayId {
+        play_id: u64,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Retune a running playback's playout gain (`set_play_gain`). `reply` carries whether any
+    /// playback held that id.
+    SetPlayGain {
+        play_id: u64,
+        gain: Gain,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     /// Attach a SIPREC / monitor fork to a source leg's decoded ingress audio (`source_a` selects
     /// leg A vs leg B). The engine builds the `RtpForkSink` and owns the matching output channel +
     /// drain task (RFC 7866 SIPREC; the subscriber is send-only — engine → SRS — no inbound media).
@@ -3075,21 +3392,69 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::BlockDtmf { source_a, blocked }) => {
                         call.set_dtmf_blocked(source_a, blocked);
                     }
-                    MediaInput::Control(MediaControl::PlayAudio { toward_a, player, play_id }) => {
-                        // Starting a prompt supersedes any prior one on the direction, which emits a
-                        // `PlayFinished{Superseded}` for the old play_id.
+                    MediaInput::Control(MediaControl::PlayAudio {
+                        toward_a,
+                        request,
+                        overlay,
+                        gain,
+                        duration_cap_ms,
+                        play_id,
+                        reply,
+                    }) => {
+                        // Starting a superseding prompt displaces any prior one on the direction,
+                        // which emits a `PlayFinished{Superseded}` for the old play_id. An overlay
+                        // displaces nothing; it is rejected instead when every slot is taken.
                         emitted.clear();
-                        call.start_play_audio(toward_a, *player, play_id, &mut emitted);
+                        let started = if overlay {
+                            call.start_play_overlay(
+                                toward_a,
+                                *request,
+                                gain,
+                                duration_cap_ms,
+                                play_id,
+                            )
+                        } else {
+                            call.start_play_audio(
+                                toward_a,
+                                *request,
+                                gain,
+                                duration_cap_ms,
+                                play_id,
+                                &mut emitted,
+                            )
+                        };
+                        if let Err(error) = &started {
+                            tracing::warn!(
+                                target: "siphon_rtp::media",
+                                %error,
+                                play_id,
+                                overlay,
+                                "play_media rejected by the media pipeline"
+                            );
+                        }
+                        // Best-effort: the control task may already have given up on the reply.
+                        if let Some(reply) = reply {
+                            let _ = reply.send(started);
+                        }
                         emit_events(&mut emitted, &events);
                     }
                     MediaInput::Control(MediaControl::PlayDtmf { toward_a, digits, duration_ms, volume, pause_ms }) => {
                         call.start_play_dtmf(toward_a, &digits, duration_ms, volume, pause_ms);
                     }
                     MediaInput::Control(MediaControl::StopPlay) => {
-                        // An explicit stop ends any prompt with `PlayFinished{Stopped}`.
+                        // An explicit stop ends every prompt and overlay with `PlayFinished{Stopped}`.
                         emitted.clear();
                         call.stop_play(&mut emitted);
                         emit_events(&mut emitted, &events);
+                    }
+                    MediaInput::Control(MediaControl::StopPlayId { play_id, reply }) => {
+                        emitted.clear();
+                        let stopped = call.stop_play_id(play_id, &mut emitted);
+                        let _ = reply.send(stopped);
+                        emit_events(&mut emitted, &events);
+                    }
+                    MediaInput::Control(MediaControl::SetPlayGain { play_id, gain, reply }) => {
+                        let _ = reply.send(call.set_play_gain(play_id, gain));
                     }
                     MediaInput::Control(MediaControl::AddFork { source_a, sink }) => {
                         call.add_fork(source_a, sink);
@@ -3214,6 +3579,28 @@ mod tests {
         EndpointId(id)
     }
 
+    impl MediaCall {
+        /// Test shorthand for the historical `play_media`: a superseding recorded prompt at unity
+        /// gain with no duration cap — the shape every pre-overlay test used.
+        fn start_prompt(
+            &mut self,
+            toward_a: bool,
+            player: PcmPlayer,
+            play_id: u64,
+            events: &mut Vec<Event>,
+        ) {
+            let started = self.start_play_audio(
+                toward_a,
+                PlayRequest::Pcm(Box::new(player)),
+                Gain::unity(),
+                None,
+                play_id,
+                events,
+            );
+            assert!(started.is_ok(), "the test prompt must start: {started:?}");
+        }
+    }
+
     /// Build a µ-law(A) ↔ A-law(B) transcoding call, both legs 8 kHz/20 ms.
     fn ulaw_alaw_call() -> MediaCall {
         ulaw_alaw_call_on(1, 2)
@@ -3282,7 +3669,7 @@ mod tests {
         let mut events = Vec::new();
 
         // A prompt toward the still-unkeyed secure party B, then many playout ticks.
-        call.start_play_audio(false, prompt_player(50), 1, &mut events);
+        call.start_prompt(false, prompt_player(50), 1, &mut events);
         for _ in 0..50 {
             call.tick(&mut out, &mut events);
         }
@@ -6153,7 +6540,7 @@ mod tests {
         let mut call = single_leg_call(None);
         // toward_a = false injects on a_to_b (the caller-facing direction), as `start_play` does for a
         // single-leg call.
-        call.start_play_audio(false, prompt_player(1), 7, &mut Vec::new());
+        call.start_prompt(false, prompt_player(1), 7, &mut Vec::new());
         assert!(call.has_injection(), "the prompt is active");
         let mut out = Vec::new();
         call.tick(&mut out, &mut Vec::new());
@@ -6262,7 +6649,7 @@ mod tests {
         let source = WavSource::parse(&wav).expect("parse wav");
         let player = PcmPlayer::new(&source, 1, 0);
 
-        call.start_play_audio(true, player, 1, &mut Vec::new()); // toward A (b_to_a egress, µ-law PT 0)
+        call.start_prompt(true, player, 1, &mut Vec::new()); // toward A (b_to_a egress, µ-law PT 0)
         assert!(call.has_injection());
 
         let mut out = Vec::new();
@@ -6330,7 +6717,7 @@ mod tests {
     fn play_emits_play_finished_completed_on_drain() {
         let mut call = ulaw_alaw_call();
         // A 2-frame (40 ms) prompt toward A.
-        call.start_play_audio(true, prompt_player(2), 7, &mut Vec::new());
+        call.start_prompt(true, prompt_player(2), 7, &mut Vec::new());
 
         let mut out = Vec::new();
         let mut events = Vec::new();
@@ -6355,7 +6742,7 @@ mod tests {
     #[test]
     fn stop_play_emits_play_finished_stopped() {
         let mut call = ulaw_alaw_call();
-        call.start_play_audio(true, prompt_player(50), 3, &mut Vec::new()); // a long prompt
+        call.start_prompt(true, prompt_player(50), 3, &mut Vec::new()); // a long prompt
         let mut out = Vec::new();
         let mut events = Vec::new();
         call.tick(&mut out, &mut events); // one frame (20 ms) played, prompt far from drained
@@ -6372,13 +6759,13 @@ mod tests {
     #[test]
     fn superseding_a_prompt_emits_play_finished_superseded() {
         let mut call = ulaw_alaw_call();
-        call.start_play_audio(true, prompt_player(50), 1, &mut Vec::new());
+        call.start_prompt(true, prompt_player(50), 1, &mut Vec::new());
         let mut out = Vec::new();
         call.tick(&mut out, &mut Vec::new()); // 20 ms of the first prompt played
                                               // A second play on the same direction replaces the first — the old play_id is reported as
                                               // Superseded so a controller awaiting it resolves rather than hanging forever.
         let mut events = Vec::new();
-        call.start_play_audio(true, prompt_player(2), 2, &mut events);
+        call.start_prompt(true, prompt_player(2), 2, &mut events);
         assert_eq!(
             expect_one_play_finished(&events),
             (1, PlayEndReason::Superseded, Some(20)),
@@ -6390,7 +6777,7 @@ mod tests {
     #[test]
     fn teardown_emits_play_finished_error_for_an_in_flight_prompt() {
         let mut call = ulaw_alaw_call();
-        call.start_play_audio(true, prompt_player(50), 9, &mut Vec::new());
+        call.start_prompt(true, prompt_player(50), 9, &mut Vec::new());
         let mut out = Vec::new();
         call.tick(&mut out, &mut Vec::new()); // 20 ms played, prompt far from drained
                                               // The leg is torn down mid-play: the actor reports the in-flight prompt as Error so the engine
@@ -6414,7 +6801,7 @@ mod tests {
         recorder.write_pcm(&vec![2000i16; 160]);
         let source = WavSource::parse(&recorder.into_wav()).expect("parse");
         let player = PcmPlayer::new(&source, 2, 0);
-        call.start_play_audio(true, player, 5, &mut Vec::new());
+        call.start_prompt(true, player, 5, &mut Vec::new());
 
         let mut out = Vec::new();
         let mut events = Vec::new();
@@ -7387,6 +7774,358 @@ mod tests {
             erle_on >= 20.0,
             "echo cancellation did not run on the datapath: ERLE on {erle_on:.1} dB \
              (off {erle_off:.1} dB); residual on {residual_on:.0} vs off {residual_off:.0}"
+        );
+    }
+
+    // ── Overlay playback (`play_media` with `overlay`) ──────────────────────────────────────────
+
+    /// Start a ringback-tone overlay toward A at `gain_decibels`.
+    fn start_ringback_overlay(
+        call: &mut MediaCall,
+        play_id: u64,
+        gain_decibels: i32,
+    ) -> Result<(), PlaybackError> {
+        let spec = ToneSpec::resolve("ringback_eu").expect("preset resolves");
+        call.start_play_overlay(
+            true,
+            PlayRequest::Tone(spec),
+            Gain::from_decibels(gain_decibels),
+            None,
+            play_id,
+        )
+    }
+
+    /// Push `count` B→A ingress packets through the call and return the payload of each egress
+    /// datagram toward A, so two runs can be compared byte-for-byte.
+    fn transcode_payloads_toward_a(call: &mut MediaCall, count: u16) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::new();
+        for sequence in 0..count {
+            let mut out = Vec::new();
+            call.process(
+                &rx(2, B_ADDR, alaw_rtp(sequence, 0x40)),
+                &mut out,
+                &mut Vec::new(),
+            );
+            for outbound in &out {
+                let packet = RtpPacket::parse(&outbound.data).expect("parse egress");
+                payloads.push(packet.payload.to_vec());
+            }
+        }
+        payloads
+    }
+
+    #[test]
+    fn an_overlay_mixes_under_the_live_transcoded_stream_and_leaves_it_intact_when_stopped() {
+        // The whole point of overlay: the party keeps hearing the call while the tone rides under
+        // it. Compared against an identical call with no overlay, so the difference is the overlay
+        // and nothing else.
+        let mut plain = ulaw_alaw_call();
+        let baseline = transcode_payloads_toward_a(&mut plain, 6);
+        assert!(!baseline.is_empty(), "the transcode path must emit");
+
+        let mut mixed = ulaw_alaw_call();
+        start_ringback_overlay(&mut mixed, 1, 0).expect("a slot is free");
+        let with_overlay = transcode_payloads_toward_a(&mut mixed, 6);
+        assert_eq!(
+            with_overlay.len(),
+            baseline.len(),
+            "an overlay must not change the packet rate — it rides the stream, it does not add one"
+        );
+        assert!(
+            with_overlay != baseline,
+            "the overlay must actually be audible in the egress"
+        );
+
+        // Stopping the overlay hands the party back exactly the audio it would have had all along.
+        let mut events = Vec::new();
+        assert!(
+            mixed.stop_play_id(1, &mut events),
+            "the overlay was running"
+        );
+        assert_eq!(
+            expect_one_play_finished(&events).1,
+            PlayEndReason::Stopped,
+            "the stopped overlay reports its own end"
+        );
+        let after_stop = transcode_payloads_toward_a(&mut mixed, 6);
+        let plain_continued = transcode_payloads_toward_a(&mut plain, 6);
+        assert_eq!(
+            after_stop, plain_continued,
+            "once the overlay stops the live audio is byte-identical to the un-overlaid call"
+        );
+    }
+
+    #[test]
+    fn an_overlay_carries_the_egress_when_nothing_else_is_producing() {
+        // Ringback toward a party that is receiving no media at all (its peer has not answered):
+        // there is no transcode frame to ride, so the playout tick must carry the overlay itself.
+        let mut call = ulaw_alaw_call();
+        assert!(
+            !call.needs_egress_tick(),
+            "an idle 2-party transcode call needs no playout tick"
+        );
+        start_ringback_overlay(&mut call, 1, 0).expect("a slot is free");
+        assert!(
+            call.needs_egress_tick(),
+            "an overlay must keep the playout tick alive — it is the only clock carrying it"
+        );
+
+        let mut out = Vec::new();
+        for _ in 0..5 {
+            call.tick(&mut out, &mut Vec::new());
+        }
+        assert_eq!(out.len(), 5, "one overlay frame per playout tick");
+        for outbound in &out {
+            assert_eq!(outbound.endpoint, endpoint(1), "toward A's socket");
+            let packet = RtpPacket::parse(&outbound.data).expect("parse");
+            assert_eq!(packet.payload_type, 0, "encoded in A's codec (µ-law)");
+        }
+        // Sequence numbers advance by one per packet (RFC 3550 §5.1) — one continuous stream.
+        let first = RtpPacket::parse(&out[0].data).expect("parse").sequence;
+        for (step, outbound) in out.iter().enumerate() {
+            let packet = RtpPacket::parse(&outbound.data).expect("parse");
+            assert_eq!(packet.sequence, first.wrapping_add(step as u16));
+        }
+    }
+
+    #[test]
+    fn an_overlay_does_not_add_a_second_stream_while_the_transcode_path_is_producing() {
+        // The overlay rides the transcode frame; the tick must not emit a *second* frame in the same
+        // ptime, which would put two packets on one SSRC per 20 ms.
+        let mut call = ulaw_alaw_call();
+        start_ringback_overlay(&mut call, 1, 0).expect("a slot is free");
+        let mut out = Vec::new();
+        for sequence in 0..10u16 {
+            call.process(
+                &rx(2, B_ADDR, alaw_rtp(sequence, 0x40)),
+                &mut out,
+                &mut Vec::new(),
+            );
+            call.tick(&mut out, &mut Vec::new());
+        }
+        assert_eq!(
+            out.len(),
+            10,
+            "exactly one egress packet per ingress packet, overlay or not"
+        );
+    }
+
+    #[test]
+    fn two_overlays_at_different_gains_stop_independently_with_their_own_completions() {
+        let mut call = ulaw_alaw_call();
+        start_ringback_overlay(&mut call, 11, 0).expect("a slot is free");
+        start_ringback_overlay(&mut call, 22, -12).expect("a second slot is free");
+        assert_eq!(call.overlay_count(true), 2);
+
+        let mut out = Vec::new();
+        call.tick(&mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1, "both overlays share one egress stream");
+
+        // Stop the quiet one: the loud one keeps running and only the stopped one reports.
+        let mut events = Vec::new();
+        assert!(call.stop_play_id(22, &mut events));
+        assert_eq!(
+            expect_one_play_finished(&events),
+            (22, PlayEndReason::Stopped, Some(20)),
+            "only the stopped overlay reports, with its own played duration"
+        );
+        assert_eq!(call.overlay_count(true), 1);
+        assert!(call.has_overlay(), "the other overlay is untouched");
+
+        // Stop the loud one too.
+        let mut events = Vec::new();
+        assert!(call.stop_play_id(11, &mut events));
+        assert_eq!(expect_one_play_finished(&events).0, 11);
+        assert!(!call.has_overlay());
+        // A play_id no playback holds is reported as such, never as a hollow success.
+        assert!(!call.stop_play_id(11, &mut Vec::new()));
+    }
+
+    #[test]
+    fn a_fifth_overlay_is_rejected_and_the_four_already_running_are_untouched() {
+        let mut call = ulaw_alaw_call();
+        for play_id in 0..MAX_OVERLAY_SLOTS as u64 {
+            start_ringback_overlay(&mut call, play_id, 0).expect("a slot is free");
+        }
+        assert_eq!(call.overlay_count(true), MAX_OVERLAY_SLOTS);
+        assert_eq!(
+            start_ringback_overlay(&mut call, 99, 0),
+            Err(PlaybackError::NoFreeOverlaySlot {
+                limit: MAX_OVERLAY_SLOTS
+            }),
+            "an over-cap start is a typed rejection, not a silent drop"
+        );
+        assert_eq!(
+            call.overlay_count(true),
+            MAX_OVERLAY_SLOTS,
+            "the four running overlays are untouched by the rejection"
+        );
+        // And they are still audible: the tick still emits.
+        let mut out = Vec::new();
+        call.tick(&mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn overlay_gain_changes_what_the_party_hears_and_is_retunable_in_flight() {
+        // Two identical calls, the overlay at two levels: the egress must differ. Then retune the
+        // loud one down to the quiet one's level and prove it lands on the quiet one's bytes.
+        fn overlay_frames(gain_decibels: i32, retune_to: Option<i32>) -> Vec<Vec<u8>> {
+            let mut call = ulaw_alaw_call();
+            start_ringback_overlay(&mut call, 1, gain_decibels).expect("a slot is free");
+            if let Some(gain) = retune_to {
+                assert!(call.set_play_gain(1, Gain::from_decibels(gain)));
+            }
+            let mut out = Vec::new();
+            for _ in 0..4 {
+                call.tick(&mut out, &mut Vec::new());
+            }
+            out.iter()
+                .map(|outbound| {
+                    RtpPacket::parse(&outbound.data)
+                        .expect("parse")
+                        .payload
+                        .to_vec()
+                })
+                .collect()
+        }
+        let loud = overlay_frames(0, None);
+        let quiet = overlay_frames(-20, None);
+        assert!(!loud.is_empty() && loud != quiet, "gain must be audible");
+        assert_eq!(
+            overlay_frames(0, Some(-20)),
+            quiet,
+            "retuning a running overlay to -20 dB gives exactly the -20 dB stream"
+        );
+        // An id no playback holds is reported, not silently accepted.
+        let mut call = ulaw_alaw_call();
+        assert!(!call.set_play_gain(404, Gain::unity()));
+    }
+
+    #[test]
+    fn a_superseding_prompt_and_an_overlay_coexist_without_displacing_each_other() {
+        let mut call = ulaw_alaw_call();
+        start_ringback_overlay(&mut call, 1, -6).expect("a slot is free");
+        // Starting a prompt supersedes prompts, not overlays.
+        let mut events = Vec::new();
+        call.start_prompt(true, prompt_player(4), 2, &mut events);
+        assert!(events.is_empty(), "there was no prior prompt to supersede");
+        assert!(call.has_injection() && call.has_overlay());
+
+        let mut out = Vec::new();
+        call.tick(&mut out, &mut Vec::new());
+        assert_eq!(out.len(), 1, "one stream, prompt with the overlay mixed in");
+        assert_eq!(
+            call.overlay_count(true),
+            1,
+            "the overlay survived the prompt"
+        );
+
+        // Stopping the prompt by id leaves the overlay running.
+        let mut events = Vec::new();
+        assert!(call.stop_play_id(2, &mut events));
+        assert_eq!(expect_one_play_finished(&events).0, 2);
+        assert!(!call.has_injection());
+        assert!(call.has_overlay(), "the overlay is not a prompt");
+    }
+
+    #[test]
+    fn a_call_wide_stop_ends_overlays_as_well_as_the_prompt() {
+        let mut call = ulaw_alaw_call();
+        start_ringback_overlay(&mut call, 1, 0).expect("a slot is free");
+        start_ringback_overlay(&mut call, 2, 0).expect("a slot is free");
+        call.start_prompt(true, prompt_player(10), 3, &mut Vec::new());
+
+        let mut events = Vec::new();
+        call.stop_play(&mut events);
+        let mut reported: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::PlayFinished {
+                    play_id, reason, ..
+                } => {
+                    assert_eq!(*reason, PlayEndReason::Stopped);
+                    Some(*play_id)
+                }
+                _ => None,
+            })
+            .collect();
+        reported.sort_unstable();
+        assert_eq!(
+            reported,
+            vec![1, 2, 3],
+            "a call-wide stop must release every awaiting controller, overlays included"
+        );
+        assert!(!call.has_overlay() && !call.has_injection());
+    }
+
+    #[test]
+    fn a_torn_down_leg_reports_its_overlays_as_errored() {
+        let mut call = ulaw_alaw_call();
+        start_ringback_overlay(&mut call, 5, 0).expect("a slot is free");
+        let mut events = Vec::new();
+        call.finish_pending_plays(&mut events);
+        assert_eq!(
+            expect_one_play_finished(&events),
+            (5, PlayEndReason::Error, Some(0)),
+            "an overlay that dies with the leg releases its controller"
+        );
+    }
+
+    #[test]
+    fn a_duration_capped_overlay_completes_on_its_own_and_reports_once() {
+        // An endless tone bounded by `duration_ms`: 60 ms = three 20 ms frames.
+        let mut call = ulaw_alaw_call();
+        let spec = ToneSpec::resolve("425/1000*inf").expect("spec parses");
+        call.start_play_overlay(true, PlayRequest::Tone(spec), Gain::unity(), Some(60), 8)
+            .expect("a slot is free");
+
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            call.tick(&mut out, &mut events);
+        }
+        assert_eq!(out.len(), 3, "three 20 ms frames");
+        assert_eq!(
+            expect_one_play_finished(&events),
+            (8, PlayEndReason::Completed, Some(60)),
+            "the cap ends the tone with Completed, exactly once"
+        );
+        assert!(!call.has_overlay());
+        // And nothing more is emitted afterwards.
+        out.clear();
+        call.tick(&mut out, &mut Vec::new());
+        assert!(out.is_empty(), "a finished overlay stops producing");
+    }
+
+    #[test]
+    fn a_blocked_direction_emits_nothing_even_with_an_overlay_running() {
+        // `block_media` drops egress entirely; an overlay must not become a way around it.
+        let mut call = ulaw_alaw_call();
+        call.set_blocked(true);
+        start_ringback_overlay(&mut call, 1, 0).expect("a slot is free");
+        let mut out = Vec::new();
+        for _ in 0..5 {
+            call.tick(&mut out, &mut Vec::new());
+        }
+        assert!(out.is_empty(), "a blocked direction stays silent");
+    }
+
+    #[test]
+    fn an_unkeyed_dtls_leg_receives_no_overlay_either() {
+        // Same gate as the injected prompt: nothing the pipeline synthesises may reach a peer whose
+        // DTLS handshake has not keyed the leg.
+        let mut call = ulaw_alaw_call().with_far_secure_pending();
+        let spec = ToneSpec::resolve("ringback_eu").expect("preset resolves");
+        call.start_play_overlay(false, PlayRequest::Tone(spec), Gain::unity(), None, 1)
+            .expect("a slot is free");
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            call.tick(&mut out, &mut Vec::new());
+        }
+        assert!(
+            out.is_empty(),
+            "an overlay must not reach a peer whose DTLS handshake has not keyed the leg"
         );
     }
 }
