@@ -53,6 +53,13 @@ tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 rustls = { workspace = true }
 # The Mozilla CA bundle seeded into that client config's trust store.
 webpki-roots = { workspace = true }
+# `play_media` from an http(s) URL: hyper's low-level HTTP/1.1 client over a socket we connect (and
+# time out) ourselves, with tokio-rustls terminating TLS on the same ring-backed client config the
+# `wss://` bridge uses. See `media_fetch.rs` for the bounds and the security posture.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio-rustls = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }

@@ -108,6 +108,43 @@ Both flags are `Option`/omitted-when-unset, so existing controller JSON serialis
   [docs/control/json.md](docs/control/json.md#answering-machine-beep-detection) for the parameters,
   the operating point and what it cannot do.
 
+- **Overlay playback** — `play_media` with `"overlay": true` mixes audio *under* a leg's live egress
+  instead of replacing it: ringback beneath a leg that has not answered, hold music beneath silence,
+  a background bed beneath a conversation. Up to **four concurrent overlays per direction**, each
+  addressed by its own `play_id` for `stop_media` and `set_play_gain` and each ending with its own
+  `play_finished`; a fifth is rejected with an error naming the cap rather than displacing one. An
+  overlay rides the live stream when there is one (one overlay frame per emitted egress frame, so it
+  adds no packets) and carries the egress itself when there is not — which is what makes ringback
+  toward a leg receiving no media work. Mixing accumulates in `i32` and saturates, like the
+  conference mix bus. Zero per-tick heap allocation, proven by a counting-allocator test.
+- **Playout gain** — `gain_decibels` on `play_media` (overlay *and* superseding), in whole decibels
+  over −60 … +12 dB, plus a new `set_play_gain` verb to retune a playback that is already running.
+  Better than 0.1 dB accurate across the range; saturating, so a boost clips rather than wraps.
+- **Tone generation** — a new `{"source": "tone", "tone": "…"}` playback source. Fourteen cited
+  call-progress presets (`ringback_eu`, `busy_na`, `dial_uk`, …) from ETSI ETR 187, Telcordia
+  GR-506-CORE and the ITU-T E.180 Supplement 2 national tables, at the −10 dBm0 nominal of ITU-T
+  E.180/Q.35 §2 — plus a documented cadence grammar (`425/1000,0/4000*inf`) for anything the table
+  does not cover, parsed with typed errors and fuzzed (`tone_spec_fuzz`). Tones render directly at
+  the leg's codec rate off a 32-bit phase accumulator, so they are never resampled and allocate
+  nothing per frame.
+- **Playback from a URL** — a new `{"source": "http", "url": "…"}` source fetched by the engine over
+  `http`/`https`. Bounded on every axis (connect, first-byte and overall timeouts, a body-size cap
+  enforced against `Content-Length` *and* while reading, a redirect cap), all configurable via
+  `--media-fetch-*` / the TOML equivalents. The fetch runs on its own task, so it never touches the
+  media path or stalls the control connection: the accept returns a `play_id` immediately and any
+  failure resolves the playback with `play_finished` reason `error`. Only `http`/`https` are
+  accepted and every redirect hop is re-validated, with an optional `--media-fetch-allow-host`
+  allow-list; the SSRF posture is documented in `docs/control/json.md`.
+- **`stop_media` can target one playback** — an optional `play_id` stops just that one and leaves the
+  rest running. Without it the verb still stops everything on the call, exactly as before.
+
+### Fixed
+- `play_media`'s `duration_ms` was parsed and then dropped. It is now the hard playout cap the
+  contract always described — and the only bound, short of a stop, on an endless tone.
+- A resampled prompt now emits exactly one egress frame per playout tick. Previously it emitted
+  whatever the polyphase resampler happened to produce while advancing the RTP timestamp by a fixed
+  increment, so a prompt whose source rate differed from the leg's drifted against its own clock.
+
 ## [0.2.1] — 2026-08-20
 
 ### Changed

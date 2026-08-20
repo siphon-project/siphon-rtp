@@ -18,6 +18,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::parser::ValueSource;
 use clap::ArgMatches;
@@ -30,6 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{resolve_defaulted, resolve_optional, FileConfig, InterfaceConfig};
 use crate::interface::{InterfaceEntry, InterfaceTable};
+use crate::media_fetch::{self, MediaFetchLimits};
 use crate::srtp_bridge::run_redirect_dispatcher_with_text;
 use crate::{cluster, metrics, server, shutdown, ClientId, Engine};
 
@@ -121,6 +123,37 @@ pub struct EngineArgs {
     /// the live session count to reach 0.
     #[arg(long, default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS)]
     pub shutdown_grace_secs: u64,
+
+    /// Bound (milliseconds) on DNS + TCP connect + TLS for a `play_media` fetch from an http(s)
+    /// URL, per redirect hop.
+    #[arg(long, default_value_t = media_fetch::DEFAULT_CONNECT_TIMEOUT_MS)]
+    pub media_fetch_connect_timeout_ms: u64,
+
+    /// Bound (milliseconds) on the wait for response headers on a `play_media` URL fetch.
+    #[arg(long, default_value_t = media_fetch::DEFAULT_FIRST_BYTE_TIMEOUT_MS)]
+    pub media_fetch_first_byte_timeout_ms: u64,
+
+    /// Bound (milliseconds) on a whole `play_media` URL fetch — every redirect hop and the body
+    /// read together. A fetch that outlives it ends the playback with `PlayFinished{error}`.
+    #[arg(long, default_value_t = media_fetch::DEFAULT_TOTAL_TIMEOUT_MS)]
+    pub media_fetch_timeout_ms: u64,
+
+    /// Largest `play_media` URL response body accepted, in bytes. Checked against Content-Length
+    /// up front and enforced again while reading, so a chunked response cannot exceed it either.
+    #[arg(long, default_value_t = media_fetch::DEFAULT_MAX_BODY_BYTES)]
+    pub media_fetch_max_bytes: usize,
+
+    /// Redirect hops a `play_media` URL fetch follows before giving up. Every hop is re-checked
+    /// against the scheme rule and the allow-list.
+    #[arg(long, default_value_t = media_fetch::DEFAULT_MAX_REDIRECTS)]
+    pub media_fetch_max_redirects: u8,
+
+    /// Restrict `play_media` URL fetches to these hosts (repeat the flag for several; exact,
+    /// case-insensitive match, no wildcards). Unset means **unrestricted** — the engine will fetch
+    /// any host it can route to, from its own network position. Set this, or an egress policy, when
+    /// the control plane is not fully trusted.
+    #[arg(long)]
+    pub media_fetch_allow_host: Vec<String>,
 
     /// STUN server to ask for a server-reflexive ICE candidate during gathering (RFC 8445 §5.1.1.2).
     /// Repeat the flag for several. The built-in TURN server answers Binding requests (RFC 8656 §12),
@@ -231,6 +264,8 @@ pub struct RunConfig {
     pub turn_tls_key: Option<PathBuf>,
     /// Public IP advertised in XOR-RELAYED-ADDRESS when the bound IP differs.
     pub turn_relay_ip: Option<IpAddr>,
+    /// Bounds a `play_media` fetch from an http(s) URL runs under.
+    pub media_fetch: MediaFetchLimits,
     /// Only carried through for the log filter: the file may set it, but the process environment
     /// (`RUST_LOG` / the default-env filter) always wins, so it is applied before anything is logged.
     pub log_filter: Option<String>,
@@ -314,6 +349,44 @@ impl RunConfig {
             turn_tls_cert: resolve_optional(args.turn_tls_cert, file.turn_tls_cert),
             turn_tls_key: resolve_optional(args.turn_tls_key, file.turn_tls_key),
             turn_relay_ip: resolve_optional(args.turn_relay_ip, file.turn_relay_ip),
+            media_fetch: MediaFetchLimits {
+                connect_timeout: Duration::from_millis(resolve_defaulted(
+                    args.media_fetch_connect_timeout_ms,
+                    explicit("media_fetch_connect_timeout_ms"),
+                    file.media_fetch_connect_timeout_ms,
+                    media_fetch::DEFAULT_CONNECT_TIMEOUT_MS,
+                )),
+                first_byte_timeout: Duration::from_millis(resolve_defaulted(
+                    args.media_fetch_first_byte_timeout_ms,
+                    explicit("media_fetch_first_byte_timeout_ms"),
+                    file.media_fetch_first_byte_timeout_ms,
+                    media_fetch::DEFAULT_FIRST_BYTE_TIMEOUT_MS,
+                )),
+                total_timeout: Duration::from_millis(resolve_defaulted(
+                    args.media_fetch_timeout_ms,
+                    explicit("media_fetch_timeout_ms"),
+                    file.media_fetch_timeout_ms,
+                    media_fetch::DEFAULT_TOTAL_TIMEOUT_MS,
+                )),
+                max_body_bytes: resolve_defaulted(
+                    args.media_fetch_max_bytes,
+                    explicit("media_fetch_max_bytes"),
+                    file.media_fetch_max_bytes,
+                    media_fetch::DEFAULT_MAX_BODY_BYTES,
+                ),
+                max_redirects: resolve_defaulted(
+                    args.media_fetch_max_redirects,
+                    explicit("media_fetch_max_redirects"),
+                    file.media_fetch_max_redirects,
+                    media_fetch::DEFAULT_MAX_REDIRECTS,
+                ),
+                // A repeated CLI flag has no "explicit" bit, so a non-empty list wins over the file.
+                allow_hosts: Arc::new(if args.media_fetch_allow_host.is_empty() {
+                    file.media_fetch_allow_host.unwrap_or_default()
+                } else {
+                    args.media_fetch_allow_host
+                }),
+            },
             log_filter: file.log_filter,
             node_id: resolve_optional(args.node_id, file.node_id),
             max_sessions: resolve_defaulted(
@@ -481,9 +554,24 @@ where
         max_sessions = config.max_sessions,
         "cluster node identity registered"
     );
+    if config.media_fetch.allow_hosts.is_empty() {
+        tracing::info!(
+            target: "siphon_rtp::control",
+            "play_media URL fetches are unrestricted — the engine will fetch any host it can route \
+             to; set --media-fetch-allow-host (or an egress policy) if the control plane is not \
+             fully trusted"
+        );
+    } else {
+        tracing::info!(
+            target: "siphon_rtp::control",
+            hosts = ?config.media_fetch.allow_hosts,
+            "play_media URL fetches restricted to these hosts"
+        );
+    }
     let mut engine = Engine::new(datapath.clone())
         .with_cluster(cluster.clone())
-        .with_interfaces(interfaces);
+        .with_interfaces(interfaces)
+        .with_media_fetch_limits(config.media_fetch.clone());
     if !config.stun_servers.is_empty() {
         tracing::info!(
             target: "siphon_rtp::control",
@@ -820,6 +908,7 @@ where
 mod tests {
     use super::{resolve_port_range, RunConfig};
     use crate::config::InterfaceConfig;
+    use crate::media_fetch::MediaFetchLimits;
     use siphon_rtp_datapath::AddressFamily;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -850,6 +939,7 @@ mod tests {
             turn_tls_cert: None,
             turn_tls_key: None,
             turn_relay_ip: None,
+            media_fetch: MediaFetchLimits::default(),
             log_filter: None,
             node_id: None,
             max_sessions: 0,

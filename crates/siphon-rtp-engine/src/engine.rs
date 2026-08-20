@@ -31,11 +31,14 @@ use siphon_rtp_hep::report::QosReport;
 use siphon_rtp_hep::text_report::TextQosReport;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
-use siphon_rtp_media::player::{PcmPlayer, WavSource};
+use siphon_rtp_media::playback::Gain;
+use siphon_rtp_media::player::{PcmPlayer, WavError, WavSource};
+use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    PlayMediaSource, ProfileFlags, SessionStats, WsTeeDirection, WsTeeEndReason, WsVadEngine,
+    PlayEndReason, PlayMediaSource, ProfileFlags, SessionStats, WsTeeDirection, WsTeeEndReason,
+    WsVadEngine,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
@@ -47,9 +50,10 @@ use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
 use crate::ice::driver::{AgentOutcome, AgentSupervisor, ConsentOutcome, ConsentSupervisor};
 use crate::ice::{self, IceCredentials};
 use crate::interface::{Interface, InterfaceTable};
+use crate::media_fetch::{self, MediaFetchLimits};
 use crate::media_pipeline::{
     DirectionConfig, DirectionQuality, FinalCallQuality, MediaCall, MediaControl, MediaRegistry,
-    PcapCapture, RawTee, RelayConfig, RtcpRelay, SecureSide,
+    PcapCapture, PlayRequest, RawTee, RelayConfig, RtcpRelay, SecureSide,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
@@ -790,6 +794,19 @@ pub struct Engine<D: Datapath> {
     /// in the accept's `play_id` and in the matching [`Event::PlayFinished`], so a controller
     /// correlates a completion with the specific prompt it started (a leg may play several in sequence).
     play_id_counter: std::sync::atomic::AtomicU64,
+    /// Bounds on a [`PlayMediaSource::Http`] fetch — connect / first-byte / overall timeouts, the
+    /// body-size cap, the redirect cap and the optional host allow-list. Defaults are the ones
+    /// documented on [`MediaFetchLimits`]; the daemon replaces them from config
+    /// ([`Self::with_media_fetch_limits`]).
+    media_fetch_limits: MediaFetchLimits,
+    /// Playbacks accepted from a URL whose fetch has not finished yet, keyed by `play_id`.
+    ///
+    /// A URL playback accepts before its bytes exist, so between the accept and the fetch there is a
+    /// window in which the controller holds a `play_id` for something the media actor has never
+    /// heard of. `stop_media` and call teardown consult this map so that window is still
+    /// cancellable — otherwise a stopped playback would start playing a second later. Shared with
+    /// the fetch tasks (`Arc`), which remove their own entry when they finish.
+    pending_fetches: Arc<DashMap<u64, PendingFetch>>,
     /// RFC 7675 consent freshness, when the operator enabled it (`--ice-consent`). `None` ⇒ the
     /// engine only *answers* checks (the RFC 7675 §4 ICE-lite posture) and dead paths are caught by
     /// the media-timeout sweep alone. Shared with the sweeper task, which drives it once per tick.
@@ -902,6 +919,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             )),
             // Start at 1 so a `play_id` of 0 never appears (a controller can treat 0 as "no play").
             play_id_counter: std::sync::atomic::AtomicU64::new(1),
+            media_fetch_limits: MediaFetchLimits::default(),
+            pending_fetches: Arc::new(DashMap::new()),
             // Off unless the operator opts in — see `with_consent`.
             consent: None,
             ice_agents: None,
@@ -1304,22 +1323,41 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 source,
                 repeat_times,
                 start_pos_ms,
+                duration_ms,
+                overlay,
+                gain_decibels,
                 to_tag,
-                ..
             } => {
                 self.play_media(
                     client,
                     &call_id,
                     &from_tag,
                     source,
-                    repeat_times,
-                    start_pos_ms,
+                    PlayOptions {
+                        repeat_times,
+                        start_pos_ms,
+                        duration_ms,
+                        overlay,
+                        gain_decibels,
+                    },
                     to_tag.as_deref(),
                 )
                 .await
             }
-            Command::StopMedia { call_id, from_tag } => {
-                self.stop_media(client, &call_id, &from_tag)
+            Command::StopMedia {
+                call_id,
+                from_tag,
+                play_id,
+            } => self.stop_media(client, &call_id, &from_tag, play_id).await,
+            Command::SetPlayGain {
+                call_id,
+                from_tag,
+                play_id,
+                gain_decibels,
+                ..
+            } => {
+                self.set_play_gain(client, &call_id, &from_tag, play_id, gain_decibels)
+                    .await
             }
             Command::PlayDtmf {
                 call_id,
@@ -2522,6 +2560,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     async fn teardown_call(&self, call_id: &str) {
         if let Some((_, call)) = self.calls.remove(call_id) {
             let endpoints: Vec<EndpointId> = call.all_endpoint_ids().collect();
+            // A URL playback still fetching for this call dies with it: abort the task before the
+            // media actor is deregistered, and release the controller awaiting it. Without this the
+            // fetch would land on a call that no longer exists (harmless) while the controller waited
+            // for a completion that never came (not harmless).
+            self.cancel_pending_fetches_for_call(call_id, PlayEndReason::Error);
             // Free any SIPREC subscriptions first (detach forks, abort drains, free subscriber ports)
             // before the media actor is deregistered.
             self.drop_subscriptions(call_id).await;
@@ -6049,10 +6092,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         call_id: &str,
         from_tag: &str,
         source: PlayMediaSource,
-        repeat_times: Option<u64>,
-        start_pos_ms: Option<u64>,
+        options: PlayOptions,
         to_tag: Option<&str>,
-    ) -> Result<(u64, u64), Box<CmdResult>> {
+    ) -> Result<(Option<u64>, u64), Box<CmdResult>> {
         let Some(call_to) = self.owned_call(client, call_id, |call| call.to_tag.clone()) else {
             return Err(Box::new(unknown_call(call_id)));
         };
@@ -6068,12 +6110,56 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return Err(Box::new(error_result("play_media: promote call", &reason)));
             }
         }
-        let bytes = match source {
-            PlayMediaSource::Blob { data } => data,
+        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
+        let repeat = options.repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        let start = options.start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        // Resolve the source into something the media actor can play. A recorded prompt is decoded
+        // here (the source rate is a property of the file, not of the leg); a tone is only *parsed*
+        // here — it is synthesised at the leg's egress rate inside the actor, which is the only place
+        // that knows it, so a tone is never resampled.
+        let resolved = match source {
+            PlayMediaSource::Blob { data } => parse_prompt_wav(&data)
+                .map_err(|error| error_result("play_media: parse WAV", &error))?,
             PlayMediaSource::File { path } => match tokio::fs::read(&path).await {
-                Ok(bytes) => bytes,
+                Ok(bytes) => parse_prompt_wav(&bytes)
+                    .map_err(|error| Box::new(error_result("play_media: parse WAV", &error)))?,
                 Err(error) => return Err(Box::new(error_result("play_media: read file", &error))),
             },
+            PlayMediaSource::Tone { tone } => match ToneSpec::resolve(&tone) {
+                Ok(spec) => ResolvedPlaySource::Tone(spec),
+                Err(error) => return Err(Box::new(error_result("play_media: tone", &error))),
+            },
+            PlayMediaSource::Http { url } => {
+                // A URL playback cannot be resolved synchronously without blocking the control
+                // connection for the whole fetch deadline, so it accepts now and fetches on its own
+                // task. What *is* checked synchronously is everything that needs no network — the
+                // scheme, the host and the allow-list — so an unusable URL is a plain control error
+                // rather than an accepted playback that fails a moment later.
+                if let Err(error) = media_fetch::validate_media_url(&url, &self.media_fetch_limits)
+                {
+                    return Err(Box::new(error_result("play_media: url", &error)));
+                }
+                let toward_a = if call_to.is_none() {
+                    false
+                } else {
+                    resolve_toward_a(from_tag, call_to.as_deref(), to_tag)
+                };
+                let play_id = self.next_play_id();
+                self.spawn_media_fetch(MediaFetchRequest {
+                    client,
+                    call_id: call_id.to_string(),
+                    from_tag: from_tag.to_string(),
+                    to_tag: to_tag.map(str::to_string),
+                    url,
+                    toward_a,
+                    options,
+                    repeat,
+                    start_pos_ms: start,
+                    play_id,
+                });
+                // The length is not known until the body has arrived, so the accept reports none.
+                return Ok((None, play_id));
+            }
             PlayMediaSource::DbId { .. } => {
                 return Err(Box::new(error_result(
                     "play_media",
@@ -6081,15 +6167,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 )))
             }
         };
-        let wav = match WavSource::parse(&bytes) {
-            Ok(wav) => wav,
-            Err(error) => return Err(Box::new(error_result("play_media: parse WAV", &error))),
+        let (request, source_duration_ms) = match resolved {
+            ResolvedPlaySource::Wav(wav) => {
+                let player = PcmPlayer::new(&wav, repeat, start);
+                let duration = player.duration_ms();
+                (PlayRequest::Pcm(Box::new(player)), Some(duration))
+            }
+            ResolvedPlaySource::Tone(spec) => {
+                let duration = spec.total_duration_ms();
+                (PlayRequest::Tone(spec), duration)
+            }
         };
-        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
-        let repeat = repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
-        let start = start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
-        let player = PcmPlayer::new(&wav, repeat, start);
-        let duration_ms = player.duration_ms();
+        // The accepted duration is the source's own length bounded by the `duration_ms` cap; a cap
+        // on an endless tone *is* the duration, and an uncapped endless tone reports none.
+        let duration_ms = match (source_duration_ms, options.duration_ms) {
+            (Some(source), Some(cap)) => Some(source.min(cap)),
+            (Some(source), None) => Some(source),
+            (None, cap) => cap,
+        };
         // Offer-only single-leg call: both directions face the caller on one endpoint and `process`
         // always runs the `a_to_b` branch, so inject on `a_to_b` (toward_a = false) — see the doc
         // comment. A normal 2-leg call resolves the target leg from `from_tag` as usual.
@@ -6099,47 +6194,178 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             resolve_toward_a(from_tag, call_to.as_deref(), to_tag)
         };
         let play_id = self.next_play_id();
-        self.media.control(
+        let gain = Gain::from_decibels(options.gain_decibels.unwrap_or(0));
+        // An overlay start can be rejected (all four slots busy), and that rejection has to reach the
+        // controller — so it waits for the actor's answer. A superseding start cannot be rejected on
+        // capacity grounds, so it stays fire-and-forget exactly as it always was.
+        let mut receiver = None;
+        let sender = if options.overlay {
+            let (sender, reply) = tokio::sync::oneshot::channel();
+            receiver = Some(reply);
+            Some(sender)
+        } else {
+            None
+        };
+        if !self.media.control(
             call_id,
             MediaControl::PlayAudio {
                 toward_a,
-                player: Box::new(player),
+                request: Box::new(request),
+                overlay: options.overlay,
+                gain,
+                duration_cap_ms: options.duration_ms,
                 play_id,
+                reply: sender,
             },
-        );
+        ) {
+            return Err(Box::new(error_result(
+                "play_media",
+                &"call has no media-processing actor",
+            )));
+        }
+        if let Some(receiver) = receiver {
+            match receiver.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(Box::new(error_result("play_media: overlay", &error)))
+                }
+                Err(_) => {
+                    return Err(Box::new(error_result(
+                        "play_media",
+                        &"media actor closed before the overlay started",
+                    )))
+                }
+            }
+        }
         Ok((duration_ms, play_id))
     }
 
-    /// Inject a prompt / announcement toward a leg ([`Command::PlayMedia`]). Answers immediately
-    /// (accept-on-start) with the playback's `play_id` and total `duration_ms`; the prompt's end is
-    /// reported asynchronously as an [`Event::PlayFinished`] carrying the same `play_id`. A controller
-    /// that wants to sequence a following action awaits that event's `Completed` reason. The NG
-    /// front-end takes this same entry and never consumes the event (fire-and-forget).
+    /// Fetch a URL playback's WAV on its own task, then start it on the media actor.
+    ///
+    /// Off the media path by construction: the media tick never waits on this, and neither does the
+    /// control connection — `play_media` has already accepted by the time this runs. The fetch is
+    /// bounded by [`Self::media_fetch_limits`], so the task always terminates. Every failure —
+    /// timeout, bad status, oversized body, non-WAV bytes, an actor that has gone away — resolves
+    /// the playback with `PlayFinished{Error}` under the accepted `play_id`, so a controller
+    /// awaiting it is never left hanging.
+    fn spawn_media_fetch(&self, request: MediaFetchRequest) {
+        let media = self.media.clone();
+        let limits = self.media_fetch_limits.clone();
+        let tls = self.ws_tls_client_config();
+        let events = self.events.get(&request.client).map(|entry| entry.clone());
+        let pending = PendingFetch {
+            call_id: request.call_id.clone(),
+            from_tag: request.from_tag.clone(),
+            to_tag: request.to_tag.clone(),
+            client: request.client,
+            // Filled in by `with_abort` once the task exists.
+            abort: None,
+        };
+        let play_id = request.play_id;
+        let failure_event = pending.play_finished(play_id, PlayEndReason::Error);
+        let pending_key = self.pending_fetches.clone();
+
+        let task = tokio::spawn(async move {
+            let outcome = fetch_and_start(&media, &limits, tls, &request).await;
+            // The entry is consumed either way: a completed fetch is no longer cancellable, and a
+            // failed one has just reported. Removing it here is what keeps the map bounded.
+            pending_key.remove(&play_id);
+            if let Err(reason) = outcome {
+                tracing::warn!(
+                    target: "siphon_rtp::control",
+                    call_id = %request.call_id,
+                    play_id,
+                    %reason,
+                    "play_media url fetch failed — the playback ends as PlayFinished error"
+                );
+                if let Some(sender) = events {
+                    if sender.try_send(failure_event).is_err() {
+                        tracing::debug!(
+                            target: "siphon_rtp::control",
+                            play_id,
+                            "PlayFinished dropped (control queue full or closed)"
+                        );
+                    }
+                }
+            }
+        });
+        self.pending_fetches
+            .insert(play_id, pending.with_abort(task.abort_handle()));
+    }
+
+    /// Cancel a still-running URL fetch for `play_id`, reporting it as `reason`. Returns whether a
+    /// pending fetch was cancelled.
+    fn cancel_pending_fetch(&self, play_id: u64, reason: PlayEndReason) -> bool {
+        let Some((_, pending)) = self.pending_fetches.remove(&play_id) else {
+            return false;
+        };
+        if let Some(abort) = &pending.abort {
+            abort.abort();
+        }
+        self.push_event(pending.client, pending.play_finished(play_id, reason));
+        true
+    }
+
+    /// Cancel every still-running URL fetch on a call, reporting each as `reason`. Returns how many
+    /// were cancelled. Called by a call-wide `stop_media` and by call teardown, so a fetch can never
+    /// outlive the call it was started for and start playing into a torn-down actor.
+    fn cancel_pending_fetches_for_call(&self, call_id: &str, reason: PlayEndReason) -> usize {
+        let ids: Vec<u64> = self
+            .pending_fetches
+            .iter()
+            .filter(|entry| entry.value().call_id == call_id)
+            .map(|entry| *entry.key())
+            .collect();
+        ids.into_iter()
+            .filter(|play_id| self.cancel_pending_fetch(*play_id, reason))
+            .count()
+    }
+
+    /// Replace the default [`MediaFetchLimits`] with the operator's (`main.rs` wiring). Builder-style
+    /// consuming setter, mirroring [`Self::with_cluster`].
+    #[must_use]
+    pub fn with_media_fetch_limits(mut self, limits: MediaFetchLimits) -> Self {
+        self.media_fetch_limits = limits;
+        self
+    }
+
+    /// The bounds a URL playback fetch runs under (test / observability helper).
+    #[must_use]
+    pub fn media_fetch_limits(&self) -> &MediaFetchLimits {
+        &self.media_fetch_limits
+    }
+
+    /// How many URL playbacks are still fetching (test / observability helper).
+    #[must_use]
+    pub fn pending_media_fetches(&self) -> usize {
+        self.pending_fetches.len()
+    }
+
+    /// Inject a prompt / announcement / tone toward a leg ([`Command::PlayMedia`]). Answers
+    /// immediately (accept-on-start) with the playback's `play_id` and total `duration_ms`; the
+    /// playback's end is reported asynchronously as an [`Event::PlayFinished`] carrying the same
+    /// `play_id`. A controller that wants to sequence a following action awaits that event's
+    /// `Completed` reason. The NG front-end takes this same entry and never consumes the event
+    /// (fire-and-forget).
+    ///
+    /// `duration_ms` is absent from the accept only when the source is endless and no cap was given
+    /// (an `*inf` tone) — there is no finite length to report.
     async fn play_media(
         &self,
         client: ClientId,
         call_id: &str,
         from_tag: &str,
         source: PlayMediaSource,
-        repeat_times: Option<u64>,
-        start_pos_ms: Option<u64>,
+        options: PlayOptions,
         to_tag: Option<&str>,
     ) -> CmdResult {
         match self
-            .start_play(
-                client,
-                call_id,
-                from_tag,
-                source,
-                repeat_times,
-                start_pos_ms,
-                to_tag,
-            )
+            .start_play(client, call_id, from_tag, source, options, to_tag)
             .await
         {
             Ok((duration_ms, play_id)) => CmdResult::Ok {
                 sdp: None,
-                duration_ms: Some(duration_ms),
+                duration_ms,
                 play_id: Some(play_id),
                 to_tag: None,
                 stats: None,
@@ -6148,15 +6374,94 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// Stop any prompt / DTMF playback on a call ([`Command::StopMedia`]).
-    fn stop_media(&self, client: ClientId, call_id: &str, _from_tag: &str) -> CmdResult {
+    /// Stop playback on a call ([`Command::StopMedia`]).
+    ///
+    /// With no `play_id` this stops everything — the superseding prompt, any DTMF burst and every
+    /// overlay — which is the original behaviour. With one, it stops only that playback and leaves
+    /// the rest running, and an id no playback holds is an error rather than a hollow success.
+    async fn stop_media(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        _from_tag: &str,
+        play_id: Option<u64>,
+    ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
         }
-        if self.media.control(call_id, MediaControl::StopPlay) {
-            ok_empty()
-        } else {
-            error_result("stop_media", &"call has no active media playback")
+        let Some(play_id) = play_id else {
+            // A URL playback whose fetch is still in flight has no actor state to stop, so cancel it
+            // here — otherwise it would start playing seconds after the controller stopped the call.
+            let cancelled =
+                self.cancel_pending_fetches_for_call(call_id, PlayEndReason::Stopped) > 0;
+            return if self.media.control(call_id, MediaControl::StopPlay) || cancelled {
+                ok_empty()
+            } else {
+                error_result("stop_media", &"call has no active media playback")
+            };
+        };
+        // Same window, targeted: the id may name a fetch that has not produced audio yet.
+        if self.cancel_pending_fetch(play_id, PlayEndReason::Stopped) {
+            return ok_empty();
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.media.control(
+            call_id,
+            MediaControl::StopPlayId {
+                play_id,
+                reply: sender,
+            },
+        ) {
+            return error_result("stop_media", &"call has no active media playback");
+        }
+        match receiver.await {
+            Ok(true) => ok_empty(),
+            Ok(false) => error_result(
+                "stop_media",
+                &format!("no playback {play_id} is running on this call"),
+            ),
+            Err(_) => error_result(
+                "stop_media",
+                &"media actor closed before the stop was applied",
+            ),
+        }
+    }
+
+    /// Retune a running playback's playout gain ([`Command::SetPlayGain`]) — how a controller ducks
+    /// an overlay bed under a prompt and lifts it again. Addressed by the `play_id` the playback's
+    /// accept returned; an id no playback holds is an error, never a hollow success.
+    async fn set_play_gain(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        _from_tag: &str,
+        play_id: u64,
+        gain_decibels: i32,
+    ) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.media.control(
+            call_id,
+            MediaControl::SetPlayGain {
+                play_id,
+                gain: Gain::from_decibels(gain_decibels),
+                reply: sender,
+            },
+        ) {
+            return error_result("set_play_gain", &"call has no active media playback");
+        }
+        match receiver.await {
+            Ok(true) => ok_empty(),
+            Ok(false) => error_result(
+                "set_play_gain",
+                &format!("no playback {play_id} is running on this call"),
+            ),
+            Err(_) => error_result(
+                "set_play_gain",
+                &"media actor closed before the gain was applied",
+            ),
         }
     }
 
@@ -9418,6 +9723,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Restore { .. } => "restore",
         Command::PlayMedia { .. } => "play_media",
         Command::StopMedia { .. } => "stop_media",
+        Command::SetPlayGain { .. } => "set_play_gain",
         Command::PlayDtmf { .. } => "play_dtmf",
         Command::SilenceMedia { .. } => "silence_media",
         Command::UnsilenceMedia { .. } => "unsilence_media",
@@ -9456,6 +9762,7 @@ fn command_call_id(command: &Command) -> Option<&str> {
         | Command::Checkpoint { call_id, .. }
         | Command::PlayMedia { call_id, .. }
         | Command::StopMedia { call_id, .. }
+        | Command::SetPlayGain { call_id, .. }
         | Command::PlayDtmf { call_id, .. }
         | Command::SilenceMedia { call_id, .. }
         | Command::UnsilenceMedia { call_id, .. }
@@ -9589,6 +9896,131 @@ fn unknown_call(call_id: &str) -> CmdResult {
     CmdResult::Error {
         reason: format!("unknown call: {call_id}"),
     }
+}
+
+/// The optional knobs on [`Command::PlayMedia`], grouped so the play path carries one parameter
+/// rather than six positional ones (and so a new knob is an added field, not another argument to
+/// thread through three call sites).
+#[derive(Debug, Clone, Copy, Default)]
+struct PlayOptions {
+    /// Total play count for a recorded prompt; `0`/`None` plays it once.
+    repeat_times: Option<u64>,
+    /// Seek into a recorded prompt before the first frame (and the point each loop rewinds to).
+    start_pos_ms: Option<u64>,
+    /// Hard playout cap. The only bound on an endless tone short of a stop.
+    duration_ms: Option<u64>,
+    /// Mix under the party's live egress instead of replacing it.
+    overlay: bool,
+    /// Playout gain in whole decibels; `None` ⇒ 0 dB (the source's own level).
+    gain_decibels: Option<i32>,
+}
+
+/// A `play_media` source after it has been fetched/read and validated, but before the media actor
+/// has turned it into a playback on the leg's egress clock.
+enum ResolvedPlaySource {
+    /// Decoded linear PCM from a WAV (inline blob, host file, or fetched body).
+    Wav(WavSource),
+    /// A parsed tone cadence, synthesised later at the leg's own rate.
+    Tone(ToneSpec),
+}
+
+/// Everything the background fetch task needs to start a URL playback once the bytes arrive.
+struct MediaFetchRequest {
+    client: ClientId,
+    call_id: String,
+    from_tag: String,
+    to_tag: Option<String>,
+    url: String,
+    toward_a: bool,
+    options: PlayOptions,
+    /// Total play count for the fetched prompt (`0`/`1` play it once).
+    repeat: u32,
+    /// Seek into the fetched prompt before the first frame.
+    start_pos_ms: u32,
+    play_id: u64,
+}
+
+/// A URL playback whose fetch has not finished. Holds what a cancellation needs: the call it
+/// belongs to, the identifiers its `PlayFinished` is keyed by, and the task to abort.
+struct PendingFetch {
+    call_id: String,
+    from_tag: String,
+    to_tag: Option<String>,
+    client: ClientId,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+impl PendingFetch {
+    /// Attach the spawned task's abort handle (built before the task exists, so it is set after).
+    fn with_abort(mut self, abort: tokio::task::AbortHandle) -> Self {
+        self.abort = Some(abort);
+        self
+    }
+
+    /// The completion event for this playback, keyed the same way the media actor keys its own.
+    fn play_finished(&self, play_id: u64, reason: PlayEndReason) -> Event {
+        Event::PlayFinished {
+            call_id: self.call_id.clone(),
+            from_tag: self.from_tag.clone(),
+            to_tag: self.to_tag.clone(),
+            play_id,
+            reason,
+            // A fetch that never produced audio played nothing — say so rather than omit it.
+            played_ms: Some(0),
+        }
+    }
+}
+
+/// Fetch a URL playback's WAV and hand it to the media actor.
+///
+/// Every step is bounded by `limits`, so this future always resolves; the error string it returns
+/// on failure is what the control plane logs and what the playback's `PlayFinished{Error}` stands
+/// for. Runs on its own task — never on the media path, never on a control connection.
+async fn fetch_and_start(
+    media: &Arc<MediaRegistry>,
+    limits: &MediaFetchLimits,
+    tls: Arc<rustls::ClientConfig>,
+    request: &MediaFetchRequest,
+) -> Result<(), String> {
+    let bytes = media_fetch::fetch_media(&request.url, limits, tls)
+        .await
+        .map_err(|error| error.to_string())?;
+    // The fetched bytes are as untrusted as anything else off the network: validated through the
+    // same pure-Rust RIFF/WAVE reader every other source uses, which errors rather than panics.
+    let wav = WavSource::parse(&bytes).map_err(|error| format!("parse WAV: {error}"))?;
+    let player = PcmPlayer::new(&wav, request.repeat, request.start_pos_ms);
+    let gain = Gain::from_decibels(request.options.gain_decibels.unwrap_or(0));
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    if !media.control(
+        &request.call_id,
+        MediaControl::PlayAudio {
+            toward_a: request.toward_a,
+            request: Box::new(PlayRequest::Pcm(Box::new(player))),
+            overlay: request.options.overlay,
+            gain,
+            duration_cap_ms: request.options.duration_ms,
+            play_id: request.play_id,
+            // The fetch always waits for the actor's verdict — unlike a synchronous start, there is
+            // no control response left to carry a rejection, so the only way an over-cap overlay can
+            // be reported at all is through this reply turning into a `PlayFinished{Error}`.
+            reply: Some(sender),
+        },
+    ) {
+        return Err("call has no media-processing actor".to_string());
+    }
+    match receiver.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("media actor closed before the playback started".to_string()),
+    }
+}
+
+/// Parse a WAV buffer for playback. Every source that yields bytes — inline blob, host file,
+/// fetched body — validates through this one point, so a malformed buffer is a typed error rather
+/// than something each source handles its own way.
+fn parse_prompt_wav(bytes: &[u8]) -> Result<ResolvedPlaySource, WavError> {
+    WavSource::parse(bytes).map(ResolvedPlaySource::Wav)
 }
 
 /// Map a control-plane [`ConferenceRole`] to the conference's internal [`Routing`]. A whisperer stays
@@ -16109,6 +16541,8 @@ mod tests {
                     repeat_times: None,
                     start_pos_ms: None,
                     duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
                     to_tag: None,
                 },
             )
@@ -16177,6 +16611,508 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlay_tone_playback_runs_end_to_end_through_the_control_plane() {
+        // Every new control-plane surface on one call: an overlay tone start, a second overlay, a
+        // gain retune, a `play_id`-targeted stop, and the four-slot cap. Proves each field reaches
+        // the code that acts on it — a field parsed and dropped would pass none of these.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events_rx = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let offered = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_near = sdp::parse(&ok_sdp_text(&offered))
+            .expect("engine near SDP")
+            .remote_rtp;
+
+        /// One `play_media` overlay start with a tone source.
+        fn overlay_tone(tone: &str, gain_decibels: i32, duration_ms: Option<u64>) -> Command {
+            Command::PlayMedia {
+                call_id: "overlay-call".into(),
+                from_tag: "tag-a".into(),
+                source: PlayMediaSource::Tone { tone: tone.into() },
+                repeat_times: None,
+                start_pos_ms: None,
+                duration_ms,
+                overlay: true,
+                gain_decibels: Some(gain_decibels),
+                to_tag: None,
+            }
+        }
+
+        // A preset ringback overlay: accepted with a play_id and, being endless, no duration.
+        let first = engine
+            .handle(CLIENT, overlay_tone("ringback_eu", -6, None))
+            .await;
+        let first_id = match first {
+            CmdResult::Ok {
+                play_id: Some(id),
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(
+                    duration_ms, None,
+                    "an endless tone with no cap reports no duration"
+                );
+                id
+            }
+            other => panic!("overlay accept expected, got {other:?}"),
+        };
+        assert!(
+            engine.media().is_transcoding_call("overlay-call"),
+            "the overlay promoted the offer-only relay into a processing MediaCall"
+        );
+
+        // A second overlay from an explicit cadence spec, this one capped: the cap is the duration.
+        let second = engine
+            .handle(
+                CLIENT,
+                overlay_tone("425/1000,0/4000*inf", -18, Some(2_000)),
+            )
+            .await;
+        let second_id = match second {
+            CmdResult::Ok {
+                play_id: Some(id),
+                duration_ms: Some(2_000),
+                ..
+            } => id,
+            other => panic!("capped overlay accept expected, got {other:?}"),
+        };
+        assert_ne!(first_id, second_id, "each playback gets its own id");
+
+        // The party hears the overlay even though nothing is flowing toward it yet.
+        let mut heard = false;
+        for _ in 0..25u16 {
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                assert_eq!(
+                    from, engine_near,
+                    "the overlay comes from the engine's port"
+                );
+                assert!(len > 12, "an RTP packet, not an empty datagram");
+                heard = true;
+                break;
+            }
+        }
+        assert!(
+            heard,
+            "an overlay with no live audio still reaches the party"
+        );
+
+        // Retune the first overlay in flight; an id no playback holds is an error, not a hollow ok.
+        let retuned = engine
+            .handle(
+                CLIENT,
+                Command::SetPlayGain {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: first_id,
+                    gain_decibels: -20,
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(retuned, CmdResult::Ok { .. }), "gain accepted");
+        let unknown = engine
+            .handle(
+                CLIENT,
+                Command::SetPlayGain {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: 999_999,
+                    gain_decibels: 0,
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(unknown, CmdResult::Error { .. }),
+            "an unknown play_id is an error, got {unknown:?}"
+        );
+
+        // Fill the remaining two slots, then prove the fifth is rejected.
+        for _ in 0..2 {
+            let filled = engine
+                .handle(CLIENT, overlay_tone("busy_eu", -12, None))
+                .await;
+            assert!(matches!(filled, CmdResult::Ok { .. }), "slot accepted");
+        }
+        let over_cap = engine
+            .handle(CLIENT, overlay_tone("busy_eu", -12, None))
+            .await;
+        match over_cap {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("no free overlay slot"),
+                "the over-cap rejection must name the cap, got {reason:?}"
+            ),
+            other => panic!("a fifth overlay must be rejected, got {other:?}"),
+        }
+
+        // Stop just the second overlay: it reports Stopped, the others keep running.
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopMedia {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: Some(second_id),
+                },
+            )
+            .await;
+        assert!(matches!(stopped, CmdResult::Ok { .. }), "targeted stop ok");
+        let mut finished = None;
+        for _ in 0..40u16 {
+            match timeout(Duration::from_millis(200), events_rx.recv_async()).await {
+                Ok(Ok(Event::PlayFinished {
+                    play_id, reason, ..
+                })) => {
+                    finished = Some((play_id, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            finished,
+            Some((second_id, siphon_rtp_proto::PlayEndReason::Stopped)),
+            "only the stopped overlay reports, under its own play_id"
+        );
+        // A second stop of the same id finds nothing.
+        let again = engine
+            .handle(
+                CLIENT,
+                Command::StopMedia {
+                    call_id: "overlay-call".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: Some(second_id),
+                },
+            )
+            .await;
+        assert!(
+            matches!(again, CmdResult::Error { .. }),
+            "stopping an id twice is an error, got {again:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_media_from_a_url_rejects_a_bad_scheme_before_it_accepts() {
+        // A URL the engine will never fetch is a plain control error, not an accepted playback that
+        // fails a second later — the controller learns immediately.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr_a) = phone().await;
+        let _ = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "url-bad".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.invalid/p.wav",
+            "not a url",
+        ] {
+            let result = engine
+                .handle(
+                    CLIENT,
+                    Command::PlayMedia {
+                        call_id: "url-bad".into(),
+                        from_tag: "tag-a".into(),
+                        source: PlayMediaSource::Http { url: url.into() },
+                        repeat_times: None,
+                        start_pos_ms: None,
+                        duration_ms: None,
+                        overlay: false,
+                        gain_decibels: None,
+                        to_tag: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, CmdResult::Error { .. }),
+                "{url} must be refused on accept, got {result:?}"
+            );
+        }
+        assert_eq!(
+            engine.pending_media_fetches(),
+            0,
+            "a refused URL must leave no pending fetch behind"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_media_from_a_url_that_never_answers_ends_with_play_finished_error() {
+        // The requirement in one test: a fetch that hangs must never hang the leg. `play_media`
+        // accepts immediately with a `play_id` and no duration (the length is not knowable yet), the
+        // failure arrives asynchronously as `PlayFinished{Error}` under that id, and the call is
+        // still alive afterwards.
+        use crate::media_fetch::MediaFetchLimits;
+        use std::sync::Arc as StdArc;
+
+        // A loopback listener that accepts and never answers — the first-byte timeout's job.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let silent = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                drop(stream);
+            }
+        });
+
+        let engine =
+            Engine::new(UdpLoopbackDatapath::new()).with_media_fetch_limits(MediaFetchLimits {
+                connect_timeout: std::time::Duration::from_millis(300),
+                first_byte_timeout: std::time::Duration::from_millis(300),
+                total_timeout: std::time::Duration::from_millis(1_000),
+                max_body_bytes: 64 * 1024,
+                max_redirects: 1,
+                allow_hosts: StdArc::new(Vec::new()),
+            });
+        let events_rx = engine.register_client(CLIENT);
+        let (_phone, addr_a) = phone().await;
+        let _ = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "url-hang".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        let accepted = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "url-hang".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Http {
+                        url: format!("http://{silent}/prompt.wav"),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
+                    to_tag: None,
+                },
+            )
+            .await;
+        let play_id = match accepted {
+            CmdResult::Ok {
+                play_id: Some(id),
+                duration_ms: None,
+                ..
+            } => id,
+            other => panic!("a URL play accepts with a play_id and no duration, got {other:?}"),
+        };
+
+        let mut finished = None;
+        // Up to 8 s of polling: the fetch's own bounds fire in well under one, but a loaded CI box
+        // must not turn a real pass into a flake. An elapsed poll is "not yet", not "never".
+        for _ in 0..40u16 {
+            match timeout(Duration::from_millis(200), events_rx.recv_async()).await {
+                Ok(Ok(Event::PlayFinished {
+                    play_id: id,
+                    reason,
+                    call_id,
+                    ..
+                })) => {
+                    assert_eq!(call_id, "url-hang");
+                    finished = Some((id, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                // The control channel closed — nothing more will arrive.
+                Ok(Err(_)) => break,
+                // No event in this slice; the fetch is still running its bounds down.
+                Err(_) => continue,
+            }
+        }
+        assert_eq!(
+            finished,
+            Some((play_id, siphon_rtp_proto::PlayEndReason::Error)),
+            "a fetch that never answers resolves the playback as an error"
+        );
+        assert!(
+            engine.owned_call(CLIENT, "url-hang", |_| ()).is_some(),
+            "the leg survives a failed prompt fetch"
+        );
+        assert_eq!(
+            engine.pending_media_fetches(),
+            0,
+            "a finished fetch removes its own pending entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_a_url_playback_before_its_fetch_lands_cancels_it() {
+        // Between the accept and the fetch there is a window where the controller holds a `play_id`
+        // for something the media actor has never heard of. A stop in that window must cancel, not
+        // be ignored and then play seconds later.
+        use crate::media_fetch::MediaFetchLimits;
+        use std::sync::Arc as StdArc;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let silent = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                drop(stream);
+            }
+        });
+
+        let engine =
+            Engine::new(UdpLoopbackDatapath::new()).with_media_fetch_limits(MediaFetchLimits {
+                connect_timeout: std::time::Duration::from_millis(800),
+                first_byte_timeout: std::time::Duration::from_millis(2_000),
+                total_timeout: std::time::Duration::from_millis(2_500),
+                max_body_bytes: 64 * 1024,
+                max_redirects: 1,
+                allow_hosts: StdArc::new(Vec::new()),
+            });
+        let events_rx = engine.register_client(CLIENT);
+        let (_phone, addr_a) = phone().await;
+        let _ = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "url-stop".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let accepted = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "url-stop".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Http {
+                        url: format!("http://{silent}/slow.wav"),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
+                    to_tag: None,
+                },
+            )
+            .await;
+        let play_id = match accepted {
+            CmdResult::Ok {
+                play_id: Some(id), ..
+            } => id,
+            other => panic!("expected an accept, got {other:?}"),
+        };
+        assert_eq!(engine.pending_media_fetches(), 1, "the fetch is in flight");
+
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopMedia {
+                    call_id: "url-stop".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: Some(play_id),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stopping an in-flight fetch is accepted, got {stopped:?}"
+        );
+        assert_eq!(engine.pending_media_fetches(), 0, "the fetch was cancelled");
+        let event = timeout(Duration::from_millis(500), events_rx.recv_async())
+            .await
+            .expect("an event arrives")
+            .expect("channel open");
+        assert_eq!(
+            event,
+            Event::PlayFinished {
+                call_id: "url-stop".into(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+                play_id,
+                reason: siphon_rtp_proto::PlayEndReason::Stopped,
+                played_ms: Some(0),
+            },
+            "the cancelled fetch reports Stopped under its own play_id"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_media_rejects_a_malformed_tone_spec() {
+        // The tone string is controller-supplied and untrusted: a malformed one is a clean control
+        // error, never a panic and never a silently-started playback.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr_a) = phone().await;
+        let _ = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "bad-tone".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        for tone in ["", "425", "425/0", "9000/100", "not_a_preset", "425/100*0"] {
+            let result = engine
+                .handle(
+                    CLIENT,
+                    Command::PlayMedia {
+                        call_id: "bad-tone".into(),
+                        from_tag: "tag-a".into(),
+                        source: PlayMediaSource::Tone { tone: tone.into() },
+                        repeat_times: None,
+                        start_pos_ms: None,
+                        duration_ms: None,
+                        overlay: false,
+                        gain_decibels: None,
+                        to_tag: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, CmdResult::Error { .. }),
+                "tone {tone:?} must be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn play_media_on_an_unknown_call_returns_an_error() {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let result = engine
@@ -16189,6 +17125,8 @@ mod tests {
                     repeat_times: None,
                     start_pos_ms: None,
                     duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
                     to_tag: None,
                 },
             )
@@ -16599,6 +17537,7 @@ mod tests {
                 Command::StopMedia {
                     call_id: "nope".into(),
                     from_tag: "f".into(),
+                    play_id: None,
                 },
             )
             .await;

@@ -112,3 +112,12 @@ path = "fuzz_targets/opus_decode_fuzz.rs"
 test = false
 doc = false
 bench = false
+
+# Call-progress tone cadence grammar — a controller-supplied `play_media` tone string, parsed and
+# then rendered, so neither the parser nor the generator can be driven off the rails.
+[[bin]]
+name = "tone_spec_fuzz"
+path = "fuzz_targets/tone_spec_fuzz.rs"
+test = false
+doc = false
+bench = false

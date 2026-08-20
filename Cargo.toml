@@ -69,6 +69,15 @@ getrandom = "0.3"
 tokio-tungstenite = "0.30"
 webpki-roots = "1.0"
 futures-util = "0.3"
+# HTTP/1.1 client for the `play_media` URL source (fetch a WAV prompt over http/https). Pure Rust,
+# no C: hyper's low-level `client::conn` API is driven directly rather than through a pooled client,
+# so the connect / first-byte / overall-deadline bounds and the redirect cap are ours to enforce,
+# and TLS is the tokio-rustls/ring stack already vendored for `wss://` (never aws-lc-rs, never
+# native-tls). `hyper-util` supplies only the tokio<->hyper IO adapter; `http-body-util` the body
+# reader the size cap is enforced on.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
 # Control protocol (JSON over TCP) + serde
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

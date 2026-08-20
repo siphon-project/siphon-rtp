@@ -47,6 +47,7 @@ nav:
       - Secure media (SRTP / SDES): cookbook/secure-srtp.md
       - WebRTC legs (DTLS-SRTP / ICE / TURN): cookbook/webrtc.md
       - Voice-AI (RTP ↔ WebSocket): cookbook/voice-ai.md
+      - Announcements, ringback & hold music: cookbook/playback.md
       - Conferencing (MCU): cookbook/conferencing.md
       - NAT traversal & latching: cookbook/nat.md
       - Recording & forking (SIPREC): cookbook/recording.md

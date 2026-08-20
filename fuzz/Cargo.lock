@@ -153,6 +153,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-waker"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -169,6 +175,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -631,6 +643,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-channel"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
+dependencies = [
+ "futures-core",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -789,6 +810,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-body"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c"
+dependencies = [
+ "bytes",
+ "http",
+]
+
+[[package]]
+name = "http-body-util"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -801,6 +845,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "typenum",
+]
+
+[[package]]
+name = "hyper"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d22053281f852e11534f5198498373cbb59295120a20771d90f7ed1897490a72"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "futures-channel",
+ "futures-core",
+ "http",
+ "http-body",
+ "httparse",
+ "itoa",
+ "pin-project-lite",
+ "smallvec",
+ "tokio",
+ "want",
+]
+
+[[package]]
+name = "hyper-util"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "hyper",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -1093,7 +1171,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -1527,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "clap",
@@ -1535,6 +1613,9 @@ dependencies = [
  "flume",
  "futures-util",
  "getrandom 0.3.4",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rustls",
  "serde",
  "serde_json",
@@ -1554,6 +1635,7 @@ dependencies = [
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "toml",
  "tracing",
@@ -1563,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-codec"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "siphon-rtp-simd",
  "thiserror 2.0.20",
@@ -1571,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-datapath"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1585,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dsp"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "siphon-rtp-simd",
  "thiserror 2.0.20",
@@ -1593,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dtls"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1608,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ebpf-common"
-version = "0.1.5"
+version = "0.2.1"
 
 [[package]]
 name = "siphon-rtp-fuzz"
@@ -1626,14 +1708,14 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-hep"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "siphon-rtp-ice"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "siphon-rtp-stun",
  "thiserror 2.0.20",
@@ -1641,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-media"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "flume",
@@ -1658,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ngcompat"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "siphon-rtp-proto",
  "thiserror 2.0.20",
@@ -1668,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -1678,14 +1760,14 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-simd"
-version = "0.1.5"
+version = "0.2.1"
 
 [[package]]
 name = "siphon-rtp-srtp"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "aes",
- "base64",
+ "base64 0.23.1",
  "ctr",
  "getrandom 0.3.4",
  "hmac",
@@ -1696,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-stun"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "getrandom 0.3.4",
  "thiserror 2.0.20",
@@ -1704,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-turn"
-version = "0.1.5"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "flume",
@@ -2076,6 +2158,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "try-lock"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
 name = "tungstenite"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2138,6 +2226,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "want"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
+dependencies = [
+ "try-lock",
+]
 
 [[package]]
 name = "wasi"
