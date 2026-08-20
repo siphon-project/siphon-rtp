@@ -17,14 +17,17 @@ it, and that designation stays through 1.0.0.
 ### Control plane
 - **Native JSON-over-TCP control protocol** (`siphon-rtp-proto`) — length-prefixed
   JSON, request/response correlated by id, async events pushed back, optional
-  shared-secret authentication. Verbs: offer, answer, delete, query, ping, list,
-  statistics, load, node_info, drain/undrain, checkpoint, restore, play_media,
-  stop_media, play_dtmf, silence/unsilence_media, block/unblock_media,
-  block/unblock_dtmf, echo, start/stop_recording, subscribe_request/answer,
-  unsubscribe, conference_join/leave/route/bridge, attach/detach_ws_tee.
-  `play_media` accepts immediately with a `play_id` and reports its end
-  asynchronously (below). Events: dtmf, media_timeout, play_finished,
-  active_speaker, call_quality, call_summary, ws_tee_started, ws_tee_ended.
+  shared-secret authentication. Verbs: offer, reoffer, ice_candidate, answer,
+  answer_local, delete, query, ping, list, statistics, load, node_info,
+  drain/undrain, checkpoint, restore, play_media, stop_media, play_dtmf,
+  silence/unsilence_media, block/unblock_media, block/unblock_dtmf, echo,
+  start/stop_recording, subscribe_request/answer, unsubscribe,
+  conference_join/leave/route/bridge, attach/detach_ws_tee. `play_media` accepts
+  immediately with a `play_id` and reports its end asynchronously (below). Events:
+  dtmf, text, media_timeout, play_finished, active_speaker, call_quality,
+  call_summary, ws_tee_started, ws_tee_ended — an unrecognised event tag decodes to
+  `Unknown`, so a controller pinned to an older proto never hard-fails against a
+  newer engine.
 - **rtpengine NG/bencode front-end** (`--ng`, `siphon-rtp-ngcompat`) — drop-in for
   existing Kamailio / OpenSIPS + `mod_rtpengine` deployments, plus siphon-rtp
   extensions (cluster load/node-info/drain, HA checkpoint/restore).
