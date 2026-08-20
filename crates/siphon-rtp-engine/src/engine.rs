@@ -6595,6 +6595,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &"db-id media source is not supported",
                 )))
             }
+            // [`PlayMediaSource`] is `#[non_exhaustive]`, so a source added to the contract after
+            // this resolver was written lands here. Refuse it exactly as `db_id` is refused —
+            // accepting the play would hand the controller a `play_id` and then never emit the
+            // `play_finished` it waits on, which is the failure mode this release just removed
+            // elsewhere. The error is logged at `warn` by the dispatch wrapper.
+            _ => {
+                return Err(Box::new(error_result(
+                    "play_media",
+                    &"media source is not supported by this engine",
+                )))
+            }
         };
         let (request, source_duration_ms) = match resolved {
             ResolvedPlaySource::Wav(wav) => {
@@ -10251,6 +10262,11 @@ fn command_name(command: &Command) -> &'static str {
         Command::AttachWsTee { .. } => "attach_ws_tee",
         Command::DetachWsTee { .. } => "detach_ws_tee",
         Command::Authenticate { .. } => "authenticate",
+        // [`Command`] is `#[non_exhaustive]`. A verb this engine has no arm for still has to be
+        // *named* in the log line and in the `unsupported command: …` error the dispatch returns,
+        // so it gets a stable placeholder rather than nothing. The dispatch refuses it; this only
+        // decides what the refusal is called.
+        _ => "unknown",
     }
 }
 
@@ -10300,6 +10316,11 @@ fn command_call_id(command: &Command) -> Option<&str> {
         | Command::Undrain
         | Command::Restore { .. }
         | Command::Authenticate { .. } => None,
+        // [`Command`] is `#[non_exhaustive]`. A correct no-op: this function only picks the
+        // correlation id for the control log line, and there is no field to read on a variant this
+        // build does not know. The command itself is refused by the dispatch's wildcard arm, so
+        // nothing is silently accepted here — only logged with `call_id = "-"`.
+        _ => None,
     }
 }
 

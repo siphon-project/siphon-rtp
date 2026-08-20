@@ -14,8 +14,8 @@ keywords = ["rtp", "rtcp", "jitter", "voip", "media"]
 categories = ["network-programming", "multimedia::audio"]
 
 [dependencies]
-siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.2.0" }
-siphon-rtp-dsp = { path = "../siphon-rtp-dsp", version = "0.2.0" }
+siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.3.0" }
+siphon-rtp-dsp = { path = "../siphon-rtp-dsp", version = "0.3.0" }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

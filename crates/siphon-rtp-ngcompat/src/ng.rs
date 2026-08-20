@@ -325,6 +325,24 @@ pub fn serialize_result(result: &CmdResult) -> Value {
                 dict.insert(b"totals".to_vec(), Value::Dict(totals));
             }
         }
+        // [`CmdResult`] is `#[non_exhaustive]`, so a result kind added to the contract after this
+        // front-end was written must not fall through to a dict with no `result` key — an NG caller
+        // reads that as a malformed reply and has nothing to log. Answer the `error` result the NG
+        // protocol already defines, naming the shortfall, and warn with the discriminant so the gap
+        // shows up in the operator's log rather than only at the caller. Unreachable within a
+        // release (every crate here ships at the one workspace version); it exists for the version
+        // skew a `path` dependency cannot have but a published `siphon-rtp-proto` can.
+        other => {
+            tracing::warn!(
+                result = ?std::mem::discriminant(other),
+                "control result has no NG rendering; answering error"
+            );
+            dict.insert(b"result".to_vec(), Value::string("error"));
+            dict.insert(
+                b"error-reason".to_vec(),
+                Value::string("result kind not supported by the NG front-end"),
+            );
+        }
     }
     Value::Dict(dict)
 }

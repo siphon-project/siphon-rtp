@@ -8,6 +8,76 @@
 //! server-initiated and carry no id. The verb set and session keying
 //! (`call_id` / `from_tag` / `to_tag`) mirror the rtpengine NG semantics SIPhon already
 //! speaks — only the encoding (JSON, not bencode) differs.
+//!
+//! # Forward compatibility
+//!
+//! The **JSON wire** is additive by construction: every optional field is
+//! `Option` + `skip_serializing_if`, so a field a peer does not know is simply absent, and an
+//! [`Event`] tag a consumer does not know decodes to [`Event::Unknown`] rather than failing the
+//! frame. A newer engine and an older controller interoperate on the wire.
+//!
+//! The **Rust API** needs its own answer, because a `match` in a downstream crate stops compiling
+//! the moment an enum here grows a variant. The rule this crate applies:
+//!
+//! * Types the engine **emits** and a controller merely *observes* carry `#[non_exhaustive]` —
+//!   [`Event`], [`CmdResult`], [`PlayEndReason`], [`WsTeeEndReason`], [`ProtoError`]. A variant a
+//!   consumer has never heard of is genuinely ignorable ("some event happened", "the playback
+//!   ended some other way"), so forcing every downstream `match` to be rewritten on every release
+//!   buys nothing.
+//! * The two types a controller **sends** that will keep growing — [`Command`] and
+//!   [`PlayMediaSource`] — also carry it, so a controller library that inspects a verb still
+//!   compiles against a newer engine. The engine's own dispatch answers an unhandled verb or
+//!   source with a `CmdResult::Error` naming it; it never accepts one silently.
+//! * The small **closed selector** sets a controller sends to *choose* engine behaviour are
+//!   deliberately left exhaustive — [`WsTeeDirection`], [`WsVadEngine`], [`ConferenceRole`],
+//!   [`BridgeDirection`]. Nothing sensible happens when a consumer ignores one of those: falling
+//!   back to a default is exactly the silent downgrade the engine refuses elsewhere. Losing
+//!   compilation on a new variant is the feature, and each attribute site says so again.
+//!
+//! What `#[non_exhaustive]` at the **enum** level does *not* buy: it does not make **adding a
+//! field to an existing struct variant** additive. `Command::PlayMedia { .. }` gaining a field
+//! still breaks external construction. Making *that* additive needs `#[non_exhaustive]` on each
+//! variant, which would also stop other crates constructing them at all — including this
+//! workspace's own tests — so it is deliberately not done.
+//!
+//! A doctest compiles as its own crate, so the two below are the property under test rather than a
+//! description of it. Matching an emitted enum exhaustively from outside no longer builds:
+//!
+//! ```compile_fail,E0004
+//! use siphon_rtp_proto::{Event, PlayEndReason};
+//! fn played(event: &Event) -> bool {
+//!     match event {
+//!         Event::PlayFinished { reason, .. } => *reason == PlayEndReason::Completed,
+//!         Event::Dtmf { .. } => false,
+//!         Event::Text { .. } => false,
+//!         Event::MediaTimeout { .. } => false,
+//!         Event::ActiveSpeaker { .. } => false,
+//!         Event::CallQuality { .. } => false,
+//!         Event::CallSummary { .. } => false,
+//!         Event::WsTeeStarted { .. } => false,
+//!         Event::BeepDetected { .. } => false,
+//!         Event::WsTeeEnded { .. } => false,
+//!         Event::Unknown => false,
+//!     }
+//! }
+//! ```
+//!
+//! Adding the wildcard arm is the whole migration, and it keeps building when the next variant
+//! lands:
+//!
+//! ```
+//! use siphon_rtp_proto::{Event, PlayEndReason};
+//! fn played(event: &Event) -> bool {
+//!     match event {
+//!         Event::PlayFinished { reason, .. } => *reason == PlayEndReason::Completed,
+//!         // Any other event — including one this build has never heard of — is not a completed
+//!         // playback. Make the wildcard *do* something, or say why it correctly does nothing: a
+//!         // silent catch-all is how a new variant becomes an invisible dropped notification.
+//!         _ => false,
+//!     }
+//! }
+//! assert!(!played(&Event::Unknown));
+//! ```
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
@@ -35,8 +105,14 @@ pub struct Request {
 
 /// The control verbs. Internally tagged on `"command"`; a near-mechanical translation of
 /// the rtpengine NG verb set SIPhon emits today.
+///
+/// `#[non_exhaustive]`: the verb set grows every release, and a controller library that inspects a
+/// verb should keep compiling against a newer engine rather than break on a verb it will never
+/// send. The engine's own dispatch keeps a wildcard arm that answers an unhandled verb with
+/// `CmdResult::Error` naming it — refused visibly, never accepted silently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Command {
     /// SDP offer (A→B). Allocates media ports, rewrites SDP, returns the rewritten SDP.
     Offer {
@@ -419,6 +495,10 @@ pub enum Command {
 
 /// Which leg(s) of a call a [`Command::AttachWsTee`] streams. "Caller" is the offerer (leg A, the
 /// `from_tag` side); "callee" is the answerer (leg B).
+///
+/// Deliberately **not** `#[non_exhaustive]`: a closed three-way selector describing which audio a
+/// consumer receives. A fourth direction would change the shape of the stream, so every consumer
+/// has to think about it — the broken `match` is the notification.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WsTeeDirection {
@@ -432,6 +512,11 @@ pub enum WsTeeDirection {
 }
 
 /// Which voice-activity detector the WS uplink runs (`ProfileFlags::ws_vad_engine`).
+///
+/// Deliberately **not** `#[non_exhaustive]`: this selects behaviour the caller asked for by name.
+/// A consumer that met an unknown detector through a wildcard would have to fall back to the
+/// detector the controller was explicitly avoiding — the silent downgrade the engine already
+/// refuses at offer time. Exhaustiveness forces the fallback question to be answered in code.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WsVadEngine {
@@ -449,8 +534,12 @@ pub enum WsVadEngine {
 }
 
 /// Why a WebSocket tee stream ended, carried by [`Event::WsTeeEnded`].
+///
+/// `#[non_exhaustive]`: engine-emitted, purely informational. A reason a consumer has not heard of
+/// still means "the stream ended", which is the part that drives its state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WsTeeEndReason {
     /// The controller detached it ([`Command::DetachWsTee`]) or the call was torn down.
     Detached,
@@ -466,6 +555,11 @@ pub enum WsTeeEndReason {
 
 /// A participant's role in a conference — the audio routing matrix (call-centre / PBX). Tagged on
 /// `"role"`. The symmetric "everyone hears everyone" conference is the [`ConferenceRole::Talker`] case.
+///
+/// Deliberately **not** `#[non_exhaustive]`: the role *is* the routing matrix. A new role is by
+/// definition a new row and column in who-hears-whom, and a mixer that swept it into a wildcard
+/// would seat the participant with the wrong audience — a privacy failure, not a missing feature.
+/// Every consumer must be made to handle it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum ConferenceRole {
@@ -487,6 +581,9 @@ pub enum ConferenceRole {
 }
 
 /// The direction(s) audio flows across a conference bridge ([`Command::ConferenceBridge`]).
+///
+/// Deliberately **not** `#[non_exhaustive]`: three values that exhaust the possibilities for two
+/// rooms, and getting one wrong means audio crossing a bridge it was not meant to cross.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BridgeDirection {
@@ -500,8 +597,14 @@ pub enum BridgeDirection {
 }
 
 /// Source for [`Command::PlayMedia`]. Tagged on `"source"`.
+///
+/// `#[non_exhaustive]`: the source list grows with the engine (this release added `tone` and
+/// `http`), and a controller should not have to be rebuilt for a source it does not use. The
+/// engine refuses a source it cannot resolve with a `CmdResult::Error` rather than accepting the
+/// play and never producing audio.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PlayMediaSource {
     /// A path on the engine host.
     File { path: String },
@@ -727,8 +830,13 @@ pub struct Response {
 }
 
 /// The result payload of a [`Response`]. Tagged on `"result"`.
+///
+/// `#[non_exhaustive]`: a new result kind arrives only in answer to a verb the controller chose to
+/// send, so a controller that never sends that verb never meets it, and one that does can treat
+/// the unknown kind as "not the answer I awaited" without a rebuild.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CmdResult {
     /// Success. Fields are populated per the originating command.
     Ok {
@@ -924,8 +1032,13 @@ pub struct TextStreamStats {
 /// How a [`Command::PlayMedia`] playback ended, carried by [`Event::PlayFinished`]. Only
 /// [`PlayEndReason::Completed`] means the prompt played out in full; the others resolve a controller's
 /// await as *not* completed (the prompt did not finish on its own).
+///
+/// `#[non_exhaustive]`: the safe reading of an unknown reason is already the documented one —
+/// anything that is not `Completed` resolves the await as not-completed — so a wildcard arm is
+/// correct rather than lossy, and a new way for a prompt to end must not break a controller build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PlayEndReason {
     /// The prompt drained naturally — all repeats done, or the `duration_ms` cap was hit.
     Completed,
@@ -942,8 +1055,13 @@ pub enum PlayEndReason {
 ///
 /// (No `Eq`: [`Event::CallQuality`] carries `f64` quality figures. `PartialEq` still derives, so
 /// `assert_eq!` in tests and value comparisons keep working.)
+///
+/// `#[non_exhaustive]`: the Rust half of the forward compatibility `#[serde(other)]` already gives
+/// the wire. An event is a notification the consumer did not ask for — one it does not recognise is
+/// ignorable by construction, and every release adds some.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Event {
     /// A DTMF digit was detected on a leg. Deserializes 1:1 into SIPhon's `DtmfEvent`.
     Dtmf {
@@ -1109,7 +1227,11 @@ pub enum Event {
 }
 
 /// Errors from the framing helpers.
+///
+/// `#[non_exhaustive]`: the standard posture for a public error type. A caller that cannot classify
+/// a new failure mode still has `Display`/`source`, and a new one must not be a breaking change.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProtoError {
     /// JSON (de)serialization failure.
     #[error("json error: {0}")]
