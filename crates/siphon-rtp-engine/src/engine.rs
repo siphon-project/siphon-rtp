@@ -14566,6 +14566,248 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------------------------------
+    // WebSocket takeover on a SECURE offerer (SDES-SRTP / DTLS-SRTP).
+    //
+    // A takeover call deliberately wires no A<->B path: the WS server *is* leg A's far side. That is
+    // only a complete call when the engine can actually terminate leg A's media — which, on a secure
+    // offerer, means holding a `SecureLeg` (RFC 3711) keyed by SDES (RFC 4568) or by the DTLS-SRTP
+    // handshake (RFC 5764). Accepting `ws_uri` on a secure offerer without one answers cleanly and
+    // bridges nothing: A's SRTP is fed to the decoder as ciphertext and the downlink leaves as
+    // plaintext RTP the peer discards.
+    // ----------------------------------------------------------------------------------------
+
+    /// An **SDES-SRTP offerer** (RFC 4568): the caller's own `m=audio` is `RTP/SAVP` and carries its
+    /// `a=crypto`. Distinct from the engine's `transport_protocol` SDES, which secures leg *B*.
+    fn sdes_offerer_sdp(rtp: SocketAddr, key: &CryptoAttribute) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\na={crypto}\r\n",
+            ip = rtp.ip(),
+            port = rtp.port(),
+            crypto = key.to_attribute_value(),
+        )
+    }
+
+    /// A **DTLS-SRTP offerer** (RFC 5764 / RFC 5763 §5): the caller's own `m=audio` is
+    /// `UDP/TLS/RTP/SAVPF` and carries `a=setup` + `a=fingerprint`.
+    fn dtls_offerer_sdp(
+        rtp: SocketAddr,
+        fingerprint: &siphon_rtp_dtls::Fingerprint,
+        setup: &str,
+    ) -> String {
+        let hex = fingerprint
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+             a=setup:{setup}\r\na=fingerprint:{hash} {hex}\r\n",
+            ip = rtp.ip(),
+            port = rtp.port(),
+            hash = fingerprint.hash_function,
+        )
+    }
+
+    /// A WS server that republishes every frame it receives on `frames` and forwards anything pushed
+    /// into `downlink` to the engine. The shared harness for the secure-takeover tests.
+    async fn takeover_ws_server() -> (
+        String,
+        flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+        flume::Sender<Vec<u8>>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
+        let addr = listener.local_addr().expect("ws addr");
+        let (frames_tx, frames_rx) = flume::unbounded::<Message>();
+        let (down_tx, down_rx) = flume::unbounded::<Vec<u8>>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept ws");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws handshake");
+            let (mut sink, mut source) = socket.split();
+            loop {
+                tokio::select! {
+                    incoming = source.next() => match incoming {
+                        Some(Ok(message)) => {
+                            if frames_tx.send(message).is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    },
+                    downlink = down_rx.recv_async() => match downlink {
+                        Ok(bytes) => {
+                            if sink.send(Message::binary(bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                }
+            }
+        });
+        (format!("ws://{addr}/stream"), frames_rx, down_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_refuses_ws_takeover_on_an_sdes_srtp_offerer() {
+        // The two-leg takeover (`offer` + `ws_uri`) builds A's answer at `answer` time out of *B's*
+        // SDP, so it has nowhere to advertise the engine's own `a=crypto` — the engine cannot become
+        // the secure far side of A on this verb. Accepting it produced a call that answered and
+        // bridged nothing. Refuse at OFFER time, before the controller commits to the dialog.
+        //
+        // The WS server is live, so the refusal is proven to be about the offerer's security posture
+        // and not an incidental dial failure.
+        let (ws_uri, _frames, _downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let peer_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("peer key");
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-sdes-offer".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr_a, &peer_key),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("ws-takeover-secure-offerer"),
+                "the refusal must name the reason, got: {reason}"
+            ),
+            other => panic!("a secure offerer with ws_uri must be refused, got {other:?}"),
+        }
+        assert!(
+            !engine.calls.contains_key("ws-sdes-offer"),
+            "a refused offer creates no call"
+        );
+        assert!(!engine.ws().is_ws_call("ws-sdes-offer"));
+        assert_eq!(engine.client_call_count(CLIENT), 0, "no quota slot leaked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_refuses_ws_takeover_on_a_dtls_srtp_offerer() {
+        // Same gap on the DTLS-SRTP (RFC 5764) shape — a browser-style offerer.
+        let (ws_uri, _frames, _downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let peer_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("peer cert");
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-dtls-offer".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: dtls_offerer_sdp(addr_a, &peer_cert.fingerprint(), "actpass"),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("ws-takeover-secure-offerer"),
+                "the refusal must name the reason, got: {reason}"
+            ),
+            other => panic!("a DTLS-SRTP offerer with ws_uri must be refused, got {other:?}"),
+        }
+        assert!(!engine.calls.contains_key("ws-dtls-offer"));
+        assert_eq!(engine.client_call_count(CLIENT), 0, "no quota slot leaked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_local_on_an_sdes_offerer_answers_with_the_engines_own_key() {
+        // `answer_local` owns the answer to A outright, so it *can* be A's secure far side: it mints
+        // its own SDES key (RFC 4568), answers `RTP/SAVP` + that key, and keys the takeover leg. The
+        // key it advertises must be the ENGINE's, never the offerer's echoed back — echoing A's key
+        // would have A decrypt our egress with a key we never encrypt under.
+        let (ws_uri, _frames, _downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let peer_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("peer key");
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "al-sdes-ws".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr_a, &peer_key),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+        assert!(answer.secure, "the answer keeps the secure profile");
+        let advertised = answer
+            .crypto
+            .first()
+            .copied()
+            .expect("the answer carries the engine's own a=crypto");
+        assert_ne!(
+            advertised.key.to_inline_bytes(),
+            peer_key.key.to_inline_bytes(),
+            "the engine must advertise its OWN key, not echo the offerer's"
+        );
+        assert!(engine.ws().is_ws_call("al-sdes-ws"), "the takeover is up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_local_on_a_dtls_offerer_answers_with_the_engines_own_fingerprint() {
+        // RFC 5763 §5: the answer carries the ENGINE's certificate fingerprint and the complement of
+        // the offerer's `a=setup` role. Echoing A's own fingerprint back (the pre-change behaviour of
+        // the plaintext single-leg path) makes the handshake unverifiable against us.
+        let (ws_uri, _frames, _downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let peer_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("peer cert");
+        let peer_fingerprint = peer_cert.fingerprint();
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "al-dtls-ws".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: dtls_offerer_sdp(addr_a, &peer_fingerprint, "active"),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+        assert!(answer.dtls, "the answer stays UDP/TLS/RTP/SAVPF");
+        let advertised = answer.fingerprint.clone().expect("engine a=fingerprint");
+        assert_ne!(
+            advertised.bytes, peer_fingerprint.bytes,
+            "the engine must advertise its OWN fingerprint, not echo the offerer's"
+        );
+        // The offerer said `active`, so the engine is the DTLS server (RFC 5763 §5).
+        assert_eq!(answer.setup, Some(sdp::Setup::Passive), "complement role");
+        assert!(engine.ws().is_ws_call("al-dtls-ws"), "the takeover is up");
+    }
     #[tokio::test]
     async fn answer_local_ws_takeover_does_not_negotiate_comfort_noise() {
         // CN egress is generated by the promoted media actor, which a takeover call does not have. The
