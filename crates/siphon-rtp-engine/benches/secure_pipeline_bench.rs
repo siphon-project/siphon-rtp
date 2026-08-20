@@ -64,6 +64,8 @@ fn direction(
         recorder: None,
         noise_suppression: false,
         echo_cancellation: false,
+        beep_detection: false,
+        beep_cadence_guard_ms: None,
         produce_echo_reference: false,
         ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
     }
