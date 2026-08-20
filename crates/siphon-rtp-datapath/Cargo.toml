@@ -28,3 +28,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+criterion = { workspace = true }
+
+# Per-packet dispatch cost: the Redirect / Forward paths plus the layer-4 ICE gate's own lookups.
+[[bench]]
+name = "dispatch_bench"
+harness = false

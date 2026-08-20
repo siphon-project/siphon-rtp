@@ -2068,6 +2068,46 @@ mod tests {
     }
 
     #[test]
+    fn a_redirect_flow_carries_the_ice_posture_the_classifier_gates_on() {
+        // The classifier's REDIRECT arm applies the same layer-4 gate as its FORWARD arm
+        // (docs/security-and-nat.md §4 layer 4), so a redirected ICE endpoint — a conference seat, a
+        // promoted call, an SRTP/DTLS bridge leg — must reach the kernel carrying the flag *and* the
+        // adopted source. `to_kernel_action` builds no gate fields for a Redirect action, so this is
+        // entirely `apply_ice_posture`'s job on the install path; without it the arm would have
+        // nothing to compare against and would hand userspace every source.
+        let mut action = to_kernel_action(
+            DpFlowAction::Redirect,
+            &empty_endpoints(),
+            Ipv4Addr::LOCALHOST,
+            0,
+        );
+        assert_eq!(action.ice, 0, "a plain redirect leg is not ICE-gated");
+        assert_eq!(action.latch_valid, 0);
+
+        apply_ice_posture(&mut action, true, Some(peer()));
+        assert_eq!(action.kind, action::REDIRECT, "still a redirect flow");
+        assert_eq!(action.ice, 1);
+        let latched = siphon_rtp_ebpf_common::rewrite::Latched {
+            ipv4: action.latched_ipv4,
+            port: action.latched_port,
+            ssrc: action.latched_ssrc,
+        };
+        assert!(siphon_rtp_ebpf_common::rewrite::ice_media_allowed(
+            Some(latched),
+            u32::from_be_bytes([198, 51, 100, 10]),
+            5000
+        ));
+        assert!(
+            !siphon_rtp_ebpf_common::rewrite::ice_media_allowed(
+                Some(latched),
+                u32::from_be_bytes([198, 51, 100, 11]),
+                5000
+            ),
+            "an unvalidated source is gated out of the redirect path too"
+        );
+    }
+
+    #[test]
     fn a_non_ice_flow_keeps_its_kernel_owned_media_latch() {
         // `apply_ice_posture` runs on every flow install, so it must leave a plain relay's
         // symmetric-RTP latch — which the kernel owns and updates — completely alone.

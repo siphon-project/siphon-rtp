@@ -304,8 +304,44 @@ fn try_classify(ctx: &XdpContext) -> Result<u32, ()> {
             xdp_action::XDP_DROP
         })),
         action::REDIRECT => {
-            // RTPBleed gate: a source the SDP did not signal never reaches userspace.
-            if !source_allowed(&rule, source_ipv4) {
+            if rule.ice != 0 {
+                // --- Layer 4: ICE supersedes the signalled-source gate on the redirected path too
+                // (docs/security-and-nat.md §4 layer 4; RFC 8445 §7). A userspace consumer — a
+                // conference seat, a promoted transcode call, the SRTP/DTLS bridges — cannot gate an
+                // ICE leg by address, because an ICE leg deliberately runs the signalled-source gate
+                // open (§7.3.1.3). So the same adopted-source check the FORWARD arm applies runs here:
+                // only the source a connectivity check validated reaches userspace, and nothing at all
+                // before one has. Mirrors `Inner::ice_gate` in the loopback backend, which is the
+                // behavioural reference this classifier must match.
+                //
+                // STUN is exempt, exactly as on the FORWARD arm: the userspace responder / RFC 8445
+                // agent owns every connectivity check and is the only thing that may adopt a source, so
+                // a check must reach it — including the peer-reflexive one, which by definition does
+                // not come from the adopted source yet. A datagram too short to classify is treated as
+                // not-STUN and faces the gate.
+                let is_check = match load::<u8>(ctx, udp_offset + 8) {
+                    Ok(first_byte) => is_stun(&[first_byte]),
+                    Err(()) => false,
+                };
+                if !is_check {
+                    let adopted = if rule.latch_valid != 0 {
+                        Some(Latched {
+                            ipv4: rule.latched_ipv4,
+                            port: rule.latched_port,
+                            ssrc: rule.latched_ssrc,
+                        })
+                    } else {
+                        None
+                    };
+                    let src_ip_host = load_be_u32(ctx, ip_offset + 12)?;
+                    let src_port_host = load_be_u16(ctx, udp_offset)?;
+                    if !ice_media_allowed(adopted, src_ip_host, src_port_host) {
+                        account(stats_entry, |s| s.packets_dropped += 1);
+                        return Ok(xdp_action::XDP_DROP);
+                    }
+                }
+            } else if !source_allowed(&rule, source_ipv4) {
+                // --- Layer 2: RTPBleed gate — a source the SDP did not signal never reaches userspace.
                 account(stats_entry, |s| s.packets_dropped += 1);
                 return Ok(xdp_action::XDP_DROP);
             }

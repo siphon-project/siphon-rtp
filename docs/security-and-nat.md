@@ -130,6 +130,13 @@ Classify each datagram by its first byte and route it; **only RTP/RTCP may touch
   the datapath receive path (STUN answered in-datapath on an ICE endpoint, RTP/RTCP gated to the media
   latch, everything else dropped on the `Forward` path before any latch write) *and* the userspace
   split of a secure WebRTC leg's `Redirect` stream into its DTLS-handshake and SRTP-media sub-streams.
+- **This table is the `Forward` path's, and is deliberately *not* replayed on `Redirect`.** A
+  redirected endpoint is entitled to non-RTP: a DTLS-SRTP leg's handshake records must reach the
+  bridge (RFC 5764), and a TURN allocation's own STUN must reach its client (RFC 5766 §11, §11.1).
+  Dropping everything outside 128–191 there would deadlock both. The demux therefore stays where the
+  consumer is — the DTLS bridge splits its own stream, the TURN client reads its own responses — and
+  what the datapath applies on the redirected path instead is the **source** gate (layer 4 for an ICE
+  endpoint; see the `Redirect` bullet there).
 - **Effect on A1:** garbage and STUN sprays can no longer poison the media latch.
 
 ### Layer 2 — Signalled-source gate
@@ -208,6 +215,20 @@ Latch state machine, per direction:
   the peer's real post-latch source with no cross-leg reference in the per-flow kernel ABI. The engine
   mirrors **only** a source the kernel *already* validated (its own source-gate + SSRC re-latch), so no
   new trust is introduced. A FIB miss / unresolved neighbour still falls back to `Redirect`.
+- **Known divergence — the userspace latch declines, it does not drop.** On the `Forward` path a
+  latch rejection is a **drop**: `Inner::update_latch` returns `Reject` and `dispatch` discards the
+  packet, so under `symmetric` (`SourceFilter::Any` + `LatchPolicy::Symmetric`) the first source
+  latches and a later different-SSRC spray is thrown away. The `Redirect` consumers mirror the state
+  machine but not that consequence: `SymmetricLatch::observe` returning `None` only means "keep the
+  current reply address", and the packet is still decoded, mixed or relayed
+  (`MediaCall::process`, `Conference::ingest`, the text pipeline). For the default `Exact` gate this
+  is immaterial — layer 2 already pinned the source. It matters **only** under the opt-in
+  `symmetric` flag, where layer 2 is open and the latch is the sole remaining constraint: such a
+  redirected leg accepts injected media from any source (it cannot be *stolen* — egress stays pinned
+  to the latched source). Tracked as a deliberate, named gap rather than a silent one; closing it
+  means giving the userspace latch the same drop-on-reject semantics across all three consumers,
+  which is a behaviour change to an operator-selected rtpengine-parity flag and belongs in its own
+  change.
 - **Effect on A1:** even inside the learning window, a hijack must reproduce the victim's live SSRC,
   which the blind attacker does not know.
 
@@ -295,9 +316,31 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
   itself creates or moves the latch (a genuine rebind comes via a fresh validated check, not a media
   spray). The engine builds the ICE `Forward` rule with `SourceFilter::Any` + `LatchPolicy::Off` (no
   rule-level latch) and calls `set_ice` **before** installing the flow, so an ICE leg is check-gated
-  from its first packet — no first-source race. Secure ICE (DTLS-SRTP / SDES) legs run on the
-  `Redirect` path and are unaffected. Enforcement: `Inner::dispatch` (the Forward-path ICE branch) in
-  [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs); the rule + `set_ice` ordering in `engine::answer`.
+  from its first packet — no first-source race. Enforcement: `Inner::dispatch` (the Forward-path ICE
+  branch) in [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs); the rule + `set_ice` ordering in `engine::answer`.
+- **The same gate runs on the `Redirect` path, and it has to.** Every userspace consumer — a
+  conference seat, a promoted transcode/record/echo call, a WebSocket takeover leg, the SRTP and DTLS
+  bridges — receives its media as `FlowAction::Redirect`, and each re-enforces the **layer-2**
+  signalled-source gate itself (Layers 5a–5d). That is not enough for an ICE endpoint, because an ICE
+  leg deliberately runs layer 2 **open** (`SourceFilter::Any`): the signalled address is not the
+  discriminator when a peer-reflexive check legitimately arrives from a transport the SDP never
+  carried (RFC 8445 §7.3.1.3). On a `Forward` leg layer 4 takes over from layer 2 — so on a
+  `Redirect` leg it must too, or an ICE endpoint ends up with *no* source gate at all. The
+  `Redirect` arm therefore consults the identical verdict (`Inner::ice_gate`, the one definition both
+  arms call, so the two paths cannot drift): an endpoint carrying ICE credentials hands the consumer
+  only the source a connectivity check validated — nothing before one has, nothing from another
+  source after. Only the source is gated, never the packet class: a redirected endpoint is entitled
+  to non-RTP (Layer 1), and STUN never reaches the arm at all because `recv_loop` routes it to the
+  responder or the full agent first, which is what lets a check through and lets the latch form. A
+  non-ICE `Redirect` endpoint is untouched — the TURN relay path in particular still receives
+  everything raw. Enforcement: `Inner::{ice_gate, dispatch}` in `udp.rs`.
+  - **What this closed.** Before it, an **ice-lite** conference seat had no source gate whatsoever:
+    `conference_join` opened layer 2 for the ICE case, the room's `ice_pending` gate is only set for a
+    *full* agent (an ice-lite seat has no agent that would ever call `ice_selected` to narrow it), and
+    the `Redirect` arm applied nothing — so anyone able to reach the seat's port injected audio into
+    the mix every other participant heard. The same gap covered every other redirected ICE consumer:
+    a promoted ICE call inherits `SourceFilter::Any` from the `Forward` rule `ingress_rule` built for
+    it, and neither `MediaCall::process` nor the SRTP/DTLS bridges have an ICE gate of their own.
 - **The kernel datapath enforces the same gate** (XDP `Forward` fast path). An ICE endpoint sets the
   flow's `ice` byte, which changes two things in the classifier:
   - **STUN is redirected to userspace instead of dropped.** The layer-1 demux drops everything that
@@ -315,10 +358,16 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     the userspace ice-lite responder on the datapath thread, and is **re-stamped on every flow
     install** — a rebuilt rule would otherwise drop the flag mid-call and quietly revert the leg to
     the signalled-source gate.
+  - **The classifier's `REDIRECT` arm applies the same gate**, for the same reason the loopback
+    backend's does: a redirected ICE endpoint's consumer gates by address, and an ICE leg's address
+    gate is open. `apply_ice_posture` already stamped the flag and the adopted source onto a Redirect
+    action, so the arm has everything it needs; before it consulted them, an ICE conference seat or
+    promoted call on XDP reached userspace ungated. STUN is exempt there too, so a check still
+    reaches the datapath thread's `IceDemux`.
   - **Enforcement:** `rewrite::{is_stun, ice_media_allowed}` (the pure, host-tested decisions),
-    `forward_in_kernel` in the eBPF classifier, `IceDemux` + `apply_ice_posture` in
-    `siphon-rtp-xdp`. Both backends share one responder (`datapath::respond_to_stun_check`), so what
-    authenticates a check cannot drift between them.
+    `forward_in_kernel` **and the `action::REDIRECT` arm of `try_classify`** in the eBPF classifier,
+    `IceDemux` + `apply_ice_posture` in `siphon-rtp-xdp`. Both backends share one responder
+    (`datapath::respond_to_stun_check`), so what authenticates a check cannot drift between them.
 - **Relayed candidates carry traffic, they are not just advertised** (RFC 5766). A relayed candidate's
   transport address lives on the TURN server, so nothing sent from the endpoint reaches the peer
   directly. The datapath therefore wraps egress to a **bound** peer in ChannelData and addresses it to
@@ -568,6 +617,15 @@ is the same shape SDES secure-transcode (`SrtpMedia`) already had; DTLS now join
     `ice_pending` gate drops all media — and selection replaces the open gate with
     `SourceFilter::Exact` on the chosen remote. The symmetric latch is re-armed at the same moment, so
     a stale pre-ICE observation cannot move the reply back off the selected pair.
+  - **`ice_pending` is the *full-agent* half of that, and only that.** An **ice-lite** seat never sets
+    it: the datapath's own responder answers checks and adopts the validated source, no selection is
+    coming, and a seat left pending forever would never be mixed at all. What covers an ice-lite seat
+    — and, before its selection, a full-agent one — is the **datapath's layer-4 gate on the redirected
+    path** (`Inner::ice_gate`, Layer 4): the room is handed only the source a check authenticated with
+    the engine's own password. The seat's own `SourceFilter::Any` is therefore not the gate on an ICE
+    seat, and must not be read as one; it is deliberately open so the *datapath* gate can be the
+    discriminator. Both halves are armed by the credentials `conference_join` installs
+    (`set_ice` / `set_ice_agent`) — without them an ICE seat would fall back to that open filter alone.
   - **A failed checklist removes the seat** (§8.1.2). A participant has no `MediaCall` for the
     2-party `ice_failed` teardown to reap, so `drive_ice_agents` drops it from the room (and tears the
     room down if it was the last member) rather than leaving it seated behind a gate that can never
@@ -590,7 +648,12 @@ so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the 
 - **Source gate (RTPBleed, restated for `Redirect`).** `Conference::ingest` checks
   `SourceFilter::accepts` for the participant's endpoint **before** the packet enters the jitter buffer
   (same `Exact`/`Subnet`/`Any` policy). A spoofed source never reaches the mix — proven by
-  `unsignalled_source_is_dropped_from_the_mix`.
+  `unsignalled_source_is_dropped_from_the_mix`. **Two seats set that filter to `Any` and are therefore
+  gated elsewhere, not here:** an **ICE** seat, which is covered by the datapath's layer-4 gate on the
+  redirected path (Layer 4, and the `ice_pending` note in Layer 5d) — proven by
+  `an_ice_lite_conference_seat_mixes_only_a_stun_validated_source`; and a **`symmetric`** seat, whose
+  only remaining constraint is the reply latch, which declines rather than drops (see the known
+  divergence in Layer 3).
 - **Constrained, SSRC-consistent latch (after auth).** An accepted participant's egress destination
   is latched to its observed source (symmetric RTP), so a NATed leg is replied to where its media
   originates — but only for an authenticated, SSRC-consistent stream: the re-latch runs **after** the
