@@ -16068,6 +16068,123 @@ mod tests {
             "expected the WS downlink to reach the caller so there is something to audit"
         );
     }
+
+    #[test]
+    fn ws_takeover_security_resolves_the_offerers_own_posture() {
+        // Unit cover for the resolver the takeover verbs branch on. A plaintext offer is `Plain`
+        // whether or not a takeover was asked for; a secure one is only ever resolved for a takeover.
+        let plain = sdp::parse(plain_offer_sdp()).expect("plain offer");
+        assert!(matches!(
+            resolve_ws_takeover_security(&plain, false),
+            Ok(WsTakeoverSecurity::Plain)
+        ));
+        assert!(matches!(
+            resolve_ws_takeover_security(&plain, true),
+            Ok(WsTakeoverSecurity::Plain)
+        ));
+
+        let key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("key");
+        let address: SocketAddr = "203.0.113.7:30000".parse().expect("addr");
+        let sdes = sdp::parse(&sdes_offerer_sdp(address, &key)).expect("sdes offer");
+        match resolve_ws_takeover_security(&sdes, true) {
+            Ok(WsTakeoverSecurity::Sdes { peer_key }) => assert_eq!(
+                peer_key.key.to_inline_bytes(),
+                key.key.to_inline_bytes(),
+                "the offerer's own key is carried through"
+            ),
+            other => panic!("expected Sdes, got {other:?}"),
+        }
+        match resolve_ws_takeover_security(&sdes, false) {
+            Err(reason) => assert!(reason.contains("secure-offerer-unsupported"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        let certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("cert");
+        let fingerprint = certificate.fingerprint();
+        let dtls =
+            sdp::parse(&dtls_offerer_sdp(address, &fingerprint, "active")).expect("dtls offer");
+        match resolve_ws_takeover_security(&dtls, true) {
+            Ok(WsTakeoverSecurity::Dtls {
+                peer_fingerprint,
+                peer_setup,
+            }) => {
+                assert_eq!(peer_fingerprint.bytes, fingerprint.bytes);
+                assert_eq!(peer_setup, Some(sdp::Setup::Active));
+            }
+            other => panic!("expected Dtls, got {other:?}"),
+        }
+
+        // A secure profile with nothing to key from is refused, never downgraded to plaintext.
+        let no_crypto = sdp::parse(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n\
+             m=audio 30000 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+        )
+        .expect("savp without crypto");
+        match resolve_ws_takeover_security(&no_crypto, true) {
+            Err(reason) => assert!(
+                reason.contains("ws-takeover-unkeyable") && reason.contains("a=crypto"),
+                "{reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let no_fingerprint = sdp::parse(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n\
+             m=audio 30000 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=setup:actpass\r\n",
+        )
+        .expect("dtls without fingerprint");
+        match resolve_ws_takeover_security(&no_fingerprint, true) {
+            Err(reason) => assert!(
+                reason.contains("ws-takeover-unkeyable") && reason.contains("a=fingerprint"),
+                "{reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_secure_takeover_call_refuses_ha_checkpoint() {
+        // HA is unchanged by securing the leg, and this pins that it stays honest rather than handing
+        // back a blob that would restore as something that never existed. A takeover's far side is an
+        // external WebSocket session — not replicable state — and `answer_local` holds a single leg,
+        // so `checkpoint` refuses outright (`restore` separately rejects a `Ws` snapshot).
+        let (ws_uri, _frames, _downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let peer_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("peer key");
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "secure-takeover-ha".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr_a, &peer_key),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+
+        let checkpoint = engine
+            .handle(
+                CLIENT,
+                Command::Checkpoint {
+                    call_id: "secure-takeover-ha".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        match checkpoint {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("single-leg"),
+                "the refusal must say why, got: {reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
     #[tokio::test]
     async fn answer_local_ws_takeover_does_not_negotiate_comfort_noise() {
         // CN egress is generated by the promoted media actor, which a takeover call does not have. The

@@ -170,6 +170,11 @@ Both flags are `Option`/omitted-when-unset, so existing controller JSON serialis
 - **`answer_local` no longer echoes a secure offerer's own keying back at it.** A secure offer to the
   single-leg IVR / echo / announcement pipeline was answered with the caller's own `a=crypto` /
   `a=fingerprint` copied into the answer, which no media path could back. It is refused.
+- **`play_media` on a call with no media actor is refused instead of accepted.** On a crypto bridge
+  (`Srtp` / `Dtls`) or a WebSocket takeover there is no pipeline to inject into and none is promoted,
+  so the injection landed nowhere while the controller got back an accepted `play_id` and waited for a
+  `play_finished` that never came. It now errors, as `play_dtmf` and `silence_media` already did and
+  as the control reference already documented.
 
 ## [0.2.1] — 2026-08-20
 
