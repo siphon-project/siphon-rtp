@@ -16,6 +16,31 @@
 //! — no second jitter buffer, no second PLC state, no second concealment decision on the same stream.
 //! That separation is the whole point of the split: decoding a stream twice makes the WS consumer
 //! hear artefacts the call itself never had.
+//!
+//! # Which rate domain the core runs in
+//!
+//! **The core runs entirely in the negotiated WS *wire* rate** — [`BridgeCore::format`]'s
+//! `sample_rate` — not the leg's codec rate. Those were the same thing until the wire rate became
+//! selectable ([`super::wire_rate`]); now the RTP shell converts on the way in and on the way back
+//! out ([`super::session::BridgeSession::with_rate_conversion`]) and everything inside this module —
+//! the staged uplink, the L16 the transport writes, the playout queue, the noise suppressor and both
+//! sides of the echo canceller — is wire-domain.
+//!
+//! That choice is not arbitrary. The wire rate is **the domain the far side actually hears**, so
+//! cleaning the audio there is cleaning what the server receives rather than an intermediate the
+//! conversion will then re-filter; 16 kHz, the common reason to raise the rate above a G.711 leg, is
+//! also a rate the suppressor and canceller are validated at. Above all it is the only placement that
+//! keeps the echo canceller coherent: its **near-end** input is the staged uplink and its **far-end
+//! reference** is the downlink frame this same tick renders, and those two must be in one domain and
+//! one frame length or the canceller is subtracting a signal that is not the echo. Putting the
+//! conversion inside the core would split them — uplink at the leg rate, downlink from the server at
+//! the wire rate — and the canceller would silently degrade to noise injection.
+//!
+//! The suppressor and canceller only exist at 8 or 16 kHz. A wire rate outside those leaves both
+//! **off** (logged once at `warn`) and the wire rate **unchanged** — degrading the feature, never
+//! silently overriding what the controller negotiated. The turn-taking VAD is unaffected either way:
+//! [`EnergyVad`] thresholds on *mean-square* energy, which is per-sample and so rate-independent, and
+//! its hangover is counted in ptime frames, which are a duration, not a sample count.
 
 use std::collections::VecDeque;
 
@@ -31,8 +56,9 @@ use siphon_rtp_dsp::{EchoCanceller, EnergyVad, NoiseSuppressor};
 /// buffers — so the bridge's idea of "the longest frame" can never drift from the rest of the engine's.
 pub const MAX_PTIME_MS: usize = siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS as usize;
 /// Highest native sample rate any codec on this path runs at, in Hz: RFC 7587 §4.1 pins Opus at
-/// 48 kHz, and every other codec here samples at 8 or 16 kHz.
-const MAX_SAMPLE_RATE_HZ: usize = 48_000;
+/// 48 kHz, and every other codec here samples at 8 or 16 kHz. Also the ceiling on a **selectable WS
+/// wire rate** ([`super::wire_rate::MAX_WIRE_SAMPLE_RATE_HZ`]) — every buffer below is sized against it.
+pub const MAX_SAMPLE_RATE_HZ: usize = 48_000;
 /// Audio channels in the longest **decoded** frame. RFC 7587 §6.1 makes an Opus RTP stream mono or
 /// stereo (`sprop-stereo`); Opus multistream / surround (RFC 7845) is out of scope and every other
 /// codec here is mono.
@@ -80,8 +106,11 @@ pub struct BridgeCore {
     /// profile flag). Its far-end **reference** is the *downlink* frame played toward the call this
     /// tick (server → call), so the phone's echo of the voice-AI audio is cancelled off the uplink
     /// before the server hears it — otherwise the model would transcribe its own reflected speech.
-    /// Built at the leg's native rate (decode == encode rate on a bridge leg, so uplink and downlink
-    /// share it); `None` when the leg was stood up without the flag or its rate is unsupported.
+    /// Built at the **wire** rate, which is what both of its inputs are in: the near-end is the staged
+    /// uplink (already converted from the leg's codec rate by the RTP shell) and the far-end reference
+    /// is the downlink frame the server sent at that same wire rate. Keeping one domain for both is
+    /// the canceller's correctness precondition — see this module's "Which rate domain the core runs
+    /// in". `None` when the leg was stood up without the flag or the wire rate is unsupported.
     /// Preallocated ⇒ its per-frame `cancel` does zero heap allocation.
     echo_canceller: Option<EchoCanceller>,
     /// Preallocated far-end reference for `echo_canceller` — the downlink frame this tick plays,
@@ -132,13 +161,30 @@ impl BridgeCore {
     }
 
     /// Enable single-channel noise suppression on the uplink audio (call → voice-AI server). Built
-    /// from the advertised uplink sample rate; a no-op unless `enabled` is set *and* that rate is
-    /// 8 or 16 kHz (the suppressor's supported rates — e.g. a 48 kHz Opus leg leaves it off).
+    /// from the negotiated **wire** sample rate (see the module docs); a no-op unless `enabled` is set
+    /// *and* that rate is 8 or 16 kHz — the suppressor's supported rates, so a 24 kHz wire (or a
+    /// 48 kHz Opus leg) leaves it off. An unsupported rate is **logged** rather than silently
+    /// swallowed, and never changes the wire rate: degrading the feature is right, quietly
+    /// renegotiating the stream behind the controller's back is not.
     #[must_use]
     pub fn with_noise_suppression(mut self, enabled: bool) -> Self {
-        self.noise_suppressor = enabled
-            .then(|| NoiseSuppressor::new(self.format.sample_rate).ok())
-            .flatten();
+        if !enabled {
+            self.noise_suppressor = None;
+            return self;
+        }
+        match NoiseSuppressor::new(self.format.sample_rate) {
+            Ok(suppressor) => self.noise_suppressor = Some(suppressor),
+            Err(error) => {
+                tracing::warn!(
+                    target: "siphon_rtp::media",
+                    %error,
+                    sample_rate_hz = self.format.sample_rate,
+                    "noise suppression requested but unsupported at the websocket wire rate; \
+                     leaving the uplink unsuppressed (the wire rate is unchanged)"
+                );
+                self.noise_suppressor = None;
+            }
+        }
         self
     }
 
@@ -160,8 +206,9 @@ impl BridgeCore {
     /// bridge is rendering toward the call (the far-end reference — the audio the phone plays and its
     /// mic re-captures), after noise suppression and before it is framed as L16, so the voice-AI server
     /// does not hear its own reflected speech. `None` leaves the uplink unchanged. The canceller must
-    /// be built for the leg's native rate so its frame length matches the per-tick frame (no per-frame
-    /// reallocation).
+    /// be built for the **wire** rate — the rate both the staged uplink and the server's downlink are
+    /// in — so its frame length matches the per-tick frame (no per-frame reallocation) and its two
+    /// signals are the same signal domain.
     #[must_use]
     pub fn with_echo_canceller(mut self, echo_canceller: Option<EchoCanceller>) -> Self {
         // Only a cancelling core ever reads a far-end frame; sized to the longest near-end frame it
@@ -179,6 +226,22 @@ impl BridgeCore {
     #[must_use]
     pub fn format(&self) -> MediaFormat {
         self.format
+    }
+
+    /// Whether the uplink is actually being noise-suppressed. `false` after
+    /// [`BridgeCore::with_noise_suppression(true)`](BridgeCore::with_noise_suppression) means the
+    /// wire rate is outside the suppressor's supported 8/16 kHz — the feature degraded, the stream
+    /// did not.
+    #[must_use]
+    pub fn suppresses_uplink_noise(&self) -> bool {
+        self.noise_suppressor.is_some()
+    }
+
+    /// Whether the uplink is actually being echo-cancelled against the downlink. Same "did the
+    /// feature survive this rate" question as [`BridgeCore::suppresses_uplink_noise`].
+    #[must_use]
+    pub fn cancels_uplink_echo(&self) -> bool {
+        self.echo_canceller.is_some()
     }
 
     /// Take the next tick-originated control message to send to the server (turn signals), or `None`.

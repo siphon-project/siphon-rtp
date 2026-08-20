@@ -683,6 +683,111 @@ mod tests {
         assert_eq!(frame.len(), 320, "160 samples at 8 kHz");
     }
 
+    /// A narrowband leg **upsampled** into a wider wire: an 8 kHz frame teed at 16 kHz must produce
+    /// the 16 kHz frame the `start` envelope announces (320 samples = 640 bytes), not the leg's 160.
+    #[test]
+    fn an_8k_leg_teed_at_16k_frames_the_wire_rate_not_the_codec_rate() {
+        use crate::bridge::wire_rate::wire_resampler;
+        let plan = plan_ws_tee(format(16_000, 1), false, false);
+        assert_eq!(plan.format.frame_bytes(), 640, "16 kHz × 20 ms mono L16");
+
+        let resampler = wire_resampler(8_000, 16_000)
+            .expect("serviceable")
+            .expect("a conversion into the wider wire");
+        let mut sink = WsTeeSink::new(
+            TeeChannel::Caller,
+            plan.mixer.clone(),
+            "tee-1",
+            Some(resampler),
+        );
+        sink.write_pcm(&[1500i16; 160]); // one 20 ms frame at the leg's 8 kHz
+
+        let frame = plan.frames.try_recv().expect("one 16 kHz wire frame");
+        assert_eq!(
+            frame.len(),
+            640,
+            "320 samples at the negotiated 16 kHz wire rate"
+        );
+        assert!(plan.frames.try_recv().is_err(), "exactly one frame");
+
+        match tee_start_message("tee-1", "call-1", plan.format, plan.tracks) {
+            ControlMessage::Start(data) => assert_eq!(
+                data.media.sample_rate, 16_000,
+                "the start envelope must announce the wire rate, never the codec rate"
+            ),
+            other => panic!("expected start, got {other:?}"),
+        }
+    }
+
+    /// The same, stereo: both 8 kHz legs upsampled into one 16 kHz interleaved wire frame.
+    #[test]
+    fn a_stereo_tee_at_16k_interleaves_two_upsampled_legs() {
+        use crate::bridge::wire_rate::wire_resampler;
+        let plan = plan_ws_tee(format(16_000, 2), true, false);
+        let conversion = || {
+            wire_resampler(8_000, 16_000)
+                .expect("serviceable")
+                .expect("a conversion")
+        };
+        let mut caller = WsTeeSink::new(
+            TeeChannel::Caller,
+            plan.mixer.clone(),
+            "tee-1",
+            Some(conversion()),
+        );
+        let mut callee = WsTeeSink::new(
+            TeeChannel::Callee,
+            plan.mixer.clone(),
+            "tee-1",
+            Some(conversion()),
+        );
+
+        caller.write_pcm(&[4000i16; 160]);
+        assert!(
+            plan.frames.try_recv().is_err(),
+            "a stereo frame still waits for both channels"
+        );
+        callee.write_pcm(&[-4000i16; 160]);
+
+        let frame = plan.frames.try_recv().expect("one stereo 16 kHz frame");
+        assert_eq!(
+            frame.len(),
+            1280,
+            "2 channels × 320 samples × 2 bytes at 16 kHz / 20 ms"
+        );
+        // Past the filter's start-up ramp the two channels stay separated and opposite in sign.
+        let pcm = samples(&frame);
+        let (caller_channel, callee_channel) = (pcm[200], pcm[201]);
+        assert!(caller_channel > 0, "channel 0 carries the caller");
+        assert!(callee_channel < 0, "channel 1 carries the callee");
+    }
+
+    /// A tee whose wire rate is the leg's own rate builds no resampler, so it pays nothing at all for
+    /// having been asked explicitly for the rate it was already going to use.
+    #[test]
+    fn a_tee_at_the_leg_rate_builds_no_resampler_and_is_byte_identical() {
+        use crate::bridge::wire_rate::wire_resampler;
+        assert!(
+            wire_resampler(8_000, 8_000).expect("identity").is_none(),
+            "no conversion for a wire rate the leg already runs at"
+        );
+
+        let pcm: Vec<i16> = (0..160).map(|n| ((n * 211) % 6000) as i16 - 3000).collect();
+        let render = || -> Vec<u8> {
+            let plan = plan_ws_tee(format(8000, 1), false, false);
+            let mut sink = WsTeeSink::new(TeeChannel::Caller, plan.mixer.clone(), "tee-1", None);
+            sink.write_pcm(&pcm);
+            plan.frames.try_recv().expect("one frame")
+        };
+        let baseline = render();
+        assert_eq!(baseline.len(), 320);
+        assert_eq!(
+            samples(&baseline),
+            pcm,
+            "an identity tee copies the PCM through"
+        );
+    }
+
     #[test]
     fn the_sink_reports_its_detach_tag() {
         let plan = plan_ws_tee(format(8000, 1), false, false);

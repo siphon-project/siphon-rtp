@@ -7,15 +7,30 @@
 //! WS control protocol — lives in [`BridgeCore`], so a **teed** call (whose media pipeline has
 //! already decoded the frame) reuses the identical audio logic without a second jitter buffer.
 //!
-//! - **Uplink** (call → server): RTP in → [`MediaLeg`] jitter/decode → [`BridgeCore`] → L16 WS frame.
+//! - **Uplink** (call → server): RTP in → [`MediaLeg`] jitter/decode → *(wire-rate conversion)* →
+//!   [`BridgeCore`] → L16 WS frame.
 //! - **Downlink** (server → call): WS binary frame → [`BridgeCore`] playout → one frame/tick →
-//!   [`MediaLeg`] encode → RTP to the call.
+//!   *(wire-rate conversion)* → [`MediaLeg`] encode → RTP to the call.
 //! - **Barge-in**: `clear` (or the local VAD) drops the queued playout within one tick.
+//!
+//! **Where the rate boundary sits.** The WS **wire rate** is negotiated independently of the leg's
+//! codec rate (see [`super::wire_rate`]), so the RTP shell — this module — owns both conversions and
+//! the [`BridgeCore`] inside it runs entirely in the **wire** domain. That placement is deliberate:
+//! it keeps the core's uplink, its downlink playout, its noise suppressor and its echo canceller's
+//! near-end *and* far-end signals in one single rate, which is exactly what the echo canceller
+//! requires (see [`BridgeCore`]'s module docs). A leg whose codec rate already equals the wire rate
+//! builds no resampler at all and takes the identical per-tick path it always did.
 
-use crate::bridge::audio::{BridgeCore, MAX_FRAME_VALUES};
+use crate::bridge::audio::{BridgeCore, MAX_FRAME_SAMPLES, MAX_FRAME_VALUES, MAX_PTIME_MS};
 use crate::bridge::protocol::{ControlMessage, Direction, MediaFormat};
 use crate::leg::{MediaLeg, PcmFrame};
+use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_dsp::EchoCanceller;
+
+/// Headroom on a resample buffer for the polyphase filter's fractional remainder, which can put one
+/// extra sample in a frame when the rate ratio is not an integer. Mirrors the tee's own slack
+/// ([`super::tee`]) — both reserve once at construction so the per-frame path never grows a `Vec`.
+const RESAMPLE_SLACK_SAMPLES: usize = 8;
 
 /// What one [`BridgeSession::tick`] produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -42,6 +57,39 @@ pub struct BridgeSession {
     /// Downlink frames the leg's encoder rejected (e.g. a server frame that is not one codec frame
     /// long, or a payload past the MTU bound). Same reasoning as `uplink_decode_errors`.
     downlink_encode_errors: u64,
+    /// Uplink conversion **leg codec rate → wire rate**, or `None` when the two already match (the
+    /// default, and the zero-cost path: the leg then decodes straight into the core's staging slot).
+    uplink_resampler: Option<Resampler>,
+    /// Downlink conversion **wire rate → leg codec rate**, or `None` when they match. Without it a
+    /// server rendering at any other rate is encoded sample-for-sample into the leg's codec and the
+    /// call hears the wrong speed and pitch — the bug this conversion exists to close.
+    downlink_resampler: Option<Resampler>,
+    /// Decode target for the **converting** uplink path only: the leg cannot decode into the core's
+    /// slot when a conversion sits between them, so it decodes here first. Interleaved values (the
+    /// decoder's buffer contract), so it is measured against [`MAX_FRAME_VALUES`]. Empty — and never
+    /// touched — when no uplink conversion is engaged.
+    uplink_scratch: Vec<i16>,
+    /// Converted uplink frame handed to the core. Capacity reserved once from the wire rate and the
+    /// ptime ceiling; `clear`ed (never reallocated) each tick.
+    uplink_converted: Vec<i16>,
+    /// Converted downlink frame handed to the encoder. Same reservation contract as above, sized from
+    /// the **leg** rate (the conversion's output).
+    downlink_converted: Vec<i16>,
+}
+
+/// The longest frame at `rate_hz` the ptime ceiling allows, in samples.
+fn ceiling_frame_samples(rate_hz: u32) -> usize {
+    (rate_hz as usize / 1000) * MAX_PTIME_MS
+}
+
+/// Capacity for one converted frame at `output_rate_hz`: the longest frame the ptime ceiling allows,
+/// plus slack for the polyphase remainder. Reserved once so `Resampler::process` — which *appends*
+/// into a `Vec` — never grows it on the per-tick path. The reservation is only exact because both
+/// directions clamp their **input** to [`ceiling_frame_samples`] of the conversion's input rate; a
+/// frame longer than the ptime ceiling is truncated, exactly as the non-converting path already
+/// truncates at [`MAX_FRAME_SAMPLES`].
+fn converted_frame_capacity(output_rate_hz: u32) -> usize {
+    ceiling_frame_samples(output_rate_hz) + RESAMPLE_SLACK_SAMPLES
 }
 
 impl BridgeSession {
@@ -61,7 +109,63 @@ impl BridgeSession {
             core: BridgeCore::new(format, stream_id, call_id, direction, playout_cap),
             uplink_decode_errors: 0,
             downlink_encode_errors: 0,
+            uplink_resampler: None,
+            downlink_resampler: None,
+            uplink_scratch: Vec::new(),
+            uplink_converted: Vec::new(),
+            downlink_converted: Vec::new(),
         }
+    }
+
+    /// Convert between the leg's codec rate and the negotiated **wire** rate in both directions —
+    /// `uplink` is leg → wire (what the server hears), `downlink` is wire → leg (what the call hears).
+    /// Build them with [`super::wire_rate::wire_resampler`], which yields `None` when the two rates
+    /// are already equal; passing `None` for a direction leaves that direction on the untouched,
+    /// zero-cost path it took before wire rates were selectable.
+    ///
+    /// Both scratch buffers are reserved **here**, from the rate each conversion outputs, so the
+    /// per-tick path only ever `clear()`s and refills them.
+    #[must_use]
+    pub fn with_rate_conversion(
+        mut self,
+        uplink: Option<Resampler>,
+        downlink: Option<Resampler>,
+    ) -> Self {
+        if let Some(resampler) = uplink.as_ref() {
+            // The decoder writes interleaved values into this, so it is the ceiling-sized slot the
+            // core would otherwise have lent out (see `BridgeCore::uplink_slot`).
+            self.uplink_scratch = vec![0i16; MAX_FRAME_VALUES];
+            self.uplink_converted =
+                Vec::with_capacity(converted_frame_capacity(resampler.output_rate()));
+        }
+        if let Some(resampler) = downlink.as_ref() {
+            self.downlink_converted =
+                Vec::with_capacity(converted_frame_capacity(resampler.output_rate()));
+        }
+        self.uplink_resampler = uplink;
+        self.downlink_resampler = downlink;
+        self
+    }
+
+    /// The rate the [`BridgeCore`] — and therefore the WS wire, the uplink noise suppressor and both
+    /// sides of the echo canceller — runs at, in Hz. Equal to the leg's codec rate unless a wire-rate
+    /// conversion was installed.
+    #[must_use]
+    pub fn wire_sample_rate(&self) -> u32 {
+        self.core.format().sample_rate
+    }
+
+    /// Whether the uplink is actually being noise-suppressed at the wire rate — see
+    /// [`BridgeCore::suppresses_uplink_noise`].
+    #[must_use]
+    pub fn suppresses_uplink_noise(&self) -> bool {
+        self.core.suppresses_uplink_noise()
+    }
+
+    /// Whether the uplink is actually being echo-cancelled — see [`BridgeCore::cancels_uplink_echo`].
+    #[must_use]
+    pub fn cancels_uplink_echo(&self) -> bool {
+        self.core.cancels_uplink_echo()
     }
 
     /// Uplink frames this session's decoder rejected — audio the WS server never received. Non-zero
@@ -159,9 +263,38 @@ impl BridgeSession {
         // whatever was signalled, and RFC 4566 §6 makes `ptime` a recommendation rather than a
         // constraint — sizing the slot at the leg's nominal frame would fail the decode of a longer
         // packet, which is exactly the silent uplink this path already had once.
-        match self.leg.next_pcm(self.core.uplink_slot(MAX_FRAME_VALUES)) {
+        //
+        // With a wire-rate conversion engaged the decode cannot land in the core's slot — the
+        // conversion sits between them — so it lands in this session's own ceiling-sized scratch and
+        // the resampled frame is staged instead. Without one, the zero-copy path is unchanged.
+        let decoded = match self.uplink_resampler {
+            Some(_) => self.leg.next_pcm(&mut self.uplink_scratch),
+            None => self.leg.next_pcm(self.core.uplink_slot(MAX_FRAME_VALUES)),
+        };
+        match decoded {
             Ok(PcmFrame::Decoded(written) | PcmFrame::Concealed(written)) => {
-                self.core.commit_uplink(written, self.decode_channels);
+                if let Some(resampler) = self.uplink_resampler.as_mut() {
+                    // Fold to mono at the codec boundary first, exactly where `commit_uplink` does it
+                    // — resampling interleaved stereo would filter across the channel pair and smear
+                    // them into each other. Then convert into the wire rate the core (and the WS
+                    // server) work in.
+                    let values = written.min(self.uplink_scratch.len());
+                    let samples = siphon_rtp_codec::downmix_to_mono(
+                        &mut self.uplink_scratch[..values],
+                        self.decode_channels,
+                    );
+                    // Clamp the conversion's input to one ptime-ceiling frame at the *leg's* rate, so
+                    // the output can never exceed the capacity reserved for it — the same truncation
+                    // `commit_uplink` applies at `MAX_FRAME_SAMPLES` on the non-converting path.
+                    let feed = samples
+                        .min(MAX_FRAME_SAMPLES)
+                        .min(ceiling_frame_samples(resampler.input_rate()));
+                    self.uplink_converted.clear();
+                    resampler.process(&self.uplink_scratch[..feed], &mut self.uplink_converted);
+                    self.core.on_pcm_uplink(&self.uplink_converted);
+                } else {
+                    self.core.commit_uplink(written, self.decode_channels);
+                }
             }
             Ok(PcmFrame::Starved) => {} // nothing to play this tick — not a failure
             Err(error) => {
@@ -193,9 +326,34 @@ impl BridgeSession {
             downlink_bytes: 0,
         };
 
-        // Downlink: render the frame the core dequeued (absent after a barge-in) toward the call.
+        // Downlink: render the frame the core dequeued (absent after a barge-in) toward the call. The
+        // core's playout is in the **wire** domain — the server sends at the negotiated wire rate —
+        // so convert it back to the leg's codec rate before the encode. Skipping this renders the
+        // frame sample-for-sample at the wrong rate: the right samples at the wrong speed and pitch,
+        // with no error anywhere unless the encoder happens to reject the length.
         if let Some(frame) = self.core.take_downlink_pcm() {
-            match self.leg.encode_rtp(&frame, downlink_rtp_out) {
+            let rendered: &[i16] = match self.downlink_resampler.as_mut() {
+                Some(resampler) => {
+                    // Same clamp as the uplink: a server frame longer than the ptime ceiling is
+                    // truncated rather than allowed to grow the reserved scratch. The encoder would
+                    // reject an over-long frame anyway; this just keeps the hot path allocation-free
+                    // whatever the server sends.
+                    let feed = frame
+                        .len()
+                        .min(ceiling_frame_samples(resampler.input_rate()));
+                    self.downlink_converted.clear();
+                    resampler.process(&frame[..feed], &mut self.downlink_converted);
+                    &self.downlink_converted
+                }
+                None => &frame,
+            };
+            let rendered_samples = rendered.len();
+            if rendered_samples == 0 {
+                // A conversion can legitimately need more input before it emits its first sample;
+                // there is simply nothing to render this tick, which is not an encode failure.
+                return result;
+            }
+            match self.leg.encode_rtp(rendered, downlink_rtp_out) {
                 Ok(len) => result.downlink_bytes = len,
                 Err(error) => {
                     self.downlink_encode_errors += 1;
@@ -203,7 +361,7 @@ impl BridgeSession {
                         tracing::error!(
                             target: "siphon_rtp::media",
                             %error,
-                            frame_samples = frame.len(),
+                            frame_samples = rendered_samples,
                             "ws bridge downlink frame failed to encode — the call hears nothing \
                              (further failures at debug)"
                         );
@@ -264,6 +422,238 @@ mod tests {
         let len = write_packet(&header, &payload, &mut buffer).expect("write");
         buffer.truncate(len);
         buffer
+    }
+
+    /// **The downlink bug this work package closes.** A server rendering 24 kHz L16 into an 8 kHz
+    /// G.711 leg must have its audio resampled before the encode — otherwise 480 samples are handed
+    /// to an encoder expecting 160 and the call hears three times the audio in one packet (or a
+    /// rejected encode), i.e. the wrong speed and pitch.
+    #[test]
+    fn a_wideband_server_downlink_is_rendered_at_the_legs_rate() {
+        use siphon_rtp_dsp::resample::Resampler;
+
+        let mut session = ulaw_session().with_rate_conversion(
+            None, // uplink not exercised here
+            Some(Resampler::new(24_000, 8_000).expect("downlink conversion")),
+        );
+
+        // One 20 ms frame of a 300 Hz tone sampled at 24 kHz = 480 samples.
+        let wire: Vec<i16> = (0..480)
+            .map(|n| {
+                (8000.0 * (2.0 * std::f32::consts::PI * 300.0 * n as f32 / 24_000.0).sin()) as i16
+            })
+            .collect();
+        let mut l16 = vec![0u8; wire.len() * 2];
+        pcm_to_l16_le(&wire, &mut l16);
+        session.on_ws_binary(&l16);
+
+        let mut uplink = [0u8; 4096];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+
+        // 160 samples at 8 kHz = one 20 ms µ-law packet: 12-byte header + 160-byte payload.
+        assert_eq!(
+            result.downlink_bytes,
+            FIXED_HEADER_LEN + 160,
+            "a 20 ms wire frame must render as exactly one 20 ms RTP packet at the leg's rate"
+        );
+        assert_eq!(session.downlink_encode_errors(), 0);
+
+        // The rendered payload must equal an **independently** computed reference: resample the same
+        // input with a fresh resampler and µ-law encode it directly. (Not an encode/decode round-trip
+        // — a shared bug would pass that.)
+        let mut reference_pcm = Vec::new();
+        Resampler::new(24_000, 8_000)
+            .expect("reference conversion")
+            .process(&wire, &mut reference_pcm);
+        assert_eq!(reference_pcm.len(), 160, "the reference is one 8 kHz frame");
+        let mut reference_payload = [0u8; 160];
+        let reference_len = {
+            use siphon_rtp_codec::Encoder as _;
+            G711::ulaw()
+                .encode(&reference_pcm, &mut reference_payload)
+                .expect("reference encode")
+        };
+        assert_eq!(
+            &downlink[FIXED_HEADER_LEN..result.downlink_bytes],
+            &reference_payload[..reference_len],
+            "the call must hear exactly the directly-resampled audio"
+        );
+    }
+
+    /// A µ-law session whose WS wire runs at `wire_rate_hz` — the leg is still 8 kHz G.711, so both
+    /// conversions are built unless the requested rate happens to be the leg's own.
+    fn ulaw_session_at(wire_rate_hz: u32) -> BridgeSession {
+        use crate::bridge::wire_rate::wire_resampler;
+        const LEG_RATE_HZ: u32 = 8_000;
+        let leg = MediaLeg::new(
+            Box::new(G711::ulaw()),
+            Box::new(G711::ulaw()),
+            JitterBuffer::new(1, 16),
+            0x5555_6666,
+            0,
+        );
+        BridgeSession::new(
+            leg,
+            MediaFormat {
+                encoding: Encoding::L16,
+                sample_rate: wire_rate_hz,
+                channels: 1,
+                bit_depth: 16,
+                endianness: Endianness::Little,
+                ptime: 20,
+            },
+            "str_1",
+            "call_1",
+            Direction::Duplex,
+            8,
+        )
+        .with_rate_conversion(
+            wire_resampler(LEG_RATE_HZ, wire_rate_hz).expect("uplink conversion"),
+            wire_resampler(wire_rate_hz, LEG_RATE_HZ).expect("downlink conversion"),
+        )
+    }
+
+    /// An 8 kHz G.711 leg asked to stream at 16 kHz must frame **the wire rate**, not its codec rate:
+    /// one 20 ms frame is 320 samples = 640 L16 bytes, and `start` must say 16000 rather than lie.
+    #[test]
+    fn an_8k_leg_streams_the_uplink_at_the_requested_16k_wire_rate() {
+        let mut session = ulaw_session_at(16_000);
+        assert_eq!(session.wire_sample_rate(), 16_000);
+        match session.start_message() {
+            ControlMessage::Start(data) => assert_eq!(
+                data.media.sample_rate, 16_000,
+                "the start envelope must announce the negotiated wire rate"
+            ),
+            other => panic!("expected start, got {other:?}"),
+        }
+
+        session.on_rtp(&ulaw_packet(0, 0xFF));
+        let mut uplink = [0u8; 4096];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+        assert_eq!(
+            result.uplink_bytes, 640,
+            "16 kHz × 20 ms mono L16 = 320 samples = 640 bytes"
+        );
+        assert_eq!(session.uplink_decode_errors(), 0);
+    }
+
+    /// Asking for the rate you already have must cost nothing **and** change nothing: no resampler is
+    /// installed, and the uplink bytes are identical to a session that was never told about wire
+    /// rates at all.
+    #[test]
+    fn a_wire_rate_equal_to_the_leg_rate_installs_no_conversion() {
+        use crate::bridge::wire_rate::wire_resampler;
+        assert!(
+            wire_resampler(8_000, 8_000).expect("identity").is_none(),
+            "no conversion is built for a rate the leg already runs at"
+        );
+
+        let pcm: Vec<i16> = (0..160).map(|n| ((n * 137) % 4000) as i16 - 2000).collect();
+        let render = |mut session: BridgeSession| -> Vec<u8> {
+            session.on_rtp(&ulaw_packet_pcm(0, &pcm));
+            let mut uplink = [0u8; 4096];
+            let mut downlink = [0u8; 4096];
+            let result = session.tick(&mut uplink, &mut downlink);
+            uplink[..result.uplink_bytes].to_vec()
+        };
+
+        let baseline = render(ulaw_session());
+        let requested = render(ulaw_session_at(8_000));
+        assert_eq!(baseline.len(), 320, "8 kHz × 20 ms mono L16");
+        assert_eq!(
+            requested, baseline,
+            "requesting the leg's own rate must be byte-identical to not requesting one"
+        );
+    }
+
+    /// The echo canceller's **near-end** (the staged uplink) and **far-end reference** (the downlink
+    /// frame this tick renders) must live in one rate domain and one frame length. This fails if the
+    /// wire-rate conversion is ever moved inside the core, which would leave the uplink at the leg's
+    /// 8 kHz while the server's downlink stayed at 16 kHz — the canceller would then subtract a
+    /// half-length, wrong-domain signal from the speech and degrade it instead of cleaning it.
+    #[test]
+    fn the_echo_canceller_sees_one_rate_domain_on_both_of_its_inputs() {
+        const WIRE_RATE_HZ: u32 = 16_000;
+        const WIRE_FRAME_SAMPLES: usize = 320; // 16 kHz × 20 ms
+
+        let canceller = EchoCanceller::new(WIRE_RATE_HZ, WIRE_RATE_HZ as usize / 8)
+            .expect("a canceller at the wire rate");
+        let mut session = ulaw_session_at(WIRE_RATE_HZ).with_echo_canceller(Some(canceller));
+
+        // The server plays one 20 ms wire frame; the phone sends one 20 ms leg frame.
+        let far_end = [3000i16; WIRE_FRAME_SAMPLES];
+        let mut l16 = vec![0u8; far_end.len() * 2];
+        pcm_to_l16_le(&far_end, &mut l16);
+        session.on_ws_binary(&l16);
+        session.on_rtp(&ulaw_packet_pcm(0, &[2000i16; 160]));
+
+        let mut uplink = [0u8; 4096];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+
+        // Near end: the uplink the canceller cleaned, in the wire domain.
+        assert_eq!(
+            result.uplink_bytes,
+            WIRE_FRAME_SAMPLES * 2,
+            "the near-end frame must be one wire-rate frame"
+        );
+        // Far end: the same wire frame the server sent — same length, same domain, same tick.
+        assert_eq!(
+            l16.len(),
+            WIRE_FRAME_SAMPLES * 2,
+            "the far-end reference must be one wire-rate frame"
+        );
+        assert_eq!(
+            result.uplink_bytes,
+            l16.len(),
+            "near-end and far-end must be the same frame length, or the canceller is aligning \
+             two different signals"
+        );
+        // …and the call still hears that frame back at its own 8 kHz codec rate.
+        assert_eq!(result.downlink_bytes, FIXED_HEADER_LEN + 160);
+        assert_eq!(session.downlink_encode_errors(), 0);
+    }
+
+    /// A wire rate the **noise suppressor** does not support must degrade that feature and nothing
+    /// else: the stream still runs at the 24 kHz the controller negotiated, it is simply not
+    /// suppressed. Silently dropping to 16 kHz to keep the suppressor would hand the server frames
+    /// that do not match the `start` envelope it was given.
+    #[test]
+    fn an_unsuppressable_wire_rate_disables_the_cleaning_not_the_stream() {
+        let mut session = ulaw_session_at(24_000).with_noise_suppression(true);
+        assert_eq!(
+            session.wire_sample_rate(),
+            24_000,
+            "the wire rate the controller asked for is untouched"
+        );
+        assert!(
+            !session.suppresses_uplink_noise(),
+            "the suppressor exists only at 8/16 kHz, so it must be off — not forcing a rate change"
+        );
+
+        session.on_rtp(&ulaw_packet(0, 0xFF));
+        let mut uplink = [0u8; 8192];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+        assert_eq!(
+            result.uplink_bytes, 960,
+            "24 kHz × 20 ms mono L16 = 480 samples = 960 bytes"
+        );
+        assert_eq!(session.uplink_decode_errors(), 0);
+    }
+
+    /// At a rate both features support, raising the wire rate above the leg's codec rate keeps them
+    /// engaged — the degradation above is the exception, not the rule.
+    #[test]
+    fn a_supported_wire_rate_keeps_the_cleaning_engaged() {
+        let session = ulaw_session_at(16_000)
+            .with_noise_suppression(true)
+            .with_echo_canceller(EchoCanceller::new(16_000, 2_000).ok());
+        assert!(session.suppresses_uplink_noise(), "16 kHz is supported");
+        assert!(session.cancels_uplink_echo(), "16 kHz is supported");
+        assert_eq!(session.wire_sample_rate(), 16_000);
     }
 
     #[test]
