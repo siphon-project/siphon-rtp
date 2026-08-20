@@ -23,6 +23,7 @@ use siphon_rtp_datapath::{
     AddressFamily, Datapath, Endpoint, EndpointId, FlowAction, ForwardRule, IceAgentMode,
     IceConfig, LatchPolicy, ObservedRtcp, SourceFilter,
 };
+use siphon_rtp_dsp::VoiceDetector;
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_hep::mos::Impairments;
@@ -34,7 +35,7 @@ use siphon_rtp_media::player::{PcmPlayer, WavSource};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    PlayMediaSource, ProfileFlags, SessionStats, WsTeeDirection, WsTeeEndReason,
+    PlayMediaSource, ProfileFlags, SessionStats, WsTeeDirection, WsTeeEndReason, WsVadEngine,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
@@ -2448,11 +2449,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             None
         });
-        // Local energy-VAD turn-taking (speech_started/stopped + optional barge-in) when requested.
-        // The hangover is carried in ms and converted to ptime frames now that the codec ptime known.
+        // Local VAD turn-taking (speech_started/stopped + optional barge-in) when requested. Both
+        // the trailing hangover and the leading minimum-speech run are carried in ms and converted
+        // to ptime frames now that the codec ptime is known. The neural detector can refuse, which
+        // fails the bridge rather than silently downgrading to the detector the controller was
+        // trying to avoid.
+        //
+        // Built at the **wire** rate, not the leg's codec rate: the rate conversion sits in the RTP
+        // shell, so by the time a frame reaches the core — where the detector runs — it is already
+        // in the wire domain, exactly like the noise suppressor and the echo canceller above.
+        // Handing the detector the codec rate would have it frame against a length the audio no
+        // longer has. (The neural detector resamples anything that is not 16 kHz into itself.)
         if let Some(vad) = vad_config {
-            let hangover_frames = (vad.hangover_ms / u32::from(codec.ptime_ms.max(1))).max(1);
-            session = session.with_vad(vad.threshold, hangover_frames, vad.barge_in);
+            let ptime_ms = codec.ptime_ms.max(1);
+            let detector = vad.build_detector(wire_rate)?;
+            let minimum_speech_frames = vad.minimum_speech_frames(ptime_ms);
+            tracing::debug!(
+                target: "media",
+                %call_id,
+                engine = ?vad.engine,
+                pcm_rate_hz = wire_rate,
+                hangover_frames = vad.hangover_frames(ptime_ms),
+                minimum_speech_frames,
+                barge_in = vad.barge_in,
+                "ws bridge uplink VAD selected"
+            );
+            session = session.with_voice_detector(detector, minimum_speech_frames, vad.barge_in);
         }
 
         let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
@@ -9081,10 +9103,15 @@ const DEFAULT_WS_VAD_HANGOVER_MS: u32 = 200;
 /// Local-VAD turn-taking config for a WS voice-AI leg, resolved from [`ProfileFlags`] at offer time.
 #[derive(Debug, Clone, Copy)]
 struct WsVadConfig {
-    /// Mean-square energy at/above which an uplink frame is speech.
+    /// Which detector to run (`ws_vad_engine`); the energy gate unless the controller says otherwise.
+    engine: WsVadEngine,
+    /// Mean-square energy at/above which an uplink frame is speech. Energy detector only.
     threshold: i64,
     /// Trailing hangover in milliseconds (converted to ptime frames once the codec ptime is known).
+    /// Energy detector only — the neural one holds speech with its own probability hysteresis.
     hangover_ms: u32,
+    /// Leading minimum-speech run in milliseconds before the speech-start edge fires (0 = none).
+    minimum_speech_ms: u32,
     /// Flush the downlink playout locally on a speech-start edge (barge-in).
     barge_in: bool,
 }
@@ -9094,12 +9121,45 @@ impl WsVadConfig {
     /// requested. Barge-in implies VAD, so either flag turns the detector on.
     fn from_profile(profile: &ProfileFlags) -> Option<Self> {
         (profile.ws_vad || profile.ws_barge_in).then(|| Self {
+            engine: profile.ws_vad_engine.unwrap_or_default(),
             threshold: profile.ws_vad_threshold.unwrap_or(DEFAULT_WS_VAD_THRESHOLD),
             hangover_ms: profile
                 .ws_vad_hangover_ms
                 .unwrap_or(DEFAULT_WS_VAD_HANGOVER_MS),
+            minimum_speech_ms: profile.ws_vad_min_speech_ms.unwrap_or(0),
             barge_in: profile.ws_barge_in,
         })
+    }
+
+    /// Build the detector this config selects for a leg running at `pcm_rate_hz`.
+    ///
+    /// # Errors
+    /// A human-readable reason the bridge could not be stood up. The neural detector is refused
+    /// rather than silently downgraded to the energy one: a controller that asked for it did so to
+    /// stop barge-in firing on noise, and quietly handing back the detector it was avoiding is the
+    /// failure mode that costs someone an afternoon.
+    fn build_detector(&self, pcm_rate_hz: u32) -> Result<VoiceDetector, String> {
+        match self.engine {
+            WsVadEngine::Energy => Ok(VoiceDetector::energy(
+                self.threshold,
+                self.hangover_frames(1),
+            )),
+            WsVadEngine::Neural => VoiceDetector::neural(pcm_rate_hz).map_err(|error| {
+                format!("neural VAD unavailable for a {pcm_rate_hz} Hz leg: {error}")
+            }),
+        }
+    }
+
+    /// Trailing hangover in ptime frames, at least one.
+    fn hangover_frames(&self, ptime_ms: u8) -> u32 {
+        (self.hangover_ms / u32::from(ptime_ms.max(1))).max(1)
+    }
+
+    /// Leading minimum-speech run in ptime frames, at least one (one == no leading requirement).
+    fn minimum_speech_frames(&self, ptime_ms: u8) -> u32 {
+        self.minimum_speech_ms
+            .div_ceil(u32::from(ptime_ms.max(1)))
+            .max(1)
     }
 }
 
@@ -9641,6 +9701,89 @@ mod tests {
 
     /// The default control client for tests that don't exercise per-client isolation.
     const CLIENT: ClientId = ClientId(1);
+
+    #[test]
+    fn ws_vad_config_is_absent_unless_vad_or_barge_in_is_requested() {
+        assert!(WsVadConfig::from_profile(&ProfileFlags::default()).is_none());
+        // Setting only the tuning knobs is not a request for a detector.
+        let tuned = ProfileFlags {
+            ws_vad_engine: Some(WsVadEngine::Neural),
+            ws_vad_min_speech_ms: Some(100),
+            ..Default::default()
+        };
+        assert!(WsVadConfig::from_profile(&tuned).is_none());
+        // Barge-in implies VAD.
+        let barge = ProfileFlags {
+            ws_barge_in: true,
+            ..Default::default()
+        };
+        assert!(WsVadConfig::from_profile(&barge).is_some());
+    }
+
+    #[test]
+    fn ws_vad_config_defaults_to_the_energy_detector_with_no_leading_run() {
+        let profile = ProfileFlags {
+            ws_vad: true,
+            ..Default::default()
+        };
+        let config = WsVadConfig::from_profile(&profile).expect("requested");
+        assert_eq!(config.engine, WsVadEngine::Energy);
+        assert_eq!(config.threshold, DEFAULT_WS_VAD_THRESHOLD);
+        assert_eq!(config.hangover_ms, DEFAULT_WS_VAD_HANGOVER_MS);
+        assert_eq!(config.minimum_speech_ms, 0);
+        // 200 ms of hangover at a 20 ms ptime is 10 frames; no leading run is one frame.
+        assert_eq!(config.hangover_frames(20), 10);
+        assert_eq!(config.minimum_speech_frames(20), 1);
+        assert!(!config
+            .build_detector(8_000)
+            .expect("energy is infallible")
+            .is_neural());
+    }
+
+    #[test]
+    fn ws_vad_config_selects_the_neural_detector_and_the_leading_run() {
+        let profile = ProfileFlags {
+            ws_vad: true,
+            ws_barge_in: true,
+            ws_vad_engine: Some(WsVadEngine::Neural),
+            ws_vad_min_speech_ms: Some(100),
+            ..Default::default()
+        };
+        let config = WsVadConfig::from_profile(&profile).expect("requested");
+        assert_eq!(config.engine, WsVadEngine::Neural);
+        assert!(config.barge_in);
+        // The run is carried in ms and rounded **up** to whole ptime frames — under-delivering on a
+        // debounce is the failure that matters.
+        assert_eq!(config.minimum_speech_frames(20), 5);
+        assert_eq!(config.minimum_speech_frames(30), 4);
+        // Both telephony rates build; the narrowband leg is resampled into the detector.
+        for rate in [8_000u32, 16_000] {
+            assert!(config
+                .build_detector(rate)
+                .expect("neural builds for a telephony rate")
+                .is_neural());
+        }
+    }
+
+    #[test]
+    fn a_neural_detector_that_cannot_be_built_fails_the_bridge_rather_than_downgrading() {
+        // A controller asking for the neural detector did so to stop barge-in firing on noise;
+        // handing back the energy gate it was avoiding would look like success and behave like the
+        // bug. `setup_ws_bridge` propagates this reason out of `Command::Offer` as an error result.
+        let profile = ProfileFlags {
+            ws_vad: true,
+            ws_vad_engine: Some(WsVadEngine::Neural),
+            ..Default::default()
+        };
+        let config = WsVadConfig::from_profile(&profile).expect("requested");
+        let error = config
+            .build_detector(0)
+            .expect_err("a zero rate is refused");
+        assert!(
+            error.contains("neural VAD unavailable"),
+            "unhelpful reason: {error}"
+        );
+    }
 
     async fn phone() -> (UdpSocket, SocketAddr) {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))

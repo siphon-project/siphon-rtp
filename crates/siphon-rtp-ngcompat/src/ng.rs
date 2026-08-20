@@ -415,6 +415,8 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         ws_vad_threshold: None,
         ws_vad_hangover_ms: None,
         ws_sample_rate: None,
+        ws_vad_engine: None,
+        ws_vad_min_speech_ms: None,
         // The WS tee is a native siphon-rtp (JSON control) extension too — same rule as `ws_uri`.
         ws_tee: None,
         ws_tee_direction: None,
