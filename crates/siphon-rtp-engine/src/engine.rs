@@ -5473,11 +5473,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // RTPBleed gate: exact signalled-source by default; accept-any only for an explicit symmetric
         // leg. The constrained latch then learns the reply address from the gated source.
         //
-        // An ICE seat starts with the gate open (`Any`): a connectivity check legitimately arrives
-        // from a peer-reflexive transport the SDP never carried (RFC 8445 §7.3.1.3), and the room's
-        // `ice_pending` gate below drops *all* media until the agent selects, at which point
-        // `ice_selected` narrows this to the selected pair. So the window is not permissive — nothing
-        // is mixed or sent during it.
+        // An ICE seat runs this gate open (`Any`), because the signalled address is not the
+        // discriminator on an ICE leg: a connectivity check legitimately arrives from a
+        // peer-reflexive transport the SDP never carried (RFC 8445 §7.3.1.3). What actually holds
+        // the seat shut is the datapath's **layer-4 ICE gate**, which redirects media to this room
+        // only from the source a check authenticated with our own password — for a full-agent seat
+        // the room's `ice_pending` below additionally drops everything until the agent selects, and
+        // `ice_selected` then narrows this filter to the selected pair.
+        // (docs/security-and-nat.md §4 layer 4; RFC 8445 §7.)
         let accepted_source = if want_ice || profile.flags.iter().any(|flag| flag == "symmetric") {
             SourceFilter::Any
         } else {
@@ -5512,9 +5515,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // A full RFC 8445 agent runs when the operator enabled it and the peer gave us both
         // credentials and candidates; otherwise the datapath's ice-lite responder answers checks and
-        // adopts the validated source, exactly as on a 2-party leg. Only a full agent gates the seat:
-        // an ice-lite seat is already covered by the datapath's own layer-4 gate, and there is no
-        // selection coming that would ever clear a pending flag.
+        // adopts the validated source, exactly as on a 2-party leg.
+        //
+        // Only a full agent sets `ice_pending` on the seat, and that is a *room-level* gate for the
+        // window in which a selection is still coming. An ice-lite seat never sets it, because no
+        // selection is coming and a seat left pending forever would never be mixed at all; what
+        // covers an ice-lite seat is the datapath's layer-4 ICE gate on the redirected path, which
+        // hands the room only the source a connectivity check validated (`Inner::ice_gate`;
+        // docs/security-and-nat.md §4 layer 4). Both gates are armed by the credentials installed
+        // below — without them the seat would fall back to its `accepted_source` filter alone, which
+        // an ICE seat deliberately leaves open.
         let peer_ice = peer_ice_credentials(&info);
         let mut ice_pending = false;
         if let Some(config) = ice_config.as_ref() {
@@ -19522,13 +19532,22 @@ mod tests {
         let username = format!("{engine_ufrag}:{A_UFRAG}");
         let check = siphon_rtp_stun::binding_request(&[5u8; 12], &username, engine_pwd.as_bytes());
         phone_b.send_to(&check, engine_b).await.expect("send check");
+        // The seat is already receiving the room's 20 ms egress on this socket, so skip past the
+        // mix frames to the Binding success response.
         let mut buffer = [0u8; 2048];
-        let (len, _) = timeout(Duration::from_secs(1), phone_b.recv_from(&mut buffer))
-            .await
-            .expect("no timeout")
-            .expect("STUN response");
-        let response = siphon_rtp_stun::parse(&buffer[..len]).expect("parse response");
-        assert_eq!(response.message_type, siphon_rtp_stun::BINDING_SUCCESS);
+        let mut answered = false;
+        for _ in 0..25 {
+            let (len, _) = timeout(Duration::from_secs(1), phone_b.recv_from(&mut buffer))
+                .await
+                .expect("no timeout")
+                .expect("datagram");
+            if let Ok(response) = siphon_rtp_stun::parse(&buffer[..len]) {
+                assert_eq!(response.message_type, siphon_rtp_stun::BINDING_SUCCESS);
+                answered = true;
+                break;
+            }
+        }
+        assert!(answered, "the ice-lite responder answers the seat's check");
 
         for sequence in 0..30 {
             phone_b
@@ -19618,6 +19637,141 @@ mod tests {
         );
         // The seat is still seated (ICE succeeded, so nothing tore it down).
         assert_eq!(engine.conference().participant_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_ice_conference_seat_is_mixed_once_its_agent_selects_a_pair() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_codec::g711::G711;
+        use siphon_rtp_codec::Decoder as _;
+        use siphon_rtp_dsp::EnergyVad;
+        use siphon_rtp_media::rtp::RtpPacket;
+
+        // The other half of the layer-4 gate on the redirected path: it must *narrow* a seat, not
+        // close it. A full RFC 8445 agent runs the checklist, the datapath adopts the pair it selects
+        // (`Datapath::adopt_source`), and from then on that seat's audio reaches the mix exactly as a
+        // plain seat's does. Complements
+        // `a_full_ice_conference_seat_opens_its_media_path_only_after_a_pair_is_selected`, which stops
+        // at the selection and never sends media through it.
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        // A plain listener seat, so the room has somewhere to send what it mixed.
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 1)).await;
+        let joined_a = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "full-ice-room".into(),
+                    from_tag: "alice".into(),
+                    sdp: sdp_for(addr_a, true),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let engine_a = sdp::parse(&ok_sdp_text(&joined_a))
+            .expect("A answer")
+            .remote_rtp;
+
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let joined_b = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "full-ice-room".into(),
+                    from_tag: "bob".into(),
+                    sdp: ice_offer_with_candidate(addr_b),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let answer_b = sdp::parse(&ok_sdp_text(&joined_b)).expect("B answer");
+        let engine_b = answer_b.remote_rtp;
+        let seat_endpoint = engine
+            .conference()
+            .participant_at_tag("full-ice-room", "bob")
+            .expect("the seat is registered");
+
+        // Drive both agents until the engine's selects a pair.
+        let mut peer = peer_agent(&answer_b, addr_b);
+        let mut buffer = [0u8; 2048];
+        let mut now = 0u64;
+        while now < 4_000
+            && engine
+                .datapath()
+                .ice_validated_source(seat_endpoint)
+                .is_none()
+        {
+            for action in peer.poll(now) {
+                if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                    phone_b.send_to(&datagram, to).await.expect("peer send");
+                }
+            }
+            engine.drive_ice_agents(now).await;
+            while let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(20), phone_b.recv_from(&mut buffer)).await
+            {
+                if siphon_rtp_stun::parse(&buffer[..len]).is_err() {
+                    continue; // the room's mix egress, not a connectivity check
+                }
+                for action in peer.on_datagram(addr_b, from, &buffer[..len], now) {
+                    if let siphon_rtp_ice::AgentAction::Send { to, datagram, .. } = action {
+                        phone_b.send_to(&datagram, to).await.expect("peer send");
+                    }
+                }
+                engine.drive_ice_agents(now).await;
+            }
+            now += 20;
+        }
+        assert_eq!(
+            engine.datapath().ice_validated_source(seat_endpoint),
+            Some(addr_b),
+            "the seat's agent selected the participant's real transport"
+        );
+
+        // The room has been ticking silence at A for the whole ICE exchange above, so its socket
+        // holds a backlog of pre-selection frames. Drain it first: scanning the backlog instead of
+        // what B actually sent would look like "the gate blocked it" and make this test a
+        // load-dependent coin flip.
+        let mut backlog = [0u8; 2048];
+        while timeout(Duration::from_millis(5), phone_a.recv_from(&mut backlog))
+            .await
+            .is_ok()
+        {}
+
+        // The selected pair now carries audio all the way into the mix.
+        for sequence in 0..30 {
+            phone_b
+                .send_to(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x00), engine_b)
+                .await
+                .expect("b send");
+        }
+        let mut decoder = G711::ulaw();
+        let mut pcm = vec![0i16; 320];
+        let mut heard_loud = false;
+        for _ in 0..25 {
+            let (mix, from) = recv(&phone_a).await;
+            assert_eq!(from, engine_a, "A hears the mix from its engine port");
+            let packet = RtpPacket::parse(&mix).expect("A egress RTP");
+            let samples = decoder.decode(packet.payload, &mut pcm).expect("decode");
+            if EnergyVad::energy(&pcm[..samples]) > 1_000_000 {
+                heard_loud = true;
+                break;
+            }
+        }
+        assert!(
+            heard_loud,
+            "the selected pair's audio is mixed once ICE has chosen it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
