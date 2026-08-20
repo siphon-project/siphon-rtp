@@ -7,6 +7,14 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-08-20
+
+### Changed
+- Strip the distributed binaries (docker image, `.deb`/`.rpm`, tarballs). The release profile still
+  keeps debug symbols for the iai-callgrind perf gate — stripping happens only on the release
+  artifacts, shrinking the container image from ~219 MB to ~13 MB (and the packages likewise). No
+  code change.
+
 ## [0.2.0] — 2026-08-19
 
 The workspace version is `0.2.0` (a single number across every crate, see

@@ -38,7 +38,8 @@ RUN cargo chef cook --release --target x86_64-unknown-linux-musl \
 COPY . .
 RUN cargo build --release --target x86_64-unknown-linux-musl \
         -p siphon-rtp ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
- && cp target/x86_64-unknown-linux-musl/release/siphon-rtp /siphon-rtp
+ && cp target/x86_64-unknown-linux-musl/release/siphon-rtp /siphon-rtp \
+ && strip /siphon-rtp
 
 # ── Runtime (prod): distroless static, just the binary ───────────────────────────────────
 FROM gcr.io/distroless/static-debian12 AS runtime
