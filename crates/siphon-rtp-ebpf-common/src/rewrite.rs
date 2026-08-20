@@ -285,11 +285,11 @@ mod tests {
     /// byte of a word whose low byte is zero, RFC 1071 §1).
     fn sum_be16(data: &[u8]) -> u32 {
         let mut sum = 0u32;
-        let mut chunks = data.chunks_exact(2);
-        for chunk in &mut chunks {
+        let (words, remainder) = data.as_chunks::<2>();
+        for chunk in words {
             sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
         }
-        if let [last] = chunks.remainder() {
+        if let [last] = remainder {
             sum += u32::from(u16::from_be_bytes([*last, 0]));
         }
         sum

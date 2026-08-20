@@ -1607,16 +1607,15 @@ fn build_code_8i40_31bits(
         let pos_index = shr(i, 2); // index = pos/4
         let track = (i & 3) as usize; // track = pos%4
 
-        let sign_index;
-        if j > 0 {
+        let sign_index = if j > 0 {
             cod[i as usize] = add(cod[i as usize], POS_CODE_MR102);
             sign_pulses[k] = POS_SIGN_MR102;
-            sign_index = 0; // bit=0 -> positive pulse
+            0 // bit=0 -> positive pulse
         } else {
             cod[i as usize] = sub(cod[i as usize], POS_CODE_MR102);
             sign_pulses[k] = NEG_SIGN_MR102;
-            sign_index = 1; // bit=1 -> negative pulse
-        }
+            1 // bit=1 -> negative pulse
+        };
 
         if codewords[track] < 0 {
             // first pulse of the track

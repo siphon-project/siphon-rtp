@@ -336,7 +336,7 @@ fn plan_blocks(magnitudes: &mut [i32], blocks: usize) -> BlockPlan {
             // 1+1 -> 2, then 2+2 -> 4, 4+4 -> 8 and 8+8 -> 16 in place, each against its own
             // ceiling. `|=` rather than `||`: the C sums all four verdicts, so every level runs.
             let mut overflowed = false;
-            for (slot, pair) in combined.iter_mut().zip(window.chunks_exact(2)) {
+            for (slot, pair) in combined.iter_mut().zip(window.as_chunks::<2>().0) {
                 let sum = pair[0] + pair[1];
                 if sum > MAX_PULSES_TABLE[0] {
                     overflowed = true;
@@ -408,13 +408,13 @@ fn encode_shell_block(encoder: &mut RangeEncoder<'_>, magnitudes: &[i32]) {
     let mut level1 = [0i32; 8];
     let mut level2 = [0i32; 4];
     let mut level3 = [0i32; 2];
-    for (slot, pair) in level1.iter_mut().zip(magnitudes.chunks_exact(2)) {
+    for (slot, pair) in level1.iter_mut().zip(magnitudes.as_chunks::<2>().0) {
         *slot = pair[0] + pair[1];
     }
-    for (slot, pair) in level2.iter_mut().zip(level1.chunks_exact(2)) {
+    for (slot, pair) in level2.iter_mut().zip(level1.as_chunks::<2>().0) {
         *slot = pair[0] + pair[1];
     }
-    for (slot, pair) in level3.iter_mut().zip(level2.chunks_exact(2)) {
+    for (slot, pair) in level3.iter_mut().zip(level2.as_chunks::<2>().0) {
         *slot = pair[0] + pair[1];
     }
     let total = level3[0] + level3[1];
@@ -456,7 +456,9 @@ fn encode_signs(
     let row = 7 * (offset_column + (signal_type.index() << 1));
 
     for (block, chunk) in pulses
-        .chunks_exact(SHELL_BLOCK_LENGTH)
+        .as_chunks::<SHELL_BLOCK_LENGTH>()
+        .0
+        .iter()
         .enumerate()
         .take(plan.blocks)
     {

@@ -498,9 +498,8 @@ pub fn az_isp(a: &[i16], isp: &mut [i16], old_isp: &[i16]) {
             let x = sub(xhigh, xlow);
             let y = sub(yhigh, ylow);
 
-            let xint;
-            if y == 0 {
-                xint = xlow;
+            let xint = if y == 0 {
+                xlow
             } else {
                 let sign = y;
                 let mut yy = abs_s(y);
@@ -515,8 +514,8 @@ pub fn az_isp(a: &[i16], isp: &mut [i16], old_isp: &[i16]) {
                 }
                 let mut t0b = l_mult(ylow, yq);
                 t0b = l_shr(t0b, 11);
-                xint = sub(xlow, extract_l(t0b));
-            }
+                sub(xlow, extract_l(t0b))
+            };
 
             isp[nf] = xint;
             xlow = xint;

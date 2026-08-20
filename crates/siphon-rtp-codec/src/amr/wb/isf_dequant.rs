@@ -256,7 +256,7 @@ mod tests {
             14600, 7000,
         ];
         let mut buf = [0i16; L_MEANBUF * M];
-        for row in buf.chunks_exact_mut(M) {
+        for row in buf.as_chunks_mut::<M>().0 {
             row.copy_from_slice(&isfold);
         }
         dpisf_2s_46b(

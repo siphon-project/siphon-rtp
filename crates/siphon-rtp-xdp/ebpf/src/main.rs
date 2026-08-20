@@ -25,7 +25,8 @@
 //! relay is a fixed rewrite the kernel can do without ever touching userspace. The userspace TURN
 //! server (`siphon-rtp-turn`) already programs the seam — its `TurnFastPath` installs a `ChannelRoute`
 //! on ChannelBind and withdraws it on teardown — and the shared ABI is the
-//! [`TurnPeerKey`]→[`TurnClientRoute`] / [`TurnChannelKey`]→[`TurnPeerRoute`] map pairs in
+//! [`siphon_rtp_ebpf_common::TurnPeerKey`]→[`siphon_rtp_ebpf_common::TurnClientRoute`] /
+//! [`siphon_rtp_ebpf_common::TurnChannelKey`]→[`siphon_rtp_ebpf_common::TurnPeerRoute`] map pairs in
 //! `siphon-rtp-ebpf-common`. The kernel dispatch this enables, *checked before the generic `FLOWS`
 //! redirect so an established channel bypasses the AF_XDP slow path:*
 //!

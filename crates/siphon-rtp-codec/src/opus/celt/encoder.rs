@@ -2208,7 +2208,7 @@ mod tests {
             decoder
                 .decode(&payload[..written], &mut pcm, frame_size)
                 .expect("decode");
-            for pair in pcm.chunks_exact(2) {
+            for pair in pcm.as_chunks::<2>().0 {
                 out_left.push(f32::from(pair[0]) / 32768.0);
                 out_right.push(f32::from(pair[1]) / 32768.0);
             }

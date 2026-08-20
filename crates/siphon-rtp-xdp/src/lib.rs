@@ -208,7 +208,11 @@ impl Loader {
 
     /// Register an AF_XDP socket fd into the `XSKS` map at `queue` so the classifier's
     /// `XDP_REDIRECT(queue)` lands packets on it. The socket must be bound to the same queue.
-    pub fn register_xsk(&mut self, queue: u32, socket_fd: std::os::fd::RawFd) -> Result<(), XdpError> {
+    pub fn register_xsk(
+        &mut self,
+        queue: u32,
+        socket_fd: std::os::fd::RawFd,
+    ) -> Result<(), XdpError> {
         let mut xsks: XskMap<&mut MapData> =
             XskMap::try_from(self.ebpf.map_mut("XSKS").ok_or_else(|| XdpError::Map {
                 map: "XSKS",
@@ -218,10 +222,11 @@ impl Loader {
                 map: "XSKS",
                 detail: error.to_string(),
             })?;
-        xsks.set(queue, socket_fd, 0).map_err(|error| XdpError::Map {
-            map: "XSKS",
-            detail: error.to_string(),
-        })
+        xsks.set(queue, socket_fd, 0)
+            .map_err(|error| XdpError::Map {
+                map: "XSKS",
+                detail: error.to_string(),
+            })
     }
 
     /// Install (or replace) the flow rule for `key`.
@@ -248,16 +253,15 @@ impl Loader {
     /// every flow). Per-endpoint counters come from [`Loader::flow_stats`]; this stays the global
     /// health metric.
     pub fn stats(&self) -> Result<FlowStats, XdpError> {
-        let stats: PerCpuArray<_, PodStats> = PerCpuArray::try_from(
-            self.ebpf.map("STATS").ok_or_else(|| XdpError::Map {
+        let stats: PerCpuArray<_, PodStats> =
+            PerCpuArray::try_from(self.ebpf.map("STATS").ok_or_else(|| XdpError::Map {
                 map: "STATS",
                 detail: "missing".to_string(),
-            })?,
-        )
-        .map_err(|error| XdpError::Map {
-            map: "STATS",
-            detail: error.to_string(),
-        })?;
+            })?)
+            .map_err(|error| XdpError::Map {
+                map: "STATS",
+                detail: error.to_string(),
+            })?;
 
         let per_cpu = stats.get(&0, 0).map_err(|error| XdpError::Map {
             map: "STATS",
@@ -649,9 +653,13 @@ impl XdpDatapath {
             local_port: port.to_be(),
             _pad: 0,
         };
-        self.inner
-            .endpoints
-            .insert(id, EndpointRecord { local_addr, flow_key });
+        self.inner.endpoints.insert(
+            id,
+            EndpointRecord {
+                local_addr,
+                flow_key,
+            },
+        );
         Ok(Endpoint { id, local_addr })
     }
 }
@@ -904,7 +912,13 @@ impl IceDemux {
     /// forward to the agent first (so it sees Binding responses too), then let the responder answer
     /// unless the endpoint is [`IceAgentMode::ForwardOnly`] — where answering behind a full agent's
     /// back would adopt a source the checklist never selected.
-    fn classify(&self, endpoint: EndpointId, source: SocketAddr, datagram: &[u8], tick: u64) -> StunDisposition {
+    fn classify(
+        &self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        datagram: &[u8],
+        tick: u64,
+    ) -> StunDisposition {
         let registration = self.ice_agents.get(&endpoint).map(|entry| entry.clone());
         if let Some(registration) = registration.as_ref() {
             // Bounded sink, drop-on-full — never stall the datapath thread on a slow consumer.
@@ -986,7 +1000,9 @@ fn adopt_source_in_kernel(
     let Some(key) = endpoints.get(&endpoint).map(|record| record.flow_key) else {
         return;
     };
-    let mut loader = loader.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut loader = loader
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let existing = match loader.flow(key) {
         Ok(Some(action)) => action,
         Ok(None) => return,
@@ -1495,12 +1511,7 @@ impl Datapath for XdpDatapath {
 
     fn adopt_source(&self, endpoint: EndpointId, source: SocketAddr) {
         self.inner.ice_adopted.insert(endpoint, source);
-        adopt_source_in_kernel(
-            &self.inner.loader,
-            &self.inner.endpoints,
-            endpoint,
-            source,
-        );
+        adopt_source_in_kernel(&self.inner.loader, &self.inner.endpoints, endpoint, source);
     }
 
     fn rx(&self) -> flume::Receiver<RxPacket> {
@@ -1798,7 +1809,8 @@ mod tests {
         // `Datapath::learned_source` is `learned_latch(..).map(|l| SocketAddr::V4(l.source))`. A real
         // `XdpDatapath` needs a NIC + kernel, so exercise that exact mapping over the shared fixture:
         // a valid latch maps to the V4 socket address; an invalid one maps to `None`.
-        let mapped = learned_latch_from_action(&latched_action(1)).map(|l| SocketAddr::V4(l.source));
+        let mapped =
+            learned_latch_from_action(&latched_action(1)).map(|l| SocketAddr::V4(l.source));
         assert_eq!(
             mapped,
             Some("198.51.100.10:5000".parse::<SocketAddr>().expect("addr"))
@@ -1883,9 +1895,15 @@ mod tests {
         let check = signed_check(&config);
 
         let first = demux.classify(ICE_ENDPOINT, peer(), &check, 0);
-        assert!(matches!(first, StunDisposition::Consumed { adopt: Some(_), .. }));
+        assert!(matches!(
+            first,
+            StunDisposition::Consumed { adopt: Some(_), .. }
+        ));
         let second = demux.classify(ICE_ENDPOINT, peer(), &check, 1);
-        assert!(matches!(second, StunDisposition::Consumed { adopt: None, .. }));
+        assert!(matches!(
+            second,
+            StunDisposition::Consumed { adopt: None, .. }
+        ));
     }
 
     #[test]

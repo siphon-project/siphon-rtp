@@ -86,7 +86,9 @@ fn read_sw(path: &Path, max_values: usize) -> Option<Vec<f32>> {
     let bytes = std::fs::read(path).ok()?;
     Some(
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .take(max_values)
             .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
             .collect(),
@@ -194,7 +196,9 @@ fn encode_and_self_check(
 fn segmental_snr_db(reference: &[u8], test: &[u8], channels: usize) -> f32 {
     let frame = 960 * channels; // 20 ms at 48 kHz, interleaved
     let to_i16 = |b: &[u8]| -> Vec<f32> {
-        b.chunks_exact(2)
+        b.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])))
             .collect()
     };
@@ -231,7 +235,7 @@ fn segmental_snr_db(reference: &[u8], test: &[u8], channels: usize) -> f32 {
 /// `opus_compare` requires of its *reference* file (`opus_compare.c:231`).
 fn mono_to_stereo(mono: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(mono.len() * 2);
-    for pair in mono.chunks_exact(2) {
+    for pair in mono.as_chunks::<2>().0 {
         out.extend_from_slice(pair);
         out.extend_from_slice(pair);
     }

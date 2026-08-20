@@ -222,23 +222,22 @@ fn pitch_ol(
     // slots followed by l_frame samples; scal_sig points at &scaled_signal[pit_max].
     let mut scaled = [0i16; PIT_MAX as usize + L_FRAME];
     let sbase = pit_max as usize;
-    let scal_fac: i16;
-    if t0 == i32::MAX {
+    let scal_fac: i16 = if t0 == i32::MAX {
         for (idx, k) in (lo..hi).enumerate() {
             scaled[idx] = shr(signal[k], 3);
         }
-        scal_fac = 3;
+        3
     } else if t0 < 1_048_576 {
         for (idx, k) in (lo..hi).enumerate() {
             scaled[idx] = shl(signal[k], 3);
         }
-        scal_fac = -3;
+        -3
     } else {
         for (idx, k) in (lo..hi).enumerate() {
             scaled[idx] = signal[k];
         }
-        scal_fac = 0;
-    }
+        0
+    };
 
     // correlations over the scaled signal
     let mut corr = [0i32; PIT_MAX as usize + 1];
@@ -613,7 +612,9 @@ mod tests {
         };
 
         let pcm: Vec<i16> = pcm_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
 
@@ -682,7 +683,9 @@ mod tests {
             return;
         };
         let pcm: Vec<i16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert!(

@@ -649,7 +649,7 @@ mod tests {
 
         let noise = quiet_noise(320 * 60);
         let mut floor_activity = 255;
-        for frame in noise.chunks_exact(320) {
+        for frame in noise.as_chunks::<320>().0 {
             let measures = analyse(
                 &mut state,
                 frame,
@@ -665,7 +665,7 @@ mod tests {
 
         let speech = voiced(320 * 30, 80, 6000.0);
         let mut speech_activity = 0;
-        for frame in speech.chunks_exact(320) {
+        for frame in speech.as_chunks::<320>().0 {
             let measures = analyse(
                 &mut state,
                 frame,

@@ -464,9 +464,9 @@ pub fn md5(input: &[u8]) -> [u8; 16] {
     }
     message.extend_from_slice(&bit_len.to_le_bytes());
 
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
-        for (word, bytes) in m.iter_mut().zip(chunk.chunks_exact(4)) {
+        for (word, bytes) in m.iter_mut().zip(chunk.as_chunks::<4>().0) {
             *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
@@ -547,7 +547,7 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
         if pad > 2 {
             return None;

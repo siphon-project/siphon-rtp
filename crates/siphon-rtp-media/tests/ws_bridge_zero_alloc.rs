@@ -124,7 +124,7 @@ fn vad_adds_no_per_frame_allocation() {
 /// One RTP packet carrying `pcm` as an L16 payload (RFC 3551 §4.5.11: network byte order).
 fn l16_packet(sequence: u16, pcm: &[i16], payload_type: u8) -> Vec<u8> {
     let mut payload = vec![0u8; pcm.len() * 2];
-    for (sample, chunk) in pcm.iter().zip(payload.chunks_exact_mut(2)) {
+    for (sample, chunk) in pcm.iter().zip(payload.as_chunks_mut::<2>().0) {
         chunk.copy_from_slice(&sample.to_be_bytes());
     }
     let header = RtpHeader {
