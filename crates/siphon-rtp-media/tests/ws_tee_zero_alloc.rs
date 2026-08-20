@@ -208,3 +208,47 @@ fn a_resampling_long_ptime_tee_write_pcm_makes_no_heap_allocation() {
         after - before
     );
 }
+
+/// The **upsampling** sink: an 8 kHz leg teed at 16 kHz, the shape a controller asks for when it
+/// wants wideband audio out of a narrowband call. The resample scratch is sized from the tee's output
+/// rate, so producing *more* samples than came in still never grows a buffer on the media path.
+#[test]
+fn an_upsampling_tee_write_pcm_makes_no_heap_allocation() {
+    const FRAMES: usize = 2_000;
+    let plan = plan_ws_tee(format(16_000, 1), false, false);
+    let resampler = siphon_rtp_dsp::resample::Resampler::new(8_000, 16_000).expect("resampler");
+    let mut sink = WsTeeSink::new(
+        TeeChannel::Caller,
+        plan.mixer.clone(),
+        "tee-1",
+        Some(resampler),
+    );
+    let pcm = [4321i16; 160]; // 8 kHz x 20 ms in, 320 samples out
+
+    for _ in 0..64 {
+        sink.write_pcm(&pcm);
+        while let Ok(frame) = plan.frames.try_recv() {
+            assert_eq!(frame.len(), 640, "16 kHz x 20 ms mono L16");
+            plan.recycle.send(frame).expect("recycle");
+        }
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..FRAMES {
+        sink.write_pcm(&pcm);
+        while let Ok(frame) = plan.frames.try_recv() {
+            std::hint::black_box(frame.len());
+            plan.recycle.send(frame).expect("recycle");
+        }
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(
+        after,
+        before,
+        "upsampling tee allocated {} times across {FRAMES} frames (must be zero)",
+        after - before
+    );
+}
