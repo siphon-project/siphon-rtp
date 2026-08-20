@@ -151,5 +151,70 @@ fn bench_secure_pipeline(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_secure_pipeline);
+/// The per-packet crypto a **WebSocket-takeover** leg pays once its offerer is secure. The takeover
+/// datapath has exactly two crypto sites — the registry's ingress `unprotect` on the way to the
+/// bridge, and the drain task's egress `protect` on the way out — so benching the two calls measures
+/// the whole delta between a plaintext takeover and a secure one.
+///
+/// `pending_key` is the DTLS window before the handshake lands, where both directions must drop. It
+/// has to be a branch, not work thrown away: a peer flooding an unkeyed leg must cost less than a
+/// keyed one, not more.
+fn bench_ws_secure_leg(criterion: &mut Criterion) {
+    use siphon_rtp_engine::ws_bridge::WsSecureLeg;
+
+    let key = SrtpKeyMaterial::from_inline_bytes(&[9u8; 30]).expect("30 bytes");
+    let clear = ulaw_packet(0);
+
+    let mut group = criterion.benchmark_group("ws_secure_leg_8k_20ms");
+
+    group.bench_function("protect_egress", |bencher| {
+        let leg = WsSecureLeg::keyed(SecureLeg::new(&key, &key));
+        let mut packet = clear.clone();
+        let mut sequence: u16 = 0;
+        let mut out = Vec::with_capacity(packet.len() + 16);
+        bencher.iter(|| {
+            sequence = sequence.wrapping_add(1);
+            packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+            out.clear();
+            black_box(leg.protect_egress(&packet, &mut out))
+        });
+    });
+
+    // Both crypto sites of one 20 ms frame: the peer seals a packet exactly as a real offerer does,
+    // the leg's ingress unseals it for the bridge, and the leg's egress seals the reply. Measured as
+    // a round trip because the RFC 3711 §3.3.2 replay window means an ingress packet can only be
+    // unprotected once — so a per-iteration `unprotect` needs its own freshly-sealed input anyway.
+    group.bench_function("ingress_plus_egress_roundtrip", |bencher| {
+        let mut peer = SecureLeg::new(&key, &key);
+        let leg = WsSecureLeg::keyed(SecureLeg::new(&key, &key));
+        let mut packet = clear.clone();
+        let mut sequence: u16 = 0;
+        let mut sealed = Vec::with_capacity(packet.len() + 16);
+        let mut out = Vec::with_capacity(packet.len() + 16);
+        bencher.iter(|| {
+            sequence = sequence.wrapping_add(1);
+            packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+            sealed.clear();
+            peer.protect(&packet, &mut sealed).expect("peer protect");
+            out.clear();
+            black_box((
+                leg.unprotect_ingress(&sealed),
+                leg.protect_egress(&packet, &mut out),
+            ))
+        });
+    });
+
+    group.bench_function("protect_egress_pending_key", |bencher| {
+        let leg = WsSecureLeg::pending();
+        let mut out = Vec::with_capacity(clear.len() + 16);
+        bencher.iter(|| {
+            out.clear();
+            black_box(leg.protect_egress(&clear, &mut out))
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_secure_pipeline, bench_ws_secure_leg);
 criterion_main!(benches);

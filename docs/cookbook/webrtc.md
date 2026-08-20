@@ -25,6 +25,13 @@ Rust, at different levels of maturity. This page says exactly which level.
 - DTLS-SRTP **and** full-ICE legs into a conference. Both are seated *pending*
   and open only once the handshake keys them / ICE selects a pair; a full-ICE
   seat's egress and source gate follow the selected pair.
+- DTLS-SRTP (and SDES-SRTP) legs into a **WebSocket takeover** — the voice-AI
+  shape, where the WS media server is the caller's far side. The engine answers
+  with its own keying, decrypts the caller's ingress for the server and encrypts
+  the server's downlink back, fail-closed while the handshake is still running.
+  `answer_local` only, with the full ICE agent when the caller offers ICE; the
+  two-leg `offer`/`answer` refuses it rather than answering a call it cannot
+  bridge. See [Voice-AI](voice-ai.md#which-callers-a-takeover-supports).
 
 - Relayed (TURN) candidates: the engine can act as a TURN *client* as well as a
   server, allocating a relayed candidate and ChannelData-framing media through it.

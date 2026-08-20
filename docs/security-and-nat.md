@@ -782,6 +782,88 @@ copy of Layers 1–3.
   captures pre-decrypt). The one difference from the plaintext path: a secure text stream is never
   demoted back to the kernel (it holds a permanent `Secure` promotion reason).
 
+### Layer 5e — The WebSocket-takeover Redirect path
+A **takeover** call (`ProfileFlags.ws_uri`, `PipelineKind::Ws`) points leg A's RTP endpoint at
+`FlowAction::Redirect` and makes an external WebSocket media server A's far side; the A↔B
+relay/transcode path is deliberately not wired. That makes the engine A's *only* peer — and therefore,
+when A negotiated SRTP, A's cryptographic peer. It is a full inbound surface, so it carries its own
+copy of Layers 1–4.
+
+> **Status (landed — secure takeover):** a takeover leg on a secure offerer terminates SRTP on its own
+> `WsSecureLeg` (`engine/src/ws_bridge.rs`), keyed by SDES (RFC 4568) in the answer or by the RFC 5764
+> handshake. Only `answer_local` supports it; `offer`/`answer` refuse it (see "Where a secure takeover
+> is refused" below).
+
+- **Source gate (RTPBleed, restated for `Redirect`).** `WsRegistry::dispatch` re-enforces the
+  signalled-source gate (`Exact`/`Subnet`/`Any`, tightened by the `received-from` public-IP hint)
+  before anything reaches the bridge — `Redirect` bypasses the datapath's Forward-path gate, exactly as
+  on Layers 5a–5d.
+- **Only `answer_local` can be a secure offerer's far side, and that is a structural fact, not a
+  policy.** The engine has to advertise *its own* keying (`a=crypto`, or `a=fingerprint` + the
+  complement `a=setup` per RFC 5763 §5) in the answer that goes back to A. `answer_local` writes that
+  answer itself. `offer`/`answer` do not: the answer delivered to A there is rewritten from **B's**
+  SDP, and on a takeover call B does not exist. Advertising nothing (the pre-change behaviour) left A
+  encrypting to an engine that had no key, and the downlink leaving in the clear.
+- **The leg owns its crypto, and the crypto lives in one module.** `WsSecureLeg` holds the RFC 3711
+  inbound and outbound contexts for the leg; the registry decrypts ingress on the way to the bridge and
+  the bridge's drain task encrypts egress on the way out, both through that one type. The bridge itself
+  never sees ciphertext and never sees the key — the same single-owner rule Layers 5b–5d follow.
+- **Fail-closed in both directions.** An unkeyed leg (a DTLS handshake that has not finished), an SRTP
+  authentication failure, or a crypto error drops the packet:
+  - **ingress** — unkeyed or unauthenticated SRTP is never handed to the decoder, so ciphertext cannot
+    be decoded as G.711 and streamed to the WS server as if it were audio (RFC 3711 §3.3);
+  - **egress** — the downlink is *dropped*, never emitted in the clear. This is the half that matters
+    most, and it is not hypothetical: the takeover bridge's ticker produces a downlink frame every
+    ptime whether or not the leg is keyed, so a fail-open drain would spray plaintext RTP at a peer
+    that negotiated encryption for the whole duration of the handshake.
+  A takeover call has exactly **one** egress site — the bridge's drain task — because every other
+  emitter (`play_media`, `play_dtmf`, pcap recording, SIPREC, the WS tee) already refuses a
+  `PipelineKind::Ws` call and a takeover call has neither a media actor nor a forward rule. That is
+  what makes a single encrypt point sufficient here, where Layer 5b needed a `push_egress` choke point.
+- **SRTCP has no consumer and is dropped.** The bridge speaks PCM to the WS server, not RTCP, so an
+  SRTCP packet on a muxed takeover port is discarded at the RFC 5761 §4 demux rather than decrypted and
+  thrown away.
+- **DTLS-SRTP reuses the existing bridge, unchanged.** The endpoint stays owned by `dtls_bridge.rs` for
+  the two DTLS-specific jobs (the RFC 7983 demux and the handshake); accepted media is forwarded to the
+  WS leg **still encrypted** via `PipelineTarget::Ws`, and the handshake's key is installed into the
+  leg's `WsSecureLeg` before media is released — the same "key first, then publish" ordering
+  `PipelineTarget::Call` and `PipelineTarget::Conference` use, with one fewer hop (the registry write
+  is synchronous, so there is no mailbox to race).
+- **Full ICE on a takeover leg, and why ice-lite is refused.** A takeover leg's egress belongs to the
+  bridge's drain task, not to a datapath forward rule, so `Datapath::adopt_source` alone never reaches
+  it — the selection is additionally routed to `WsRegistry::ice_selected` (driven from
+  `Engine::drive_ice_agents`, exactly as a conference seat is), which re-points the drain's destination
+  at the selected pair and narrows the source gate to it.
+  - The pre-selection window is **not** permissive: the gate starts `Any` because a peer-reflexive
+    check legitimately arrives from a transport the SDP never carried (RFC 8445 §7.3.1.3), and that is
+    only safe because the `ice_pending` flag drops **all** media until the agent selects.
+  - An ICE offerer with **no full agent** available (`--ice-full` off, or a peer that supplied no
+    credentials/candidates) is **refused**, not downgraded to the ice-lite responder. The responder
+    adopts the validated source into the datapath's own latch, which gates a `Forward` rule — and a
+    takeover leg is `Redirect`, so that gate never runs. Accepting would produce a leg that is open at
+    Layer 2 and deaf at Layer 4: wide to the world on ingress and sending its downlink to an address a
+    NATed peer cannot receive on. `ICE=remove` remains the explicit escape hatch.
+  - A DTLS takeover leg under full ICE holds its handshake for the selection (RFC 8445 §12,
+    `gate_on_ice`), and only when an agent is actually running.
+- **Where a secure takeover is refused.** Each refusal is returned at **offer** time (or at
+  `answer_local`, which *is* the offer-time decision for a single-leg call) with a stable leading
+  token, so a controller learns it before it commits to the dialog rather than discovering silent
+  one-way audio afterwards:
+
+  | Shape | Verb | Reason token |
+  |---|---|---|
+  | Secure (SDES or DTLS) offerer + `ws_uri` | `offer` / `answer` | `ws-takeover-secure-offerer` |
+  | ICE offerer + `ws_uri` | `offer` / `answer` | `ws-takeover-ice-offerer` |
+  | Secure offerer, **no** `ws_uri` (single-leg IVR/echo) | `answer_local` | `secure-offerer-unsupported` |
+  | `RTP/SAVP` with no usable `a=crypto`; `UDP/TLS/RTP/SAVPF` with no `a=fingerprint`; no engine certificate | `answer_local` | `ws-takeover-unkeyable` |
+  | ICE offerer with no full agent available | `answer_local` | `ws-takeover-ice-unsupported` |
+
+  The class of bug being closed is "accepted silently", not "DTLS specifically": every one of these
+  used to return `ok` on a call whose media went nowhere.
+- **HA.** A takeover call is not restorable — the external WebSocket session is not replicable state —
+  so `checkpoint` refuses a single-leg call outright and `restore` rejects a `Ws` snapshot. Securing
+  the leg does not change that; it is refused for the same reason it was before.
+
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
 

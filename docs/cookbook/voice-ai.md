@@ -55,6 +55,38 @@ The ingress is gated like every other leg: only packets from A's signalled sourc
 `received_from` public IP, when the proxy supplies one) reach the bridge. See
 [Security & NAT](../security-and-nat.md).
 
+## Which callers a takeover supports
+
+A takeover makes the engine the caller's *only* peer, so it has to be able to terminate whatever
+the caller negotiated — and it has to say so in the answer that goes back to the caller. That
+answer is written by `answer_local`, but on `offer`/`answer` it is rewritten from **B's** SDP, and
+a takeover call has no B. So the verb decides what a takeover can carry:
+
+| Caller's `m=audio` | `offer` + `answer` | `answer_local` |
+|---|---|---|
+| `RTP/AVP` (plaintext) | supported | supported |
+| `RTP/AVP` + ICE | refused (`ws-takeover-ice-offerer`) | supported with `--ice-full`; refused otherwise (`ws-takeover-ice-unsupported`) |
+| `RTP/SAVP` + `a=crypto` (SDES-SRTP, RFC 4568) | refused (`ws-takeover-secure-offerer`) | supported |
+| `UDP/TLS/RTP/SAVPF` (DTLS-SRTP, RFC 5764) | refused (`ws-takeover-secure-offerer`) | supported |
+
+Every refusal is returned at **offer** time — before the controller commits to the dialog — with a
+stable token at the front of the `reason`, so it can be branched on without parsing prose. The
+alternative, which is what these paths used to do, is a clean `ok` on a call whose media goes
+nowhere.
+
+On a supported secure takeover the engine mints its **own** keying for the answer (an `a=crypto`
+of its own for SDES, or its certificate fingerprint plus the complement `a=setup` role for DTLS —
+RFC 5763 §5), decrypts the caller's ingress before decoding it, and encrypts the downlink before
+sending it. It is fail-closed: while a DTLS handshake is still running, or if a packet fails SRTP
+authentication, the frame is dropped — the downlink is never emitted in the clear toward a peer
+that negotiated encryption. Two further consequences on a secure takeover:
+
+- `ICE=remove` is the escape hatch when you want a takeover on an ICE offerer without running the
+  full agent: the caller's ICE is stripped and the leg falls back to the signalled address.
+- A secure caller with **no** `ws_uri` is refused by `answer_local` (`secure-offerer-unsupported`).
+  The single-leg IVR / echo / announcement pipeline terminates no SRTP, so it cannot be a secure
+  caller's far side at all.
+
 ## The WebSocket wire
 
 Text frames carry a small `{"type": ..., "data": ...}` JSON control envelope (camelCase fields);
@@ -294,8 +326,11 @@ you hear yourself back with roughly one jitter-buffer frame plus one playout fra
 
 The on-the-wire bytes of a WS call are not the clear two-party media, so several runtime verbs
 are rejected on it: `block_media` / `silence_media`, `start_recording` (pcap), SIPREC
-`subscribe_request`, `block_dtmf`, and `attach_ws_tee`. HA `checkpoint` works but `restore` of a
-WS call is rejected (the WS connection cannot be rebuilt from a snapshot yet). Latency is tuned
+`subscribe_request`, `block_dtmf`, and `attach_ws_tee`. That is also what keeps a *secure*
+takeover honest: the bridge's downlink drain is the call's only egress site, so one encrypt point
+covers the whole surface. HA `checkpoint` works on a two-leg WS call but `restore` of a WS call is
+rejected (the WS connection cannot be rebuilt from a snapshot), and `checkpoint` refuses a
+single-leg call — including every `answer_local` takeover — outright. Latency is tuned
 for voice-AI: a shallow jitter buffer (target one frame) and the bounded playout queue keep
 mouth-to-ear delay low at the cost of a little more concealment under jitter.
 
