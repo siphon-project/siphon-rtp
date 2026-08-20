@@ -187,11 +187,17 @@ jobs:
   # executed*, which is deterministic run-to-run (unlike the wall-clock criterion benches, too noisy
   # to gate on a shared runner). We build the baseline from the PR's base (main) in this same runner,
   # so the two instruction counts are directly comparable, then re-run the PR against it; the bench's
-  # `soft_limits([(Ir, 10.0)])` makes iai-callgrind exit non-zero on a >10% regression. PR-only.
+  # `soft_limits([(Ir, 10.0)])` makes iai-callgrind exit non-zero on a >10% regression.
+  # PR-only, and same-repo PRs only: this is the self-hosted box, so a fork PR must never reach it
+  # (it would run untrusted code on a persistent, kernel-capable runner) - the same rule the
+  # xdp-integration job below states. A fork PR skips this job, and the `CI passed` rollup treats a
+  # skipped job as non-failing, so forks still get a mergeable CI result without the perf gate.
   perf-gate:
     name: perf regression (iai-callgrind)
     runs-on: [self-hosted, linux, x64]
-    if: github.event_name == 'pull_request'
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v7
         with:
