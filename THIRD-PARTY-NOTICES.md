@@ -7,11 +7,16 @@ decomposition, and in some cases the ROM constant tables follow a specific upstr
 codec source headers spell out function by function. This file attributes those upstreams and
 reproduces their copyright and licence notices.
 
-No third-party C source and no reference test vectors are committed to this repository. The
+No third-party C source and no codec reference test vectors are committed to this repository. The
 reference C is fetched separately and read only as the algorithm reference (it is gitignored,
 never compiled, never redistributed); the official 3GPP/ITU-T test vectors are likewise kept
-out of git history. What is attributed below is the *lineage* of the Rust ports, not any
-bundled upstream code.
+out of git history. What is attributed below is, for the codecs, the *lineage* of the Rust ports,
+not any bundled upstream code.
+
+**One upstream artifact is an exception and *is* redistributed here:** the trained parameters of
+the neural voice-activity detector, plus the speech recording its conformance vectors are cut
+from, both from the MIT-licensed Silero VAD release. See
+[Silero VAD (neural voice activity detection)](#silero-vad-neural-voice-activity-detection) below.
 
 > **Important: this is attribution, not a licence-compatibility ruling.** Recording where each
 > codec was ported from and under what upstream terms does **not** assert that re-licensing
@@ -145,6 +150,57 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## Silero VAD (neural voice activity detection)
+
+Unlike everything above, this is **not** a port of an algorithm — it is upstream *content*
+redistributed in the binary. `crates/siphon-rtp-dsp/src/vad/neural.rs` is a hand-written pure-Rust
+forward pass of the **Silero VAD v5** network, and it runs that network's own trained parameters,
+embedded verbatim at `crates/siphon-rtp-dsp/src/vad/silero_vad_v5_16k.f32`. No inference runtime,
+no ONNX parser and no C are involved; the file is a flat little-endian `f32` blob read with
+`include_bytes!`.
+
+| | |
+|---|---|
+| Upstream | <https://github.com/snakers4/silero-vad> |
+| Release | tag `v5.1.2` |
+| Source file | `src/silero_vad/data/silero_vad.onnx`, sha256 `2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f` |
+| Embedded blob | `silero_vad_v5_16k.f32`, 309 633 `f32` / 1 238 532 bytes, sha256 `b8df2e6e32753b7aa47ab59571b0d9d0b490a223f8dc9118bb388efeaec6f8e3` |
+| Content | the 16 kHz branch only (STFT basis, four encoder convolutions, the LSTM, the output convolution) |
+| Licence | MIT |
+
+The conformance vectors under `crates/siphon-rtp-dsp/tests/vectors/` are also upstream-derived:
+`neural_vad_speech.pcm` and the far-end material in the echo cases are cut from
+`tests/data/test.wav` of the same repository (sha256
+`89f17d9c94c4b31eb320f424628bcbc920abaddbee6e2760fd868bfb1d9a2e47`), and every `*.f32` is that
+release's own ONNX graph run over the matching PCM by `onnxruntime`, out of tree, once. The
+extraction and generation scripts are committed at `reference/silero-vad/` so both the blob and the
+vectors can be regenerated from the upstream release and byte-compared; neither Python nor
+`onnxruntime` is a build or test dependency.
+
+```
+MIT License
+
+Copyright (c) 2020-present Silero Team
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ---

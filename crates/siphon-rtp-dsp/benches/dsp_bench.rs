@@ -4,6 +4,13 @@
 //!     samples). The per-output-sample cost is a polyphase FIR dot (`siphon_rtp_simd::fir_dot_f32`).
 //!   - `vad_energy_320` — the energy VAD's per-frame sum-of-squares (`fir`-free reduction via
 //!     `siphon_rtp_simd::sum_sq_i16`).
+//!   - `neural_vad_16k_window` — one 32 ms (512-sample) window through the whole Silero v5 graph:
+//!     the 256-point transform as a filter-bank convolution, four encoder convolutions + ReLU, the
+//!     LSTM cell, the output convolution and the sigmoid. ~680 K multiply-accumulates, every dot
+//!     through `siphon_rtp_simd::fir_dot_f32`. This is the cost per 32 ms per concurrent call.
+//!   - `neural_vad_stream_16k_20ms` / `neural_vad_stream_8k_20ms` — what a leg pays per media tick
+//!     once the window cost is amortised over the frame clock (a window completes every 1.6 frames
+//!     at 20 ms), narrowband additionally paying the 8 → 16 kHz polyphase resample.
 //!   - `ns_8k_20ms` / `ns_16k_20ms` — one 20 ms noise-suppression frame (√Hann WOLA STFT + a real
 //!     FFT/IFFT hop + the decision-directed Wiener gain over `N/2+1` bins), reported as µs/frame.
 //!   - `aec_8k_20ms` / `aec_16k_20ms` — one NLMS echo-cancel frame (L=256): per sample a SIMD
@@ -22,7 +29,10 @@
 //! per-frame allocation).
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use siphon_rtp_dsp::{EchoCanceller, EnergyVad, NoiseSuppressor, Resampler};
+use siphon_rtp_dsp::{
+    EchoCanceller, EnergyVad, NeuralVad, NeuralVadStream, NoiseSuppressor, Resampler,
+    NEURAL_VAD_WINDOW_SAMPLES,
+};
 
 fn bench_resampler(criterion: &mut Criterion) {
     // 8 kHz → 16 kHz, one 20 ms frame (160 samples) → ~320 out: the WS/voice-AI bridge upsample.
@@ -47,6 +57,48 @@ fn bench_vad_energy(criterion: &mut Criterion) {
 
     criterion.bench_function("vad_energy_320", |bencher| {
         bencher.iter(|| black_box(EnergyVad::energy(black_box(&frame))));
+    });
+}
+
+fn bench_neural_vad(criterion: &mut Criterion) {
+    // A deterministic voiced-ish window: harmonics under a slow envelope, so the network runs its
+    // full path (a silent window takes the same instruction count — there is no data-dependent
+    // branching in a convolution — but a realistic input keeps the numbers honest).
+    let window: Vec<i16> = (0..NEURAL_VAD_WINDOW_SAMPLES)
+        .map(|index| {
+            let time = index as f32 / 16_000.0;
+            let envelope = 0.6 + 0.4 * (2.0 * std::f32::consts::PI * 4.0 * time).sin();
+            let voiced = (2.0 * std::f32::consts::PI * 140.0 * time).sin()
+                + 0.5 * (2.0 * std::f32::consts::PI * 420.0 * time).sin()
+                + 0.25 * (2.0 * std::f32::consts::PI * 1_100.0 * time).sin();
+            (voiced * envelope * 6_000.0) as i16
+        })
+        .collect();
+
+    // The headline number: one 32 ms window through the whole graph — the 256-point transform as a
+    // filter-bank convolution, four encoder convolutions with ReLU, the LSTM cell, the output
+    // convolution and the sigmoid. This is paid once per 32 ms per concurrent call.
+    criterion.bench_function("neural_vad_16k_window", |bencher| {
+        let mut detector = NeuralVad::new();
+        bencher.iter(|| black_box(detector.speech_probability(black_box(&window))));
+    });
+
+    // What the WS bridge actually pays per media tick: most 20 ms frames only accumulate, and one
+    // in every 1.6 frames completes a window and runs the network. Amortised, this is the per-frame
+    // cost a leg carries.
+    let frame_16k: Vec<i16> = (0..320).map(|index| window[index % window.len()]).collect();
+    criterion.bench_function("neural_vad_stream_16k_20ms", |bencher| {
+        let mut stream = NeuralVadStream::new(16_000).expect("build");
+        bencher.iter(|| black_box(stream.is_speech(black_box(&frame_16k))));
+    });
+
+    // The narrowband leg additionally pays an 8 → 16 kHz polyphase resample of every frame.
+    let frame_8k: Vec<i16> = (0..160)
+        .map(|index| window[(index * 2) % window.len()])
+        .collect();
+    criterion.bench_function("neural_vad_stream_8k_20ms", |bencher| {
+        let mut stream = NeuralVadStream::new(8_000).expect("build");
+        bencher.iter(|| black_box(stream.is_speech(black_box(&frame_8k))));
     });
 }
 
@@ -220,6 +272,7 @@ criterion_group!(
     benches,
     bench_resampler,
     bench_vad_energy,
+    bench_neural_vad,
     bench_noise_suppression,
     bench_aec
 );

@@ -25,7 +25,7 @@ use crate::bridge::audio::{BridgeCore, MAX_FRAME_SAMPLES, MAX_FRAME_VALUES, MAX_
 use crate::bridge::protocol::{ControlMessage, Direction, MediaFormat};
 use crate::leg::{MediaLeg, PcmFrame};
 use siphon_rtp_dsp::resample::Resampler;
-use siphon_rtp_dsp::EchoCanceller;
+use siphon_rtp_dsp::{EchoCanceller, VoiceDetector};
 
 /// Headroom on a resample buffer for the polyphase filter's fractional remainder, which can put one
 /// extra sample in a frame when the rate ratio is not an integer. Mirrors the tee's own slack
@@ -194,6 +194,21 @@ impl BridgeSession {
     #[must_use]
     pub fn with_vad(mut self, threshold: i64, hangover_frames: u32, barge_in: bool) -> Self {
         self.core = self.core.with_vad(threshold, hangover_frames, barge_in);
+        self
+    }
+
+    /// Enable turn-taking with a caller-chosen detector and a leading minimum-speech run — see
+    /// [`BridgeCore::with_voice_detector`].
+    #[must_use]
+    pub fn with_voice_detector(
+        mut self,
+        detector: VoiceDetector,
+        minimum_speech_frames: u32,
+        barge_in: bool,
+    ) -> Self {
+        self.core = self
+            .core
+            .with_voice_detector(detector, minimum_speech_frames, barge_in);
         self
     }
 

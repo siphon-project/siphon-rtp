@@ -37,6 +37,17 @@ Two vendored exceptions, stated so the claim stays honest: the jemalloc allocato
 C/assembly compiled into the crate. Both are self-contained, build from vendored source, and add
 no system library dependency; the runtime image is still `FROM distroless/static`.
 
+The rule is also why the neural voice-activity detector is a hand-written forward pass rather than
+an inference runtime: binding the published ONNX would have dragged a C++ runtime and a shared
+library into the deployment, and that is the whole property being defended. Instead the network's
+309 633 parameters are a flat little-endian `f32` blob embedded with `include_bytes!`, and the
+graph — a strided 1-D convolution, ReLU, one LSTM cell, a sigmoid — is written out against the
+crate's own SIMD primitives. It is **the one upstream artifact this repository redistributes**
+(MIT; source, hashes and regeneration scripts in
+[THIRD-PARTY-NOTICES.md](https://github.com/siphon-project/siphon-rtp/blob/main/THIRD-PARTY-NOTICES.md)
+and `reference/silero-vad/`), so an SBOM consumer should know it is in the binary even though it is
+not a Cargo dependency and will not appear in the graph below.
+
 ## Software Bill of Materials (SBOM)
 
 Every tagged release ships a full SBOM in **two industry formats**, generated from the exact

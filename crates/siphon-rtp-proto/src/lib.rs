@@ -376,6 +376,23 @@ pub enum WsTeeDirection {
     Callee,
 }
 
+/// Which voice-activity detector the WS uplink runs (`ProfileFlags::ws_vad_engine`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WsVadEngine {
+    /// Mean-square energy against a threshold, with a trailing hangover. Cheap and exact, but it
+    /// answers "is something loud here", so breathing, mains hum, fan noise and uncancelled echo
+    /// all read as speech. The default, and the right choice when a false turn start is harmless.
+    #[default]
+    Energy,
+    /// A neural speech classifier (the Silero v5 network, hand-written in pure Rust and embedded —
+    /// no inference runtime, no extra deployment artifact). Answers "is what is here speech", so it
+    /// does not turn-start on non-speech noise. Runs on its own 32 ms cadence fed from the frame
+    /// clock, which puts the turn-detection floor at 32 ms plus up to one media frame; costs tens
+    /// of microseconds per window per call. Pick it for turn taking and barge-in.
+    Neural,
+}
+
 /// Why a WebSocket tee stream ended, carried by [`Event::WsTeeEnded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -521,7 +538,8 @@ pub struct ProfileFlags {
     pub ws_vad_threshold: Option<i64>,
     /// Trailing hangover for the WS uplink VAD, in milliseconds — how long speech is held after energy
     /// drops before `speech_stopped` (the turn endpoint) fires. `None` uses ~200 ms. Only meaningful
-    /// with `ws_vad` / `ws_barge_in`.
+    /// with `ws_vad` / `ws_barge_in`, and only with the `energy` detector (the `neural` one holds
+    /// speech with its own probability hysteresis instead).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_vad_hangover_ms: Option<u32>,
     /// L16 wire sample rate in Hz for the `ws_uri` takeover bridge, **independent of the leg's codec
@@ -537,6 +555,18 @@ pub struct ProfileFlags {
     /// without `ws_uri`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_sample_rate: Option<u32>,
+    /// Which detector the WS uplink VAD runs. `None` ⇒ [`WsVadEngine::Energy`], the historical
+    /// behaviour. Only meaningful with `ws_vad` / `ws_barge_in`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_vad_engine: Option<WsVadEngine>,
+    /// **Leading** minimum-speech run, in milliseconds: how long the uplink must read as speech
+    /// *continuously* before the `speech_started` edge (and barge-in) fires. `None` ⇒ no leading
+    /// requirement, i.e. the edge fires on the first speech frame, which is what lets a cough, a
+    /// door or one burst of echo interrupt a prompt. Rounded up to whole ptime frames, and it adds
+    /// directly to turn-start latency, so 60–120 ms is the useful range. Works with either
+    /// detector. Only meaningful with `ws_vad` / `ws_barge_in`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_vad_min_speech_ms: Option<u32>,
     /// Observe this call's RFC 4103 Real-Time Text (`m=text`) stream at the control plane: when set (and
     /// the call negotiated a plaintext text stream and the owner has an event sink), the engine promotes
     /// **only** the low-rate text stream to a userspace processor that RED-depacketizes + reassembles it
@@ -1165,6 +1195,8 @@ mod tests {
             "ws_barge_in",
             "ws_vad_threshold",
             "ws_vad_hangover_ms",
+            "ws_vad_engine",
+            "ws_vad_min_speech_ms",
         ] {
             assert!(
                 serialized.get(field).is_none(),
@@ -1176,6 +1208,62 @@ mod tests {
         assert!(!profile.ws_barge_in);
         assert_eq!(profile.ws_vad_threshold, None);
         assert_eq!(profile.ws_vad_hangover_ms, None);
+        assert_eq!(profile.ws_vad_engine, None);
+        assert_eq!(profile.ws_vad_min_speech_ms, None);
+    }
+
+    #[test]
+    fn default_profile_serializes_to_an_empty_object() {
+        // The strongest statement of "additive": a controller that sets nothing produces byte-identical
+        // JSON before and after the detector-selection fields were added. Any new field that forgets
+        // `skip_serializing_if` breaks this, not just a review.
+        let serialized = serde_json::to_string(&ProfileFlags::default()).expect("to_string");
+        assert_eq!(serialized, "{}");
+    }
+
+    #[test]
+    fn ws_vad_engine_selects_the_detector_and_round_trips_in_snake_case() {
+        // Default stays the energy detector: an existing controller's JSON means what it always did.
+        assert_eq!(WsVadEngine::default(), WsVadEngine::Energy);
+
+        let json = concat!(
+            r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n","#,
+            r#""profile":{"ws_uri":"ws://[2001:db8::1]:8080/","ws_vad":true,"ws_barge_in":true,"#,
+            r#""ws_vad_engine":"neural","ws_vad_min_speech_ms":80}}"#
+        );
+        let command: Command = serde_json::from_str(json).expect("deserialize");
+        match command {
+            Command::Offer { profile, .. } => {
+                assert_eq!(profile.ws_vad_engine, Some(WsVadEngine::Neural));
+                assert_eq!(profile.ws_vad_min_speech_ms, Some(80));
+                assert!(profile.ws_vad);
+                assert!(profile.ws_barge_in);
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
+
+        let profile = ProfileFlags {
+            ws_vad_engine: Some(WsVadEngine::Neural),
+            ws_vad_min_speech_ms: Some(80),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&profile).expect("to_value");
+        assert_eq!(value["ws_vad_engine"], "neural");
+        assert_eq!(value["ws_vad_min_speech_ms"], 80);
+        let energy = ProfileFlags {
+            ws_vad_engine: Some(WsVadEngine::Energy),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&energy).expect("to_value")["ws_vad_engine"],
+            "energy"
+        );
+
+        // An unrecognised detector name is a hard error, not a silent fall back to energy: a
+        // controller asking for a detector this engine does not have must be told, not quietly
+        // given the one it was trying to avoid.
+        let unknown = r#"{"ws_vad_engine":"telepathy"}"#;
+        assert!(serde_json::from_str::<ProfileFlags>(unknown).is_err());
     }
 
     #[test]

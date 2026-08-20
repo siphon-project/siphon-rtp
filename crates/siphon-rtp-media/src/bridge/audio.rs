@@ -48,7 +48,7 @@ use crate::bridge::pcm_to_l16_le;
 use crate::bridge::protocol::{
     ControlMessage, Direction, ErrorData, MarkData, MediaFormat, PlaySource, SpeechData, StartData,
 };
-use siphon_rtp_dsp::{EchoCanceller, EnergyVad, NoiseSuppressor};
+use siphon_rtp_dsp::{EchoCanceller, NoiseSuppressor, SpeechRunGate, VoiceDetector};
 
 /// Longest packetization a leg on this path can negotiate, in milliseconds. Single-sourced from
 /// [`siphon_rtp_codec::factory::OPUS_MAX_PTIME_MS`] — the RFC 7587 §6.1 `maxptime` ceiling, which is
@@ -90,9 +90,16 @@ pub struct BridgeCore {
     /// cleaned speech. `Some` only when requested *and* the uplink rate is 8/16 kHz (see
     /// [`BridgeCore::with_noise_suppression`]); introduces the suppressor's WOLA latency on uplink.
     noise_suppressor: Option<NoiseSuppressor>,
-    /// Local energy VAD on the uplink, driving `speech_started`/`speech_stopped` turn signals (and
-    /// barge-in when `barge_in`). `Some` only when requested (see [`BridgeCore::with_vad`]).
-    vad: Option<EnergyVad>,
+    /// Local voice-activity detection on the uplink, driving `speech_started`/`speech_stopped` turn
+    /// signals (and barge-in when `barge_in`). `Some` only when requested — see
+    /// [`BridgeCore::with_vad`] for the energy gate and [`BridgeCore::with_voice_detector`] to hand
+    /// in a detector the caller chose (the neural one).
+    vad: Option<VoiceDetector>,
+    /// Leading minimum-speech-run gate over the detector's raw decision: the speech-start edge only
+    /// fires once speech has run for this many consecutive frames, so a cough, a door or one burst
+    /// of echo does not barge in. A one-frame gate is a pass-through, which is what the historical
+    /// `with_vad` path installs.
+    speech_gate: SpeechRunGate,
     /// When `vad` fires a speech-start edge, flush the queued downlink playout in the same tick — a
     /// local barge-in that skips the server round-trip. No effect unless `vad` is set.
     barge_in: bool,
@@ -149,6 +156,7 @@ impl BridgeCore {
             stopped: false,
             noise_suppressor: None,
             vad: None,
+            speech_gate: SpeechRunGate::new(1),
             barge_in: false,
             speaking: false,
             pending_control: Vec::new(),
@@ -193,10 +201,42 @@ impl BridgeCore {
     /// `barge_in`, flushes the downlink playout in that same tick — no server round-trip), and on the
     /// speech→silence edge past `hangover_frames` it emits `speech_stopped` (the turn endpoint).
     /// `threshold` is the mean-square energy for speech; `hangover_frames` is the trailing hold in
-    /// ptime frames (see [`EnergyVad`]). Turn signals are drained via [`BridgeCore::next_control`].
+    /// ptime frames (see [`siphon_rtp_dsp::EnergyVad`]). The leading minimum-speech-run gate is left
+    /// transparent, so this is exactly the pre-detector-selection behaviour; use
+    /// [`BridgeCore::with_voice_detector`] to require one. Turn signals are drained via
+    /// [`BridgeCore::next_control`].
     #[must_use]
-    pub fn with_vad(mut self, threshold: i64, hangover_frames: u32, barge_in: bool) -> Self {
-        self.vad = Some(EnergyVad::new(threshold, hangover_frames));
+    pub fn with_vad(self, threshold: i64, hangover_frames: u32, barge_in: bool) -> Self {
+        // One required frame == a pass-through gate, so this path is bit-identical to the one that
+        // predates detector selection.
+        self.with_voice_detector(
+            VoiceDetector::energy(threshold, hangover_frames),
+            1,
+            barge_in,
+        )
+    }
+
+    /// Enable turn-taking with a detector the caller built — the neural classifier, or an energy
+    /// gate with non-default settings — plus a **leading** minimum-speech run.
+    ///
+    /// The caller owns the choice because it owns the policy: the engine knows the leg's sample
+    /// rate and ptime, and building the neural detector is fallible (see
+    /// `siphon_rtp_dsp::VoiceDetector::neural`), so a configuration it cannot honour is refused at
+    /// call setup rather than silently downgraded here.
+    ///
+    /// `minimum_speech_frames` is the leading run in ptime frames: the speech-start edge (and
+    /// barge-in) waits until the detector has read speech that many frames running. `1` is a
+    /// pass-through. It adds `minimum_speech_frames - 1` frames to turn-start latency, which is the
+    /// trade being made against interrupting on a cough.
+    #[must_use]
+    pub fn with_voice_detector(
+        mut self,
+        detector: VoiceDetector,
+        minimum_speech_frames: u32,
+        barge_in: bool,
+    ) -> Self {
+        self.vad = Some(detector);
+        self.speech_gate = SpeechRunGate::new(minimum_speech_frames);
         self.barge_in = barge_in;
         self
     }
@@ -384,10 +424,10 @@ impl BridgeCore {
             let pcm = &mut self.uplink[..written];
             // Turn-taking VAD runs on the *raw* staged frame, before noise suppression can swallow
             // low-energy speech onsets. Emits a signal only on an edge; barge-in flushes here.
-            let speaking = self
-                .vad
-                .as_mut()
-                .map(|vad| vad.is_speech_with_energy(EnergyVad::energy(pcm)));
+            let raw_speech = self.vad.as_mut().map(|vad| vad.is_speech(pcm));
+            // The leading run gate sits between the detector and the edge, so a single noisy frame
+            // never opens a turn. At its default of one frame it is the identity.
+            let speaking = raw_speech.map(|speech| self.speech_gate.update(speech));
             if let Some(speaking) = speaking {
                 if speaking && !self.speaking {
                     // Silence → speech: local barge-in (flush queued playout, no round-trip) + notify.
@@ -449,7 +489,7 @@ impl BridgeCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::protocol::{ClearData, StopData};
+    use crate::bridge::protocol::{ClearData, Encoding, Endianness, StopData};
     use crate::bridge::{l16_le_to_pcm, pcm_to_l16_le};
 
     fn core() -> BridgeCore {
@@ -655,6 +695,104 @@ mod tests {
             core.on_pcm_uplink(&[4000i16; 160]);
             core.tick(&mut uplink);
             assert!(core.next_control().is_none());
+        }
+    }
+
+    /// Push one frame through and report the control message it produced, if any.
+    fn tick_with(core: &mut BridgeCore, frame: &[i16]) -> Option<ControlMessage> {
+        let mut uplink = [0u8; 1024];
+        core.on_pcm_uplink(frame);
+        core.tick(&mut uplink);
+        core.next_control()
+    }
+
+    #[test]
+    fn a_single_loud_frame_does_not_barge_in_when_a_leading_run_is_required() {
+        // The cough / door / echo-burst case. Three frames of continuous speech are required, so a
+        // lone loud frame must neither emit `speech_started` nor flush the playout.
+        let mut core = core().with_voice_detector(VoiceDetector::energy(1_000_000, 1), 3, true);
+        let mut l16 = [0u8; 320];
+        pcm_to_l16_le(&[1000i16; 160], &mut l16);
+        for _ in 0..5 {
+            core.on_ws_binary(&l16);
+        }
+
+        assert!(tick_with(&mut core, &[0i16; 160]).is_none());
+        assert!(
+            tick_with(&mut core, &[4000i16; 160]).is_none(),
+            "one loud frame must not open a turn"
+        );
+        assert!(tick_with(&mut core, &[0i16; 160]).is_none());
+        // Three ticks dequeued three frames; a barge-in would have flushed the other two as well.
+        assert_eq!(core.playout_depth(), 2, "barge-in must not have fired");
+    }
+
+    #[test]
+    fn a_run_at_the_required_length_barges_in_on_that_frame() {
+        let mut core = core().with_voice_detector(VoiceDetector::energy(1_000_000, 1), 3, true);
+        let mut l16 = [0u8; 320];
+        pcm_to_l16_le(&[1000i16; 160], &mut l16);
+        for _ in 0..5 {
+            core.on_ws_binary(&l16);
+        }
+
+        assert!(tick_with(&mut core, &[4000i16; 160]).is_none());
+        assert!(tick_with(&mut core, &[4000i16; 160]).is_none());
+        assert!(
+            matches!(
+                tick_with(&mut core, &[4000i16; 160]),
+                Some(ControlMessage::SpeechStarted(_))
+            ),
+            "the third consecutive speech frame opens the turn"
+        );
+        assert_eq!(core.playout_depth(), 0, "and barge-in flushed the playout");
+    }
+
+    #[test]
+    fn a_one_frame_run_gate_behaves_exactly_like_the_historical_path() {
+        // `with_vad` must stay a pass-through, or the committed takeover golden digest moves.
+        let mut legacy = core().with_vad(1_000_000, 3, true);
+        let mut explicit = core().with_voice_detector(VoiceDetector::energy(1_000_000, 3), 1, true);
+        for frame in [
+            [0i16; 160],
+            [4000i16; 160],
+            [0i16; 160],
+            [0i16; 160],
+            [0i16; 160],
+            [0i16; 160],
+            [4000i16; 160],
+        ] {
+            let from_legacy = tick_with(&mut legacy, &frame);
+            let from_explicit = tick_with(&mut explicit, &frame);
+            assert_eq!(
+                format!("{from_legacy:?}"),
+                format!("{from_explicit:?}"),
+                "the two construction paths must produce identical turn signals"
+            );
+        }
+    }
+
+    #[test]
+    fn the_neural_detector_drives_the_same_turn_signals() {
+        // A wideband core so the detector runs at its native rate. Digital silence must never open
+        // a turn, and speech-like broadband energy eventually must — the point is that the enum
+        // variant is wired through `tick`, not that the network is accurate (that is the dsp
+        // crate's conformance suite).
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: 16_000,
+            channels: 1,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime: 20,
+        };
+        let mut core = BridgeCore::new(format, "str_1", "call_1", Direction::Duplex, 4)
+            .with_voice_detector(VoiceDetector::neural(16_000).expect("build"), 1, true);
+        for _ in 0..20 {
+            assert!(
+                tick_with(&mut core, &[0i16; 320]).is_none(),
+                "silence must never open a turn"
+            );
         }
     }
 }

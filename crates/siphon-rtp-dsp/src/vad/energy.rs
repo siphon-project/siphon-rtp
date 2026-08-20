@@ -1,9 +1,11 @@
 //! A cheap energy-based voice-activity detector — the zero-dependency barge-in fallback.
 //!
 //! Per frame it compares mean-square energy to a threshold, with a **hangover** so brief dips
-//! inside speech don't chop it off. This is the lightweight default; the Silero-via-ONNX VAD is the
-//! quality option on the same per-frame interface. Deterministic (energy only, no clock), so it
-//! golden-tests directly. It drives WS-bridge barge-in and the OpenAI `input_audio_buffer.commit`.
+//! inside speech don't chop it off. This is the lightweight default; [`crate::vad::NeuralVad`] —
+//! the hand-written pure-Rust forward pass of the same network the ONNX distribution ships — is
+//! the quality option on the same per-frame interface. Deterministic (energy only, no clock), so
+//! it golden-tests directly. It drives WS-bridge barge-in and the OpenAI
+//! `input_audio_buffer.commit`.
 
 /// A frame-by-frame energy VAD with hangover.
 #[derive(Debug, Clone)]
