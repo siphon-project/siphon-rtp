@@ -72,6 +72,23 @@ impl Repacketizer {
         Some(count)
     }
 
+    /// Drain the buffered **partial** frame into `frame` and empty the FIFO, returning the sample
+    /// count written. Zero when nothing is buffered, or when `frame` is too short to hold the tail
+    /// (a caller-side sizing bug, never on the wire) — in which case nothing is drained.
+    ///
+    /// This is the end-of-stream counterpart to [`Repacketizer::next_frame`]: a source that runs
+    /// dry mid-frame still has to put its last few samples on the wire rather than swallow them.
+    /// A caller that wants a full-length frame zero-pads the remainder itself.
+    pub fn drain_tail(&mut self, frame: &mut [i16]) -> usize {
+        let count = self.accumulator.len();
+        if count == 0 || frame.len() < count {
+            return 0;
+        }
+        frame[..count].copy_from_slice(&self.accumulator);
+        self.accumulator.clear();
+        count
+    }
+
     /// Discard all buffered samples (e.g. on teardown). Keeps the reserved capacity.
     pub fn clear(&mut self) {
         self.accumulator.clear();
@@ -238,5 +255,36 @@ mod tests {
         repacketizer.push(&[1i16; 100]);
         repacketizer.clear();
         assert_eq!(repacketizer.buffered(), 0);
+    }
+
+    #[test]
+    fn drain_tail_takes_the_partial_frame_a_source_left_behind() {
+        // A prompt that runs dry mid-frame still has to put its last samples on the wire.
+        let mut repacketizer = Repacketizer::new(160, 320);
+        repacketizer.push(&[7i16; 90]);
+        assert_eq!(
+            repacketizer.next_frame(&mut [0i16; 160]),
+            None,
+            "90 samples is not a whole egress frame"
+        );
+        let mut frame = [0i16; 160];
+        assert_eq!(repacketizer.drain_tail(&mut frame), 90);
+        assert!(frame[..90].iter().all(|&sample| sample == 7));
+        assert_eq!(repacketizer.buffered(), 0);
+    }
+
+    #[test]
+    fn drain_tail_on_an_empty_fifo_takes_nothing() {
+        let mut repacketizer = Repacketizer::new(160, 320);
+        assert_eq!(repacketizer.drain_tail(&mut [0i16; 160]), 0);
+    }
+
+    #[test]
+    fn drain_tail_refuses_a_buffer_too_short_for_the_tail() {
+        // A caller-side sizing bug must not panic and must not silently lose the tail.
+        let mut repacketizer = Repacketizer::new(160, 320);
+        repacketizer.push(&[5i16; 100]);
+        assert_eq!(repacketizer.drain_tail(&mut [0i16; 50]), 0);
+        assert_eq!(repacketizer.buffered(), 100, "the tail is still there");
     }
 }

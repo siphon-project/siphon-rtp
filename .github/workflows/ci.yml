@@ -157,7 +157,7 @@ jobs:
         run: |
           for target in \
             rtp_parser_fuzz sdp_fuzz bencode_fuzz proto_frame_fuzz stun_fuzz \
-            amr_wb_decode_fuzz amr_nb_decode_fuzz opus_decode_fuzz; do
+            amr_wb_decode_fuzz amr_nb_decode_fuzz opus_decode_fuzz tone_spec_fuzz; do
             echo "::group::fuzz $target"
             cargo +nightly fuzz run "$target" -- -max_total_time=30
             echo "::endgroup::"
