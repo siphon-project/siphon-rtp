@@ -15,6 +15,11 @@ CLAUDE.md
 .claude/
 *.plan
 plans/
+# Scratch git worktrees. `.claude/worktrees/` is already covered by `.claude/` above, but a
+# worktree checked out at the repo root is not, and a stray `git add -A` would commit a whole
+# second copy of the tree.
+/.worktrees/
+/worktrees/
 
 # Editor / OS
 .DS_Store
