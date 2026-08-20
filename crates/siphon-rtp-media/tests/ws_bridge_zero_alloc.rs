@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::Encoder as _;
+use siphon_rtp_dsp::VoiceDetector;
 use siphon_rtp_media::bridge::protocol::{Direction, MediaFormat};
 use siphon_rtp_media::bridge::BridgeSession;
 use siphon_rtp_media::jitter::JitterBuffer;
@@ -62,10 +63,21 @@ fn ulaw_packet(sequence: u16, pcm: &[i16]) -> Vec<u8> {
     buffer
 }
 
+/// Which detector a measurement run installs on the bridge.
+enum Detector {
+    /// No turn-taking at all — the allocation baseline.
+    None,
+    /// The energy gate, as `with_vad` builds it.
+    Energy,
+    /// The neural classifier, which runs the network every 1.6 frames at an 8 kHz leg's ptime and
+    /// resamples every frame into it.
+    Neural,
+}
+
 /// Count allocations across `MEASURED` steady-state (continuous-speech) ticks of a bridge session
 /// whose jitter is pre-filled outside the armed window, so the measured ticks only pop → decode →
 /// (optionally) VAD.
-fn tick_allocations(vad: bool) -> usize {
+fn tick_allocations(detector: Detector) -> usize {
     const MEASURED: usize = 1000;
     const PREFILL: usize = MEASURED + 64;
     let loud = [4000i16; 160]; // mean-square energy 16e6 ≫ threshold
@@ -85,9 +97,15 @@ fn tick_allocations(vad: bool) -> usize {
         Direction::Duplex,
         8,
     );
-    if vad {
-        session = session.with_vad(1_000_000, 5, true);
-    }
+    session = match detector {
+        Detector::None => session,
+        Detector::Energy => session.with_vad(1_000_000, 5, true),
+        Detector::Neural => session.with_voice_detector(
+            VoiceDetector::neural(8_000).expect("neural detector for an 8 kHz leg"),
+            1,
+            true,
+        ),
+    };
 
     // Pre-fill the jitter with loud frames (allocates freely; before arming).
     for sequence in 0..PREFILL {
@@ -113,11 +131,24 @@ fn tick_allocations(vad: bool) -> usize {
 
 #[test]
 fn vad_adds_no_per_frame_allocation() {
-    let baseline = tick_allocations(false);
-    let with_vad = tick_allocations(true);
+    let baseline = tick_allocations(Detector::None);
+    let with_vad = tick_allocations(Detector::Energy);
     assert_eq!(
         with_vad, baseline,
         "enabling WS VAD changed per-frame allocations: {with_vad} with VAD vs {baseline} baseline over 1000 ticks"
+    );
+}
+
+#[test]
+fn the_neural_detector_adds_no_per_frame_allocation() {
+    // The heavier detector must be free of per-frame heap too, and on the narrowband path where it
+    // additionally resamples every frame into itself: this runs per call per media tick, so an
+    // allocation here is churn proportional to concurrent calls.
+    let baseline = tick_allocations(Detector::None);
+    let with_neural = tick_allocations(Detector::Neural);
+    assert_eq!(
+        with_neural, baseline,
+        "the neural detector changed per-frame allocations: {with_neural} vs {baseline} baseline over 1000 ticks"
     );
 }
 

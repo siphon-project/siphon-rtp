@@ -14,7 +14,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::l16::L16;
 use siphon_rtp_codec::Encoder as _;
-use siphon_rtp_dsp::EchoCanceller;
+use siphon_rtp_dsp::{EchoCanceller, VoiceDetector};
 use siphon_rtp_media::bridge::protocol::{Direction, Encoding, Endianness, MediaFormat};
 use siphon_rtp_media::bridge::BridgeSession;
 use siphon_rtp_media::jitter::JitterBuffer;
@@ -71,9 +71,24 @@ fn session(vad: bool) -> BridgeSession {
 fn bench_tick(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("ws_bridge_tick_8k_20ms");
     let loud = [4000i16; FRAME_SAMPLES];
-    for (label, vad) in [("vad_off", false), ("vad_on", true)] {
+    for (label, detector) in [
+        ("vad_off", None),
+        ("vad_on", Some(false)),
+        // The neural detector on the narrowband path: an 8 → 16 kHz polyphase resample of every
+        // frame plus the network on each completed 512-sample window (one every 1.6 frames). This is
+        // the whole extra per-tick cost a leg pays for choosing it over the energy gate.
+        ("vad_neural", Some(true)),
+    ] {
         group.bench_function(label, |bencher| {
-            let mut session = session(vad);
+            let mut session = match detector {
+                None => session(false),
+                Some(false) => session(true),
+                Some(true) => session(false).with_voice_detector(
+                    VoiceDetector::neural(8_000).expect("neural detector for an 8 kHz leg"),
+                    1,
+                    true,
+                ),
+            };
             // One pre-built packet whose sequence we bump in place each tick (monotonic, no per-iter
             // allocation), keeping the leg fed one loud frame per tick so `next_pcm` decodes real audio.
             let mut packet = ulaw_packet(0, &loud);

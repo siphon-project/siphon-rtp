@@ -179,7 +179,7 @@ native-JSON-only and inert without `ws_uri`.
 |  | `energy` (default) | `neural` |
 |---|---|---|
 | answers | "is something loud here" | "is what is here speech" |
-| cost | ~30 ns per 20 ms frame | ~37 µs per 32 ms window, i.e. ~23 µs per 20 ms frame amortised (~0.1 % of one core per call) |
+| cost | ~30 ns per 20 ms frame | ~37 µs per 32 ms window. End to end on the bridge tick that is **~27 µs per 20 ms frame on an 8 kHz leg** (window cost amortised over the frame clock, plus the 8 → 16 kHz resample of every frame) against ~83 ns with the energy gate — about 0.14 % of one core per call |
 | turn-detect floor | one media frame | 32 ms + up to one media frame |
 | tuning | `ws_vad_threshold`, `ws_vad_hangover_ms` | none needed |
 | fires on hum / breathing / fan noise | yes | no |

@@ -69,8 +69,9 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
   Framing is the model's own 512 samples at 16 kHz (32 ms) run on its own cadence fed from the media
   frame clock, which puts the turn-detection floor at 32 ms plus up to one media frame; a leg at any
-  other rate is resampled into the detector. Cost: ~37 µs per 32 ms window (~23 µs per 20 ms frame
-  amortised, ~0.1 % of one core per call), zero heap allocation per window.
+  other rate is resampled into the detector. Cost: ~37 µs per 32 ms window; on the WS bridge tick,
+  ~27 µs per 20 ms frame on an 8 kHz leg (resample included) against ~83 ns for the energy gate,
+  about 0.14 % of one core per call. Zero heap allocation per window and per bridge tick.
 - **`ws_vad_engine`** profile flag — `energy` (default, unchanged behaviour) or `neural`, selecting
   the WS voice-AI bridge's uplink detector. A selection the engine cannot build for the leg fails
   the offer with a reason rather than downgrading to the detector the controller was avoiding.
