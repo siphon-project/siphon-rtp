@@ -9,7 +9,7 @@ on per-packet `protect` / `unprotect`.
 
 ```toml
 [dependencies]
-siphon-rtp-srtp = "0.1"
+siphon-rtp-srtp = "0.2"
 ```
 
 ## License

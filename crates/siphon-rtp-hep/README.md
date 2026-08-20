@@ -4,11 +4,12 @@ HEP3 (Homer Encapsulation Protocol v3) packet encoding for
 [siphon-rtp](https://github.com/siphon-project/siphon-rtp) — exports RTCP / QoS telemetry (with a
 MOS estimate) to a Homer / VoIPmonitor capture node over UDP.
 
-Pure Rust, `std` only, zero dependencies, matching the HEP3 wire format byte-for-byte.
+Pure Rust, zero C, matching the HEP3 wire format byte-for-byte. The encoder is dependency-free; the
+optional async UDP exporter uses `tokio`.
 
 ```toml
 [dependencies]
-siphon-rtp-hep = "0.1"
+siphon-rtp-hep = "0.2"
 ```
 
 ## License

@@ -130,7 +130,7 @@ of bandwidth through the engine, which is the price of anchoring.
 ## ICE legs
 
 When a leg offers ICE, connectivity checks replace latching as the address-learning mechanism:
-the engine answers as ICE-lite (RFC 8445), and a STUN Binding check authenticated with the
+the engine answers as ICE-lite (RFC 8445) (or runs the full RFC 8445 agent under `--ice-full`), and a STUN Binding check authenticated with the
 negotiated credentials adopts the validated source. The gate/latch story above applies to the
 plain-RTP legs, which in VoLTE/PSTN work is most of them. See
 [Security & NAT §4, layer 4](../security-and-nat.md) and [WebRTC legs](webrtc.md).

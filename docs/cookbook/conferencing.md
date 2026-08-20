@@ -79,8 +79,9 @@ and such a leg's frames straddle tick boundaries at its own phase.
 Honest limits first:
 
 - Plain `RTP/AVP` and SDES-keyed `RTP/SAVP` (RFC 3711 / RFC 4568, `a=crypto` with
-  `AES_CM_128_HMAC_SHA1_80`) legs are supported. An offer with ICE or DTLS-SRTP (WebRTC) is
-  rejected with an error; those conference legs are a follow-up.
+  `AES_CM_128_HMAC_SHA1_80`) legs are supported. An ICE or DTLS-SRTP (WebRTC) offer is accepted and
+  the seat is taken *pending*: it joins the mix only once the DTLS handshake keys it or ICE selects a
+  pair; until then its ingress is dropped and it hears nothing.
 - The participant's codec must be both decodable and encodable by this build, because the engine
   has to encode the mix back. AMR-WB and AMR-NB egress need the `amr` Cargo feature (off by default,
   see [codec licensing](../codec-licensing.md)); without it an AMR join is refused. With `amr`,

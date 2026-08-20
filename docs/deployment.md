@@ -62,9 +62,10 @@ running codec code. The `amr` feature only matters when the engine transcodes.
 
 ## The CLI
 
-The full flag surface, verbatim from `siphon-rtp --help`. There are no other flags; in particular
-there is **no `--xdp` flag** today, the daemon always runs the UDP datapath
-([Datapath](datapath.md)).
+The full flag surface of the default `siphon-rtp` binary, verbatim from `siphon-rtp --help`. The
+default binary has **no `--xdp` flag** and always runs the UDP datapath ([Datapath](datapath.md));
+the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which adds `--xdp-interface`
+(and `--xdp-queue`) on top of this same flag surface.
 
 | Flag | Default | What it does |
 |---|---|---|
@@ -83,6 +84,11 @@ there is **no `--xdp` flag** today, the daemon always runs the UDP datapath
 | `--turn-udp <ADDR>` / `--turn-tcp <ADDR>` / `--turn-tls <ADDR>` | off | Built-in TURN server listeners (`turn:` / `turns:`, RFC 5766/8656). |
 | `--turn-tls-cert <PATH>` / `--turn-tls-key <PATH>` | none | PEM certificate chain and private key for the `turns:` listener. |
 | `--turn-relay-ip <IP>` | datapath-assigned | Public IP advertised in XOR-RELAYED-ADDRESS when the bound IP is not the reachable one (NAT'd host). |
+| `--stun-server <ADDR>` | none | STUN server probed for a server-reflexive ICE candidate (RFC 8445 §5.1.1). Repeatable. |
+| `--ice-full` | off | Run the full RFC 8445 ICE agent (checklists, connectivity checks, nomination) instead of ICE-lite responder-only. |
+| `--ice-consent` | off | RFC 7675 consent freshness: probe the validated pair and tear the call down on consent loss. |
+| `--consent-interval-secs <N>` | — | Consent-check interval; only meaningful together with `--ice-consent`. |
+| `--consent-timeout-secs <N>` | `30` | Consent timeout before teardown (RFC 7675 §5.1); only with `--ice-consent`. |
 
 ## Environment variables
 
@@ -204,17 +210,17 @@ docker compose --profile prod up --build    # distroless, host networking
 
 - **dev** builds the `runtime-dev` image (adds `iproute2` and an entrypoint that mounts bpffs and
   creates a `siphon0`/`siphon-peer` veth pair) and grants `NET_ADMIN`/`BPF`/`SYS_ADMIN` plus
-  unlimited memlock. That is scaffolding for the planned XDP datapath; today the binary inside is
-  the UDP-backend build and the caps go unused.
+  unlimited memlock. Those caps are what running the separate `siphon-rtp-xdp-daemon` needs; the
+  default image ships the UDP `siphon-rtp` build, which does not use them.
 - **prod** runs the distroless `runtime` image with `network_mode: host` and requires
   `SIPHON_RTP_TURN_REALM` / `SIPHON_RTP_TURN_SECRET` to be set (it refuses to start with them
   unset; the dev profile has insecure defaults). It starts the TURN listeners on 3478.
 
 Two honest caveats:
 
-1. The `CARGO_FEATURES` build arg is reserved for the future XDP backend. Leave it empty (or set
-   it to `amr`): there is no `xdp` Cargo feature yet, and passing one fails the build. Both
-   profiles run the UDP datapath today ([Datapath](datapath.md)).
+1. The `CARGO_FEATURES` build arg only toggles `amr` (leave it empty or set it to `amr`). **XDP is a
+   separate binary (`siphon-rtp-xdp-daemon`), never a Cargo feature** — there is no `xdp` feature, and
+   passing one fails the build. Both profiles run the UDP datapath ([Datapath](datapath.md)).
 2. The compose commands do not pass `--relay-bind-ip`, so relayed media stays on loopback. For
    real peers, append `--relay-bind-ip <host IP>` (and a `--port-min`/`--port-max` window) to the
    `command:` list, which is trivial under host networking in the prod profile.

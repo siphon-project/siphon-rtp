@@ -10,7 +10,7 @@ rtpengine kernel module.
 
 ```toml
 [dependencies]
-siphon-rtp-ngcompat = "0.1"
+siphon-rtp-ngcompat = "0.2"
 ```
 
 ## License

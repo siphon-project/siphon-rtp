@@ -1,14 +1,15 @@
-# Datapath (UDP today, XDP planned)
+# Datapath (UDP default, XDP via a separate daemon)
 
-Where packets actually move. This page describes the datapath architecture as it is, not as the
-roadmap wants it to be: **the UDP backend is the production datapath today**, and the XDP/AF_XDP
-backend is built and unit-tested in its own workspace but **not yet wired into the daemon**.
+Where packets actually move. This page describes the datapath architecture as it is: **the UDP
+backend is what the default `siphon-rtp` binary runs**, and the XDP/AF_XDP backend is wired into the
+separate **`siphon-rtp-xdp-daemon`** binary — the same engine via `run_with_datapath`, choosing the
+in-kernel backend when the NIC supports it and falling back to UDP when it does not.
 
 - [The `Datapath` seam](#the-datapath-seam)
 - [What happens to a packet](#what-happens-to-a-packet)
 - [The UDP backend (shipping)](#the-udp-backend-shipping)
-- [The intended two-tier XDP model (planned)](#the-intended-two-tier-xdp-model-planned)
-- [XDP status: built vs. wired](#xdp-status-built-vs-wired)
+- [The intended two-tier XDP model](#the-intended-two-tier-xdp-model)
+- [XDP status](#xdp-status)
 - [What this means for capacity planning](#what-this-means-for-capacity-planning)
 
 ---
@@ -88,10 +89,13 @@ the lab, and in production.
 - Its clock is logical (explicitly advanced by the daemon's 1 s sweeper, directly settable in
   tests), which is why media-timeout and soak tests are deterministic.
 
-There is no `--xdp` flag and no runtime datapath selection today. If you are running siphon-rtp,
-you are running this backend.
+The default `siphon-rtp` binary is UDP-only: it has no `--xdp` flag and no runtime datapath
+selection, so if you are running `siphon-rtp` you are running this backend. The separate
+`siphon-rtp-xdp-daemon` selects the XDP backend with `--xdp-interface <NAME>` (and `--xdp-queue
+<N>`), probing the NIC's capability and falling back to this UDP backend when the host cannot
+support XDP.
 
-## The intended two-tier XDP model (planned)
+## The intended two-tier XDP model
 
 The design goal, stated plainly so the current state below is measurable against it:
 
@@ -104,40 +108,47 @@ The design goal, stated plainly so the current state below is measurable against
    in the same per-leg actors that exist today. The `Datapath` trait is the seam that makes the
    two backends interchangeable; the engine above it does not change.
 
-Today, both tiers run in userspace: the UDP backend's `Forward` is the fast path and its
-`Redirect` stream is the slow path, over ordinary sockets.
+In the default `siphon-rtp` binary both tiers run in userspace: the UDP backend's `Forward` is the
+fast path and its `Redirect` stream is the slow path, over ordinary sockets. Under
+`siphon-rtp-xdp-daemon` the fast path is an in-kernel `XDP_TX` rewrite and the slow path is an
+`XDP_REDIRECT` to an AF_XDP socket.
 
-## XDP status: built vs. wired
+## XDP status
 
 The XDP backend lives in `crates/siphon-rtp-xdp`, deliberately **excluded from the main
 workspace** (the eBPF program crate builds on a pinned nightly via aya-build; the stable workspace
-and `cargo test` never touch it).
+and `cargo test` never touch it). It ships as the separate `siphon-rtp-xdp-daemon` binary, which
+depends up into the engine, reuses the whole CLI/TOML surface, and hands its `XdpDatapath` to the
+same `siphon_rtp_engine::run_with_datapath` runner the UDP binary uses — so control, TURN,
+dispatch, sweep, metrics and NG behave identically over either datapath.
 
-Built and unit-tested, NIC-free:
+Built, unit-tested, and wired into `siphon-rtp-xdp-daemon`:
 
-- the loader (load the embedded classifier, attach native or SKB/generic mode),
-- the `FLOWS` / `STATS` / `XSKS` map programming with a shared no_std ABI crate
-  (`siphon-rtp-ebpf-common`),
+- **backend selection and fallback** — `--xdp-interface` / `--xdp-queue`, a capability probe
+  (`xdp_supported`), native-then-generic-SKB attach, and a clean fall back to the UDP datapath on
+  any missing capability, attach failure, or a non-routable `--relay-bind-ip` (never a hard error);
+- the loader and the `FLOWS` / `FLOW_STATS` / `XSKS` map programming over the shared `no_std` ABI
+  crate (`siphon-rtp-ebpf-common`);
 - an in-house AF_XDP socket implementation (UMEM/ring bookkeeping) and the busy-poll thread that
-  drains RX into the redirect stream,
-- Ethernet/IPv4/UDP header build/parse and checksums for TX,
-- a capability probe (`xdp_supported`) plus an eager AF_XDP bind, so backend selection can fall
-  back to the UDP datapath gracefully.
+  drains RX into the redirect stream;
+- Ethernet/IPv4/UDP header build/parse and checksums for TX;
+- **next-hop MAC resolution** via rtnetlink/ARP (`crates/siphon-rtp-xdp/src/neighbor/`), so TX
+  frames egress a real NIC;
+- the **in-kernel `XDP_TX` rewrite fast path** (`forward_in_kernel`): a plain-RTP `Forward` flow is
+  demuxed (RFC 7983), source-gated, SSRC-latched, L3/L4-rewritten with an RFC 1624 incremental
+  checksum fixup, and transmitted straight back out — falling back to `XDP_REDIRECT` only on a
+  FIB / neighbour miss;
+- **per-flow kernel stats and activity feedback** — the classifier stamps `FlowStats::last_seen_ns`
+  per flow, which `Datapath::last_activity` reads to drive the media-timeout sweep;
+- an **in-kernel RTCP copy-to-userspace tap** (`RTCP_TAP`), so a kernelized relay's RTCP still
+  reaches the HEP QoS export (loss / jitter / RTT for VoIPmonitor / Homer).
 
-Not wired, and why it is not the production path yet:
+Remaining gaps:
 
-- **Not selected by the daemon.** `main.rs` constructs the UDP backend unconditionally; there is
-  no flag, feature, or capability probe in the daemon today.
-- **No next-hop MAC resolution.** TX frames are built with a zeroed destination MAC; ARP/neighbour
-  lookup (rtnetlink) is the missing piece before frames can egress a real NIC.
-- **No in-kernel `XDP_TX` yet.** The eBPF classifier currently `XDP_REDIRECT`s every matched flow
-  to userspace; the in-kernel rewrite fast path is unimplemented, so even the wired-up backend
-  would today be "kernel-bypass receive, userspace relay".
-- Aggregate (not per-flow) kernel stats, no per-flow activity feedback for the media-timeout
-  sweep, and no RTCP observation on the future fast path. All documented in the crate as gaps.
+- **Single media RX queue.** The classifier redirects to the AF_XDP socket bound on queue 0; there
+  is no multi-queue / RSS fan-out across queues yet (`--xdp-queue` selects one queue).
 
-The docker-compose profiles already grant the capabilities this will need (`NET_ADMIN`, `BPF`,
-bpffs, memlock) so the operational wiring is proven ahead of the code
+The docker-compose profiles grant the capabilities this needs (`NET_ADMIN`, `BPF`, bpffs, memlock)
 ([deployment](deployment.md#docker-compose-profiles)).
 
 ## What this means for capacity planning

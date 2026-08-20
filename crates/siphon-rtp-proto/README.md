@@ -18,7 +18,7 @@ big-endian `u32` byte length followed by a JSON body.
 
 ```toml
 [dependencies]
-siphon-rtp-proto = "0.1"
+siphon-rtp-proto = "0.2"
 ```
 
 ```rust

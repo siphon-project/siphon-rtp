@@ -107,10 +107,10 @@ Recommendations. The Recommendation text and reference software copyright remain
 
 ## libopus / Xiph.Org (Opus)
 
-The in-progress pure-Rust Opus decoder (`crates/siphon-rtp-codec/src/opus/`) ports the float
-build of **libopus** (Xiph.Org) and targets RFC 6716 conformance. It is **not** wired into the
-codec factory and is not shipped for transcoding; it is attributed here because the code in the
-tree derives from libopus. libopus is under the **3-clause BSD licence**:
+The pure-Rust Opus codec (`crates/siphon-rtp-codec/src/opus/`) — decoder and encoder — ports the
+float build of **libopus** (Xiph.Org) and conforms to RFC 6716. It is wired into the codec factory
+and used for transcoding; it is attributed here because the code in the tree derives from libopus.
+libopus is under the **3-clause BSD licence**:
 
 ```
 Copyright (c) 2001-2011 Xiph.Org, Skype Limited, Octasic,

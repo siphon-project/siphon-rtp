@@ -9,8 +9,12 @@ reads a clock. That is deliberate — it makes the RFC's behaviour testable agai
 without a runtime or a network, and it keeps the engine free to execute the resulting actions on
 whichever datapath backend it is running.
 
-Today it ships the candidate layer. Candidate gathering, checklists, connectivity checks, nomination,
-and consent freshness land on top of it as the full agent replaces the current ICE-lite posture; see
+It ships the full RFC 8445 agent: candidate gathering (`Gatherer` — host and server-reflexive
+candidates), checklists and candidate pairs (`Checklist`), and connectivity checks with
+peer-reflexive discovery, role-conflict resolution, and regular nomination (`IceAgent`).
+Trickle-ICE (RFC 8838) is supported — a candidate learned after the offer/answer is paired and
+checked as a triggered check. The engine wires the agent behind `--ice-full`; consent freshness
+(RFC 7675) and ICE-restart detection (RFC 8445 §9) live in the engine on top of this crate. See
 `docs/security-and-nat.md` §4 layer 4 in the parent repository.
 
 ## Scope note
