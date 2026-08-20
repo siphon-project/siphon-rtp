@@ -73,6 +73,17 @@ jobs:
           # jemalloc (the one accepted -sys dep) cross-compiles with the gnu cross toolchain.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
+      # Strip the DISTRIBUTED binary only. [profile.release] keeps debug=true/strip=false because the
+      # iai-callgrind perf gate needs symbols (and [profile.bench] inherits release), so stripping the
+      # profile would break the gate — strip here instead, shrinking image/packages ~200MB -> ~13MB.
+      - name: Strip the release binary
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            aarch64-linux-gnu-strip "target/${{ matrix.target }}/release/siphon-rtp"
+          else
+            strip "target/${{ matrix.target }}/release/siphon-rtp"
+          fi
+
       # .deb / .rpm are built only on x86_64: the engine is a workspace member, so the release
       # binary is at the WORKSPACE target dir (target/<triple>/release/siphon-rtp) and both tools
       # rewrite the `target/release/` asset prefix to that triple-qualified path via `--target`.
