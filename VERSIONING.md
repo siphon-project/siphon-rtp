@@ -37,6 +37,26 @@ The published library crates additionally follow semver on their `pub` Rust API,
 while the project is pre-1.0 that API may change with a minor bump; pin exact
 versions if you embed a crate directly.
 
+### `#[non_exhaustive]` on the control contract
+
+Since 0.3.0 the enums a controller *observes* — `Event`, `CmdResult`, `PlayEndReason`,
+`WsTeeEndReason`, `ProtoError` — plus the two it *sends* that keep growing (`Command`,
+`PlayMediaSource`) are `#[non_exhaustive]`, so **adding a variant to them is no longer a
+breaking change.** A `match` in your crate needs a wildcard arm; give it real behaviour, because
+a silent catch-all turns a new variant into a dropped notification.
+
+Two things it does not cover, both still breaking:
+
+- **Adding a field to an existing struct variant** (`Command::PlayMedia` gaining `overlay`, say).
+  Only per-variant `#[non_exhaustive]` would make that additive, and it would also stop you
+  constructing the variant at all, so it is deliberately not applied.
+- The **selector** enums a controller sends to choose engine behaviour — `WsTeeDirection`,
+  `WsVadEngine`, `ConferenceRole`, `BridgeDirection` — are deliberately exhaustive. A new value
+  there changes what the engine does, and the broken `match` is the notification.
+
+None of this touches the JSON wire, which is additive on its own terms: optional fields are
+omitted when unset, and an unrecognised `event` tag decodes to `Event::Unknown`.
+
 ## Cutting a release
 
 There is no release script to hand-hold: the tag drives everything.
