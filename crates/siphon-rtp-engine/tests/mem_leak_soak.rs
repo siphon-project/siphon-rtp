@@ -589,3 +589,99 @@ async fn ws_tee_attach_detach_does_not_leak() {
         after.saturating_sub(before)
     );
 }
+
+/// A DTLS-SRTP offerer's SDP (RFC 5764 / RFC 5763 §5). Documentation-range address (RFC 5737).
+fn dtls_offerer_sdp(host: &str, port: u16, fingerprint: &siphon_rtp_dtls::Fingerprint) -> String {
+    let hex = fingerprint
+        .bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {host}\r\ns=-\r\nc=IN IP4 {host}\r\nt=0 0\r\n\
+         m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+         a=setup:active\r\na=fingerprint:{hash} {hex}\r\n",
+        hash = fingerprint.hash_function,
+    )
+}
+
+/// One secure-takeover churn cycle: `answer_local` on a DTLS-SRTP offerer with `ws_uri` (which dials
+/// the WS server, registers the takeover route with its pending `WsSecureLeg`, and spawns the DTLS
+/// handshake + record-drain tasks against a peer that never answers) → `delete`.
+///
+/// The handshake deliberately never completes, so this is the worst case for the teardown path: every
+/// cycle strands a waiting handshake task, a record drain, a WS bridge task and a downlink drain that
+/// `delete` has to abort.
+async fn secure_ws_takeover_answer_delete(
+    engine: &Engine<UdpLoopbackDatapath>,
+    uri: &str,
+    fingerprint: &siphon_rtp_dtls::Fingerprint,
+    index: usize,
+) {
+    let call_id = format!("secure-takeover-soak-{index}");
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: dtls_offerer_sdp("198.51.100.1", 40_000, fingerprint),
+                    profile: siphon_rtp_proto::ProfileFlags {
+                        ws_uri: Some(uri.to_string()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await,
+        "answer_local secure takeover",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secure_ws_takeover_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let (uri, live) = tee_sink_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("peer cert");
+    let fingerprint = certificate.fingerprint();
+    let _prime = allocated_bytes();
+
+    // Warm up: the dialled TCP+WebSocket stack, the bridge's preallocated buffers, the DTLS transport
+    // channels and jemalloc's arenas all settle. Same reasoning (and scale) as the tee soak — this
+    // cycle dials a real connection and spawns four tasks per call.
+    for index in 0..200 {
+        secure_ws_takeover_answer_delete(&engine, &uri, &fingerprint, index).await;
+    }
+    drain_tee_server(&live).await;
+    assert_eq!(engine.session_count(), 0, "registry empty after warmup");
+
+    let before = allocated_bytes();
+    for index in 200..500 {
+        secure_ws_takeover_answer_delete(&engine, &uri, &fingerprint, index).await;
+    }
+    drain_tee_server(&live).await;
+    let after = allocated_bytes();
+
+    assert_eq!(engine.session_count(), 0, "registry drained after soak");
+    let tolerance = 512 * 1024;
+    assert!(
+        after <= before + tolerance,
+        "secure ws takeover leaked {} bytes over 300 churned calls (before={before}, after={after})",
+        after.saturating_sub(before)
+    );
+}

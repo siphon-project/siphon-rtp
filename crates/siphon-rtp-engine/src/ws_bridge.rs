@@ -101,7 +101,7 @@ impl WsSecureLeg {
     /// Decrypt one inbound datagram for the bridge. `None` means **drop it**: the leg is not keyed,
     /// the packet is SRTCP (the takeover bridge consumes no RTCP), or it failed SRTP authentication
     /// — which is exactly the RFC 3711 §3.3 check that stops an injected packet reaching the decoder.
-    fn unprotect_ingress(&self, packet: &[u8]) -> Option<Bytes> {
+    pub fn unprotect_ingress(&self, packet: &[u8]) -> Option<Bytes> {
         // RFC 5761 §4 demux on the clear header byte: SRTCP on a muxed takeover port has no consumer
         // (the bridge speaks PCM to the WS server, not RTCP), so it is dropped before the crypto
         // rather than decrypted and thrown away.
