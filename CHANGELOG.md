@@ -145,6 +145,32 @@ Both flags are `Option`/omitted-when-unset, so existing controller JSON serialis
   whatever the polyphase resampler happened to produce while advancing the RTP timestamp by a fixed
   increment, so a prompt whose source rate differed from the leg's drifted against its own clock.
 
+- **WebSocket takeover on a secure offerer.** A takeover call (`ws_uri`) makes the WS media server
+  leg A's far side, which makes the engine A's cryptographic peer when A negotiated SRTP.
+  `answer_local` now terminates that: it mints the engine's **own** SDES key (RFC 4568) or advertises
+  its own certificate fingerprint plus the complement `a=setup` role (RFC 5763 §5), then decrypts A's
+  ingress before the decoder and encrypts the bridge's downlink before it leaves (RFC 3711). DTLS-SRTP
+  (RFC 5764) reuses the existing bridge through a new `PipelineTarget::Ws`, so the RFC 7983 demux and
+  the handshake stay where they are and the takeover leg is the single owner of the key.
+- **Full ICE on a takeover leg.** A takeover leg's egress belongs to the bridge's drain task rather
+  than a datapath forward rule, so an RFC 8445 selection is now routed to `WsRegistry::ice_selected`
+  as well as to the datapath: it re-points the downlink at the selected pair (§8.1.1) and narrows the
+  source gate to it. Nothing crosses the leg before the agent selects (§12).
+
+### Fixed
+- **`ws_uri` on a leg the engine cannot bridge is refused instead of accepted.** A secure or ICE
+  offerer carrying `ws_uri` used to return `ok` and produce a call that answered and bridged nothing —
+  A's SRTP reached the decoder as ciphertext and the downlink left in the clear. Each unsupported
+  shape is now refused at **offer** time with a stable leading reason token, before the controller
+  commits to the dialog: `ws-takeover-secure-offerer` / `ws-takeover-ice-offerer` on `offer` and
+  `answer`, and `secure-offerer-unsupported` / `ws-takeover-unkeyable` /
+  `ws-takeover-ice-unsupported` on `answer_local`. See the matrix in
+  [docs/cookbook/voice-ai.md](docs/cookbook/voice-ai.md) and Layer 5e of
+  [docs/security-and-nat.md](docs/security-and-nat.md).
+- **`answer_local` no longer echoes a secure offerer's own keying back at it.** A secure offer to the
+  single-leg IVR / echo / announcement pipeline was answered with the caller's own `a=crypto` /
+  `a=fingerprint` copied into the answer, which no media path could back. It is refused.
+
 ## [0.2.1] — 2026-08-20
 
 ### Changed

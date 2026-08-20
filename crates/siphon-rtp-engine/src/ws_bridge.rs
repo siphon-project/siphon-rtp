@@ -171,7 +171,9 @@ pub struct WsCallPlan {
     pub endpoint_a: EndpointId,
     /// Signalled-source gate for leg A's ingress (RTPBleed defence).
     pub accepted_source: SourceFilter,
-    /// A full ICE agent runs on this leg and has not selected a pair yet (see [`WsRoute::ice_pending`]).
+    /// A full RFC 8445 agent runs on this leg and has not selected a pair yet: the source gate is
+    /// open for peer-reflexive checks (§7.3.1.3), so **all** media is dropped until the selection
+    /// lands and [`WsRegistry::ice_selected`] narrows the gate to the chosen pair.
     pub ice_pending: bool,
     /// SRTP crypto for a secure (SDES or DTLS) takeover leg; `None` on a plaintext one.
     pub secure: Option<Arc<WsSecureLeg>>,
