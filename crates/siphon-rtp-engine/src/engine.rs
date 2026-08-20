@@ -2364,6 +2364,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             None => (Vec::new(), None),
         };
+        // The `Mismatch` / `Strip` arms are scoped to a takeover deliberately. A takeover leg is the
+        // only single-leg shape whose ICE this verb decides; the plaintext IVR / echo / announcement
+        // path keeps its pre-existing `Keep` behaviour byte for byte. (That path has its own, separate,
+        // pre-existing gap — it echoes an ICE offerer's credentials back and runs no agent — which is
+        // out of scope here; widening the ICE rewrite would half-fix it and hide it.)
         let ice_rewrite = match ice_credentials.as_ref() {
             Some(credentials) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
                 ufrag: credentials.ufrag.as_str(),
@@ -2372,7 +2377,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }),
             // RFC 8839 §5.3: say why ICE is absent rather than dropping it silently, so the offerer
             // stops waiting for checks that will never come.
-            None if ice_mismatch => IceRewrite::Mismatch,
+            None if takeover && ice_mismatch => IceRewrite::Mismatch,
+            // `ICE=remove` on a takeover: the leg runs on the signalled address, so the peer's ICE is
+            // stripped rather than echoed back at it (the same thing `offer` does for this directive).
+            None if takeover && ice_directive(profile) == Some(IceDirective::Remove) => {
+                IceRewrite::Strip
+            }
             None => IceRewrite::Keep,
         };
         let mut rewritten =
@@ -15730,6 +15740,11 @@ mod tests {
             "ICE=remove must still be accepted: {accepted:?}"
         );
         assert!(engine.ws().is_ws_call("al-ice-removed"));
+        let stripped = sdp::parse(&ok_sdp_text(&accepted)).expect("answer sdp");
+        assert!(
+            !stripped.is_ice(),
+            "ICE=remove strips the peer's ICE rather than echoing its credentials back"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
