@@ -6625,6 +6625,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             None
         };
+        // A call with no media actor — a crypto bridge (`Srtp` / `Dtls`) or a WebSocket takeover — is
+        // never promoted by the guard above, so the control message lands nowhere. Report that instead
+        // of returning an accepted `play_id` for a prompt no one will ever hear and a `PlayFinished`
+        // that will never arrive; the same honesty `play_dtmf` and `silence_media` already keep.
         if !self.media.control(
             call_id,
             MediaControl::PlayAudio {
@@ -6639,7 +6643,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ) {
             return Err(Box::new(error_result(
                 "play_media",
-                &"call has no media-processing actor",
+                &"call is not a media-processing call (a secure bridge or a WebSocket takeover \
+                   has no pipeline to inject into)",
             )));
         }
         if let Some(receiver) = receiver {
@@ -15833,6 +15838,235 @@ mod tests {
             .await
             .expect("audio reaches the WS server once the pair is selected");
         assert_eq!(uplink.len(), 320, "8k/20ms L16 uplink");
+    }
+
+    /// A minimal 8 kHz mono 16-bit PCM RIFF/WAVE prompt blob for `play_media`.
+    fn prompt_wav_blob(sample_count: usize) -> Vec<u8> {
+        let data_len = (sample_count * 2) as u32;
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"RIFF");
+        buffer.extend_from_slice(&(36 + data_len).to_le_bytes());
+        buffer.extend_from_slice(b"WAVE");
+        buffer.extend_from_slice(b"fmt ");
+        buffer.extend_from_slice(&16u32.to_le_bytes());
+        buffer.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        buffer.extend_from_slice(&1u16.to_le_bytes()); // mono
+        buffer.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
+        buffer.extend_from_slice(&16000u32.to_le_bytes()); // byte rate
+        buffer.extend_from_slice(&2u16.to_le_bytes()); // block align
+        buffer.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        buffer.extend_from_slice(b"data");
+        buffer.extend_from_slice(&data_len.to_le_bytes());
+        for index in 0..sample_count {
+            buffer.extend_from_slice(&((index as i16).wrapping_mul(7)).to_le_bytes());
+        }
+        buffer
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_egress_on_a_secure_takeover_leg_is_encrypted() {
+        // The audit this repo has already been bitten by once: a secure call whose media path is
+        // correct but which has a *second* emitter that pushes plaintext (the telephone-event relay
+        // and the injected-DTMF tick, both fixed earlier). A takeover call must have exactly one
+        // egress site — the bridge's downlink drain — so this test proves the two halves of that:
+        //
+        // 1. every other verb that can put a packet on the wire refuses a takeover call, and
+        // 2. every datagram that actually reaches the caller decrypts under the advertised key, i.e.
+        //    not one of them is plaintext.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_media::bridge::pcm_to_l16_le;
+
+        let (ws_uri, _frames, downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let peer_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("peer key");
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "egress-audit".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr_a, &peer_key),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+        let engine_key = answer.crypto.first().copied().expect("engine a=crypto");
+        let mut caller_leg = SecureLeg::new(&peer_key.key, &engine_key.key);
+
+        // 1. No second emitter. Each of these can put a packet on the wire on some other pipeline; on
+        //    a takeover call every one of them must refuse rather than find a way to emit.
+        let refusals: Vec<(&str, CmdResult)> = vec![
+            (
+                "play_media",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::PlayMedia {
+                            call_id: "egress-audit".into(),
+                            from_tag: "tag-a".into(),
+                            to_tag: None,
+                            // A *valid* prompt, so the refusal comes from the missing pipeline and
+                            // not from a WAV parse error further up.
+                            source: PlayMediaSource::Blob {
+                                data: prompt_wav_blob(320),
+                            },
+                            repeat_times: None,
+                            start_pos_ms: None,
+                            duration_ms: None,
+                        },
+                    )
+                    .await,
+            ),
+            (
+                "play_dtmf",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::PlayDtmf {
+                            call_id: "egress-audit".into(),
+                            from_tag: "tag-a".into(),
+                            to_tag: None,
+                            code: "1".into(),
+                            duration_ms: None,
+                            volume_dbm0: None,
+                            pause_ms: None,
+                        },
+                    )
+                    .await,
+            ),
+            (
+                "silence_media",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::SilenceMedia {
+                            call_id: "egress-audit".into(),
+                            from_tag: "tag-a".into(),
+                        },
+                    )
+                    .await,
+            ),
+            (
+                "echo",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::Echo {
+                            call_id: "egress-audit".into(),
+                            from_tag: "tag-a".into(),
+                            to_tag: None,
+                            enabled: true,
+                        },
+                    )
+                    .await,
+            ),
+            (
+                "block_dtmf",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::BlockDtmf {
+                            call_id: "egress-audit".into(),
+                            from_tag: "tag-a".into(),
+                            to_tag: None,
+                        },
+                    )
+                    .await,
+            ),
+            (
+                "start_recording",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::StartRecording {
+                            call_id: "egress-audit".into(),
+                            from_tag: "tag-a".into(),
+                            recording_dir: None,
+                        },
+                    )
+                    .await,
+            ),
+            (
+                "attach_ws_tee",
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::AttachWsTee {
+                            call_id: "egress-audit".into(),
+                            from_tag: "tag-a".into(),
+                            ws_uri: "ws://127.0.0.1:1/tee".into(),
+                            direction: WsTeeDirection::Caller,
+                            channels: None,
+                        },
+                    )
+                    .await,
+            ),
+        ];
+        for (verb, result) in refusals {
+            match result {
+                CmdResult::Error { reason } => {
+                    if verb == "play_media" {
+                        // Pin the *reason*: the prompt is a valid WAV, so a refusal that mentions
+                        // parsing would mean this case is passing for the wrong reason and the real
+                        // guard (no pipeline to inject into) is still absent.
+                        assert!(
+                            reason.contains("media-processing"),
+                            "play_media must refuse because there is no pipeline to inject into, \
+                             got: {reason}"
+                        );
+                    }
+                }
+                other => panic!(
+                    "{verb} must refuse a WebSocket-takeover call rather than emit on it: {other:?}"
+                ),
+            }
+        }
+
+        // 2. Everything the caller actually receives is SRTP. Push several downlink frames and audit
+        //    every datagram: a single plaintext one fails the test.
+        let mut l16 = [0u8; 320];
+        pcm_to_l16_le(&[2000i16; 160], &mut l16);
+        for _ in 0..5 {
+            downlink.send(l16.to_vec()).expect("queue downlink");
+        }
+        let mut buffer = [0u8; 2048];
+        let mut audited = 0usize;
+        for _ in 0..40 {
+            let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            else {
+                continue;
+            };
+            let datagram = &buffer[..len];
+            let mut clear = Vec::new();
+            assert!(
+                caller_leg.unprotect(datagram, &mut clear).is_ok(),
+                "a takeover leg on a secure offerer emitted a datagram the peer cannot decrypt \
+                 (plaintext leak or wrong key): {datagram:02x?}"
+            );
+            audited += 1;
+            if audited >= 3 {
+                break;
+            }
+        }
+        assert!(
+            audited >= 1,
+            "expected the WS downlink to reach the caller so there is something to audit"
+        );
     }
     #[tokio::test]
     async fn answer_local_ws_takeover_does_not_negotiate_comfort_noise() {
