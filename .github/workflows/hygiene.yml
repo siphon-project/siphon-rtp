@@ -18,7 +18,7 @@ permissions:
 jobs:
   no-stray-local-refs:
     name: no stray local-tooling references
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Scan tracked files
