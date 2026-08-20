@@ -93,6 +93,8 @@ per-leg media interface (below).
 | `record_call`, `record_path` | bool, string | Record this call from setup; output directory. |
 | `noise_suppression` | bool | Single-channel noise suppression on this leg's decoded ingress before it is transcoded/relayed (and captured by recording/forks). Engaged only on a userspace-transcoded leg whose codec is 8 or 16 kHz; inert on an in-kernel passthrough or a 48 kHz codec. Setting it forces a same-codec call off the in-kernel fast path onto the media slow path (like `record_call`). Native extension; not set over NG. |
 | `echo_cancellation` | bool | Acoustic/line echo cancellation on this leg's send path, using the audio played *toward* that party as the far-end reference (on a WebSocket voice-AI bridge, the AI downlink cancels the phone's echo of the AI). Runs at the codec's native 8 or 16 kHz; a codec at another rate passes through uncancelled. Wired on transcode and WebSocket-bridge legs, **not** on SRTP/DTLS-secured legs. Setting it promotes a same-codec plaintext call to the userspace pipeline. Native extension; not set over NG. |
+| `beep_detection` | bool | Watch this call's decoded ingress audio for the short single tone an answering machine plays before it records (the "voicemail beep"), and report it as a `beep_detected` event — the media half of answering-machine detection. Armed on **both** legs of the call; the event's `from_tag` names the leg the tone was heard on. Needs decoded audio, so setting it promotes a same-codec plaintext call to the userspace media pipeline (like `noise_suppression`); inert on a codec whose native rate is neither 8 nor 16 kHz. Fires **once** per leg per call — no mid-call re-arm. See [Answering-machine (beep) detection](#answering-machine-beep-detection). Native extension; not set over NG. |
+| `beep_cadence_guard_ms` | int | How long the beep detector waits after a candidate tone to rule out a repeat — the discriminator that keeps a cadenced ringback / busy / congestion / special-information tone from reading as a record tone, and therefore also the detection latency. Unset ⇒ 4500 ms. Inert without `beep_detection`. |
 | `ws_uri` | string | Attach leg A to an external WebSocket media server (`ws://` or `wss://`; `wss://` on ring/rustls with webpki-roots trust). A native extension; not available over NG. |
 | `ws_vad`, `ws_barge_in` | bool | Voice-AI turn-taking on the `ws_uri` bridge. `ws_vad` runs a local energy-VAD on the uplink and emits `speech_started` / `speech_stopped` WS control frames on the caller's speech edges (turn boundaries without a server-side VAD). `ws_barge_in` additionally flushes the queued downlink playout in the same tick when the caller starts speaking (no server round-trip); it implies `ws_vad`. Both inert without `ws_uri`. |
 | `ws_sample_rate` | int | L16 wire sample rate in Hz for the `ws_uri` takeover bridge, independent of the leg's codec rate and applied in **both** directions (uplink is resampled leg→wire, downlink wire→leg before re-encoding). Also the domain the uplink noise suppressor / echo canceller run in; they engage only at 8/16 kHz, so another rate leaves them off without changing the wire rate. Must be a multiple of 1000 within 8000–48000, else the offer/answer is rejected (never clamped). Unset ⇒ the leg codec's own PCM rate, no conversion. Inert without `ws_uri`. |
@@ -231,6 +233,7 @@ Events are pushed down the same TCP connection, tagged on `"event"`, with no `id
 | `active_speaker` | `conference_id`, `from_tag?` | The dominant speaker in a conference changed; `from_tag` absent means the floor went silent. |
 | `call_quality` | `conference_id?` xor `call_id?`, `from_tag`, `jitter_ms`, `loss_percent`, `mos` | Periodic reception quality: RFC 3550 §6.4.1 interarrival jitter, residual loss, and an ITU-T G.107 E-model MOS estimate (1.0..=4.5). Fires every few seconds per conference participant (keyed by `conference_id`) and per 2-party relay or transcode leg (keyed by `call_id`); exactly one identifier is present. |
 | `text` | `call_id`, `from_tag`, `to_tag?`, `text`, `direction?` | Newly-recovered RFC 4103 real-time text (T.140) on a call's `m=text` stream. `text` is the UTF-8 increment this packet delivered (U+FFFD markers preserved where loss occurred, RFC 4103 §5.3); `from_tag` is the sending leg; `direction` is `a_to_b` / `b_to_a`. Requires `text_events`. |
+| `beep_detected` | `call_id`, `from_tag`, `to_tag?`, `frequency_hz`, `duration_ms`, `offset_ms` | An answering-machine record tone was heard on a leg armed with `beep_detection`. `from_tag` is the leg that played it; `frequency_hz` / `duration_ms` are what was measured (duration accurate to ≈ ±32 ms); `offset_ms` is how far into that leg's decoded audio the tone *started* — the event itself arrives `beep_cadence_guard_ms` later. Emitted at most once per leg per call. |
 | `call_summary` | `call_id`, `reason`, `duration_ms`, `legs[]` | End-of-call CDR, emitted once at teardown (`delete` or media-timeout). Carries per-party byte/packet counters and, for a userspace media call, RFC 3550 loss/jitter + ITU-T G.107 MOS. One `legs` entry per party (a single-leg call has one). |
 | `ws_tee_started` | `call_id`, `from_tag`, `stream_id`, `ws_uri`, `direction`, `channels`, `sample_rate` | A WebSocket tee started streaming (`attach_ws_tee` or `ws_tee`): carries the negotiated wire shape (channels, and the L16 `sample_rate` actually negotiated — the requested one when `sample_rate` / `ws_tee_sample_rate` was set, otherwise the tapped leg's codec rate) and the `stream_id` matching the WS `start` frame. |
 | `ws_tee_ended` | `call_id`, `from_tag`, `stream_id`, `reason`, `frames_sent?`, `frames_dropped?` | The WebSocket tee stopped (detach, call teardown, or the server ended it). Emitted exactly once per started tee. |
@@ -238,6 +241,74 @@ Events are pushed down the same TCP connection, tagged on `"event"`, with no `id
 `active_speaker` is conference-scoped. `call_quality` now also fires for ordinary 2-party relay and
 transcode calls (keyed by `call_id`), so per-call quality is on the control channel as well as in the
 [HEP/Homer export](../observability.md).
+
+## Answering-machine (beep) detection
+
+`beep_detection` turns on a media-only detector for the short single tone an answering machine plays
+before it starts recording, so a controller can abort an attended transfer instead of bridging a live
+caller into a voicemail box. It is opt-in per call, arms both legs, and reports through the
+`beep_detected` event above.
+
+### What it looks for
+
+A record tone is a *lone, sustained, narrow-band tone of stable frequency and stable amplitude, of a
+plausible duration, that is not speech*. The one standardised anchor point is ITU-T E.180 / Q.35's
+recording warning tone (1400 Hz, 500 ms); deployed voicemail tones sit in the same neighbourhood. Per
+16 ms analysis hop the detector requires **all** of:
+
+| Rule | Default | Why this value |
+|---|---|---|
+| Frequency window | 400 Hz … 2000 Hz | Below 400 Hz lie mains hum harmonics and the 350/425 Hz dial-tone family; above 2 kHz lie the fax answer tone (2100 Hz) and modem signalling. |
+| Narrow-band concentration | ≥ 0.60 of the 200–3400 Hz band power in the three bins around the peak | A clean tone scores ≈ 0.99 and the ratio degrades as `SNR/(SNR+1)`; 0.60 holds a tone to ≈ 2 dB in-band SNR while sitting far above anything speech reaches. |
+| No second tone | strongest out-of-lobe bin ≥ 12 dB below the peak | DTMF is dual-frequency with at most 8 dB of twist (ITU-T Q.24), so 12 dB rejects every valid DTMF pair with margin; a lone tone's own spectral leakage is ≥ 23 dB down. |
+| Frequency stability | peak-to-peak excursion ≤ 30 Hz across the tone | Just under one 31.25 Hz analysis bin — inside a clean tone's measurement error even at low SNR, but well below a formant glide or an instrument vibrato. |
+| Amplitude stability | peak-to-peak level swing ≤ 5 dB (ignoring the onset hop) | A tone's envelope is flat to well under a dB; a syllable swings by tens, and two close tones (440+480 Hz ringback) beat. |
+| Duration | 120 ms … 1000 ms | Deployed record tones are 200–600 ms with a tail to 1 s. The *upper* bound is what stops a continuous dial or hold tone ever qualifying. |
+| Not cadenced | no other qualifying burst within `beep_cadence_guard_ms` (default 4500 ms) either side | Ringback, busy, congestion and the three-segment special-information tone all repeat, and the repeat is the discriminator. 4500 ms clears the 4 s silent interval of the slowest widely deployed ringback cadence. |
+
+Silence and comfort noise never reach the spectral tests: an energy gate (mean-square ≥ 20 000,
+≈ −44 dBFS RMS) screens them out first.
+
+### Latency
+
+Because the cadence rule has to see what *follows* the tone, the event is emitted
+`beep_cadence_guard_ms` after the tone ends — **≈ 4.5 s with the default**. That is the price of not
+reporting a ringback burst as a beep. Lower it if the flow cannot wait; ≈ 1200 ms still covers busy,
+congestion, the special-information tone and the UK double-ring inter-burst gap, but a slow-cadence
+in-band ringback (1 s on / 4 s off) will then be reported as a beep on its first burst.
+
+### What it cannot do
+
+This is a media-only detector, and it errs toward **missing a beep rather than inventing one** — a
+spurious "you reached a machine" tears down a live call, while a missed one just leaves the flow
+where it would have been without the feature.
+
+- It detects a *record tone*, not "an answering machine". A machine whose greeting ends without a
+  tone, or whose tone is outside the frequency or duration window, is not detected. There is no
+  greeting-length or silence-pattern heuristic and no speech recognition.
+- Measured operating floor: the tone is still found down to **2 dB** in-band SNR at 8 kHz and
+  **0 dB** at 16 kHz (`tone_detect_corpus`'s SNR sweep). Below that it is missed.
+- A lone, harmonic-free, perfectly steady instrument note of 120–1000 ms surrounded by several
+  seconds of silence is indistinguishable from a record tone by these rules. Real music on hold is
+  neither harmonic-free nor surrounded by silence, and is rejected by the second-tone and cadence
+  rules — but a synthetic one would fire.
+- Duration is quantised to the 16 ms analysis hop and is accurate to about one analysis window
+  (±32 ms). The reported frequency is sub-bin accurate (typically within a few Hz).
+- Only the 8 kHz and 16 kHz telephony rates are supported. A leg at another native rate (a 48 kHz
+  Opus leg) is left unwatched, logged at `warn` — it does not fail the call.
+- Not restored by `restore`: a checkpoint does not carry the profile, so re-arm by re-issuing it.
+
+It *is* wired on secure legs, unlike `echo_cancellation`: an SDES-SRTP or DTLS-SRTP call with the
+flag set takes the secure media slow path (decrypt → detect → re-encrypt) rather than the cheaper
+crypto-only bridge.
+
+### Cost
+
+One forward real FFT per 16 ms hop plus a bin scan. Criterion (`beep_8k_20ms` / `beep_16k_20ms`)
+measures **≈ 2.1 µs per 20 ms frame at 8 kHz** and **≈ 4.0 µs at 16 kHz**; the noise suppressor
+measured 6.0 µs / 12.3 µs on the same run, so beep detection costs about **a third of what noise
+suppression does** on the same path — roughly 0.02 % of the 20 ms budget either way. Zero heap
+allocation per frame.
 
 ## Worked examples
 

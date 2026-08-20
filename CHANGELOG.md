@@ -89,6 +89,25 @@ Both flags are `Option`/omitted-when-unset, so existing controller JSON serialis
   (the network still calls far-end speech "speech" down to about −36 dB of ERL — echo of speech is
   speech, and no VAD can substitute for the canceller).
 
+- **Answering-machine (voicemail beep) detection** — opt-in per call via the new `beep_detection`
+  profile flag, reporting the new `beep_detected` event (`call_id`, `from_tag`, `to_tag?`,
+  `frequency_hz`, `duration_ms`, `offset_ms`) so a controller can abort an attended transfer instead
+  of bridging a caller into a voicemail box. A new pure-Rust `RecordToneDetector`
+  (`siphon-rtp-dsp`'s `tone_detect`) runs on the leg's decoded ingress over the same √Hann WOLA STFT
+  the noise suppressor uses, and requires a tone to pass *every* discriminator: narrow-band energy
+  concentration, no second tone (which is what excludes DTMF, ITU-T Q.24), frequency stability,
+  amplitude stability, a 120–1000 ms duration, and — the discriminator that separates a record tone
+  from ringback / busy / congestion / the special-information tone — no repeat inside a configurable
+  cadence guard (`beep_cadence_guard_ms`, default 4500 ms, which is also the reporting latency).
+  Setting the flag promotes a same-codec call from the in-kernel relay to the userspace media
+  pipeline exactly as `noise_suppression` does; supported at 8 and 16 kHz, inert elsewhere. Fires
+  once per leg per call. Validated against a synthesised corpus (196 must-fire / 240 must-not-fire
+  cases across both rates, 0 false negatives and 0 false positives), benched at ≈ 2.1 µs/frame at
+  8 kHz and ≈ 4.0 µs at 16 kHz (about a third of the noise suppressor's cost measured on the same
+  run) with zero per-frame heap allocation. See
+  [docs/control/json.md](docs/control/json.md#answering-machine-beep-detection) for the parameters,
+  the operating point and what it cannot do.
+
 ## [0.2.1] — 2026-08-20
 
 ### Changed
