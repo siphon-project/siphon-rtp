@@ -4,6 +4,7 @@
   <img src="https://img.shields.io/badge/Tokio-actor%20model-blue" alt="Tokio">
   <img src="https://img.shields.io/badge/codecs-pure%20Rust%2C%20zero%20C-success" alt="Pure Rust codecs">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
+  <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status: experimental">
 </p>
 
 <h1 align="center">siphon-rtp</h1>
@@ -12,6 +13,13 @@
   A pure-Rust, kernel-accelerated <b>media engine</b> for
   <a href="https://github.com/siphon-project/siphon-sip">SIPhon</a>.
 </p>
+
+> **Experimental, and staying that way through 1.0.0.** The feature surface is huge (kernel XDP datapath,
+> a dozen-plus codecs, ICE/TURN/DTLS, conferencing, real-time text, voice-AI bridging), and breadth like
+> that does not settle quickly. Expect rough edges and breaking changes between releases. Nothing here is
+> called production-ready until it has been through real-traffic **production soak testing** (the
+> per-commit leak-soak in CI is a unit check, not that), and a 1.0.0 tag will not mean "hardened across
+> every feature". Run it in production only if you are ready to read the code and track releases closely.
 
 <p align="center">
   <a href="#why-siphon-rtp">Why</a> &middot;
@@ -64,12 +72,12 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **Control: native JSON-over-TCP** | — | Implemented — length-prefixed JSON, async events, optional shared-secret auth |
 | **Control: rtpengine NG / bencode** | rtpengine NG | Implemented — drop-in for existing Kamailio / OpenSIPS |
 | **Datapath: UDP backend** | — | Implemented — the production datapath today (NIC-free, symmetric-RTP latching) |
-| **Datapath: eBPF/XDP + AF_XDP** | — | Planned — `aya`, pure Rust; control plane built, not yet wired into the daemon |
+| **Datapath: eBPF/XDP + AF_XDP** | — | Implemented as the separate `siphon-rtp-xdp-daemon` binary — aya, pure Rust; in-kernel XDP_TX fast path + AF_XDP slow path, next-hop MAC resolution. Default `siphon-rtp` binary stays UDP-only |
 | **RTP / RTCP (SR + RR)** | RFC 3550 / 3551 | Implemented — parse and construct |
 | **SRTP (SDES)** | RFC 3711 / 4568 | Implemented — AES-CM + HMAC-SHA1, RFC 3711 anti-replay |
 | **DTLS-SRTP** | RFC 5764 | Implemented — pure-RustCrypto handshake keying (webrtc-dtls) |
-| **ICE / STUN** | RFC 8445 / 5389 | Implemented — ICE-lite + STUN Binding (full ICE state machine planned) |
-| **TURN server** | RFC 5766 / 8656 | Implemented — `turn:` / `turns:` (UDP/TCP/TLS), coturn REST credentials |
+| **ICE / STUN** | RFC 8445 / 5389 / 8839 / 8838 | Implemented — ICE-lite default plus a full RFC 8445 agent (`--ice-full`: gathering, checklists, connectivity checks, nomination), ICE restart via the `reoffer` verb, and trickle-ICE receive |
+| **TURN server + client** | RFC 5766 / 8656 | Implemented — `turn:` / `turns:` (UDP/TCP/TLS), coturn REST credentials; plus a TURN client for relayed ICE candidates (RFC 5766 ChannelData), wired at the engine API (`Engine::with_turn_server`), not yet a daemon flag |
 | **NAT traversal (symmetric RTP, advertised IP, named interfaces)** | RFC 3550 §8 | Implemented — RTPbleed-gated symmetric latch, `--advertise-ip` for a 1:1-NAT / Elastic-IP host, and rtpengine-style `[[interface]]` + `direction` per-leg selection ([docs](docs/security-and-nat.md)) |
 | **Jitter buffer + PLC + resampler** | RFC 3550 | Implemented (resampler AVX2, PLC drives decoder concealment) |
 | **VAD / noise suppression / echo cancellation** | — | Implemented — energy VAD, single-channel noise suppression, and echo cancellation (AEC wired on the transcode and WebSocket-bridge paths, not on SRTP/DTLS legs) |
@@ -243,9 +251,10 @@ Two front-ends onto one internal engine:
                             resample → encode → packetize → SRTP → TX
 ```
 
-That XDP fast/slow split is the **target** datapath. Today the daemon runs the userspace slow path on
-the UDP backend (the XDP loader and classifier are built and unit-tested, not yet wired into the
-runtime); see the [datapath](https://rtp.siphon-sip.org/datapath/) page.
+That XDP fast/slow split ships in the separate **`siphon-rtp-xdp-daemon`** binary (the same engine
+via `run_with_datapath`), which probes the NIC's XDP capability and falls back to UDP. The default
+`siphon-rtp` binary runs the userspace UDP datapath; see the
+[datapath](https://rtp.siphon-sip.org/datapath/) page.
 
 Crates:
 
@@ -257,11 +266,13 @@ Crates:
 - `siphon-rtp-media` — RTP/RTCP, jitter/PLC, leg pipeline, fan-out/fork, the MCU mixer, stream bridges.
 - `siphon-rtp-srtp` — SRTP/SRTCP (SDES) with RFC 3711 anti-replay and the secure-leg demux.
 - `siphon-rtp-dtls` — DTLS-SRTP (RFC 5764) handshake keying, pure RustCrypto.
-- `siphon-rtp-stun` / `siphon-rtp-turn` — STUN plus the built-in TURN server (a coturn replacement).
+- `siphon-rtp-stun` / `siphon-rtp-turn` — STUN and the full RFC 8445 ICE agent core (`siphon-rtp-ice`),
+  the TURN client (`siphon-rtp-stun`), plus the built-in TURN server (a coturn replacement).
 - `siphon-rtp-hep` — HEP3 / Homer export with G.107 MOS.
 - `siphon-rtp-ngcompat` — the rtpengine NG/bencode control front-end.
 - `siphon-rtp-datapath` — the `Datapath` trait and the UDP backend (the runtime datapath today).
-- `siphon-rtp-xdp` / `siphon-rtp-ebpf-common` — the aya XDP loader + classifier (built, not yet wired in).
+- `siphon-rtp-xdp` / `siphon-rtp-ebpf-common` — the aya XDP datapath backend + `no_std` map ABI,
+  shipped as the separate `siphon-rtp-xdp-daemon` binary (excluded workspace).
 - **`siphon-rtp`** — the installable daemon binary (dir `crates/siphon-rtp-engine/`): control
   front-ends, session manager, actor runtime + aya loader.
 
@@ -282,16 +293,16 @@ paired perf + memory-leak check before every commit.
 Pre-1.0, but the core is built and wired end-to-end. Shipping today: both control front-ends (native
 JSON-over-TCP and rtpengine NG/bencode), the userspace relay on the UDP datapath (with symmetric-RTP
 latching), the IMS-priority codecs (G.711, G.722, G.726, GSM-FR, comfort noise, and bit-exact
-AMR-NB/AMR-WB behind the `amr` feature), SRTP-SDES and DTLS-SRTP, a built-in TURN server, RTCP with
-G.107 MOS plus HEP/Homer export, the jitter buffer / PLC / resampler, energy VAD, single-channel
-noise suppression and echo cancellation (on the transcode and WebSocket-bridge paths), SIPREC
-forking, the N-party conferencing MCU, the RTP↔WebSocket bridge, runtime pcap recording, and
-cluster load / drain with warm-standby checkpoint/restore.
+AMR-NB/AMR-WB behind the `amr` feature), Opus (SILK / CELT / Hybrid, decode and encode), SRTP-SDES
+and DTLS-SRTP (including DTLS-SRTP transcoding), ICE-lite plus the full RFC 8445 ICE agent
+(`--ice-full`), a built-in TURN server and a TURN client at the engine API (`Engine::with_turn_server`),
+RFC 4103 / 9071 real-time text, RTCP with G.107 MOS plus HEP/Homer export, the jitter buffer / PLC /
+resampler, energy VAD, single-channel noise suppression and echo cancellation (on the transcode and
+WebSocket-bridge paths), SIPREC forking, the N-party conferencing MCU, the RTP↔WebSocket bridge,
+runtime pcap recording, and cluster load / drain with warm-standby checkpoint/restore.
 
-On the forward track: wiring the eBPF/XDP in-kernel fast path into the daemon (the loader and
-classifier are built and unit-tested but not yet selected at runtime), the full ICE state machine
-(the agent is foundations-only today), the Opus codec, and the OpenAI-Realtime / gRPC /
-direct-WebRTC voice-AI adapters. See the [docs](https://rtp.siphon-sip.org/) for the full picture.
+On the forward track: the OpenAI-Realtime / gRPC / direct-WebRTC voice-AI adapters, and the EVS
+codec. See the [docs](https://rtp.siphon-sip.org/) for the full picture.
 
 ## License
 

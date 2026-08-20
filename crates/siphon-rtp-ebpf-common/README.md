@@ -8,7 +8,7 @@ is unit-tested here. The `aya::Pod` impls are added behind a `user` feature alon
 
 ```toml
 [dependencies]
-siphon-rtp-ebpf-common = "0.1"
+siphon-rtp-ebpf-common = "0.2"
 ```
 
 ## License

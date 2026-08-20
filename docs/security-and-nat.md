@@ -3,9 +3,11 @@
 > Design + threat model for the media plane. Status: **implemented and wired.** The gated latch, the
 > source-consistency checks, symmetric-RTP NAT traversal, SDP address rewrite, ICE-lite + STUN, the
 > built-in TURN server, SRTP-SDES (RFC 3711 / 4568), and DTLS-SRTP (RFC 5764) all ship today, as does
-> RFC 7675 consent freshness (opt-in, `--ice-consent` — §4.4). The main remaining item is the full ICE
-> state machine (RFC 8445: gathering, checklists, nomination, controlling agent); ICE-lite is the
-> current server posture. Crypto posture: secure legs stay secure end to end, and a plaintext leg can
+> RFC 7675 consent freshness (opt-in, `--ice-consent` — §4.4). Candidate gathering, the full RFC 8445
+> agent (`--ice-full`), ICE restart (the `reoffer` verb, RFC 8445 §9), trickle-receive (RFC 8838), and
+> a TURN **client** (wired at the engine API, `Engine::with_turn_server`, not a daemon flag) all ship
+> too; ICE-lite is the **default** responder posture, not the only one. Crypto posture: secure legs
+> stay secure end to end, and a plaintext leg can
 > still run behind network-layer security (IPsec / SBC / private bearer) where a deployment prefers
 > that. Order as built: **latch hardening, then SRTP/DTLS keying, then ICE/TURN, then DoS /
 > control-plane hygiene.**
@@ -185,11 +187,12 @@ Latch state machine, per direction:
 - **Spec:** RFC 3550 §8 (SSRC identity/collision), RFC 4961 (symmetric RTP/RTCP).
 - **Enforcement:** datapath latch state carries `ssrc`; needs the RTP header parse already in
   `siphon-rtp-media`.
-- **In-kernel enforcement (XDP_TX fast path) — specified + built, not yet wired.** This kernel
-  datapath is **not the shipped relay path today**: the daemon runs the userspace UDP datapath, which
-  enforces layers 1–3 in [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs). The XDP program and its map ABI are built but the in-kernel
-  rewrite + `XDP_TX` is not yet wired — [`docs/datapath.md`](datapath.md) is the authority on what is
-  built vs. wired. The design, once attached: for a plain `Forward` (`rtp_passthrough`) leg these
+- **In-kernel enforcement (XDP_TX fast path) — shipped in the separate `siphon-rtp-xdp-daemon`.** The
+  default `siphon-rtp` binary runs the userspace UDP datapath, which enforces layers 1–3 in
+  [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs). The in-kernel `XDP_TX` fast path, with the same
+  layer-1..4 checks, ships in the separate `siphon-rtp-xdp-daemon` binary —
+  [`docs/datapath.md`](datapath.md) is the authority on the two-binary split. When attached: for a
+  plain `Forward` (`rtp_passthrough`) leg these
   same three layers run **in the kernel** before the relay: the eBPF classifier demuxes (layer 1,
   RFC 7983), re-checks the signalled-source gate (layer 2), and applies this SSRC-consistent latch —
   learning the peer's real source into the flow's kernel latch state and re-latching a new source
@@ -229,8 +232,9 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 > resolution, peer-reflexive discovery, and regular nomination — with media gated on the selected
 > pair. **ICE restart (§9) and trickle-receive (RFC 8838) are wired**, and the **XDP kernel datapath
 > now enforces the same layer-4 gate** as the userspace one (see the bullet below).
-> **Relayed candidates are wired too** (`--turn-server`): the engine is now a TURN *client* as well as
-> a server, and a relayed candidate is advertised only when the allocation actually came up and the
+> **Relayed candidates are wired too** (via a TURN *client* at the engine API,
+> `Engine::with_turn_server`, not a daemon flag): the engine can act as a TURN client as well as a
+> server, and a relayed candidate is advertised only when the allocation actually came up and the
 > datapath can relay through it. RTCP-port ICE under non-mux is wired.
 
 - The peer proves reachability with a STUN Binding request authenticated by the negotiated
@@ -253,8 +257,9 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
     §6.2.1, and gives up at a deadline, advertising what it has and logging which servers went quiet.
     A dead STUN server costs one bounded delay and a host-only list — never a failed call. Components
     gather concurrently, so that delay is paid once per leg, not once per component.
-  - Because there is no trickle yet, the offer/answer *is* the complete list, and it is marked
-    `a=end-of-candidates` (RFC 8838 §14).
+  - We still gather fully before answering and mark the list `a=end-of-candidates` (RFC 8838 §14),
+    but we now **accept** trickled remote candidates (`a=ice-options:trickle`) even though we do not
+    send our own.
   - **Enforcement:** `siphon-rtp-ice/src/gather.rs` (the pure plan), `Engine::gather_leg_candidates` /
     `run_gatherer` (its I/O), `sdp::IceAdvertisement` (emission).
 - **The full agent (`--ice-full`) changes who decides the media path**, which is why it belongs in this
@@ -398,8 +403,8 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
   registry entry was simply overwritten and the old `Call` dropped unfreed, leaking its media ports
   and its quota slot on every repeat — a client re-offering in a loop could exhaust both. Note this is
   replacement, not re-negotiation: the replacement binds fresh ports, so the peer must be told the new
-  address. A true re-offer on the existing ports (a SIP re-INVITE, and the trigger an RFC 8445 §9 ICE
-  restart needs) is a separate control verb that does not exist yet.
+  address. That in-place re-offer on the existing ports (a SIP re-INVITE, and the trigger an RFC 8445
+  §9 ICE restart needs) is the `reoffer` verb (see the ICE-restart bullet above).
 
 ### Layer 5 — SRTP / DTLS-SRTP
 The cryptographic fix: authenticated media cannot be injected or silently hijacked even if the latch

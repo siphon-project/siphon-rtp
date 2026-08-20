@@ -70,7 +70,10 @@ Two more per-connection guards apply regardless of auth:
 | Verb | Fields | Purpose |
 |---|---|---|
 | `offer` | `call_id`, `from_tag`, `sdp`, `profile` | SDP offer (A to B). Allocates media ports, rewrites the SDP (RFC 3264 offer/answer), returns the rewritten SDP. |
+| `reoffer` | `call_id`, `from_tag`, `sdp`, `profile` | SDP re-offer (SIP re-INVITE, RFC 3264 §8) on a live call: renegotiate **on the existing media ports** instead of replacing the call. A re-offer whose `a=ice-ufrag`/`a=ice-pwd` differ triggers an RFC 8445 §9 ICE restart while media keeps flowing. Owner-only; returns the rewritten SDP on the same ports. |
 | `answer` | `call_id`, `from_tag`, `to_tag`, `sdp`, `profile` | SDP answer (B to A). Completes negotiation, returns the rewritten SDP. |
+| `answer_local` | `call_id`, `from_tag`, `sdp`, `profile` | Single-leg UAS answer — the engine *is* the far side (IVR / echo / announcement). Picks one encodable codec from the offer, synthesises the RFC 3264 answer, and engages the transcoder now. No `to_tag` (there is no far leg). |
+| `ice_candidate` | `call_id`, `from_tag`, `to_tag?`, `candidates`, `end_of_candidates?` | A trickled ICE candidate from a peer (RFC 8838), arriving after its offer/answer. Each `a=candidate:` line is paired and checked as a triggered check. `to_tag` absent ⇒ near (offerer) leg, present ⇒ far (answerer) leg. Owner-only; requires `--ice-full`. |
 | `delete` | `call_id`, `from_tag`, `to_tag?` | Tear down the session. |
 | `query` | `call_id`, `from_tag`, `to_tag?` | Session statistics: `packets_in/out`, `bytes_in/out`, `packets_lost`. |
 
@@ -81,7 +84,7 @@ per-leg media interface (below).
 | `profile` field | Type | Meaning |
 |---|---|---|
 | `transport_protocol` | string | Far-leg transport, e.g. `RTP/AVP`, `RTP/SAVP` (SDES-SRTP, RFC 4568), `UDP/TLS/RTP/SAVPF` (DTLS-SRTP, RFC 5764). |
-| `ice` | string | Override the SDP-derived ICE posture on the far offer (RFC 8445 / RFC 8839 §5). `force` (and `force-relay`) advertise engine ICE-lite even when the offer carried no ICE; `remove` strips the offerer's ICE and advertises none of ours. Unset ⇒ mirror the offer. `force-relay` degrades to `force` — the engine has no TURN allocator, so only its host candidate is offered. |
+| `ice` | string | Override the SDP-derived ICE posture on the far offer (RFC 8445 / RFC 8839 §5). `force` (and `force-relay`) advertise engine ICE-lite even when the offer carried no ICE; `remove` strips the offerer's ICE and advertises none of ours. Unset ⇒ mirror the offer. `force-relay` is treated as `force` (the relay-only restriction is not honored). The engine advertises its host candidate, a server-reflexive candidate when `--stun-server` answers, and — when a TURN server is configured for the engine to allocate against (`Engine::with_turn_server`, not a daemon flag today) — a relayed candidate; a plain `force` leg offers the same set. |
 | `dtls` | string | Override the DTLS-SRTP posture of a secure (`UDP/TLS/RTP/SAVP[F]`) far leg. `off` downgrades it to plaintext `RTP/AVP` (strips `a=fingerprint`/`a=setup`); `passive` / `active` / `actpass` set the offerer `a=setup` role (RFC 4145 §4 / RFC 5763 §5) instead of the default `actpass`. On a non-DTLS far leg the field is a no-op. |
 | `replace` | string list | SDP fields to rewrite, e.g. `["origin"]`. |
 | `address_family` | string | `IP4` \| `IP6` for the far leg's engine endpoints (v4/v6 interworking). |
@@ -95,6 +98,10 @@ per-leg media interface (below).
 | `ws_vad_threshold`, `ws_vad_hangover_ms` | int, int | Tune the WS uplink VAD: mean-square energy threshold (`None` ≈ 1_000_000; higher is less sensitive) and trailing hangover in ms before `speech_stopped` fires (`None` ≈ 200 ms). Only meaningful with `ws_vad` / `ws_barge_in`. |
 | `received_from` | IP string | The real post-NAT source IP the SIP proxy saw. Tightens the ingress source gate (anti-RTPBleed, see [Security and NAT](../security-and-nat.md)). |
 | `rtcp_mux` | string list | rtpengine `rtcp-mux` directives (`offer`, `require`, `demux`, `accept`, `reject`, `remove`) overriding the RFC 5761 mux decision. |
+| `text_events` | bool | Emit `text` events for recovered RFC 4103 real-time text on the call's `m=text` stream (routes the text through the userspace text processor). Native extension; not set over NG. |
+| `ws_tee` | string | Attach a send-only WebSocket tee at offer time (the `attach_ws_tee` twin): a `ws://` / `wss://` URI the engine streams the call's decoded audio to while it keeps relaying. Native extension; not over NG. |
+| `ws_tee_direction` | string | Which leg(s) `ws_tee` streams: `both` (default) / `caller` / `callee`. Inert without `ws_tee`. |
+| `ws_tee_channels` | int | Wire channel count for `ws_tee`: `2` = stereo caller/callee, `1` = mixed mono. Unset ⇒ 2 when both legs are teed, 1 for a single leg. Inert without `ws_tee`. |
 
 ### Liveness and census
 
@@ -122,7 +129,8 @@ per-leg media interface (below).
 
 `restore` currently rebuilds four call shapes: a plain passthrough relay, an SDES-SRTP
 bridge, a plaintext transcode call, and a secure transcode call (`SrtpMedia`). A
-WebSocket-bridged call keeps live state inside its running actor and is rejected with
+WebSocket-bridged or DTLS-SRTP call keeps live state that a snapshot cannot recover (a running
+WS actor, or handshake-derived DTLS keys) and is rejected with
 `restore of a ... call is not yet supported`. Restoring a `call_id` that already exists
 on the node is also rejected.
 
@@ -137,6 +145,8 @@ on the node is also rejected.
 | `block_media` / `unblock_media` | `call_id`, `from_tag` | Drop egress packets entirely / resume. |
 | `block_dtmf` / `unblock_dtmf` | `call_id`, `from_tag`, `to_tag?` | Stop relaying one leg's RFC 4733 telephone-events to the peer. The digit is still detected and surfaced as a `dtmf` event; only the relay is suppressed. Drop mode only (no tone/PCM replacement yet). |
 | `echo` | `call_id`, `from_tag`, `to_tag?`, `enabled` | Loop a leg's inbound audio back to itself (echo test). `enabled` defaults to `true`; send `false` to stop. |
+| `attach_ws_tee` | `call_id`, `from_tag`, `ws_uri`, `direction?`, `channels?` | Attach a send-only WebSocket tee to a live call: stream its decoded audio to `ws_uri` while the call keeps relaying. `direction` is `both` (default) / `caller` / `callee`; `channels` is `2` (stereo caller/callee) or `1` (mono mix), both-legs only. A plain relay is promoted to the userspace pipeline for the tee's lifetime. Native extension; not over NG. |
+| `detach_ws_tee` | `call_id`, `from_tag` | Detach the WebSocket tee and close its stream. Idempotent. |
 
 Media-control honesty, in one place:
 
@@ -181,9 +191,10 @@ before recording is a follow-up.
 or `{"role": "monitor", "target": "...", "whisper_target": "..."}` (listen to one
 participant, optionally whispering to another). Rooms are capped at 64 participants.
 
-Conference legs accept plain `RTP/AVP` and SDES `RTP/SAVP` offers. An ICE / DTLS-SRTP
-(WebRTC) conference leg is rejected with a clear error; that is a follow-up. A
-participant whose codec the engine can decode but not encode is also refused a seat (the
+Conference legs accept plain `RTP/AVP` and SDES `RTP/SAVP` offers. An ICE or DTLS-SRTP
+(WebRTC) conference leg is accepted and seated *pending*: the seat opens only once the DTLS
+handshake keys it / ICE selects a pair, and until then the room drops its ingress and sends it
+nothing. A participant whose codec the engine can decode but not encode is also refused a seat (the
 room mix could not be sent back).
 
 ## Results
@@ -212,6 +223,10 @@ Events are pushed down the same TCP connection, tagged on `"event"`, with no `id
 | `play_finished` | `call_id`, `from_tag`, `to_tag?`, `play_id`, `reason`, `played_ms?` | A `play_media` prompt ended. `play_id` matches the accept; `reason` is `completed` (drained in full, all repeats / the `duration_ms` cap), `stopped` (`stop_media`), `superseded` (a newer `play_media` on the same leg), or `error` (decode/source error or the leg was torn down mid-play). Only `completed` means the prompt finished on its own. |
 | `active_speaker` | `conference_id`, `from_tag?` | The dominant speaker in a conference changed; `from_tag` absent means the floor went silent. |
 | `call_quality` | `conference_id?` xor `call_id?`, `from_tag`, `jitter_ms`, `loss_percent`, `mos` | Periodic reception quality: RFC 3550 §6.4.1 interarrival jitter, residual loss, and an ITU-T G.107 E-model MOS estimate (1.0..=4.5). Fires every few seconds per conference participant (keyed by `conference_id`) and per 2-party relay or transcode leg (keyed by `call_id`); exactly one identifier is present. |
+| `text` | `call_id`, `from_tag`, `to_tag?`, `text`, `direction?` | Newly-recovered RFC 4103 real-time text (T.140) on a call's `m=text` stream. `text` is the UTF-8 increment this packet delivered (U+FFFD markers preserved where loss occurred, RFC 4103 §5.3); `from_tag` is the sending leg; `direction` is `a_to_b` / `b_to_a`. Requires `text_events`. |
+| `call_summary` | `call_id`, `reason`, `duration_ms`, `legs[]` | End-of-call CDR, emitted once at teardown (`delete` or media-timeout). Carries per-party byte/packet counters and, for a userspace media call, RFC 3550 loss/jitter + ITU-T G.107 MOS. One `legs` entry per party (a single-leg call has one). |
+| `ws_tee_started` | `call_id`, `from_tag`, `stream_id`, `ws_uri`, `direction`, `channels`, `sample_rate` | A WebSocket tee started streaming (`attach_ws_tee` or `ws_tee`): carries the negotiated wire shape (channels, L16 `sample_rate`) and the `stream_id` matching the WS `start` frame. |
+| `ws_tee_ended` | `call_id`, `from_tag`, `stream_id`, `reason`, `frames_sent?`, `frames_dropped?` | The WebSocket tee stopped (detach, call teardown, or the server ended it). Emitted exactly once per started tee. |
 
 `active_speaker` is conference-scoped. `call_quality` now also fires for ordinary 2-party relay and
 transcode calls (keyed by `call_id`), so per-call quality is on the control channel as well as in the

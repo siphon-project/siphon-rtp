@@ -67,13 +67,13 @@ Download the format your tooling prefers from the release assets, then feed it i
 Scan for known vulnerabilities with [Grype](https://github.com/anchore/grype):
 
 ```sh
-grype sbom:./siphon-rtp-v0.1.0.cdx.json
+grype sbom:./siphon-rtp-v0.2.0.cdx.json
 ```
 
 Scan with [Trivy](https://github.com/aquasecurity/trivy):
 
 ```sh
-trivy sbom ./siphon-rtp-v0.1.0.cdx.json
+trivy sbom ./siphon-rtp-v0.2.0.cdx.json
 ```
 
 Continuous monitoring with [Dependency-Track](https://dependencytrack.org/): upload the CycloneDX

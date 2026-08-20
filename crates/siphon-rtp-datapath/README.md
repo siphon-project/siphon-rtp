@@ -6,7 +6,7 @@ by CI and as the reference for the XDP / AF_XDP backends.
 
 ```toml
 [dependencies]
-siphon-rtp-datapath = "0.1"
+siphon-rtp-datapath = "0.2"
 ```
 
 ## License

@@ -58,7 +58,7 @@ nav:
   - Running in production:
       - Deployment & operations: deployment.md
       - Scaling, clustering & HA: scaling-and-ha.md
-      - Datapath (UDP today, XDP planned): datapath.md
+      - Datapath (UDP default, XDP via a separate daemon): datapath.md
       - Supply chain & SBOM: supply-chain.md
       - Migrating from rtpengine: migrating-from-rtpengine.md
   - Reference:

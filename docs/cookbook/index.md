@@ -13,7 +13,7 @@ in the shipped engine.
 | [Plain RTP relay](relay.md) | SBC media anchoring: SIPhon or Kamailio anchors both legs through the engine, RTP forwarded unchanged |
 | [Transcoding](transcoding.md) | The VoLTE workhorse: AMR-WB and AMR-NB to G.711, plus the codec-transcode / codec-mask directives |
 | [Secure media (SRTP)](secure-srtp.md) | SDES-keyed SRTP legs (RFC 3711/4568): bridge a secure access leg to a plaintext core |
-| [WebRTC legs](webrtc.md) | DTLS-SRTP (RFC 5764) with ICE-lite and the built-in TURN server |
+| [WebRTC legs](webrtc.md) | DTLS-SRTP (RFC 5764); ICE-lite by default or the full RFC 8445 agent with `--ice-full` (connectivity checks, nomination, restart, trickle-receive); built-in TURN server plus a TURN client (engine API) for relayed candidates |
 | [Voice-AI streaming](voice-ai.md) | Bridge a call leg to a WebSocket media server: decode to L16 uplink, encode the downlink |
 | [Conferencing](conferencing.md) | N-party mixed audio rooms (MCU): roles, active speaker, whisper/monitor, room bridging |
 | [NAT traversal & latching](nat.md) | Symmetric RTP done safely: gated latching, `received-from`, SDP address rewrite, hairpinning |

@@ -26,14 +26,13 @@ Rust, at different levels of maturity. This page says exactly which level.
   and open only once the handshake keys them / ICE selects a pair; a full-ICE
   seat's egress and source gate follow the selected pair.
 
-- Relayed (TURN) candidates, with `--turn-server`: the engine is a TURN *client*
-  as well as a server, and media on a relayed candidate is ChannelData-framed
-  through the allocation by the datapath. Advertised only when the allocation
-  came up and the backend can carry it.
+- Relayed (TURN) candidates: the engine can act as a TURN *client* as well as a
+  server, allocating a relayed candidate and ChannelData-framing media through it.
+  Wired at the engine API level (`Engine::with_turn_server`); it is not yet exposed
+  as a daemon CLI flag.
 
-**Planned, not shipped:** transcoding on a DTLS leg
-(today a DTLS leg is bridged as-is, so both sides must share a codec); HA
-checkpoint/restore of a DTLS leg.
+**Planned, not shipped:** HA checkpoint/restore of a DTLS leg (the handshake-derived
+keys cannot be recovered from a snapshot).
 
 ## One port, three protocols: the RFC 7983 demux
 
@@ -207,10 +206,11 @@ burn the DTLS retransmissions and fail a call ICE would have completed. Without
 `--ice-full` the handshake starts immediately at the signalled address, exactly as
 before.
 
-Still the responder half only in one respect: the engine does not yet perform an
-ICE restart (§9) or trickle (RFC 8838). If you need the engine to be an ICE
-*client* for outbound WebRTC trunking, that is the same agent driven from the
-offerer side and is a follow-up.
+Still the responder half in one respect: the engine performs an ICE restart and
+trickle-receive as the *answerer* (a `reoffer` with fresh credentials restarts ICE;
+`ice_candidate` feeds trickled remote candidates), but it does not yet drive the agent
+from the *offerer* side. If you need the engine to be an ICE client for outbound WebRTC
+trunking, that is a follow-up.
 
 ## Consent freshness (RFC 7675)
 

@@ -3,6 +3,13 @@
 **A pure-Rust, kernel-accelerated media engine for [SIPhon](https://github.com/siphon-project/siphon-sip)
 and for existing Kamailio / OpenSIPS deployments.**
 
+> **Experimental, and staying that way through 1.0.0.** The feature surface is huge (kernel XDP datapath,
+> a dozen-plus codecs, ICE/TURN/DTLS, conferencing, real-time text, voice-AI bridging), and breadth like
+> that does not settle quickly. Expect rough edges and breaking changes between releases. Nothing is
+> called production-ready until it has been through real-traffic **production soak testing** (the
+> per-commit leak-soak in CI is a unit check, not that); a 1.0.0 tag will not mean "hardened across every
+> feature".
+
 siphon-rtp is the media plane SIPhon owns: an RTP/SRTP relay, a bit-exact VoLTE codec stack, a
 transcoder, an N-party conferencing MCU, and a bidirectional RTP↔WebSocket bridge for voice-AI. It
 speaks two control protocols onto one engine, so it drops in for SIPhon over native JSON and for
@@ -51,8 +58,8 @@ control exchange and how to verify it:
   and readiness probes, graceful drain, and the ops runbook.
 - **[Scaling, clustering & HA](scaling-and-ha.md)**: how a single-node engine scales behind the SIP
   dispatcher, the load/drain surface for rolling upgrades, and warm-standby checkpoint/restore.
-- **[Datapath](datapath.md)**: the UDP backend that runs today and the eBPF/XDP in-kernel path that
-  is built but not yet wired in. An honest map of what forwards where.
+- **[Datapath](datapath.md)**: the UDP backend the default binary runs, and the eBPF/XDP in-kernel
+  path shipped as the separate `siphon-rtp-xdp-daemon` binary. An honest map of what forwards where.
 - **[Supply chain & SBOM](supply-chain.md)**: the per-release SPDX + CycloneDX SBOM, the cargo-deny
   audit that enforces the zero-C rule, and how to report a vulnerability.
 - **[Migrating from rtpengine](migrating-from-rtpengine.md)**: the NG parity table and what to

@@ -7,8 +7,12 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
-The initial public surface. The workspace version is `0.1.5` (a single number across
-every crate, see [VERSIONING.md](VERSIONING.md)); this is what the first public tag ships.
+## [0.2.0] — 2026-08-19
+
+The workspace version is `0.2.0` (a single number across every crate, see
+[VERSIONING.md](VERSIONING.md)). siphon-rtp is **experimental** — a very large feature surface that
+keeps moving and breaking; nothing is production-ready until it has real-traffic soak testing behind
+it, and that designation stays through 1.0.0.
 
 ### Control plane
 - **Native JSON-over-TCP control protocol** (`siphon-rtp-proto`) — length-prefixed
@@ -26,18 +30,50 @@ every crate, see [VERSIONING.md](VERSIONING.md)); this is what the first public 
   extensions (cluster load/node-info/drain, HA checkpoint/restore).
 
 ### Media plane
-- **UDP datapath** with symmetric-RTP latching (the runtime datapath today); the
-  eBPF/XDP loader and classifier are built and unit-tested, not yet wired in.
+- **UDP datapath** with symmetric-RTP latching — the datapath the default
+  `siphon-rtp` binary runs. (The in-kernel XDP datapath ships separately; see the
+  XDP entry below.)
 - **Codecs**, pure Rust, bit-exact against the reference vectors: G.711 µ/A-law, L16,
   G.722, G.726 (16/24/32/40 kbit/s), GSM Full Rate, comfort noise (RFC 3389), and,
   behind the `amr` feature, AMR-WB (decode and encode all 9 modes) and AMR-NB
   (decode and encode all 8 modes; DTX/SID out of scope).
 - **SRTP-SDES** (RFC 3711 / 4568) with anti-replay, and **DTLS-SRTP** (RFC 5764),
   both pure RustCrypto.
-- **ICE-lite + STUN**, with opt-in **consent freshness** (RFC 7675, `--ice-consent`:
-  probes the validated candidate pair and tears the call down when the peer stops
-  answering), and a **built-in TURN server** (RFC 5766 / 8656, coturn REST
-  credentials, `turn:` / `turns:` over UDP/TCP/TLS).
+- **ICE-lite + STUN** as the default responder posture, with opt-in **consent
+  freshness** (RFC 7675, `--ice-consent`: probes the validated candidate pair and
+  tears the call down when the peer stops answering), and a **built-in TURN server**
+  (RFC 5766 / 8656, coturn REST credentials, `turn:` / `turns:` over UDP/TCP/TLS).
+- **Full RFC 8445 ICE agent** behind `--ice-full` (checklists, connectivity checks,
+  both roles with 487 role-conflict, peer-reflexive discovery, regular nomination;
+  media gated on the selected pair). ICE-lite responder remains the default posture.
+  (`siphon-rtp-ice`)
+- **Candidate gathering** per leg/component with `--stun-server` (host +
+  server-reflexive, RFC 8445 §5.1.1; the built-in TURN server answers Binding,
+  RFC 8656 §12).
+- **ICE restart** (RFC 8445 §9) via a new `reoffer` control verb — renegotiates on
+  the existing media ports (advertised in `node_info` features as `reoffer`).
+- **Trickle-ICE receive** (RFC 8838) — new `ice_candidate` control verb;
+  `a=ice-options:trickle` / `a=end-of-candidates`. Requires `--ice-full`.
+- **RFC 8839 §5.3 ICE-mismatch** detection/signalling.
+- **TURN client** (`siphon-rtp-stun/src/turn_client.rs`) for relayed ICE candidates
+  (RFC 5766 Allocate/Refresh/CreatePermission/ChannelBind + ChannelData datapath).
+  Wired at the engine API level (`Engine::with_turn_server`); not yet exposed as a
+  daemon CLI flag.
+- **Opus** (RFC 6716 / RFC 7587) — pure-Rust SILK/CELT/Hybrid, decode AND encode
+  wired into the codec factory, all five RFC 7587 fmtp parameters honoured,
+  advertised in `node_info`. No Cargo feature.
+- **DTLS-SRTP media pipeline leg** (`PipelineKind::DtlsMedia`) — a WebRTC/DTLS leg
+  can be transcoded, recorded or ws-teed, not only relayed; DTLS-SRTP conference
+  participant seating.
+- **XDP kernel datapath** shipped as the separate `siphon-rtp-xdp-daemon` binary —
+  in-kernel `XDP_TX` fast path, next-hop MAC resolution (rtnetlink/ARP), layer-1..4
+  gate enforced in-kernel; plugs into the engine via `run_with_datapath`. Default
+  `siphon-rtp` binary stays UDP-only.
+- **Real-time text** (RFC 4103 / RFC 9071) — RFC 2198 RED + RFC 4103 T.140
+  reassembly; plaintext `m=text` relay and secure SDES-SRTP text; RFC 9071
+  multiparty RTT in the conference; text QoS on the HEP wire; text re-anchored on
+  the ICE-restart reoffer path.
+- **Repeated `offer` on a live call-id hardened** — owner-only, clean replace.
 - **RTCP** SR/RR (parse and construct), **jitter buffer + PLC**, **resampler** (AVX2),
   an energy **VAD**, single-channel **noise suppression**, and **echo cancellation**
   (wired on the transcode and WebSocket-bridge paths, not on SRTP/DTLS legs).
@@ -66,8 +102,14 @@ every crate, see [VERSIONING.md](VERSIONING.md)); this is what the first public 
 - **Prometheus `/metrics` + `/healthz` + `/readyz`**, **HEP/Homer export** with G.107
   MOS, cluster **load / node_info / drain** for rolling upgrades, and warm-standby
   **checkpoint / restore** (plain relay, SDES-SRTP bridge, plaintext transcode, and
-  secure transcode; only WebSocket restore is not yet covered).
+  secure transcode; WebSocket and DTLS-SRTP restore are not yet covered).
 
 ### Supply chain
 - Per-release **SBOM** (SPDX 2.3 + CycloneDX 1.4), a scheduled **cargo-deny** advisory
   audit, and a CI ban list enforcing the **zero C library dependency** rule.
+
+### Dependencies
+- rcgen 0.13 → 0.14; base64 0.23 (`siphon-rtp-srtp`); the cargo-minor-patch group
+  (tokio, rustls, rustls-pki-types, webpki-roots, futures-util, serde_json,
+  thiserror, clap, toml, async-trait); spin unyanked to 0.9.9. Dependabot now
+  ignores the aes/ctr 0.9 wave and standalone webrtc-util bumps.

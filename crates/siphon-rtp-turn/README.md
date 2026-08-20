@@ -10,7 +10,7 @@ auth are hand-rolled in [`siphon-rtp-stun`](https://crates.io/crates/siphon-rtp-
 
 ```toml
 [dependencies]
-siphon-rtp-turn = "0.1"
+siphon-rtp-turn = "0.2"
 ```
 
 ## License
