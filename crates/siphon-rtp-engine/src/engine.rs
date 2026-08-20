@@ -19428,6 +19428,131 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ice_lite_conference_seat_mixes_only_a_stun_validated_source() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_codec::g711::G711;
+        use siphon_rtp_codec::Decoder as _;
+        use siphon_rtp_dsp::EnergyVad;
+        use siphon_rtp_media::rtp::RtpPacket;
+
+        // An **ice-lite** seat (the default posture — no `--ice full`) takes its seat with the
+        // signalled-source gate open, because a connectivity check legitimately arrives from a
+        // peer-reflexive transport the SDP never carried (RFC 8445 §7.3.1.3). Nothing in the room
+        // closes that window again: `ice_pending` is only set for a full agent, and no selection is
+        // coming that would narrow the gate. What must close it is the datapath's layer-4 ICE gate
+        // on the redirected path — media reaches the room only from the source a check validated.
+        // Without it, anyone who can reach the seat's port injects audio into the mix every other
+        // participant hears: RTPBleed on a conference seat.
+        // docs/security-and-nat.md §4 layer 4; RFC 8445 §7.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        // A plain listener seat, so the room has somewhere to send whatever it mixed.
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 1)).await;
+        let joined_a = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "lite-room".into(),
+                    from_tag: "alice".into(),
+                    sdp: sdp_for(addr_a, true),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let engine_a = sdp::parse(&ok_sdp_text(&joined_a))
+            .expect("A answer")
+            .remote_rtp;
+
+        // The ICE seat. The engine has no full agent, so this is the datapath's ice-lite responder.
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let joined_b = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "lite-room".into(),
+                    from_tag: "bob".into(),
+                    sdp: ice_offer_with_candidate(addr_b),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let answer_b = sdp::parse(&ok_sdp_text(&joined_b)).expect("B answer");
+        let engine_b = answer_b.remote_rtp;
+        let engine_ufrag = answer_b.ice_ufrag.clone().expect("seat ufrag");
+        let engine_pwd = answer_b.ice_pwd.clone().expect("seat pwd");
+
+        // An off-path attacker sprays the seat's port with full-scale µ-law, never having answered
+        // (or sent) a single connectivity check.
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 9)).await;
+        for sequence in 0..30 {
+            attacker
+                .send_to(&g711_rtp(0, sequence, 0x0EEE_0EEE, 0x00), engine_b)
+                .await
+                .expect("attacker send");
+        }
+
+        let mut decoder = G711::ulaw();
+        let mut pcm = vec![0i16; 320];
+        let mut loudest = 0i64;
+        for _ in 0..15 {
+            let (mix, from) = recv(&phone_a).await;
+            assert_eq!(from, engine_a, "A hears the mix from its engine port");
+            let packet = RtpPacket::parse(&mix).expect("A egress RTP");
+            let samples = decoder.decode(packet.payload, &mut pcm).expect("decode");
+            loudest = loudest.max(EnergyVad::energy(&pcm[..samples]));
+        }
+        assert!(
+            loudest < 1_000_000,
+            "an unvalidated source must never be mixed into the room (loudest frame {loudest})"
+        );
+
+        // Positive control: the real participant validates its path with a connectivity check, and
+        // from then on its audio is mixed exactly as before — the gate narrows the seat, it does not
+        // close it.
+        let username = format!("{engine_ufrag}:{A_UFRAG}");
+        let check = siphon_rtp_stun::binding_request(&[5u8; 12], &username, engine_pwd.as_bytes());
+        phone_b.send_to(&check, engine_b).await.expect("send check");
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(1), phone_b.recv_from(&mut buffer))
+            .await
+            .expect("no timeout")
+            .expect("STUN response");
+        let response = siphon_rtp_stun::parse(&buffer[..len]).expect("parse response");
+        assert_eq!(response.message_type, siphon_rtp_stun::BINDING_SUCCESS);
+
+        for sequence in 0..30 {
+            phone_b
+                .send_to(&g711_rtp(0, sequence, 0x0B0B_0B0B, 0x00), engine_b)
+                .await
+                .expect("b send");
+        }
+        let mut heard_loud = false;
+        for _ in 0..25 {
+            let (mix, _) = recv(&phone_a).await;
+            let packet = RtpPacket::parse(&mix).expect("A egress RTP");
+            let samples = decoder.decode(packet.payload, &mut pcm).expect("decode");
+            if EnergyVad::energy(&pcm[..samples]) > 1_000_000 {
+                heard_loud = true;
+                break;
+            }
+        }
+        assert!(
+            heard_loud,
+            "the validated participant's audio is still mixed into the room"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_full_ice_conference_seat_opens_its_media_path_only_after_a_pair_is_selected() {
         // The end-to-end proof for a *room* seat: a real peer agent runs against the engine's, and
         // the room neither mixes the seat's audio nor sends it the mix until ICE has chosen. The

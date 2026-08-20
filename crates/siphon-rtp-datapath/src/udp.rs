@@ -1283,6 +1283,123 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_redirect_endpoint_hands_up_media_only_from_a_stun_validated_source() {
+        // The `Redirect` counterpart of `ice_forward_leg_forwards_media_only_from_a_stun_validated_source`.
+        // A userspace-owned leg (conference seat, promoted relay, SRTP/DTLS bridge) is a `Redirect`
+        // endpoint, and an ICE one must be gated by the same layer 4 the relay path enforces: media
+        // reaches its consumer only from the source a connectivity check validated, never before one
+        // has, and never from a different source afterwards. Without this the consumer's own
+        // signalled-source gate is the only thing left — and an ICE leg deliberately runs that gate
+        // open, because a peer-reflexive check legitimately arrives from a transport the SDP never
+        // carried (RFC 8445 §7.3.1.3). docs/security-and-nat.md §4 layer 4; RFC 8445 §7.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        datapath.set_ice(
+            leg.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        datapath
+            .install_flow(leg.id, FlowAction::Redirect)
+            .expect("redirect flow");
+        let rx = datapath.rx();
+
+        // Pre-check spray: an attacker's RTP arrives before any connectivity check.
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        attacker
+            .send_to(&rtp(0xAAAA_AAAA, 1), leg.local_addr)
+            .await
+            .expect("attacker send");
+        assert!(
+            timeout(NEGATIVE, rx.recv_async()).await.is_err(),
+            "media before any STUN validation must be dropped, not redirected to the consumer"
+        );
+
+        // A valid connectivity check from the real peer adopts its source.
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        peer.send_to(&check, leg.local_addr)
+            .await
+            .expect("send check");
+        let _ = recv(&peer).await; // await the success response so the adoption has completed
+
+        // The validated peer's media now reaches the consumer.
+        peer.send_to(&rtp(0x1234_5678, 1), leg.local_addr)
+            .await
+            .expect("peer rtp");
+        let packet = timeout(SHORT, rx.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("packet");
+        assert_eq!(packet.source, peer_addr);
+        assert_eq!(&packet.data[..], rtp(0x1234_5678, 1).as_slice());
+
+        // A different source spraying after adoption is still rejected — media never creates or
+        // moves an ICE endpoint's latch.
+        attacker
+            .send_to(&rtp(0xBBBB_BBBB, 2), leg.local_addr)
+            .await
+            .expect("attacker rtp");
+        assert!(
+            timeout(NEGATIVE, rx.recv_async()).await.is_err(),
+            "a different source after adoption must not be redirected (no media re-latch on ICE)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_redirect_endpoint_still_hands_up_non_rtp_from_the_validated_source() {
+        // The layer-4 gate on the `Redirect` path is a *source* gate, not the relay path's layer-1
+        // RFC 7983 demux. A DTLS-SRTP leg's handshake records (first byte 20..=63) are not RTP and
+        // must still reach the DTLS bridge — the handshake keys the pair ICE chose (RFC 5764; RFC
+        // 8445 §12), so dropping them would deadlock every secure ICE leg.
+        let datapath = UdpLoopbackDatapath::new();
+        let leg = datapath.alloc_endpoint().await.expect("alloc");
+        datapath.set_ice(
+            leg.id,
+            Some(IceConfig {
+                local_ufrag: "ENG".into(),
+                local_pwd: "engpass".into(),
+            }),
+        );
+        datapath
+            .install_flow(leg.id, FlowAction::Redirect)
+            .expect("redirect flow");
+        let rx = datapath.rx();
+
+        let (peer, peer_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let check = stun::binding_request(&[9u8; 12], "ENG:remote", b"engpass");
+        peer.send_to(&check, leg.local_addr)
+            .await
+            .expect("send check");
+        let _ = recv(&peer).await;
+
+        // A DTLS handshake record (content type 22, DTLS 1.2 version) from the validated source.
+        let record = [0x16u8, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        peer.send_to(&record, leg.local_addr)
+            .await
+            .expect("peer dtls");
+        let packet = timeout(SHORT, rx.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("packet");
+        assert_eq!(packet.source, peer_addr);
+        assert_eq!(&packet.data[..], &record);
+
+        // The same record from an unvalidated source is dropped: DTLS runs *over* the pair ICE chose.
+        let (attacker, _) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        attacker
+            .send_to(&record, leg.local_addr)
+            .await
+            .expect("attacker dtls");
+        assert!(
+            timeout(NEGATIVE, rx.recv_async()).await.is_err(),
+            "a DTLS record from an unvalidated source must not reach the handshake"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drop_action_and_stats_counters() {
         let datapath = UdpLoopbackDatapath::new();
         let leg_a = datapath.alloc_endpoint().await.expect("alloc a");
