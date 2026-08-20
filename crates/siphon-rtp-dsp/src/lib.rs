@@ -4,6 +4,10 @@
 //! the AEC follow on the same NIC-free, synchronous, **deterministic** footing (driven by a logical
 //! sample-clock, never `Instant::now()`), so every unit golden-tests without audio hardware.
 //!
+//! Voice activity detection ([`vad`]) ships two detectors on one interface: the cheap
+//! [`EnergyVad`] gate and [`NeuralVad`], a hand-written pure-Rust forward pass of the Silero VAD
+//! v5 network (~309 K embedded parameters, no inference runtime, no C).
+//!
 //! Noise suppression ([`ns`]) is built from a safe, self-contained radix-2 real [`fft`] and a
 //! √Hann WOLA framing ([`window`]); the FFT twiddle/bit-reversal convention matches the in-tree
 //! libopus KISS-FFT port (`siphon-rtp-codec` `opus/celt/mdct.rs`), validated transitively against a
@@ -24,7 +28,10 @@ pub use fft::{Complex, RealFft};
 pub use ns::NoiseSuppressor;
 pub use res::ResidualEchoSuppressor;
 pub use resample::{ResampleError, Resampler};
-pub use vad::EnergyVad;
+pub use vad::{
+    EnergyVad, NeuralVad, NeuralVadStream, SpeechRunGate, VadError, VoiceDetector,
+    NEURAL_VAD_SAMPLE_RATE_HZ, NEURAL_VAD_WINDOW_MS, NEURAL_VAD_WINDOW_SAMPLES,
+};
 pub use window::{WolaAnalyzer, WolaProcessor};
 
 /// Errors constructing a DSP block (noise suppressor, WOLA framing, FFT).
