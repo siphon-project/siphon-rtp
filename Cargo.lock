@@ -2050,6 +2050,7 @@ name = "siphon-rtp-datapath"
 version = "0.2.1"
 dependencies = [
  "bytes",
+ "criterion",
  "dashmap",
  "flume",
  "siphon-rtp-ebpf-common",

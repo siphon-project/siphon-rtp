@@ -163,6 +163,17 @@ enum LatchOutcome {
     Reject,
 }
 
+/// Verdict of the layer-4 ICE gate for one datagram (`docs/security-and-nat.md` §4 layer 4).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IceGate {
+    /// The endpoint carries no ICE credentials — layers 2 and 3 apply instead.
+    NotIce,
+    /// An ICE endpoint whose source a connectivity check validated.
+    Accept,
+    /// An ICE endpoint, and this is not the validated source (or nothing is validated yet).
+    Reject,
+}
+
 /// Shared backend state. Held by the public handle (strong) and by receive tasks (weak), so the
 /// strong count reaches zero on teardown and [`Drop`] can abort the parked receive tasks.
 struct Inner {
@@ -232,41 +243,34 @@ impl Inner {
                     in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                if self.ice.contains_key(&endpoint) {
-                    // Layer 4 — ICE supersedes blind latching (docs/security-and-nat.md §4 layer 4;
-                    // RFC 8445 §7). On an ICE endpoint the STUN connectivity-check responder
-                    // (`handle_stun`) is the *only* thing that adopts a media source: media is
-                    // forwarded **only** from the STUN-validated latch, and media never creates or
-                    // moves that latch. So drop media that arrives before any check has validated a
-                    // source, and drop media whose source is not the adopted one — the leg never
-                    // blind-latches the first RTP sender. The signalled-source gate (layer 2) and the
-                    // SSRC re-latch (layer 3) are subsumed by the authenticated connectivity check.
-                    let validated = self
-                        .latched
-                        .get(&endpoint)
-                        .is_some_and(|state| state.addr == source);
-                    if !validated {
+                // Layer 4 — ICE supersedes blind latching (docs/security-and-nat.md §4 layer 4;
+                // RFC 8445 §7). On an ICE endpoint the signalled-source gate (layer 2) and the SSRC
+                // re-latch (layer 3) are subsumed by the authenticated connectivity check.
+                match self.ice_gate(endpoint, source) {
+                    IceGate::Reject => {
                         in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                } else {
-                    // Layer 2 — signalled-source gate: only the SDP-signalled peer may send here.
-                    // This is the RTPBleed fix; an off-path source on another address is dropped
-                    // before it can latch or be forwarded. (docs/security-and-nat.md §4 layer 2; RFC
-                    // 3264.)
-                    if !rule.accepted_source.accepts(source.ip()) {
-                        in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    // Layer 3 — SSRC-consistent latch: a new source re-latches only when it carries
-                    // the same RTP SSRC (a genuine NAT rebind), never a hijack spray.
-                    // (docs/security-and-nat.md §4 layer 3; RFC 3550 §8.)
-                    if rule.latch != LatchPolicy::Off
-                        && self.update_latch(endpoint, source, rtp_ssrc(payload))
-                            == LatchOutcome::Reject
-                    {
-                        in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        return;
+                    IceGate::Accept => {}
+                    IceGate::NotIce => {
+                        // Layer 2 — signalled-source gate: only the SDP-signalled peer may send here.
+                        // This is the RTPBleed fix; an off-path source on another address is dropped
+                        // before it can latch or be forwarded. (docs/security-and-nat.md §4 layer 2;
+                        // RFC 3264.)
+                        if !rule.accepted_source.accepts(source.ip()) {
+                            in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        // Layer 3 — SSRC-consistent latch: a new source re-latches only when it
+                        // carries the same RTP SSRC (a genuine NAT rebind), never a hijack spray.
+                        // (docs/security-and-nat.md §4 layer 3; RFC 3550 §8.)
+                        if rule.latch != LatchPolicy::Off
+                            && self.update_latch(endpoint, source, rtp_ssrc(payload))
+                                == LatchOutcome::Reject
+                        {
+                            in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
 
@@ -330,6 +334,26 @@ impl Inner {
                 }
             }
             FlowAction::Redirect => {
+                // Layer 4 — the same ICE gate the relay path enforces, on the userspace slow path
+                // (docs/security-and-nat.md §4 layer 4; RFC 8445 §7). A `Redirect` endpoint is how a
+                // conference seat, a promoted call, a WebSocket takeover and the SRTP/DTLS bridges
+                // receive their media, and an ICE one of those must be gated on the connectivity
+                // check exactly as a `Forward` leg is: the consumer's own signalled-source gate
+                // cannot do it, because an ICE leg deliberately runs that gate open — a
+                // peer-reflexive check legitimately arrives from a transport the SDP never carried
+                // (RFC 8445 §7.3.1.3), so the address is not the discriminator here; the
+                // MESSAGE-INTEGRITY the responder verified is.
+                //
+                // Only the *source* is gated, never the packet class: unlike the relay path there is
+                // no layer-1 RFC 7983 demux here, because a redirected endpoint is entitled to
+                // non-RTP — a DTLS-SRTP leg's handshake records must reach the bridge (RFC 5764),
+                // and a TURN allocation's own STUN must reach its client (RFC 5766 §11). STUN never
+                // reaches this arm on an ICE endpoint: `recv_loop` hands it to the responder or the
+                // full agent first, which is what lets a check through and lets the latch form.
+                if self.ice_gate(endpoint, source) == IceGate::Reject {
+                    in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 let packet = RxPacket {
                     endpoint,
                     source,
@@ -346,6 +370,35 @@ impl Inner {
             FlowAction::Drop => {
                 in_stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// The layer-4 ICE verdict for one datagram arriving on `endpoint` from `source`
+    /// (docs/security-and-nat.md §4 layer 4; RFC 8445 §7).
+    ///
+    /// On an endpoint carrying ICE credentials the connectivity-check responder ([`handle_stun`]) —
+    /// or, for a full RFC 8445 agent, the engine through [`Datapath::adopt_source`] — is the **only**
+    /// thing that adopts a media source. Traffic is accepted only from that adopted source: nothing
+    /// before a check has validated one, and nothing from a different source afterwards, so an ICE
+    /// leg never blind-latches its first sender the way a plain relay's layer 3 may. The signalled
+    /// address is deliberately not consulted; a peer-reflexive candidate legitimately sends from a
+    /// transport the SDP never carried (RFC 8445 §7.3.1.3).
+    ///
+    /// One definition, consulted by both delivery paths — the in-kernel-style relay
+    /// ([`FlowAction::Forward`]) and the userspace slow path ([`FlowAction::Redirect`]) — so the two
+    /// cannot drift on what an ICE leg is allowed to receive.
+    fn ice_gate(&self, endpoint: EndpointId, source: SocketAddr) -> IceGate {
+        if !self.ice.contains_key(&endpoint) {
+            return IceGate::NotIce;
+        }
+        if self
+            .latched
+            .get(&endpoint)
+            .is_some_and(|state| state.addr == source)
+        {
+            IceGate::Accept
+        } else {
+            IceGate::Reject
         }
     }
 
