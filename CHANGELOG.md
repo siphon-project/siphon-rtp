@@ -7,6 +7,26 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+- **Security (RTPBleed class): a redirected ICE endpoint had no source gate at all.** The datapath's
+  layer-4 ICE gate — media is accepted only from the transport a STUN connectivity check validated
+  (RFC 8445 §7) — ran on the in-kernel/relay `Forward` path only. Every userspace consumer receives
+  its media as `Redirect` (conference seats, promoted transcode/record/echo/DTMF calls, WebSocket
+  takeover legs, the SDES-SRTP and DTLS-SRTP bridges), and each of those re-enforces the layer-2
+  *signalled-source* gate itself — which an ICE leg deliberately leaves open (`SourceFilter::Any`),
+  because a peer-reflexive check legitimately arrives from a transport the SDP never carried
+  (RFC 8445 §7.3.1.3). The two together left an ICE leg on the redirected path with nothing gating
+  its source. The sharpest case was an **ice-lite conference seat** — the default posture, no
+  `--ice full` — where the room's `ice_pending` gate is never set (it exists for the window before a
+  *full* agent selects a pair) so anyone able to reach the seat's UDP port could inject audio into
+  the mix every other participant heard. Both datapaths now apply the identical verdict on the
+  `Redirect` path (`Inner::ice_gate` in the UDP backend, the `action::REDIRECT` arm of the eBPF
+  classifier): an endpoint carrying ICE credentials hands its consumer only the check-validated
+  source. Only the *source* is gated — a redirected endpoint is still entitled to non-RTP, so a
+  DTLS-SRTP handshake (RFC 5764) and a TURN allocation's own STUN (RFC 5766 §11) are unaffected —
+  and STUN itself is exempt so the handshake cannot deadlock. Non-ICE redirected endpoints are
+  unchanged. `docs/security-and-nat.md` §4 layers 1/3/4 and 5c/5d updated.
+
 ## [0.2.1] — 2026-08-20
 
 ### Changed
