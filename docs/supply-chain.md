@@ -48,6 +48,26 @@ crate's own SIMD primitives. It is **the one upstream artifact this repository r
 and `reference/silero-vad/`), so an SBOM consumer should know it is in the binary even though it is
 not a Cargo dependency and will not appear in the graph below.
 
+### HTTP client (`play_media` from a URL)
+
+`play_media` can fetch a WAV prompt from an `http://` / `https://` URL, which means the engine
+carries an HTTP client. The dependency was picked to add as little surface as possible:
+
+| Crate | Why | Licence |
+| --- | --- | --- |
+| `hyper` (`client`, `http1`) | HTTP/1.1 only. The **low-level `client::conn` API** is driven directly rather than the pooled `Client`, so the socket is one we connected (and timed out) ourselves and the connect / first-byte / overall-deadline bounds and the redirect cap are enforced in our code, not delegated. | MIT |
+| `hyper-util` (`tokio`) | Only the tokio↔hyper IO adapter (`TokioIo`). No pool, no connector, no resolver. | MIT |
+| `http-body-util` | The body reader the response-size cap is enforced on, frame by frame. | MIT |
+
+TLS is **not** a new dependency: `https://` terminates on the same `tokio-rustls` + `webpki-roots`
+stack, on the **ring** provider, that the `wss://` WebSocket bridge already dials with. `reqwest`
+was considered and rejected — it would pull a connection pool, its own DNS resolver, cookie/proxy
+machinery and a second TLS configuration path, all of which have to be audited and none of which a
+one-shot prompt fetch needs. No `native-tls`, no OpenSSL, no C.
+
+The operational bounds and the SSRF posture of that fetch are documented in
+[the JSON control reference](control/json.md#playback-from-a-url).
+
 ## Software Bill of Materials (SBOM)
 
 Every tagged release ships a full SBOM in **two industry formats**, generated from the exact

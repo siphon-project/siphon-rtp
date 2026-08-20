@@ -130,6 +130,23 @@ pub struct FileConfig {
     pub turn_tls_key: Option<PathBuf>,
     /// Public IP to advertise in XOR-RELAYED-ADDRESS (`--turn-relay-ip`).
     pub turn_relay_ip: Option<IpAddr>,
+    /// Bound on DNS + TCP connect + TLS for a `play_media` URL fetch, milliseconds
+    /// (`--media-fetch-connect-timeout-ms`).
+    pub media_fetch_connect_timeout_ms: Option<u64>,
+    /// Bound on the wait for response headers on a `play_media` URL fetch, milliseconds
+    /// (`--media-fetch-first-byte-timeout-ms`).
+    pub media_fetch_first_byte_timeout_ms: Option<u64>,
+    /// Bound on a whole `play_media` URL fetch (redirects + body read), milliseconds
+    /// (`--media-fetch-timeout-ms`).
+    pub media_fetch_timeout_ms: Option<u64>,
+    /// Largest `play_media` URL response body accepted, bytes (`--media-fetch-max-bytes`).
+    pub media_fetch_max_bytes: Option<usize>,
+    /// Redirect hops a `play_media` URL fetch follows (`--media-fetch-max-redirects`).
+    pub media_fetch_max_redirects: Option<u8>,
+    /// Hosts a `play_media` URL fetch may dial (`--media-fetch-allow-host`). **Empty (the default)
+    /// means unrestricted**: the engine will fetch any host it can route to, from its own network
+    /// position. Set this — or an egress policy — if the control plane is not fully trusted.
+    pub media_fetch_allow_host: Option<Vec<String>>,
     /// `tracing` env-filter directive used when the process environment does not set one
     /// (`RUST_LOG` / the default-env filter always win over this).
     pub log_filter: Option<String>,
