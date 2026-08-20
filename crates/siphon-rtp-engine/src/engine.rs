@@ -15942,6 +15942,8 @@ mod tests {
                             repeat_times: None,
                             start_pos_ms: None,
                             duration_ms: None,
+                            overlay: false,
+                            gain_decibels: None,
                         },
                     )
                     .await,
@@ -16026,6 +16028,7 @@ mod tests {
                             ws_uri: "ws://127.0.0.1:1/tee".into(),
                             direction: WsTeeDirection::Caller,
                             channels: None,
+                            sample_rate: None,
                         },
                     )
                     .await,
