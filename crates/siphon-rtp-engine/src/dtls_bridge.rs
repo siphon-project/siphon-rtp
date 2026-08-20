@@ -79,6 +79,13 @@ pub enum PipelineTarget {
         conference_id: String,
         tag: String,
     },
+    /// A WebSocket-**takeover** leg (`PipelineKind::Ws`): the WS media server is this leg's far side,
+    /// so the leg's own [`crate::ws_bridge::WsSecureLeg`] decrypts its ingress and encrypts the
+    /// bridge's downlink. Until the handshake keys it the registry drops ingress and refuses egress.
+    Ws {
+        ws: Arc<crate::ws_bridge::WsRegistry>,
+        call_id: String,
+    },
 }
 
 impl PipelineTarget {
@@ -87,6 +94,7 @@ impl PipelineTarget {
         match self {
             Self::Call { media, .. } => media.dispatch(packet),
             Self::Conference { conference, .. } => conference.dispatch(packet),
+            Self::Ws { ws, .. } => ws.dispatch(packet),
         }
     }
 
@@ -111,6 +119,10 @@ impl PipelineTarget {
                     leg: Box::new(leg),
                 },
             ),
+            // No mailbox hop: the WS leg's crypto is shared state the registry writes synchronously,
+            // so the key is in place before `keyed` is published and therefore before this bridge
+            // releases the first media packet.
+            Self::Ws { ws, call_id } => ws.attach_secure_leg(call_id, leg),
         }
     }
 }
