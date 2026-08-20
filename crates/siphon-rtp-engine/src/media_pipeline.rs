@@ -30,7 +30,7 @@ use siphon_rtp_codec::cn::Cn;
 use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
-use siphon_rtp_dsp::{EchoCanceller, NoiseSuppressor};
+use siphon_rtp_dsp::{EchoCanceller, NoiseSuppressor, RecordToneDetector, ToneOutcome};
 use siphon_rtp_media::dtmf::{DtmfDetector, DtmfSequence, DtmfStep};
 use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::ingress::IngressStats;
@@ -251,6 +251,36 @@ pub(crate) fn build_echo_canceller(sample_rate_hz: u32) -> Option<EchoCanceller>
     }
 }
 
+/// Build the answering-machine record-tone detector for a leg decoding at `sample_rate_hz`, honouring
+/// an optional `cadence_guard_ms` override from the control plane.
+///
+/// `None` when the rate is one the detector does not support (it works on the 8 kHz and 16 kHz
+/// telephony rates; a 48 kHz Opus leg is left unwatched rather than mis-measured) or when the override
+/// is not a usable guard — both are logged, never silent, so an operator sees why no event ever came.
+pub(crate) fn build_record_tone_detector(
+    sample_rate_hz: u32,
+    cadence_guard_ms: Option<u32>,
+) -> Option<RecordToneDetector> {
+    let mut parameters = siphon_rtp_dsp::RecordToneParameters::default();
+    if let Some(guard_ms) = cadence_guard_ms {
+        parameters.cadence_guard_ms = guard_ms;
+    }
+    match RecordToneDetector::with_parameters(sample_rate_hz, parameters) {
+        Ok(detector) => Some(detector),
+        Err(error) => {
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                %error,
+                sample_rate_hz,
+                cadence_guard_ms,
+                "record-tone (beep) detection requested but unsupported at the codec rate; \
+                 leaving this leg unwatched"
+            );
+            None
+        }
+    }
+}
+
 /// An RTP/RTCP datagram the pipeline wants to transmit: from `endpoint` toward `dst`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outbound {
@@ -369,6 +399,13 @@ pub struct Direction {
     /// direction cancels (it needs this direction's egress as its reference); `None` otherwise, so emit
     /// captures nothing.
     echo_reference: Option<EchoReference>,
+    /// Answering-machine record-tone ("voicemail beep") detector over this direction's decoded
+    /// ingress audio, fed post-decode / post-NS / post-AEC — the same PCM the recorder and the SIPREC
+    /// forks see, so what it judges is what the leg actually sent. `Some` only when the control armed
+    /// `beep_detection` *and* the ingress rate is 8/16 kHz (built and rate-gated in `Direction::new`).
+    /// **Taken (set to `None`) the moment it fires**: that is the once-per-leg latch, and it frees the
+    /// STFT state for the rest of the call. Preallocated ⇒ its per-frame `process` allocates nothing.
+    beep_detector: Option<RecordToneDetector>,
     egress_sequence: u16,
     egress_timestamp: u32,
     egress_ssrc: u32,
@@ -647,6 +684,14 @@ pub struct DirectionConfig {
     /// egress toward the same party. Built at the ingress codec's native rate; a codec at a rate the
     /// canceller rejects (< 8 kHz or not a 50 Hz multiple) transcodes uncancelled.
     pub echo_cancellation: bool,
+    /// Watch this direction's decoded ingress audio for an answering-machine record tone and report
+    /// it as [`Event::BeepDetected`]. Built and rate-gated (to 8/16 kHz) in `Direction::new`; inert
+    /// on an unsupported ingress rate. Fires once — the detector is dropped with the event.
+    pub beep_detection: bool,
+    /// Override for the record-tone detector's cadence guard, in milliseconds — how long it waits
+    /// after a candidate tone to rule out a repeat, which is also its reporting latency. `None` keeps
+    /// the detector's own default. Inert without `beep_detection`.
+    pub beep_cadence_guard_ms: Option<u32>,
     /// Produce this direction's egress a far-end **reference** ring for the *opposite* direction's
     /// canceller. True exactly when the opposite direction cancels (it needs the audio this direction
     /// sends toward its party as its reference). For a symmetric leg (both directions cancel) this
@@ -837,6 +882,14 @@ impl Direction {
         } else {
             None
         };
+        // Record-tone detection on the decoded ingress PCM, at the ingress codec's native rate. Like
+        // the suppressor it only supports 8/16 kHz, so an unsupported rate (48 kHz Opus) leaves it
+        // off rather than silently mis-scaling every frequency it would report.
+        let beep_detector = if config.beep_detection {
+            build_record_tone_detector(ingress_rate, config.beep_cadence_guard_ms)
+        } else {
+            None
+        };
         // When the *opposite* direction cancels, this direction produces the far-end reference it reads:
         // a preallocated ring of the egress PCM this direction sends toward its party (captured in
         // `emit_pcm`, at the egress codec rate). Bounded (drop-oldest), and only present when the sibling
@@ -920,6 +973,7 @@ impl Direction {
             noise_suppressor,
             echo_canceller,
             echo_reference,
+            beep_detector,
             egress_sequence: 0,
             egress_timestamp: 0,
             egress_ssrc: config.egress_ssrc,
@@ -977,11 +1031,14 @@ impl Direction {
             echo_scratch: Vec::new(),
             egress_scratch: Vec::new(),
             resampler: None,
-            // A relay-only leg forwards verbatim (never decodes), so there is nothing to suppress or
-            // cancel, and it produces no reference for the opposite direction.
+            // A relay-only leg forwards verbatim (never decodes), so there is nothing to suppress,
+            // cancel or listen to for a record tone, and it produces no reference for the opposite
+            // direction. `resolve_pipeline` never routes an armed call here: any of those flags
+            // promotes it to a decoding pipeline instead.
             noise_suppressor: None,
             echo_canceller: None,
             echo_reference: None,
+            beep_detector: None,
             egress_sequence: 0,
             egress_timestamp: 0,
             egress_ssrc: 0,
@@ -1350,7 +1407,7 @@ impl Direction {
         &mut self,
         data: &[u8],
         arrival_micros: u64,
-        dtmf_meta: DtmfMeta<'_>,
+        leg_meta: LegMeta<'_>,
         // The far-end reference for this direction's echo canceller: the *opposite* direction's egress
         // ring (the PCM the engine sent toward this party). Handed in by [`MediaCall::process`] so the
         // cross-direction read needs no `Arc<Mutex>` over leg state. `None` when the leg has no AEC.
@@ -1411,9 +1468,9 @@ impl Direction {
                             self.dtmf.on_packet(parsed.timestamp, parsed.payload)
                         {
                             events.push(Event::Dtmf {
-                                call_id: dtmf_meta.call_id.to_string(),
-                                from_tag: dtmf_meta.from_tag.to_string(),
-                                to_tag: dtmf_meta.to_tag.map(str::to_string),
+                                call_id: leg_meta.call_id.to_string(),
+                                from_tag: leg_meta.from_tag.to_string(),
+                                to_tag: leg_meta.to_tag.map(str::to_string),
                                 digit: event.digit.to_string(),
                                 duration_ms: u32::from(event.duration) / 8,
                                 volume: -i32::from(event.volume),
@@ -1464,9 +1521,9 @@ impl Direction {
         if Some(parsed.payload_type) == self.telephone_event_in {
             if let Ok(Some(event)) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
                 events.push(Event::Dtmf {
-                    call_id: dtmf_meta.call_id.to_string(),
-                    from_tag: dtmf_meta.from_tag.to_string(),
-                    to_tag: dtmf_meta.to_tag.map(str::to_string),
+                    call_id: leg_meta.call_id.to_string(),
+                    from_tag: leg_meta.from_tag.to_string(),
+                    to_tag: leg_meta.to_tag.map(str::to_string),
                     digit: event.digit.to_string(),
                     // RTP timestamp units are samples at the 8 kHz telephone-event clock (RFC 4733).
                     duration_ms: u32::from(event.duration) / 8,
@@ -1499,9 +1556,74 @@ impl Direction {
         // moved out of `self` for the frame so the pipeline below can borrow `self` mutably, and put
         // back before returning — a pointer swap, not a copy.
         let mut scratch = std::mem::take(&mut self.decode_scratch);
-        self.transcode_frame(&mut scratch, &parsed, stream_ssrc, echo_reference, out);
+        self.transcode_frame(
+            &mut scratch,
+            &parsed,
+            stream_ssrc,
+            echo_reference,
+            leg_meta,
+            out,
+            events,
+        );
         self.decode_scratch = scratch;
         Some(stream_ssrc)
+    }
+
+    /// Run the record-tone ("voicemail beep") detector over one decoded ingress frame and, on a
+    /// confirmed tone, emit the leg's single [`Event::BeepDetected`].
+    ///
+    /// The detector is **taken** when it fires: that is the once-per-leg latch (the controller never
+    /// has to de-duplicate) and it frees the STFT state for the rest of the call. A rejected
+    /// candidate is logged at `debug` with the rule that dropped it, so an operator chasing a false
+    /// negative can see the tone was heard and why it did not qualify. A no-op on a leg that was not
+    /// armed, or whose codec rate the detector does not support.
+    fn detect_record_tone(
+        &mut self,
+        decoded: &[i16],
+        leg_meta: LegMeta<'_>,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(detector) = self.beep_detector.as_mut() else {
+            return;
+        };
+        match detector.process(decoded) {
+            ToneOutcome::Detected(detection) => {
+                tracing::info!(
+                    target: "siphon_rtp::media",
+                    call_id = leg_meta.call_id,
+                    from_tag = leg_meta.near_tag,
+                    frequency_hz = detection.frequency_hz,
+                    duration_ms = detection.duration_ms,
+                    offset_ms = detection.start_offset_ms,
+                    "answering-machine record tone detected on this leg"
+                );
+                events.push(Event::BeepDetected {
+                    call_id: leg_meta.call_id.to_string(),
+                    from_tag: leg_meta.near_tag.to_string(),
+                    to_tag: leg_meta.far_tag.map(str::to_string),
+                    frequency_hz: detection.frequency_hz,
+                    duration_ms: detection.duration_ms,
+                    offset_ms: detection.start_offset_ms,
+                });
+                self.beep_detector = None;
+            }
+            ToneOutcome::Rejected {
+                frequency_hz,
+                duration_ms,
+                reason,
+            } => {
+                tracing::debug!(
+                    target: "siphon_rtp::media",
+                    call_id = leg_meta.call_id,
+                    from_tag = leg_meta.near_tag,
+                    frequency_hz,
+                    duration_ms,
+                    reason = ?reason,
+                    "tone heard on this leg but not reported as a record tone"
+                );
+            }
+            ToneOutcome::Idle | ToneOutcome::Tracking { .. } => {}
+        }
     }
 
     /// The decode → fold → NS → AEC → record/fork → resample → repacketize tail of
@@ -1511,13 +1633,16 @@ impl Direction {
     /// `scratch` is [`MAX_PCM`] long, sized for the largest **interleaved** frame any codec produces
     /// (48 kHz × 120 ms × 2 channels), so a 60 ms or 120 ms Opus packet decodes instead of being
     /// rejected with `OutputTooSmall`. A decode failure is logged and counted, never swallowed.
+    #[allow(clippy::too_many_arguments)]
     fn transcode_frame(
         &mut self,
         scratch: &mut [i16],
         parsed: &RtpPacket<'_>,
         stream_ssrc: u32,
         echo_reference: Option<&mut EchoReference>,
+        leg_meta: LegMeta<'_>,
         out: &mut Vec<Outbound>,
+        events: &mut Vec<Event>,
     ) {
         let decoded = scratch;
         let samples = match self.decoder.decode(parsed.payload, decoded) {
@@ -1581,6 +1706,11 @@ impl Direction {
             reference.read_into(far_end);
             canceller.cancel(&mut decoded[..samples], far_end);
         }
+        // Answering-machine record-tone detection, on the same post-decode / post-NS / post-AEC PCM
+        // the recorder and the SIPREC forks are about to see — i.e. what this leg actually said, and
+        // pre-silence/hold so a `block`ed egress does not blind the detector. It reads the frame and
+        // never modifies it, so nothing downstream changes when a leg is armed.
+        self.detect_record_tone(&decoded[..samples], leg_meta, events);
         let decoded = &decoded[..samples];
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.write_pcm(decoded);
@@ -1734,7 +1864,7 @@ impl Direction {
         &mut self,
         egress: &mut Direction,
         data: &[u8],
-        dtmf_meta: DtmfMeta<'_>,
+        leg_meta: LegMeta<'_>,
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
     ) -> Option<u32> {
@@ -1754,9 +1884,9 @@ impl Direction {
         if Some(parsed.payload_type) == self.telephone_event_in {
             if let Ok(Some(event)) = self.dtmf.on_packet(parsed.timestamp, parsed.payload) {
                 events.push(Event::Dtmf {
-                    call_id: dtmf_meta.call_id.to_string(),
-                    from_tag: dtmf_meta.from_tag.to_string(),
-                    to_tag: dtmf_meta.to_tag.map(str::to_string),
+                    call_id: leg_meta.call_id.to_string(),
+                    from_tag: leg_meta.from_tag.to_string(),
+                    to_tag: leg_meta.to_tag.map(str::to_string),
                     digit: event.digit.to_string(),
                     duration_ms: u32::from(event.duration) / 8,
                     volume: -i32::from(event.volume),
@@ -1799,7 +1929,13 @@ impl Direction {
         // Same single fold at the codec boundary as `handle` — the echo reflect re-encodes mono PCM.
         let samples =
             siphon_rtp_codec::downmix_to_mono(&mut self.decode_scratch[..samples], channels);
-        egress.emit_pcm(&self.decode_scratch[..samples], parsed.marker, out);
+        // An armed leg keeps listening under the `echo` verb too: the decoded ingress is the same
+        // audio `handle` would have judged, so arming a leg and then putting the call in echo mode
+        // must not silently stop the detector.
+        let mut decoded = std::mem::take(&mut self.decode_scratch);
+        self.detect_record_tone(&decoded[..samples], leg_meta, events);
+        egress.emit_pcm(&decoded[..samples], parsed.marker, out);
+        std::mem::swap(&mut self.decode_scratch, &mut decoded);
         Some(stream_ssrc)
     }
 
@@ -1825,11 +1961,24 @@ impl Direction {
     }
 }
 
-/// Metadata threaded into [`Direction::handle`] so an extracted DTMF event names its call/leg.
-struct DtmfMeta<'a> {
+/// Metadata threaded into [`Direction::handle`] so an event extracted from the media names its call
+/// and its leg.
+///
+/// `call_id` / `from_tag` / `to_tag` are the **call**'s identity — the triple [`Event::Dtmf`] has
+/// always carried (the call's offerer tag, whichever direction the digit arrived on), kept as-is so
+/// that wire shape does not change. `near_tag` / `far_tag` are the **leg**'s: the party this
+/// direction decodes and the party on the other side, so an event about one leg's audio
+/// ([`Event::BeepDetected`]) can name the leg it heard — the same sender/receiver convention
+/// `text_pipeline` uses for [`Event::Text`].
+#[derive(Clone, Copy)]
+struct LegMeta<'a> {
     call_id: &'a str,
     from_tag: &'a str,
     to_tag: Option<&'a str>,
+    /// Tag of the party whose audio this direction decodes.
+    near_tag: &'a str,
+    /// Tag of the party on the far side of this direction, when the call has one.
+    far_tag: Option<&'a str>,
 }
 
 /// A media-processing call: two directions plus the call identity for event correlation.
@@ -2020,12 +2169,19 @@ impl MediaCall {
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
     ) -> bool {
-        let meta = DtmfMeta {
+        // The call identity is the same whichever direction the packet arrived on; the *leg* identity
+        // is not, so `near_tag` / `far_tag` are flipped per branch below. A single-leg call (no
+        // to-tag) has only the offerer, so both sides fall back to its tag.
+        let call_meta = LegMeta {
             call_id: &self.call_id,
             from_tag: &self.from_tag,
             to_tag: self.to_tag.as_deref(),
+            near_tag: &self.from_tag,
+            far_tag: self.to_tag.as_deref(),
         };
         if packet.endpoint == self.a_to_b.ingress_endpoint {
+            // A→B decodes party A: the near leg is the offerer.
+            let meta = call_meta;
             // Party A's media: gate A's source; the B→A direction now knows where to reply to A.
             if !self.a_to_b.accepted_source.accepts(packet.source.ip()) {
                 tracing::debug!(source = %packet.source, "media-pipeline dropped packet from unsignalled source");
@@ -2076,6 +2232,12 @@ impl MediaCall {
             }
             true
         } else if packet.endpoint == self.b_to_a.ingress_endpoint {
+            // B→A decodes party B: the near leg is the answerer (the offerer when there is no to-tag).
+            let meta = LegMeta {
+                near_tag: self.to_tag.as_deref().unwrap_or(&self.from_tag),
+                far_tag: Some(&self.from_tag),
+                ..call_meta
+            };
             if !self.b_to_a.accepted_source.accepts(packet.source.ip()) {
                 tracing::debug!(source = %packet.source, "media-pipeline dropped packet from unsignalled source");
                 return false;
@@ -3074,6 +3236,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -3091,6 +3255,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -3351,6 +3517,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::Opus,
         };
@@ -3368,6 +3536,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::Opus,
         };
@@ -3631,6 +3801,8 @@ mod tests {
                 recorder: None,
                 noise_suppression: false,
                 echo_cancellation: false,
+                beep_detection: false,
+                beep_cadence_guard_ms: None,
                 produce_echo_reference: false,
                 ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
@@ -3985,6 +4157,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -4002,6 +4176,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -4163,6 +4339,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -4180,6 +4358,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -4356,6 +4536,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -4374,6 +4556,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -4434,6 +4618,8 @@ mod tests {
                 recorder: None,
                 noise_suppression: false,
                 echo_cancellation: false,
+                beep_detection: false,
+                beep_cadence_guard_ms: None,
                 produce_echo_reference: false,
                 ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
@@ -4532,6 +4718,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::Opus,
         };
@@ -4552,6 +4740,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -4920,6 +5110,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::AmrWb,
         };
@@ -4939,6 +5131,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::Opus,
         };
@@ -5018,6 +5212,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -5115,6 +5311,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -5184,6 +5382,8 @@ mod tests {
                 recorder: None,
                 noise_suppression: false,
                 echo_cancellation: false,
+                beep_detection: false,
+                beep_cadence_guard_ms: None,
                 produce_echo_reference: false,
                 ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
             };
@@ -5236,6 +5436,286 @@ mod tests {
         );
     }
 
+    /// A µ-law(A) ↔ A-law(B) call with the record-tone detector armed on both legs, with the cadence
+    /// guard shortened so the test does not have to synthesise 4.5 s of trailing silence per case.
+    fn beep_armed_call(cadence_guard_ms: Option<u32>) -> MediaCall {
+        let direction =
+            |ingress: u64, source: &str, egress: u64, destination: &str| DirectionConfig {
+                ingress_endpoint: endpoint(ingress),
+                accepted_source: SourceFilter::Exact(addr(source).ip()),
+                egress_endpoint: endpoint(egress),
+                egress_dst: addr(destination),
+                decoder: Box::new(G711::ulaw()),
+                encoder: Box::new(G711::ulaw()),
+                egress_ssrc: 0xB000_0BEE,
+                egress_payload_type: 0,
+                telephone_event_in: None,
+                telephone_event_out: None,
+                recorder: None,
+                noise_suppression: false,
+                echo_cancellation: false,
+                beep_detection: true,
+                beep_cadence_guard_ms: cadence_guard_ms,
+                produce_echo_reference: false,
+                ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+            };
+        MediaCall::new(
+            "call-beep",
+            "tag-a",
+            Some("tag-b".into()),
+            direction(1, A_ADDR, 2, B_ADDR),
+            direction(2, B_ADDR, 1, A_ADDR),
+            true,
+            None,
+        )
+    }
+
+    /// One 20 ms µ-law RTP packet (160 samples) carrying `pcm`.
+    fn ulaw_rtp_pcm(sequence: u16, ssrc: u32, pcm: &[i16]) -> Vec<u8> {
+        let mut encoder = G711::ulaw();
+        let mut payload = [0u8; 160];
+        let written = encoder.encode(pcm, &mut payload).expect("µ-law encode");
+        let header = RtpHeader {
+            marker: false,
+            payload_type: 0,
+            sequence,
+            timestamp: u32::from(sequence) * 160,
+            ssrc,
+        };
+        let mut buffer = vec![0u8; 12 + written];
+        let len = write_packet(&header, &payload[..written], &mut buffer).expect("write");
+        buffer.truncate(len);
+        buffer
+    }
+
+    /// 8 kHz PCM: `silence_before_ms` of silence, then a `frequency_hz` tone for `tone_ms`, then
+    /// `silence_after_ms` of silence — split into 20 ms (160-sample) frames.
+    fn beep_frames(
+        silence_before_ms: u32,
+        frequency_hz: f32,
+        tone_ms: u32,
+        silence_after_ms: u32,
+    ) -> Vec<Vec<i16>> {
+        let mut pcm = Vec::new();
+        let samples = |milliseconds: u32| (8_000u32 * milliseconds / 1000) as usize;
+        pcm.extend(std::iter::repeat_n(0i16, samples(silence_before_ms)));
+        let step = 2.0 * std::f32::consts::PI * frequency_hz / 8_000.0;
+        let mut phase = 0.0f32;
+        for _ in 0..samples(tone_ms) {
+            pcm.push((8000.0 * phase.sin()) as i16);
+            phase += step;
+        }
+        pcm.extend(std::iter::repeat_n(0i16, samples(silence_after_ms)));
+        pcm.chunks(160).map(<[i16]>::to_vec).collect()
+    }
+
+    #[test]
+    fn an_armed_leg_reports_the_record_tone_it_heard_exactly_once() {
+        // The detector is only real if the event actually reaches the control channel, so drive the
+        // whole ingress path — source gate, decode, fold, detect — through `MediaCall::process` and
+        // read the events it emits (the same `Vec<Event>` `run_media_call` forwards to the sink).
+        let mut call = beep_armed_call(Some(320));
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut sequence = 0u16;
+        // Party B plays the 1400 ms... a 1400 Hz, 400 ms record tone (ITU-T E.180 recording-warning
+        // frequency), preceded and followed by silence.
+        for frame in beep_frames(200, 1400.0, 400, 900) {
+            call.process(
+                &rx(2, B_ADDR, ulaw_rtp_pcm(sequence, 0x0B0B_0B0B, &frame)),
+                &mut out,
+                &mut events,
+            );
+            sequence = sequence.wrapping_add(1);
+        }
+
+        let detections: Vec<&Event> = events
+            .iter()
+            .filter(|event| matches!(event, Event::BeepDetected { .. }))
+            .collect();
+        assert_eq!(
+            detections.len(),
+            1,
+            "exactly one beep event per tone, got {events:?}"
+        );
+        match detections[0] {
+            Event::BeepDetected {
+                call_id,
+                from_tag,
+                to_tag,
+                frequency_hz,
+                duration_ms,
+                offset_ms,
+            } => {
+                assert_eq!(call_id, "call-beep");
+                assert_eq!(from_tag, "tag-b", "the leg the tone was heard on");
+                assert_eq!(to_tag.as_deref(), Some("tag-a"), "the far side of that leg");
+                assert!(
+                    (frequency_hz - 1400.0).abs() < 20.0,
+                    "reported {frequency_hz} Hz, expected ≈1400"
+                );
+                assert!(
+                    duration_ms.abs_diff(400) <= 48,
+                    "reported {duration_ms} ms, expected ≈400"
+                );
+                assert!(
+                    offset_ms.abs_diff(200) <= 48,
+                    "reported offset {offset_ms} ms, expected ≈200"
+                );
+            }
+            other => panic!("expected BeepDetected, got {other:?}"),
+        }
+
+        // The latch: a second tone on the same leg produces no second event for the life of the call.
+        events.clear();
+        for frame in beep_frames(200, 1000.0, 400, 900) {
+            call.process(
+                &rx(2, B_ADDR, ulaw_rtp_pcm(sequence, 0x0B0B_0B0B, &frame)),
+                &mut out,
+                &mut events,
+            );
+            sequence = sequence.wrapping_add(1);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::BeepDetected { .. })),
+            "the beep event fires once per leg per call, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn an_armed_offerer_leg_names_itself_as_the_leg_that_beeped() {
+        // The mirror of the case above: a tone on A must be reported with A's tag, so a controller can
+        // tell which party reached a machine.
+        let mut call = beep_armed_call(Some(320));
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for (sequence, frame) in beep_frames(200, 1000.0, 400, 900).into_iter().enumerate() {
+            call.process(
+                &rx(
+                    1,
+                    A_ADDR,
+                    ulaw_rtp_pcm(sequence as u16, 0x0A0A_0A0A, &frame),
+                ),
+                &mut out,
+                &mut events,
+            );
+        }
+        let found = events
+            .iter()
+            .find_map(|event| match event {
+                Event::BeepDetected {
+                    from_tag, to_tag, ..
+                } => Some((from_tag.clone(), to_tag.clone())),
+                _ => None,
+            })
+            .expect("a beep event on the A leg");
+        assert_eq!(found, ("tag-a".to_string(), Some("tag-b".to_string())));
+    }
+
+    #[test]
+    fn an_unarmed_call_never_reports_a_record_tone() {
+        // The same audio through the default (unarmed) transcode call: no detector, no event, and the
+        // transcode itself is unaffected.
+        let mut call = ulaw_alaw_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for (sequence, frame) in beep_frames(200, 1400.0, 400, 900).into_iter().enumerate() {
+            call.process(
+                &rx(
+                    1,
+                    A_ADDR,
+                    ulaw_rtp_pcm(sequence as u16, 0x0A0A_0A0A, &frame),
+                ),
+                &mut out,
+                &mut events,
+            );
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::BeepDetected { .. })),
+            "beep detection must be opt-in, got {events:?}"
+        );
+        assert!(!out.is_empty(), "the call still relays its audio");
+    }
+
+    #[test]
+    fn an_armed_leg_ignores_a_cadenced_tone_with_the_default_guard() {
+        // The default guard is what keeps in-band ringback / busy from reading as a record tone. Drive
+        // a 425 Hz 0.5 s on / 0.5 s off busy cadence through the whole pipeline and require silence
+        // from the control plane.
+        let mut call = beep_armed_call(None);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut sequence = 0u16;
+        for _ in 0..8 {
+            for frame in beep_frames(0, 425.0, 500, 500) {
+                call.process(
+                    &rx(2, B_ADDR, ulaw_rtp_pcm(sequence, 0x0B0B_0B0B, &frame)),
+                    &mut out,
+                    &mut events,
+                );
+                sequence = sequence.wrapping_add(1);
+            }
+        }
+        // Plus 5 s of trailing silence, so nothing is merely still held inside the guard.
+        for frame in beep_frames(5_000, 425.0, 0, 0) {
+            call.process(
+                &rx(2, B_ADDR, ulaw_rtp_pcm(sequence, 0x0B0B_0B0B, &frame)),
+                &mut out,
+                &mut events,
+            );
+            sequence = sequence.wrapping_add(1);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::BeepDetected { .. })),
+            "a cadenced busy tone must not be reported as a record tone, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn an_armed_leg_keeps_listening_in_echo_mode() {
+        // `MediaControl::Echo` reuses the call's existing directions, so an armed leg switched into
+        // echo mode must still report a record tone — otherwise arming a leg and then echo-testing it
+        // would silently disarm the detector.
+        let mut call = beep_armed_call(Some(320));
+        call.set_echo(true);
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for (sequence, frame) in beep_frames(200, 1400.0, 400, 900).into_iter().enumerate() {
+            call.process(
+                &rx(
+                    1,
+                    A_ADDR,
+                    ulaw_rtp_pcm(sequence as u16, 0x0A0A_0A0A, &frame),
+                ),
+                &mut out,
+                &mut events,
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::BeepDetected { .. })),
+            "the echo path must keep feeding the detector, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_detector_at_an_unsupported_codec_rate_is_left_off_rather_than_mis_measured() {
+        // The detector supports the 8/16 kHz telephony rates; a leg at any other rate is left
+        // unwatched (logged at `warn`) instead of reporting frequencies scaled by the wrong bin width.
+        assert!(build_record_tone_detector(8_000, None).is_some());
+        assert!(build_record_tone_detector(16_000, Some(1_500)).is_some());
+        assert!(build_record_tone_detector(48_000, None).is_none());
+        // An override that cannot describe a guard is rejected the same way — never silently ignored.
+        assert!(build_record_tone_detector(8_000, Some(0)).is_some());
+    }
+
     #[test]
     fn egress_sequence_and_timestamp_advance_per_packet() {
         let mut call = ulaw_alaw_call();
@@ -5271,6 +5751,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -5288,6 +5770,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -5552,6 +6036,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -6038,6 +6524,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -6055,6 +6543,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -6581,6 +7071,8 @@ mod tests {
             recorder: Some(WavRecorder::new(8000, 1)),
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -6598,6 +7090,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -6636,6 +7130,8 @@ mod tests {
             recorder: None,
             noise_suppression,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -6653,6 +7149,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: false,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: false,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
@@ -6765,6 +7263,8 @@ mod tests {
             recorder: None,
             noise_suppression: false,
             echo_cancellation: cancel,
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
             produce_echo_reference: produce,
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };

@@ -13,6 +13,10 @@
 //!     at 20 ms), narrowband additionally paying the 8 → 16 kHz polyphase resample.
 //!   - `ns_8k_20ms` / `ns_16k_20ms` — one 20 ms noise-suppression frame (√Hann WOLA STFT + a real
 //!     FFT/IFFT hop + the decision-directed Wiener gain over `N/2+1` bins), reported as µs/frame.
+//!   - `beep_8k_20ms` / `beep_16k_20ms` — one 20 ms frame through the record-tone ("voicemail
+//!     beep") detector: the √Hann WOLA analysis FFT per 16 ms hop plus the per-hop concentration /
+//!     second-tone / peak-interpolation scan over the 200…3400 Hz band. Measured on a steady in-band
+//!     tone, the worst case (every rule runs to completion instead of returning early).
 //!   - `aec_8k_20ms` / `aec_16k_20ms` — one NLMS echo-cancel frame (L=256): per sample a SIMD
 //!     estimate dot (`siphon_rtp_simd::fir_dot_f32`) + a scalar NLMS weight update.
 //!   - `aec_twopath_8k_20ms` — one two-path/NCC echo-cancel frame (L=256): two SIMD estimate dots per
@@ -30,8 +34,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_dsp::{
-    EchoCanceller, EnergyVad, NeuralVad, NeuralVadStream, NoiseSuppressor, Resampler,
-    NEURAL_VAD_WINDOW_SAMPLES,
+    EchoCanceller, EnergyVad, NeuralVad, NeuralVadStream, NoiseSuppressor, RecordToneDetector,
+    Resampler, NEURAL_VAD_WINDOW_SAMPLES,
 };
 
 fn bench_resampler(criterion: &mut Criterion) {
@@ -136,6 +140,30 @@ fn bench_noise_suppression(criterion: &mut Criterion) {
             wb.process(black_box(&mut frame));
             black_box(frame[0])
         });
+    });
+}
+
+fn bench_record_tone_detection(criterion: &mut Criterion) {
+    // A steady in-band tone: the worst case for the detector, because every per-hop rule runs to
+    // completion (a frame that fails the concentration test returns early and is cheaper).
+    let make_tone = |frame_len: usize, rate: f32| -> Vec<i16> {
+        (0..frame_len)
+            .map(|index| {
+                (8000.0 * (2.0 * std::f32::consts::PI * 1400.0 * index as f32 / rate).sin()) as i16
+            })
+            .collect()
+    };
+
+    let mut narrowband = RecordToneDetector::new(8_000).expect("build");
+    let narrowband_frame = make_tone(160, 8_000.0);
+    criterion.bench_function("beep_8k_20ms", |bencher| {
+        bencher.iter(|| black_box(narrowband.process(black_box(&narrowband_frame))));
+    });
+
+    let mut wideband = RecordToneDetector::new(16_000).expect("build");
+    let wideband_frame = make_tone(320, 16_000.0);
+    criterion.bench_function("beep_16k_20ms", |bencher| {
+        bencher.iter(|| black_box(wideband.process(black_box(&wideband_frame))));
     });
 }
 
@@ -274,6 +302,7 @@ criterion_group!(
     bench_vad_energy,
     bench_neural_vad,
     bench_noise_suppression,
+    bench_record_tone_detection,
     bench_aec
 );
 criterion_main!(benches);

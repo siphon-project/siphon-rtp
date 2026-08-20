@@ -407,6 +407,10 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         // Echo cancellation is likewise a native siphon-rtp (JSON control) extension; the NG/bencode
         // front-end never sets it.
         echo_cancellation: false,
+        // Record-tone ("voicemail beep") detection is a native siphon-rtp (JSON control) extension —
+        // rtpengine's NG dictionary has no equivalent directive, so it is never armed from here.
+        beep_detection: false,
+        beep_cadence_guard_ms: None,
         // The WS bridge and its voice-AI turn-taking knobs are native siphon-rtp (JSON control)
         // extensions; the NG/bencode front-end never sets them.
         ws_uri: None,

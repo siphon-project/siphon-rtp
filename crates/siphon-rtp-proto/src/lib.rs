@@ -512,6 +512,28 @@ pub struct ProfileFlags {
     /// extension — the NG/bencode front-end does not set it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub echo_cancellation: bool,
+    /// Watch this call's decoded ingress audio for the short single tone an answering machine plays
+    /// before it starts recording (the "voicemail beep"), and report it as [`Event::BeepDetected`].
+    /// The media half of answering-machine detection: a controller that gets the event can abort an
+    /// attended transfer instead of bridging the caller into a voicemail box.
+    ///
+    /// Set per leg — the flag arms the detector on the leg the `offer`/`answer` carrying it names, so
+    /// arming it on the outbound (callee) leg is what watches the party that might be a machine. Like
+    /// `noise_suppression` / `echo_cancellation` it needs decoded audio, so setting it promotes a
+    /// same-codec plaintext call from the in-kernel relay to the userspace media pipeline; it is
+    /// inert on a codec whose native rate is neither 8 nor 16 kHz. The event fires **once** per leg
+    /// per call — there is no mid-call re-arm. A native siphon-rtp extension — the NG/bencode
+    /// front-end does not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub beep_detection: bool,
+    /// How long, in milliseconds, the beep detector waits after a candidate tone ends to confirm no
+    /// repeat follows it — the discriminator that keeps a cadenced ringback / busy / congestion /
+    /// special-information tone from reading as a record tone. It is also the detection latency: the
+    /// event arrives this long after the beep. `None` uses the engine default (4500 ms, longer than
+    /// the 4 s silent interval of the slowest widely deployed ringback cadence). Lower it to trade
+    /// cadence robustness for latency. Inert without `beep_detection`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beep_cadence_guard_ms: Option<u32>,
     /// Attach this call's offerer (leg A) audio to an external WebSocket media server (the
     /// mod_audio_stream / voice-AI integration). When set on `offer`/`answer`, the engine dials this
     /// URI as a WebSocket client and bridges leg A's RTP to it (decode → L16 uplink, L16 downlink →
@@ -964,6 +986,30 @@ pub enum Event {
         channels: u8,
         /// Wire sample rate in Hz (L16, little-endian).
         sample_rate: u32,
+    },
+    /// A record tone (the "voicemail beep" an answering machine plays before it starts recording)
+    /// was detected on a leg armed with `ProfileFlags::beep_detection`. The media half of
+    /// answering-machine detection — a controller can abort an attended transfer on this rather than
+    /// bridging the caller into a voicemail box.
+    ///
+    /// Emitted **once** per leg per call: the engine drops the detector after the first tone, so the
+    /// controller never has to de-duplicate and there is no mid-call re-arm (a fresh `offer`/`answer`
+    /// with the flag set re-arms it). `from_tag` names the leg the tone was heard *on*, matching the
+    /// `call_id` / `from_tag` / `to_tag` triple of [`Event::Dtmf`]. Additive: a consumer predating
+    /// this variant decodes it as [`Event::Unknown`] and ignores it.
+    BeepDetected {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+        /// Measured tone frequency in Hz (sub-bin accurate, typically within a few Hz).
+        frequency_hz: f32,
+        /// Measured tone length in milliseconds, accurate to about one analysis window (±32 ms).
+        duration_ms: u32,
+        /// Milliseconds of decoded audio seen on this leg before the tone *started*. This is the
+        /// offset of the tone itself, not of the event — the event is emitted after the detector's
+        /// cadence guard (`ProfileFlags::beep_cadence_guard_ms`) has elapsed.
+        offset_ms: u64,
     },
     /// A WebSocket tee stopped. Emitted exactly once per started tee — including when the *server*
     /// ends it — so a controller learns the stream died rather than silently losing audio.
@@ -2063,6 +2109,100 @@ mod tests {
         let minimal_json = serde_json::to_value(&minimal).expect("to_value");
         assert!(minimal_json.get("to_tag").is_none(), "to_tag omitted");
         assert!(minimal_json.get("direction").is_none(), "direction omitted");
+    }
+
+    #[test]
+    fn beep_detected_event_wire_shape() {
+        let event = Event::BeepDetected {
+            call_id: "c@host".into(),
+            from_tag: "ft-a".into(),
+            to_tag: Some("tt-b".into()),
+            frequency_hz: 1402.5,
+            duration_ms: 496,
+            offset_ms: 8_144,
+        };
+        roundtrip(&event);
+
+        let json = serde_json::to_value(&event).expect("to_value");
+        assert_eq!(json["event"], "beep_detected", "snake_case event tag");
+        assert_eq!(json["call_id"], "c@host");
+        assert_eq!(json["from_tag"], "ft-a");
+        assert_eq!(json["to_tag"], "tt-b");
+        assert_eq!(json["frequency_hz"], 1402.5);
+        assert_eq!(json["duration_ms"], 496);
+        assert_eq!(json["offset_ms"], 8_144);
+
+        // The optional leg tag is omitted when absent (minimal, forward-compatible form).
+        let minimal = Event::BeepDetected {
+            call_id: "c".into(),
+            from_tag: "ft".into(),
+            to_tag: None,
+            frequency_hz: 1000.0,
+            duration_ms: 320,
+            offset_ms: 0,
+        };
+        roundtrip(&minimal);
+        let minimal_json = serde_json::to_value(&minimal).expect("to_value");
+        assert!(minimal_json.get("to_tag").is_none(), "to_tag omitted");
+    }
+
+    #[test]
+    fn an_unrecognised_event_tag_decodes_to_unknown() {
+        // A controller pinned to an older contract must not hard-fail on a newer engine's event —
+        // `#[serde(other)]` is what makes `beep_detected` safe to add.
+        let json = concat!(
+            r#"{"event":"beep_detected","call_id":"c","from_tag":"f","frequency_hz":1000.0,"#,
+            r#""duration_ms":320,"offset_ms":0}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Event>(json).expect("deserialize"),
+            Event::BeepDetected { .. }
+        ));
+        let future = r#"{"event":"a_verb_from_a_newer_engine","whatever":1}"#;
+        assert_eq!(
+            serde_json::from_str::<Event>(future).expect("deserialize"),
+            Event::Unknown
+        );
+    }
+
+    #[test]
+    fn beep_detection_profile_flags_are_additive_and_omitted_when_unset() {
+        // Existing controller JSON must deserialize unchanged...
+        let json = r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::Offer { profile, .. } => {
+                assert!(!profile.beep_detection);
+                assert_eq!(profile.beep_cadence_guard_ms, None);
+                assert_eq!(profile, ProfileFlags::default());
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
+        // ...and re-serialize byte-identically: the new fields never appear while unset.
+        let serialized = serde_json::to_value(ProfileFlags::default()).expect("to_value");
+        for field in ["beep_detection", "beep_cadence_guard_ms"] {
+            assert!(
+                serialized.get(field).is_none(),
+                "{field} omitted when unset"
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&ProfileFlags::default()).expect("to_string"),
+            "{}",
+            "an all-default profile still serializes to the empty object"
+        );
+
+        // And both are honoured when a controller does set them.
+        let armed = concat!(
+            r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n","#,
+            r#""profile":{"beep_detection":true,"beep_cadence_guard_ms":1500}}"#
+        );
+        match serde_json::from_str::<Command>(armed).expect("deserialize") {
+            Command::Offer { profile, .. } => {
+                assert!(profile.beep_detection);
+                assert_eq!(profile.beep_cadence_guard_ms, Some(1500));
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
     }
 
     #[test]

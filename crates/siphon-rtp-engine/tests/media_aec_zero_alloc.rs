@@ -79,6 +79,8 @@ fn ulaw_call(aec: bool) -> MediaCall {
         ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         noise_suppression: false,
         echo_cancellation: aec,
+        beep_detection: false,
+        beep_cadence_guard_ms: None,
         produce_echo_reference: aec,
     };
     MediaCall::new(

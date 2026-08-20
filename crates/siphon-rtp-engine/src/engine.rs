@@ -3502,6 +3502,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.beep_detection,
+                profile.beep_cadence_guard_ms,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("DTLS media pipeline (A→B)", &reason),
@@ -3518,6 +3520,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.beep_detection,
+                profile.beep_cadence_guard_ms,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("DTLS media pipeline (B→A)", &reason),
@@ -3652,6 +3656,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.beep_detection,
+                profile.beep_cadence_guard_ms,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (A→B)", &reason),
@@ -3668,6 +3674,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.beep_detection,
+                profile.beep_cadence_guard_ms,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("secure media pipeline (B→A)", &reason),
@@ -3765,6 +3773,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.beep_detection,
+                profile.beep_cadence_guard_ms,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("media pipeline (A→B)", &reason),
@@ -3781,6 +3791,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.beep_detection,
+                profile.beep_cadence_guard_ms,
             ) {
                 Ok(direction) => direction,
                 Err(reason) => return error_result("media pipeline (B→A)", &reason),
@@ -4860,10 +4872,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     None,
                     None,
-                    // Noise suppression is not carried in the checkpoint snapshot, so a cold restore
-                    // resumes without it — matching how recording (`record_path`) is not restored.
+                    // Noise suppression, echo cancellation and record-tone detection are not carried
+                    // in the checkpoint snapshot, so a cold restore resumes without them — matching how
+                    // recording (`record_path`) is not restored. The controller re-arms them by
+                    // re-issuing the profile.
                     false, // noise_suppression
                     false, // echo_cancellation (re-armed when the controller re-issues the profile)
+                    false, // beep_detection (likewise not carried in the snapshot)
+                    None,  // beep_cadence_guard_ms
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -4883,6 +4899,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (re-armed when the controller re-issues the profile)
+                    false, // beep_detection (likewise not carried in the snapshot)
+                    None,  // beep_cadence_guard_ms
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -4984,6 +5002,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (re-armed when the controller re-issues the profile)
+                    false, // beep_detection (likewise not carried in the snapshot)
+                    None,  // beep_cadence_guard_ms
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -5003,6 +5023,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (re-armed when the controller re-issues the profile)
+                    false, // beep_detection (likewise not carried in the snapshot)
+                    None,  // beep_cadence_guard_ms
                 ) {
                     Ok(direction) => direction,
                     Err(reason) => {
@@ -7098,9 +7120,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     far_te,
                     None,
-                    // Echo promotion is a runtime control action, not an offer/answer profile; no NS here.
+                    // Echo promotion is a runtime control action, not an offer/answer profile, so
+                    // neither NS nor beep detection is armed here. An already-armed *transcoding* call
+                    // switched into echo mode with `MediaControl::Echo` keeps its detector — that path
+                    // reuses the existing directions rather than rebuilding them.
                     false, // noise_suppression
                     false, // echo_cancellation (a reflect/echo path wants the echo)
+                    false, // beep_detection (the echo verb carries no offer/answer profile)
+                    None,  // beep_cadence_guard_ms
                 )?;
                 let b_to_a = build_direction(
                     layout.far_endpoint,
@@ -7114,6 +7141,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (a reflect/echo path wants the echo)
+                    false, // beep_detection (the echo verb carries no offer/answer profile)
+                    None,  // beep_cadence_guard_ms
                 )?;
                 (
                     a_to_b,
@@ -7157,6 +7186,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (a reflect/echo path wants the echo)
+                    false, // beep_detection (the echo verb carries no offer/answer profile)
+                    None,  // beep_cadence_guard_ms
                 )?;
                 let b_to_a = build_direction(
                     caller_facing_endpoint,
@@ -7170,6 +7201,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (a reflect/echo path wants the echo)
+                    false, // beep_detection (the echo verb carries no offer/answer profile)
+                    None,  // beep_cadence_guard_ms
                 )?;
                 (
                     a_to_b,
@@ -8911,13 +8944,14 @@ fn resolve_pipeline(
     };
     if far_dtls {
         // DTLS-SRTP far leg. Route it through the media pipeline when something actually needs the
-        // decoded audio — a codec mismatch, recording, noise suppression or echo cancellation —
-        // and through the plain crypto bridge otherwise, which stays cheaper (no decode/re-encode)
-        // and is all a same-codec WebRTC↔SIP call needs.
+        // decoded audio — a codec mismatch, recording, noise suppression, echo cancellation or
+        // record-tone (beep) detection — and through the plain crypto bridge otherwise, which stays
+        // cheaper (no decode/re-encode) and is all a same-codec WebRTC↔SIP call needs.
         return if transcode
             || profile.record_call
             || profile.noise_suppression
             || profile.echo_cancellation
+            || profile.beep_detection
         {
             PipelineKind::DtlsMedia
         } else {
@@ -8925,18 +8959,25 @@ fn resolve_pipeline(
         };
     }
     if far_local_crypto.is_some() {
-        // Secure far leg: the plain SRTP bridge when both legs share a codec (crypto only), or the
-        // secure transcoding media slow path when they differ — decrypt → transcode → encrypt
-        // (BGCF/SBC: a secure AMR-WB access leg ↔ a plaintext G.711 PSTN leg).
-        return if transcode {
+        // Secure far leg: the plain SRTP bridge when both legs share a codec and nothing needs the
+        // decoded audio (crypto only), or the secure transcoding media slow path otherwise —
+        // decrypt → transcode → encrypt (BGCF/SBC: a secure AMR-WB access leg ↔ a plaintext G.711
+        // PSTN leg). Record-tone detection needs the PCM, so it takes the same slow path.
+        return if transcode || profile.beep_detection {
             PipelineKind::SrtpMedia
         } else {
             PipelineKind::Srtp
         };
     }
-    if profile.record_call || profile.noise_suppression || profile.echo_cancellation || transcode {
-        // Recording, noise suppression, echo cancellation, or a codec mismatch all need the decoded
-        // audio, so force the userspace media slow path instead of the in-kernel passthrough.
+    if profile.record_call
+        || profile.noise_suppression
+        || profile.echo_cancellation
+        || profile.beep_detection
+        || transcode
+    {
+        // Recording, noise suppression, echo cancellation, record-tone (beep) detection, or a codec
+        // mismatch all need the decoded audio, so force the userspace media slow path instead of the
+        // in-kernel passthrough.
         PipelineKind::Media
     } else {
         PipelineKind::Passthrough
@@ -9014,6 +9055,8 @@ fn build_direction(
     record_path: Option<&str>,
     noise_suppression: bool,
     echo_cancellation: bool,
+    beep_detection: bool,
+    beep_cadence_guard_ms: Option<u32>,
 ) -> Result<DirectionConfig, String> {
     let decoder = factory::decoder_for(ingress_codec).map_err(|error| error.to_string())?;
     let encoder = factory::encoder_for(egress_codec).map_err(|error| error.to_string())?;
@@ -9042,6 +9085,10 @@ fn build_direction(
         // rate; carry only the request here. Inert unless the ingress rate is 8/16 kHz.
         noise_suppression,
         echo_cancellation,
+        // The detector is built (and rate-gated) inside `Direction::new` from the decoder's native
+        // rate; carry only the request and the optional cadence-guard override here.
+        beep_detection,
+        beep_cadence_guard_ms,
         // A 2-party leg's echo cancellation is symmetric: both directions cancel, so each must also
         // produce the far-end reference the other reads (the audio it sends toward its party). Hence
         // `produce_echo_reference == echo_cancellation` here — the two are only ever set apart for a
@@ -12650,6 +12697,174 @@ mod tests {
             )
             .await;
         assert!(matches!(deleted, CmdResult::Ok { .. }));
+    }
+
+    /// One 20 ms µ-law RTP packet carrying `pcm` (160 samples at 8 kHz).
+    fn ulaw_rtp_pcm(sequence: u16, ssrc: u32, pcm: &[i16]) -> Vec<u8> {
+        use siphon_rtp_codec::Encoder;
+        let mut encoder = siphon_rtp_codec::g711::G711::ulaw();
+        let mut payload = [0u8; 160];
+        let written = encoder.encode(pcm, &mut payload).expect("µ-law encode");
+        let mut packet = vec![0x80, 0u8];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&(u32::from(sequence) * 160).to_be_bytes());
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+        packet.extend_from_slice(&payload[..written]);
+        packet
+    }
+
+    /// 8 kHz PCM in 20 ms frames: silence, a record tone, then silence.
+    fn record_tone_frames(
+        silence_before_ms: u32,
+        frequency_hz: f32,
+        tone_ms: u32,
+        silence_after_ms: u32,
+    ) -> Vec<Vec<i16>> {
+        let samples = |milliseconds: u32| (8_000u32 * milliseconds / 1000) as usize;
+        let mut pcm = vec![0i16; samples(silence_before_ms)];
+        let step = 2.0 * std::f32::consts::PI * frequency_hz / 8_000.0;
+        let mut phase = 0.0f32;
+        for _ in 0..samples(tone_ms) {
+            pcm.push((8000.0 * phase.sin()) as i16);
+            phase += step;
+        }
+        pcm.extend(std::iter::repeat_n(0i16, samples(silence_after_ms)));
+        pcm.chunks(160).map(<[i16]>::to_vec).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn beep_detection_promotes_a_same_codec_call_and_reports_the_tone_to_the_controller() {
+        // The whole feature, end to end through the control plane: a *same-codec plaintext* call that
+        // would otherwise relay in-kernel is promoted to the userspace media pipeline purely because
+        // `beep_detection` is set (that is `resolve_pipeline`'s new arm), the answering party plays a
+        // record tone, and the controller receives one `Event::BeepDetected` naming that leg.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        let rx = engine.datapath().rx();
+        tokio::spawn(run_redirect_dispatcher(
+            rx,
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        // A short cadence guard keeps the fixture to ~1.5 s of audio; the guard's own default is
+        // exercised by the dsp corpus and the media-pipeline cadence test.
+        let profile = ProfileFlags {
+            beep_detection: true,
+            beep_cadence_guard_ms: Some(320),
+            ..Default::default()
+        };
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "beep-e2e".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                    profile: profile.clone(),
+                },
+            )
+            .await;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+
+        // Both legs answer PCMU — same codec, so nothing but the flag can force the slow path.
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "beep-e2e".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 0, "PCMU"),
+                    profile,
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+        assert!(
+            engine.media().is_media_call("beep-e2e"),
+            "beep detection must promote a same-codec call off the in-kernel relay"
+        );
+
+        // B plays a 1400 Hz / 400 ms record tone. Drain A's socket in lock-step so the relay never
+        // backs up behind an unread receive buffer.
+        for (sequence, frame) in record_tone_frames(200, 1400.0, 400, 900)
+            .into_iter()
+            .enumerate()
+        {
+            phone_b
+                .send_to(
+                    &ulaw_rtp_pcm(sequence as u16, 0x0B0B_0B0B, &frame),
+                    far_addr,
+                )
+                .await
+                .expect("b send");
+            let (_relayed, from) = recv(&phone_a).await;
+            assert_eq!(from, near_addr, "the call still relays B's audio to A");
+        }
+
+        // The controller's event channel carries exactly the beep, naming B's leg.
+        let mut detected = None;
+        while let Ok(Ok(event)) = timeout(Duration::from_millis(500), events.recv_async()).await {
+            if let Event::BeepDetected {
+                call_id,
+                from_tag,
+                to_tag,
+                frequency_hz,
+                duration_ms,
+                offset_ms,
+            } = event
+            {
+                assert_eq!(call_id, "beep-e2e");
+                assert_eq!(from_tag, "tag-b", "the leg that played the tone");
+                assert_eq!(to_tag.as_deref(), Some("tag-a"));
+                assert!(
+                    (frequency_hz - 1400.0).abs() < 20.0,
+                    "reported {frequency_hz} Hz, expected ≈1400"
+                );
+                assert!(
+                    duration_ms.abs_diff(400) <= 48,
+                    "reported {duration_ms} ms, expected ≈400"
+                );
+                assert!(
+                    offset_ms.abs_diff(200) <= 48,
+                    "reported offset {offset_ms} ms"
+                );
+                detected = Some(());
+                break;
+            }
+        }
+        assert!(
+            detected.is_some(),
+            "the controller must receive a beep_detected event"
+        );
+
+        let deleted = engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "beep-e2e".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(matches!(deleted, CmdResult::Ok { .. }));
+        assert!(
+            !engine.media().is_media_call("beep-e2e"),
+            "the media actor (and its detector) is torn down with the call"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

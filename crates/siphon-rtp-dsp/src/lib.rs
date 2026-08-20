@@ -8,6 +8,10 @@
 //! [`EnergyVad`] gate and [`NeuralVad`], a hand-written pure-Rust forward pass of the Silero VAD
 //! v5 network (~309 K embedded parameters, no inference runtime, no C).
 //!
+//! Record-tone detection ([`tone_detect`]) shares that same STFT front end: it decides, from the
+//! media alone, whether a leg just played the short single tone an answering machine emits before it
+//! records.
+//!
 //! Noise suppression ([`ns`]) is built from a safe, self-contained radix-2 real [`fft`] and a
 //! √Hann WOLA framing ([`window`]); the FFT twiddle/bit-reversal convention matches the in-tree
 //! libopus KISS-FFT port (`siphon-rtp-codec` `opus/celt/mdct.rs`), validated transitively against a
@@ -20,6 +24,7 @@ pub mod ns;
 pub mod res;
 pub mod resample;
 mod spectral;
+pub mod tone_detect;
 pub mod vad;
 pub mod window;
 
@@ -28,6 +33,9 @@ pub use fft::{Complex, RealFft};
 pub use ns::NoiseSuppressor;
 pub use res::ResidualEchoSuppressor;
 pub use resample::{ResampleError, Resampler};
+pub use tone_detect::{
+    RecordToneDetector, RecordToneParameters, ToneDetection, ToneOutcome, ToneRejection,
+};
 pub use vad::{
     EnergyVad, NeuralVad, NeuralVadStream, SpeechRunGate, VadError, VoiceDetector,
     NEURAL_VAD_SAMPLE_RATE_HZ, NEURAL_VAD_WINDOW_MS, NEURAL_VAD_WINDOW_SAMPLES,
@@ -57,5 +65,11 @@ pub enum DspError {
     InvalidFftSize {
         /// The rejected FFT size.
         size: usize,
+    },
+    /// [`tone_detect::RecordToneParameters`] that cannot describe a detectable tone.
+    #[error("invalid tone-detector parameters: {reason}")]
+    InvalidToneParameters {
+        /// Which constraint the parameter set violated.
+        reason: &'static str,
     },
 }
