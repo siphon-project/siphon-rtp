@@ -100,3 +100,72 @@ rustls-pki-types = { workspace = true }
 [[bench]]
 name = "secure_pipeline_bench"
 harness = false
+
+# --- Debian packaging (cargo-deb) ---
+# This crate is a workspace member (crates/siphon-rtp-engine/), so the release binary lands at the
+# WORKSPACE target dir (target/<triple>/release/siphon-rtp). cargo-deb rewrites a `target/release/`
+# asset prefix to the real workspace target dir (and to target/<triple>/release when `--target` is
+# given). The other assets live at the repo root, two levels up from this manifest, hence `../../`.
+# Invoke from the repo root: `cargo deb -p siphon-rtp --no-build` (add `--target <triple>` in CI).
+[package.metadata.deb]
+name = "siphon-rtp"
+maintainer = "SIPhon Contributors <mvdvlies@gmail.com>"
+section = "net"
+priority = "optional"
+extended-description = """\
+siphon-rtp is a standalone, pure-Rust, kernel-accelerated media engine for \
+SIPhon: an RTP/SRTP relay (userspace UDP, plus an optional eBPF/XDP fast path in \
+a separate daemon), pure-Rust transcoding (G.711, G.722, G.726, AMR-NB/WB, Opus, \
+…), audio forking and conferencing, and bidirectional RTP↔WebSocket streaming \
+for voice-AI. It is a drop-in for SIPhon's native JSON-over-TCP control and for \
+existing Kamailio/OpenSIPS rtpengine deployments via the NG/bencode front-end."""
+depends = "$auto"
+assets = [
+    ["target/release/siphon-rtp", "usr/bin/", "755"],
+    ["../../dist/siphon-rtp.service", "lib/systemd/system/siphon-rtp.service", "644"],
+    ["../../dist/siphon-rtp.conf", "etc/siphon-rtp/siphon-rtp.conf", "644"],
+    ["../../etc/logrotate.d/siphon-rtp", "etc/logrotate.d/siphon-rtp", "644"],
+    ["../../README.md", "usr/share/doc/siphon-rtp/README.md", "644"],
+    ["../../LICENSE", "usr/share/doc/siphon-rtp/LICENSE", "644"],
+]
+conf-files = ["/etc/siphon-rtp/siphon-rtp.conf", "/etc/logrotate.d/siphon-rtp"]
+maintainer-scripts = "../../dist/debian/"
+systemd-units = { unit-name = "siphon-rtp", enable = false, start = false }
+
+# --- RPM packaging (cargo-generate-rpm) ---
+# Pure Rust, no rpmbuild needed. Invoke from the repo root: `cargo generate-rpm -p siphon-rtp`
+# (add `--target <triple>` in CI, which rewrites the `target/release/` binary prefix the same way).
+# generate-rpm resolves source paths relative to the workspace root, so these are repo-root-relative.
+# cargo-generate-rpm reads the config, assets, AND scriptlet keys directly from this table (the
+# scriptlet keys are NOT a `.scriptlets` subtable — that nesting is silently ignored).
+# `config = "noreplace"` marks a %config(noreplace) file: on upgrade rpm keeps the operator's edited
+# file untouched and drops the new default as .rpmnew — the .conf carries the operator's public relay
+# IP, which an upgrade must never reset to the dev loopback default (the dpkg conffiles equivalent).
+[package.metadata.generate-rpm]
+name = "siphon-rtp"
+assets = [
+    { source = "target/release/siphon-rtp", dest = "/usr/bin/siphon-rtp", mode = "755" },
+    { source = "dist/siphon-rtp.service", dest = "/usr/lib/systemd/system/siphon-rtp.service", mode = "644" },
+    { source = "dist/siphon-rtp.conf", dest = "/etc/siphon-rtp/siphon-rtp.conf", mode = "644", config = "noreplace" },
+    { source = "etc/logrotate.d/siphon-rtp", dest = "/etc/logrotate.d/siphon-rtp", mode = "644", config = "noreplace" },
+    { source = "README.md", dest = "/usr/share/doc/siphon-rtp/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/siphon-rtp/LICENSE", mode = "644", doc = true },
+]
+
+# RPM scriptlets: create the system user, own the state/log dirs, reload systemd, stop on removal.
+pre_install_script = """
+getent group siphon-rtp >/dev/null || groupadd -r siphon-rtp
+getent passwd siphon-rtp >/dev/null || useradd -r -g siphon-rtp -d /var/lib/siphon-rtp -s /sbin/nologin -c "siphon-rtp media engine" siphon-rtp
+mkdir -p /var/lib/siphon-rtp /var/log/siphon-rtp
+chown siphon-rtp:siphon-rtp /var/lib/siphon-rtp /var/log/siphon-rtp
+"""
+post_install_script = """
+systemctl daemon-reload
+"""
+pre_uninstall_script = """
+systemctl stop siphon-rtp.service 2>/dev/null || true
+systemctl disable siphon-rtp.service 2>/dev/null || true
+"""
+post_uninstall_script = """
+systemctl daemon-reload
+"""

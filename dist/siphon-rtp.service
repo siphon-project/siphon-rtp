@@ -1,0 +1,77 @@
+[Unit]
+Description=siphon-rtp — pure-Rust, kernel-accelerated media engine (RTP/SRTP relay, transcoding, conferencing, WebRTC) for SIPhon
+Documentation=https://github.com/siphon-project/siphon-rtp
+After=network-online.target
+Wants=network-online.target
+
+# Give up instead of restarting forever. siphon-rtp exits non-zero on a fatal
+# startup error (a bad --config, an unbindable relay address), and RestartSec=5s
+# puts only two starts in systemd's default 10 s window, so a permanently broken
+# invocation would loop silently until someone reads the journal. The window here
+# is deliberately generous (roughly a minute of retrying before the unit fails):
+# long enough that a slow-to-appear address or a dependency still coming up
+# recovers on its own, short of the endless loop a bad config used to produce.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+
+# Runtime arguments live in the EnvironmentFile so an operator sets the relay's
+# reachable media address (deployment-specific) without editing this unit. The
+# leading `-` makes the file optional: with it absent, $SIPHON_RTP_ARGS is empty
+# and the daemon falls back to its built-in defaults (--control 127.0.0.1:8080),
+# which is a dev-only loopback posture — see the conf file for production flags.
+EnvironmentFile=-/etc/siphon-rtp/siphon-rtp.conf
+ExecStart=/usr/bin/siphon-rtp $SIPHON_RTP_ARGS
+Restart=on-failure
+RestartSec=5s
+
+# Sandboxing and hardening
+DynamicUser=no
+User=siphon-rtp
+Group=siphon-rtp
+
+# File system
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/siphon-rtp
+PrivateTmp=yes
+
+# Writable state and logs. ProtectSystem=strict leaves the whole of /var
+# read-only, so these are what make recordings, HA checkpoints and any
+# file-based logs work at all — they create the directories owned by the
+# service user and add them to the writable set.
+#   StateDirectory=siphon-rtp → /var/lib/siphon-rtp  (recordings, HA checkpoints)
+#   LogsDirectory=siphon-rtp  → /var/log/siphon-rtp  (file logs, if enabled)
+StateDirectory=siphon-rtp
+LogsDirectory=siphon-rtp
+WorkingDirectory=/var/lib/siphon-rtp
+
+# Capabilities — the built-in TURN server can be pointed at the privileged
+# standard port 3478 (--turn-udp/--turn-tcp), and a relay may be asked to bind
+# a privileged media port, so keep CAP_NET_BIND_SERVICE. Nothing else is needed.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Network. AF_NETLINK is deliberately absent — the in-kernel XDP fast path is a
+# SEPARATE daemon (siphon-rtp-xdp-daemon); this engine is a pure userspace UDP
+# media relay and never touches netlink/XFRM.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Misc hardening
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+
+# Resource limits — a media relay holds two sockets per leg plus jitter/codec
+# state, so the descriptor ceiling is set high. Adjust for your deployment.
+LimitNOFILE=1048576
+LimitNPROC=8192
+
+[Install]
+WantedBy=multi-user.target
