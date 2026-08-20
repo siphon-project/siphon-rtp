@@ -154,22 +154,90 @@ and rejects an inline (base64) `play_start` with an `error` message; downlink au
 
 ## Turn-taking, barge-in, and echo control
 
-Three optional profile flags move the turn-taking work into the engine so your inference server
-does not have to run its own VAD or fight the phone's echo of the AI. All are native-JSON-only and
-inert without `ws_uri`.
+A handful of optional profile flags move the turn-taking work into the engine so your inference
+server does not have to run its own VAD or fight the phone's echo of the AI. All are
+native-JSON-only and inert without `ws_uri`.
 
-- **`ws_vad`** runs a local energy-VAD on the uplink and emits two text control frames on the
-  caller's speech edges: `speech_started` when the caller starts talking and `speech_stopped` (the
-  turn endpoint) after the trailing hangover. The server gets clean turn boundaries with no VAD of
-  its own, which cuts turn latency.
+- **`ws_vad`** runs a local VAD on the uplink and emits two text control frames on the caller's
+  speech edges: `speech_started` when the caller starts talking and `speech_stopped` (the turn
+  endpoint) when they stop. The server gets clean turn boundaries with no VAD of its own, which
+  cuts turn latency.
 - **`ws_barge_in`** adds engine-side barge-in: the moment the caller starts speaking, the bridge
   flushes the queued downlink playout in the same tick (no server round-trip) and sends
   `speech_started`. It implies `ws_vad`. This is the counterpart to the server-initiated `clear`
   above: `clear` is the server flushing on its own decision, `ws_barge_in` is the engine flushing
   the instant the caller talks over the AI.
+- **`ws_vad_engine`** picks *which* detector runs — see the next section.
+- **`ws_vad_min_speech_ms`** requires the uplink to read as speech **continuously** for that long
+  before the speech-start edge fires. See [Not barging in on a cough](#not-barging-in-on-a-cough).
 - **`ws_vad_threshold`** (mean-square energy, higher is less sensitive, default ≈ 1_000_000) and
   **`ws_vad_hangover_ms`** (how long speech is held after energy drops before `speech_stopped`
-  fires, default ≈ 200 ms) tune the local VAD. Both only matter with `ws_vad` / `ws_barge_in`.
+  fires, default ≈ 200 ms) tune the **energy** detector specifically.
+
+### Choosing a detector
+
+|  | `energy` (default) | `neural` |
+|---|---|---|
+| answers | "is something loud here" | "is what is here speech" |
+| cost | ~30 ns per 20 ms frame | ~37 µs per 32 ms window, i.e. ~23 µs per 20 ms frame amortised (~0.1 % of one core per call) |
+| turn-detect floor | one media frame | 32 ms + up to one media frame |
+| tuning | `ws_vad_threshold`, `ws_vad_hangover_ms` | none needed |
+| fires on hum / breathing / fan noise | yes | no |
+
+`energy` is a threshold on frame energy. It is exact, free, and correct for what it claims, but as
+a *turn* detector it interrupts on things that are not a turn: 50 Hz mains hum, a breath into a
+close-talking handset and a cooling fan all clear an absolute energy threshold. Keep it where a
+false turn start is harmless — mute detection, cheap talk-spurt marking, a call where nobody barges
+in.
+
+`neural` runs the Silero v5 network, hand-written in pure Rust and embedded in the binary (309 633
+parameters, ~1.2 MB; **no** inference runtime, no shared library, no extra deployment artifact —
+`siphon-rtp` stays one static binary). On synthetic hum and breathing at **four times** the default
+energy threshold — signals the energy gate fires on throughout — it peaks at probability 0.07 and
+0.35 respectively, well under the 0.5 speech threshold. Pick it for turn taking and barge-in with a
+conversational agent.
+
+Selecting a detector the engine cannot build for the leg **fails the offer** with a reason; it is
+never silently downgraded to the energy gate, because a controller that asked for `neural` asked
+for it precisely to stop barge-in firing on noise.
+
+#### Framing and the latency floor
+
+The network consumes exactly 512 samples at 16 kHz — **32 ms** — with 64 samples of context carried
+from the previous window and its recurrent state carried across windows. That is the framing it was
+trained on, so the engine does not re-window it to the 20 ms media tick: it accumulates frames and
+fires the network on each completed window. A decision therefore describes audio that ended 32 ms
+ago, plus up to one media frame of accumulation remainder — **32–52 ms at a 20 ms ptime** — before
+`ws_vad_min_speech_ms` adds anything on top.
+
+A leg that is not already at 16 kHz (every G.711 call) is resampled into the detector by the
+engine's own polyphase resampler. Nothing is refused for its rate.
+
+#### What it will not do: echo
+
+A speech classifier cannot reject acoustic echo, because echo of speech *is* speech. Measured
+against the reference on far-end speech through a room response, the network still calls it speech
+down to about −36 dB of echo-return loss, and only goes quiet at −42 dB:
+
+| echo-return loss | 0 dB | −12 dB | −24 dB | −30 dB | −36 dB | −42 dB |
+|---|---|---|---|---|---|---|
+| windows called speech (of 64) | 59 | 56 | 54 | 50 | 36 | 0 |
+
+So on a loudspeaker or handsfree endpoint, **`echo_cancellation` is not optional under barge-in** —
+it is what puts the residual below the detector, and neither detector can substitute for it.
+
+### Not barging in on a cough
+
+Both detectors have a *trailing* hold, so speech is not chopped up at its end. Neither has a
+*leading* one by default: the speech-start edge fires on the very first frame that reads as speech,
+which is what lets a cough, a door, a keyboard or one burst of echo interrupt the prompt.
+
+**`ws_vad_min_speech_ms`** is that missing leading requirement — the uplink must read as speech for
+that many milliseconds *continuously* before `speech_started` (and barge-in) fires; anything shorter
+is discarded and the counter restarts. It is rounded up to whole ptime frames and it adds directly
+to turn-start latency, so 60–120 ms is the useful range: long enough to swallow a transient, short
+enough that a caller talking over the AI still feels heard. It works with either detector, and
+pairing it with `neural` is the combination that makes barge-in feel right.
 
 - **`echo_cancellation`** cancels the phone's echo of the AI on the uplink toward the server: the
   bridge runs `siphon-rtp-dsp`'s echo canceller on the caller's uplink using the AI downlink (what
@@ -189,7 +257,8 @@ inert without `ws_uri`.
     "ws_uri": "ws://127.0.0.1:9001/stream",
     "ws_vad": true,
     "ws_barge_in": true,
-    "ws_vad_hangover_ms": 300,
+    "ws_vad_engine": "neural",
+    "ws_vad_min_speech_ms": 100,
     "echo_cancellation": true
   }
 }

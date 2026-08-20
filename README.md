@@ -80,7 +80,7 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **TURN server + client** | RFC 5766 / 8656 | Implemented — `turn:` / `turns:` (UDP/TCP/TLS), coturn REST credentials; plus a TURN client for relayed ICE candidates (RFC 5766 ChannelData), wired at the engine API (`Engine::with_turn_server`), not yet a daemon flag |
 | **NAT traversal (symmetric RTP, advertised IP, named interfaces)** | RFC 3550 §8 | Implemented — RTPbleed-gated symmetric latch, `--advertise-ip` for a 1:1-NAT / Elastic-IP host, and rtpengine-style `[[interface]]` + `direction` per-leg selection ([docs](docs/security-and-nat.md)) |
 | **Jitter buffer + PLC + resampler** | RFC 3550 | Implemented (resampler AVX2, PLC drives decoder concealment) |
-| **VAD / noise suppression / echo cancellation** | — | Implemented — energy VAD, single-channel noise suppression, and echo cancellation (AEC wired on the transcode and WebSocket-bridge paths, not on SRTP/DTLS legs) |
+| **VAD / noise suppression / echo cancellation** | — | Implemented — energy VAD **and a neural (Silero v5) speech classifier written out in pure Rust and embedded, no inference runtime**, single-channel noise suppression, and echo cancellation (AEC wired on the transcode and WebSocket-bridge paths, not on SRTP/DTLS legs) |
 | **WebSocket bridge (raw L16 PCM)** | — | Implemented — bidirectional, `ws://` and `wss://` (wss via ring/rustls + webpki-roots) |
 | **OpenAI Realtime / gRPC / WebRTC bridges** | — | Planned |
 | **Forking (SIPREC raw-RTP tee)** | RFC 7866 | Implemented |
@@ -262,7 +262,9 @@ Crates:
 - **`siphon-rtp-codec`** — pure-Rust codecs (G.711, G.722, G.726, GSM-FR, L16, comfort noise, AMR-NB/WB).
 - **`siphon-rtp-simd`** — pure-Rust SIMD DSP primitives (runtime-detected AVX2 + scalar fallback),
   shared by the codec and dsp hot paths.
-- `siphon-rtp-dsp` — resampler (SIMD), energy VAD, single-channel noise suppression, and echo cancellation.
+- `siphon-rtp-dsp` — resampler (SIMD), energy VAD, a neural (Silero v5) VAD as a hand-written
+  pure-Rust forward pass with embedded weights, single-channel noise suppression, and echo
+  cancellation.
 - `siphon-rtp-media` — RTP/RTCP, jitter/PLC, leg pipeline, fan-out/fork, the MCU mixer, stream bridges.
 - `siphon-rtp-srtp` — SRTP/SRTCP (SDES) with RFC 3711 anti-replay and the secure-leg demux.
 - `siphon-rtp-dtls` — DTLS-SRTP (RFC 5764) handshake keying, pure RustCrypto.
@@ -297,7 +299,7 @@ AMR-NB/AMR-WB behind the `amr` feature), Opus (SILK / CELT / Hybrid, decode and 
 and DTLS-SRTP (including DTLS-SRTP transcoding), ICE-lite plus the full RFC 8445 ICE agent
 (`--ice-full`), a built-in TURN server and a TURN client at the engine API (`Engine::with_turn_server`),
 RFC 4103 / 9071 real-time text, RTCP with G.107 MOS plus HEP/Homer export, the jitter buffer / PLC /
-resampler, energy VAD, single-channel noise suppression and echo cancellation (on the transcode and
+resampler, energy and neural VAD, single-channel noise suppression and echo cancellation (on the transcode and
 WebSocket-bridge paths), SIPREC forking, the N-party conferencing MCU, the RTP↔WebSocket bridge,
 runtime pcap recording, and cluster load / drain with warm-standby checkpoint/restore.
 
