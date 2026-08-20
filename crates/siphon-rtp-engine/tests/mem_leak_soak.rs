@@ -265,6 +265,131 @@ async fn record_start_stop_does_not_leak() {
     );
 }
 
+/// One overlay-playback cycle on a fresh call: promote by starting four tone overlays (the slot
+/// cap), retune one, stop one by id, then delete the call with the rest still running — so the
+/// teardown path is what frees them, which is where a stranded `Playback` (its resampler, re-framer
+/// and scratch buffers) would show up.
+async fn overlay_play_cycle(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    use siphon_rtp_proto::PlayMediaSource;
+    let call_id = format!("overlay-soak-{index}");
+
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: sdp_for("198.51.100.1", 40_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&offer, "offer");
+
+    let mut play_ids = Vec::new();
+    for slot in 0..4u8 {
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Tone {
+                        // Alternate a preset and an explicitly-parsed cadence, so both paths churn.
+                        tone: if slot % 2 == 0 {
+                            "ringback_eu".into()
+                        } else {
+                            "440+480/500,0/500*inf".into()
+                        },
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: true,
+                    gain_decibels: Some(-6),
+                    to_tag: None,
+                },
+            )
+            .await;
+        match started {
+            CmdResult::Ok {
+                play_id: Some(id), ..
+            } => play_ids.push(id),
+            other => panic!("overlay {slot} should start, got {other:?}"),
+        }
+    }
+
+    let retuned = engine
+        .handle(
+            CLIENT,
+            Command::SetPlayGain {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                play_id: play_ids[0],
+                gain_decibels: -20,
+                to_tag: None,
+            },
+        )
+        .await;
+    assert_ok(&retuned, "set_play_gain");
+
+    let stopped = engine
+        .handle(
+            CLIENT,
+            Command::StopMedia {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                play_id: Some(play_ids[1]),
+            },
+        )
+        .await;
+    assert_ok(&stopped, "targeted stop");
+
+    let deleted = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id,
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert_ok(&deleted, "delete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_playback_start_stop_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+    let _prime = allocated_bytes();
+
+    // Warm up: the promote path, the media actor, its overlay bus and every slot's scratch settle.
+    for index in 0..50 {
+        overlay_play_cycle(&engine, index).await;
+    }
+    quiesce().await;
+    assert_eq!(engine.session_count(), 0, "registry empty after warmup");
+    let before = allocated_bytes();
+
+    // Each cycle promotes a relay, fills all four overlay slots (each with its own tone generator,
+    // re-framer and mix scratch), retunes one, stops one, and tears the call down with two still
+    // running. Across 300 cycles live bytes must not climb.
+    for index in 50..350 {
+        overlay_play_cycle(&engine, index).await;
+    }
+    quiesce().await;
+    let after = allocated_bytes();
+
+    assert_eq!(engine.session_count(), 0, "registry drained after soak");
+    let tolerance = 512 * 1024;
+    assert!(
+        after <= before + tolerance,
+        "overlay playback leaked {} bytes over 300 churned calls (before={before}, after={after})",
+        after.saturating_sub(before)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conference_join_leave_does_not_leak() {
     let _serialized = SOAK.lock().await;
