@@ -875,7 +875,7 @@ mod tests {
 
     /// STL vectors are 16-bit little-endian words; the companded octet / ADPCM code is the low byte.
     fn read_octets(bytes: &[u8]) -> Vec<u8> {
-        bytes.chunks_exact(2).map(|c| c[0]).collect()
+        bytes.as_chunks::<2>().0.iter().map(|c| c[0]).collect()
     }
 
     fn rate_num(rate: Rate) -> u32 {

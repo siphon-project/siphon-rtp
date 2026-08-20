@@ -4604,7 +4604,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Bind the endpoints at their exact ports (shared by both pipelines).
         let bound = match self.bind_snapshot_endpoints(&snapshot).await {
             Ok(bound) => bound,
-            Err(reason) => return reason,
+            Err(reason) => return *reason,
         };
         let role_endpoint = |role: EndpointRole| -> Option<Endpoint> {
             bound
@@ -5109,7 +5109,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     async fn bind_snapshot_endpoints(
         &self,
         snapshot: &crate::ha::CallSnapshot,
-    ) -> Result<Vec<(crate::ha::EndpointRole, Endpoint)>, CmdResult> {
+    ) -> Result<Vec<(crate::ha::EndpointRole, Endpoint)>, Box<CmdResult>> {
         use crate::ha::EndpointRole;
         let mut targets: Vec<(EndpointRole, std::net::SocketAddr)> =
             vec![(EndpointRole::NearRtp, snapshot.near.rtp_local)];
@@ -5132,10 +5132,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 Ok(endpoint) => bound.push((role, endpoint)),
                 Err(error) => {
                     self.free_bound(&bound).await;
-                    return Err(error_result(
+                    return Err(Box::new(error_result(
                         "restore: bind endpoint at snapshot port",
                         &error,
-                    ));
+                    )));
                 }
             }
         }
@@ -5953,9 +5953,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         repeat_times: Option<u64>,
         start_pos_ms: Option<u64>,
         to_tag: Option<&str>,
-    ) -> Result<(u64, u64), CmdResult> {
+    ) -> Result<(u64, u64), Box<CmdResult>> {
         let Some(call_to) = self.owned_call(client, call_id, |call| call.to_tag.clone()) else {
-            return Err(unknown_call(call_id));
+            return Err(Box::new(unknown_call(call_id)));
         };
         // Promote an offer-only single-leg IVR call (or a plain relay) to a processing MediaCall so a
         // prompt can play with no B leg — the same promote `set_echo` uses. Idempotent on an
@@ -5966,25 +5966,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .hold_in_userspace(call_id, PromotionReason::MediaOp, PromoteMode::Processing)
                 .await
             {
-                return Err(error_result("play_media: promote call", &reason));
+                return Err(Box::new(error_result("play_media: promote call", &reason)));
             }
         }
         let bytes = match source {
             PlayMediaSource::Blob { data } => data,
             PlayMediaSource::File { path } => match tokio::fs::read(&path).await {
                 Ok(bytes) => bytes,
-                Err(error) => return Err(error_result("play_media: read file", &error)),
+                Err(error) => return Err(Box::new(error_result("play_media: read file", &error))),
             },
             PlayMediaSource::DbId { .. } => {
-                return Err(error_result(
+                return Err(Box::new(error_result(
                     "play_media",
                     &"db-id media source is not supported",
-                ))
+                )))
             }
         };
         let wav = match WavSource::parse(&bytes) {
             Ok(wav) => wav,
-            Err(error) => return Err(error_result("play_media: parse WAV", &error)),
+            Err(error) => return Err(Box::new(error_result("play_media: parse WAV", &error))),
         };
         // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
         let repeat = repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
@@ -6045,7 +6045,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 to_tag: None,
                 stats: None,
             },
-            Err(error) => error,
+            Err(error) => *error,
         }
     }
 

@@ -615,7 +615,7 @@ mod tests {
             if frame < FRAMES / 2 {
                 continue; // convergence lead-in (delay lock + MDF settle)
             }
-            for chunk in uplink[..result.uplink_bytes].chunks_exact(2) {
+            for chunk in uplink[..result.uplink_bytes].as_chunks::<2>().0 {
                 let value = f64::from(i16::from_le_bytes([chunk[0], chunk[1]]));
                 energy += value * value;
                 samples += 1;
@@ -770,7 +770,7 @@ mod tests {
     /// One RTP packet carrying `pcm` as an L16 payload (RFC 3551 §4.5.11: network byte order).
     fn l16_packet(sequence: u16, pcm: &[i16]) -> Vec<u8> {
         let mut payload = vec![0u8; pcm.len() * 2];
-        for (sample, chunk) in pcm.iter().zip(payload.chunks_exact_mut(2)) {
+        for (sample, chunk) in pcm.iter().zip(payload.as_chunks_mut::<2>().0) {
             chunk.copy_from_slice(&sample.to_be_bytes());
         }
         let header = RtpHeader {

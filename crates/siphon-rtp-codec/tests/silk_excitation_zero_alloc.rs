@@ -111,7 +111,12 @@ fn encode_frame(frame_length: usize, lsb_shifts: u8) -> Vec<u8> {
         }
         for block in &blocks {
             let combine = |input: &[u16]| -> Vec<u16> {
-                input.chunks_exact(2).map(|p| p[0] + p[1]).collect()
+                input
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|p| p[0] + p[1])
+                    .collect()
             };
             let level0 = block.to_vec();
             let level1 = combine(&level0);

@@ -302,7 +302,9 @@ fn bench_amrwb_decode(criterion: &mut Criterion) {
             continue; // vectors not present in this checkout
         };
         let cod_words: Vec<i16> = cod
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
 
@@ -358,7 +360,9 @@ fn bench_amrnb_decode(criterion: &mut Criterion) {
             continue; // vectors not present in this checkout
         };
         let cod_words: Vec<i16> = cod
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
 
@@ -396,7 +400,9 @@ fn bench_amrwb_encode(criterion: &mut Criterion) {
         return; // input vector not present in this checkout
     };
     let pcm: Vec<i16> = inp
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
     let n_frames = pcm.len() / constants::L_FRAME16K;
@@ -448,7 +454,9 @@ fn bench_amrnb_encode(criterion: &mut Criterion) {
         return; // input vector not present in this checkout
     };
     let pcm: Vec<i16> = inp
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
     let n_frames = pcm.len() / FRAME;
@@ -1210,7 +1218,12 @@ fn bench_silk_excitation(c: &mut Criterion) {
             for block in &blocks {
                 // libopus' `silk_shell_encoder` symbol order (shell_coder.c:78-115).
                 let combine = |input: &[u16]| -> Vec<u16> {
-                    input.chunks_exact(2).map(|p| p[0] + p[1]).collect()
+                    input
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|p| p[0] + p[1])
+                        .collect()
                 };
                 let level0 = block.to_vec();
                 let level1 = combine(&level0);

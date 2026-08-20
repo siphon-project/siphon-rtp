@@ -277,7 +277,9 @@ fn score_stream(bit_path: &Path, name: &str) -> Result<Coverage, String> {
     let reference_bytes = std::fs::read(bit_path.with_extension("dec"))
         .map_err(|error| format!("unreadable .dec: {error}"))?;
     let reference: Vec<i16> = reference_bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     if reference.len() != decoded.pcm.len() {

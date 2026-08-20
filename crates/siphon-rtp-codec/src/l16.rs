@@ -57,7 +57,7 @@ impl Decoder for L16 {
                 have: out.len(),
             });
         }
-        for (sample, chunk) in out.iter_mut().zip(payload.chunks_exact(2)) {
+        for (sample, chunk) in out.iter_mut().zip(payload.as_chunks::<2>().0) {
             *sample = i16::from_be_bytes([chunk[0], chunk[1]]);
         }
         Ok(samples)
@@ -87,7 +87,7 @@ impl Encoder for L16 {
                 have: out.len(),
             });
         }
-        for (sample, chunk) in pcm.iter().zip(out.chunks_exact_mut(2)) {
+        for (sample, chunk) in pcm.iter().zip(out.as_chunks_mut::<2>().0) {
             let bytes = sample.to_be_bytes();
             chunk[0] = bytes[0];
             chunk[1] = bytes[1];

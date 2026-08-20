@@ -108,7 +108,7 @@ impl WavSource {
                 // Truncate a stray trailing odd byte: 16-bit PCM is always sample-aligned.
                 let aligned = body.len() & !1;
                 let mut decoded = Vec::with_capacity(aligned / 2);
-                for pair in body[..aligned].chunks_exact(2) {
+                for pair in body[..aligned].as_chunks::<2>().0 {
                     decoded.push(i16::from_le_bytes([pair[0], pair[1]]));
                 }
                 samples = Some(decoded);

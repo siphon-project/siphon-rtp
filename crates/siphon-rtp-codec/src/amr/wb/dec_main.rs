@@ -152,7 +152,7 @@ impl DecoderState {
     #[must_use]
     pub fn new() -> Self {
         let mut isf_buf = [0i16; L_MEANBUF * M];
-        for chunk in isf_buf.chunks_exact_mut(M) {
+        for chunk in isf_buf.as_chunks_mut::<M>().0 {
             chunk.copy_from_slice(&ISF_INIT);
         }
         let mut dec_gain = [0i16; DEC_GAIN_LEN];
@@ -1082,7 +1082,9 @@ mod tests {
 
     fn read_le_i16(bytes: &[u8]) -> Vec<i16> {
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect()
     }
@@ -1147,8 +1149,8 @@ mod tests {
         assert_eq!(state.dec_gain[0], -14336);
         assert_eq!(state.dec_gain[22], 21845);
         assert!(state.first_frame);
-        for row in state.isf_buf.chunks_exact(M) {
-            assert_eq!(row, ISF_INIT);
+        for row in state.isf_buf.as_chunks::<M>().0 {
+            assert_eq!(row, &ISF_INIT);
         }
     }
 

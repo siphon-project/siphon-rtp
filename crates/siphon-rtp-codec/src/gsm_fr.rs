@@ -1113,7 +1113,9 @@ mod tests {
 
     fn read_i16_le(bytes: &[u8]) -> Vec<i16> {
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect()
     }
@@ -1122,11 +1124,15 @@ mod tests {
     /// order (LARc[0..7] then 4× Nc, bc, Mc, xmaxc, xMc[0..12]).
     fn parse_cod(bytes: &[u8]) -> Vec<Frame> {
         let words: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         words
-            .chunks_exact(76)
+            .as_chunks::<76>()
+            .0
+            .iter()
             .map(|w| {
                 let mut f = Frame::zero();
                 for (dst, &src) in f.larc.iter_mut().zip(w[..8].iter()) {

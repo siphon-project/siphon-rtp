@@ -35,7 +35,7 @@ pub use ws::{run_bridge, BridgeError};
 /// samples are skipped if it is shorter.
 pub fn pcm_to_l16_le(pcm: &[i16], out: &mut [u8]) -> usize {
     let count = pcm.len().min(out.len() / 2);
-    for (sample, chunk) in pcm.iter().zip(out.chunks_exact_mut(2)).take(count) {
+    for (sample, chunk) in pcm.iter().zip(out.as_chunks_mut::<2>().0).take(count) {
         chunk.copy_from_slice(&sample.to_le_bytes());
     }
     count * 2
@@ -45,7 +45,13 @@ pub fn pcm_to_l16_le(pcm: &[i16], out: &mut [u8]) -> usize {
 /// A trailing odd byte is ignored.
 pub fn l16_le_to_pcm(bytes: &[u8], out: &mut [i16]) -> usize {
     let count = (bytes.len() / 2).min(out.len());
-    for (chunk, sample) in bytes.chunks_exact(2).zip(out.iter_mut()).take(count) {
+    for (chunk, sample) in bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(out.iter_mut())
+        .take(count)
+    {
         *sample = i16::from_le_bytes([chunk[0], chunk[1]]);
     }
     count

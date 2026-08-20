@@ -1510,7 +1510,7 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
         present.sort_by_key(|&pt| {
             name_of(pt)
                 .and_then(|n| policy.order.iter().position(|o| *o == n))
-                .map_or(usize::MAX, |index| index)
+                .unwrap_or(usize::MAX)
         });
     }
     let reordered = present

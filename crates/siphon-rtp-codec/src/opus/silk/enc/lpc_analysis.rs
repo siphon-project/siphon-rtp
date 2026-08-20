@@ -192,8 +192,7 @@ pub fn burg_modified(
         stage += 1;
     }
 
-    let residual_energy;
-    if reached_max_gain {
+    let residual_energy = if reached_max_gain {
         for (slot, &value) in coefficients.iter_mut().zip(prediction.iter()) {
             *slot = -value as f32;
         }
@@ -201,7 +200,7 @@ pub fn burg_modified(
         for subframe in 0..subframe_count {
             c0 -= energy(&input[subframe * subframe_length..][..order]);
         }
-        residual_energy = c0 * inverse_gain;
+        c0 * inverse_gain
     } else {
         let mut accumulator = correlation_forward[0];
         let mut coefficient_energy = 1.0f64;
@@ -211,8 +210,8 @@ pub fn burg_modified(
             coefficient_energy += value * value;
             coefficients[k] = -value as f32;
         }
-        residual_energy = accumulator - FIND_LPC_COND_FAC * c0 * coefficient_energy;
-    }
+        accumulator - FIND_LPC_COND_FAC * c0 * coefficient_energy
+    };
 
     residual_energy as f32
 }

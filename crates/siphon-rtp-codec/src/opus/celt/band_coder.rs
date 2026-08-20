@@ -311,7 +311,6 @@ pub fn quant_partition<C: CeltCoder>(
         let lb_hi = lowband.map(|lb| &lb[half..]);
 
         let mut rebalance = ctx.remaining_bits;
-        let cm;
         if mbits >= sbits {
             let mut cm0 = quant_partition(
                 ctx,
@@ -343,7 +342,7 @@ pub fn quant_partition<C: CeltCoder>(
                 fill >> new_big_b,
                 coder,
             ) << (b0 >> 1);
-            cm = cm0;
+            cm0
         } else {
             let mut cm0 = quant_partition(
                 ctx,
@@ -375,9 +374,8 @@ pub fn quant_partition<C: CeltCoder>(
                 fill,
                 coder,
             );
-            cm = cm0;
+            cm0
         }
-        cm
     } else {
         // Leaf: convert the bit budget to a pulse count, never busting the budget.
         let mut q = bits2pulses(ctx.band, lm, b);

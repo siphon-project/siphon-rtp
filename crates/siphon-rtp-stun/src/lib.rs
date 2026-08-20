@@ -360,9 +360,9 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     }
     message.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
-        for (word, bytes) in w.iter_mut().zip(chunk.chunks_exact(4)) {
+        for (word, bytes) in w.iter_mut().zip(chunk.as_chunks::<4>().0) {
             *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         for i in 16..80 {
@@ -396,7 +396,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     }
 
     let mut out = [0u8; 20];
-    for (slot, word) in out.chunks_exact_mut(4).zip(h.iter()) {
+    for (slot, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h.iter()) {
         slot.copy_from_slice(&word.to_be_bytes());
     }
     out

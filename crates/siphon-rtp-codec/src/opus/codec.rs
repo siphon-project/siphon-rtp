@@ -708,7 +708,7 @@ mod tests {
         // A mono bitstream decoded to a stereo API duplicates the channel (libopus upmix), so the
         // pairs are equal — which is exactly what proves the layout is interleaved, not planar.
         assert!(
-            pcm.chunks_exact(2).all(|pair| pair[0] == pair[1]),
+            pcm.as_chunks::<2>().0.iter().all(|pair| pair[0] == pair[1]),
             "a mono stream upmixed to stereo must be equal L/R at each instant"
         );
         assert!(energy(&pcm) > 1_000_000);

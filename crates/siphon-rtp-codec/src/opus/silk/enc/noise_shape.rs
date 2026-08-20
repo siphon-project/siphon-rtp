@@ -437,19 +437,18 @@ pub fn noise_shape_analysis(
 
     let mut lf_ma_shp = [0.0f32; MAX_NB_SUBFR];
     let mut lf_ar_shp = [0.0f32; MAX_NB_SUBFR];
-    let tilt_target;
-    if signal_type == SignalType::Voiced {
+    let tilt_target = if signal_type == SignalType::Voiced {
         // Reduce low-frequency quantisation noise for periodic signals, depending on the pitch lag.
         for subframe in 0..subframe_count {
             let corner = 0.2 / config.fs_khz as f32 + 3.0 / pitch_lags[subframe] as f32;
             lf_ma_shp[subframe] = -1.0 + corner;
             lf_ar_shp[subframe] = 1.0 - corner - corner * low_frequency_strength;
         }
-        tilt_target = -HP_NOISE_COEF
+        -HP_NOISE_COEF
             - (1.0 - HP_NOISE_COEF)
                 * HARM_HP_NOISE_COEF
                 * measures.speech_activity_q8 as f32
-                * (1.0 / 256.0);
+                * (1.0 / 256.0)
     } else {
         let corner = 1.3 / config.fs_khz as f32;
         lf_ma_shp[0] = -1.0 + corner;
@@ -458,8 +457,8 @@ pub fn noise_shape_analysis(
             lf_ma_shp[subframe] = lf_ma_shp[0];
             lf_ar_shp[subframe] = lf_ar_shp[0];
         }
-        tilt_target = -HP_NOISE_COEF;
-    }
+        -HP_NOISE_COEF
+    };
 
     // ---- Harmonic shaping control ----
     // `USE_HARM_SHAPING` is 1 in every libopus build.

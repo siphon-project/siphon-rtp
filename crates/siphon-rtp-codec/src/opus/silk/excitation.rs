@@ -453,7 +453,12 @@ pub fn decode_pulses(
     }
 
     // ── Pulse locations (§4.2.7.8.3) ──────────────────────────────────────────────────────────
-    for (block, chunk) in pulses.chunks_exact_mut(SHELL_BLOCK_LENGTH).enumerate() {
+    for (block, chunk) in pulses
+        .as_chunks_mut::<SHELL_BLOCK_LENGTH>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         if pulse_counts[block] > 0 {
             decode_shell_block(decoder, u16::from(pulse_counts[block]), chunk);
         } else {
@@ -464,7 +469,12 @@ pub fn decode_pulses(
     // ── LSBs (§4.2.7.8.4) ─────────────────────────────────────────────────────────────────────
     // Read for *every* sample of a block that asked for them, including samples with no pulses and
     // the padding samples of a 10 ms mediumband frame.
-    for (block, chunk) in pulses.chunks_exact_mut(SHELL_BLOCK_LENGTH).enumerate() {
+    for (block, chunk) in pulses
+        .as_chunks_mut::<SHELL_BLOCK_LENGTH>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         if lsb_shifts[block] == 0 {
             continue;
         }
@@ -518,7 +528,12 @@ fn decode_signs(
     // silk_SMULBB(7, silk_ADD_LSHIFT(quantOffsetType, signalType, 1)) (code_signs.c:90).
     let row = 7 * (offset_column + (signal_type.index() << 1));
 
-    for (block, chunk) in pulses.chunks_exact_mut(SHELL_BLOCK_LENGTH).enumerate() {
+    for (block, chunk) in pulses
+        .as_chunks_mut::<SHELL_BLOCK_LENGTH>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         // The C's `p = sum_pulses[i]` after `sum_pulses[i] |= nLS << 5`.
         if pulse_counts[block] == 0 && lsb_shifts[block] == 0 {
             continue;
@@ -1016,7 +1031,9 @@ mod tests {
     fn shell_encode_symbols(block: &[u16; SHELL_BLOCK_LENGTH], out: &mut Vec<(usize, Vec<u8>)>) {
         let combine = |input: &[u16]| -> Vec<u16> {
             input
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| pair[0] + pair[1])
                 .collect()
         };

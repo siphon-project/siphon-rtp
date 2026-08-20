@@ -298,7 +298,9 @@ fn score_stream(bit_path: &Path) -> Result<Option<Coverage>, String> {
     let reference_bytes =
         std::fs::read(&reference_path).map_err(|error| format!("unreadable .plcdec: {error}"))?;
     let reference: Vec<i16> = reference_bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     if reference.len() != pcm.len() {

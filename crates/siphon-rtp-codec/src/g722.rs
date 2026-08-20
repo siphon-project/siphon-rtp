@@ -413,7 +413,7 @@ impl Encoder for G722 {
                 have: out.len(),
             });
         }
-        for (byte, pair) in out.iter_mut().zip(pcm.chunks_exact(2)) {
+        for (byte, pair) in out.iter_mut().zip(pcm.as_chunks::<2>().0) {
             *byte = self.encode_pair(pair[0], pair[1]);
         }
         Ok(bytes)

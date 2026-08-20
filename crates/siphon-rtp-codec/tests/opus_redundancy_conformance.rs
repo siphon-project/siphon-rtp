@@ -96,7 +96,9 @@ fn stream_dir() -> Option<PathBuf> {
 fn read_pcm16(path: &Path) -> Result<Vec<i16>, String> {
     let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
         .collect())
 }
