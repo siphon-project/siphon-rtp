@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+# Create siphon-rtp system user and group
+if ! getent group siphon-rtp >/dev/null; then
+    addgroup --system siphon-rtp
+fi
+
+if ! getent passwd siphon-rtp >/dev/null; then
+    adduser --system --ingroup siphon-rtp --home /var/lib/siphon-rtp \
+        --no-create-home --gecos "siphon-rtp media engine" siphon-rtp
+fi
+
+# systemd creates and owns these through StateDirectory=/LogsDirectory= when the
+# unit starts, but recordings, HA checkpoints and any file-based logs point
+# inside them, so create them here too for anyone running the binary by hand
+# before the first `systemctl start`.
+mkdir -p /var/lib/siphon-rtp /var/log/siphon-rtp
+chown siphon-rtp:siphon-rtp /var/lib/siphon-rtp /var/log/siphon-rtp
+
+#DEBHELPER#

@@ -1,0 +1,19 @@
+# Rotation for any log files siphon-rtp writes under /var/log/siphon-rtp. By
+# default the daemon logs to stdout/journald (systemd captures it), so this only
+# matters when logs are directed to files there. The packaged systemd unit
+# creates that directory, owned by the siphon-rtp user, through LogsDirectory=.
+#
+# copytruncate is load-bearing: siphon-rtp holds a log file open for the life of
+# the process and has no SIGHUP reopen, so a rename-based rotation would leave it
+# writing to the unlinked inode until the next restart. copytruncate copies the
+# file and truncates it in place, keeping the open descriptor valid.
+/var/log/siphon-rtp/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su siphon-rtp siphon-rtp
+}
