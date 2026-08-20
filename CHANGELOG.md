@@ -7,108 +7,55 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-21
+
+### Breaking changes
+
+**The JSON wire is backward compatible.** Every new field is `Option` (or a `bool` with
+`skip_serializing_if`), the default `ProfileFlags` still serialises to `{}`, and an event tag a
+consumer does not recognise still decodes to `Event::Unknown`. An existing controller's frames go
+out byte-identical and are understood unchanged. The breaks are in the **Rust API** of
+`siphon-rtp-proto` and in **runtime behaviour**.
+
+Rust API:
+
+- **The contract enums are now `#[non_exhaustive]`** — `Command`, `CmdResult`, `Event`,
+  `PlayEndReason`, `PlayMediaSource`, `WsTeeEndReason` and `ProtoError`. A downstream `match` on any
+  of them now needs a wildcard arm. That is a one-time cost that buys the opposite for every release
+  after this one: adding a variant stops being a breaking change. `WsTeeDirection`, `WsVadEngine`,
+  `ConferenceRole` and `BridgeDirection` are deliberately left exhaustive — those select engine
+  behaviour, and a consumer that swept a new value into a wildcard would silently do the wrong thing
+  instead of failing to build. The reasoning is recorded per type in the crate docs.
+- **New variants**: `Command::SetPlayGain`, `Event::BeepDetected`, `PlayMediaSource::Tone` and
+  `PlayMediaSource::Http`; plus a new `WsVadEngine` enum.
+- **New fields on existing struct variants**: `overlay` and `gain_decibels` on `Command::PlayMedia`,
+  `play_id` on `Command::StopMedia`, `sample_rate` on `Command::AttachWsTee`, and `beep_detection`,
+  `beep_cadence_guard_ms`, `ws_sample_rate`, `ws_vad_engine`, `ws_vad_min_speech_ms` and
+  `ws_tee_sample_rate` on `ProfileFlags`. Rust code that constructs these exhaustively (without
+  `..Default::default()`) must be updated. Note the limit of what the previous bullet buys:
+  `#[non_exhaustive]` at the **enum** level does not make *adding a field to a struct variant*
+  additive. Only per-variant `#[non_exhaustive]` would, and that also stops other crates
+  constructing the variant at all, so it is deliberately not applied — adding a field to a struct
+  variant stays a breaking change.
+
+Behaviour:
+
+- **`play_media`'s `duration_ms` is now enforced.** It was parsed and dropped, so a caller that set
+  it heard the whole prompt anyway; it now caps playout exactly as the contract always described. A
+  controller that was relying on the field being ignored will see truncated playback.
+- **`ws_uri` on a secure or ICE offerer is refused at offer time**, with a stable leading reason
+  token, where it used to return `ok` and produce a call that answered and bridged nowhere. A
+  controller that read the old `ok` as success now gets an error instead of a silently dead call.
+- **`play_media` on a call with no media actor now errors** instead of returning a `play_id` and a
+  `play_finished` that never arrived.
+- **Media from an unvalidated source on a redirected ICE endpoint is now dropped** (the security fix
+  below). Traffic that was reaching a conference seat, a promoted userspace call or a WebSocket
+  takeover leg from a transport ICE never validated stops being relayed. That is the point of the
+  fix, but it is a behaviour change for anything that was unknowingly relying on the open gate.
+
 ### Added
-- **Selectable WebSocket wire sample rate.** The L16 rate a WS consumer exchanges is now negotiable
-  and independent of the leg's codec rate, on both WS shapes:
-  - `sample_rate` on `attach_ws_tee` and `ws_tee_sample_rate` in `ProfileFlags` — every tapped leg is
-    resampled into the requested rate before framing, so an 8 kHz G.711 call can be teed at 16 kHz
-    and a stereo tee over two different codecs produces one coherent stream. The `start` envelope's
-    `media.sampleRate` and the `ws_tee_started` event both report the **negotiated** rate.
-  - `ws_sample_rate` in `ProfileFlags` for the `ws_uri` takeover bridge, applied in **both**
-    directions (leg → wire on the uplink, wire → leg on the downlink before re-encoding).
-  - All three are strictly additive and optional; unset means exactly the previous behaviour (follow
-    the leg codec's PCM rate, with no conversion built at all). An unserviceable rate — zero, outside
-    8000–48000, or not a multiple of 1000 — is rejected with a typed error at attach/offer/answer
-    time, before anything is dialled, promoted or attached, and is never silently clamped.
 
-### Fixed
-- **WebSocket takeover downlink was rendered at the wrong rate.** A server sending playout PCM at
-  anything other than the leg's codec rate had it encoded sample-for-sample into the leg's codec, so
-  the call heard the right samples at the wrong speed and pitch with no error reported anywhere. The
-  downlink is now resampled into the leg's rate before the encode.
-
-### Changed
-- The WS bridge's uplink noise suppressor and echo canceller now run in the **wire** rate domain —
-  the domain the far side hears, and the only one that keeps the canceller's near-end input and
-  far-end reference in a single rate and frame length. A wire rate the noise suppressor does not
-  support (anything but 8/16 kHz) leaves it off with a `warn`, and never changes the negotiated rate.
-
-### Fixed
-- **Security (RTPBleed class): a redirected ICE endpoint had no source gate at all.** The datapath's
-  layer-4 ICE gate — media is accepted only from the transport a STUN connectivity check validated
-  (RFC 8445 §7) — ran on the in-kernel/relay `Forward` path only. Every userspace consumer receives
-  its media as `Redirect` (conference seats, promoted transcode/record/echo/DTMF calls, WebSocket
-  takeover legs, the SDES-SRTP and DTLS-SRTP bridges), and each of those re-enforces the layer-2
-  *signalled-source* gate itself — which an ICE leg deliberately leaves open (`SourceFilter::Any`),
-  because a peer-reflexive check legitimately arrives from a transport the SDP never carried
-  (RFC 8445 §7.3.1.3). The two together left an ICE leg on the redirected path with nothing gating
-  its source. The sharpest case was an **ice-lite conference seat** — the default posture, no
-  `--ice full` — where the room's `ice_pending` gate is never set (it exists for the window before a
-  *full* agent selects a pair) so anyone able to reach the seat's UDP port could inject audio into
-  the mix every other participant heard. Both datapaths now apply the identical verdict on the
-  `Redirect` path (`Inner::ice_gate` in the UDP backend, the `action::REDIRECT` arm of the eBPF
-  classifier): an endpoint carrying ICE credentials hands its consumer only the check-validated
-  source. Only the *source* is gated — a redirected endpoint is still entitled to non-RTP, so a
-  DTLS-SRTP handshake (RFC 5764) and a TURN allocation's own STUN (RFC 5766 §11) are unaffected —
-  and STUN itself is exempt so the handshake cannot deadlock. Non-ICE redirected endpoints are
-  unchanged. `docs/security-and-nat.md` §4 layers 1/3/4 and 5c/5d updated.
-
-- **Neural voice-activity detection** (`siphon-rtp-dsp`) — the Silero VAD v5 network as a
-  hand-written pure-Rust forward pass with its 309 633 parameters embedded in the binary (~1.2 MB,
-  MIT, provenance and hashes in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)). No inference
-  runtime, no shared library, no extra deployment artifact: siphon-rtp stays one static binary. The
-  existing `EnergyVad` is unchanged and stays the default.
-
-  The energy detector answers "is something loud here", so as a *turn* detector it fires on mains
-  hum, breathing and fan noise. On synthetic hum and breathing at four times the default energy
-  threshold — where the energy gate fires throughout — the network peaks at probability 0.07 and
-  0.35. Validated against the published ONNX graph run by `onnxruntime` out of tree: worst
-  per-window probability error 1.3e-6 and **100 % decision agreement over 937 windows** (30 s) of
-  speech, plus committed hum / breathing / echo / speech-onset cases
-  (`crates/siphon-rtp-dsp/tests/vectors/`, regenerated by `reference/silero-vad/`).
-
-  Framing is the model's own 512 samples at 16 kHz (32 ms) run on its own cadence fed from the media
-  frame clock, which puts the turn-detection floor at 32 ms plus up to one media frame; a leg at any
-  other rate is resampled into the detector. Cost: ~37 µs per 32 ms window; on the WS bridge tick,
-  ~27 µs per 20 ms frame on an 8 kHz leg (resample included) against ~83 ns for the energy gate,
-  about 0.14 % of one core per call. Zero heap allocation per window and per bridge tick.
-- **`ws_vad_engine`** profile flag — `energy` (default, unchanged behaviour) or `neural`, selecting
-  the WS voice-AI bridge's uplink detector. A selection the engine cannot build for the leg fails
-  the offer with a reason rather than downgrading to the detector the controller was avoiding.
-- **`ws_vad_min_speech_ms`** profile flag — a **leading** minimum-speech run: the uplink must read
-  as speech continuously for that long before `speech_started` (and barge-in) fires. Previously the
-  edge fired on the first speech frame, so a cough, a door or one burst of echo interrupted the
-  prompt. Unset ⇒ unchanged behaviour. Works with either detector.
-
-Both flags are `Option`/omitted-when-unset, so existing controller JSON serialises byte-identically.
-
-### Documentation
-- [Voice AI cookbook](docs/cookbook/voice-ai.md) gains a detector-choice section: the comparison
-  table, the 32 ms framing and its latency floor, the measured cost, the leading-run gate, and the
-  measured echo-return-loss curve showing why `echo_cancellation` is not optional under barge-in
-  (the network still calls far-end speech "speech" down to about −36 dB of ERL — echo of speech is
-  speech, and no VAD can substitute for the canceller).
-
-- **Answering-machine (voicemail beep) detection** — opt-in per call via the new `beep_detection`
-  profile flag, reporting the new `beep_detected` event (`call_id`, `from_tag`, `to_tag?`,
-  `frequency_hz`, `duration_ms`, `offset_ms`) so a controller can abort an attended transfer instead
-  of bridging a caller into a voicemail box. A new pure-Rust `RecordToneDetector`
-  (`siphon-rtp-dsp`'s `tone_detect`) runs on the leg's decoded ingress over the same √Hann WOLA STFT
-  the noise suppressor uses, and requires a tone to pass *every* discriminator: narrow-band energy
-  concentration, no second tone (which is what excludes DTMF, ITU-T Q.24), frequency stability,
-  amplitude stability, a 120–1000 ms duration, and — the discriminator that separates a record tone
-  from ringback / busy / congestion / the special-information tone — no repeat inside a configurable
-  cadence guard (`beep_cadence_guard_ms`, default 4500 ms, which is also the reporting latency).
-  Setting the flag promotes a same-codec call from the in-kernel relay to the userspace media
-  pipeline exactly as `noise_suppression` does; supported at 8 and 16 kHz, inert elsewhere. Fires
-  once per leg per call. Validated against a synthesised corpus (196 must-fire / 240 must-not-fire
-  cases across both rates, 0 false negatives and 0 false positives), benched at ≈ 2.1 µs/frame at
-  8 kHz and ≈ 4.0 µs at 16 kHz (about a third of the noise suppressor's cost measured on the same
-  run) with zero per-frame heap allocation. See
-  [docs/control/json.md](docs/control/json.md#answering-machine-beep-detection) for the parameters,
-  the operating point and what it cannot do.
-
-- **Overlay playback** — `play_media` with `"overlay": true` mixes audio *under* a leg's live egress
+- **Overlay playback.** `play_media` with `"overlay": true` mixes audio *under* a leg's live egress
   instead of replacing it: ringback beneath a leg that has not answered, hold music beneath silence,
   a background bed beneath a conversation. Up to **four concurrent overlays per direction**, each
   addressed by its own `play_id` for `stop_media` and `set_play_gain` and each ending with its own
@@ -137,14 +84,62 @@ Both flags are `Option`/omitted-when-unset, so existing controller JSON serialis
   allow-list; the SSRF posture is documented in `docs/control/json.md`.
 - **`stop_media` can target one playback** — an optional `play_id` stops just that one and leaves the
   rest running. Without it the verb still stops everything on the call, exactly as before.
+- **Answering-machine (voicemail beep) detection** — opt-in per call via the new `beep_detection`
+  profile flag, reporting the new `beep_detected` event (`call_id`, `from_tag`, `to_tag?`,
+  `frequency_hz`, `duration_ms`, `offset_ms`) so a controller can abort an attended transfer instead
+  of bridging a caller into a voicemail box. A new pure-Rust `RecordToneDetector`
+  (`siphon-rtp-dsp`'s `tone_detect`) runs on the leg's decoded ingress over the same √Hann WOLA STFT
+  the noise suppressor uses, and requires a tone to pass *every* discriminator: narrow-band energy
+  concentration, no second tone (which is what excludes DTMF, ITU-T Q.24), frequency stability,
+  amplitude stability, a 120–1000 ms duration, and — the discriminator that separates a record tone
+  from ringback / busy / congestion / the special-information tone — no repeat inside a configurable
+  cadence guard (`beep_cadence_guard_ms`, default 4500 ms, which is also the reporting latency).
+  Setting the flag promotes a same-codec call from the in-kernel relay to the userspace media
+  pipeline exactly as `noise_suppression` does; supported at 8 and 16 kHz, inert elsewhere. Fires
+  once per leg per call. Validated against a synthesised corpus (196 must-fire / 240 must-not-fire
+  cases across both rates, 0 false negatives and 0 false positives), benched at ≈ 2.1 µs/frame at
+  8 kHz and ≈ 4.0 µs at 16 kHz (about a third of the noise suppressor's cost measured on the same
+  run) with zero per-frame heap allocation. See
+  [docs/control/json.md](docs/control/json.md#answering-machine-beep-detection) for the parameters,
+  the operating point and what it cannot do.
+- **Neural voice-activity detection** (`siphon-rtp-dsp`) — the Silero VAD v5 network as a
+  hand-written pure-Rust forward pass with its 309 633 parameters embedded in the binary (~1.2 MB,
+  MIT, provenance and hashes in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)). No inference
+  runtime, no shared library, no extra deployment artifact: siphon-rtp stays one static binary. The
+  existing `EnergyVad` is unchanged and stays the default.
 
-### Fixed
-- `play_media`'s `duration_ms` was parsed and then dropped. It is now the hard playout cap the
-  contract always described — and the only bound, short of a stop, on an endless tone.
-- A resampled prompt now emits exactly one egress frame per playout tick. Previously it emitted
-  whatever the polyphase resampler happened to produce while advancing the RTP timestamp by a fixed
-  increment, so a prompt whose source rate differed from the leg's drifted against its own clock.
+  The energy detector answers "is something loud here", so as a *turn* detector it fires on mains
+  hum, breathing and fan noise. On synthetic hum and breathing at four times the default energy
+  threshold — where the energy gate fires throughout — the network peaks at probability 0.07 and
+  0.35. Validated against the published ONNX graph run by `onnxruntime` out of tree: worst
+  per-window probability error 1.3e-6 and **100 % decision agreement over 937 windows** (30 s) of
+  speech, plus committed hum / breathing / echo / speech-onset cases
+  (`crates/siphon-rtp-dsp/tests/vectors/`, regenerated by `reference/silero-vad/`).
 
+  Framing is the model's own 512 samples at 16 kHz (32 ms) run on its own cadence fed from the media
+  frame clock, which puts the turn-detection floor at 32 ms plus up to one media frame; a leg at any
+  other rate is resampled into the detector. Cost: ~37 µs per 32 ms window; on the WS bridge tick,
+  ~27 µs per 20 ms frame on an 8 kHz leg (resample included) against ~83 ns for the energy gate,
+  about 0.14 % of one core per call. Zero heap allocation per window and per bridge tick.
+- **`ws_vad_engine`** profile flag — `energy` (default, unchanged behaviour) or `neural`, selecting
+  the WS voice-AI bridge's uplink detector. A selection the engine cannot build for the leg fails
+  the offer with a reason rather than downgrading to the detector the controller was avoiding.
+- **`ws_vad_min_speech_ms`** profile flag — a **leading** minimum-speech run: the uplink must read
+  as speech continuously for that long before `speech_started` (and barge-in) fires. Previously the
+  edge fired on the first speech frame, so a cough, a door or one burst of echo interrupted the
+  prompt. Unset ⇒ unchanged behaviour. Works with either detector.
+- **Selectable WebSocket wire sample rate.** The L16 rate a WS consumer exchanges is now negotiable
+  and independent of the leg's codec rate, on both WS shapes:
+  - `sample_rate` on `attach_ws_tee` and `ws_tee_sample_rate` in `ProfileFlags` — every tapped leg is
+    resampled into the requested rate before framing, so an 8 kHz G.711 call can be teed at 16 kHz
+    and a stereo tee over two different codecs produces one coherent stream. The `start` envelope's
+    `media.sampleRate` and the `ws_tee_started` event both report the **negotiated** rate.
+  - `ws_sample_rate` in `ProfileFlags` for the `ws_uri` takeover bridge, applied in **both**
+    directions (leg → wire on the uplink, wire → leg on the downlink before re-encoding).
+  - All three are strictly additive and optional; unset means exactly the previous behaviour (follow
+    the leg codec's PCM rate, with no conversion built at all). An unserviceable rate — zero, outside
+    8000–48000, or not a multiple of 1000 — is rejected with a typed error at attach/offer/answer
+    time, before anything is dialled, promoted or attached, and is never silently clamped.
 - **WebSocket takeover on a secure offerer.** A takeover call (`ws_uri`) makes the WS media server
   leg A's far side, which makes the engine A's cryptographic peer when A negotiated SRTP.
   `answer_local` now terminates that: it mints the engine's **own** SDES key (RFC 4568) or advertises
@@ -157,7 +152,27 @@ Both flags are `Option`/omitted-when-unset, so existing controller JSON serialis
   as well as to the datapath: it re-points the downlink at the selected pair (§8.1.1) and narrows the
   source gate to it. Nothing crosses the leg before the agent selects (§12).
 
+### Changed
+
+- **The published contract enums carry `#[non_exhaustive]`** so that adding a variant is additive
+  from here on. See the Breaking changes call-out above for which types, which are deliberately
+  exempt, and why.
+- The WS bridge's uplink noise suppressor and echo canceller now run in the **wire** rate domain —
+  the domain the far side hears, and the only one that keeps the canceller's near-end input and
+  far-end reference in a single rate and frame length. A wire rate the noise suppressor does not
+  support (anything but 8/16 kHz) leaves it off with a `warn`, and never changes the negotiated rate.
+
 ### Fixed
+
+- **WebSocket takeover downlink was rendered at the wrong rate.** A server sending playout PCM at
+  anything other than the leg's codec rate had it encoded sample-for-sample into the leg's codec, so
+  the call heard the right samples at the wrong speed and pitch with no error reported anywhere. The
+  downlink is now resampled into the leg's rate before the encode.
+- `play_media`'s `duration_ms` was parsed and then dropped. It is now the hard playout cap the
+  contract always described — and the only bound, short of a stop, on an endless tone.
+- A resampled prompt now emits exactly one egress frame per playout tick. Previously it emitted
+  whatever the polyphase resampler happened to produce while advancing the RTP timestamp by a fixed
+  increment, so a prompt whose source rate differed from the leg's drifted against its own clock.
 - **`ws_uri` on a leg the engine cannot bridge is refused instead of accepted.** A secure or ICE
   offerer carrying `ws_uri` used to return `ok` and produce a call that answered and bridged nothing —
   A's SRTP reached the decoder as ciphertext and the downlink left in the clear. Each unsupported
@@ -175,6 +190,35 @@ Both flags are `Option`/omitted-when-unset, so existing controller JSON serialis
   so the injection landed nowhere while the controller got back an accepted `play_id` and waited for a
   `play_finished` that never came. It now errors, as `play_dtmf` and `silence_media` already did and
   as the control reference already documented.
+
+### Security
+
+- **RTPBleed class: a redirected ICE endpoint had no source gate at all.** The datapath's
+  layer-4 ICE gate — media is accepted only from the transport a STUN connectivity check validated
+  (RFC 8445 §7) — ran on the in-kernel/relay `Forward` path only. Every userspace consumer receives
+  its media as `Redirect` (conference seats, promoted transcode/record/echo/DTMF calls, WebSocket
+  takeover legs, the SDES-SRTP and DTLS-SRTP bridges), and each of those re-enforces the layer-2
+  *signalled-source* gate itself — which an ICE leg deliberately leaves open (`SourceFilter::Any`),
+  because a peer-reflexive check legitimately arrives from a transport the SDP never carried
+  (RFC 8445 §7.3.1.3). The two together left an ICE leg on the redirected path with nothing gating
+  its source. The sharpest case was an **ice-lite conference seat** — the default posture, no
+  `--ice full` — where the room's `ice_pending` gate is never set (it exists for the window before a
+  *full* agent selects a pair) so anyone able to reach the seat's UDP port could inject audio into
+  the mix every other participant heard. Both datapaths now apply the identical verdict on the
+  `Redirect` path (`Inner::ice_gate` in the UDP backend, the `action::REDIRECT` arm of the eBPF
+  classifier): an endpoint carrying ICE credentials hands its consumer only the check-validated
+  source. Only the *source* is gated — a redirected endpoint is still entitled to non-RTP, so a
+  DTLS-SRTP handshake (RFC 5764) and a TURN allocation's own STUN (RFC 5766 §11) are unaffected —
+  and STUN itself is exempt so the handshake cannot deadlock. Non-ICE redirected endpoints are
+  unchanged. `docs/security-and-nat.md` §4 layers 1/3/4 and 5c/5d updated.
+
+### Documentation
+
+- [Voice AI cookbook](docs/cookbook/voice-ai.md) gains a detector-choice section: the comparison
+  table, the 32 ms framing and its latency floor, the measured cost, the leading-run gate, and the
+  measured echo-return-loss curve showing why `echo_cancellation` is not optional under barge-in
+  (the network still calls far-end speech "speech" down to about −36 dB of ERL — echo of speech is
+  speech, and no VAD can substitute for the canceller).
 
 ## [0.2.1] — 2026-08-20
 
