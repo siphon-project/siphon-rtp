@@ -62,8 +62,10 @@ fn load_pcm(name: &str) -> Vec<i16> {
     let bytes = fs::read(vector_path(name, "pcm")).expect("committed PCM vector");
     assert_eq!(bytes.len() % 2, 0, "{name}: PCM is not whole i16 samples");
     bytes
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| i16::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -75,15 +77,19 @@ fn load_reference(name: &str) -> Vec<f32> {
         "{name}: reference is not whole f32 values"
     );
     bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 
 /// Run the port over a vector, window by window, returning our probability per window.
 fn port_probabilities(pcm: &[i16]) -> Vec<f32> {
     let mut detector = NeuralVad::new();
-    pcm.chunks_exact(NEURAL_VAD_WINDOW_SAMPLES)
+    pcm.as_chunks::<NEURAL_VAD_WINDOW_SAMPLES>()
+        .0
+        .iter()
         .map(|window| detector.speech_probability(window).expect("full window"))
         .collect()
 }
@@ -163,8 +169,10 @@ fn low_frequency_hum_does_not_trigger_although_an_energy_gate_does() {
 
     let mut energy_vad = EnergyVad::new(ENERGY_THRESHOLD, 5);
     let energy_frames = pcm
-        .chunks_exact(320)
-        .filter(|frame| energy_vad.is_speech(frame))
+        .as_chunks::<320>()
+        .0
+        .iter()
+        .filter(|frame| energy_vad.is_speech(*frame))
         .count();
     assert_eq!(
         energy_frames,
@@ -184,8 +192,10 @@ fn breathing_does_not_trigger_although_an_energy_gate_does() {
 
     let mut energy_vad = EnergyVad::new(ENERGY_THRESHOLD, 5);
     let energy_frames = pcm
-        .chunks_exact(320)
-        .filter(|frame| energy_vad.is_speech(frame))
+        .as_chunks::<320>()
+        .0
+        .iter()
+        .filter(|frame| energy_vad.is_speech(*frame))
         .count();
     // The breath vector is bursts separated by quiet gaps, so the energy gate fires on the bursts
     // (~40 of 102 frames) rather than throughout — those are the frames that would false-start a
@@ -277,7 +287,7 @@ fn the_stream_adapter_reaches_the_same_decisions_as_direct_windowing() {
     let mut window_index = 0usize;
     let mut consumed = 0usize;
     let mut disagreements = 0usize;
-    for frame in pcm.chunks_exact(320) {
+    for frame in pcm.as_chunks::<320>().0 {
         stream.is_speech(frame);
         consumed += frame.len();
         // Every completed window advances the adapter's held probability.
@@ -306,11 +316,11 @@ fn an_eight_kilohertz_leg_still_detects_the_speech_onset() {
     // conversion), but the decision must still land within a couple of windows of the onset.
     const ONSET_WINDOW: usize = 50;
     let pcm = load_pcm("neural_vad_onset");
-    let narrowband: Vec<i16> = pcm.chunks_exact(2).map(|pair| pair[0]).collect();
+    let narrowband: Vec<i16> = pcm.as_chunks::<2>().0.iter().map(|pair| pair[0]).collect();
 
     let mut stream = NeuralVadStream::new(8_000).expect("build");
     let mut fired_at = None;
-    for (index, frame) in narrowband.chunks_exact(160).enumerate() {
+    for (index, frame) in narrowband.as_chunks::<160>().0.iter().enumerate() {
         if stream.is_speech(frame) {
             fired_at = Some(index);
             break;
