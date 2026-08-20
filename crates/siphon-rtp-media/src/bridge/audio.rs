@@ -201,7 +201,10 @@ impl BridgeCore {
     /// `barge_in`, flushes the downlink playout in that same tick — no server round-trip), and on the
     /// speech→silence edge past `hangover_frames` it emits `speech_stopped` (the turn endpoint).
     /// `threshold` is the mean-square energy for speech; `hangover_frames` is the trailing hold in
-    /// ptime frames (see [`EnergyVad`]). Turn signals are drained via [`BridgeCore::next_control`].
+    /// ptime frames (see [`siphon_rtp_dsp::EnergyVad`]). The leading minimum-speech-run gate is left
+    /// transparent, so this is exactly the pre-detector-selection behaviour; use
+    /// [`BridgeCore::with_voice_detector`] to require one. Turn signals are drained via
+    /// [`BridgeCore::next_control`].
     #[must_use]
     pub fn with_vad(self, threshold: i64, hangover_frames: u32, barge_in: bool) -> Self {
         // One required frame == a pass-through gate, so this path is bit-identical to the one that

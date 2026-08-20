@@ -18,6 +18,7 @@ Nothing in this directory is compiled, packaged, or shipped.
 |---|---|---|
 | `extract_weights.py` | `silero_vad_v5_16k.f32` — the 16 kHz branch's tensors as a flat little-endian `f32` blob, in ONNX tensor order | `crates/siphon-rtp-dsp/src/vad/` |
 | `make_vectors.py` | `neural_vad_*.pcm` (raw i16 LE mono @ 16 kHz) and `neural_vad_*.f32` (the reference speech probability per 512-sample window) | `crates/siphon-rtp-dsp/tests/vectors/` |
+| `echo_sweep.py` | nothing — it prints the echo-return-loss curve quoted in [the voice-AI cookbook](../../docs/cookbook/voice-ai.md), i.e. how far down far-end speech has to be before the network stops calling it speech | (printed only) |
 
 The blob keeps the upstream tensor order rather than the kernel's, so it can be regenerated and
 byte-compared against the upstream release. The one re-layout the kernels want (transposing each
