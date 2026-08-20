@@ -391,6 +391,7 @@ async fn ws_tee_attach_detach(engine: &Engine<UdpLoopbackDatapath>, uri: &str, i
                     ws_uri: uri.to_string(),
                     direction: WsTeeDirection::Both,
                     channels: Some(2),
+                    sample_rate: None,
                 },
             )
             .await,

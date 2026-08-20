@@ -344,6 +344,15 @@ pub enum Command {
         /// legs, 1 for one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         channels: Option<u8>,
+        /// L16 wire sample rate in Hz, **independent of the leg's codec rate**: the engine resamples
+        /// each tapped leg's decoded PCM into it, so an 8 kHz G.711 call can be streamed at 16 kHz.
+        /// Must be a multiple of 1000 within 8000–48000; anything else is rejected at attach time
+        /// rather than clamped, and the call keeps relaying untouched. `None` ⇒ today's behaviour:
+        /// follow the tapped leg's own codec PCM rate (no conversion, no cost). Whatever is
+        /// negotiated is what the WS `start` frame's `media.sampleRate` and the `ws_tee_started`
+        /// event's `sample_rate` report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample_rate: Option<u32>,
     },
     /// Detach the WebSocket tee from a call, closing its stream. Idempotent: detaching a call with no
     /// tee is not an error.
@@ -515,6 +524,19 @@ pub struct ProfileFlags {
     /// with `ws_vad` / `ws_barge_in`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_vad_hangover_ms: Option<u32>,
+    /// L16 wire sample rate in Hz for the `ws_uri` takeover bridge, **independent of the leg's codec
+    /// rate** and applied in **both** directions: the engine resamples leg A's decoded uplink into it
+    /// and resamples the server's downlink playout back into the leg's codec rate before re-encoding.
+    /// So an 8 kHz G.711 call can speak 16 kHz L16 to the server, and a server rendering 24 kHz audio
+    /// into that call is played at the right speed and pitch instead of the wrong one. It is also the
+    /// domain the uplink noise suppressor and echo canceller run in — the audio the far side actually
+    /// hears — and those engage only at 8 or 16 kHz, so another rate leaves them off without changing
+    /// the wire rate. Must be a multiple of 1000 within 8000–48000; anything else fails the
+    /// offer/answer rather than being clamped. `None` ⇒ today's behaviour: the leg codec's own PCM
+    /// rate (8000 for G.711, 16000 for G.722/AMR-WB), with no conversion in either direction. Inert
+    /// without `ws_uri`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_sample_rate: Option<u32>,
     /// Observe this call's RFC 4103 Real-Time Text (`m=text`) stream at the control plane: when set (and
     /// the call negotiated a plaintext text stream and the owner has an event sink), the engine promotes
     /// **only** the low-rate text stream to a userspace processor that RED-depacketizes + reassembles it
@@ -548,6 +570,13 @@ pub struct ProfileFlags {
     /// both legs are teed, 1 for a single leg. Inert without `ws_tee`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_tee_channels: Option<u8>,
+    /// L16 wire sample rate in Hz for `ws_tee` — the declarative twin of
+    /// [`Command::AttachWsTee`]'s `sample_rate`, and independent of either leg's codec rate: each
+    /// tapped leg's decoded PCM is resampled into it before framing. Must be a multiple of 1000
+    /// within 8000–48000; anything else fails the answer rather than being clamped. `None` ⇒ today's
+    /// behaviour: follow the tapped leg's own codec PCM rate. Inert without `ws_tee`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_tee_sample_rate: Option<u32>,
     /// rtpengine `rtcp-mux` directive list (`offer` | `require` | `demux` | `accept` | `reject` |
     /// `remove`), letting the controller override the mux decision derived from the offered SDP
     /// (RFC 5761). Empty ⇒ mirror the offer (the default). See [`crate`] callers / the engine's
@@ -1161,12 +1190,14 @@ mod tests {
                 ws_uri,
                 direction,
                 channels,
+                sample_rate,
             } => {
                 assert_eq!(call_id, "c");
                 assert_eq!(from_tag, "f");
                 assert_eq!(ws_uri, "ws://h/s");
                 assert_eq!(direction, WsTeeDirection::Both, "both legs by default");
                 assert_eq!(channels, None);
+                assert_eq!(sample_rate, None, "unset ⇒ follow the leg codec's rate");
             }
             other => panic!("expected attach_ws_tee, got {other:?}"),
         }
@@ -1177,6 +1208,7 @@ mod tests {
             ws_uri: "wss://h/s".into(),
             direction: WsTeeDirection::Caller,
             channels: Some(1),
+            sample_rate: None,
         };
         let value = serde_json::to_value(&explicit).expect("to_value");
         assert_eq!(value["command"], "attach_ws_tee");
@@ -1217,6 +1249,101 @@ mod tests {
                 assert_eq!(profile.ws_uri, None);
             }
             other => panic!("expected offer, got {other:?}"),
+        }
+    }
+
+    /// The three selectable-wire-rate fields are strictly **additive**: absent from the serialization
+    /// when unset, so an existing controller's JSON round-trips byte-identically, and `None`
+    /// everywhere means "follow the leg codec's rate" — exactly the behaviour that shipped before.
+    #[test]
+    fn ws_wire_sample_rate_fields_are_additive_and_omitted_when_unset() {
+        let flags = serde_json::to_value(ProfileFlags::default()).expect("to_value");
+        for field in ["ws_sample_rate", "ws_tee_sample_rate"] {
+            assert!(flags.get(field).is_none(), "{field} omitted when unset");
+        }
+        // The whole default profile still serializes to the empty object it always did.
+        assert_eq!(
+            serde_json::to_string(&ProfileFlags::default()).expect("to_string"),
+            "{}",
+            "an unset wire rate must not change one byte of an existing controller's profile"
+        );
+
+        let attach = Command::AttachWsTee {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            ws_uri: "ws://h/tee".into(),
+            direction: WsTeeDirection::Both,
+            channels: None,
+            sample_rate: None,
+        };
+        let value = serde_json::to_value(&attach).expect("to_value");
+        assert!(
+            value.get("sample_rate").is_none(),
+            "attach_ws_tee omits sample_rate when unset"
+        );
+    }
+
+    /// An existing controller's JSON — written before the field existed — still deserializes, and
+    /// leaves every wire rate `None` (the "follow the codec rate" default).
+    #[test]
+    fn a_pre_wire_rate_controllers_json_still_means_follow_the_codec_rate() {
+        let json = concat!(
+            r#"{"command":"attach_ws_tee","call_id":"c","from_tag":"f","#,
+            r#""ws_uri":"ws://h/tee","direction":"both"}"#
+        );
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::AttachWsTee {
+                sample_rate,
+                channels,
+                ..
+            } => {
+                assert_eq!(sample_rate, None, "no rate requested ⇒ follow the codec");
+                assert_eq!(channels, None);
+            }
+            other => panic!("expected attach_ws_tee, got {other:?}"),
+        }
+
+        let offer = concat!(
+            r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n",""#,
+            r#"profile":{"ws_uri":"ws://h/s","ws_tee":"ws://h/tee"}}"#
+        );
+        match serde_json::from_str::<Command>(offer).expect("deserialize") {
+            Command::Offer { profile, .. } => {
+                assert_eq!(profile.ws_sample_rate, None);
+                assert_eq!(profile.ws_tee_sample_rate, None);
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_requested_wire_sample_rate_survives_the_wire() {
+        let attach = Command::AttachWsTee {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            ws_uri: "ws://h/tee".into(),
+            direction: WsTeeDirection::Caller,
+            channels: Some(1),
+            sample_rate: Some(16_000),
+        };
+        let value = serde_json::to_value(&attach).expect("to_value");
+        assert_eq!(value["sample_rate"], 16_000);
+        assert_eq!(
+            serde_json::from_value::<Command>(value).expect("roundtrip"),
+            attach
+        );
+
+        let json = concat!(
+            r#"{"command":"answer","call_id":"c","from_tag":"f","to_tag":"t","sdp":"v=0\r\n",""#,
+            r#"profile":{"ws_uri":"ws://h/s","ws_sample_rate":24000,"#,
+            r#""ws_tee":"ws://h/tee","ws_tee_sample_rate":16000}}"#
+        );
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::Answer { profile, .. } => {
+                assert_eq!(profile.ws_sample_rate, Some(24_000));
+                assert_eq!(profile.ws_tee_sample_rate, Some(16_000));
+            }
+            other => panic!("expected answer, got {other:?}"),
         }
     }
 

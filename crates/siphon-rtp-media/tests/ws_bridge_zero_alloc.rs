@@ -204,3 +204,96 @@ fn a_long_ptime_leg_ticks_without_per_frame_allocation() {
         after - before
     );
 }
+
+/// The **wire-rate conversion** must be allocation-free per tick in *both* directions. An 8 kHz
+/// G.711 leg streaming at 16 kHz resamples the uplink 8k→16k and the server's downlink 16k→8k on
+/// every tick, and `Resampler::process` *appends* into a `Vec` — so the session reserves both scratch
+/// buffers once and only `clear()`s them, never regrows them. The playout queue is filled outside the
+/// measured window (`on_ws_binary` allocates its own frame, which is the WS receive path, not the
+/// per-tick path).
+#[test]
+fn a_wire_rate_converting_bridge_ticks_without_per_frame_allocation() {
+    use siphon_rtp_media::bridge::pcm_to_l16_le;
+    use siphon_rtp_media::bridge::wire_rate::wire_resampler;
+
+    const MEASURED: usize = 500;
+    const PREFILL: usize = MEASURED + 64;
+    const LEG_RATE_HZ: u32 = 8_000;
+    const WIRE_RATE_HZ: u32 = 16_000;
+    const WIRE_FRAME_SAMPLES: usize = 320; // 16 kHz x 20 ms
+
+    let leg = MediaLeg::new(
+        Box::new(G711::ulaw()),
+        Box::new(G711::ulaw()),
+        JitterBuffer::new(1, PREFILL + 16),
+        0x5555_6666,
+        0,
+    );
+    let mut session = BridgeSession::new(
+        leg,
+        MediaFormat {
+            encoding: siphon_rtp_media::bridge::protocol::Encoding::L16,
+            sample_rate: WIRE_RATE_HZ,
+            channels: 1,
+            bit_depth: 16,
+            endianness: siphon_rtp_media::bridge::protocol::Endianness::Little,
+            ptime: 20,
+        },
+        "str_1",
+        "call_1",
+        Direction::Duplex,
+        PREFILL + 16, // deep playout so the whole measured run has a downlink frame to convert
+    )
+    .with_rate_conversion(
+        wire_resampler(LEG_RATE_HZ, WIRE_RATE_HZ).expect("uplink conversion"),
+        wire_resampler(WIRE_RATE_HZ, LEG_RATE_HZ).expect("downlink conversion"),
+    );
+
+    // Fill both directions outside the armed window.
+    let loud = [4000i16; 160];
+    for sequence in 0..PREFILL {
+        session.on_rtp(&ulaw_packet(sequence as u16, &loud));
+    }
+    let mut wire_frame = vec![0u8; WIRE_FRAME_SAMPLES * 2];
+    pcm_to_l16_le(&[1500i16; WIRE_FRAME_SAMPLES], &mut wire_frame);
+    // Every other queued frame is **longer than the ptime ceiling** (16 kHz × 120 ms is 1920 samples;
+    // this is 4000). The conversion clamps its input to that ceiling, so even a server that ignores
+    // the announced framing cannot grow the reserved scratch on the per-tick path.
+    let mut oversized_frame = vec![0u8; 4000 * 2];
+    pcm_to_l16_le(&[900i16; 4000], &mut oversized_frame);
+    for index in 0..PREFILL {
+        if index % 2 == 0 {
+            session.on_ws_binary(&wire_frame);
+        } else {
+            session.on_ws_binary(&oversized_frame);
+        }
+    }
+
+    let mut uplink = vec![0u8; 4096];
+    let mut downlink = vec![0u8; 4096];
+    let warmup = session.tick(&mut uplink, &mut downlink);
+    assert_eq!(
+        warmup.uplink_bytes,
+        WIRE_FRAME_SAMPLES * 2,
+        "uplink converts"
+    );
+    assert!(warmup.downlink_bytes > 0, "downlink converts and encodes");
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..MEASURED {
+        let result = session.tick(&mut uplink, &mut downlink);
+        std::hint::black_box(result);
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(session.uplink_decode_errors(), 0);
+    assert_eq!(session.downlink_encode_errors(), 0);
+    assert_eq!(
+        after,
+        before,
+        "wire-rate converting bridge allocated {} times across {MEASURED} ticks (must be zero)",
+        after - before
+    );
+}

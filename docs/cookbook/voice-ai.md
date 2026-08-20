@@ -78,9 +78,14 @@ The first frame the server receives is `start`, announcing the leg and the audio
 }
 ```
 
-`sampleRate` is the codec's native PCM rate: 8000 for a G.711 leg, 16000 for a G.722 leg (G.722
-audio is 16 kHz even though its RTP clock is 8 kHz, RFC 3551 §4.5.2). `ptime` follows the
-negotiated packet time, default 20 ms.
+`sampleRate` is **the negotiated wire rate, and it is authoritative** — the rate of every binary
+frame in *both* directions, for the whole life of the stream. Frame it against this number, not
+against whatever codec you believe the call is using.
+
+By default it is the codec's native PCM rate: 8000 for a G.711 leg, 16000 for a G.722 leg (G.722
+audio is 16 kHz even though its RTP clock is 8 kHz, RFC 3551 §4.5.2). Set the `ws_sample_rate`
+profile flag to choose it instead — see [Choosing the wire sample rate](#choosing-the-wire-sample-rate).
+`ptime` follows the negotiated packet time, default 20 ms.
 
 After `start`:
 
@@ -105,6 +110,42 @@ After `start`:
 One byte-order gotcha worth repeating: the WS wire is little-endian L16, while RTP L16
 (RFC 3551) is big-endian. The engine byte-swaps at the RTP boundary; your server should treat
 the WS side as plain host-order 16-bit samples and never see the difference.
+
+### Choosing the wire sample rate
+
+The wire rate is **independent of the leg's codec rate**. `ws_sample_rate` on the takeover profile
+picks it, and the engine resamples in both directions: leg → wire on the uplink, wire → leg on the
+downlink before re-encoding. So an 8 kHz G.711 call can speak 16 kHz L16 to a model that wants
+wideband input, and a server that renders 24 kHz TTS into that same call has it played back at the
+right speed and pitch instead of the wrong one.
+
+```json
+{
+  "command": "offer",
+  "call_id": "call-7@198.51.100.2",
+  "from_tag": "a1b2",
+  "sdp": "v=0\r\n...",
+  "profile": {
+    "ws_uri": "ws://127.0.0.1:9001/stream",
+    "ws_sample_rate": 16000
+  }
+}
+```
+
+- Valid rates are multiples of 1000 from 8000 to 48000. Anything else — 0, 44100, 96000 — is
+  **rejected** on the offer/answer with a message naming the reason. The engine never silently
+  clamps: a rate you did not ask for would drift against your clock with nothing to point at.
+- Omit the flag for today's behaviour: the leg's own codec rate, and no conversion anywhere. Asking
+  for the rate you already have is also free — no resampler is built.
+- Uplink noise suppression (`noise_suppression`) and echo cancellation (`echo_cancellation`) run in
+  the **wire** domain, because that is what the far side hears and it is the only placement that
+  keeps the echo canceller's near-end and far-end reference in one rate. The suppressor exists only
+  at 8 and 16 kHz, so another wire rate leaves it off (logged at `warn`) — the *feature* degrades,
+  the negotiated rate does not change.
+- The turn-taking VAD is unaffected: `ws_vad_threshold` is a **mean-square** (per-sample) energy, so
+  it means the same thing at any rate, and `ws_vad_hangover_ms` is a duration in ptime frames.
+- Conversion is not free: expect a few microseconds per 20 ms frame per engaged direction, paid only
+  when the rates actually differ.
 
 The envelope also defines `play_start` / `play_stop` / `mark` / `dtmf` / `event` message types
 for compatibility with the mod_audio_stream family. In v1 the engine honours `clear` and `stop`,
@@ -264,7 +305,14 @@ the NG/bencode front-end does not carry it.
 
 - `tracing` logs the dial at offer time; a failed dial fails the offer with the reason.
 - On the server, assert the first frame is `start` and that uplink binary frames are exactly
-  `sampleRate / 1000 * ptime * 2` bytes.
+  `sampleRate / 1000 * ptime * 2` bytes, where `sampleRate` is the **negotiated wire rate** the
+  `start` frame announced.
+- **Wire rate.** As with takeover, the tee's rate is independent of the codec: pass `sample_rate` on
+  `attach_ws_tee` (or `ws_tee_sample_rate` in the profile) and every tapped leg is resampled into it
+  before framing, so a stereo tee over legs on two different codecs still produces one coherent
+  stream. Same 8000–48000 band, same multiple-of-1000 rule, same rejection-rather-than-clamp
+  posture. Omitted, the tee follows the tapped leg's own codec rate exactly as before. A tee is
+  send-only, so only the uplink direction converts.
 - Send a known tone as downlink PCM and capture A's inbound RTP: the payload decodes to your
   tone, stamped with the engine's SSRC.
 - `query` on the call still reports packet counters; `delete` ends both the call and the WS

@@ -2,7 +2,13 @@
 //! bridged leg pays. Benches the same tick with local-VAD turn-taking **off vs on** at 8 kHz (µ-law),
 //! so the delta is exactly the added energy-VAD + turn-edge logic, plus the echo-cancelling tick
 //! (whose far-end reference is preallocated on the core) and a **long-ptime** leg at 48 kHz / 60 ms,
-//! the frame shape a WebRTC/Opus peer produces. `cargo bench -p siphon-rtp-media`.
+//! the frame shape a WebRTC/Opus peer produces.
+//!
+//! It also gates the **selectable WS wire rate**: `ws_bridge_tick_wire_rate` measures a duplex tick
+//! with no conversion (the control), against one converting uplink *and* downlink, so the price of
+//! asking for a rate the leg does not run at is a measured number rather than a guess — and the
+//! control proves a bridge that did not ask pays nothing. `ws_tee_write_pcm_20ms/mono_8k_to_16k` is
+//! the same cost isolated to a single (send-only) direction. `cargo bench -p siphon-rtp-media`.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_codec::g711::G711;
@@ -180,6 +186,76 @@ fn bench_long_ptime_tick(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// The **wire-rate conversion** cost on a duplex takeover tick. All three variants do identical work
+/// apart from the conversion — one µ-law ingress packet in, one L16 wire frame queued for playout,
+/// one tick that frames the uplink and encodes the downlink — so the delta against `identity_8k` is
+/// exactly what a leg pays for streaming at a rate it does not natively run at. Each converting
+/// variant engages **both** directions (leg→wire on the uplink, wire→leg on the downlink), which is
+/// what a real bridge at that rate does.
+fn bench_wire_rate_tick(criterion: &mut Criterion) {
+    use siphon_rtp_media::bridge::pcm_to_l16_le;
+    use siphon_rtp_media::bridge::wire_rate::wire_resampler;
+
+    const LEG_RATE_HZ: u32 = 8_000;
+    let mut group = criterion.benchmark_group("ws_bridge_tick_wire_rate");
+    let loud = [4000i16; FRAME_SAMPLES];
+
+    for (label, wire_rate) in [
+        ("identity_8k", 8_000u32),
+        ("wire_16k", 16_000),
+        ("wire_24k", 24_000),
+    ] {
+        group.bench_function(label, |bencher| {
+            let leg = MediaLeg::new(
+                Box::new(G711::ulaw()),
+                Box::new(G711::ulaw()),
+                JitterBuffer::new(1, 16),
+                0x5555_6666,
+                0,
+            );
+            let mut session = BridgeSession::new(
+                leg,
+                MediaFormat {
+                    encoding: Encoding::L16,
+                    sample_rate: wire_rate,
+                    channels: 1,
+                    bit_depth: 16,
+                    endianness: Endianness::Little,
+                    ptime: 20,
+                },
+                "str_1",
+                "call_1",
+                Direction::Duplex,
+                4,
+            )
+            .with_rate_conversion(
+                wire_resampler(LEG_RATE_HZ, wire_rate).expect("uplink conversion"),
+                wire_resampler(wire_rate, LEG_RATE_HZ).expect("downlink conversion"),
+            );
+
+            // One pre-built ingress packet whose sequence is bumped in place, and one pre-built wire
+            // frame at the negotiated rate — so the measured loop allocates nothing of its own beyond
+            // what the bridge itself does.
+            let wire_samples = wire_rate as usize / 1000 * 20;
+            let mut wire_frame = vec![0u8; wire_samples * 2];
+            pcm_to_l16_le(&vec![1500i16; wire_samples], &mut wire_frame);
+            let mut packet = ulaw_packet(0, &loud);
+            let mut sequence: u16 = 0;
+            let mut uplink = vec![0u8; 4096];
+            let mut downlink = vec![0u8; 4096];
+            bencher.iter(|| {
+                sequence = sequence.wrapping_add(1);
+                packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+                session.on_rtp(&packet);
+                session.on_ws_binary(black_box(&wire_frame));
+                let result = session.tick(&mut uplink, &mut downlink);
+                black_box(result)
+            });
+        });
+    }
+    group.finish();
+}
+
 /// An RTP packet carrying `pcm` as an L16 payload (RFC 3551 §4.5.11: network byte order).
 fn l16_packet(sequence: u16, pcm: &[i16]) -> Vec<u8> {
     let mut payload = vec![0u8; pcm.len() * 2];
@@ -245,6 +321,26 @@ fn bench_tee(criterion: &mut Criterion) {
         });
     });
 
+    group.bench_function("mono_8k_to_16k", |bencher| {
+        // The selectable-wire-rate shape: a narrowband leg upsampled into a wideband tee. Send-only,
+        // so this is the uplink conversion cost on its own, with no downlink in the measurement.
+        let plan = plan_ws_tee(format(16_000, 1), false, false);
+        let resampler =
+            siphon_rtp_dsp::resample::Resampler::new(8_000, 16_000).expect("build resampler");
+        let mut sink = WsTeeSink::new(
+            TeeChannel::Caller,
+            plan.mixer.clone(),
+            "tee",
+            Some(resampler),
+        );
+        bencher.iter(|| {
+            sink.write_pcm(black_box(&frame));
+            if let Ok(buffer) = plan.frames.try_recv() {
+                let _ = plan.recycle.send(buffer);
+            }
+        });
+    });
+
     group.bench_function("mono_16k_resampled_to_8k", |bencher| {
         let plan = plan_ws_tee(format(8000, 1), false, false);
         let resampler =
@@ -303,6 +399,7 @@ criterion_group!(
     bench_tick,
     bench_tick_with_echo_canceller,
     bench_long_ptime_tick,
+    bench_wire_rate_tick,
     bench_tee,
     bench_long_ptime_tee
 );

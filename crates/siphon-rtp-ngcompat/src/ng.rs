@@ -414,10 +414,12 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         ws_barge_in: false,
         ws_vad_threshold: None,
         ws_vad_hangover_ms: None,
+        ws_sample_rate: None,
         // The WS tee is a native siphon-rtp (JSON control) extension too — same rule as `ws_uri`.
         ws_tee: None,
         ws_tee_direction: None,
         ws_tee_channels: None,
+        ws_tee_sample_rate: None,
         // Text-event observability is a native siphon-rtp (JSON control) extension; the NG/bencode
         // front-end never requests it (a rtpengine-NG text relay still works, just without Event::Text).
         text_events: false,
