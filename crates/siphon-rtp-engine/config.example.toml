@@ -48,6 +48,42 @@ control = "127.0.0.1:8080"
 # Default: 30.
 # media_timeout_secs = 30
 
+# --- play_media from an http(s) URL --------------------------------------------------------------
+#
+# `play_media` can fetch a WAV prompt from a URL. The fetch runs on its own task (never on the media
+# path or the control connection) and every bound below is a hard stop — a fetch that outlives one
+# ends the playback with `play_finished` reason `error`, and the leg keeps relaying untouched.
+#
+# DNS + TCP connect + TLS, per redirect hop (CLI: --media-fetch-connect-timeout-ms). Default: 2000.
+# media_fetch_connect_timeout_ms = 2000
+#
+# Wait for response headers after the request is written (CLI: --media-fetch-first-byte-timeout-ms).
+# Default: 5000.
+# media_fetch_first_byte_timeout_ms = 5000
+#
+# The whole fetch — every redirect hop and the body read together (CLI: --media-fetch-timeout-ms).
+# Default: 15000. This is what stops a server that dribbles one byte per second.
+# media_fetch_timeout_ms = 15000
+#
+# Largest response body accepted, bytes (CLI: --media-fetch-max-bytes). Default: 8388608 (8 MiB,
+# about 8 minutes of 8 kHz mono WAV). Checked against Content-Length up front AND while reading, so
+# a chunked response that declares nothing is cut off too.
+# media_fetch_max_bytes = 8388608
+#
+# Redirect hops followed (CLI: --media-fetch-max-redirects). Default: 3. Every hop is re-validated
+# against the scheme rule and the allow-list, so an open redirect cannot walk the fetch elsewhere.
+# media_fetch_max_redirects = 3
+#
+# Hosts the engine may fetch from (CLI: --media-fetch-allow-host, repeatable). Exact,
+# case-insensitive match — no wildcards, no suffix matching.
+#
+# UNSET (the default) MEANS UNRESTRICTED: the engine will fetch any host it can route to, from its
+# own network position. That is an SSRF surface, bounded only by the http/https scheme rule. It is
+# an acceptable default because the control plane is authenticated and owns the call — if you do not
+# fully trust it, set this list, put the engine behind an egress policy, or leave the URL source
+# unused.
+# media_fetch_allow_host = ["prompts.internal.example"]
+
 # --- ICE candidate gathering (RFC 8445 §5.1.1) --------------------------------------------------
 #
 # STUN servers to probe for a server-reflexive candidate (CLI: --stun-server, repeatable). Default:

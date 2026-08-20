@@ -147,8 +147,9 @@ on the node is also rejected.
 
 | Verb | Fields | Purpose |
 |---|---|---|
-| `play_media` | `call_id`, `from_tag`, `source`, `repeat_times?`, `start_pos_ms?`, `duration_ms?`, `to_tag?` | Inject a WAV prompt toward a leg. `source` is tagged: `{"source": "file", "path": "..."}` or `{"source": "blob", "data": [...]}`. Accepts immediately (accept-on-start) with a `play_id`; the prompt's end is reported later by a matching `play_finished` event carrying the same `play_id`, so a controller correlates the completion without a late response racing the request timeout. |
-| `stop_media` | `call_id`, `from_tag` | Stop prompt/DTMF playback. |
+| `play_media` | `call_id`, `from_tag`, `source`, `repeat_times?`, `start_pos_ms?`, `duration_ms?`, `overlay?`, `gain_decibels?`, `to_tag?` | Play audio toward a leg. `source` is tagged — see [Playback sources](#playback-sources). Accepts immediately (accept-on-start) with a `play_id`; the playback's end is reported later by a matching `play_finished` event carrying the same `play_id`, so a controller correlates the completion without a late response racing the request timeout. By default the playback **supersedes** the leg's egress; `overlay` mixes it **under** the live stream instead — see [Overlay playback](#overlay-playback). |
+| `stop_media` | `call_id`, `from_tag`, `play_id?` | Stop playback. Without `play_id`, stops everything on the call (the superseding prompt, any DTMF burst, every overlay) — the original behaviour. With one, stops only that playback. Each stopped playback reports `play_finished` with reason `stopped`. |
+| `set_play_gain` | `call_id`, `from_tag`, `play_id`, `gain_decibels`, `to_tag?` | Retune a running playback's level without restarting it — how a music bed is ducked under a prompt and lifted again. An unknown `play_id` is an error, not a silent success. |
 | `play_dtmf` | `call_id`, `from_tag`, `code`, `duration_ms?`, `volume_dbm0?`, `pause_ms?`, `to_tag?` | Inject RFC 4733 telephone-events toward a leg. |
 | `silence_media` / `unsilence_media` | `call_id`, `from_tag` | Replace egress audio with comfort silence / resume. |
 | `block_media` / `unblock_media` | `call_id`, `from_tag` | Drop egress packets entirely / resume. |
@@ -161,14 +162,159 @@ Media-control honesty, in one place:
 
 - `play_media`, `play_dtmf`, `silence_media`, and `echo` require a media-processing
   (transcoding) call. A plain relay forwards opaque payloads and cannot synthesize into
-  them; the error says so.
+  them; the error says so. An offer-only single-leg call (and a plain relay) is *promoted*
+  into one by `play_media` itself.
 - `play_media` with `{"source": "db_id"}` is rejected (`db-id media source is not
-  supported`). Use `file` or `blob`.
+  supported`). Use `file`, `blob`, `tone` or `http`.
 - `block_dtmf` is rejected on a plain SRTP bridge or a WebSocket-bridged call, whose DTMF
   is not carried as clear telephone-events. A secure *transcode* call is fine (the actor
   sees clear RTP).
 - `block_media` on an SRTP bridge (non-transcoding) is rejected: the call is not answered
   as a plain relay and has no media actor to gate.
+- `block_media` also silences overlays: it drops the direction's egress entirely, and an
+  overlay is not a way around that.
+
+#### Playback sources
+
+`source` is internally tagged on `"source"`:
+
+| Tag | Fields | What it plays |
+|---|---|---|
+| `file` | `path` | A WAV on the engine host. |
+| `blob` | `data` | WAV bytes carried inline in the control frame. |
+| `tone` | `tone` | A synthesised call-progress tone — see [Tones](#tones). |
+| `http` | `url` | A WAV fetched over `http://` / `https://` by the engine — see [Playback from a URL](#playback-from-a-url). |
+| `db_id` | `id` | Rejected; there is no media database. |
+
+Recorded audio (`file`, `blob`, `http`) is 16-bit linear PCM WAV, any sample rate, any
+channel count — it is downmixed to mono and resampled onto the leg's codec rate. A `tone`
+is synthesised **at** the leg's rate and never resampled.
+
+#### Overlay playback
+
+`"overlay": true` mixes the playback **under** whatever the leg's egress is already
+carrying instead of replacing it: ringback beneath a leg that has not answered, hold music
+beneath silence, a background bed beneath a live conversation.
+
+- **Four slots per direction.** Each is addressed by its own `play_id` and ends with its
+  own `play_finished`. Starting a fifth is rejected with an error naming the cap (`no free
+  overlay slot (limit 4)`) — the four already running are untouched. A cap rather than a
+  displacement, because a controller that loses a playback it believes is running has no
+  way to notice.
+- **An overlay supersedes nothing**, including another overlay. Only a non-overlay
+  `play_media` supersedes, and it supersedes only the previous non-overlay playback.
+- **It rides the live stream when there is one** (one overlay frame per emitted egress
+  frame, so it plays at real time and adds no packets), and **carries the stream itself
+  when there is not** — which is what makes ringback toward a leg receiving no media work
+  at all.
+- Mixing accumulates in 32 bits and saturates to 16, so a loud overlay over loud speech
+  clips rather than wrapping.
+
+#### Gain
+
+`gain_decibels` sets a playback's level, in **whole decibels** relative to the source's own
+level. Range **−60 … +12 dB**, clamped (a request outside it lands on the nearer bound, it
+is not an error); omitted means 0 dB. It applies to overlay and superseding playback alike,
+and `set_play_gain` changes it on a playback that is already running.
+
+Attenuation is exact to better than 0.1 dB across the whole range (a Q16 fixed-point
+multiplier), and the result saturates, so `+12` on already-loud audio clips rather than
+wrapping. −60 dB is the floor rather than a mute: it is 1/1000 of the source's amplitude,
+inaudible under anything.
+
+#### Tones
+
+`{"source": "tone", "tone": "..."}` synthesises call-progress audio, so ringback and busy
+need no audio files provisioned. The string is a **preset name** or a **cadence spec**; the
+two are told apart by the `/` — no preset name contains one, and no cadence spec is valid
+without one.
+
+Every component is generated at −13 dBm0, so a two-frequency tone sums to the −10 dBm0
+nominal of ITU-T E.180/Q.35 §2. Every preset repeats forever (a call-progress tone plays
+until the call progresses): bound it with `duration_ms`, or `stop_media` it.
+
+| Preset | Frequencies | Cadence | Source |
+|---|---|---|---|
+| `ringback_eu` | 425 Hz | 1 s on / 4 s off | ETSI ETR 187 (1995-04) §4.2; 425 Hz per ITU-T E.180/Q.35 (03/98) §5.3 |
+| `busy_eu` | 425 Hz | 0.5 s on / 0.5 s off | ETSI ETR 187 §4.3; ITU-T E.180/Q.35 §6.4 |
+| `congestion_eu` | 425 Hz | 0.2 s on / 0.2 s off | ETSI ETR 187 §4.4; ITU-T E.180/Q.35 §6.4 |
+| `dial_eu` | 425 Hz | continuous | ETSI ETR 187 §4.1; ITU-T E.180/Q.35 §4.1, §4.3 |
+| `call_waiting_eu` | 425 Hz | 0.2 on / 0.6 off / 0.2 on / 3 s off | ETSI ETR 187 §4.6 |
+| `ringback_na` | 440 + 480 Hz | 2 s on / 4 s off | Telcordia GR-506-CORE §17.2.5; ITU-T E.180 Suppl. 2 (2003), United States |
+| `busy_na` | 480 + 620 Hz | 0.5 s on / 0.5 s off | Telcordia GR-506-CORE §17.2.6 |
+| `congestion_na` | 480 + 620 Hz | 0.25 s on / 0.25 s off | Telcordia GR-506-CORE §17.2.7 |
+| `dial_na` | 350 + 440 Hz | continuous | Telcordia GR-506-CORE §17.2.1 |
+| `call_waiting_na` | 440 Hz | 0.3 s on / 10 s off | Telcordia GR-506-CORE §14.2 / GR-571-CORE; ITU-T E.180 Suppl. 2, United States |
+| `ringback_uk` | 400 + 450 Hz | 0.4 on / 0.2 off / 0.4 on / 2 s off | ITU-T E.180 Suppl. 2 (2003), United Kingdom |
+| `busy_uk` | 400 Hz | 0.375 s on / 0.375 s off | ITU-T E.180 Suppl. 2, United Kingdom |
+| `congestion_uk` | 400 Hz | 0.4 on / 0.35 off / 0.225 on / 0.525 off | ITU-T E.180 Suppl. 2, United Kingdom |
+| `dial_uk` | 350 + 440 Hz | continuous | ITU-T E.180 Suppl. 2, United Kingdom |
+
+Three notes so the citations stay honest. ITU-T E.180/Q.35 specifies tone/silence as
+*envelopes* (ringing: tone 0.67–1.5 s, silence 3–5 s) and recommends 425 Hz, but never
+states one cadence — so the concrete European set cites **ETSI ETR 187**, whose values all
+sit inside those envelopes. The Telcordia clause numbers are quoted second-hand from
+CableLabs PacketCable NCS `PKT-SP-EC-MGCP-I10-040402` Appendix A, which reproduces them
+per-frequency; GR-506-CORE itself is paywalled. And two national tones fall outside E.180's
+*recommended* envelope (the NA 2 s ring tone, the UK 2 s silence) — that is the
+administration's choice, faithfully reproduced.
+
+**Cadence spec** — for anything the table does not cover:
+
+```text
+spec        = segment *( "," segment ) [ "*" repeat ]
+segment     = components "/" duration
+components  = component *( "+" component )
+component   = 1*DIGIT           ; frequency in Hz, 1..=4000; a single "0" means silence
+duration    = 1*DIGIT           ; segment length in ms, 1..=60000
+repeat      = 1*DIGIT / "inf"   ; whole-spec cycles, default 1; "inf" plays until stopped
+```
+
+At most 3 simultaneous components per segment and 8 segments per spec. Whitespace around
+any token is ignored. Examples:
+
+- `425/1000,0/4000*inf` — the European ringing cadence, forever.
+- `440+480/2000,0/4000*3` — a dual-frequency burst, three cycles.
+- `425/1000*inf` — continuous 425 Hz (back-to-back 1 s segments, no gap).
+
+A malformed spec is a control error naming the offending segment; it never starts a
+playback and never panics.
+
+#### Playback from a URL
+
+`{"source": "http", "url": "https://…/prompt.wav"}` has the engine fetch the WAV itself.
+The accept returns a `play_id` **immediately, with no `duration_ms`** — the length is not
+known until the body arrives — and the fetch runs on its own task, so a slow server never
+touches the media path or the control connection. Any failure resolves the playback with
+`play_finished` reason `error` under that `play_id`; `stop_media` in the window between the
+accept and the body cancels the fetch instead of letting it start playing later.
+
+Every bound is a hard stop, configurable on the daemon:
+
+| Bound | Flag / TOML key | Default |
+|---|---|---|
+| DNS + TCP + TLS, per hop | `--media-fetch-connect-timeout-ms` | 2000 ms |
+| Wait for response headers | `--media-fetch-first-byte-timeout-ms` | 5000 ms |
+| Whole fetch (redirects + body) | `--media-fetch-timeout-ms` | 15000 ms |
+| Response body size | `--media-fetch-max-bytes` | 8388608 (8 MiB) |
+| Redirect hops | `--media-fetch-max-redirects` | 3 |
+| Host allow-list | `--media-fetch-allow-host` (repeatable) | *empty = unrestricted* |
+
+The size cap is checked against `Content-Length` before a byte is buffered **and** enforced
+while reading, so a chunked response that declares nothing is cut off too.
+
+!!! warning "The URL is fetched from the engine's own network position"
+    This is an SSRF surface by construction, in the same way rtpengine's `file` source is a
+    local-filesystem surface. What bounds it: only `http` and `https` are accepted (no
+    `file:`, `ftp:`, `gopher:`), and **every redirect hop is re-validated** against that
+    rule and against the allow-list, so an open redirect cannot walk the fetch onto another
+    scheme or another host.
+
+    With no `--media-fetch-allow-host` the engine will fetch **any host it can route to**.
+    That is the right default only because the control plane is authenticated and owns the
+    call. If you do not fully trust it, set the allow-list (exact, case-insensitive host
+    match — no wildcards, no suffix matching), put the engine behind an egress policy, or
+    leave the URL source unused.
 
 ### Recording and forking
 
@@ -212,7 +358,7 @@ Every response is one of:
 
 | `result` | Payload |
 |---|---|
-| `ok` | Optional `sdp` (offer/answer/subscribe), `play_id` + `duration_ms` (play_media accept), `to_tag` (subscribe_request), `stats` (query). |
+| `ok` | Optional `sdp` (offer/answer/subscribe), `play_id` + `duration_ms` (play_media accept — `duration_ms` is absent when the length is not yet knowable: an endless tone with no cap, or a URL whose body has not arrived), `to_tag` (subscribe_request), `stats` (query). |
 | `pong` | none |
 | `list` | `call_ids` |
 | `statistics` | `statistics` counter object |
@@ -229,7 +375,7 @@ Events are pushed down the same TCP connection, tagged on `"event"`, with no `id
 |---|---|---|
 | `dtmf` | `call_id`, `from_tag`, `to_tag?`, `digit`, `duration_ms`, `volume`, `source?` | An RFC 4733 telephone-event completed on a leg of a media-processing call or a conference participant. Fires even while that leg's DTMF relay is blocked. |
 | `media_timeout` | `call_id`, `from_tag` | The call went silent past `--media-timeout-secs` and the engine reaped it. Release your own per-call state. |
-| `play_finished` | `call_id`, `from_tag`, `to_tag?`, `play_id`, `reason`, `played_ms?` | A `play_media` prompt ended. `play_id` matches the accept; `reason` is `completed` (drained in full, all repeats / the `duration_ms` cap), `stopped` (`stop_media`), `superseded` (a newer `play_media` on the same leg), or `error` (decode/source error or the leg was torn down mid-play). Only `completed` means the prompt finished on its own. |
+| `play_finished` | `call_id`, `from_tag`, `to_tag?`, `play_id`, `reason`, `played_ms?` | A `play_media` playback ended. `play_id` matches the accept; `reason` is `completed` (drained in full, all repeats / the `duration_ms` cap), `stopped` (`stop_media`, by `play_id` or call-wide), `superseded` (a newer non-overlay `play_media` on the same leg — an overlay supersedes nothing), or `error` (decode / source / URL-fetch failure, or the leg was torn down mid-play). Only `completed` means the playback finished on its own. **One event per playback**: four overlays ending give four events, each under its own `play_id`. |
 | `active_speaker` | `conference_id`, `from_tag?` | The dominant speaker in a conference changed; `from_tag` absent means the floor went silent. |
 | `call_quality` | `conference_id?` xor `call_id?`, `from_tag`, `jitter_ms`, `loss_percent`, `mos` | Periodic reception quality: RFC 3550 §6.4.1 interarrival jitter, residual loss, and an ITU-T G.107 E-model MOS estimate (1.0..=4.5). Fires every few seconds per conference participant (keyed by `conference_id`) and per 2-party relay or transcode leg (keyed by `call_id`); exactly one identifier is present. |
 | `text` | `call_id`, `from_tag`, `to_tag?`, `text`, `direction?` | Newly-recovered RFC 4103 real-time text (T.140) on a call's `m=text` stream. `text` is the UTF-8 increment this packet delivered (U+FFFD markers preserved where loss occurred, RFC 4103 §5.3); `from_tag` is the sending leg; `direction` is `a_to_b` / `b_to_a`. Requires `text_events`. |
@@ -377,6 +523,65 @@ Block a leg's DTMF relay, then observe the digit still arriving as an event:
   "duration_ms": 120,
   "volume": -8
 }
+```
+
+Ringback under a leg that has not answered, ducked when the announcement starts, then
+stopped on its own without touching the announcement:
+
+```json
+{
+  "id": 20,
+  "command": "play_media",
+  "call_id": "7f9a2b1c@198.51.100.20",
+  "from_tag": "a7c31f",
+  "source": {"source": "tone", "tone": "ringback_eu"},
+  "overlay": true,
+  "gain_decibels": -6
+}
+```
+
+```json
+{"id": 20, "result": "ok", "play_id": 41}
+```
+
+No `duration_ms` in the accept: the preset repeats forever, so there is no finite length to
+report. Start the announcement over the top of it (a normal, superseding play) and duck the
+ringback while it runs:
+
+```json
+{
+  "id": 21,
+  "command": "play_media",
+  "call_id": "7f9a2b1c@198.51.100.20",
+  "from_tag": "a7c31f",
+  "source": {"source": "http", "url": "https://prompts.internal.example/please-hold.wav"}
+}
+```
+
+```json
+{"id": 21, "result": "ok", "play_id": 42}
+```
+
+```json
+{"id": 22, "command": "set_play_gain", "call_id": "7f9a2b1c@198.51.100.20", "from_tag": "a7c31f", "play_id": 41, "gain_decibels": -20}
+```
+
+When the announcement drains it reports itself, under its own id, leaving the ringback
+running:
+
+```json
+{
+  "event": "play_finished",
+  "call_id": "7f9a2b1c@198.51.100.20",
+  "from_tag": "a7c31f",
+  "play_id": 42,
+  "reason": "completed",
+  "played_ms": 3400
+}
+```
+
+```json
+{"id": 23, "command": "stop_media", "call_id": "7f9a2b1c@198.51.100.20", "from_tag": "a7c31f", "play_id": 41}
 ```
 
 ## See also

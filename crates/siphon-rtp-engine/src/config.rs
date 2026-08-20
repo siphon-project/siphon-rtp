@@ -289,6 +289,35 @@ mod tests {
         assert_eq!(config.xdp_queue, Some(2));
     }
 
+    /// Every `play_media` URL-fetch bound deserializes, including the host allow-list array.
+    #[test]
+    fn deserializes_the_media_fetch_bounds() {
+        let toml = concat!(
+            "media_fetch_connect_timeout_ms = 1500\n",
+            "media_fetch_first_byte_timeout_ms = 4000\n",
+            "media_fetch_timeout_ms = 12000\n",
+            "media_fetch_max_bytes = 2097152\n",
+            "media_fetch_max_redirects = 1\n",
+            "media_fetch_allow_host = [\"prompts.internal.example\", \"cdn.internal.example\"]\n",
+        );
+        let config = FileConfig::parse_str(toml).expect("valid TOML deserializes");
+        assert_eq!(config.media_fetch_connect_timeout_ms, Some(1_500));
+        assert_eq!(config.media_fetch_first_byte_timeout_ms, Some(4_000));
+        assert_eq!(config.media_fetch_timeout_ms, Some(12_000));
+        assert_eq!(config.media_fetch_max_bytes, Some(2_097_152));
+        assert_eq!(config.media_fetch_max_redirects, Some(1));
+        assert_eq!(
+            config.media_fetch_allow_host.as_deref(),
+            Some(
+                [
+                    "prompts.internal.example".to_string(),
+                    "cdn.internal.example".to_string()
+                ]
+                .as_slice()
+            )
+        );
+    }
+
     /// The single-interface advertise-IP override deserializes (the 1:1-NAT / Elastic-IP case).
     #[test]
     fn deserializes_advertise_ip() {

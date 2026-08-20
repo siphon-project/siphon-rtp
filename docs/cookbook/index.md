@@ -15,6 +15,7 @@ in the shipped engine.
 | [Secure media (SRTP)](secure-srtp.md) | SDES-keyed SRTP legs (RFC 3711/4568): bridge a secure access leg to a plaintext core |
 | [WebRTC legs](webrtc.md) | DTLS-SRTP (RFC 5764); ICE-lite by default or the full RFC 8445 agent with `--ice-full` (connectivity checks, nomination, restart, trickle-receive); built-in TURN server plus a TURN client (engine API) for relayed candidates |
 | [Voice-AI streaming](voice-ai.md) | Bridge a call leg to a WebSocket media server: decode to L16 uplink, encode the downlink |
+| [Announcements, ringback & hold music](playback.md) | Prompts, call-progress tones and overlay playback: supersede or mix under the live stream, per-playback gain, WAV from a file, a blob or a URL |
 | [Conferencing](conferencing.md) | N-party mixed audio rooms (MCU): roles, active speaker, whisper/monitor, room bridging |
 | [NAT traversal & latching](nat.md) | Symmetric RTP done safely: gated latching, `received-from`, SDP address rewrite, hairpinning |
 | [Recording](recording.md) | Runtime pcap recording, `record-call` WAV capture, SIPREC media forking (RFC 7865/7866) |
