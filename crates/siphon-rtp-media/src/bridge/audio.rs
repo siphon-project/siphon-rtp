@@ -39,7 +39,7 @@
 //! The suppressor and canceller only exist at 8 or 16 kHz. A wire rate outside those leaves both
 //! **off** (logged once at `warn`) and the wire rate **unchanged** — degrading the feature, never
 //! silently overriding what the controller negotiated. The turn-taking VAD is unaffected either way:
-//! [`EnergyVad`] thresholds on *mean-square* energy, which is per-sample and so rate-independent, and
+//! [`siphon_rtp_dsp::EnergyVad`] thresholds on *mean-square* energy, which is per-sample and so rate-independent, and
 //! its hangover is counted in ptime frames, which are a duration, not a sample count.
 
 use std::collections::VecDeque;
