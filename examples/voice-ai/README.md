@@ -33,7 +33,12 @@ frames.
 
 - **Text frames**: a `{"type": ..., "data": ...}` JSON envelope (camelCase). The first is `start`,
   announcing `streamId` and the audio `media` format (`L16`, `sampleRate`, `ptime`, little-endian).
-- **Binary frames**: one raw little-endian L16 mono PCM frame per ptime (320 bytes at 8 kHz / 20 ms).
+  `sampleRate` is the **negotiated wire rate and is authoritative** in both directions — read it from
+  `start` (as `server.py` does) rather than assuming the codec's rate. It defaults to the leg's codec
+  rate, but the `ws_sample_rate` profile flag sets it independently, so an 8 kHz G.711 call can be
+  streamed at 16 kHz and the engine resamples both ways.
+- **Binary frames**: one raw little-endian L16 mono PCM frame per ptime —
+  `sampleRate / 1000 * ptime * 2` bytes, so 320 at 8 kHz / 20 ms and 640 at 16 kHz / 20 ms.
   Send binary frames back to play audio; no announcement needed.
 - **Barge-in**: send `clear` to flush queued playout; the engine replies with a `mark` named
   `cleared`.

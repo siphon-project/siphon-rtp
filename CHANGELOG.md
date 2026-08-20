@@ -7,6 +7,32 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+- **Selectable WebSocket wire sample rate.** The L16 rate a WS consumer exchanges is now negotiable
+  and independent of the leg's codec rate, on both WS shapes:
+  - `sample_rate` on `attach_ws_tee` and `ws_tee_sample_rate` in `ProfileFlags` — every tapped leg is
+    resampled into the requested rate before framing, so an 8 kHz G.711 call can be teed at 16 kHz
+    and a stereo tee over two different codecs produces one coherent stream. The `start` envelope's
+    `media.sampleRate` and the `ws_tee_started` event both report the **negotiated** rate.
+  - `ws_sample_rate` in `ProfileFlags` for the `ws_uri` takeover bridge, applied in **both**
+    directions (leg → wire on the uplink, wire → leg on the downlink before re-encoding).
+  - All three are strictly additive and optional; unset means exactly the previous behaviour (follow
+    the leg codec's PCM rate, with no conversion built at all). An unserviceable rate — zero, outside
+    8000–48000, or not a multiple of 1000 — is rejected with a typed error at attach/offer/answer
+    time, before anything is dialled, promoted or attached, and is never silently clamped.
+
+### Fixed
+- **WebSocket takeover downlink was rendered at the wrong rate.** A server sending playout PCM at
+  anything other than the leg's codec rate had it encoded sample-for-sample into the leg's codec, so
+  the call heard the right samples at the wrong speed and pitch with no error reported anywhere. The
+  downlink is now resampled into the leg's rate before the encode.
+
+### Changed
+- The WS bridge's uplink noise suppressor and echo canceller now run in the **wire** rate domain —
+  the domain the far side hears, and the only one that keeps the canceller's near-end input and
+  far-end reference in a single rate and frame length. A wire rate the noise suppressor does not
+  support (anything but 8/16 kHz) leaves it off with a `warn`, and never changes the negotiated rate.
+
 ### Fixed
 - **Security (RTPBleed class): a redirected ICE endpoint had no source gate at all.** The datapath's
   layer-4 ICE gate — media is accepted only from the transport a STUN connectivity check validated
