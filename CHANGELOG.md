@@ -7,6 +7,21 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The WS uplink VAD's trailing hangover was counted in milliseconds, not ptime frames** — a 0.3.0
+  regression from the detector-selection refactor, which moved the ms → frames conversion into
+  `WsVadConfig` and then called it with a hard-coded 1 ms ptime. `ws_vad_hangover_ms: 300` built an
+  energy gate holding speech for 300 *frames* (six seconds at a 20 ms ptime), and the 200 ms default
+  held it for four, so `speech_stopped` — the turn endpoint a voice-AI server commits ASR on — never
+  arrived inside a normal turn and the next `speech_started` could not fire either. `speech_started`
+  and barge-in were unaffected, which is what made it look like turn-taking still worked. The
+  detector is now built with the leg's own ptime. The pre-existing unit test only ever covered the
+  conversion helper, which was the half that was right, so the guard is a new end-to-end one: it
+  offers a leg with `ws_vad` and a 300 ms hangover, talks into it over real RTP, and counts the
+  uplink frames a WS server sees between `speech_started` and `speech_stopped` — 15 frames at the
+  leg's 20 ms ptime, against the 300 the defect produced.
+
 ## [0.3.0] — 2026-08-21
 
 ### Breaking changes
