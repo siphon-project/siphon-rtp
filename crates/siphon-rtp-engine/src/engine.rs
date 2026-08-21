@@ -2863,7 +2863,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // longer has. (The neural detector resamples anything that is not 16 kHz into itself.)
         if let Some(vad) = vad_config {
             let ptime_ms = codec.ptime_ms.max(1);
-            let detector = vad.build_detector(wire_rate)?;
+            let detector = vad.build_detector(wire_rate, ptime_ms)?;
             let minimum_speech_frames = vad.minimum_speech_frames(ptime_ms);
             tracing::debug!(
                 target: "media",
@@ -10001,18 +10001,24 @@ impl WsVadConfig {
         })
     }
 
-    /// Build the detector this config selects for a leg running at `pcm_rate_hz`.
+    /// Build the detector this config selects for a leg running at `pcm_rate_hz` with a
+    /// `ptime_ms` packetization.
+    ///
+    /// The ptime is what turns the energy gate's hangover from the duration the controller asked
+    /// for into the frame count the detector counts in. It is a parameter rather than a field
+    /// because the config is resolved from the profile at offer time, before a codec — and so a
+    /// ptime — has been picked.
     ///
     /// # Errors
     /// A human-readable reason the bridge could not be stood up. The neural detector is refused
     /// rather than silently downgraded to the energy one: a controller that asked for it did so to
     /// stop barge-in firing on noise, and quietly handing back the detector it was avoiding is the
     /// failure mode that costs someone an afternoon.
-    fn build_detector(&self, pcm_rate_hz: u32) -> Result<VoiceDetector, String> {
+    fn build_detector(&self, pcm_rate_hz: u32, ptime_ms: u8) -> Result<VoiceDetector, String> {
         match self.engine {
             WsVadEngine::Energy => Ok(VoiceDetector::energy(
                 self.threshold,
-                self.hangover_frames(1),
+                self.hangover_frames(ptime_ms),
             )),
             WsVadEngine::Neural => VoiceDetector::neural(pcm_rate_hz).map_err(|error| {
                 format!("neural VAD unavailable for a {pcm_rate_hz} Hz leg: {error}")
@@ -10742,9 +10748,52 @@ mod tests {
         assert_eq!(config.hangover_frames(20), 10);
         assert_eq!(config.minimum_speech_frames(20), 1);
         assert!(!config
-            .build_detector(8_000)
+            .build_detector(8_000, 20)
             .expect("energy is infallible")
             .is_neural());
+    }
+
+    #[test]
+    fn build_detector_converts_the_hangover_at_the_ptime_it_is_given() {
+        // Scope, stated plainly because it is easy to overclaim here: this covers
+        // `build_detector`'s **conversion** — the detector it returns holds speech for
+        // `hangover_ms / ptime_ms` frames — and nothing else. The ptime is a literal, so this can
+        // say nothing about whether the engine hands the helper the leg's real ptime.
+        //
+        // That wiring is where the 0.3.0 regression lived (the call site passed a hard-coded 1 ms,
+        // so a 300 ms hangover became 300 frames and `speech_stopped` never arrived), and it is
+        // covered end to end by
+        // `a_ws_takeover_leg_reaches_the_turn_endpoint_within_the_configured_hangover`.
+        let profile = ProfileFlags {
+            ws_vad: true,
+            ws_vad_hangover_ms: Some(300),
+            ..Default::default()
+        };
+        let config = WsVadConfig::from_profile(&profile).expect("requested");
+        let mut detector = config
+            .build_detector(8_000, 20)
+            .expect("energy is infallible");
+
+        // 20 ms at 8 kHz. Mean-square energy of the loud frame is 16e6, well over the 1e6 default.
+        let loud: Vec<i16> = (0..160)
+            .map(|index| if index % 2 == 0 { 4_000 } else { -4_000 })
+            .collect();
+        let silence = [0i16; 160];
+
+        assert!(detector.is_speech(&loud), "a loud frame is speech");
+        // 300 ms of hangover at a 20 ms ptime is 15 frames, so silence still reads as speech
+        // through the fifteenth …
+        for frame in 1..=15 {
+            assert!(
+                detector.is_speech(&silence),
+                "the hangover expired {frame} frames in; it should hold 15"
+            );
+        }
+        // … and the sixteenth is the turn endpoint, 320 ms after the last loud frame.
+        assert!(
+            !detector.is_speech(&silence),
+            "the detector held speech past 15 frames, so it was not built with hangover_ms / ptime_ms"
+        );
     }
 
     #[test]
@@ -10766,7 +10815,7 @@ mod tests {
         // Both telephony rates build; the narrowband leg is resampled into the detector.
         for rate in [8_000u32, 16_000] {
             assert!(config
-                .build_detector(rate)
+                .build_detector(rate, 20)
                 .expect("neural builds for a telephony rate")
                 .is_neural());
         }
@@ -10784,7 +10833,7 @@ mod tests {
         };
         let config = WsVadConfig::from_profile(&profile).expect("requested");
         let error = config
-            .build_detector(0)
+            .build_detector(0, 20)
             .expect_err("a zero rate is refused");
         assert!(
             error.contains("neural VAD unavailable"),
@@ -14620,6 +14669,18 @@ mod tests {
         packet.extend_from_slice(&ssrc.to_be_bytes());
         packet.extend_from_slice(&[payload_byte; 160]);
         packet
+    }
+
+    /// The µ-law byte a constant-`level` PCM sample encodes to, so a test can fill a frame with a
+    /// known energy without hand-computing the G.711 companding table.
+    fn ulaw_byte(level: i16) -> u8 {
+        use siphon_rtp_codec::g711::G711;
+        use siphon_rtp_codec::Encoder as _;
+        let mut encoded = [0u8; 1];
+        G711::ulaw()
+            .encode(&[level], &mut encoded)
+            .expect("one sample encodes to one byte");
+        encoded[0]
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -25432,6 +25493,207 @@ mod tests {
             rendered,
             Some((0, 160)),
             "one 20 ms µ-law frame at the leg's own 8 kHz rate"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ws_takeover_leg_reaches_the_turn_endpoint_within_the_configured_hangover() {
+        // Regression, driven end to end through the control plane. `WsVadConfig::build_detector`
+        // converts the trailing hangover from milliseconds into ptime frames, and the
+        // detector-selection refactor called it with a hard-coded 1 ms ptime. `ws_vad_hangover_ms:
+        // 300` therefore built an energy gate that held speech for 300 *frames* — six seconds at
+        // this leg's 20 ms ptime — so `speech_stopped`, the turn endpoint a voice-AI server commits
+        // ASR on, never arrived inside a normal turn. `speech_started` and barge-in kept working,
+        // which is what disguised it, and the debug log one statement away printed the correct
+        // frame count while the detector held 300.
+        //
+        // The conversion helper itself was never wrong, so calling `build_detector` directly with a
+        // literal ptime cannot see this — only the engine's own call site can. This test never
+        // names the helper: it offers a leg with `ws_vad`, lets the engine pick the codec, the
+        // ptime and the detector, and asserts on what the WS server observes.
+        //
+        // The measurement is a **logical frame clock, not wall time**: the bridge stages at most one
+        // uplink frame per ptime tick and emits exactly one binary WS frame per staged frame, and an
+        // empty jitter buffer starves rather than conceals (`JitterBuffer::pop`), so one binary
+        // frame is one frame the detector classified. Counting binary frames between the
+        // `speech_started` and `speech_stopped` text frames measures the hangover in frames however
+        // fast or slow the box is. The timeouts below are liveness nets, never the measurement.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use futures_util::StreamExt;
+        use siphon_rtp_media::bridge::protocol::ControlMessage;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio_tungstenite::tungstenite::Message;
+
+        /// The hangover the controller asks for. At the leg's 20 ms ptime that is 15 frames.
+        const HANGOVER_MS: u32 = 300;
+        /// The turn endpoint must land within this many uplink frames of `speech_started`. Measured
+        /// at 17-18 on this harness: the 15 hangover frames, plus the one or two already-queued loud
+        /// frames that still drain after the talker falls silent. The *worst case* is bounded rather
+        /// than hoped for — a stalled talker task makes `tokio::time::interval` burst its missed
+        /// ticks, but the jitter buffer caps at 16 packets and drops the excess (it advances the
+        /// cursor, so no concealment is manufactured either), so no more than 16 loud frames can
+        /// still be in flight when the talker goes quiet: 16 + 15 = 31 is the ceiling even on a
+        /// wedged box. 40 clears that and is still 7.5x under the 300 frames a millisecond-counted
+        /// hangover produces.
+        const MAX_FRAMES_TO_ENDPOINT: usize = 40;
+        /// Below this the hangover would be too *short* to be the 300 ms that was asked for — a leg
+        /// whose ptime was misread as 40 ms, say, would endpoint at around 7 frames. The floor is 15
+        /// (silence cannot reach the detector before the edge that reports it), so this has the same
+        /// kind of margin underneath as the ceiling has above.
+        const MIN_FRAMES_TO_ENDPOINT: usize = 10;
+        /// Stop reading rather than hang if the bridge goes quiet without reaching either edge.
+        const MAX_FRAMES_READ: usize = 2_000;
+
+        // A WS server that forwards everything it receives. This test asserts on the engine's
+        // uplink and turn signals, so it never plays anything back into the call.
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
+        let ws_addr = ws_listener.local_addr().expect("ws addr");
+        let (ws_tx, ws_rx) = flume::unbounded::<Message>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = ws_listener.accept().await.expect("accept ws");
+            let socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws handshake");
+            let (_sink, mut source) = socket.split();
+            while let Some(Ok(message)) = source.next().await {
+                if ws_tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-vad-hangover".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some(format!("ws://{ws_addr}/stream")),
+                        ws_vad: true,
+                        ws_vad_hangover_ms: Some(HANGOVER_MS),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        assert!(matches!(offer, CmdResult::Ok { .. }), "{offer:?}");
+        // The answer returns A's own endpoint — the one the bridge redirected, and the one phone A
+        // has to send to for its media to reach the WS leg.
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ws-vad-hangover".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("answer reply")
+            .remote_rtp;
+
+        // The talker: 20 ms µ-law frames, loud until this test has seen `speech_started`, silent
+        // from then on. Paced at the leg's own ptime so the shallow jitter buffer (target 1, cap 16)
+        // neither backs up nor is ever asked to conceal, which is what keeps one sent packet equal
+        // to one classified frame. Loud is the same 4000-amplitude frame the bridge core's own VAD
+        // tests use — mean-square energy 16e6, well over the 1e6 default threshold — and silence
+        // encodes to zero, which is under it.
+        let loud = ulaw_byte(4_000);
+        let silence = ulaw_byte(0);
+        let talker_silent = Arc::new(AtomicBool::new(false));
+        let sender_silent = Arc::clone(&talker_silent);
+        let talker = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(20));
+            for sequence in 0..1_000u16 {
+                ticker.tick().await;
+                let payload_byte = if sender_silent.load(Ordering::Relaxed) {
+                    silence
+                } else {
+                    loud
+                };
+                if phone_a
+                    .send_to(
+                        &ulaw_rtp_packet(sequence, 0x0A0A_0A0A, payload_byte),
+                        near_addr,
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let mut started = false;
+        let mut frames_since_start = 0usize;
+        let mut frames_to_endpoint = None;
+        for _ in 0..MAX_FRAMES_READ {
+            let message = timeout(Duration::from_secs(5), ws_rx.recv_async())
+                .await
+                .expect("the bridge kept the socket busy")
+                .expect("the ws server stayed up");
+            match message {
+                Message::Text(text) => match ControlMessage::from_json(text.as_str()) {
+                    Ok(ControlMessage::SpeechStarted(_)) => {
+                        started = true;
+                        talker_silent.store(true, Ordering::Relaxed);
+                    }
+                    Ok(ControlMessage::SpeechStopped(_)) => {
+                        frames_to_endpoint = Some(frames_since_start);
+                        break;
+                    }
+                    _ => {}
+                },
+                // One binary frame is one 20 ms frame the detector classified. Frames before the
+                // speech edge are the talker warming up and are not part of the hangover.
+                Message::Binary(_) if started => {
+                    frames_since_start += 1;
+                    if frames_since_start > MAX_FRAMES_TO_ENDPOINT {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        talker.abort();
+        server.abort();
+
+        assert!(
+            started,
+            "the loud uplink never produced a speech_started edge"
+        );
+        let Some(frames_to_endpoint) = frames_to_endpoint else {
+            panic!(
+                "no speech_stopped after {frames_since_start} uplink frames: a {HANGOVER_MS} ms \
+                 hangover at this leg's 20 ms ptime is 15 frames, so the turn endpoint must land \
+                 inside {MAX_FRAMES_TO_ENDPOINT} — a hangover counted in milliseconds instead of \
+                 ptime frames holds speech for {HANGOVER_MS} frames (six seconds) and the server \
+                 never gets to commit the turn"
+            );
+        };
+        assert!(
+            (MIN_FRAMES_TO_ENDPOINT..=MAX_FRAMES_TO_ENDPOINT).contains(&frames_to_endpoint),
+            "the turn endpoint landed {frames_to_endpoint} uplink frames after speech_started; a \
+             {HANGOVER_MS} ms hangover at a 20 ms ptime is 15 frames, so it belongs in \
+             {MIN_FRAMES_TO_ENDPOINT}..={MAX_FRAMES_TO_ENDPOINT}"
         );
     }
 
