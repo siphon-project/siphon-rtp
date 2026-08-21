@@ -6,14 +6,21 @@
 # `[package.metadata.generate-rpm]` + the systemd unit / EnvironmentFile / logrotate under dist/
 # and etc/), a Docker image, and SBOMs. Differences from siphon-sip:
 #   * no Python/libsctp/PyO3 setup, no PyPI job (there is no Python SDK);
-#   * NO crates.io job — the workspace is not published to crates.io from here; the `.deb`/`.rpm`,
-#     the Docker image and the tarballs ARE the distribution;
+#   * ONE crates.io job, and only for `siphon-rtp-proto` — the control contract is a library that
+#     controllers (SIPhon and anyone else) compile against, so it has to be on crates.io at the same
+#     version as the engine that speaks it. Every other member of the workspace is a daemon or an
+#     internal crate and is NOT published: the `.deb`/`.rpm`, the Docker image and the tarballs ARE
+#     the distribution for those. Do not widen this to `--workspace`.
 #   * docker builds the Dockerfile's `runtime` (musl/distroless) target.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  # Run against an existing tag (`gh workflow run release.yaml --ref vX.Y.Z`) to publish the contract
+  # crate for a release that shipped before this job existed. Only the version gate and the crates.io
+  # job run on a dispatch — the binaries, image and GitHub Release are already published.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,9 +50,37 @@ jobs:
             exit 1
           fi
 
+  # ── Publish the control contract to crates.io ────────────────────────────
+  # `siphon-rtp-proto` is the only published crate: it is the JSON control contract a controller
+  # compiles against, so it must exist on crates.io at the same version as the engine that speaks it.
+  # Everything else in the workspace ships as a binary. **Never widen this to `--workspace`** — the
+  # rest of the members are daemons and internal crates and must not appear on the registry.
+  #
+  # Auth is crates.io Trusted Publishing (OIDC): no long-lived token in repository secrets. It has to
+  # be enabled once on the crate (crates.io → siphon-rtp-proto → Settings → Trusted Publishing) for
+  # repository `siphon-project/siphon-rtp` and workflow `release.yaml`. Without that the exchange step
+  # fails closed and the job errors rather than silently skipping the publish.
+  crates-io:
+    name: publish siphon-rtp-proto to crates.io
+    runs-on: ubuntu-latest
+    needs: verify-version
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish the contract crate (and only that crate)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p siphon-rtp-proto --locked
+
   # ── Build the engine binary + tarball (per target) ───────────────────────
   build:
     needs: verify-version
+    if: github.event_name == 'push'
     strategy:
       matrix:
         include:
@@ -137,6 +172,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     needs: build
+    if: github.event_name == 'push'
     permissions:
       contents: read
       packages: write # push to ghcr.io/<owner>/<repo>
@@ -178,6 +214,7 @@ jobs:
   sbom:
     runs-on: ubuntu-latest
     needs: verify-version
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -199,6 +236,7 @@ jobs:
   github-release:
     runs-on: ubuntu-latest
     needs: [build, docker, sbom]
+    if: github.event_name == 'push'
     permissions:
       contents: write # create the release and upload assets
     steps:
