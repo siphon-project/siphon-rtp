@@ -17,10 +17,22 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Run against an existing tag (`gh workflow run release.yaml --ref vX.Y.Z`) to publish the contract
-  # crate for a release that shipped before this job existed. Only the version gate and the crates.io
-  # job run on a dispatch — the binaries, image and GitHub Release are already published.
+  # Publish the contract crate for a release that shipped before the crates.io job existed. Dispatch
+  # from the DEFAULT BRANCH and name the tag as an input — GitHub reads the workflow definition from
+  # the ref being dispatched, so `--ref <old tag>` cannot work: the file at that tag has no
+  # `workflow_dispatch` trigger. The jobs check the named tag out, so the crate published is the
+  # tagged source and not whatever the branch has drifted to.
+  #
+  #   gh workflow run release.yaml --ref main -f tag=vX.Y.Z
+  #
+  # Only the version gate and the crates.io job run on a dispatch — the binaries, the image and the
+  # GitHub Release were already published by the original tag push.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish the contract crate from (e.g. v0.3.0)"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,9 +52,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # On a dispatch the interesting tree is the tag named in the input, not the branch the
+          # workflow definition came from.
+          ref: ${{ inputs.tag || github.ref }}
       - name: Workspace version must equal the tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
           echo "tag=$tag_version cargo=$cargo_version"
           if [ "$tag_version" != "$cargo_version" ]; then
@@ -69,6 +87,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
