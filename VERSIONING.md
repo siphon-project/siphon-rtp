@@ -83,9 +83,19 @@ crates.io → `siphon-rtp-proto` → Settings → Trusted Publishing, for reposi
 `siphon-project/siphon-rtp` and workflow `release.yaml`. There is no long-lived
 token in repository secrets, and the job fails closed if the exchange is refused.
 
-A tag that shipped before the publish job existed can be published after the fact
-with `gh workflow run release.yaml --ref vX.Y.Z` — on a manual dispatch only the
-version gate and the crates.io job run, so nothing is rebuilt or re-released.
+A tag that shipped before the publish job existed can be published after the fact.
+Dispatch from the **default branch** and name the tag as an input:
+
+```
+gh workflow run release.yaml --ref main -f tag=vX.Y.Z
+```
+
+`--ref vX.Y.Z` does **not** work for such a tag: GitHub reads the workflow
+definition from the ref being dispatched, and the file at an older tag has no
+`workflow_dispatch` trigger, so the API rejects it with a 422. The jobs check out
+the tag named in the input, so the crate published is the tagged source rather than
+whatever the branch has drifted to. On a dispatch only the version gate and the
+crates.io job run — nothing is rebuilt or re-released.
 
 **Never hand-edit a per-crate version.** They all inherit the workspace version by
 construction, which is what keeps them in lockstep.
