@@ -7,6 +7,11 @@
 //! flat across thousands of completed calls. Gate on `allocated` (live bytes), never RSS — jemalloc
 //! retains freed pages, so RSS is too noisy to gate on. A rising `allocated` at steady state is a
 //! real leak (a stranded `Call`, a recv task whose socket/buffer never freed).
+//!
+//! Two things have to be true before `allocated` means that, and both are set up here rather than
+//! assumed: the counter has to report live bytes rather than thread-cache residue (see
+//! [`malloc_conf`]), and the engine's own *bounded* one-off steady-state cost has to be behind us
+//! before the window opens (see [`LeakGate`]).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -28,10 +33,227 @@ static SOAK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Turns jemalloc's thread cache off **for this test binary only**, because with it on
+/// `stats.allocated` does not mean live bytes.
+///
+/// A free that lands in a thread's cache does not move the bin's `ndalloc`; only flushing the cache
+/// back to the arena does. `stats.allocated` is derived from `nmalloc - ndalloc`, so every region
+/// sitting in some Tokio worker's cache is still counted as allocated. At a quiesced steady state
+/// that residue is whatever the workers happened to be holding when the sample was taken: measured
+/// on this file it moved the same 2400-cycle churn between −165 KB and +451 KB run to run, the same
+/// order as the leak budget itself. That is the noise these soaks were flaking on.
+///
+/// With the cache off the counter is exact and the same churn reports the *identical* byte count
+/// segment after segment. It can only remove false positives, never hide a leak — a leak still
+/// allocates, and an allocation is counted the moment it is made whether or not a cache exists.
+///
+/// `_rjem_` is the symbol prefix `tikv-jemalloc-sys` builds jemalloc with. If that ever changes the
+/// symbol is silently ignored, so [`LeakGate::new`] asserts `opt.tcache` actually came back off
+/// rather than letting the soaks quietly go back to measuring cache residue.
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8; 13] = b"tcache:false\0";
+
 /// Live bytes currently allocated, per jemalloc. Advancing the epoch refreshes the cached stats.
 fn allocated_bytes() -> usize {
     tikv_jemalloc_ctl::epoch::advance().expect("advance jemalloc epoch");
     tikv_jemalloc_ctl::stats::allocated::read().expect("read jemalloc allocated")
+}
+
+/// Live bytes once teardown has actually finished, rather than whenever the sample was asked for.
+///
+/// Aborting a task only *schedules* it: the socket, the actor's buffers and its codec state come
+/// back when the runtime next polls it, on whichever worker owns it. A fixed number of yields gives
+/// that a chance but no guarantee, and sampling into the window reads a call that is on its way out
+/// as still live. Measured on the conference soak that transient is 75–260 KB — most of the old leak
+/// budget, appearing and vanishing between otherwise identical runs, which is exactly the shape that
+/// makes a soak flake.
+///
+/// So a sample is not one read. It is reads separated by yields until the number stops moving, which
+/// is the observable actually being waited on. Bounded, so a genuine hang fails the soak on its
+/// assertion rather than spinning forever.
+///
+/// Yields alone are not enough. An actor that only observes its own shutdown on its next tick does
+/// not retire because the loop spun — a promoted overlay leg is one ptime away from noticing, and
+/// until it does, its jitter buffer, codec state and four overlay slots are counted as live. That
+/// showed up as the overlay soak sitting on either of two exact values 135 864 bytes apart, flipping
+/// between them segment after segment for thousands of cycles and never converging. So the loop lets
+/// real time pass as well, which is what those teardowns are actually waiting on.
+async fn allocated_when_quiesced() -> usize {
+    let mut previous = allocated_bytes();
+    for _ in 0..256 {
+        quiesce().await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let settled = allocated_bytes();
+        if settled == previous {
+            return settled;
+        }
+        previous = settled;
+    }
+    previous
+}
+
+/// Churn until live bytes stop growing, then prove they stay there.
+///
+/// A single `warm up → before → churn → after` pair cannot tell a leak from the engine's *bounded*
+/// one-off steady-state cost, and that cost is not small. Every `DashMap` in the engine, the media
+/// pipeline and the datapath allocates its shard array up front but each shard's hash table only on
+/// that shard's first insert — and a hash table is never given back when its last entry is removed.
+/// Churning calls with fresh keys walks the shards in effectively random order, so the soak keeps
+/// discovering untouched ones for hundreds of cycles before it has hit them all. `DashMap` sizes
+/// itself as `(available_parallelism * 4).next_power_of_two()` shards, so both the height of that
+/// plateau and the number of cycles needed to top out scale with the core count of the machine
+/// running the test: measured here, ~1 KB reached inside ~200 cycles on 2 cores against ~600 KB
+/// needing ~800 cycles on 24. No fixed warmup is right on both, and when it is too short the
+/// leftover ramp lands inside the measurement window and reads as a leak.
+///
+/// So this does not guess a warmup. It churns segment after segment until several in a row come
+/// back flat, and only the growth *after* that counts. Bounded work converges; a leak does not, and
+/// fails either by never settling or by the growth once it has.
+struct LeakGate {
+    /// Names the soak in the failure message.
+    label: &'static str,
+    /// Churn cycles per measured segment.
+    cycles_per_segment: usize,
+    /// Segments the steady state is allowed to converge in before the soak gives up.
+    max_settle_segments: usize,
+    /// `allocated` before any churn, then after every segment.
+    samples: Vec<usize>,
+    /// Consecutive flat segments ending at the most recent sample.
+    flat_streak: usize,
+}
+
+impl LeakGate {
+    /// Growth per churned cycle that still counts as flat. Per cycle rather than per segment so the
+    /// bar means the same thing whatever a soak sizes its segments at. Measured across every soak in
+    /// this file with the thread cache off, a converged one moves by single-digit bytes per cycle
+    /// (the last few shards being discovered) while one still on the ramp moves by hundreds.
+    const FLAT_BYTES_PER_CYCLE: usize = 16;
+
+    /// Consecutive flat segments that declare the steady state reached. The plateau is not
+    /// approached smoothly — it is climbed in ~6 KB steps, one shard's hash table at a time, and the
+    /// last few of those are hundreds of cycles apart. A short streak keeps landing between two of
+    /// them and calls the ramp finished while it is not, which puts the next step inside the
+    /// verification window and reads as a leak. Five, so a soak has to be genuinely quiet for
+    /// [`Self::SETTLE_STREAK`] × its segment length before anything is measured.
+    const SETTLE_STREAK: usize = 5;
+
+    /// Segments that must stay flat once live bytes have converged. Each of them has to clear the
+    /// per-segment bar on its own *and* their combined growth has to clear the same bar over their
+    /// combined cycles — so a single late shard does not get a budget to hide in. It simply resets
+    /// the streak and the soak keeps churning, which a bounded plateau survives and a leak does not.
+    const VERIFY_SEGMENTS: usize = 5;
+
+    /// The unbroken run of flat segments the soak is looking for: long enough to be sure the ramp
+    /// is over, then the ones that are actually measured.
+    const FLAT_RUN: usize = Self::SETTLE_STREAK + Self::VERIFY_SEGMENTS;
+
+    /// The flat bar over `cycles` churned cycles.
+    fn flat_bytes(cycles: usize) -> usize {
+        Self::FLAT_BYTES_PER_CYCLE * cycles
+    }
+
+    async fn new(
+        label: &'static str,
+        cycles_per_segment: usize,
+        max_settle_segments: usize,
+    ) -> Self {
+        assert!(
+            !tikv_jemalloc_ctl::opt::tcache::read().expect("read opt.tcache"),
+            "{label}: jemalloc's thread cache is on, so `stats.allocated` counts cache-resident \
+             frees as live and this soak would measure noise — see `malloc_conf`"
+        );
+        assert!(
+            max_settle_segments >= Self::SETTLE_STREAK + Self::VERIFY_SEGMENTS,
+            "{label}: the settle budget cannot be shorter than the flat run it has to find"
+        );
+        // Sized so no segment sample can reallocate inside a measurement window.
+        let mut samples = Vec::with_capacity(max_settle_segments + 1);
+        // Prime jemalloc's stat machinery so the baseline is not itself a first-read allocation.
+        let _prime = allocated_bytes();
+        samples.push(allocated_when_quiesced().await);
+        Self {
+            label,
+            cycles_per_segment,
+            max_settle_segments,
+            samples,
+            flat_streak: 0,
+        }
+    }
+
+    /// Churn cycles the caller should run before the next [`Self::sample`].
+    fn cycles_per_segment(&self) -> usize {
+        self.cycles_per_segment
+    }
+
+    /// Segments churned so far.
+    fn segments_run(&self) -> usize {
+        self.samples.len() - 1
+    }
+
+    /// Whether another segment of churn is needed — `false` once a long enough flat run has been
+    /// seen, or once the settle budget is spent, which [`Self::assert_no_leak`] then reports as the
+    /// leak it is.
+    fn needs_more_churn(&self) -> bool {
+        self.flat_streak < Self::FLAT_RUN && self.segments_run() < self.max_settle_segments
+    }
+
+    /// Sample live bytes after a segment of churn, once teardown has finished.
+    async fn sample(&mut self) {
+        let now = allocated_when_quiesced().await;
+        let previous = self.samples[self.samples.len() - 1];
+        self.samples.push(now);
+        if now.saturating_sub(previous) <= Self::flat_bytes(self.cycles_per_segment) {
+            self.flat_streak += 1;
+        } else {
+            // Not the plateau after all. Nothing measured so far counts.
+            self.flat_streak = 0;
+        }
+    }
+
+    /// The whole series, so a CI failure is diagnosable without a rerun.
+    fn series(&self) -> String {
+        self.samples
+            .iter()
+            .enumerate()
+            .map(|(segment, allocated)| {
+                format!("{}:{allocated}", segment * self.cycles_per_segment)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The gate: live bytes converged, and stayed converged.
+    fn assert_no_leak(&self) {
+        assert!(
+            self.flat_streak >= Self::FLAT_RUN,
+            "{} never reached a steady state — live bytes were still climbing after {} churned \
+             cycles, which is what a leak looks like (cycle:allocated {})",
+            self.label,
+            self.segments_run() * self.cycles_per_segment,
+            self.series()
+        );
+        let settled_at = self.segments_run() - Self::VERIFY_SEGMENTS;
+        let verified_cycles = Self::VERIFY_SEGMENTS * self.cycles_per_segment;
+        let grew = self.samples[self.samples.len() - 1].saturating_sub(self.samples[settled_at]);
+        let budget = Self::flat_bytes(verified_cycles);
+        // Captured by libtest unless `--nocapture`, and replayed when the assertion below fires.
+        println!(
+            "{}: settled at cycle {}, grew {grew} bytes (budget {budget}) over the \
+             {verified_cycles} verified cycles (cycle:allocated {})",
+            self.label,
+            settled_at * self.cycles_per_segment,
+            self.series()
+        );
+        assert!(
+            grew <= budget,
+            "{} leaked {grew} bytes (budget {budget}) over the {verified_cycles} cycles churned \
+             after live bytes settled at cycle {} (cycle:allocated {})",
+            self.label,
+            settled_at * self.cycles_per_segment,
+            self.series()
+        );
+    }
 }
 
 /// A two-port SDP (RTP + default RTCP at port+1). Documentation-range address (RFC 5737), never real.
@@ -104,34 +326,25 @@ async fn quiesce() {
 async fn offer_answer_delete_does_not_leak() {
     let _serialized = SOAK.lock().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
-    let _prime = allocated_bytes();
-
-    // Warm up to steady state (jemalloc arenas, tokio caches, DashMap shards all settled).
-    for index in 0..200 {
-        offer_answer_delete(&engine, index).await;
-    }
-    quiesce().await;
-    assert_eq!(engine.session_count(), 0, "registry empty after warmup");
-    let before = allocated_bytes();
 
     // Each call allocates four endpoints (2× RTP + 2× RTCP) plus SDP strings and a registry entry,
-    // and frees them all on delete. Across 2000 completed calls, live bytes must not climb.
-    for index in 200..2_200 {
-        offer_answer_delete(&engine, index).await;
+    // and frees them all on delete. Once live bytes settle they must stay settled.
+    let mut gate = LeakGate::new("plain relay", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            offer_answer_delete(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
     }
-    quiesce().await;
-    let after = allocated_bytes();
-
-    assert_eq!(engine.session_count(), 0, "registry drained after soak");
-
-    // A small steady-state drift is allowed (lazy arena / thread-cache growth); a real leak over
-    // 2000 churned calls would dwarf it.
-    let tolerance = 512 * 1024;
-    assert!(
-        after <= before + tolerance,
-        "engine leaked {} bytes over 2000 churned calls (before={before}, after={after})",
-        after.saturating_sub(before)
-    );
+    gate.assert_no_leak();
 }
 
 /// Churn one conference room through `join ×3 → leave ×3` — the room actor spawns on the first join
@@ -238,31 +451,25 @@ async fn record_start_stop_does_not_leak() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_string_lossy().into_owned();
     let engine = Engine::new(UdpLoopbackDatapath::new());
-    let _prime = allocated_bytes();
 
-    // Warm up: promote/demote paths, the drain task's blocking-pool threads, and jemalloc all settle.
-    for index in 0..100 {
-        record_start_stop(&engine, &path, index).await;
+    // Each cycle promotes a relay (spawning a drain task) and demotes + deletes it. Once live bytes
+    // settle they must stay settled — no stranded promoted actor, capture channel, or drain task.
+    let mut gate = LeakGate::new("recording", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            record_start_stop(&engine, &path, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
     }
-    quiesce().await;
-    assert_eq!(engine.session_count(), 0, "registry empty after warmup");
-    let before = allocated_bytes();
-
-    // Each cycle promotes a relay (spawning a drain task) and demotes + deletes it. Across 500 cycles
-    // live bytes must not climb — no stranded promoted actor, capture channel, or drain task.
-    for index in 100..600 {
-        record_start_stop(&engine, &path, index).await;
-    }
-    quiesce().await;
-    let after = allocated_bytes();
-
-    assert_eq!(engine.session_count(), 0, "registry drained after soak");
-    let tolerance = 512 * 1024;
-    assert!(
-        after <= before + tolerance,
-        "recording leaked {} bytes over 500 churned record cycles (before={before}, after={after})",
-        after.saturating_sub(before)
-    );
+    gate.assert_no_leak();
 }
 
 /// One overlay-playback cycle on a fresh call: promote by starting four tone overlays (the slot
@@ -362,70 +569,50 @@ async fn overlay_play_cycle(engine: &Engine<UdpLoopbackDatapath>, index: usize) 
 async fn overlay_playback_start_stop_does_not_leak() {
     let _serialized = SOAK.lock().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
-    let _prime = allocated_bytes();
-
-    // Warm up: the promote path, the media actor, its overlay bus and every slot's scratch settle.
-    for index in 0..50 {
-        overlay_play_cycle(&engine, index).await;
-    }
-    quiesce().await;
-    assert_eq!(engine.session_count(), 0, "registry empty after warmup");
-    let before = allocated_bytes();
 
     // Each cycle promotes a relay, fills all four overlay slots (each with its own tone generator,
     // re-framer and mix scratch), retunes one, stops one, and tears the call down with two still
-    // running. Across 300 cycles live bytes must not climb.
-    for index in 50..350 {
-        overlay_play_cycle(&engine, index).await;
+    // running. Once live bytes settle they must stay settled.
+    let mut gate = LeakGate::new("overlay playback", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            overlay_play_cycle(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
     }
-    quiesce().await;
-    let after = allocated_bytes();
-
-    assert_eq!(engine.session_count(), 0, "registry drained after soak");
-    let tolerance = 512 * 1024;
-    assert!(
-        after <= before + tolerance,
-        "overlay playback leaked {} bytes over 300 churned calls (before={before}, after={after})",
-        after.saturating_sub(before)
-    );
+    gate.assert_no_leak();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conference_join_leave_does_not_leak() {
     let _serialized = SOAK.lock().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
-    let _prime = allocated_bytes();
-
-    // Warm up: rooms, per-participant mixers/jitter, endpoints all settle into steady state.
-    for index in 0..100 {
-        conference_join_leave(&engine, index).await;
-    }
-    quiesce().await;
-    assert_eq!(
-        engine.conference().room_count(),
-        0,
-        "rooms drained after warmup"
-    );
-    let before = allocated_bytes();
 
     // Each cycle spawns a room actor + 3 participant legs/endpoints and frees them all on leave.
-    for index in 100..1_100 {
-        conference_join_leave(&engine, index).await;
+    let mut gate = LeakGate::new("conferences", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            conference_join_leave(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.conference().room_count(),
+            0,
+            "rooms drained after every segment"
+        );
+        gate.sample().await;
     }
-    quiesce().await;
-    let after = allocated_bytes();
-
-    assert_eq!(
-        engine.conference().room_count(),
-        0,
-        "rooms drained after soak"
-    );
-    let tolerance = 512 * 1024;
-    assert!(
-        after <= before + tolerance,
-        "conferences leaked {} bytes over 1000 churned rooms (before={before}, after={after})",
-        after.saturating_sub(before)
-    );
+    gate.assert_no_leak();
 }
 
 /// A local WebSocket server that accepts connection after connection and drains every frame — the
@@ -554,40 +741,33 @@ async fn ws_tee_attach_detach_does_not_leak() {
     let _serialized = SOAK.lock().await;
     let (uri, live) = tee_sink_server().await;
     let engine = Engine::new(UdpLoopbackDatapath::new());
-    let _prime = allocated_bytes();
 
-    // Warm up: the promote/demote paths, the dialled TCP+WebSocket stack, the tee's preallocated
-    // buffer pool and jemalloc's arenas all settle into steady state.
-    // The longest warmup in this file, because this is by far the heaviest cycle in it: each one
-    // dials a TCP + WebSocket connection, promotes a relay into a processing actor with two tee
-    // sinks, then detaches and demotes it. That touches many more jemalloc size classes than the
-    // other soaks, so the arenas need proportionally longer to reach the steady state `before` is
-    // meant to sample — undersized, the measured delta is arena growth rather than engine state.
-    for index in 0..200 {
-        ws_tee_attach_detach(&engine, &uri, index).await;
+    // Each cycle dials a WebSocket, promotes a relay into a processing media actor with two tee
+    // sinks, then detaches and demotes it — no stranded mixer, sink, transport task or promoted
+    // actor. Every cycle burns a real TCP connection, so this one gets a shorter settle budget than
+    // the socket-free soaks: a build that never converges should fail on the assertion rather than
+    // churn its way through the ephemeral-port range first.
+    let mut gate = LeakGate::new("ws tee", 100, 40).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            ws_tee_attach_detach(&engine, &uri, index).await;
+            index += 1;
+        }
+        drain_tee_server(&live).await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(
+            engine.ws_tee_count(),
+            0,
+            "tee registry drained after every segment"
+        );
+        gate.sample().await;
     }
-    drain_tee_server(&live).await;
-    assert_eq!(engine.session_count(), 0, "registry empty after warmup");
-    assert_eq!(engine.ws_tee_count(), 0, "no tee retained after warmup");
-    let before = allocated_bytes();
-
-    // Each cycle dials a WebSocket, promotes a relay into a processing media actor with two tee sinks,
-    // then detaches and demotes it. Across 300 cycles live bytes must not climb — no stranded mixer,
-    // sink, transport task or promoted actor.
-    for index in 200..500 {
-        ws_tee_attach_detach(&engine, &uri, index).await;
-    }
-    drain_tee_server(&live).await;
-    let after = allocated_bytes();
-
-    assert_eq!(engine.session_count(), 0, "registry drained after soak");
-    assert_eq!(engine.ws_tee_count(), 0, "tee registry drained after soak");
-    let tolerance = 512 * 1024;
-    assert!(
-        after <= before + tolerance,
-        "ws tee leaked {} bytes over 300 churned attach/detach cycles (before={before}, after={after})",
-        after.saturating_sub(before)
-    );
+    gate.assert_no_leak();
 }
 
 /// A DTLS-SRTP offerer's SDP (RFC 5764 / RFC 5763 §5). Documentation-range address (RFC 5737).
@@ -659,29 +839,23 @@ async fn secure_ws_takeover_does_not_leak() {
     let engine = Engine::new(UdpLoopbackDatapath::new());
     let certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("peer cert");
     let fingerprint = certificate.fingerprint();
-    let _prime = allocated_bytes();
 
-    // Warm up: the dialled TCP+WebSocket stack, the bridge's preallocated buffers, the DTLS transport
-    // channels and jemalloc's arenas all settle. Same reasoning (and scale) as the tee soak — this
-    // cycle dials a real connection and spawns four tasks per call.
-    for index in 0..200 {
-        secure_ws_takeover_answer_delete(&engine, &uri, &fingerprint, index).await;
+    // Same reasoning (and segment size) as the tee soak — this cycle also dials a real connection,
+    // and spawns four tasks per call that `delete` has to abort.
+    let mut gate = LeakGate::new("secure ws takeover", 100, 40).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            secure_ws_takeover_answer_delete(&engine, &uri, &fingerprint, index).await;
+            index += 1;
+        }
+        drain_tee_server(&live).await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
     }
-    drain_tee_server(&live).await;
-    assert_eq!(engine.session_count(), 0, "registry empty after warmup");
-
-    let before = allocated_bytes();
-    for index in 200..500 {
-        secure_ws_takeover_answer_delete(&engine, &uri, &fingerprint, index).await;
-    }
-    drain_tee_server(&live).await;
-    let after = allocated_bytes();
-
-    assert_eq!(engine.session_count(), 0, "registry drained after soak");
-    let tolerance = 512 * 1024;
-    assert!(
-        after <= before + tolerance,
-        "secure ws takeover leaked {} bytes over 300 churned calls (before={before}, after={after})",
-        after.saturating_sub(before)
-    );
+    gate.assert_no_leak();
 }
