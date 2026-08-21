@@ -273,10 +273,13 @@ pairing it with `neural` is the combination that makes barge-in feel right.
 
 - **`echo_cancellation`** cancels the phone's echo of the AI on the uplink toward the server: the
   bridge runs `siphon-rtp-dsp`'s echo canceller on the caller's uplink using the AI downlink (what
-  the engine last sent toward the caller) as the far-end reference, at the codec's native 8 or
-  16 kHz. This stops the AI hearing itself looped back through the caller's handset, which otherwise
-  triggers false barge-ins and derails the model. A codec at another rate passes through
-  uncancelled.
+  the engine last sent toward the caller) as the far-end reference, in the **wire** domain — the
+  `ws_sample_rate` the stream negotiated, not the leg's codec rate (see the wire-rate section above;
+  the two are the same when no rate was requested). That placement is what keeps the canceller's
+  near end and its far-end reference in one rate and one frame length. This stops the AI hearing
+  itself looped back through the caller's handset, which otherwise triggers false barge-ins and
+  derails the model. The canceller exists only at 8 and 16 kHz, so a wire rate outside that leaves
+  the uplink uncancelled.
 
 ```json
 {
