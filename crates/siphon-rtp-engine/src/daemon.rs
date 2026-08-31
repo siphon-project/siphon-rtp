@@ -77,6 +77,29 @@ pub struct EngineArgs {
     /// reachable one (e.g. a NAT'd host). Defaults to the datapath-assigned address.
     #[arg(long)]
     pub turn_relay_ip: Option<IpAddr>,
+    /// PEM certificate chain presented to the lawful-interception Mediation Function (ETSI
+    /// TS 103 221-2 X3). Interception needs this, `--x3-client-key` and `--x3-ca`; without all
+    /// three, `attach_x3` is refused rather than silently delivering nowhere.
+    #[arg(long)]
+    pub x3_client_cert: Option<PathBuf>,
+    /// PEM private-key file for `--x3-client-cert`.
+    #[arg(long)]
+    pub x3_client_key: Option<PathBuf>,
+    /// PEM CA file the Mediation Function's own certificate is verified against (a private PKI).
+    #[arg(long)]
+    pub x3_ca: Option<PathBuf>,
+    /// Network Function ID on every delivered PDU (conditional attribute 6).
+    #[arg(long)]
+    pub x3_network_function_id: Option<String>,
+    /// Interception Point ID on every delivered PDU (conditional attribute 7).
+    #[arg(long)]
+    pub x3_interception_point_id: Option<String>,
+    /// Intercepted packets buffered per interception before content is dropped.
+    #[arg(long)]
+    pub x3_buffer_packets: Option<usize>,
+    /// Idle seconds before a keepalive PDU is sent on the delivery connection.
+    #[arg(long)]
+    pub x3_keepalive_secs: Option<u64>,
 
     /// Bind relay/media sockets to this IP instead of loopback — the production posture so the relay
     /// is reachable by real peers (docs/security-and-nat.md §11.1). With a `0.0.0.0` bind or a NAT'd
@@ -264,6 +287,9 @@ pub struct RunConfig {
     pub turn_tls_key: Option<PathBuf>,
     /// Public IP advertised in XOR-RELAYED-ADDRESS when the bound IP differs.
     pub turn_relay_ip: Option<IpAddr>,
+    /// Lawful-interception content delivery (ETSI TS 103 221-2 X3). `None` ⇒ this node is not
+    /// provisioned for interception and `attach_x3` is refused.
+    pub x3: Option<crate::x3::X3Config>,
     /// Bounds a `play_media` fetch from an http(s) URL runs under.
     pub media_fetch: MediaFetchLimits,
     /// Only carried through for the log filter: the file may set it, but the process environment
@@ -283,6 +309,10 @@ impl RunConfig {
         // A flag counts as "explicit" only when clap sourced it from the command line — a value left
         // at its clap default must not mask a file setting.
         let explicit = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+
+        // Resolved before the struct literal because it reads several fields of both inputs, which
+        // the field-by-field moves below would otherwise have partially consumed.
+        let x3 = resolve_x3(&args, &file);
 
         Self {
             control: resolve_defaulted(
@@ -349,6 +379,10 @@ impl RunConfig {
             turn_tls_cert: resolve_optional(args.turn_tls_cert, file.turn_tls_cert),
             turn_tls_key: resolve_optional(args.turn_tls_key, file.turn_tls_key),
             turn_relay_ip: resolve_optional(args.turn_relay_ip, file.turn_relay_ip),
+            // Interception is provisioned only when all three PEM paths are present. Anything less
+            // is treated as "not configured" rather than half-configured: a partially-provisioned
+            // node would accept a warrant it cannot deliver on.
+            x3,
             media_fetch: MediaFetchLimits {
                 connect_timeout: Duration::from_millis(resolve_defaulted(
                     args.media_fetch_connect_timeout_ms,
@@ -428,6 +462,42 @@ impl RunConfig {
             .collect();
         InterfaceTable::from_entries(entries, self.default_interface.as_deref())
     }
+}
+
+/// Resolve the lawful-interception (ETSI TS 103 221-2 X3) delivery configuration from the CLI args
+/// and the config file, CLI winning.
+///
+/// Returns `None` unless **all three** PEM paths are present. A node with, say, a client certificate
+/// but no CA is treated as unprovisioned rather than half-provisioned, because the alternative is
+/// accepting a warrant onto a delivery connection that can never complete a handshake — an
+/// interception that looks wired and delivers nothing.
+///
+/// The two identity strings default to empty (the attributes are still emitted, carrying no value)
+/// and the buffer depth and keepalive to [`crate::x3::X3Config::default`].
+fn resolve_x3(args: &EngineArgs, file: &FileConfig) -> Option<crate::x3::X3Config> {
+    let defaults = crate::x3::X3Config::default();
+    let client_cert = resolve_optional(args.x3_client_cert.clone(), file.x3_client_cert.clone())?;
+    let client_key = resolve_optional(args.x3_client_key.clone(), file.x3_client_key.clone())?;
+    let ca = resolve_optional(args.x3_ca.clone(), file.x3_ca.clone())?;
+    Some(crate::x3::X3Config {
+        client_cert,
+        client_key,
+        ca,
+        network_function_id: resolve_optional(
+            args.x3_network_function_id.clone(),
+            file.x3_network_function_id.clone(),
+        )
+        .unwrap_or_default(),
+        interception_point_id: resolve_optional(
+            args.x3_interception_point_id.clone(),
+            file.x3_interception_point_id.clone(),
+        )
+        .unwrap_or_default(),
+        buffer_packets: resolve_optional(args.x3_buffer_packets, file.x3_buffer_packets)
+            .unwrap_or(defaults.buffer_packets),
+        keepalive: resolve_optional(args.x3_keepalive_secs, file.x3_keepalive_secs)
+            .map_or(defaults.keepalive, Duration::from_secs),
+    })
 }
 
 /// Validate the optional media-port range: both `--port-min` and `--port-max` must be set together
@@ -572,6 +642,19 @@ where
         .with_cluster(cluster.clone())
         .with_interfaces(interfaces)
         .with_media_fetch_limits(config.media_fetch.clone());
+    if let Some(x3) = config.x3.clone() {
+        // Logged at startup so an operator can see, without placing a call, that this node will
+        // accept a warrant — and, just as importantly, so its absence is visible on a node that
+        // will refuse one. The identifiers are node identity, not interception data.
+        tracing::info!(
+            target: "siphon_rtp::li",
+            network_function_id = %x3.network_function_id,
+            interception_point_id = %x3.interception_point_id,
+            buffer_packets = x3.buffer_packets,
+            "lawful-interception content delivery (ETSI TS 103 221-2 X3) is provisioned"
+        );
+        engine = engine.with_x3(x3);
+    }
     if !config.stun_servers.is_empty() {
         tracing::info!(
             target: "siphon_rtp::control",
@@ -906,11 +989,90 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_port_range, RunConfig};
-    use crate::config::InterfaceConfig;
+    use super::{resolve_port_range, resolve_x3, EngineArgs, RunConfig};
+    use crate::config::{FileConfig, InterfaceConfig};
     use crate::media_fetch::MediaFetchLimits;
     use siphon_rtp_datapath::AddressFamily;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
+
+    /// `EngineArgs` is a flattenable `clap::Args`, not a top-level `Parser`, so a test parses it the
+    /// same way the real binaries do — through a wrapper that flattens it.
+    #[derive(clap::Parser)]
+    struct TestCommandLine {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    /// `EngineArgs` with every flag unset, so an X3 resolution test drives the file side alone.
+    fn bare_args() -> EngineArgs {
+        <TestCommandLine as clap::Parser>::parse_from(["siphon-rtp"]).engine
+    }
+
+    /// A `FileConfig` naming all three lawful-interception PEM paths.
+    fn provisioned_file() -> FileConfig {
+        FileConfig {
+            x3_client_cert: Some(PathBuf::from("/etc/siphon-rtp/li/client.pem")),
+            x3_client_key: Some(PathBuf::from("/etc/siphon-rtp/li/client.key")),
+            x3_ca: Some(PathBuf::from("/etc/siphon-rtp/li/mdf-ca.pem")),
+            ..FileConfig::default()
+        }
+    }
+
+    #[test]
+    fn interception_is_unconfigured_unless_all_three_pem_paths_are_present() {
+        // Half-provisioned must count as unprovisioned. A node with a client certificate but no CA
+        // could never complete the delivery handshake, so accepting a warrant on it would produce an
+        // interception that looks wired and delivers nothing.
+        assert!(
+            resolve_x3(&bare_args(), &FileConfig::default()).is_none(),
+            "nothing set means not provisioned"
+        );
+
+        for missing in ["x3_client_cert", "x3_client_key", "x3_ca"] {
+            let mut file = provisioned_file();
+            match missing {
+                "x3_client_cert" => file.x3_client_cert = None,
+                "x3_client_key" => file.x3_client_key = None,
+                _ => file.x3_ca = None,
+            }
+            assert!(
+                resolve_x3(&bare_args(), &file).is_none(),
+                "missing {missing} must leave the node unprovisioned, not half-provisioned"
+            );
+        }
+
+        assert!(
+            resolve_x3(&bare_args(), &provisioned_file()).is_some(),
+            "all three present provisions the node"
+        );
+    }
+
+    #[test]
+    fn interception_defaults_the_buffer_depth_and_keepalive() {
+        let resolved = resolve_x3(&bare_args(), &provisioned_file()).expect("provisioned");
+        let defaults = crate::x3::X3Config::default();
+        assert_eq!(resolved.buffer_packets, defaults.buffer_packets);
+        assert_eq!(resolved.keepalive, defaults.keepalive);
+        // The identity attributes are optional; they are emitted carrying no value when unset.
+        assert!(resolved.network_function_id.is_empty());
+        assert!(resolved.interception_point_id.is_empty());
+    }
+
+    #[test]
+    fn interception_reads_the_identity_and_bounds_from_the_file() {
+        let mut file = provisioned_file();
+        file.x3_network_function_id = Some("siphon-rtp-sbc-01".into());
+        file.x3_interception_point_id = Some("media-relay-a".into());
+        file.x3_buffer_packets = Some(40_000);
+        file.x3_keepalive_secs = Some(15);
+
+        let resolved = resolve_x3(&bare_args(), &file).expect("provisioned");
+        assert_eq!(resolved.network_function_id, "siphon-rtp-sbc-01");
+        assert_eq!(resolved.interception_point_id, "media-relay-a");
+        assert_eq!(resolved.buffer_packets, 40_000);
+        assert_eq!(resolved.keepalive, std::time::Duration::from_secs(15));
+    }
 
     /// A `RunConfig` with everything at its off/default value, so a test overrides only the fields it
     /// cares about (the interface-table inputs).
@@ -939,6 +1101,7 @@ mod tests {
             turn_tls_cert: None,
             turn_tls_key: None,
             turn_relay_ip: None,
+            x3: None,
             media_fetch: MediaFetchLimits::default(),
             log_filter: None,
             node_id: None,

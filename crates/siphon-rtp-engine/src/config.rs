@@ -147,6 +147,28 @@ pub struct FileConfig {
     /// means unrestricted**: the engine will fetch any host it can route to, from its own network
     /// position. Set this — or an egress policy — if the control plane is not fully trusted.
     pub media_fetch_allow_host: Option<Vec<String>>,
+    /// PEM certificate chain the engine presents to the lawful-interception Mediation Function
+    /// (`--x3-client-cert`). Interception is enabled only when this, `x3_client_key` and `x3_ca` are
+    /// all set; without them `attach_x3` is **refused** rather than accepted and left inert.
+    pub x3_client_cert: Option<PathBuf>,
+    /// PEM private key for `x3_client_cert` (`--x3-client-key`).
+    pub x3_client_key: Option<PathBuf>,
+    /// PEM certificate(s) of the private CA that signs the Mediation Function's certificate
+    /// (`--x3-ca`). The delivery PKI is private, so the public Mozilla bundle is not it.
+    pub x3_ca: Option<PathBuf>,
+    /// Network Function ID put on every delivered PDU (`--x3-network-function-id`, TS 103 221-2
+    /// conditional attribute 6) — which network element produced it.
+    pub x3_network_function_id: Option<String>,
+    /// Interception Point ID put on every delivered PDU (`--x3-interception-point-id`, conditional
+    /// attribute 7) — where within that element the tap sits.
+    pub x3_interception_point_id: Option<String>,
+    /// Intercepted packets buffered per interception before content is dropped
+    /// (`--x3-buffer-packets`). Deeper than the pcap recorder's queue on purpose: a Mediation
+    /// Function outage must be survived, not discarded through.
+    pub x3_buffer_packets: Option<usize>,
+    /// Idle seconds before a keepalive PDU is sent on the delivery connection
+    /// (`--x3-keepalive-secs`).
+    pub x3_keepalive_secs: Option<u64>,
     /// `tracing` env-filter directive used when the process environment does not set one
     /// (`RUST_LOG` / the default-env filter always win over this).
     pub log_filter: Option<String>,
@@ -443,6 +465,36 @@ mod tests {
             config.control,
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)))
         );
+    }
+
+    /// The lawful-interception keys parse into [`FileConfig`]. `deny_unknown_fields` means a typo'd
+    /// key is a loud startup error, so this also guards the documented names in the example file.
+    #[test]
+    fn lawful_interception_keys_parse() {
+        let config = FileConfig::parse_str(concat!(
+            "x3_client_cert = \"/etc/siphon-rtp/li/client.pem\"\n",
+            "x3_client_key = \"/etc/siphon-rtp/li/client.key\"\n",
+            "x3_ca = \"/etc/siphon-rtp/li/mdf-ca.pem\"\n",
+            "x3_network_function_id = \"siphon-rtp-sbc-01\"\n",
+            "x3_interception_point_id = \"media-relay-a\"\n",
+            "x3_buffer_packets = 20000\n",
+            "x3_keepalive_secs = 30\n",
+        ))
+        .expect("x3 keys parse");
+        assert_eq!(
+            config.x3_client_cert.as_deref(),
+            Some(Path::new("/etc/siphon-rtp/li/client.pem"))
+        );
+        assert_eq!(
+            config.x3_ca.as_deref(),
+            Some(Path::new("/etc/siphon-rtp/li/mdf-ca.pem"))
+        );
+        assert_eq!(
+            config.x3_network_function_id.as_deref(),
+            Some("siphon-rtp-sbc-01")
+        );
+        assert_eq!(config.x3_buffer_packets, Some(20_000));
+        assert_eq!(config.x3_keepalive_secs, Some(30));
     }
 
     /// A real on-disk file is read and parsed by [`FileConfig::load`] (the filesystem path, not just

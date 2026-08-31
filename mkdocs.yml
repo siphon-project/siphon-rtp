@@ -61,6 +61,7 @@ nav:
       - Scaling, clustering & HA: scaling-and-ha.md
       - Datapath (UDP default, XDP via a separate daemon): datapath.md
       - Supply chain & SBOM: supply-chain.md
+      - Lawful interception (ETSI X3): lawful-interception.md
       - Migrating from rtpengine: migrating-from-rtpengine.md
   - Reference:
       - Codec support matrix: codecs.md
