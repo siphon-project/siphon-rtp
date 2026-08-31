@@ -7,6 +7,11 @@ amr-wb/c-code/
 # committed via LFS; they must never enter normal git history as binaries.
 amr-wb/testv/
 
+# The third-party X2/X3 Wireshark dissector used as an independent decoder for the TS 103 221-2
+# framing. Fetched by x2x3-dissector/fetch.sh against a pinned SHA-256, never committed — it is
+# someone else's code under its own licence. Tests skip-when-absent.
+x2x3-dissector/x2x3PduDissector.lua
+
 # Opus RFC 6716 conformance reference data — the official testvectorNN.bit/.dec, the locally
 # generated CELT-only oracle vectors (celt_only/, from a libopus OPUS_SET_FORCE_MODE oracle), and any
 # libopus source/oracle build artifacts. All reference-only acceptance data: never committed (bloat +

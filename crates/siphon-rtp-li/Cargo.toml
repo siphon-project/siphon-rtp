@@ -1,0 +1,27 @@
+# siphon-rtp-li — ETSI TS 103 221-2 X2/X3 PDU framing for lawful-interception content delivery.
+# Pure Rust, std only: the crate owns the clause 5 wire format and nothing else (no sockets, no
+# engine types), so the framing can be validated against an independent decoder on its own.
+[package]
+name = "siphon-rtp-li"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "siphon-rtp ETSI TS 103 221-2 X2/X3 PDU framing for lawful-interception content delivery"
+readme = "README.md"
+keywords = ["lawful-interception", "etsi", "rtp", "voip", "x3"]
+categories = ["network-programming"]
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { workspace = true }
+# Scratch files for the independent-decoder gate (text2pcap input, the synthetic capture, and a
+# writable Wireshark config dir).
+tempfile = { workspace = true }
+
+[[bench]]
+name = "li_bench"
+harness = false
