@@ -45,6 +45,8 @@ use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{Event, PlayEndReason};
 
+use crate::x3::X3Tap;
+
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
 /// 20 ms, the telephony default ptime (RFC 3551).
 pub const INJECT_TICK: std::time::Duration = std::time::Duration::from_millis(20);
@@ -354,6 +356,17 @@ pub struct Direction {
     /// SIPREC / monitor raw-RTP tee targets: each receives the **original ingress RTP** byte-for-byte
     /// (RFC 7866 §6). Independent of transcode/relay — added/removed by `subscribe_answer`/`unsubscribe`.
     raw_tee: Vec<RawTee>,
+    /// Lawful-interception content tap (ETSI TS 103 221-2 X3), when this call is under interception.
+    ///
+    /// Fires inside [`Direction::handle`] on the **decrypted** slice and only for datagrams the
+    /// engine accepted — deliberately *not* where `MediaCall::capture_ingress` sits. The pcap
+    /// recorder copies the verbatim wire bytes before `handle` runs, which on a secure leg is
+    /// ciphertext, and copies them before the SRTP authentication decision, which would present
+    /// forged packets to an agency as the target's media. Neither is acceptable for interception.
+    ///
+    /// The tap carries its own target-relative direction, fixed when it was installed, so the
+    /// per-packet path does not branch on which leg is the warrant's target.
+    x3: Option<X3Tap>,
     decoder: Box<dyn Decoder>,
     encoder: Box<dyn Encoder>,
     /// Audio channels the decoder emits per frame (`decoder.params().channels`) — 1 for every
@@ -1018,6 +1031,7 @@ impl Direction {
             egress_dst: config.egress_dst,
             relay_only: false,
             raw_tee: Vec::new(),
+            x3: None,
             decoder: config.decoder,
             encoder: config.encoder,
             ingress_channels,
@@ -1090,6 +1104,7 @@ impl Direction {
             egress_dst: config.egress_dst,
             relay_only: true,
             raw_tee: Vec::new(),
+            x3: None,
             decoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             encoder: Box::new(siphon_rtp_codec::g711::G711::ulaw()),
             // A relay-only direction never decodes, so the channel fold and the decode-error counter
@@ -1529,6 +1544,7 @@ impl Direction {
     fn handle(
         &mut self,
         data: &[u8],
+        source: SocketAddr,
         arrival_micros: u64,
         leg_meta: LegMeta<'_>,
         // The far-end reference for this direction's echo canceller: the *opposite* direction's egress
@@ -1570,6 +1586,20 @@ impl Direction {
         // subscriber's SRS before any transcode/relay. The SRS records the leg's *actual* media in its
         // negotiated codec — independent of hold/mute/transcode on the A↔B path.
         self.tee_raw(data, out);
+
+        // Lawful-interception content (ETSI TS 103 221-2 X3). Placed **here** for two reasons that
+        // are both defects if got wrong:
+        //   * it is after the decrypt rebinding above, so a secure leg delivers plaintext RTP the
+        //     agency can actually decode rather than ciphertext it has no key for;
+        //   * it is after the `secure_pending` drop and the failed-`unprotect` drop, so a forged or
+        //     replayed packet — which the engine refuses to relay — is never presented to the agency
+        //     as the target's media.
+        // It is also before the `relay_only` early return below, so an intercepted plain relay is
+        // covered without being forced into a transcode. RTCP is filtered inside the tap (a PDU
+        // declares payload format 8, "RTP packet").
+        if let Some(x3) = &self.x3 {
+            x3.deliver(source, arrival_micros, data);
+        }
 
         // Relay-only (promoted passthrough): forward the ingress RTP verbatim to the peer — no
         // decode/encode. (The raw tee above already copied it to any subscriber, regardless of
@@ -2348,6 +2378,7 @@ impl MediaCall {
                 // (`a_to_b` receiver, `b_to_a` reference) hand it across with no lock, as `echo_into`.
                 let latch_ssrc = self.a_to_b.handle(
                     &packet.data,
+                    packet.source,
                     packet.arrival,
                     meta,
                     self.b_to_a.echo_reference.as_mut(),
@@ -2401,6 +2432,7 @@ impl MediaCall {
                 // engine last sent toward B).
                 let latch_ssrc = self.b_to_a.handle(
                     &packet.data,
+                    packet.source,
                     packet.arrival,
                     meta,
                     self.a_to_b.echo_reference.as_mut(),
@@ -2552,6 +2584,35 @@ impl MediaCall {
     #[must_use]
     pub fn is_recording(&self) -> bool {
         self.capture.is_some()
+    }
+
+    /// Begin lawful-interception content delivery on both legs (`Command::AttachX3`).
+    ///
+    /// `taps` is `(leg A ingress tap, leg B ingress tap)`, each already carrying its target-relative
+    /// [`siphon_rtp_li::PayloadDirection`] — see [`crate::x3::ingress_directions`]. Both ingress taps
+    /// together cover both directions of the call, so there is no egress tap: what leg B sends is
+    /// what leg A receives.
+    ///
+    /// Replacing an existing interception drops the old taps, which closes their channel and ends
+    /// the previous delivery task.
+    pub fn start_x3(&mut self, taps: (X3Tap, X3Tap)) {
+        let (leg_a, leg_b) = taps;
+        self.a_to_b.x3 = Some(leg_a);
+        self.b_to_a.x3 = Some(leg_b);
+    }
+
+    /// Stop lawful-interception content delivery (`Command::DetachX3`): drop both taps so the
+    /// delivery task sees its channel close, drains what is buffered, and finishes. A no-op if this
+    /// call is not under interception.
+    pub fn stop_x3(&mut self) {
+        self.a_to_b.x3 = None;
+        self.b_to_a.x3 = None;
+    }
+
+    /// Whether this call is under lawful-interception content delivery (test/observability helper).
+    #[must_use]
+    pub fn is_intercepted(&self) -> bool {
+        self.a_to_b.x3.is_some() || self.b_to_a.x3.is_some()
     }
 
     /// Copy one accepted ingress datagram to the pcap sink, if recording. `leg_a` selects the capture
@@ -3093,6 +3154,11 @@ pub enum MediaControl {
         gain: Gain,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
+    /// Begin lawful-interception content delivery (ETSI TS 103 221-2 X3) on both legs. The tuple is
+    /// `(leg A ingress tap, leg B ingress tap)`, each carrying its own target-relative direction.
+    StartX3(Box<(X3Tap, X3Tap)>),
+    /// Stop lawful-interception content delivery, closing the delivery task's channel. Idempotent.
+    StopX3,
     /// Attach a SIPREC / monitor fork to a source leg's decoded ingress audio (`source_a` selects
     /// leg A vs leg B). The engine builds the `RtpForkSink` and owns the matching output channel +
     /// drain task (RFC 7866 SIPREC; the subscriber is send-only — engine → SRS — no inbound media).
@@ -3475,6 +3541,8 @@ async fn run_media_call<D>(
                         call.start_recording(capture);
                     }
                     MediaInput::Control(MediaControl::StopRecording) => call.stop_recording(),
+                    MediaInput::Control(MediaControl::StartX3(taps)) => call.start_x3(*taps),
+                    MediaInput::Control(MediaControl::StopX3) => call.stop_x3(),
                     MediaInput::Control(MediaControl::AttachSecureLeg { leg }) => {
                         call.attach_secure_leg(leg);
                         tracing::debug!(target: "siphon_rtp::media", "DTLS-SRTP key installed on the media pipeline");
@@ -8126,6 +8194,264 @@ mod tests {
         assert!(
             out.is_empty(),
             "an overlay must not reach a peer whose DTLS handshake has not keyed the leg"
+        );
+    }
+
+    // --- Lawful-interception content delivery (ETSI TS 103 221-2 X3) --------------------------
+    //
+    // These pin *where* the tap sits. The framing is covered in `siphon-rtp-li` against an
+    // independent decoder; what can only be verified here is that the bytes handed to it are the
+    // decrypted, accepted ones — the two properties the existing pcap tap does not have.
+
+    /// Install an X3 tap on both legs and hand back the delivery end.
+    fn intercept(call: &mut MediaCall, target_is_caller: bool) -> crate::x3::X3Delivery {
+        let (factory, delivery) = crate::x3::x3_channel(64);
+        let (direction_a, direction_b) = crate::x3::ingress_directions(target_is_caller);
+        call.start_x3((
+            factory.tap(addr("127.0.0.1:10000"), direction_a),
+            factory.tap(addr("127.0.0.1:10002"), direction_b),
+        ));
+        delivery
+    }
+
+    #[test]
+    fn x3_on_a_secure_leg_delivers_plaintext_rtp_not_ciphertext() {
+        // The defect this exists to prevent: the pcap recorder copies the verbatim wire bytes
+        // *before* `Direction::handle` decrypts, so on an SRTP leg it records ciphertext. That is
+        // defensible for a debugging capture and disqualifying for interception — the agency has no
+        // key. This test fails if the X3 tap ever moves upstream of the decrypt.
+        use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
+        let engine_key = SrtpKeyMaterial::from_inline_bytes(&[7u8; 30]).expect("engine key");
+        let b_key = SrtpKeyMaterial::from_inline_bytes(&[9u8; 30]).expect("b key");
+        let actor_leg = Arc::new(Mutex::new(SecureLeg::new(&engine_key, &b_key)));
+        let mut peer_leg = SecureLeg::new(&b_key, &engine_key);
+
+        let mut call = ulaw_alaw_call().with_far_secure_leg(actor_leg);
+        let delivery = intercept(&mut call, false); // the target is the secure (callee) leg
+
+        let plaintext = ulaw_rtp_with_ssrc(1, 0xB0B0_B0B0);
+        let mut ciphertext = Vec::new();
+        peer_leg
+            .protect(&plaintext, &mut ciphertext)
+            .expect("peer encrypt");
+        assert_ne!(
+            ciphertext, plaintext,
+            "the fixture must actually be encrypted"
+        );
+
+        call.process(
+            &rx(2, B_ADDR, ciphertext.clone()),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+
+        let delivered = delivery.packets.try_recv().expect("a delivered packet");
+        assert_eq!(
+            delivered.payload, plaintext,
+            "X3 must deliver the decrypted RTP, not the wire ciphertext"
+        );
+        assert_ne!(delivered.payload, ciphertext);
+        // …and it must actually parse as RTP, which is what payload format 8 promises.
+        let parsed = RtpPacket::parse(&delivered.payload).expect("delivered payload parses as RTP");
+        assert_eq!(parsed.ssrc, 0xB0B0_B0B0);
+    }
+
+    #[test]
+    fn x3_does_not_deliver_a_packet_that_fails_srtp_authentication() {
+        // The second defect: the pcap tap fires before the authentication decision, so a forged or
+        // replayed packet would reach the agency presented as the target's media. `handle` drops
+        // those, and the X3 tap sits after that drop.
+        use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
+        let engine_key = SrtpKeyMaterial::from_inline_bytes(&[7u8; 30]).expect("engine key");
+        let b_key = SrtpKeyMaterial::from_inline_bytes(&[9u8; 30]).expect("b key");
+        let actor_leg = Arc::new(Mutex::new(SecureLeg::new(&engine_key, &b_key)));
+
+        let mut call = ulaw_alaw_call().with_far_secure_leg(actor_leg);
+        let delivery = intercept(&mut call, false);
+
+        // Never SRTP-protected, so `unprotect` fails. It comes from the gated source, so only the
+        // authentication check stands between it and the agency.
+        let forged = ulaw_rtp_with_ssrc(1, 0xB0B0_B0B0);
+        call.process(&rx(2, B_ADDR, forged), &mut Vec::new(), &mut Vec::new());
+
+        assert!(
+            delivery.packets.try_recv().is_err(),
+            "a packet failing SRTP authentication must never be delivered as the target's media"
+        );
+        assert_eq!(delivery.counters.delivered(), 0);
+        assert_eq!(
+            delivery.counters.dropped(),
+            0,
+            "a refused packet is not a delivery *loss* — it was never warranted content"
+        );
+    }
+
+    #[test]
+    fn x3_delivers_nothing_before_a_dtls_leg_is_keyed() {
+        // The same principle for the DTLS pending gate: until the handshake keys the leg the
+        // pipeline cannot tell plaintext from ciphertext, so it drops — and so must delivery.
+        let mut call = ulaw_alaw_call().with_far_secure_pending();
+        let delivery = intercept(&mut call, false);
+
+        call.process(
+            &rx(2, B_ADDR, ulaw_rtp_with_ssrc(1, 0xB0B0_B0B0)),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+
+        assert!(
+            delivery.packets.try_recv().is_err(),
+            "media arriving before the DTLS handshake keys the leg must not be delivered"
+        );
+    }
+
+    #[test]
+    fn x3_does_not_deliver_a_packet_from_an_unsignalled_source() {
+        // The RTPBleed source gate runs before the tap, so an injected stream from an unexpected
+        // address is not attributed to the target.
+        let mut call = relay_call();
+        let delivery = intercept(&mut call, true);
+
+        call.process(
+            &rx(1, "127.0.0.9:4000", ulaw_rtp(1, 0xAB)),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            delivery.packets.try_recv().is_err(),
+            "a packet from an unsignalled source must not be delivered"
+        );
+
+        // The gated source still is.
+        call.process(
+            &rx(1, A_ADDR, ulaw_rtp(2, 0xAB)),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(delivery.packets.try_recv().is_ok());
+    }
+
+    #[test]
+    fn x3_direction_is_relative_to_the_target_leg_not_to_the_call_legs() {
+        // TS 103 221-2 §5.2.6: 2 is "sent to the target", 3 is "sent from the target". The engine
+        // knows which leg is the caller; only the warrant knows which is the target, so the same
+        // two packets must carry opposite directions depending on it.
+        for target_is_caller in [true, false] {
+            let mut call = relay_call();
+            let delivery = intercept(&mut call, target_is_caller);
+
+            call.process(
+                &rx(1, A_ADDR, ulaw_rtp(1, 0xAB)),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            call.process(
+                &rx(2, B_ADDR, ulaw_rtp(2, 0xCD)),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+
+            let from_leg_a = delivery.packets.try_recv().expect("leg A packet").direction;
+            let from_leg_b = delivery.packets.try_recv().expect("leg B packet").direction;
+
+            if target_is_caller {
+                assert_eq!(from_leg_a, siphon_rtp_li::PayloadDirection::FromTarget);
+                assert_eq!(from_leg_b, siphon_rtp_li::PayloadDirection::ToTarget);
+            } else {
+                assert_eq!(from_leg_a, siphon_rtp_li::PayloadDirection::ToTarget);
+                assert_eq!(from_leg_b, siphon_rtp_li::PayloadDirection::FromTarget);
+            }
+        }
+    }
+
+    #[test]
+    fn x3_covers_a_relay_only_call_without_forcing_a_transcode() {
+        // The tap sits before the `relay_only` early return, so an intercepted plain relay is
+        // delivered while still forwarding its RTP verbatim — no decode, no re-encode.
+        let mut call = relay_call();
+        assert!(call.is_relay_only());
+        let delivery = intercept(&mut call, true);
+
+        let original = ulaw_rtp(7, 0xAB);
+        let mut out = Vec::new();
+        call.process(&rx(1, A_ADDR, original.clone()), &mut out, &mut Vec::new());
+
+        assert_eq!(
+            delivery.packets.try_recv().expect("delivered").payload,
+            original
+        );
+        assert_eq!(out.len(), 1, "the relay still forwards");
+        assert_eq!(&out[0].data[..], &original[..], "still byte-for-byte");
+    }
+
+    #[test]
+    fn x3_stamps_the_observed_source_and_the_engine_local_destination() {
+        // The conditional attributes describing the 5-tuple come from these, so a mix-up would
+        // misattribute the traffic in the delivered record.
+        let mut call = relay_call();
+        let delivery = intercept(&mut call, true);
+
+        call.process(
+            &rx_at(1, A_ADDR, 123_456, ulaw_rtp(1, 0xAB)),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+
+        let delivered = delivery.packets.try_recv().expect("delivered");
+        assert_eq!(delivered.source, addr(A_ADDR), "the peer's observed source");
+        assert_eq!(
+            delivered.destination,
+            addr("127.0.0.1:10000"),
+            "leg A's engine-local address"
+        );
+        assert_eq!(delivered.arrival_micros, 123_456);
+    }
+
+    #[test]
+    fn x3_does_not_deliver_rtcp() {
+        // A PDU declares payload format 8, "RTP packet". RTCP on a muxed endpoint is relayed but
+        // must not be framed as RTP content.
+        let mut call = relay_call();
+        let delivery = intercept(&mut call, true);
+
+        // PT 200 (sender report) is inside the RFC 5761 demux range.
+        let sender_report = vec![0x80, 200, 0x00, 0x06, 0xde, 0xad, 0xbe, 0xef];
+        call.process(
+            &rx(1, A_ADDR, sender_report),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            delivery.packets.try_recv().is_err(),
+            "RTCP is not X3 content"
+        );
+    }
+
+    #[test]
+    fn stopping_x3_ends_delivery_and_is_idempotent() {
+        let mut call = relay_call();
+        let delivery = intercept(&mut call, true);
+        assert!(call.is_intercepted());
+
+        call.process(
+            &rx(1, A_ADDR, ulaw_rtp(1, 0xAB)),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(delivery.packets.try_recv().is_ok());
+
+        call.stop_x3();
+        assert!(!call.is_intercepted());
+        call.stop_x3(); // idempotent
+
+        call.process(
+            &rx(1, A_ADDR, ulaw_rtp(2, 0xAB)),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            delivery.packets.try_recv().is_err(),
+            "no content is delivered after the interception is detached"
         );
     }
 }

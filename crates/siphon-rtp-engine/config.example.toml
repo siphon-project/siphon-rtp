@@ -221,6 +221,45 @@ control = "127.0.0.1:8080"
 # reachable one, e.g. a NAT'd host (CLI: --turn-relay-ip). Defaults to the datapath-assigned address.
 # turn_relay_ip = "203.0.113.7"
 
+# --- Lawful interception, ETSI TS 103 221-2 X3 content delivery ---------------------------------
+#
+# Provisions this node to deliver intercepted media straight from the media plane to a Mediation
+# Function. X1 provisioning and X2 IRI live in the signalling process, not here.
+#
+# The three PEM paths are what enable the feature, and ALL THREE must be set: a node with a client
+# certificate but no CA counts as unprovisioned, not half-provisioned. With them absent the
+# `attach_x3` control verb is REFUSED — never accepted and left delivering nowhere, which would read
+# as a served warrant. See docs/lawful-interception.md.
+
+# PEM certificate chain the engine presents to the Mediation Function, which authenticates the
+# network element by certificate (CLI: --x3-client-cert).
+# x3_client_cert = "/etc/siphon-rtp/li/client.pem"
+
+# PEM private-key file for x3_client_cert (CLI: --x3-client-key).
+# x3_client_key = "/etc/siphon-rtp/li/client.key"
+
+# PEM CA the Mediation Function's own certificate is verified against (CLI: --x3-ca). The delivery
+# PKI is private, so the public Mozilla bundle the WebSocket client uses is not it.
+# x3_ca = "/etc/siphon-rtp/li/mdf-ca.pem"
+
+# Network Function ID on every delivered PDU — which network element produced it
+# (CLI: --x3-network-function-id, conditional attribute 6).
+# x3_network_function_id = "siphon-rtp-sbc-01"
+
+# Interception Point ID on every delivered PDU — where within that element the tap sits
+# (CLI: --x3-interception-point-id, conditional attribute 7).
+# x3_interception_point_id = "media-relay-a"
+
+# Intercepted packets buffered per interception before content is dropped
+# (CLI: --x3-buffer-packets). Default 20000, roughly 400 s of one direction at a 20 ms ptime.
+# Deliberately far deeper than the pcap recorder's queue: a Mediation Function outage must be
+# survived, not discarded through. When it does fill, the ARRIVING packet is dropped so what was
+# delivered stays a contiguous prefix, and every drop raises an `x3_loss` event.
+# x3_buffer_packets = 20000
+
+# Idle seconds before a keepalive PDU is sent on the delivery connection (CLI: --x3-keepalive-secs).
+# x3_keepalive_secs = 30
+
 # --- XDP / AF_XDP kernel datapath ---------------------------------------------------------------
 #
 # These two keys are acted on ONLY by the separate `siphon-rtp-xdp-daemon` binary (the kernel fast

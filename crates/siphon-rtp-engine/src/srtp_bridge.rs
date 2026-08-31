@@ -20,6 +20,7 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use crate::dtls_bridge::DtlsBridge;
+use crate::x3::X3Tap;
 
 /// The crypto a bridge flow applies to ingress before forwarding it out the peer endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,14 @@ struct Flow {
     out_endpoint: EndpointId,
     out_dst: SocketAddr,
     leg: Arc<Mutex<SecureLeg>>,
+    /// Lawful-interception content tap for this endpoint's ingress (ETSI TS 103 221-2 X3).
+    ///
+    /// A crypto bridge never reaches the media pipeline, so without this a **same-codec WebRTC or
+    /// SDES call would be silently uninterceptable** — and that is the ordinary app-client shape,
+    /// not a corner case. The tap fires after the crypto transform succeeds, on whichever side of it
+    /// is plaintext, which is also after the authentication decision: a failed `unprotect` returns
+    /// before it.
+    x3: Option<X3Tap>,
 }
 
 /// The bridge registry: redirected endpoint → its `Flow`. Shared (`Arc`) between the control path
@@ -105,6 +114,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     out_endpoint: flow.out_endpoint,
                     out_dst: flow.out_dst,
                     leg: leg.clone(),
+                    x3: None,
                 },
             );
         }
@@ -155,6 +165,29 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             .collect()
     }
 
+    /// Install a lawful-interception content tap on one bridged endpoint's ingress, replacing any
+    /// tap already there. Returns whether the endpoint is bridged here; a DTLS endpoint is delegated
+    /// to the sibling bridge.
+    ///
+    /// The caller decides which endpoint gets which tap, because only it knows which leg the warrant
+    /// names — the direction on a PDU is target-relative, and the bridge's own crypto op says which
+    /// side is encrypted, not which side is the target.
+    pub fn set_x3_tap(&self, endpoint: EndpointId, tap: X3Tap) -> bool {
+        if let Some(mut flow) = self.flows.get_mut(&endpoint) {
+            flow.x3 = Some(tap);
+            return true;
+        }
+        self.dtls.set_x3_tap(endpoint, tap)
+    }
+
+    /// Remove the lawful-interception tap from one bridged endpoint. Idempotent.
+    pub fn clear_x3_tap(&self, endpoint: EndpointId) {
+        if let Some(mut flow) = self.flows.get_mut(&endpoint) {
+            flow.x3 = None;
+        }
+        self.dtls.clear_x3_tap(endpoint);
+    }
+
     /// Handle one redirected datagram: gate the source, apply the flow's crypto, and forward it.
     /// Anything that fails to gate or transform is dropped (never forwarded into the void).
     pub async fn handle(&self, packet: RxPacket) {
@@ -164,7 +197,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             return;
         }
         // Snapshot the flow and release the map guard before any crypto or `.await`.
-        let Some((op, accepted_source, out_endpoint, out_dst, leg)) =
+        let Some((op, accepted_source, out_endpoint, out_dst, leg, x3)) =
             self.flows.get(&packet.endpoint).map(|flow| {
                 (
                     flow.op,
@@ -172,6 +205,7 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
                     flow.out_endpoint,
                     flow.out_dst,
                     flow.leg.clone(),
+                    flow.x3.clone(),
                 )
             })
         else {
@@ -203,6 +237,19 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             tracing::debug!(?error, ?op, "bridge crypto failed; dropping packet");
             return;
         }
+
+        // Lawful-interception content (ETSI TS 103 221-2 X3), taken from whichever side of the
+        // transform is plaintext: an `Encrypt` flow was handed plaintext and produced ciphertext, a
+        // `Decrypt` flow the reverse. Reached only after the source gate above and after the crypto
+        // succeeded, so a forged or replayed packet — which returns above — is never delivered.
+        if let Some(x3) = &x3 {
+            let plaintext = match op {
+                BridgeOp::Encrypt => packet.data.as_ref(),
+                BridgeOp::Decrypt => out.as_slice(),
+            };
+            x3.deliver(packet.source, packet.arrival, plaintext);
+        }
+
         if let Err(error) = self.datapath.send(out_endpoint, out_dst, &out).await {
             tracing::debug!(%error, "bridge forward send failed");
         }
@@ -330,11 +377,15 @@ mod tests {
     struct Harness {
         // Kept alive: dropping the datapath aborts the endpoint receive tasks.
         _datapath: UdpLoopbackDatapath,
-        _bridge: Arc<SrtpBridge<UdpLoopbackDatapath>>,
+        bridge: Arc<SrtpBridge<UdpLoopbackDatapath>>,
         /// Engine's plain endpoint — phone A sends RTP here.
         plain_addr: SocketAddr,
         /// Engine's secure endpoint — phone B sends SRTP here.
         secure_addr: SocketAddr,
+        /// The two redirected endpoint ids, so a test can install a lawful-interception tap on the
+        /// same flows the dispatcher drives.
+        plain_endpoint: EndpointId,
+        secure_endpoint: EndpointId,
         /// Engine's offered key (the secure peer decrypts engine→peer media with it).
         local: SrtpKeyMaterial,
         /// Secure peer's answered key (the peer encrypts peer→engine media with it).
@@ -390,10 +441,12 @@ mod tests {
         let harness = Harness {
             plain_addr: plain.local_addr,
             secure_addr: secure.local_addr,
+            plain_endpoint: plain.id,
+            secure_endpoint: secure.id,
             local,
             remote,
             _datapath: datapath,
-            _bridge: bridge,
+            bridge,
         };
         (harness, (phone_a, addr_a), (phone_b, addr_b))
     }
@@ -559,5 +612,179 @@ mod tests {
         assert!(bridge.owns(endpoint.id));
         bridge.deregister([endpoint.id]);
         assert!(!bridge.owns(endpoint.id));
+    }
+
+    // --- Lawful-interception content delivery (ETSI TS 103 221-2 X3) --------------------------
+    //
+    // A crypto bridge relays without ever reaching the media pipeline, so a same-codec SDES or
+    // WebRTC call — the ordinary app-client shape — has no pipeline tap to fire. These pin that the
+    // bridge itself delivers, on plaintext, and only for packets it accepted.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn x3_on_a_bridged_call_delivers_plaintext_in_both_directions() {
+        let (harness, (phone_a, addr_a), (phone_b, addr_b)) = live_bridge().await;
+        let (factory, delivery) = crate::x3::x3_channel(64);
+        // Target on the plain leg: its own ingress is "from the target", the secure peer's is
+        // "to the target".
+        let (from_target, to_target) = crate::x3::ingress_directions(true);
+        assert!(harness.bridge.set_x3_tap(
+            harness.plain_endpoint,
+            factory.tap(harness.plain_addr, from_target)
+        ));
+        assert!(harness.bridge.set_x3_tap(
+            harness.secure_endpoint,
+            factory.tap(harness.secure_addr, to_target)
+        ));
+
+        // Plain leg → secure peer. The bridge encrypts, but the intercepted copy is the plaintext
+        // ingress, not the ciphertext it emitted.
+        let plain = rtp(1, 0x1111_1111);
+        phone_a
+            .send_to(&plain, harness.plain_addr)
+            .await
+            .expect("send plain");
+        let on_wire = recv(&phone_b).await;
+        assert_ne!(on_wire, plain, "the peer really did receive ciphertext");
+
+        let delivered = timeout(SHORT, delivery.packets.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("delivered");
+        assert_eq!(
+            delivered.payload, plain,
+            "X3 delivers the plaintext ingress"
+        );
+        assert_eq!(delivered.direction, from_target);
+        assert_eq!(delivered.source, addr_a);
+        assert_eq!(delivered.destination, harness.plain_addr);
+
+        // Secure peer → plain leg. Here the ciphertext is the ingress, so the intercepted copy must
+        // be what the bridge *decrypted*.
+        // Phone B encrypts with its answered (remote) key, as the peer does on the wire.
+        let mut peer = SrtpContext::from_key_material(&harness.remote);
+        let peer_plain = rtp(2, 0x2222_2222);
+        let mut sealed = Vec::new();
+        peer.protect(&peer_plain, &mut sealed)
+            .expect("peer encrypt");
+        assert_ne!(sealed, peer_plain);
+        phone_b
+            .send_to(&sealed, harness.secure_addr)
+            .await
+            .expect("send secure");
+        let _ = recv(&phone_a).await;
+
+        let delivered = timeout(SHORT, delivery.packets.recv_async())
+            .await
+            .expect("no timeout")
+            .expect("delivered");
+        assert_eq!(
+            delivered.payload, peer_plain,
+            "X3 delivers the decrypted RTP, never the wire ciphertext"
+        );
+        assert_eq!(delivered.direction, to_target);
+        assert_eq!(delivered.source, addr_b);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn x3_on_a_bridged_call_delivers_nothing_for_a_packet_that_fails_authentication() {
+        let (harness, _phone_a, (phone_b, _)) = live_bridge().await;
+        let (factory, delivery) = crate::x3::x3_channel(64);
+        harness.bridge.set_x3_tap(
+            harness.secure_endpoint,
+            factory.tap(
+                harness.secure_addr,
+                siphon_rtp_li::PayloadDirection::FromTarget,
+            ),
+        );
+
+        // Never SRTP-protected, so `unprotect` fails and the bridge drops it before the tap.
+        phone_b
+            .send_to(&rtp(1, 0x3333_3333), harness.secure_addr)
+            .await
+            .expect("send forged");
+
+        assert!(
+            timeout(NEGATIVE, delivery.packets.recv_async())
+                .await
+                .is_err(),
+            "a packet failing SRTP authentication must never be delivered as target content"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn x3_on_a_bridged_call_delivers_nothing_from_an_unsignalled_source() {
+        let (harness, _phone_a, _phone_b) = live_bridge().await;
+        let (factory, delivery) = crate::x3::x3_channel(64);
+        harness.bridge.set_x3_tap(
+            harness.plain_endpoint,
+            factory.tap(
+                harness.plain_addr,
+                siphon_rtp_li::PayloadDirection::FromTarget,
+            ),
+        );
+
+        // The bridge's RTPBleed gate runs before the tap, so an injected stream is not attributed
+        // to the target.
+        let (attacker, _) = phone(Ipv4Addr::new(127, 0, 0, 9)).await;
+        attacker
+            .send_to(&rtp(1, 0x4444_4444), harness.plain_addr)
+            .await
+            .expect("send");
+
+        assert!(
+            timeout(NEGATIVE, delivery.packets.recv_async())
+                .await
+                .is_err(),
+            "a packet from an unsignalled source must not be delivered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_the_x3_tap_stops_bridged_delivery() {
+        let (harness, (phone_a, _), (phone_b, _)) = live_bridge().await;
+        let (factory, delivery) = crate::x3::x3_channel(64);
+        harness.bridge.set_x3_tap(
+            harness.plain_endpoint,
+            factory.tap(
+                harness.plain_addr,
+                siphon_rtp_li::PayloadDirection::FromTarget,
+            ),
+        );
+
+        phone_a
+            .send_to(&rtp(1, 0x5555_5555), harness.plain_addr)
+            .await
+            .expect("send");
+        let _ = recv(&phone_b).await;
+        assert!(timeout(SHORT, delivery.packets.recv_async()).await.is_ok());
+
+        harness.bridge.clear_x3_tap(harness.plain_endpoint);
+        harness.bridge.clear_x3_tap(harness.plain_endpoint); // idempotent
+
+        phone_a
+            .send_to(&rtp(2, 0x5555_5555), harness.plain_addr)
+            .await
+            .expect("send");
+        let _ = recv(&phone_b).await; // the call keeps relaying
+        assert!(
+            timeout(NEGATIVE, delivery.packets.recv_async())
+                .await
+                .is_err(),
+            "no content is delivered after the interception is detached"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tapping_an_endpoint_this_bridge_does_not_own_reports_failure() {
+        // The engine unwinds on this rather than reporting an interception that taps nothing.
+        let (harness, _phone_a, _phone_b) = live_bridge().await;
+        let (factory, _delivery) = crate::x3::x3_channel(4);
+        assert!(!harness.bridge.set_x3_tap(
+            EndpointId(9_999),
+            factory.tap(
+                harness.plain_addr,
+                siphon_rtp_li::PayloadDirection::FromTarget
+            ),
+        ));
     }
 }

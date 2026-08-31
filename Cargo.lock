@@ -2088,6 +2088,7 @@ dependencies = [
  "siphon-rtp-dtls",
  "siphon-rtp-hep",
  "siphon-rtp-ice",
+ "siphon-rtp-li",
  "siphon-rtp-media",
  "siphon-rtp-ngcompat",
  "siphon-rtp-proto",

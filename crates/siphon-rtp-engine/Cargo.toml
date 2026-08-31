@@ -40,6 +40,8 @@ siphon-rtp-srtp = { path = "../siphon-rtp-srtp", version = "0.3.0" }
 siphon-rtp-dtls = { path = "../siphon-rtp-dtls", version = "0.3.0" }
 siphon-rtp-turn = { path = "../siphon-rtp-turn", version = "0.3.0" }
 siphon-rtp-hep = { path = "../siphon-rtp-hep", version = "0.3.0" }
+# ETSI TS 103 221-2 X3 framing for lawful-interception content delivery.
+siphon-rtp-li = { path = "../siphon-rtp-li", version = "0.3.0" }
 siphon-rtp-ngcompat = { path = "../siphon-rtp-ngcompat", version = "0.3.0" }
 siphon-rtp-codec = { path = "../siphon-rtp-codec", version = "0.3.0" }
 siphon-rtp-media = { path = "../siphon-rtp-media", version = "0.3.0" }
@@ -60,6 +62,10 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 tokio-rustls = { workspace = true }
+# PEM material for the X3 delivery client: the operator's client certificate/key (the Mediation
+# Function authenticates the network element by certificate) and the private CA that signs the
+# Mediation Function's own certificate.
+rustls-pki-types = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }

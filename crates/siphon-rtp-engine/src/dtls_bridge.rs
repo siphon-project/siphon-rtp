@@ -20,6 +20,8 @@ use siphon_rtp_dtls::{handshake, DtlsCertificate, DtlsRole, DtlsTransport, Finge
 use siphon_rtp_srtp::leg::SecureLeg;
 use tokio::task::JoinHandle;
 
+use crate::x3::X3Tap;
+
 /// A shared secure leg that is `None` until the DTLS handshake installs it.
 type SharedSecureLeg = Arc<Mutex<Option<SecureLeg>>>;
 
@@ -139,6 +141,13 @@ struct Flow {
     secure_dst: Option<SecureDestination>,
     /// Shared with the call's other direction; `None` until the handshake completes.
     secure: SharedSecureLeg,
+    /// Lawful-interception content tap for this endpoint's ingress (ETSI TS 103 221-2 X3).
+    ///
+    /// Only the two *relaying* directions consult it. A [`Direction::Pipeline`] flow hands its
+    /// still-encrypted media to the per-call media actor, which decrypts and taps on its own
+    /// `Direction::handle` — tapping here as well would deliver every packet twice, once as
+    /// ciphertext.
+    x3: Option<X3Tap>,
 }
 
 /// Block until the leg's destination is decided. Returns `Err` if the leg is torn down first (every
@@ -279,6 +288,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: None,
                 secure_dst: Some(destination.clone()),
                 secure: secure.clone(),
+                x3: None,
             },
         );
         self.flows.insert(
@@ -291,6 +301,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: Some(plan.plain_dst),
                 secure_dst: None,
                 secure,
+                x3: None,
             },
         );
         self.sessions
@@ -386,6 +397,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 out_dst: None,
                 secure_dst: Some(destination.clone()),
                 secure: Arc::new(Mutex::new(None)),
+                x3: None,
             },
         );
         self.sessions
@@ -431,10 +443,35 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         self.flows.contains_key(&endpoint)
     }
 
+    /// Install a lawful-interception content tap on one bridged endpoint's ingress, replacing any
+    /// tap already there. Returns whether this bridge owns the endpoint.
+    ///
+    /// A **pipeline** flow (one whose media belongs to the per-call media actor rather than to a
+    /// peer socket) is left untapped on purpose: its media reaches that actor still encrypted and is
+    /// tapped there, on plaintext. Installing one here would deliver each packet twice, and the copy
+    /// from here would be ciphertext.
+    pub fn set_x3_tap(&self, endpoint: EndpointId, tap: X3Tap) -> bool {
+        let Some(mut flow) = self.flows.get_mut(&endpoint) else {
+            return false;
+        };
+        if matches!(flow.direction, Direction::Pipeline { .. }) {
+            return false;
+        }
+        flow.x3 = Some(tap);
+        true
+    }
+
+    /// Remove the lawful-interception tap from one bridged endpoint. Idempotent.
+    pub fn clear_x3_tap(&self, endpoint: EndpointId) {
+        if let Some(mut flow) = self.flows.get_mut(&endpoint) {
+            flow.x3 = None;
+        }
+    }
+
     /// Handle one redirected datagram: gate the source, then either feed the DTLS handshake or apply
     /// the flow's SRTP crypto and forward it. Anything unkeyed, un-gated, or un-decryptable is dropped.
     pub async fn handle(&self, packet: RxPacket) {
-        let Some((direction, accepted_source, out_endpoint, out_dst, secure)) =
+        let Some((direction, accepted_source, out_endpoint, out_dst, secure, x3)) =
             self.flows.get(&packet.endpoint).map(|flow| {
                 (
                     flow.direction.clone(),
@@ -445,6 +482,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                     flow.out_dst
                         .or_else(|| flow.secure_dst.as_ref().and_then(|dst| *dst.borrow())),
                     flow.secure.clone(),
+                    flow.x3.clone(),
                 )
             })
         else {
@@ -515,6 +553,19 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             tracing::debug!(?error, "DTLS bridge crypto failed; dropping packet");
             return;
         }
+
+        // Lawful-interception content (ETSI TS 103 221-2 X3), taken from whichever side of the
+        // transform is plaintext — the same placement as the SDES bridge. Reached only after the
+        // source gate, after the leg is keyed, and after the crypto succeeded, so an unkeyed,
+        // forged or replayed packet is never delivered.
+        if let Some(x3) = &x3 {
+            let plaintext = match direction {
+                Direction::Encrypt => packet.data.as_ref(),
+                Direction::Decrypt { .. } | Direction::Pipeline { .. } => out.as_slice(),
+            };
+            x3.deliver(packet.source, packet.arrival, plaintext);
+        }
+
         if let Err(error) = self.datapath.send(out_endpoint, out_dst, &out).await {
             tracing::debug!(%error, "DTLS bridge forward send failed");
         }

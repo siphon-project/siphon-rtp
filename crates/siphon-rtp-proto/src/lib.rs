@@ -81,6 +81,8 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
 /// Wire protocol version. Bumped on any breaking change to the message schema.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -488,9 +490,156 @@ pub enum Command {
     /// Detach the WebSocket tee from a call, closing its stream. Idempotent: detaching a call with no
     /// tee is not an error.
     DetachWsTee { call_id: String, from_tag: String },
+    /// Begin **lawful-interception content delivery** (ETSI TS 103 221-2 X3) for a call: the engine
+    /// frames every accepted media packet on both legs as an X3 PDU and ships it to the Mediation
+    /// Function over its own mutually-authenticated TLS connection.
+    ///
+    /// Additive, like [`Command::AttachWsTee`]: the call keeps relaying, recording and teeing
+    /// exactly as it was. The engine delivers the media it *accepted* — after SRTP decryption and
+    /// after the authentication and replay checks — so a secure leg yields plaintext RTP and a
+    /// forged packet yields nothing.
+    ///
+    /// Refused when the daemon has no `x3_*` configuration: an intercept that was accepted and then
+    /// silently delivered nowhere is the worst possible failure mode.
+    AttachX3 {
+        call_id: String,
+        from_tag: String,
+        /// Where the Mediation Function listens, as `host:port`. A hostname is resolved at dial
+        /// time and is what the server certificate is verified against.
+        delivery: String,
+        /// The 16-byte interception task identifier provisioned over X1. Carried opaquely into
+        /// every PDU header — the engine never interprets it.
+        xid: Xid,
+        /// The 8-byte session correlation provisioned over X1, which must be non-zero and must
+        /// match the one the signalling plane puts on this session's X2 records (TS 103 221-2
+        /// clause 6). Carried opaquely.
+        correlation_id: u64,
+        /// Which leg the warrant names. The engine knows which leg is the caller and which the
+        /// callee, but only the warrant knows which is the *target*, and PDU direction is defined
+        /// against the target rather than against a leg.
+        target_leg: X3TargetLeg,
+    },
+    /// Stop lawful-interception content delivery for a call, closing the delivery connection.
+    /// Idempotent: detaching a call with no interception is not an error.
+    DetachX3 { call_id: String, from_tag: String },
     /// Authenticate the control connection with the server's shared secret. Handled by the control
     /// server (not the session engine); required as the first command when a secret is configured.
     Authenticate { token: String },
+}
+
+/// A 16-byte lawful-interception task identifier (XID), provisioned over X1 and carried opaquely in
+/// every X2/X3 PDU header (ETSI TS 103 221-2 §5.2.7).
+///
+/// On the JSON control wire it is a UUID string, which is the form an X1 provisioning system hands
+/// out and an operator pastes. Dashes are optional on input; output is always canonical, so a
+/// round-trip normalises. The engine attaches no meaning to the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Xid([u8; 16]);
+
+impl Xid {
+    /// Wrap 16 raw bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw bytes, as they go on the wire.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// Whether this is the all-zero XID. Only a keepalive PDU may carry one, so an all-zero XID on
+    /// an interception request is a provisioning error rather than a valid task.
+    #[must_use]
+    pub fn is_nil(&self) -> bool {
+        self.0 == [0u8; 16]
+    }
+}
+
+/// Why an XID string could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XidParseError;
+
+impl fmt::Display for XidParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "expected a 16-byte XID as 32 hexadecimal digits, optionally dash-separated"
+        )
+    }
+}
+
+impl std::error::Error for XidParseError {}
+
+impl FromStr for Xid {
+    type Err = XidParseError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut bytes = [0u8; 16];
+        let mut digits = text.chars().filter(|character| *character != '-');
+        for byte in &mut bytes {
+            let high = digits.next().ok_or(XidParseError)?;
+            let low = digits.next().ok_or(XidParseError)?;
+            let high = high.to_digit(16).ok_or(XidParseError)?;
+            let low = low.to_digit(16).ok_or(XidParseError)?;
+            // Both digits are < 16, so the combination is always a valid byte.
+            *byte = ((high << 4) | low) as u8;
+        }
+        // Trailing characters mean the caller passed something longer than an XID; refuse rather
+        // than silently truncate a mis-pasted identifier.
+        if digits.next().is_some() {
+            return Err(XidParseError);
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for Xid {
+    /// Canonical dashed UUID form (8-4-4-4-12).
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, byte) in self.0.iter().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                write!(formatter, "-")?;
+            }
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for Xid {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Xid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Which leg of a call the lawful-interception warrant names as the target
+/// ([`Command::AttachX3`]). "Caller" is the offerer (leg A, the `from_tag` side); "callee" is the
+/// answerer (leg B).
+///
+/// This exists separately from [`WsTeeDirection`] because it answers a different question.
+/// `WsTeeDirection` is leg-relative and selects *which* audio to stream; this selects the reference
+/// point for TS 103 221-2 §5.2.6's target-relative `Payload Direction`, where 2 is "sent to the
+/// target" and 3 is "sent from the target". Both legs are always delivered; this decides which
+/// direction value each one carries.
+///
+/// Deliberately **not** `#[non_exhaustive]`: a two-party call has exactly two legs, and mislabelling
+/// which one is the target inverts the direction on every delivered packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum X3TargetLeg {
+    /// The offerer (leg A) is the intercept target.
+    Caller,
+    /// The answerer (leg B) is the intercept target.
+    Callee,
 }
 
 /// Which leg(s) of a call a [`Command::AttachWsTee`] streams. "Caller" is the offerer (leg A, the
@@ -1221,9 +1370,73 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frames_dropped: Option<u64>,
     },
+    /// Lawful-interception content delivery started ([`Command::AttachX3`]): the engine connected to
+    /// the Mediation Function and the call's accepted media is now being framed and shipped.
+    X3Started {
+        call_id: String,
+        from_tag: String,
+        /// Where the Mediation Function was dialled, as given on the command.
+        delivery: String,
+        /// The interception task identifier, echoed so the controller can tie this to its warrant.
+        xid: Xid,
+        /// The session correlation, echoed. Must match the value on this session's X2 records.
+        correlation_id: u64,
+        /// Which leg the warrant named as the target.
+        target_leg: X3TargetLeg,
+    },
+    /// Warranted content was **dropped** rather than delivered, because the delivery buffer filled —
+    /// the Mediation Function was unreachable or too slow for longer than the buffer covers.
+    ///
+    /// This is a reportable failure, not a degraded recording: the controller is expected to raise
+    /// the corresponding destination-level report toward the Administration Function. Emitted when
+    /// loss begins and then rate-limited, so a long outage does not flood the control channel.
+    ///
+    /// Delivered content stays a contiguous prefix — the engine discards *arriving* packets when
+    /// full rather than evicting buffered ones, so the gap is a single contiguous range starting at
+    /// `dropped_since_ms`.
+    X3Loss {
+        call_id: String,
+        from_tag: String,
+        /// Packets dropped on this interception so far.
+        dropped: u64,
+        /// Packets successfully handed to the delivery transport so far.
+        delivered: u64,
+        /// Milliseconds since this interception started, at the first drop of the current gap.
+        dropped_since_ms: u64,
+    },
+    /// Lawful-interception content delivery ended, with the delivery counts for the record.
+    X3Ended {
+        call_id: String,
+        from_tag: String,
+        reason: X3EndReason,
+        /// Packets handed to the delivery transport over the interception's lifetime.
+        delivered: u64,
+        /// Packets dropped because the buffer filled. **Non-zero means warranted content did not
+        /// reach the agency** and a destination-level report is owed.
+        dropped: u64,
+    },
     /// Unknown / future event kind (forward-compat).
     #[serde(other)]
     Unknown,
+}
+
+/// Why lawful-interception content delivery ended, carried by [`Event::X3Ended`].
+///
+/// `#[non_exhaustive]`: engine-emitted and informational. A reason a consumer has not heard of still
+/// means delivery stopped, which is the part that drives its state machine — and the delivered and
+/// dropped counts on the event are what the compliance record actually needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum X3EndReason {
+    /// The controller detached it ([`Command::DetachX3`]).
+    Detached,
+    /// The call was torn down, so there is no further media to intercept.
+    CallEnded,
+    /// The Mediation Function closed the delivery connection.
+    MediationClosed,
+    /// The delivery connection failed and could not be re-established.
+    TransportError,
 }
 
 /// Errors from the framing helpers.
@@ -1678,6 +1891,178 @@ mod tests {
             }
             other => panic!("expected answer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn xid_parses_a_uuid_with_or_without_dashes() {
+        let dashed: Xid = "8c292fa1-5831-46ec-86be-bd85f2083299"
+            .parse()
+            .expect("dashed");
+        let bare: Xid = "8c292fa1583146ec86bebd85f2083299".parse().expect("bare");
+        assert_eq!(dashed, bare);
+        assert_eq!(
+            dashed.as_bytes(),
+            &[
+                0x8c, 0x29, 0x2f, 0xa1, 0x58, 0x31, 0x46, 0xec, 0x86, 0xbe, 0xbd, 0x85, 0xf2, 0x08,
+                0x32, 0x99
+            ]
+        );
+    }
+
+    #[test]
+    fn xid_renders_canonically_so_a_round_trip_normalises() {
+        let xid: Xid = "8C292FA1583146EC86BEBD85F2083299".parse().expect("upper");
+        assert_eq!(xid.to_string(), "8c292fa1-5831-46ec-86be-bd85f2083299");
+        assert_eq!(xid.to_string().parse::<Xid>().expect("reparse"), xid);
+    }
+
+    #[test]
+    fn xid_refuses_anything_that_is_not_exactly_sixteen_bytes() {
+        // A mis-pasted identifier must be refused, never silently truncated into something that
+        // would be delivered as a valid-looking task id.
+        for bad in [
+            "",
+            "8c292fa1",
+            "8c292fa1583146ec86bebd85f208329",   // 31 digits
+            "8c292fa1583146ec86bebd85f20832990", // 33 digits
+            "8c292fa1583146ec86bebd85f208329g",  // non-hex
+            "8c292fa1583146ec86bebd85f2083299 ", // trailing whitespace
+        ] {
+            assert!(bad.parse::<Xid>().is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn xid_ignores_dash_placement_entirely() {
+        // Dashes are separators, not structure: X1 systems and operators vary in where they put
+        // them, and all of these name the same task.
+        let canonical: Xid = "8c292fa1-5831-46ec-86be-bd85f2083299".parse().expect("xid");
+        for equivalent in [
+            "8c292fa1583146ec86bebd85f2083299",
+            "8c29-2fa1-5831-46ec-86be-bd85-f208-3299",
+            "8c292fa1-5831-46ec-86be-bd85f2083299-",
+        ] {
+            assert_eq!(
+                equivalent.parse::<Xid>().expect(equivalent),
+                canonical,
+                "{equivalent}"
+            );
+        }
+    }
+
+    #[test]
+    fn xid_reports_the_nil_value() {
+        assert!(Xid::default().is_nil());
+        assert!("00000000-0000-0000-0000-000000000000"
+            .parse::<Xid>()
+            .expect("nil")
+            .is_nil());
+        assert!(!"8c292fa1583146ec86bebd85f2083299"
+            .parse::<Xid>()
+            .expect("xid")
+            .is_nil());
+    }
+
+    #[test]
+    fn attach_x3_wire_shape() {
+        let json = concat!(
+            r#"{"command":"attach_x3","call_id":"c","from_tag":"f","#,
+            r#""delivery":"mdf.example.net:8090","#,
+            r#""xid":"8c292fa1-5831-46ec-86be-bd85f2083299","#,
+            r#""correlation_id":72623859790382856,"target_leg":"caller"}"#
+        );
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::AttachX3 {
+                call_id,
+                delivery,
+                xid,
+                correlation_id,
+                target_leg,
+                ..
+            } => {
+                assert_eq!(call_id, "c");
+                assert_eq!(delivery, "mdf.example.net:8090");
+                assert_eq!(xid.to_string(), "8c292fa1-5831-46ec-86be-bd85f2083299");
+                assert_eq!(correlation_id, 0x0102_0304_0506_0708);
+                assert_eq!(target_leg, X3TargetLeg::Caller);
+            }
+            other => panic!("expected attach_x3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detach_x3_wire_shape() {
+        let json = r#"{"command":"detach_x3","call_id":"c","from_tag":"f"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::DetachX3 { call_id, from_tag } => {
+                assert_eq!(call_id, "c");
+                assert_eq!(from_tag, "f");
+            }
+            other => panic!("expected detach_x3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x3_target_leg_names_the_two_legs() {
+        assert_eq!(
+            serde_json::to_value(X3TargetLeg::Caller).expect("caller"),
+            serde_json::json!("caller")
+        );
+        assert_eq!(
+            serde_json::to_value(X3TargetLeg::Callee).expect("callee"),
+            serde_json::json!("callee")
+        );
+    }
+
+    #[test]
+    fn x3_events_wire_shape() {
+        let xid: Xid = "8c292fa1-5831-46ec-86be-bd85f2083299".parse().expect("xid");
+        let started = Event::X3Started {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            delivery: "mdf.example.net:8090".into(),
+            xid,
+            correlation_id: 1,
+            target_leg: X3TargetLeg::Callee,
+        };
+        let value = serde_json::to_value(&started).expect("to_value");
+        assert_eq!(value["event"], "x3_started");
+        assert_eq!(value["xid"], "8c292fa1-5831-46ec-86be-bd85f2083299");
+        assert_eq!(value["target_leg"], "callee");
+        assert_eq!(
+            serde_json::from_value::<Event>(value).expect("roundtrip"),
+            started
+        );
+
+        let loss = Event::X3Loss {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            dropped: 12,
+            delivered: 20_000,
+            dropped_since_ms: 45_000,
+        };
+        let value = serde_json::to_value(&loss).expect("to_value");
+        assert_eq!(value["event"], "x3_loss");
+        assert_eq!(value["dropped"], 12);
+        assert_eq!(
+            serde_json::from_value::<Event>(value).expect("roundtrip"),
+            loss
+        );
+
+        let ended = Event::X3Ended {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            reason: X3EndReason::Detached,
+            delivered: 20_000,
+            dropped: 0,
+        };
+        let value = serde_json::to_value(&ended).expect("to_value");
+        assert_eq!(value["event"], "x3_ended");
+        assert_eq!(value["reason"], "detached");
+        assert_eq!(
+            serde_json::from_value::<Event>(value).expect("roundtrip"),
+            ended
+        );
     }
 
     #[test]

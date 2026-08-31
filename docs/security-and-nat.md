@@ -1032,7 +1032,33 @@ RFC 3264 (offer/answer) · RFC 3550 §5,§8 / 3551 (RTP/RTCP) · RFC 4961 (symme
 RFC 6263 (RTP NAT keepalives) · RFC 7983 (STUN/DTLS/RTP demux) · RFC 8445 / 8839 / 8489 (ICE / SDP-for-ICE / STUN) ·
 RFC 7675 (ICE consent freshness) · RFC 3711 (SRTP) · RFC 5764 (DTLS-SRTP) · RFC 4568 (SDES) ·
 RFC 4566 (SDP) · RFC 5761 / 3605 (rtcp-mux / a=rtcp) · RFC 5766 / 8656 (TURN) · RFC 6062 (TURN-over-TCP) ·
-RFC 1321 (MD5) · RFC 4648 (base64) · RFC 2104 / 2202 (HMAC). RTPBleed: Enable Security advisory, 2017.
+RFC 1321 (MD5) · RFC 4648 (base64) · RFC 2104 / 2202 (HMAC) · ETSI TS 103 221-2 (lawful-interception
+X2/X3 delivery). RTPBleed: Enable Security advisory, 2017.
+
+---
+
+## 10a. Consumers of the accepted-packet path
+
+Everything that copies media out of the engine hangs off the same acceptance decision this document
+describes, and each one sits at a deliberately chosen point on it. The differences are not
+incidental — they are the security property of each consumer:
+
+| Consumer | Tap point | Sees |
+|---|---|---|
+| pcap recording (`start recording`) | before `Direction::handle` | the **verbatim wire bytes**, so on a secure leg it records ciphertext — correct for debugging, since the point is to capture what was on the wire |
+| SIPREC raw tee (`subscribe_*`) | in `handle`, after decrypt | plaintext, pre-transcode |
+| WebSocket tee (`attach_ws_tee`) | post-decode fan-out | decoded PCM |
+| **Lawful interception (`attach_x3`)** | in `handle` after decrypt **and** after the authentication decision; plus both crypto bridges | plaintext RTP the engine **accepted** |
+
+The X3 tap is the strictest, and deliberately so. It must never deliver ciphertext (the agency has
+no key) and must never deliver a packet the engine refused — a failed SRTP `unprotect`, a replay, or
+media arriving before a DTLS handshake keys the leg — because forged traffic presented to an agency
+as the target's media is worse than no delivery at all. It also runs on the SDES and DTLS **crypto
+bridges**, which relay without ever entering the media pipeline: without that, a same-codec WebRTC
+call would be silently uninterceptable.
+
+The source gate (layer 2) runs before all of them, so no consumer ever sees a packet from an
+unsignalled source. See [Lawful interception](lawful-interception.md).
 
 ---
 

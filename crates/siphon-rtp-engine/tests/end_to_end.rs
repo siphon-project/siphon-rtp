@@ -12,7 +12,7 @@ use siphon_rtp_engine::srtp_bridge::run_redirect_dispatcher_with_text;
 use siphon_rtp_engine::{sdp, server, Engine};
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_proto::{
-    frame, CmdResult, Command, ConferenceRole, Event, ProfileFlags, Request, Response,
+    frame, CmdResult, Command, ConferenceRole, Event, ProfileFlags, Request, Response, X3TargetLeg,
 };
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite};
 use siphon_rtp_srtp::SrtpContext;
@@ -1911,4 +1911,166 @@ fn pcmu_rtp(sequence: u16) -> Vec<u8> {
     packet.extend_from_slice(&0x0A0A_0A0Au32.to_be_bytes());
     packet.extend_from_slice(&[0xFFu8; 160]);
     packet
+}
+
+// --- Lawful-interception content delivery (ETSI TS 103 221-2 X3), control plane ----------------
+
+/// Offer + answer a plain two-leg PCMU relay named `call_id`. Returns both phone sockets (kept
+/// alive by the caller, so the call stays up) and the engine's **near**, A-facing address — the one
+/// phone A sends to, which the engine relays out its far port to phone B.
+async fn offer_answer_relay(
+    control: &mut Control,
+    call_id: &str,
+) -> (UdpSocket, UdpSocket, SocketAddr) {
+    let (phone_a, addr_a) = phone().await;
+    let (phone_b, addr_b) = phone().await;
+    let offer = control
+        .request(Command::Offer {
+            call_id: call_id.into(),
+            from_tag: "tag-a".into(),
+            sdp: pcmu_offer(addr_a),
+            profile: Default::default(),
+        })
+        .await;
+    assert!(matches!(offer, CmdResult::Ok { .. }), "offer accepted");
+    let answer = control
+        .request(Command::Answer {
+            call_id: call_id.into(),
+            from_tag: "tag-a".into(),
+            to_tag: "tag-b".into(),
+            sdp: pcmu_answer(addr_b),
+            profile: Default::default(),
+        })
+        .await;
+    let near_addr = engine_addr(&answer);
+    (phone_a, phone_b, near_addr)
+}
+
+/// A valid interception request for `call_id`, pointing at an address nothing is listening on
+/// (these tests exercise the control plane's accept/refuse decision, not the delivery connection).
+fn attach_x3(call_id: &str) -> Command {
+    Command::AttachX3 {
+        call_id: call_id.into(),
+        from_tag: "tag-a".into(),
+        delivery: "127.0.0.1:9".into(),
+        xid: "8c292fa1-5831-46ec-86be-bd85f2083299".parse().expect("xid"),
+        correlation_id: 0x0102_0304_0506_0708,
+        target_leg: X3TargetLeg::Caller,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_x3_is_refused_on_a_node_with_no_interception_configuration() {
+    // The single most important refusal in this feature. An `attach_x3` that returns success on a
+    // node with no delivery PKI reads as a served warrant and delivers nothing — the kind of
+    // failure a compliance audit finds long after the warrant expired. It must be an error at the
+    // command, not an acceptance followed by silence.
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let (_phone_a, _phone_b, _far) = offer_answer_relay(&mut control, "x3-unconfigured").await;
+
+    let result = control.request(attach_x3("x3-unconfigured")).await;
+    let CmdResult::Error { reason } = result else {
+        panic!("attach_x3 on an unprovisioned node must be refused, got {result:?}");
+    };
+    assert!(
+        reason.contains("not configured"),
+        "the refusal must say the node is not provisioned, got {reason:?}"
+    );
+    assert!(
+        reason.contains("x3_client_cert"),
+        "...and name the missing configuration, got {reason:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_x3_is_refused_without_a_correlation_id() {
+    // TS 103 221-2 clause 6: content the Mediation Function cannot tie to its X2 records is worse
+    // than no content, because it reads as a successful delivery.
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let (_phone_a, _phone_b, _far) = offer_answer_relay(&mut control, "x3-zero-correlation").await;
+
+    let Command::AttachX3 {
+        call_id,
+        from_tag,
+        delivery,
+        xid,
+        target_leg,
+        ..
+    } = attach_x3("x3-zero-correlation")
+    else {
+        unreachable!("constructed above")
+    };
+    let result = control
+        .request(Command::AttachX3 {
+            call_id,
+            from_tag,
+            delivery,
+            xid,
+            correlation_id: 0,
+            target_leg,
+        })
+        .await;
+    assert!(
+        matches!(result, CmdResult::Error { .. }),
+        "a zero correlation id must be refused, got {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_x3_is_refused_for_an_unknown_call() {
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let result = control.request(attach_x3("x3-no-such-call")).await;
+    assert!(
+        matches!(result, CmdResult::Error { .. }),
+        "an unknown call must be refused, got {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detach_x3_is_idempotent_and_leaves_the_call_relaying() {
+    // Detaching a call that was never intercepted is not an error, and detaching must not disturb
+    // the media path — an interception is additive in both directions.
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let (phone_a, phone_b, near_addr) = offer_answer_relay(&mut control, "x3-detach").await;
+
+    for _ in 0..2 {
+        let result = control
+            .request(Command::DetachX3 {
+                call_id: "x3-detach".into(),
+                from_tag: "tag-a".into(),
+            })
+            .await;
+        assert!(
+            matches!(result, CmdResult::Ok { .. }),
+            "detach_x3 is idempotent, got {result:?}"
+        );
+    }
+
+    // The call still relays A to B.
+    phone_a
+        .send_to(&pcmu_rtp(1), near_addr)
+        .await
+        .expect("send a");
+    let (relayed, _) = recv(&phone_b).await;
+    assert_eq!(relayed, pcmu_rtp(1), "the call keeps relaying after detach");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detach_x3_is_refused_for_an_unknown_call() {
+    let control_addr = spawn_control_server().await;
+    let mut control = Control::connect(control_addr).await;
+    let result = control
+        .request(Command::DetachX3 {
+            call_id: "x3-no-such-call".into(),
+            from_tag: "tag-a".into(),
+        })
+        .await;
+    assert!(
+        matches!(result, CmdResult::Error { .. }),
+        "an unknown call must be refused, got {result:?}"
+    );
 }
