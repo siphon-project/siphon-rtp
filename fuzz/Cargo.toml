@@ -23,6 +23,7 @@ siphon-rtp-proto = { path = "../crates/siphon-rtp-proto" }
 siphon-rtp-stun = { path = "../crates/siphon-rtp-stun" }
 siphon-rtp-ice = { path = "../crates/siphon-rtp-ice" }
 siphon-rtp-codec = { path = "../crates/siphon-rtp-codec", features = ["amr"] }
+siphon-rtp-li = { path = "../crates/siphon-rtp-li" }
 
 # RFC 3550/3551/5761 — RTP header, compound RTCP, rtcp-mux classifier.
 [[bin]]
@@ -118,6 +119,16 @@ bench = false
 [[bin]]
 name = "tone_spec_fuzz"
 path = "fuzz_targets/tone_spec_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# ETSI TS 103 221-2 §5.2 — the X2/X3 PDU header read back from the Mediation Function on the lawful
+# -interception delivery connection. The stream framing is computed from its length fields, so a
+# hostile length must not underflow, wrap, or desynchronise the reader.
+[[bin]]
+name = "li_pdu_fuzz"
+path = "fuzz_targets/li_pdu_fuzz.rs"
 test = false
 doc = false
 bench = false

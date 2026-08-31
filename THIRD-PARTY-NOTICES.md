@@ -205,6 +205,63 @@ SOFTWARE.
 
 ---
 
+## Acknowledgements — projects we validated against
+
+Nothing in this section is redistributed here, and no code from any of it is in this repository.
+These are projects whose work we *checked ourselves against*, which is a real debt even though it
+leaves no trace in the binary. Recorded because "we validated against an independent
+implementation" is worth nothing if the implementation is not named.
+
+The same references underpin siphon-sip's X1/X2 side of lawful interception, so this is a
+project-wide acknowledgement rather than one crate's.
+
+### Wireshark / `tshark` — the independent decoder
+
+**<https://www.wireshark.org/>** — the Wireshark Foundation and its contributors, GPL-2.0-or-later.
+
+Wireshark is the project's standing answer to "how do you know the bytes are right?". Our encoders
+emit; `tshark` dissects; the assertion is on what a decoder that does not share our bugs read back.
+It is used this way for the ETSI TS 103 221-2 X2/X3 framing (`crates/siphon-rtp-li`) and for
+protocol work across the wider stack.
+
+It is a **development and test tool**, invoked as an external process. It is not linked, not
+bundled, not redistributed, and not required to build or run siphon-rtp — the tests that use it skip
+when it is absent. Its GPL licence therefore does not reach this codebase.
+
+### `x2x3PduDissector` — the X2/X3 Lua dissector
+
+**<https://github.com/hyavari/x2x3PduDissector>** by *hyavari*.
+
+The Wireshark Lua dissector that makes the point above possible for TS 103 221-2: it reads our
+emitted PDUs back field by field and hands the RTP payload to Wireshark's own RTP dissector. Without
+it there was no independent decoder for this wire format at all.
+
+**It carries no licence file, so default copyright applies — all rights reserved.** That is exactly
+why it is *fetched, never vendored*: `reference/x2x3-dissector/fetch.sh` downloads it against a
+pinned SHA-256 into a gitignored path, it is never committed or redistributed, and the tests that
+drive it skip when it is absent. Anyone wanting to run that check fetches their own copy from
+upstream under whatever terms the author offers.
+
+### sipgate LI reference implementation and simulator
+
+**<https://github.com/sipgate/li-lib-x1x2x3>** and
+**<https://github.com/sipgate/li-simulator-x1x2x3>** — MIT, Copyright 2025 sipgate GmbH.
+
+An independently written Java implementation of ETSI TS 103 221 X1/X2/X3, and a simulator that acts
+as an ADMF and Mediation Function for testing network elements against it.
+
+A specific and concrete debt: the demo capture shipped in that library's test resources
+(`x2-demo-01.pcap`) is a real X2 PDU produced by a different implementation, and reading it is what
+established that the PDU-format version field is `00 05` — version 0.5, which is **not** the version
+of the specification document. Our encoder had it the other way round, and would have emitted PDUs
+that library rejects outright and that a conformant Mediation Function would too. Its `PduObject`
+validation and the simulator's role as a testable MDF were the cross-check that settled it.
+
+No sipgate code is used, copied or ported here; the Rust is written from the specification. What was
+taken was the ability to check our reading of it against someone else's.
+
+---
+
 ## Dependency licences
 
 The above concerns codec *ports*. The full set of Rust dependency crates compiled into a build,
