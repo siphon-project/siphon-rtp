@@ -76,6 +76,14 @@ encode/decode bug passes one. It is checked three ways:
 The inbound header parser eats untrusted bytes from a network peer and has a libFuzzer target
 (`fuzz/fuzz_targets/li_pdu_fuzz.rs`).
 
+### Credit where it is owed
+
+The independent checks above exist because of other people's work: **Wireshark** and *hyavari*'s
+[`x2x3PduDissector`](https://github.com/hyavari/x2x3PduDissector) provide the decoder, and
+**sipgate**'s [`li-lib-x1x2x3`](https://github.com/sipgate/li-lib-x1x2x3) ships the captured PDU that
+proved our version field was the wrong way round. See
+[THIRD-PARTY-NOTICES.md](../../THIRD-PARTY-NOTICES.md) — none of it is redistributed here.
+
 ## Benchmarks
 
 `cargo bench -p siphon-rtp-li` — per-packet framing cost, split into the TLV writer and the header

@@ -5,10 +5,26 @@ nothing: a shared encode/decode bug passes one. So the framing is checked agains
 decoder that does not share our bugs, the same way the project's other encoders are checked with
 Wireshark.
 
-The decoder is a Lua dissector for Wireshark, fetched rather than vendored (it is someone else's
-code under its own licence). `crates/siphon-rtp-li/tests/dissector.rs` drives it through `tshark`
-and asserts that every header field and conditional attribute reads back as intended, and that the
-RTP payload hands off to Wireshark's own RTP dissector.
+The decoder is a Lua dissector for Wireshark by *hyavari*, fetched rather than vendored.
+`crates/siphon-rtp-li/tests/dissector.rs` drives it through `tshark` and asserts that every header
+field and conditional attribute reads back as intended, and that the RTP payload hands off to
+Wireshark's own RTP dissector.
+
+## Licence — why this is fetched and never committed
+
+**The upstream repository carries no licence file, so default copyright applies: all rights
+reserved.** That is the reason for the fetch-don't-vendor arrangement rather than a stylistic
+preference. The file is downloaded into this directory against a pinned hash, is gitignored, is
+never committed or redistributed as part of siphon-rtp, and nothing in the build or the shipped
+artifacts depends on it. Running the check means fetching your own copy from upstream, under
+whatever terms the author offers.
+
+Wireshark itself (GPL-2.0-or-later) is likewise a development tool invoked as an external process —
+not linked, not bundled, not required to build or run siphon-rtp.
+
+See [THIRD-PARTY-NOTICES.md](../../THIRD-PARTY-NOTICES.md) for the full acknowledgement, including
+sipgate's LI reference implementation, whose captured demo PDU is what established the PDU-format
+version this crate emits.
 
 ## Fetching
 
