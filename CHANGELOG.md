@@ -7,6 +7,46 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-08-31
+
+A small release, cut so controllers can pick up the control-contract additions:
+`siphon-rtp-proto` **0.3.1** carries the lawful-interception verbs and types that
+[SIPhon](https://github.com/siphon-project/siphon) compiles against for the X1/X2 side.
+
+### Added
+
+- **Lawful interception — ETSI TS 103 221-2 X3 content delivery.** Intercepted media is framed and
+  shipped to a Mediation Function **straight from the media plane**, over its own
+  mutually-authenticated TLS connection, instead of being forked through the signalling process.
+  Attach it to a live call with `attach_x3` (`delivery`, `xid`, `correlation_id`, `target_leg`) and
+  stop it with `detach_x3`; both are additive, so the call keeps relaying, recording and teeing.
+  Scope here is X3 content only — X1 provisioning and X2 IRI live in the signalling plane.
+
+  - New crate **`siphon-rtp-li`**: the clause 5 wire format on its own, pure Rust and std only.
+    Written against **V1.4.1 (2021-04)** with every constant carrying its clause citation, and
+    validated three ways — byte-exact fixtures, a known-answer test against a PDU captured from an
+    unrelated implementation, and an independent third-party Wireshark dissector driven through
+    `tshark`. Framing costs ~49 ns/packet and allocates nothing per intercepted frame.
+  - **Control contract** (`siphon-rtp-proto`): `Command::AttachX3` / `Command::DetachX3`, the `Xid`
+    task-identifier type (UUID on the wire, carried opaquely), `X3TargetLeg`, and
+    `Event::X3Started` / `Event::X3Loss` / `Event::X3Ended` with `X3EndReason`. Additive —
+    `Command` and `Event` are already `#[non_exhaustive]`, so no consumer breaks.
+  - **Configuration** (`x3_client_cert`, `x3_client_key`, `x3_ca`, `x3_network_function_id`,
+    `x3_interception_point_id`, `x3_buffer_packets`, `x3_keepalive_secs`). All three PEM paths are
+    required; a half-provisioned node counts as unprovisioned. **Without them `attach_x3` is
+    refused**, never accepted and left inert — an interception that reports success and delivers
+    nowhere reads as a served warrant.
+  - Delivered content is what the engine **accepted**: after SRTP decryption and after the
+    authentication and replay checks, so a secure leg yields plaintext RTP and a forged, replayed or
+    not-yet-keyed packet yields nothing. Coverage includes the SDES and DTLS **crypto bridges**,
+    which relay without decoding — without that, an ordinary same-codec WebRTC call would have been
+    silently uninterceptable.
+  - Loss is treated as reportable, not best-effort: the buffer survives a Mediation Function outage
+    rather than discarding through it, a full buffer drops the *arriving* packet so what was
+    delivered stays a contiguous prefix, and every drop is counted and raised as `Event::X3Loss`.
+
+  See [docs/lawful-interception.md](docs/lawful-interception.md).
+
 ### Fixed
 
 - **The WS uplink VAD's trailing hangover was counted in milliseconds, not ptime frames** — a 0.3.0
@@ -21,6 +61,22 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   offers a leg with `ws_vad` and a 300 ms hangover, talks into it over real RTP, and counts the
   uplink frames a WS server sees between `speech_started` and `speech_stopped` — 15 frames at the
   leg's 20 ms ptime, against the 300 the defect produced.
+
+### Internal
+
+- **The memory-leak soaks now gate on a converged steady state rather than a fixed warmup.** The
+  intermittent "overlay playback leaked ~600 KB" was measurement, not a leak: the delta does not
+  scale with cycles, and the plateau's height and the cycles needed to reach it both scale with core
+  count, so no fixed warmup could be right about it. The new gate churns until ten consecutive
+  segments come back flat and then holds the last five to 16 bytes per cycle — 109× tighter than the
+  bar it replaces, which passed an injected 64-bytes-per-cycle leak most of the time.
+- **Release CI publishes `siphon-rtp-proto` to crates.io on a tag**, authenticated by Trusted
+  Publishing rather than a stored token, and reachable by `workflow_dispatch` against an existing tag
+  so a release predating the job can still be published.
+- Third-party notices now credit the projects the X2/X3 framing was validated against — Wireshark,
+  hyavari's `x2x3PduDissector`, and sipgate's MIT-licensed LI reference implementation and simulator,
+  whose captured demo PDU established the PDU-format version. None of it is redistributed here.
+- Docs: the echo canceller runs in the wire domain, not at the codec's native rate.
 
 ## [0.3.0] — 2026-08-21
 
