@@ -7,14 +7,19 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
-**Lands as 0.4.0, not a 0.3.x patch.** The workspace version is bumped here rather than at the
-release cut, because a controller floating on `^0.3` would otherwise pick this up from an ordinary
-dependency bump. The JSON wire stays backward compatible as always — new verbs a peer never sends,
-and new event tags an older consumer decodes as `Event::Unknown` — and `Command` / `Event` have been
-`#[non_exhaustive]` since 0.3.0, so a downstream `match` keeps compiling. What a minor bump buys is
-that picking the change up is a *decision*: the engine's runtime behaviour changes (a takeover bridge
-now has a lifecycle, and `block_media` is refused on a call that has one), and that should not arrive
-in a consumer's build unannounced.
+## [0.4.0] — 2026-09-01
+
+Cut so controllers can build against the takeover-bridge lifecycle: `siphon-rtp-proto` **0.4.0**
+carries `attach_ws_bridge` / `detach_ws_bridge` and the `ws_bridge_started` / `ws_bridge_ended`
+events that [SIPhon](https://github.com/siphon-project/siphon) compiles against.
+
+**A minor, not a 0.3.x patch**, because a controller floating on `^0.3` would otherwise pick this up
+from an ordinary dependency bump. The JSON wire stays backward compatible as always — new verbs a
+peer never sends, and new event tags an older consumer decodes as `Event::Unknown` — and `Command` /
+`Event` have been `#[non_exhaustive]` since 0.3.0, so a downstream `match` keeps compiling. What the
+minor buys is that picking the change up is a *decision*: the engine's runtime behaviour changes (a
+takeover bridge now has a lifecycle, and `block_media` is refused on a call that has one), and that
+should not arrive in a consumer's build unannounced.
 
 ### Added
 
