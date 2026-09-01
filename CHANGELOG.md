@@ -94,6 +94,12 @@ should not arrive in a consumer's build unannounced.
   reuses it), so a selection landing on a leg whose bridge has died must still be recorded, or the
   replacement bridge would start out aimed at the pre-ICE address.
 
+### Dependencies
+
+- `chacha20` 0.10.1 → 0.10.2 in all three lockfiles (workspace, `fuzz/`, `crates/siphon-rtp-xdp/`).
+  0.10.1 was yanked; it reaches the tree transitively through `tokio-tungstenite`'s `rand`, and none
+  of it is in `siphon-rtp-proto`'s graph.
+
 ### Not included, and why
 
 **Detaching a bridge that was negotiated with `ws_uri` is refused** (`ws-bridge-negotiated`), not
