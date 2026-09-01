@@ -7,14 +7,19 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
-**Lands as 0.4.0, not a 0.3.x patch.** The workspace version is bumped here rather than at the
-release cut, because a controller floating on `^0.3` would otherwise pick this up from an ordinary
-dependency bump. The JSON wire stays backward compatible as always — new verbs a peer never sends,
-and new event tags an older consumer decodes as `Event::Unknown` — and `Command` / `Event` have been
-`#[non_exhaustive]` since 0.3.0, so a downstream `match` keeps compiling. What a minor bump buys is
-that picking the change up is a *decision*: the engine's runtime behaviour changes (a takeover bridge
-now has a lifecycle, and `block_media` is refused on a call that has one), and that should not arrive
-in a consumer's build unannounced.
+## [0.4.0] — 2026-09-01
+
+Cut so controllers can build against the takeover-bridge lifecycle: `siphon-rtp-proto` **0.4.0**
+carries `attach_ws_bridge` / `detach_ws_bridge` and the `ws_bridge_started` / `ws_bridge_ended`
+events that [SIPhon](https://github.com/siphon-project/siphon) compiles against.
+
+**A minor, not a 0.3.x patch**, because a controller floating on `^0.3` would otherwise pick this up
+from an ordinary dependency bump. The JSON wire stays backward compatible as always — new verbs a
+peer never sends, and new event tags an older consumer decodes as `Event::Unknown` — and `Command` /
+`Event` have been `#[non_exhaustive]` since 0.3.0, so a downstream `match` keeps compiling. What the
+minor buys is that picking the change up is a *decision*: the engine's runtime behaviour changes (a
+takeover bridge now has a lifecycle, and `block_media` is refused on a call that has one), and that
+should not arrive in a consumer's build unannounced.
 
 ### Added
 
@@ -88,6 +93,12 @@ in a consumer's build unannounced.
   what happens the moment a bridge's drain task exits. The watch now outlives that task (a re-point
   reuses it), so a selection landing on a leg whose bridge has died must still be recorded, or the
   replacement bridge would start out aimed at the pre-ICE address.
+
+### Dependencies
+
+- `chacha20` 0.10.1 → 0.10.2 in all three lockfiles (workspace, `fuzz/`, `crates/siphon-rtp-xdp/`).
+  0.10.1 was yanked; it reaches the tree transitively through `tokio-tungstenite`'s `rand`, and none
+  of it is in `siphon-rtp-proto`'s graph.
 
 ### Not included, and why
 
