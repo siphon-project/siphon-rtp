@@ -2164,7 +2164,8 @@ mod tests {
     fn attach_detach_ws_bridge_wire_shape() {
         // The takeover twin of `attach_ws_tee`: same keying triple, and deliberately no direction /
         // channels — a takeover is one leg, duplex, and its wire rate comes from the negotiation.
-        let wire = r#"{"command":"attach_ws_bridge","call_id":"c","from_tag":"f","ws_uri":"ws://h/s"}"#;
+        let wire =
+            r#"{"command":"attach_ws_bridge","call_id":"c","from_tag":"f","ws_uri":"ws://h/s"}"#;
         match serde_json::from_str::<Command>(wire).expect("decode attach_ws_bridge") {
             Command::AttachWsBridge {
                 call_id,
@@ -2232,8 +2233,7 @@ mod tests {
             WsBridgeEndReason::TransportError,
         ] {
             let text = serde_json::to_string(&reason).expect("serialize reason");
-            let decoded: WsBridgeEndReason =
-                serde_json::from_str(&text).expect("decode reason");
+            let decoded: WsBridgeEndReason = serde_json::from_str(&text).expect("decode reason");
             assert_eq!(decoded, reason);
         }
     }

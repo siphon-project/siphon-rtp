@@ -37,8 +37,8 @@ use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    PlayEndReason, PlayMediaSource, ProfileFlags, SessionStats, WsBridgeEndReason,
-    WsTeeDirection, WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
+    PlayEndReason, PlayMediaSource, ProfileFlags, SessionStats, WsBridgeEndReason, WsTeeDirection,
+    WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
@@ -2973,8 +2973,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         // The lifecycle events are addressed to the call's owner and carry its offerer tag, and both
         // have to be captured now: teardown emits the end event after `delete` has removed the call.
-        let Some((from_tag, owner)) = self
-            .owned_call_internal(call_id, |call| (call.from_tag.clone(), call.owner))
+        let Some((from_tag, owner)) =
+            self.owned_call_internal(call_id, |call| (call.from_tag.clone(), call.owner))
         else {
             return Err("call no longer exists".to_string());
         };
@@ -3169,8 +3169,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // datapath forward rule, so `Datapath::adopt_source` alone would never reach it.
         // Reused verbatim on a re-point (see `WsBridgeSetup::egress`), so an ICE selection that has
         // already landed keeps steering the downlink; minted at `a_rtp` for a first attach.
-        let egress = existing_egress
-            .unwrap_or_else(|| Arc::new(tokio::sync::watch::Sender::new(a_rtp)));
+        let egress =
+            existing_egress.unwrap_or_else(|| Arc::new(tokio::sync::watch::Sender::new(a_rtp)));
         // The drain: forward each rendered downlink RTP packet out A's endpoint toward A, encrypting
         // it first on a secure leg. This is the ONLY egress site a takeover call has — `play_media`,
         // `play_dtmf`, recording, SIPREC and the WS tee all refuse a `PipelineKind::Ws` call, and a
@@ -6124,9 +6124,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// flips its actor's egress; a plain relay flips its datapath flows to `Drop` and back. Only the
     /// owning client may control the call (A3 — docs §5).
     async fn set_block(&self, client: ClientId, call_id: &str, block: bool) -> CmdResult {
-        let Some((relay_flows, pipeline)) =
-            self.owned_call(client, call_id, |call| (call.relay_flows.clone(), call.pipeline))
-        else {
+        let Some((relay_flows, pipeline)) = self.owned_call(client, call_id, |call| {
+            (call.relay_flows.clone(), call.pipeline)
+        }) else {
             return unknown_call(call_id);
         };
         if pipeline == PipelineKind::Ws {
@@ -8433,7 +8433,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return Err("the call has no negotiated codec on the offerer's leg".to_string());
         };
         let Some(signalled) = near.remote_rtp else {
-            return Err("the offerer's leg has no signalled address to send the downlink to".to_string());
+            return Err(
+                "the offerer's leg has no signalled address to send the downlink to".to_string(),
+            );
         };
 
         // Where the bridge's downlink goes. The relay this is taking over may have latched leg A's
@@ -26978,7 +26980,10 @@ mod tests {
     /// Drain `events` until the next WS-bridge lifecycle event, or `None` if none arrives.
     async fn next_ws_bridge_event(events: &flume::Receiver<Event>) -> Option<Event> {
         for _ in 0..64 {
-            let event = timeout(Duration::from_secs(3), events.recv_async()).await.ok()?.ok()?;
+            let event = timeout(Duration::from_secs(3), events.recv_async())
+                .await
+                .ok()?
+                .ok()?;
             if matches!(
                 event,
                 Event::WsBridgeStarted { .. } | Event::WsBridgeEnded { .. }
@@ -26992,12 +26997,9 @@ mod tests {
     /// Whether `socket` receives anything within `millis` — a non-panicking `recv`.
     async fn receives_within(socket: &UdpSocket, millis: u64) -> bool {
         let mut buffer = [0u8; 2048];
-        timeout(
-            Duration::from_millis(millis),
-            socket.recv_from(&mut buffer),
-        )
-        .await
-        .is_ok()
+        timeout(Duration::from_millis(millis), socket.recv_from(&mut buffer))
+            .await
+            .is_ok()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -27052,7 +27054,10 @@ mod tests {
                 sample_rate,
                 ..
             }) => {
-                assert_eq!(stream_id, "ws-ws-attach", "the WS start frame's own stream id");
+                assert_eq!(
+                    stream_id, "ws-ws-attach",
+                    "the WS start frame's own stream id"
+                );
                 assert_eq!(reported, ws_uri);
                 assert_eq!(sample_rate, 8000, "the G.711 leg's own PCM rate");
             }
@@ -27217,7 +27222,10 @@ mod tests {
                     "a re-point carries the negotiated wire rate across; a controller moving the \
                      destination did not ask for its 16 kHz wire to silently drop to the leg rate"
                 );
-                assert_eq!(stream_id, "ws-ws-move", "the correlator is the call's, not the connection's");
+                assert_eq!(
+                    stream_id, "ws-ws-move",
+                    "the correlator is the call's, not the connection's"
+                );
             }
             other => panic!("expected ws_bridge_started, got {other:?}"),
         }
@@ -27325,7 +27333,10 @@ mod tests {
             .await
             .expect("a send");
         let (relayed, _) = recv(&phone_b).await;
-        assert!(!relayed.is_empty(), "the relay is untouched by a no-op detach");
+        assert!(
+            !relayed.is_empty(),
+            "the relay is untouched by a no-op detach"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -27496,7 +27507,11 @@ mod tests {
             other => panic!("a teed call must be refused, got {other:?}"),
         }
         assert!(!engine.ws().is_ws_call("ws-vs-tee"), "nothing attached");
-        assert_eq!(engine.ws_tee_count(), 1, "the tee is untouched by the refusal");
+        assert_eq!(
+            engine.ws_tee_count(),
+            1,
+            "the tee is untouched by the refusal"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -27754,7 +27769,10 @@ mod tests {
             }
             other => panic!("expected ws_bridge_ended, got {other:?}"),
         }
-        assert!(!engine.ws().is_ws_call("ws-delete"), "torn down with the call");
+        assert!(
+            !engine.ws().is_ws_call("ws-delete"),
+            "torn down with the call"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
