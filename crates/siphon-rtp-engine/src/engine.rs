@@ -3112,6 +3112,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
         let (rtp_out_tx, rtp_out_rx) = flume::bounded::<bytes::Bytes>(1024);
 
+        // Announce the bridge **before** spawning the task that can report its end. The task starts
+        // running the moment it is spawned, and a WS server that closes on the handshake (or a dial
+        // onto a socket that is already going away) makes `run_bridge` return almost immediately —
+        // so with the announcement after the spawn, `ws_bridge_ended` could be enqueued first and a
+        // controller would receive an end for a stream it was never told had started. Keying
+        // per-stream state on the start event is the obvious way to consume this, and that consumer
+        // would leak or fault on the unknown stream.
+        //
+        // Enqueue order is the fix, not a lock: the event channel is FIFO and the spawn happens
+        // strictly after this `push_event` returns, so the end can only ever be queued behind the
+        // start. Everything from here to the registration below is infallible (the last `?` is the
+        // VAD detector, above), so this cannot announce a bridge that then fails to come up.
+        self.push_event(
+            owner,
+            Event::WsBridgeStarted {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.clone(),
+                stream_id: stream_id.clone(),
+                ws_uri: ws_uri.to_string(),
+                sample_rate: wire_rate,
+            },
+        );
+
         // The bridge: pump A's RTP (rtp_in) ↔ WS, render WS downlink to RTP (rtp_out). Whichever way
         // it ends, say so once — a detach that beat it to the latch has already reported `Detached`.
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3196,9 +3219,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.ws_bridges.insert(
             call_id.to_string(),
             WsBridge {
-                from_tag: from_tag.clone(),
+                from_tag,
                 owner,
-                stream_id: stream_id.clone(),
+                stream_id,
                 ws_uri: ws_uri.to_string(),
                 ended,
                 codec: codec.clone(),
@@ -3208,16 +3231,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 echo_cancellation,
                 vad_config,
                 takeover,
-            },
-        );
-        self.push_event(
-            owner,
-            Event::WsBridgeStarted {
-                call_id: call_id.to_string(),
-                from_tag,
-                stream_id,
-                ws_uri: ws_uri.to_string(),
-                sample_rate: wire_rate,
             },
         );
         tracing::info!(
@@ -7694,6 +7707,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (owner, from_tag) = self
             .owned_call_internal(call_id, |call| (call.owner, call.from_tag.clone()))
             .ok_or_else(|| "call no longer exists".to_string())?;
+        // Announced before the transport task is spawned, for the same reason the takeover bridge is
+        // (see `setup_ws_bridge`): the task can end — a server that closes on the handshake — before
+        // a later announcement would have been enqueued, and `ws_tee_ended` for a stream that was
+        // never announced started is not something a consumer keyed on `ws_tee_started` can act on.
+        self.emit_call_event(
+            call_id,
+            Event::WsTeeStarted {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.clone(),
+                stream_id: stream_id.clone(),
+                ws_uri: ws_uri.to_string(),
+                direction,
+                channels: wire_channels,
+                sample_rate: wire_rate,
+            },
+        );
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let start = tee_start_message(&stream_id, call_id, plan.format, plan.tracks.clone());
         let transport = {
@@ -7739,25 +7768,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.ws_tees.insert(
             call_id.to_string(),
             WsTee {
-                stream_id: stream_id.clone(),
-                from_tag: from_tag.clone(),
+                stream_id,
+                from_tag,
                 owner,
                 mixer: plan.mixer,
                 tapped_legs,
                 transport,
                 ended,
-            },
-        );
-        self.emit_call_event(
-            call_id,
-            Event::WsTeeStarted {
-                call_id: call_id.to_string(),
-                from_tag,
-                stream_id,
-                ws_uri: ws_uri.to_string(),
-                direction,
-                channels: wire_channels,
-                sample_rate: wire_rate,
             },
         );
         tracing::info!(
@@ -26879,6 +26896,29 @@ mod tests {
         format!("ws://{addr}/stream")
     }
 
+    /// A WS server that accepts connection after connection and closes each one the moment the
+    /// handshake completes — the repeated form of [`closing_ws_server`], for a guard that needs many
+    /// attempts rather than one.
+    async fn closing_ws_server_repeating() -> String {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
+        let addr = listener.local_addr().expect("ws addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await {
+                        let _ = socket.send(Message::Close(None)).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}/tee")
+    }
+
     /// Drain a takeover server's frames until the `start` handshake, returning what it announced.
     async fn expect_bridge_start(
         frames: &flume::Receiver<tokio_tungstenite::tungstenite::Message>,
@@ -26914,6 +26954,25 @@ mod tests {
             }
         }
         panic!("no uplink audio frame arrived");
+    }
+
+    /// Drain `events` until the next WS-**tee** lifecycle event, or `None` if none arrives.
+    ///
+    /// Deliberately narrow: it skips only events of other *kinds*, never a tee event it did not
+    /// want. A helper that drained until it found the tee event the caller was hoping for could not
+    /// see an ordering defect at all — which is precisely how the tee's start/end ordering bug
+    /// survived from the day it shipped until the takeover bridge inherited the same shape.
+    async fn next_ws_tee_event(events: &flume::Receiver<Event>) -> Option<Event> {
+        for _ in 0..64 {
+            let event = timeout(Duration::from_secs(3), events.recv_async())
+                .await
+                .ok()?
+                .ok()?;
+            if matches!(event, Event::WsTeeStarted { .. } | Event::WsTeeEnded { .. }) {
+                return Some(event);
+            }
+        }
+        None
     }
 
     /// Drain `events` until the next WS-bridge lifecycle event, or `None` if none arrives.
@@ -27441,11 +27500,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_ws_bridge_the_server_drops_reports_itself_instead_of_going_silent()
-    {
-        // The defect the end event exists for. A takeover bridge is leg A's only far side, so a
-        // server that goes away leaves a live call one-way — and until now nothing anywhere said
-        // so: the tee had `ws_tee_ended`, the bridge had nothing at all.
+    async fn a_ws_bridge_the_server_drops_reports_itself_in_order_instead_of_going_silent() {
+        // Two guarantees at once, on the shape that stresses both: a server that closes on the
+        // handshake, so the bridge ends within microseconds of starting.
+        //
+        // 1. It is *reported*. A takeover bridge is leg A's only far side, so a server that goes
+        //    away leaves a live call one-way, and until `ws_bridge_ended` nothing anywhere said so.
+        // 2. It is reported **after its own start**. This is the half that was wrong: the bridge
+        //    task was spawned before the start event was enqueued, so under scheduling pressure the
+        //    end overtook it and a consumer got an end for a stream it had never been told about —
+        //    a fault or a leak for any controller keying per-stream state on the start. The start is
+        //    now enqueued before the task exists, so the FIFO event channel orders the two.
+        //
+        // The assertions below are deliberately on the *sequence*, not on "an end arrives
+        // eventually": a test that drains until it finds the event it wants cannot see this defect.
         use crate::srtp_bridge::run_redirect_dispatcher;
 
         let engine = Engine::new(UdpLoopbackDatapath::new());
@@ -27475,19 +27543,33 @@ mod tests {
             .await;
         assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
 
-        match next_ws_bridge_event(&events).await {
-            Some(Event::WsBridgeStarted { .. }) => {}
-            other => panic!("expected ws_bridge_started, got {other:?}"),
-        }
+        // FIRST, before anything else on this channel: the start.
+        let started_stream = match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeStarted {
+                call_id, stream_id, ..
+            }) => {
+                assert_eq!(call_id, "ws-dies");
+                stream_id
+            }
+            other => panic!(
+                "the start must be the first bridge event a consumer sees, even when the server \
+                 ends the bridge immediately — got {other:?}"
+            ),
+        };
+        // ...and only then the end, naming the same stream.
         match next_ws_bridge_event(&events).await {
             Some(Event::WsBridgeEnded {
                 call_id,
                 from_tag,
+                stream_id,
                 reason,
-                ..
             }) => {
                 assert_eq!(call_id, "ws-dies");
                 assert_eq!(from_tag, "tag-a");
+                assert_eq!(
+                    stream_id, started_stream,
+                    "the end names the stream the start announced"
+                );
                 assert_eq!(
                     reason,
                     WsBridgeEndReason::ServerClosed,
@@ -27495,6 +27577,88 @@ mod tests {
                 );
             }
             other => panic!("expected ws_bridge_ended, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ws_tee_the_server_drops_reports_its_start_before_its_end() {
+        // The tee's half of the ordering guarantee, and it needs its own guard for a reason: the tee
+        // carried this defect from the day it shipped, and its existing test could never have caught
+        // it — that test drains until it finds `ws_tee_started`, so an end that overtook the start is
+        // skipped over on the way. This asserts the *sequence* instead.
+        //
+        // It is a **repeated** guard, not a single attempt, and that is deliberate. The window the
+        // defect lives in is one map insert here (against a watch, a second spawn and two inserts on
+        // the takeover bridge), so a single attach observes a reordering far too rarely to gate on:
+        // reverting the fix and running the whole engine suite fifteen times caught it zero times,
+        // where the bridge's single-shot guard caught its own reordering twice in fifteen. Many
+        // rounds turn a rare window into one this will actually sit on. It can only ever fail when
+        // the ordering is genuinely violated, so repetition costs nothing but coverage.
+        let (engine, _phone_a, _phone_b) = two_party_relay("tee-order").await;
+        let events = engine.register_client(CLIENT);
+        let uri = closing_ws_server_repeating().await;
+
+        for round in 0..512 {
+            let attached = engine
+                .handle(
+                    CLIENT,
+                    Command::AttachWsTee {
+                        call_id: "tee-order".into(),
+                        from_tag: "tag-a".into(),
+                        ws_uri: uri.clone(),
+                        direction: WsTeeDirection::Caller,
+                        channels: None,
+                        sample_rate: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(attached, CmdResult::Ok { .. }),
+                "round {round} attach: {attached:?}"
+            );
+
+            // FIRST, before anything else on this channel: the start.
+            let started_stream = match next_ws_tee_event(&events).await {
+                Some(Event::WsTeeStarted {
+                    call_id, stream_id, ..
+                }) => {
+                    assert_eq!(call_id, "tee-order");
+                    stream_id
+                }
+                other => panic!(
+                    "round {round}: the start must be the first tee event a consumer sees, even \
+                     when the server ends the stream immediately — got {other:?}"
+                ),
+            };
+            // ...and only then the end, naming the stream the start announced.
+            match next_ws_tee_event(&events).await {
+                Some(Event::WsTeeEnded {
+                    call_id, stream_id, ..
+                }) => {
+                    assert_eq!(call_id, "tee-order");
+                    assert_eq!(
+                        stream_id, started_stream,
+                        "round {round}: the end names the stream the start announced"
+                    );
+                }
+                other => panic!("round {round}: expected ws_tee_ended, got {other:?}"),
+            }
+
+            // Clear the tee so the next round attaches fresh rather than replacing. The end has
+            // already been reported by the transport, so this emits nothing (the once-only latch).
+            let detached = engine
+                .handle(
+                    CLIENT,
+                    Command::DetachWsTee {
+                        call_id: "tee-order".into(),
+                        from_tag: "tag-a".into(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(detached, CmdResult::Ok { .. }),
+                "round {round} detach: {detached:?}"
+            );
         }
     }
 

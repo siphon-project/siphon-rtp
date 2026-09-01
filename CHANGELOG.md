@@ -52,6 +52,28 @@ in a consumer's build unannounced.
 - **`siphon_rtp_ws_bridges` gauge** — live takeover bridges, alongside the existing tee gauges (which
   the metrics reference had never listed; it does now).
 
+### Fixed
+
+- **A stream's `*_started` event is now guaranteed to precede its own `*_ended`.** Both the takeover
+  bridge and the WebSocket tee spawned their transport task *before* enqueuing the start event, so a
+  media server that closes on the handshake could have its end event enqueued first — leaving a
+  consumer with an `ws_bridge_ended` / `ws_tee_ended` for a `stream_id` it was never told had
+  started. Anything keying per-stream state on the start (the obvious way to consume these) would
+  fault or leak on the unknown stream. Both now enqueue the start before the task that can report an
+  end exists; the event channel is FIFO and the spawn happens strictly afterwards, so the ordering is
+  structural rather than a matter of timing. The contract documents the guarantee on both end events.
+
+  Each half has its own guard, asserting the *sequence* (start first, then an end naming the same
+  `stream_id`) rather than that an end arrives eventually — a guard that drains until it finds the
+  event it wants cannot see this defect at all, which is how the tee carried it undetected from the
+  day it shipped. Both were mutation-checked by reverting only their own reorder and re-running the
+  full engine suite: the bridge's guard caught it in 2 of 15 runs, the tee's in 3 of 15. The tee
+  needs 512 attach/detach rounds to get there because its window is a single map insert, against a
+  watch, a second task spawn and two inserts on the bridge.
+
+  The tee half is a pre-existing defect, not new in this release — the bridge inherited the shape
+  from it.
+
 ### Changed
 
 - **`block_media` / `unblock_media` are refused on a WebSocket-takeover call.** They already made no

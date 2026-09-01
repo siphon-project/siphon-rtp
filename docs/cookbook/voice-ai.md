@@ -408,7 +408,13 @@ gone silent. `ws_bridge_ended` says so, once, whichever end gave up:
 
 `detached` is the only orderly reason (a `detach_ws_bridge`, or the close half of a re-point).
 `server_closed`, `server_stopped` and `transport_error` all mean the consumer went away mid-call;
-`call_ended` means the call did. The engine does **not** silently re-point or restore anything on
+`call_ended` means the call did.
+
+**`ws_bridge_ended` always follows its own `ws_bridge_started`**, so it is safe to key per-stream
+state on the start and clear it on the end — an end never arrives for a `stream_id` you have not
+been told about. Worth saying explicitly because the two can be microseconds apart: a server that
+closes on the handshake ends the bridge almost as soon as it starts, and both events are then in
+flight together. The same guarantee holds for `ws_tee_started` / `ws_tee_ended`. The engine does **not** silently re-point or restore anything on
 its own — it holds the leg where it is and tells you, so the decision (re-point to a fallback,
 detach back to the relay, or tear the call down) stays with the controller. It is also logged at
 WARN, so a node with no event consumer still leaves a trace.

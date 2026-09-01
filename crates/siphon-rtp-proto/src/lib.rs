@@ -1418,6 +1418,9 @@ pub enum Event {
     },
     /// A WebSocket tee stopped. Emitted exactly once per started tee — including when the *server*
     /// ends it — so a controller learns the stream died rather than silently losing audio.
+    ///
+    /// **Always preceded by its own [`Event::WsTeeStarted`]**, on the same guarantee (and for the
+    /// same reason) as [`Event::WsBridgeEnded`].
     WsTeeEnded {
         call_id: String,
         from_tag: String,
@@ -1494,6 +1497,13 @@ pub enum Event {
     /// A WebSocket **takeover** bridge stopped. Emitted exactly once per started bridge, including
     /// when the *server* ends it — without which a takeover bridge dying is indistinguishable from a
     /// quiet call, and the controller learns nothing while its caller hears silence.
+    ///
+    /// **Always preceded by its own [`Event::WsBridgeStarted`].** The engine enqueues the start
+    /// before the task that can report an end exists, so keying per-stream state on the start is
+    /// safe: an end never arrives for a `stream_id` the consumer has not been told about. This is
+    /// worth stating because the two are genuinely close together — a media server that closes on
+    /// the handshake ends the bridge within microseconds of it starting, and both events are then
+    /// in flight at once.
     WsBridgeEnded {
         call_id: String,
         from_tag: String,
