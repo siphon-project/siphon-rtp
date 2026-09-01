@@ -7,6 +7,99 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+**Lands as 0.4.0, not a 0.3.x patch.** The workspace version is bumped here rather than at the
+release cut, because a controller floating on `^0.3` would otherwise pick this up from an ordinary
+dependency bump. The JSON wire stays backward compatible as always — new verbs a peer never sends,
+and new event tags an older consumer decodes as `Event::Unknown` — and `Command` / `Event` have been
+`#[non_exhaustive]` since 0.3.0, so a downstream `match` keeps compiling. What a minor bump buys is
+that picking the change up is a *decision*: the engine's runtime behaviour changes (a takeover bridge
+now has a lifecycle, and `block_media` is refused on a call that has one), and that should not arrive
+in a consumer's build unannounced.
+
+### Added
+
+- **The WebSocket takeover bridge has a lifecycle.** `ProfileFlags::ws_uri` could only ever create a
+  bridge at negotiation and destroy it with the call, so a controller could not attach one to a call
+  already up, move one to a different server, or take one off without tearing the call down. Two
+  verbs close that:
+
+  - **`attach_ws_bridge`** (`call_id`, `from_tag`, `ws_uri`), following `attach_ws_tee`'s
+    replace-on-existing shape, so one verb covers both halves:
+    - On a call that **already has** a bridge it **re-points** it — the headline case, moving a live
+      call's audio to a different consumer. The leg does not renegotiate: its codec, wire rate,
+      uplink VAD / noise suppression / echo cancellation, source gate, SRTP keying and ICE-selected
+      egress are all carried across rather than rebuilt, so there is no re-INVITE and nothing
+      silently reverts to a default. The outgoing connection is closed and awaited before the
+      replacement is registered, so two drain tasks never write to the leg at once.
+    - On a call that has **none** it **takes a live two-party relay over**: A's media goes to the WS
+      server and the A↔B path is unwired, so leg B hears nothing until the bridge is detached.
+  - **`detach_ws_bridge`** (`call_id`, `from_tag`) reinstalls the exact forward rules the takeover
+    displaced — gate and latch policy included — and the two parties hear each other again.
+    Idempotent on a call with no bridge.
+
+  Both are native JSON verbs; the NG/bencode front-end does not carry them.
+
+- **`ws_bridge_started` / `ws_bridge_ended` events.** A takeover bridge dying used to be **silent**:
+  the tee had `ws_tee_ended`, the bridge had nothing at all — and a takeover bridge is leg A's *only*
+  far side, so its death is one-way audio on a live call with no signal anywhere. `ws_bridge_ended`
+  is emitted exactly once per started bridge with a `WsBridgeEndReason` mirroring the tee's:
+  `detached` (a detach, or the close half of a re-point — the only orderly end), `server_closed`,
+  `server_stopped`, `call_ended`, `transport_error`. Anything but `detached` is also logged at WARN,
+  so a node with no event consumer still leaves a trace. `ws_bridge_started` reports the negotiated
+  wire rate and the `stream_id` matching the WS `start` frame, for bridges stood up at negotiation as
+  well as at runtime.
+
+- **`siphon_rtp_ws_bridges` gauge** — live takeover bridges, alongside the existing tee gauges (which
+  the metrics reference had never listed; it does now).
+
+### Fixed
+
+- **A stream's `*_started` event is now guaranteed to precede its own `*_ended`.** Both the takeover
+  bridge and the WebSocket tee spawned their transport task *before* enqueuing the start event, so a
+  media server that closes on the handshake could have its end event enqueued first — leaving a
+  consumer with an `ws_bridge_ended` / `ws_tee_ended` for a `stream_id` it was never told had
+  started. Anything keying per-stream state on the start (the obvious way to consume these) would
+  fault or leak on the unknown stream. Both now enqueue the start before the task that can report an
+  end exists; the event channel is FIFO and the spawn happens strictly afterwards, so the ordering is
+  structural rather than a matter of timing. The contract documents the guarantee on both end events.
+
+  Each half has its own guard, asserting the *sequence* (start first, then an end naming the same
+  `stream_id`) rather than that an end arrives eventually — a guard that drains until it finds the
+  event it wants cannot see this defect at all, which is how the tee carried it undetected from the
+  day it shipped. Both were mutation-checked by reverting only their own reorder and re-running the
+  full engine suite: the bridge's guard caught it in 2 of 15 runs, the tee's in 3 of 15. The tee
+  needs 512 attach/detach rounds to get there because its window is a single map insert, against a
+  watch, a second task spawn and two inserts on the bridge.
+
+  The tee half is a pre-existing defect, not new in this release — the bridge inherited the shape
+  from it.
+
+### Changed
+
+- **`block_media` / `unblock_media` are refused on a WebSocket-takeover call.** They already made no
+  sense there — a takeover call's wire bytes are not the two-party media, which is why recording,
+  SIPREC, the tee and `block_dtmf` all refuse it — and once a bridge can be *attached* to a live
+  relay it became unsafe: such a call still holds the displaced relay's forward rules so its detach
+  can reinstall them, and `unblock` walks exactly that list, which would have pulled leg A back off
+  the bridge with nothing reporting it.
+
+- **An ICE selection on a takeover leg is recorded with `send_replace` rather than `send`.** A
+  `watch::Sender::send` fails and leaves the value untouched once every receiver is gone, which is
+  what happens the moment a bridge's drain task exits. The watch now outlives that task (a re-point
+  reuses it), so a selection landing on a leg whose bridge has died must still be recorded, or the
+  replacement bridge would start out aimed at the pre-ICE address.
+
+### Not included, and why
+
+**Detaching a bridge that was negotiated with `ws_uri` is refused** (`ws-bridge-negotiated`), not
+performed. That bridge *is* the call's media path: nothing was displaced, a two-leg negotiated
+takeover never wired A↔B (leg B's ports exist, but its codec was never negotiated against A's), and a
+single-leg `answer_local` takeover has no second party at all. Detaching it would have to *invent* a
+media path from state the engine does not hold — and answering `ok` on a call that now has no audio
+path is worse than the gap this work package set out to close. The controller keeps both working
+options, named in the refusal: re-point the bridge, or `delete` the call. Handing a negotiated
+takeover to a real leg B remains the distinct, unimplemented transition it was.
+
 ## [0.3.1] — 2026-08-31
 
 A small release, cut so controllers can pick up the control-contract additions:

@@ -20,7 +20,8 @@
 //! the moment an enum here grows a variant. The rule this crate applies:
 //!
 //! * Types the engine **emits** and a controller merely *observes* carry `#[non_exhaustive]` —
-//!   [`Event`], [`CmdResult`], [`PlayEndReason`], [`WsTeeEndReason`], [`ProtoError`]. A variant a
+//!   [`Event`], [`CmdResult`], [`PlayEndReason`], [`WsTeeEndReason`], [`WsBridgeEndReason`],
+//!   [`ProtoError`]. A variant a
 //!   consumer has never heard of is genuinely ignorable ("some event happened", "the playback
 //!   ended some other way"), so forcing every downstream `match` to be rewritten on every release
 //!   buys nothing.
@@ -490,6 +491,41 @@ pub enum Command {
     /// Detach the WebSocket tee from a call, closing its stream. Idempotent: detaching a call with no
     /// tee is not an error.
     DetachWsTee { call_id: String, from_tag: String },
+    /// Attach — or **re-point** — the WebSocket **takeover** bridge on a live call: leg A's audio is
+    /// pumped to `ws_uri` in both directions, and the WS server becomes A's far side.
+    ///
+    /// This is the runtime twin of `ProfileFlags::ws_uri`, which can only ever stand a bridge up at
+    /// negotiation. Two distinct things, one verb, following [`Command::AttachWsTee`]'s
+    /// replace-on-existing shape:
+    ///
+    /// * On a call that **already has** a takeover bridge this is a **re-point**: the existing
+    ///   connection is closed and a new one is dialled to `ws_uri`, keeping the leg's negotiated
+    ///   codec, wire rate, source gate, SRTP keying and ICE-selected egress. This is how a live
+    ///   call's audio is moved to a different consumer without a re-INVITE.
+    /// * On a call that has **no** bridge this is a **takeover of a live relay**: the A-to-B relay is
+    ///   unwired and A's media is redirected into the bridge. Only a plain two-party relay can be
+    ///   taken over, and only one with nothing else attached — a secure or ICE leg is refused with
+    ///   the same `ws-takeover-*` reasons `offer`/`answer` use, because the engine is not that leg's
+    ///   cryptographic far side and has no agent to follow its selected pair. **Leg B hears nothing
+    ///   for as long as the takeover lasts**; that is what a takeover *is*, and
+    ///   [`Command::DetachWsBridge`] puts the relay back.
+    ///
+    /// A native siphon-rtp extension — the NG/bencode front-end does not carry it.
+    AttachWsBridge {
+        call_id: String,
+        from_tag: String,
+        /// `ws://` or `wss://` URI of the media server the engine dials as a client.
+        ws_uri: String,
+    },
+    /// Detach a call's WebSocket **takeover** bridge and put its media path back the way it was.
+    ///
+    /// Only a bridge [`Command::AttachWsBridge`] created by taking over a live relay can be
+    /// detached, because only then is there a relay to return the call to. A bridge negotiated with
+    /// `ProfileFlags::ws_uri` **is** the call's media path — nothing was displaced, and for a
+    /// single-leg (`answer_local`) takeover there is no second party that could ever be relayed to —
+    /// so detaching one is refused rather than answered with a call that has no audio path at all.
+    /// Re-point it with [`Command::AttachWsBridge`], or end it with [`Command::Delete`].
+    DetachWsBridge { call_id: String, from_tag: String },
     /// Begin **lawful-interception content delivery** (ETSI TS 103 221-2 X3) for a call: the engine
     /// frames every accepted media packet on both legs as an X3 PDU and ships it to the Mediation
     /// Function over its own mutually-authenticated TLS connection.
@@ -699,6 +735,31 @@ pub enum WsTeeEndReason {
     /// The call's media path went away, so no further audio can be teed.
     CallEnded,
     /// A WebSocket/transport error ended the stream.
+    TransportError,
+}
+
+/// Why a WebSocket **takeover** bridge ended, carried by [`Event::WsBridgeEnded`].
+///
+/// The takeover twin of [`WsTeeEndReason`], and the reason the event exists at all: a tee dying
+/// costs a consumer its copy, while a takeover bridge dying costs the *call* its far side. Anything
+/// other than [`WsBridgeEndReason::Detached`] means a live call is now one-way.
+///
+/// `#[non_exhaustive]`: engine-emitted, purely informational. A reason a consumer has not heard of
+/// still means "the bridge ended", which is the part that drives its state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WsBridgeEndReason {
+    /// The controller detached it ([`Command::DetachWsBridge`]) or re-pointed it
+    /// ([`Command::AttachWsBridge`] on a call that already had one) — the only orderly end.
+    Detached,
+    /// The WS server closed the connection.
+    ServerClosed,
+    /// The WS server sent a `stop` control frame.
+    ServerStopped,
+    /// The call was torn down, so the bridge went with it.
+    CallEnded,
+    /// A WebSocket/transport error ended it.
     TransportError,
 }
 
@@ -1357,6 +1418,9 @@ pub enum Event {
     },
     /// A WebSocket tee stopped. Emitted exactly once per started tee — including when the *server*
     /// ends it — so a controller learns the stream died rather than silently losing audio.
+    ///
+    /// **Always preceded by its own [`Event::WsTeeStarted`]**, on the same guarantee (and for the
+    /// same reason) as [`Event::WsBridgeEnded`].
     WsTeeEnded {
         call_id: String,
         from_tag: String,
@@ -1414,6 +1478,37 @@ pub enum Event {
         /// Packets dropped because the buffer filled. **Non-zero means warranted content did not
         /// reach the agency** and a destination-level report is owed.
         dropped: u64,
+    },
+    /// A WebSocket **takeover** bridge started: the engine dialled the server, sent `start`, and
+    /// leg A's audio is now flowing to and from it. Emitted for a bridge stood up at negotiation
+    /// (`ProfileFlags::ws_uri`) as well as one attached or re-pointed with
+    /// [`Command::AttachWsBridge`], so a controller sees every bridge this engine owns.
+    WsBridgeStarted {
+        call_id: String,
+        from_tag: String,
+        /// The bridge's `streamId`, matching the `start` frame on the WebSocket — the correlator
+        /// between this control event and the media stream.
+        stream_id: String,
+        ws_uri: String,
+        /// Negotiated L16 wire sample rate in Hz, in both directions (`ProfileFlags::ws_sample_rate`
+        /// when it was set, else the leg codec's own PCM rate).
+        sample_rate: u32,
+    },
+    /// A WebSocket **takeover** bridge stopped. Emitted exactly once per started bridge, including
+    /// when the *server* ends it — without which a takeover bridge dying is indistinguishable from a
+    /// quiet call, and the controller learns nothing while its caller hears silence.
+    ///
+    /// **Always preceded by its own [`Event::WsBridgeStarted`].** The engine enqueues the start
+    /// before the task that can report an end exists, so keying per-stream state on the start is
+    /// safe: an end never arrives for a `stream_id` the consumer has not been told about. This is
+    /// worth stating because the two are genuinely close together — a media server that closes on
+    /// the handshake ends the bridge within microseconds of it starting, and both events are then
+    /// in flight at once.
+    WsBridgeEnded {
+        call_id: String,
+        from_tag: String,
+        stream_id: String,
+        reason: WsBridgeEndReason,
     },
     /// Unknown / future event kind (forward-compat).
     #[serde(other)]
@@ -2063,6 +2158,108 @@ mod tests {
             serde_json::from_value::<Event>(value).expect("roundtrip"),
             ended
         );
+    }
+
+    #[test]
+    fn attach_detach_ws_bridge_wire_shape() {
+        // The takeover twin of `attach_ws_tee`: same keying triple, and deliberately no direction /
+        // channels — a takeover is one leg, duplex, and its wire rate comes from the negotiation.
+        let wire =
+            r#"{"command":"attach_ws_bridge","call_id":"c","from_tag":"f","ws_uri":"ws://h/s"}"#;
+        match serde_json::from_str::<Command>(wire).expect("decode attach_ws_bridge") {
+            Command::AttachWsBridge {
+                call_id,
+                from_tag,
+                ws_uri,
+            } => {
+                assert_eq!(call_id, "c");
+                assert_eq!(from_tag, "f");
+                assert_eq!(ws_uri, "ws://h/s");
+            }
+            other => panic!("expected attach_ws_bridge, got {other:?}"),
+        }
+        let value = serde_json::to_value(Command::AttachWsBridge {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            ws_uri: "wss://h/s".into(),
+        })
+        .expect("serialize");
+        assert_eq!(value["command"], "attach_ws_bridge");
+        assert_eq!(value["ws_uri"], "wss://h/s");
+
+        match serde_json::from_str::<Command>(
+            r#"{"command":"detach_ws_bridge","call_id":"c","from_tag":"f"}"#,
+        )
+        .expect("decode detach_ws_bridge")
+        {
+            Command::DetachWsBridge { call_id, from_tag } => {
+                assert_eq!((call_id.as_str(), from_tag.as_str()), ("c", "f"));
+            }
+            other => panic!("expected detach_ws_bridge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ws_bridge_events_wire_shape() {
+        let started = Event::WsBridgeStarted {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            stream_id: "ws-c".into(),
+            ws_uri: "ws://h/s".into(),
+            sample_rate: 16_000,
+        };
+        let value = serde_json::to_value(&started).expect("serialize");
+        assert_eq!(value["event"], "ws_bridge_started");
+        assert_eq!(value["stream_id"], "ws-c");
+        assert_eq!(value["sample_rate"], 16_000);
+
+        let ended = Event::WsBridgeEnded {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            stream_id: "ws-c".into(),
+            reason: WsBridgeEndReason::ServerClosed,
+        };
+        let value = serde_json::to_value(&ended).expect("serialize");
+        assert_eq!(value["event"], "ws_bridge_ended");
+        assert_eq!(value["reason"], "server_closed");
+
+        // Round-trips, and an end reason a peer has never heard of is still an end reason: the enum
+        // is `#[non_exhaustive]`, so a consumer keeps compiling — the *wire* is what has to decode.
+        for reason in [
+            WsBridgeEndReason::Detached,
+            WsBridgeEndReason::ServerClosed,
+            WsBridgeEndReason::ServerStopped,
+            WsBridgeEndReason::CallEnded,
+            WsBridgeEndReason::TransportError,
+        ] {
+            let text = serde_json::to_string(&reason).expect("serialize reason");
+            let decoded: WsBridgeEndReason = serde_json::from_str(&text).expect("decode reason");
+            assert_eq!(decoded, reason);
+        }
+    }
+
+    #[test]
+    fn an_older_consumer_reads_a_ws_bridge_event_as_unknown() {
+        // The JSON-wire half of forward compatibility: a controller built before these variants
+        // existed decodes them as `Event::Unknown` rather than failing the frame.
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        enum OldEvent {
+            Dtmf,
+            #[serde(other)]
+            Unknown,
+        }
+        let wire = serde_json::to_string(&Event::WsBridgeEnded {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            stream_id: "ws-c".into(),
+            reason: WsBridgeEndReason::TransportError,
+        })
+        .expect("serialize");
+        assert!(matches!(
+            serde_json::from_str::<OldEvent>(&wire).expect("decode"),
+            OldEvent::Unknown
+        ));
     }
 
     #[test]

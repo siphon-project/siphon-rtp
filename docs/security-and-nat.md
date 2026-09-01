@@ -863,6 +863,40 @@ copy of Layers 1–4.
 - **HA.** A takeover call is not restorable — the external WebSocket session is not replicable state —
   so `checkpoint` refuses a single-leg call outright and `restore` rejects a `Ws` snapshot. Securing
   the leg does not change that; it is refused for the same reason it was before.
+- **Runtime lifecycle (`attach_ws_bridge` / `detach_ws_bridge`) inherits every layer above, and adds
+  no new way in.** A bridge can now be attached to a call already up, moved to a different server, and
+  removed again. None of that touches how a packet is accepted:
+  - **A re-point carries the gate, the keying and the egress across; it never re-derives them.** The
+    replacement bridge is handed the *live* `SourceFilter` — already narrowed to the selected pair if
+    ICE has chosen one — the same `WsSecureLeg`, and the same egress watch. Rebuilding any of the
+    three from the signalling would silently widen the Layer 2 gate back to the `c=` address, drop a
+    secure leg's keys, and aim the downlink at an address a NATed peer cannot receive on. (The watch is
+    also written with `send_replace` rather than `send`, so a selection landing while no drain task
+    holds a receiver is still recorded for the bridge that follows.)
+  - **Taking over a live relay keeps that relay's own gate, and follows its latch.** The bridge inherits
+    the `accepted_source` from the `Forward` rule it displaces, so the leg is gated exactly as it was a
+    packet earlier. Its downlink goes to the address the relay had **latched** (Layer 3) rather than the
+    signalled `c=`, read through `Datapath::latched_source` — a symmetric-RTP peer's real port is
+    routinely not the one its SDP advertised, so re-deriving the destination from the signalling would
+    break precisely the calls the latch exists for. That read is for **continuity only**: it reports the
+    media path as it stands and makes no claim that a connectivity check authenticated it, which is why
+    it is a separate method from `ice_validated_source` and never feeds a trust decision.
+  - **The two negotiation-time refusals now also run at runtime.** A runtime attach that would *create*
+    a takeover on a secure or ICE leg is refused with the same `ws-takeover-secure-offerer` /
+    `ws-takeover-ice-offerer` tokens, for the identical structural reasons: on a two-leg call the engine
+    is not A's cryptographic far side, and no agent is armed to re-point a takeover leg's egress.
+    Re-pointing an *existing* bridge is unaffected — that leg was keyed and armed when it was
+    negotiated, and the state is carried, not rebuilt.
+  - **A detach restores exactly what the attach displaced.** The stored `Forward` rules are reinstalled
+    verbatim, gate and latch policy included; the datapath keeps the latch in separate state, so a flow
+    install does not disturb it and a NATed leg keeps the path it had. A bridge that was *negotiated*
+    (`ws_uri`) displaced nothing and is refused (`ws-bridge-negotiated`) rather than detached into a
+    call with no media path at all.
+  - **`block_media` / `unblock_media` are refused on a takeover call.** A taken-over call still holds
+    the displaced relay's `Forward` rules so its detach can reinstall them, and `unblock` walks exactly
+    that list — it would have pulled leg A back off the bridge silently. This joins the existing
+    refusals (`play_media`, `play_dtmf`, recording, SIPREC, the tee, `block_dtmf`), so the "one egress
+    site" property above still holds.
 
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.

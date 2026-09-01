@@ -40,6 +40,8 @@ pub struct LiveGauges {
     pub draining: bool,
     /// Live WebSocket tees (send-only audio streams riding a relaying call).
     pub ws_tees: u64,
+    /// Live WebSocket takeover bridges (a WS server acting as one party's far side).
+    pub ws_bridges: u64,
     /// Wire frames handed to the WS-tee transports over this process's lifetime.
     pub ws_tee_frames_sent: u64,
     /// WS-tee frames dropped because a consumer stalled (bounded queue full) or a channel ring
@@ -183,6 +185,13 @@ impl Metrics {
             "Live WebSocket tees streaming a relaying call's audio.",
             "gauge",
             live.ws_tees,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_ws_bridges",
+            "Live WebSocket takeover bridges (the WS server is one party's far side).",
+            "gauge",
+            live.ws_bridges,
         );
         metric(
             &mut output,
@@ -556,6 +565,7 @@ mod tests {
                 cpu_permille: Some(247),
                 draining: true,
                 ws_tees: 2,
+                ws_bridges: 3,
                 ws_tee_frames_sent: 1500,
                 ws_tee_frames_dropped: 7,
             },
@@ -567,6 +577,7 @@ mod tests {
         assert!(body
             .contains("# TYPE siphon_rtp_conference_rooms gauge\nsiphon_rtp_conference_rooms 5\n"));
         assert!(body.contains("# TYPE siphon_rtp_ws_tees gauge\nsiphon_rtp_ws_tees 2\n"));
+        assert!(body.contains("# TYPE siphon_rtp_ws_bridges gauge\nsiphon_rtp_ws_bridges 3\n"));
         assert!(body.contains(
             "# TYPE siphon_rtp_ws_tee_frames_dropped_total counter\nsiphon_rtp_ws_tee_frames_dropped_total 7\n"
         ));
@@ -595,9 +606,9 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_cpu_permille 247\n"));
         assert!(body.contains("# TYPE siphon_rtp_draining gauge\nsiphon_rtp_draining 1\n"));
-        // Every series carries a HELP + TYPE line (19 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 19);
-        assert_eq!(body.matches("# TYPE ").count(), 19);
+        // Every series carries a HELP + TYPE line (20 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 20);
+        assert_eq!(body.matches("# TYPE ").count(), 20);
     }
 
     #[test]
@@ -619,8 +630,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (18 vs 19).
-        assert_eq!(body.matches("# TYPE ").count(), 18);
+        // One fewer series than the CPU-present case (19 vs 20).
+        assert_eq!(body.matches("# TYPE ").count(), 19);
     }
 
     #[test]

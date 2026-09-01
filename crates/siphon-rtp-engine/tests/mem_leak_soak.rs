@@ -770,6 +770,126 @@ async fn ws_tee_attach_detach_does_not_leak() {
     gate.assert_no_leak();
 }
 
+/// One takeover-bridge churn cycle: offer → answer → attach a bridge to the live relay (which
+/// displaces its `Forward` rules, dials a WS server and spawns the bridge + drain tasks) → re-point
+/// it at a second connection → detach (reinstalling the relay) → delete.
+///
+/// Two dialled WebSockets per cycle, and the re-point in the middle is the interesting one: it tears
+/// a bridge down and stands another up on the *same* leg, reusing the egress watch and the source
+/// gate. That is exactly where a stranded bridge task, drain task, socket or `WsBridge` record would
+/// accumulate without the call ever ending.
+async fn ws_bridge_attach_repoint_detach(
+    engine: &Engine<UdpLoopbackDatapath>,
+    uri: &str,
+    index: usize,
+) {
+    let call_id = format!("ws-bridge-soak-{index}");
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for("198.51.100.1", 40_000),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "offer",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for("203.0.113.1", 41_000),
+                    profile: Default::default(),
+                },
+            )
+            .await,
+        "answer",
+    );
+    for what in ["attach_ws_bridge", "re-point"] {
+        assert_ok(
+            &engine
+                .handle(
+                    CLIENT,
+                    Command::AttachWsBridge {
+                        call_id: call_id.clone(),
+                        from_tag: "tag-a".into(),
+                        ws_uri: uri.to_string(),
+                    },
+                )
+                .await,
+            what,
+        );
+    }
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::DetachWsBridge {
+                    call_id: call_id.clone(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await,
+        "detach_ws_bridge",
+    );
+    assert_ok(
+        &engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id,
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await,
+        "delete",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_bridge_attach_repoint_detach_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    // The takeover bridge speaks the same `ws://` envelope as the tee, so the drain-everything sink
+    // server serves both; only the direction differs, and this soak never sends media.
+    let (uri, live) = tee_sink_server().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    // Two real TCP connections per cycle (attach + re-point), so this gets the tee soak's shorter
+    // settle budget for the same reason: a build that never converges should fail on its assertion
+    // rather than churn through the ephemeral-port range first.
+    let mut gate = LeakGate::new("ws bridge", 100, 40).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            ws_bridge_attach_repoint_detach(&engine, &uri, index).await;
+            index += 1;
+        }
+        drain_tee_server(&live).await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        assert_eq!(
+            engine.ws_bridge_count(),
+            0,
+            "bridge registry drained after every segment — a re-point must not strand the record it \
+             replaced, and a detach must not leave one behind"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// A DTLS-SRTP offerer's SDP (RFC 5764 / RFC 5763 §5). Documentation-range address (RFC 5737).
 fn dtls_offerer_sdp(host: &str, port: u16, fingerprint: &siphon_rtp_dtls::Fingerprint) -> String {
     let hex = fingerprint

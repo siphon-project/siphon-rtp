@@ -16,7 +16,7 @@ keywords = ["rtpengine", "bencode", "sip", "rtp", "voip"]
 categories = ["network-programming"]
 
 [dependencies]
-siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.3.0" }
+siphon-rtp-proto = { path = "../siphon-rtp-proto", version = "0.4.0" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

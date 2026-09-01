@@ -16,7 +16,7 @@ publish = false
 
 [dependencies]
 aya-ebpf = "0.1"
-siphon-rtp-ebpf-common = { path = "../../siphon-rtp-ebpf-common", version = "0.3.0" }
+siphon-rtp-ebpf-common = { path = "../../siphon-rtp-ebpf-common", version = "0.4.0" }
 
 [[bin]]
 name = "siphon-rtp-ebpf"

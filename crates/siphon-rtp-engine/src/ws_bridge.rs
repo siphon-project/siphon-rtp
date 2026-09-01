@@ -166,6 +166,29 @@ struct WsRoute {
     egress: Arc<tokio::sync::watch::Sender<SocketAddr>>,
 }
 
+/// The per-leg state a **re-point** ([`Command::AttachWsBridge`](siphon_rtp_proto::Command) on a
+/// call that already has a bridge) must carry across from the connection being replaced.
+///
+/// None of it belongs to the WebSocket: the endpoint, the RTPBleed source gate, the SRTP keying and
+/// the egress watch are all properties of *leg A*, which does not renegotiate just because its far
+/// side moved. Rebuilding them instead of carrying them would silently reopen the source gate, drop
+/// a secure leg's keys, and send the new downlink to the signalled `c=` address rather than the pair
+/// ICE selected (RFC 8445 §8.1.1) — for a NATed peer, an address it cannot receive on.
+pub struct WsRouteState {
+    /// Leg A's RTP endpoint — already redirected to this registry.
+    pub endpoint_a: EndpointId,
+    /// The live RTPBleed source gate (narrowed to the selected pair if ICE has chosen one).
+    pub accepted_source: SourceFilter,
+    /// Whether a full ICE agent still owes this leg a selection.
+    pub ice_pending: bool,
+    /// The secure leg's SRTP state, shared so the replacement bridge keeps the same keying (and, on
+    /// DTLS, the same handle a completing handshake keys).
+    pub secure: Option<Arc<WsSecureLeg>>,
+    /// The egress watch — carried so an ICE selection that already landed still points the new
+    /// bridge's downlink at the chosen pair.
+    pub egress: Arc<tokio::sync::watch::Sender<SocketAddr>>,
+}
+
 /// Everything the registry needs to route and tear down one running WS-bridge call.
 pub struct WsCallPlan {
     /// The call this bridge belongs to.
@@ -290,7 +313,11 @@ impl WsRegistry {
         // The selected pair is now the only source this leg accepts (docs/security-and-nat.md §4
         // layer 4) — the open window an ICE seat starts with closes here.
         route.accepted_source = SourceFilter::Exact(remote.ip());
-        let _ = route.egress.send(remote);
+        // `send_replace`, not `send`: `send` fails and leaves the value untouched once every receiver
+        // is gone, which happens the moment a bridge's drain task exits. The watch outlives that task
+        // — a re-point reuses it — so a selection landing on a leg whose bridge has died must still be
+        // recorded, or the replacement bridge would start out aimed at the pre-ICE address.
+        let _ = route.egress.send_replace(remote);
         true
     }
 
@@ -336,14 +363,57 @@ impl WsRegistry {
         }
     }
 
+    /// The live per-leg state of `call_id`'s bridge, for standing a replacement up on the same leg
+    /// (see [`WsRouteState`]). `None` when this call has no bridge.
+    #[must_use]
+    pub fn route_state(&self, call_id: &str) -> Option<WsRouteState> {
+        let endpoint_a = self.calls.get(call_id)?.endpoint_a;
+        let route = self.routes.get(&endpoint_a)?;
+        Some(WsRouteState {
+            endpoint_a,
+            accepted_source: route.accepted_source,
+            ice_pending: route.ice_pending,
+            secure: route.secure.clone(),
+            egress: route.egress.clone(),
+        })
+    }
+
     /// Tear a WS-bridge call down: drop its route and abort the bridge + drain tasks (closing the WS
     /// connection and the RTP-out drain). The WS half of call teardown.
-    pub fn deregister(&self, call_id: &str) {
-        if let Some((_, handle)) = self.calls.remove(call_id) {
-            self.routes.remove(&handle.endpoint_a);
-            handle.bridge_task.abort();
-            handle.drain_task.abort();
-        }
+    ///
+    /// Returns the two aborted task handles so the caller can **await** them. `abort()` only
+    /// schedules cancellation, so a caller that returns here leaves the WebSocket socket, the
+    /// bridge's codec state and the drain's buffers alive for an unbounded moment — the same reason
+    /// [`crate::engine`]'s tee teardown awaits its transport. It matters more here than for a tee: a
+    /// re-point stands a *replacement* bridge up on the same endpoint, and the outgoing drain task
+    /// must be gone before the new one starts writing, or two drains briefly interleave RTP (two
+    /// sequence-number and timestamp series, RFC 3550 §5.1) toward the same peer. A no-op returning
+    /// `None` for a call this registry does not hold.
+    pub fn deregister(&self, call_id: &str) -> Option<WsCallTasks> {
+        let (_, handle) = self.calls.remove(call_id)?;
+        self.routes.remove(&handle.endpoint_a);
+        handle.bridge_task.abort();
+        handle.drain_task.abort();
+        Some(WsCallTasks {
+            bridge_task: handle.bridge_task,
+            drain_task: handle.drain_task,
+        })
+    }
+}
+
+/// The two aborted tasks of a torn-down bridge, handed back by [`WsRegistry::deregister`] so the
+/// caller can await their cancellation rather than racing it.
+pub struct WsCallTasks {
+    bridge_task: tokio::task::JoinHandle<()>,
+    drain_task: tokio::task::JoinHandle<()>,
+}
+
+impl WsCallTasks {
+    /// Wait for both aborted tasks to actually finish. Each resolves promptly with
+    /// `JoinError::Cancelled` — both are cancel-safe select loops.
+    pub async fn joined(self) {
+        let _ = self.bridge_task.await;
+        let _ = self.drain_task.await;
     }
 }
 
@@ -448,7 +518,7 @@ mod tests {
         let received = rtp_in_rx.try_recv().expect("forwarded to the bridge");
         assert_eq!(&received[..], b"rtp-frame");
 
-        registry.deregister("call-1");
+        let _ = registry.deregister("call-1");
     }
 
     #[tokio::test]
@@ -469,7 +539,7 @@ mod tests {
             "off-source packet must not reach the bridge"
         );
 
-        registry.deregister("call-1");
+        let _ = registry.deregister("call-1");
     }
 
     #[tokio::test]
@@ -491,7 +561,7 @@ mod tests {
         registry.register(registration);
         assert!(registry.owns(endpoint(1)));
 
-        registry.deregister("call-1");
+        let _ = registry.deregister("call-1");
         assert!(!registry.owns(endpoint(1)), "route dropped");
         assert!(!registry.is_ws_call("call-1"), "call dropped");
         // The tasks were aborted (pending() never completes otherwise). `abort()` schedules
@@ -509,7 +579,66 @@ mod tests {
     #[tokio::test]
     async fn deregister_unknown_call_is_a_noop() {
         let registry = WsRegistry::default();
-        registry.deregister("nope"); // must not panic
+        assert!(
+            registry.deregister("nope").is_none(),
+            "an unknown call yields no tasks to await, and must not panic"
+        );
+        assert!(registry.route_state("nope").is_none());
+    }
+
+    #[tokio::test]
+    async fn route_state_hands_a_re_point_the_leg_state_it_must_not_rebuild() {
+        // What a re-point carries across. The egress watch and the SRTP leg are shared *handles*, not
+        // copies: an ICE selection that lands between the two bridges still steers the new downlink,
+        // and a DTLS handshake completing in the same window still keys the leg. Rebuilding either
+        // would send the replacement bridge's audio to the signalled address the NATed peer cannot
+        // receive on, or leave a secure leg dropping every packet.
+        let registry = WsRegistry::default();
+        let (rtp_in_tx, _rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (bridge_task, drain_task) = idle_tasks();
+        let egress = Arc::new(tokio::sync::watch::Sender::new(address("127.0.0.2:5000")));
+        let secure = Arc::new(WsSecureLeg::pending());
+        registry.register(WsCallPlan {
+            call_id: "call-1".to_string(),
+            endpoint_a: endpoint(1),
+            accepted_source: SourceFilter::Exact(Ipv4Addr::new(127, 0, 0, 2).into()),
+            ice_pending: true,
+            secure: Some(secure.clone()),
+            egress: egress.clone(),
+            rtp_in: rtp_in_tx,
+            bridge_task,
+            drain_task,
+        });
+
+        // ICE selects a pair: the gate narrows and the watch is re-pointed.
+        assert!(registry.ice_selected(endpoint(1), address("203.0.113.9:40000")));
+
+        let state = registry.route_state("call-1").expect("a live route");
+        assert_eq!(state.endpoint_a, endpoint(1));
+        assert!(!state.ice_pending, "the selection cleared the pending flag");
+        assert_eq!(
+            state.accepted_source,
+            SourceFilter::Exact(Ipv4Addr::new(203, 0, 113, 9).into()),
+            "the narrowed gate, not the one the SDP signalled"
+        );
+        assert_eq!(
+            *state.egress.borrow(),
+            address("203.0.113.9:40000"),
+            "the selected pair, carried on the same watch"
+        );
+        assert!(
+            Arc::ptr_eq(&state.egress, &egress),
+            "the very same watch, so a later selection reaches the replacement bridge too"
+        );
+        assert!(
+            Arc::ptr_eq(state.secure.as_ref().expect("a secure leg"), &secure),
+            "the very same SRTP leg, so a completing DTLS handshake still keys it"
+        );
+
+        let tasks = registry.deregister("call-1").expect("the two tasks");
+        tasks.joined().await;
+        assert!(!registry.owns(endpoint(1)));
+        assert!(registry.route_state("call-1").is_none());
     }
 
     // ---- secure (SRTP) takeover legs ------------------------------------------------------------
@@ -539,7 +668,7 @@ mod tests {
         let received = rtp_in_rx.try_recv().expect("decrypted and forwarded");
         assert_eq!(&received[..], &clear[..], "the bridge sees clear RTP");
 
-        registry.deregister("secure");
+        let _ = registry.deregister("secure");
     }
 
     #[tokio::test]
@@ -569,7 +698,7 @@ mod tests {
         );
         assert!(out.is_empty(), "and must not have produced a datagram");
 
-        registry.deregister("pending");
+        let _ = registry.deregister("pending");
     }
 
     #[tokio::test]
@@ -595,7 +724,7 @@ mod tests {
             "media flows once the handshake keys the leg"
         );
 
-        registry.deregister("dtls");
+        let _ = registry.deregister("dtls");
     }
 
     #[tokio::test]
@@ -610,7 +739,7 @@ mod tests {
         assert_eq!(registry.secure_state("plain"), None, "not a secure leg");
         let (leg, _peer) = secure_pair();
         assert!(!registry.attach_secure_leg("nope", leg));
-        registry.deregister("plain");
+        let _ = registry.deregister("plain");
     }
 
     #[tokio::test]
@@ -631,7 +760,7 @@ mod tests {
         registry.dispatch(rx(1, "127.0.0.2:5000", &rtcp_packet()));
         assert!(rtp_in_rx.try_recv().is_err(), "SRTCP has no consumer");
 
-        registry.deregister("forge");
+        let _ = registry.deregister("forge");
     }
 
     #[tokio::test]
@@ -678,7 +807,7 @@ mod tests {
             !registry.ice_selected(endpoint(2), selected),
             "a selection for an endpoint this registry does not own is a no-op"
         );
-        registry.deregister("ice");
+        let _ = registry.deregister("ice");
     }
 
     #[tokio::test]

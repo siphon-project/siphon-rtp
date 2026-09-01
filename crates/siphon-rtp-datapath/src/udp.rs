@@ -1117,6 +1117,10 @@ impl Datapath for UdpLoopbackDatapath {
         );
     }
 
+    fn latched_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        self.inner.latched.get(&endpoint).map(|state| state.addr)
+    }
+
     fn ice_validated_source(&self, endpoint: EndpointId) -> Option<SocketAddr> {
         // Only an ICE endpoint has a *validated* source. On one, `handle_stun` is the sole writer of
         // `latched` — media never creates or moves it (`Inner::dispatch`, layer 4) — so the latch is
