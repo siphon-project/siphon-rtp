@@ -636,6 +636,25 @@ pub trait Datapath: Send + Sync {
     /// Default: no-op, for a backend with no ICE support at all.
     fn adopt_source(&self, _endpoint: EndpointId, _source: SocketAddr) {}
 
+    /// The address `endpoint` is currently **latching** to — the peer's observed source, adopted by
+    /// symmetric RTP (docs/security-and-nat.md §4 layer 3) or written by an ICE selection — or
+    /// `None` when nothing has been observed yet.
+    ///
+    /// The read side of what [`LatchPolicy`] maintains, for a caller that has to take a *live* flow
+    /// over and keep sending where the peer is actually reachable rather than where its SDP said it
+    /// would be. A NATed peer's `c=` port is routinely not the one it sends from (RFC 3264 offers
+    /// the signalled address; symmetric RTP is what makes the real one usable), so a takeover that
+    /// re-derived the destination from the signalling would break exactly the calls the latch exists
+    /// for. Distinct from [`ice_validated_source`](Self::ice_validated_source), which is deliberately
+    /// `None` on a non-ICE endpoint because no connectivity check ever authenticated the latch —
+    /// this reports the media path as it stands, with no claim about how it was learned, and is
+    /// therefore for continuity only, never for a trust decision.
+    ///
+    /// Default: `None`, for a backend that keeps no latch state.
+    fn latched_source(&self, _endpoint: EndpointId) -> Option<SocketAddr> {
+        None
+    }
+
     /// Install (or clear with `None`) the TURN allocation `endpoint` relays through (RFC 5766).
     ///
     /// While installed, traffic to a **bound peer** is wrapped in ChannelData and sent to the TURN

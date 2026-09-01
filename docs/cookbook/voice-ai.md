@@ -11,7 +11,7 @@ There are **two** modes, and they are separate fields on purpose:
 
 | Mode | Field | What it does |
 |---|---|---|
-| **Takeover** | `ws_uri` | The WS server *is* leg A's far side. Duplex. A↔B is not wired. Use it when the AI answers the call. |
+| **Takeover** | `ws_uri` / `attach_ws_bridge` | The WS server *is* leg A's far side. Duplex. A↔B is not wired. Use it when the AI answers the call. `attach_ws_bridge` also [moves or removes](#moving-and-removing-a-takeover-bridge) one mid-call. |
 | **Tee** | `ws_tee` / `attach_ws_tee` | A send-only stream riding a call that keeps relaying normally. Use it to listen to a live two-party call. |
 
 A call may hold both — they attach at different points. Takeover is the rest of this page;
@@ -337,14 +337,81 @@ single-leg call — including every `answer_local` takeover — outright. Latenc
 for voice-AI: a shallow jitter buffer (target one frame) and the bounded playout queue keep
 mouth-to-ear delay low at the cost of a little more concealment under jitter.
 
-**A takeover call cannot be bridged to a second party in place.** A WS call's leg B ports are
-allocated by offer/answer, which makes it look like a later `answer` might hand the caller to a
-real party — it does not. `answer` short-circuits on a WS call and returns the rewritten SDP
-without installing any A↔B path, so the caller's media keeps going to the WS server and leg B
-receives nothing. Moving a WS-bridged caller onto a live second leg (keeping A's ports and SSRC
-continuous so no re-INVITE is needed) is a distinct transition that is **not implemented**. Today
-the way to hand the call away is a SIP-level transfer (REFER), which takes the call off this
-engine's WS bridge entirely.
+**A takeover call negotiated with `ws_uri` cannot be bridged to a second party in place.** A WS
+call's leg B ports are allocated by offer/answer, which makes it look like a later `answer` might
+hand the caller to a real party — it does not. `answer` short-circuits on a WS call and returns the
+rewritten SDP without installing any A↔B path, so the caller's media keeps going to the WS server
+and leg B receives nothing. Moving a WS-bridged caller onto a live second leg (keeping A's ports and
+SSRC continuous so no re-INVITE is needed) is a distinct transition that is **not implemented**. The
+way to hand such a call away is a SIP-level transfer (REFER), which takes the call off this engine's
+WS bridge entirely. The reverse direction *is* available — see below: a call that is already a plain
+two-party relay can be taken over and handed back.
+
+## Moving and removing a takeover bridge
+
+`ws_uri` stands a bridge up at negotiation. Two verbs give it a lifecycle after that:
+
+| Verb | On a call that already has a bridge | On a call that has none |
+|---|---|---|
+| `attach_ws_bridge` | **re-point** it at a different server | **take over** a live two-party relay |
+| `detach_ws_bridge` | put the media path back | no-op (idempotent) |
+
+```json
+{ "id": 7, "command": "attach_ws_bridge",
+  "call_id": "abc@example.com", "from_tag": "1a2b", "ws_uri": "ws://127.0.0.1:9002/stream" }
+```
+
+**Re-pointing** is the one to reach for when a live call's audio has to move to a different consumer
+— a second model, a fallback when the first server drains, a handoff between two stages of a flow.
+The leg does not renegotiate: same ports, same codec, same wire rate and uplink VAD / noise
+suppression / echo cancellation, same source gate, same SRTP keying, same ICE-selected path. Only
+the far side moves, so there is no re-INVITE and the caller hears a gap, not a new call. The old
+connection is closed and *awaited* before the new one is registered, so the two never overlap on the
+leg. You get one `ws_bridge_ended` (`reason: "detached"`) and one `ws_bridge_started` for the new
+URI, both carrying the call's `stream_id`.
+
+**Taking over a live relay** points leg A at the WS server and unwires A↔B — so **leg B hears
+nothing** until you detach. That is what a takeover is; put B on hold at the SIP layer if it should
+not simply hear silence. Only a plain, answered, two-party relay with nothing else attached can be
+taken over, and every refusal carries its own token:
+
+| Shape | Reason token |
+|---|---|
+| Secure (SDES / DTLS) offerer | `ws-takeover-secure-offerer` |
+| ICE leg | `ws-takeover-ice-offerer` |
+| Recording, SIPREC subscription, WS tee, DTMF block or X3 interception attached | `ws-takeover-call-is-held` |
+| Transcoding, secure-bridge or already-promoted call | `ws-takeover-not-a-plain-relay` |
+| Unanswered offer, or a single-leg `answer_local` call | `ws-takeover-not-answered` |
+
+The first two are the same structural refusals `offer` and `answer` make for `ws_uri`, for the same
+reasons: on a two-leg call the engine is not the offerer's cryptographic far side, and no ICE agent
+is armed to re-point a takeover leg's egress. Negotiate those takeovers with `answer_local`.
+
+**Detaching** reinstalls the exact forward rules the takeover displaced — gate and latch policy
+included — and the two parties hear each other again. It is refused (`ws-bridge-negotiated`) on a
+bridge that was **negotiated** with `ws_uri`: that bridge *is* the call's media path. Nothing was
+displaced, and on an `answer_local` takeover there is no second party that could ever be relayed to,
+so detaching would leave the caller connected to nothing. Re-point it, or `delete` the call.
+
+`block_media` / `unblock_media` are refused on a taken-over call for a related reason: the call is
+still holding the displaced relay's forward rules for its detach, and an unblock walks that list.
+
+## Knowing when a bridge dies
+
+A takeover bridge is leg A's **only** far side, so one that stops without you asking is a live call
+gone silent. `ws_bridge_ended` says so, once, whichever end gave up:
+
+```json
+{ "event": "ws_bridge_ended", "call_id": "abc@example.com", "from_tag": "1a2b",
+  "stream_id": "ws-abc@example.com", "reason": "server_closed" }
+```
+
+`detached` is the only orderly reason (a `detach_ws_bridge`, or the close half of a re-point).
+`server_closed`, `server_stopped` and `transport_error` all mean the consumer went away mid-call;
+`call_ended` means the call did. The engine does **not** silently re-point or restore anything on
+its own — it holds the leg where it is and tells you, so the decision (re-point to a fallback,
+detach back to the relay, or tear the call down) stays with the controller. It is also logged at
+WARN, so a node with no event consumer still leaves a trace.
 
 ## Teeing a live call to a WebSocket
 

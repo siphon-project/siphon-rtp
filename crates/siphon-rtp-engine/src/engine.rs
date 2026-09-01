@@ -37,8 +37,8 @@ use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    PlayEndReason, PlayMediaSource, ProfileFlags, SessionStats, WsTeeDirection, WsTeeEndReason,
-    WsVadEngine, X3EndReason, X3TargetLeg, Xid,
+    PlayEndReason, PlayMediaSource, ProfileFlags, SessionStats, WsBridgeEndReason,
+    WsTeeDirection, WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
@@ -94,7 +94,7 @@ struct TurnAllocation {
 use std::net::SocketAddr;
 
 use siphon_rtp_media::bridge::protocol::{Direction as WsDirection, MediaFormat};
-use siphon_rtp_media::bridge::{run_bridge, BridgeSession};
+use siphon_rtp_media::bridge::{run_bridge, BridgeEndReason, BridgeSession};
 use siphon_rtp_media::jitter::JitterBuffer;
 use siphon_rtp_media::leg::MediaLeg;
 use siphon_rtp_media::mixer::Role;
@@ -754,7 +754,7 @@ struct WsBridgeSetup<'a> {
     /// The WebSocket media server to dial (`ws://` or `wss://`).
     ws_uri: &'a str,
     /// Leg A's RTP endpoint — redirected to the bridge, and the socket the downlink leaves from.
-    endpoint_a: Endpoint,
+    endpoint_a: EndpointId,
     /// Leg A's signalled transport address: the initial downlink destination (ICE may re-point it).
     a_rtp: SocketAddr,
     /// A's negotiated primary codec — the bridge decodes it uplink and encodes it downlink.
@@ -775,6 +775,93 @@ struct WsBridgeSetup<'a> {
     echo_cancellation: bool,
     /// Local energy-VAD turn-taking / barge-in, when the profile asked for it.
     vad_config: Option<WsVadConfig>,
+    /// The downlink destination watch to **reuse**, on a re-point ([`Engine::start_ws_bridge`] on a
+    /// call that already has a bridge). `None` mints a fresh one pointing at `a_rtp`, which is what
+    /// every negotiation-time setup wants. Carried across a re-point because the watch is leg A's
+    /// state, not the connection's: an ICE selection that already landed (RFC 8445 §8.1.1) published
+    /// the chosen pair here, and a fresh watch would send the replacement bridge's downlink back to
+    /// the signalled `c=` address the NATed peer cannot receive on.
+    egress: Option<Arc<tokio::sync::watch::Sender<SocketAddr>>>,
+    /// Set only when this bridge is **taking over a live relay** — the flows to switch off, and the
+    /// ones a later detach switches back on. `None` at negotiation time, where there is no relay yet.
+    takeover: Option<WsRelayTakeover>,
+    /// A connection the caller has **already** dialled, used instead of dialling `ws_uri` here.
+    ///
+    /// Only a re-point supplies one, and it has to: a re-point must stop the outgoing bridge before
+    /// the replacement can own the leg, and if the new dial then failed the call would be left
+    /// redirected into nothing with the relay-restore plan already dropped. Dialling first turns that
+    /// into a clean refusal with the live bridge still up. Everything this function does *before* the
+    /// dial — resolving the codec, validating the wire rate, building the resamplers and the detector
+    /// — is, on a re-point, a rerun of a computation that already succeeded for these exact
+    /// parameters, so nothing between here and the redirect can fail on that path.
+    socket: Option<WsClientSocket>,
+}
+
+/// A dialled WebSocket client connection to a media server — what
+/// [`tokio_tungstenite::connect_async_tls_with_config`] hands back, named so it can be dialled by one
+/// function and consumed by another.
+type WsClientSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Switching a live two-party relay onto a WebSocket takeover, and back again.
+///
+/// The two halves are recorded together because they are one decision: `displace` is applied with
+/// the redirect that hands leg A to the bridge, and `restore` is the exact set of `Forward` rules
+/// [`Engine::detach_ws_bridge`] reinstalls to give the call its A↔B path back. Keeping the restore
+/// verbatim — rather than recomputing a relay at detach time — is what makes the detach safe: the
+/// engine puts back precisely what it took away, gate and latch policy included, and never has to
+/// invent a media path from state it does not hold.
+#[derive(Clone, Debug)]
+struct WsRelayTakeover {
+    /// Applied when the bridge is installed: every endpoint of the displaced relay goes to
+    /// [`FlowAction::Drop`]. Leg B's ingress included — with A's media owned by the bridge there is
+    /// nowhere to forward it, and leaving the rule up would mix B's audio into the bridge's downlink
+    /// on A's socket. RFC 3264 §8: the parties' negotiated addresses do not move; only what the
+    /// engine does with the packets does.
+    displace: Vec<(EndpointId, FlowAction)>,
+    /// Reinstalled on detach — the call's own `relay_flows`, untouched.
+    restore: Vec<(EndpointId, FlowAction)>,
+    /// The [`PipelineKind`] the call had before the takeover, restored alongside the flows.
+    restore_pipeline: PipelineKind,
+}
+
+/// A live WebSocket **takeover** bridge, tracked per call alongside the [`crate::ws_bridge`]
+/// registry that routes its packets.
+///
+/// The registry owns the datapath route and the two tasks; this owns everything the *control plane*
+/// needs and the registry has no business knowing: who to send the lifecycle events to, the
+/// once-only end latch, the negotiated shape to carry across a re-point, and the relay to restore.
+/// It is held here (rather than on the `Call`) for the same reason [`WsTee`] is: the end event is
+/// emitted during teardown, *after* `delete` has already removed the call.
+struct WsBridge {
+    /// The call's offerer tag and owning control client, copied at setup so the end event can still
+    /// be addressed once the call itself is gone.
+    from_tag: String,
+    owner: ClientId,
+    /// The bridge's `streamId` — the same one the WS `start` frame carries, so a controller can line
+    /// the control events up against the media stream.
+    stream_id: String,
+    /// Where this bridge is currently pointed. Read back by observability and re-point logging.
+    ws_uri: String,
+    /// Set once an end event has been emitted, so the controller sees exactly one `ws_bridge_ended`
+    /// whether the server, the transport or a detach got there first.
+    ended: Arc<std::sync::atomic::AtomicBool>,
+    /// The leg's negotiated codec, kept so a re-point rebuilds the same coder pair rather than
+    /// re-deriving it from a `Call` that (on `answer_local`) may never have recorded one.
+    codec: CodecSpec,
+    /// Leg A's signalled RTP address — the fresh-watch seed, kept for the record's own sake.
+    a_rtp: SocketAddr,
+    /// The negotiated L16 wire rate, and the uplink processing the profile asked for. Carried across
+    /// a re-point: a controller moving a voice-AI call to a second consumer asked for a different
+    /// *destination*, not for its VAD, noise suppression or wire rate to be silently turned off.
+    wire_sample_rate: Option<u32>,
+    noise_suppression: bool,
+    echo_cancellation: bool,
+    vad_config: Option<WsVadConfig>,
+    /// The relay this bridge displaced, or `None` when the bridge *is* the call's negotiated media
+    /// path (`ProfileFlags::ws_uri`). This is exactly what makes a detach possible or not — see
+    /// [`Engine::detach_ws_bridge`].
+    takeover: Option<WsRelayTakeover>,
 }
 
 /// The session engine, generic over a [`Datapath`] backend.
@@ -878,6 +965,11 @@ pub struct Engine<D: Datapath> {
     /// one. Held here (not in the media actor) because the transport task, the WS socket and the
     /// dropped/forwarded counters outlive individual control ops and must be torn down on `delete`.
     ws_tees: DashMap<String, WsTee>,
+    /// Live WebSocket **takeover** bridges, keyed by call-id — the control-plane half of what the
+    /// [`crate::ws_bridge::WsRegistry`] routes. One per call; attaching again re-points it. Held
+    /// here for the same reason `ws_tees` is: the `ws_bridge_ended` event is emitted during teardown,
+    /// after `delete` has removed the `Call` the tag and owner would have come from.
+    ws_bridges: DashMap<String, WsBridge>,
     /// Operator configuration for lawful-interception content delivery (ETSI TS 103 221-2 X3), set
     /// by the daemon from the `x3_*` config keys.
     ///
@@ -1013,6 +1105,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             turn_server: None,
             ice_relays: Arc::new(DashMap::new()),
             ws_tees: DashMap::new(),
+            ws_bridges: DashMap::new(),
             // Lawful interception is unconfigured unless the daemon supplies `x3_*`, and `attach_x3`
             // refuses while it is — never accepted and left delivering nowhere.
             x3_config: None,
@@ -1237,6 +1330,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     #[must_use]
     pub fn ws_tee_count(&self) -> usize {
         self.ws_tees.len()
+    }
+
+    /// Live WebSocket **takeover** bridges — one per bridged call (the `siphon_rtp_ws_bridges`
+    /// gauge). Distinct from `ws_tee_count`, and worth watching separately: a tee is a copy of a
+    /// call, a takeover bridge *is* one party's far side.
+    #[must_use]
+    pub fn ws_bridge_count(&self) -> usize {
+        self.ws_bridges.len()
     }
 
     /// Audio frames handed to the live tees' transports so far. Read across every live tee; a tee that
@@ -1551,6 +1652,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     .await
             }
             Command::DetachWsTee { call_id, .. } => self.detach_ws_tee(client, &call_id).await,
+            Command::AttachWsBridge {
+                call_id, ws_uri, ..
+            } => self.attach_ws_bridge(client, &call_id, &ws_uri).await,
+            Command::DetachWsBridge { call_id, .. } => {
+                self.detach_ws_bridge(client, &call_id).await
+            }
             Command::AttachX3 {
                 call_id,
                 delivery,
@@ -2187,7 +2294,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .setup_ws_bridge(WsBridgeSetup {
                     call_id: &call_id,
                     ws_uri: &ws_uri,
-                    endpoint_a: near_rtp,
+                    endpoint_a: near_rtp.id,
                     a_rtp: info.remote_rtp,
                     codec: near_codec.as_ref(),
                     // Gate leg A's ingress to its `received-from` public IP when the offer supplied
@@ -2205,6 +2312,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     echo_cancellation: profile.echo_cancellation,
                     vad_config: WsVadConfig::from_profile(profile),
                     wire_sample_rate: profile.ws_sample_rate,
+                    // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
+                    // yet) — so there is nothing for a detach to put back either.
+                    egress: None,
+                    takeover: None,
+                    socket: None,
                 })
                 .await
             {
@@ -2654,7 +2766,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 .setup_ws_bridge(WsBridgeSetup {
                     call_id,
                     ws_uri: &ws_uri,
-                    endpoint_a: near_rtp,
+                    endpoint_a: near_rtp.id,
                     a_rtp: info.remote_rtp,
                     codec: Some(&chosen),
                     accepted_source,
@@ -2664,6 +2776,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     echo_cancellation: profile.echo_cancellation,
                     vad_config: WsVadConfig::from_profile(profile),
                     wire_sample_rate: profile.ws_sample_rate,
+                    // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
+                    // yet) — so there is nothing for a detach to put back either.
+                    egress: None,
+                    takeover: None,
+                    socket: None,
                 })
                 .await
             {
@@ -2821,6 +2938,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// On a **secure** takeover leg (`setup.secure`) the registry SRTP-decrypts A's ingress before the
     /// bridge sees it and the drain task SRTP-encrypts the downlink before it leaves — fail-closed
     /// both ways, so an unkeyed or failing leg emits nothing rather than plaintext (RFC 3711).
+    ///
+    /// The dial happens **before** any flow is installed. At negotiation time that only shortens the
+    /// window in which A's endpoint is redirected with no route behind it; for a runtime attach it is
+    /// load-bearing, because the call is *already carrying audio* and a failed dial must leave it
+    /// exactly as it was rather than redirected into nothing. `setup.takeover` then switches the
+    /// displaced relay off in the same step as the redirect, so B's media never mixes into the
+    /// bridge's downlink on A's socket.
+    ///
+    /// Emits [`Event::WsBridgeStarted`] on success, and arranges the matching
+    /// [`Event::WsBridgeEnded`] for whenever the bridge stops — including when the *server* ends it,
+    /// which was previously silent. That silence is the failure this reports: a takeover bridge is
+    /// leg A's only far side, so a bridge that dies without a word is a live call gone one-way with
+    /// nothing anywhere saying so.
     async fn setup_ws_bridge(&self, setup: WsBridgeSetup<'_>) -> Result<(), String> {
         let WsBridgeSetup {
             call_id,
@@ -2835,8 +2965,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             echo_cancellation,
             vad_config,
             wire_sample_rate,
+            egress: existing_egress,
+            takeover,
+            socket: dialled,
         } = setup;
         use siphon_rtp_media::bridge::wire_rate::{validate_wire_sample_rate, wire_resampler};
+
+        // The lifecycle events are addressed to the call's owner and carry its offerer tag, and both
+        // have to be captured now: teardown emits the end event after `delete` has removed the call.
+        let Some((from_tag, owner)) = self
+            .owned_call_internal(call_id, |call| (call.from_tag.clone(), call.owner))
+        else {
+            return Err("call no longer exists".to_string());
+        };
 
         let Some(codec) = codec else {
             return Err("offer carried no usable audio codec for the WS bridge".to_string());
@@ -2865,19 +3006,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let downlink_resampler =
             wire_resampler(wire_rate, leg_pcm_rate).map_err(|error| error.to_string())?;
 
-        // Redirect A's RTP so the dispatcher routes it here (the WS bridge owns leg A's media).
-        self.datapath
-            .install_flow(endpoint_a.id, FlowAction::Redirect)
-            .map_err(|error| format!("install WS bridge redirect: {error}"))?;
+        // Dial the WS server (or take the connection the caller already dialled — see
+        // `WsBridgeSetup::socket`). Before anything is installed, so a dial that fails leaves the
+        // call's datapath untouched, which for a runtime attach means still relaying.
+        let socket = match dialled {
+            Some(socket) => socket,
+            None => self.dial_ws_bridge(ws_uri).await?,
+        };
 
-        // Dial the WS server as a client. Supply a ring/rustls TLS connector so a `wss://` URI
-        // completes the RFC 8446 handshake before the RFC 6455 upgrade; a `ws://` URI ignores the
-        // connector (plain TCP). Returns the stream + the HTTP upgrade response; keep only the stream.
-        let connector = tokio_tungstenite::Connector::Rustls(self.ws_tls_client_config());
-        let (socket, _response) =
-            tokio_tungstenite::connect_async_tls_with_config(ws_uri, None, false, Some(connector))
-                .await
-                .map_err(|error| format!("dial {ws_uri}: {error}"))?;
+        // Switch the displaced relay off (all `Drop`) and redirect A's RTP here in one step, so the
+        // dispatcher routes A to the bridge and B's ingress stops being forwarded onto A's socket.
+        // Empty at negotiation time — there is no relay to displace before the call is answered.
+        if let Some(takeover) = takeover.as_ref() {
+            for (endpoint, action) in &takeover.displace {
+                if let Err(error) = self.datapath.install_flow(*endpoint, *action) {
+                    let _ = self.restore_displaced_relay(takeover);
+                    return Err(format!("displace relay flow for WS takeover: {error}"));
+                }
+            }
+        }
+        if let Err(error) = self.datapath.install_flow(endpoint_a, FlowAction::Redirect) {
+            // Nothing owns the leg yet, so put the relay back rather than leave the call half
+            // displaced with no bridge and no record to detach.
+            if let Some(takeover) = takeover.as_ref() {
+                let _ = self.restore_displaced_relay(takeover);
+            }
+            return Err(format!("install WS bridge redirect: {error}"));
+        }
 
         // A jitter buffer shallow enough for low-latency voice-AI (target 1, cap 16 — the bridge
         // pops one frame per ptime tick, the consumer's cadence being the sample-tick clock).
@@ -2899,10 +3054,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             endianness: siphon_rtp_media::bridge::protocol::Endianness::Little,
             ptime: codec.ptime_ms.max(1),
         };
+        // The `streamId` the WS `start` frame announces — and, on the control plane, the correlator
+        // carried by `ws_bridge_started` / `ws_bridge_ended`. One value, so the two line up.
+        let stream_id = format!("ws-{call_id}");
         let mut session = BridgeSession::new(
             leg,
             format,
-            format!("ws-{call_id}"),
+            stream_id.clone(),
             call_id.to_string(),
             WsDirection::Duplex,
             8, // playout cap (drop-oldest): late audio is worthless
@@ -2954,23 +3112,49 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let (rtp_in_tx, rtp_in_rx) = flume::bounded::<bytes::Bytes>(1024);
         let (rtp_out_tx, rtp_out_rx) = flume::bounded::<bytes::Bytes>(1024);
 
-        // The bridge: pump A's RTP (rtp_in) ↔ WS, render WS downlink to RTP (rtp_out).
-        let bridge_task = tokio::spawn(async move {
-            if let Err(error) = run_bridge(socket, session, rtp_in_rx, rtp_out_tx, ptime).await {
-                tracing::debug!(%error, "ws bridge exited with error");
-            }
-        });
+        // The bridge: pump A's RTP (rtp_in) ↔ WS, render WS downlink to RTP (rtp_out). Whichever way
+        // it ends, say so once — a detach that beat it to the latch has already reported `Detached`.
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bridge_task = {
+            let events = self.events.get(&owner).map(|sink| sink.value().clone());
+            let call_id = call_id.to_string();
+            let from_tag = from_tag.clone();
+            let stream_id = stream_id.clone();
+            let ended = ended.clone();
+            tokio::spawn(async move {
+                let reason = match run_bridge(socket, session, rtp_in_rx, rtp_out_tx, ptime).await {
+                    Ok(BridgeEndReason::ServerClosed) => WsBridgeEndReason::ServerClosed,
+                    Ok(BridgeEndReason::ServerStopped) => WsBridgeEndReason::ServerStopped,
+                    Ok(BridgeEndReason::CallEnded) => WsBridgeEndReason::CallEnded,
+                    Err(error) => {
+                        tracing::debug!(%error, %call_id, "ws bridge exited with error");
+                        WsBridgeEndReason::TransportError
+                    }
+                };
+                emit_ws_bridge_ended(
+                    events.as_ref(),
+                    &ended,
+                    &call_id,
+                    &from_tag,
+                    &stream_id,
+                    reason,
+                );
+            })
+        };
         // Where the downlink goes. Published rather than captured so an ICE selection can re-point it
         // mid-call (RFC 8445 §8.1.1) — a takeover leg's egress belongs to this drain task, not to a
         // datapath forward rule, so `Datapath::adopt_source` alone would never reach it.
-        let egress = Arc::new(tokio::sync::watch::Sender::new(a_rtp));
+        // Reused verbatim on a re-point (see `WsBridgeSetup::egress`), so an ICE selection that has
+        // already landed keeps steering the downlink; minted at `a_rtp` for a first attach.
+        let egress = existing_egress
+            .unwrap_or_else(|| Arc::new(tokio::sync::watch::Sender::new(a_rtp)));
         // The drain: forward each rendered downlink RTP packet out A's endpoint toward A, encrypting
         // it first on a secure leg. This is the ONLY egress site a takeover call has — `play_media`,
         // `play_dtmf`, recording, SIPREC and the WS tee all refuse a `PipelineKind::Ws` call, and a
         // takeover call has no media actor and no forward rule — so encrypting here covers the whole
         // egress surface of a secure takeover.
         let datapath = self.datapath.clone();
-        let drain_endpoint = endpoint_a.id;
+        let drain_endpoint = endpoint_a;
         let drain_secure = secure.clone();
         let drain_egress = egress.subscribe();
         let drain_task = tokio::spawn(async move {
@@ -3000,7 +3184,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
         self.ws.register(crate::ws_bridge::WsCallPlan {
             call_id: call_id.to_string(),
-            endpoint_a: endpoint_a.id,
+            endpoint_a,
             accepted_source,
             ice_pending,
             secure,
@@ -3009,6 +3193,33 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             bridge_task,
             drain_task,
         });
+        self.ws_bridges.insert(
+            call_id.to_string(),
+            WsBridge {
+                from_tag: from_tag.clone(),
+                owner,
+                stream_id: stream_id.clone(),
+                ws_uri: ws_uri.to_string(),
+                ended,
+                codec: codec.clone(),
+                a_rtp,
+                wire_sample_rate,
+                noise_suppression,
+                echo_cancellation,
+                vad_config,
+                takeover,
+            },
+        );
+        self.push_event(
+            owner,
+            Event::WsBridgeStarted {
+                call_id: call_id.to_string(),
+                from_tag,
+                stream_id,
+                ws_uri: ws_uri.to_string(),
+                sample_rate: wire_rate,
+            },
+        );
         tracing::info!(
             target: "siphon_rtp::media",
             call_id,
@@ -3019,6 +3230,42 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             "ws bridge attached"
         );
         Ok(())
+    }
+
+    /// Dial a WebSocket media server as a client. A `wss://` URI completes the RFC 8446 handshake on
+    /// the ring/rustls connector before the RFC 6455 upgrade; a `ws://` URI ignores the connector.
+    async fn dial_ws_bridge(&self, ws_uri: &str) -> Result<WsClientSocket, String> {
+        let connector = tokio_tungstenite::Connector::Rustls(self.ws_tls_client_config());
+        let (socket, _response) =
+            tokio_tungstenite::connect_async_tls_with_config(ws_uri, None, false, Some(connector))
+                .await
+                .map_err(|error| format!("dial {ws_uri}: {error}"))?;
+        Ok(socket)
+    }
+
+    /// Reinstall the `Forward` rules a takeover displaced. Shared by the detach path and by the
+    /// rollback in [`Self::setup_ws_bridge`].
+    ///
+    /// Every rule is attempted even after one fails, so a partial restore is as complete as it can
+    /// be rather than stopping at the first endpoint — but the failure is both logged at ERROR and
+    /// returned, because a leg left without a flow has no media path and the controller has to hear
+    /// about it.
+    fn restore_displaced_relay(&self, takeover: &WsRelayTakeover) -> Result<(), String> {
+        let mut failure: Option<String> = None;
+        for (endpoint, action) in &takeover.restore {
+            if let Err(error) = self.datapath.install_flow(*endpoint, *action) {
+                tracing::error!(
+                    %error,
+                    ?endpoint,
+                    "failed to reinstall a displaced relay flow; the leg has no media path"
+                );
+                failure.get_or_insert_with(|| error.to_string());
+            }
+        }
+        match failure {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
     }
 
     /// Tear down a call's datapath + slow-path state without an ownership check (an internal cleanup
@@ -3043,7 +3290,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.stop_x3(call_id, X3EndReason::CallEnded).await;
             self.bridge.deregister(endpoints.iter().copied());
             self.media.deregister(call_id);
-            self.ws.deregister(call_id);
+            // ...and any WS takeover bridge, so its controller gets a final `ws_bridge_ended` rather
+            // than a stream that simply stops.
+            self.stop_ws_bridge(call_id, WsBridgeEndReason::CallEnded)
+                .await;
             if let Some(consent) = &self.consent {
                 consent.unregister_call(call_id);
             }
@@ -3661,7 +3911,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         .setup_ws_bridge(WsBridgeSetup {
                             call_id,
                             ws_uri: &ws_uri,
-                            endpoint_a: near.rtp,
+                            endpoint_a: near.rtp.id,
                             a_rtp,
                             codec: near_codec.as_ref(),
                             // Gate leg A to its offer `received-from` public IP when supplied.
@@ -3676,6 +3926,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             echo_cancellation: profile.echo_cancellation,
                             vad_config: WsVadConfig::from_profile(profile),
                             wire_sample_rate: profile.ws_sample_rate,
+                            egress: None,
+                            takeover: None,
+                            socket: None,
                         })
                         .await
                     {
@@ -4867,7 +5120,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.bridge.deregister(endpoints.iter().copied());
         self.media.deregister(call_id);
         self.text.deregister(call_id);
-        self.ws.deregister(call_id);
+        // The WS takeover bridge closes with the call, so its controller gets a final
+        // `ws_bridge_ended` rather than a stream that simply stops.
+        self.stop_ws_bridge(call_id, WsBridgeEndReason::CallEnded)
+            .await;
         // Consent state dies with the call — otherwise a torn-down leg keeps a checker (and its
         // credentials) alive forever and the registry never drains to zero.
         if let Some(consent) = &self.consent {
@@ -5855,10 +6111,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// flips its actor's egress; a plain relay flips its datapath flows to `Drop` and back. Only the
     /// owning client may control the call (A3 — docs §5).
     async fn set_block(&self, client: ClientId, call_id: &str, block: bool) -> CmdResult {
-        let Some(relay_flows) = self.owned_call(client, call_id, |call| call.relay_flows.clone())
+        let Some((relay_flows, pipeline)) =
+            self.owned_call(client, call_id, |call| (call.relay_flows.clone(), call.pipeline))
         else {
             return unknown_call(call_id);
         };
+        if pipeline == PipelineKind::Ws {
+            // A takeover call's on-the-wire bytes are not the two-party media (the same reason
+            // recording, SIPREC and the tee refuse it). It matters doubly once a bridge can be
+            // *attached* to a live relay: that call still carries the displaced relay's `Forward`
+            // rules for its detach, and reinstalling one here would take leg A's media back off the
+            // bridge without telling anyone. Silence it by detaching or re-pointing the bridge.
+            return error_result(
+                "block",
+                &"a WebSocket-takeover call's media cannot be blocked at the datapath; detach the \
+                  bridge (detach_ws_bridge) or tear the call down",
+            );
+        }
         if self.media.is_media_call(call_id) {
             self.media.control(call_id, MediaControl::Block(block));
             return ok_empty();
@@ -7963,6 +8232,351 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         Ok(built)
     }
 
+    /// Attach — or re-point — a call's WebSocket **takeover** bridge ([`Command::AttachWsBridge`]).
+    ///
+    /// The runtime half of what `ProfileFlags::ws_uri` could previously only do at negotiation.
+    /// Ownership is checked here (A3 — docs/security-and-nat.md §5); the work is in
+    /// [`Self::start_ws_bridge`].
+    async fn attach_ws_bridge(&self, client: ClientId, call_id: &str, ws_uri: &str) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        match self.start_ws_bridge(call_id, ws_uri).await {
+            Ok(()) => ok_empty(),
+            Err(reason) => error_result("attach_ws_bridge", &reason),
+        }
+    }
+
+    /// Stand a takeover bridge up on `call_id`, or move the one it already has.
+    ///
+    /// **Re-point** (the call already has a bridge). Everything except the destination belongs to
+    /// leg A and is carried across: its codec, the negotiated wire rate and uplink processing, the
+    /// RTPBleed source gate, the SRTP keying and the egress watch an ICE selection may already have
+    /// re-pointed (RFC 8445 §8.1.1). The outgoing bridge is stopped and **awaited** before the
+    /// replacement is registered, so two drain tasks never write to A's socket at once — that would
+    /// interleave two RTP sequence-number and timestamp series toward one peer (RFC 3550 §5.1).
+    ///
+    /// **Takeover** (the call has no bridge). Only a plain, answered, two-party relay with nothing
+    /// else attached to it can be taken over, because a takeover unwires A↔B and the engine has to
+    /// be able to give that path back verbatim on detach. Everything else is refused rather than
+    /// half-served:
+    ///
+    /// * A **secure offerer** (SDES-SRTP RFC 4568 / DTLS-SRTP RFC 5764) and an **ICE** leg get the
+    ///   same `ws-takeover-secure-offerer` / `ws-takeover-ice-offerer` refusals `offer` and `answer`
+    ///   already make, for the same reasons: on a two-leg call the engine is not A's cryptographic
+    ///   far side, so the bridge would receive ciphertext and answer in the clear; and no agent is
+    ///   armed to re-point a takeover leg's egress at the selected pair. Those guards previously ran
+    ///   only on the negotiation path — a runtime attach reaches the identical code, so it makes the
+    ///   identical checks.
+    /// * A **transcoding, secure-bridge or promoted** call, and one held in userspace by a
+    ///   recording, a SIPREC subscription, a WS tee or an X3 interception. Each of those owns per-
+    ///   packet state built on the media path the takeover would remove; silently stopping an
+    ///   interception or a recording is worse than refusing to start.
+    /// * A **single-leg** call (`answer_local`, or an offer nobody answered). There is no relay to
+    ///   displace and no second party a detach could ever hand it back to.
+    async fn start_ws_bridge(&self, call_id: &str, ws_uri: &str) -> Result<(), String> {
+        // --- re-point ------------------------------------------------------------------------
+        if let Some(state) = self.ws.route_state(call_id) {
+            let Some(previous) = self.ws_bridges.get(call_id).map(|bridge| {
+                (
+                    bridge.codec.clone(),
+                    bridge.a_rtp,
+                    bridge.wire_sample_rate,
+                    bridge.noise_suppression,
+                    bridge.echo_cancellation,
+                    bridge.vad_config,
+                    bridge.takeover.clone(),
+                    bridge.ws_uri.clone(),
+                )
+            }) else {
+                // A route with no record is an engine bug, not a controller error: the two are
+                // written together. Refuse rather than rebuild a bridge from guessed parameters.
+                return Err(
+                    "ws-bridge-untracked: the call has a WebSocket route with no bridge record; \
+                     delete the call"
+                        .to_string(),
+                );
+            };
+            let (
+                codec,
+                a_rtp,
+                wire_sample_rate,
+                noise_suppression,
+                echo_cancellation,
+                vad_config,
+                takeover,
+                old_uri,
+            ) = previous;
+            // Dial first, while the outgoing bridge still owns the leg: a re-point that cannot reach
+            // the new consumer must be a clean refusal on a call that is still up, not a call left
+            // redirected into nothing with its relay-restore plan already dropped.
+            let socket = self.dial_ws_bridge(ws_uri).await?;
+            self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
+                .await;
+            let result = self
+                .setup_ws_bridge(WsBridgeSetup {
+                    call_id,
+                    ws_uri,
+                    endpoint_a: state.endpoint_a,
+                    a_rtp,
+                    codec: Some(&codec),
+                    accepted_source: state.accepted_source,
+                    ice_pending: state.ice_pending,
+                    secure: state.secure,
+                    noise_suppression,
+                    echo_cancellation,
+                    vad_config,
+                    wire_sample_rate,
+                    egress: Some(state.egress),
+                    // Carried forward: a re-point moves the far side, it does not change what the
+                    // bridge displaced, so a detach after one still restores the original relay.
+                    takeover,
+                    socket: Some(socket),
+                })
+                .await;
+            if result.is_ok() {
+                tracing::info!(
+                    target: "siphon_rtp::media",
+                    call_id,
+                    from = %old_uri,
+                    to = %ws_uri,
+                    "ws bridge re-pointed"
+                );
+            }
+            return result;
+        }
+
+        // --- takeover of a live relay ----------------------------------------------------------
+        let Some((pipeline, near, near_codec, relay_flows, near_secure, has_ice, received_from)) =
+            self.owned_call_internal(call_id, |call| {
+                (
+                    call.pipeline,
+                    call.near,
+                    call.near_codec.clone(),
+                    call.relay_flows.clone(),
+                    call.near_secure,
+                    call.ice.is_some(),
+                    call.offer_received_from,
+                )
+            })
+        else {
+            return Err("call no longer exists".to_string());
+        };
+
+        // The same two refusals `offer` and `answer` make for `ws_uri`, checked first because they
+        // are about the leg itself rather than about what is attached to it.
+        if near_secure {
+            return Err(
+                "ws-takeover-secure-offerer: a WebSocket takeover on a secure (SRTP) offerer is not \
+                 supported on a two-leg call — the engine is not that leg's cryptographic far side, \
+                 so the bridge would receive ciphertext and answer in the clear; negotiate the \
+                 takeover with answer_local instead"
+                    .to_string(),
+            );
+        }
+        if has_ice {
+            return Err(
+                "ws-takeover-ice-offerer: a WebSocket takeover on an ICE leg is not supported here — \
+                 no ICE agent is armed for a takeover leg on a two-leg call, so its downlink would \
+                 never follow the selected pair; negotiate the takeover with answer_local, or \
+                 ICE=remove to drop ICE"
+                    .to_string(),
+            );
+        }
+        // Checked before the pipeline kind, because each of these *promotes* a plain relay into the
+        // media pipeline: reporting the promotion ("this call is Media") would name the symptom,
+        // where naming the feature tells the controller what to stop.
+        if self.ws_tees.contains_key(call_id)
+            || self.x3_sessions.contains_key(call_id)
+            || self.call_has_userspace_hold(call_id)
+        {
+            return Err(
+                "ws-takeover-call-is-held: a recording, SIPREC subscription, WebSocket tee, DTMF \
+                 block or lawful-interception delivery is attached to this call and taps the media \
+                 path a takeover removes; stop it first"
+                    .to_string(),
+            );
+        }
+        if pipeline != PipelineKind::Passthrough || self.media.is_media_call(call_id) {
+            return Err(format!(
+                "ws-takeover-not-a-plain-relay: only a plain two-party relay can be taken over at \
+                 runtime, and this call is {pipeline:?} — a transcoding, secure-bridge or promoted \
+                 call's media path cannot be handed back verbatim on detach"
+            ));
+        }
+        if relay_flows.is_empty() {
+            return Err(
+                "ws-takeover-not-answered: the call has no two-party relay to take over (it is \
+                 unanswered, or was answered locally, so there is no second party a detach could \
+                 hand it back to); negotiate the takeover with ws_uri instead"
+                    .to_string(),
+            );
+        }
+        let Some(codec) = near_codec else {
+            return Err("the call has no negotiated codec on the offerer's leg".to_string());
+        };
+        let Some(signalled) = near.remote_rtp else {
+            return Err("the offerer's leg has no signalled address to send the downlink to".to_string());
+        };
+
+        // Where the bridge's downlink goes. The relay this is taking over may have latched leg A's
+        // *observed* source (symmetric RTP, docs/security-and-nat.md §4 layer 3), which for a NATed
+        // caller is routinely not the port its `c=` advertised — so follow the media path the call
+        // is actually using, and fall back to the signalled address when nothing has been observed.
+        let a_rtp = self
+            .datapath
+            .latched_source(near.rtp.id)
+            .unwrap_or(signalled);
+        // …and the gate stays exactly the one the negotiation installed on this endpoint, rather
+        // than a fresh one derived from the signalling: `Redirect` bypasses the datapath's gate, so
+        // the registry re-enforces this filter itself and it must not silently widen.
+        let accepted_source = relay_flows
+            .iter()
+            .find_map(|(endpoint, action)| match action {
+                FlowAction::Forward(rule) if *endpoint == near.rtp.id => Some(rule.accepted_source),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                SourceFilter::Exact(
+                    apply_received_from(Some(signalled), received_from)
+                        .unwrap_or(signalled)
+                        .ip(),
+                )
+            });
+
+        let takeover = WsRelayTakeover {
+            // Every endpoint of the relay stops: A's because the bridge owns it, B's because there
+            // is nowhere to forward B's media to while it does, and the RTCP companions because
+            // relaying reports for a stream that is no longer flowing is worse than silence.
+            displace: relay_flows
+                .iter()
+                .map(|(endpoint, _)| (*endpoint, FlowAction::Drop))
+                .collect(),
+            restore: relay_flows,
+            restore_pipeline: pipeline,
+        };
+        self.setup_ws_bridge(WsBridgeSetup {
+            call_id,
+            ws_uri,
+            endpoint_a: near.rtp.id,
+            a_rtp,
+            codec: Some(&codec),
+            accepted_source,
+            // Refused above for both shapes that would need them.
+            ice_pending: false,
+            secure: None,
+            // A runtime attach carries no offer/answer profile, so the uplink processing knobs are
+            // off. They are set on the negotiation that armed the bridge, which is where the
+            // controller states them; a re-point then carries whatever that negotiation chose.
+            noise_suppression: false,
+            echo_cancellation: false,
+            vad_config: None,
+            wire_sample_rate: None,
+            egress: None,
+            takeover: Some(takeover),
+            // Nothing has been displaced yet — `setup_ws_bridge` dials before it installs a flow, so
+            // a dial failure here leaves the relay exactly as it was.
+            socket: None,
+        })
+        .await?;
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.pipeline = PipelineKind::Ws;
+        }
+        Ok(())
+    }
+
+    /// Detach a call's WebSocket takeover bridge ([`Command::DetachWsBridge`]) and put the media
+    /// path back.
+    ///
+    /// Idempotent on a call with no bridge, so a controller may call it unconditionally on hangup.
+    /// On a bridge this engine created by **taking over a live relay** it reinstalls that relay's
+    /// exact `Forward` rules — the ones it displaced, gate and latch policy included — and the call
+    /// carries on where it left off; the datapath's latch is separate state that a flow install does
+    /// not disturb, so a NATed leg keeps the path it had.
+    ///
+    /// On a bridge that was **negotiated** (`ProfileFlags::ws_uri`) it is refused. That bridge *is*
+    /// the call's media path: nothing was displaced, and there is nothing to go back to — a two-leg
+    /// negotiated takeover never wired A↔B (leg B's ports exist but its codec was never negotiated
+    /// against A's), and a single-leg `answer_local` takeover has no second party at all. Answering
+    /// `ok` and leaving the caller connected to nothing is the failure mode this whole verb exists
+    /// to prevent, so the controller is told plainly and keeps its two working options: re-point the
+    /// bridge, or `delete` the call.
+    async fn detach_ws_bridge(&self, client: ClientId, call_id: &str) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        let Some(takeover) = self
+            .ws_bridges
+            .get(call_id)
+            .map(|bridge| bridge.takeover.clone())
+        else {
+            // No bridge at all — including a route left behind by an engine bug, which `delete` will
+            // clean up. Idempotent, like `detach_ws_tee`.
+            return ok_empty();
+        };
+        let Some(takeover) = takeover else {
+            return error_result(
+                "detach_ws_bridge",
+                &"ws-bridge-negotiated: this bridge is the call's negotiated media path (ws_uri), \
+                  not a takeover of a relay, so there is no media path to return it to; re-point it \
+                  with attach_ws_bridge, or end the call with delete",
+            );
+        };
+        self.stop_ws_bridge(call_id, WsBridgeEndReason::Detached)
+            .await;
+        // Put the relay back exactly as it was. A failure here leaves the call with no audio path,
+        // which the controller must hear about — it is the one outcome worse than refusing.
+        if let Err(reason) = self.restore_displaced_relay(&takeover) {
+            return error_result("detach_ws_bridge: restore relay flow", &reason);
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.pipeline = takeover.restore_pipeline;
+        }
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id,
+            "ws bridge detached; the displaced relay is back"
+        );
+        ok_empty()
+    }
+
+    /// Tear a call's takeover bridge down: drop its route, abort **and await** the bridge + drain
+    /// tasks, and emit [`Event::WsBridgeEnded`] if the bridge task has not already. A no-op when the
+    /// call has no bridge.
+    ///
+    /// Awaiting matters here for the same reason it does for a tee — an aborted task still holds its
+    /// socket until the runtime polls it — plus one this has and a tee does not: a re-point stands a
+    /// replacement drain up on the same endpoint, and two drains writing to one peer would interleave
+    /// two RTP sequence/timestamp series (RFC 3550 §5.1).
+    ///
+    /// This does **not** restore anything. Detach owns that decision (see [`Self::detach_ws_bridge`])
+    /// because the other callers are call teardown, where the endpoints are being freed anyway.
+    async fn stop_ws_bridge(&self, call_id: &str, reason: WsBridgeEndReason) {
+        let Some((_, bridge)) = self.ws_bridges.remove(call_id) else {
+            return;
+        };
+        // Claim the end latch with the caller's reason **before** the route is dropped. Dropping it
+        // closes the bridge's `rtp_in` channel, which the bridge task reads as the call going away —
+        // so the two race, and the task would win often enough to report a controller's detach or a
+        // re-point as `call_ended`. The reason a caller states is authoritative; the task's own is
+        // for the ends nobody asked for.
+        let events = self
+            .events
+            .get(&bridge.owner)
+            .map(|sink| sink.value().clone());
+        emit_ws_bridge_ended(
+            events.as_ref(),
+            &bridge.ended,
+            call_id,
+            &bridge.from_tag,
+            &bridge.stream_id,
+            reason,
+        );
+        if let Some(tasks) = self.ws.deregister(call_id) {
+            tasks.joined().await;
+        }
+    }
+
     /// SIPREC / monitor `subscribe_request` (RFC 7866): the engine **offers** one or more source
     /// legs' media to a send-only subscriber (a Session Recording Server, SRS). It resolves the source
     /// legs from `from_tags` (an MPTY subscription taps every named leg), allocates one subscriber
@@ -9821,6 +10435,50 @@ fn emit_event(events: Option<&flume::Sender<Event>>, event: Event) {
     }
 }
 
+/// Emit a takeover bridge's [`Event::WsBridgeEnded`] **exactly once**, whichever of the bridge task
+/// or a detach gets there first (`ended` is the shared latch they race on).
+///
+/// Unconditionally logged, and at WARN for anything the controller did not ask for: a takeover
+/// bridge is leg A's only far side, so the server closing it, stopping it or failing its transport
+/// leaves a live call with no audio path. A node with no event consumer registered must still leave
+/// a trace of that in its own logs.
+fn emit_ws_bridge_ended(
+    events: Option<&flume::Sender<Event>>,
+    ended: &std::sync::atomic::AtomicBool,
+    call_id: &str,
+    from_tag: &str,
+    stream_id: &str,
+    reason: WsBridgeEndReason,
+) {
+    use std::sync::atomic::Ordering;
+    if ended.swap(true, Ordering::SeqCst) {
+        return; // already reported
+    }
+    if matches!(
+        reason,
+        WsBridgeEndReason::Detached | WsBridgeEndReason::CallEnded
+    ) {
+        tracing::info!(target: "siphon_rtp::media", call_id, stream_id, ?reason, "ws bridge ended");
+    } else {
+        tracing::warn!(
+            target: "siphon_rtp::media",
+            call_id,
+            stream_id,
+            ?reason,
+            "ws takeover bridge ended without a detach — the call has no far side until it is \
+             re-pointed or detached"
+        );
+    }
+    if let Some(sender) = events {
+        let _ = sender.try_send(Event::WsBridgeEnded {
+            call_id: call_id.to_string(),
+            from_tag: from_tag.to_string(),
+            stream_id: stream_id.to_string(),
+            reason,
+        });
+    }
+}
+
 /// A bare success (no SDP/stats) — the reply to control verbs like block/silence.
 fn ok_empty() -> CmdResult {
     CmdResult::Ok {
@@ -10709,6 +11367,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::ConferenceBridge { .. } => "conference_bridge",
         Command::AttachWsTee { .. } => "attach_ws_tee",
         Command::DetachWsTee { .. } => "detach_ws_tee",
+        Command::AttachWsBridge { .. } => "attach_ws_bridge",
+        Command::DetachWsBridge { .. } => "detach_ws_bridge",
         Command::AttachX3 { .. } => "attach_x3",
         Command::DetachX3 { .. } => "detach_x3",
         Command::Authenticate { .. } => "authenticate",
@@ -10751,6 +11411,8 @@ fn command_call_id(command: &Command) -> Option<&str> {
         | Command::Unsubscribe { call_id, .. }
         | Command::AttachWsTee { call_id, .. }
         | Command::DetachWsTee { call_id, .. }
+        | Command::AttachWsBridge { call_id, .. }
+        | Command::DetachWsBridge { call_id, .. }
         | Command::AttachX3 { call_id, .. }
         | Command::DetachX3 { call_id, .. } => Some(call_id),
         Command::ConferenceJoin { conference_id, .. }
@@ -26187,5 +26849,801 @@ mod tests {
             !engine.ws().is_ws_call("ws-bad-rate"),
             "no WS route left behind"
         );
+    }
+
+    // ---- WebSocket takeover-bridge lifecycle (attach / re-point / detach) ------------------------
+    //
+    // Until these, a takeover bridge was created at negotiation and destroyed with the call: there
+    // was no way to put one on a call already up, move one, or take one off. These cover the three,
+    // and the refusals that keep a detach from ever answering `ok` on a call with no audio path.
+
+    /// A WS server that completes the handshake and immediately closes — the "the consumer went
+    /// away mid-call" shape, which used to be entirely silent.
+    async fn closing_ws_server() -> String {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws");
+        let addr = listener.local_addr().expect("ws addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept ws");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws handshake");
+            // RFC 6455 §5.5.1: an orderly close, which is what a consumer shutting down sends. A
+            // bare TCP reset would be a `TransportError` instead — a different reason, on purpose.
+            let _ = socket.send(Message::Close(None)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        format!("ws://{addr}/stream")
+    }
+
+    /// Drain a takeover server's frames until the `start` handshake, returning what it announced.
+    async fn expect_bridge_start(
+        frames: &flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+    ) -> siphon_rtp_media::bridge::protocol::StartData {
+        use siphon_rtp_media::bridge::protocol::ControlMessage;
+        use tokio_tungstenite::tungstenite::Message;
+        for _ in 0..8 {
+            let message = timeout(Duration::from_secs(3), frames.recv_async())
+                .await
+                .expect("no timeout")
+                .expect("a frame");
+            if let Message::Text(text) = message {
+                if let Ok(ControlMessage::Start(data)) = ControlMessage::from_json(text.as_str()) {
+                    return data;
+                }
+            }
+        }
+        panic!("no start frame arrived");
+    }
+
+    /// Drain the takeover server until a binary (uplink audio) frame arrives.
+    async fn expect_bridge_uplink(
+        frames: &flume::Receiver<tokio_tungstenite::tungstenite::Message>,
+    ) -> Vec<u8> {
+        use tokio_tungstenite::tungstenite::Message;
+        for _ in 0..40 {
+            let message = timeout(Duration::from_secs(3), frames.recv_async())
+                .await
+                .expect("no timeout")
+                .expect("a frame");
+            if let Message::Binary(bytes) = message {
+                return bytes.to_vec();
+            }
+        }
+        panic!("no uplink audio frame arrived");
+    }
+
+    /// Drain `events` until the next WS-bridge lifecycle event, or `None` if none arrives.
+    async fn next_ws_bridge_event(events: &flume::Receiver<Event>) -> Option<Event> {
+        for _ in 0..64 {
+            let event = timeout(Duration::from_secs(3), events.recv_async()).await.ok()?.ok()?;
+            if matches!(
+                event,
+                Event::WsBridgeStarted { .. } | Event::WsBridgeEnded { .. }
+            ) {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    /// Whether `socket` receives anything within `millis` — a non-panicking `recv`.
+    async fn receives_within(socket: &UdpSocket, millis: u64) -> bool {
+        let mut buffer = [0u8; 2048];
+        timeout(
+            Duration::from_millis(millis),
+            socket.recv_from(&mut buffer),
+        )
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn attaching_a_ws_bridge_takes_a_live_relay_over_and_detaching_gives_it_back() {
+        // The headline round trip. A plain two-party G.711 relay is carrying audio; a takeover is
+        // attached to it at runtime (no re-INVITE, the leg's ports and gate do not move); leg A's
+        // audio now goes to the WS server and leg B hears nothing, which is what a takeover *is*;
+        // and a detach reinstalls the exact `Forward` rules that were displaced, so the two parties
+        // go back to hearing each other.
+        let (engine, (phone_a, near_addr), (phone_b, far_addr)) =
+            two_party_relay("ws-attach").await;
+        let events = engine.register_client(CLIENT);
+
+        // The relay works before anything is attached — otherwise the "B hears nothing" assertion
+        // below would pass for the wrong reason.
+        phone_a
+            .send_to(&g711_rtp(0, 0, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let (relayed, _) = recv(&phone_b).await;
+        assert!(!relayed.is_empty(), "the relay carries audio before attach");
+
+        let (ws_uri, frames, _downlink) = takeover_ws_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "ws-attach".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: ws_uri.clone(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(attached, CmdResult::Ok { .. }),
+            "attach: {attached:?}"
+        );
+        assert!(engine.ws().is_ws_call("ws-attach"), "the bridge is up");
+        assert_eq!(
+            engine
+                .calls
+                .get("ws-attach")
+                .expect("call present")
+                .pipeline,
+            PipelineKind::Ws,
+        );
+
+        match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeStarted {
+                stream_id,
+                ws_uri: reported,
+                sample_rate,
+                ..
+            }) => {
+                assert_eq!(stream_id, "ws-ws-attach", "the WS start frame's own stream id");
+                assert_eq!(reported, ws_uri);
+                assert_eq!(sample_rate, 8000, "the G.711 leg's own PCM rate");
+            }
+            other => panic!("expected ws_bridge_started, got {other:?}"),
+        }
+
+        let start = expect_bridge_start(&frames).await;
+        assert_eq!(start.media.sample_rate, 8000);
+        assert_eq!(start.media.channels, 1, "a takeover leg is one mono leg");
+
+        // A talks: the WS server hears it, and B does not — the relay is unwired.
+        for sequence in 1..10u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        assert_eq!(
+            expect_bridge_uplink(&frames).await.len(),
+            320,
+            "8 kHz x 20 ms mono L16 = 160 samples = 320 bytes"
+        );
+        assert!(
+            !receives_within(&phone_b, 300).await,
+            "a takeover unwires A<->B: B must not receive A's media while the bridge holds the leg"
+        );
+
+        // Detach puts the relay back, verbatim.
+        let detached = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsBridge {
+                    call_id: "ws-attach".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(detached, CmdResult::Ok { .. }),
+            "detach: {detached:?}"
+        );
+        assert!(
+            !engine.ws().is_ws_call("ws-attach"),
+            "the bridge is gone after detach"
+        );
+        assert_eq!(
+            engine
+                .calls
+                .get("ws-attach")
+                .expect("call present")
+                .pipeline,
+            PipelineKind::Passthrough,
+            "the call is a plain relay again"
+        );
+        match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeEnded { reason, .. }) => {
+                assert_eq!(reason, WsBridgeEndReason::Detached);
+            }
+            other => panic!("expected ws_bridge_ended, got {other:?}"),
+        }
+
+        // Both directions relay again.
+        phone_a
+            .send_to(&g711_rtp(0, 50, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let (to_b, _) = recv(&phone_b).await;
+        assert!(!to_b.is_empty(), "A reaches B again after detach");
+        phone_b
+            .send_to(&g711_rtp(0, 50, 0x0B0B_0B0B, 0xFF), far_addr)
+            .await
+            .expect("b send");
+        let (to_a, _) = recv(&phone_a).await;
+        assert!(!to_a.is_empty(), "B reaches A again after detach");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn re_pointing_a_ws_bridge_moves_a_live_call_to_a_second_consumer() {
+        // The blocker this work package exists for: moving a live call's audio to a different
+        // consumer. The leg is untouched — same ports, same codec, same gate — so there is no
+        // re-INVITE and the caller never hears the handover as anything but a gap.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        let (first_uri, first_frames, _first_down) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let events = engine.register_client(CLIENT);
+        let (phone_a, addr_a) = phone().await;
+
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "ws-move".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some(first_uri.clone()),
+                        ws_sample_rate: Some(16_000),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let caller_target = sdp::parse(&ok_sdp_text(&answered))
+            .expect("answer sdp")
+            .remote_rtp;
+        assert_eq!(
+            expect_bridge_start(&first_frames).await.media.sample_rate,
+            16_000
+        );
+        match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeStarted {
+                ws_uri: reported, ..
+            }) => assert_eq!(reported, first_uri),
+            other => panic!("expected ws_bridge_started, got {other:?}"),
+        }
+
+        // Move it.
+        let (second_uri, second_frames, _second_down) = takeover_ws_server().await;
+        let moved = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "ws-move".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: second_uri.clone(),
+                },
+            )
+            .await;
+        assert!(matches!(moved, CmdResult::Ok { .. }), "re-point: {moved:?}");
+        assert!(engine.ws().is_ws_call("ws-move"), "still bridged");
+
+        // Exactly one orderly end and one start, in that order.
+        match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeEnded { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    WsBridgeEndReason::Detached,
+                    "a re-point ends the old connection as an orderly detach"
+                );
+            }
+            other => panic!("expected ws_bridge_ended, got {other:?}"),
+        }
+        match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeStarted {
+                ws_uri: reported,
+                sample_rate,
+                stream_id,
+                ..
+            }) => {
+                assert_eq!(reported, second_uri, "the new consumer");
+                assert_eq!(
+                    sample_rate, 16_000,
+                    "a re-point carries the negotiated wire rate across; a controller moving the \
+                     destination did not ask for its 16 kHz wire to silently drop to the leg rate"
+                );
+                assert_eq!(stream_id, "ws-ws-move", "the correlator is the call's, not the connection's");
+            }
+            other => panic!("expected ws_bridge_started, got {other:?}"),
+        }
+
+        // The second server gets the handshake at the carried-over rate, and the caller's audio.
+        assert_eq!(
+            expect_bridge_start(&second_frames).await.media.sample_rate,
+            16_000
+        );
+        for sequence in 0..12u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), caller_target)
+                .await
+                .expect("a send");
+        }
+        assert_eq!(
+            expect_bridge_uplink(&second_frames).await.len(),
+            640,
+            "16 kHz x 20 ms mono L16 = 320 samples = 640 bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn detaching_a_negotiated_ws_bridge_is_refused_rather_than_muting_the_call() {
+        // The decision this verb turns on. A bridge negotiated with `ws_uri` *is* the call's media
+        // path — on `answer_local` there is not even a second party — so there is nothing to hand
+        // the call back to. Refuse and say so, rather than answer `ok` on a call that now has no
+        // audio path at all, which is the exact failure the lifecycle work is meant to prevent.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        let (ws_uri, frames, _down) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "ws-negotiated".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let caller_target = sdp::parse(&ok_sdp_text(&answered))
+            .expect("answer sdp")
+            .remote_rtp;
+        let _ = expect_bridge_start(&frames).await;
+
+        let refused = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsBridge {
+                    call_id: "ws-negotiated".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        match refused {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("ws-bridge-negotiated"),
+                "the refusal must name the reason, got: {reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // And the refusal left the call exactly as it was — still bridged, still carrying audio.
+        assert!(engine.ws().is_ws_call("ws-negotiated"));
+        for sequence in 0..12u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), caller_target)
+                .await
+                .expect("a send");
+        }
+        assert_eq!(expect_bridge_uplink(&frames).await.len(), 320);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn detaching_a_call_with_no_ws_bridge_is_a_no_op() {
+        // Idempotent, like `detach_ws_tee`, so a controller can call it unconditionally on hangup.
+        let (engine, (phone_a, near_addr), (phone_b, _far)) = two_party_relay("ws-nodetach").await;
+        let detached = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsBridge {
+                    call_id: "ws-nodetach".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(matches!(detached, CmdResult::Ok { .. }), "{detached:?}");
+        phone_a
+            .send_to(&g711_rtp(0, 0, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let (relayed, _) = recv(&phone_b).await;
+        assert!(!relayed.is_empty(), "the relay is untouched by a no-op detach");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn attaching_a_ws_bridge_is_refused_where_the_media_path_could_not_be_given_back() {
+        // Every refusal names its own token, because each is a different thing for a controller to
+        // do about it. The common thread: a takeover is only offered where a detach can restore
+        // exactly what it displaced.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        // 1. A transcoding call — its actor is built from the negotiation, not reconstructible here.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-transcode".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "ws-transcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let (ws_uri, _frames, _down) = takeover_ws_server().await;
+        match engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "ws-transcode".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: ws_uri.clone(),
+                },
+            )
+            .await
+        {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("ws-takeover-not-a-plain-relay"),
+                "got: {reason}"
+            ),
+            other => panic!("a transcoding call must be refused, got {other:?}"),
+        }
+        assert!(!engine.ws().is_ws_call("ws-transcode"), "nothing attached");
+
+        // 2. An unanswered offer — there is no second party a detach could hand it back to.
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-unanswered".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        match engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "ws-unanswered".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: ws_uri.clone(),
+                },
+            )
+            .await
+        {
+            CmdResult::Error { reason } => {
+                assert!(reason.contains("ws-takeover-not-answered"), "got: {reason}");
+            }
+            other => panic!("an unanswered call must be refused, got {other:?}"),
+        }
+
+        // 3. A secure offerer — the engine is not that leg's cryptographic far side on a two-leg
+        //    call, so the bridge would be handed ciphertext and would answer in the clear. Same
+        //    reason token `offer` and `answer` already use.
+        let peer_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("peer key");
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ws-secure".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr_a, &peer_key),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        match engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "ws-secure".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri,
+                },
+            )
+            .await
+        {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("ws-takeover-secure-offerer"),
+                "the runtime attach must make the same refusal the negotiation path does, got: \
+                 {reason}"
+            ),
+            other => panic!("a secure offerer must be refused, got {other:?}"),
+        }
+        assert!(!engine.ws().is_ws_call("ws-secure"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn attaching_a_ws_bridge_is_refused_while_a_tee_holds_the_call() {
+        // A tee taps the post-decode fan-out of the very media path a takeover removes. Refusing is
+        // the same posture `attach_ws_tee` already takes in the other direction (a takeover call
+        // cannot be teed) — neither side silently turns the other off.
+        let (engine, _a, _b) = two_party_relay("ws-vs-tee").await;
+        let (tee_uri, _tee_frames) = tee_server().await;
+        let teed = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsTee {
+                    call_id: "ws-vs-tee".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: tee_uri,
+                    direction: WsTeeDirection::Caller,
+                    channels: None,
+                    sample_rate: None,
+                },
+            )
+            .await;
+        assert!(matches!(teed, CmdResult::Ok { .. }), "{teed:?}");
+
+        let (ws_uri, _frames, _down) = takeover_ws_server().await;
+        match engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "ws-vs-tee".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri,
+                },
+            )
+            .await
+        {
+            CmdResult::Error { reason } => {
+                assert!(reason.contains("ws-takeover-call-is-held"), "got: {reason}");
+            }
+            other => panic!("a teed call must be refused, got {other:?}"),
+        }
+        assert!(!engine.ws().is_ws_call("ws-vs-tee"), "nothing attached");
+        assert_eq!(engine.ws_tee_count(), 1, "the tee is untouched by the refusal");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ws_bridge_the_server_drops_reports_itself_instead_of_going_silent()
+    {
+        // The defect the end event exists for. A takeover bridge is leg A's only far side, so a
+        // server that goes away leaves a live call one-way — and until now nothing anywhere said
+        // so: the tee had `ws_tee_ended`, the bridge had nothing at all.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let events = engine.register_client(CLIENT);
+        let (_phone_a, addr_a) = phone().await;
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "ws-dies".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        ws_uri: Some(closing_ws_server().await),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        assert!(matches!(answered, CmdResult::Ok { .. }), "{answered:?}");
+
+        match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeStarted { .. }) => {}
+            other => panic!("expected ws_bridge_started, got {other:?}"),
+        }
+        match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeEnded {
+                call_id,
+                from_tag,
+                reason,
+                ..
+            }) => {
+                assert_eq!(call_id, "ws-dies");
+                assert_eq!(from_tag, "tag-a");
+                assert_eq!(
+                    reason,
+                    WsBridgeEndReason::ServerClosed,
+                    "the controller learns which end gave up, not merely that audio stopped"
+                );
+            }
+            other => panic!("expected ws_bridge_ended, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_taken_over_call_can_be_detached_back_to_its_relay_after_the_server_dies() {
+        // The recovery the end event exists to make possible. The engine deliberately does not
+        // re-point or restore anything by itself when a consumer goes away — it holds the leg and
+        // reports — so the controller's options have to still work afterwards. They do: the record
+        // (and its restore plan) outlives the dead bridge task, so a detach still hands the call back
+        // to the two parties it took it from.
+        let (engine, (phone_a, near_addr), (phone_b, _far_addr)) =
+            two_party_relay("ws-recover").await;
+        let events = engine.register_client(CLIENT);
+
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "ws-recover".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri: closing_ws_server().await,
+                },
+            )
+            .await;
+        assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+        assert!(matches!(
+            next_ws_bridge_event(&events).await,
+            Some(Event::WsBridgeStarted { .. })
+        ));
+        match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeEnded { reason, .. }) => {
+                assert_eq!(reason, WsBridgeEndReason::ServerClosed);
+            }
+            other => panic!("expected ws_bridge_ended, got {other:?}"),
+        }
+
+        let detached = engine
+            .handle(
+                CLIENT,
+                Command::DetachWsBridge {
+                    call_id: "ws-recover".into(),
+                    from_tag: "tag-a".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(detached, CmdResult::Ok { .. }),
+            "a dead bridge is still detachable: {detached:?}"
+        );
+        phone_a
+            .send_to(&g711_rtp(0, 0, 0x0A0A_0A0A, 0xFF), near_addr)
+            .await
+            .expect("a send");
+        let (to_b, _) = recv(&phone_b).await;
+        assert!(!to_b.is_empty(), "the two parties have their relay back");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deleting_a_bridged_call_reports_the_bridge_ending_with_it() {
+        let (engine, _a, _b) = two_party_relay("ws-delete").await;
+        let events = engine.register_client(CLIENT);
+        let (ws_uri, frames, _down) = takeover_ws_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "ws-delete".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri,
+                },
+            )
+            .await;
+        assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+        let _ = expect_bridge_start(&frames).await;
+        assert!(matches!(
+            next_ws_bridge_event(&events).await,
+            Some(Event::WsBridgeStarted { .. })
+        ));
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "ws-delete".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+        match next_ws_bridge_event(&events).await {
+            Some(Event::WsBridgeEnded { reason, .. }) => {
+                assert_eq!(reason, WsBridgeEndReason::CallEnded);
+            }
+            other => panic!("expected ws_bridge_ended, got {other:?}"),
+        }
+        assert!(!engine.ws().is_ws_call("ws-delete"), "torn down with the call");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocking_a_taken_over_call_is_refused_rather_than_undoing_the_takeover() {
+        // A taken-over call still carries the displaced relay's `Forward` rules so its detach can
+        // reinstall them. `block_media` walks exactly that list, so an unblock would have quietly
+        // pulled leg A back off the bridge. Refuse — the same posture recording, SIPREC and the tee
+        // already take on a takeover call.
+        let (engine, (phone_a, near_addr), _b) = two_party_relay("ws-block").await;
+        let (ws_uri, frames, _down) = takeover_ws_server().await;
+        let attached = engine
+            .handle(
+                CLIENT,
+                Command::AttachWsBridge {
+                    call_id: "ws-block".into(),
+                    from_tag: "tag-a".into(),
+                    ws_uri,
+                },
+            )
+            .await;
+        assert!(matches!(attached, CmdResult::Ok { .. }), "{attached:?}");
+        let _ = expect_bridge_start(&frames).await;
+
+        for block in [true, false] {
+            let result = engine
+                .handle(
+                    CLIENT,
+                    if block {
+                        Command::BlockMedia {
+                            call_id: "ws-block".into(),
+                            from_tag: "tag-a".into(),
+                        }
+                    } else {
+                        Command::UnblockMedia {
+                            call_id: "ws-block".into(),
+                            from_tag: "tag-a".into(),
+                        }
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, CmdResult::Error { .. }),
+                "block={block} must be refused on a takeover call, got {result:?}"
+            );
+        }
+
+        // And the bridge still has the leg.
+        for sequence in 0..12u16 {
+            phone_a
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0xFF), near_addr)
+                .await
+                .expect("a send");
+        }
+        assert_eq!(expect_bridge_uplink(&frames).await.len(), 320);
     }
 }

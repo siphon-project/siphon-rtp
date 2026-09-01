@@ -40,17 +40,36 @@ pub enum BridgeError {
     Json(#[from] serde_json::Error),
 }
 
+/// Why a takeover bridge stopped, reported once when [`run_bridge`] returns.
+///
+/// The mirror of [`crate::bridge::TeeEndReason`], and for the same reason: a takeover bridge *is*
+/// leg A's far side, so a bridge that ends without the controller asking is one-way audio on a live
+/// call. The engine cannot report which end gave up unless the transport says so, and it can only
+/// say so if this is a value rather than `()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeEndReason {
+    /// The WS server closed the connection (RFC 6455 §5.5.1 close frame, or the stream just ended).
+    ServerClosed,
+    /// The WS server sent a `stop` control frame.
+    ServerStopped,
+    /// The call side went away — the RTP-in channel closed, or nothing is left to render RTP to.
+    CallEnded,
+}
+
 /// Run the bridge until the peer closes, a `stop` is received, or the RTP source ends.
 ///
 /// `rtp_in` carries packets from the call (redirected by the datapath); `rtp_out` carries packets
 /// the bridge renders back toward the call. `ptime` is the audio frame interval (e.g. 20 ms).
+///
+/// The [`BridgeEndReason`] names which end ended it, so the engine can raise a `ws_bridge_ended`
+/// that distinguishes "the controller detached it" from "the media server went away".
 pub async fn run_bridge<S>(
     socket: WebSocketStream<S>,
     mut session: BridgeSession,
     rtp_in: flume::Receiver<Bytes>,
     rtp_out: flume::Sender<Bytes>,
     ptime: Duration,
-) -> Result<(), BridgeError>
+) -> Result<BridgeEndReason, BridgeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -64,9 +83,10 @@ where
     let mut uplink = vec![0u8; UPLINK_CAP];
     let mut downlink = vec![0u8; DOWNLINK_CAP];
 
-    loop {
+    let reason = loop {
         if session.is_stopped() {
-            break;
+            // A `stop` control frame arrived on a previous iteration and the session latched it.
+            break BridgeEndReason::ServerStopped;
         }
         tokio::select! {
             incoming = stream.next() => match incoming {
@@ -79,13 +99,13 @@ where
                     }
                     Err(error) => tracing::debug!(%error, "bridge ignoring malformed control frame"),
                 },
-                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Close(_))) | None => break BridgeEndReason::ServerClosed,
                 Some(Ok(_)) => {} // ping/pong/raw frames: handled by tungstenite or ignored
                 Some(Err(error)) => return Err(error.into()),
             },
             received = rtp_in.recv_async() => match received {
                 Ok(packet) => session.on_rtp(&packet),
-                Err(_) => break, // RTP source gone (call torn down)
+                Err(_) => break BridgeEndReason::CallEnded, // RTP source gone (call torn down)
             },
             _ = ticker.tick() => {
                 let result = session.tick(&mut uplink, &mut downlink);
@@ -98,14 +118,14 @@ where
                     sink.send(Message::binary(uplink[..result.uplink_bytes].to_vec())).await?;
                 }
                 if result.downlink_bytes > 0 && rtp_out.send(Bytes::copy_from_slice(&downlink[..result.downlink_bytes])).is_err() {
-                    break; // call side gone
+                    break BridgeEndReason::CallEnded; // call side gone
                 }
             },
         }
-    }
+    };
 
     let _ = sink.send(Message::Close(None)).await;
-    Ok(())
+    Ok(reason)
 }
 
 #[cfg(test)]
@@ -229,9 +249,63 @@ mod tests {
             .await
             .expect("send stop");
         let outcome = timeout(Duration::from_secs(2), bridge).await.expect("join");
-        assert!(
-            outcome.expect("task").is_ok(),
-            "bridge exits cleanly on stop"
+        assert_eq!(
+            outcome.expect("task").expect("clean exit"),
+            BridgeEndReason::ServerStopped,
+            "a `stop` frame is reported as the server stopping it, not as a generic clean exit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_reports_the_server_closing_the_connection() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+
+        let (_rtp_in_tx, rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (rtp_out_tx, _rtp_out_rx) = flume::unbounded::<Bytes>();
+        let bridge = tokio::spawn(run_bridge(
+            server_ws,
+            session_fixture(),
+            rtp_in_rx,
+            rtp_out_tx,
+            Duration::from_millis(10),
+        ));
+
+        let (mut client_tx, _client_rx) = client_ws.split();
+        client_tx
+            .send(Message::Close(None))
+            .await
+            .expect("send close");
+
+        let outcome = timeout(Duration::from_secs(2), bridge).await.expect("join");
+        assert_eq!(
+            outcome.expect("task").expect("clean exit"),
+            BridgeEndReason::ServerClosed,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_reports_the_call_going_away() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let _client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+
+        let (rtp_in_tx, rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (rtp_out_tx, _rtp_out_rx) = flume::unbounded::<Bytes>();
+        let bridge = tokio::spawn(run_bridge(
+            server_ws,
+            session_fixture(),
+            rtp_in_rx,
+            rtp_out_tx,
+            Duration::from_millis(10),
+        ));
+
+        drop(rtp_in_tx); // the call's redirect went away — teardown, not the server's doing
+        let outcome = timeout(Duration::from_secs(2), bridge).await.expect("join");
+        assert_eq!(
+            outcome.expect("task").expect("clean exit"),
+            BridgeEndReason::CallEnded,
         );
     }
 

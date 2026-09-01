@@ -29,7 +29,7 @@ pub use protocol::{
 pub use session::{BridgeSession, TickResult};
 pub use tee::{plan_ws_tee, run_ws_tee, TeeChannel, TeeEndReason, WsTeePlan, WsTeeSink};
 pub use wire_rate::{validate_wire_sample_rate, wire_resampler, WireRateError};
-pub use ws::{run_bridge, BridgeError};
+pub use ws::{run_bridge, BridgeEndReason, BridgeError};
 
 /// Encode i16 PCM samples to little-endian L16 bytes (the M1 binary-frame wire order).
 ///

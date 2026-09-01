@@ -805,6 +805,7 @@ where
                 cpu_permille,
                 draining: cluster.is_draining(),
                 ws_tees: gauge_engine.ws_tee_count() as u64,
+                ws_bridges: gauge_engine.ws_bridge_count() as u64,
                 ws_tee_frames_sent: gauge_engine.ws_tee_frames_sent(),
                 ws_tee_frames_dropped: gauge_engine.ws_tee_frames_dropped(),
             }
