@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "clap",
@@ -2156,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-codec"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "siphon-rtp-simd",
  "thiserror 2.0.18",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-datapath"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "dashmap",
@@ -2178,7 +2178,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dsp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "siphon-rtp-simd",
  "thiserror 2.0.18",
@@ -2186,7 +2186,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-dtls"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2209,18 +2209,18 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ebpf-common"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "siphon-rtp-hep"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "siphon-rtp-ice"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "siphon-rtp-stun",
  "thiserror 2.0.18",
@@ -2228,11 +2228,11 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-li"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "siphon-rtp-media"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "flume",
@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-ngcompat"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "siphon-rtp-proto",
  "thiserror 2.0.18",
@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -2269,11 +2269,11 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-simd"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "siphon-rtp-srtp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes",
  "base64 0.23.1",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-stun"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "getrandom 0.3.4",
  "thiserror 2.0.18",
@@ -2295,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "siphon-rtp-turn"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "flume",
