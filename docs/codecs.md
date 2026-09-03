@@ -15,6 +15,29 @@ end-to-end. The codec implementations below are only invoked when you ask the en
 WebSocket. That distinction also carries the patent posture: relaying an encumbered
 codec is free, running it is not. See [Codec licensing](codec-licensing.md).
 
+## When the engine decides to transcode
+
+A codec implementation is only ever reached on a call the engine transcodes, and it decides that
+from the offer/answer, once, at `answer`:
+
+- **B selected a codec A also offered** — the ordinary case. RFC 3264 §6.1 makes the answerer's
+  choice the format for the stream, and the engine relays that answer to A unchanged, so both
+  parties end up on it. Plain relay, no codec executed, whatever A happened to list first. An offer
+  of `G729 PCMA` answered as `PCMA` is a G.711 relay, not a G.729 call.
+- **B selected a codec A never offered** — only reachable when `codec-transcode-X` added it to the
+  offer B saw. The two sides genuinely differ, so the transcoder runs and A is answered with its own
+  codec.
+- **The profile withheld A's codec from B** (`codec-mask-X`, `codec-consume-X`, or a `codec-offer`
+  whitelist that omits it) — the operator asking for exactly that transcode. A stays on the codec B
+  never saw.
+- **Something else needs the audio** — recording at answer (`record-call`), noise suppression, echo
+  cancellation or record-tone detection put the call on the media path even when both legs share a
+  codec, and that path decodes.
+
+Only the last three need the codec compiled in. When one of them names a codec this build cannot
+build, the `answer` fails and says which codec and which direction — it does not quietly relay a
+stream the far side cannot decode.
+
 ## The matrix
 
 | Codec | SDP name (PT) | Decode | Encode | Bit-exact against | Cargo feature |
