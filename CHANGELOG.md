@@ -7,6 +7,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-03
+
+Cut immediately, because the defect below does not present as a refused command: the call answers,
+the media plane installs no forward rule, and both directions carry nothing until the media-timeout
+sweep reaps it. A controller that does not treat a failed `answer` as fatal keeps the dialog — and
+its charging — running over silence.
+
+**A patch, not a minor.** `siphon-rtp-proto` is untouched: no verb, event, field or type changed, so
+a controller floating on `^0.4` compiles against exactly what it did before and needs no work to
+take this. What does change is runtime behaviour, deliberately — a call whose answerer selected a
+codec other than the offerer's first choice now relays where it used to transcode. The only
+configuration that depended on the old behaviour is `codec-mask-X` / `codec-consume-X` (and a
+`codec-offer` whitelist), which ask for that transcode explicitly and still get it.
+
 ### Fixed
 
 - **A call is no longer transcoded just because the answerer picked something other than the
