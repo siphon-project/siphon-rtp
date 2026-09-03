@@ -7,6 +7,32 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`received-from` now aims the relay as well as gating it.** The hint re-keyed each leg's ingress
+  gate to the peer's real post-NAT source, which is what it is for, but the forward *destination* was
+  left on the address the peer signalled. For a NATed UA that is an RFC 1918 address it never receives
+  on, so until that peer's own first packet moved the latch, the other party's media was addressed
+  into the void — the whole pre-latch window, around 400 ms at 20 ms ptime on a call where the callee
+  speaks first, and RFC 1918 datagrams leaving the node.
+
+  The same `(hint IP, signalled port)` pair the gate keys on is now the destination each direction
+  starts from, everywhere an initial destination is derived from a signalled address: the in-kernel
+  relay (RTP and companion RTCP), the SDES and DTLS bridges, all three transcoding pipelines, and the
+  RFC 4103 text relay in both its plaintext and secure forms.
+
+  It is an opening guess and stays confined to the pre-latch window: behind a symmetric NAT the public
+  media port need not be the signalled one, so the latch still governs from the first accepted packet
+  onward and none of this widens what the engine will accept. The gate policy, the latch and the SDP
+  presented to either party are unchanged. See `docs/security-and-nat.md` §4 layer 2.
+
+- **A DTLS-SRTP far leg no longer gates its plaintext near leg on the address that leg signalled.**
+  Both DTLS plans built their near-side source filter straight from the signalled `c=`, skipping the
+  `received-from` tightening every other pipeline applies, so a NATed plaintext leg bridged to a
+  WebRTC peer had its media dropped outright rather than merely misaimed. Found while fixing the
+  above; the two now share one effective address.
+
+
 ## [0.4.1] — 2026-09-03
 
 Cut immediately, because the defect below does not present as a refused command: the call answers,
