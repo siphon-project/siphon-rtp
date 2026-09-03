@@ -7,6 +7,20 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-03
+
+Cut for the same reason as 0.4.1: the defect below is silent on the control plane. The `answer`
+succeeds, the call is up, the gate is correct — and the audio of whichever party speaks first goes to
+an address that cannot be reached, for as long as it takes the other side to send its first packet.
+Nothing in the engine's own logs says so; it shows up in a capture on the node as RFC 1918 datagrams
+leaving it.
+
+**A patch.** `siphon-rtp-proto` is untouched — no verb, event, field or type changed — so a
+controller floating on `^0.4` needs no work to take this, and the internal path-deps pinned at
+`"0.4.0"` still caret-match. Behaviour changes only for a call whose peer supplied a `received-from`
+hint, and only in where the relay aims before that peer's first packet latches; the gate, the latch
+and the SDP presented to either party are unchanged.
+
 ### Fixed
 
 - **`received-from` now aims the relay as well as gating it.** The hint re-keyed each leg's ingress
