@@ -3810,13 +3810,32 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the **answer's** hint tightens the far (B) leg's. Both keep the signalled port and only
         // override the gated source IP — every gate path below uses these effective addresses so the
         // source gate is uniform (docs/security-and-nat.md §4 layer 2). `None` ⇒ the signalled
-        // address is used unchanged.
+        // address is used unchanged. The same pair is what the relay *aims* at before the latch forms
+        // — see the destination bindings below.
         let near_gate_rtp = apply_received_from(near.remote_rtp, offer_received_from);
         let near_gate_rtcp = apply_received_from(near.remote_rtcp, offer_received_from);
         let far_gate_rtp = apply_received_from(Some(info.remote_rtp), profile.received_from)
             .unwrap_or(info.remote_rtp);
         let far_gate_rtcp = apply_received_from(Some(info.remote_rtcp), profile.received_from)
             .unwrap_or(info.remote_rtcp);
+
+        // Where each peer's media is *aimed* until its own first packet moves the latch — the same
+        // (hint IP, signalled port) pair the gate keys on, deliberately. A `received-from` hint is the
+        // proxy telling us the peer's signalling really arrived from that public address, so its media
+        // almost certainly will too, while the private `c=` it advertised is unroutable: aiming there
+        // put the answering party's audio into the void for the whole pre-latch window (~400 ms of a
+        // NATed call at 20 ms ptime) and leaked RFC 1918 datagrams off the node.
+        //
+        // It is a better opening guess, not a guarantee — behind a symmetric NAT the public media port
+        // need not be the signalled one, and that port on the NAT may even belong to another device.
+        // That is precisely why it stays confined to the pre-latch window and never becomes a latch
+        // substitute: the latch still governs from the first *accepted* packet onward, and the gate is
+        // unchanged, so nothing here widens what the engine will accept (docs/security-and-nat.md §4
+        // layer 2). Without a hint these are the signalled addresses unchanged.
+        let near_media_dst = near_gate_rtp;
+        let near_rtcp_dst = near_gate_rtcp;
+        let far_media_dst = far_gate_rtp;
+        let far_rtcp_dst = far_gate_rtcp;
 
         // The rewritten answer is delivered to A, so it advertises the `near` leg — with the same
         // advertised IP the offer picked for it (the near interface's advertised address), stored on
@@ -4247,7 +4266,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     op: BridgeOp::Encrypt,
                     accepted_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                     out_endpoint: far.rtp.id,
-                    out_dst: info.remote_rtp,
+                    out_dst: far_media_dst,
                 },
                 // B (secure) ingress → decrypt for A → out the near endpoint toward A.
                 BridgeFlowPlan {
@@ -4255,7 +4274,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     op: BridgeOp::Decrypt,
                     accepted_source: bridge_source_filter(profile, far_gate_rtp),
                     out_endpoint: near.rtp.id,
-                    out_dst: a_rtp,
+                    out_dst: near_media_dst.unwrap_or(a_rtp),
                 },
             ];
             if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
@@ -4267,14 +4286,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         near_gate_rtcp.unwrap_or(a_rtcp),
                     ),
                     out_endpoint: far_rtcp.id,
-                    out_dst: info.remote_rtcp,
+                    out_dst: far_rtcp_dst,
                 });
                 flows.push(BridgeFlowPlan {
                     endpoint: far_rtcp.id,
                     op: BridgeOp::Decrypt,
                     accepted_source: bridge_source_filter(profile, far_gate_rtcp),
                     out_endpoint: near_rtcp.id,
-                    out_dst: a_rtcp,
+                    out_dst: near_rtcp_dst.unwrap_or(a_rtcp),
                 });
             }
             self.bridge.register(BridgeCallPlan {
@@ -4309,11 +4328,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             self.dtls_bridge().register(DtlsCallPlan {
                 plain_endpoint: near.rtp.id,
-                plain_source: bridge_source_filter(profile, a_rtp),
-                plain_dst: a_rtp,
+                plain_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
+                plain_dst: near_media_dst.unwrap_or(a_rtp),
                 secure_endpoint: far.rtp.id,
-                secure_source: bridge_source_filter(profile, info.remote_rtp),
-                secure_dst: info.remote_rtp,
+                secure_source: bridge_source_filter(profile, far_gate_rtp),
+                secure_dst: far_media_dst,
                 secure_local: far.rtp.local_addr,
                 certificate,
                 role,
@@ -4378,7 +4397,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near.rtp.id,
                 bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                 far.rtp.id,
-                info.remote_rtp,
+                far_media_dst,
                 &near_codec,
                 &far_codec,
                 near_telephone_event,
@@ -4396,7 +4415,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far.rtp.id,
                 bridge_source_filter(profile, far_gate_rtp),
                 near.rtp.id,
-                a_rtp,
+                near_media_dst.unwrap_or(a_rtp),
                 &far_codec,
                 &near_codec,
                 info.telephone_event_payload_type(),
@@ -4469,11 +4488,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             self.dtls_bridge().register_for_pipeline(
                 DtlsCallPlan {
                     plain_endpoint: near.rtp.id,
-                    plain_source: bridge_source_filter(profile, a_rtp),
-                    plain_dst: a_rtp,
+                    plain_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
+                    plain_dst: near_media_dst.unwrap_or(a_rtp),
                     secure_endpoint: far.rtp.id,
-                    secure_source: bridge_source_filter(profile, info.remote_rtp),
-                    secure_dst: info.remote_rtp,
+                    secure_source: bridge_source_filter(profile, far_gate_rtp),
+                    secure_dst: far_media_dst,
                     secure_local: far.rtp.local_addr,
                     certificate,
                     role,
@@ -4532,7 +4551,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near.rtp.id,
                 bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                 far.rtp.id,
-                info.remote_rtp,
+                far_media_dst,
                 &near_codec,
                 &far_codec,
                 near_telephone_event,
@@ -4550,7 +4569,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far.rtp.id,
                 bridge_source_filter(profile, far_gate_rtp),
                 near.rtp.id,
-                a_rtp,
+                near_media_dst.unwrap_or(a_rtp),
                 &far_codec,
                 &near_codec,
                 info.telephone_event_payload_type(),
@@ -4649,7 +4668,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near.rtp.id,
                 bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                 far.rtp.id,
-                info.remote_rtp,
+                far_media_dst,
                 &near_codec,
                 &far_codec,
                 near_telephone_event,
@@ -4667,7 +4686,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far.rtp.id,
                 bridge_source_filter(profile, far_gate_rtp),
                 near.rtp.id,
-                a_rtp,
+                near_media_dst.unwrap_or(a_rtp),
                 &far_codec,
                 &near_codec,
                 info.telephone_event_payload_type(),
@@ -4731,10 +4750,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // to the peer's effective source and latches per policy (RTPBleed fix —
             // docs/security-and-nat.md §4): `near` receives from A (`near_gate_rtp`, A's
             // `received-from` public IP when supplied, else the signalled `near.remote_rtp`); `far`
-            // from B (`far_gate_rtp`). The forward destination is always the real signalled address.
+            // from B (`far_gate_rtp`). The forward destination is that same effective address, so a
+            // NATed peer is aimed at its public one from the first packet rather than at the private
+            // `c=` it advertised (see the destination bindings above).
             let near_action = FlowAction::Forward(ingress_rule(
                 far.rtp.id,
-                Some(info.remote_rtp),
+                Some(far_media_dst),
                 near_gate_rtp,
                 profile,
                 near_ice,
@@ -4745,7 +4766,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             relay_flows.push((near.rtp.id, near_action));
             let far_action = FlowAction::Forward(ingress_rule(
                 near.rtp.id,
-                near.remote_rtp,
+                near_media_dst,
                 Some(far_gate_rtp),
                 profile,
                 far_ice,
@@ -4759,7 +4780,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
                 let near_rtcp_action = FlowAction::Forward(ingress_rule(
                     far_rtcp.id,
-                    Some(info.remote_rtcp),
+                    Some(far_rtcp_dst),
                     near_gate_rtcp,
                     profile,
                     near_ice,
@@ -4770,7 +4791,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 relay_flows.push((near_rtcp.id, near_rtcp_action));
                 let far_rtcp_action = FlowAction::Forward(ingress_rule(
                     near_rtcp.id,
-                    near.remote_rtcp,
+                    near_rtcp_dst,
                     Some(far_gate_rtcp),
                     profile,
                     far_ice,
@@ -4803,13 +4824,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 let b_text_rtp = b_text.remote_rtp;
                 far_text_remote = Some(b_text_rtp);
                 // Gate each side's text ingress to its signalled source, tightened to the
-                // `received-from` public IP when the proxy supplied one (the audio-leg posture).
+                // `received-from` public IP when the proxy supplied one, and aim each direction at
+                // that same effective address until the latch forms (the audio-leg posture).
                 let near_text_gate = apply_received_from(near.text_remote_rtp, offer_received_from);
                 let far_text_gate = apply_received_from(Some(b_text_rtp), profile.received_from)
                     .unwrap_or(b_text_rtp);
                 let near_text_action = FlowAction::Forward(ingress_rule(
                     far_text.id,
-                    Some(b_text_rtp),
+                    Some(far_text_gate),
                     near_text_gate,
                     profile,
                     false,
@@ -4819,7 +4841,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
                 let far_text_action = FlowAction::Forward(ingress_rule(
                     near_text.id,
-                    near.text_remote_rtp,
+                    near_text_gate,
                     Some(far_text_gate),
                     profile,
                     false,
@@ -4864,7 +4886,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     far_text_remote = Some(b_text_rtp);
                     // Same per-stream source gate + symmetric-latch posture as the plaintext text relay
                     // and the audio SDES bridge: gate each side to its signalled source, tightened to the
-                    // `received-from` public IP when the proxy supplied one (docs/security-and-nat.md §4).
+                    // `received-from` public IP when the proxy supplied one, and aim each direction at
+                    // that same effective address until the latch forms (docs/security-and-nat.md §4).
                     let near_text_gate =
                         apply_received_from(near.text_remote_rtp, offer_received_from);
                     let far_text_gate =
@@ -4872,14 +4895,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             .unwrap_or(b_text_rtp);
                     let near_rule = ingress_rule(
                         far_text.id,
-                        Some(b_text_rtp),
+                        Some(far_text_gate),
                         near_text_gate,
                         profile,
                         false,
                     );
                     let far_rule = ingress_rule(
                         near_text.id,
-                        Some(a_text_dst),
+                        Some(near_text_gate.unwrap_or(a_text_dst)),
                         Some(far_text_gate),
                         profile,
                         false,
@@ -21896,6 +21919,147 @@ mod tests {
             .expect("peer send");
         let (data, _from) = recv(&phone_b).await;
         assert_eq!(data, rtp(0x1234_5678), "received-from source flows through");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn received_from_also_aims_the_relay_at_the_public_source_before_the_latch() {
+        // The gate half of `received-from` was already right; the destination half was not. A NATed UA
+        // advertises a private `c=` it will never receive on, so until its own first packet moves the
+        // latch the relay was aiming the *other* party's audio at an unroutable address — the whole
+        // pre-latch window (~400 ms at 20 ms ptime on a call where the callee speaks first), leaving
+        // the node as a source of RFC 1918 datagrams.
+        //
+        // Here B speaks first, which is exactly that window: nothing from A has arrived, so nothing has
+        // latched, and B's media has to reach A on the strength of the hint alone.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+
+        // A advertises the documentation address 203.0.113.2 (unusable) on its real media port; the
+        // proxy tells us its media really comes from 127.0.0.2.
+        let offer_sdp = sdp_with_conn(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            addr_a.port(),
+            0,
+            "PCMU",
+        );
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "recvfrom-dst".into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile: ProfileFlags {
+                        received_from: Some(addr_a.ip()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "recvfrom-dst".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        // B speaks first. A has sent nothing, so no latch exists on the near leg.
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), far_addr)
+            .await
+            .expect("b send");
+        let (data, _from) = recv(&phone_a).await;
+        assert_eq!(
+            data,
+            rtp(0x0B0B_0B0B),
+            "B's first packet reaches A on the received-from address, not the private c="
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn received_from_never_installs_the_private_address_as_a_destination() {
+        // The same property stated on the installed rule rather than on the wire: no `Forward` action
+        // this call installs may carry the unroutable `c=` as its out_dst — not the RTP one and not the
+        // companion RTCP one. Asserted on the rules because that is what the datapath transmits from
+        // until the latch moves it.
+        let datapath = LatchLearningDatapath::new();
+        let engine = Engine::new(datapath.clone());
+        let (_phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (_phone_b, addr_b) = phone().await;
+        let private = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
+        // No rtcp-mux, so the companion RTCP flows are installed and covered too.
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {private}\r\ns=-\r\nc=IN IP4 {private}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            port = addr_a.port(),
+        );
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "recvfrom-rules".into(),
+                    from_tag: "a".into(),
+                    sdp: offer_sdp,
+                    profile: ProfileFlags {
+                        received_from: Some(addr_a.ip()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let _ = datapath.take_installs();
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "recvfrom-rules".into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        let installs = datapath.take_installs();
+        let destinations: Vec<SocketAddr> = installs
+            .iter()
+            .filter_map(|(_, action)| match action {
+                FlowAction::Forward(rule) => rule.out_dst,
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !destinations.is_empty(),
+            "the answer installed relay flows: {installs:?}"
+        );
+        assert!(
+            destinations.iter().all(|dst| dst.ip() != private),
+            "no flow may aim at the unroutable signalled address: {destinations:?}"
+        );
+        // A's two ports are aimed at the received-from IP, keeping each signalled port.
+        assert!(
+            destinations
+                .iter()
+                .any(|dst| *dst == SocketAddr::new(addr_a.ip(), addr_a.port())),
+            "A's RTP is aimed at the public source on its signalled port: {destinations:?}"
+        );
+        assert!(
+            destinations
+                .iter()
+                .any(|dst| *dst == SocketAddr::new(addr_a.ip(), addr_a.port() + 1)),
+            "A's companion RTCP likewise: {destinations:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

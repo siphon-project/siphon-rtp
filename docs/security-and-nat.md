@@ -160,6 +160,25 @@ Only **accept** (and only latch from) media whose source matches the address lea
   path — the datapath Forward relay, the redirect-dispatched media/transcode actor's `accepted_source`,
   the SRTP bridge (`bridge_source_filter`), and the WS bridge — so no path silently keeps the private
   address.
+- **The hint also aims the relay, not just the gate.** The same `(hint IP, signalled port)` pair is
+  the destination each direction transmits to **until that peer's own first accepted packet moves the
+  latch**. Gating on the hint while still *sending* to the private `c=` left the whole pre-latch
+  window — every packet the other party speaks before this one does, ~400 ms on a NATed call at 20 ms
+  ptime — addressed to an unroutable RFC 1918 destination, so the audio was lost and the node emitted
+  bogons. It applies wherever a peer's initial destination is derived from its signalled address: the
+  in-kernel Forward relay (RTP and companion RTCP), the SDES and DTLS bridges, all three transcoding
+  pipelines, and the RFC 4103 text relay in both its plaintext and secure forms.
+
+  This is an **opening guess, and only that**. Behind a symmetric NAT the public media port need not
+  be the signalled one, so the seeded destination can still be wrong — never *more* wrong than an
+  unroutable address, but it does mean aiming at a port on the NAT that may belong to another device
+  behind it. Two properties keep that bounded, and both are load-bearing:
+  - it is confined to the pre-latch window and is **never a latch substitute** — the latch still
+    governs from the first accepted packet onward, and it is fed only by packets that passed the
+    gate, so nothing here widens what the engine accepts (§4.7 is untouched);
+  - it uses **control-plane** data — an address the SIP proxy observed the signalling arrive from —
+    not anything asserted by an unauthenticated media packet, which is the distinction between this
+    and the RTPBleed class of blind adoption.
 - Relax to `Symmetric` (accept any source, latch the first) **only** when the control plane sets it —
   for UAs behind symmetric NAT where the signalled address is genuinely unusable. This is opt-in per
   leg, never a global default.
