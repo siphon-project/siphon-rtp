@@ -7,6 +7,39 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A call is no longer transcoded just because the answerer picked something other than the
+  offerer's first codec.** Leg A's codec was captured at `offer` as the first payload type on its
+  `m=` line and never revisited, so an offer of `G729 PCMA 101` answered with `PCMA` was resolved as
+  a G.729-to-G.711 transcode. RFC 3264 §6.1 makes the answerer's choice the format for the stream,
+  and the engine relays that answer to A unchanged on every non-transcoding pipeline, so A sends
+  PCMA too: the call was a plain relay all along.
+
+  The visible failure was a call that answered and then carried nothing. `build_direction` asked for
+  a G.729 decoder, got `CodecError::Unsupported`, and the `answer` verb failed while the dialog
+  stayed up — silent audio for the length of the call. G.729-first offers are common on mobile
+  clients configured for bandwidth, and the operator does not control which codec the far carrier
+  picks. Any offer whose answerer chose a lower preference was affected; it was only fatal when the
+  first-listed codec had no implementation, and merely wasteful otherwise (a `G722 PCMU` offer
+  answered as `PCMU` transcoded a call that both ends were happy to relay).
+
+  The engine now adopts the codec the answer selected whenever it is one A offered, and transcodes
+  only where the two sides genuinely diverge: B chose a codec `codec-transcode-X` put in the far
+  offer that A never sent, or the profile withheld A's own codec from B (`codec-mask-X` /
+  `codec-consume-X` / a `codec-offer` whitelist), which is those flags asking for exactly that
+  transcode and still behaves as before. A re-offer is judged the same way — it is refused only when
+  it *drops* the negotiated codec, not when it restates the preference order it opened with, which
+  is what a re-INVITE from such a phone does on every hold and resume.
+
+- **An unsupported-codec failure names the codec.** `media pipeline (A→B): unsupported: unknown or
+  unsupported codec` identified neither the codec, the payload type, nor whether the decode or the
+  encode side was refused, while the engine knew all three. It now reads
+  `cannot decode the ingress codec G729/8000 (payload type 18)`, and the codecs that are planned but
+  not built — G.729, G.723.1, EVS — say so by name and repeat that passthrough is unaffected, the
+  way the AMR message already did.
+
+
 ## [0.4.0] — 2026-09-01
 
 Cut so controllers can build against the takeover-bridge lifecycle: `siphon-rtp-proto` **0.4.0**

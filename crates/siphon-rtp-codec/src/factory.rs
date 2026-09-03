@@ -500,6 +500,28 @@ fn unsupported_name(encoding_name: &str) -> &'static str {
         // an Opus spec never reaches here from either `decoder_for` or `encoder_for` — there is
         // deliberately no entry for it.
         "TELEPHONE-EVENT" => "telephone-event is not an audio codec",
+        // Planned but not implemented. Each names the Cargo feature it is *planned* behind rather than
+        // claiming a flag exists that would fix the build today — there is no code to gate yet — and
+        // each repeats the rule that matters to the operator reading this in a call trace: only
+        // transcoding is missing, relaying the codec is always available (docs/codec-licensing.md).
+        "G729" | "G729A" | "G729B" | "G729AB" => {
+            "G.729 transcoding is not implemented (planned behind the `g729` build feature, \
+             patent-licensed — see docs/codec-licensing.md); G.729 passthrough/relay is always \
+             available"
+        }
+        "G723" => {
+            "G.723.1 transcoding is not implemented (planned behind the `g729` build feature, \
+             patent-licensed — see docs/codec-licensing.md); G.723.1 passthrough/relay is always \
+             available"
+        }
+        "EVS" => {
+            "EVS transcoding is not implemented (planned behind the `evs` build feature, \
+             patent-licensed — see docs/codec-licensing.md); EVS passthrough/relay is always available"
+        }
+        "ILBC" | "SPEEX" => {
+            "this codec is royalty-free but has no implementation in the engine; passthrough/relay is \
+             always available"
+        }
         _ => "unknown or unsupported codec",
     }
 }
@@ -1103,6 +1125,34 @@ mod tests {
             let spec = CodecSpec::new(96, name, 8000, 1, 20);
             assert!(decoder_for(&spec).is_ok(), "{name} mono decoder");
             assert!(encoder_for(&spec).is_ok(), "{name} mono encoder");
+        }
+    }
+
+    #[test]
+    fn an_unimplemented_codec_names_itself_and_says_relay_still_works() {
+        // A codec trace that reads "unknown or unsupported codec" sends an operator to the source to
+        // work out which codec the engine declined. The planned-but-unbuilt ones say what they are,
+        // where they are planned, and that only *transcoding* is missing — the distinction that
+        // decides whether a call had to fail at all (docs/codec-licensing.md).
+        for (name, expected) in [
+            ("G729", "G.729 transcoding is not implemented"),
+            ("G729A", "G.729 transcoding is not implemented"),
+            ("G723", "G.723.1 transcoding is not implemented"),
+            ("EVS", "EVS transcoding is not implemented"),
+        ] {
+            let spec = CodecSpec::new(18, name, 8000, 1, 20);
+            let Err(CodecError::Unsupported(message)) = decoder_for(&spec) else {
+                panic!("{name} has no decoder in this build");
+            };
+            assert!(message.contains(expected), "{name}: {message}");
+            assert!(
+                message.contains("passthrough/relay is always available"),
+                "{name} must not read as if the call had to fail: {message}"
+            );
+            let Err(CodecError::Unsupported(message)) = encoder_for(&spec) else {
+                panic!("{name} has no encoder in this build");
+            };
+            assert!(message.contains(expected), "{name}: {message}");
         }
     }
 

@@ -227,8 +227,21 @@ struct Call {
     /// carry the engine's own keying, so the takeover would terminate no SRTP.
     near_secure: bool,
     /// The near (offerer) leg's primary audio codec, captured at offer — paired with the answer's
-    /// codec to decide whether the call transcodes (the media slow path).
+    /// codec to decide whether the call transcodes (the media slow path). Replaced at answer by the
+    /// codec B actually selected whenever that codec is one A offered (RFC 3264 §6.1 — see
+    /// [`negotiated_near_codec`]), so it always names the codec A is really sending.
     near_codec: Option<CodecSpec>,
+    /// Every audio codec A offered, in offer order, captured at offer and refreshed on a re-offer.
+    /// Read at answer to tell an answer A can simply be relayed (B picked one of these — a plain
+    /// relay) from one that genuinely diverges (B picked a codec a codec policy put in the far offer,
+    /// which A never offered — the transcoder). Empty for a call restored from an HA snapshot, which
+    /// is already answered and never re-runs the decision.
+    near_offered_codecs: Vec<CodecSpec>,
+    /// Whether the profile's codec policy removed A's own primary codec from the offer B saw
+    /// (`codec-mask-X` / `codec-consume-X`, or a `codec-offer` whitelist that omits it). That is the
+    /// operator asking to hold A on that codec and transcode, so the answer-time adoption of B's
+    /// selection is skipped for such a call — see [`negotiated_near_codec`].
+    near_codec_withheld: bool,
     /// The far (answerer) leg's primary audio codec, captured at answer — the fork codec for a
     /// `subscribe_request` that forks leg B. `None` until the call is answered.
     far_codec: Option<CodecSpec>,
@@ -2161,7 +2174,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // negotiated (primary) codec — the engine dials the WS as a client and pumps A's audio in
         // both directions. The A↔B relay/transcode path is not wired in this mode (the WS is A's far
         // side). Resolved at offer because A's codec + signalled address are both known here.
-        let near_codec = info.primary_codec();
+        // A's full offered set, kept alongside its first choice: at answer it decides whether B's
+        // selection is one A can simply be relayed on (RFC 3264 §6.1) or a genuine divergence that
+        // needs the transcoder — see `negotiated_near_codec`.
+        let near_offered_codecs = info.audio_codecs();
+        let near_codec = near_offered_codecs.first().cloned();
+        // Did the codec policy take A's own codec out of the offer B sees? Read off the far offer the
+        // policy actually produced rather than re-deriving it from the flags, so `mask`, `consume`, an
+        // `offer` whitelist and `strip-all` are all judged by their outcome. B cannot then select that
+        // codec, so its answer says nothing about whether A moved — `negotiated_near_codec` leaves A on
+        // its own codec and the transcoder engages, which is what those flags ask for. A far offer that
+        // will not re-parse (our own rewrite, so a bug rather than input) counts as *not* withheld: the
+        // relay that keeps the call up is the better failure mode.
+        let near_codec_withheld = match near_codec.as_ref() {
+            Some(primary) if !codec_policy.is_noop() => {
+                sdp::parse(&rewritten.sdp).is_ok_and(|far_offer| {
+                    !far_offer
+                        .audio_codecs()
+                        .iter()
+                        .any(|offered| same_codec(offered, primary))
+                })
+            }
+            _ => false,
+        };
         let ws_uri = profile.ws_uri.clone();
         let pipeline = if ws_uri.is_some() {
             PipelineKind::Ws
@@ -2261,6 +2296,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // A's own posture, for the late-`ws_uri` takeover guard in `answer`.
                 near_secure: info.secure,
                 near_codec: near_codec.clone(),
+                near_offered_codecs,
+                near_codec_withheld,
                 far_codec: None,
                 near_telephone_event: info.telephone_event_payload_type(),
                 far_telephone_event: None,
@@ -2637,6 +2674,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // Recorded for symmetry; a single-leg call never reaches `answer`.
                 near_secure: info.secure,
                 near_codec: None,
+                // A single-leg local answer never reaches `answer`, so the offered set is unused.
+                near_offered_codecs: Vec::new(),
+                near_codec_withheld: false,
                 far_codec: None,
                 near_telephone_event: info.telephone_event_payload_type(),
                 far_telephone_event: None,
@@ -3467,17 +3507,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             return unknown_call(call_id);
         };
 
-        // A codec change needs a pipeline rebuild we do not do here — say so.
-        let offered_codec = info.primary_codec();
-        if let (Some(previous), Some(offered)) = (previous_codec.as_ref(), offered_codec.as_ref()) {
-            if previous.encoding_name != offered.encoding_name
-                || previous.clock_rate_hz != offered.clock_rate_hz
+        // A codec change needs a pipeline rebuild we do not do here — say so. What counts as a change
+        // is whether the re-offer still *lists* the codec this call negotiated, not whether it leads
+        // with it: a phone that offered G.729 first and settled on G.711 restates that same preference
+        // order on every re-INVITE (RFC 3264 §8 — a re-offer restates the whole session), and holding
+        // it to its first entry would reject a re-offer that renegotiates nothing.
+        let reoffered_codecs = info.audio_codecs();
+        if let Some(previous) = previous_codec.as_ref() {
+            if !reoffered_codecs.is_empty()
+                && !reoffered_codecs
+                    .iter()
+                    .any(|offered| same_codec(offered, previous))
             {
                 return CmdResult::Error {
                     reason: format!(
-                        "re-offer changes the negotiated codec ({} → {}); not supported on a live \
+                        "re-offer drops the negotiated codec ({} → {}); not supported on a live \
                          call — replace it with a fresh offer instead",
-                        previous.encoding_name, offered.encoding_name
+                        previous.encoding_name,
+                        reoffered_codecs
+                            .first()
+                            .map_or("none", |offered| offered.encoding_name.as_str()),
                     ),
                 };
             }
@@ -3578,6 +3627,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.near.remote_rtp = Some(info.remote_rtp);
             call.near.remote_rtcp = Some(info.remote_rtcp);
+            // A re-offer restates A's codec list, so an `answer` still to come negotiates against what
+            // A last offered rather than what it opened the dialog with (the guard above already
+            // refused a list that drops the negotiated codec). A re-offer that resolves no codec at
+            // all leaves the stored set alone rather than blanking it — it tells us nothing new.
+            if !reoffered_codecs.is_empty() {
+                call.near_offered_codecs = reoffered_codecs;
+            }
             call.near_remote_ice = new_remote_ice;
             call.near_remote_candidates = info.candidates.clone();
             call.near_peer_is_lite = info.ice_lite;
@@ -3663,6 +3719,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             far_dtls,
             near_secure,
             near_codec,
+            near_offered_codecs,
+            near_codec_withheld,
             near_telephone_event,
             offer_pipeline,
             offer_received_from,
@@ -3701,6 +3759,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.far_dtls,
                     call.near_secure,
                     call.near_codec.clone(),
+                    call.near_offered_codecs.clone(),
+                    call.near_codec_withheld,
                     call.near_telephone_event,
                     call.pipeline,
                     call.offer_received_from,
@@ -3732,6 +3792,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         };
+
+        // RFC 3264 §6.1: B's answer selects the format, and that answer is relayed to A unmodified on
+        // every non-transcoding pipeline — so if B picked something A offered, A sends it too and the
+        // call is a plain relay. Adopt it as A's codec here, before anything reads `near_codec`: the
+        // pipeline decision, the WebSocket bridge, the answer-side codec presentation and the CDR all
+        // then name the codec A is really sending, instead of whichever one A happened to list first.
+        let near_codec = negotiated_near_codec(
+            &near_offered_codecs,
+            near_codec,
+            info.primary_codec().as_ref(),
+            near_codec_withheld,
+        );
 
         // rtpengine `received-from`: the real post-NAT source the SIP proxy saw each request come
         // from. The **offer's** hint (stored on the call) tightens the near (A) leg's ingress gate;
@@ -5967,6 +6039,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_secure: false,
                 // Set for a transcode (`Media`) call; `None` for relay/bridge, which don't transcode.
                 near_codec: near_codec_out,
+                // The offered set is not carried in the HA snapshot: a restored call is already
+                // answered, so the answer-time negotiation never runs again, and a re-offer is judged
+                // against the negotiated codec itself rather than the original offer.
+                near_offered_codecs: Vec::new(),
+                near_codec_withheld: false,
                 far_codec: far_codec_out,
                 near_telephone_event: snapshot.near_telephone_event,
                 // The far leg's telephone-event PT is not carried in the HA snapshot (a restored call
@@ -10514,9 +10591,11 @@ fn ok_empty() -> CmdResult {
 /// (`docs/ng_control_protocol.md`) into `codec-<op>-<NAME>` flag strings, which map as:
 /// - `codec-strip-X` — remove X from the offer.
 /// - `codec-mask-X` / `codec-consume-X` — remove X from the offer but keep it usable near-side for
-///   transcoding. This engine derives the near leg's codec from the offerer's *own* offer,
-///   independent of the far-offer edit, so the near side keeps X regardless (and a masked near codec
-///   engages the transcoder because the near/far primaries then differ — see [`sdp::CodecPolicy`]).
+///   transcoding. Removing A's own codec from what B is offered is read as exactly that request: the
+///   answer-time adoption of B's selection is skipped and the near side keeps X, which engages the
+///   transcoder because the near/far codecs then differ (see [`negotiated_near_codec`]). `strip`
+///   shares this branch, so it behaves the same way — which is *not* rtpengine's "remove it, I do not
+///   want it" and cannot be used to keep a codec off the near leg.
 /// - `codec-transcode-X` — add X to the offer; the transcoder engages when the far side selects it.
 /// - `codec-except-X` / `codec-accept-X` — a keep-list: X is never stripped (the exception to
 ///   `strip-all` / `mask-all`).
@@ -10869,6 +10948,59 @@ fn resolve_ws_takeover_security(
 
 /// Decide how a call's media is carried once answered: an SRTP bridge (secure far leg), the
 /// userspace media slow path (transcode requested or recording on), or the in-datapath plain relay.
+/// Whether two specs name the same negotiated codec: the `a=rtpmap` encoding name (case-insensitive,
+/// RFC 4566 §6), the RTP clock rate and the channel count. Deliberately **not** the payload type — the
+/// two sides of a call may number the same codec differently, and it is the encoding, not the number,
+/// that decides whether a transcoder is needed.
+fn same_codec(left: &CodecSpec, right: &CodecSpec) -> bool {
+    left.encoding_name
+        .eq_ignore_ascii_case(&right.encoding_name)
+        && left.clock_rate_hz == right.clock_rate_hz
+        && left.channels == right.channels
+}
+
+/// The codec leg A ends up actually sending, given the codecs A offered (`offered`, captured at offer),
+/// A's first-listed one (`primary`) and the one B selected in its answer (`answered`).
+///
+/// RFC 3264 §6.1: the **answerer** picks the format for the stream. Every non-transcoding pipeline
+/// relays B's answer to A byte-for-byte, so when B selects a codec A offered, both parties end up on
+/// *that* codec and the call is a plain relay — the payload type, clock rate and parameters A will use
+/// are precisely the ones in the answer, which is why the answer's spec is adopted wholesale rather
+/// than A's own entry for the same codec.
+///
+/// Holding A to the codec it happened to list first instead would force a needless transcode on any
+/// call whose answerer picked a lower preference (a G.722-first offer answered as G.711 is transcoded
+/// for nothing), and would fail the call outright when A's first choice is a codec the engine has no
+/// implementation for (a G.729-first offer answered as G.711: `decoder_for("G729")` is `Unsupported`,
+/// so the whole answer is rejected even though nothing needed to be decoded).
+///
+/// The transcoder engages only where the two sides genuinely diverge: B answered a codec A never
+/// offered (reachable only when `codec-transcode` put a codec in the far offer that was not in A's),
+/// or `withheld_from_far` says the profile removed A's own codec from what B saw (`codec-mask` /
+/// `codec-consume`). There A keeps its own primary codec and the engine bridges the two, which is what
+/// those flags exist to ask for.
+fn negotiated_near_codec(
+    offered: &[CodecSpec],
+    primary: Option<CodecSpec>,
+    answered: Option<&CodecSpec>,
+    withheld_from_far: bool,
+) -> Option<CodecSpec> {
+    // `codec-mask-X` / `codec-consume-X` (and a `codec-offer` whitelist that omits X) mean exactly
+    // "keep A on X and transcode it" — the operator removed A's own codec from what B was offered, so
+    // B could not have selected it and its answer is not evidence that A moved. Honour that: the
+    // transcoder is what those flags are for.
+    if withheld_from_far {
+        return primary;
+    }
+    let Some(answered) = answered else {
+        return primary;
+    };
+    if offered.iter().any(|spec| same_codec(spec, answered)) {
+        return Some(answered.clone());
+    }
+    primary
+}
+
 fn resolve_pipeline(
     near_codec: Option<&CodecSpec>,
     info: &sdp::MediaInfo,
@@ -10878,10 +11010,7 @@ fn resolve_pipeline(
 ) -> PipelineKind {
     // Transcode when the two legs' primary codecs differ in encoding or clock rate.
     let transcode = match (near_codec, info.primary_codec()) {
-        (Some(near), Some(far)) => {
-            !near.encoding_name.eq_ignore_ascii_case(&far.encoding_name)
-                || near.clock_rate_hz != far.clock_rate_hz
-        }
+        (Some(near), Some(far)) => !same_codec(near, &far),
         _ => false,
     };
     if far_dtls {
@@ -11000,8 +11129,21 @@ fn build_direction(
     beep_detection: bool,
     beep_cadence_guard_ms: Option<u32>,
 ) -> Result<DirectionConfig, String> {
-    let decoder = factory::decoder_for(ingress_codec).map_err(|error| error.to_string())?;
-    let encoder = factory::encoder_for(egress_codec).map_err(|error| error.to_string())?;
+    // Name the codec (and which half of the transcode wanted it) in the failure: the factory's error
+    // holds a `&'static str`, so on its own it says only "unsupported", leaving an operator to guess
+    // which leg's codec the engine could not build.
+    let decoder = factory::decoder_for(ingress_codec).map_err(|error| {
+        format!(
+            "cannot decode the ingress codec {}/{} (payload type {}): {error}",
+            ingress_codec.encoding_name, ingress_codec.clock_rate_hz, ingress_codec.payload_type
+        )
+    })?;
+    let encoder = factory::encoder_for(egress_codec).map_err(|error| {
+        format!(
+            "cannot encode the egress codec {}/{} (payload type {}): {error}",
+            egress_codec.encoding_name, egress_codec.clock_rate_hz, egress_codec.payload_type
+        )
+    })?;
     // Record at the codec's *native* PCM rate (what the decoder emits), not the RTP clock — they
     // differ for G.722 (16 kHz audio, 8 kHz RTP clock; RFC 3551 §4.5.2), and a clock-rate WAV header
     // would replay the recording at the wrong pitch.
@@ -12715,7 +12857,7 @@ mod tests {
                 Command::Offer {
                     call_id: "ptime-call".into(),
                     from_tag: "tag-a".into(),
-                    sdp: sdp_for(addr_a, true),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
                     profile: ProfileFlags::default(),
                 },
             )
@@ -13652,7 +13794,7 @@ mod tests {
                 Command::Offer {
                     call_id: "ha-xcode".into(),
                     from_tag: "tag-a".into(),
-                    sdp: sdp_for(addr_a, true),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
                     profile: Default::default(),
                 },
             )
@@ -13789,7 +13931,7 @@ mod tests {
                 Command::Offer {
                     call_id: "ha-savp-xcode".into(),
                     from_tag: "tag-a".into(),
-                    sdp: sdp_for(addr_a, true),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
                     profile: ProfileFlags {
                         transport_protocol: Some("RTP/SAVP".into()),
                         ..Default::default()
@@ -15003,11 +15145,340 @@ mod tests {
         );
     }
 
+    /// An SDP offering several audio codecs in `m=` order, each with an `a=rtpmap` — the shape a real
+    /// UA sends (a desk phone leading with G.729 and falling back to G.711, say).
+    fn sdp_codec_list(rtp: SocketAddr, codecs: &[(u8, &str)]) -> String {
+        let payload_types: Vec<String> = codecs
+            .iter()
+            .map(|(payload_type, _)| payload_type.to_string())
+            .collect();
+        let rtpmaps: String = codecs
+            .iter()
+            .map(|(payload_type, name)| format!("a=rtpmap:{payload_type} {name}/8000\r\n"))
+            .collect();
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP {list}\r\n{rtpmaps}a=rtcp-mux\r\n",
+            ip = rtp.ip(),
+            port = rtp.port(),
+            list = payload_types.join(" "),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_relays_when_b_selects_a_codec_a_also_offered() {
+        // RFC 3264 §6.1: the answerer picks the format. A leads with G.729 (a codec this engine has no
+        // implementation for) but also offers G.711; B answers PCMA. The answer is relayed to A
+        // unmodified, so A sends PCMA too and the call is a plain relay — it must NOT be resolved as a
+        // G.729→PCMA transcode, which would fail the answer outright on the missing G.729 decoder.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "g729-relay".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_codec_list(addr_a, &[(18, "G729"), (8, "PCMA"), (0, "PCMU")]),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_addr = sdp::parse(&ok_sdp_text(&offer))
+            .expect("offer reply")
+            .remote_rtp;
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "g729-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(answer, CmdResult::Ok { .. }),
+            "the answer is accepted — nothing here needs a G.729 codec, got {answer:?}"
+        );
+        assert!(
+            !engine.media().is_media_call("g729-relay"),
+            "no transcoding actor: both parties settled on PCMA, so this is a plain relay"
+        );
+
+        // The answer relayed to A advertises B's selection (PCMA), never A's first preference.
+        let answer_sdp = ok_sdp_text(&answer);
+        let near_addr = sdp::parse(&answer_sdp).expect("answer reply").remote_rtp;
+        let m_line = answer_sdp
+            .lines()
+            .find(|line| line.starts_with("m=audio"))
+            .expect("m=audio line");
+        assert!(
+            m_line.ends_with(" 8"),
+            "A is answered with B's selected codec: {m_line}"
+        );
+
+        // A's A-law media relays byte-for-byte to B.
+        let from_a = g711_rtp(8, 100, 0x0A0A_0A0A, 0xD5);
+        phone_a.send_to(&from_a, near_addr).await.expect("a send");
+        let (relayed, from) = recv(&phone_b).await;
+        assert_eq!(from, far_addr, "media leaves the engine's B-facing port");
+        assert_eq!(
+            relayed, from_a,
+            "relayed verbatim — no decode, no re-encode"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codec_mask_still_holds_the_near_leg_on_the_masked_codec() {
+        // The counterpart to `answer_relays_when_b_selects_a_codec_a_also_offered`: adopting B's
+        // selection must not quietly undo `codec-mask`. A offers PCMU and PCMA, the profile masks PCMU
+        // so B is offered PCMA alone and answers it. B picking a codec A also offered would normally
+        // be a relay, but here it had no other option — the operator asked for A to stay on PCMU and
+        // for the engine to transcode, so this stays a media call.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "masked".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        flags: vec!["codec-mask-PCMU".into()],
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "masked".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(matches!(answer, CmdResult::Ok { .. }), "got {answer:?}");
+        assert!(
+            engine.media().is_media_call("masked"),
+            "a masked near codec still engages the transcoder"
+        );
+        // And A is answered with the codec it was held on, not B's (RFC 3264 §6 — A must be told what
+        // to send, and what it must send here is what the engine decodes).
+        let answer_sdp = ok_sdp_text(&answer);
+        let m_line = answer_sdp
+            .lines()
+            .find(|line| line.starts_with("m=audio"))
+            .expect("m=audio line");
+        assert!(m_line.ends_with(" 0"), "A is answered with PCMU: {m_line}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_naming_an_unimplemented_codec_says_which_codec_it_is() {
+        // The genuine-divergence case on a codec the engine cannot build: A offers only G.729,
+        // `codec-transcode-PCMA` offers B A-law, and B takes it. That *does* need a G.729 decoder the
+        // engine does not have, so the answer is refused — and the refusal has to name the codec, not
+        // just say "unsupported".
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "g729-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_single_codec(addr_a, 18, "G729"),
+                    profile: ProfileFlags {
+                        flags: vec!["codec-transcode-PCMA".into()],
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "g729-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let CmdResult::Error { reason } = &answer else {
+            panic!("a transcode the engine cannot run is refused, got {answer:?}");
+        };
+        assert!(
+            reason.contains("G729"),
+            "the refusal names the codec it could not build: {reason}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reoffer_accepts_a_restated_preference_order_after_a_lower_choice_was_answered() {
+        // A offers G.729 first and settles on PCMA. Its re-INVITE restates the same preference order
+        // (that is what a re-offer is — RFC 3264 §8), which renegotiates nothing: the call still runs
+        // the codec it negotiated, so the re-offer is accepted rather than refused as a codec change.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offered = sdp_codec_list(addr_a, &[(18, "G729"), (8, "PCMA")]);
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "g729-reoffer".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offered.clone(),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "g729-reoffer".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let reoffered = engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "g729-reoffer".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offered,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(reoffered, CmdResult::Ok { .. }),
+            "the same list A opened with renegotiates nothing, got {reoffered:?}"
+        );
+
+        // Dropping the negotiated codec, though, is a real change the live pipeline cannot absorb.
+        let dropped = engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: "g729-reoffer".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&dropped, CmdResult::Error { reason } if reason.contains("drops the negotiated codec")),
+            "a re-offer without the negotiated codec is refused, got {dropped:?}"
+        );
+    }
+
+    #[test]
+    fn negotiated_near_codec_adopts_the_answered_codec_when_a_offered_it() {
+        let pcma = CodecSpec::new(8, "PCMA", 8000, 1, 20);
+        let offered = vec![CodecSpec::new(18, "G729", 8000, 1, 20), pcma.clone()];
+        let negotiated =
+            negotiated_near_codec(&offered, offered.first().cloned(), Some(&pcma), false)
+                .expect("codec");
+        assert_eq!(
+            negotiated.encoding_name, "PCMA",
+            "A follows the answer, not its own first preference"
+        );
+        assert_eq!(
+            negotiated.payload_type, 8,
+            "and the answer's payload type, which is what A is told to send"
+        );
+    }
+
+    #[test]
+    fn negotiated_near_codec_keeps_as_own_codec_when_the_answer_diverges() {
+        // B selected something A never offered — only a codec policy puts the engine here, and it is
+        // exactly the case the transcoder exists for.
+        let offered = vec![CodecSpec::new(0, "PCMU", 8000, 1, 20)];
+        let g722 = CodecSpec::new(9, "G722", 8000, 1, 20);
+        let negotiated =
+            negotiated_near_codec(&offered, offered.first().cloned(), Some(&g722), false)
+                .expect("codec");
+        assert_eq!(negotiated.encoding_name, "PCMU", "A keeps its own codec");
+    }
+
+    #[test]
+    fn negotiated_near_codec_keeps_the_primary_without_an_answer_or_an_offer_set() {
+        let pcmu = CodecSpec::new(0, "PCMU", 8000, 1, 20);
+        assert_eq!(
+            negotiated_near_codec(std::slice::from_ref(&pcmu), Some(pcmu.clone()), None, false),
+            Some(pcmu.clone()),
+            "an answer that resolves no codec changes nothing"
+        );
+        assert_eq!(
+            negotiated_near_codec(&[], Some(pcmu.clone()), Some(&pcmu), false),
+            Some(pcmu),
+            "an empty offered set (a restored call) changes nothing"
+        );
+    }
+
+    #[test]
+    fn negotiated_near_codec_keeps_a_codec_the_policy_withheld_from_the_far_side() {
+        // `codec-mask-G722` means "B never sees G.722, A stays on it, transcode". B answering PCMU —
+        // which A also offered — is not A moving to PCMU: B was never given the choice.
+        let g722 = CodecSpec::new(9, "G722", 8000, 1, 20);
+        let pcmu = CodecSpec::new(0, "PCMU", 8000, 1, 20);
+        let offered = vec![g722.clone(), pcmu.clone()];
+        let negotiated =
+            negotiated_near_codec(&offered, Some(g722), Some(&pcmu), true).expect("codec");
+        assert_eq!(
+            negotiated.encoding_name, "G722",
+            "a masked near codec still engages the transcoder"
+        );
+    }
+
+    #[test]
+    fn same_codec_compares_the_encoding_not_the_payload_type() {
+        // The two sides of a call may number the same codec differently; a differing number is not a
+        // transcode. A differing clock rate or channel count is.
+        let dynamic = CodecSpec::new(96, "AMR-WB", 16000, 1, 20);
+        let other_number = CodecSpec::new(97, "amr-wb", 16000, 1, 20);
+        assert!(same_codec(&dynamic, &other_number));
+        assert!(!same_codec(
+            &CodecSpec::new(0, "L16", 8000, 1, 20),
+            &CodecSpec::new(0, "L16", 16000, 1, 20)
+        ));
+        assert!(!same_codec(
+            &CodecSpec::new(0, "L16", 16000, 1, 20),
+            &CodecSpec::new(0, "L16", 16000, 2, 20)
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offer_answer_transcodes_ulaw_to_alaw_end_to_end() {
-        // A offers PCMU (µ-law); B answers PCMA (A-law). The differing codecs resolve to the media
-        // slow path, which redirects both legs to a transcoding actor — proven end-to-end through the
-        // control plane with the redirect dispatcher live.
+        // A offers PCMU (µ-law) and nothing else; `codec-transcode-PCMA` puts A-law in the offer B
+        // sees, and B answers with it. That is a genuine divergence — B selected a codec A never
+        // offered — so the two legs resolve to the media slow path, which redirects both to a
+        // transcoding actor. Proven end-to-end through the control plane with the redirect dispatcher
+        // live. (Had A itself offered PCMA, B's answer would be relayed and no transcode is needed —
+        // `answer_relays_when_b_selects_a_codec_a_also_offered` covers that.)
         use crate::srtp_bridge::run_redirect_dispatcher;
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let rx = engine.datapath().rx();
@@ -15023,15 +15494,18 @@ mod tests {
         let (phone_a, addr_a) = phone().await;
         let (phone_b, addr_b) = phone().await;
 
-        // A's offer advertises PCMU as its primary codec (the `sdp_for` fixture: `0 8`, rtpmap PCMU).
+        // A's offer advertises PCMU and only PCMU; the profile adds PCMA to what B is offered.
         let offer = engine
             .handle(
                 CLIENT,
                 Command::Offer {
                     call_id: "xcode-1".into(),
                     from_tag: "tag-a".into(),
-                    sdp: sdp_for(addr_a, true),
-                    profile: Default::default(),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                    profile: ProfileFlags {
+                        flags: vec!["codec-transcode-PCMA".into()],
+                        ..Default::default()
+                    },
                 },
             )
             .await;
@@ -15039,7 +15513,7 @@ mod tests {
             .expect("offer reply")
             .remote_rtp;
 
-        // B answers PCMA only → near=PCMU, far=PCMA → transcode.
+        // B answers PCMA only → near=PCMU (A offered no PCMA), far=PCMA → transcode.
         let answer = engine
             .handle(
                 CLIENT,
@@ -15136,7 +15610,7 @@ mod tests {
                 Command::Offer {
                     call_id: "cdr-1".into(),
                     from_tag: "tag-a".into(),
-                    sdp: sdp_for(addr_a, true),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
                     profile: Default::default(),
                 },
             )
@@ -15306,7 +15780,7 @@ mod tests {
                 Command::Offer {
                     call_id: "siprec-1".into(),
                     from_tag: "tag-a".into(),
-                    sdp: sdp_for(addr_a, true),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
                     profile: Default::default(),
                 },
             )
@@ -20137,7 +20611,7 @@ mod tests {
                 Command::Offer {
                     call_id: "echo-tc".into(),
                     from_tag: "tag-a".into(),
-                    sdp: sdp_for(addr_a, true), // PCMU primary
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"), // PCMU primary
                     profile: Default::default(),
                 },
             )
@@ -20885,7 +21359,7 @@ mod tests {
                 Command::Offer {
                     call_id: "dtls-transcode".into(),
                     from_tag: "tag-a".into(),
-                    sdp: sdp_for(addr_a, true),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
                     profile: ProfileFlags {
                         transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
                         ..Default::default()
@@ -21036,7 +21510,7 @@ mod tests {
                     Command::Offer {
                         call_id: call_id.into(),
                         from_tag: "tag-a".into(),
-                        sdp: sdp_for(addr_a, true),
+                        sdp: sdp_single_codec(addr_a, 0, "PCMU"),
                         profile: ProfileFlags {
                             transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
                             ..Default::default()
@@ -27364,7 +27838,7 @@ mod tests {
                 Command::Offer {
                     call_id: "ws-transcode".into(),
                     from_tag: "tag-a".into(),
-                    sdp: sdp_for(addr_a, true),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
                     profile: Default::default(),
                 },
             )
