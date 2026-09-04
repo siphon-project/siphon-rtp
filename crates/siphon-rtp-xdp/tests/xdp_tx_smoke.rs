@@ -25,6 +25,7 @@ use std::os::fd::RawFd;
 use std::process::Command;
 use std::time::Duration;
 
+use siphon_rtp_datapath::Dscp;
 use siphon_rtp_ebpf_common::{action, latch, source, FlowAction, FlowKey};
 use siphon_rtp_xdp::headers::{self, FrameAddrs, ETH_HDR_LEN, IPV4_HDR_LEN, UDP_HDR_LEN};
 use siphon_rtp_xdp::{AttachMode, Loader};
@@ -123,7 +124,7 @@ fn run_smoke() -> Result<SmokeOutcome, String> {
     }
 
     // Attach the classifier to the engine side in SKB mode. Failure → skip (no generic XDP).
-    let mut loader = match Loader::load(VETH_ENGINE, AttachMode::Skb) {
+    let mut loader = match Loader::load(VETH_ENGINE, AttachMode::Skb, Dscp::DEFAULT) {
         Ok(loader) => loader,
         Err(error) => {
             return Ok(SmokeOutcome::Skipped(format!("cannot attach XDP: {error}")));
@@ -171,6 +172,8 @@ fn run_smoke() -> Result<SmokeOutcome, String> {
         dst_ip: ENGINE_IP,
         src_port: CALLER_PORT,
         dst_port: ENGINE_PORT,
+        // An unmarked UA: the relay is what stamps the DSCP, so the inbound frame carries none.
+        tos: 0x00,
     };
     let mut inbound_frame = vec![0u8; headers::TOTAL_HDR_LEN + RTP_PAYLOAD.len()];
     let inbound_len = headers::build_udp_frame(&inbound, &RTP_PAYLOAD, &mut inbound_frame)
@@ -238,6 +241,15 @@ fn run_smoke() -> Result<SmokeOutcome, String> {
             &frame[parsed.payload_offset..parsed.payload_offset + parsed.payload_len],
             &RTP_PAYLOAD[..],
             "RTP payload relayed unchanged",
+        );
+
+        // The in-kernel relay stamped the media DSCP (RFC 2474 §3) onto a frame that arrived
+        // unmarked: EF (46, RFC 3246) << 2 == 0xB8, the same byte the userspace datapath sets. The
+        // header-checksum assertion just below is what proves the incremental fixup went with it.
+        assert_eq!(
+            frame[ETH_HDR_LEN + 1],
+            0xB8,
+            "relayed frame marked EF by the in-kernel fast path",
         );
 
         // Both checksums validate at the receiver (RFC 1071 / RFC 768): re-summing the header (its

@@ -113,6 +113,7 @@ fn try_build_xdp_datapath(
     interface: Option<&str>,
     relay_bind_ip: Option<IpAddr>,
     queue: u32,
+    dscp: siphon_rtp_datapath::Dscp,
 ) -> Option<siphon_rtp_xdp::XdpDatapath> {
     use siphon_rtp_xdp::{xsk, AttachMode, Loader, XdpDatapath};
 
@@ -146,7 +147,7 @@ fn try_build_xdp_datapath(
     // Try native/driver XDP first, then generic SKB mode. A failed attempt drops its loader (which
     // detaches the program), so the next mode starts clean; total failure falls back to UDP-loopback.
     for mode in [AttachMode::Native, AttachMode::Skb] {
-        let loader = match Loader::load(interface, mode) {
+        let loader = match Loader::load(interface, mode, dscp) {
             Ok(loader) => loader,
             Err(error) => {
                 tracing::debug!(target: "siphon_rtp::datapath", interface, ?mode, %error, "XDP attach failed; trying next mode");
@@ -167,6 +168,7 @@ fn try_build_xdp_datapath(
                     queue,
                     local_ip = %local_ip,
                     ?mode,
+                    media_dscp = %dscp,
                     "XDP/AF_XDP datapath selected (kernel fast path)"
                 );
                 return Some(datapath);
@@ -244,9 +246,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // we fall through to the always-available UDP-loopback backend (docs/security-and-nat.md §11.1).
     match choose_datapath(xdp_interface.as_deref(), config.relay_bind_ip) {
         DatapathChoice::TryXdp => {
-            if let Some(xdp) =
-                try_build_xdp_datapath(xdp_interface.as_deref(), config.relay_bind_ip, xdp_queue)
-            {
+            if let Some(xdp) = try_build_xdp_datapath(
+                xdp_interface.as_deref(),
+                config.relay_bind_ip,
+                xdp_queue,
+                config.media_dscp,
+            ) {
                 return run_with_datapath(xdp, config).await;
             }
         }

@@ -7,6 +7,49 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+The engine marked nothing. Every media datagram it emitted left at DSCP 0 — best effort — on the
+userspace relay and on the AF_XDP TX path, while the in-kernel `XDP_TX` path passed through whatever
+byte the sending UA set, so the same call could be marked differently depending on which datapath
+carried it. A media relay's entire job is the real-time plane; leaving it in the default class is
+wrong on a link that is ever congested, and it is a one-line configuration on every other engine in
+the room (`tos_audio` in Asterisk, `tos` in rtpengine).
+
+**A patch.** `siphon-rtp-proto` is untouched — no verb, event, field or type changed — so a
+controller floating on `^0.4` needs no work to take this, and the internal path-deps pinned at
+`"0.4.0"` still caret-match. The kernel flow-map ABI is also unchanged: the marking is node policy,
+so it is a load-time `.rodata` constant rather than a per-flow field.
+
+**One behaviour change to be aware of.** Media now leaves marked EF where it previously left
+unmarked. On a network that classifies on DSCP this is the point; on a network with a policer that
+drops or reclassifies unexpected EF at its edge, set `--media-dscp BE` (or the code point that
+network expects) to restore the old behaviour exactly — `BE` does not write a zero, it leaves the
+byte alone.
+
+### Added
+
+- **DSCP marking on outbound media, defaulting to EF.** `--media-dscp` (config file: `media_dscp`)
+  takes a DiffServ name — `EF`, `CS3`, `AF41`, `VA`/`VOICE-ADMIT`, `BE`, the `CS`/`AF` pool-1 set —
+  or a raw `0`–`63`, the same vocabulary siphon-sip uses for signalling. The default is **EF** (46,
+  RFC 3246; RFC 4594 §4.1 assigns EF the Telephony service class), which is TOS byte `184`: the
+  value operators already configure as Asterisk's `tos_audio` and rtpengine's `tos`, so a node
+  migrating from either needs no equivalent line.
+
+  All three egress paths mark identically, so a call's marking never depends on which datapath
+  carried it: the userspace relay sets `IP_TOS`/`IPV6_TCLASS` on each bound media socket (a
+  dual-stack `::` socket gets both, since a v4-mapped destination egresses through the IPv4 path);
+  the AF_XDP TX frame builder writes the byte before computing the header checksum; the in-kernel
+  `XDP_TX` fast path rewrites it alongside the address/port rewrite with an RFC 1624 incremental
+  checksum fixup, proven against a full RFC 1071 recompute — including the composition of the two
+  fixups — by proptest.
+
+  `BE` (or `0`) means *do not mark*, not *mark zero*: the socket option is never set and the kernel
+  path skips the write, so an operator marking upstream (tc, a CNI plugin, a hypervisor) is not
+  overwritten. Marking is socket-level, not per-packet, so RTP, RTCP, STUN and DTLS on a muxed
+  socket all carry it. Only media is marked — the control listeners, the metrics/health server, the
+  HEP exporter and the WS bridge stay at best effort. A failed `setsockopt` warns and carries on: a
+  sandbox that forbids the option must not take a call down. See
+  [`docs/datapath.md`](docs/datapath.md#qos-marking-dscp).
+
 ## [0.4.2] — 2026-09-03
 
 Cut for the same reason as 0.4.1: the defect below is silent on the control plane. The `answer`

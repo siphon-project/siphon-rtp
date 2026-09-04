@@ -62,11 +62,25 @@ use siphon_rtp_ebpf_common::{
     action, latch,
     loss::{rtp_loss_update, RTP_SEQ_NONE},
     rewrite::{
-        ice_media_allowed, ipv4_checksum_after_addr_rewrite, is_rtp_or_rtcp, is_stun,
-        latch_decision, rtp_media_ssrc, udp_checksum_after_rewrite, LatchVerdict, Latched,
+        ice_media_allowed, ipv4_checksum_after_addr_rewrite, ipv4_checksum_after_tos_rewrite,
+        is_rtp_or_rtcp, is_stun, latch_decision, rtp_media_ssrc, udp_checksum_after_rewrite,
+        LatchVerdict, Latched,
     },
     source, FlowAction, FlowKey, FlowStats, RtcpTapRecord, RTCP_TAP_MAX_PAYLOAD,
 };
+
+/// The IPv4 TOS byte stamped on every datagram the in-kernel relay forwards: the DiffServ code
+/// point (RFC 2474 §3) shifted left two, ECN bits (RFC 3168) clear.
+///
+/// Node policy, not per-flow state, so it is a **load-time constant** the loader rewrites in
+/// `.rodata` (`aya::EbpfLoader::set_global`) rather than a field on every `FlowAction`: the map ABI
+/// stays as it was, and the verifier sees a constant. `0` means "do not mark" — the relay then
+/// leaves the byte the sender set, exactly as it did before marking existed.
+///
+/// Default `0xB8` = DSCP 46 (EF, RFC 3246; RFC 4594 §4.1 Telephony), matching the userspace
+/// datapath's default, so an unpatched loader and a patched program agree.
+#[no_mangle]
+static MEDIA_TOS: u8 = 0xB8;
 
 /// Flow table: destination transport → relay rule. Keyed/valued by the shared ABI POD.
 #[map]
@@ -696,6 +710,21 @@ fn forward_in_kernel(
         old_dst_ip_host,
         new_dst_ip_host,
     );
+    // DSCP (RFC 2474 §3): stamp the node's media marking so a kernelized relay marks identically to
+    // the userspace one. `read_volatile` keeps the loader's `.rodata` rewrite from being constant-
+    // folded away. A zero `MEDIA_TOS`, or a packet already carrying the marking, writes nothing —
+    // the byte the sender set is then preserved, as it was before marking existed.
+    let version_ihl: u8 = load(ctx, ip_offset)?;
+    let old_tos: u8 = load(ctx, ip_offset + 1)?;
+    let new_tos = unsafe { core::ptr::read_volatile(&MEDIA_TOS) };
+    let (new_tos, new_ip_checksum) = if new_tos == 0 || new_tos == old_tos {
+        (old_tos, new_ip_checksum)
+    } else {
+        (
+            new_tos,
+            ipv4_checksum_after_tos_rewrite(new_ip_checksum, version_ihl, old_tos, new_tos),
+        )
+    };
     let new_udp_checksum = udp_checksum_after_rewrite(
         old_udp_checksum,
         src_ip_host,
@@ -710,6 +739,9 @@ fn forward_in_kernel(
 
     store::<[u8; 4]>(ctx, ip_offset + 12, new_src_ip_host.to_be_bytes())?;
     store::<[u8; 4]>(ctx, ip_offset + 16, new_dst_ip_host.to_be_bytes())?;
+    if new_tos != old_tos {
+        store::<u8>(ctx, ip_offset + 1, new_tos)?;
+    }
     store::<[u8; 2]>(ctx, ip_offset + 10, new_ip_checksum.to_be_bytes())?;
     store::<[u8; 2]>(ctx, udp_offset, new_src_port_host.to_be_bytes())?;
     store::<[u8; 2]>(ctx, udp_offset + 2, new_dst_port_host.to_be_bytes())?;

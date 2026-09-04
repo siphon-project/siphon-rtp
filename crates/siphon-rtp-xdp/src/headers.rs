@@ -49,6 +49,12 @@ pub struct FrameAddrs {
     pub src_port: u16,
     /// Destination UDP port (the peer's media port).
     pub dst_port: u16,
+    /// IPv4 TOS byte: the DiffServ code point (RFC 2474 §3) shifted left two, with the ECN bits
+    /// (RFC 3168) clear. `0xB8` is EF (DSCP 46, RFC 3246 — RFC 4594 §4.1 Telephony), what the relay
+    /// stamps on media by default; `0x00` leaves the frame unmarked. Built from
+    /// `siphon_rtp_datapath::Dscp::to_tos_byte`, so the AF_XDP TX path marks exactly as the
+    /// userspace UDP sockets and the in-kernel XDP_TX path do.
+    pub tos: u8,
 }
 
 /// Build a complete Ethernet+IPv4+UDP frame for `payload` into `out`, returning the total frame
@@ -75,7 +81,7 @@ pub fn build_udp_frame(addrs: &FrameAddrs, payload: &[u8], out: &mut [u8]) -> Op
     let ip = &mut out[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN];
     let ip_total_len = (IPV4_HDR_LEN + UDP_HDR_LEN + payload.len()) as u16;
     ip[0] = 0x45; // version 4, IHL 5 (20 bytes, no options)
-    ip[1] = 0x00; // DSCP/ECN 0
+    ip[1] = addrs.tos; // DSCP (RFC 2474 §3) << 2, ECN (RFC 3168) clear — see `FrameAddrs::tos`
     ip[2..4].copy_from_slice(&ip_total_len.to_be_bytes());
     ip[4..6].copy_from_slice(&0u16.to_be_bytes()); // identification (0 — DF set, never fragmented)
     ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags=DF, fragment offset 0
@@ -256,6 +262,8 @@ mod tests {
             dst_ip: Ipv4Addr::new(203, 0, 113, 5),
             src_port: 5000,
             dst_port: 6000,
+            // EF (DSCP 46, RFC 3246) << 2 — the media default the daemon configures.
+            tos: 0xB8,
         }
     }
 
@@ -294,8 +302,9 @@ mod tests {
         assert_eq!(&out[6..12], &SRC_MAC);
         assert_eq!(&out[12..14], &ETH_P_IP.to_be_bytes());
 
-        // IPv4: version/IHL, protocol, addresses, total length.
+        // IPv4: version/IHL, TOS (the DSCP marking), protocol, addresses, total length.
         assert_eq!(out[ETH_HDR_LEN], 0x45);
+        assert_eq!(out[ETH_HDR_LEN + 1], 0xB8);
         assert_eq!(out[ETH_HDR_LEN + 9], IPPROTO_UDP);
         let ip_total = u16::from_be_bytes([out[ETH_HDR_LEN + 2], out[ETH_HDR_LEN + 3]]);
         assert_eq!(
@@ -323,6 +332,35 @@ mod tests {
         let ip = &out[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN];
         // A receiver re-summing the header (checksum field included) must get 0 (RFC 1071).
         assert_eq!(ones_complement_checksum(ip), 0);
+    }
+
+    #[test]
+    fn the_tos_byte_is_written_verbatim_and_stays_checksummed() {
+        // Every marking an operator can configure, including "unmarked", must leave a header a
+        // next hop accepts — a wrong checksum on a marked packet is a silently black-holed call.
+        for tos in [0x00, 0x60, 0xB0, 0xB8, 0xFC] {
+            let mut out = [0u8; 256];
+            let addrs = FrameAddrs { tos, ..addrs() };
+            let _ = build_udp_frame(&addrs, b"marked", &mut out).expect("build");
+            assert_eq!(out[ETH_HDR_LEN + 1], tos, "TOS byte for {tos:#04x}");
+            let ip = &out[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN];
+            assert_eq!(ones_complement_checksum(ip), 0, "checksum for {tos:#04x}");
+        }
+    }
+
+    #[test]
+    fn the_tos_byte_does_not_disturb_the_udp_checksum() {
+        // The TOS byte is not in the UDP pseudo-header (RFC 768), so re-marking must not change the
+        // UDP checksum — proof the in-kernel path is right to leave it alone on a DSCP rewrite.
+        let payload = b"unchanged-udp";
+        let udp_checksum = |tos: u8| {
+            let mut out = [0u8; 256];
+            let addrs = FrameAddrs { tos, ..addrs() };
+            let _ = build_udp_frame(&addrs, payload, &mut out).expect("build");
+            let udp = ETH_HDR_LEN + IPV4_HDR_LEN;
+            u16::from_be_bytes([out[udp + 6], out[udp + 7]])
+        };
+        assert_eq!(udp_checksum(0x00), udp_checksum(0xB8));
     }
 
     #[test]

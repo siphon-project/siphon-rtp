@@ -23,7 +23,7 @@ use std::time::Duration;
 use clap::parser::ValueSource;
 use clap::ArgMatches;
 use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
-use siphon_rtp_datapath::{Datapath, RxPacket};
+use siphon_rtp_datapath::{Datapath, Dscp, RxPacket};
 use siphon_rtp_hep::exporter::HepExporter;
 use siphon_rtp_turn::{tls, NoFastPath, SystemUnixClock, Turn, TurnConfig};
 use tokio::net::{TcpListener, UdpSocket};
@@ -125,6 +125,20 @@ pub struct EngineArgs {
     /// Highest media port the datapath may bind. Set together with `--port-min`.
     #[arg(long)]
     pub port_max: Option<u16>,
+
+    /// DiffServ code point (RFC 2474) stamped on outbound media — the QoS marking a network polices
+    /// voice on. Accepts a name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`.
+    ///
+    /// Defaults to **EF** (46, RFC 3246; RFC 4594 §4.1 assigns it the Telephony service class),
+    /// which is the TOS byte 184 an operator knows from Asterisk's `tos_audio` and rtpengine's
+    /// `--tos`. `BE` (or `0`) disables marking entirely, leaving the TOS byte untouched so an
+    /// upstream marker (tc, a CNI plugin) is not overwritten.
+    ///
+    /// Applies to every media egress path identically — the userspace relay's sockets, the AF_XDP TX
+    /// frames, and the in-kernel XDP_TX rewrite — so a call's marking never depends on which
+    /// datapath carried it. It does **not** mark the control, metrics, HEP, or WS-bridge sockets.
+    #[arg(long, default_value_t = Dscp::DEFAULT, value_name = "DSCP")]
+    pub media_dscp: Dscp,
 
     /// Prometheus metrics + health HTTP listen address. Off unless given. Exposes `GET /metrics`
     /// (OpenMetrics text), `GET /healthz` (liveness), and `GET /readyz` (readiness).
@@ -257,6 +271,9 @@ pub struct RunConfig {
     pub port_min: Option<u16>,
     /// Highest media port the datapath may bind (paired with [`Self::port_min`]).
     pub port_max: Option<u16>,
+    /// DiffServ code point (RFC 2474) stamped on outbound media on every egress path. Defaults to
+    /// [`Dscp::EF`]; [`Dscp::BE`] disables marking.
+    pub media_dscp: Dscp,
     /// Prometheus metrics + health HTTP listen address; `None` = off.
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap (requests/second); `0` disables.
@@ -328,6 +345,12 @@ impl RunConfig {
             default_interface: file.default_interface,
             port_min: resolve_optional(args.port_min, file.port_min),
             port_max: resolve_optional(args.port_max, file.port_max),
+            media_dscp: resolve_defaulted(
+                args.media_dscp,
+                explicit("media_dscp"),
+                file.media_dscp,
+                Dscp::DEFAULT,
+            ),
             metrics_addr: resolve_optional(args.metrics_addr, file.metrics_addr),
             max_control_rps: resolve_defaulted(
                 args.max_control_rps,
@@ -533,13 +556,16 @@ pub fn build_udp_datapath(
     let bind_ip = config
         .relay_bind_ip
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    match port_range {
+    let datapath = match port_range {
         Some((min, max)) => UdpLoopbackDatapath::with_port_range(bind_ip, min, max),
         None => match config.relay_bind_ip {
             Some(ip) => UdpLoopbackDatapath::with_bind_ip(ip),
             None => UdpLoopbackDatapath::new(),
         },
-    }
+    };
+    // The DSCP marking (RFC 2474) every media socket this backend binds carries — see
+    // `RunConfig::media_dscp`.
+    datapath.with_dscp(config.media_dscp)
 }
 
 /// Install the global `tracing` subscriber, applying the log-filter precedence: the process
@@ -993,7 +1019,7 @@ mod tests {
     use super::{resolve_port_range, resolve_x3, EngineArgs, RunConfig};
     use crate::config::{FileConfig, InterfaceConfig};
     use crate::media_fetch::MediaFetchLimits;
-    use siphon_rtp_datapath::AddressFamily;
+    use siphon_rtp_datapath::{AddressFamily, Dscp};
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
 
@@ -1008,6 +1034,63 @@ mod tests {
     /// `EngineArgs` with every flag unset, so an X3 resolution test drives the file side alone.
     fn bare_args() -> EngineArgs {
         <TestCommandLine as clap::Parser>::parse_from(["siphon-rtp"]).engine
+    }
+
+    /// Resolve a `RunConfig` from a command line + a config file, the way the binaries do.
+    fn resolve_from(argv: &[&str], file: FileConfig) -> RunConfig {
+        let matches = <TestCommandLine as clap::CommandFactory>::command()
+            .get_matches_from(argv.iter().copied());
+        let args = <TestCommandLine as clap::FromArgMatches>::from_arg_matches(&matches)
+            .expect("args parse")
+            .engine;
+        RunConfig::resolve(args, &matches, file)
+    }
+
+    #[test]
+    fn media_is_marked_expedited_forwarding_when_nothing_configures_it() {
+        // The whole point of the default: an operator who configures nothing still gets voice
+        // marked EF (RFC 3246 / RFC 4594 §4.1 Telephony) rather than best effort.
+        let config = resolve_from(&["siphon-rtp"], FileConfig::default());
+        assert_eq!(config.media_dscp, Dscp::EF);
+        assert_eq!(config.media_dscp.to_tos_byte(), 184);
+    }
+
+    #[test]
+    fn the_media_dscp_flag_accepts_a_name_or_a_raw_code_point() {
+        for (flag, expected) in [("EF", 46), ("cs3", 24), ("AF41", 34), ("BE", 0), ("46", 46)] {
+            let config = resolve_from(&["siphon-rtp", "--media-dscp", flag], FileConfig::default());
+            assert_eq!(config.media_dscp.value(), expected, "--media-dscp {flag}");
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_media_dscp_is_rejected_at_the_command_line() {
+        // 64 does not fit the 6-bit DiffServ field; a typo must be a loud startup failure, never a
+        // silently truncated marking.
+        let parsed = <TestCommandLine as clap::CommandFactory>::command().try_get_matches_from([
+            "siphon-rtp",
+            "--media-dscp",
+            "64",
+        ]);
+        assert!(parsed.is_err(), "64 is out of range for a 6-bit DSCP");
+    }
+
+    #[test]
+    fn the_config_file_sets_the_media_dscp_and_the_flag_overrides_it() {
+        let file = FileConfig {
+            media_dscp: Some(Dscp::CS3),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve_from(&["siphon-rtp"], file.clone()).media_dscp,
+            Dscp::CS3,
+            "the file value applies when the flag is absent"
+        );
+        assert_eq!(
+            resolve_from(&["siphon-rtp", "--media-dscp", "EF"], file).media_dscp,
+            Dscp::EF,
+            "an explicit flag beats the file"
+        );
     }
 
     /// A `FileConfig` naming all three lawful-interception PEM paths.
@@ -1087,6 +1170,7 @@ mod tests {
             default_interface: None,
             port_min: None,
             port_max: None,
+            media_dscp: Dscp::DEFAULT,
             metrics_addr: None,
             max_control_rps: 0,
             media_timeout_secs: 30,
