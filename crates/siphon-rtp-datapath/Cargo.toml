@@ -25,6 +25,10 @@ bytes = { workspace = true }
 dashmap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# `IP_TOS` / `IPV6_TCLASS` on a bound media socket (the DSCP marking, RFC 2474). tokio's `UdpSocket`
+# exposes no setsockopt surface for these, and socket2 borrows the fd rather than taking it, so the
+# option is set on the already-bound tokio socket without a conversion round trip.
+socket2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

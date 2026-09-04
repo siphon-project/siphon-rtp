@@ -2141,6 +2141,7 @@ dependencies = [
  "flume",
  "siphon-rtp-ebpf-common",
  "siphon-rtp-stun",
+ "socket2",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

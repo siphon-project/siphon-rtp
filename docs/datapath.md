@@ -95,6 +95,38 @@ selection, so if you are running `siphon-rtp` you are running this backend. The 
 <N>`), probing the NIC's capability and falling back to this UDP backend when the host cannot
 support XDP.
 
+## QoS marking (DSCP)
+
+Every media datagram the engine emits carries a DiffServ code point (RFC 2474 §3) in the IPv4 TOS
+byte / IPv6 Traffic Class octet, so the network can police the media plane as voice. The default is
+**EF** (46, RFC 3246 — RFC 4594 §4.1 assigns EF to the Telephony service class), which is TOS byte
+`184`: the same value operators already configure as Asterisk's `tos_audio` or rtpengine's `--tos`.
+`--media-dscp` (or `media_dscp:` in the config file) takes a name (`EF`, `CS3`, `AF41`, `VA`, `BE`,
+…) or a raw `0`–`63`.
+
+**All three egress paths mark identically**, so a call's marking never depends on which datapath
+carried it:
+
+| Path | How the byte is set |
+| --- | --- |
+| Userspace UDP relay | `IP_TOS` / `IPV6_TCLASS` on each bound media socket. A dual-stack `::` socket also gets `IP_TOS`, since a v4-mapped destination egresses through the IPv4 path. |
+| AF_XDP TX (the slow path's frame builder) | Written into the IPv4 header it constructs, before the header checksum is computed. |
+| In-kernel `XDP_TX` fast path | Rewritten in place alongside the address/port rewrite, with an RFC 1624 incremental header-checksum fixup. The value is a load-time `.rodata` constant (`MEDIA_TOS`, set by the loader), not a per-flow map field — it is node policy, so the flow ABI is unchanged. |
+
+Two deliberate choices:
+
+- **`BE` (or `0`) means "do not mark", not "mark zero".** The option is never set and the byte is
+  left as-is, so an operator marking upstream (tc, a CNI plugin, a hypervisor) is not overwritten.
+  The in-kernel path likewise skips the write, preserving the sender's byte exactly as it did before
+  marking existed.
+- **The marking is socket-level, not per-packet.** RTP, RTCP, STUN and DTLS share one socket under
+  rtcp-mux, so they all carry the media marking. Giving RTCP its own code point would need an
+  `IP_TOS` control message on every `sendmsg` — per-packet cost on the hot path for no real gain.
+
+Only media is marked. The control listeners, the metrics/health HTTP server, the HEP exporter and
+the WS bridge are left at best effort. And marking is a request, not a guarantee: an access network
+that does not trust DSCP will bleach it at its edge.
+
 ## The intended two-tier XDP model
 
 The design goal, stated plainly so the current state below is measurable against it:

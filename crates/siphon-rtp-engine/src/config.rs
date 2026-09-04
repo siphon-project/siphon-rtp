@@ -22,7 +22,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
+use siphon_rtp_datapath::Dscp;
 use thiserror::Error;
 
 /// Failure loading or parsing the `--config` TOML file. Surfaced to the operator as a clear message
@@ -64,6 +65,34 @@ pub struct InterfaceConfig {
     pub advertised: Option<IpAddr>,
 }
 
+/// Deserialize a `media_dscp` entry, accepting either a name (`EF`, `CS3`, `AF41`, `VA`, `BE`, ...)
+/// or a raw integer `0`-`63` — the same vocabulary the `--media-dscp` flag takes, so an operator
+/// writes `media_dscp: EF` or `media_dscp: 46` and gets the same marking.
+///
+/// Both forms are accepted rather than forcing the file to quote numbers: a bare `46` deserializes
+/// as an integer, `EF` as a string.
+fn deserialize_media_dscp<'de, D>(deserializer: D) -> Result<Option<Dscp>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Name(String),
+        Code(u16),
+    }
+
+    match Option::<Raw>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Raw::Name(name)) => name.parse().map(Some).map_err(de::Error::custom),
+        Some(Raw::Code(code)) => u8::try_from(code)
+            .ok()
+            .and_then(Dscp::new)
+            .map(Some)
+            .ok_or_else(|| de::Error::custom(format!("DSCP must be 0-63, got {code}"))),
+    }
+}
+
 /// The on-disk TOML schema for the daemon. Every field is optional: a config file only sets the keys
 /// it overrides, and the rest fall through to the CLI default. Field names mirror the CLI long flags
 /// (`--relay-bind-ip` → `relay_bind_ip`, …). Unknown keys are rejected so a typo'd key is a loud
@@ -100,6 +129,10 @@ pub struct FileConfig {
     pub port_min: Option<u16>,
     /// Highest media port the datapath may bind (`--port-max`). Set together with `port_min`.
     pub port_max: Option<u16>,
+    /// DiffServ code point stamped on outbound media (`--media-dscp`). A name (`EF`, `CS3`, `AF41`,
+    /// `VA`, `BE`, …) or a raw `0`-`63`; defaults to `EF`. `BE`/`0` disables marking.
+    #[serde(default, deserialize_with = "deserialize_media_dscp")]
+    pub media_dscp: Option<Dscp>,
     /// Prometheus metrics + health HTTP listen address (`--metrics-addr`).
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap, requests/second; 0 disables (`--max-control-rps`).

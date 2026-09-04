@@ -75,6 +75,7 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 | `--relay-bind-ip <IP>` | loopback | Bind relay/media sockets to this IP. The production posture; without it media only reaches loopback peers. |
 | `--advertise-ip <IP>` | bound IP | Public IP advertised in offer/answer SDP (`c=`/`m=`/`o=`/ICE candidate) instead of the bound IP, for a single-homed host behind 1:1 NAT (e.g. an Elastic IP): bind private with `--relay-bind-ip`, advertise the public IP here, same port. Emit-only (does not affect the bind, the source gate, the latch, or TURN). For a multi-network split use `[[interface]]` + the control `direction` instead. |
 | `--port-min <PORT>` / `--port-max <PORT>` | OS-ephemeral | Bounded media port range (rtpengine `port-min`/`port-max` parity). Both-or-neither; a half-set or inverted range is a fatal startup error. Required for HA takeover. |
+| `--media-dscp <DSCP>` | `EF` | DiffServ marking (RFC 2474) on outbound media. A name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`. `EF` is TOS byte 184 — Asterisk's `tos_audio`, rtpengine's `--tos`. `BE`/`0` disables marking and leaves the TOS byte untouched. Applies to every egress path (UDP sockets, AF_XDP TX, in-kernel XDP_TX); never to the control, metrics, HEP or WS sockets. |
 | `--metrics-addr <ADDR>` | off | Prometheus + health HTTP: `GET /metrics`, `GET /healthz`, `GET /readyz`. |
 | `--max-control-rps <N>` | `200` | Per-connection control request cap (requests/second). `0` disables the limit. |
 | `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). |
@@ -163,6 +164,14 @@ Why each of these:
   of 30000-40000 comfortably covers ~2,500 calls at the worst case. A deterministic range is also
   the prerequisite for warm-standby HA takeover
   ([Scaling, clustering & HA](scaling-and-ha.md#warm-standby-ha)).
+- **`--media-dscp`** is what makes the network treat the media as voice. It defaults to `EF`
+  (DSCP 46, RFC 3246 — RFC 4594 §4.1 assigns it the Telephony service class), which is the TOS byte
+  184 you already set as `tos_audio` in Asterisk or `tos` in rtpengine, so a node that configures
+  nothing still marks correctly. Set it to `BE` only where something upstream marks for you — that
+  leaves the TOS byte untouched rather than writing an explicit zero over an existing marking. Note
+  that marking is a *request*: an access network that does not trust or honour DSCP will bleach it
+  at its edge, and marking alone does not create capacity. It is the media plane only; the control,
+  metrics, HEP and WS-bridge sockets are never marked.
 - **`--metrics-addr`** on the management interface, never the public one. It serves the readiness
   probe your dispatcher and orchestrator need.
 - **Control listeners stay on a trusted network.** Set `SIPHON_RTP_CONTROL_SECRET` for the JSON

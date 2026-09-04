@@ -7,7 +7,7 @@
 //! or NIC, so it is the CI datapath and the behavioural reference the XDP backend must match.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
@@ -15,6 +15,7 @@ use dashmap::{DashMap, DashSet};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
+use crate::dscp::Dscp;
 use crate::{
     classify, AddressFamily, Datapath, DatapathError, Endpoint, EndpointId, EndpointStats,
     FlowAction, IceAgentMode, IceConfig, IceDatapathEvent, LatchPolicy, ObservedRtcp, PacketClass,
@@ -191,6 +192,10 @@ struct Inner {
     /// `[min, max]` window (firewallable; re-bindable on a standby); `None` uses OS `:0` ephemeral
     /// ports (the default / CI posture).
     ports: Option<PortAllocator>,
+    /// The DSCP (RFC 2474) every media socket is marked with, as a raw 6-bit code point. Read once
+    /// per bind (never on the per-packet path), so an atomic costs nothing and lets
+    /// [`UdpLoopbackDatapath::with_dscp`] configure the backend after the `Arc` exists.
+    dscp: AtomicU8,
     endpoints: DashMap<EndpointId, EndpointEntry>,
     flows: DashMap<EndpointId, FlowAction>,
     /// Per-endpoint latched peer source (address + RTP SSRC). A packet from a new source re-latches
@@ -506,6 +511,25 @@ impl UdpLoopbackDatapath {
         Self::build(bind_ip, usize::MAX, Some((port_min, port_max)))
     }
 
+    /// Set the DSCP (RFC 2474) applied to every media socket this backend binds — the QoS marking
+    /// the network polices voice on. Defaults to [`Dscp::DEFAULT`] (EF, RFC 3246 / RFC 4594 §4.1
+    /// Telephony); [`Dscp::BE`] disables marking, leaving the TOS byte untouched.
+    ///
+    /// Applies to sockets bound *after* this call, which for the daemon is all of them — it is
+    /// configured before the first `alloc_endpoint`.
+    #[must_use]
+    pub fn with_dscp(self, dscp: Dscp) -> Self {
+        self.inner.dscp.store(dscp.value(), Ordering::Relaxed);
+        self
+    }
+
+    /// The DSCP currently applied to newly bound media sockets.
+    #[must_use]
+    pub fn dscp(&self) -> Dscp {
+        // The field only ever holds a value taken from a `Dscp`, so it is always in range.
+        Dscp::new(self.inner.dscp.load(Ordering::Relaxed)).unwrap_or(Dscp::BE)
+    }
+
     fn build(bind_ip: IpAddr, max_endpoints: usize, port_range: Option<(u16, u16)>) -> Self {
         let (redirect_tx, redirect_rx) = flume::unbounded();
         let (observe_tx, observe_rx) = flume::bounded(256);
@@ -516,6 +540,7 @@ impl UdpLoopbackDatapath {
                 live: AtomicUsize::new(0),
                 max_endpoints,
                 bind_ip,
+                dscp: AtomicU8::new(Dscp::DEFAULT.value()),
                 ports: port_range.map(|(min, max)| PortAllocator::new(min, max)),
                 endpoints: DashMap::new(),
                 flows: DashMap::new(),
@@ -568,9 +593,10 @@ impl UdpLoopbackDatapath {
             });
         }
         // Bind from the configured port range, or an OS-ephemeral `:0` port when no range is set.
+        let dscp = self.dscp();
         let bound = match &self.inner.ports {
-            Some(pool) => Self::bind_in_range(bind_ip, pool).await,
-            None => Self::bind_ephemeral(bind_ip, 0).await,
+            Some(pool) => Self::bind_in_range(bind_ip, pool, dscp).await,
+            None => Self::bind_ephemeral(bind_ip, 0, dscp).await,
         };
         let (socket, local_addr) = match bound {
             Ok(pair) => pair,
@@ -619,7 +645,7 @@ impl UdpLoopbackDatapath {
                 return Err(DatapathError::PortUnavailable { port });
             }
         }
-        match Self::bind_ephemeral(bind_ip, port).await {
+        match Self::bind_ephemeral(bind_ip, port, self.dscp()).await {
             Ok((socket, local_addr)) => Ok(self.register_socket(socket, local_addr)),
             Err(error) => {
                 if let Some(pool) = &self.inner.ports {
@@ -631,16 +657,18 @@ impl UdpLoopbackDatapath {
         }
     }
 
-    /// Bind a UDP socket on `bind_ip:port` (`port == 0` asks the OS for an ephemeral port) and read
-    /// back its local address.
+    /// Bind a UDP socket on `bind_ip:port` (`port == 0` asks the OS for an ephemeral port), apply
+    /// the media DSCP marking, and read back its local address.
     async fn bind_ephemeral(
         bind_ip: IpAddr,
         port: u16,
+        dscp: Dscp,
     ) -> Result<(UdpSocket, SocketAddr), DatapathError> {
         let socket = UdpSocket::bind((bind_ip, port))
             .await
             .map_err(DatapathError::Bind)?;
         let local_addr = socket.local_addr().map_err(DatapathError::Bind)?;
+        apply_dscp(&socket, local_addr, dscp);
         Ok((socket, local_addr))
     }
 
@@ -650,12 +678,13 @@ impl UdpLoopbackDatapath {
     async fn bind_in_range(
         bind_ip: IpAddr,
         pool: &PortAllocator,
+        dscp: Dscp,
     ) -> Result<(UdpSocket, SocketAddr), DatapathError> {
         for _ in 0..pool.span() {
             let Some(port) = pool.reserve_next() else {
                 return Err(DatapathError::PoolExhausted { limit: pool.span() });
             };
-            match Self::bind_ephemeral(bind_ip, port).await {
+            match Self::bind_ephemeral(bind_ip, port, dscp).await {
                 Ok(bound) => return Ok(bound),
                 Err(_) => pool.release(port),
             }
@@ -683,6 +712,47 @@ impl UdpLoopbackDatapath {
             },
         );
         Endpoint { id, local_addr }
+    }
+}
+
+/// Mark a bound media socket with `dscp` (RFC 2474) so the network can police it as voice.
+///
+/// The wire field is the IPv4 TOS byte / IPv6 Traffic Class octet, written as `DSCP << 2` with the
+/// ECN bits (RFC 3168) left clear — see [`Dscp::to_tos_byte`]. [`Dscp::BE`] is "do not mark": the
+/// option is not set at all, so an operator marking upstream (tc, a CNI plugin) is not overwritten
+/// with an explicit zero.
+///
+/// A socket is marked for the family it is bound to. A dual-stack `::` socket also gets `IP_TOS`,
+/// because a datagram sent to a v4-mapped destination leaves through the IPv4 output path and takes
+/// the IPv4 option; that call is best-effort (some kernels refuse `IPPROTO_IP` options on an
+/// `AF_INET6` socket) and its failure is not itself worth a warning.
+///
+/// **Failure is never fatal.** A sandbox that forbids the option must not take the call down — QoS
+/// marking is advisory, so this logs and carries on rather than failing the bind.
+fn apply_dscp(socket: &UdpSocket, local_addr: SocketAddr, dscp: Dscp) {
+    if !dscp.is_marked() {
+        return;
+    }
+    let tos = u32::from(dscp.to_tos_byte());
+    let socket = socket2::SockRef::from(socket);
+    let outcome = match local_addr {
+        SocketAddr::V4(_) => socket.set_tos_v4(tos),
+        SocketAddr::V6(_) => {
+            let result = socket.set_tclass_v6(tos);
+            // Dual-stack: v4-mapped destinations egress via IPv4 and read IP_TOS, not IPV6_TCLASS.
+            let _ = socket.set_tos_v4(tos);
+            result
+        }
+    };
+    if let Err(error) = outcome {
+        tracing::warn!(
+            target: "datapath",
+            %local_addr,
+            %dscp,
+            tos,
+            %error,
+            "could not set the media DSCP marking on the endpoint socket; media flows unmarked"
+        );
     }
 }
 
@@ -1166,6 +1236,108 @@ mod tests {
             .expect("bind phone");
         let addr = socket.local_addr().expect("phone addr");
         (socket, addr)
+    }
+
+    /// Read back the kernel's actual TOS byte for an endpoint this backend bound — proof the
+    /// marking reached the socket, not just our own copy of the setting.
+    fn readback_tos(datapath: &UdpLoopbackDatapath, endpoint: EndpointId) -> u32 {
+        let entry = datapath
+            .inner
+            .endpoints
+            .get(&endpoint)
+            .expect("endpoint is registered");
+        socket2::SockRef::from(entry.socket.as_ref())
+            .tos_v4()
+            .expect("getsockopt(IP_TOS)")
+    }
+
+    #[tokio::test]
+    async fn media_sockets_are_marked_expedited_forwarding_by_default() {
+        let datapath = UdpLoopbackDatapath::new();
+        assert_eq!(datapath.dscp(), Dscp::EF);
+        let endpoint = datapath.alloc_endpoint().await.expect("alloc");
+        // DSCP 46 << 2 == 184, the same TOS byte Asterisk writes for `tos_audio=ef`.
+        assert_eq!(readback_tos(&datapath, endpoint.id), 184);
+    }
+
+    #[tokio::test]
+    async fn with_dscp_overrides_the_default_marking() {
+        let datapath = UdpLoopbackDatapath::new().with_dscp(Dscp::CS3);
+        let endpoint = datapath.alloc_endpoint().await.expect("alloc");
+        assert_eq!(readback_tos(&datapath, endpoint.id), 96);
+    }
+
+    #[tokio::test]
+    async fn best_effort_leaves_the_tos_byte_untouched() {
+        // BE means "do not mark" — the option is never set, so the socket keeps the kernel default
+        // (0) rather than being explicitly overwritten. An operator marking upstream survives.
+        let datapath = UdpLoopbackDatapath::new().with_dscp(Dscp::BE);
+        let endpoint = datapath.alloc_endpoint().await.expect("alloc");
+        assert_eq!(readback_tos(&datapath, endpoint.id), 0);
+    }
+
+    #[tokio::test]
+    async fn a_port_range_endpoint_is_marked_too() {
+        // The HA/firewallable bind path is a different branch from the ephemeral one; both mark.
+        let datapath =
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 41000, 41010);
+        let endpoint = datapath.alloc_endpoint().await.expect("alloc");
+        assert_eq!(readback_tos(&datapath, endpoint.id), 184);
+    }
+
+    #[tokio::test]
+    async fn a_restored_specific_port_endpoint_is_marked_too() {
+        // `alloc_specific` is the HA-takeover bind; a standby's media must not lose its marking.
+        let datapath =
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 41100, 41110);
+        let endpoint = datapath
+            .alloc_specific(AddressFamily::V4, 41105)
+            .await
+            .expect("alloc specific");
+        assert_eq!(endpoint.local_addr.port(), 41105);
+        assert_eq!(readback_tos(&datapath, endpoint.id), 184);
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_endpoint_is_marked_via_the_traffic_class_octet() {
+        let datapath = UdpLoopbackDatapath::with_bind_ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let endpoint = datapath
+            .alloc_endpoint_for(AddressFamily::V6)
+            .await
+            .expect("alloc v6");
+        let entry = datapath
+            .inner
+            .endpoints
+            .get(&endpoint.id)
+            .expect("endpoint is registered");
+        let tclass = socket2::SockRef::from(entry.socket.as_ref())
+            .tclass_v6()
+            .expect("getsockopt(IPV6_TCLASS)");
+        assert_eq!(tclass, 184);
+    }
+
+    #[tokio::test]
+    async fn marking_does_not_disturb_the_relay_path() {
+        // The marking is a socket option, not a packet rewrite: a marked endpoint still relays
+        // byte-for-byte. Guards against a future "mark by rewriting the datagram" regression.
+        let datapath = UdpLoopbackDatapath::new();
+        let left = datapath.alloc_endpoint().await.expect("alloc left");
+        let right = datapath.alloc_endpoint().await.expect("alloc right");
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        datapath
+            .install_flow(
+                left.id,
+                FlowAction::Forward(ForwardRule::signalled(right.id, Some(addr_b), addr_a.ip())),
+            )
+            .expect("install flow");
+        let packet = [0x80u8, 0x00, 0x12, 0x34, 0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4];
+        phone_a
+            .send_to(&packet, left.local_addr)
+            .await
+            .expect("send");
+        let (received, _from) = recv(&phone_b).await;
+        assert_eq!(received, packet);
     }
 
     async fn recv(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {

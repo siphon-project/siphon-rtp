@@ -86,7 +86,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 
 use siphon_rtp_datapath::{
-    classify, Datapath, DatapathError, Endpoint, EndpointId, EndpointStats,
+    classify, Datapath, DatapathError, Dscp, Endpoint, EndpointId, EndpointStats,
     FlowAction as DpFlowAction, ForwardRule, IceAgentMode, IceConfig, IceDatapathEvent,
     ObservedRtcp, PacketClass, RxPacket, SourceFilter,
 };
@@ -168,16 +168,27 @@ impl AttachMode {
 pub struct Loader {
     ebpf: Ebpf,
     interface: String,
+    dscp: Dscp,
 }
 
 impl Loader {
-    /// Load the embedded XDP program and attach it to `interface` in `mode`.
-    pub fn load(interface: &str, mode: AttachMode) -> Result<Self, XdpError> {
-        let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
-            env!("OUT_DIR"),
-            "/siphon-rtp-ebpf"
-        )))
-        .map_err(|error| XdpError::Load(error.to_string()))?;
+    /// Load the embedded XDP program and attach it to `interface` in `mode`, marking every packet
+    /// the in-kernel fast path forwards with `dscp` (RFC 2474).
+    ///
+    /// The marking is a **load-time constant**, not a per-flow map field: it is node policy, so it
+    /// is stamped into the program's `.rodata` via `MEDIA_TOS` before the verifier sees it. The
+    /// kernel then folds the DSCP write into the rewrite it already does, and a
+    /// [`Dscp::BE`] configuration compiles down to a byte the program compares equal and skips.
+    pub fn load(interface: &str, mode: AttachMode, dscp: Dscp) -> Result<Self, XdpError> {
+        let mut ebpf = aya::EbpfLoader::new()
+            // `must_exist = false`: a program object built before this global existed still loads,
+            // it simply forwards unmarked — the same posture the datapath had before marking.
+            .set_global("MEDIA_TOS", &dscp.to_tos_byte(), false)
+            .load(aya::include_bytes_aligned!(concat!(
+                env!("OUT_DIR"),
+                "/siphon-rtp-ebpf"
+            )))
+            .map_err(|error| XdpError::Load(error.to_string()))?;
 
         let program: &mut Xdp = ebpf
             .program_mut("siphon_rtp_xdp")
@@ -197,6 +208,7 @@ impl Loader {
         Ok(Self {
             ebpf,
             interface: interface.to_string(),
+            dscp,
         })
     }
 
@@ -204,6 +216,13 @@ impl Loader {
     #[must_use]
     pub fn interface(&self) -> &str {
         &self.interface
+    }
+
+    /// The DSCP the loaded program marks forwarded media with. [`XdpDatapath`] reads it back from
+    /// here so the in-kernel XDP_TX path and the userspace AF_XDP TX path cannot drift apart.
+    #[must_use]
+    pub fn dscp(&self) -> Dscp {
+        self.dscp
     }
 
     /// Register an AF_XDP socket fd into the `XSKS` map at `queue` so the classifier's
@@ -474,6 +493,10 @@ impl XdpDatapath {
         local_ip: Ipv4Addr,
         config: xsk::XskConfig,
     ) -> Result<Self, XdpError> {
+        // The marking the loader stamped into the kernel program, so the AF_XDP TX frames this
+        // backend builds in userspace carry the identical TOS byte (RFC 2474) — one call must not
+        // be marked differently depending on whether it took the in-kernel or the slow path.
+        let tos = loader.dscp().to_tos_byte();
         let ifindex = xsk::ifindex(interface);
         let socket = xsk::XskSocket::new(ifindex, queue, &config)?;
         loader.register_xsk(queue, socket.as_raw_fd())?;
@@ -549,6 +572,7 @@ impl XdpDatapath {
                         last_check: ice_last_check,
                     },
                     thread_loader,
+                    tos,
                 );
             })
             .map_err(|error| XdpError::Xsk(xsk::XskError::Socket(error)))?;
@@ -1043,6 +1067,9 @@ fn datapath_loop(
     observe: flume::Sender<ObservedRtcp>,
     ice: IceDemux,
     loader: Arc<Mutex<Loader>>,
+    // TOS byte (DSCP << 2, RFC 2474) stamped on every frame this thread builds — see
+    // `headers::FrameAddrs::tos`.
+    tos: u8,
 ) {
     // Reused across bursts so answering a check allocates nothing per packet (the responses
     // themselves are built by the STUN encoder).
@@ -1117,7 +1144,7 @@ fn datapath_loop(
                 data: response,
                 done,
             };
-            if let Err(error) = build_and_push(&mut socket, &request, &resolver) {
+            if let Err(error) = build_and_push(&mut socket, &request, &resolver, tos) {
                 tracing::debug!(target: "siphon_rtp::datapath", ?endpoint, %error, "sending the STUN response failed");
             }
         }
@@ -1144,7 +1171,7 @@ fn datapath_loop(
         // Serve any pending TX requests (build the frame, push, kick).
         let mut transmitted = false;
         while let Ok(request) = tx_rx.try_recv() {
-            let result = build_and_push(&mut socket, &request, &resolver);
+            let result = build_and_push(&mut socket, &request, &resolver, tos);
             transmitted = transmitted || result.as_ref().map(|n| *n > 0).unwrap_or(false);
             let _ = request.done.send(result);
         }
@@ -1163,7 +1190,7 @@ fn datapath_loop(
             resolver.reap();
             match tx_rx.recv_timeout(std::time::Duration::from_millis(1)) {
                 Ok(request) => {
-                    let result = build_and_push(&mut socket, &request, &resolver);
+                    let result = build_and_push(&mut socket, &request, &resolver, tos);
                     let _ = request.done.send(result);
                     let _ = socket.tx_kick();
                 }
@@ -1183,6 +1210,7 @@ fn build_and_push(
     socket: &mut xsk::XskSocket,
     request: &TxRequest,
     resolver: &NeighborResolver,
+    tos: u8,
 ) -> Result<usize, DatapathError> {
     let (SocketAddr::V4(src), SocketAddr::V4(dst)) = (request.source, request.destination) else {
         // IPv4-only datapath; a v6 transport cannot be framed by the current ABI.
@@ -1209,6 +1237,7 @@ fn build_and_push(
         dst_ip: *dst.ip(),
         src_port: src.port(),
         dst_port: dst.port(),
+        tos,
     };
     let mut frame = vec![0u8; headers::TOTAL_HDR_LEN + request.data.len()];
     let len = headers::build_udp_frame(&addrs, &request.data, &mut frame).ok_or_else(|| {
@@ -1533,7 +1562,7 @@ impl Datapath for XdpDatapath {
 /// probe (CAP_BPF/CAP_NET_ADMIN + kernel ≥ 5.10) can replace this once the loader is hot-pathed.
 #[must_use]
 pub fn xdp_supported() -> bool {
-    Loader::load("lo", AttachMode::Skb).is_ok()
+    Loader::load("lo", AttachMode::Skb, Dscp::DEFAULT).is_ok()
 }
 
 #[cfg(test)]

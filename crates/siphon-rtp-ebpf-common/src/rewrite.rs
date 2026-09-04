@@ -80,6 +80,34 @@ pub fn ipv4_checksum_after_addr_rewrite(
     !fold16(sum)
 }
 
+/// The RFC 1624 incremental IPv4 header checksum after rewriting the **TOS byte** — the DiffServ
+/// code point (RFC 2474 §3) the relay stamps on media it forwards, so the in-kernel fast path marks
+/// identically to the userspace one.
+///
+/// The TOS byte shares a 16-bit word with the version/IHL byte at header offset 0, so the caller
+/// passes `version_ihl` (unchanged) to reassemble that word; this function owns the assembly so a
+/// caller cannot get the byte order wrong.
+///
+/// Composes with [`ipv4_checksum_after_addr_rewrite`]: feeding this the checksum that returned
+/// gives the same result as one combined RFC 1624 sum, because `!fold16` and the leading `!` of the
+/// next step cancel. The proptest below pins that composition against a full RFC 1071 recompute.
+#[inline(always)]
+#[must_use]
+pub fn ipv4_checksum_after_tos_rewrite(
+    old_checksum: u16,
+    version_ihl: u8,
+    old_tos: u8,
+    new_tos: u8,
+) -> u16 {
+    if old_tos == new_tos {
+        return old_checksum;
+    }
+    let word = |tos: u8| (u16::from(version_ihl) << 8) | u16::from(tos);
+    let mut sum = u32::from(!old_checksum);
+    accumulate(&mut sum, word(old_tos), word(new_tos));
+    !fold16(sum)
+}
+
 /// The RFC 1624 incremental **UDP** checksum after rewriting the source/destination address (the
 /// UDP pseudo-header, RFC 768) and the source/destination port (the UDP header). All addresses are
 /// host-order `u32`; ports and checksums are host-order `u16`.
@@ -321,8 +349,21 @@ mod tests {
 
     /// Build a 20-byte IPv4 header (checksum field zeroed) with the given fields + addresses.
     fn ipv4_header(total_len: u16, id: u16, ttl: u8, src: u32, dst: u32) -> [u8; 20] {
+        ipv4_header_with_tos(total_len, id, ttl, 0, src, dst)
+    }
+
+    /// As [`ipv4_header`], with an explicit TOS byte (RFC 2474 DSCP ‖ RFC 3168 ECN).
+    fn ipv4_header_with_tos(
+        total_len: u16,
+        id: u16,
+        ttl: u8,
+        tos: u8,
+        src: u32,
+        dst: u32,
+    ) -> [u8; 20] {
         let mut header = [0u8; 20];
         header[0] = 0x45; // version 4, IHL 5
+        header[1] = tos;
         header[2..4].copy_from_slice(&total_len.to_be_bytes());
         header[4..6].copy_from_slice(&id.to_be_bytes());
         header[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags=DF
@@ -332,6 +373,34 @@ mod tests {
         header[12..16].copy_from_slice(&src.to_be_bytes());
         header[16..20].copy_from_slice(&dst.to_be_bytes());
         header
+    }
+
+    #[test]
+    fn an_unchanged_tos_leaves_the_checksum_alone() {
+        // The common case on an already-marked flow: no write, no fixup, no cost.
+        let header = ipv4_header_with_tos(200, 7, 64, 0xB8, 0xC000_0201, 0xC000_0202);
+        let checksum = full_ipv4_checksum(&header);
+        assert_eq!(
+            ipv4_checksum_after_tos_rewrite(checksum, 0x45, 0xB8, 0xB8),
+            checksum
+        );
+    }
+
+    #[test]
+    fn marking_an_unmarked_header_expedited_forwarding_keeps_it_valid() {
+        // DSCP 46 (EF, RFC 3246) << 2 == 0xB8 — the byte the relay stamps on media.
+        let unmarked = ipv4_header_with_tos(200, 7, 64, 0x00, 0xC000_0201, 0xC000_0202);
+        let old_checksum = full_ipv4_checksum(&unmarked);
+        let marked = ipv4_header_with_tos(200, 7, 64, 0xB8, 0xC000_0201, 0xC000_0202);
+
+        let got = ipv4_checksum_after_tos_rewrite(old_checksum, 0x45, 0x00, 0xB8);
+        assert_eq!(got, full_ipv4_checksum(&marked));
+
+        // And the marked header with that checksum written in sums to zero (RFC 1071 §1: a valid
+        // header's one's-complement sum including the checksum field is 0xFFFF -> ~ == 0).
+        let mut verified = marked;
+        verified[10..12].copy_from_slice(&got.to_be_bytes());
+        assert_eq!(!fold16(sum_be16(&verified)), 0);
     }
 
     #[test]
@@ -387,6 +456,58 @@ mod tests {
             let got = ipv4_checksum_after_addr_rewrite(
                 old_checksum, old_src, new_src, old_dst, new_dst,
             );
+            prop_assert_eq!(got, expected);
+        }
+
+        /// The RFC 1624 incremental IPv4 checksum after a TOS rewrite equals a full RFC 1071
+        /// recompute over the re-marked header — the in-kernel DSCP stamp (RFC 2474) must leave the
+        /// header checksum valid or every marked packet is dropped by the next hop.
+        #[test]
+        fn ipv4_tos_incremental_equals_full_recompute(
+            total_len in any::<u16>(),
+            id in any::<u16>(),
+            ttl in any::<u8>(),
+            old_tos in any::<u8>(),
+            new_tos in any::<u8>(),
+            src in any::<u32>(),
+            dst in any::<u32>(),
+        ) {
+            let old_header = ipv4_header_with_tos(total_len, id, ttl, old_tos, src, dst);
+            let old_checksum = full_ipv4_checksum(&old_header);
+
+            let new_header = ipv4_header_with_tos(total_len, id, ttl, new_tos, src, dst);
+            let expected = full_ipv4_checksum(&new_header);
+
+            let got = ipv4_checksum_after_tos_rewrite(old_checksum, 0x45, old_tos, new_tos);
+            prop_assert_eq!(got, expected);
+        }
+
+        /// The address fixup and the TOS fixup **compose**: the kernel forward path applies both to
+        /// one header, so chaining them must equal a full recompute of the fully-rewritten header.
+        #[test]
+        fn ipv4_addr_then_tos_composes_to_the_full_recompute(
+            total_len in any::<u16>(),
+            id in any::<u16>(),
+            ttl in any::<u8>(),
+            old_tos in any::<u8>(),
+            new_tos in any::<u8>(),
+            old_src in any::<u32>(),
+            new_src in any::<u32>(),
+            old_dst in any::<u32>(),
+            new_dst in any::<u32>(),
+        ) {
+            let old_header =
+                ipv4_header_with_tos(total_len, id, ttl, old_tos, old_src, old_dst);
+            let old_checksum = full_ipv4_checksum(&old_header);
+
+            let new_header =
+                ipv4_header_with_tos(total_len, id, ttl, new_tos, new_src, new_dst);
+            let expected = full_ipv4_checksum(&new_header);
+
+            let after_addrs = ipv4_checksum_after_addr_rewrite(
+                old_checksum, old_src, new_src, old_dst, new_dst,
+            );
+            let got = ipv4_checksum_after_tos_rewrite(after_addrs, 0x45, old_tos, new_tos);
             prop_assert_eq!(got, expected);
         }
 

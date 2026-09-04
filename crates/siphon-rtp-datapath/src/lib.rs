@@ -19,7 +19,10 @@ use std::net::{IpAddr, SocketAddr};
 
 use bytes::Bytes;
 
+pub mod dscp;
 pub mod udp;
+
+pub use dscp::{Dscp, DscpParseError};
 
 /// Opaque handle to an allocated endpoint (one bound socket / media port).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
