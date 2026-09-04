@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-09-04
+
 The engine marked nothing. Every media datagram it emitted left at DSCP 0 — best effort — on the
 userspace relay and on the AF_XDP TX path, while the in-kernel `XDP_TX` path passed through whatever
 byte the sending UA set, so the same call could be marked differently depending on which datapath
