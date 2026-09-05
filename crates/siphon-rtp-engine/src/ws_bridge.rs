@@ -148,6 +148,32 @@ impl WsSecureLeg {
     }
 }
 
+/// Mark a media endpoint as having just received accepted media, so the engine's idle sweep does not
+/// reap a call that is plainly alive (docs/security-and-nat.md §4 layer 6). Maps to
+/// [`Datapath::note_activity`](siphon_rtp_datapath::Datapath::note_activity).
+///
+/// A narrow object-safe trait rather than a `D: Datapath` parameter on the registry, for two reasons
+/// that both bite: [`Datapath`](siphon_rtp_datapath::Datapath) returns `impl Future` from several
+/// methods and so cannot be made into a trait object, and this registry is shared, non-generic state
+/// that the single redirect dispatcher routes into by [`EndpointId`].
+///
+/// It has to live on the route because a takeover leg is the one userspace `Redirect` consumer with
+/// no per-call actor to hang it off. The media pipeline, the conference room and the text pipeline
+/// each stamp from an actor that owns a datapath; a takeover leg's bridge task lives in
+/// `siphon-rtp-media` and never sees one, so without this the endpoint's `last_seen` stays at the
+/// call's `created_tick` forever — the `Redirect` arm of the datapath deliberately does not stamp it
+/// — and the sweep tears the call down mid-conversation however much audio is arriving.
+pub trait MediaActivity: Send + Sync {
+    /// Stamp `endpoint` as having just received accepted media.
+    fn stamp(&self, endpoint: EndpointId);
+}
+
+impl<D: siphon_rtp_datapath::Datapath> MediaActivity for D {
+    fn stamp(&self, endpoint: EndpointId) {
+        siphon_rtp_datapath::Datapath::note_activity(self, endpoint);
+    }
+}
+
 /// Where one takeover leg's downlink is sent, plus the symmetric-RTP latch that steers it.
 ///
 /// One object rather than two fields because the destination and the thing that moves it are a
@@ -276,6 +302,8 @@ struct WsRoute {
     /// Where the bridge's rendered downlink is sent, and the latch that steers it — moved by this
     /// leg's own accepted media (symmetric RTP) or, on an ICE leg, by the agent's selection.
     egress: Arc<WsEgress>,
+    /// Stamps the endpoint's liveness for the engine's idle sweep on each accepted packet.
+    activity: Arc<dyn MediaActivity>,
 }
 
 /// The per-leg state a **re-point** ([`Command::AttachWsBridge`](siphon_rtp_proto::Command) on a
@@ -320,6 +348,9 @@ pub struct WsCallPlan {
     pub secure: Option<Arc<WsSecureLeg>>,
     /// Where the drain task sends the rendered downlink, shared so the latch and ICE can re-point it.
     pub egress: Arc<WsEgress>,
+    /// How this leg reports liveness to the engine's idle sweep — the engine's datapath. Without it a
+    /// takeover call is reaped at the media timeout however much audio it is receiving.
+    pub activity: Arc<dyn MediaActivity>,
     /// The bridge's RTP-in mailbox.
     pub rtp_in: flume::Sender<Bytes>,
     /// The bridge task (`run_bridge` over the dialed WS connection).
@@ -364,6 +395,7 @@ impl WsRegistry {
                 rtp_in: plan.rtp_in,
                 secure: plan.secure,
                 egress: plan.egress,
+                activity: plan.activity,
             },
         );
         self.calls.insert(
@@ -465,6 +497,17 @@ impl WsRegistry {
                 None => return,
             },
         };
+        // The packet is accepted: it cleared the source gate and, on a secure leg, SRTP
+        // authentication. Stamp the endpoint's liveness for the engine's idle sweep
+        // (docs/security-and-nat.md §4 layer 6) — the `Redirect` arm never touches the datapath's
+        // `last_seen`, so without this a takeover call is reaped at the media timeout no matter how
+        // much audio is arriving, which is what every other userspace `Redirect` consumer avoids by
+        // stamping from its per-call actor.
+        //
+        // Deliberately after both checks and before the mailbox: an off-source or forged packet must
+        // not be able to hold a dead call open, and a bridge whose mailbox is momentarily full is
+        // still a live call.
+        route.activity.stamp(packet.endpoint);
         // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3): aim the downlink at the source
         // this leg's media actually arrives from. Offered after the gate above and after SRTP auth,
         // so only an authentic packet from an accepted source can move it, and skipped entirely on an
@@ -548,6 +591,38 @@ mod tests {
         EndpointId(id)
     }
 
+    /// Records every liveness stamp, so a test can assert both that a live leg reports itself and
+    /// that a rejected packet reports nothing.
+    #[derive(Default)]
+    struct CountingActivity {
+        stamps: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingActivity {
+        fn count(&self) -> usize {
+            self.stamps.load(Ordering::SeqCst)
+        }
+    }
+
+    impl MediaActivity for CountingActivity {
+        fn stamp(&self, _endpoint: EndpointId) {
+            self.stamps.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A plan wired to a counting sink, handing back the sink so the test can read it.
+    fn plan_with_activity(
+        call_id: &str,
+        endpoint_a: EndpointId,
+        accepted_source: SourceFilter,
+        rtp_in: flume::Sender<Bytes>,
+    ) -> (WsCallPlan, Arc<CountingActivity>) {
+        let activity = Arc::new(CountingActivity::default());
+        let mut registration = plan(call_id, endpoint_a, accepted_source, rtp_in);
+        registration.activity = activity.clone();
+        (registration, activity)
+    }
+
     fn rx(endpoint_id: u64, source: &str, data: &[u8]) -> RxPacket {
         RxPacket {
             endpoint: endpoint(endpoint_id),
@@ -584,6 +659,7 @@ mod tests {
             ice_pending: false,
             secure: None,
             egress: Arc::new(WsEgress::new(address("127.0.0.2:5000"), false)),
+            activity: Arc::new(CountingActivity::default()),
             rtp_in,
             bridge_task,
             drain_task,
@@ -744,6 +820,7 @@ mod tests {
             ice_pending: true,
             secure: Some(secure.clone()),
             egress: egress.clone(),
+            activity: Arc::new(CountingActivity::default()),
             rtp_in: rtp_in_tx,
             bridge_task,
             drain_task,
@@ -864,6 +941,102 @@ mod tests {
         );
 
         let _ = registry.deregister("dtls");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_packet_stamps_the_leg_as_live_for_the_idle_sweep() {
+        // R7: the engine's sweep reads `Datapath::last_activity`, and the `Redirect` arm never sets
+        // it — so a takeover leg that does not stamp here reports as idle from the moment it is
+        // created and is reaped mid-conversation, however much audio is arriving.
+        let registry = WsRegistry::default();
+        let (rtp_in_tx, rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (registration, activity) = plan_with_activity(
+            "live",
+            endpoint(1),
+            SourceFilter::Exact(Ipv4Addr::new(127, 0, 0, 2).into()),
+            rtp_in_tx,
+        );
+        registry.register(registration);
+
+        registry.dispatch(rx(1, "127.0.0.2:41000", &rtp_packet(1, 0x0A0A_0A0A)));
+        assert_eq!(activity.count(), 1, "an accepted packet marks the leg live");
+        assert!(rtp_in_rx.try_recv().is_ok(), "and still reaches the bridge");
+
+        let _ = registry.deregister("live");
+    }
+
+    #[tokio::test]
+    async fn a_packet_the_leg_rejects_never_marks_it_live() {
+        // The other half, and the one that matters for security: liveness is only claimed for media
+        // the leg actually accepted, so neither an off-source flood nor a forged packet on a secure
+        // leg can hold a dead call open past its media timeout.
+        let registry = WsRegistry::default();
+
+        // Off-source, on a plaintext leg.
+        let (rtp_in_tx, _rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (registration, gated) = plan_with_activity(
+            "gated",
+            endpoint(1),
+            SourceFilter::Exact(Ipv4Addr::new(127, 0, 0, 2).into()),
+            rtp_in_tx,
+        );
+        registry.register(registration);
+        registry.dispatch(rx(1, "198.51.100.7:41000", &rtp_packet(1, 0x0A0A_0A0A)));
+        assert_eq!(gated.count(), 0, "an off-source packet is not liveness");
+
+        // Before an ICE agent has selected a pair, nothing crosses the leg — including this.
+        let (rtp_in_tx, _rtp_in_rx2) = flume::unbounded::<Bytes>();
+        let (mut registration, pending) =
+            plan_with_activity("ice", endpoint(2), SourceFilter::Any, rtp_in_tx);
+        registration.ice_pending = true;
+        registry.register(registration);
+        registry.dispatch(rx(2, "127.0.0.2:41000", &rtp_packet(1, 0x0A0A_0A0A)));
+        assert_eq!(pending.count(), 0, "nothing crosses an unselected ICE leg");
+
+        // A forged packet on a secure leg fails RFC 3711 §3.3 and must not count either.
+        let (engine_leg, _peer) = secure_pair();
+        let (rtp_in_tx, _rtp_in_rx3) = flume::unbounded::<Bytes>();
+        let (mut registration, secure) =
+            plan_with_activity("secure", endpoint(3), SourceFilter::Any, rtp_in_tx);
+        registration.secure = Some(Arc::new(WsSecureLeg::keyed(engine_leg)));
+        registry.register(registration);
+        registry.dispatch(rx(3, "127.0.0.3:41000", &rtp_packet(1, 0x0A0A_0A0A)));
+        assert_eq!(
+            secure.count(),
+            0,
+            "a packet that fails SRTP authentication is not liveness"
+        );
+
+        for call_id in ["gated", "ice", "secure"] {
+            let _ = registry.deregister(call_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_bridge_mailbox_still_reports_the_leg_as_live() {
+        // The stamp sits before the mailbox deliberately. A bridge that is momentarily behind is a
+        // live call, and reaping it because its consumer was busy would be the worst kind of flap.
+        let registry = WsRegistry::default();
+        let (rtp_in_tx, rtp_in_rx) = flume::bounded::<Bytes>(1);
+        let (registration, activity) =
+            plan_with_activity("full", endpoint(1), SourceFilter::Any, rtp_in_tx);
+        registry.register(registration);
+
+        for sequence in 0..4 {
+            registry.dispatch(rx(1, "127.0.0.2:41000", &rtp_packet(sequence, 0x0A0A_0A0A)));
+        }
+        assert_eq!(
+            rtp_in_rx.len(),
+            1,
+            "the mailbox filled and dropped the rest"
+        );
+        assert_eq!(
+            activity.count(),
+            4,
+            "every accepted packet is still liveness"
+        );
+
+        let _ = registry.deregister("full");
     }
 
     #[tokio::test]

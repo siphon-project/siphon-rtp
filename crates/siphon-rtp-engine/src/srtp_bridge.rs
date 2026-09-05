@@ -238,6 +238,14 @@ impl<D: Datapath + Clone + 'static> SrtpBridge<D> {
             return;
         }
 
+        // Accepted: past the source gate and past the crypto. Stamp the endpoint's liveness for the
+        // engine's idle sweep (docs/security-and-nat.md §4 layer 6). The `Redirect` arm never touches
+        // the datapath's `last_seen`, so a bridged call — whose legs are both `Redirect` and so has no
+        // `Forward` rule stamping anywhere — would otherwise be reaped at the media timeout however
+        // much audio was crossing it. Placed after the crypto so a forged or replayed packet, which
+        // returns above, can never hold a dead call open.
+        self.datapath.note_activity(packet.endpoint);
+
         // Lawful-interception content (ETSI TS 103 221-2 X3), taken from whichever side of the
         // transform is plaintext: an `Encrypt` flow was handed plaintext and produced ciphertext, a
         // `Decrypt` flow the reverse. Reached only after the source gate above and after the crypto

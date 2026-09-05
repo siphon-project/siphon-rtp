@@ -513,6 +513,14 @@ is wrong, and encryption defeats A2 eavesdrop.
   re-forwarded. The window is recorded only *after* authentication, so a forged packet can never
   advance or poison it; on an HA takeover the standby anchors the window at the checkpointed rollover
   index and keeps rejecting the primary's last-seen packet.
+- **Idle reap.** A packet that clears the gate *and* the crypto stamps the endpoint's activity
+  (`Datapath::note_activity`); one that fails either does **not**, so neither an off-path spray nor a
+  forged packet can hold a dead call open. This has to be done by the bridge itself, and the reason is
+  worth stating because it is easy to assume otherwise: the `Redirect` arm never touches `last_seen`,
+  and **both** legs of a bridged call are `Redirect`, so there is no `Forward` rule stamping anywhere
+  on the call. Without it the Layer 6 sweep reaps a secure bridge at the media timeout however much
+  audio is crossing it. The same applies to the DTLS bridge's two relaying directions; its
+  `Pipeline`-mode media is stamped by the per-call actor it is handed to.
 - **Key direction (the footgun `SecureLeg` pins down).** Outbound (engine→peer) encrypts with the
   engine's *own* offered key (the `a=crypto` it advertised); inbound (peer→engine) decrypts with the
   *peer's* answered key. The peer's `a=crypto` is always re-originated (dropped and replaced), like
@@ -821,6 +829,16 @@ copy of Layers 1–4.
   signalled-source gate (`Exact`/`Subnet`/`Any`, tightened by the `received-from` public-IP hint)
   before anything reaches the bridge — `Redirect` bypasses the datapath's Forward-path gate, exactly as
   on Layers 5a–5d.
+- **Idle reap.** `WsRegistry::dispatch` stamps the endpoint's activity on each packet that clears the
+  gate and, on a secure leg, SRTP authentication — before the bridge's mailbox, so a bridge that is
+  momentarily behind is not mistaken for a dead call, and after both checks, so an off-source or
+  forged packet cannot hold one open. A takeover leg is the one userspace `Redirect` consumer with no
+  per-call actor to stamp from (the media pipeline, the conference room and the text relay each stamp
+  from an actor that owns a datapath; a takeover leg's bridge task lives in `siphon-rtp-media` and
+  never sees one), so the registry carries the datapath itself as a narrow `MediaActivity` handle on
+  the route. Without it the endpoint's `last_seen` never leaves the call's `created_tick` and Layer 6
+  tears the call down at the media timeout mid-conversation — indistinguishable, from the outside,
+  from the caller hanging up.
 - **The hint aims the downlink too, and the leg latches its own egress (§4 layers 2 and 3).** The
   same `(hint IP, signalled port)` pair the gate keys on is where the bridge's drain task starts
   sending, at every setup site — the two-leg `offer`, the single-leg `answer_local`, a `ws_uri` that
