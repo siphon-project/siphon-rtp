@@ -7,6 +7,47 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-09-05
+
+Three of the engine's userspace slow paths never told the idle sweep they were alive, so it reaped
+calls that were plainly carrying audio. On a WebSocket takeover that capped **every** call at the
+media timeout — 30 s by default — and the teardown is indistinguishable from the caller hanging up.
+
+The mechanism is worth stating, because it is a rule the codebase deliberately holds and three paths
+simply missed. The sweep reads `Datapath::last_activity`, and the `Redirect` arm never writes it: each
+userspace consumer stamps for itself, *after* its own source gate, so a spoofed spray cannot hold a
+dead path open. The media pipeline, the conference room and the text relay each do that from their
+per-call actor. The WebSocket takeover, the SDES bridge and the DTLS bridge did not do it anywhere, so
+their endpoints sat at the call's `created_tick` for its whole life.
+
+**A patch.** `siphon-rtp-proto` is untouched — no verb, event, field or type changed — so a controller
+floating on `^0.4` needs no work to take this, and the internal path-deps pinned at `"0.4.0"` still
+caret-match. Nothing about what the engine accepts, decrypts or forwards changes; the only behaviour
+delta is which calls the sweep considers idle, and it now considers idle exactly the ones that are.
+
+### Fixed
+
+- **A WebSocket-takeover call is no longer reaped at the media timeout while its caller is talking.**
+  `WsRegistry::dispatch` stamps the endpoint's liveness on each packet that clears the source gate
+  and, on a secure leg, SRTP authentication — and before the bridge's mailbox, so a bridge that is
+  momentarily behind is not mistaken for a dead call. A takeover leg is the one userspace `Redirect`
+  consumer with no per-call actor to stamp from (its bridge task lives in `siphon-rtp-media`, where no
+  datapath is in scope), so the registry carries the datapath itself behind a narrow object-safe
+  `MediaActivity` handle on the route.
+
+- **An SDES-SRTP or DTLS-SRTP bridged call is no longer reaped while media crosses it.** The same gap,
+  reached a different way: *both* legs of a bridged call are `Redirect`, so there is no `Forward` rule
+  stamping anywhere on the call. `SrtpBridge::handle` and `DtlsBridge::handle` now stamp after the
+  gate and after the crypto, so a forged or replayed packet still cannot keep a dead call alive. The
+  DTLS bridge's `Pipeline`-mode media needed no change — the per-call actor it is handed to already
+  stamps.
+
+  Liveness is claimed only for media the leg actually accepted. An off-source packet, a packet on an
+  ICE leg whose agent has not selected a pair, and a forged packet on a secure leg each stamp nothing,
+  and each is a test. Costs ~19 ns per accepted packet; the rejected-packet path is unchanged, so
+  flooding a leg from an unsignalled address still costs less than sending it real media. See
+  `docs/security-and-nat.md` §4 layer 6 and Layers 5 / 5e.
+
 ## [0.4.4] — 2026-09-05
 
 0.4.2 gave the `received-from` hint the job of aiming the relay as well as gating it, and listed the
