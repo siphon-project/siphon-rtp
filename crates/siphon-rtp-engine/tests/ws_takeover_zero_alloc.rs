@@ -145,10 +145,14 @@ async fn the_downlink_latch_allocates_nothing_on_the_ingress_path() {
     pump(&no_latch, two, &no_latch_rx, &frame, 16, |_| peer(41000));
 
     let with_latch = allocations(|| {
-        pump(&latching, one, &latching_rx, &frame, FRAMES, |_| peer(41000));
+        pump(&latching, one, &latching_rx, &frame, FRAMES, |_| {
+            peer(41000)
+        });
     });
     let without_latch = allocations(|| {
-        pump(&no_latch, two, &no_latch_rx, &frame, FRAMES, |_| peer(41000));
+        pump(&no_latch, two, &no_latch_rx, &frame, FRAMES, |_| {
+            peer(41000)
+        });
     });
     assert_eq!(
         with_latch, without_latch,
