@@ -26,7 +26,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
-use siphon_rtp_codec::cn::Cn;
+use siphon_rtp_codec::cn::{Cn, COMFORT_NOISE_LEVEL_DBOV};
 use siphon_rtp_codec::{Decoder, Encoder};
 use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
@@ -54,15 +54,6 @@ pub const INJECT_TICK: std::time::Duration = std::time::Duration::from_millis(20
 /// How many [`INJECT_TICK`]s between periodic per-leg [`Event::CallQuality`] reports — 250 × 20 ms ≈
 /// 5 s, the same reporting cadence the conference actor uses for its quality events / RTCP SRs.
 const QUALITY_INTERVAL_TICKS: u64 = 250;
-
-/// The comfort-noise level (`-dBov`, RFC 3389 §3.1) a single-leg local-answer / IVR leg emits while
-/// idle — a faint background floor so the caller hears "nothing to say" rather than dead air or its
-/// own audio looped back. Larger = quieter (further below full scale): at 75 the RMS is ~32768·10⁻³·⁷⁵
-/// ≈ 6 (peak ≈ ±10), a barely-perceptible floor. Kept deliberately low because the generated noise is
-/// spectrally flat (RFC 3389 §3.2 shaping is unimplemented), so flat white noise reads as a harsher
-/// hiss than a real, low-passed room tone at the same level. Sent as the level byte of a CN packet
-/// when CN was negotiated, else as the target level of the audio-encoded fallback noise.
-const COMFORT_NOISE_LEVEL_DBOV: u8 = 75;
 
 /// Largest RTP packet the egress scratch buffers accommodate.
 const MAX_RTP: usize = 1500;

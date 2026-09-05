@@ -48,6 +48,7 @@ use crate::bridge::pcm_to_l16_le;
 use crate::bridge::protocol::{
     ControlMessage, Direction, ErrorData, MarkData, MediaFormat, PlaySource, SpeechData, StartData,
 };
+use siphon_rtp_codec::cn::{Cn, COMFORT_NOISE_LEVEL_DBOV};
 use siphon_rtp_dsp::{EchoCanceller, NoiseSuppressor, SpeechRunGate, VoiceDetector};
 
 /// Longest packetization a leg on this path can negotiate, in milliseconds. Single-sourced from
@@ -76,15 +77,43 @@ pub const MAX_FRAME_SAMPLES: usize = MAX_SAMPLE_RATE_HZ / 1000 * MAX_PTIME_MS;
 /// [`MAX_FRAME_SAMPLES`].
 pub const MAX_FRAME_VALUES: usize = MAX_FRAME_SAMPLES * MAX_CHANNELS;
 
+/// One ptime of mono samples at `format`'s wire rate — the downlink quantum the core drains per tick
+/// and the length of every frame it renders. Clamped to at least one sample so a degenerate format
+/// cannot produce a zero-length frame (and a division by zero in `playout_depth`).
+fn frame_samples_for(format: &MediaFormat) -> usize {
+    let rate = format.sample_rate.max(8_000) as usize;
+    let ptime = usize::from(format.ptime.max(1));
+    (rate * ptime / 1000).max(1)
+}
+
 /// The PCM-domain core of a WS bridge session. See the module docs for the uplink/downlink contract.
 pub struct BridgeCore {
     format: MediaFormat,
     stream_id: String,
     call_id: String,
     direction: Direction,
-    /// Downlink PCM frames awaiting render to the call (drop-oldest bounded).
-    playout: VecDeque<Vec<i16>>,
-    playout_cap: usize,
+    /// Downlink PCM awaiting render to the call, in **samples** rather than whole frames
+    /// (drop-oldest bounded). A sample ring, not a frame queue, because the server's frame size is
+    /// its own business: the protocol asks for one frame per ptime and nothing enforces it, and a
+    /// server that writes 40 ms per turn (a common default) against a 20 ms ptime used to have every
+    /// frame rendered as one oversized RTP packet stamped as a single ptime — timestamps advancing at
+    /// half the rate of the audio, every packet overlapping its predecessor, and the handset playing
+    /// nothing. Draining a fixed ptime of *samples* per tick makes the RTP cadence the engine's own,
+    /// whatever arrives, and fixes the second half of the same bug: a frame queue popped once per tick
+    /// also drained at half the rate it filled, so it saturated and drop-oldest threw audio away.
+    playout: VecDeque<i16>,
+    /// Ring bound in samples, so the buffered span is the same length of audio whatever frame size the
+    /// server sends.
+    playout_cap_samples: usize,
+    /// One ptime at the wire rate — what [`BridgeCore::tick`] drains, and the length of every frame it
+    /// hands the caller to render.
+    frame_samples: usize,
+    /// Scratch for decoding one ptime of inbound L16 at a time, so a server frame of *any* size costs
+    /// a fixed buffer and no allocation.
+    ws_decode: Vec<i16>,
+    /// Low-level comfort noise for the idle downlink, when the leg is comfort-idle. `None` ⇒ the leg
+    /// renders only what the server sent (the historical behaviour, kept for a non-takeover session).
+    comfort: Option<Cn>,
     stopped: bool,
     /// Single-channel noise suppression on the uplink (call → server) audio, so the voice-AI receives
     /// cleaned speech. `Some` only when requested *and* the uplink rate is 8/16 kHz (see
@@ -132,8 +161,12 @@ pub struct BridgeCore {
     uplink: Box<[i16; MAX_FRAME_VALUES]>,
     /// Valid **mono** sample count in `uplink`, or `None` when no frame was staged for this tick.
     uplink_samples: Option<usize>,
-    /// The frame [`BridgeCore::tick`] dequeued from `playout` for the caller to render this tick.
-    downlink: Option<Vec<i16>>,
+    /// The frame [`BridgeCore::tick`] drained from `playout` for the caller to render this tick.
+    /// Preallocated at exactly one ptime and refilled in place, so a tick allocates nothing.
+    downlink: Vec<i16>,
+    /// Whether `downlink` holds a frame this tick. A barge-in clears it, and a leg that is not
+    /// comfort-idle leaves it clear whenever the server sent nothing.
+    downlink_ready: bool,
 }
 
 impl BridgeCore {
@@ -146,13 +179,19 @@ impl BridgeCore {
         direction: Direction,
         playout_cap: usize,
     ) -> Self {
+        // One ptime at the wire rate. Everything downlink is measured in this: the ring's bound, the
+        // per-tick drain, and the frame handed to the caller to render.
+        let frame_samples = frame_samples_for(&format);
         Self {
             format,
             stream_id: stream_id.into(),
             call_id: call_id.into(),
             direction,
-            playout: VecDeque::new(),
-            playout_cap: playout_cap.max(1),
+            playout: VecDeque::with_capacity(playout_cap.max(1) * frame_samples),
+            playout_cap_samples: playout_cap.max(1) * frame_samples,
+            frame_samples,
+            ws_decode: vec![0i16; frame_samples],
+            comfort: None,
             stopped: false,
             noise_suppressor: None,
             vad: None,
@@ -164,8 +203,27 @@ impl BridgeCore {
             echo_reference: Vec::new(),
             uplink: Box::new([0i16; MAX_FRAME_VALUES]),
             uplink_samples: None,
-            downlink: None,
+            downlink: vec![0i16; frame_samples],
+            downlink_ready: false,
         }
+    }
+
+    /// Render low-level comfort noise toward the call whenever the server has not supplied a full
+    /// ptime, so the leg's egress clock never stops.
+    ///
+    /// A takeover leg **is** the caller's far side — there is no second party and no relay behind it —
+    /// so a tick that emits nothing is a leg that emits nothing for as long as the server is quiet,
+    /// which is most of a conversation. That silences the call's NAT pinhole and leaves the caller
+    /// listening to dead air rather than a line that is plainly still up. The noise is audio-encoded
+    /// on the leg's own codec at [`COMFORT_NOISE_LEVEL_DBOV`]; RFC 3389 CN is deliberately *not* used
+    /// here, because a takeover answer does not negotiate a CN payload type (the engine cannot promise
+    /// one it has no media actor to generate) and inventing one at render time would put a payload
+    /// type on the wire the caller never agreed to.
+    #[must_use]
+    pub fn with_comfort_idle(mut self, enabled: bool) -> Self {
+        self.comfort =
+            enabled.then(|| Cn::new(self.format.sample_rate.max(8_000), self.format.ptime.max(1)));
+        self
     }
 
     /// Enable single-channel noise suppression on the uplink audio (call → voice-AI server). Built
@@ -316,6 +374,13 @@ impl BridgeCore {
     /// Frames currently queued for downlink playout.
     #[must_use]
     pub fn playout_depth(&self) -> usize {
+        self.playout.len() / self.frame_samples.max(1)
+    }
+
+    /// Buffered downlink audio in samples — the ring's real depth, which `playout_depth` rounds down
+    /// to whole ptimes.
+    #[must_use]
+    pub fn playout_samples(&self) -> usize {
         self.playout.len()
     }
 
@@ -363,16 +428,23 @@ impl BridgeCore {
 
     /// Feed an inbound binary WS frame (downlink playout audio, L16 little-endian).
     pub fn on_ws_binary(&mut self, bytes: &[u8]) {
-        let mut pcm = vec![0i16; bytes.len() / 2];
-        let samples = crate::bridge::l16_le_to_pcm(bytes, &mut pcm);
-        pcm.truncate(samples);
-        if pcm.is_empty() {
-            return;
+        // Decoded one ptime at a time into a fixed scratch, so a frame of any size — the 40 ms a
+        // server may well write against a 20 ms ptime, or something far larger from a buggy one —
+        // costs no allocation and cannot grow this buffer. Memory is bounded by the ring below, not
+        // by trusting the sender's framing.
+        for chunk in bytes.chunks(2 * self.frame_samples) {
+            let decoded = crate::bridge::l16_le_to_pcm(chunk, &mut self.ws_decode);
+            if decoded == 0 {
+                continue;
+            }
+            self.playout.extend(&self.ws_decode[..decoded]);
         }
-        if self.playout.len() >= self.playout_cap {
-            self.playout.pop_front(); // drop-oldest backpressure
+        // Drop-oldest backpressure, in the sample domain: late audio is worthless, and bounding by
+        // samples rather than by frames keeps the buffered span honest whatever the server sends.
+        let excess = self.playout.len().saturating_sub(self.playout_cap_samples);
+        if excess > 0 {
+            self.playout.drain(..excess);
         }
-        self.playout.push_back(pcm);
     }
 
     /// Handle an inbound control message, returning a message to send back when one is warranted
@@ -417,7 +489,7 @@ impl BridgeCore {
         // reference for the uplink (the audio the phone plays and its mic re-captures). Take it up front
         // so the uplink can cancel against it; the caller renders it after this returns. A barge-in
         // below drops it along with the rest of the queue, so no bot audio plays that tick.
-        let mut downlink_frame = self.playout.pop_front();
+        let mut downlink_frame = self.drain_downlink_frame();
         let mut uplink_bytes = 0;
 
         if let Some(written) = self.uplink_samples.take() {
@@ -433,8 +505,18 @@ impl BridgeCore {
                     // Silence → speech: local barge-in (flush queued playout, no round-trip) + notify.
                     if self.barge_in {
                         self.playout.clear();
-                        // Also drop the frame already taken this tick, so no bot audio plays on barge-in.
-                        downlink_frame = None;
+                        // Also drop the frame already drained this tick, so no bot audio plays on
+                        // barge-in. A comfort-idle leg re-fills it with noise rather than going
+                        // silent: the queued bot audio is what barge-in drops, not the egress clock.
+                        downlink_frame = match self.comfort.as_mut() {
+                            Some(comfort) => {
+                                self.downlink.clear();
+                                self.downlink.resize(self.frame_samples, 0);
+                                comfort.fill(COMFORT_NOISE_LEVEL_DBOV, &mut self.downlink);
+                                true
+                            }
+                            None => false,
+                        };
                     }
                     self.pending_control
                         .push(ControlMessage::SpeechStarted(SpeechData {
@@ -463,26 +545,66 @@ impl BridgeCore {
                 // zeroed each tick — not the whole ceiling-sized buffer. `written` is bounded by
                 // `MAX_FRAME_SAMPLES`, which is exactly the reference's length.
                 let reference = &mut self.echo_reference[..written];
-                let carried = downlink_frame.as_ref().map_or(0, |frame| {
-                    let count = frame.len().min(written);
-                    reference[..count].copy_from_slice(&frame[..count]);
+                let carried = if downlink_frame {
+                    let count = self.downlink.len().min(written);
+                    reference[..count].copy_from_slice(&self.downlink[..count]);
                     count
-                });
+                } else {
+                    0
+                };
                 reference[carried..].fill(0);
                 echo_canceller.cancel(pcm, reference);
             }
             uplink_bytes = pcm_to_l16_le(pcm, uplink_out);
         }
 
-        self.downlink = downlink_frame;
+        self.downlink_ready = downlink_frame;
         uplink_bytes
+    }
+
+    /// Fill `downlink` with exactly one ptime for this tick, returning whether there is anything to
+    /// render. Short of a full ptime, a comfort-idle leg pads the remainder with low-level noise so
+    /// the egress clock keeps running; a leg that is not comfort-idle renders only a *complete* frame
+    /// and otherwise nothing — a partial frame would be a packet whose payload duration disagreed with
+    /// the timestamp it advances, which is the whole defect this ring exists to remove.
+    fn drain_downlink_frame(&mut self) -> bool {
+        let available = self.playout.len().min(self.frame_samples);
+        if available == 0 && self.comfort.is_none() {
+            return false;
+        }
+        // Copied out of the ring's two halves rather than through `Drain`: the iterator walks the
+        // ring element by element, which measured ~160 ns per tick against a pair of `copy_from_slice`
+        // calls on a 20 ms frame — real money on a path that runs every ptime of every call.
+        self.downlink.resize(self.frame_samples, 0);
+        let (front, back) = self.playout.as_slices();
+        let from_front = front.len().min(available);
+        self.downlink[..from_front].copy_from_slice(&front[..from_front]);
+        self.downlink[from_front..available].copy_from_slice(&back[..available - from_front]);
+        self.playout.drain(..available);
+        if available < self.frame_samples {
+            let Some(comfort) = self.comfort.as_mut() else {
+                // Not comfort-idle and the server is mid-frame: put the partial frame back and leave
+                // it for the next tick rather than emit a short packet, whose payload duration would
+                // disagree with the ptime its timestamp advances.
+                for (index, sample) in self.downlink[..available].iter().enumerate() {
+                    self.playout.insert(index, *sample);
+                }
+                return false;
+            };
+            self.downlink.resize(self.frame_samples, 0);
+            comfort.fill(COMFORT_NOISE_LEVEL_DBOV, &mut self.downlink[available..]);
+        }
+        true
     }
 
     /// Take the downlink PCM frame [`BridgeCore::tick`] dequeued for this tick, or `None` when the
     /// playout queue was empty (or a barge-in flushed it). The caller renders it toward the call — an
     /// RTP encode in takeover mode. Taking it a second time in the same tick yields `None`.
-    pub fn take_downlink_pcm(&mut self) -> Option<Vec<i16>> {
-        self.downlink.take()
+    pub fn take_downlink_pcm(&mut self) -> Option<&[i16]> {
+        if !std::mem::take(&mut self.downlink_ready) {
+            return None;
+        }
+        Some(&self.downlink)
     }
 }
 

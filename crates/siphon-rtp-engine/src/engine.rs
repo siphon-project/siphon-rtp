@@ -3101,6 +3101,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         )
         // Convert between A's codec rate and the wire rate in both directions (no-ops when equal).
         .with_rate_conversion(uplink_resampler, downlink_resampler)
+        // A takeover leg is the caller's only far side: nothing else feeds this call, and a WS server
+        // is quiet for most of a conversation. Without an idle floor the leg emits RTP only while the
+        // bot is speaking, which reads to the caller as dead air, lets the NAT pinhole toward them
+        // expire, and leaves the egress clock stopped between turns.
+        .with_comfort_idle(true)
         // Clean leg A's uplink audio toward the voice-AI server when requested (rate-gated inside).
         .with_noise_suppression(noise_suppression)
         // Cancel leg A's uplink echo toward the voice-AI server, referenced against the downlink the
@@ -16986,6 +16991,77 @@ mod tests {
             }
         });
         (format!("ws://{addr}/stream"), frames_rx, down_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_takeover_with_a_silent_server_still_sends_at_the_ptime_rate() {
+        // R6. A takeover leg is the caller's only far side, so its egress rate used to track the
+        // bot's duty cycle: nothing at all on a call where the server never spoke. To the caller that
+        // is dead air on a line that is plainly still up, and it lets the NAT pinhole toward them
+        // expire between turns. The engine wires comfort-idle on for every takeover bridge, so the
+        // clock runs whether or not the server has anything to say.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        let (ws_uri, frames, _downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "ws-quiet".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, CmdResult::Ok { .. }),
+            "the takeover answers"
+        );
+        expect_ws_start(&frames).await;
+
+        // The server says nothing for the whole test. Collect a run of downlink packets anyway.
+        let mut buffer = [0u8; 2048];
+        let mut stamps = Vec::new();
+        for _ in 0..6 {
+            let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(500), phone_a.recv_from(&mut buffer)).await
+            else {
+                break;
+            };
+            let packet = siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).expect("rtp");
+            assert_eq!(
+                packet.payload_type, 0,
+                "on the caller's own negotiated codec"
+            );
+            assert_eq!(packet.payload.len(), 160, "a full 20 ms frame");
+            stamps.push(packet.timestamp);
+        }
+        assert!(
+            stamps.len() >= 4,
+            "the leg keeps sending while the server is quiet (got {})",
+            stamps.len()
+        );
+        for pair in stamps.windows(2) {
+            assert_eq!(
+                pair[1].wrapping_sub(pair[0]),
+                160,
+                "the egress clock advances one ptime per packet, not per bot utterance"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

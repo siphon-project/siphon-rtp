@@ -25,6 +25,18 @@ use crate::{CodecError, CodecParams, Decoder};
 /// (for tests) reproducible.
 const PRNG_SEED: u32 = 0x2545_F491;
 
+/// The comfort-noise level (`-dBov`, RFC 3389 §3.1) the engine emits on an idle leg — a faint
+/// background floor, so a caller hears "nothing to say" rather than dead air. Larger = quieter
+/// (further below full scale): at 75 the RMS is ~32768·10⁻³·⁷⁵ ≈ 6 (peak ≈ ±10), barely perceptible.
+/// Kept deliberately low because the generated noise is spectrally flat (RFC 3389 §3.2 shaping is
+/// unimplemented), so flat white noise reads as a harsher hiss than a real, low-passed room tone at
+/// the same level. Sent as the level byte of a CN packet where CN was negotiated, else as the target
+/// level of the audio-encoded fallback noise [`Cn::fill`] renders.
+///
+/// Shared by the transcode pipeline's comfort-idle egress and the WebSocket-takeover bridge, so the
+/// two cannot drift into emitting different floors on the same product.
+pub const COMFORT_NOISE_LEVEL_DBOV: u8 = 75;
+
 /// √3, the peak/RMS ratio of uniform white noise (used to hit a target RMS from a uniform source).
 const SQRT_3: f64 = 1.732_050_807_568_877_2;
 

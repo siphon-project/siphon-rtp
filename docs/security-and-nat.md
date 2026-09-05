@@ -839,6 +839,14 @@ copy of Layers 1–4.
   the route. Without it the endpoint's `last_seen` never leaves the call's `created_tick` and Layer 6
   tears the call down at the media timeout mid-conversation — indistinguishable, from the outside,
   from the caller hanging up.
+- **The downlink runs on the engine's clock, not the server's, and never stops.** The bridge core
+  drains its playout by *samples* — exactly one ptime per tick — rather than by whole WS frames, so
+  the RTP cadence is the engine's whatever framing the server chose. This is a NAT property as much
+  as a correctness one: the leg now emits continuously (a low-level comfort floor between turns
+  rather than nothing), which is what keeps the pinhole toward a NATed caller open for the whole
+  call. A takeover leg has no second party whose media would hold that pinhole open for it — it is
+  the caller's only far side — so a leg that emitted only while the bot spoke left the return path to
+  expire between turns, on top of reading as dead air.
 - **The hint aims the downlink too, and the leg latches its own egress (§4 layers 2 and 3).** The
   same `(hint IP, signalled port)` pair the gate keys on is where the bridge's drain task starts
   sending, at every setup site — the two-leg `offer`, the single-leg `answer_local`, a `ws_uri` that
