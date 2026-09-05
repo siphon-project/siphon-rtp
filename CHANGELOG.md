@@ -7,6 +7,62 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-09-05
+
+0.4.2 gave the `received-from` hint the job of aiming the relay as well as gating it, and listed the
+paths it reached. The WebSocket-takeover pipeline was not among them, and it is the one path where
+getting this wrong costs everything rather than a window. On a relay leg a wrong destination is
+bounded by the datapath's own symmetric-RTP latch, which corrects it on the peer's first accepted
+packet — the ~400 ms 0.4.2 describes. A takeover leg has no reverse relay direction: no forward rule
+faces it, so there is no datapath latch behind it and nothing ever corrected the address. A caller
+behind NAT had every downlink packet addressed to the private `c=` for the whole call.
+
+It presents as a bridge that is simply dead, which is why it is worth describing rather than just
+listing. The signalling is clean, the SDP answer is clean, the bridge attaches and reports itself
+started, the caller's audio arrives and decodes perfectly — and nothing comes back, with nothing on
+the control plane saying why.
+
+**A patch.** `siphon-rtp-proto` is untouched — no verb, event, field or type changed — so a
+controller floating on `^0.4` needs no work to take this, and the internal path-deps pinned at
+`"0.4.0"` still caret-match. Behaviour changes only on `PipelineKind::Ws` legs: where their downlink
+is aimed before their peer has been heard from, and that it now follows that peer. No other pipeline
+is touched, and no SDP presented to any party changes.
+
+**One behaviour change to be aware of.** A takeover leg carrying the `symmetric` flag now follows the
+first source that reaches it, exactly as a `symmetric` relay leg always has. That width is what the
+flag asks for, but it is still the wrong tool for a NATed takeover: the `received-from` hint reaches
+the same destination while leaving the ingress gate `Exact`, and `symmetric` widens that gate to
+`Any`. If it was set on a takeover leg purely as an attempt to work around the defect below, remove
+it and supply the hint instead.
+
+### Fixed
+
+- **A WebSocket-takeover leg aims its downlink at the `received-from` address, not the signalled
+  one.** The hint reached that leg's ingress gate and stopped there, so a UA whose `c=` advertised an
+  unusable private address had the bridge's downlink sent to that address. The same
+  `(hint IP, signalled port)` pair the gate already computes is now the destination at every takeover
+  setup site: the two-leg `offer`, the single-leg `answer_local`, a `ws_uri` arriving first at
+  `answer`, and the runtime attach's fallback for when the relay it displaced had not latched
+  anything yet.
+
+- **A WebSocket-takeover leg latches its egress to the source its media arrives from.** Every other
+  pipeline gets this from the datapath; this one had nothing, so a destination the signalling got
+  wrong stayed wrong for the life of the call. `WsRegistry::dispatch` now applies the same
+  SSRC-consistent symmetric-RTP latch (RFC 3550 §8) the relay and transcode paths use — literally the
+  same `SymmetricLatch`, so the two userspace `Redirect` paths cannot drift on what counts as a
+  genuine NAT rebind and what counts as a hijack spray. It matters beyond the seeded address: behind
+  a symmetric NAT the public media port need not be the signalled one, so the hint fixes the address
+  and the latch fixes the port.
+
+  The posture is the one the relay paths already hold. The latch is offered a packet only after the
+  source gate and, on a secure leg, only after SRTP authentication, so a packet that fails RFC 3711
+  §3.3 can never re-point a call's audio; only RTP media is offered, so a STUN or DTLS record on a
+  muxed takeover port cannot steer the downlink; a new source keeping the stream's SSRC follows a
+  rebind, and one carrying a different SSRC never moves it. On an ICE leg the latch is off entirely —
+  the agent's selection is the only thing that may adopt a transport (RFC 8445 §7.3.1.3), the same
+  posture the datapath takes with `LatchPolicy::Off` on an ICE relay leg. Costs ~17 ns per packet and
+  allocates nothing, both gated. See `docs/security-and-nat.md` §4 layers 2–3 and §5e.
+
 ## [0.4.3] — 2026-09-04
 
 The engine marked nothing. Every media datagram it emitted left at DSCP 0 — best effort — on the
