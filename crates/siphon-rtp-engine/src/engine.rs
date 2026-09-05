@@ -788,13 +788,14 @@ struct WsBridgeSetup<'a> {
     echo_cancellation: bool,
     /// Local energy-VAD turn-taking / barge-in, when the profile asked for it.
     vad_config: Option<WsVadConfig>,
-    /// The downlink destination watch to **reuse**, on a re-point ([`Engine::start_ws_bridge`] on a
-    /// call that already has a bridge). `None` mints a fresh one pointing at `a_rtp`, which is what
-    /// every negotiation-time setup wants. Carried across a re-point because the watch is leg A's
-    /// state, not the connection's: an ICE selection that already landed (RFC 8445 §8.1.1) published
-    /// the chosen pair here, and a fresh watch would send the replacement bridge's downlink back to
-    /// the signalled `c=` address the NATed peer cannot receive on.
-    egress: Option<Arc<tokio::sync::watch::Sender<SocketAddr>>>,
+    /// The downlink destination + latch to **reuse**, on a re-point ([`Engine::start_ws_bridge`] on
+    /// a call that already has a bridge). `None` mints a fresh one aimed at `a_rtp`, which is what
+    /// every negotiation-time setup wants. Carried across a re-point because it is leg A's state, not
+    /// the connection's: an ICE selection that already landed (RFC 8445 §8.1.1) published the chosen
+    /// pair there, and the leg's own media may have latched a source since — a fresh one would send
+    /// the replacement bridge's downlink back to the signalled `c=` address the NATed peer cannot
+    /// receive on.
+    egress: Option<Arc<crate::ws_bridge::WsEgress>>,
     /// Set only when this bridge is **taking over a live relay** — the flows to switch off, and the
     /// ones a later detach switches back on. `None` at negotiation time, where there is no relay yet.
     takeover: Option<WsRelayTakeover>,
@@ -2327,20 +2328,17 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Stand the WS bridge up now that the call is recorded (so a dispatch can find its route). On
         // any failure (no codec, redirect install, or dial), tear the half-built call back down.
         if let Some(ws_uri) = ws_uri {
+            // Aim the downlink at leg A's `received-from` public IP when the offer supplied one, and
+            // gate its ingress on the same address — one value for both, see the helper.
+            let a_media = ws_takeover_media_address(info.remote_rtp, profile.received_from);
             if let Err(reason) = self
                 .setup_ws_bridge(WsBridgeSetup {
                     call_id: &call_id,
                     ws_uri: &ws_uri,
                     endpoint_a: near_rtp.id,
-                    a_rtp: info.remote_rtp,
+                    a_rtp: a_media,
                     codec: near_codec.as_ref(),
-                    // Gate leg A's ingress to its `received-from` public IP when the offer supplied
-                    // one, else the signalled `c=` address (docs/security-and-nat.md §4 layer 2).
-                    accepted_source: bridge_source_filter(
-                        profile,
-                        apply_received_from(Some(info.remote_rtp), profile.received_from)
-                            .unwrap_or(info.remote_rtp),
-                    ),
+                    accepted_source: bridge_source_filter(profile, a_media),
                     // A two-leg takeover is refused on a secure or ICE offerer (see the guard at the
                     // top of `offer`), so this arm is always a plaintext, non-ICE leg.
                     ice_pending: false,
@@ -2790,24 +2788,20 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // §7.3.1.3) — safe only because `ice_pending` drops **all** media until the agent selects,
             // at which point the gate narrows to the selected pair.
             let ice_pending = ice_config.is_some();
+            // Aim the downlink at the caller's `received-from` public IP when the control supplied
+            // one, and gate its ingress on the same address — identical to the offer path.
+            let a_media = ws_takeover_media_address(info.remote_rtp, profile.received_from);
             let accepted_source = if ice_pending {
                 SourceFilter::Any
             } else {
-                // Gate the caller's ingress to its `received-from` public IP when the control
-                // supplied one, else the signalled `c=` address (docs/security-and-nat.md §4
-                // layer 2) — identical to the offer path's gate.
-                bridge_source_filter(
-                    profile,
-                    apply_received_from(Some(info.remote_rtp), profile.received_from)
-                        .unwrap_or(info.remote_rtp),
-                )
+                bridge_source_filter(profile, a_media)
             };
             if let Err(reason) = self
                 .setup_ws_bridge(WsBridgeSetup {
                     call_id,
                     ws_uri: &ws_uri,
                     endpoint_a: near_rtp.id,
-                    a_rtp: info.remote_rtp,
+                    a_rtp: a_media,
                     codec: Some(&chosen),
                     accepted_source,
                     ice_pending,
@@ -3204,13 +3198,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 );
             })
         };
-        // Where the downlink goes. Published rather than captured so an ICE selection can re-point it
-        // mid-call (RFC 8445 §8.1.1) — a takeover leg's egress belongs to this drain task, not to a
-        // datapath forward rule, so `Datapath::adopt_source` alone would never reach it.
-        // Reused verbatim on a re-point (see `WsBridgeSetup::egress`), so an ICE selection that has
-        // already landed keeps steering the downlink; minted at `a_rtp` for a first attach.
-        let egress =
-            existing_egress.unwrap_or_else(|| Arc::new(tokio::sync::watch::Sender::new(a_rtp)));
+        // Where the downlink goes. Published rather than captured so the leg's own symmetric-RTP
+        // latch and an ICE selection can both re-point it mid-call (RFC 8445 §8.1.1) — a takeover
+        // leg's egress belongs to this drain task, not to a datapath forward rule, so neither the
+        // datapath's latch nor `Datapath::adopt_source` would ever reach it.
+        // Reused verbatim on a re-point (see `WsBridgeSetup::egress`), so a selection or a latch that
+        // has already landed keeps steering the downlink; minted at `a_rtp` for a first attach.
+        let egress = existing_egress
+            .unwrap_or_else(|| Arc::new(crate::ws_bridge::WsEgress::new(a_rtp, ice_pending)));
         // The drain: forward each rendered downlink RTP packet out A's endpoint toward A, encrypting
         // it first on a secure leg. This is the ONLY egress site a takeover call has — `play_media`,
         // `play_dtmf`, recording, SIPREC and the WS tee all refuse a `PipelineKind::Ws` call, and a
@@ -3982,9 +3977,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let already_ws = offer_pipeline == PipelineKind::Ws;
         if already_ws || profile.ws_uri.is_some() {
             if !already_ws {
-                let Some(a_rtp) = near.remote_rtp else {
+                let Some(signalled) = near.remote_rtp else {
                     return error_result("ws bridge", &"near leg has no signalled address");
                 };
+                // Aim the downlink at leg A's offer `received-from` public IP when one was supplied,
+                // and gate its ingress on the same address — identical to the offer path.
+                let a_rtp = near_gate_rtp.unwrap_or(signalled);
                 if let Some(ws_uri) = profile.ws_uri.clone() {
                     // The same refusal the offer path makes, for a `ws_uri` that arrives first at
                     // answer: this answer is rewritten from B's SDP, so a secure offerer would get no
@@ -4018,11 +4016,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             endpoint_a: near.rtp.id,
                             a_rtp,
                             codec: near_codec.as_ref(),
-                            // Gate leg A to its offer `received-from` public IP when supplied.
-                            accepted_source: bridge_source_filter(
-                                profile,
-                                near_gate_rtp.unwrap_or(a_rtp),
-                            ),
+                            accepted_source: bridge_source_filter(profile, a_rtp),
                             // Refused above for both shapes that would need them.
                             ice_pending: false,
                             secure: None,
@@ -8541,11 +8535,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // Where the bridge's downlink goes. The relay this is taking over may have latched leg A's
         // *observed* source (symmetric RTP, docs/security-and-nat.md §4 layer 3), which for a NATed
         // caller is routinely not the port its `c=` advertised — so follow the media path the call
-        // is actually using, and fall back to the signalled address when nothing has been observed.
+        // is actually using. With nothing observed yet, fall back to the same `received-from`-seeded
+        // address the negotiation paths aim at rather than the raw signalled one; the bridge's own
+        // latch then corrects it on leg A's first accepted packet.
         let a_rtp = self
             .datapath
             .latched_source(near.rtp.id)
-            .unwrap_or(signalled);
+            .unwrap_or_else(|| ws_takeover_media_address(signalled, received_from));
         // …and the gate stays exactly the one the negotiation installed on this endpoint, rather
         // than a fresh one derived from the signalling: `Redirect` bypasses the datapath's gate, so
         // the registry re-enforces this filter itself and it must not silently widen.
@@ -8556,11 +8552,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 _ => None,
             })
             .unwrap_or_else(|| {
-                SourceFilter::Exact(
-                    apply_received_from(Some(signalled), received_from)
-                        .unwrap_or(signalled)
-                        .ip(),
-                )
+                SourceFilter::Exact(ws_takeover_media_address(signalled, received_from).ip())
             });
 
         let takeover = WsRelayTakeover {
@@ -11977,6 +11969,27 @@ fn apply_received_from(
         (Some(addr), Some(ip)) => Some(std::net::SocketAddr::new(ip, addr.port())),
         (addr, _) => addr,
     }
+}
+
+/// Where a WebSocket-takeover leg's media is **aimed**, from the peer's signalled transport address
+/// and the rtpengine `received-from` hint — the same value its ingress gate keys on.
+///
+/// One address for both, deliberately. The hint is the real post-NAT source the SIP proxy saw the
+/// request arrive from, so pairing it with the signalled media port is a better opening guess than
+/// the `c=` address itself, which for a NATed UA is an RFC 1918 address it never receives on
+/// (docs/security-and-nat.md §4 layer 2). A relay leg can afford to aim at the signalled address and
+/// be corrected by the symmetric-RTP latch on the peer's first accepted packet; a takeover leg has no
+/// reverse relay direction, so nothing in the datapath ever corrects it and a wrong seed misaddresses
+/// the whole call rather than just its opening window.
+///
+/// Same bound as everywhere else the hint aims a destination: behind a symmetric NAT the public media
+/// port need not be the signalled one, so this is a better guess, never a guarantee and never a
+/// substitute for the latch that follows it.
+fn ws_takeover_media_address(
+    signalled: std::net::SocketAddr,
+    received_from: Option<std::net::IpAddr>,
+) -> std::net::SocketAddr {
+    apply_received_from(Some(signalled), received_from).unwrap_or(signalled)
 }
 
 /// The source-address gate for an SRTP-bridge leg, mirroring [`ingress_rule`]'s policy: an exact
@@ -16825,6 +16838,27 @@ mod tests {
         )
     }
 
+    /// A **NATed offerer**: its `c=` carries the address the UA sees on its own interface, which is
+    /// not one anything can send to, while its media really arrives from — and has to be answered at
+    /// — somewhere else entirely. `signalled_port` is the media port the UA chose; a cone NAT
+    /// preserves it and a symmetric one does not, which is the difference the two tests below draw.
+    fn nated_offer_sdp(private_ip: &str, signalled_port: u16) -> String {
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {private_ip}\r\ns=-\r\nc=IN IP4 {private_ip}\r\nt=0 0\r\n\
+             m=audio {signalled_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+        )
+    }
+
+    /// Where `call_id`'s WebSocket takeover bridge is currently sending its downlink.
+    fn takeover_downlink_target(engine: &Engine<UdpLoopbackDatapath>, call_id: &str) -> SocketAddr {
+        engine
+            .ws()
+            .route_state(call_id)
+            .expect("the call has a takeover route")
+            .egress
+            .destination()
+    }
+
     /// A WS server that republishes every frame it receives on `frames` and forwards anything pushed
     /// into `downlink` to the engine. The shared harness for the secure-takeover tests.
     async fn takeover_ws_server() -> (
@@ -16869,6 +16903,202 @@ mod tests {
             }
         });
         (format!("ws://{addr}/stream"), frames_rx, down_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_nated_takeover_answers_at_the_received_from_address_not_the_private_one() {
+        // The `received-from` hint re-keyed a takeover leg's ingress *gate* and stopped there: the
+        // downlink kept the address off the caller's `c=`, which for a NATed UA is one it never
+        // receives on. On a relay that costs the pre-latch window, because the datapath's own latch
+        // corrects it from the peer's first accepted packet. A takeover leg has no reverse relay
+        // direction and so no latch behind it — the wrong address was permanent, and the caller heard
+        // nothing at all for the whole call while its own audio arrived and decoded perfectly.
+        //
+        // The cone-NAT shape: the hint carries the real source address and the NAT preserved the port
+        // the UA signalled, so seeding the destination from the hint lands exactly on the caller.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_media::bridge::pcm_to_l16_le;
+
+        let (ws_uri, frames, downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "nat-takeover".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: nated_offer_sdp("192.0.2.9", addr_a.port()),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        // What the SIP proxy observed the request arrive from.
+                        received_from: Some(addr_a.ip()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+        let caller_target = answer.remote_rtp;
+
+        // Before the caller has sent a single packet — the window the whole defect lived in.
+        assert_eq!(
+            takeover_downlink_target(&engine, "nat-takeover"),
+            addr_a,
+            "the downlink is aimed at the observed source, never at the signalled private address"
+        );
+
+        // And end to end: the caller's audio reaches the server, and the server's audio reaches the
+        // caller. The second half is what a NATed caller never got.
+        phone_a
+            .send_to(&ulaw_rtp_packet(7, 0x0A0A_0A0A, 0xFF), caller_target)
+            .await
+            .expect("caller send");
+        assert_eq!(
+            next_uplink_frame(&frames)
+                .await
+                .expect("the WS server received the caller's audio")
+                .len(),
+            320,
+            "8k/20ms L16 uplink"
+        );
+
+        let mut l16 = [0u8; 320];
+        pcm_to_l16_le(&[2000i16; 160], &mut l16);
+        downlink.send(l16.to_vec()).expect("queue downlink");
+        let mut buffer = [0u8; 2048];
+        let mut heard = None;
+        for _ in 0..40 {
+            let Ok(Ok((len, from))) =
+                timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+            else {
+                continue;
+            };
+            assert_eq!(
+                from, caller_target,
+                "the downlink leaves the leg's own socket"
+            );
+            heard = Some(
+                siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len])
+                    .expect("parse rtp")
+                    .payload_type,
+            );
+            break;
+        }
+        assert_eq!(heard, Some(0), "the caller hears the bot, in its own codec");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_takeover_leg_latches_its_downlink_when_the_signalled_port_is_wrong() {
+        // The other half of the fix, and the honest bound on the first. Behind a *symmetric* NAT the
+        // public media port need not be the one the UA signalled, so seeding the destination from the
+        // `received-from` hint is a better guess, not a guarantee — it fixes the address and can
+        // still miss the port. Every other pipeline recovers from that for free, because a relay leg
+        // latches its peer's observed source; a takeover leg has no reverse relay direction, so it
+        // latches here or not at all.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_media::bridge::pcm_to_l16_le;
+
+        let (ws_uri, frames, downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        // Two real sockets: the port the UA signalled, and the different one its media comes from.
+        let (stale_phone, stale_addr) = phone().await;
+        let (phone_a, addr_a) = phone().await;
+        assert_ne!(addr_a.port(), stale_addr.port());
+
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "nat-rebind".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: nated_offer_sdp("192.0.2.9", stale_addr.port()),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        received_from: Some(addr_a.ip()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = sdp::parse(&ok_sdp_text(&result)).expect("answer sdp");
+        let caller_target = answer.remote_rtp;
+        assert_eq!(
+            takeover_downlink_target(&engine, "nat-rebind"),
+            stale_addr,
+            "the seed pairs the hint's address with the port the UA signalled — right address, \
+             wrong port"
+        );
+
+        // The caller's media arrives from its real port. It clears the gate (the hint fixed the
+        // address, which is all the gate keys on) and must move the downlink onto it.
+        phone_a
+            .send_to(&ulaw_rtp_packet(7, 0x0A0A_0A0A, 0xFF), caller_target)
+            .await
+            .expect("caller send");
+        assert_eq!(
+            next_uplink_frame(&frames)
+                .await
+                .expect("the caller's audio reaches the server")
+                .len(),
+            320
+        );
+        assert_eq!(
+            takeover_downlink_target(&engine, "nat-rebind"),
+            addr_a,
+            "the leg latched the source its media actually came from"
+        );
+
+        let mut l16 = [0u8; 320];
+        pcm_to_l16_le(&[2000i16; 160], &mut l16);
+        downlink.send(l16.to_vec()).expect("queue downlink");
+        let mut buffer = [0u8; 2048];
+        let mut heard = false;
+        for _ in 0..40 {
+            let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+            else {
+                continue;
+            };
+            assert_eq!(
+                siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len])
+                    .expect("parse rtp")
+                    .payload_type,
+                0
+            );
+            heard = true;
+            break;
+        }
+        assert!(heard, "the caller hears the bot once the leg has latched");
+
+        // Nothing keeps going to the port the signalling named once the latch has moved.
+        let mut stale = [0u8; 2048];
+        let after_latch = timeout(
+            Duration::from_millis(300),
+            stale_phone.recv_from(&mut stale),
+        )
+        .await;
+        assert!(
+            after_latch.is_err(),
+            "the pre-latch guess is abandoned, not kept alongside the latched address"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

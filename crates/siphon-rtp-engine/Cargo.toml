@@ -114,6 +114,12 @@ rustls-pki-types = { workspace = true }
 name = "secure_pipeline_bench"
 harness = false
 
+# The per-packet cost of a WebSocket-takeover leg's ingress — the source gate, the symmetric-RTP
+# latch that aims its downlink, and the SRTP (de)crypt a secure leg adds in front of both.
+[[bench]]
+name = "ws_takeover_bench"
+harness = false
+
 # --- Debian packaging (cargo-deb) ---
 # This crate is a workspace member (crates/siphon-rtp-engine/), so the release binary lands at the
 # WORKSPACE target dir (target/<triple>/release/siphon-rtp). cargo-deb rewrites a `target/release/`

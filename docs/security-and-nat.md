@@ -167,7 +167,8 @@ Only **accept** (and only latch from) media whose source matches the address lea
   ptime — addressed to an unroutable RFC 1918 destination, so the audio was lost and the node emitted
   bogons. It applies wherever a peer's initial destination is derived from its signalled address: the
   in-kernel Forward relay (RTP and companion RTCP), the SDES and DTLS bridges, all three transcoding
-  pipelines, and the RFC 4103 text relay in both its plaintext and secure forms.
+  pipelines, the RFC 4103 text relay in both its plaintext and secure forms, and the
+  WebSocket-takeover leg (§5e).
 
   This is an **opening guess, and only that**. Behind a symmetric NAT the public media port need not
   be the signalled one, so the seeded destination can still be wrong — never *more* wrong than an
@@ -175,7 +176,10 @@ Only **accept** (and only latch from) media whose source matches the address lea
   behind it. Two properties keep that bounded, and both are load-bearing:
   - it is confined to the pre-latch window and is **never a latch substitute** — the latch still
     governs from the first accepted packet onward, and it is fed only by packets that passed the
-    gate, so nothing here widens what the engine accepts (§4.7 is untouched);
+    gate, so nothing here widens what the engine accepts (§4.7 is untouched). That bound is only
+    real where a latch actually exists, which is why the WebSocket-takeover leg had to grow one of
+    its own (§5e): it has no reverse relay direction, so no `ForwardRule` faces it and the datapath
+    latch never runs. On that path a wrong seed was not a 400 ms window, it was the whole call;
   - it uses **control-plane** data — an address the SIP proxy observed the signalling arrive from —
     not anything asserted by an unauthenticated media packet, which is the distinction between this
     and the RTPBleed class of blind adoption.
@@ -817,6 +821,34 @@ copy of Layers 1–4.
   signalled-source gate (`Exact`/`Subnet`/`Any`, tightened by the `received-from` public-IP hint)
   before anything reaches the bridge — `Redirect` bypasses the datapath's Forward-path gate, exactly as
   on Layers 5a–5d.
+- **The hint aims the downlink too, and the leg latches its own egress (§4 layers 2 and 3).** The
+  same `(hint IP, signalled port)` pair the gate keys on is where the bridge's drain task starts
+  sending, at every setup site — the two-leg `offer`, the single-leg `answer_local`, a `ws_uri` that
+  arrives first at `answer`, and the runtime attach's fallback when the relay it displaced had not
+  latched anything yet. From there `WsRegistry::dispatch` applies the same SSRC-consistent
+  symmetric-RTP latch the relay and transcode paths use (`WsEgress`, sharing `SymmetricLatch` with
+  `media_pipeline` so the two userspace `Redirect` paths cannot drift): the first packet to pass the
+  gate — and, on a secure leg, SRTP authentication — re-points the downlink at the source it actually
+  arrived from, a new source keeping the stream's SSRC follows a genuine NAT rebind, and a new source
+  carrying a different SSRC never moves it. Only RTP media is offered to the latch, so a STUN or DTLS
+  record on a muxed takeover port cannot steer the call's audio.
+  - Gating on the hint while still *sending* to the private `c=` is the general defect §4 layer 2
+    describes, but it is worse here than on a relay leg and it is worth being explicit about why:
+    a relay leg is corrected by the datapath's latch on the peer's first accepted packet, whereas a
+    takeover leg has no reverse relay direction and so no forward rule and no datapath latch behind
+    it. Nothing corrected it, so a NATed caller's downlink went to an RFC 1918 address for the life
+    of the call — signalling clean, uplink arriving and decoding perfectly, and silence back.
+  - The `symmetric` profile flag was never the fix for this and is not one now. It widens the
+    ingress *gate* to `Any`, a strictly weaker Layer 2, and before the latch existed it did nothing
+    whatever about where the downlink was aimed — a takeover leg with it set still sent to the
+    private `c=`. With the latch in place a `symmetric` takeover leg does now follow the first source
+    that reaches it, exactly as a `symmetric` relay leg has always done; that width is what the flag
+    asks for, and it is still the wrong tool here, because the `received-from` hint reaches the same
+    destination while leaving the gate `Exact`.
+  - On an **ICE** leg the latch is off entirely (`WsEgress::ice_managed`). The agent's selection is
+    the only thing that may adopt a transport (Layer 4, RFC 8445 §7.3.1.3) — the same posture the
+    datapath takes by installing `LatchPolicy::Off` on an ICE relay leg — so media from an unselected
+    port on the selected address is forwarded but never re-points the downlink.
 - **Only `answer_local` can be a secure offerer's far side, and that is a structural fact, not a
   policy.** The engine has to advertise *its own* keying (`a=crypto`, or `a=fingerprint` + the
   complement `a=setup` per RFC 5763 §5) in the answer that goes back to A. `answer_local` writes that
