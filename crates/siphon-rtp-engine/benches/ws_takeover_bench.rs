@@ -37,12 +37,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::ws_bridge::{WsCallPlan, WsEgress, WsRegistry, WsSecureLeg};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::SrtpKeyMaterial;
 
-const ENDPOINT: EndpointId = EndpointId(1);
 const PEER: &str = "127.0.0.2:41000";
 const OFF_SOURCE: &str = "198.51.100.7:41000";
 /// 8 kHz / 20 ms of µ-law.
@@ -68,9 +68,9 @@ fn key(seed: u8) -> SrtpKeyMaterial {
 
 /// One received datagram. `data` is cloned from a preallocated [`Bytes`] (a refcount bump), so no
 /// bench point is measuring the allocator instead of `dispatch`.
-fn packet(source: SocketAddr, data: &Bytes) -> RxPacket {
+fn packet(endpoint: EndpointId, source: SocketAddr, data: &Bytes) -> RxPacket {
     RxPacket {
-        endpoint: ENDPOINT,
+        endpoint,
         source,
         arrival: 0,
         data: data.clone(),
@@ -79,7 +79,14 @@ fn packet(source: SocketAddr, data: &Bytes) -> RxPacket {
 
 /// Register one takeover leg and hand back the registry plus its mailbox, so each point can drain
 /// what it feeds and none of them drifts into measuring a full channel.
+///
+/// `endpoint` is a **real** endpoint on `datapath`, not a synthetic id: `dispatch` stamps the leg's
+/// liveness for the idle sweep on every accepted packet, and that stamp is a map lookup plus an
+/// atomic store which only happens for an endpoint the datapath actually knows. Handing it an id
+/// that misses would measure the lookup miss and quietly under-report the real per-packet cost.
 fn registry(
+    datapath: &UdpLoopbackDatapath,
+    endpoint: EndpointId,
     secure: Option<Arc<WsSecureLeg>>,
     ice_managed: bool,
 ) -> (WsRegistry, flume::Receiver<Bytes>) {
@@ -87,11 +94,12 @@ fn registry(
     let (rtp_in, rtp_in_rx) = flume::bounded::<Bytes>(1024);
     registry.register(WsCallPlan {
         call_id: "bench".to_string(),
-        endpoint_a: ENDPOINT,
+        endpoint_a: endpoint,
         accepted_source: SourceFilter::Exact(addr(PEER).ip()),
         ice_pending: false,
         secure,
         egress: Arc::new(WsEgress::new(addr(PEER), ice_managed)),
+        activity: Arc::new(datapath.clone()),
         rtp_in,
         // The registry only ever aborts these; a takeover leg's real bridge and drain tasks are not
         // on the ingress path being measured.
@@ -110,30 +118,40 @@ fn ws_takeover_dispatch(criterion: &mut Criterion) {
     let _guard = runtime.enter();
     let mut group = criterion.benchmark_group("ws_takeover_dispatch");
 
+    // Four real endpoints on one backend, so each point's liveness stamp does its real work.
+    let datapath = UdpLoopbackDatapath::new();
+    let endpoints: Vec<EndpointId> = runtime.block_on(async {
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            ids.push(datapath.alloc_endpoint().await.expect("endpoint").id);
+        }
+        ids
+    });
+
     let peer = addr(PEER);
     let frame = Bytes::from(rtp_packet(1, 0x0A0A_0A0A));
 
     // Settled: gate + latch + mailbox, the latch already on this source.
-    let (plain, plain_rx) = registry(None, false);
+    let (plain, plain_rx) = registry(&datapath, endpoints[0], None, false);
     group.bench_function("plaintext", |bencher| {
         bencher.iter(|| {
-            plain.dispatch(black_box(packet(peer, &frame)));
+            plain.dispatch(black_box(packet(endpoints[0], peer, &frame)));
             let _ = plain_rx.try_recv();
         })
     });
 
     // The same leg with the latch switched off (an ICE-managed egress): the delta is the latch.
-    let (no_latch, no_latch_rx) = registry(None, true);
+    let (no_latch, no_latch_rx) = registry(&datapath, endpoints[1], None, true);
     group.bench_function("plaintext_no_latch", |bencher| {
         bencher.iter(|| {
-            no_latch.dispatch(black_box(packet(peer, &frame)));
+            no_latch.dispatch(black_box(packet(endpoints[1], peer, &frame)));
             let _ = no_latch_rx.try_recv();
         })
     });
 
     // The latch's write path on every packet — a source that never settles. Addresses are resolved
     // up front; parsing one per iteration would measure the parser, not the latch.
-    let (rebind, rebind_rx) = registry(None, false);
+    let (rebind, rebind_rx) = registry(&datapath, endpoints[2], None, false);
     let sources: Vec<SocketAddr> = (41000u16..41064)
         .map(|port| SocketAddr::new(peer.ip(), port))
         .collect();
@@ -141,7 +159,7 @@ fn ws_takeover_dispatch(criterion: &mut Criterion) {
     group.bench_function("rebind", |bencher| {
         bencher.iter(|| {
             next = (next + 1) % sources.len();
-            rebind.dispatch(black_box(packet(sources[next], &frame)));
+            rebind.dispatch(black_box(packet(endpoints[2], sources[next], &frame)));
             let _ = rebind_rx.try_recv();
         })
     });
@@ -149,7 +167,7 @@ fn ws_takeover_dispatch(criterion: &mut Criterion) {
     // An off-source flood: the gate must reject it more cheaply than it accepts real media.
     let off_source = addr(OFF_SOURCE);
     group.bench_function("dropped", |bencher| {
-        bencher.iter(|| plain.dispatch(black_box(packet(off_source, &frame))))
+        bencher.iter(|| plain.dispatch(black_box(packet(endpoints[0], off_source, &frame))))
     });
 
     // A secure leg: SRTP `unprotect` in front of the same gate and latch. Each iteration gets a fresh
@@ -159,6 +177,8 @@ fn ws_takeover_dispatch(criterion: &mut Criterion) {
     let peer_key = key(0x22);
     let mut peer_leg = SecureLeg::new(&peer_key, &engine_key);
     let (secure, secure_rx) = registry(
+        &datapath,
+        endpoints[3],
         Some(Arc::new(WsSecureLeg::keyed(SecureLeg::new(
             &engine_key,
             &peer_key,
@@ -177,7 +197,7 @@ fn ws_takeover_dispatch(criterion: &mut Criterion) {
                 Bytes::from(sealed)
             },
             |sealed| {
-                secure.dispatch(black_box(packet(peer, &sealed)));
+                secure.dispatch(black_box(packet(endpoints[3], peer, &sealed)));
                 let _ = secure_rx.try_recv();
             },
             BatchSize::SmallInput,

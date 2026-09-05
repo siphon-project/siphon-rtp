@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::udp::UdpLoopbackDatapath;
+use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_engine::ws_bridge::{WsCallPlan, WsEgress, WsRegistry};
 
 /// A pass-through allocator that counts allocations on the armed thread only.
@@ -59,7 +60,6 @@ fn allocations(body: impl FnOnce()) -> usize {
     ALLOCATIONS.load(Ordering::Relaxed) - before
 }
 
-const ENDPOINT: EndpointId = EndpointId(1);
 const PEER_IP: [u8; 4] = [127, 0, 0, 2];
 
 fn peer(port: u16) -> SocketAddr {
@@ -77,16 +77,25 @@ fn rtp_packet(sequence: u16, ssrc: u32) -> Vec<u8> {
 }
 
 /// One registered takeover leg, plus its mailbox so the caller can drain what it feeds.
-fn leg(ice_managed: bool) -> (WsRegistry, flume::Receiver<Bytes>) {
+///
+/// `endpoint` is a real endpoint on `datapath`: `dispatch` stamps the leg's liveness for the idle
+/// sweep on every accepted packet, and that stamp must be exercised for real here — it is on the same
+/// per-packet path and is exactly the kind of thing that could start allocating unnoticed.
+fn leg(
+    datapath: &UdpLoopbackDatapath,
+    endpoint: EndpointId,
+    ice_managed: bool,
+) -> (WsRegistry, flume::Receiver<Bytes>) {
     let registry = WsRegistry::default();
     let (rtp_in, rtp_in_rx) = flume::bounded::<Bytes>(1024);
     registry.register(WsCallPlan {
         call_id: "zero-alloc".to_string(),
-        endpoint_a: ENDPOINT,
+        endpoint_a: endpoint,
         accepted_source: SourceFilter::Exact(peer(0).ip()),
         ice_pending: false,
         secure: None,
         egress: Arc::new(WsEgress::new(peer(41000), ice_managed)),
+        activity: Arc::new(datapath.clone()),
         rtp_in,
         bridge_task: tokio::spawn(std::future::pending()),
         drain_task: tokio::spawn(std::future::pending()),
@@ -94,9 +103,9 @@ fn leg(ice_managed: bool) -> (WsRegistry, flume::Receiver<Bytes>) {
     (registry, rtp_in_rx)
 }
 
-fn packet(source: SocketAddr, data: &Bytes) -> RxPacket {
+fn packet(endpoint: EndpointId, source: SocketAddr, data: &Bytes) -> RxPacket {
     RxPacket {
-        endpoint: ENDPOINT,
+        endpoint,
         source,
         arrival: 0,
         data: data.clone(),
@@ -107,13 +116,14 @@ fn packet(source: SocketAddr, data: &Bytes) -> RxPacket {
 /// the datagram itself is what the counter sees.
 fn pump(
     registry: &WsRegistry,
+    endpoint: EndpointId,
     mailbox: &flume::Receiver<Bytes>,
     frame: &Bytes,
     count: usize,
     source_for: impl Fn(usize) -> SocketAddr,
 ) {
     for index in 0..count {
-        registry.dispatch(packet(source_for(index), frame));
+        registry.dispatch(packet(endpoint, source_for(index), frame));
         let _ = mailbox.try_recv();
     }
 }
@@ -123,18 +133,22 @@ async fn the_downlink_latch_allocates_nothing_on_the_ingress_path() {
     const FRAMES: usize = 2_000;
     let frame = Bytes::from(rtp_packet(1, 0x0A0A_0A0A));
 
-    let (latching, latching_rx) = leg(false);
-    let (no_latch, no_latch_rx) = leg(true);
+    let datapath = UdpLoopbackDatapath::new();
+    let one = datapath.alloc_endpoint().await.expect("endpoint").id;
+    let two = datapath.alloc_endpoint().await.expect("endpoint").id;
+    let three = datapath.alloc_endpoint().await.expect("endpoint").id;
+    let (latching, latching_rx) = leg(&datapath, one, false);
+    let (no_latch, no_latch_rx) = leg(&datapath, two, true);
 
     // Warm both: the first packet latches, and any one-off inside the mailbox happens now.
-    pump(&latching, &latching_rx, &frame, 16, |_| peer(41000));
-    pump(&no_latch, &no_latch_rx, &frame, 16, |_| peer(41000));
+    pump(&latching, one, &latching_rx, &frame, 16, |_| peer(41000));
+    pump(&no_latch, two, &no_latch_rx, &frame, 16, |_| peer(41000));
 
     let with_latch = allocations(|| {
-        pump(&latching, &latching_rx, &frame, FRAMES, |_| peer(41000));
+        pump(&latching, one, &latching_rx, &frame, FRAMES, |_| peer(41000));
     });
     let without_latch = allocations(|| {
-        pump(&no_latch, &no_latch_rx, &frame, FRAMES, |_| peer(41000));
+        pump(&no_latch, two, &no_latch_rx, &frame, FRAMES, |_| peer(41000));
     });
     assert_eq!(
         with_latch, without_latch,
@@ -143,12 +157,12 @@ async fn the_downlink_latch_allocates_nothing_on_the_ingress_path() {
     );
 
     // The write path, taken on every packet: a source that never settles must not allocate either.
-    let (rebinding, rebinding_rx) = leg(false);
-    pump(&rebinding, &rebinding_rx, &frame, 16, |index| {
+    let (rebinding, rebinding_rx) = leg(&datapath, three, false);
+    pump(&rebinding, three, &rebinding_rx, &frame, 16, |index| {
         peer(41000 + (index % 64) as u16)
     });
     let while_rebinding = allocations(|| {
-        pump(&rebinding, &rebinding_rx, &frame, FRAMES, |index| {
+        pump(&rebinding, three, &rebinding_rx, &frame, FRAMES, |index| {
             peer(41000 + (index % 64) as u16)
         });
     });

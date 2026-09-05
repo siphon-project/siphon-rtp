@@ -554,6 +554,12 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             return;
         }
 
+        // Accepted: past the source gate, past the keyed check and past the crypto. Stamp liveness for
+        // the idle sweep, exactly as the SDES bridge does and for the same reason — a `Redirect` leg
+        // gets no `last_seen` from the datapath (docs/security-and-nat.md §4 layer 6). `Pipeline`-mode
+        // media returned above and is stamped by the per-call actor it was handed to.
+        self.datapath.note_activity(packet.endpoint);
+
         // Lawful-interception content (ETSI TS 103 221-2 X3), taken from whichever side of the
         // transform is plaintext — the same placement as the SDES bridge. Reached only after the
         // source gate, after the leg is keyed, and after the crypto succeeded, so an unkeyed,

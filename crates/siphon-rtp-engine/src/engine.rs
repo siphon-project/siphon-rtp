@@ -3247,6 +3247,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_pending,
             secure,
             egress,
+            // A takeover leg has no per-call actor to stamp its liveness from, so the registry
+            // carries the datapath itself and stamps on each accepted packet.
+            activity: Arc::new(self.datapath.clone()),
             rtp_in: rtp_in_tx,
             bridge_task,
             drain_task,
@@ -14293,6 +14296,86 @@ mod tests {
         assert_eq!(recovered_a, from_b, "A receives the decrypted plaintext");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_secure_bridge_carrying_media_is_not_reaped_but_a_silent_one_still_is() {
+        // The same gap R7 named on the takeover pipeline, on the SDES bridge. Both of a bridged
+        // call's legs are `Redirect`, so no `Forward` rule stamps anywhere and the datapath's
+        // `Redirect` arm deliberately does not either — without the bridge stamping for itself, a
+        // secure bridge call is reaped at the media timeout however much audio is crossing it.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::SrtpContext;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "savp-idle".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        transport_protocol: Some("RTP/SAVP".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let offer_reply = sdp::parse(&ok_sdp_text(&offer)).expect("parse offer reply");
+        let engine_far_key = *offer_reply.crypto.first().expect("engine a=crypto to B");
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "savp-idle".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: savp_answer_sdp(addr_b, &b_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let near_addr = sdp::parse(&ok_sdp_text(&answer))
+            .expect("parse answer reply")
+            .remote_rtp;
+
+        // Past the timeout first, so surviving the sweep can only be the packet below.
+        engine.datapath().advance_clock(10);
+        let from_a = rtp_packet(100, 0x0A0A_0A0A);
+        phone_a.send_to(&from_a, near_addr).await.expect("a send");
+        // B receiving it is the synchronisation point: the datagram cleared the gate and the crypto.
+        let (srtp, _from) = recv(&phone_b).await;
+        let mut b_decrypt = SrtpContext::from_key_material(&engine_far_key.key);
+        let mut recovered = Vec::new();
+        b_decrypt
+            .unprotect(&srtp, &mut recovered)
+            .expect("B decrypts");
+        assert_eq!(recovered, from_a);
+
+        assert!(
+            engine.reap_idle(5).await.is_empty(),
+            "a secure bridge carrying audio is not idle"
+        );
+
+        engine.datapath().advance_clock(10);
+        assert_eq!(
+            engine.reap_idle(5).await,
+            vec!["savp-idle".to_string()],
+            "and one that has genuinely gone quiet is still reaped"
+        );
+    }
+
     /// An `RTP/SAVP` answer SDP advertising AMR-WB (PT 96, 16 kHz) at `addr` with `crypto` (rtcp-mux).
     #[cfg(feature = "amr")]
     fn savp_amr_wb_answer_sdp(addr: SocketAddr, crypto: &CryptoAttribute) -> String {
@@ -16903,6 +16986,80 @@ mod tests {
             }
         });
         (format!("ws://{addr}/stream"), frames_rx, down_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_takeover_carrying_ingress_is_not_reaped_but_a_silent_one_still_is() {
+        // R7. The idle sweep reads `Datapath::last_activity`, and the `Redirect` arm deliberately
+        // never sets it — each userspace consumer stamps its own, after its own gate, so a spoofed
+        // spray cannot hold a dead path open. The takeover pipeline never did, so its endpoint stayed
+        // at `created_tick` for the life of the call and the sweep tore it down at the media timeout
+        // however much audio was arriving. It presents as the caller hanging up.
+        //
+        // Both halves matter and are asserted together: a call being talked into must survive, and a
+        // call whose caller has genuinely stopped must still be reaped on schedule.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        let (ws_uri, frames, _downlink) = takeover_ws_server().await;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "ws-idle".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: ProfileFlags {
+                        ws_uri: Some(ws_uri),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let caller_target = sdp::parse(&ok_sdp_text(&result))
+            .expect("answer sdp")
+            .remote_rtp;
+        expect_ws_start(&frames).await;
+
+        // Move the clock past the timeout *first*, so surviving the sweep can only be the packet
+        // below and never a call that is simply too young to reap.
+        engine.datapath().advance_clock(10);
+        phone_a
+            .send_to(&ulaw_rtp_packet(7, 0x0A0A_0A0A, 0xFF), caller_target)
+            .await
+            .expect("caller send");
+        // The uplink frame is the synchronisation point: it proves the datagram cleared the gate and
+        // reached the bridge, which is strictly after the liveness stamp.
+        assert!(
+            next_uplink_frame(&frames).await.is_some(),
+            "the caller's audio reaches the WS server"
+        );
+
+        assert!(
+            engine.reap_idle(5).await.is_empty(),
+            "a takeover call being talked into is not idle"
+        );
+        assert!(
+            engine.ws().is_ws_call("ws-idle"),
+            "and its bridge is intact"
+        );
+
+        // Now the caller goes quiet: the sweep must still do its job.
+        engine.datapath().advance_clock(10);
+        assert_eq!(
+            engine.reap_idle(5).await,
+            vec!["ws-idle".to_string()],
+            "a takeover call whose caller has stopped sending is still reaped"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
