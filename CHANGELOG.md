@@ -7,6 +7,58 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.4.6] — 2026-09-05
+
+Two defects on the WebSocket-takeover downlink, both silent in every place an operator would look: the
+control plane reports the bridge started, the leg counters show healthy `packets_out`, and a capture
+shows well-formed RTP going to the right address.
+
+**A patch.** `siphon-rtp-proto` is untouched — no verb, event, field or type changed — so a controller
+floating on `^0.4` needs no work to take this, and the internal path-deps pinned at `"0.4.0"` still
+caret-match.
+
+**One behaviour change to be aware of.** A takeover leg now emits continuously — a low-level comfort
+floor between turns — where it previously emitted only while the WS server was speaking. That is the
+point (see below), but it does mean a takeover call's egress packet rate is now the ptime rate rather
+than the bot's duty cycle. No other pipeline changes, and nothing about what the engine accepts,
+decrypts or forwards moves.
+
+### Fixed
+
+- **The downlink no longer assumes one WebSocket frame is one ptime.** The bridge advanced the egress
+  RTP timestamp by one ptime per frame *received* rather than by the samples that frame carried. The
+  `start` envelope announces a ptime and the protocol asks for one frame per ptime, but nothing
+  enforces it — and a server writing 40 ms per turn against a 20 ms ptime is an ordinary default, not
+  a broken client. Each such frame was emitted as one oversized packet claiming to begin one ptime
+  after the last, so timestamps advanced at half the rate of the audio, every packet overlapped its
+  predecessor, and the handset played nothing.
+
+  The same assumption cost audio a second way: a queue of whole frames popped once per tick drained at
+  half the rate a 40 ms server filled it, so it saturated at the cap and drop-oldest discarded audio
+  on top of the incoherence.
+
+  The core now holds its playout as a **sample ring** and drains exactly one ptime per tick. The RTP
+  cadence is the engine's own whatever the server's framing is, and the fixed per-ptime timestamp
+  advance is correct by construction rather than by assumption. Frames *shorter* than a ptime are
+  handled too, which a repacketizer at the encoder would not have covered.
+
+- **A takeover leg keeps its egress clock running while the server is quiet.** It previously emitted
+  nothing at all between turns, which is most of a conversation. A takeover leg is the caller's only
+  far side — no second party, no relay behind it — so nothing else holds the return path open: the
+  leg read as dead air and its NAT pinhole toward the caller expired between turns. An underrun now
+  renders a low-level comfort floor, audio-encoded on the leg's own codec at the same level the
+  transcode pipeline's comfort-idle egress uses (the constant moved to `siphon-rtp-codec` so the two
+  cannot drift).
+
+  Deliberately **not** RFC 3389 CN: a takeover answer negotiates no CN payload type, and inventing one
+  at render time would put a format on the wire the caller never agreed to. Barge-in still flushes the
+  queued bot audio — that is its whole point — but no longer stops the clock along with it.
+
+  Net **faster** despite the extra copy, because the per-frame allocation the decode used to make is
+  gone: the duplex tick with an engaged 16 kHz wire conversion drops from 8.74 µs to 7.75 µs, and the
+  un-converted tick from 330 ns to 263 ns. Zero per-tick heap — the ring, the staging frame and the
+  decode scratch are all preallocated. See `docs/security-and-nat.md` Layer 5e.
+
 ## [0.4.5] — 2026-09-05
 
 Three of the engine's userspace slow paths never told the idle sweep they were alive, so it reaped
