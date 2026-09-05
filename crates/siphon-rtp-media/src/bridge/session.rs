@@ -189,6 +189,16 @@ impl BridgeSession {
         self
     }
 
+    /// Render low-level comfort noise toward the call whenever the server has not supplied a full
+    /// ptime, so the leg's egress clock never stops — see [`BridgeCore::with_comfort_idle`]. What a
+    /// **takeover** leg always wants: it is the caller's only far side, so a tick that emits nothing
+    /// is silence on the wire for as long as the server is quiet.
+    #[must_use]
+    pub fn with_comfort_idle(mut self, enabled: bool) -> Self {
+        self.core = self.core.with_comfort_idle(enabled);
+        self
+    }
+
     /// Enable local energy-VAD turn-taking (and optional barge-in) on the uplink — see
     /// [`BridgeCore::with_vad`].
     #[must_use]
@@ -239,6 +249,12 @@ impl BridgeSession {
     #[must_use]
     pub fn playout_depth(&self) -> usize {
         self.core.playout_depth()
+    }
+
+    /// Buffered downlink audio in samples — see [`BridgeCore::playout_samples`].
+    #[must_use]
+    pub fn playout_samples(&self) -> usize {
+        self.core.playout_samples()
     }
 
     /// Feed an inbound RTP packet from the call (uplink ingress).
@@ -346,13 +362,19 @@ impl BridgeSession {
         // so convert it back to the leg's codec rate before the encode. Skipping this renders the
         // frame sample-for-sample at the wrong rate: the right samples at the wrong speed and pitch,
         // with no error anywhere unless the encoder happens to reject the length.
+        //
+        // The frame is **exactly one ptime** at the wire rate, whatever the server's own framing was:
+        // the core drains its playout by samples, not by frames. That is what makes the fixed
+        // per-ptime timestamp advance in `MediaLeg::packetize` correct — hand it a 40 ms frame, as a
+        // server writing 40 ms per turn against a 20 ms ptime used to, and it emits one oversized
+        // packet stamped as a single ptime, so timestamps run at half the rate of the audio and every
+        // packet overlaps its predecessor. Impeccable packet by packet; unplayable as a stream.
         if let Some(frame) = self.core.take_downlink_pcm() {
             let rendered: &[i16] = match self.downlink_resampler.as_mut() {
                 Some(resampler) => {
-                    // Same clamp as the uplink: a server frame longer than the ptime ceiling is
-                    // truncated rather than allowed to grow the reserved scratch. The encoder would
-                    // reject an over-long frame anyway; this just keeps the hot path allocation-free
-                    // whatever the server sends.
+                    // Same clamp as the uplink. The core already bounds the frame to one ptime, so
+                    // this only ever bites on a degenerate ptime/rate pairing; it keeps the hot path
+                    // allocation-free regardless.
                     let feed = frame
                         .len()
                         .min(ceiling_frame_samples(resampler.input_rate()));
@@ -360,7 +382,7 @@ impl BridgeSession {
                     resampler.process(&frame[..feed], &mut self.downlink_converted);
                     &self.downlink_converted
                 }
-                None => &frame,
+                None => frame,
             };
             let rendered_samples = rendered.len();
             if rendered_samples == 0 {
@@ -439,6 +461,171 @@ mod tests {
         buffer
     }
 
+    /// R8. The protocol asks for one binary frame per ptime and nothing enforces it — a server that
+    /// writes 40 ms per turn against a 20 ms ptime is an ordinary default, not a broken client. Each
+    /// such frame used to be rendered as one oversized RTP packet whose timestamp advanced by a single
+    /// ptime, so timestamps ran at half the rate of the audio and every packet overlapped its
+    /// predecessor by 20 ms. Impeccable packet by packet — right payload type, one SSRC, monotonic
+    /// sequence, no gaps, correct destination — and unplayable as a stream.
+    #[test]
+    fn a_server_frame_longer_than_the_ptime_renders_as_whole_ptime_packets() {
+        let mut session = ulaw_session(); // 8 kHz wire, 20 ms ptime ⇒ 160 samples per packet
+                                          // One 40 ms frame: two ptimes in a single WS write.
+        let wire: Vec<i16> = (0..320).map(|n| ((n * 37) % 4000) as i16 - 2000).collect();
+        let mut l16 = vec![0u8; wire.len() * 2];
+        pcm_to_l16_le(&wire, &mut l16);
+        session.on_ws_binary(&l16);
+
+        let mut uplink = [0u8; 4096];
+        let mut downlink = [0u8; 4096];
+        let mut stamps = Vec::new();
+        let mut payload = Vec::new();
+        for _ in 0..2 {
+            let result = session.tick(&mut uplink, &mut downlink);
+            let packet =
+                RtpPacket::parse(&downlink[..result.downlink_bytes]).expect("a downlink packet");
+            assert_eq!(
+                packet.payload.len(),
+                160,
+                "one ptime of µ-law per packet, never the whole 40 ms frame"
+            );
+            stamps.push(packet.timestamp);
+            payload.extend_from_slice(packet.payload);
+        }
+        assert_eq!(
+            stamps[1].wrapping_sub(stamps[0]),
+            160,
+            "the timestamp advances by exactly the samples the previous packet carried"
+        );
+
+        // No audio is lost or duplicated by the split: the two payloads concatenated are the µ-law
+        // encoding of the whole frame, computed independently rather than by decoding our own output.
+        use siphon_rtp_codec::Encoder as _;
+        let mut reference = vec![0u8; 320];
+        G711::ulaw()
+            .encode(&wire, &mut reference)
+            .expect("reference encode");
+        assert_eq!(payload, reference, "the split preserves the audio exactly");
+    }
+
+    /// The other half of the same defect. A queue of whole frames popped once per tick drains at one
+    /// frame per ptime, so a 40 ms server filled it twice as fast as it emptied: it saturated at the
+    /// cap and drop-oldest threw audio away for the rest of the call. Draining by samples matches the
+    /// fill rate exactly, whatever the server's framing.
+    #[test]
+    fn a_forty_millisecond_server_cadence_drains_without_discarding_audio() {
+        let mut session = ulaw_session();
+        let wire = vec![1234i16; 320]; // 40 ms per write
+        let mut l16 = vec![0u8; wire.len() * 2];
+        pcm_to_l16_le(&wire, &mut l16);
+
+        let mut uplink = [0u8; 4096];
+        let mut downlink = [0u8; 4096];
+        let mut emitted = 0usize;
+        for _ in 0..40 {
+            session.on_ws_binary(&l16);
+            // Two ptimes elapse for every 40 ms the server writes.
+            for _ in 0..2 {
+                let result = session.tick(&mut uplink, &mut downlink);
+                assert!(result.downlink_bytes > 0, "every tick renders a packet");
+                emitted += 1;
+            }
+            assert!(
+                session.playout_samples() <= 160,
+                "the ring tracks the server rather than growing to the cap and dropping"
+            );
+        }
+        assert_eq!(emitted, 80, "40 ms in, two 20 ms packets out, every time");
+    }
+
+    /// R6. A takeover leg is the caller's only far side — no second party, no relay behind it — so a
+    /// tick that renders nothing is silence on the wire for as long as the WS server is quiet, which
+    /// is most of a conversation. That reads to the caller as a dead line and lets the NAT pinhole
+    /// toward them expire. Comfort-idle keeps the egress clock running.
+    #[test]
+    fn a_comfort_idle_leg_keeps_its_egress_clock_running_while_the_server_is_silent() {
+        let mut uplink = [0u8; 4096];
+        let mut downlink = [0u8; 4096];
+
+        // Without it: nothing at all, which is what a takeover leg used to do between turns.
+        let mut plain = ulaw_session();
+        assert_eq!(
+            plain.tick(&mut uplink, &mut downlink).downlink_bytes,
+            0,
+            "a leg that is not comfort-idle renders only what the server sent"
+        );
+
+        let mut session = ulaw_session().with_comfort_idle(true);
+        let mut previous: Option<u32> = None;
+        for _ in 0..5 {
+            let result = session.tick(&mut uplink, &mut downlink);
+            let packet =
+                RtpPacket::parse(&downlink[..result.downlink_bytes]).expect("an idle packet");
+            assert_eq!(packet.payload.len(), 160, "a full ptime of comfort noise");
+            assert_eq!(packet.payload_type, 0, "on the leg's own negotiated codec");
+            if let Some(previous) = previous {
+                assert_eq!(
+                    packet.timestamp.wrapping_sub(previous),
+                    160,
+                    "the egress clock advances one ptime per tick"
+                );
+            }
+            previous = Some(packet.timestamp);
+
+            // A *comfort* floor, not audible noise: decode it back and check it is far below speech.
+            use siphon_rtp_codec::Decoder as _;
+            let mut pcm = [0i16; 160];
+            G711::ulaw()
+                .decode(packet.payload, &mut pcm)
+                .expect("decode the floor");
+            let peak = pcm.iter().map(|sample| sample.abs()).max().unwrap_or(0);
+            assert!(peak < 200, "a faint floor, not a hiss (peak {peak})");
+        }
+    }
+
+    /// Barge-in drops the bot's queued audio — that is its whole point — but on a comfort-idle leg it
+    /// must not also stop the clock, or every barge-in punches a hole in the egress stream.
+    #[test]
+    fn barge_in_drops_the_queued_audio_but_not_the_egress_clock() {
+        let mut session = ulaw_session()
+            .with_comfort_idle(true)
+            // A trivially-triggered energy gate: any real speech frame opens a turn.
+            .with_vad(1, 1, true);
+
+        let loud = vec![8000i16; 320];
+        let mut l16 = vec![0u8; loud.len() * 2];
+        pcm_to_l16_le(&loud, &mut l16);
+        session.on_ws_binary(&l16);
+        // The caller speaks: this tick barges in.
+        session.on_rtp(&ulaw_packet_pcm(1, &loud[..160]));
+
+        let mut uplink = [0u8; 4096];
+        let mut downlink = [0u8; 4096];
+        let result = session.tick(&mut uplink, &mut downlink);
+        let packet = RtpPacket::parse(&downlink[..result.downlink_bytes]).expect("still emitting");
+        assert_eq!(
+            packet.payload.len(),
+            160,
+            "the clock keeps running through a barge-in"
+        );
+        assert_eq!(
+            session.playout_samples(),
+            0,
+            "and the queued bot audio really was flushed"
+        );
+
+        use siphon_rtp_codec::Decoder as _;
+        let mut pcm = [0i16; 160];
+        G711::ulaw()
+            .decode(packet.payload, &mut pcm)
+            .expect("decode");
+        let peak = pcm.iter().map(|sample| sample.abs()).max().unwrap_or(0);
+        assert!(
+            peak < 200,
+            "what it emits is the comfort floor, not the flushed audio"
+        );
+    }
+
     /// **The downlink bug this work package closes.** A server rendering 24 kHz L16 into an 8 kHz
     /// G.711 leg must have its audio resampled before the encode — otherwise 480 samples are handed
     /// to an encoder expecting 160 and the call hears three times the audio in one packet (or a
@@ -447,10 +634,13 @@ mod tests {
     fn a_wideband_server_downlink_is_rendered_at_the_legs_rate() {
         use siphon_rtp_dsp::resample::Resampler;
 
-        let mut session = ulaw_session().with_rate_conversion(
-            None, // uplink not exercised here
-            Some(Resampler::new(24_000, 8_000).expect("downlink conversion")),
-        );
+        // Built through `ulaw_session_at`, so the core's declared wire rate is the 24 kHz the server
+        // actually sends. That is what production does (`setup_ws_bridge` puts the negotiated wire
+        // rate in the format), and it matters now that the core drains its playout by samples: a
+        // format claiming 8 kHz while 24 kHz frames arrive would have it take a third of each frame
+        // per tick. The hand-rolled fixture this replaced attached the resampler without moving the
+        // format, which no real bridge does.
+        let mut session = ulaw_session_at(24_000);
 
         // One 20 ms frame of a 300 Hz tone sampled at 24 kHz = 480 samples.
         let wire: Vec<i16> = (0..480)
