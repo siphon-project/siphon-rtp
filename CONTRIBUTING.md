@@ -55,6 +55,7 @@ Fetch the vectors from their sources and drop them under `reference/<codec>/test
 | GSM Full Rate | ETSI / 3GPP TS 06.10 | `reference/gsm-fr/testv` |
 | AMR-NB | 3GPP TS 26.074 | `reference/amr-nb/testv` |
 | AMR-WB | 3GPP TS 26.174 | `reference/amr-wb/testv` |
+| G.729 / G.729A / G.729B | ITU-T G.729 software package — fetched by `sh reference/g729/fetch.sh` | `reference/g729/testv` |
 | Opus | RFC 6716 official vectors (opus-codec.org) | `reference/opus/opus_testvectors` |
 | Opus (CELT layer) | generated locally — see "Opus conformance oracle" below | `reference/opus/celt_only` |
 | Opus (SILK layer) | generated locally — see "Opus conformance oracle" below | `reference/opus/silk_only` |
