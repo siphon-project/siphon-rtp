@@ -35,12 +35,17 @@
 // `docs/codec-licensing.md` and the `[features]` section of Cargo.toml.
 #[cfg(feature = "amr")]
 pub mod amr;
+// The ITU-T G.191 basic operators, the 32-bit helpers built on them, and the interpolation tables
+// their transcendental approximations index — shared by every ITU-lineage codec here rather than
+// restated per codec. Gated with the codecs that use them so a default build carries none of it.
 pub mod cn;
 pub mod factory;
 pub mod g711;
 pub mod g722;
 pub mod g726;
 pub mod gsm_fr;
+#[cfg(feature = "amr")]
+pub mod itu;
 pub mod l16;
 pub mod opus;
 
