@@ -26,6 +26,7 @@ pub mod lspdec;
 pub mod overflow;
 pub mod postfilter;
 pub mod postproc;
+pub mod qualsp;
 pub mod tables;
 
 use bitstream::{FrameParameters, FRAME_SAMPLES, SUBFRAME_SAMPLES};

@@ -3,6 +3,7 @@
 use siphon_rtp_codec::g729::analysis::{
     autocorrelation, lag_window, lp_to_lsp, Levinson, PreProcessor, ORDER, WINDOW,
 };
+use siphon_rtp_codec::g729::qualsp::LspQuantiser;
 fn main() {
     let mut args = std::env::args().skip(1);
     let pcm_bytes = std::fs::read(args.next().unwrap()).unwrap();
@@ -28,6 +29,12 @@ fn main() {
     // lookahead read is behind #ifdef SYNC and was disabled when the vectors were generated.
 
     let (mut frames, mut bad_lsp, mut bad_a) = (0_u32, 0_u32, 0_u32);
+    let mut quantiser = LspQuantiser::new();
+    let mut bad_q = 0_u32;
+    let quant_want = std::env::var("QLSP")
+        .ok()
+        .map(|p| std::fs::read_to_string(p).unwrap());
+    let mut quant_lines = quant_want.as_deref().map(|t| t.lines());
     let mut lines = want.lines();
     let mut offset = 0;
     while offset + 80 <= pcm.len() {
@@ -70,8 +77,27 @@ fn main() {
             }
         }
         buffer.copy_within(80.., 0);
+        if let Some(lines) = quant_lines.as_mut() {
+            if let Some(line) = lines.next() {
+                let w: Vec<i32> = line
+                    .split_whitespace()
+                    .map(|x| x.parse().unwrap())
+                    .collect();
+                let (s1, s2, q) = quantiser.quantise(&lsp);
+                let got: Vec<i32> = std::iter::once(i32::from(s1))
+                    .chain(std::iter::once(i32::from(s2)))
+                    .chain(q.iter().map(|&v| i32::from(v)))
+                    .collect();
+                if got != w {
+                    bad_q += 1;
+                    if bad_q <= 2 {
+                        println!("frame {frames} qlsp\n  got  {got:?}\n  want {w:?}");
+                    }
+                }
+            }
+        }
         frames += 1;
         offset += 80;
     }
-    println!("frames {frames}: lsp mismatches {bad_lsp}, A(z) mismatches {bad_a}");
+    println!("frames {frames}: lsp mismatches {bad_lsp}, A(z) mismatches {bad_a}, quantiser mismatches {bad_q}");
 }
