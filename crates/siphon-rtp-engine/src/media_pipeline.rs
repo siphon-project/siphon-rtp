@@ -122,9 +122,63 @@ const AEC_DELAY_SEARCH_MILLIS: u32 = 256;
 const AEC_DELAY_SEARCH_MILLIS_MIN: u32 = 16;
 /// See [`AEC_DELAY_SEARCH_MILLIS_MIN`].
 const AEC_DELAY_SEARCH_MILLIS_MAX: u32 = 1_000;
+/// Default adaptive tail in long-tail mode (`ProfileFlags::echo_long_tail`), in milliseconds — the
+/// filter spans the echo path itself, so this has to cover the whole relay delay rather than just the
+/// residual dispersion [`AEC_TAIL_MILLIS`] covers after the estimator removes the bulk.
+///
+/// 256 ms rather than the reachable maximum for the same reason the search default stops there: the
+/// per-frame cost scales with the tail (the MDF's gradient constraint runs a transform pair *inside*
+/// the per-partition loop), so a leg that needs more asks for it.
+const AEC_LONG_TAIL_MILLIS: u32 = 256;
+/// Bounds accepted for a long-tail request. The ceiling is what the tap cap
+/// ([`EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED`]) buys at the *wideband* rate, so the same number is
+/// serviceable whichever rate the leg negotiates — asking for more at 8 kHz would succeed there and
+/// fail at 16 kHz, which is the rate-dependent limit this whole path exists to stop shipping.
+const AEC_LONG_TAIL_MILLIS_MIN: u32 = 16;
+/// See [`AEC_LONG_TAIL_MILLIS_MIN`].
+const AEC_LONG_TAIL_MILLIS_MAX: u32 = 512;
 
-/// Range-check a controller's `ProfileFlags::echo_delay_search_ms` at the control plane, before any
-/// port is allocated or any dialog is committed.
+/// How a leg cancels echo: whether at all, and in which of the two postures.
+///
+/// One value rather than a handful of parallel `bool`s and `Option`s threaded side by side, because
+/// they are only ever meaningful together — every one of them is inert without `enabled`, and
+/// `delay_search_ms` means two different things depending on `long_tail`. Bundling them also keeps
+/// the settings from being passed positionally, which for adjacent booleans is a silent-swap waiting
+/// to happen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EchoProfile {
+    /// Cancel this direction's near-end (uplink) echo at all. Built at the ingress codec's native
+    /// rate; a codec at a rate the canceller rejects (< 8 kHz or not a 50 Hz multiple) transcodes
+    /// uncancelled rather than failing.
+    pub enabled: bool,
+    /// Milliseconds of GCC-PHAT bulk-delay search window, or — when `long_tail` is set — of adaptive
+    /// tail. `None` keeps the engine default (256 ms of search). Widen it when the far party is
+    /// behind a carrier or a mobile network: the echo path is the whole media path twice over, and an
+    /// echo outside the window is not found at all while the canceller goes on reporting no error.
+    pub delay_search_ms: Option<u32>,
+    /// Span the echo path with the filter instead of estimating a bulk delay first — no estimator, so
+    /// no lock to get wrong, at roughly 6× the per-frame cost at a 512 ms tail.
+    pub long_tail: bool,
+    /// Chain the residual-echo WOLA post-filter after the linear canceller. Adds ~32 ms of latency,
+    /// so it is opt-in on a turn-taking bridge.
+    pub residual_suppression: bool,
+}
+
+impl EchoProfile {
+    /// The echo posture a controller asked for on this leg.
+    #[must_use]
+    pub fn from_profile(profile: &ProfileFlags) -> Self {
+        Self {
+            enabled: profile.echo_cancellation,
+            delay_search_ms: profile.echo_delay_search_ms,
+            long_tail: profile.echo_long_tail,
+            residual_suppression: profile.echo_residual_suppression,
+        }
+    }
+}
+
+/// Range-check a controller's echo settings at the control plane, before any port is allocated or any
+/// dialog is committed.
 ///
 /// Rejected rather than clamped, deliberately, and the split from [`build_echo_canceller`]'s clamp is
 /// the point: a value outside these bounds is a controller mistake it can see and fix, and silently
@@ -136,16 +190,40 @@ const AEC_DELAY_SEARCH_MILLIS_MAX: u32 = 1_000;
 /// # Errors
 /// The reason string, ready to return as a `CmdResult::Error`.
 pub(crate) fn validate_echo_delay_search_ms(profile: &ProfileFlags) -> Result<(), String> {
+    // The posture flags are inert without a canceller, and saying so is better than accepting a
+    // profile that reads as if it configured something. Refused only when they would otherwise be
+    // silently ignored.
+    if !profile.echo_cancellation && (profile.echo_long_tail || profile.echo_residual_suppression) {
+        return Err(
+            "echo-posture-without-canceller: echo_long_tail and echo_residual_suppression \
+             configure how the echo canceller runs, so they do nothing without echo_cancellation"
+                .to_string(),
+        );
+    }
     let Some(requested) = profile.echo_delay_search_ms else {
         return Ok(());
     };
-    if (AEC_DELAY_SEARCH_MILLIS_MIN..=AEC_DELAY_SEARCH_MILLIS_MAX).contains(&requested) {
+    let (low, high, meaning) = if profile.echo_long_tail {
+        (
+            AEC_LONG_TAIL_MILLIS_MIN,
+            AEC_LONG_TAIL_MILLIS_MAX,
+            "the adaptive tail the canceller spans the echo path with (echo_long_tail is set, so \
+             this is a tail length and not a search window)",
+        )
+    } else {
+        (
+            AEC_DELAY_SEARCH_MILLIS_MIN,
+            AEC_DELAY_SEARCH_MILLIS_MAX,
+            "the window the echo canceller searches for the returning echo, which on a relayed \
+             call spans the media path twice",
+        )
+    };
+    if (low..=high).contains(&requested) {
         return Ok(());
     }
     Err(format!(
-        "echo-delay-search-range: echo_delay_search_ms must be {AEC_DELAY_SEARCH_MILLIS_MIN}-\
-         {AEC_DELAY_SEARCH_MILLIS_MAX} ms (got {requested}); it is the window the echo canceller \
-         searches for the returning echo, which on a relayed call spans the media path twice"
+        "echo-delay-search-range: echo_delay_search_ms must be {low}-{high} ms (got {requested}); \
+         it is {meaning}"
     ))
 }
 
@@ -287,8 +365,10 @@ impl EchoReference {
 /// `siphon-rtp-dsp` (`cancel_two_path`) is the alternative for a short handset tail, and both backends
 /// re-converge after a delay re-lock. The MDF adds a fixed ~16 ms block algorithmic latency the
 /// receiving jitter buffer absorbs; its per-frame cost is tens of µs, so it stays inline on the actor
-/// (no `spawn_blocking`). The residual-echo WOLA post-filter (a further ~32 ms latency) is left off:
-/// it has no production route in the shipped engine and is out of scope here. All state is preallocated
+/// (no `spawn_blocking`). The residual-echo WOLA post-filter is chained only when the leg asks for it
+/// (`ProfileFlags::echo_residual_suppression`), because it costs a further ~32 ms of algorithmic
+/// latency — cheap for a transcoded call, and material on a turn-taking bridge where the round trip is
+/// what an interruption feels like. All state is preallocated
 /// ⇒ `cancel` allocates nothing on the hot path. Shared by the 2-party transcode path
 /// ([`Direction::new`]) and the WS voice-AI bridge so both cancel with the identical, single-sourced
 /// configuration.
@@ -302,10 +382,13 @@ impl EchoReference {
 /// silent do-nothing this whole path exists to stop.
 pub(crate) fn build_echo_canceller(
     sample_rate_hz: u32,
-    delay_search_millis: Option<u32>,
+    echo: EchoProfile,
 ) -> Option<EchoCanceller> {
+    if echo.long_tail {
+        return build_long_tail_echo_canceller(sample_rate_hz, echo);
+    }
     let tail_samples = (sample_rate_hz * AEC_TAIL_MILLIS / 1000).max(1) as usize;
-    let requested_millis = delay_search_millis.unwrap_or(AEC_DELAY_SEARCH_MILLIS);
+    let requested_millis = echo.delay_search_ms.unwrap_or(AEC_DELAY_SEARCH_MILLIS);
     // u64 throughout: the control plane bounds the request, but the conversion should not be the
     // thing relying on that.
     let requested = ((u64::from(sample_rate_hz) * u64::from(requested_millis)) / 1000).max(1);
@@ -331,6 +414,7 @@ pub(crate) fn build_echo_canceller(
             tracing::debug!(
                 target: "siphon_rtp::media",
                 sample_rate_hz,
+                mode = "delay-estimation",
                 tail_samples,
                 search_range_samples = search_range,
                 search_range_millis = requested_millis.min(
@@ -339,7 +423,7 @@ pub(crate) fn build_echo_canceller(
                 ),
                 "echo canceller built"
             );
-            Some(canceller.with_two_path_dtd())
+            chain_residual_suppression(canceller.with_two_path_dtd(), sample_rate_hz, echo)
         }
         Err(error) => {
             tracing::warn!(
@@ -350,6 +434,116 @@ pub(crate) fn build_echo_canceller(
                 "echo cancellation requested but unsupported at the codec rate; leaving it uncancelled"
             );
             None
+        }
+    }
+}
+
+/// The long-tail posture: no bulk-delay estimator, and a filter long enough to span the whole echo
+/// path (`ProfileFlags::echo_long_tail`).
+///
+/// Chosen per leg because it trades cost for a failure mode. The estimating build is cheap and exact
+/// when it works, but it commits the tallest lag inside its window whatever that lag is, so an echo
+/// beyond the window leaves it adapting against a reference that is not the echo — cancelling nothing
+/// while every accessor reads healthy. This build makes no alignment decision, so it has nothing to
+/// get wrong; it simply pays for the taps, at roughly 6× the per-frame cost at 512 ms because the MDF
+/// runs its gradient constraint's transform pair inside the per-partition loop.
+///
+/// The mode is named on the build line on purpose. With no estimator there is no delay report, so a
+/// long-tail leg emits none of the lock/weak-lock/never-locked lines a reader uses to tell a working
+/// canceller from a broken one — and silence that means "fine" here and "never located the echo"
+/// elsewhere is the ambiguity this whole path was opened to remove.
+fn build_long_tail_echo_canceller(sample_rate_hz: u32, echo: EchoProfile) -> Option<EchoCanceller> {
+    let requested_millis = echo.delay_search_ms.unwrap_or(AEC_LONG_TAIL_MILLIS);
+    let requested = ((u64::from(sample_rate_hz) * u64::from(requested_millis)) / 1000).max(1);
+    let tail_samples = usize::try_from(requested)
+        .unwrap_or(usize::MAX)
+        .min(EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED);
+    if (tail_samples as u64) < requested {
+        let reachable_millis = (tail_samples as u64 * 1000) / u64::from(sample_rate_hz).max(1);
+        // Clamped rather than refused, for the same reason the search window is: a shorter filter
+        // still cancels what it reaches, and refusing here would leave the leg with none at all.
+        tracing::warn!(
+            target: "siphon_rtp::media",
+            sample_rate_hz,
+            requested_millis,
+            reachable_millis,
+            tail_samples,
+            max_tail_samples = EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED,
+            "echo-canceller long tail clamped: the filter's tap cap is a shorter tail at this rate \
+             than was asked for; echo arriving beyond the clamped tail will not be cancelled"
+        );
+    }
+    match EchoCanceller::with_mdf_long_tail(sample_rate_hz, tail_samples) {
+        Ok(canceller) => {
+            tracing::debug!(
+                target: "siphon_rtp::media",
+                sample_rate_hz,
+                mode = "long-tail",
+                tail_samples,
+                tail_millis = requested_millis.min(
+                    u32::try_from((tail_samples as u64 * 1000) / u64::from(sample_rate_hz).max(1))
+                        .unwrap_or(u32::MAX)
+                ),
+                "echo canceller built (no bulk-delay estimator, so this leg reports no delay lock)"
+            );
+            chain_residual_suppression(canceller.with_two_path_dtd(), sample_rate_hz, echo)
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                %error,
+                sample_rate_hz,
+                tail_samples,
+                "echo cancellation requested but unsupported at the codec rate; leaving it uncancelled"
+            );
+            None
+        }
+    }
+}
+
+/// Chain the residual-echo WOLA post-filter when the leg asked for it.
+///
+/// An unsupported rate keeps the **linear** canceller and drops only the post-filter, which is the
+/// asymmetry that matters: the post-filter is an improvement on cancellation, so losing it costs
+/// quality, while losing the canceller with it would cost the leg its echo control entirely. Logged
+/// either way, because a silently absent post-filter is a quieter version of the same problem.
+fn chain_residual_suppression(
+    canceller: EchoCanceller,
+    sample_rate_hz: u32,
+    echo: EchoProfile,
+) -> Option<EchoCanceller> {
+    if !echo.residual_suppression {
+        return Some(canceller);
+    }
+    match canceller.with_residual_suppression() {
+        Ok(suppressed) => {
+            tracing::debug!(
+                target: "siphon_rtp::media",
+                sample_rate_hz,
+                added_latency_samples = suppressed.residual_suppression_latency_samples(),
+                "residual-echo suppressor chained after the linear canceller"
+            );
+            Some(suppressed)
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                %error,
+                sample_rate_hz,
+                "residual echo suppression requested but unsupported at this rate; the linear \
+                 canceller runs without it"
+            );
+            // `with_residual_suppression` consumes the canceller on the error path, so rebuild the
+            // same leg with the post-filter request cleared rather than losing echo cancellation
+            // over an unavailable *improvement* to it. Terminates: the rebuilt profile has
+            // `residual_suppression` false, so this arm cannot be reached twice.
+            build_echo_canceller(
+                sample_rate_hz,
+                EchoProfile {
+                    residual_suppression: false,
+                    ..echo
+                },
+            )
         }
     }
 }
@@ -853,16 +1047,8 @@ pub struct DirectionConfig {
     /// 8/16 kHz) in `Direction::new`; inert on an unsupported ingress rate.
     pub noise_suppression: bool,
     /// Cancel this direction's near-end (uplink) echo, referenced against the opposite direction's
-    /// egress toward the same party. Built at the ingress codec's native rate; a codec at a rate the
-    /// canceller rejects (< 8 kHz or not a 50 Hz multiple) transcodes uncancelled.
-    pub echo_cancellation: bool,
-    /// Override for the GCC-PHAT bulk-delay search window, in milliseconds — how far from the
-    /// reference the estimator will look for the returning echo. `None` keeps the engine default
-    /// (256 ms). Widen it when the far party is behind a carrier or a mobile network (the echo path
-    /// is the whole media path, twice); an echo outside the window is not found at all, and the
-    /// canceller then runs against a lock on noise without reporting an error. Inert without
-    /// `echo_cancellation`.
-    pub echo_delay_search_ms: Option<u32>,
+    /// egress toward the same party, and how. See [`EchoProfile`].
+    pub echo: EchoProfile,
     /// Watch this direction's decoded ingress audio for an answering-machine record tone and report
     /// it as [`Event::BeepDetected`]. Built and rate-gated (to 8/16 kHz) in `Direction::new`; inert
     /// on an unsupported ingress rate. Fires once — the detector is dropped with the event.
@@ -1056,8 +1242,8 @@ impl Direction {
         // opposite direction's egress toward the same party (spec §"Reference/near-end plumbing"). Built
         // at the ingress codec's native rate (what the decoder emits, so its 20 ms frame matches the
         // decoded frame) — see [`build_echo_canceller`] for the backend/default rationale.
-        let echo_canceller = if config.echo_cancellation {
-            build_echo_canceller(ingress_rate, config.echo_delay_search_ms)
+        let echo_canceller = if config.echo.enabled {
+            build_echo_canceller(ingress_rate, config.echo)
         } else {
             None
         };
@@ -3806,8 +3992,7 @@ mod tests {
             telephone_event_out: Some(101),
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -3826,8 +4011,7 @@ mod tests {
             telephone_event_out: Some(101),
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4089,8 +4273,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4109,8 +4292,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4375,8 +4557,7 @@ mod tests {
                 telephone_event_out: None,
                 recorder: None,
                 noise_suppression: false,
-                echo_cancellation: false,
-                echo_delay_search_ms: None,
+                echo: EchoProfile::default(),
                 beep_detection: false,
                 beep_cadence_guard_ms: None,
                 produce_echo_reference: false,
@@ -4732,8 +4913,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4752,8 +4932,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4916,8 +5095,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4936,8 +5114,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5115,8 +5292,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5136,8 +5312,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5199,8 +5374,7 @@ mod tests {
                 telephone_event_out: None,
                 recorder: None,
                 noise_suppression: false,
-                echo_cancellation: false,
-                echo_delay_search_ms: None,
+                echo: EchoProfile::default(),
                 beep_detection: false,
                 beep_cadence_guard_ms: None,
                 produce_echo_reference: false,
@@ -5300,8 +5474,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5323,8 +5496,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5694,8 +5866,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5716,8 +5887,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5798,8 +5968,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5898,8 +6067,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5970,8 +6138,7 @@ mod tests {
                 telephone_event_out: Some(101),
                 recorder: None,
                 noise_suppression: false,
-                echo_cancellation: false,
-                echo_delay_search_ms: None,
+                echo: EchoProfile::default(),
                 beep_detection: false,
                 beep_cadence_guard_ms: None,
                 produce_echo_reference: false,
@@ -6043,8 +6210,7 @@ mod tests {
                 telephone_event_out: None,
                 recorder: None,
                 noise_suppression: false,
-                echo_cancellation: false,
-                echo_delay_search_ms: None,
+                echo: EchoProfile::default(),
                 beep_detection: true,
                 beep_cadence_guard_ms: cadence_guard_ms,
                 produce_echo_reference: false,
@@ -6341,8 +6507,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -6361,8 +6526,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -6628,8 +6792,7 @@ mod tests {
             telephone_event_out: Some(101),
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7117,8 +7280,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7137,8 +7299,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7666,8 +7827,7 @@ mod tests {
             telephone_event_out: None,
             recorder: Some(WavRecorder::new(8000, 1)),
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7686,8 +7846,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7727,8 +7886,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7747,8 +7905,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7868,8 +8025,11 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: cancel,
-            echo_delay_search_ms: search_ms,
+            echo: EchoProfile {
+                enabled: cancel,
+                delay_search_ms: search_ms,
+                ..EchoProfile::default()
+            },
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: produce,
@@ -7997,7 +8157,14 @@ mod tests {
     #[test]
     fn the_default_search_window_is_the_same_duration_at_both_media_rates() {
         for rate in [8_000u32, 16_000] {
-            let canceller = build_echo_canceller(rate, None).expect("supported media rate");
+            let canceller = build_echo_canceller(
+                rate,
+                EchoProfile {
+                    enabled: true,
+                    ..EchoProfile::default()
+                },
+            )
+            .expect("supported media rate");
             let range = canceller
                 .delay_search_range()
                 .expect("the engine always builds with automatic estimation");
@@ -8016,17 +8183,40 @@ mod tests {
     #[test]
     fn a_per_leg_search_window_override_is_applied_and_clamped_never_dropped() {
         // Widened for a relay path: honoured exactly.
-        let wide = build_echo_canceller(8_000, Some(512)).expect("built");
+        let wide = build_echo_canceller(
+            8_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(512),
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
         assert_eq!(wide.delay_search_range(), Some(4_096));
 
         // Narrowed for a LAN leg that should not pay for reach it cannot use.
-        let narrow = build_echo_canceller(16_000, Some(64)).expect("built");
+        let narrow = build_echo_canceller(
+            16_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(64),
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
         assert_eq!(narrow.delay_search_range(), Some(1_024));
 
         // 1000 ms is inside the control-plane bounds but past what 16 kHz can express in the
         // estimator's sample cap. The canceller must still exist, clamped to the reachable window.
-        let clamped = build_echo_canceller(16_000, Some(AEC_DELAY_SEARCH_MILLIS_MAX))
-            .expect("a request the rate cannot reach must still yield a canceller");
+        let clamped = build_echo_canceller(
+            16_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(AEC_DELAY_SEARCH_MILLIS_MAX),
+                ..EchoProfile::default()
+            },
+        )
+        .expect("a request the rate cannot reach must still yield a canceller");
         assert_eq!(
             clamped.delay_search_range(),
             Some(EchoCanceller::MAX_DELAY_SEARCH_SAMPLES),
@@ -8036,13 +8226,27 @@ mod tests {
         // rate-dependent ceiling has not gone away — it cannot, the cap is a sample count — it has
         // moved out past the whole useful range: at 16 kHz everything up to 512 ms is now reachable,
         // where before the cap bit at 256 ms, which is inside the range a relayed call needs.
-        let unclamped =
-            build_echo_canceller(8_000, Some(AEC_DELAY_SEARCH_MILLIS_MAX)).expect("built");
+        let unclamped = build_echo_canceller(
+            8_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(AEC_DELAY_SEARCH_MILLIS_MAX),
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
         assert_eq!(unclamped.delay_search_range(), Some(8_000));
         assert_eq!(
-            build_echo_canceller(16_000, Some(512))
-                .expect("built")
-                .delay_search_range(),
+            build_echo_canceller(
+                16_000,
+                EchoProfile {
+                    enabled: true,
+                    delay_search_ms: Some(512),
+                    ..EchoProfile::default()
+                }
+            )
+            .expect("built")
+            .delay_search_range(),
             Some(8_192),
             "512 ms at 16 kHz is exactly the cap and must not clamp"
         );
@@ -8080,6 +8284,174 @@ mod tests {
                 "the reason must name the offending value, got {error}"
             );
         }
+    }
+
+    /// Long-tail mode builds a different canceller, not a differently-configured one: no estimator at
+    /// all, and a filter sized to span the whole path. The absence of the estimator is the property
+    /// worth pinning — it is what removes the lock-on-noise failure, and it is also why such a leg
+    /// reports no delay lock, which the build line has to say out loud.
+    #[test]
+    fn long_tail_mode_builds_a_canceller_with_no_estimator_and_a_path_length_tail() {
+        let long_tail = |rate: u32, millis: Option<u32>| {
+            build_echo_canceller(
+                rate,
+                EchoProfile {
+                    enabled: true,
+                    delay_search_ms: millis,
+                    long_tail: true,
+                    ..EchoProfile::default()
+                },
+            )
+            .expect("built")
+        };
+
+        // Unset takes the long-tail default, which is a *tail* and not a search window.
+        let default = long_tail(8_000, None);
+        assert!(!default.delay_estimation_enabled());
+        assert_eq!(default.delay_search_range(), None);
+        assert_eq!(
+            default.tail_samples(),
+            (8_000 * AEC_LONG_TAIL_MILLIS / 1000) as usize
+        );
+
+        // Asked for explicitly, at both media rates: the same milliseconds, different taps.
+        assert_eq!(long_tail(8_000, Some(512)).tail_samples(), 4_096);
+        assert_eq!(long_tail(16_000, Some(512)).tail_samples(), 8_192);
+
+        // The estimating build is unchanged and still has its estimator — the two postures are
+        // genuinely different objects, not one with a flag flipped.
+        let estimating = build_echo_canceller(
+            8_000,
+            EchoProfile {
+                enabled: true,
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
+        assert!(estimating.delay_estimation_enabled());
+        assert_eq!(
+            estimating.tail_samples(),
+            (8_000 * AEC_TAIL_MILLIS / 1000) as usize,
+            "the estimating build keeps the short residual tail — the estimator removes the bulk"
+        );
+    }
+
+    /// The post-filter is chained when asked for, and — the part that matters — its absence at an
+    /// unsupported rate costs the *post-filter* and not the canceller. Losing an improvement to echo
+    /// control is a quality regression; losing echo control is the bug this whole path is about.
+    #[test]
+    fn residual_suppression_is_chained_when_asked_and_never_costs_the_canceller() {
+        let with_residual = |rate: u32| {
+            build_echo_canceller(
+                rate,
+                EchoProfile {
+                    enabled: true,
+                    residual_suppression: true,
+                    ..EchoProfile::default()
+                },
+            )
+        };
+
+        for rate in [8_000u32, 16_000] {
+            let canceller = with_residual(rate).expect("built");
+            assert!(
+                canceller.residual_suppression_enabled(),
+                "the post-filter must be chained at {rate} Hz"
+            );
+            assert!(canceller.residual_suppression_latency_samples().is_some());
+        }
+
+        // Not requested ⇒ not chained, so a leg never pays the extra ~32 ms it did not ask for.
+        let plain = build_echo_canceller(
+            8_000,
+            EchoProfile {
+                enabled: true,
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
+        assert!(!plain.residual_suppression_enabled());
+
+        // A rate the post-filter does not support (it is 8/16 kHz only) keeps the linear canceller.
+        let unsupported = with_residual(32_000);
+        if let Some(canceller) = unsupported {
+            assert!(
+                !canceller.residual_suppression_enabled(),
+                "an unsupported rate must drop the post-filter, not silently claim it"
+            );
+        }
+
+        // And it composes with long-tail mode, which is the combination a hard relay leg wants.
+        let both = build_echo_canceller(
+            16_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(512),
+                long_tail: true,
+                residual_suppression: true,
+            },
+        )
+        .expect("built");
+        assert!(!both.delay_estimation_enabled());
+        assert!(both.residual_suppression_enabled());
+        assert_eq!(both.tail_samples(), 8_192);
+    }
+
+    /// The posture flags are refused when they would be silently ignored, and the long-tail bound is
+    /// the tail's, not the search window's — the same field means two different things and so carries
+    /// two different ranges.
+    #[test]
+    fn the_echo_posture_is_range_checked_against_the_meaning_the_flags_give_it() {
+        let check = |profile: ProfileFlags| validate_echo_delay_search_ms(&profile);
+
+        // Inert without a canceller: refused rather than accepted and ignored.
+        let error = check(ProfileFlags {
+            echo_long_tail: true,
+            ..ProfileFlags::default()
+        })
+        .expect_err("a posture flag without echo_cancellation must be refused");
+        assert!(error.contains("echo-posture-without-canceller"), "{error}");
+        assert!(check(ProfileFlags {
+            echo_residual_suppression: true,
+            ..ProfileFlags::default()
+        })
+        .is_err());
+
+        // With a canceller, both are fine.
+        assert!(check(ProfileFlags {
+            echo_cancellation: true,
+            echo_long_tail: true,
+            echo_residual_suppression: true,
+            ..ProfileFlags::default()
+        })
+        .is_ok());
+
+        // In long-tail mode the field is a tail, whose ceiling is what the tap cap buys at the
+        // *wideband* rate — so the accepted range is narrower than the search window's, and a value
+        // between the two ceilings is accepted as a window and refused as a tail.
+        let as_tail = |millis: u32| {
+            check(ProfileFlags {
+                echo_cancellation: true,
+                echo_long_tail: true,
+                echo_delay_search_ms: Some(millis),
+                ..ProfileFlags::default()
+            })
+        };
+        assert!(as_tail(AEC_LONG_TAIL_MILLIS_MAX).is_ok());
+        assert!(as_tail(AEC_LONG_TAIL_MILLIS_MAX + 1).is_err());
+        assert!(
+            check(ProfileFlags {
+                echo_cancellation: true,
+                echo_delay_search_ms: Some(AEC_DELAY_SEARCH_MILLIS_MAX),
+                ..ProfileFlags::default()
+            })
+            .is_ok(),
+            "the same value is a valid search window — the flag decides which limit applies"
+        );
+        // The refusal says which reading it applied, or the operator cannot tell why the number they
+        // used yesterday stopped being accepted today.
+        let error = as_tail(AEC_LONG_TAIL_MILLIS_MAX + 1).expect_err("out of range");
+        assert!(error.contains("tail"), "{error}");
     }
 
     #[test]

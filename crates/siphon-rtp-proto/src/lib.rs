@@ -931,6 +931,46 @@ pub struct ProfileFlags {
     /// `echo_cancellation`. A native siphon-rtp extension — the NG/bencode front-end does not set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub echo_delay_search_ms: Option<u32>,
+    /// Span the echo path with the adaptive filter itself instead of estimating a bulk delay first —
+    /// the posture for a leg whose delay the estimator cannot be trusted to find.
+    ///
+    /// The two modes differ in **how they fail**, which is the whole reason both exist. Estimation is
+    /// cheap and precise when it works, but it commits the tallest correlation peak inside its search
+    /// window whatever that peak is, so an echo beyond the window yields a lock on noise and a filter
+    /// that adapts against a reference that is not the echo: it cancels nothing and looks perfectly
+    /// healthy doing it. A long tail makes no alignment decision at all, so it has nothing to get
+    /// wrong; it is simply slower to converge and more expensive per frame.
+    ///
+    /// With this set, `echo_delay_search_ms` names the **tail length** rather than a search window,
+    /// and the two are mutually exclusive in meaning — setting this alongside a request the engine
+    /// would have to interpret as a search window fails the offer/answer rather than silently
+    /// preferring one reading.
+    ///
+    /// Not free, and deliberately opt-in: the MDF runs its gradient constraint's transform pair
+    /// *inside* the per-partition loop, so per-frame cost scales with the tail. Going from the 64 ms
+    /// default to a 512 ms long tail is roughly **6×** the canceller's per-frame work and about
+    /// 96 KiB more state per leg — comfortably inside a 20 ms budget, and not something to pay on
+    /// every call. Reach is 1 s at an 8 kHz rate and 512 ms at 16 kHz (the tail cap is a tap count).
+    /// Inert without `echo_cancellation`. A native siphon-rtp extension — the NG/bencode front-end
+    /// does not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub echo_long_tail: bool,
+    /// Chain the residual-echo suppressor after the linear canceller — a frequency-selective
+    /// post-filter on what cancellation leaves behind, keyed on far-end activity.
+    ///
+    /// Even a well-aligned canceller leaves residual, and on a nonlinear endpoint (a handset that
+    /// re-encodes, a speakerphone) it leaves a lot. The post-filter is the standard answer and is
+    /// strictly better than the blanket half-duplex an application can implement without a reference
+    /// signal, because it is proportional and per-band rather than muting a party outright.
+    ///
+    /// Opt-in because it costs **latency**, not just cycles: it adds one WOLA window (~32 ms) on top
+    /// of the MDF's ~16 ms block delay, which is real on a turn-taking voice-AI bridge where the
+    /// round trip is what an interruption feels like. Available at 8 and 16 kHz only; at any other
+    /// rate the request is logged and the linear canceller runs without it, rather than the leg
+    /// losing echo cancellation altogether. Inert without `echo_cancellation`. A native siphon-rtp
+    /// extension — the NG/bencode front-end does not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub echo_residual_suppression: bool,
     /// Watch this call's decoded ingress audio for the short single tone an answering machine plays
     /// before it starts recording (the "voicemail beep"), and report it as [`Event::BeepDetected`].
     /// The media half of answering-machine detection: a controller that gets the event can abort an
@@ -3256,6 +3296,41 @@ mod tests {
         match serde_json::from_str::<Command>(relay).expect("deserialize") {
             Command::Offer { profile, .. } => {
                 assert!(profile.echo_cancellation);
+                assert_eq!(profile.echo_delay_search_ms, Some(512));
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
+    }
+
+    /// The canceller's two posture flags are additive the same way: a controller that never heard of
+    /// either must still produce and consume byte-identical JSON, and both must default to off so
+    /// upgrading the engine cannot change how an existing leg cancels.
+    #[test]
+    fn the_echo_posture_flags_are_additive_and_default_to_off() {
+        let json = r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::Offer { profile, .. } => {
+                assert!(!profile.echo_long_tail);
+                assert!(!profile.echo_residual_suppression);
+                assert_eq!(profile, ProfileFlags::default());
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
+        let serialized = serde_json::to_value(ProfileFlags::default()).expect("to_value");
+        assert!(serialized.get("echo_long_tail").is_none());
+        assert!(serialized.get("echo_residual_suppression").is_none());
+
+        let posture = concat!(
+            r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n","#,
+            r#""profile":{"echo_cancellation":true,"echo_long_tail":true,"#,
+            r#""echo_residual_suppression":true,"echo_delay_search_ms":512}}"#
+        );
+        match serde_json::from_str::<Command>(posture).expect("deserialize") {
+            Command::Offer { profile, .. } => {
+                assert!(profile.echo_long_tail);
+                assert!(profile.echo_residual_suppression);
+                // In long-tail mode this is the tail length, not a search window — same field, and
+                // the engine decides which reading applies from `echo_long_tail`.
                 assert_eq!(profile.echo_delay_search_ms, Some(512));
             }
             other => panic!("expected offer, got {other:?}"),

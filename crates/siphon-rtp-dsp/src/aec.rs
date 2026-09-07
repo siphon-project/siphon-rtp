@@ -78,9 +78,15 @@ use siphon_rtp_simd::fir_dot_f32;
 /// regularization, and Geigel threshold are all scale-independent pure ratios.
 const SAMPLE_SCALE: f32 = 32_768.0;
 
-/// Longest adaptive tail we preallocate for (256 taps @ 8 kHz is the default target; this bounds a
-/// pathological request to ~0.5 s @ 8 kHz).
-const MAX_TAIL_SAMPLES: usize = 4_096;
+/// Longest adaptive tail we preallocate for — **1 s @ 8 kHz / 0.5 s @ 16 kHz**, bounding a
+/// pathological request while leaving room for the long-tail mode
+/// ([`EchoCanceller::with_mdf_long_tail`]) to span a relay-length echo path with the filter itself.
+///
+/// Raised from 4096 for the same reason the delay-search cap was: a sample count is a *duration*
+/// only once the rate is fixed, and this one was worth half as many milliseconds at 16 kHz — the
+/// rate every speech model wants and the one the voice-AI guidance recommends — so the wideband leg
+/// was the one that ran out first, at 256 ms, on exactly the deployment most likely to need more.
+const MAX_TAIL_SAMPLES: usize = 8_192;
 /// Longest bulk delay we preallocate the far-end ring for (1 s @ 16 kHz).
 const MAX_BULK_DELAY_SAMPLES: usize = 16_000;
 
@@ -350,8 +356,25 @@ const MDF_STEP_SIZE: f32 = 0.5;
 /// of the NLMS `δ`).
 const MDF_REGULARIZATION: f32 = 1.0e-4;
 /// Largest partition count the MDF preallocates for — 64 blocks of the (rate-dependent) block size,
-/// i.e. up to ~2048 taps (256 ms) @ 8 kHz / ~4096 taps (256 ms) @ 16 kHz. Bounds a pathological tail.
+/// i.e. up to 8192 taps @ 8 kHz (block 128) and 16384 @ 16 kHz (block 256), which is **1 s at either
+/// rate**. Bounds a pathological tail.
+///
+/// A tail that needs more partitions than this is now rejected rather than quietly given a shorter
+/// filter — see [`MdfFilter::new`]. It is not the binding limit in practice ([`MAX_TAIL_SAMPLES`]
+/// is), but a cap that silently shortens what it was asked for is the same class of defect as a
+/// delay search that silently locks on noise.
 const MDF_MAX_PARTITIONS: usize = 64;
+/// The smallest MDF block a supported media rate produces: 8 kHz gives a 160-sample frame, and the
+/// block is the largest power of two that fits, so 128. Every higher rate gives a larger block and
+/// therefore more taps per partition.
+const MIN_MDF_BLOCK_SAMPLES: usize = 128;
+/// The two caps must not disagree: at the *narrowest* block any supported rate produces,
+/// [`MDF_MAX_PARTITIONS`] partitions have to cover [`MAX_TAIL_SAMPLES`], or a tail inside the
+/// documented cap would be refused by the partition check at 8 kHz and accepted at 16 kHz. Asserted
+/// rather than commented, so raising either constant without the other stops the build instead of
+/// producing a limit that depends on the negotiated rate — which is the precise shape of the defect
+/// this whole path was opened for.
+const _: () = assert!(MAX_TAIL_SAMPLES <= MDF_MAX_PARTITIONS * MIN_MDF_BLOCK_SAMPLES);
 /// Below this per-frame normalized energy on either the microphone or the block echo estimate the MDF
 /// two-path NCC is undefined (a 0/0), so the frame drives neither a freeze nor an unfreeze — the
 /// bootstrap guard that lets the very first (all-zero-filter) blocks adapt.
@@ -1136,7 +1159,17 @@ impl MdfFilter {
         }
         let block_size = floor_power_of_two(frame_capacity);
         let fft_size = block_size * 2;
-        let partitions = tail_samples.div_ceil(block_size).min(MDF_MAX_PARTITIONS);
+        let partitions = tail_samples.div_ceil(block_size);
+        // Refuse rather than clamp. `partitions.min(MDF_MAX_PARTITIONS)` used to silently hand back a
+        // filter shorter than the caller asked for, reported only through `tail_samples()` if anyone
+        // thought to look — the same shape of defect as a delay search that locks on noise, and the
+        // long-tail mode is exactly the caller that would hit it.
+        if partitions > MDF_MAX_PARTITIONS {
+            return Err(AecError::InvalidTail {
+                got: tail_samples,
+                max: MDF_MAX_PARTITIONS * block_size,
+            });
+        }
         // `fft_size` is a power of two `>= 4` (block_size >= 2), so this cannot fail; map any future
         // contract change to the tail error rather than panicking.
         let fft = RealFft::new(fft_size).map_err(|_| AecError::InvalidTail {
@@ -1541,6 +1574,11 @@ impl EchoCanceller {
     /// it (and say so) rather than have the constructor reject the request and leave the leg with no
     /// canceller at all, which is the failure this whole surface exists to stop being silent.
     pub const MAX_DELAY_SEARCH_SAMPLES: usize = MAX_SEARCH_RANGE_SAMPLES;
+    /// The longest adaptive tail any constructor accepts, in taps — 1 s at 8 kHz, 512 ms at 16 kHz.
+    /// Exposed for the same reason as [`EchoCanceller::MAX_DELAY_SEARCH_SAMPLES`]: a caller turning a
+    /// *duration* into taps needs to clamp against it and say so, rather than have the constructor
+    /// refuse and leave the leg with no canceller.
+    pub const MAX_TAIL_SAMPLES_SUPPORTED: usize = MAX_TAIL_SAMPLES;
 
     /// A canceller for `sample_rate_hz` with a `tail_samples`-tap adaptive filter and **no** bulk
     /// delay (the echo is assumed to start within the tail). Default target: `tail_samples = 256`
@@ -1677,6 +1715,40 @@ impl EchoCanceller {
     /// # Errors
     /// As [`EchoCanceller::new`] for the sample rate and tail.
     pub fn with_mdf(sample_rate_hz: u32, tail_samples: usize) -> Result<Self, AecError> {
+        Self::build_mdf(sample_rate_hz, tail_samples, 0, None)
+    }
+
+    /// The MDF backend with a tail long enough to span the **whole** echo path, and **no bulk-delay
+    /// estimation** — the alternative posture to [`EchoCanceller::with_mdf_delay_estimation`] for a
+    /// leg whose delay the estimator cannot be trusted to find.
+    ///
+    /// The two differ in how they fail, which is the entire point of offering both. The estimator is
+    /// cheap and precise when it works, but GCC-PHAT commits the tallest lag inside its search window
+    /// whatever that lag is, so an echo beyond the window produces a lock on *noise* and a filter that
+    /// adapts against a reference that is not the echo — it cancels nothing, reports nothing, and is
+    /// indistinguishable from a leg with no echo on it. A long tail has no such failure: it makes no
+    /// alignment decision at all, so there is nothing to get wrong. Its cost is honest and gradual
+    /// instead — more taps to converge, and more work per block.
+    ///
+    /// **That cost is not small.** [`MdfFilter::process_block`] runs the gradient constraint's
+    /// IFFT/FFT pair *inside* the per-partition loop, so an adapting block costs `2K + 3` transforms
+    /// for `K = ceil(tail / block_size)` partitions, not one transform plus `O(K)` multiply-
+    /// accumulates. Going from a 64 ms tail (`K = 4`) to a 512 ms one (`K = 32`) is therefore roughly
+    /// six times the per-frame work, plus about 96 KiB more state per canceller. Both stay far inside
+    /// a 20 ms budget, and neither is free — which is why the engine exposes this per leg rather than
+    /// defaulting to it.
+    ///
+    /// Chainable with [`EchoCanceller::with_two_path_dtd`] and
+    /// [`EchoCanceller::with_residual_suppression`]. Note that
+    /// [`EchoCanceller::take_delay_report`] is always `None` here: there is no estimator, so there is
+    /// nothing to report and the never-locked warning correctly never fires. A caller that wants an
+    /// operator to be able to tell a long-tail leg from a broken one must say so where the canceller
+    /// is built.
+    ///
+    /// # Errors
+    /// As [`EchoCanceller::new`] for the sample rate, and [`AecError::InvalidTail`] if `tail_samples`
+    /// exceeds [`MAX_TAIL_SAMPLES`] or needs more than `MDF_MAX_PARTITIONS` partitions at this rate.
+    pub fn with_mdf_long_tail(sample_rate_hz: u32, tail_samples: usize) -> Result<Self, AecError> {
         Self::build_mdf(sample_rate_hz, tail_samples, 0, None)
     }
 
@@ -3182,7 +3254,8 @@ mod tests {
     /// demonstrably does not occupy stop competing for the pick.
     #[test]
     fn a_confident_lock_narrows_the_peak_scan_around_the_located_delay() {
-        let (canceller, _, reports) = run_delay_estimation_reporting(1_024, 192, 300, 400, 0x5CA1_0001);
+        let (canceller, _, reports) =
+            run_delay_estimation_reporting(1_024, 192, 300, 400, 0x5CA1_0001);
         let lock = first_lock(&reports);
         assert!(!lock.is_weak(), "fixture must produce a confident lock");
 
@@ -3288,7 +3361,9 @@ mod tests {
             "the first, confident lock should have narrowed the scan — this test proves nothing \
              about widening if it never narrowed"
         );
-        let first = locks.first().expect("the estimator must lock at least once");
+        let first = locks
+            .first()
+            .expect("the estimator must lock at least once");
         assert!(
             first.delay_samples.abs_diff(first_delay) <= REALIGN_TOLERANCE_SAMPLES,
             "expected the first lock near {first_delay}, got {}",
@@ -4366,6 +4441,85 @@ mod tests {
             "MDF long-tail advantage only {:.1} dB (NLMS {nlms_erle:.1} → MDF {mdf_erle:.1})",
             mdf_erle - nlms_erle
         );
+    }
+
+    /// The reason the long-tail mode exists, stated as the comparison it has to win.
+    ///
+    /// Both cancellers here are correctly configured for what they are, both run without error, and
+    /// both report healthy from every accessor. The estimating one is given a search window shorter
+    /// than the echo path — the field condition: a handset behind a carrier — so it commits the
+    /// tallest lag it can see, which is noise, and then adapts against a reference that is not the
+    /// echo. The long-tail one makes no alignment decision at all, so it has nothing to get wrong,
+    /// and simply covers the delay with taps.
+    #[test]
+    fn a_long_tail_cancels_an_echo_a_too_short_search_window_misses() {
+        let frame = 160;
+        let frames = 600;
+        // 300 ms at 8 kHz — a mobile handset behind a PSTN carrier, past any 128 ms window.
+        let relay_delay = 2_400;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x104C_7A12);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, relay_delay);
+
+        let run = |canceller: &mut EchoCanceller| -> f64 {
+            let mut residual_stream = vec![0i16; frames * frame];
+            for index in 0..frames {
+                let range = index * frame..(index + 1) * frame;
+                let mut mic = echo[range.clone()].to_vec();
+                canceller.cancel(&mut mic, &far[range.clone()]);
+                residual_stream[range].copy_from_slice(&mic);
+            }
+            steady_erle(&echo, &residual_stream, frame, 40)
+        };
+
+        // 128 ms of search against a 300 ms echo: the estimator cannot see it.
+        let mut estimating =
+            EchoCanceller::with_mdf_delay_estimation(8_000, 512, 1_024).expect("build estimating");
+        let estimating_erle = run(&mut estimating);
+        // 512 ms of tail spans the whole path, delay and dispersion together.
+        let mut long_tail =
+            EchoCanceller::with_mdf_long_tail(8_000, 4_096).expect("build long tail");
+        let long_tail_erle = run(&mut long_tail);
+
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "relay-delay ERLE: estimating(1024 window) {estimating_erle:.1} dB, \
+                 long tail(4096) {long_tail_erle:.1} dB"
+            );
+        }
+        assert!(
+            long_tail_erle - estimating_erle >= 10.0,
+            "the long tail must cancel an echo the too-short window misses: estimating \
+             {estimating_erle:.1} dB vs long tail {long_tail_erle:.1} dB"
+        );
+        // No estimator, so nothing to report — and the never-locked warning correctly never fires,
+        // which is why the engine has to name the mode where the canceller is built or a long-tail
+        // leg becomes unreadable in a new way.
+        assert!(!long_tail.delay_estimation_enabled());
+        assert_eq!(long_tail.take_delay_report(), None);
+    }
+
+    /// A tail past the cap is refused, not quietly shortened. The clamp it replaces reported the
+    /// truncation only through `tail_samples()`, so a caller asking for a relay-length filter could
+    /// be handed a short one and never know — the same shape of failure as a delay search that locks
+    /// on noise.
+    #[test]
+    fn a_tail_past_the_cap_is_refused_rather_than_silently_shortened() {
+        assert!(matches!(
+            EchoCanceller::with_mdf_long_tail(8_000, MAX_TAIL_SAMPLES + 1),
+            Err(AecError::InvalidTail { .. })
+        ));
+        // And the cap itself is reachable at both media rates, which is the property that was broken
+        // before it was raised: a sample count is a duration only once the rate is fixed.
+        assert!(EchoCanceller::with_mdf_long_tail(8_000, MAX_TAIL_SAMPLES).is_ok());
+        assert!(EchoCanceller::with_mdf_long_tail(16_000, MAX_TAIL_SAMPLES).is_ok());
+        // 8 kHz reaches 1 s and 16 kHz reaches 0.5 s — the same *taps*, and the engine's knob is in
+        // milliseconds, so the rate decides how far that goes.
+        let narrowband = EchoCanceller::with_mdf_long_tail(8_000, MAX_TAIL_SAMPLES).expect("8k");
+        let wideband = EchoCanceller::with_mdf_long_tail(16_000, MAX_TAIL_SAMPLES).expect("16k");
+        assert_eq!(narrowband.tail_samples(), MAX_TAIL_SAMPLES);
+        assert_eq!(wideband.tail_samples(), MAX_TAIL_SAMPLES);
     }
 
     /// Determinism: the MDF path is a pure function of the input (logical clock, fixed-seed PRNG), so

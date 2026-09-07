@@ -321,6 +321,44 @@ fn bench_aec(criterion: &mut Criterion) {
         });
     });
 
+    // What the long-tail posture costs, which is the number that keeps it opt-in.
+    //
+    // Cost is linear in the partition count `K = tail / block_size` with an **FFT** constant, not a
+    // multiply-accumulate one: `process_block` runs the gradient constraint's IFFT/FFT pair inside
+    // the per-partition loop, so an adapting block is `2K + 3` transforms. The sweep starts at the
+    // engine's own 64 ms residual tail (`K = 4`, what the estimating build uses once the estimator
+    // has removed the bulk delay) so the ratio to a path-length tail is read straight off, at both
+    // media rates because the same milliseconds are twice the taps at 16 kHz.
+    let mut tail_group = criterion.benchmark_group("aec_long_tail");
+    for &(rate, millis) in &[
+        (8_000u32, 64u32),
+        (8_000, 256),
+        (8_000, 512),
+        (16_000, 64),
+        (16_000, 256),
+        (16_000, 512),
+    ] {
+        let (far, near_template) = if rate == 8_000 {
+            (&far_loud_8k, &near_quiet_8k)
+        } else {
+            (&far_loud_16k, &near_quiet_16k)
+        };
+        let tail = (rate * millis / 1000) as usize;
+        tail_group.bench_function(format!("{}k_{millis}ms", rate / 1000), |bencher| {
+            // The engine's own long-tail configuration: no estimator, two-path DTD.
+            let mut canceller = EchoCanceller::with_mdf_long_tail(rate, tail)
+                .expect("build")
+                .with_two_path_dtd();
+            let mut near = near_template.clone();
+            bencher.iter(|| {
+                near.copy_from_slice(near_template);
+                canceller.cancel(black_box(&mut near), black_box(far));
+                black_box(near[0])
+            });
+        });
+    }
+    tail_group.finish();
+
     // The residual-echo suppressor chained after the time-domain NLMS: on top of the linear cancel it
     // pays, per 20 ms frame, a √Hann WOLA STFT over the residual (one or two 256-point forward+inverse
     // FFT hops + the per-bin decision-directed Wiener gain) and an analysis-only forward FFT of the

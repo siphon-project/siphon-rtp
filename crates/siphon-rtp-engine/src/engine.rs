@@ -784,11 +784,9 @@ struct WsBridgeSetup<'a> {
     wire_sample_rate: Option<u32>,
     /// Clean A's uplink toward the WS server.
     noise_suppression: bool,
-    /// Cancel A's uplink echo against the downlink the bridge plays toward the call.
-    echo_cancellation: bool,
-    /// How far the canceller's GCC-PHAT estimator looks for the returning echo. `None` keeps the
-    /// engine default; a leg reached through a carrier needs more. Inert without `echo_cancellation`.
-    echo_delay_search_ms: Option<u32>,
+    /// Cancel A's uplink echo against the downlink the bridge plays toward the call, and how — the
+    /// search window or long tail, and whether the residual post-filter is chained.
+    echo: crate::media_pipeline::EchoProfile,
     /// Local energy-VAD turn-taking / barge-in, when the profile asked for it.
     vad_config: Option<WsVadConfig>,
     /// The downlink destination + latch to **reuse**, on a re-point ([`Engine::start_ws_bridge`] on
@@ -873,8 +871,7 @@ struct WsBridge {
     /// *destination*, not for its VAD, noise suppression or wire rate to be silently turned off.
     wire_sample_rate: Option<u32>,
     noise_suppression: bool,
-    echo_cancellation: bool,
-    echo_delay_search_ms: Option<u32>,
+    echo: crate::media_pipeline::EchoProfile,
     vad_config: Option<WsVadConfig>,
     /// The relay this bridge displaced, or `None` when the bridge *is* the call's negotiated media
     /// path (`ProfileFlags::ws_uri`). This is exactly what makes a detach possible or not — see
@@ -2353,8 +2350,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ice_pending: false,
                     secure: None,
                     noise_suppression: profile.noise_suppression,
-                    echo_cancellation: profile.echo_cancellation,
-                    echo_delay_search_ms: profile.echo_delay_search_ms,
+                    echo: crate::media_pipeline::EchoProfile::from_profile(profile),
                     vad_config: WsVadConfig::from_profile(profile),
                     wire_sample_rate: profile.ws_sample_rate,
                     // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
@@ -2822,8 +2818,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ice_pending,
                     secure,
                     noise_suppression: profile.noise_suppression,
-                    echo_cancellation: profile.echo_cancellation,
-                    echo_delay_search_ms: profile.echo_delay_search_ms,
+                    echo: crate::media_pipeline::EchoProfile::from_profile(profile),
                     vad_config: WsVadConfig::from_profile(profile),
                     wire_sample_rate: profile.ws_sample_rate,
                     // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
@@ -3012,8 +3007,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_pending,
             secure,
             noise_suppression,
-            echo_cancellation,
-            echo_delay_search_ms,
+            echo,
             vad_config,
             wire_sample_rate,
             egress: existing_egress,
@@ -3132,8 +3126,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // far-end reference is the server's own downlink frame. Single-sourced from the same
         // `build_echo_canceller` the transcode path uses (an unsupported rate keeps the uplink
         // uncancelled rather than failing the bridge).
-        .with_echo_canceller(if echo_cancellation {
-            crate::media_pipeline::build_echo_canceller(wire_rate, echo_delay_search_ms)
+        .with_echo_canceller(if echo.enabled {
+            crate::media_pipeline::build_echo_canceller(wire_rate, echo)
         } else {
             None
         });
@@ -3288,8 +3282,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 a_rtp,
                 wire_sample_rate,
                 noise_suppression,
-                echo_cancellation,
-                echo_delay_search_ms,
+                echo,
                 vad_config,
                 takeover,
             },
@@ -4052,8 +4045,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             ice_pending: false,
                             secure: None,
                             noise_suppression: profile.noise_suppression,
-                            echo_cancellation: profile.echo_cancellation,
-                            echo_delay_search_ms: profile.echo_delay_search_ms,
+                            echo: crate::media_pipeline::EchoProfile::from_profile(profile),
                             vad_config: WsVadConfig::from_profile(profile),
                             wire_sample_rate: profile.ws_sample_rate,
                             egress: None,
@@ -4430,8 +4422,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.telephone_event_payload_type(),
                 record_path.as_deref(),
                 profile.noise_suppression,
-                profile.echo_cancellation,
-                profile.echo_delay_search_ms,
+                crate::media_pipeline::EchoProfile::from_profile(profile),
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4449,8 +4440,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event,
                 record_path.as_deref(),
                 profile.noise_suppression,
-                profile.echo_cancellation,
-                profile.echo_delay_search_ms,
+                crate::media_pipeline::EchoProfile::from_profile(profile),
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4586,8 +4576,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.telephone_event_payload_type(),
                 record_path.as_deref(),
                 profile.noise_suppression,
-                profile.echo_cancellation,
-                profile.echo_delay_search_ms,
+                crate::media_pipeline::EchoProfile::from_profile(profile),
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4605,8 +4594,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event,
                 record_path.as_deref(),
                 profile.noise_suppression,
-                profile.echo_cancellation,
-                profile.echo_delay_search_ms,
+                crate::media_pipeline::EchoProfile::from_profile(profile),
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4705,8 +4693,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 info.telephone_event_payload_type(),
                 record_path.as_deref(),
                 profile.noise_suppression,
-                profile.echo_cancellation,
-                profile.echo_delay_search_ms,
+                crate::media_pipeline::EchoProfile::from_profile(profile),
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4724,8 +4711,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_telephone_event,
                 record_path.as_deref(),
                 profile.noise_suppression,
-                profile.echo_cancellation,
-                profile.echo_delay_search_ms,
+                crate::media_pipeline::EchoProfile::from_profile(profile),
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -5821,9 +5807,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // in the checkpoint snapshot, so a cold restore resumes without them — matching how
                     // recording (`record_path`) is not restored. The controller re-arms them by
                     // re-issuing the profile.
-                    false, // noise_suppression
-                    false, // echo_cancellation (re-armed when the controller re-issues the profile)
-                    None,  // echo_delay_search_ms (inert without echo_cancellation)
+                    false,                                         // noise_suppression
+                    crate::media_pipeline::EchoProfile::default(), // echo (re-armed when the controller re-issues the profile)
                     false, // beep_detection (likewise not carried in the snapshot)
                     None,  // beep_cadence_guard_ms
                 ) {
@@ -5843,9 +5828,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     near_te,
                     None,
-                    false, // noise_suppression
-                    false, // echo_cancellation (re-armed when the controller re-issues the profile)
-                    None,  // echo_delay_search_ms (inert without echo_cancellation)
+                    false,                                         // noise_suppression
+                    crate::media_pipeline::EchoProfile::default(), // echo (re-armed when the controller re-issues the profile)
                     false, // beep_detection (likewise not carried in the snapshot)
                     None,  // beep_cadence_guard_ms
                 ) {
@@ -5947,9 +5931,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     None,
                     None,
-                    false, // noise_suppression
-                    false, // echo_cancellation (re-armed when the controller re-issues the profile)
-                    None,  // echo_delay_search_ms (inert without echo_cancellation)
+                    false,                                         // noise_suppression
+                    crate::media_pipeline::EchoProfile::default(), // echo (re-armed when the controller re-issues the profile)
                     false, // beep_detection (likewise not carried in the snapshot)
                     None,  // beep_cadence_guard_ms
                 ) {
@@ -5969,9 +5952,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     near_te,
                     None,
-                    false, // noise_suppression
-                    false, // echo_cancellation (re-armed when the controller re-issues the profile)
-                    None,  // echo_delay_search_ms (inert without echo_cancellation)
+                    false,                                         // noise_suppression
+                    crate::media_pipeline::EchoProfile::default(), // echo (re-armed when the controller re-issues the profile)
                     false, // beep_detection (likewise not carried in the snapshot)
                     None,  // beep_cadence_guard_ms
                 ) {
@@ -8436,8 +8418,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     bridge.a_rtp,
                     bridge.wire_sample_rate,
                     bridge.noise_suppression,
-                    bridge.echo_cancellation,
-                    bridge.echo_delay_search_ms,
+                    bridge.echo,
                     bridge.vad_config,
                     bridge.takeover.clone(),
                     bridge.ws_uri.clone(),
@@ -8456,8 +8437,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 a_rtp,
                 wire_sample_rate,
                 noise_suppression,
-                echo_cancellation,
-                echo_delay_search_ms,
+                echo,
                 vad_config,
                 takeover,
                 old_uri,
@@ -8479,8 +8459,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     ice_pending: state.ice_pending,
                     secure: state.secure,
                     noise_suppression,
-                    echo_cancellation,
-                    echo_delay_search_ms,
+                    echo,
                     vad_config,
                     wire_sample_rate,
                     egress: Some(state.egress),
@@ -8625,8 +8604,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // off. They are set on the negotiation that armed the bridge, which is where the
             // controller states them; a re-point then carries whatever that negotiation chose.
             noise_suppression: false,
-            echo_cancellation: false,
-            echo_delay_search_ms: None,
+            echo: crate::media_pipeline::EchoProfile::default(),
             vad_config: None,
             wire_sample_rate: None,
             egress: None,
@@ -9032,9 +9010,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // neither NS nor beep detection is armed here. An already-armed *transcoding* call
                     // switched into echo mode with `MediaControl::Echo` keeps its detector — that path
                     // reuses the existing directions rather than rebuilding them.
-                    false, // noise_suppression
-                    false, // echo_cancellation (a reflect/echo path wants the echo)
-                    None,  // echo_delay_search_ms (inert without echo_cancellation)
+                    false,                                         // noise_suppression
+                    crate::media_pipeline::EchoProfile::default(), // echo (a reflect path wants the echo)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
                     None,  // beep_cadence_guard_ms
                 )?;
@@ -9048,9 +9025,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     far_te,
                     near_te,
                     None,
-                    false, // noise_suppression
-                    false, // echo_cancellation (a reflect/echo path wants the echo)
-                    None,  // echo_delay_search_ms (inert without echo_cancellation)
+                    false,                                         // noise_suppression
+                    crate::media_pipeline::EchoProfile::default(), // echo (a reflect path wants the echo)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
                     None,  // beep_cadence_guard_ms
                 )?;
@@ -9094,9 +9070,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     near_te,
                     None,
-                    false, // noise_suppression
-                    false, // echo_cancellation (a reflect/echo path wants the echo)
-                    None,  // echo_delay_search_ms (inert without echo_cancellation)
+                    false,                                         // noise_suppression
+                    crate::media_pipeline::EchoProfile::default(), // echo (a reflect path wants the echo)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
                     None,  // beep_cadence_guard_ms
                 )?;
@@ -9110,9 +9085,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     near_te,
                     near_te,
                     None,
-                    false, // noise_suppression
-                    false, // echo_cancellation (a reflect/echo path wants the echo)
-                    None,  // echo_delay_search_ms (inert without echo_cancellation)
+                    false,                                         // noise_suppression
+                    crate::media_pipeline::EchoProfile::default(), // echo (a reflect path wants the echo)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
                     None,  // beep_cadence_guard_ms
                 )?;
@@ -11190,8 +11164,7 @@ fn build_direction(
     telephone_event_out: Option<u8>,
     record_path: Option<&str>,
     noise_suppression: bool,
-    echo_cancellation: bool,
-    echo_delay_search_ms: Option<u32>,
+    echo: crate::media_pipeline::EchoProfile,
     beep_detection: bool,
     beep_cadence_guard_ms: Option<u32>,
 ) -> Result<DirectionConfig, String> {
@@ -11234,19 +11207,18 @@ fn build_direction(
         // The suppressor is built (and rate-gated) inside `Direction::new` from the decoder's native
         // rate; carry only the request here. Inert unless the ingress rate is 8/16 kHz.
         noise_suppression,
-        echo_cancellation,
         // Likewise the canceller: built and rate-gated in `Direction::new`, so only the request and
-        // the optional search-window override travel here.
-        echo_delay_search_ms,
+        // its posture (search window or long tail, residual post-filter) travel here.
+        echo,
         // The detector is built (and rate-gated) inside `Direction::new` from the decoder's native
         // rate; carry only the request and the optional cadence-guard override here.
         beep_detection,
         beep_cadence_guard_ms,
         // A 2-party leg's echo cancellation is symmetric: both directions cancel, so each must also
         // produce the far-end reference the other reads (the audio it sends toward its party). Hence
-        // `produce_echo_reference == echo_cancellation` here — the two are only ever set apart for a
+        // `produce_echo_reference == echo.enabled` here — the two are only ever set apart for a
         // (future) single-leg asymmetric AEC or in the integration tests.
-        produce_echo_reference: echo_cancellation,
+        produce_echo_reference: echo.enabled,
         // The G.107 codec class of the stream this direction decodes (the ingress codec), for the MOS
         // in its periodic quality report — mapped the same way as the HEP QoS / conference paths.
         ingress_mos_codec: crate::conference::hep_codec_for_name(&ingress_codec.encoding_name),

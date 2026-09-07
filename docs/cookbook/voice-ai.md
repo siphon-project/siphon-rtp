@@ -390,6 +390,65 @@ speaks first, that is the greeting. Accepted range is 16–1000 ms; a value outs
 the offer/answer, and one the negotiated rate cannot express is clamped down with a warning rather
 than dropping the canceller.
 
+### When you would rather not guess at all
+
+Widening the window makes the estimator more likely to find the echo. It does not make it *certain*,
+and when it is wrong it is wrong silently. If a route is bad enough that you would rather remove the
+guess than tune it, `echo_long_tail` spans the whole path with the filter itself:
+
+```json
+{
+  "profile": {
+    "ws_uri": "ws://127.0.0.1:9001/stream",
+    "ws_barge_in": true,
+    "echo_cancellation": true,
+    "echo_long_tail": true,
+    "echo_delay_search_ms": 512
+  }
+}
+```
+
+There is no estimator in this mode, so there is no lock to get wrong — `echo_delay_search_ms` becomes
+the **tail length** rather than a search window (16–512 ms). What it costs instead is honest and
+gradual, because the filter is doing with taps what the estimator was doing with one number. Measured
+per 20 ms frame:
+
+| tail | 8 kHz | 16 kHz |
+|---|---|---|
+| 64 ms (what the estimating build uses) | 17.6 µs | 38.4 µs |
+| 256 ms | 55.7 µs | 121.9 µs |
+| 512 ms | 106.7 µs | 236.4 µs |
+
+So a 512 ms tail is about **6×** the estimating build's filter cost, plus ~96 KiB more state per leg.
+It is still only ~1.2 % of a core per call at the worst corner, and it is not nothing at scale — a
+hundred concurrent wideband long-tail legs is a core and a bit of pure echo cancellation. Budget for
+it on the routes that need it rather than enabling it fleet-wide.
+
+The trade is really about which failure you prefer. Estimation is precise and cheap when it works and
+cancels nothing when it does not. A long tail is never wrong about where the echo is, only slower and
+dearer. On a route that has already burned you, the second is the better deal.
+
+One consequence to know: a long-tail leg has no estimator, so it emits **none** of the delay-lock
+reporting above — no lock line, no weak-lock warning, no `never_locked`. The build line names the
+mode instead, so `RUST_LOG=siphon_rtp::media=debug` still tells you which posture a leg is running.
+
+### Cleaning up what is left over
+
+Neither posture cancels perfectly, and a handset that re-encodes (any mobile leg) leaves nonlinear
+residual no linear filter can reach. `echo_residual_suppression` chains a frequency-selective
+post-filter on that remainder:
+
+```json
+{ "profile": { "echo_cancellation": true, "echo_residual_suppression": true } }
+```
+
+It is off by default because it costs **latency**, not just cycles: one analysis window, about 32 ms,
+on top of the canceller's own ~16 ms. On a transcoded call that is free real estate. On a turn-taking
+bridge it is added to the round trip an interruption has to travel, so turn it on when the residual
+is actually the problem — a caller who reports the agent talking over itself *despite* a healthy
+delay lock is the case it is for. It exists only at 8 and 16 kHz; at any other rate it is logged and
+the linear canceller runs without it, rather than the leg losing echo cancellation altogether.
+
 ## A minimal server
 
 An echo agent in Python (`pip install websockets`), enough to prove the path end to end:
