@@ -9,7 +9,7 @@
 //! own reference.
 
 use crate::itu::basic_ops::{
-    extract_h, extract_l, l_deposit_h, l_mult, l_msu, l_shl, l_shr, l_shr_r, norm_l, sub,
+    extract_h, extract_l, l_deposit_h, l_msu, l_mult, l_shl, l_shr, l_shr_r, norm_l, sub,
 };
 use crate::itu::tables::{ISQRT, LOG2, POW2};
 

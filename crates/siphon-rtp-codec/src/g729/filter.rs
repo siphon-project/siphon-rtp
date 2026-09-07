@@ -83,7 +83,10 @@ mod tests {
         let mut y = [0_i16; 40];
         let mut mem = [0_i16; ORDER];
         let flag = syn_filt(&IDENTITY, &x, &mut y, 40, &mut mem, false);
-        assert!(!flag.raised(), "a unity filter on small input cannot saturate");
+        assert!(
+            !flag.raised(),
+            "a unity filter on small input cannot saturate"
+        );
         assert_eq!(&y[..], &x[..]);
     }
 
@@ -121,7 +124,10 @@ mod tests {
 
         let mut mem = [0_i16; ORDER];
         let _ = syn_filt(&a, &x, &mut y, 40, &mut mem, false);
-        assert_eq!(mem, [0_i16; ORDER], "no update requested, history untouched");
+        assert_eq!(
+            mem, [0_i16; ORDER],
+            "no update requested, history untouched"
+        );
 
         let _ = syn_filt(&a, &x, &mut y, 40, &mut mem, true);
         assert_eq!(
@@ -150,7 +156,9 @@ mod tests {
         // The counterpart to the test above: speech-level input through a realistic filter must not
         // trip the flag, or the decoder would rescale its excitation on every frame.
         let a: [i16; ORDER + 1] = [4096, -1800, 900, -400, 200, -100, 50, -25, 12, -6, 3];
-        let x: Vec<i16> = (0..40).map(|i| ((i as f32 * 0.9).sin() * 2000.0) as i16).collect();
+        let x: Vec<i16> = (0..40)
+            .map(|i| ((i as f32 * 0.9).sin() * 2000.0) as i16)
+            .collect();
         let mut y = [0_i16; 40];
         let mut mem = [0_i16; ORDER];
         let flag = syn_filt(&a, &x, &mut y, 40, &mut mem, false);

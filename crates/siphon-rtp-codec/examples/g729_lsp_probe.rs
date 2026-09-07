@@ -8,12 +8,20 @@ fn main() {
     let mut decoder = LspDecoder::new();
     let (mut frames, mut bad) = (0_u32, 0_u32);
     for (line, want_line) in parm.lines().zip(lsp.lines()) {
-        let p: Vec<i32> = line.split_whitespace().map(|x| x.parse().unwrap()).collect();
-        let want: Vec<i16> = want_line.split_whitespace().map(|x| x.parse().unwrap()).collect();
+        let p: Vec<i32> = line
+            .split_whitespace()
+            .map(|x| x.parse().unwrap())
+            .collect();
+        let want: Vec<i16> = want_line
+            .split_whitespace()
+            .map(|x| x.parse().unwrap())
+            .collect();
         let got = decoder.decode(p[1] as u16, p[2] as u16, p[0] != 0);
         if got.to_vec() != want {
             bad += 1;
-            if bad <= 3 { println!("frame {frames}\n  got  {got:?}\n  want {want:?}"); }
+            if bad <= 3 {
+                println!("frame {frames}\n  got  {got:?}\n  want {want:?}");
+            }
         }
         frames += 1;
     }

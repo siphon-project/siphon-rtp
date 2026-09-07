@@ -110,7 +110,10 @@ mod tests {
         let mut coefficients: Vec<f64> = a.iter().map(|&c| f64::from(c) / 4096.0).collect();
         for order in (1..=ORDER).rev() {
             let k = coefficients[order];
-            assert!(k.abs() < 1.0, "reflection coefficient at order {order} is {k}");
+            assert!(
+                k.abs() < 1.0,
+                "reflection coefficient at order {order} is {k}"
+            );
             let previous = coefficients.clone();
             for i in 1..order {
                 coefficients[i] = (previous[i] - k * previous[order - i]) / (1.0 - k * k);
@@ -145,9 +148,17 @@ mod tests {
             *value = value.saturating_sub(1500);
         }
         let filters = interpolate_subframe_filters(&LSP, &moved);
-        assert_eq!(filters[1], lsp_to_lp(&moved), "second subframe is the new vector");
+        assert_eq!(
+            filters[1],
+            lsp_to_lp(&moved),
+            "second subframe is the new vector"
+        );
         assert_ne!(filters[0], filters[1], "first subframe lags behind it");
-        assert_ne!(filters[0], lsp_to_lp(&LSP), "and is not the old vector either");
+        assert_ne!(
+            filters[0],
+            lsp_to_lp(&LSP),
+            "and is not the old vector either"
+        );
     }
 
     #[test]

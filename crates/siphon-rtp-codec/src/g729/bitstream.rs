@@ -96,7 +96,9 @@ impl FrameParameters {
 /// codebook is masked to that codebook's width by construction, and the parity bit is advisory.
 pub fn unpack(frame: &[u8]) -> Result<FrameParameters, CodecError> {
     if frame.len() != FRAME_BYTES {
-        return Err(CodecError::Malformed("G.729 frame must be exactly 10 octets"));
+        return Err(CodecError::Malformed(
+            "G.729 frame must be exactly 10 octets",
+        ));
     }
     let mut reader = BitReader::new(frame);
     let mut parameters = [0_u16; 11];
@@ -184,7 +186,10 @@ mod tests {
         assert!(matches!(unpack(&[]), Err(CodecError::Malformed(_))));
         assert!(matches!(unpack(&[0; 9]), Err(CodecError::Malformed(_))));
         assert!(matches!(unpack(&[0; 11]), Err(CodecError::Malformed(_))));
-        assert!(unpack(&[0; FRAME_BYTES]).is_ok(), "any 80-bit pattern decodes");
+        assert!(
+            unpack(&[0; FRAME_BYTES]).is_ok(),
+            "any 80-bit pattern decodes"
+        );
     }
 
     #[test]
@@ -233,7 +238,10 @@ mod tests {
             parameters[2] = lag;
             parameters[3] = agreeing_parity;
             let frame = unpack(&pack(parameters)).expect("frame");
-            assert!(!frame.pitch_parity_error(), "lag {lag} with matching parity");
+            assert!(
+                !frame.pitch_parity_error(),
+                "lag {lag} with matching parity"
+            );
 
             parameters[3] = agreeing_parity ^ 1;
             let frame = unpack(&pack(parameters)).expect("frame");

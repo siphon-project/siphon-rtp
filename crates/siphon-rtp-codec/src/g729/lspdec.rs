@@ -11,7 +11,9 @@
 //! also remembers which set was last used, for the erasure path to keep predicting with.
 
 use super::tables::{FG, FG_SUM, FG_SUM_INV, LSPCB1, LSPCB2, SLOPE_COS, TABLE2};
-use crate::itu::basic_ops::{add, extract_h, extract_l, l_deposit_h, l_mac, l_msu, l_mult, l_shl, l_shr, mult, shr, sub};
+use crate::itu::basic_ops::{
+    add, extract_h, extract_l, l_deposit_h, l_mac, l_msu, l_mult, l_shl, l_shr, mult, shr, sub,
+};
 
 /// LP order: ten line spectral pairs per frame.
 pub const ORDER: usize = 10;
@@ -127,8 +129,8 @@ impl LspDecoder {
         let mut lsf = [0_i16; ORDER];
         for j in 0..ORDER {
             let mut accumulator = l_mult(residual[j], FG_SUM[mode][j]);
-            for k in 0..MA_ORDER {
-                accumulator = l_mac(accumulator, self.history[k][j], FG[mode][k][j]);
+            for (previous, coefficients) in self.history.iter().zip(&FG[mode]) {
+                accumulator = l_mac(accumulator, previous[j], coefficients[j]);
             }
             lsf[j] = extract_h(accumulator);
         }
@@ -141,8 +143,8 @@ impl LspDecoder {
         let mut residual = [0_i16; ORDER];
         for j in 0..ORDER {
             let mut accumulator = l_deposit_h(lsf[j]);
-            for k in 0..MA_ORDER {
-                accumulator = l_msu(accumulator, self.history[k][j], FG[mode][k][j]);
+            for (previous, coefficients) in self.history.iter().zip(&FG[mode]) {
+                accumulator = l_msu(accumulator, previous[j], coefficients[j]);
             }
             let temp = extract_h(accumulator);
             let scaled = l_mult(temp, FG_SUM_INV[mode][j]);
@@ -253,12 +255,16 @@ mod tests {
 
     #[test]
     fn expansion_separates_colliding_frequencies_and_leaves_spaced_ones_alone() {
-        let mut spaced = [1000, 3000, 5000, 7000, 9000, 11_000, 13_000, 15_000, 17_000, 19_000];
+        let mut spaced = [
+            1000, 3000, 5000, 7000, 9000, 11_000, 13_000, 15_000, 17_000, 19_000,
+        ];
         let untouched = spaced;
         expand(&mut spaced, GAP1);
         assert_eq!(spaced, untouched, "already further apart than the gap");
 
-        let mut collided = [5000, 5000, 5000, 7000, 9000, 11_000, 13_000, 15_000, 17_000, 19_000];
+        let mut collided = [
+            5000, 5000, 5000, 7000, 9000, 11_000, 13_000, 15_000, 17_000, 19_000,
+        ];
         expand(&mut collided, GAP1);
         assert!(
             collided.windows(2).all(|w| w[1] > w[0]),
@@ -268,7 +274,9 @@ mod tests {
 
     #[test]
     fn stability_sorts_clamps_and_spaces() {
-        let mut crossed = [9000, 8000, 12_000, 13_000, 14_000, 15_000, 16_000, 17_000, 18_000, 19_000];
+        let mut crossed = [
+            9000, 8000, 12_000, 13_000, 14_000, 15_000, 16_000, 17_000, 18_000, 19_000,
+        ];
         stabilise(&mut crossed);
         assert!(crossed[0] < crossed[1], "a crossed pair is swapped back");
 
@@ -276,11 +284,16 @@ mod tests {
         stabilise(&mut low);
         assert_eq!(low[0], LOW_LIMIT, "the bottom is clamped up");
 
-        let mut high = [40, 4000, 8000, 12_000, 16_000, 20_000, 24_000, 26_000, 27_000, 32_000];
+        let mut high = [
+            40, 4000, 8000, 12_000, 16_000, 20_000, 24_000, 26_000, 27_000, 32_000,
+        ];
         stabilise(&mut high);
         assert_eq!(high[ORDER - 1], HIGH_LIMIT, "the top is clamped down");
         for pair in high.windows(2) {
-            assert!(pair[1] - pair[0] >= GAP3 || pair[1] == HIGH_LIMIT, "{high:?}");
+            assert!(
+                pair[1] - pair[0] >= GAP3 || pair[1] == HIGH_LIMIT,
+                "{high:?}"
+            );
         }
     }
 
@@ -306,13 +319,18 @@ mod tests {
         // are fixed-point inverses, so agreement is close rather than exact; a sign or scaling error
         // in either would show up here as a gross mismatch.
         let decoder = LspDecoder::new();
-        let residual = [500_i16, 1200, 2400, 3600, 4800, 6000, 7200, 8400, 9600, 10_800];
+        let residual = [
+            500_i16, 1200, 2400, 3600, 4800, 6000, 7200, 8400, 9600, 10_800,
+        ];
         for mode in 0..2 {
             let composed = decoder.compose(&residual, mode);
             let extracted = decoder.extract_residual(&composed, mode);
             for (index, (&back, &original)) in extracted.iter().zip(&residual).enumerate() {
                 let error = (i32::from(back) - i32::from(original)).abs();
-                assert!(error < 64, "mode {mode} coefficient {index}: {back} vs {original}");
+                assert!(
+                    error < 64,
+                    "mode {mode} coefficient {index}: {back} vs {original}"
+                );
             }
         }
     }
@@ -320,10 +338,15 @@ mod tests {
     #[test]
     fn line_frequencies_map_to_line_pairs_monotonically_downwards() {
         // The conversion is a cosine, so a rising LSF gives a falling LSP across the band.
-        let lsf: [i16; ORDER] = [40, 2600, 5200, 7800, 10_400, 13_000, 15_600, 18_200, 20_800, 25_681];
+        let lsf: [i16; ORDER] = [
+            40, 2600, 5200, 7800, 10_400, 13_000, 15_600, 18_200, 20_800, 25_681,
+        ];
         let lsp = lsf_to_lsp(&lsf);
         assert!(lsp.windows(2).all(|w| w[0] > w[1]), "{lsp:?}");
         assert!(lsp[0] > 30_000, "an LSF near zero maps to an LSP near +1");
-        assert!(lsp[ORDER - 1] < -30_000, "an LSF near PI maps to an LSP near -1");
+        assert!(
+            lsp[ORDER - 1] < -30_000,
+            "an LSF near PI maps to an LSP near -1"
+        );
     }
 }
