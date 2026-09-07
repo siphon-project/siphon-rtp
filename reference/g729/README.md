@@ -69,6 +69,39 @@ itself; both are recorded in [`docs/codec-licensing.md`](../../docs/codec-licens
 transcoding path is gated behind the off-by-default `g729` Cargo feature for the second reason, not
 the first.
 
+## Using the reference as an oracle
+
+The vectors gate the finished decoder, but they only say *whether* it is right, not *where* it went
+wrong. Building the reference and instrumenting it turns a failing sequence into a line number, and
+it is what the port was actually developed against — each stage was compared to the reference's own
+intermediate values before the next was written.
+
+The sources ship with DOS-uppercase filenames while their `#include`s are lowercase, so a build on a
+case-sensitive filesystem needs lowercase copies:
+
+```sh
+cd "$(mktemp -d)" && cp /path/to/reference/g729/c-code/g729/* .
+for f in *.C *.H; do cp "$f" "$(echo "$f" | tr '"'"'[:upper:]'"'"' '"'"'[:lower:]'"'"')"; done
+gcc -O2 -w -o decoder dec_ld8k.c decoder.c de_acelp.c dec_gain.c dec_lag3.c lspdec.c \
+    lspgetq.c post_pro.c pred_lt3.c pst.c basic_op.c oper_32b.c bits.c dspfunc.c \
+    filter.c gainpred.c lpcfunc.c tab_ld8k.c util.c p_parity.c
+./decoder testv/base/speech.bit out.pst && cmp out.pst testv/base/speech.pst
+```
+
+That last comparison is worth running before trusting anything the build says: it establishes that
+*this* build reproduces the shipped vectors, so a later disagreement is the port's and not the
+compiler's.
+
+To bisect, add an `fprintf` guarded by an environment variable at the point of interest — after
+`D_lsp` for the line spectral pairs, after `Dec_lag3` for the pitch, after `Dec_gain` for the gains,
+before `Post` for the pre-postfilter synthesis — and diff against the same value from the Rust side.
+Working outwards from the first stage that disagrees is much faster than staring at a diverging
+waveform, because every stage feeds the next and only the earliest divergence is real.
+
+One trap, from an hour lost to it: the reference's own `Word16` is a `short`, so a loop written
+`for (Word16 f = 0; f < 32768; f += 1031)` never terminates. Use `int` for loop counters in anything
+you add.
+
 ## Re-running
 
 ```sh

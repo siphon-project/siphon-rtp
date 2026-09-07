@@ -7,7 +7,9 @@
 //! frame's vector and the previous one, the second uses this frame's directly.
 
 use super::filter::ORDER;
-use crate::itu::basic_ops::{add, extract_l, l_add, l_msu, l_mult, l_shl, l_shr_r, l_sub, shr};
+use crate::itu::basic_ops::{
+    add, extract_l, l_add, l_msu, l_mult, l_shl, l_shr_r, l_sub, round_word, shr,
+};
 use crate::itu::oper_32b::{l_extract, mpy_32_16};
 
 /// Coefficients in one LP filter: `A(z)` has order 10, so eleven taps including the leading 1.
@@ -86,6 +88,24 @@ pub fn interpolate_subframe_filters(
     [lsp_to_lp(&midpoint), lsp_to_lp(current)]
 }
 
+/// Bandwidth-expand an LP filter by `gamma`, giving `A(z/gamma)` (`Weight_Az`).
+///
+/// Each coefficient is multiplied by a rising power of `gamma`, which widens the filter's formant
+/// bandwidths without moving their centres. The postfilter builds both of its short-term filters
+/// this way from the same `A(z)`, with different factors.
+#[must_use]
+pub fn weight_lp(a: &[i16; COEFFICIENTS], gamma: i16) -> [i16; COEFFICIENTS] {
+    let mut weighted = [0_i16; COEFFICIENTS];
+    weighted[0] = a[0];
+    let mut factor = gamma;
+    for i in 1..ORDER {
+        weighted[i] = round_word(l_mult(a[i], factor));
+        factor = round_word(l_mult(factor, gamma));
+    }
+    weighted[ORDER] = round_word(l_mult(a[ORDER], factor));
+    weighted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +114,32 @@ mod tests {
     const LSP: [i16; ORDER] = [
         30_864, 27_346, 22_887, 16_217, 2516, -5842, -13_459, -20_234, -25_756, -29_622,
     ];
+
+    #[test]
+    fn weighting_leaves_the_leading_tap_alone_and_shrinks_the_rest() {
+        // A(z/gamma) keeps a[0] = 1 and scales a[i] by gamma^i, so every other tap moves towards
+        // zero and the later ones move furthest. A weighting that touched a[0] would change the
+        // filter's gain rather than its bandwidth.
+        let a = lsp_to_lp(&LSP);
+        let weighted = weight_lp(&a, 22_938); // GAMMA1_PST, 0.7
+        assert_eq!(weighted[0], a[0], "the leading tap is untouched");
+        for i in 1..=ORDER {
+            assert!(
+                weighted[i].unsigned_abs() <= a[i].unsigned_abs() + 1,
+                "tap {i}: {} grew from {}",
+                weighted[i],
+                a[i]
+            );
+        }
+        // gamma = 1.0 in Q15 is very nearly the identity (rounding aside).
+        let unity = weight_lp(&a, 32_767);
+        for i in 0..=ORDER {
+            assert!(
+                (i32::from(unity[i]) - i32::from(a[i])).abs() <= 2,
+                "tap {i}"
+            );
+        }
+    }
 
     #[test]
     fn the_leading_coefficient_is_unity_in_q12() {

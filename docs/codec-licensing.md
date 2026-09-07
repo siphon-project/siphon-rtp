@@ -33,7 +33,7 @@ default binary.
 | Cargo feature | Codecs | Status |
 |---|---|---|
 | `amr` | AMR-NB (TS 26.071), AMR-WB / G.722.2 (TS 26.171) | implemented, bit-exact (AMR-WB decode + encode, all 9 modes; AMR-NB decode + encode, all 8 speech modes) |
-| `g729` *(planned)* | G.729, G.729A/B | not yet implemented |
+| `g729` | G.729, G.729A | **decoder** implemented, bit-exact against all nine ITU-T Release 3 sequences; encoder and Annex B not yet |
 | `evs` *(planned)* | EVS (TS 26.441…) | not yet implemented (largest effort; post-Opus) |
 
 **Enabling any feature above is an explicit statement that you, the operator, hold the necessary
@@ -61,7 +61,7 @@ status on the right (passthrough of every codec is always available, per the rul
 | Codec | Posture |
 |---|---|
 | AMR-NB / AMR-WB | 3GPP patent pool. Core patents have largely expired (NB ~2019, WB ~2022) but there is **no explicit royalty-free grant** — treat as licence-required. *Mandatory for VoLTE*, so implemented (behind `amr`); the operator carries the licence. |
-| G.729 / G.723.1 | Core patents expired (~2015–2017) but, again, **no explicit grant** — a counsel-grade call. Gated behind `g729` when implemented. |
+| G.729 / G.723.1 | Core patents expired (~2015–2017) but, again, **no explicit grant** — a counsel-grade call. Gated behind `g729`; the operator enabling it carries that call. G.723.1 is not implemented. |
 | EVS | **Actively encumbered** — large pool (Fraunhofer/Qualcomm/Nokia/…), filed ~2012–14, **no expiry until ~2032+**. Always gated; only ever compiled in by an explicitly-licensed operator. |
 
 ## Excluded outright
@@ -84,6 +84,7 @@ headers document function by function. Who each was ported from, and under what 
 | AMR-NB (encode + decode) | 3GPP TS 26.073 fixed-point reference C (ANSI-C: TS 26.104) | 3GPP Organizational Partners' reference-software terms + AMR patent pool |
 | AMR-WB (encode + decode) | 3GPP TS 26.173 / TS 26.190 reference C (ANSI-C: TS 26.204) | 3GPP Organizational Partners' reference-software terms + AMR patent pool |
 | G.722 | ITU-T G.722 reference | ITU-T reference-software terms |
+| G.729 (decoder) | ITU-T G.729 Release 3 fixed-point reference C | ITU-T reference-software terms; the code itself is © 1995 AT&T, France Telecom, NTT, Université de Sherbrooke |
 | Opus (decoder and encoder complete and factory-wired) | libopus float build (Xiph.Org) | BSD-3-Clause |
 
 G.711 is a clean-room implementation of the companding law (not a port), validated against the

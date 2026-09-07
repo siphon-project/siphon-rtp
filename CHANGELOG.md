@@ -7,6 +7,32 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **A G.729 decoder, bit-exact against all nine official ITU-T test sequences**, behind the
+  off-by-default `g729` Cargo feature — the same posture `amr` has, and for the same reason: the
+  feature gates *transcoding*, and relaying G.729 has always worked without executing a codec.
+
+  Ported from the ITU-T G.729 Release 3 fixed-point reference, function by function, and validated
+  the way `docs/codecs.md` requires: every `*.bit` must reproduce its `*.pst` byte for byte. That is
+  726 720 samples across `algthm`, `erasure`, `fixed`, `lsp`, `overflow`, `parity`, `pitch`,
+  `speech` and `tame`, with zero mismatches — a claim a round trip could not make, since a shared
+  encode/decode bug passes one and fails this.
+
+  Two details worth knowing. The ITU basic operators the codec is written against were already in
+  the tree under `amr/`, so they moved to a shared `itu` module rather than being restated; their
+  interpolation tables are shared too, but the routines indexing them deliberately are not, because
+  the two lineages differ in Q format and in the direction of a denormalising shift. And G.729's
+  decoder *reacts* to arithmetic saturation, rescaling its whole excitation history and
+  re-synthesising, so the ITU `Overflow` flag had to be exact: it is observed by comparing each
+  saturating operator's result against the same arithmetic done wide, rather than reimplemented, and
+  the `overflow` sequence is what proves that equivalent.
+
+  **Not yet wired into the codec factory.** A transcoding call needs both directions, so a decoder
+  alone enables nothing, and a half-populated factory entry would read as enabled while failing at
+  answer. The factory entry lands with the encoder. Annex B (VAD/DTX/CNG) is also still to come,
+  along with honouring `annexb=` on both legs.
+
 ## [0.6.0] — 2026-09-13
 
 Eight gaps a PBX runs into that a trunk-facing SBC and a voice-AI bridge never did. A call on hold
@@ -839,6 +865,7 @@ cancels exactly as before, one lock later.
   per-frame energy sums move from `f64` to exact `i64`, and the second one now runs only for a frame
   loud enough to judge instead of unconditionally. `ws_bridge_tick_8k_20ms/aec_on` 5.03 → 4.58 µs
   against 4.44 µs with the verdict removed entirely.
+
 
 ## [0.4.6] — 2026-09-05
 
