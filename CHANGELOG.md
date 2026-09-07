@@ -7,6 +7,24 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-07
+
+The echo canceller silently did nothing on a leg whose far party was more than 128 ms away, and
+nothing anywhere said so. On a voice-AI bridge that surfaced two components away, as an agent
+interrupting itself on a caller who had said nothing.
+
+**A minor, not a patch.** `siphon-rtp-proto` gains three additive fields — `echo_delay_search_ms`,
+`echo_long_tail`, `echo_residual_suppression` — so a controller floating on `^0.4` does **not** pick
+this up and must move to `^0.5`. Nothing was removed or renamed and every new field defaults to the
+previous behaviour, so a controller that ignores all three sees an engine that behaves as before
+apart from the wider default search window. The internal path-deps move from `"0.4.0"` to `"0.5.0"`
+with it, which a patch cut did not need.
+
+**One behaviour change to be aware of.** The bulk-delay search window defaults to 256 ms instead of
+128 ms, which doubles the estimator's per-leg state and the audio it needs before its first lock
+(~0.8 s → ~1.5 s of far-end-active audio at 16 kHz). A leg whose echo was already inside 128 ms
+cancels exactly as before, one lock later.
+
 ### Fixed
 
 - **The echo canceller silently did nothing on a leg whose far party was more than 128 ms away.**
