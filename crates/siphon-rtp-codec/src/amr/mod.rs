@@ -6,12 +6,16 @@
 //! the mode tables (bit/byte sizes, frame-type mapping), and RFC 4867 payload framing. Modes that
 //! have no encoder yet, and SID/DTX, return [`CodecError::Unsupported`] rather than panicking.
 
-pub mod basic_ops;
 pub mod math_op;
 pub mod nb;
-pub mod oper_32b;
 pub mod payload;
 pub mod wb;
+
+// The G.191 basic operators and the 32-bit helpers built on them are not AMR's — the G.729
+// reference C is written against the same `basic_op.c` / `oper_32b.c`. They live in [`crate::itu`]
+// so a second ITU codec reuses them instead of restating them, and are re-exported here because
+// every AMR module below refers to them by these paths, as its reference C does.
+pub use crate::itu::{basic_ops, oper_32b};
 
 use crate::{CodecError, CodecParams, Decoder, Encoder};
 
