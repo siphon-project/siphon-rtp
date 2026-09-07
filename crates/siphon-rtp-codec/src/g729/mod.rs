@@ -16,6 +16,7 @@
 //! `docs/codec-licensing.md`.
 
 pub mod bitstream;
+pub mod decoder;
 pub mod dspfunc;
 pub mod excitation;
 pub mod filter;
