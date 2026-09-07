@@ -28,7 +28,10 @@ pub mod tone_detect;
 pub mod vad;
 pub mod window;
 
-pub use aec::{AecError, EchoCanceller};
+pub use aec::{
+    delay_estimation_counters, AecError, DelayEstimationCounters, DelayLock, DelayReport,
+    EchoCanceller, WEAK_DELAY_LOCK_CONFIDENCE,
+};
 pub use fft::{Complex, RealFft};
 pub use ns::NoiseSuppressor;
 pub use res::ResidualEchoSuppressor;

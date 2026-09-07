@@ -67,6 +67,8 @@
 //! were tuned to the previous alignment); the far-end history ring is preallocated for the whole
 //! search range, so a re-align only shifts a read offset — never a heap allocation.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::fft::{Complex, RealFft};
 use crate::res::ResidualEchoSuppressor;
 use crate::DspError;
@@ -76,9 +78,15 @@ use siphon_rtp_simd::fir_dot_f32;
 /// regularization, and Geigel threshold are all scale-independent pure ratios.
 const SAMPLE_SCALE: f32 = 32_768.0;
 
-/// Longest adaptive tail we preallocate for (256 taps @ 8 kHz is the default target; this bounds a
-/// pathological request to ~0.5 s @ 8 kHz).
-const MAX_TAIL_SAMPLES: usize = 4_096;
+/// Longest adaptive tail we preallocate for — **1 s @ 8 kHz / 0.5 s @ 16 kHz**, bounding a
+/// pathological request while leaving room for the long-tail mode
+/// ([`EchoCanceller::with_mdf_long_tail`]) to span a relay-length echo path with the filter itself.
+///
+/// Raised from 4096 for the same reason the delay-search cap was: a sample count is a *duration*
+/// only once the rate is fixed, and this one was worth half as many milliseconds at 16 kHz — the
+/// rate every speech model wants and the one the voice-AI guidance recommends — so the wideband leg
+/// was the one that ran out first, at 256 ms, on exactly the deployment most likely to need more.
+const MAX_TAIL_SAMPLES: usize = 8_192;
 /// Longest bulk delay we preallocate the far-end ring for (1 s @ 16 kHz).
 const MAX_BULK_DELAY_SAMPLES: usize = 16_000;
 
@@ -126,15 +134,34 @@ const DIVERGE_RESIDUAL_MARGIN: f64 = 2.0;
 const NCC_ENERGY_FLOOR: f64 = 1.0e-7;
 
 // --- GCC-PHAT delay estimation ---
-/// Largest bulk delay (and therefore search range) automatic estimation supports, in samples
-/// (~0.5 s @ 8 kHz / ~0.25 s @ 16 kHz) — far beyond any realistic loudspeaker→microphone path,
-/// and it bounds the estimation FFT to [`DELAY_BLOCK_MAX`].
-const MAX_SEARCH_RANGE_SAMPLES: usize = 4_096;
+/// Largest bulk delay (and therefore search range) automatic estimation supports, in samples —
+/// **1 s @ 8 kHz / 0.5 s @ 16 kHz**, and it bounds the estimation FFT to [`DELAY_BLOCK_MAX`].
+///
+/// This is a *sample* count, so it is only a duration once a rate is fixed, and it halves as the
+/// rate doubles. That mattered: at 4096 (the previous value) a 16 kHz canceller — the rate every
+/// speech model wants, and the one a voice-AI bridge is told to negotiate — could reach only 256 ms,
+/// half of what an 8 kHz one got, on exactly the deployment most likely to need more. 8192 gives
+/// 16 kHz the 512 ms that 8 kHz already had.
+///
+/// It is a *cap*, not a target: the FFT is sized at [`choose_block_size`] ≥ 2× the range, so asking
+/// for the maximum at 16 kHz buys a 16384-point transform (~0.7 MB of estimator state per leg) and
+/// pushes the first lock out to `MIN_BLOCKS_BEFORE_LOCK` × 1024 ms of far-end-active audio. That
+/// cost is why the engine's default sits well below this and the range is configurable per leg
+/// rather than simply being pinned here — see `AEC_DELAY_SEARCH_MILLIS` in the engine.
+const MAX_SEARCH_RANGE_SAMPLES: usize = 8_192;
 /// Smallest GCC-PHAT block (a power of two). The block must be several times the search range so the
 /// circular cross-correlation approximates the linear one over the whole search span.
 const DELAY_BLOCK_MIN: usize = 512;
-/// Largest GCC-PHAT block (a power of two) — the FFT size at the maximum search range.
-const DELAY_BLOCK_MAX: usize = 8_192;
+/// Largest GCC-PHAT block (a power of two) — the FFT size at the maximum search range, i.e.
+/// 2 × [`MAX_SEARCH_RANGE_SAMPLES`]. The two move together: a block that is not at least twice the
+/// range leaves the longest lags dominated by circular wrap-around instead of the linear
+/// correlation, so raising the range without raising this would silently degrade the estimate at
+/// exactly the delays the wider range was bought for.
+const DELAY_BLOCK_MAX: usize = 16_384;
+/// The two above move together or the estimate silently degrades at the longest lags — enforced at
+/// compile time rather than in a test, because the failure it guards against is a *quiet* one and
+/// would otherwise depend on someone running the right test after changing the right constant.
+const _: () = assert!(DELAY_BLOCK_MAX >= 2 * MAX_SEARCH_RANGE_SAMPLES);
 /// Phase-transform regularization: each cross-power bin is divided by `magnitude + ε`, so a
 /// near-silent bin contributes ~0 phase instead of blowing up (RFC-free classical GCC-PHAT).
 const PHAT_EPSILON: f32 = 1.0e-6;
@@ -151,9 +178,171 @@ const REALIGN_TOLERANCE_SAMPLES: usize = 8;
 /// A genuinely different peak must persist for this many consecutive decision blocks before the
 /// alignment is moved — the hangover that stops a transient from thrashing the ring/weights.
 const REALIGN_HANGOVER_BLOCKS: usize = 5;
+/// Once a delay is located confidently, the peak search narrows to `committed ± search_range/this`,
+/// so lags the echo demonstrably does not occupy stop competing for the pick.
+///
+/// A **fraction of the search range** rather than a sample count, deliberately. The estimator works
+/// purely in samples and is never told the sample rate, so any fixed sample margin would be two
+/// different durations at 8 and 16 kHz — the trap that produced the defect this whole path exists to
+/// fix. A fraction is rate-free, and it scales the right way besides: a leg configured with a wide
+/// window is one whose path length is uncertain, and it earns a proportionally wider re-lock margin,
+/// while a LAN leg on a narrow window gets a tight one. At the 256 ms default this is 32 ms at
+/// either rate.
+const RELOCK_MARGIN_DIVISOR: usize = 8;
+/// Floor for the narrowed margin, so a very short search range cannot collapse the scan onto a band
+/// narrower than the ±1-sample jitter [`REALIGN_TOLERANCE_SAMPLES`] already absorbs.
+const RELOCK_MARGIN_FLOOR_SAMPLES: usize = REALIGN_TOLERANCE_SAMPLES * 2;
+/// Consecutive usable blocks whose narrowed peak fails [`WEAK_DELAY_LOCK_CONFIDENCE`] before the
+/// scan widens back to the full range.
+///
+/// Longer than [`REALIGN_HANGOVER_BLOCKS`] on purpose: a path that moved *within* the margin should
+/// be followed by the ordinary re-align, and only a path that left the margin entirely — a re-INVITE
+/// onto a different carrier route — should cost a widen. Without this the narrowing would be a trap:
+/// once locked, the estimator could never again see a delay outside its own margin.
+const RELOCK_WIDEN_BLOCKS: usize = 6;
 /// Mean per-sample far-end block energy (normalized) below which a block carries no usable echo, so
 /// it is skipped for estimation (a silent far-end produces only a noise correlation).
 const DELAY_FAR_ENERGY_FLOOR: f32 = 1.0e-6;
+/// Peak prominence ([`DelayLock::confidence`]) below which a committed delay is reported as **weak**
+/// — the estimator picked the tallest lag it could see rather than locating an echo.
+///
+/// `decide` commits unconditionally, so an echo that lies beyond the search range yields a lock on
+/// noise, not an absence of one. Measured on the synthetic relay path in
+/// `a_located_echo_and_a_picked_one_are_told_apart_by_peak_prominence`, a located echo scores **100**
+/// and the same echo missed by a too-short window scores **4** — a 25× gap. 12.0 sits 3× above the
+/// miss and 8× below the hit, so it separates them on a log scale rather than sitting against either
+/// end, and a real line (a shallower peak than a synthetic one) has room to fall well short of the
+/// synthetic figure and still read as located.
+pub const WEAK_DELAY_LOCK_CONFIDENCE: f32 = 12.0;
+/// Frames the estimator may consume without committing anything before it reports itself stuck
+/// ([`DelayReport::NeverLocked`]). 500 frames is ~10 s at the 20 ms media tick — long enough that a
+/// leg whose far end simply has not spoken yet is not accused, short enough that a leg which never
+/// gets a clean look at its echo says so inside the first turn of a conversation.
+const UNLOCKED_REPORT_FRAMES: usize = 500;
+
+/// Process-wide count of bulk delays committed by any [`EchoCanceller`]'s GCC-PHAT estimator.
+static DELAY_LOCKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// The subset of [`DELAY_LOCKS_TOTAL`] whose prominence was below [`WEAK_DELAY_LOCK_CONFIDENCE`].
+static WEAK_DELAY_LOCKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Process-wide count of estimators that ran [`UNLOCKED_REPORT_FRAMES`] frames without committing.
+static UNLOCKED_ESTIMATORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Process-wide count of narrowed scans that widened back to the full search range because the echo
+/// left the re-lock margin — see [`RELOCK_WIDEN_BLOCKS`].
+static DELAY_REWIDENS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// A snapshot of the process-wide GCC-PHAT delay-estimation counters, for `/metrics`.
+///
+/// Process-wide rather than per-leg on purpose: a canceller is owned by exactly one actor and is
+/// never reachable from a scrape, so a per-leg gauge would need shared state on the media path that
+/// nothing else there has. The per-leg number is carried on the log line the engine emits from
+/// [`EchoCanceller::take_delay_report`] instead, where the call and leg identity are already in
+/// scope; these counters answer the fleet-shaped question — *is this happening at all, and to how
+/// many calls* — which is the one a dashboard can act on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DelayEstimationCounters {
+    /// Bulk delays committed (first locks and re-aligns) since process start.
+    pub locks_total: u64,
+    /// Of those, the ones whose peak prominence was below [`WEAK_DELAY_LOCK_CONFIDENCE`] — the
+    /// estimator picked a lag out of noise. A ratio near 1 here says the search range is too short
+    /// for the paths this node is carrying.
+    pub weak_locks_total: u64,
+    /// Estimators that consumed 500 frames (~10 s at the 20 ms media tick) without committing
+    /// anything. A different failure from a weak lock: nothing was decided at all.
+    pub never_locked_total: u64,
+    /// Narrowed peak scans that widened back to the full search range because the echo left the
+    /// re-lock margin. A handful over a call's life is a path that genuinely moved (a re-INVITE onto
+    /// another route); a rate that climbs with call volume says the paths this node carries are
+    /// unstable, or that the margin is too tight for them.
+    pub rewidens_total: u64,
+}
+
+/// Read the process-wide GCC-PHAT delay-estimation counters.
+#[must_use]
+pub fn delay_estimation_counters() -> DelayEstimationCounters {
+    DelayEstimationCounters {
+        locks_total: DELAY_LOCKS_TOTAL.load(Ordering::Relaxed),
+        weak_locks_total: WEAK_DELAY_LOCKS_TOTAL.load(Ordering::Relaxed),
+        never_locked_total: UNLOCKED_ESTIMATORS_TOTAL.load(Ordering::Relaxed),
+        rewidens_total: DELAY_REWIDENS_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+/// A bulk delay the GCC-PHAT estimator has committed, drained edge-triggered by
+/// [`EchoCanceller::take_delay_report`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DelayLock {
+    /// The committed bulk delay, in samples at [`DelayLock::sample_rate_hz`].
+    pub delay_samples: usize,
+    /// The search range the estimator was configured with, in samples — the window this delay was
+    /// found *in*, which is the other half of the fact.
+    pub search_range_samples: usize,
+    /// The canceller's sample rate, so a duration can be rendered without the reader knowing it.
+    pub sample_rate_hz: u32,
+    /// Peak prominence over the correlation surface (`peak / mean|surface|`); see
+    /// [`WEAK_DELAY_LOCK_CONFIDENCE`].
+    pub confidence: f32,
+    /// Whether this was the estimator's **first** lock (as opposed to a hangover-confirmed re-align).
+    pub first_lock: bool,
+}
+
+impl DelayLock {
+    /// The committed bulk delay in milliseconds.
+    #[must_use]
+    pub fn delay_millis(&self) -> u32 {
+        self.millis(self.delay_samples)
+    }
+
+    /// The configured search range in milliseconds.
+    #[must_use]
+    pub fn search_range_millis(&self) -> u32 {
+        self.millis(self.search_range_samples)
+    }
+
+    /// Whether the peak was too flat to be an echo — see [`WEAK_DELAY_LOCK_CONFIDENCE`]. The single
+    /// most useful thing to alert on: it is what "the echo is outside the search range" looks like
+    /// from inside a canceller that is otherwise running perfectly.
+    #[must_use]
+    pub fn is_weak(&self) -> bool {
+        self.confidence < WEAK_DELAY_LOCK_CONFIDENCE
+    }
+
+    /// Whether the committed delay sits in the last eighth of the search window. Not a failure on
+    /// its own — a genuine path can be that long — but paired with a real echo it is the signature
+    /// of a window that is about to be too short, so it is worth saying before the next carrier hop
+    /// pushes the path over the edge.
+    #[must_use]
+    pub fn at_search_edge(&self) -> bool {
+        self.delay_samples * 8 >= self.search_range_samples * 7
+    }
+
+    fn millis(&self, samples: usize) -> u32 {
+        let rate = self.sample_rate_hz.max(1) as u64;
+        u32::try_from(samples as u64 * 1000 / rate).unwrap_or(u32::MAX)
+    }
+}
+
+/// What the GCC-PHAT bulk-delay estimator has concluded since it was last asked, drained by
+/// [`EchoCanceller::take_delay_report`].
+///
+/// Edge-triggered: a variant is produced only when something actually happened, so a converged leg
+/// yields `None` every frame for the rest of the call and the caller pays one `Option` check.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DelayReport {
+    /// A bulk delay was committed — an initial lock, or a hangover-confirmed re-align.
+    Locked(DelayLock),
+    /// The estimator has consumed 500 frames (~10 s at the 20 ms media tick) without committing
+    /// anything. Raised **once** per estimator (re-armed by [`EchoCanceller::reset`]).
+    NeverLocked {
+        /// Frames fed to the estimator while unlocked.
+        frames_observed: usize,
+        /// Blocks assembled and then discarded — a silent far end, or one the double-talk gate
+        /// marked unusable. `blocks_dropped == 0` alongside this means the far end has simply not
+        /// produced a full block yet; a large count means it did and none of it was usable.
+        blocks_dropped: usize,
+        /// The canceller's sample rate, so `frames_observed` can be rendered as a duration.
+        sample_rate_hz: u32,
+    },
+}
 
 // --- MDF / partitioned-block frequency-domain adaptive filter (Soo & Pang 1990) ---
 /// Frequency-domain NLMS step size `μ` for the MDF weight update (0 < μ < 2 for stability). At each
@@ -167,8 +356,25 @@ const MDF_STEP_SIZE: f32 = 0.5;
 /// of the NLMS `δ`).
 const MDF_REGULARIZATION: f32 = 1.0e-4;
 /// Largest partition count the MDF preallocates for — 64 blocks of the (rate-dependent) block size,
-/// i.e. up to ~2048 taps (256 ms) @ 8 kHz / ~4096 taps (256 ms) @ 16 kHz. Bounds a pathological tail.
+/// i.e. up to 8192 taps @ 8 kHz (block 128) and 16384 @ 16 kHz (block 256), which is **1 s at either
+/// rate**. Bounds a pathological tail.
+///
+/// A tail that needs more partitions than this is now rejected rather than quietly given a shorter
+/// filter — see [`MdfFilter::new`]. It is not the binding limit in practice ([`MAX_TAIL_SAMPLES`]
+/// is), but a cap that silently shortens what it was asked for is the same class of defect as a
+/// delay search that silently locks on noise.
 const MDF_MAX_PARTITIONS: usize = 64;
+/// The smallest MDF block a supported media rate produces: 8 kHz gives a 160-sample frame, and the
+/// block is the largest power of two that fits, so 128. Every higher rate gives a larger block and
+/// therefore more taps per partition.
+const MIN_MDF_BLOCK_SAMPLES: usize = 128;
+/// The two caps must not disagree: at the *narrowest* block any supported rate produces,
+/// [`MDF_MAX_PARTITIONS`] partitions have to cover [`MAX_TAIL_SAMPLES`], or a tail inside the
+/// documented cap would be refused by the partition check at 8 kHz and accepted at 16 kHz. Asserted
+/// rather than commented, so raising either constant without the other stops the build instead of
+/// producing a limit that depends on the negotiated rate — which is the precise shape of the defect
+/// this whole path was opened for.
+const _: () = assert!(MAX_TAIL_SAMPLES <= MDF_MAX_PARTITIONS * MIN_MDF_BLOCK_SAMPLES);
 /// Below this per-frame normalized energy on either the microphone or the block echo estimate the MDF
 /// two-path NCC is undefined (a 0/0), so the frame drives neither a freeze nor an unfreeze — the
 /// bootstrap guard that lets the very first (all-zero-filter) blocks adapt.
@@ -406,6 +612,38 @@ struct DelayEstimator {
     candidate_delay: usize,
     /// Consecutive decisions the candidate has held.
     candidate_count: usize,
+    /// The latest commit awaiting collection by [`EchoCanceller::take_delay_report`]. Written only
+    /// when a delay is actually committed (a first lock or a hangover-confirmed re-align), so the
+    /// per-frame path never touches it once a stable path has locked.
+    pending_lock: Option<PendingLock>,
+    /// Frames fed to [`DelayEstimator::observe`] while still unlocked. Stops counting at the first
+    /// lock, so it is the age of the estimator's *failure*, not of the call.
+    frames_unlocked: usize,
+    /// Blocks assembled but discarded before accumulation while still unlocked — a silent far end
+    /// (nothing to correlate) or a frame the double-talk gate marked unusable. It is what separates
+    /// "there is no echo to find" from "the estimator never got a clean look at one".
+    blocks_dropped: usize,
+    /// Whether the one-shot never-locked report has already been raised, so a leg that genuinely has
+    /// no far-end audio reports once rather than every frame for the life of the call.
+    unlocked_reported: bool,
+    /// Whether the peak search is currently restricted to the re-lock margin around
+    /// [`Self::committed_delay`] — set only by a lock that cleared [`WEAK_DELAY_LOCK_CONFIDENCE`],
+    /// never by a weak one (narrowing onto a lag picked out of noise would make the mistake
+    /// permanent).
+    narrowed: bool,
+    /// Consecutive usable blocks whose narrowed peak failed [`WEAK_DELAY_LOCK_CONFIDENCE`]. At
+    /// [`RELOCK_WIDEN_BLOCKS`] the scan widens back — the escape hatch that keeps the narrowing from
+    /// blinding the estimator to a path that genuinely moved.
+    low_confidence_blocks: usize,
+}
+
+/// A commit latched by [`DelayEstimator::decide`] for the canceller to hand out. Rate-free — the
+/// estimator works purely in samples; [`EchoCanceller::take_delay_report`] stamps the rate on.
+#[derive(Clone, Copy, Debug)]
+struct PendingLock {
+    delay_samples: usize,
+    confidence: f32,
+    first_lock: bool,
 }
 
 impl DelayEstimator {
@@ -417,8 +655,9 @@ impl DelayEstimator {
             });
         }
         let block_size = choose_block_size(search_range);
-        // `block_size` is a power of two in `[512, 8192]` by construction, so this cannot fail; map
-        // any future contract change to the search-range error rather than panicking.
+        // `block_size` is a power of two in `[DELAY_BLOCK_MIN, DELAY_BLOCK_MAX]` by construction, so
+        // this cannot fail; map any future contract change to the search-range error rather than
+        // panicking.
         let fft = RealFft::new(block_size).map_err(|_| AecError::InvalidSearchRange {
             got: search_range,
             max: MAX_SEARCH_RANGE_SAMPLES,
@@ -442,6 +681,12 @@ impl DelayEstimator {
             committed_delay: 0,
             candidate_delay: 0,
             candidate_count: 0,
+            pending_lock: None,
+            frames_unlocked: 0,
+            blocks_dropped: 0,
+            unlocked_reported: false,
+            narrowed: false,
+            low_confidence_blocks: 0,
         })
     }
 
@@ -456,6 +701,11 @@ impl DelayEstimator {
     /// alignment is committed (an initial lock or a hangover-confirmed re-align), else `None`.
     fn observe(&mut self, near: &[i16], far: &[i16], usable: bool) -> Option<usize> {
         let count = near.len().min(far.len());
+        // Age the *failure*, not the call: this stops the moment a delay is committed, so a leg that
+        // locks normally pays one predictable-branch increment for its first second and nothing after.
+        if !self.locked {
+            self.frames_unlocked += 1;
+        }
         let mut decision = None;
         let mut offset = 0;
         while offset < count {
@@ -482,12 +732,14 @@ impl DelayEstimator {
     /// whether to (re-)commit a delay.
     fn process_block(&mut self) -> Option<usize> {
         if !self.block_usable {
+            self.blocks_dropped += 1;
             return None;
         }
         // Skip a silent far-end block — no echo to correlate, only a noise surface.
         let far_energy: f32 =
             self.far_block.iter().map(|&s| s * s).sum::<f32>() / self.block_size as f32;
         if far_energy < DELAY_FAR_ENERGY_FLOOR {
+            self.blocks_dropped += 1;
             return None;
         }
 
@@ -521,30 +773,110 @@ impl DelayEstimator {
         if self.blocks_seen < MIN_BLOCKS_BEFORE_LOCK {
             return None;
         }
-        let peak = self.peak_lag();
-        self.decide(peak)
+        let (peak, confidence) = self.peak_lag();
+        self.decide(peak, confidence)
     }
 
-    /// Index of the largest accumulated correlation over `0 ..= search_range`.
-    fn peak_lag(&self) -> usize {
-        let mut best_lag = 0;
-        let mut best_value = self.accumulator[0];
-        for (lag, &value) in self.accumulator.iter().enumerate() {
+    /// Half-width of the narrowed peak scan, in samples — see [`RELOCK_MARGIN_DIVISOR`].
+    fn relock_margin(&self) -> usize {
+        (self.search_range / RELOCK_MARGIN_DIVISOR).max(RELOCK_MARGIN_FLOOR_SAMPLES)
+    }
+
+    /// Inclusive lag bounds the peak pick may choose from: the whole range while unlocked or widened,
+    /// and `committed ± relock_margin` (clamped) once a confident lock has narrowed it.
+    ///
+    /// Only the *scan* narrows. The accumulator keeps its full `search_range + 1` length and every
+    /// lag keeps being integrated, so widening back costs nothing and needs no reallocation — which
+    /// is what keeps this inside the zero-per-frame-allocation gate.
+    fn scan_bounds(&self) -> (usize, usize) {
+        if !self.narrowed {
+            return (0, self.search_range);
+        }
+        let margin = self.relock_margin();
+        (
+            self.committed_delay.saturating_sub(margin),
+            self.committed_delay
+                .saturating_add(margin)
+                .min(self.search_range),
+        )
+    }
+
+    /// Index of the largest accumulated correlation over `0 ..= search_range`, together with that
+    /// peak's **prominence** over the rest of the surface: `peak / mean|surface|`.
+    ///
+    /// The prominence is the only thing that distinguishes a delay the estimator *found* from one it
+    /// merely *picked*. `decide` commits the largest lag in the window unconditionally, so an echo
+    /// that lies outside the search range does not produce "no lock" — it produces a lock on the
+    /// tallest sample of a noise surface, which looks identical from every accessor. A phase
+    /// transform whitens both spectra, so a genuine path leaves `G_phat = H/|H|`, whose inverse
+    /// transform is concentrated on the dominant tap and stands far above the floor; a surface with
+    /// no echo in it is the maximum of `search_range + 1` noise samples, which sits at a small
+    /// multiple of their mean. Scale-free by construction (a ratio of the same accumulator), so it
+    /// means the same thing at any level, rate, or number of smoothed blocks.
+    ///
+    /// One pass, folded into the peak scan that already runs each block, so it costs an `abs` and an
+    /// add per lag and never touches the per-frame path.
+    fn peak_lag(&self) -> (usize, f32) {
+        // The prominence denominator stays the **whole** surface even when the pick is narrowed.
+        // Confidence means "how far this peak stands above the correlation floor", and the floor is a
+        // property of the surface, not of the slice being searched. Narrowing the denominator too
+        // would shrink it (a band around a real peak is mostly peak), deflating confidence on exactly
+        // the good locks and pushing them under `WEAK_DELAY_LOCK_CONFIDENCE` — the calibration in
+        // that constant is against a full-surface mean and has to stay comparable across a narrow and
+        // a wide scan, or a narrowed leg would start reporting itself broken.
+        let mut absolute_total = 0.0f64;
+        for &value in &self.accumulator {
+            absolute_total += f64::from(value.abs());
+        }
+        let (low, high) = self.scan_bounds();
+        let mut best_lag = low;
+        let mut best_value = self.accumulator[low];
+        for (offset, &value) in self.accumulator[low..=high].iter().enumerate() {
             if value > best_value {
                 best_value = value;
-                best_lag = lag;
+                best_lag = low + offset;
             }
         }
-        best_lag
+        let mean_absolute = absolute_total / self.accumulator.len() as f64;
+        // A flat-zero surface cannot happen here (a block only reaches this point past the far-end
+        // energy floor), but division by it would yield a NaN that compares false against every
+        // threshold and would therefore read as *confident*. Report no confidence instead.
+        let confidence = if mean_absolute > 0.0 {
+            (f64::from(best_value) / mean_absolute) as f32
+        } else {
+            0.0
+        };
+        (best_lag, confidence.max(0.0))
     }
 
-    /// Lock/hangover decision for a freshly picked peak.
-    fn decide(&mut self, peak: usize) -> Option<usize> {
+    /// Lock/hangover decision for a freshly picked peak. `confidence` is the peak's prominence from
+    /// [`DelayEstimator::peak_lag`], latched with the commit so a consumer can tell a located echo
+    /// from a picked one.
+    fn decide(&mut self, peak: usize, confidence: f32) -> Option<usize> {
+        // Scan-width bookkeeping first, so the widen decision is made on this block's evidence rather
+        // than a block late. While narrowed, a run of blocks whose best in-margin lag is
+        // indistinguishable from noise means the echo is no longer in the margin — the path moved —
+        // and the only way to find it again is to look everywhere. A confident block resets the run,
+        // so ordinary double-talk or a quiet stretch never widens anything.
+        if self.narrowed {
+            if confidence >= WEAK_DELAY_LOCK_CONFIDENCE {
+                self.low_confidence_blocks = 0;
+            } else {
+                self.low_confidence_blocks += 1;
+                if self.low_confidence_blocks >= RELOCK_WIDEN_BLOCKS {
+                    self.narrowed = false;
+                    self.low_confidence_blocks = 0;
+                    DELAY_REWIDENS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         if !self.locked {
             self.locked = true;
             self.committed_delay = peak;
             self.candidate_delay = peak;
             self.candidate_count = 0;
+            self.narrow_if_confident(confidence);
+            self.commit_report(peak, confidence, true);
             return Some(peak);
         }
         if peak.abs_diff(self.committed_delay) <= REALIGN_TOLERANCE_SAMPLES {
@@ -558,6 +890,11 @@ impl DelayEstimator {
             if self.candidate_count >= REALIGN_HANGOVER_BLOCKS {
                 self.committed_delay = self.candidate_delay;
                 self.candidate_count = 0;
+                // A confirmed re-align re-centres the margin on the new delay, and re-narrows if the
+                // new peak is itself trustworthy — a path that moved and was found confidently is
+                // just as worth protecting from noise as the first lock was.
+                self.narrow_if_confident(confidence);
+                self.commit_report(self.committed_delay, confidence, false);
                 return Some(self.committed_delay);
             }
             None
@@ -566,6 +903,57 @@ impl DelayEstimator {
             self.candidate_count = 1;
             None
         }
+    }
+
+    /// Narrow the peak scan around the freshly committed delay, but **only** on a lock that cleared
+    /// [`WEAK_DELAY_LOCK_CONFIDENCE`].
+    ///
+    /// Narrowing onto a weak lock would be the worst possible move: a weak lock is the signature of
+    /// an echo *outside* the search window, so restricting the scan around it would fence the
+    /// estimator into the noise it just mistook for an echo and remove the one chance it had of
+    /// picking up the real peak later. A weak lock therefore keeps looking everywhere, which is also
+    /// what the operator-facing warning tells them is happening.
+    fn narrow_if_confident(&mut self, confidence: f32) {
+        self.low_confidence_blocks = 0;
+        self.narrowed = confidence >= WEAK_DELAY_LOCK_CONFIDENCE;
+    }
+
+    /// Latch a commit for collection and record it in the process-wide counters. Called only from
+    /// [`DelayEstimator::decide`] on an actual commit, so a stable path pays this once per call.
+    fn commit_report(&mut self, delay_samples: usize, confidence: f32, first_lock: bool) {
+        self.pending_lock = Some(PendingLock {
+            delay_samples,
+            confidence,
+            first_lock,
+        });
+        DELAY_LOCKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if confidence < WEAK_DELAY_LOCK_CONFIDENCE {
+            WEAK_DELAY_LOCKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Drain the latched commit, if any, and otherwise raise the one-shot never-locked report once
+    /// the estimator has been fed [`UNLOCKED_REPORT_FRAMES`] frames without committing anything.
+    fn take_report(&mut self, sample_rate_hz: u32) -> Option<DelayReport> {
+        if let Some(lock) = self.pending_lock.take() {
+            return Some(DelayReport::Locked(DelayLock {
+                delay_samples: lock.delay_samples,
+                search_range_samples: self.search_range,
+                sample_rate_hz,
+                confidence: lock.confidence,
+                first_lock: lock.first_lock,
+            }));
+        }
+        if self.locked || self.unlocked_reported || self.frames_unlocked < UNLOCKED_REPORT_FRAMES {
+            return None;
+        }
+        self.unlocked_reported = true;
+        UNLOCKED_ESTIMATORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        Some(DelayReport::NeverLocked {
+            frames_observed: self.frames_unlocked,
+            blocks_dropped: self.blocks_dropped,
+            sample_rate_hz,
+        })
     }
 
     fn reset(&mut self) {
@@ -579,6 +967,17 @@ impl DelayEstimator {
         self.committed_delay = 0;
         self.candidate_delay = 0;
         self.candidate_count = 0;
+        self.pending_lock = None;
+        self.frames_unlocked = 0;
+        self.blocks_dropped = 0;
+        // Deliberately re-armed: a reset re-runs the whole estimation from an unaligned ring, so if
+        // *that* run never locks either it is a fresh fact about the leg and worth a fresh report.
+        self.unlocked_reported = false;
+        // Back to searching everywhere. A margin is only ever justified by a lock, and this reset has
+        // just discarded the lock that justified it — keeping it would search a band around a delay
+        // the estimator no longer claims.
+        self.narrowed = false;
+        self.low_confidence_blocks = 0;
     }
 }
 
@@ -760,7 +1159,17 @@ impl MdfFilter {
         }
         let block_size = floor_power_of_two(frame_capacity);
         let fft_size = block_size * 2;
-        let partitions = tail_samples.div_ceil(block_size).min(MDF_MAX_PARTITIONS);
+        let partitions = tail_samples.div_ceil(block_size);
+        // Refuse rather than clamp. `partitions.min(MDF_MAX_PARTITIONS)` used to silently hand back a
+        // filter shorter than the caller asked for, reported only through `tail_samples()` if anyone
+        // thought to look — the same shape of defect as a delay search that locks on noise, and the
+        // long-tail mode is exactly the caller that would hit it.
+        if partitions > MDF_MAX_PARTITIONS {
+            return Err(AecError::InvalidTail {
+                got: tail_samples,
+                max: MDF_MAX_PARTITIONS * block_size,
+            });
+        }
         // `fft_size` is a power of two `>= 4` (block_size >= 2), so this cannot fail; map any future
         // contract change to the tail error rather than panicking.
         let fft = RealFft::new(fft_size).map_err(|_| AecError::InvalidTail {
@@ -1160,6 +1569,17 @@ pub struct EchoCanceller {
 }
 
 impl EchoCanceller {
+    /// The largest GCC-PHAT search range automatic estimation supports, in samples — 1 s at 8 kHz,
+    /// 512 ms at 16 kHz. Exposed so a caller converting a *duration* into a range can clamp against
+    /// it (and say so) rather than have the constructor reject the request and leave the leg with no
+    /// canceller at all, which is the failure this whole surface exists to stop being silent.
+    pub const MAX_DELAY_SEARCH_SAMPLES: usize = MAX_SEARCH_RANGE_SAMPLES;
+    /// The longest adaptive tail any constructor accepts, in taps — 1 s at 8 kHz, 512 ms at 16 kHz.
+    /// Exposed for the same reason as [`EchoCanceller::MAX_DELAY_SEARCH_SAMPLES`]: a caller turning a
+    /// *duration* into taps needs to clamp against it and say so, rather than have the constructor
+    /// refuse and leave the leg with no canceller.
+    pub const MAX_TAIL_SAMPLES_SUPPORTED: usize = MAX_TAIL_SAMPLES;
+
     /// A canceller for `sample_rate_hz` with a `tail_samples`-tap adaptive filter and **no** bulk
     /// delay (the echo is assumed to start within the tail). Default target: `tail_samples = 256`
     /// at 8 kHz. Preallocates all state.
@@ -1295,6 +1715,41 @@ impl EchoCanceller {
     /// # Errors
     /// As [`EchoCanceller::new`] for the sample rate and tail.
     pub fn with_mdf(sample_rate_hz: u32, tail_samples: usize) -> Result<Self, AecError> {
+        Self::build_mdf(sample_rate_hz, tail_samples, 0, None)
+    }
+
+    /// The MDF backend with a tail long enough to span the **whole** echo path, and **no bulk-delay
+    /// estimation** — the alternative posture to [`EchoCanceller::with_mdf_delay_estimation`] for a
+    /// leg whose delay the estimator cannot be trusted to find.
+    ///
+    /// The two differ in how they fail, which is the entire point of offering both. The estimator is
+    /// cheap and precise when it works, but GCC-PHAT commits the tallest lag inside its search window
+    /// whatever that lag is, so an echo beyond the window produces a lock on *noise* and a filter that
+    /// adapts against a reference that is not the echo — it cancels nothing, reports nothing, and is
+    /// indistinguishable from a leg with no echo on it. A long tail has no such failure: it makes no
+    /// alignment decision at all, so there is nothing to get wrong. Its cost is honest and gradual
+    /// instead — more taps to converge, and more work per block.
+    ///
+    /// **That cost is not small.** The MDF runs the gradient constraint's
+    /// IFFT/FFT pair *inside* the per-partition loop, so an adapting block costs `2K + 3` transforms
+    /// for `K = ceil(tail / block_size)` partitions, not one transform plus `O(K)` multiply-
+    /// accumulates. Going from a 64 ms tail (`K = 4`) to a 512 ms one (`K = 32`) is therefore roughly
+    /// six times the per-frame work, plus about 96 KiB more state per canceller. Both stay far inside
+    /// a 20 ms budget, and neither is free — which is why the engine exposes this per leg rather than
+    /// defaulting to it.
+    ///
+    /// Chainable with [`EchoCanceller::with_two_path_dtd`] and
+    /// [`EchoCanceller::with_residual_suppression`]. Note that
+    /// [`EchoCanceller::take_delay_report`] is always `None` here: there is no estimator, so there is
+    /// nothing to report and the never-locked warning correctly never fires. A caller that wants an
+    /// operator to be able to tell a long-tail leg from a broken one must say so where the canceller
+    /// is built.
+    ///
+    /// # Errors
+    /// As [`EchoCanceller::new`] for the sample rate, and [`AecError::InvalidTail`] if `tail_samples`
+    /// exceeds [`EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED`] or needs more partitions than the MDF
+    /// preallocates for at this rate.
+    pub fn with_mdf_long_tail(sample_rate_hz: u32, tail_samples: usize) -> Result<Self, AecError> {
         Self::build_mdf(sample_rate_hz, tail_samples, 0, None)
     }
 
@@ -1455,6 +1910,34 @@ impl EchoCanceller {
         }
     }
 
+    /// Whether the most recent frame's near-end was, on the canceller's own evidence, **the far-end
+    /// reference coming back** rather than a near-end talker.
+    ///
+    /// This is the one question a speech detector cannot answer. The far end's voice returning
+    /// through a handset *is* speech, and nothing computable from the near-end signal alone separates
+    /// "a person talking" from "the audio we just played, delayed". The canceller is the only place
+    /// that holds the other half — what was played, and when — and its two-path detector already
+    /// forms exactly that statistic per block: `ρ = <mic, ŷ> / (‖mic‖·‖ŷ‖)` against its own echo
+    /// estimate. `ρ → 1` means the microphone *is* the echo; an uncorrelated near-end talker lifts
+    /// `‖mic‖` without lifting the inner product, so `ρ` falls.
+    ///
+    /// **Deliberately not `!double_talk_active()`.** That reads `false` whenever the correlation is
+    /// undefined — an unconverged filter, a silent far end, or Geigel mode — so its negation claims
+    /// "this is our echo" in precisely the cases where the canceller knows nothing. Used to gate
+    /// turn-taking, that would suppress every genuine interruption on exactly the legs where
+    /// cancellation is already failing. This returns `true` only on positive evidence: a correlation
+    /// that exists *and* clears the echo-only threshold. Every uncertain case is `false`, so a caller
+    /// is never silenced by a canceller that cannot see.
+    ///
+    /// Requires the two-path detector ([`EchoCanceller::with_two_path_dtd`]); in Geigel mode no
+    /// correlation is formed and this is always `false`. It reflects the frame most recently passed
+    /// to [`EchoCanceller::cancel`], so read it after cancelling that frame, not before.
+    #[must_use]
+    pub fn near_end_is_echo(&self) -> bool {
+        self.double_talk_correlation()
+            .is_some_and(|rho| rho >= NCC_DOUBLETALK_THRESHOLD)
+    }
+
     /// Number of background→foreground copies since construction or the last [`EchoCanceller::reset`]
     /// (two-path mode) — a convergence-health metric (it climbs during single-talk, holds during
     /// double-talk).
@@ -1513,6 +1996,29 @@ impl EchoCanceller {
         self.delay_estimator
             .as_ref()
             .map(|estimator| estimator.search_range)
+    }
+
+    /// Drain what the GCC-PHAT estimator has concluded since the last call — a committed delay, or
+    /// the one-shot admission that it has been fed a lot of audio and committed nothing.
+    ///
+    /// This exists because the estimator's failure is **invisible from every other accessor**.
+    /// [`EchoCanceller::estimated_bulk_delay`] returns `Some` whether the peak was an echo or the
+    /// tallest sample of a noise surface, and a canceller adapting against a reference that is not
+    /// the echo still runs, still allocates nothing, and still passes audio through — so "the
+    /// estimator never located the echo" and "there is no echo on this leg" produce the same
+    /// observation everywhere else. [`DelayLock::confidence`] is the number that separates them.
+    ///
+    /// Edge-triggered and allocation-free: a report is latched only when the estimator actually
+    /// commits (or gives up once), so the steady state is an `Option` check per frame and a caller
+    /// can drain it straight from the media path. Everything needed to log or export the event is in
+    /// the returned value — the caller adds the call/leg identity it already holds.
+    ///
+    /// Always `None` for a canceller built without automatic estimation.
+    pub fn take_delay_report(&mut self) -> Option<DelayReport> {
+        let sample_rate_hz = self.sample_rate_hz;
+        self.delay_estimator
+            .as_mut()
+            .and_then(|estimator| estimator.take_report(sample_rate_hz))
     }
 
     /// Whether the most recently cancelled frame contained double-talk (near-end speech that froze
@@ -2485,6 +2991,21 @@ mod tests {
         frames: usize,
         seed: u64,
     ) -> (EchoCanceller, f64) {
+        let (canceller, erle, _reports) =
+            run_delay_estimation_reporting(search_range, tail, injected_delay, frames, seed);
+        (canceller, erle)
+    }
+
+    /// [`run_delay_estimation`], additionally draining every [`DelayReport`] the canceller raises —
+    /// the estimator's own account of what it concluded, which is the only place a located echo and
+    /// a picked one look different.
+    fn run_delay_estimation_reporting(
+        search_range: usize,
+        tail: usize,
+        injected_delay: usize,
+        frames: usize,
+        seed: u64,
+    ) -> (EchoCanceller, f64, Vec<DelayReport>) {
         let frame = 160;
         let rir = build_rir(128);
         let mut prng = SplitMix64::new(seed);
@@ -2493,13 +3014,28 @@ mod tests {
         let far = far_stream(&mut prng, 0.6, frames * frame);
         let echo = synthesize_echo(&normalize(&far), &rir, injected_delay);
         let mut erle = f64::NAN;
+        let mut reports = Vec::new();
         for index in 0..frames {
             let range = index * frame..(index + 1) * frame;
             let mut mic = echo[range.clone()].to_vec();
             canceller.cancel(&mut mic, &far[range.clone()]);
+            if let Some(report) = canceller.take_delay_report() {
+                reports.push(report);
+            }
             erle = erle_db(&echo[range], &mic);
         }
-        (canceller, erle)
+        (canceller, erle, reports)
+    }
+
+    /// The first [`DelayReport::Locked`] in a run, which is the one an operator sees.
+    fn first_lock(reports: &[DelayReport]) -> DelayLock {
+        reports
+            .iter()
+            .find_map(|report| match report {
+                DelayReport::Locked(lock) if lock.first_lock => Some(*lock),
+                _ => None,
+            })
+            .expect("the estimator must report its first lock")
     }
 
     /// Delay recovery: sweep several known bulk delays across the search range and assert GCC-PHAT
@@ -2522,6 +3058,579 @@ mod tests {
                 "delay {delay}: estimated {estimated} (error {error} > {DELAY_RECOVERY_TOLERANCE})"
             );
         }
+    }
+
+    /// The media-relay case the search range exists for: the echo path is a full network round trip
+    /// (access → carrier → access) on *both* sides of the acoustic reflection, so the echo can return
+    /// several hundred milliseconds after the reference the engine sent toward that party. An echo
+    /// whose bulk delay lies **outside** the configured search range is invisible to GCC-PHAT — the
+    /// estimator still commits the best peak it can see, which is noise, and the adaptive filter then
+    /// converges against a reference that is not the echo. The canceller runs, allocates and cancels
+    /// nothing; from outside it is indistinguishable from a leg that has no echo on it.
+    ///
+    /// Pins both halves: the miss when the range is too short, and the recovery on the same path once
+    /// the range covers it.
+    #[test]
+    fn an_echo_beyond_the_search_range_is_not_cancelled_until_the_range_covers_it() {
+        // 300 ms @ 8 kHz — a mobile-behind-a-carrier echo path, past anything a handset-plus-LAN
+        // window covers.
+        let relay_delay = 2_400;
+        let tail = 192;
+
+        // 128 ms @ 8 kHz: the echo is outside the window entirely.
+        let (short, short_erle) = run_delay_estimation(1_024, tail, relay_delay, 500, 0x5A0E_0001);
+        let short_estimate = short
+            .estimated_bulk_delay()
+            .expect("the estimator commits a peak whatever it is — that is exactly the defect");
+        assert!(
+            short_estimate.abs_diff(relay_delay) > DELAY_RECOVERY_TOLERANCE,
+            "a {relay_delay}-sample echo cannot be located in a 1024-sample window (got \
+             {short_estimate})"
+        );
+        assert!(
+            short_erle < 6.0,
+            "an echo outside the search range must stay uncancelled, got {short_erle:.1} dB ERLE"
+        );
+
+        // 512 ms @ 8 kHz: the same path, now inside the window.
+        let (wide, wide_erle) = run_delay_estimation(4_096, tail, relay_delay, 500, 0x5A0E_0001);
+        let wide_estimate = wide
+            .estimated_bulk_delay()
+            .expect("GCC-PHAT must lock the relay delay once it is inside the range");
+        assert!(
+            wide_estimate.abs_diff(relay_delay) <= DELAY_RECOVERY_TOLERANCE,
+            "estimated {wide_estimate} for injected {relay_delay}"
+        );
+        assert!(
+            wide_erle >= 20.0,
+            "steady-state ERLE once the delay is inside the range {wide_erle:.1} dB < 20 dB"
+        );
+    }
+
+    /// `near_end_is_echo` must answer on **positive evidence only**. The tempting implementation —
+    /// negating `double_talk_active()` — is wrong in the case that matters: that flag is `false`
+    /// whenever the correlation is undefined, so its negation asserts "this is our own audio" for a
+    /// canceller that has converged on nothing, a silent far end, and Geigel mode alike. Gating
+    /// turn-taking on it would silence a caller precisely on the legs where cancellation is failing.
+    #[test]
+    fn near_end_is_echo_answers_only_on_positive_evidence() {
+        // A fresh canceller has formed no correlation. `double_talk_active` is false here — and
+        // negating it would claim the near end is echo before a single sample has been seen.
+        let fresh = EchoCanceller::new(8_000, 256)
+            .expect("build")
+            .with_two_path_dtd();
+        assert_eq!(fresh.double_talk_correlation(), None);
+        assert!(!fresh.double_talk_active());
+        assert!(
+            !fresh.near_end_is_echo(),
+            "no correlation is not evidence of echo"
+        );
+
+        // Geigel mode forms no correlation at all, however much audio it has processed.
+        let mut geigel = EchoCanceller::new(8_000, 256).expect("build");
+        let mut prng = SplitMix64::new(0x6E16_0001);
+        let far = far_stream(&mut prng, 0.6, 160 * 40);
+        let echo = synthesize_echo(&normalize(&far), &build_rir(128), 32);
+        for index in 0..40 {
+            let range = index * 160..(index + 1) * 160;
+            let mut mic = echo[range.clone()].to_vec();
+            geigel.cancel(&mut mic, &far[range]);
+        }
+        assert!(!geigel.two_path_enabled());
+        assert!(
+            !geigel.near_end_is_echo(),
+            "a detector that forms no correlation must never claim echo"
+        );
+    }
+
+    /// The turn-taking decision itself, on the two signals a bridge has to tell apart: the far end's
+    /// own audio returning (must read as echo, so an agent does not interrupt itself) and a genuine
+    /// near-end talker over the top of it (must not, so a caller can still interrupt).
+    #[test]
+    fn near_end_is_echo_separates_returning_audio_from_a_talker_over_it() {
+        let frame = 160;
+        let frames = 200;
+        let mut prng = SplitMix64::new(0x8A26_0001);
+        let mut canceller = EchoCanceller::with_mdf_delay_estimation(8_000, 256, 512)
+            .expect("build")
+            .with_two_path_dtd();
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &build_rir(128), 128);
+
+        // Converge on pure echo — the agent talking, the caller silent.
+        let mut echo_only_verdicts = 0usize;
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+            // Only the converged tail is meaningful: before that there is no echo estimate to
+            // correlate against, and the verdict must (correctly) stay silent about it.
+            if index >= frames / 2 && canceller.near_end_is_echo() {
+                echo_only_verdicts += 1;
+            }
+        }
+        assert!(
+            echo_only_verdicts > frames / 4,
+            "returning far-end audio must read as echo on most converged frames, got \
+             {echo_only_verdicts} of {}",
+            frames / 2
+        );
+
+        // Now a near-end talker on top of the same echo — a genuine barge-in. An uncorrelated voice
+        // lifts ‖mic‖ without lifting <mic, ŷ>, so the verdict must flip.
+        let mut talker = SplitMix64::new(0x8A26_0002);
+        let voice = far_stream(&mut talker, 0.6, frames * frame);
+        let doubletalk_frames = 20;
+        let mut talker_verdicts = 0usize;
+        for index in 0..doubletalk_frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic: Vec<i16> = echo[range.clone()]
+                .iter()
+                .zip(&voice[range])
+                .map(|(&echo_sample, &voice_sample)| echo_sample.saturating_add(voice_sample))
+                .collect();
+            canceller.cancel(&mut mic, &far[index * frame..(index + 1) * frame]);
+            if canceller.near_end_is_echo() {
+                talker_verdicts += 1;
+            }
+        }
+        assert!(
+            talker_verdicts * 4 < doubletalk_frames,
+            "a talker over the echo must not read as echo — that would silence a real caller \
+             ({talker_verdicts} of {doubletalk_frames} frames still called it echo)"
+        );
+    }
+
+    /// The observability half of the same defect. Both runs above end with a canceller that reports
+    /// `delay_estimation_enabled`, returns `Some` from `estimated_bulk_delay`, cancels in place and
+    /// raises no error — identical from every accessor, while one of them is cancelling nothing.
+    /// Peak prominence is what separates them, so pin the separation *and* the threshold that
+    /// classifies it, or the reporting is decoration.
+    #[test]
+    fn a_located_echo_and_a_picked_one_are_told_apart_by_peak_prominence() {
+        let relay_delay = 2_400;
+        let tail = 192;
+
+        let (_, _, missed) =
+            run_delay_estimation_reporting(1_024, tail, relay_delay, 500, 0x5A0E_0001);
+        let (_, _, located) =
+            run_delay_estimation_reporting(4_096, tail, relay_delay, 500, 0x5A0E_0001);
+        let missed = first_lock(&missed);
+        let located = first_lock(&located);
+
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "missed: delay {} confidence {:.1} | located: delay {} confidence {:.1}",
+                missed.delay_samples, missed.confidence, located.delay_samples, located.confidence
+            );
+        }
+
+        assert!(
+            located.confidence > missed.confidence * 4.0,
+            "a located echo must stand clear of a picked one: located {:.1} vs missed {:.1}",
+            located.confidence,
+            missed.confidence
+        );
+        assert!(
+            missed.is_weak(),
+            "a lock on noise must report weak (confidence {:.1} vs threshold \
+             {WEAK_DELAY_LOCK_CONFIDENCE})",
+            missed.confidence
+        );
+        assert!(
+            !located.is_weak(),
+            "a lock on a real echo must not report weak (confidence {:.1} vs threshold \
+             {WEAK_DELAY_LOCK_CONFIDENCE})",
+            located.confidence
+        );
+        // The other half of the fact: the window the delay was found in, so a reader can tell
+        // "220 ms echo in a 512 ms window" from "220 ms echo in a 256 ms window".
+        assert_eq!(located.search_range_samples, 4_096);
+        assert_eq!(located.search_range_millis(), 512);
+        assert_eq!(located.delay_millis(), 300);
+        assert!(located.first_lock);
+    }
+
+    /// Once the echo is located, the peak pick narrows to a margin around it, so lags the echo
+    /// demonstrably does not occupy stop competing for the pick.
+    #[test]
+    fn a_confident_lock_narrows_the_peak_scan_around_the_located_delay() {
+        let (canceller, _, reports) =
+            run_delay_estimation_reporting(1_024, 192, 300, 400, 0x5CA1_0001);
+        let lock = first_lock(&reports);
+        assert!(!lock.is_weak(), "fixture must produce a confident lock");
+
+        let estimator = canceller
+            .delay_estimator
+            .as_ref()
+            .expect("delay estimation is enabled");
+        assert!(
+            estimator.narrowed,
+            "a confident lock must narrow the scan; it stayed wide"
+        );
+        let (low, high) = estimator.scan_bounds();
+        let margin = estimator.relock_margin();
+        assert_eq!(margin, 1_024 / RELOCK_MARGIN_DIVISOR);
+        assert!(
+            low <= lock.delay_samples && lock.delay_samples <= high,
+            "the narrowed window {low}..={high} must contain the delay it was centred on \
+             ({})",
+            lock.delay_samples
+        );
+        assert!(
+            high - low < 1_024,
+            "the scan must actually be narrower than the full range, got {low}..={high}"
+        );
+    }
+
+    /// The inverse, and the one that would be a trap if it were wrong: a **weak** lock must not
+    /// narrow. A weak lock is the signature of an echo outside the search window, so fencing the scan
+    /// around it would lock the estimator inside the noise it just mistook for an echo and destroy
+    /// the only chance it had of picking up the real peak later.
+    #[test]
+    fn a_weak_lock_does_not_narrow_the_peak_scan() {
+        // 1024-sample window against a 2400-sample echo: the echo is outside, so the estimator picks
+        // the tallest noise lag it can see — exactly the case the reporting calls weak.
+        let (canceller, _, reports) =
+            run_delay_estimation_reporting(1_024, 192, 2_400, 500, 0x5CA1_0002);
+        let lock = first_lock(&reports);
+        assert!(lock.is_weak(), "fixture must produce a weak lock");
+
+        let estimator = canceller
+            .delay_estimator
+            .as_ref()
+            .expect("delay estimation is enabled");
+        assert!(
+            !estimator.narrowed,
+            "a weak lock must keep searching the whole window — narrowing onto a lag picked out of \
+             noise would make the mistake permanent"
+        );
+        assert_eq!(estimator.scan_bounds(), (0, 1_024));
+    }
+
+    /// The escape hatch. Narrowing is only safe if a path that genuinely moves is still found, so
+    /// this moves the echo clean outside the re-lock margin mid-run and requires the estimator to
+    /// widen back and re-lock onto the new delay. Without the widen it would be blind to it forever —
+    /// which would be a worse bug than the one narrowing fixes.
+    #[test]
+    fn a_path_that_moves_outside_the_margin_is_found_again() {
+        let frame = 160;
+        let search_range = 1_024;
+        let first_delay = 200;
+        // Far outside `first_delay ± search_range/RELOCK_MARGIN_DIVISOR` (±128).
+        let second_delay = 800;
+        let settle_frames = 200;
+        let moved_frames = 700;
+        let total = settle_frames + moved_frames;
+
+        let mut prng = SplitMix64::new(0x5CA1_0003);
+        let rir = build_rir(128);
+        let mut canceller =
+            EchoCanceller::with_delay_estimation(8_000, 192, search_range).expect("build");
+        let far = far_stream(&mut prng, 0.6, total * frame);
+        let normalized = normalize(&far);
+        // Both echo paths over the same far-end audio; the leg switches from one to the other, the
+        // way a re-INVITE onto a different carrier route would.
+        let echo_before = synthesize_echo(&normalized, &rir, first_delay);
+        let echo_after = synthesize_echo(&normalized, &rir, second_delay);
+
+        let mut locks = Vec::new();
+        let mut narrowed_after_settling = false;
+        for index in 0..total {
+            let range = index * frame..(index + 1) * frame;
+            let source = if index < settle_frames {
+                &echo_before
+            } else {
+                &echo_after
+            };
+            let mut mic = source[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+            if index == settle_frames - 1 {
+                narrowed_after_settling = canceller
+                    .delay_estimator
+                    .as_ref()
+                    .expect("delay estimation is enabled")
+                    .narrowed;
+            }
+            if let Some(DelayReport::Locked(lock)) = canceller.take_delay_report() {
+                locks.push(lock);
+            }
+        }
+
+        assert!(
+            narrowed_after_settling,
+            "the first, confident lock should have narrowed the scan — this test proves nothing \
+             about widening if it never narrowed"
+        );
+        let first = locks
+            .first()
+            .expect("the estimator must lock at least once");
+        assert!(
+            first.delay_samples.abs_diff(first_delay) <= REALIGN_TOLERANCE_SAMPLES,
+            "expected the first lock near {first_delay}, got {}",
+            first.delay_samples
+        );
+        let final_delay = locks
+            .last()
+            .expect("the estimator must lock at least once")
+            .delay_samples;
+        assert!(
+            final_delay.abs_diff(second_delay) <= REALIGN_TOLERANCE_SAMPLES,
+            "the estimator must widen back and re-lock onto the moved path: expected \
+             ~{second_delay}, still at {final_delay} after {moved_frames} frames — the narrowed \
+             scan has blinded it to a real echo"
+        );
+    }
+
+    /// P2's ceiling: a 16 kHz canceller must reach the same *duration* an 8 kHz one does. The cap is
+    /// a sample count, so before it was raised a wideband leg — the rate every speech model wants,
+    /// and the one a voice-AI bridge is told to negotiate — could search only half as far in time as
+    /// a narrowband one, on exactly the deployment most likely to need more.
+    #[test]
+    fn the_search_range_reaches_the_same_duration_at_both_media_rates() {
+        // 512 ms at each rate.
+        let narrowband = EchoCanceller::with_delay_estimation(8_000, 512, 4_096).expect("8 kHz");
+        let wideband = EchoCanceller::with_delay_estimation(16_000, 1_024, 8_192).expect("16 kHz");
+        assert_eq!(narrowband.delay_search_range(), Some(4_096));
+        assert_eq!(wideband.delay_search_range(), Some(8_192));
+
+        // The block must still be at least twice the range at the top of it, or the longest lags —
+        // the ones the wider range was bought for — are dominated by circular wrap-around. The
+        // inequality itself is a compile-time assertion beside the constants; this pins that the
+        // clamp actually delivers it at the maximum.
+        assert_eq!(choose_block_size(MAX_SEARCH_RANGE_SAMPLES), DELAY_BLOCK_MAX);
+    }
+
+    /// What a wider search window actually costs, measured rather than reasoned about — because the
+    /// per-frame CPU figure does *not* show it. The estimation FFT grows with the window but the
+    /// blocks get proportionally rarer, so the amortized µs/frame is nearly flat; the real price is
+    /// paid at call setup, where a lock needs [`MIN_BLOCKS_BEFORE_LOCK`] *whole* blocks and a block
+    /// is `choose_block_size(range)` samples however long that takes to arrive.
+    ///
+    /// That matters because it is the same failure with a timer on it: until the first lock the ring
+    /// is unaligned, so a relay echo is uncancelled and a voice-AI agent can barge in on its own
+    /// greeting. It is what stops the engine defaulting to the widest window it could.
+    #[test]
+    fn a_wider_search_window_costs_proportionally_more_audio_before_the_first_lock() {
+        /// Frames of clean single-talk echo before the estimator commits anything, at 16 kHz — the
+        /// rate a voice-AI bridge is told to negotiate, and the one the sample cap squeezes.
+        fn frames_to_first_lock(search_range: usize) -> usize {
+            let frame = 320;
+            let frames = 400;
+            let mut prng = SplitMix64::new(0x10C4_0001);
+            let mut canceller =
+                EchoCanceller::with_delay_estimation(16_000, 1_024, search_range).expect("build");
+            let far = far_stream(&mut prng, 0.6, frames * frame);
+            let echo = synthesize_echo(&normalize(&far), &build_rir(128), 800);
+            for index in 0..frames {
+                let range = index * frame..(index + 1) * frame;
+                let mut mic = echo[range.clone()].to_vec();
+                canceller.cancel(&mut mic, &far[range]);
+                if canceller.estimated_bulk_delay().is_some() {
+                    return index + 1;
+                }
+            }
+            panic!("no lock within {frames} frames at search range {search_range}");
+        }
+
+        // 20 ms frames, so frames are milliseconds ÷ 20.
+        let default_window = frames_to_first_lock(4_096); // 256 ms — the engine default
+        let widest = frames_to_first_lock(8_192); // 512 ms — the reachable maximum
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "frames to first lock @ 16 kHz: 256 ms window {default_window} ({} ms), \
+                 512 ms window {widest} ({} ms)",
+                default_window * 20,
+                widest * 20
+            );
+        }
+
+        // Three 8192-sample blocks at 16 kHz is 1.536 s; three 16384-sample blocks is 3.072 s. Assert
+        // the exact block arithmetic rather than a loose bound, so a change to the smoothing or the
+        // block sizing that quietly doubles call-setup latency fails here instead of in production.
+        // `div_ceil`: the lock lands on the frame that *completes* the third block, not the frame
+        // boundary the block ends on (24576 samples is 76.8 frames, so frame 77).
+        assert_eq!(
+            default_window,
+            (MIN_BLOCKS_BEFORE_LOCK * 8_192).div_ceil(320),
+            "the default window must lock after {MIN_BLOCKS_BEFORE_LOCK} 8192-sample blocks"
+        );
+        assert_eq!(
+            widest,
+            (MIN_BLOCKS_BEFORE_LOCK * 16_384).div_ceil(320),
+            "the widest window must lock after {MIN_BLOCKS_BEFORE_LOCK} 16384-sample blocks"
+        );
+        assert_eq!(
+            widest,
+            default_window * 2,
+            "doubling the window doubles the audio needed before anything is cancelled — the reason \
+             the engine default is not simply the maximum"
+        );
+    }
+
+    /// The report is an **edge**, not a level: a converged leg must yield nothing for the rest of the
+    /// call, so a caller can drain it from the per-frame media path without a rate limiter.
+    #[test]
+    fn the_delay_report_is_edge_triggered() {
+        let mut canceller = EchoCanceller::with_delay_estimation(8_000, 160, 512).expect("build");
+        assert_eq!(
+            canceller.take_delay_report(),
+            None,
+            "nothing before any audio"
+        );
+
+        let mut prng = SplitMix64::new(0xED6E_0001);
+        let frame = 160;
+        let frames = 200;
+        let rir = build_rir(128);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, 256);
+
+        let mut locks = 0usize;
+        let mut frames_reporting = 0usize;
+        for index in 0..frames {
+            let range = index * frame..(index + 1) * frame;
+            let mut mic = echo[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+            if let Some(report) = canceller.take_delay_report() {
+                frames_reporting += 1;
+                if matches!(report, DelayReport::Locked(_)) {
+                    locks += 1;
+                }
+            }
+        }
+        assert!(locks >= 1, "a clean synthetic path must lock");
+        assert_eq!(
+            frames_reporting, locks,
+            "a stable path reports only its commits — nothing per frame"
+        );
+        assert!(
+            frames_reporting < frames / 10,
+            "{frames_reporting} reports over {frames} frames is a level, not an edge"
+        );
+        assert_eq!(
+            canceller.take_delay_report(),
+            None,
+            "a drained report must not be handed out twice"
+        );
+    }
+
+    /// The genuine no-lock case, which the confidence signal cannot cover: the estimator is fed
+    /// plenty of audio but never gets a usable block out of it, so it commits nothing at all and
+    /// every accessor stays at its construction value. It must say so — once, not once per frame.
+    #[test]
+    fn an_estimator_that_never_locks_reports_itself_exactly_once() {
+        let mut canceller = EchoCanceller::with_delay_estimation(8_000, 160, 512).expect("build");
+        // A silent far end: no echo to correlate, so every assembled block is dropped at the energy
+        // floor and `blocks_seen` never reaches the lock minimum.
+        let silence = vec![0i16; 160];
+        let mut reports = Vec::new();
+        for _ in 0..(UNLOCKED_REPORT_FRAMES + 200) {
+            let mut near = silence.clone();
+            canceller.cancel(&mut near, &silence);
+            if let Some(report) = canceller.take_delay_report() {
+                reports.push(report);
+            }
+        }
+
+        assert_eq!(canceller.estimated_bulk_delay(), None, "nothing was locked");
+        assert_eq!(
+            reports.len(),
+            1,
+            "the admission is one-shot, got {reports:?}"
+        );
+        let DelayReport::NeverLocked {
+            frames_observed,
+            blocks_dropped,
+            sample_rate_hz,
+        } = reports[0]
+        else {
+            panic!("expected NeverLocked, got {:?}", reports[0]);
+        };
+        assert_eq!(sample_rate_hz, 8_000);
+        assert_eq!(frames_observed, UNLOCKED_REPORT_FRAMES);
+        // A silent far end drops its blocks at the energy floor rather than never assembling one,
+        // which is what tells an operator "nothing was playing" apart from "nothing was usable".
+        assert!(
+            blocks_dropped > 0,
+            "a silent far end must show up as dropped blocks, not as an absence of them"
+        );
+
+        // A reset re-runs the estimation from scratch, so the admission re-arms with it.
+        canceller.reset();
+        for _ in 0..(UNLOCKED_REPORT_FRAMES + 1) {
+            let mut near = silence.clone();
+            canceller.cancel(&mut near, &silence);
+        }
+        assert!(
+            matches!(
+                canceller.take_delay_report(),
+                Some(DelayReport::NeverLocked { .. })
+            ),
+            "reset must re-arm the never-locked report"
+        );
+    }
+
+    /// The rendered fields an operator actually reads, plus the edge flag. Rate-aware, because the
+    /// whole point of P2 is that a sample count is not a duration until you fix the rate.
+    #[test]
+    fn delay_lock_renders_durations_and_flags_the_window_edge() {
+        let mid = DelayLock {
+            delay_samples: 1_600,
+            search_range_samples: 8_192,
+            sample_rate_hz: 16_000,
+            confidence: 40.0,
+            first_lock: true,
+        };
+        assert_eq!(mid.delay_millis(), 100);
+        assert_eq!(mid.search_range_millis(), 512);
+        assert!(
+            !mid.at_search_edge(),
+            "100 ms in a 512 ms window is not near it"
+        );
+        assert!(!mid.is_weak());
+
+        // The same sample count at half the rate is twice the duration — the P2 trap in one assert.
+        let narrowband = DelayLock {
+            sample_rate_hz: 8_000,
+            ..mid
+        };
+        assert_eq!(narrowband.delay_millis(), 200);
+        assert_eq!(narrowband.search_range_millis(), 1_024);
+
+        let edge = DelayLock {
+            delay_samples: 7_800,
+            ..mid
+        };
+        assert!(
+            edge.at_search_edge(),
+            "a delay in the last eighth of the window is the warning that the next hop overflows it"
+        );
+    }
+
+    /// The counters `/metrics` renders. Asserted as deltas, never as absolutes: they are
+    /// process-wide by design and the test binary runs its cases in parallel.
+    #[test]
+    fn delay_estimation_counters_record_locks_and_weak_locks() {
+        let before = delay_estimation_counters();
+        // An echo well outside the window: the estimator commits, and the commit is a weak one.
+        let (_, _, reports) = run_delay_estimation_reporting(1_024, 192, 2_400, 500, 0x0C0E_0001);
+        let after = delay_estimation_counters();
+
+        let locks = reports
+            .iter()
+            .filter(|report| matches!(report, DelayReport::Locked(_)))
+            .count() as u64;
+        assert!(locks > 0, "the run must commit at least one delay");
+        assert!(
+            after.locks_total - before.locks_total >= locks,
+            "every commit must be counted"
+        );
+        assert!(
+            after.weak_locks_total > before.weak_locks_total,
+            "a lock on noise must count as weak — that is the fleet-level signal that the search \
+             range is too short for the paths this node carries"
+        );
     }
 
     /// ERLE with estimation on: the reference is misaligned by an unknown bulk delay; automatic
@@ -3333,6 +4442,85 @@ mod tests {
             "MDF long-tail advantage only {:.1} dB (NLMS {nlms_erle:.1} → MDF {mdf_erle:.1})",
             mdf_erle - nlms_erle
         );
+    }
+
+    /// The reason the long-tail mode exists, stated as the comparison it has to win.
+    ///
+    /// Both cancellers here are correctly configured for what they are, both run without error, and
+    /// both report healthy from every accessor. The estimating one is given a search window shorter
+    /// than the echo path — the field condition: a handset behind a carrier — so it commits the
+    /// tallest lag it can see, which is noise, and then adapts against a reference that is not the
+    /// echo. The long-tail one makes no alignment decision at all, so it has nothing to get wrong,
+    /// and simply covers the delay with taps.
+    #[test]
+    fn a_long_tail_cancels_an_echo_a_too_short_search_window_misses() {
+        let frame = 160;
+        let frames = 600;
+        // 300 ms at 8 kHz — a mobile handset behind a PSTN carrier, past any 128 ms window.
+        let relay_delay = 2_400;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x104C_7A12);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, relay_delay);
+
+        let run = |canceller: &mut EchoCanceller| -> f64 {
+            let mut residual_stream = vec![0i16; frames * frame];
+            for index in 0..frames {
+                let range = index * frame..(index + 1) * frame;
+                let mut mic = echo[range.clone()].to_vec();
+                canceller.cancel(&mut mic, &far[range.clone()]);
+                residual_stream[range].copy_from_slice(&mic);
+            }
+            steady_erle(&echo, &residual_stream, frame, 40)
+        };
+
+        // 128 ms of search against a 300 ms echo: the estimator cannot see it.
+        let mut estimating =
+            EchoCanceller::with_mdf_delay_estimation(8_000, 512, 1_024).expect("build estimating");
+        let estimating_erle = run(&mut estimating);
+        // 512 ms of tail spans the whole path, delay and dispersion together.
+        let mut long_tail =
+            EchoCanceller::with_mdf_long_tail(8_000, 4_096).expect("build long tail");
+        let long_tail_erle = run(&mut long_tail);
+
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "relay-delay ERLE: estimating(1024 window) {estimating_erle:.1} dB, \
+                 long tail(4096) {long_tail_erle:.1} dB"
+            );
+        }
+        assert!(
+            long_tail_erle - estimating_erle >= 10.0,
+            "the long tail must cancel an echo the too-short window misses: estimating \
+             {estimating_erle:.1} dB vs long tail {long_tail_erle:.1} dB"
+        );
+        // No estimator, so nothing to report — and the never-locked warning correctly never fires,
+        // which is why the engine has to name the mode where the canceller is built or a long-tail
+        // leg becomes unreadable in a new way.
+        assert!(!long_tail.delay_estimation_enabled());
+        assert_eq!(long_tail.take_delay_report(), None);
+    }
+
+    /// A tail past the cap is refused, not quietly shortened. The clamp it replaces reported the
+    /// truncation only through `tail_samples()`, so a caller asking for a relay-length filter could
+    /// be handed a short one and never know — the same shape of failure as a delay search that locks
+    /// on noise.
+    #[test]
+    fn a_tail_past_the_cap_is_refused_rather_than_silently_shortened() {
+        assert!(matches!(
+            EchoCanceller::with_mdf_long_tail(8_000, MAX_TAIL_SAMPLES + 1),
+            Err(AecError::InvalidTail { .. })
+        ));
+        // And the cap itself is reachable at both media rates, which is the property that was broken
+        // before it was raised: a sample count is a duration only once the rate is fixed.
+        assert!(EchoCanceller::with_mdf_long_tail(8_000, MAX_TAIL_SAMPLES).is_ok());
+        assert!(EchoCanceller::with_mdf_long_tail(16_000, MAX_TAIL_SAMPLES).is_ok());
+        // 8 kHz reaches 1 s and 16 kHz reaches 0.5 s — the same *taps*, and the engine's knob is in
+        // milliseconds, so the rate decides how far that goes.
+        let narrowband = EchoCanceller::with_mdf_long_tail(8_000, MAX_TAIL_SAMPLES).expect("8k");
+        let wideband = EchoCanceller::with_mdf_long_tail(16_000, MAX_TAIL_SAMPLES).expect("16k");
+        assert_eq!(narrowband.tail_samples(), MAX_TAIL_SAMPLES);
+        assert_eq!(wideband.tail_samples(), MAX_TAIL_SAMPLES);
     }
 
     /// Determinism: the MDF path is a pure function of the input (logical clock, fixed-seed PRNG), so

@@ -77,6 +77,57 @@ pub const MAX_FRAME_SAMPLES: usize = MAX_SAMPLE_RATE_HZ / 1000 * MAX_PTIME_MS;
 /// [`MAX_FRAME_SAMPLES`].
 pub const MAX_FRAME_VALUES: usize = MAX_FRAME_SAMPLES * MAX_CHANNELS;
 
+/// Fraction of a frame's energy cancellation must remove before the frame is taken as evidence that
+/// the uplink was the agent's own audio returning: 10× is 10 dB, i.e. nine tenths of what arrived was
+/// predicted by what we played. A converged canceller clears this comfortably on echo, and a caller
+/// talking over that echo does not — their voice is uncorrelated with the reference, so it survives
+/// untouched and drags the ratio down. Deliberately well short of the ERLE the canceller actually
+/// achieves on clean echo (30 dB and up), so that a leg with a poor but working canceller — a
+/// nonlinear handset, a re-encoding mobile leg — still gets a usable verdict.
+const ECHO_VERDICT_REMOVAL_RATIO: i64 = 10;
+/// Mean-square (per-sample) energy below which the removal ratio is meaningless — a near-silent
+/// frame divides one small number by another — so the verdict abstains. Roughly −60 dBFS, i.e. an
+/// RMS amplitude of 32 on the i16 scale.
+///
+/// **Per sample, not per frame.** The bridge runs at the negotiated *wire* rate, so a frame is 160
+/// samples at 8 kHz and 320 at 16 kHz — the rate the voice-AI guidance recommends. A whole-frame
+/// threshold would therefore mean two different amplitudes at the two rates and be 3 dB looser at
+/// 16 kHz, and it would be loose in the one direction this verdict must never fail in: below the
+/// floor the verdict abstains and changes nothing, but above it a frame too quiet to judge yields a
+/// noisy removal ratio that can read as *our own audio*, latch the echo run, and veto the **caller's**
+/// turn start. Dividing by the frame length keeps the threshold a fixed amplitude at every rate, the
+/// same way `ws_vad_threshold` is a per-sample mean square so it means one thing at any rate.
+const ECHO_VERDICT_ENERGY_FLOOR: i64 = 32 * 32;
+
+/// Sum of squares of `frame`, or `None` when the frame's **mean** square sits below
+/// [`ECHO_VERDICT_ENERGY_FLOOR`] and the echo verdict must therefore abstain.
+///
+/// Returning the sum rather than the mean is deliberate: the caller compares it against the sum that
+/// survives cancellation, and a ratio of two sums over the same frame needs no normalising. Only the
+/// *threshold* has to be rate-independent, and that is what dividing by the length buys — the floor
+/// is one amplitude whether the wire rate makes a 20 ms frame 160 samples or 320. An empty frame is
+/// below any floor, so it yields `None` instead of dividing by zero.
+/// Integer throughout: an i16 frame's sum of squares is exact in `i64` (the longest frame this path
+/// accepts tops out around 6.2e12, eleven orders inside the range), and the comparisons are a
+/// multiply rather than a division, so the floor test needs no float at all. This runs twice per
+/// tick on a leg that cancels, which is enough for the conversions to show up.
+fn verdict_frame_energy(frame: &[i16]) -> Option<i64> {
+    if frame.is_empty() {
+        return None;
+    }
+    let energy = frame_energy(frame);
+    // `energy / len > FLOOR` without the division.
+    (energy > ECHO_VERDICT_ENERGY_FLOOR * frame.len() as i64).then_some(energy)
+}
+
+/// Sum of squares of an i16 frame, exact in `i64`.
+fn frame_energy(frame: &[i16]) -> i64 {
+    frame
+        .iter()
+        .map(|&sample| i64::from(sample) * i64::from(sample))
+        .sum()
+}
+
 /// One ptime of mono samples at `format`'s wire rate — the downlink quantum the core drains per tick
 /// and the length of every frame it renders. Clamped to at least one sample so a degenerate format
 /// cannot produce a zero-length frame (and a division by zero in `playout_depth`).
@@ -134,6 +185,11 @@ pub struct BridgeCore {
     barge_in: bool,
     /// Latched VAD state, so `tick` emits a turn signal only on an edge (silence↔speech transition).
     speaking: bool,
+    /// Whether the current *run* of detected speech has been identified by the echo canceller as the
+    /// far end's own audio returning, rather than a near-end talker. Latched across the run because
+    /// the detector and the canceller stop at different moments — see the veto in [`BridgeCore::tick`].
+    /// Always false without a canceller, which is what makes the veto inert on a leg that has none.
+    echo_run: bool,
     /// Tick-originated control messages awaiting the socket (turn signals). Populated on VAD edges
     /// only, so the steady-state per-frame path never touches (or allocates) it; drained by the
     /// transport via [`BridgeCore::next_control`].
@@ -198,6 +254,7 @@ impl BridgeCore {
             speech_gate: SpeechRunGate::new(1),
             barge_in: false,
             speaking: false,
+            echo_run: false,
             pending_control: Vec::new(),
             echo_canceller: None,
             echo_reference: Vec::new(),
@@ -484,6 +541,19 @@ impl BridgeCore {
     /// Order matters and is load-bearing: the downlink frame is taken **first** so it can serve as the
     /// echo canceller's far-end reference for this tick's uplink, and so a local barge-in can drop it
     /// along with the rest of the queue before it is ever rendered.
+    ///
+    /// Within the uplink, the detector reads the **raw** staged frame (before noise suppression can
+    /// swallow a low-energy onset) but the turn *edge* is decided **after** the echo canceller has
+    /// processed that same frame, so the canceller's verdict on it — is this the caller, or our own
+    /// audio returning? — is available to veto a false turn start. That is the only ordering in which
+    /// the veto describes the current frame rather than the previous one, and a one-tick lag would
+    /// leave exactly the onset frames a turn is decided from ungated.
+    ///
+    /// One consequence worth stating: on a barge-in tick the canceller has already taken the drained
+    /// downlink as its reference by the time the flush drops that frame, so for that single frame the
+    /// reference names audio the caller never heard. It is harmless — barge-in fires on genuine
+    /// double-talk, which is precisely when the detector has frozen adaptation — and it is the
+    /// cheaper side of the trade against an ungated turn onset.
     pub fn tick(&mut self, uplink_out: &mut [u8]) -> usize {
         // The downlink frame this tick renders toward the call is also the echo canceller's far-end
         // reference for the uplink (the audio the phone plays and its mic re-captures). Take it up front
@@ -495,11 +565,123 @@ impl BridgeCore {
         if let Some(written) = self.uplink_samples.take() {
             let pcm = &mut self.uplink[..written];
             // Turn-taking VAD runs on the *raw* staged frame, before noise suppression can swallow
-            // low-energy speech onsets. Emits a signal only on an edge; barge-in flushes here.
+            // low-energy speech onsets. The *edge* it feeds is decided further down, after the echo
+            // canceller has had its say about this same frame.
             let raw_speech = self.vad.as_mut().map(|vad| vad.is_speech(pcm));
+
+            // Clean the uplink audio in place before framing it toward the server, when enabled.
+            if let Some(suppressor) = self.noise_suppressor.as_mut() {
+                suppressor.process(pcm);
+            }
+            // Echo cancellation on the uplink, referenced against the downlink played this tick: the
+            // canceller's GCC-PHAT delay estimate aligns the reference to the returned echo, so the
+            // model does not hear its own speech reflected by the phone. A silent (absent) downlink
+            // yields a zero reference — nothing to cancel. In place, zero per-frame heap.
+            let mut echo_evidence: Option<bool> = None;
+            if let Some(echo_canceller) = self.echo_canceller.as_mut() {
+                // Energy of the frame as it arrived, kept to compare against what survives
+                // cancellation — see the echo verdict below. `None` when the frame is too quiet for
+                // that comparison to mean anything, which makes the verdict abstain.
+                let arrived_energy = verdict_frame_energy(pcm);
+                // Preallocated (see `echo_reference`), so only the *tail* past the downlink frame is
+                // zeroed each tick — not the whole ceiling-sized buffer. `written` is bounded by
+                // `MAX_FRAME_SAMPLES`, which is exactly the reference's length.
+                let reference = &mut self.echo_reference[..written];
+                let carried = if downlink_frame {
+                    let count = self.downlink.len().min(written);
+                    reference[..count].copy_from_slice(&self.downlink[..count]);
+                    count
+                } else {
+                    0
+                };
+                reference[carried..].fill(0);
+                echo_canceller.cancel(pcm, reference);
+
+                // The canceller's verdict on *this* frame: was the uplink our own audio coming back?
+                // Read here, immediately after cancelling, because it describes the frame just
+                // processed — and read at all because it is the only signal in the engine that can
+                // answer it.
+                //
+                // Two independent pieces of evidence, because neither covers the whole utterance:
+                //
+                // 1. The two-path detector's correlation ([`EchoCanceller::near_end_is_echo`]). It is
+                //    the sharper signal, but it is only formed while the far end is *currently*
+                //    active, and the echo lags what was played by the bulk delay. So for the whole
+                //    bulk delay after the agent stops talking, its voice is still arriving with no
+                //    reference activity to correlate against — and that tail is exactly where a false
+                //    turn fires, at the end of every utterance.
+                //
+                // 2. How much energy cancellation removed from this frame. The canceller keeps a
+                //    reference *history*, so it goes on subtracting the tail long after the far end
+                //    fell silent; a frame it can largely remove was predominantly our own audio,
+                //    and one it cannot has something else in it. That covers the tail the
+                //    correlation cannot.
+                //
+                // Both are positive evidence and both fail open: no cancellation, no verdict.
+                //
+                // The surviving energy is only summed for a frame loud enough to judge — below the
+                // floor the verdict abstains whatever the ratio would have been, so computing it
+                // there is a second pass over the frame whose result is discarded.
+                if let Some(arrived_energy) = arrived_energy {
+                    let survived_energy = frame_energy(pcm);
+                    // Both sides are sums over the same frame, so the ratio needs no normalising.
+                    // `survived · 10` cannot overflow: the sum is bounded by 6.2e12 for the longest
+                    // frame this path accepts, and ten times that is still far inside `i64`.
+                    let mostly_removed =
+                        survived_energy * ECHO_VERDICT_REMOVAL_RATIO <= arrived_energy;
+                    // `Some(true)` — ours; `Some(false)` — something the canceller could not predict
+                    // from what we played, i.e. a talker. A frame too quiet to judge stays `None` and
+                    // changes nothing.
+                    echo_evidence = Some(echo_canceller.near_end_is_echo() || mostly_removed);
+                }
+                // Report what the bulk-delay estimator concluded. This is the leg the failure was
+                // found on: a takeover bridge's echo path is the caller's whole media path twice
+                // over, so it is the one most likely to return from beyond the search window — and
+                // the symptom, an agent barging in on its own voice, points at the VAD rather than
+                // here. Edge-triggered, so a converged bridge logs once and then costs an `Option`
+                // check per tick.
+                if let Some(report) = echo_canceller.take_delay_report() {
+                    crate::echo::log_delay_report(&report, &self.call_id, &self.stream_id);
+                }
+            }
+
+            // The turn edge, decided only now that the canceller has spoken.
+            //
+            // A speech detector cannot do this on its own, and no better one could: the far end's
+            // voice returning through a handset *is* speech, and nothing computable from the uplink
+            // alone separates it from a person. Without this veto an agent that talks, hears itself
+            // come back, and correctly classifies that as speech will barge in on itself — on a
+            // caller who said nothing.
+            //
+            // The veto applies to the **start** of a turn only. Once the caller's turn is open, the
+            // agent's echo must not be able to close it: a caller genuinely talking over the agent
+            // would otherwise be cut off the moment the agent's own audio returned. And it is
+            // positive-evidence-only (see `near_end_is_echo`), so a canceller that has converged on
+            // nothing vetoes nothing — this can quieten an agent, never a caller.
+            // The verdict is latched across a whole *run* of detected speech, because the detector and
+            // the canceller stop at different moments. A detector holds speech through its hangover
+            // after the energy has gone, and the echo itself outlives the audio that caused it by the
+            // bulk delay — so the last frames of a run routinely carry a speech assertion with no
+            // echo left to judge. Deciding frame by frame let exactly those frames through, and a
+            // rising edge on them is the same false turn arriving a few frames late: measured on the
+            // fixture below, every single false interruption landed there and nowhere else.
+            //
+            // So: once a run is identified as our own audio it stays identified, until either the
+            // detector falls silent (the run is over) or the canceller produces positive evidence of
+            // a *talker* — a frame with real energy that it could not predict from what we played.
+            // Both transitions are driven by evidence, never by an absence of it.
+            match echo_evidence {
+                Some(true) => self.echo_run = true,
+                Some(false) => self.echo_run = false,
+                None => {}
+            }
+            if !raw_speech.unwrap_or(false) {
+                self.echo_run = false;
+            }
+            let echo_veto = self.echo_run && !self.speaking;
             // The leading run gate sits between the detector and the edge, so a single noisy frame
             // never opens a turn. At its default of one frame it is the identity.
-            let speaking = raw_speech.map(|speech| self.speech_gate.update(speech));
+            let speaking = raw_speech.map(|speech| self.speech_gate.update(speech && !echo_veto));
             if let Some(speaking) = speaking {
                 if speaking && !self.speaking {
                     // Silence → speech: local barge-in (flush queued playout, no round-trip) + notify.
@@ -530,30 +712,6 @@ impl BridgeCore {
                         }));
                 }
                 self.speaking = speaking;
-            }
-
-            // Clean the uplink audio in place before framing it toward the server, when enabled.
-            if let Some(suppressor) = self.noise_suppressor.as_mut() {
-                suppressor.process(pcm);
-            }
-            // Echo cancellation on the uplink, referenced against the downlink played this tick: the
-            // canceller's GCC-PHAT delay estimate aligns the reference to the returned echo, so the
-            // model does not hear its own speech reflected by the phone. A silent (absent) downlink
-            // yields a zero reference — nothing to cancel. In place, zero per-frame heap.
-            if let Some(echo_canceller) = self.echo_canceller.as_mut() {
-                // Preallocated (see `echo_reference`), so only the *tail* past the downlink frame is
-                // zeroed each tick — not the whole ceiling-sized buffer. `written` is bounded by
-                // `MAX_FRAME_SAMPLES`, which is exactly the reference's length.
-                let reference = &mut self.echo_reference[..written];
-                let carried = if downlink_frame {
-                    let count = self.downlink.len().min(written);
-                    reference[..count].copy_from_slice(&self.downlink[..count]);
-                    count
-                } else {
-                    0
-                };
-                reference[carried..].fill(0);
-                echo_canceller.cancel(pcm, reference);
             }
             uplink_bytes = pcm_to_l16_le(pcm, uplink_out);
         }
@@ -622,6 +780,207 @@ mod tests {
             Direction::Duplex,
             8,
         )
+    }
+
+    /// Deterministic LCG (fixed seed) — never `rand`, never the wall clock.
+    struct Lcg(u32);
+    impl Lcg {
+        fn next_bipolar(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (self.0 >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+        }
+    }
+
+    /// Drive a VAD + barge-in + AEC core for `frames` ticks. Each tick plays one downlink frame of
+    /// agent audio toward the call and stages an uplink built by `uplink` from the agent audio that
+    /// left `delay_frames` ago — i.e. the agent's own voice coming back. Returns how many
+    /// `speech_started` turn edges were raised.
+    /// Frames the agent talks, then pauses, in each utterance cycle. The agent must speak in
+    /// **bursts** for this to measure anything: with one unbroken stretch of echo the detector latches
+    /// speaking on its first frame and never presents a second rising edge, so a veto and no veto
+    /// score identically. Real turn-taking is bursts, and each burst is a fresh chance to interrupt
+    /// oneself.
+    const AGENT_TALK_FRAMES: usize = 25;
+    const AGENT_PAUSE_FRAMES: usize = 15;
+    /// Ticks allowed for the canceller to lock its delay and converge before false edges are counted.
+    /// Nothing can veto during this window: with no alignment there is no echo estimate, so no
+    /// correlation, and the veto answers only on positive evidence. It is a real limitation of the
+    /// approach, pinned here rather than hidden — see `an_agents_own_returning_audio...`.
+    const CONVERGENCE_FRAMES: usize = 120;
+
+    fn turn_edges_over_returning_audio(
+        frames: usize,
+        delay_frames: usize,
+        mut uplink: impl FnMut(usize, &[i16]) -> Vec<i16>,
+    ) -> usize {
+        const N: usize = 160; // 20 ms @ 8 kHz
+        let mut core = BridgeCore::new(
+            MediaFormat::telephony_default(),
+            "str_echo",
+            "call_echo",
+            Direction::Duplex,
+            8,
+        )
+        .with_voice_detector(VoiceDetector::energy(1_000_000, 3), 1, true)
+        .with_echo_canceller(Some(
+            EchoCanceller::with_mdf_delay_estimation(8_000, 512, 1_024)
+                .expect("build aec")
+                .with_two_path_dtd(),
+        ));
+
+        let mut agent_rng = Lcg(0x0EC0_1111);
+        // The agent's downlink, generated up front so the uplink can be a delayed copy of it. It
+        // speaks in utterances rather than continuously — see `AGENT_TALK_FRAMES`.
+        let cycle = AGENT_TALK_FRAMES + AGENT_PAUSE_FRAMES;
+        let played: Vec<Vec<i16>> = (0..frames)
+            .map(|frame| {
+                let talking = frame % cycle < AGENT_TALK_FRAMES;
+                (0..N)
+                    .map(|_| {
+                        let sample = 6000.0 * agent_rng.next_bipolar();
+                        if talking {
+                            sample as i16
+                        } else {
+                            0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut wire = [0u8; 4 * N];
+        let mut uplink_out = [0u8; 4 * N];
+        let mut edges = 0usize;
+        for frame in 0..frames {
+            let length = pcm_to_l16_le(&played[frame], &mut wire);
+            core.on_ws_binary(&wire[..length]);
+            // The agent's own audio returning through the echo path. Deliberately **nonlinear**: a
+            // handset's speaker and microphone clip, and a mobile leg re-encodes through a lossy
+            // codec, so a real returning echo is never a scaled copy of what was played. A linear
+            // filter can only subtract the linear part, which is why a well-aligned canceller still
+            // leaves a residual loud enough to read as speech — and why the veto is needed on top of
+            // cancellation rather than instead of it. A purely linear echo here would be cancelled so
+            // completely that the detector never triggered and this test would prove nothing.
+            let returning: Vec<i16> = match frame.checked_sub(delay_frames) {
+                Some(source) => played[source]
+                    .iter()
+                    .map(|&sample| {
+                        let scaled = f32::from(sample) * 0.55;
+                        // Soft saturation — the dominant nonlinearity of a small loudspeaker driven hard.
+                        (2400.0 * (scaled / 2400.0).tanh()) as i16
+                    })
+                    .collect(),
+                None => vec![0i16; N],
+            };
+            core.on_pcm_uplink(&uplink(frame, &returning));
+            core.tick(&mut uplink_out);
+            while let Some(control) = core.next_control() {
+                // Only the converged region counts: before the canceller has located the echo it has
+                // no estimate to correlate against and cannot answer, by construction.
+                if matches!(control, ControlMessage::SpeechStarted(_))
+                    && frame >= CONVERGENCE_FRAMES
+                {
+                    edges += 1;
+                }
+            }
+        }
+        edges
+    }
+
+    /// The defect this veto exists for: an agent talks, its own voice returns on the uplink, the
+    /// speech detector correctly calls that speech, and barge-in fires — so the agent interrupts
+    /// itself on a caller who said nothing.
+    ///
+    /// No better detector can fix this. The agent's voice returning through a handset *is* speech,
+    /// and nothing computable from the uplink alone separates it from a person; the signal that does
+    /// is the far-end reference, and only the echo canceller holds it.
+    #[test]
+    fn an_agents_own_returning_audio_does_not_open_a_turn() {
+        // The uplink is the agent's audio and nothing else — the caller is silent throughout.
+        let edges = turn_edges_over_returning_audio(480, 6, |_, returning| returning.to_vec());
+        assert_eq!(
+            edges, 0,
+            "the agent's own returning voice must not raise a turn edge once the canceller has \
+             converged — {edges} raised, each one an agent interrupting itself on a silent caller"
+        );
+    }
+
+    /// The other half, and the one that makes this better than the half-duplex an application can
+    /// implement on its own: a caller talking *over* the agent must still get through. A veto that
+    /// bought silence by making the caller uninterruptible would be a worse bug than the one it fixes.
+    #[test]
+    fn a_caller_talking_over_the_agent_still_opens_a_turn() {
+        let mut caller_rng = Lcg(0x0EC0_2222);
+        let edges = turn_edges_over_returning_audio(480, 6, move |frame, returning| {
+            // The agent alone until well past convergence, then the caller talks over the echo.
+            if frame < 240 {
+                returning.to_vec()
+            } else {
+                returning
+                    .iter()
+                    .map(|&echo| echo.saturating_add((6000.0 * caller_rng.next_bipolar()) as i16))
+                    .collect()
+            }
+        });
+        assert!(
+            edges >= 1,
+            "a caller talking over the agent must still be able to interrupt — no turn edge was \
+             raised, so the veto has made the caller unheard"
+        );
+    }
+
+    /// The abstain floor must be the same *amplitude* at every wire rate, not the same frame energy.
+    ///
+    /// The bridge cancels at the negotiated wire rate, so a 20 ms frame is 160 samples at 8 kHz and
+    /// 320 at 16 kHz — and 16 kHz is what the voice-AI guidance recommends, so a whole-frame
+    /// threshold would be loosest on the configuration most likely to use this. It matters because
+    /// the looseness is one-directional: below the floor the verdict abstains and changes nothing,
+    /// but above it a frame too quiet to judge yields a noisy removal ratio that can read as the
+    /// agent's own audio, latch the echo run and veto the **caller's** turn. This verdict is allowed
+    /// to quieten an agent, never a caller.
+    #[test]
+    fn the_echo_verdict_floor_is_the_same_amplitude_at_every_wire_rate() {
+        // Just under and just over the floor's RMS amplitude of 32, as a constant-magnitude frame.
+        let quiet = |samples: usize| vec![31i16; samples];
+        let loud = |samples: usize| vec![33i16; samples];
+
+        for &samples in &[160usize, 320] {
+            assert!(
+                verdict_frame_energy(&quiet(samples)).is_none(),
+                "a frame below the floor must abstain at every rate ({samples} samples)"
+            );
+            assert!(
+                verdict_frame_energy(&loud(samples)).is_some(),
+                "a frame above the floor must be judged at every rate ({samples} samples)"
+            );
+        }
+
+        // The regression this pins: the old whole-frame floor was 160·32², so a 320-sample frame
+        // cleared it at an amplitude of ~22.6 and the verdict engaged on frames it should have
+        // abstained on. Anything between the two amplitudes must now abstain at *both* lengths.
+        let borderline = vec![24i16; 320];
+        assert!(
+            verdict_frame_energy(&borderline).is_none(),
+            "a 16 kHz frame quieter than the floor must abstain — under the old whole-frame \
+             threshold this frame was judged, and a noisy verdict there vetoes a real caller"
+        );
+
+        // Degenerate input yields no verdict rather than a division by zero.
+        assert!(verdict_frame_energy(&[]).is_none());
+    }
+
+    /// The energy handed back is the **sum**, not the mean: the caller divides it by the surviving
+    /// sum over the same frame, and normalising one side and not the other would scale the removal
+    /// ratio by the frame length.
+    #[test]
+    fn the_verdict_energy_is_the_unnormalised_sum() {
+        let frame = vec![100i16; 160];
+        let energy = verdict_frame_energy(&frame).expect("above the floor");
+        assert_eq!(
+            energy,
+            160 * 100 * 100,
+            "expected the exact sum of squares, got {energy}"
+        );
     }
 
     #[test]

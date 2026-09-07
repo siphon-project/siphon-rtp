@@ -8,6 +8,7 @@
 
 pub mod bridge;
 pub mod dtmf;
+pub mod echo;
 pub mod fanout;
 pub mod fork;
 pub mod ingress;

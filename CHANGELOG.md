@@ -7,6 +7,178 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The echo canceller silently did nothing on a leg whose far party was more than 128 ms away.**
+  The bulk-delay search window was sized for a handset plus a LAN, but the delay it has to span is
+  not an acoustic loudspeaker→microphone path: the reference is what the engine sent *toward* a
+  party and the echo arrives on that party's uplink, so the whole media path sits in the loop twice
+  with the acoustic reflection in the middle. A wide-area hop is rarely the dominant term (tens of ms
+  round trip); the carrier and mobile legs are, at conventionally 100–200 ms each way, which puts a
+  mobile-behind-a-carrier echo past 200 ms and outside the window entirely.
+
+  The failure was **quiet in every direction**. GCC-PHAT commits the tallest lag inside its window
+  whatever that lag is, so an echo beyond the window does not yield "no lock" — it yields a lock on
+  noise, after which the adaptive filter converges against a reference that is not the echo. The
+  canceller was built, ran, allocated nothing, returned no error and emitted no log line at any
+  level, so from outside "the estimator never located the echo" and "there is no echo on this leg"
+  were the same observation. The only visible symptom was two components away: a voice-AI agent that
+  starts a sentence, hears its own voice return on the uplink, has its VAD correctly call that
+  speech, fires barge-in and **interrupts itself** — on a caller who said nothing.
+
+  The default window is now **256 ms**, and the estimator's cap rises so 16 kHz can reach the 512 ms
+  8 kHz already could. That cap is a *sample* count, so it was worth half as many milliseconds at
+  16 kHz — the rate every speech model wants and the one the voice-AI guidance recommends, making
+  the documented configuration the one with the least echo reach. The GCC block scales with it, or
+  the longest lags would be dominated by circular wrap-around instead of the correlation, which is
+  now a compile-time assertion rather than a comment.
+
+### Added
+
+- **`echo_delay_search_ms` on the offer/answer profile** — the bulk-delay search window per leg,
+  because how far away the far party is, is a property of the deployment and not of the engine: a
+  LAN softphone wants a narrow window and should not pay for more, and a leg reached through a
+  carrier is broken without a wide one. Range 16–1000 ms, rejected outside that at the control plane
+  where the controller can still see it; a value the negotiated codec rate cannot express is clamped
+  down with a warning rather than refused, because dropping the canceller entirely would be strictly
+  worse than a shorter window. Inert without `echo_cancellation`, and not settable over NG/bencode.
+
+  It is a knob rather than a wider default because widening is not free. The estimation FFT is sized
+  at ≥ 2× the window and rounded to a power of two, so crossing 256 ms at 16 kHz doubles both the
+  estimator's per-leg memory and the audio needed before its first lock — measured at 1.54 s → 3.08 s
+  of far-end speech, during which nothing is cancelled. On a bridge whose agent speaks first, that is
+  the greeting.
+
+- **The echo canceller can now veto a turn the caller never started**, which is the only way to stop
+  a voice-AI agent barging in on its own returning voice. No speech detector can do this, and a
+  better one would not help: the agent's voice coming back through a handset **is** speech, and
+  nothing computable from the uplink alone separates it from a person. The signal that does separate
+  them is the far-end reference — what we played, and when — and only the canceller holds it.
+
+  `EchoCanceller::near_end_is_echo()` exposes that verdict, and the WebSocket bridge's turn edge now
+  moves to *after* cancellation so the verdict describes the frame being judged rather than the
+  previous one. Two subtleties are load-bearing and were found the hard way:
+
+  - It is **not** `!double_talk_active()`. That flag reads `false` whenever the correlation is
+    undefined — an unconverged filter, a silent far end, Geigel mode — so its negation claims "this is
+    our own audio" in exactly the cases where the canceller knows nothing, and would silence every
+    genuine interruption on the legs where cancellation is already failing. The verdict answers only
+    on positive evidence and fails open in every uncertain case: it can quieten an agent, never a
+    caller.
+  - The verdict is latched across a whole **run** of detected speech, because the detector and the
+    canceller stop at different moments — a detector holds speech through its hangover, and the echo
+    outlives the audio that caused it by the bulk delay. Judging frame by frame let exactly those
+    trailing frames through, and on the test fixture every single false interruption landed there and
+    nowhere else. A run stays identified until the detector falls silent or the canceller produces
+    positive evidence of a *talker*: a frame with real energy it could not predict from what we
+    played.
+
+  Two pieces of evidence feed it, because neither covers a whole utterance: the two-path detector's
+  correlation (sharp, but only formed while the far end is currently active) and how much energy
+  cancellation removed from the frame (which keeps working off the reference history after the far
+  end falls silent). Measured on a nonlinear echo path, the fixture raises 9 false interruptions
+  without the veto and 0 with it, while a caller talking over the agent still gets through in both —
+  the point being that this is selective, unlike the blanket half-duplex an application can implement
+  with no reference signal of its own.
+
+  **Known limitation:** nothing can veto before the canceller has located the echo, because there is
+  no estimate to correlate against — roughly the first 1.5 s of far-end audio at the default search
+  window. An agent that speaks first can still interrupt itself once, at the start of the call.
+
+- **The delay estimator now reports what it concluded**, on the `siphon_rtp::media` target and in
+  three new counters: `siphon_rtp_aec_delay_locks_total`, `siphon_rtp_aec_delay_weak_locks_total` and
+  `siphon_rtp_aec_delay_never_locked_total`. Each leg logs the delay it located and the window it was
+  found in at `debug`; at `warn` it reports a lock whose correlation peak is too flat to be an echo
+  (what a too-short window looks like from inside a canceller that is otherwise running perfectly), a
+  delay sitting in the last eighth of its window (a real echo, but one more hop on that route puts it
+  outside), and an estimator that consumed ~10 s of audio without committing anything — distinguishing
+  a far end that never played from one whose audio was never usable.
+
+  The peak's prominence over the correlation surface is the number that separates a *located* echo
+  from a *picked* one; measured on the synthetic relay path, a located echo scores 100 against 4 for
+  the same echo missed by a too-short window. The alerting signal is
+  `weak_locks_total / locks_total`. These are process-wide rather than per-leg because a canceller is
+  owned by a single per-call actor and is not reachable from a scrape; the per-leg numbers go out on
+  the log line, where the call identity is already in scope. Draining the report is edge-triggered
+  and stays inside the zero-per-frame-allocation gate.
+
+- **The delay estimator now narrows onto the echo once it has found it**, so lags the echo
+  demonstrably does not occupy stop competing for the pick. After a lock whose prominence clears the
+  weak-lock threshold the peak search is restricted to `committed ± search_range/8`; a **weak** lock
+  never narrows, because a weak lock is the signature of an echo *outside* the window and fencing the
+  scan around it would make that mistake permanent. Six consecutive in-margin blocks that fail the
+  confidence threshold widen it back — without that the narrowing would be a trap, and a path that
+  genuinely moved (a re-INVITE onto another carrier route) would be invisible forever. Counted as
+  `siphon_rtp_aec_delay_rewidens_total`.
+
+  The margin is a **fraction** of the search range rather than a sample count: the estimator is never
+  told its sample rate, so a fixed sample margin would be two different durations at 8 and 16 kHz —
+  the exact trap that produced the original defect. Only the scan narrows; the accumulator keeps
+  integrating every lag, so widening back costs nothing and the zero-allocation gate is untouched.
+
+  This replaces the originally requested "centre the search on the measured round-trip time", which
+  is not buildable where the defect lives. A WebSocket takeover leg carries **no RTCP at all**, so it
+  has no RTT and no path to one; on the transcode path RTT needs both legs plaintext and arrives
+  5–15 s into a call, while the estimator's first lock lands at ~1.5 s — after the decision it would
+  have improved. Wiring it would have shipped a knob that silently does nothing on the one leg that
+  reported the fault.
+
+### Added
+
+- **A long-tail echo-cancellation posture** (`echo_long_tail`), for a leg on a route the estimator
+  cannot be trusted on. It spans the echo path with the adaptive filter itself and makes no alignment
+  decision, so there is nothing to get wrong. On the fixture the difference is not marginal: against
+  a 300 ms echo, a canceller given a 128 ms search window reaches **−0.8 dB** ERLE — slightly worse
+  than leaving the audio alone — where a 512 ms tail on identical input reaches **43.6 dB**.
+
+  Opt-in, because the cost is real: the MDF runs its gradient constraint's transform pair *inside* the
+  per-partition loop, so an adapting block is `2K + 3` transforms. Measured per 20 ms frame at
+  64/256/512 ms of tail — 17.6/55.7/106.7 µs at 8 kHz and 38.4/121.9/236.4 µs at 16 kHz — a 512 ms
+  wideband tail is ~6× the filter cost the estimating build pays, plus ~96 KiB per leg. With it set,
+  `echo_delay_search_ms` names the **tail** (16–512 ms). Such a leg has no estimator and so emits none
+  of the lock reporting above; the build line names the posture instead.
+
+  The tap cap rises 4096 → 8192 for the same reason the search cap did, and the partition ceiling
+  becomes a refusal rather than a silent clamp — a cap that quietly returns a shorter filter than was
+  asked for is the same defect as a search that quietly locks on noise. A compile-time assertion ties
+  the two caps together.
+
+- **`echo_residual_suppression`** wires the residual-echo WOLA post-filter, which had existed in the
+  DSP crate with a bench and a zero-allocation test and **no production route at all**. Opt-in because
+  it costs latency rather than cycles — one analysis window (~32 ms) on top of the block delay, free on
+  a transcoded call and material on a turn-taking bridge. An unsupported rate drops the post-filter and
+  keeps the linear canceller: losing an improvement to echo control is a quality regression, losing
+  echo control is the bug.
+
+### Fixed
+
+- **The echo verdict's abstain floor was a whole-frame energy, so it meant two different amplitudes at
+  the two wire rates** — and was loosest at 16 kHz, the rate the voice-AI guidance recommends. The
+  looseness was one-directional: above the floor, a frame too quiet to judge yields a noisy removal
+  ratio that can read as the agent's own audio and veto the **caller's** turn, the one direction this
+  verdict must never fail in. Now a per-sample mean square, as `ws_vad_threshold` already is.
+
+- **Relayed RTCP now carries the SSRC the receiving party actually gets media from.** The transcode
+  path re-originates RTP under its own egress SSRC while forwarding the far party's reports untouched,
+  so media and the reports about it arrived under two different source identities. RFC 3550 §6.4.1
+  defines LSR per source SSRC, so a conforming receiver files the relayed SR under a source it gets no
+  RTP from and reports `LSR = 0` for the stream it does get — leaving the engine's passive round-trip
+  estimate uncomputable against a standards-compliant endpoint, and a passive monitor unable to
+  correlate the leg. The existing test masked it by writing the peer's reply with the engine's egress
+  SSRC *and* the far party's LSR together, a pairing only a non-conforming endpoint produces.
+
+  This is the opposite of the in-kernel relay posture, where SSRC is preserved end to end and must
+  stay so — not an inconsistency: that path forwards verbatim, so both already agree. Report *blocks*
+  are deliberately left alone (translating them needs the peer direction's ingress SSRC, which a
+  single direction does not hold); that remains a gap for the far end's own statistics.
+
+### Performance
+
+- The turn-edge veto's cost on a cancelling bridge tick falls from **0.59 µs to 0.14 µs**: its two
+  per-frame energy sums move from `f64` to exact `i64`, and the second one now runs only for a frame
+  loud enough to judge instead of unconditionally. `ws_bridge_tick_8k_20ms/aec_on` 5.03 → 4.58 µs
+  against 4.44 µs with the verdict removed entirely.
+
 ## [0.4.6] — 2026-09-05
 
 Two defects on the WebSocket-takeover downlink, both silent in every place an operator would look: the

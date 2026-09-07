@@ -43,7 +43,7 @@ use siphon_rtp_media::repacketize::Repacketizer;
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket};
 use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
 use siphon_rtp_media::wav::WavRecorder;
-use siphon_rtp_proto::{Event, PlayEndReason};
+use siphon_rtp_proto::{Event, PlayEndReason, ProfileFlags};
 
 use crate::x3::X3Tap;
 
@@ -83,11 +83,149 @@ const MAX_PCM: usize = MAX_FRAME_SAMPLES * MAX_CHANNELS;
 /// estimator removes the bulk transport delay — the MDF partitioned-block backend covers it at
 /// O(N log N), so a generous tail is cheap.
 const AEC_TAIL_MILLIS: u32 = 64;
-/// GCC-PHAT bulk-delay search range, in milliseconds at the near-end codec rate. 128 ms (1024 samples
-/// @ 8 kHz / 2048 @ 16 kHz) covers the loudspeaker→microphone acoustic path plus the network/jitter
-/// round-trip between the reference the engine sent toward a party and the echo that returns on that
-/// party's uplink (a media-relay echo path is longer than a handset's, so search wide).
-const AEC_DELAY_SEARCH_MILLIS: u32 = 128;
+/// Default GCC-PHAT bulk-delay search range, in milliseconds at the near-end codec rate — the window
+/// the estimator looks for the echo in. 256 ms is 2048 samples @ 8 kHz / 4096 @ 16 kHz.
+///
+/// The delay this has to span is **not** a loudspeaker→microphone path. It is the reference the
+/// engine sent toward a party coming back on that party's uplink, so the whole media path is in the
+/// loop *twice* with the acoustic reflection in the middle: on a relayed call that is access →
+/// carrier → access in each direction. A wide-area hop is rarely the dominant term (tens of ms round
+/// trip); the carrier and mobile legs are, at conventionally 100–200 ms each way, which puts a
+/// mobile-over-PSTN echo somewhere past 200 ms before the handset's own acoustic path is reached.
+///
+/// The previous 128 ms covered a handset plus a LAN and nothing further, and the failure was
+/// **silent**: GCC-PHAT commits the tallest lag inside its window whatever that lag is, so an echo
+/// beyond the window does not produce "no lock" — it produces a lock on noise, after which the
+/// adaptive filter converges against a reference that is not the echo. The canceller runs, reports
+/// no error, and cancels nothing, which from outside is indistinguishable from a leg with no echo on
+/// it. [`build_echo_canceller`] now reports what the estimator concluded so that stops being true.
+///
+/// **Why the default stops here rather than at the 512 ms cap.** [`choose_block_size`] sizes the
+/// estimation FFT at ≥ 2× the range and rounds to a power of two, so at 16 kHz the choice is not
+/// continuous: 256 ms buys an 8192-point block and 512 ms buys a 16384-point one, with nothing in
+/// between. That doubles the estimator's per-leg state (~0.7 MB) and — because a lock needs
+/// `MIN_BLOCKS_BEFORE_LOCK` whole blocks — pushes the first lock from ~1.5 s of far-end-active audio
+/// to ~3 s. Three seconds of uncancelled echo at the start of a call is the reported symptom again,
+/// just time-boxed, so the wider window is a per-deployment decision rather than a default: a leg
+/// that needs it asks with `ProfileFlags::echo_delay_search_ms`, and a weak-lock warning tells the
+/// operator when it does.
+///
+/// [`AEC_TAIL_MILLIS`] deliberately does **not** move with this: the tail spans the residual impulse
+/// response *after* the estimator has removed the bulk delay, so it is a property of the line and
+/// the room, not of the network between them.
+const AEC_DELAY_SEARCH_MILLIS: u32 = 256;
+/// Bounds accepted for a per-leg `echo_delay_search_ms` override, in milliseconds. The floor keeps a
+/// request from rounding to a degenerate range; the ceiling is the widest any supported media rate
+/// can express (1 s at 8 kHz, [`EchoCanceller::MAX_DELAY_SEARCH_SAMPLES`]). A value inside these
+/// bounds that the *negotiated* rate cannot reach is clamped with a warning rather than rejected —
+/// see [`build_echo_canceller`].
+const AEC_DELAY_SEARCH_MILLIS_MIN: u32 = 16;
+/// See [`AEC_DELAY_SEARCH_MILLIS_MIN`].
+const AEC_DELAY_SEARCH_MILLIS_MAX: u32 = 1_000;
+/// Default adaptive tail in long-tail mode (`ProfileFlags::echo_long_tail`), in milliseconds — the
+/// filter spans the echo path itself, so this has to cover the whole relay delay rather than just the
+/// residual dispersion [`AEC_TAIL_MILLIS`] covers after the estimator removes the bulk.
+///
+/// 256 ms rather than the reachable maximum for the same reason the search default stops there: the
+/// per-frame cost scales with the tail (the MDF's gradient constraint runs a transform pair *inside*
+/// the per-partition loop), so a leg that needs more asks for it.
+const AEC_LONG_TAIL_MILLIS: u32 = 256;
+/// Bounds accepted for a long-tail request. The ceiling is what the tap cap
+/// ([`EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED`]) buys at the *wideband* rate, so the same number is
+/// serviceable whichever rate the leg negotiates — asking for more at 8 kHz would succeed there and
+/// fail at 16 kHz, which is the rate-dependent limit this whole path exists to stop shipping.
+const AEC_LONG_TAIL_MILLIS_MIN: u32 = 16;
+/// See [`AEC_LONG_TAIL_MILLIS_MIN`].
+const AEC_LONG_TAIL_MILLIS_MAX: u32 = 512;
+
+/// How a leg cancels echo: whether at all, and in which of the two postures.
+///
+/// One value rather than a handful of parallel `bool`s and `Option`s threaded side by side, because
+/// they are only ever meaningful together — every one of them is inert without `enabled`, and
+/// `delay_search_ms` means two different things depending on `long_tail`. Bundling them also keeps
+/// the settings from being passed positionally, which for adjacent booleans is a silent-swap waiting
+/// to happen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EchoProfile {
+    /// Cancel this direction's near-end (uplink) echo at all. Built at the ingress codec's native
+    /// rate; a codec at a rate the canceller rejects (< 8 kHz or not a 50 Hz multiple) transcodes
+    /// uncancelled rather than failing.
+    pub enabled: bool,
+    /// Milliseconds of GCC-PHAT bulk-delay search window, or — when `long_tail` is set — of adaptive
+    /// tail. `None` keeps the engine default (256 ms of search). Widen it when the far party is
+    /// behind a carrier or a mobile network: the echo path is the whole media path twice over, and an
+    /// echo outside the window is not found at all while the canceller goes on reporting no error.
+    pub delay_search_ms: Option<u32>,
+    /// Span the echo path with the filter instead of estimating a bulk delay first — no estimator, so
+    /// no lock to get wrong, at roughly 6× the per-frame cost at a 512 ms tail.
+    pub long_tail: bool,
+    /// Chain the residual-echo WOLA post-filter after the linear canceller. Adds ~32 ms of latency,
+    /// so it is opt-in on a turn-taking bridge.
+    pub residual_suppression: bool,
+}
+
+impl EchoProfile {
+    /// The echo posture a controller asked for on this leg.
+    #[must_use]
+    pub fn from_profile(profile: &ProfileFlags) -> Self {
+        Self {
+            enabled: profile.echo_cancellation,
+            delay_search_ms: profile.echo_delay_search_ms,
+            long_tail: profile.echo_long_tail,
+            residual_suppression: profile.echo_residual_suppression,
+        }
+    }
+}
+
+/// Range-check a controller's echo settings at the control plane, before any port is allocated or any
+/// dialog is committed.
+///
+/// Rejected rather than clamped, deliberately, and the split from [`build_echo_canceller`]'s clamp is
+/// the point: a value outside these bounds is a controller mistake it can see and fix, and silently
+/// substituting a different window would leave it configuring one thing and getting another. A value
+/// *inside* them that the negotiated codec rate cannot express is not a mistake — the controller
+/// cannot know the rate when it writes the profile — so that one is clamped with a warning, because
+/// refusing it there would drop the canceller entirely and be strictly worse than a shorter window.
+///
+/// # Errors
+/// The reason string, ready to return as a `CmdResult::Error`.
+pub(crate) fn validate_echo_delay_search_ms(profile: &ProfileFlags) -> Result<(), String> {
+    // The posture flags are inert without a canceller, and saying so is better than accepting a
+    // profile that reads as if it configured something. Refused only when they would otherwise be
+    // silently ignored.
+    if !profile.echo_cancellation && (profile.echo_long_tail || profile.echo_residual_suppression) {
+        return Err(
+            "echo-posture-without-canceller: echo_long_tail and echo_residual_suppression \
+             configure how the echo canceller runs, so they do nothing without echo_cancellation"
+                .to_string(),
+        );
+    }
+    let Some(requested) = profile.echo_delay_search_ms else {
+        return Ok(());
+    };
+    let (low, high, meaning) = if profile.echo_long_tail {
+        (
+            AEC_LONG_TAIL_MILLIS_MIN,
+            AEC_LONG_TAIL_MILLIS_MAX,
+            "the adaptive tail the canceller spans the echo path with (echo_long_tail is set, so \
+             this is a tail length and not a search window)",
+        )
+    } else {
+        (
+            AEC_DELAY_SEARCH_MILLIS_MIN,
+            AEC_DELAY_SEARCH_MILLIS_MAX,
+            "the window the echo canceller searches for the returning echo, which on a relayed \
+             call spans the media path twice",
+        )
+    };
+    if (low..=high).contains(&requested) {
+        return Ok(());
+    }
+    Err(format!(
+        "echo-delay-search-range: echo_delay_search_ms must be {low}-{high} ms (got {requested}); \
+         it is {meaning}"
+    ))
+}
 
 /// The SSRC-consistent symmetric-RTP latch for a `Redirect`-path leg — the userspace mirror of the
 /// datapath's `update_latch` (docs/security-and-nat.md §4 layer 3; RFC 3550 §8, RFC 4961). The reverse
@@ -227,23 +365,185 @@ impl EchoReference {
 /// `siphon-rtp-dsp` (`cancel_two_path`) is the alternative for a short handset tail, and both backends
 /// re-converge after a delay re-lock. The MDF adds a fixed ~16 ms block algorithmic latency the
 /// receiving jitter buffer absorbs; its per-frame cost is tens of µs, so it stays inline on the actor
-/// (no `spawn_blocking`). The residual-echo WOLA post-filter (a further ~32 ms latency) is left off:
-/// it has no production route in the shipped engine and is out of scope here. All state is preallocated
+/// (no `spawn_blocking`). The residual-echo WOLA post-filter is chained only when the leg asks for it
+/// (`ProfileFlags::echo_residual_suppression`), because it costs a further ~32 ms of algorithmic
+/// latency — cheap for a transcoded call, and material on a turn-taking bridge where the round trip is
+/// what an interruption feels like. All state is preallocated
 /// ⇒ `cancel` allocates nothing on the hot path. Shared by the 2-party transcode path
 /// ([`Direction::new`]) and the WS voice-AI bridge so both cancel with the identical, single-sourced
 /// configuration.
-pub(crate) fn build_echo_canceller(sample_rate_hz: u32) -> Option<EchoCanceller> {
+/// `delay_search_millis` overrides [`AEC_DELAY_SEARCH_MILLIS`] for this leg (the controller's
+/// `ProfileFlags::echo_delay_search_ms`), because how far away the far party is, is a property of the
+/// deployment and not of the engine: a LAN softphone wants a narrow window and should not pay for
+/// more, and a leg reached through a carrier and a mobile network is *broken* without a wide one. It
+/// is already range-checked at the control plane; a value that the negotiated rate cannot express is
+/// **clamped with a warning** rather than rejected, because rejecting it here would leave the leg
+/// with no canceller at all — trading a window that is merely narrower than asked for the exact
+/// silent do-nothing this whole path exists to stop.
+pub(crate) fn build_echo_canceller(
+    sample_rate_hz: u32,
+    echo: EchoProfile,
+) -> Option<EchoCanceller> {
+    if echo.long_tail {
+        return build_long_tail_echo_canceller(sample_rate_hz, echo);
+    }
     let tail_samples = (sample_rate_hz * AEC_TAIL_MILLIS / 1000).max(1) as usize;
-    let search_range = (sample_rate_hz * AEC_DELAY_SEARCH_MILLIS / 1000).max(1) as usize;
+    let requested_millis = echo.delay_search_ms.unwrap_or(AEC_DELAY_SEARCH_MILLIS);
+    // u64 throughout: the control plane bounds the request, but the conversion should not be the
+    // thing relying on that.
+    let requested = ((u64::from(sample_rate_hz) * u64::from(requested_millis)) / 1000).max(1);
+    let search_range = usize::try_from(requested)
+        .unwrap_or(usize::MAX)
+        .min(EchoCanceller::MAX_DELAY_SEARCH_SAMPLES);
+    if (search_range as u64) < requested {
+        let reachable_millis = (search_range as u64 * 1000) / u64::from(sample_rate_hz).max(1);
+        tracing::warn!(
+            target: "siphon_rtp::media",
+            sample_rate_hz,
+            requested_millis,
+            reachable_millis,
+            search_range_samples = search_range,
+            max_search_range_samples = EchoCanceller::MAX_DELAY_SEARCH_SAMPLES,
+            "echo-canceller delay search range clamped: the estimator's sample cap is a shorter \
+             window at this rate than was asked for; an echo beyond the clamped window will not be \
+             found"
+        );
+    }
     match EchoCanceller::with_mdf_delay_estimation(sample_rate_hz, tail_samples, search_range) {
-        Ok(canceller) => Some(canceller.with_two_path_dtd()),
+        Ok(canceller) => {
+            tracing::debug!(
+                target: "siphon_rtp::media",
+                sample_rate_hz,
+                mode = "delay-estimation",
+                tail_samples,
+                search_range_samples = search_range,
+                search_range_millis = requested_millis.min(
+                    u32::try_from((search_range as u64 * 1000) / u64::from(sample_rate_hz).max(1))
+                        .unwrap_or(u32::MAX)
+                ),
+                "echo canceller built"
+            );
+            chain_residual_suppression(canceller.with_two_path_dtd(), sample_rate_hz, echo)
+        }
         Err(error) => {
             tracing::warn!(
+                target: "siphon_rtp::media",
                 %error,
                 sample_rate_hz,
+                search_range_samples = search_range,
                 "echo cancellation requested but unsupported at the codec rate; leaving it uncancelled"
             );
             None
+        }
+    }
+}
+
+/// The long-tail posture: no bulk-delay estimator, and a filter long enough to span the whole echo
+/// path (`ProfileFlags::echo_long_tail`).
+///
+/// Chosen per leg because it trades cost for a failure mode. The estimating build is cheap and exact
+/// when it works, but it commits the tallest lag inside its window whatever that lag is, so an echo
+/// beyond the window leaves it adapting against a reference that is not the echo — cancelling nothing
+/// while every accessor reads healthy. This build makes no alignment decision, so it has nothing to
+/// get wrong; it simply pays for the taps, at roughly 6× the per-frame cost at 512 ms because the MDF
+/// runs its gradient constraint's transform pair inside the per-partition loop.
+///
+/// The mode is named on the build line on purpose. With no estimator there is no delay report, so a
+/// long-tail leg emits none of the lock/weak-lock/never-locked lines a reader uses to tell a working
+/// canceller from a broken one — and silence that means "fine" here and "never located the echo"
+/// elsewhere is the ambiguity this whole path was opened to remove.
+fn build_long_tail_echo_canceller(sample_rate_hz: u32, echo: EchoProfile) -> Option<EchoCanceller> {
+    let requested_millis = echo.delay_search_ms.unwrap_or(AEC_LONG_TAIL_MILLIS);
+    let requested = ((u64::from(sample_rate_hz) * u64::from(requested_millis)) / 1000).max(1);
+    let tail_samples = usize::try_from(requested)
+        .unwrap_or(usize::MAX)
+        .min(EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED);
+    if (tail_samples as u64) < requested {
+        let reachable_millis = (tail_samples as u64 * 1000) / u64::from(sample_rate_hz).max(1);
+        // Clamped rather than refused, for the same reason the search window is: a shorter filter
+        // still cancels what it reaches, and refusing here would leave the leg with none at all.
+        tracing::warn!(
+            target: "siphon_rtp::media",
+            sample_rate_hz,
+            requested_millis,
+            reachable_millis,
+            tail_samples,
+            max_tail_samples = EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED,
+            "echo-canceller long tail clamped: the filter's tap cap is a shorter tail at this rate \
+             than was asked for; echo arriving beyond the clamped tail will not be cancelled"
+        );
+    }
+    match EchoCanceller::with_mdf_long_tail(sample_rate_hz, tail_samples) {
+        Ok(canceller) => {
+            tracing::debug!(
+                target: "siphon_rtp::media",
+                sample_rate_hz,
+                mode = "long-tail",
+                tail_samples,
+                tail_millis = requested_millis.min(
+                    u32::try_from((tail_samples as u64 * 1000) / u64::from(sample_rate_hz).max(1))
+                        .unwrap_or(u32::MAX)
+                ),
+                "echo canceller built (no bulk-delay estimator, so this leg reports no delay lock)"
+            );
+            chain_residual_suppression(canceller.with_two_path_dtd(), sample_rate_hz, echo)
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                %error,
+                sample_rate_hz,
+                tail_samples,
+                "echo cancellation requested but unsupported at the codec rate; leaving it uncancelled"
+            );
+            None
+        }
+    }
+}
+
+/// Chain the residual-echo WOLA post-filter when the leg asked for it.
+///
+/// An unsupported rate keeps the **linear** canceller and drops only the post-filter, which is the
+/// asymmetry that matters: the post-filter is an improvement on cancellation, so losing it costs
+/// quality, while losing the canceller with it would cost the leg its echo control entirely. Logged
+/// either way, because a silently absent post-filter is a quieter version of the same problem.
+fn chain_residual_suppression(
+    canceller: EchoCanceller,
+    sample_rate_hz: u32,
+    echo: EchoProfile,
+) -> Option<EchoCanceller> {
+    if !echo.residual_suppression {
+        return Some(canceller);
+    }
+    match canceller.with_residual_suppression() {
+        Ok(suppressed) => {
+            tracing::debug!(
+                target: "siphon_rtp::media",
+                sample_rate_hz,
+                added_latency_samples = suppressed.residual_suppression_latency_samples(),
+                "residual-echo suppressor chained after the linear canceller"
+            );
+            Some(suppressed)
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "siphon_rtp::media",
+                %error,
+                sample_rate_hz,
+                "residual echo suppression requested but unsupported at this rate; the linear \
+                 canceller runs without it"
+            );
+            // `with_residual_suppression` consumes the canceller on the error path, so rebuild the
+            // same leg with the post-filter request cleared rather than losing echo cancellation
+            // over an unavailable *improvement* to it. Terminates: the rebuilt profile has
+            // `residual_suppression` false, so this arm cannot be reached twice.
+            build_echo_canceller(
+                sample_rate_hz,
+                EchoProfile {
+                    residual_suppression: false,
+                    ..echo
+                },
+            )
         }
     }
 }
@@ -385,6 +685,10 @@ pub struct Direction {
     /// Preallocated egress frame the repacketizer drains into — exactly `egress_frame_samples` long
     /// (one encoder frame), so the drain neither allocates nor zeroes per packet.
     egress_scratch: Vec<i16>,
+    /// Reused buffer for rewriting a relayed RTCP compound's report sender SSRC (see
+    /// [`Direction::handle`]). RTCP is rare next to RTP, but it is still per-call traffic and this
+    /// keeps the relay allocation-free; it grows once to the largest compound the leg has seen.
+    rtcp_scratch: Vec<u8>,
     /// Sample-rate converter when the ingress codec rate differs from the egress codec rate.
     resampler: Option<Resampler>,
     /// Single-channel noise suppression on this direction's decoded ingress audio, applied in place
@@ -747,9 +1051,8 @@ pub struct DirectionConfig {
     /// 8/16 kHz) in `Direction::new`; inert on an unsupported ingress rate.
     pub noise_suppression: bool,
     /// Cancel this direction's near-end (uplink) echo, referenced against the opposite direction's
-    /// egress toward the same party. Built at the ingress codec's native rate; a codec at a rate the
-    /// canceller rejects (< 8 kHz or not a 50 Hz multiple) transcodes uncancelled.
-    pub echo_cancellation: bool,
+    /// egress toward the same party, and how. See [`EchoProfile`].
+    pub echo: EchoProfile,
     /// Watch this direction's decoded ingress audio for an answering-machine record tone and report
     /// it as [`Event::BeepDetected`]. Built and rate-gated (to 8/16 kHz) in `Direction::new`; inert
     /// on an unsupported ingress rate. Fires once — the detector is dropped with the event.
@@ -943,8 +1246,8 @@ impl Direction {
         // opposite direction's egress toward the same party (spec §"Reference/near-end plumbing"). Built
         // at the ingress codec's native rate (what the decoder emits, so its 20 ms frame matches the
         // decoded frame) — see [`build_echo_canceller`] for the backend/default rationale.
-        let echo_canceller = if config.echo_cancellation {
-            build_echo_canceller(ingress_rate)
+        let echo_canceller = if config.echo.enabled {
+            build_echo_canceller(ingress_rate, config.echo)
         } else {
             None
         };
@@ -1036,6 +1339,7 @@ impl Direction {
                 Vec::new()
             },
             egress_scratch: vec![0i16; egress_frame_samples as usize],
+            rtcp_scratch: Vec::new(),
             resampler,
             noise_suppressor,
             echo_canceller,
@@ -1105,6 +1409,7 @@ impl Direction {
             decode_scratch: Vec::new(),
             echo_scratch: Vec::new(),
             egress_scratch: Vec::new(),
+            rtcp_scratch: Vec::new(),
             resampler: None,
             // A relay-only leg forwards verbatim (never decodes), so there is nothing to suppress,
             // cancel or listen to for a record tone, and it produces no reference for the opposite
@@ -1638,11 +1943,35 @@ impl Direction {
         }
 
         // RFC 5761 demux: payload-type byte 64..=95 marks RTCP — relay it (re-encrypting toward a
-        // secure egress), untranscoded. RTCP carries no per-stream SSRC at the latch offset, so it
-        // never drives the SSRC re-latch (return `None`).
+        // secure egress), untranscoded apart from the report sender SSRC. RTCP carries no per-stream
+        // SSRC at the latch offset, so it never drives the SSRC re-latch (return `None`).
         let packet_type = data[1] & 0x7f;
         if (64..=95).contains(&packet_type) {
-            self.push_egress(data, out);
+            // This direction re-originates RTP under `egress_ssrc`, so the party on the other end has
+            // never seen the far party's SSRC. Relaying its reports verbatim would have the media and
+            // the reports about that media arrive under two different source identities — which RFC
+            // 3550 §6.4.1 makes consequential rather than cosmetic, because LSR is defined per source
+            // SSRC: a conforming receiver files the relayed SR under a source it gets no RTP from, and
+            // reports `LSR = 0` for the stream it does get, leaving the engine's passive round-trip
+            // estimate uncomputable and a passive monitor unable to correlate the leg at all.
+            //
+            // Rewritten into a reused scratch buffer, so the relay stays allocation-free on a path
+            // that also carries the (rare, ~5 s) RTCP of every call.
+            self.rtcp_scratch.clear();
+            self.rtcp_scratch.extend_from_slice(data);
+            let rewritten = siphon_rtp_media::rtcp::rewrite_report_sender_ssrc(
+                &mut self.rtcp_scratch,
+                self.egress_ssrc,
+            );
+            if rewritten > 0 {
+                let scratch = std::mem::take(&mut self.rtcp_scratch);
+                self.push_egress(&scratch, out);
+                self.rtcp_scratch = scratch;
+            } else {
+                // Malformed, truncated, or carrying no report to rewrite (SDES/BYE/APP): relay it
+                // exactly as it arrived rather than risk a half-edited datagram on the wire.
+                self.push_egress(data, out);
+            }
             return None;
         }
 
@@ -1849,6 +2178,18 @@ impl Direction {
             let far_end = &mut self.echo_scratch[..samples];
             reference.read_into(far_end);
             canceller.cancel(&mut decoded[..samples], far_end);
+            // What the bulk-delay estimator concluded, if it concluded anything this frame. Drained
+            // here rather than polled anywhere else because this is the only place that holds both
+            // the canceller and the leg's identity; it is an edge, so a converged leg pays one
+            // `Option` check per frame and logs nothing for the rest of the call. Without this the
+            // canceller's own failure is unobservable — see `siphon_rtp_media::echo`.
+            if let Some(report) = canceller.take_delay_report() {
+                siphon_rtp_media::echo::log_delay_report(
+                    &report,
+                    leg_meta.call_id,
+                    leg_meta.near_tag,
+                );
+            }
         }
         // Answering-machine record-tone detection, on the same post-decode / post-NS / post-AEC PCM
         // the recorder and the SIPREC forks are about to see — i.e. what this leg actually said, and
@@ -3681,7 +4022,7 @@ mod tests {
             telephone_event_out: Some(101),
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -3700,7 +4041,7 @@ mod tests {
             telephone_event_out: Some(101),
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -3962,7 +4303,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -3981,7 +4322,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4246,7 +4587,7 @@ mod tests {
                 telephone_event_out: None,
                 recorder: None,
                 noise_suppression: false,
-                echo_cancellation: false,
+                echo: EchoProfile::default(),
                 beep_detection: false,
                 beep_cadence_guard_ms: None,
                 produce_echo_reference: false,
@@ -4478,6 +4819,125 @@ mod tests {
         );
     }
 
+    /// The relayed report must arrive under the SSRC the receiving party actually gets media from.
+    ///
+    /// The transcode path re-originates RTP under its own `egress_ssrc`, so party A has never seen
+    /// B's SSRC. Relaying B's Sender Report verbatim put the media and the reports about that media
+    /// under two different source identities, and RFC 3550 §6.4.1 makes that consequential rather
+    /// than cosmetic: LSR is defined as the NTP of the most recent SR **from source SSRC_n**, so a
+    /// conforming A files the relayed SR under a source it receives no RTP from, and its report block
+    /// for the stream it *does* receive carries `LSR = 0`. The engine then has nothing to match and
+    /// the passive round-trip estimate is uncomputable — against a strictly conforming endpoint, not
+    /// an unusual one.
+    ///
+    /// `passive_rtt_from_relayed_rtcp_feeds_the_leg_mos_delay` above does not catch it: it writes A's
+    /// block with the engine's egress SSRC *and* B's LSR together, which is the pairing only an
+    /// endpoint that echoes the last SR regardless of source produces. This asserts on the wire
+    /// instead, where the ambiguity does not exist.
+    #[test]
+    fn a_relayed_report_carries_the_ssrc_the_receiving_party_sees_media_from() {
+        let mut call = ulaw_alaw_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        const B_SSRC: u32 = 0xBBBB_BBBB;
+        // The engine's A-facing egress SSRC — what A's RTP actually arrives under.
+        const A_FACING_EGRESS_SSRC: u32 = 0xA000_0001;
+
+        let mut sender_report = [0u8; 64];
+        let len = siphon_rtp_media::rtcp::write_sender_report(
+            B_SSRC,
+            0xABCD_1234_5678_9ABC,
+            0,
+            0,
+            0,
+            &[],
+            &mut sender_report,
+        )
+        .expect("write B SR");
+        call.process(
+            &rx_at(2, B_ADDR, 1_000_000, sender_report[..len].to_vec()),
+            &mut out,
+            &mut events,
+        );
+
+        let forwarded = out
+            .iter()
+            .find(|packet| {
+                siphon_rtp_media::rtcp::demux(&packet.data)
+                    == Some(siphon_rtp_media::rtcp::MuxKind::Rtcp)
+            })
+            .expect("B's RTCP must be relayed toward A");
+        let parsed =
+            siphon_rtp_media::rtcp::parse_compound(&forwarded.data).expect("parse relayed RTCP");
+        let sender_ssrc = parsed
+            .iter()
+            .find_map(|packet| match packet {
+                siphon_rtp_media::rtcp::RtcpPacket::SenderReport(report) => Some(report.ssrc),
+                _ => None,
+            })
+            .expect("the relayed compound must still contain the Sender Report");
+        assert_eq!(
+            sender_ssrc, A_FACING_EGRESS_SSRC,
+            "the relayed SR must arrive under the SSRC A receives media from, not the far party's \
+             ({B_SSRC:#010x}) — a conforming A keys LSR per source SSRC, so relaying it verbatim \
+             leaves it reporting LSR = 0 for the only stream it actually has"
+        );
+    }
+
+    /// The rewrite must not corrupt what it does not understand. SDES, BYE and APP carry no report
+    /// sender SSRC at that offset, and a truncated compound must be relayed exactly as it arrived
+    /// rather than half-edited.
+    #[test]
+    fn the_report_ssrc_rewrite_leaves_other_rtcp_untouched() {
+        use siphon_rtp_media::rtcp::rewrite_report_sender_ssrc;
+
+        // A minimal SDES (PT 202): version 2, one chunk, length 1 word past the header.
+        let mut sdes = vec![
+            0x81u8, 202, 0x00, 0x02, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let original = sdes.clone();
+        assert_eq!(rewrite_report_sender_ssrc(&mut sdes, 0x1234_5678), 0);
+        assert_eq!(sdes, original, "a non-report packet must be left alone");
+
+        // Truncated: the header claims more than the buffer holds.
+        let mut truncated = vec![0x80u8, 200, 0x00, 0xFF, 0xDE, 0xAD, 0xBE, 0xEF];
+        let original = truncated.clone();
+        assert_eq!(rewrite_report_sender_ssrc(&mut truncated, 0x1234_5678), 0);
+        assert_eq!(
+            truncated, original,
+            "a malformed compound must be relayed verbatim, never half-rewritten"
+        );
+
+        // A well-formed SR is rewritten, and only in its sender-SSRC word.
+        let mut report = [0u8; 64];
+        let len = siphon_rtp_media::rtcp::write_sender_report(
+            0xBBBB_BBBB,
+            0xABCD_1234_5678_9ABC,
+            42,
+            7,
+            9,
+            &[],
+            &mut report,
+        )
+        .expect("write SR");
+        let mut buffer = report[..len].to_vec();
+        assert_eq!(rewrite_report_sender_ssrc(&mut buffer, 0x0A0A_0A0A), 1);
+        let parsed = siphon_rtp_media::rtcp::parse_compound(&buffer).expect("parse");
+        match &parsed[0] {
+            siphon_rtp_media::rtcp::RtcpPacket::SenderReport(rewritten) => {
+                assert_eq!(rewritten.ssrc, 0x0A0A_0A0A);
+                // Everything else survives — the NTP especially, since it is what the peer echoes
+                // back as LSR and the whole round-trip estimate hangs off it.
+                assert_eq!(rewritten.ntp_timestamp, 0xABCD_1234_5678_9ABC);
+                assert_eq!(rewritten.rtp_timestamp, 42);
+                assert_eq!(rewritten.packet_count, 7);
+                assert_eq!(rewritten.octet_count, 9);
+            }
+            other => panic!("expected a sender report, got {other:?}"),
+        }
+    }
+
     #[test]
     fn transcode_call_reports_call_quality_with_loss_and_jitter() {
         // A 2-party transcode call reports RFC 3550 loss/jitter + G.107 MOS on the control channel,
@@ -4602,7 +5062,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4621,7 +5081,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4784,7 +5244,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4803,7 +5263,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -4981,7 +5441,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5001,7 +5461,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5063,7 +5523,7 @@ mod tests {
                 telephone_event_out: None,
                 recorder: None,
                 noise_suppression: false,
-                echo_cancellation: false,
+                echo: EchoProfile::default(),
                 beep_detection: false,
                 beep_cadence_guard_ms: None,
                 produce_echo_reference: false,
@@ -5163,7 +5623,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5185,7 +5645,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5555,7 +6015,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5576,7 +6036,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5657,7 +6117,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5756,7 +6216,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -5827,7 +6287,7 @@ mod tests {
                 telephone_event_out: Some(101),
                 recorder: None,
                 noise_suppression: false,
-                echo_cancellation: false,
+                echo: EchoProfile::default(),
                 beep_detection: false,
                 beep_cadence_guard_ms: None,
                 produce_echo_reference: false,
@@ -5899,7 +6359,7 @@ mod tests {
                 telephone_event_out: None,
                 recorder: None,
                 noise_suppression: false,
-                echo_cancellation: false,
+                echo: EchoProfile::default(),
                 beep_detection: true,
                 beep_cadence_guard_ms: cadence_guard_ms,
                 produce_echo_reference: false,
@@ -6196,7 +6656,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -6215,7 +6675,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -6481,7 +6941,7 @@ mod tests {
             telephone_event_out: Some(101),
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -6969,7 +7429,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -6988,7 +7448,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7516,7 +7976,7 @@ mod tests {
             telephone_event_out: None,
             recorder: Some(WavRecorder::new(8000, 1)),
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7535,7 +7995,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7575,7 +8035,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7594,7 +8054,7 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: false,
+            echo: EchoProfile::default(),
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: false,
@@ -7689,6 +8149,12 @@ mod tests {
     /// are different, uncorrelated talkers). L16 makes the decode → re-encode round-trip bit-exact, so
     /// the measured A→B egress is the canceller's true residual — no codec quantization masking the ERLE.
     fn aec_l16_call(aec: bool) -> MediaCall {
+        aec_l16_call_with_window(aec, None)
+    }
+
+    /// [`aec_l16_call`] with an explicit per-leg search window — the `echo_delay_search_ms` override,
+    /// carried the whole way through `DirectionConfig` → `Direction::new` → `build_echo_canceller`.
+    fn aec_l16_call_with_window(aec: bool, search_ms: Option<u32>) -> MediaCall {
         let direction = |ingress: u64,
                          src: &str,
                          egress: u64,
@@ -7708,7 +8174,11 @@ mod tests {
             telephone_event_out: None,
             recorder: None,
             noise_suppression: false,
-            echo_cancellation: cancel,
+            echo: EchoProfile {
+                enabled: cancel,
+                delay_search_ms: search_ms,
+                ..EchoProfile::default()
+            },
             beep_detection: false,
             beep_cadence_guard_ms: None,
             produce_echo_reference: produce,
@@ -7724,6 +8194,413 @@ mod tests {
             true,
             None,
         )
+    }
+
+    /// The reported defect, reproduced through the real datapath rather than in the DSP crate: an
+    /// echo returning from a relay-length path (300 ms — a handset behind a mobile network and a
+    /// carrier, where the media path is in the loop twice) is **not cancelled** at the default
+    /// window, and **is** cancelled once the leg asks for a wider one.
+    ///
+    /// This is the end-to-end proof that `echo_delay_search_ms` is connected to real behaviour and
+    /// not just accepted: the same call, the same audio, the same everything except one profile
+    /// field, and the residual energy has to move. It also pins the shape of the failure — the
+    /// too-narrow run must still *run*, producing egress with the echo intact, because a canceller
+    /// that quietly does nothing is precisely what this reports.
+    #[test]
+    fn a_relay_length_echo_needs_a_widened_search_window_to_be_cancelled() {
+        const FRAMES: usize = 700;
+        const FRAME: usize = 160; // 20 ms @ 8 kHz
+                                  // 300 ms @ 8 kHz: outside the 256 ms default, inside a 512 ms window.
+        const DELAY: usize = 2_400;
+        const RIR: [f32; 7] = [0.20, 0.0, -0.10, 0.0, 0.05, 0.0, -0.025];
+
+        let mut state = 0x0EC0_5150u32;
+        let mut noise = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / (1u32 << 23) as f32 - 1.0) * 6000.0
+        };
+        let total = FRAMES * FRAME;
+        let far: Vec<i16> = (0..total).map(|_| noise() as i16).collect();
+        let echo: Vec<i16> = (0..total)
+            .map(|index| {
+                let mut accumulator = 0.0f32;
+                for (tap_index, &tap) in RIR.iter().enumerate() {
+                    if let Some(source) = index.checked_sub(DELAY + tap_index) {
+                        accumulator += tap * f32::from(far[source]);
+                    }
+                }
+                accumulator.round().clamp(-32768.0, 32767.0) as i16
+            })
+            .collect();
+
+        // Residual energy on the A→B egress over the converged tail, for one search window.
+        let residual_energy = |search_ms: Option<u32>| -> f64 {
+            let mut call = aec_l16_call_with_window(true, search_ms);
+            let mut decoder = L16::new(8000, 20);
+            let mut out = Vec::new();
+            let mut events = Vec::new();
+            let mut energy = 0.0f64;
+            for frame in 0..FRAMES {
+                let window = frame * FRAME..(frame + 1) * FRAME;
+                out.clear();
+                events.clear();
+                call.process(
+                    &rx(2, B_ADDR, l16_rtp(frame as u16, &far[window.clone()])),
+                    &mut out,
+                    &mut events,
+                );
+                out.clear();
+                events.clear();
+                call.process(
+                    &rx(1, A_ADDR, l16_rtp(frame as u16, &echo[window.clone()])),
+                    &mut out,
+                    &mut events,
+                );
+                // The wide window needs three 8192-sample blocks before it even locks, so the
+                // lead-in has to outlast that before either run is measured.
+                if frame < FRAMES * 3 / 4 {
+                    continue;
+                }
+                for datagram in &out {
+                    if datagram.endpoint != endpoint(2) {
+                        continue;
+                    }
+                    let packet = RtpPacket::parse(&datagram.data).expect("parse egress");
+                    let mut pcm = [0i16; MAX_PCM];
+                    let count = decoder
+                        .decode(packet.payload, &mut pcm)
+                        .expect("decode egress");
+                    energy += pcm[..count]
+                        .iter()
+                        .map(|&sample| f64::from(sample) * f64::from(sample))
+                        .sum::<f64>();
+                }
+            }
+            energy
+        };
+
+        let narrow = residual_energy(None); // the 256 ms default: echo is outside it
+        let wide = residual_energy(Some(512)); // widened for the relay path
+        let erle_db = 10.0 * (narrow / wide).log10();
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "relay echo residual: default {narrow:.3e}, widened {wide:.3e} ({erle_db:.1} dB)"
+            );
+        }
+
+        assert!(
+            narrow > 0.0,
+            "sanity: the too-narrow run must still relay — a canceller that finds nothing keeps \
+             passing the echo through, which is the whole reason this was invisible"
+        );
+        assert!(
+            erle_db >= 15.0,
+            "widening the search window must actually cancel the relay-length echo: {erle_db:.1} dB \
+             (default residual {narrow:.3e}, widened {wide:.3e})"
+        );
+    }
+
+    /// The default search window, stated as a duration and checked at both media rates — because the
+    /// thing that made this a defect is that the underlying cap is a *sample* count, so a constant
+    /// that reads as "the same everywhere" was silently worth half as much at 16 kHz.
+    #[test]
+    fn the_default_search_window_is_the_same_duration_at_both_media_rates() {
+        for rate in [8_000u32, 16_000] {
+            let canceller = build_echo_canceller(
+                rate,
+                EchoProfile {
+                    enabled: true,
+                    ..EchoProfile::default()
+                },
+            )
+            .expect("supported media rate");
+            let range = canceller
+                .delay_search_range()
+                .expect("the engine always builds with automatic estimation");
+            assert_eq!(
+                range as u32,
+                rate * AEC_DELAY_SEARCH_MILLIS / 1000,
+                "{rate} Hz must search the default window"
+            );
+        }
+    }
+
+    /// A per-leg override reaches the estimator, and one the rate cannot express is **clamped rather
+    /// than refused**. The clamp is the load-bearing half: rejecting it here would leave the leg with
+    /// no canceller at all, which is worse than a shorter window and is precisely the silent
+    /// do-nothing this whole change exists to remove.
+    #[test]
+    fn a_per_leg_search_window_override_is_applied_and_clamped_never_dropped() {
+        // Widened for a relay path: honoured exactly.
+        let wide = build_echo_canceller(
+            8_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(512),
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
+        assert_eq!(wide.delay_search_range(), Some(4_096));
+
+        // Narrowed for a LAN leg that should not pay for reach it cannot use.
+        let narrow = build_echo_canceller(
+            16_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(64),
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
+        assert_eq!(narrow.delay_search_range(), Some(1_024));
+
+        // 1000 ms is inside the control-plane bounds but past what 16 kHz can express in the
+        // estimator's sample cap. The canceller must still exist, clamped to the reachable window.
+        let clamped = build_echo_canceller(
+            16_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(AEC_DELAY_SEARCH_MILLIS_MAX),
+                ..EchoProfile::default()
+            },
+        )
+        .expect("a request the rate cannot reach must still yield a canceller");
+        assert_eq!(
+            clamped.delay_search_range(),
+            Some(EchoCanceller::MAX_DELAY_SEARCH_SAMPLES),
+            "clamped to the cap, not dropped"
+        );
+        // The same request at 8 kHz needs only 8000 samples, so it is honoured exactly. The
+        // rate-dependent ceiling has not gone away — it cannot, the cap is a sample count — it has
+        // moved out past the whole useful range: at 16 kHz everything up to 512 ms is now reachable,
+        // where before the cap bit at 256 ms, which is inside the range a relayed call needs.
+        let unclamped = build_echo_canceller(
+            8_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(AEC_DELAY_SEARCH_MILLIS_MAX),
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
+        assert_eq!(unclamped.delay_search_range(), Some(8_000));
+        assert_eq!(
+            build_echo_canceller(
+                16_000,
+                EchoProfile {
+                    enabled: true,
+                    delay_search_ms: Some(512),
+                    ..EchoProfile::default()
+                }
+            )
+            .expect("built")
+            .delay_search_range(),
+            Some(8_192),
+            "512 ms at 16 kHz is exactly the cap and must not clamp"
+        );
+    }
+
+    /// The control-plane bounds. Rejected rather than clamped, because a value outside them is a
+    /// controller mistake it can see and fix, and quietly substituting a different window would have
+    /// it configuring one thing and running another.
+    #[test]
+    fn an_out_of_range_search_window_is_refused_at_the_control_plane() {
+        let ok = |value: Option<u32>| {
+            validate_echo_delay_search_ms(&ProfileFlags {
+                echo_delay_search_ms: value,
+                ..ProfileFlags::default()
+            })
+        };
+        assert!(ok(None).is_ok(), "unset keeps the engine default");
+        assert!(ok(Some(AEC_DELAY_SEARCH_MILLIS_MIN)).is_ok());
+        assert!(ok(Some(AEC_DELAY_SEARCH_MILLIS)).is_ok());
+        assert!(ok(Some(AEC_DELAY_SEARCH_MILLIS_MAX)).is_ok());
+
+        for bad in [
+            0,
+            AEC_DELAY_SEARCH_MILLIS_MIN - 1,
+            AEC_DELAY_SEARCH_MILLIS_MAX + 1,
+            60_000,
+        ] {
+            let error = ok(Some(bad)).expect_err("{bad} ms must be refused");
+            assert!(
+                error.contains("echo-delay-search-range"),
+                "the reason must be greppable, got {error}"
+            );
+            assert!(
+                error.contains(&bad.to_string()),
+                "the reason must name the offending value, got {error}"
+            );
+        }
+    }
+
+    /// Long-tail mode builds a different canceller, not a differently-configured one: no estimator at
+    /// all, and a filter sized to span the whole path. The absence of the estimator is the property
+    /// worth pinning — it is what removes the lock-on-noise failure, and it is also why such a leg
+    /// reports no delay lock, which the build line has to say out loud.
+    #[test]
+    fn long_tail_mode_builds_a_canceller_with_no_estimator_and_a_path_length_tail() {
+        let long_tail = |rate: u32, millis: Option<u32>| {
+            build_echo_canceller(
+                rate,
+                EchoProfile {
+                    enabled: true,
+                    delay_search_ms: millis,
+                    long_tail: true,
+                    ..EchoProfile::default()
+                },
+            )
+            .expect("built")
+        };
+
+        // Unset takes the long-tail default, which is a *tail* and not a search window.
+        let default = long_tail(8_000, None);
+        assert!(!default.delay_estimation_enabled());
+        assert_eq!(default.delay_search_range(), None);
+        assert_eq!(
+            default.tail_samples(),
+            (8_000 * AEC_LONG_TAIL_MILLIS / 1000) as usize
+        );
+
+        // Asked for explicitly, at both media rates: the same milliseconds, different taps.
+        assert_eq!(long_tail(8_000, Some(512)).tail_samples(), 4_096);
+        assert_eq!(long_tail(16_000, Some(512)).tail_samples(), 8_192);
+
+        // The estimating build is unchanged and still has its estimator — the two postures are
+        // genuinely different objects, not one with a flag flipped.
+        let estimating = build_echo_canceller(
+            8_000,
+            EchoProfile {
+                enabled: true,
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
+        assert!(estimating.delay_estimation_enabled());
+        assert_eq!(
+            estimating.tail_samples(),
+            (8_000 * AEC_TAIL_MILLIS / 1000) as usize,
+            "the estimating build keeps the short residual tail — the estimator removes the bulk"
+        );
+    }
+
+    /// The post-filter is chained when asked for, and — the part that matters — its absence at an
+    /// unsupported rate costs the *post-filter* and not the canceller. Losing an improvement to echo
+    /// control is a quality regression; losing echo control is the bug this whole path is about.
+    #[test]
+    fn residual_suppression_is_chained_when_asked_and_never_costs_the_canceller() {
+        let with_residual = |rate: u32| {
+            build_echo_canceller(
+                rate,
+                EchoProfile {
+                    enabled: true,
+                    residual_suppression: true,
+                    ..EchoProfile::default()
+                },
+            )
+        };
+
+        for rate in [8_000u32, 16_000] {
+            let canceller = with_residual(rate).expect("built");
+            assert!(
+                canceller.residual_suppression_enabled(),
+                "the post-filter must be chained at {rate} Hz"
+            );
+            assert!(canceller.residual_suppression_latency_samples().is_some());
+        }
+
+        // Not requested ⇒ not chained, so a leg never pays the extra ~32 ms it did not ask for.
+        let plain = build_echo_canceller(
+            8_000,
+            EchoProfile {
+                enabled: true,
+                ..EchoProfile::default()
+            },
+        )
+        .expect("built");
+        assert!(!plain.residual_suppression_enabled());
+
+        // A rate the post-filter does not support (it is 8/16 kHz only) keeps the linear canceller.
+        let unsupported = with_residual(32_000);
+        if let Some(canceller) = unsupported {
+            assert!(
+                !canceller.residual_suppression_enabled(),
+                "an unsupported rate must drop the post-filter, not silently claim it"
+            );
+        }
+
+        // And it composes with long-tail mode, which is the combination a hard relay leg wants.
+        let both = build_echo_canceller(
+            16_000,
+            EchoProfile {
+                enabled: true,
+                delay_search_ms: Some(512),
+                long_tail: true,
+                residual_suppression: true,
+            },
+        )
+        .expect("built");
+        assert!(!both.delay_estimation_enabled());
+        assert!(both.residual_suppression_enabled());
+        assert_eq!(both.tail_samples(), 8_192);
+    }
+
+    /// The posture flags are refused when they would be silently ignored, and the long-tail bound is
+    /// the tail's, not the search window's — the same field means two different things and so carries
+    /// two different ranges.
+    #[test]
+    fn the_echo_posture_is_range_checked_against_the_meaning_the_flags_give_it() {
+        let check = |profile: ProfileFlags| validate_echo_delay_search_ms(&profile);
+
+        // Inert without a canceller: refused rather than accepted and ignored.
+        let error = check(ProfileFlags {
+            echo_long_tail: true,
+            ..ProfileFlags::default()
+        })
+        .expect_err("a posture flag without echo_cancellation must be refused");
+        assert!(error.contains("echo-posture-without-canceller"), "{error}");
+        assert!(check(ProfileFlags {
+            echo_residual_suppression: true,
+            ..ProfileFlags::default()
+        })
+        .is_err());
+
+        // With a canceller, both are fine.
+        assert!(check(ProfileFlags {
+            echo_cancellation: true,
+            echo_long_tail: true,
+            echo_residual_suppression: true,
+            ..ProfileFlags::default()
+        })
+        .is_ok());
+
+        // In long-tail mode the field is a tail, whose ceiling is what the tap cap buys at the
+        // *wideband* rate — so the accepted range is narrower than the search window's, and a value
+        // between the two ceilings is accepted as a window and refused as a tail.
+        let as_tail = |millis: u32| {
+            check(ProfileFlags {
+                echo_cancellation: true,
+                echo_long_tail: true,
+                echo_delay_search_ms: Some(millis),
+                ..ProfileFlags::default()
+            })
+        };
+        assert!(as_tail(AEC_LONG_TAIL_MILLIS_MAX).is_ok());
+        assert!(as_tail(AEC_LONG_TAIL_MILLIS_MAX + 1).is_err());
+        assert!(
+            check(ProfileFlags {
+                echo_cancellation: true,
+                echo_delay_search_ms: Some(AEC_DELAY_SEARCH_MILLIS_MAX),
+                ..ProfileFlags::default()
+            })
+            .is_ok(),
+            "the same value is a valid search window — the flag decides which limit applies"
+        );
+        // The refusal says which reading it applied, or the operator cannot tell why the number they
+        // used yesterday stopped being accepted today.
+        let error = as_tail(AEC_LONG_TAIL_MILLIS_MAX + 1).expect_err("out of range");
+        assert!(error.contains("tail"), "{error}");
     }
 
     #[test]

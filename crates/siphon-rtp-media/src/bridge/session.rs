@@ -1223,9 +1223,20 @@ mod tests {
         }
     }
 
-    /// The pre-refactor takeover-mode output, captured from the build that owned the RTP decode
-    /// inside [`BridgeSession`] itself. See `takeover_path_matches_the_pre_refactor_golden_vector`.
-    const GOLDEN_DIGEST: u64 = 1_009_670_988_991_603_878;
+    /// The takeover-mode output, originally captured from the build that owned the RTP decode inside
+    /// [`BridgeSession`] itself. See `takeover_path_matches_the_pre_refactor_golden_vector`.
+    ///
+    /// **Re-baselined once**, when the turn edge moved to *after* the echo canceller so the
+    /// canceller's verdict on a frame could veto a turn the caller never started (an agent barging in
+    /// on its own returning voice). The digest moved because on a barge-in tick the canceller now
+    /// takes the drained downlink as its reference *before* the flush drops that frame, where it
+    /// previously saw the post-flush comfort frame — so its adaptation differs from the first barge-in
+    /// onward. Nothing else moved, and that was verified rather than assumed: with barge-in disabled
+    /// this fixture digests to `12535120463142120925` on both this build and the one before the
+    /// reorder, i.e. every non-barge-in tick is byte-identical. The uplink, downlink and control
+    /// counts below are unchanged, so the turn signalling itself is untouched on this vector (its
+    /// uplink is independent noise, not an echo, so the veto correctly never fires).
+    const GOLDEN_DIGEST: u64 = 5_785_162_948_345_231_211;
     const GOLDEN_UPLINK_FRAMES: usize = 60;
     /// 57, not 60: three downlink frames were dropped by the local barge-in on a speech edge.
     const GOLDEN_DOWNLINK_FRAMES: usize = 57;

@@ -63,7 +63,7 @@ fn direction(
         telephone_event_out: None,
         recorder: None,
         noise_suppression: false,
-        echo_cancellation: false,
+        echo: siphon_rtp_engine::media_pipeline::EchoProfile::default(),
         beep_detection: false,
         beep_cadence_guard_ms: None,
         produce_echo_reference: false,

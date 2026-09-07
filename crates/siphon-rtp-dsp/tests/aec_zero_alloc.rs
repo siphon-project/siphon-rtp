@@ -220,6 +220,48 @@ fn cancel_mdf_makes_no_heap_allocation() {
     );
 }
 
+/// The long-tail mode at the widest tail the cap allows. Same backend as `with_mdf`, but this is the
+/// configuration with the most partitions in the tree — 32 of them at 16 kHz — so it runs the most
+/// per-block gradient-constraint IFFT/FFT pairs of anything here, and it is the one a relay leg
+/// actually gets. Each constructor carries its own test in this file because a preallocation miss
+/// would be invisible in any of the others.
+#[test]
+fn cancel_mdf_long_tail_makes_no_heap_allocation() {
+    const TAIL: usize = 8_192; // 512 ms @ 16 kHz — 32 partitions of 256
+    const FRAME: usize = 320; // 16 kHz / 20 ms
+
+    let mut canceller = EchoCanceller::with_mdf_long_tail(16_000, TAIL)
+        .expect("build")
+        .with_two_path_dtd();
+    let reference: Vec<i16> = (0..FRAME)
+        .map(|index| ((index as i16).wrapping_mul(211)).wrapping_sub(3_000))
+        .collect();
+    let echo_only: Vec<i16> = reference.iter().map(|&sample| sample / 4).collect();
+    let mut near = echo_only.clone();
+
+    for _ in 0..64 {
+        near.copy_from_slice(&echo_only);
+        canceller.cancel(&mut near, &reference);
+    }
+
+    ARMED.with(|armed| armed.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..2_000 {
+        near.copy_from_slice(&echo_only);
+        canceller.cancel(&mut near, &reference);
+        std::hint::black_box(near[0]);
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    ARMED.with(|armed| armed.set(false));
+
+    assert_eq!(
+        after,
+        before,
+        "long-tail MDF cancel allocated {} times across 2000 frames (must be zero)",
+        after - before
+    );
+}
+
 /// The MDF + GCC-PHAT delay-estimation path is zero per-frame heap too: on top of the MDF state, the
 /// estimation block/spectra/correlation are preallocated in `with_mdf_delay_estimation`, so the frames
 /// on which a GCC block fires (and a committed re-align re-slices the alignment ring) still allocate
