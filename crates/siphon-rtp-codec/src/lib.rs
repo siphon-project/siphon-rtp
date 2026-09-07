@@ -44,8 +44,12 @@ pub mod g711;
 pub mod g722;
 pub mod g726;
 pub mod gsm_fr;
-#[cfg(feature = "amr")]
+#[cfg(any(feature = "amr", feature = "g729"))]
 pub mod itu;
+// G.729 / G.729A (ITU-T G.729) — 8 kbit/s CS-ACELP. Same gating rationale as `amr`: the feature
+// gates TRANSCODING only, and passthrough of G.729 never reaches this crate.
+#[cfg(feature = "g729")]
+pub mod g729;
 pub mod l16;
 pub mod opus;
 

@@ -20,6 +20,9 @@ const REQUIRED_VECTOR_DIRS: &[&str] = &[
     "../../reference/g722/testv",
     "../../reference/g726/testv",
     "../../reference/gsm-fr/testv",
+    // G.729: the ITU-T Release 3 sequences for the base codec. Each is a *.bit bitstream with the
+    // *.pst the reference decoder produced from it, so the decode direction is pinned on its own.
+    "../../reference/g729/testv/base",
     // Opus: the official RFC 6716 `testvectorNN.bit`/`.dec` set, plus the locally generated
     // CELT-only and SILK-only oracle streams (`celt_only/`, `silk_only/`, see CONTRIBUTING.md — they
     // need a local libopus build). `silk_only/` must also carry the `.trace` dumps from the

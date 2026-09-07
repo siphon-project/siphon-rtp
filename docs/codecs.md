@@ -52,7 +52,13 @@ stream the far side cannot decode.
 | AMR-WB | `AMR-WB` (dynamic) | all 9 modes | all 9 modes | 3GPP TS 26.174 vectors, per mode | `amr` |
 | AMR-NB | `AMR` (dynamic) | all 8 modes | all 8 modes | 3GPP TS 26.074 vectors | `amr` |
 | Opus | `opus` (dynamic, `opus/48000/2`) | yes — SILK, CELT and Hybrid, mono and stereo, all bandwidths and frame durations, PLC and in-band FEC | yes — SILK, CELT and Hybrid, mono and stereo, VBR / constrained VBR / CBR, LBRR/FEC and DTX | all 12 official RFC 6716 vectors (mono + stereo), plus exact per-packet `final_range`; the encoder against libopus' own decoder over the full configuration matrix | none (royalty-free) |
+| G.729 / G.729A | `G729` (18) | yes | no | ITU-T G.729 Release 3 sequences, all nine, decode direction byte-exact | `g729` |
 | EVS | | no | no | | absent |
+
+G.729 is **decode-only so far**, so it is not yet wired into the codec factory: a transcoding call
+needs both directions, and half a codec in the factory would look enabled while failing at answer.
+The decoder is complete and conformant; the encoder is the next piece, and the factory entry lands
+with it.
 
 The engine resolves a codec from the `a=rtpmap` encoding name (case-insensitive, RFC
 4566 §6), falling back to the RFC 3551 §6 static payload-type table (`PCMU` 0, `GSM` 3,
