@@ -84,7 +84,7 @@ pub const MAX_FRAME_VALUES: usize = MAX_FRAME_SAMPLES * MAX_CHANNELS;
 /// untouched and drags the ratio down. Deliberately well short of the ERLE the canceller actually
 /// achieves on clean echo (30 dB and up), so that a leg with a poor but working canceller — a
 /// nonlinear handset, a re-encoding mobile leg — still gets a usable verdict.
-const ECHO_VERDICT_REMOVAL_RATIO: f64 = 10.0;
+const ECHO_VERDICT_REMOVAL_RATIO: i64 = 10;
 /// Mean-square (per-sample) energy below which the removal ratio is meaningless — a near-silent
 /// frame divides one small number by another — so the verdict abstains. Roughly −60 dBFS, i.e. an
 /// RMS amplitude of 32 on the i16 scale.
@@ -97,7 +97,7 @@ const ECHO_VERDICT_REMOVAL_RATIO: f64 = 10.0;
 /// noisy removal ratio that can read as *our own audio*, latch the echo run, and veto the **caller's**
 /// turn start. Dividing by the frame length keeps the threshold a fixed amplitude at every rate, the
 /// same way `ws_vad_threshold` is a per-sample mean square so it means one thing at any rate.
-const ECHO_VERDICT_ENERGY_FLOOR: f64 = 32.0 * 32.0;
+const ECHO_VERDICT_ENERGY_FLOOR: i64 = 32 * 32;
 
 /// Sum of squares of `frame`, or `None` when the frame's **mean** square sits below
 /// [`ECHO_VERDICT_ENERGY_FLOOR`] and the echo verdict must therefore abstain.
@@ -107,15 +107,25 @@ const ECHO_VERDICT_ENERGY_FLOOR: f64 = 32.0 * 32.0;
 /// *threshold* has to be rate-independent, and that is what dividing by the length buys — the floor
 /// is one amplitude whether the wire rate makes a 20 ms frame 160 samples or 320. An empty frame is
 /// below any floor, so it yields `None` instead of dividing by zero.
-fn verdict_frame_energy(frame: &[i16]) -> Option<f64> {
+/// Integer throughout: an i16 frame's sum of squares is exact in `i64` (the longest frame this path
+/// accepts tops out around 6.2e12, eleven orders inside the range), and the comparisons are a
+/// multiply rather than a division, so the floor test needs no float at all. This runs twice per
+/// tick on a leg that cancels, which is enough for the conversions to show up.
+fn verdict_frame_energy(frame: &[i16]) -> Option<i64> {
     if frame.is_empty() {
         return None;
     }
-    let energy: f64 = frame
+    let energy = frame_energy(frame);
+    // `energy / len > FLOOR` without the division.
+    (energy > ECHO_VERDICT_ENERGY_FLOOR * frame.len() as i64).then_some(energy)
+}
+
+/// Sum of squares of an i16 frame, exact in `i64`.
+fn frame_energy(frame: &[i16]) -> i64 {
+    frame
         .iter()
-        .map(|&sample| f64::from(sample) * f64::from(sample))
-        .sum();
-    (energy / frame.len() as f64 > ECHO_VERDICT_ENERGY_FLOOR).then_some(energy)
+        .map(|&sample| i64::from(sample) * i64::from(sample))
+        .sum()
 }
 
 /// One ptime of mono samples at `format`'s wire rate — the downlink quantum the core drains per tick
@@ -608,12 +618,15 @@ impl BridgeCore {
                 //    correlation cannot.
                 //
                 // Both are positive evidence and both fail open: no cancellation, no verdict.
-                let survived_energy: f64 = pcm
-                    .iter()
-                    .map(|&sample| f64::from(sample) * f64::from(sample))
-                    .sum();
+                //
+                // The surviving energy is only summed for a frame loud enough to judge — below the
+                // floor the verdict abstains whatever the ratio would have been, so computing it
+                // there is a second pass over the frame whose result is discarded.
                 if let Some(arrived_energy) = arrived_energy {
+                    let survived_energy = frame_energy(pcm);
                     // Both sides are sums over the same frame, so the ratio needs no normalising.
+                    // `survived · 10` cannot overflow: the sum is bounded by 6.2e12 for the longest
+                    // frame this path accepts, and ten times that is still far inside `i64`.
                     let mostly_removed =
                         survived_energy * ECHO_VERDICT_REMOVAL_RATIO <= arrived_energy;
                     // `Some(true)` — ours; `Some(false)` — something the canceller could not predict
@@ -963,9 +976,10 @@ mod tests {
     fn the_verdict_energy_is_the_unnormalised_sum() {
         let frame = vec![100i16; 160];
         let energy = verdict_frame_energy(&frame).expect("above the floor");
-        assert!(
-            (energy - 160.0 * 100.0 * 100.0).abs() < 1.0,
-            "expected the sum of squares, got {energy}"
+        assert_eq!(
+            energy,
+            160 * 100 * 100,
+            "expected the exact sum of squares, got {energy}"
         );
     }
 
