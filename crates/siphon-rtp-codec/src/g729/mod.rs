@@ -23,4 +23,5 @@ pub mod filter;
 pub mod lpcfunc;
 pub mod lspdec;
 pub mod overflow;
+pub mod postproc;
 pub mod tables;
