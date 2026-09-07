@@ -18,6 +18,7 @@
 pub mod bitstream;
 pub mod dspfunc;
 pub mod filter;
+pub mod lpcfunc;
 pub mod lspdec;
 pub mod overflow;
 pub mod tables;
