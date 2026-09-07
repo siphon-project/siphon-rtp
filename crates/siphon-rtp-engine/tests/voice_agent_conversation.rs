@@ -95,7 +95,8 @@ async fn agent_server(script: Agent) -> (String, flume::Receiver<Vec<u8>>) {
                 // The first text frame is `start`, announcing the stream and the negotiated wire
                 // format. Everything after it that matters here is binary uplink audio.
                 Message::Text(text) => {
-                    let _ = ControlMessage::from_json(&text).expect("agent parses control envelope");
+                    let _ =
+                        ControlMessage::from_json(&text).expect("agent parses control envelope");
                 }
                 Message::Binary(pcm) => {
                     if uplink_tx.send(pcm.to_vec()).is_err() {
@@ -233,7 +234,9 @@ fn parse_egress(packet: &[u8]) -> Egress {
     // Decode with the engine's own µ-law decoder rather than a second implementation of it.
     let mut pcm = vec![0i16; SAMPLES_PER_FRAME.max(payload.len())];
     let mut decoder = G711::ulaw();
-    let decoded = decoder.decode(payload, &mut pcm).expect("decode µ-law egress");
+    let decoded = decoder
+        .decode(payload, &mut pcm)
+        .expect("decode µ-law egress");
     let level = if decoded == 0 {
         0
     } else {
@@ -558,7 +561,11 @@ async fn a_scripted_turn_completes_and_reports_its_media_path_latency() {
         (0..8).collect::<Vec<_>>(),
         "the caller hears the agent's eight frames, in order"
     );
-    assert_eq!(engine.session_count(), 1, "the call survives its first turn");
+    assert_eq!(
+        engine.session_count(),
+        1,
+        "the call survives its first turn"
+    );
 
     // Reported, not asserted: the media path's own contribution to a turn, which is the term a
     // deployment can actually influence (the rest is vendor latency in the agent).
