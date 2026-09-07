@@ -337,6 +337,14 @@ impl Metrics {
             "counter",
             delay_estimation.never_locked_total,
         );
+        metric(
+            &mut output,
+            "siphon_rtp_aec_delay_rewidens_total",
+            "Narrowed delay scans that widened back to the full search range because the echo left \
+             the re-lock margin — a path that genuinely moved, or a margin too tight for it.",
+            "counter",
+            delay_estimation.rewidens_total,
+        );
         output
     }
 }
@@ -647,9 +655,10 @@ mod tests {
         assert!(body.contains("# TYPE siphon_rtp_aec_delay_locks_total counter\n"));
         assert!(body.contains("# TYPE siphon_rtp_aec_delay_weak_locks_total counter\n"));
         assert!(body.contains("# TYPE siphon_rtp_aec_delay_never_locked_total counter\n"));
-        // Every series carries a HELP + TYPE line (23 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 23);
-        assert_eq!(body.matches("# TYPE ").count(), 23);
+        assert!(body.contains("# TYPE siphon_rtp_aec_delay_rewidens_total counter\n"));
+        // Every series carries a HELP + TYPE line (24 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 24);
+        assert_eq!(body.matches("# TYPE ").count(), 24);
     }
 
     #[test]
@@ -671,8 +680,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (22 vs 23).
-        assert_eq!(body.matches("# TYPE ").count(), 22);
+        // One fewer series than the CPU-present case (23 vs 24).
+        assert_eq!(body.matches("# TYPE ").count(), 23);
     }
 
     #[test]

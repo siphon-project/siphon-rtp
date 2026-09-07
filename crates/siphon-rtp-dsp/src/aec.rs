@@ -172,6 +172,28 @@ const REALIGN_TOLERANCE_SAMPLES: usize = 8;
 /// A genuinely different peak must persist for this many consecutive decision blocks before the
 /// alignment is moved — the hangover that stops a transient from thrashing the ring/weights.
 const REALIGN_HANGOVER_BLOCKS: usize = 5;
+/// Once a delay is located confidently, the peak search narrows to `committed ± search_range/this`,
+/// so lags the echo demonstrably does not occupy stop competing for the pick.
+///
+/// A **fraction of the search range** rather than a sample count, deliberately. The estimator works
+/// purely in samples and is never told the sample rate, so any fixed sample margin would be two
+/// different durations at 8 and 16 kHz — the trap that produced the defect this whole path exists to
+/// fix. A fraction is rate-free, and it scales the right way besides: a leg configured with a wide
+/// window is one whose path length is uncertain, and it earns a proportionally wider re-lock margin,
+/// while a LAN leg on a narrow window gets a tight one. At the 256 ms default this is 32 ms at
+/// either rate.
+const RELOCK_MARGIN_DIVISOR: usize = 8;
+/// Floor for the narrowed margin, so a very short search range cannot collapse the scan onto a band
+/// narrower than the ±1-sample jitter [`REALIGN_TOLERANCE_SAMPLES`] already absorbs.
+const RELOCK_MARGIN_FLOOR_SAMPLES: usize = REALIGN_TOLERANCE_SAMPLES * 2;
+/// Consecutive usable blocks whose narrowed peak fails [`WEAK_DELAY_LOCK_CONFIDENCE`] before the
+/// scan widens back to the full range.
+///
+/// Longer than [`REALIGN_HANGOVER_BLOCKS`] on purpose: a path that moved *within* the margin should
+/// be followed by the ordinary re-align, and only a path that left the margin entirely — a re-INVITE
+/// onto a different carrier route — should cost a widen. Without this the narrowing would be a trap:
+/// once locked, the estimator could never again see a delay outside its own margin.
+const RELOCK_WIDEN_BLOCKS: usize = 6;
 /// Mean per-sample far-end block energy (normalized) below which a block carries no usable echo, so
 /// it is skipped for estimation (a silent far-end produces only a noise correlation).
 const DELAY_FAR_ENERGY_FLOOR: f32 = 1.0e-6;
@@ -198,6 +220,9 @@ static DELAY_LOCKS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WEAK_DELAY_LOCKS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Process-wide count of estimators that ran [`UNLOCKED_REPORT_FRAMES`] frames without committing.
 static UNLOCKED_ESTIMATORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Process-wide count of narrowed scans that widened back to the full search range because the echo
+/// left the re-lock margin — see [`RELOCK_WIDEN_BLOCKS`].
+static DELAY_REWIDENS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// A snapshot of the process-wide GCC-PHAT delay-estimation counters, for `/metrics`.
 ///
@@ -218,6 +243,11 @@ pub struct DelayEstimationCounters {
     /// Estimators that consumed 500 frames (~10 s at the 20 ms media tick) without committing
     /// anything. A different failure from a weak lock: nothing was decided at all.
     pub never_locked_total: u64,
+    /// Narrowed peak scans that widened back to the full search range because the echo left the
+    /// re-lock margin. A handful over a call's life is a path that genuinely moved (a re-INVITE onto
+    /// another route); a rate that climbs with call volume says the paths this node carries are
+    /// unstable, or that the margin is too tight for them.
+    pub rewidens_total: u64,
 }
 
 /// Read the process-wide GCC-PHAT delay-estimation counters.
@@ -227,6 +257,7 @@ pub fn delay_estimation_counters() -> DelayEstimationCounters {
         locks_total: DELAY_LOCKS_TOTAL.load(Ordering::Relaxed),
         weak_locks_total: WEAK_DELAY_LOCKS_TOTAL.load(Ordering::Relaxed),
         never_locked_total: UNLOCKED_ESTIMATORS_TOTAL.load(Ordering::Relaxed),
+        rewidens_total: DELAY_REWIDENS_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -572,6 +603,15 @@ struct DelayEstimator {
     /// Whether the one-shot never-locked report has already been raised, so a leg that genuinely has
     /// no far-end audio reports once rather than every frame for the life of the call.
     unlocked_reported: bool,
+    /// Whether the peak search is currently restricted to the re-lock margin around
+    /// [`Self::committed_delay`] — set only by a lock that cleared [`WEAK_DELAY_LOCK_CONFIDENCE`],
+    /// never by a weak one (narrowing onto a lag picked out of noise would make the mistake
+    /// permanent).
+    narrowed: bool,
+    /// Consecutive usable blocks whose narrowed peak failed [`WEAK_DELAY_LOCK_CONFIDENCE`]. At
+    /// [`RELOCK_WIDEN_BLOCKS`] the scan widens back — the escape hatch that keeps the narrowing from
+    /// blinding the estimator to a path that genuinely moved.
+    low_confidence_blocks: usize,
 }
 
 /// A commit latched by [`DelayEstimator::decide`] for the canceller to hand out. Rate-free — the
@@ -622,6 +662,8 @@ impl DelayEstimator {
             frames_unlocked: 0,
             blocks_dropped: 0,
             unlocked_reported: false,
+            narrowed: false,
+            low_confidence_blocks: 0,
         })
     }
 
@@ -712,6 +754,30 @@ impl DelayEstimator {
         self.decide(peak, confidence)
     }
 
+    /// Half-width of the narrowed peak scan, in samples — see [`RELOCK_MARGIN_DIVISOR`].
+    fn relock_margin(&self) -> usize {
+        (self.search_range / RELOCK_MARGIN_DIVISOR).max(RELOCK_MARGIN_FLOOR_SAMPLES)
+    }
+
+    /// Inclusive lag bounds the peak pick may choose from: the whole range while unlocked or widened,
+    /// and `committed ± relock_margin` (clamped) once a confident lock has narrowed it.
+    ///
+    /// Only the *scan* narrows. The accumulator keeps its full `search_range + 1` length and every
+    /// lag keeps being integrated, so widening back costs nothing and needs no reallocation — which
+    /// is what keeps this inside the zero-per-frame-allocation gate.
+    fn scan_bounds(&self) -> (usize, usize) {
+        if !self.narrowed {
+            return (0, self.search_range);
+        }
+        let margin = self.relock_margin();
+        (
+            self.committed_delay.saturating_sub(margin),
+            self.committed_delay
+                .saturating_add(margin)
+                .min(self.search_range),
+        )
+    }
+
     /// Index of the largest accumulated correlation over `0 ..= search_range`, together with that
     /// peak's **prominence** over the rest of the surface: `peak / mean|surface|`.
     ///
@@ -728,14 +794,24 @@ impl DelayEstimator {
     /// One pass, folded into the peak scan that already runs each block, so it costs an `abs` and an
     /// add per lag and never touches the per-frame path.
     fn peak_lag(&self) -> (usize, f32) {
-        let mut best_lag = 0;
-        let mut best_value = self.accumulator[0];
+        // The prominence denominator stays the **whole** surface even when the pick is narrowed.
+        // Confidence means "how far this peak stands above the correlation floor", and the floor is a
+        // property of the surface, not of the slice being searched. Narrowing the denominator too
+        // would shrink it (a band around a real peak is mostly peak), deflating confidence on exactly
+        // the good locks and pushing them under `WEAK_DELAY_LOCK_CONFIDENCE` — the calibration in
+        // that constant is against a full-surface mean and has to stay comparable across a narrow and
+        // a wide scan, or a narrowed leg would start reporting itself broken.
         let mut absolute_total = 0.0f64;
-        for (lag, &value) in self.accumulator.iter().enumerate() {
+        for &value in &self.accumulator {
             absolute_total += f64::from(value.abs());
+        }
+        let (low, high) = self.scan_bounds();
+        let mut best_lag = low;
+        let mut best_value = self.accumulator[low];
+        for (offset, &value) in self.accumulator[low..=high].iter().enumerate() {
             if value > best_value {
                 best_value = value;
-                best_lag = lag;
+                best_lag = low + offset;
             }
         }
         let mean_absolute = absolute_total / self.accumulator.len() as f64;
@@ -754,11 +830,29 @@ impl DelayEstimator {
     /// [`DelayEstimator::peak_lag`], latched with the commit so a consumer can tell a located echo
     /// from a picked one.
     fn decide(&mut self, peak: usize, confidence: f32) -> Option<usize> {
+        // Scan-width bookkeeping first, so the widen decision is made on this block's evidence rather
+        // than a block late. While narrowed, a run of blocks whose best in-margin lag is
+        // indistinguishable from noise means the echo is no longer in the margin — the path moved —
+        // and the only way to find it again is to look everywhere. A confident block resets the run,
+        // so ordinary double-talk or a quiet stretch never widens anything.
+        if self.narrowed {
+            if confidence >= WEAK_DELAY_LOCK_CONFIDENCE {
+                self.low_confidence_blocks = 0;
+            } else {
+                self.low_confidence_blocks += 1;
+                if self.low_confidence_blocks >= RELOCK_WIDEN_BLOCKS {
+                    self.narrowed = false;
+                    self.low_confidence_blocks = 0;
+                    DELAY_REWIDENS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         if !self.locked {
             self.locked = true;
             self.committed_delay = peak;
             self.candidate_delay = peak;
             self.candidate_count = 0;
+            self.narrow_if_confident(confidence);
             self.commit_report(peak, confidence, true);
             return Some(peak);
         }
@@ -773,6 +867,10 @@ impl DelayEstimator {
             if self.candidate_count >= REALIGN_HANGOVER_BLOCKS {
                 self.committed_delay = self.candidate_delay;
                 self.candidate_count = 0;
+                // A confirmed re-align re-centres the margin on the new delay, and re-narrows if the
+                // new peak is itself trustworthy — a path that moved and was found confidently is
+                // just as worth protecting from noise as the first lock was.
+                self.narrow_if_confident(confidence);
                 self.commit_report(self.committed_delay, confidence, false);
                 return Some(self.committed_delay);
             }
@@ -782,6 +880,19 @@ impl DelayEstimator {
             self.candidate_count = 1;
             None
         }
+    }
+
+    /// Narrow the peak scan around the freshly committed delay, but **only** on a lock that cleared
+    /// [`WEAK_DELAY_LOCK_CONFIDENCE`].
+    ///
+    /// Narrowing onto a weak lock would be the worst possible move: a weak lock is the signature of
+    /// an echo *outside* the search window, so restricting the scan around it would fence the
+    /// estimator into the noise it just mistook for an echo and remove the one chance it had of
+    /// picking up the real peak later. A weak lock therefore keeps looking everywhere, which is also
+    /// what the operator-facing warning tells them is happening.
+    fn narrow_if_confident(&mut self, confidence: f32) {
+        self.low_confidence_blocks = 0;
+        self.narrowed = confidence >= WEAK_DELAY_LOCK_CONFIDENCE;
     }
 
     /// Latch a commit for collection and record it in the process-wide counters. Called only from
@@ -839,6 +950,11 @@ impl DelayEstimator {
         // Deliberately re-armed: a reset re-runs the whole estimation from an unaligned ring, so if
         // *that* run never locks either it is a fresh fact about the leg and worth a fresh report.
         self.unlocked_reported = false;
+        // Back to searching everywhere. A margin is only ever justified by a lock, and this reset has
+        // just discarded the lock that justified it — keeping it would search a band around a delay
+        // the estimator no longer claims.
+        self.narrowed = false;
+        self.low_confidence_blocks = 0;
     }
 }
 
@@ -3060,6 +3176,134 @@ mod tests {
         assert_eq!(located.search_range_millis(), 512);
         assert_eq!(located.delay_millis(), 300);
         assert!(located.first_lock);
+    }
+
+    /// Once the echo is located, the peak pick narrows to a margin around it, so lags the echo
+    /// demonstrably does not occupy stop competing for the pick.
+    #[test]
+    fn a_confident_lock_narrows_the_peak_scan_around_the_located_delay() {
+        let (canceller, _, reports) = run_delay_estimation_reporting(1_024, 192, 300, 400, 0x5CA1_0001);
+        let lock = first_lock(&reports);
+        assert!(!lock.is_weak(), "fixture must produce a confident lock");
+
+        let estimator = canceller
+            .delay_estimator
+            .as_ref()
+            .expect("delay estimation is enabled");
+        assert!(
+            estimator.narrowed,
+            "a confident lock must narrow the scan; it stayed wide"
+        );
+        let (low, high) = estimator.scan_bounds();
+        let margin = estimator.relock_margin();
+        assert_eq!(margin, 1_024 / RELOCK_MARGIN_DIVISOR);
+        assert!(
+            low <= lock.delay_samples && lock.delay_samples <= high,
+            "the narrowed window {low}..={high} must contain the delay it was centred on \
+             ({})",
+            lock.delay_samples
+        );
+        assert!(
+            high - low < 1_024,
+            "the scan must actually be narrower than the full range, got {low}..={high}"
+        );
+    }
+
+    /// The inverse, and the one that would be a trap if it were wrong: a **weak** lock must not
+    /// narrow. A weak lock is the signature of an echo outside the search window, so fencing the scan
+    /// around it would lock the estimator inside the noise it just mistook for an echo and destroy
+    /// the only chance it had of picking up the real peak later.
+    #[test]
+    fn a_weak_lock_does_not_narrow_the_peak_scan() {
+        // 1024-sample window against a 2400-sample echo: the echo is outside, so the estimator picks
+        // the tallest noise lag it can see — exactly the case the reporting calls weak.
+        let (canceller, _, reports) =
+            run_delay_estimation_reporting(1_024, 192, 2_400, 500, 0x5CA1_0002);
+        let lock = first_lock(&reports);
+        assert!(lock.is_weak(), "fixture must produce a weak lock");
+
+        let estimator = canceller
+            .delay_estimator
+            .as_ref()
+            .expect("delay estimation is enabled");
+        assert!(
+            !estimator.narrowed,
+            "a weak lock must keep searching the whole window — narrowing onto a lag picked out of \
+             noise would make the mistake permanent"
+        );
+        assert_eq!(estimator.scan_bounds(), (0, 1_024));
+    }
+
+    /// The escape hatch. Narrowing is only safe if a path that genuinely moves is still found, so
+    /// this moves the echo clean outside the re-lock margin mid-run and requires the estimator to
+    /// widen back and re-lock onto the new delay. Without the widen it would be blind to it forever —
+    /// which would be a worse bug than the one narrowing fixes.
+    #[test]
+    fn a_path_that_moves_outside_the_margin_is_found_again() {
+        let frame = 160;
+        let search_range = 1_024;
+        let first_delay = 200;
+        // Far outside `first_delay ± search_range/RELOCK_MARGIN_DIVISOR` (±128).
+        let second_delay = 800;
+        let settle_frames = 200;
+        let moved_frames = 700;
+        let total = settle_frames + moved_frames;
+
+        let mut prng = SplitMix64::new(0x5CA1_0003);
+        let rir = build_rir(128);
+        let mut canceller =
+            EchoCanceller::with_delay_estimation(8_000, 192, search_range).expect("build");
+        let far = far_stream(&mut prng, 0.6, total * frame);
+        let normalized = normalize(&far);
+        // Both echo paths over the same far-end audio; the leg switches from one to the other, the
+        // way a re-INVITE onto a different carrier route would.
+        let echo_before = synthesize_echo(&normalized, &rir, first_delay);
+        let echo_after = synthesize_echo(&normalized, &rir, second_delay);
+
+        let mut locks = Vec::new();
+        let mut narrowed_after_settling = false;
+        for index in 0..total {
+            let range = index * frame..(index + 1) * frame;
+            let source = if index < settle_frames {
+                &echo_before
+            } else {
+                &echo_after
+            };
+            let mut mic = source[range.clone()].to_vec();
+            canceller.cancel(&mut mic, &far[range]);
+            if index == settle_frames - 1 {
+                narrowed_after_settling = canceller
+                    .delay_estimator
+                    .as_ref()
+                    .expect("delay estimation is enabled")
+                    .narrowed;
+            }
+            if let Some(DelayReport::Locked(lock)) = canceller.take_delay_report() {
+                locks.push(lock);
+            }
+        }
+
+        assert!(
+            narrowed_after_settling,
+            "the first, confident lock should have narrowed the scan — this test proves nothing \
+             about widening if it never narrowed"
+        );
+        let first = locks.first().expect("the estimator must lock at least once");
+        assert!(
+            first.delay_samples.abs_diff(first_delay) <= REALIGN_TOLERANCE_SAMPLES,
+            "expected the first lock near {first_delay}, got {}",
+            first.delay_samples
+        );
+        let final_delay = locks
+            .last()
+            .expect("the estimator must lock at least once")
+            .delay_samples;
+        assert!(
+            final_delay.abs_diff(second_delay) <= REALIGN_TOLERANCE_SAMPLES,
+            "the estimator must widen back and re-lock onto the moved path: expected \
+             ~{second_delay}, still at {final_delay} after {moved_frames} frames — the narrowed \
+             scan has blinded it to a real echo"
+        );
     }
 
     /// P2's ceiling: a 16 kHz canceller must reach the same *duration* an 8 kHz one does. The cap is

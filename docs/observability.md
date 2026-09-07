@@ -34,6 +34,7 @@ per connection, never blocking the engine. Routes: `GET /metrics`, `GET /healthz
 | `siphon_rtp_aec_delay_locks_total` | counter | echo-canceller bulk delays committed by GCC-PHAT (first locks and re-aligns) |
 | `siphon_rtp_aec_delay_weak_locks_total` | counter | of those, the ones whose correlation peak was too flat to be an echo |
 | `siphon_rtp_aec_delay_never_locked_total` | counter | echo cancellers that consumed ~10 s of audio without committing any delay |
+| `siphon_rtp_aec_delay_rewidens_total` | counter | narrowed delay scans that widened back because the echo left the re-lock margin |
 | `siphon_rtp_jemalloc_allocated_bytes` | gauge | live heap (jemalloc `stats.allocated`) |
 
 Gauges are read on demand at scrape time from the live registries (`Metrics::render` takes a
@@ -64,6 +65,19 @@ almost always means the echo path is longer than the configured search window �
 [voice-AI cookbook](cookbook/voice-ai.md)). `siphon_rtp_aec_delay_never_locked_total` is the
 different failure where nothing was committed at all: a far end that never played enough audio to
 correlate against, or a leg whose every block was unusable.
+
+Once a leg's echo is located confidently the estimator narrows its peak search to a margin around
+that delay, so lags the echo demonstrably does not occupy stop competing for the pick. It widens back
+by itself when the echo leaves the margin, and `siphon_rtp_aec_delay_rewidens_total` counts that:
+
+```promql
+rate(siphon_rtp_aec_delay_rewidens_total[15m]) / rate(siphon_rtp_aec_delay_locks_total[15m])
+```
+
+A trickle is normal — a re-INVITE onto a different carrier route moves the path, and the estimator
+follows it. A ratio that climbs says the routes this node carries are unstable, or that the margin
+(a fixed fraction of `echo_delay_search_ms`) is too tight for them, in which case a wider window
+widens the margin with it.
 
 Per-leg detail is on the `siphon_rtp::media` tracing target rather than in a metric label — a
 canceller is owned by a single per-call actor and is not reachable from a scrape. At `debug` each
