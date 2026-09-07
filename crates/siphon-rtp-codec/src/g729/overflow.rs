@@ -103,6 +103,30 @@ pub fn l_shl(flag: &mut Overflow, l_var1: i32, var2: i16) -> i32 {
     flag.observe(exact, saturated)
 }
 
+/// `add` (G.191), raising `flag` when the 16-bit sum saturates.
+///
+/// The reference reaches this through `sature`, which is one of the six sites that set `Overflow`.
+/// It matters in `Az_lsp`, where the two symmetric polynomials are accumulated with `add`/`sub` and
+/// a saturation there is what selects the lower-precision Chebyshev evaluation.
+pub fn add(flag: &mut Overflow, var1: i16, var2: i16) -> i16 {
+    let exact = i32::from(var1) + i32::from(var2);
+    let saturated = basic_ops::add(var1, var2);
+    if exact != i32::from(saturated) {
+        flag.0 = true;
+    }
+    saturated
+}
+
+/// `sub` (G.191), raising `flag` when the 16-bit difference saturates.
+pub fn sub(flag: &mut Overflow, var1: i16, var2: i16) -> i16 {
+    let exact = i32::from(var1) - i32::from(var2);
+    let saturated = basic_ops::sub(var1, var2);
+    if exact != i32::from(saturated) {
+        flag.0 = true;
+    }
+    saturated
+}
+
 /// `round` (G.191) = `extract_h(L_add(l_var1, 0x8000))`, raising `flag` from the rounding addition.
 pub fn round_word(flag: &mut Overflow, l_var1: i32) -> i16 {
     let rounded = l_add(flag, l_var1, 0x0000_8000);
@@ -148,6 +172,35 @@ mod tests {
         let mut flag = Overflow::clear();
         assert_eq!(round_word(&mut flag, i32::MAX), 0x7fff);
         assert!(flag.raised(), "round's L_add(0x8000) saturating");
+    }
+
+    #[test]
+    fn the_sixteen_bit_operators_raise_the_flag_where_sature_does() {
+        // These reach Overflow through `sature` in the reference. Az_lsp depends on them: a
+        // saturation while accumulating its symmetric polynomials is what switches the Chebyshev
+        // evaluation to lower precision, and missing it puts the root search on the wrong scale.
+        let mut flag = Overflow::clear();
+        assert_eq!(add(&mut flag, i16::MAX, 1), i16::MAX);
+        assert!(flag.raised(), "add saturating high");
+
+        let mut flag = Overflow::clear();
+        assert_eq!(sub(&mut flag, i16::MIN, 1), i16::MIN);
+        assert!(flag.raised(), "sub saturating low");
+
+        let mut flag = Overflow::clear();
+        assert_eq!(add(&mut flag, 100, 200), 300);
+        assert_eq!(sub(&mut flag, 200, 100), 100);
+        assert!(!flag.raised(), "ordinary arithmetic does not raise it");
+
+        // And they agree with the shared operators everywhere.
+        for a in [i16::MIN, -1, 0, 1, 12_345, i16::MAX] {
+            for b in [i16::MIN, -1, 0, 1, -9_876, i16::MAX] {
+                let mut flag = Overflow::clear();
+                assert_eq!(add(&mut flag, a, b), basic_ops::add(a, b), "add {a} {b}");
+                let mut flag = Overflow::clear();
+                assert_eq!(sub(&mut flag, a, b), basic_ops::sub(a, b), "sub {a} {b}");
+            }
+        }
     }
 
     #[test]
