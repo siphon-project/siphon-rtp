@@ -16,4 +16,6 @@
 //! `docs/codec-licensing.md`.
 
 pub mod bitstream;
+pub mod dspfunc;
 pub mod overflow;
+pub mod tables;
