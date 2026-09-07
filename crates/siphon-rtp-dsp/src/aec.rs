@@ -1730,7 +1730,7 @@ impl EchoCanceller {
     /// alignment decision at all, so there is nothing to get wrong. Its cost is honest and gradual
     /// instead — more taps to converge, and more work per block.
     ///
-    /// **That cost is not small.** [`MdfFilter::process_block`] runs the gradient constraint's
+    /// **That cost is not small.** The MDF runs the gradient constraint's
     /// IFFT/FFT pair *inside* the per-partition loop, so an adapting block costs `2K + 3` transforms
     /// for `K = ceil(tail / block_size)` partitions, not one transform plus `O(K)` multiply-
     /// accumulates. Going from a 64 ms tail (`K = 4`) to a 512 ms one (`K = 32`) is therefore roughly
@@ -1747,7 +1747,8 @@ impl EchoCanceller {
     ///
     /// # Errors
     /// As [`EchoCanceller::new`] for the sample rate, and [`AecError::InvalidTail`] if `tail_samples`
-    /// exceeds [`MAX_TAIL_SAMPLES`] or needs more than `MDF_MAX_PARTITIONS` partitions at this rate.
+    /// exceeds [`EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED`] or needs more partitions than the MDF
+    /// preallocates for at this rate.
     pub fn with_mdf_long_tail(sample_rate_hz: u32, tail_samples: usize) -> Result<Self, AecError> {
         Self::build_mdf(sample_rate_hz, tail_samples, 0, None)
     }
