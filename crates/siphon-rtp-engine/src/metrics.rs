@@ -304,6 +304,39 @@ impl Metrics {
             "gauge",
             u64::from(live.draining),
         );
+        // Echo-canceller bulk-delay estimation. Read straight from `siphon-rtp-dsp`'s process-wide
+        // counters rather than travelling through `LiveGauges`, because a canceller is owned by a
+        // single per-call actor and is not reachable from a scrape — the per-leg numbers go out on
+        // the `siphon_rtp::media` log target instead, where the call identity is in scope.
+        //
+        // The pair that matters is `weak_locks_total` against `locks_total`. A ratio near zero is a
+        // healthy fleet; a ratio near one says the estimator is committing lags it found in noise,
+        // which is what "the echo path is longer than the configured search window" looks like from
+        // a dashboard — and it is otherwise indistinguishable from having no echo to cancel, on a
+        // canceller that reports no error and shows healthy counters everywhere else.
+        let delay_estimation = siphon_rtp_dsp::delay_estimation_counters();
+        metric(
+            &mut output,
+            "siphon_rtp_aec_delay_locks_total",
+            "Echo-canceller bulk delays committed by GCC-PHAT (first locks and re-aligns).",
+            "counter",
+            delay_estimation.locks_total,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_aec_delay_weak_locks_total",
+            "Committed bulk delays whose correlation peak was too flat to be an echo — the search \
+             window is probably shorter than the echo path, and those legs are uncancelled.",
+            "counter",
+            delay_estimation.weak_locks_total,
+        );
+        metric(
+            &mut output,
+            "siphon_rtp_aec_delay_never_locked_total",
+            "Echo cancellers that consumed ~10 s of audio without committing any bulk delay.",
+            "counter",
+            delay_estimation.never_locked_total,
+        );
         output
     }
 }
@@ -606,9 +639,17 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_cpu_permille 247\n"));
         assert!(body.contains("# TYPE siphon_rtp_draining gauge\nsiphon_rtp_draining 1\n"));
-        // Every series carries a HELP + TYPE line (20 with the CPU sample present).
-        assert_eq!(body.matches("# HELP ").count(), 20);
-        assert_eq!(body.matches("# TYPE ").count(), 20);
+        // The echo-canceller delay-estimation counters are process-wide (they live in
+        // `siphon-rtp-dsp`, not in `Metrics`), so the *values* belong to whatever else the test
+        // binary has cancelled and cannot be asserted here — only that the series are exported and
+        // typed. `..._weak_locks_total` against `..._locks_total` is the ratio an operator alerts
+        // on, so both have to be present for either to mean anything.
+        assert!(body.contains("# TYPE siphon_rtp_aec_delay_locks_total counter\n"));
+        assert!(body.contains("# TYPE siphon_rtp_aec_delay_weak_locks_total counter\n"));
+        assert!(body.contains("# TYPE siphon_rtp_aec_delay_never_locked_total counter\n"));
+        // Every series carries a HELP + TYPE line (23 with the CPU sample present).
+        assert_eq!(body.matches("# HELP ").count(), 23);
+        assert_eq!(body.matches("# TYPE ").count(), 23);
     }
 
     #[test]
@@ -630,8 +671,8 @@ mod tests {
         );
         assert!(body.contains("siphon_rtp_load_permille 500\n"));
         assert!(body.contains("siphon_rtp_draining 0\n"));
-        // One fewer series than the CPU-present case (19 vs 20).
-        assert_eq!(body.matches("# TYPE ").count(), 19);
+        // One fewer series than the CPU-present case (22 vs 23).
+        assert_eq!(body.matches("# TYPE ").count(), 22);
     }
 
     #[test]

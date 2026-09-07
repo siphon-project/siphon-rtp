@@ -64,6 +64,7 @@ fn direction(
         recorder: None,
         noise_suppression: false,
         echo_cancellation: false,
+        echo_delay_search_ms: None,
         beep_detection: false,
         beep_cadence_guard_ms: None,
         produce_echo_reference: false,

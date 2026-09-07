@@ -431,8 +431,9 @@ fn parse_profile(request: &Value) -> ProfileFlags {
         // never requests it.
         noise_suppression: false,
         // Echo cancellation is likewise a native siphon-rtp (JSON control) extension; the NG/bencode
-        // front-end never sets it.
+        // front-end never sets it, so its search-window override never applies either.
         echo_cancellation: false,
+        echo_delay_search_ms: None,
         // Record-tone ("voicemail beep") detection is a native siphon-rtp (JSON control) extension —
         // rtpengine's NG dictionary has no equivalent directive, so it is never armed from here.
         beep_detection: false,

@@ -31,12 +31,49 @@ per connection, never blocking the engine. Routes: `GET /metrics`, `GET /healthz
 | `siphon_rtp_ws_tee_frames_sent_total` | counter | audio frames handed to a tee transport |
 | `siphon_rtp_ws_tee_frames_dropped_total` | counter | tee frames dropped because the consumer stalled (the call is unaffected) |
 | `siphon_rtp_ws_bridges` | gauge | live WebSocket **takeover** bridges (the WS server is one party's far side) |
+| `siphon_rtp_aec_delay_locks_total` | counter | echo-canceller bulk delays committed by GCC-PHAT (first locks and re-aligns) |
+| `siphon_rtp_aec_delay_weak_locks_total` | counter | of those, the ones whose correlation peak was too flat to be an echo |
+| `siphon_rtp_aec_delay_never_locked_total` | counter | echo cancellers that consumed ~10 s of audio without committing any delay |
 | `siphon_rtp_jemalloc_allocated_bytes` | gauge | live heap (jemalloc `stats.allocated`) |
 
 Gauges are read on demand at scrape time from the live registries (`Metrics::render` takes a
 [`LiveGauges`]); counters are monotonic and incremented on the control path. The jemalloc gauge is
 the leak signal — in production alert on `rate(siphon_rtp_jemalloc_allocated_bytes[30m]) > 0` while
 `siphon_rtp_sessions` is flat (jemalloc retains freed pages, so RSS is too noisy).
+
+### Is the echo canceller actually cancelling anything?
+
+`echo_cancellation` has no success signal of its own, and its failure mode is that it does not look
+like one. The canceller's delay estimator commits the tallest correlation peak inside its search
+window whatever that peak is, so an echo that returns from further away than the window reaches does
+not produce an error, a missing canceller, or an absent estimate — it produces a **lock on noise**,
+after which the adaptive filter converges against a reference that is not the echo. The leg keeps
+relaying, the counters stay healthy, and nothing distinguishes "the estimator never found the echo"
+from "there is no echo on this leg". On a voice-AI bridge the only visible symptom is in a different
+component entirely: an agent that hears its own voice come back, and barges in on itself.
+
+The ratio is the signal:
+
+```promql
+rate(siphon_rtp_aec_delay_weak_locks_total[15m]) / rate(siphon_rtp_aec_delay_locks_total[15m])
+```
+
+Near zero is healthy. Near one means the estimator is picking lags out of noise on most legs, which
+almost always means the echo path is longer than the configured search window — raise
+`echo_delay_search_ms` on those legs (see the [control reference](control/json.md) and the
+[voice-AI cookbook](cookbook/voice-ai.md)). `siphon_rtp_aec_delay_never_locked_total` is the
+different failure where nothing was committed at all: a far end that never played enough audio to
+correlate against, or a leg whose every block was unusable.
+
+Per-leg detail is on the `siphon_rtp::media` tracing target rather than in a metric label — a
+canceller is owned by a single per-call actor and is not reachable from a scrape. At `debug` each
+leg logs the delay it located and the window it was found in; at `warn` it logs a weak lock, a delay
+sitting in the last eighth of its window (the next carrier hop pushes it outside), and an estimator
+that never locked. To watch one call:
+
+```
+RUST_LOG=siphon_rtp::media=debug
+```
 
 ## 2. RTCP reception reports (RFC 3550 §6.4.1)
 

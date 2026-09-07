@@ -902,6 +902,35 @@ pub struct ProfileFlags {
     /// extension — the NG/bencode front-end does not set it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub echo_cancellation: bool,
+    /// How far from the reference the echo canceller looks for the returning echo, in milliseconds —
+    /// the GCC-PHAT bulk-delay search window. `None` uses the engine default (256 ms).
+    ///
+    /// The delay this must span is **not** an acoustic loudspeaker→microphone path. The reference is
+    /// what the engine sent *toward* a party and the echo arrives on that party's uplink, so the
+    /// entire media path sits in the loop twice with the acoustic reflection between: on a relayed
+    /// call, access → carrier → access each way. A softphone on the same LAN comes back inside a few
+    /// tens of milliseconds; a handset behind a mobile network and a PSTN carrier is conventionally
+    /// 100–200 ms *each way* before the acoustic path is reached at all. Where the far party is, is
+    /// a property of the deployment, which is why this is a knob and not a constant.
+    ///
+    /// **An echo outside the window is not found, and the failure is quiet.** The estimator commits
+    /// the tallest lag inside its window whatever that lag is, so a too-narrow window does not
+    /// produce an error or an absent canceller — it produces a lock on noise, after which the filter
+    /// adapts against a reference that is not the echo and cancels nothing, while every counter and
+    /// status field still reads healthy. The engine logs the committed delay and the window it was
+    /// found in on the `siphon_rtp::media` target, warns when the lock is too weak to be an echo, and
+    /// exports `siphon_rtp_aec_delay_weak_locks_total`; on a voice-AI bridge the visible symptom of
+    /// getting this wrong is an agent that barges in on its own voice.
+    ///
+    /// Accepted range 16–1000 ms; a value outside it fails the offer/answer. Widening is not free:
+    /// the estimation FFT is sized at ≥ 2× the window and rounded to a power of two, so crossing
+    /// 256 ms at a 16 kHz rate doubles both the estimator's per-leg memory and the audio it needs
+    /// before its first lock (roughly 1.5 s → 3 s of far-end speech). A value the negotiated rate
+    /// cannot express is clamped down with a warning rather than rejected, since dropping the
+    /// canceller entirely would be strictly worse than a narrower window. Inert without
+    /// `echo_cancellation`. A native siphon-rtp extension — the NG/bencode front-end does not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub echo_delay_search_ms: Option<u32>,
     /// Watch this call's decoded ingress audio for the short single tone an answering machine plays
     /// before it starts recording (the "voicemail beep"), and report it as [`Event::BeepDetected`].
     /// The media half of answering-machine detection: a controller that gets the event can abort an
@@ -3195,6 +3224,39 @@ mod tests {
             Command::Offer { profile, .. } => {
                 assert!(profile.beep_detection);
                 assert_eq!(profile.beep_cadence_guard_ms, Some(1500));
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
+    }
+
+    /// The echo canceller's search window is a per-leg override, so it has to be additive: a
+    /// controller that never heard of it must produce and consume byte-identical JSON.
+    #[test]
+    fn the_echo_delay_search_window_is_additive_and_omitted_when_unset() {
+        let json = r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n"}"#;
+        match serde_json::from_str::<Command>(json).expect("deserialize") {
+            Command::Offer { profile, .. } => {
+                assert_eq!(profile.echo_delay_search_ms, None);
+                assert_eq!(profile, ProfileFlags::default());
+            }
+            other => panic!("expected offer, got {other:?}"),
+        }
+        let serialized = serde_json::to_value(ProfileFlags::default()).expect("to_value");
+        assert!(
+            serialized.get("echo_delay_search_ms").is_none(),
+            "echo_delay_search_ms omitted when unset"
+        );
+
+        // Set, it carries the duration through untouched — the engine converts to samples at the
+        // negotiated rate, which the controller cannot know when it writes this.
+        let relay = concat!(
+            r#"{"command":"offer","call_id":"c","from_tag":"f","sdp":"v=0\r\n","#,
+            r#""profile":{"echo_cancellation":true,"echo_delay_search_ms":512}}"#
+        );
+        match serde_json::from_str::<Command>(relay).expect("deserialize") {
+            Command::Offer { profile, .. } => {
+                assert!(profile.echo_cancellation);
+                assert_eq!(profile.echo_delay_search_ms, Some(512));
             }
             other => panic!("expected offer, got {other:?}"),
         }

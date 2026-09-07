@@ -174,6 +174,12 @@ right speed and pitch instead of the wrong one.
   keeps the echo canceller's near-end and far-end reference in one rate. The suppressor exists only
   at 8 and 16 kHz, so another wire rate leaves it off (logged at `warn`) — the *feature* degrades,
   the negotiated rate does not change.
+- Picking 16 kHz here changes what the echo canceller can reach. Its delay-search cap is a *sample*
+  count, so the same cap is half as many milliseconds at 16 kHz as at 8 kHz — 512 ms against 1 s.
+  That is enough for anything the `echo_delay_search_ms` range allows, but it means a wideband
+  stream is the one that runs out first, and 16 kHz is exactly what a speech model wants. If the
+  caller is behind a carrier, set the window explicitly; see
+  [When the caller is far away](#when-the-caller-is-far-away).
 - The turn-taking VAD is unaffected: `ws_vad_threshold` is a **mean-square** (per-sample) energy, so
   it means the same thing at any rate, and `ws_vad_hangover_ms` is a duration in ptime frames.
 - Conversion is not free: expect a few microseconds per 20 ms frame per engaged direction, paid only
@@ -258,6 +264,29 @@ down to about −36 dB of echo-return loss, and only goes quiet at −42 dB:
 So on a loudspeaker or handsfree endpoint, **`echo_cancellation` is not optional under barge-in** —
 it is what puts the residual below the detector, and neither detector can substitute for it.
 
+This is not a shortcoming of Silero, and a better classifier would not help. The agent's voice
+returning through a handset *is* speech; a detector that rejected it would be broken. Nothing
+computable from the uplink alone separates "a person talking" from "the machine talking, delayed".
+The signal that does is the far-end reference — what was played, and when — and only the echo
+canceller has it.
+
+So with `echo_cancellation` on, the engine lets the canceller **veto the turn edge**: while the
+uplink is, on the canceller's own evidence, the agent's audio coming back, `speech_started` and
+barge-in do not fire. It is selective rather than half-duplex — a caller genuinely talking over the
+agent produces a signal the canceller cannot predict from the reference, so they still get through,
+and once a caller's turn is open the agent's echo can never close it. The veto answers only on
+positive evidence, so a canceller that has found nothing vetoes nothing: it can quieten the agent,
+never the caller.
+
+Two limits worth knowing:
+
+- **Nothing can veto before the canceller locks onto the echo**, because until then there is no
+  estimate to correlate against — roughly the first 1.5 s of far-end audio at the default search
+  window. An agent that speaks first can still interrupt itself once, at the very start of a call.
+- It needs the canceller to be **finding** the echo, which is the whole of
+  [When the caller is far away](#when-the-caller-is-far-away). On a leg whose echo returns from
+  beyond the search window there is no verdict to give, and the veto correctly stays out of the way.
+
 ### Not barging in on a cough
 
 Both detectors have a *trailing* hold, so speech is not chopped up at its end. Neither has a
@@ -298,6 +327,68 @@ pairing it with `neural` is the combination that makes barge-in feel right.
   }
 }
 ```
+
+### When the caller is far away
+
+`echo_cancellation` first has to *find* the echo before it can subtract it, and that search has a
+range. The delay it must span is not the handset's acoustic path — the reference is what the engine
+sent toward the caller, and the echo comes back on the caller's uplink, so the entire media path is
+in the loop **twice** with the acoustic reflection in the middle:
+
+```
+engine → (WAN) → SBC → carrier → mobile network → handset
+                                                     ↓ acoustic
+engine ← (WAN) ← SBC ← carrier ← mobile network ← handset
+```
+
+A softphone on the same network comes back inside a few tens of milliseconds. A mobile handset
+behind a PSTN carrier does not: the wide-area hop is rarely the dominant term (tens of ms round
+trip), but the carrier and mobile legs conventionally run 100–200 ms *each way* before the acoustic
+path is reached at all, which puts the returning echo somewhere past 200 ms.
+
+The default window is **256 ms**. Where the far party is, is a property of your deployment, so
+widen it per leg when the callers are remote:
+
+```json
+{
+  "profile": {
+    "ws_uri": "ws://127.0.0.1:9001/stream",
+    "ws_barge_in": true,
+    "echo_cancellation": true,
+    "echo_delay_search_ms": 512
+  }
+}
+```
+
+**Getting this wrong is quiet, which is why it is worth setting deliberately.** The estimator
+commits the tallest correlation peak inside whatever window it was given, so an echo that returns
+from beyond that window does not produce an error or an absent canceller — it produces a lock on
+noise, and the filter then adapts against a reference that is not the echo. The canceller runs, the
+leg counters look healthy, and no configuration is wrong anywhere. The symptom surfaces two
+components away: the agent starts a sentence, its own voice arrives back on the uplink, the VAD
+correctly identifies it as speech, barge-in fires, and **the agent interrupts itself** — on a caller
+who said nothing. Every obvious suspect (VAD threshold, `ws_vad_min_speech_ms`, the prompt, the
+model) is in the wrong place.
+
+To check rather than guess, watch the engine:
+
+```
+RUST_LOG=siphon_rtp::media=debug
+```
+
+Each leg logs the delay it located and the window it found it in once the estimate locks, and warns
+when the lock is too flat to be an echo — which is what "the echo path is longer than the window"
+looks like from inside. Fleet-wide, alert on
+`siphon_rtp_aec_delay_weak_locks_total / siphon_rtp_aec_delay_locks_total`; see
+[Observability](../observability.md#is-the-echo-canceller-actually-cancelling-anything).
+
+Widening is not free, so it is a knob rather than a bigger default. The estimation FFT is sized at
+at least twice the window and rounded to a power of two, so crossing 256 ms at a 16 kHz wire rate
+doubles both the estimator's per-leg memory and the audio it needs before its first lock —
+**1.5 s → 3.1 s of far-end speech**, during which nothing is cancelled. On a bridge whose agent
+speaks first, that is the greeting. Accepted range is 16–1000 ms; a value outside it is rejected on
+the offer/answer, and one the negotiated rate cannot express is clamped down with a warning rather
+than dropping the canceller.
 
 ## A minimal server
 

@@ -786,6 +786,9 @@ struct WsBridgeSetup<'a> {
     noise_suppression: bool,
     /// Cancel A's uplink echo against the downlink the bridge plays toward the call.
     echo_cancellation: bool,
+    /// How far the canceller's GCC-PHAT estimator looks for the returning echo. `None` keeps the
+    /// engine default; a leg reached through a carrier needs more. Inert without `echo_cancellation`.
+    echo_delay_search_ms: Option<u32>,
     /// Local energy-VAD turn-taking / barge-in, when the profile asked for it.
     vad_config: Option<WsVadConfig>,
     /// The downlink destination + latch to **reuse**, on a re-point ([`Engine::start_ws_bridge`] on
@@ -871,6 +874,7 @@ struct WsBridge {
     wire_sample_rate: Option<u32>,
     noise_suppression: bool,
     echo_cancellation: bool,
+    echo_delay_search_ms: Option<u32>,
     vad_config: Option<WsVadConfig>,
     /// The relay this bridge displaced, or `None` when the bridge *is* the call's negotiated media
     /// path (`ProfileFlags::ws_uri`). This is exactly what makes a detach possible or not — see
@@ -1777,6 +1781,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: "per-client call quota exceeded".to_string(),
             };
         }
+        if let Err(reason) = crate::media_pipeline::validate_echo_delay_search_ms(profile) {
+            return CmdResult::Error {
+                reason: format!("offer: {reason}"),
+            };
+        }
         // An offer for a call-id that already exists.
         //
         // Ownership first (A3 — docs/security-and-nat.md §5): only the client that created a call may
@@ -2345,6 +2354,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     secure: None,
                     noise_suppression: profile.noise_suppression,
                     echo_cancellation: profile.echo_cancellation,
+                    echo_delay_search_ms: profile.echo_delay_search_ms,
                     vad_config: WsVadConfig::from_profile(profile),
                     wire_sample_rate: profile.ws_sample_rate,
                     // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
@@ -2404,6 +2414,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if self.client_call_count(client) >= self.max_calls_per_client {
             return CmdResult::Error {
                 reason: "per-client call quota exceeded".to_string(),
+            };
+        }
+        if let Err(reason) = crate::media_pipeline::validate_echo_delay_search_ms(profile) {
+            return CmdResult::Error {
+                reason: format!("answer_local: {reason}"),
             };
         }
         let info = match sdp::parse(sdp) {
@@ -2808,6 +2823,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     secure,
                     noise_suppression: profile.noise_suppression,
                     echo_cancellation: profile.echo_cancellation,
+                    echo_delay_search_ms: profile.echo_delay_search_ms,
                     vad_config: WsVadConfig::from_profile(profile),
                     wire_sample_rate: profile.ws_sample_rate,
                     // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
@@ -2997,6 +3013,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             secure,
             noise_suppression,
             echo_cancellation,
+            echo_delay_search_ms,
             vad_config,
             wire_sample_rate,
             egress: existing_egress,
@@ -3116,7 +3133,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // `build_echo_canceller` the transcode path uses (an unsupported rate keeps the uplink
         // uncancelled rather than failing the bridge).
         .with_echo_canceller(if echo_cancellation {
-            crate::media_pipeline::build_echo_canceller(wire_rate)
+            crate::media_pipeline::build_echo_canceller(wire_rate, echo_delay_search_ms)
         } else {
             None
         });
@@ -3272,6 +3289,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 wire_sample_rate,
                 noise_suppression,
                 echo_cancellation,
+                echo_delay_search_ms,
                 vad_config,
                 takeover,
             },
@@ -3708,6 +3726,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         sdp: &str,
         profile: &ProfileFlags,
     ) -> CmdResult {
+        if let Err(reason) = crate::media_pipeline::validate_echo_delay_search_ms(profile) {
+            return CmdResult::Error {
+                reason: format!("answer: {reason}"),
+            };
+        }
         // Snapshot the leg endpoints under the guard, then release it. Only the owning client may
         // answer (A3 — docs/security-and-nat.md §5); to anyone else the call is unknown.
         let (
@@ -4030,6 +4053,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                             secure: None,
                             noise_suppression: profile.noise_suppression,
                             echo_cancellation: profile.echo_cancellation,
+                            echo_delay_search_ms: profile.echo_delay_search_ms,
                             vad_config: WsVadConfig::from_profile(profile),
                             wire_sample_rate: profile.ws_sample_rate,
                             egress: None,
@@ -4407,6 +4431,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.echo_delay_search_ms,
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4425,6 +4450,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.echo_delay_search_ms,
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4561,6 +4587,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.echo_delay_search_ms,
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4579,6 +4606,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.echo_delay_search_ms,
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4678,6 +4706,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.echo_delay_search_ms,
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -4696,6 +4725,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 record_path.as_deref(),
                 profile.noise_suppression,
                 profile.echo_cancellation,
+                profile.echo_delay_search_ms,
                 profile.beep_detection,
                 profile.beep_cadence_guard_ms,
             ) {
@@ -5793,6 +5823,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // re-issuing the profile.
                     false, // noise_suppression
                     false, // echo_cancellation (re-armed when the controller re-issues the profile)
+                    None,  // echo_delay_search_ms (inert without echo_cancellation)
                     false, // beep_detection (likewise not carried in the snapshot)
                     None,  // beep_cadence_guard_ms
                 ) {
@@ -5814,6 +5845,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (re-armed when the controller re-issues the profile)
+                    None,  // echo_delay_search_ms (inert without echo_cancellation)
                     false, // beep_detection (likewise not carried in the snapshot)
                     None,  // beep_cadence_guard_ms
                 ) {
@@ -5917,6 +5949,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (re-armed when the controller re-issues the profile)
+                    None,  // echo_delay_search_ms (inert without echo_cancellation)
                     false, // beep_detection (likewise not carried in the snapshot)
                     None,  // beep_cadence_guard_ms
                 ) {
@@ -5938,6 +5971,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (re-armed when the controller re-issues the profile)
+                    None,  // echo_delay_search_ms (inert without echo_cancellation)
                     false, // beep_detection (likewise not carried in the snapshot)
                     None,  // beep_cadence_guard_ms
                 ) {
@@ -8403,6 +8437,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     bridge.wire_sample_rate,
                     bridge.noise_suppression,
                     bridge.echo_cancellation,
+                    bridge.echo_delay_search_ms,
                     bridge.vad_config,
                     bridge.takeover.clone(),
                     bridge.ws_uri.clone(),
@@ -8422,6 +8457,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 wire_sample_rate,
                 noise_suppression,
                 echo_cancellation,
+                echo_delay_search_ms,
                 vad_config,
                 takeover,
                 old_uri,
@@ -8444,6 +8480,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     secure: state.secure,
                     noise_suppression,
                     echo_cancellation,
+                    echo_delay_search_ms,
                     vad_config,
                     wire_sample_rate,
                     egress: Some(state.egress),
@@ -8589,6 +8626,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // controller states them; a re-point then carries whatever that negotiation chose.
             noise_suppression: false,
             echo_cancellation: false,
+            echo_delay_search_ms: None,
             vad_config: None,
             wire_sample_rate: None,
             egress: None,
@@ -8996,6 +9034,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // reuses the existing directions rather than rebuilding them.
                     false, // noise_suppression
                     false, // echo_cancellation (a reflect/echo path wants the echo)
+                    None,  // echo_delay_search_ms (inert without echo_cancellation)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
                     None,  // beep_cadence_guard_ms
                 )?;
@@ -9011,6 +9050,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (a reflect/echo path wants the echo)
+                    None,  // echo_delay_search_ms (inert without echo_cancellation)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
                     None,  // beep_cadence_guard_ms
                 )?;
@@ -9056,6 +9096,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (a reflect/echo path wants the echo)
+                    None,  // echo_delay_search_ms (inert without echo_cancellation)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
                     None,  // beep_cadence_guard_ms
                 )?;
@@ -9071,6 +9112,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     None,
                     false, // noise_suppression
                     false, // echo_cancellation (a reflect/echo path wants the echo)
+                    None,  // echo_delay_search_ms (inert without echo_cancellation)
                     false, // beep_detection (the echo verb carries no offer/answer profile)
                     None,  // beep_cadence_guard_ms
                 )?;
@@ -11149,6 +11191,7 @@ fn build_direction(
     record_path: Option<&str>,
     noise_suppression: bool,
     echo_cancellation: bool,
+    echo_delay_search_ms: Option<u32>,
     beep_detection: bool,
     beep_cadence_guard_ms: Option<u32>,
 ) -> Result<DirectionConfig, String> {
@@ -11192,6 +11235,9 @@ fn build_direction(
         // rate; carry only the request here. Inert unless the ingress rate is 8/16 kHz.
         noise_suppression,
         echo_cancellation,
+        // Likewise the canceller: built and rate-gated in `Direction::new`, so only the request and
+        // the optional search-window override travel here.
+        echo_delay_search_ms,
         // The detector is built (and rate-gated) inside `Direction::new` from the decoder's native
         // rate; carry only the request and the optional cadence-guard override here.
         beep_detection,
@@ -27968,6 +28014,70 @@ mod tests {
         assert!(
             !engine.ws().is_ws_call("ws-bad-rate"),
             "no WS route left behind"
+        );
+    }
+
+    /// The echo canceller's search window is validated at the control plane, on the verbs that carry
+    /// a profile, before a port is allocated or a dialog is committed. It is one of the few knobs
+    /// whose wrong value is *invisible at runtime* — a window that is too short leaves the canceller
+    /// running and cancelling nothing — so an out-of-range request is refused where the controller
+    /// can still see it rather than absorbed.
+    #[tokio::test]
+    async fn an_out_of_range_echo_delay_search_window_fails_the_offer() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "aec-bad-window".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        echo_cancellation: true,
+                        echo_delay_search_ms: Some(5_000),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        match offer {
+            CmdResult::Error { reason } => {
+                assert!(
+                    reason.contains("echo-delay-search-range"),
+                    "the refusal must be greppable, got: {reason}"
+                );
+                assert!(
+                    reason.contains("5000"),
+                    "the refusal must name the offending value, got: {reason}"
+                );
+            }
+            other => {
+                panic!("an out-of-range echo search window must fail the offer, got {other:?}")
+            }
+        }
+
+        // A value inside the bounds is accepted on the same path, so the check is a range test and
+        // not a blanket refusal of the field.
+        let good = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "aec-good-window".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags {
+                        echo_cancellation: true,
+                        echo_delay_search_ms: Some(512),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        assert!(
+            matches!(good, CmdResult::Ok { .. }),
+            "a serviceable window must be accepted, got {good:?}"
         );
     }
 

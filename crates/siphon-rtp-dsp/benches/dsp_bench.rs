@@ -233,6 +233,51 @@ fn bench_aec(criterion: &mut Criterion) {
         });
     });
 
+    // What the search window costs. The estimation FFT is sized at ≥ 2× the range and rounded to a
+    // power of two, so the per-block work grows with the window while the blocks themselves get
+    // *rarer* (a block is `block_size` samples however long that is) — the two effects nearly cancel
+    // in the amortized per-frame figure, which is exactly why the window's real prices are the two
+    // this bench cannot show: the estimator's per-leg memory, and the audio needed before the first
+    // lock (`MIN_BLOCKS_BEFORE_LOCK` whole blocks). Both scale with the block, so a wider window is
+    // cheap per frame and expensive at call setup. Swept at both media rates because the underlying
+    // cap is a sample count: the same milliseconds buy a different block at 8 and 16 kHz.
+    //
+    // 256 ms is the engine default and 512 ms the reachable maximum; 128 ms is the previous default,
+    // kept as the comparison point for what raising it actually cost per frame.
+    let mut window_group = criterion.benchmark_group("aec_delay_search_window");
+    for &(rate, millis) in &[
+        (8_000u32, 128u32),
+        (8_000, 256),
+        (8_000, 512),
+        (16_000, 128),
+        (16_000, 256),
+        (16_000, 512),
+    ] {
+        let frame_samples = (rate / 50) as usize;
+        let (far, near_template) = if rate == 8_000 {
+            (&far_8k, &near_8k)
+        } else {
+            (&far_16k, &near_16k)
+        };
+        let search_range = (rate * millis / 1000) as usize;
+        // The engine's own configuration, so this measures what ships: a 64 ms MDF tail, the MDF
+        // backend, and the two-path DTD (`build_echo_canceller`). Only the window varies.
+        let tail = (rate * 64 / 1000) as usize;
+        debug_assert_eq!(frame_samples, (rate / 50) as usize);
+        window_group.bench_function(format!("{}k_{millis}ms", rate / 1000), |bencher| {
+            let mut canceller = EchoCanceller::with_mdf_delay_estimation(rate, tail, search_range)
+                .expect("build")
+                .with_two_path_dtd();
+            let mut near = near_template.clone();
+            bencher.iter(|| {
+                near.copy_from_slice(near_template);
+                canceller.cancel(black_box(&mut near), black_box(far));
+                black_box(near[0])
+            });
+        });
+    }
+    window_group.finish();
+
     // The MDF / partitioned-block frequency-domain backend covering a 256 ms tail (2048 taps @ 8 kHz,
     // 16 partitions of 128; 4096 taps @ 16 kHz, 16 partitions of 256). Per 20 ms frame it processes one
     // or two 256-/512-point overlap-save blocks; each block is the filter FFT (an inverse), the error
