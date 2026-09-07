@@ -179,9 +179,17 @@ mod tests {
         for &a in &corners {
             for &b in &corners {
                 let mut flag = Overflow::clear();
-                assert_eq!(l_add(&mut flag, a, b), basic_ops::l_add(a, b), "l_add {a} {b}");
+                assert_eq!(
+                    l_add(&mut flag, a, b),
+                    basic_ops::l_add(a, b),
+                    "l_add {a} {b}"
+                );
                 let mut flag = Overflow::clear();
-                assert_eq!(l_sub(&mut flag, a, b), basic_ops::l_sub(a, b), "l_sub {a} {b}");
+                assert_eq!(
+                    l_sub(&mut flag, a, b),
+                    basic_ops::l_sub(a, b),
+                    "l_sub {a} {b}"
+                );
             }
             for shift in -31..=31_i16 {
                 let mut flag = Overflow::clear();
@@ -192,12 +200,20 @@ mod tests {
                 );
             }
             let mut flag = Overflow::clear();
-            assert_eq!(round_word(&mut flag, a), basic_ops::round_word(a), "round {a}");
+            assert_eq!(
+                round_word(&mut flag, a),
+                basic_ops::round_word(a),
+                "round {a}"
+            );
         }
         for a in [i16::MIN, -1, 0, 1, 12_345, i16::MAX] {
             for b in [i16::MIN, -1, 0, 1, -9_876, i16::MAX] {
                 let mut flag = Overflow::clear();
-                assert_eq!(l_mult(&mut flag, a, b), basic_ops::l_mult(a, b), "l_mult {a} {b}");
+                assert_eq!(
+                    l_mult(&mut flag, a, b),
+                    basic_ops::l_mult(a, b),
+                    "l_mult {a} {b}"
+                );
                 let mut flag = Overflow::clear();
                 assert_eq!(
                     l_mac(&mut flag, 1_000, a, b),
