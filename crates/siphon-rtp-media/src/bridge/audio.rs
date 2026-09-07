@@ -85,9 +85,38 @@ pub const MAX_FRAME_VALUES: usize = MAX_FRAME_SAMPLES * MAX_CHANNELS;
 /// achieves on clean echo (30 dB and up), so that a leg with a poor but working canceller — a
 /// nonlinear handset, a re-encoding mobile leg — still gets a usable verdict.
 const ECHO_VERDICT_REMOVAL_RATIO: f64 = 10.0;
-/// Frame energy below which the removal ratio is meaningless (a near-silent frame divides one small
-/// number by another), so the verdict abstains. Roughly −60 dBFS over a 20 ms narrowband frame.
-const ECHO_VERDICT_ENERGY_FLOOR: f64 = 160.0 * 32.0 * 32.0;
+/// Mean-square (per-sample) energy below which the removal ratio is meaningless — a near-silent
+/// frame divides one small number by another — so the verdict abstains. Roughly −60 dBFS, i.e. an
+/// RMS amplitude of 32 on the i16 scale.
+///
+/// **Per sample, not per frame.** The bridge runs at the negotiated *wire* rate, so a frame is 160
+/// samples at 8 kHz and 320 at 16 kHz — the rate the voice-AI guidance recommends. A whole-frame
+/// threshold would therefore mean two different amplitudes at the two rates and be 3 dB looser at
+/// 16 kHz, and it would be loose in the one direction this verdict must never fail in: below the
+/// floor the verdict abstains and changes nothing, but above it a frame too quiet to judge yields a
+/// noisy removal ratio that can read as *our own audio*, latch the echo run, and veto the **caller's**
+/// turn start. Dividing by the frame length keeps the threshold a fixed amplitude at every rate, the
+/// same way `ws_vad_threshold` is a per-sample mean square so it means one thing at any rate.
+const ECHO_VERDICT_ENERGY_FLOOR: f64 = 32.0 * 32.0;
+
+/// Sum of squares of `frame`, or `None` when the frame's **mean** square sits below
+/// [`ECHO_VERDICT_ENERGY_FLOOR`] and the echo verdict must therefore abstain.
+///
+/// Returning the sum rather than the mean is deliberate: the caller compares it against the sum that
+/// survives cancellation, and a ratio of two sums over the same frame needs no normalising. Only the
+/// *threshold* has to be rate-independent, and that is what dividing by the length buys — the floor
+/// is one amplitude whether the wire rate makes a 20 ms frame 160 samples or 320. An empty frame is
+/// below any floor, so it yields `None` instead of dividing by zero.
+fn verdict_frame_energy(frame: &[i16]) -> Option<f64> {
+    if frame.is_empty() {
+        return None;
+    }
+    let energy: f64 = frame
+        .iter()
+        .map(|&sample| f64::from(sample) * f64::from(sample))
+        .sum();
+    (energy / frame.len() as f64 > ECHO_VERDICT_ENERGY_FLOOR).then_some(energy)
+}
 
 /// One ptime of mono samples at `format`'s wire rate — the downlink quantum the core drains per tick
 /// and the length of every frame it renders. Clamped to at least one sample so a degenerate format
@@ -541,11 +570,9 @@ impl BridgeCore {
             let mut echo_evidence: Option<bool> = None;
             if let Some(echo_canceller) = self.echo_canceller.as_mut() {
                 // Energy of the frame as it arrived, kept to compare against what survives
-                // cancellation — see the echo verdict below.
-                let arrived_energy: f64 = pcm
-                    .iter()
-                    .map(|&sample| f64::from(sample) * f64::from(sample))
-                    .sum();
+                // cancellation — see the echo verdict below. `None` when the frame is too quiet for
+                // that comparison to mean anything, which makes the verdict abstain.
+                let arrived_energy = verdict_frame_energy(pcm);
                 // Preallocated (see `echo_reference`), so only the *tail* past the downlink frame is
                 // zeroed each tick — not the whole ceiling-sized buffer. `written` is bounded by
                 // `MAX_FRAME_SAMPLES`, which is exactly the reference's length.
@@ -585,7 +612,8 @@ impl BridgeCore {
                     .iter()
                     .map(|&sample| f64::from(sample) * f64::from(sample))
                     .sum();
-                if arrived_energy > ECHO_VERDICT_ENERGY_FLOOR {
+                if let Some(arrived_energy) = arrived_energy {
+                    // Both sides are sums over the same frame, so the ratio needs no normalising.
                     let mostly_removed =
                         survived_energy * ECHO_VERDICT_REMOVAL_RATIO <= arrived_energy;
                     // `Some(true)` — ours; `Some(false)` — something the canceller could not predict
@@ -885,6 +913,59 @@ mod tests {
             edges >= 1,
             "a caller talking over the agent must still be able to interrupt — no turn edge was \
              raised, so the veto has made the caller unheard"
+        );
+    }
+
+    /// The abstain floor must be the same *amplitude* at every wire rate, not the same frame energy.
+    ///
+    /// The bridge cancels at the negotiated wire rate, so a 20 ms frame is 160 samples at 8 kHz and
+    /// 320 at 16 kHz — and 16 kHz is what the voice-AI guidance recommends, so a whole-frame
+    /// threshold would be loosest on the configuration most likely to use this. It matters because
+    /// the looseness is one-directional: below the floor the verdict abstains and changes nothing,
+    /// but above it a frame too quiet to judge yields a noisy removal ratio that can read as the
+    /// agent's own audio, latch the echo run and veto the **caller's** turn. This verdict is allowed
+    /// to quieten an agent, never a caller.
+    #[test]
+    fn the_echo_verdict_floor_is_the_same_amplitude_at_every_wire_rate() {
+        // Just under and just over the floor's RMS amplitude of 32, as a constant-magnitude frame.
+        let quiet = |samples: usize| vec![31i16; samples];
+        let loud = |samples: usize| vec![33i16; samples];
+
+        for &samples in &[160usize, 320] {
+            assert!(
+                verdict_frame_energy(&quiet(samples)).is_none(),
+                "a frame below the floor must abstain at every rate ({samples} samples)"
+            );
+            assert!(
+                verdict_frame_energy(&loud(samples)).is_some(),
+                "a frame above the floor must be judged at every rate ({samples} samples)"
+            );
+        }
+
+        // The regression this pins: the old whole-frame floor was 160·32², so a 320-sample frame
+        // cleared it at an amplitude of ~22.6 and the verdict engaged on frames it should have
+        // abstained on. Anything between the two amplitudes must now abstain at *both* lengths.
+        let borderline = vec![24i16; 320];
+        assert!(
+            verdict_frame_energy(&borderline).is_none(),
+            "a 16 kHz frame quieter than the floor must abstain — under the old whole-frame \
+             threshold this frame was judged, and a noisy verdict there vetoes a real caller"
+        );
+
+        // Degenerate input yields no verdict rather than a division by zero.
+        assert!(verdict_frame_energy(&[]).is_none());
+    }
+
+    /// The energy handed back is the **sum**, not the mean: the caller divides it by the surviving
+    /// sum over the same frame, and normalising one side and not the other would scale the removal
+    /// ratio by the frame length.
+    #[test]
+    fn the_verdict_energy_is_the_unnormalised_sum() {
+        let frame = vec![100i16; 160];
+        let energy = verdict_frame_energy(&frame).expect("above the floor");
+        assert!(
+            (energy - 160.0 * 100.0 * 100.0).abs() < 1.0,
+            "expected the sum of squares, got {energy}"
         );
     }
 
