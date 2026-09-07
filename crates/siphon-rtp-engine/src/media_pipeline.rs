@@ -685,6 +685,10 @@ pub struct Direction {
     /// Preallocated egress frame the repacketizer drains into — exactly `egress_frame_samples` long
     /// (one encoder frame), so the drain neither allocates nor zeroes per packet.
     egress_scratch: Vec<i16>,
+    /// Reused buffer for rewriting a relayed RTCP compound's report sender SSRC (see
+    /// [`Direction::handle`]). RTCP is rare next to RTP, but it is still per-call traffic and this
+    /// keeps the relay allocation-free; it grows once to the largest compound the leg has seen.
+    rtcp_scratch: Vec<u8>,
     /// Sample-rate converter when the ingress codec rate differs from the egress codec rate.
     resampler: Option<Resampler>,
     /// Single-channel noise suppression on this direction's decoded ingress audio, applied in place
@@ -1335,6 +1339,7 @@ impl Direction {
                 Vec::new()
             },
             egress_scratch: vec![0i16; egress_frame_samples as usize],
+            rtcp_scratch: Vec::new(),
             resampler,
             noise_suppressor,
             echo_canceller,
@@ -1404,6 +1409,7 @@ impl Direction {
             decode_scratch: Vec::new(),
             echo_scratch: Vec::new(),
             egress_scratch: Vec::new(),
+            rtcp_scratch: Vec::new(),
             resampler: None,
             // A relay-only leg forwards verbatim (never decodes), so there is nothing to suppress,
             // cancel or listen to for a record tone, and it produces no reference for the opposite
@@ -1937,11 +1943,35 @@ impl Direction {
         }
 
         // RFC 5761 demux: payload-type byte 64..=95 marks RTCP — relay it (re-encrypting toward a
-        // secure egress), untranscoded. RTCP carries no per-stream SSRC at the latch offset, so it
-        // never drives the SSRC re-latch (return `None`).
+        // secure egress), untranscoded apart from the report sender SSRC. RTCP carries no per-stream
+        // SSRC at the latch offset, so it never drives the SSRC re-latch (return `None`).
         let packet_type = data[1] & 0x7f;
         if (64..=95).contains(&packet_type) {
-            self.push_egress(data, out);
+            // This direction re-originates RTP under `egress_ssrc`, so the party on the other end has
+            // never seen the far party's SSRC. Relaying its reports verbatim would have the media and
+            // the reports about that media arrive under two different source identities — which RFC
+            // 3550 §6.4.1 makes consequential rather than cosmetic, because LSR is defined per source
+            // SSRC: a conforming receiver files the relayed SR under a source it gets no RTP from, and
+            // reports `LSR = 0` for the stream it does get, leaving the engine's passive round-trip
+            // estimate uncomputable and a passive monitor unable to correlate the leg at all.
+            //
+            // Rewritten into a reused scratch buffer, so the relay stays allocation-free on a path
+            // that also carries the (rare, ~5 s) RTCP of every call.
+            self.rtcp_scratch.clear();
+            self.rtcp_scratch.extend_from_slice(data);
+            let rewritten = siphon_rtp_media::rtcp::rewrite_report_sender_ssrc(
+                &mut self.rtcp_scratch,
+                self.egress_ssrc,
+            );
+            if rewritten > 0 {
+                let scratch = std::mem::take(&mut self.rtcp_scratch);
+                self.push_egress(&scratch, out);
+                self.rtcp_scratch = scratch;
+            } else {
+                // Malformed, truncated, or carrying no report to rewrite (SDES/BYE/APP): relay it
+                // exactly as it arrived rather than risk a half-edited datagram on the wire.
+                self.push_egress(data, out);
+            }
             return None;
         }
 
@@ -4787,6 +4817,125 @@ mod tests {
             quality.b_to_a.rtt_ms, None,
             "B never reported back ⇒ no RTT on the B leg (CDR marks it loss+jitter-only)"
         );
+    }
+
+    /// The relayed report must arrive under the SSRC the receiving party actually gets media from.
+    ///
+    /// The transcode path re-originates RTP under its own `egress_ssrc`, so party A has never seen
+    /// B's SSRC. Relaying B's Sender Report verbatim put the media and the reports about that media
+    /// under two different source identities, and RFC 3550 §6.4.1 makes that consequential rather
+    /// than cosmetic: LSR is defined as the NTP of the most recent SR **from source SSRC_n**, so a
+    /// conforming A files the relayed SR under a source it receives no RTP from, and its report block
+    /// for the stream it *does* receive carries `LSR = 0`. The engine then has nothing to match and
+    /// the passive round-trip estimate is uncomputable — against a strictly conforming endpoint, not
+    /// an unusual one.
+    ///
+    /// `passive_rtt_from_relayed_rtcp_feeds_the_leg_mos_delay` above does not catch it: it writes A's
+    /// block with the engine's egress SSRC *and* B's LSR together, which is the pairing only an
+    /// endpoint that echoes the last SR regardless of source produces. This asserts on the wire
+    /// instead, where the ambiguity does not exist.
+    #[test]
+    fn a_relayed_report_carries_the_ssrc_the_receiving_party_sees_media_from() {
+        let mut call = ulaw_alaw_call();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        const B_SSRC: u32 = 0xBBBB_BBBB;
+        // The engine's A-facing egress SSRC — what A's RTP actually arrives under.
+        const A_FACING_EGRESS_SSRC: u32 = 0xA000_0001;
+
+        let mut sender_report = [0u8; 64];
+        let len = siphon_rtp_media::rtcp::write_sender_report(
+            B_SSRC,
+            0xABCD_1234_5678_9ABC,
+            0,
+            0,
+            0,
+            &[],
+            &mut sender_report,
+        )
+        .expect("write B SR");
+        call.process(
+            &rx_at(2, B_ADDR, 1_000_000, sender_report[..len].to_vec()),
+            &mut out,
+            &mut events,
+        );
+
+        let forwarded = out
+            .iter()
+            .find(|packet| {
+                siphon_rtp_media::rtcp::demux(&packet.data)
+                    == Some(siphon_rtp_media::rtcp::MuxKind::Rtcp)
+            })
+            .expect("B's RTCP must be relayed toward A");
+        let parsed =
+            siphon_rtp_media::rtcp::parse_compound(&forwarded.data).expect("parse relayed RTCP");
+        let sender_ssrc = parsed
+            .iter()
+            .find_map(|packet| match packet {
+                siphon_rtp_media::rtcp::RtcpPacket::SenderReport(report) => Some(report.ssrc),
+                _ => None,
+            })
+            .expect("the relayed compound must still contain the Sender Report");
+        assert_eq!(
+            sender_ssrc, A_FACING_EGRESS_SSRC,
+            "the relayed SR must arrive under the SSRC A receives media from, not the far party's \
+             ({B_SSRC:#010x}) — a conforming A keys LSR per source SSRC, so relaying it verbatim \
+             leaves it reporting LSR = 0 for the only stream it actually has"
+        );
+    }
+
+    /// The rewrite must not corrupt what it does not understand. SDES, BYE and APP carry no report
+    /// sender SSRC at that offset, and a truncated compound must be relayed exactly as it arrived
+    /// rather than half-edited.
+    #[test]
+    fn the_report_ssrc_rewrite_leaves_other_rtcp_untouched() {
+        use siphon_rtp_media::rtcp::rewrite_report_sender_ssrc;
+
+        // A minimal SDES (PT 202): version 2, one chunk, length 1 word past the header.
+        let mut sdes = vec![
+            0x81u8, 202, 0x00, 0x02, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let original = sdes.clone();
+        assert_eq!(rewrite_report_sender_ssrc(&mut sdes, 0x1234_5678), 0);
+        assert_eq!(sdes, original, "a non-report packet must be left alone");
+
+        // Truncated: the header claims more than the buffer holds.
+        let mut truncated = vec![0x80u8, 200, 0x00, 0xFF, 0xDE, 0xAD, 0xBE, 0xEF];
+        let original = truncated.clone();
+        assert_eq!(rewrite_report_sender_ssrc(&mut truncated, 0x1234_5678), 0);
+        assert_eq!(
+            truncated, original,
+            "a malformed compound must be relayed verbatim, never half-rewritten"
+        );
+
+        // A well-formed SR is rewritten, and only in its sender-SSRC word.
+        let mut report = [0u8; 64];
+        let len = siphon_rtp_media::rtcp::write_sender_report(
+            0xBBBB_BBBB,
+            0xABCD_1234_5678_9ABC,
+            42,
+            7,
+            9,
+            &[],
+            &mut report,
+        )
+        .expect("write SR");
+        let mut buffer = report[..len].to_vec();
+        assert_eq!(rewrite_report_sender_ssrc(&mut buffer, 0x0A0A_0A0A), 1);
+        let parsed = siphon_rtp_media::rtcp::parse_compound(&buffer).expect("parse");
+        match &parsed[0] {
+            siphon_rtp_media::rtcp::RtcpPacket::SenderReport(rewritten) => {
+                assert_eq!(rewritten.ssrc, 0x0A0A_0A0A);
+                // Everything else survives — the NTP especially, since it is what the peer echoes
+                // back as LSR and the whole round-trip estimate hangs off it.
+                assert_eq!(rewritten.ntp_timestamp, 0xABCD_1234_5678_9ABC);
+                assert_eq!(rewritten.rtp_timestamp, 42);
+                assert_eq!(rewritten.packet_count, 7);
+                assert_eq!(rewritten.octet_count, 9);
+            }
+            other => panic!("expected a sender report, got {other:?}"),
+        }
     }
 
     #[test]

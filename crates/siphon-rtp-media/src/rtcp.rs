@@ -254,6 +254,64 @@ pub fn parse_compound(buffer: &[u8]) -> Result<Vec<RtcpPacket>, RtcpError> {
     Ok(packets)
 }
 
+/// Rewrite the **sender SSRC** of every Sender and Receiver Report in a compound packet, in place.
+///
+/// For a relay that re-originates RTP under its own SSRC (the transcode path does — the peer never
+/// sees the far party's SSRC), relaying RTCP untouched leaves the two disagreeing: the party receives
+/// media from the engine's egress SSRC and reports *about* it from the far party's. That is not
+/// cosmetic. RFC 3550 §6.4.1 defines LSR as the middle 32 bits of the NTP timestamp from the most
+/// recent SR **from source SSRC_n**, so a conforming receiver files the relayed SR under a source it
+/// receives no RTP from, and its report block for the stream it *does* receive carries `LSR = 0` —
+/// which makes the engine's passive round-trip estimate uncomputable, and leaves a passive monitor
+/// unable to correlate a leg's RTP with its RTCP at all.
+///
+/// Rewriting the sender SSRC to the SSRC the receiving party actually sees makes one coherent source
+/// of the pair. Report *blocks* inside are deliberately left alone: their SSRC identifies the stream
+/// being reported on, which is the receiving party's own, and translating that needs the peer
+/// direction's ingress SSRC — state a single direction does not hold. That remains a known gap for
+/// the far end's own statistics; it does not affect the round-trip estimate, which keys on the
+/// engine's egress SSRC.
+///
+/// Returns the number of reports rewritten. A malformed or truncated compound is left untouched
+/// (rewriting half a packet would be worse than relaying it verbatim).
+pub fn rewrite_report_sender_ssrc(buffer: &mut [u8], ssrc: u32) -> usize {
+    // Validate the whole compound before mutating any of it, so a truncated tail cannot leave a
+    // half-rewritten datagram on the wire.
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let Some(header) = buffer.get(offset..offset + 4) else {
+            return 0;
+        };
+        if header[0] >> 6 != 2 {
+            return 0;
+        }
+        let packet_len = (u16::from_be_bytes([header[2], header[3]]) as usize + 1) * 4;
+        if packet_len == 0 || offset + packet_len > buffer.len() {
+            return 0;
+        }
+        offset += packet_len;
+    }
+
+    let mut rewritten = 0;
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let packet_type = buffer[offset + 1];
+        let packet_len =
+            (u16::from_be_bytes([buffer[offset + 2], buffer[offset + 3]]) as usize + 1) * 4;
+        // The sender SSRC is the first word of the body in both report shapes (RFC 3550 §6.4.1/§6.4.2).
+        if matches!(
+            packet_type,
+            packet_type::SENDER_REPORT | packet_type::RECEIVER_REPORT
+        ) && packet_len >= 8
+        {
+            buffer[offset + 4..offset + 8].copy_from_slice(&ssrc.to_be_bytes());
+            rewritten += 1;
+        }
+        offset += packet_len;
+    }
+    rewritten
+}
+
 /// The two media kinds an rtcp-mux socket carries (RFC 5761 §4): inspect the second byte and
 /// classify by payload-type range. RTCP packet types occupy 64..=95 once the marker bit is masked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
