@@ -7,6 +7,24 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-09-08
+
+Every attribute the engine adds to a media section was emitted ahead of that section's `c=`, so an
+offer whose connection line sits at media level came back malformed and a strict peer rejected the
+body outright.
+
+**A patch.** `siphon-rtp-proto` is untouched — no verb, event, field or type changed — so a controller
+floating on `^0.5` needs no work to take it, and the internal path-deps pinned at `"0.5.0"` still
+caret-match, keeping the bump to the one workspace line. Nothing about what the engine accepts,
+decrypts or forwards moves.
+
+**Two behaviour deltas on the wire, both presentation-only.** A media description the engine
+re-originates now comes back in RFC 4566 §5 order rather than with the engine's own attributes at the
+`m=` line; and a fresh `a=rtcp` is no longer emitted when its port is the RTP port + 1, which
+RFC 3550 §11 already makes the peer's default. An offer whose `c=` is at session level — the common
+shape, and the one that was already correct — is emitted byte-for-byte as it was before, which a
+test pins exactly.
+
 ### Fixed
 
 - **Every attribute the engine adds was emitted ahead of the media section's `c=`, so an offer with
