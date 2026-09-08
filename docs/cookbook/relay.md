@@ -127,7 +127,6 @@ s=-
 c=IN IP4 203.0.113.10
 t=0 0
 m=audio 40002 RTP/AVP 8 0 101
-a=rtcp:40003
 a=rtpmap:8 PCMA/8000
 a=rtpmap:0 PCMU/8000
 a=rtpmap:101 telephone-event/8000
@@ -137,6 +136,20 @@ a=ptime:20
 The codec list, ptime, and every attribute the engine has no business touching pass through
 byte-for-byte. Both `IN IP4` and `IN IP6` legs are supported, and the two legs may be different
 families (see the `address_family` profile field for IPv4/IPv6 interworking).
+
+**No `a=rtcp` here**, because the companion RTCP endpoint landed on 40003 — the RTP port + 1, which
+is what a peer derives on its own (RFC 3550 §11). RFC 3605 §2.1 defines the attribute to carry a
+port that is *not* that, so the engine emits it only when the pair it was allocated is not adjacent,
+and rewrites one the offer already carried whatever the ports are.
+
+**Where the engine's own attributes go.** RFC 4566 §5 fixes the order inside a media description —
+`m=`, `i=`, `c=`, `b=`, `k=`, then `a=` — so everything the engine contributes (`a=rtcp`,
+`a=rtcp-mux`, the SDES `a=crypto` or the DTLS `a=fingerprint`/`a=setup`, `a=ice-mismatch`, the
+re-originated ICE block) is emitted at the head of the section's attribute region, after any
+connection line the section carries. That matters for an offer whose `c=` sits at media level rather
+than session level — §5.7 permits either, and an offer with no session-level `c=` requires the
+former. A section the engine re-originates comes back in §5 order; a section it does not anchor
+(`m=video`, and `m=text` when text is not anchored) is copied through line for line.
 
 ## Nothing touches the payload
 
