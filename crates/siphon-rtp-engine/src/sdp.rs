@@ -1106,6 +1106,101 @@ fn is_ice_attribute(line: &str) -> bool {
         || line.starts_with("a=end-of-candidates")
 }
 
+/// RFC 4566 §5 rank of a line inside a media description: `m=`, `i=`, `c=`, `b=`, `k=`, then `a=`.
+///
+/// Anything unrecognised ranks with the attribute region rather than the prelude — a line from a
+/// broken UA, and in particular the empty trailing element `split('\n')` yields for a body ending in
+/// CRLF, which has to stay at the end of the section instead of being hoisted ahead of its
+/// attributes, where it would become a blank line in the middle of the body.
+fn section_line_rank(line: &str) -> usize {
+    const ORDER: [&str; 5] = ["m=", "i=", "c=", "b=", "k="];
+    ORDER
+        .iter()
+        .position(|prefix| line.starts_with(prefix))
+        .unwrap_or(ORDER.len())
+}
+
+/// Collects the rewritten SDP line by line, holding each section the engine re-originates in RFC
+/// 4566 §5 order.
+///
+/// §5 fixes the order inside a media description — `m=`, `i=`, `c=`, `b=`, `k=`, then `a=` — and the
+/// engine contributes attributes of its own (`a=rtcp-mux`, `a=rtcp:`, the SDES `a=crypto` or the DTLS
+/// `a=fingerprint`/`a=setup`, `a=ice-mismatch`, the whole re-originated ICE block, and the
+/// secure-text `a=crypto`). Emitting those at the `m=` line is correct only when the section carries
+/// nothing between `m=` and its attributes — which is every SDP whose `c=` is at *session* level, and
+/// so was every fixture. For the media-level `c=` that §5.7 permits equally (and that an offer with
+/// no session-level connection line must use), each of them landed ahead of the connection line, and
+/// a parser that stops accepting `c=` once the attribute region has begun then reads the stream as
+/// having no connection address at all.
+///
+/// Lines are still emitted in arrival order; the section is put back into §5 order at its end, and
+/// only when something actually arrived out of rank. That keeps the session-level layout — the common
+/// one, and the one that was already correct — byte-identical, allocates nothing either way, and
+/// pays only where the order has to change. The reordering is scoped to the sections the engine
+/// re-originates (the audio section always, a text section whenever it is anchored or declined), so a
+/// `m=video` section, or a text section under [`TextRewrite::None`], is copied out line for line
+/// however it arrived.
+#[derive(Default)]
+struct SdpWriter {
+    lines: Vec<String>,
+    /// Index in `lines` at which the open re-originated section starts, if one is open.
+    section_start: Option<usize>,
+    /// Highest §5 rank emitted so far in the open section, and whether anything has since come back
+    /// below it — the test for "this section is not in §5 order".
+    highest_rank: usize,
+    misordered: bool,
+}
+
+impl SdpWriter {
+    /// Emit one of the input's own lines.
+    fn push(&mut self, line: String) {
+        self.emit(line);
+    }
+
+    /// Emit one of the engine's own attributes. Identical to [`Self::push`] today — both land in
+    /// arrival order and the sort below is stable, so the engine's block stays at the head of the
+    /// attribute region, ahead of the section's own attributes, exactly where it was emitted.
+    fn add(&mut self, line: String) {
+        self.emit(line);
+    }
+
+    fn emit(&mut self, line: String) {
+        if self.section_start.is_some() {
+            let rank = section_line_rank(&line);
+            if rank < self.highest_rank {
+                self.misordered = true;
+            } else {
+                self.highest_rank = rank;
+            }
+        }
+        self.lines.push(line);
+    }
+
+    /// Begin a section the engine re-originates, closing whatever was open before it.
+    fn open_section(&mut self) {
+        self.close_section();
+        self.section_start = Some(self.lines.len());
+        self.highest_rank = 0;
+        self.misordered = false;
+    }
+
+    /// End the open section, if any — at the next `m=` line, or at the end of the body — putting it
+    /// into §5 order if anything arrived out of rank. The sort is stable, so lines that share a rank
+    /// (the whole attribute region) keep the relative order they were emitted in.
+    fn close_section(&mut self) {
+        if let Some(start) = self.section_start.take() {
+            if self.misordered {
+                self.lines[start..].sort_by_key(|line| section_line_rank(line));
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.close_section();
+        self.lines
+    }
+}
+
 /// Rewrite the audio stream's RTP/RTCP transport to `engine`, returning the new SDP and the remote
 /// media info parsed from the input.
 ///
@@ -1185,7 +1280,7 @@ pub fn rewrite(
     let mut section_iter = scan.sections.iter().peekable();
     let mut current_kind: Option<MediaKind> = None;
 
-    let mut lines: Vec<String> = Vec::new();
+    let mut writer = SdpWriter::default();
     for (index, raw_line) in sdp.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         // Advance the section as we reach each `m=` line (the m-line belongs to the section it opens).
@@ -1193,6 +1288,10 @@ pub fn rewrite(
             if *m_index == index {
                 current_kind = Some(*kind);
                 section_iter.next();
+                // The previous section ends here, so close it (and put it into RFC 4566 §5 order if
+                // it needs it). The new one is opened by the arms below — and only for a section the
+                // engine re-originates, so one it passes through keeps its lines in arrival order.
+                writer.close_section();
             }
         }
         // The audio-plane attribute strips apply only to the session region + the audio section — never
@@ -1233,10 +1332,14 @@ pub fn rewrite(
         }
         if Some(index) == text_media_index {
             // The `m=text` line: anchor its port to the engine text endpoint, or decline it (port 0).
+            // Every arm but `None` re-originates the section, so it is held in RFC 4566 §5 order.
+            if !matches!(text, TextRewrite::None) {
+                writer.open_section();
+            }
             match text {
                 TextRewrite::Anchor(text_engine) => {
                     // Keep the text transport + format list; only the port is anchored.
-                    lines.push(rewrite_media_line(
+                    writer.push(rewrite_media_line(
                         line,
                         text_engine.rtp.port(),
                         Option::None,
@@ -1247,19 +1350,20 @@ pub fn rewrite(
                     crypto,
                 } => {
                     // Anchor the port AND force `RTP/SAVP` (the engine terminates SRTP on the text leg),
-                    // then advertise the engine's own SDES key for the text stream (RFC 4568).
-                    lines.push(rewrite_media_line(
+                    // then advertise the engine's own SDES key for the text stream (RFC 4568) — in the
+                    // attribute region, behind the section's own `c=` when it carries one.
+                    writer.push(rewrite_media_line(
                         line,
                         text_engine.rtp.port(),
                         Some("RTP/SAVP"),
                     ));
-                    lines.push(format!("a={}", crypto.to_attribute_value()));
+                    writer.add(format!("a={}", crypto.to_attribute_value()));
                 }
                 TextRewrite::Decline => {
                     // RFC 3264 §6: a rejected stream keeps its formats but advertises port 0.
-                    lines.push(rewrite_media_line(line, 0, Option::None));
+                    writer.push(rewrite_media_line(line, 0, Option::None));
                 }
-                TextRewrite::None => lines.push(line.to_string()),
+                TextRewrite::None => writer.push(line.to_string()),
             }
         } else if Some(index) == text_rtcp_index {
             // Text RTCP is not separately anchored: drop an anchored text section's `a=rtcp:` (single
@@ -1268,14 +1372,18 @@ pub fn rewrite(
                 TextRewrite::Anchor(_) | TextRewrite::AnchorSecure { .. } => {
                     /* drop the text a=rtcp line */
                 }
-                TextRewrite::None | TextRewrite::Decline => lines.push(line.to_string()),
+                TextRewrite::None | TextRewrite::Decline => writer.push(line.to_string()),
             }
         } else if index == media_index {
-            // `a=ice-lite` is session-level — emit it just before the media line (end of session).
+            // `a=ice-lite` is session-level — emit it just before the media line (end of session),
+            // so it goes out *before* the audio section is opened.
             if matches!(ice, IceRewrite::Reoriginate(_)) {
-                lines.push("a=ice-lite".to_string());
+                writer.push("a=ice-lite".to_string());
             }
-            lines.push(rewrite_media_line(
+            // The engine re-originates this section wholesale, so everything below belongs in its
+            // attribute region, behind a media-level `c=`/`i=`/`b=`/`k=` (RFC 4566 §5).
+            writer.open_section();
+            writer.push(rewrite_media_line(
                 line,
                 engine.rtp.port(),
                 security.as_ref().map(SecurityAdvertisement::transport),
@@ -1283,49 +1391,54 @@ pub fn rewrite(
             // RFC 5761: force `a=rtcp-mux` when the controller directs it (`Some(true)`), regardless
             // of whether the input offered it.
             if mux_override == Some(true) {
-                lines.push("a=rtcp-mux".to_string());
+                writer.add("a=rtcp-mux".to_string());
             }
-            // Insert a fresh a=rtcp line only if there is no existing one to rewrite in place.
+            // Insert a fresh a=rtcp line only if there is no existing one to rewrite in place, and
+            // only when the port is not the one the peer derives anyway: RFC 3550 §11 puts RTCP on
+            // the RTP port + 1 absent any signalling, and RFC 3605 §2.1 defines `a=rtcp` to carry a
+            // port that is *not* that. Restating the default is a line of pure noise on every
+            // non-mux anchor, and the ports come from an allocator that has no obligation to hand
+            // out an adjacent pair, so the attribute is still emitted whenever they are not adjacent.
             if let Some(rtcp) = engine.rtcp {
-                if rtcp_index.is_none() {
-                    lines.push(format!("a=rtcp:{}", rtcp.port()));
+                if rtcp_index.is_none() && engine.rtp.port().checked_add(1) != Some(rtcp.port()) {
+                    writer.add(format!("a=rtcp:{}", rtcp.port()));
                 }
             }
             // Advertise the engine's own keying on a secure leg: the SDES `a=crypto` (RFC 4568) or the
             // DTLS `a=fingerprint` + `a=setup` (RFC 5764 / RFC 5763).
             match &security {
                 Some(SecurityAdvertisement::Secure(crypto)) => {
-                    lines.push(format!("a={}", crypto.to_attribute_value()));
+                    writer.add(format!("a={}", crypto.to_attribute_value()));
                 }
                 Some(SecurityAdvertisement::Dtls { fingerprint, setup }) => {
-                    lines.push(format!("a={}", fingerprint.to_attribute_value()));
-                    lines.push(format!("a=setup:{}", setup.token()));
+                    writer.add(format!("a={}", fingerprint.to_attribute_value()));
+                    writer.add(format!("a=setup:{}", setup.token()));
                 }
                 Some(SecurityAdvertisement::Plain) | None => {}
             }
             if matches!(ice, IceRewrite::Mismatch) {
                 // RFC 8839 §5.3: say why ICE is absent rather than silently dropping it, so the
                 // offerer knows its SDP was rewritten and does not keep waiting for checks.
-                lines.push(ICE_MISMATCH_ATTRIBUTE.to_string());
+                writer.add(ICE_MISMATCH_ATTRIBUTE.to_string());
             }
             if let IceRewrite::Reoriginate(ice) = ice {
-                lines.push(format!("a=ice-ufrag:{}", ice.ufrag));
-                lines.push(format!("a=ice-pwd:{}", ice.pwd));
+                writer.add(format!("a=ice-ufrag:{}", ice.ufrag));
+                writer.add(format!("a=ice-pwd:{}", ice.pwd));
                 // RFC 8839 §5.1: the candidate's connection-address is a bare IP literal in either
                 // family — `IpAddr`'s Display emits a v6 literal without brackets, exactly as the
                 // `a=candidate` grammar requires (brackets are an `m=`/`c=`-line concern only).
                 for candidate in ice.candidates {
-                    lines.push(candidate.to_attribute_line());
+                    writer.add(candidate.to_attribute_line());
                 }
                 // RFC 8839 §5.6 / RFC 8838 §4.1: we *accept* trickled candidates, so say so — that is
                 // what lets a browser send its offer immediately and stream candidates afterwards.
                 // We never trickle our own: gathering finishes before we answer, which is why the
                 // end-of-candidates marker below is also true.
-                lines.push("a=ice-options:trickle".to_string());
+                writer.add("a=ice-options:trickle".to_string());
                 // RFC 8838 §14: our list is complete before the SDP is built (gathering runs to
                 // completion, or to its deadline, on the control path), so say so — a trickle-capable
                 // peer can stop waiting for more instead of holding its checklist open.
-                lines.push(END_OF_CANDIDATES_ATTRIBUTE.to_string());
+                writer.add(END_OF_CANDIDATES_ATTRIBUTE.to_string());
             }
         } else if let Some(&ip) = conn_rewrites.get(&index) {
             // RFC 4566 §5.7: emit the addrtype of the engine endpoint's own family (`IP4`/`IP6`),
@@ -1333,19 +1446,23 @@ pub fn rewrite(
             // is the interface's advertised (public) address, not the bound one — same family. Both the
             // audio and an anchored text stream's connection lines resolve here (they share the
             // advertised IP in this PR).
-            lines.push(format!("c=IN {} {}", addrtype(ip), ip));
+            writer.push(format!("c=IN {} {}", addrtype(ip), ip));
         } else if Some(index) == rtcp_index {
             match engine.rtcp {
-                Some(rtcp) => lines.push(format!("a=rtcp:{}", rtcp.port())),
+                // A line the offer carried is rewritten in place rather than dropped, even when the
+                // engine's port is the RFC 3550 §11 default the peer would derive: stating the
+                // default explicitly is legal (RFC 3605 §2.1 constrains the value, not its presence),
+                // and removing a line the peer asked for is a bigger edit than the redundancy costs.
+                Some(rtcp) => writer.push(format!("a=rtcp:{}", rtcp.port())),
                 None => { /* mux: drop the explicit a=rtcp line */ }
             }
         } else {
-            lines.push(line.to_string());
+            writer.push(line.to_string());
         }
     }
 
     Ok(Rewritten {
-        sdp: lines.join(CRLF),
+        sdp: writer.finish().join(CRLF),
         media,
     })
 }
@@ -1530,6 +1647,27 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
         return sdp.to_string();
     }
 
+    // Where an added codec's `a=rtpmap` goes: the last line of the audio section's RFC 4566 §5
+    // prelude (`i=` / `c=` / `b=` / `k=`), else the `m=` line itself. §5 fixes the order inside a
+    // media description — `m=`, `i=`, `c=`, `b=`, `k=`, then `a=` — and order is free only *among*
+    // the attributes, not across that boundary. This runs on the output of [`rewrite`] (the `Offer`
+    // path in `crate::engine`), so inserting at the media line would put an attribute straight back
+    // ahead of the connection line `rewrite` had just placed correctly, on any offer whose `c=` is
+    // media-level (RFC 4566 §5.7 permits it, and an offer with no session-level `c=` requires it).
+    let rtpmap_after = lines
+        .iter()
+        .enumerate()
+        .skip(media_index + 1)
+        .take_while(|(_, line)| !line.starts_with("m="))
+        .filter(|(_, line)| {
+            ["i=", "c=", "b=", "k="]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(media_index);
+
     let mut out: Vec<String> = Vec::with_capacity(lines.len() + added.len());
     for (index, line) in lines.iter().enumerate() {
         if index == media_index {
@@ -1545,28 +1683,30 @@ pub fn apply_codec_policy(sdp: &str, policy: &CodecPolicy) -> String {
                 media_fields[2],
                 formats.join(" ")
             ));
-            // Insert `a=rtpmap` for each added codec right after the media line (RFC 4566 — order-free).
-            // Emitted through the shared `rtpmap_line`, so an added Opus codec gets the mandatory
-            // `/2` channel suffix (RFC 7587 §7) rather than the illegal bare `opus/48000`.
+        } else {
+            // Drop `a=rtpmap`/`a=fmtp` for removed payload types.
+            let attr_pt = line
+                .strip_prefix("a=rtpmap:")
+                .or_else(|| line.strip_prefix("a=fmtp:"))
+                .and_then(|body| body.split(|c: char| c.is_whitespace() || c == '/').next())
+                .and_then(|pt| pt.trim().parse::<u8>().ok());
+            if let Some(pt) = attr_pt {
+                if removed.contains(&pt) {
+                    continue;
+                }
+            }
+            // Preserve the trailing empty line if the input ended with CRLF.
+            if !(index == lines.len() - 1 && line.is_empty()) {
+                out.push((*line).to_string());
+            }
+        }
+        // Insert `a=rtpmap` for each added codec at the head of the section's attribute region.
+        // Emitted through the shared `rtpmap_line`, so an added Opus codec gets the mandatory
+        // `/2` channel suffix (RFC 7587 §7) rather than the illegal bare `opus/48000`.
+        if index == rtpmap_after {
             for spec in &added {
                 out.push(rtpmap_line(spec));
             }
-            continue;
-        }
-        // Drop `a=rtpmap`/`a=fmtp` for removed payload types.
-        let attr_pt = line
-            .strip_prefix("a=rtpmap:")
-            .or_else(|| line.strip_prefix("a=fmtp:"))
-            .and_then(|body| body.split(|c: char| c.is_whitespace() || c == '/').next())
-            .and_then(|pt| pt.trim().parse::<u8>().ok());
-        if let Some(pt) = attr_pt {
-            if removed.contains(&pt) {
-                continue;
-            }
-        }
-        // Preserve the trailing empty line if the input ended with CRLF.
-        if !(index == lines.len() - 1 && line.is_empty()) {
-            out.push((*line).to_string());
         }
     }
     let mut rewritten = out.join(CRLF);
@@ -2273,10 +2413,13 @@ mod tests {
 
     #[test]
     fn rewrites_rtp_and_inserts_rtcp_for_non_mux() {
+        // A non-adjacent RTCP port, so the peer cannot derive it and the `a=rtcp` has to be inserted
+        // (RFC 3605 §2.1). The adjacent pair the allocator usually hands out is covered by
+        // `a_default_rtcp_port_is_not_advertised`.
         let sdp = offer("203.0.113.7", 49170);
         let engine = EngineMedia::new(
             "127.0.0.1:40000".parse().unwrap(),
-            Some("127.0.0.1:40001".parse().unwrap()),
+            Some("127.0.0.1:41001".parse().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -2294,13 +2437,13 @@ mod tests {
         assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
         assert!(result.sdp.contains("m=audio 40000 RTP/AVP 0 8 96"));
         assert!(
-            result.sdp.contains("a=rtcp:40001"),
+            result.sdp.contains("a=rtcp:41001"),
             "engine RTCP port advertised"
         );
         assert!(!result.sdp.contains("203.0.113.7"));
         let reparsed = parse(&result.sdp).expect("reparse");
         assert_eq!(reparsed.remote_rtp, engine.rtp);
-        assert_eq!(reparsed.remote_rtcp, "127.0.0.1:40001".parse().unwrap());
+        assert_eq!(reparsed.remote_rtcp, "127.0.0.1:41001".parse().unwrap());
     }
 
     #[test]
@@ -2405,7 +2548,7 @@ mod tests {
         sdp.push_str("a=rtcp-mux\r\n");
         let engine = EngineMedia::new(
             "127.0.0.1:40000".parse().unwrap(),
-            Some("127.0.0.1:40001".parse().unwrap()),
+            Some("127.0.0.1:41001".parse().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -2421,7 +2564,7 @@ mod tests {
             "a=rtcp-mux stripped under demux: {}",
             result.sdp
         );
-        assert!(result.sdp.contains("a=rtcp:40001"), "{}", result.sdp);
+        assert!(result.sdp.contains("a=rtcp:41001"), "{}", result.sdp);
         let reparsed = parse(&result.sdp).expect("reparse");
         assert!(!reparsed.rtcp_mux);
     }
@@ -2527,7 +2670,7 @@ mod tests {
         let sdp = offer_v6("2001:db8::1", 49170);
         let engine = EngineMedia::new(
             "[::1]:40000".parse().unwrap(),
-            Some("[::1]:40001".parse().unwrap()),
+            Some("[::1]:41001".parse().unwrap()),
         );
         let result = rewrite(
             &sdp,
@@ -2549,7 +2692,7 @@ mod tests {
             result.sdp
         );
         assert!(
-            result.sdp.contains("a=rtcp:40001"),
+            result.sdp.contains("a=rtcp:41001"),
             "engine v6 RTCP port advertised"
         );
         assert!(!result.sdp.contains("2001:db8::1"), "peer address removed");
@@ -2560,7 +2703,7 @@ mod tests {
         // The rewritten SDP reparses to the v6 engine transport.
         let reparsed = parse(&result.sdp).expect("reparse v6");
         assert_eq!(reparsed.remote_rtp, engine.rtp);
-        assert_eq!(reparsed.remote_rtcp, "[::1]:40001".parse().unwrap());
+        assert_eq!(reparsed.remote_rtcp, "[::1]:41001".parse().unwrap());
     }
 
     #[test]
@@ -3793,5 +3936,581 @@ mod tests {
         );
         assert!(result.sdp.contains("a=rtpmap:96 VP8/90000"));
         assert!(!result.sdp.contains("AUDIOKEY"), "{}", result.sdp);
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // RFC 4566 §5 line order inside a media description.
+    //
+    // §5 fixes the order of a media description: `m=`, `i=`, `c=`, `b=`, `k=`, then `a=`. Every
+    // other fixture in this module puts the connection line at **session** level, which is why the
+    // engine emitting its own attributes directly after the `m=` line went unseen for as long as
+    // that arm has existed: with a session-level `c=` there is nothing between `m=` and the
+    // attribute block for those attributes to jump ahead of. §5.7 allows either placement, a
+    // media-level `c=` is what an offer with no session-level connection line must use, and a
+    // parser that stops accepting `c=` once the attribute region has started then reads the stream
+    // as having no connection address at all.
+    // ----------------------------------------------------------------------------------------
+
+    /// The lines of `sdp`'s `m=<media>` section: its `m=` line and everything up to the next `m=`.
+    fn media_section<'a>(sdp: &'a str, media: &str) -> Vec<&'a str> {
+        let prefix = format!("m={media} ");
+        let mut lines = sdp.lines().skip_while(|line| !line.starts_with(&prefix));
+        let media_line = lines.next().expect("the section's m= line");
+        std::iter::once(media_line)
+            .chain(lines.take_while(|line| !line.starts_with("m=")))
+            .collect()
+    }
+
+    /// Assert a media description is emitted in RFC 4566 §5 order. This is the property a strict
+    /// parser enforces and the one an assertion built out of `contains` cannot see: every expected
+    /// line can be present and the section still be malformed. The tests below additionally pin
+    /// whole sections line for line, and `tests/sdp_fuzz_corpus_smoke.rs` carries an independent
+    /// copy of this oracle, so nothing rests on `section_line_rank` alone being right.
+    fn assert_rfc4566_line_order(section: &[&str], what: &str) {
+        let mut highest = 0;
+        for line in section {
+            let rank = section_line_rank(line);
+            assert!(
+                rank >= highest,
+                "{what}: `{line}` breaks RFC 4566 §5 line order in {section:?}"
+            );
+            highest = rank;
+        }
+    }
+
+    /// Index of the line starting with `needle`, for asserting one line precedes another.
+    fn position_of(section: &[&str], needle: &str) -> usize {
+        section
+            .iter()
+            .position(|line| line.starts_with(needle))
+            .unwrap_or_else(|| panic!("no `{needle}` line in {section:?}"))
+    }
+
+    /// An offer whose connection line sits at **media** level with no session-level `c=` to fall
+    /// back on — RFC 4566 §5.7 permits exactly this, and it is the shape the engine mangled.
+    fn media_level_conn_offer(addr: &str, port: u16) -> String {
+        format!(
+            "v=0\r\n\
+             o=alice 2890844526 2890844526 IN IP4 host.invalid\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             m=audio {port} RTP/AVP 0 8 96\r\n\
+             c=IN IP4 {addr}\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=rtpmap:96 telephone-event/8000\r\n\
+             a=sendrecv\r\n"
+        )
+    }
+
+    /// The same, with ICE credentials and a candidate so the re-origination arm has something to
+    /// strip and replace.
+    fn media_level_conn_ice_offer(addr: &str, port: u16) -> String {
+        format!(
+            "v=0\r\n\
+             o=alice 2890844526 2890844526 IN IP4 host.invalid\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\n\
+             c=IN IP4 {addr}\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=ice-ufrag:PEERUF\r\n\
+             a=ice-pwd:peerpassword01234567\r\n\
+             a=candidate:1 1 UDP 2130706431 {addr} {port} typ host\r\n\
+             a=sendrecv\r\n"
+        )
+    }
+
+    #[test]
+    fn a_fresh_rtcp_attribute_is_emitted_after_a_media_level_connection_line() {
+        // The plain non-mux anchor: the engine inserts an `a=rtcp:` for a port the peer cannot
+        // derive, and it must land in the attribute region, not between `m=` and `c=`.
+        let sdp = media_level_conn_offer("192.0.2.10", 20100);
+        let engine = EngineMedia::new(
+            "127.0.0.1:30168".parse().unwrap(),
+            Some("127.0.0.1:41001".parse().unwrap()),
+        );
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        let section = media_section(&result.sdp, "audio");
+        assert_rfc4566_line_order(&section, "fresh a=rtcp");
+        assert!(
+            position_of(&section, "c=") < position_of(&section, "a=rtcp:41001"),
+            "the connection line still precedes the engine's a=rtcp: {section:?}"
+        );
+        // The section's own connection line is the one anchored to the engine — the offer had no
+        // session-level `c=` to rewrite instead.
+        assert!(result.sdp.contains("c=IN IP4 127.0.0.1"));
+        assert!(!result.sdp.contains("192.0.2.10"));
+        let reparsed = parse(&result.sdp).expect("reparse");
+        assert_eq!(reparsed.remote_rtcp, "127.0.0.1:41001".parse().unwrap());
+    }
+
+    #[test]
+    fn a_forced_rtcp_mux_attribute_is_emitted_after_a_media_level_connection_line() {
+        let sdp = media_level_conn_offer("192.0.2.10", 20100);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            Some(true),
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        let section = media_section(&result.sdp, "audio");
+        assert_rfc4566_line_order(&section, "forced rtcp-mux");
+        assert!(position_of(&section, "c=") < position_of(&section, "a=rtcp-mux"));
+        assert!(parse(&result.sdp).expect("reparse").rtcp_mux);
+    }
+
+    #[test]
+    fn an_sdes_crypto_attribute_is_emitted_after_a_media_level_connection_line() {
+        use siphon_rtp_srtp::sdes::CryptoSuite;
+        let sdp = media_level_conn_offer("192.0.2.10", 20100);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let ours = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            Some(SecurityAdvertisement::Secure(ours)),
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        let section = media_section(&result.sdp, "audio");
+        assert_rfc4566_line_order(&section, "SDES a=crypto");
+        assert!(position_of(&section, "c=") < position_of(&section, "a=crypto:"));
+        assert!(result.sdp.contains("m=audio 30168 RTP/SAVP 0 8 96"));
+    }
+
+    #[test]
+    fn a_dtls_fingerprint_and_setup_are_emitted_after_a_media_level_connection_line() {
+        let sdp = media_level_conn_offer("192.0.2.10", 20100);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let fingerprint = Fingerprint::parse(
+            "fingerprint:sha-256 \
+             AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:\
+             AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89",
+        )
+        .expect("fingerprint");
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            Some(SecurityAdvertisement::Dtls {
+                fingerprint,
+                setup: Setup::Passive,
+            }),
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        let section = media_section(&result.sdp, "audio");
+        assert_rfc4566_line_order(&section, "DTLS keying");
+        assert!(position_of(&section, "c=") < position_of(&section, "a=fingerprint:"));
+        assert!(position_of(&section, "c=") < position_of(&section, "a=setup:"));
+    }
+
+    #[test]
+    fn a_re_originated_ice_block_is_emitted_after_a_media_level_connection_line() {
+        // The largest block the engine contributes: ufrag, pwd, every candidate, the trickle option
+        // and the end-of-candidates marker, all of which used to land between `m=` and `c=`.
+        let sdp = media_level_conn_ice_offer("192.0.2.10", 20100);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let candidates = gathered_host_candidates("127.0.0.1:30168");
+        let advert = IceAdvertisement {
+            ufrag: "ENGUF",
+            pwd: "engpassword01234567",
+            candidates: &candidates,
+        };
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Reoriginate(advert),
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        let section = media_section(&result.sdp, "audio");
+        assert_rfc4566_line_order(&section, "re-originated ICE");
+        let connection = position_of(&section, "c=");
+        for attribute in [
+            "a=ice-ufrag:ENGUF",
+            "a=ice-pwd:",
+            "a=candidate:",
+            "a=ice-options:trickle",
+            "a=end-of-candidates",
+        ] {
+            assert!(
+                connection < position_of(&section, attribute),
+                "`{attribute}` precedes the connection line: {section:?}"
+            );
+        }
+        // `a=ice-lite` is session-level (RFC 8839 §5.2), so it belongs *before* the `m=` line —
+        // where the session region's own attribute block is.
+        assert!(!section.contains(&"a=ice-lite"), "{section:?}");
+        assert!(result.sdp.contains("a=ice-lite"));
+    }
+
+    #[test]
+    fn an_ice_mismatch_attribute_is_emitted_after_a_media_level_connection_line() {
+        let sdp = media_level_conn_ice_offer("192.0.2.10", 20100);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Mismatch,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        let section = media_section(&result.sdp, "audio");
+        assert_rfc4566_line_order(&section, "a=ice-mismatch");
+        assert!(position_of(&section, "c=") < position_of(&section, ICE_MISMATCH_ATTRIBUTE));
+    }
+
+    #[test]
+    fn a_secure_text_anchor_emits_its_crypto_after_a_media_level_connection_line() {
+        use siphon_rtp_srtp::sdes::CryptoSuite;
+        // The text arm has the same shape as the audio one: `AnchorSecure` pushes the engine's own
+        // `a=crypto` straight after the `m=text` line, so a text section with its own `c=` is
+        // malformed by the same mechanism.
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=- 1 1 IN IP4 198.51.100.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 5000 RTP/AVP 0\r\n",
+            "c=IN IP4 198.51.100.1\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "m=text 5002 RTP/SAVP 98 99\r\n",
+            "c=IN IP4 198.51.100.1\r\n",
+            "a=rtpmap:98 red/1000\r\n",
+            "a=rtpmap:99 t140/1000\r\n",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR\r\n",
+        );
+        let audio_engine = EngineMedia::new("127.0.0.1:40000".parse().unwrap(), None);
+        let text_engine = EngineMedia::new("127.0.0.1:40002".parse().unwrap(), None);
+        let our_text_key =
+            CryptoAttribute::generate(7, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let result = rewrite(
+            sdp,
+            audio_engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::AnchorSecure {
+                engine: text_engine,
+                crypto: our_text_key,
+            },
+        )
+        .expect("rewrite");
+        let text = media_section(&result.sdp, "text");
+        assert_rfc4566_line_order(&text, "secure text anchor");
+        assert!(position_of(&text, "c=") < position_of(&text, "a=crypto:"));
+        // Both sections' own connection lines are anchored to their engine endpoint (the `o=` origin
+        // is `rewrite_origin`'s job, not `rewrite`'s, so the UE address survives there).
+        assert!(
+            !result.sdp.contains("c=IN IP4 198.51.100.1"),
+            "{}",
+            result.sdp
+        );
+        assert_eq!(result.sdp.matches("c=IN IP4 127.0.0.1").count(), 2);
+        let reparsed = parse(&result.sdp).expect("reparse");
+        let text_info = reparsed.text.expect("text");
+        assert_eq!(text_info.remote_rtp, "127.0.0.1:40002".parse().unwrap());
+        assert_eq!(text_info.crypto.first().map(|crypto| crypto.tag), Some(7));
+    }
+
+    #[test]
+    fn media_level_title_bandwidth_and_key_lines_stay_ahead_of_the_attribute_block() {
+        // §5 places `i=`, `c=`, `b=` and `k=` between `m=` and the attribute region, so all four are
+        // displaced by the same arm — not just the `c=`, which is only the most common of them.
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=alice 2890844526 2890844526 IN IP4 host.invalid\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 20100 RTP/AVP 0\r\n",
+            "i=voice\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "b=AS:64\r\n",
+            "k=prompt\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+        );
+        let engine = EngineMedia::new(
+            "127.0.0.1:30168".parse().unwrap(),
+            Some("127.0.0.1:41001".parse().unwrap()),
+        );
+        let result = rewrite(
+            sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            Some(true),
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        let section = media_section(&result.sdp, "audio");
+        assert_rfc4566_line_order(&section, "i=/c=/b=/k=");
+        assert_eq!(
+            &section[..5],
+            &[
+                "m=audio 30168 RTP/AVP 0",
+                "i=voice",
+                "c=IN IP4 127.0.0.1",
+                "b=AS:64",
+                "k=prompt",
+            ],
+            "the section's own prelude is preserved in order: {section:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_line_that_arrived_after_an_attribute_is_emitted_back_in_order() {
+        // The engine re-originates the audio section wholesale (its `m=` port, its transport, its
+        // connection address), so it must not hand a strict parser a section it knows is malformed —
+        // whether the misordering is its own or the offerer's. Sections the engine does not
+        // re-originate stay byte-for-byte verbatim; that is the next test.
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=alice 2890844526 2890844526 IN IP4 host.invalid\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 20100 RTP/AVP 0\r\n",
+            "a=rtcp:20101\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "a=sendrecv\r\n",
+        );
+        let engine = EngineMedia::new(
+            "127.0.0.1:30168".parse().unwrap(),
+            Some("127.0.0.1:41001".parse().unwrap()),
+        );
+        let result =
+            rewrite(sdp, engine, IceRewrite::Keep, None, None, TextRewrite::None).expect("rewrite");
+        let section = media_section(&result.sdp, "audio");
+        assert_rfc4566_line_order(&section, "offerer-misordered c=");
+        assert_eq!(
+            section,
+            vec![
+                "m=audio 30168 RTP/AVP 0",
+                "c=IN IP4 127.0.0.1",
+                "a=rtcp:41001",
+                "a=sendrecv",
+            ],
+            "the peer's own attributes keep their relative order: {section:?}"
+        );
+    }
+
+    #[test]
+    fn a_video_section_is_still_passed_through_verbatim() {
+        // The reorder is scoped to the sections the engine re-originates. A `m=video` section is
+        // copied out line for line, misordering included — it is not ours to normalise.
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=alice 2890844526 2890844526 IN IP4 host.invalid\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 20100 RTP/AVP 0\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "a=rtpmap:0 PCMU/8000\r\n",
+            "m=video 6000 RTP/AVP 96\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "b=AS:512\r\n",
+        );
+        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let result =
+            rewrite(sdp, engine, IceRewrite::Keep, None, None, TextRewrite::None).expect("rewrite");
+        assert_eq!(
+            media_section(&result.sdp, "video"),
+            vec![
+                "m=video 6000 RTP/AVP 96",
+                "a=rtpmap:96 VP8/90000",
+                "c=IN IP4 192.0.2.10",
+                "b=AS:512",
+            ],
+            "a section the engine does not anchor is untouched: {}",
+            result.sdp
+        );
+    }
+
+    #[test]
+    fn the_session_level_layout_keeps_the_engine_attributes_at_the_media_line() {
+        // The session-level `c=` fixtures are the other half of the coverage, and both layouts are
+        // legal (RFC 4566 §5.7). With nothing between `m=` and the attribute region, the engine's
+        // own attributes still sit directly after the `m=` line — byte for byte what it emitted
+        // before the reorder.
+        let sdp = offer("203.0.113.7", 49170);
+        let engine = EngineMedia::new(
+            "127.0.0.1:40000".parse().unwrap(),
+            Some("127.0.0.1:41001".parse().unwrap()),
+        );
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            Some(true),
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        assert_eq!(
+            result.sdp,
+            "v=0\r\n\
+             o=alice 2890844526 2890844526 IN IP4 host.invalid\r\n\
+             s=-\r\n\
+             c=IN IP4 127.0.0.1\r\n\
+             t=0 0\r\n\
+             m=audio 40000 RTP/AVP 0 8 96\r\n\
+             a=rtcp-mux\r\n\
+             a=rtcp:41001\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=rtpmap:96 telephone-event/8000\r\n"
+        );
+    }
+
+    #[test]
+    fn the_trailing_crlf_survives_the_section_reorder() {
+        // `split('\n')` yields a trailing empty element for a body ending in CRLF, and the join puts
+        // the terminator back. That empty line must stay at the end of the section rather than being
+        // hoisted into the prelude, which would put a blank line in the middle of the body.
+        let sdp = media_level_conn_offer("192.0.2.10", 20100);
+        let engine = EngineMedia::new("127.0.0.1:30168".parse().unwrap(), None);
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        assert!(result.sdp.ends_with("a=sendrecv\r\n"), "{:?}", result.sdp);
+        assert!(
+            !result.sdp.trim_end_matches("\r\n").contains("\r\n\r\n"),
+            "a blank line landed inside the body: {:?}",
+            result.sdp
+        );
+    }
+
+    #[test]
+    fn a_default_rtcp_port_is_not_advertised() {
+        // RFC 3550 §11: absent an `a=rtcp`, RTCP is the RTP port + 1. RFC 3605 §2.1 exists to signal
+        // a port that is *not* that, so restating the default is a line of pure noise on every
+        // non-mux anchor.
+        let sdp = offer("203.0.113.7", 49170);
+        let engine = EngineMedia::new(
+            "127.0.0.1:40000".parse().unwrap(),
+            Some("127.0.0.1:40001".parse().unwrap()),
+        );
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        assert!(
+            !result.sdp.contains("a=rtcp:"),
+            "the default RTCP port is restated: {}",
+            result.sdp
+        );
+        // The peer derives it, and so does our own parser — the round trip is unchanged.
+        let reparsed = parse(&result.sdp).expect("reparse");
+        assert_eq!(reparsed.remote_rtcp, "127.0.0.1:40001".parse().unwrap());
+    }
+
+    #[test]
+    fn a_peers_own_rtcp_attribute_is_still_rewritten_at_the_default_port() {
+        // Only the *fresh* insert is skipped. A peer that asked for an explicit `a=rtcp` gets one
+        // back: dropping a line the offer carried is a bigger edit than the redundancy is worth, and
+        // stating the default explicitly is legal (RFC 3605 §2.1 constrains the value, not its
+        // presence).
+        let mut sdp = offer("203.0.113.7", 49170);
+        sdp.push_str("a=rtcp:53000\r\n");
+        let engine = EngineMedia::new(
+            "127.0.0.1:40000".parse().unwrap(),
+            Some("127.0.0.1:40001".parse().unwrap()),
+        );
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        assert!(result.sdp.contains("a=rtcp:40001"), "{}", result.sdp);
+        assert_eq!(result.sdp.matches("a=rtcp:").count(), 1);
+    }
+
+    #[test]
+    fn an_added_codecs_rtpmap_lands_after_a_media_level_connection_line() {
+        // `apply_codec_policy` inserts an `a=rtpmap` per added codec, and it runs on the output of
+        // `rewrite` (`engine.rs`, the `Offer` path), so inserting at the `m=` line would put an
+        // attribute back ahead of the connection line `rewrite` had just placed correctly — the same
+        // RFC 4566 §5 defect one call later, on every `codec-transcode-X` offer.
+        let sdp = concat!(
+            "v=0\r\n",
+            "o=alice 2890844526 2890844526 IN IP4 host.invalid\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 20100 RTP/AVP 8\r\n",
+            "c=IN IP4 192.0.2.10\r\n",
+            "b=AS:64\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+        );
+        let policy = CodecPolicy {
+            add: vec![CodecSpec::new(0, "PCMU", 8000, 1, 20)],
+            ..CodecPolicy::default()
+        };
+        let rewritten = apply_codec_policy(sdp, &policy);
+        let section = media_section(&rewritten, "audio");
+        assert_rfc4566_line_order(&section, "added codec rtpmap");
+        assert_eq!(
+            section,
+            vec![
+                "m=audio 20100 RTP/AVP 8 0",
+                "c=IN IP4 192.0.2.10",
+                "b=AS:64",
+                "a=rtpmap:0 PCMU/8000",
+                "a=rtpmap:8 PCMA/8000",
+            ],
+            "{rewritten}"
+        );
+    }
+
+    #[test]
+    fn an_added_codecs_rtpmap_still_follows_the_media_line_at_session_level() {
+        // The session-level twin: with nothing between `m=` and the attribute region, the added
+        // rtpmap sits directly after the media line exactly as it always has.
+        let sdp = offer("203.0.113.7", 49170);
+        let policy = CodecPolicy {
+            add: vec![CodecSpec::new(9, "G722", 8000, 1, 20)],
+            ..CodecPolicy::default()
+        };
+        let rewritten = apply_codec_policy(&sdp, &policy);
+        let section = media_section(&rewritten, "audio");
+        assert_rfc4566_line_order(&section, "added codec rtpmap, session-level c=");
+        assert_eq!(section[0], "m=audio 49170 RTP/AVP 0 8 96 9");
+        assert_eq!(section[1], "a=rtpmap:9 G722/8000");
+        assert!(rewritten.ends_with("\r\n"), "{rewritten:?}");
     }
 }

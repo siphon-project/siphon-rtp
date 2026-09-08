@@ -7,6 +7,44 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every attribute the engine adds was emitted ahead of the media section's `c=`, so an offer with
+  a media-level connection line came back malformed.** RFC 4566 §5 fixes the order inside a media
+  description — `m=`, `i=`, `c=`, `b=`, `k=`, then `a=` — and the rewriter pushed everything it
+  contributes (`a=rtcp`, `a=rtcp-mux`, the SDES `a=crypto` or the DTLS `a=fingerprint` + `a=setup`,
+  `a=ice-mismatch`, and the whole re-originated ICE block) directly after the `m=` line. That is
+  indistinguishable from correct for an offer whose `c=` is at **session** level, because nothing
+  then sits between `m=` and the attribute region — and every SDP fixture in the tree was that shape,
+  which is why the arm emitted in this order for as long as it has existed without a test noticing.
+  §5.7 permits the connection line at media level equally, and an offer carrying no session-level
+  `c=` has no other choice; on those, each of those attributes landed ahead of it. A peer that stops
+  accepting `c=` once the attribute region has begun then reads the audio stream as having no
+  connection address at all and rejects the body, which is a lenient-versus-strict split rather than
+  a regression: the same SDP is accepted by most of the world and refused by some.
+
+  The text arm had the same shape — `TextRewrite::AnchorSecure` pushed the engine's `a=crypto`
+  straight after the `m=text` line — and so did `apply_codec_policy`, which inserts an `a=rtpmap` per
+  added codec and runs on the rewriter's *output*, so it would have put an attribute back ahead of a
+  connection line the rewriter had just placed correctly on every `codec-transcode-X` offer.
+
+  A section the engine re-originates (the audio section always; a text section when it is anchored or
+  declined) is now emitted in §5 order, whether the misordering would have been the engine's own or
+  the offerer's: the engine rewrites that section's port, transport and connection address, so it
+  must not hand a strict parser a body it knows is malformed. A section it does **not** anchor —
+  `m=video`, and `m=text` under `TextRewrite::None` — is still copied through line for line.
+
+  Nothing about which attributes are emitted, what the engine accepts, or what it forwards changes;
+  only where those attributes sit within their section.
+
+- **The `a=rtcp` attribute is no longer emitted for a port the peer derives anyway.** RFC 3550 §11
+  puts RTCP on the RTP port + 1 absent any signalling, and RFC 3605 §2.1 defines the attribute to
+  carry a port that is *not* that, so restating the default was a line of noise on every non-mux
+  anchor. The engine still emits it whenever the pair it was allocated is not adjacent — the port
+  allocator has no obligation to hand out adjacent ports — and still rewrites in place an `a=rtcp`
+  the offer itself carried, at any port: stating the default explicitly is legal, and dropping a line
+  a peer asked for is a bigger edit than the redundancy costs.
+
 ## [0.5.0] — 2026-09-07
 
 The echo canceller silently did nothing on a leg whose far party was more than 128 ms away, and
