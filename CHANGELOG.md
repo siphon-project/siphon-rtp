@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-09-10
+
 The long-tail echo canceller could not span an echo path longer than 512 ms on a wideband leg, which
 is inside the range a relayed call to a mobile actually returns in.
 
