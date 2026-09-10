@@ -7,6 +7,59 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+The long-tail echo canceller could not span an echo path longer than 512 ms on a wideband leg, which
+is inside the range a relayed call to a mobile actually returns in.
+
+### Changed
+
+- **The long-tail ceiling is 1000 ms, at both media rates.** `echo_delay_search_ms` read as a tail
+  (`echo_long_tail` set) now accepts 16–1000 ms instead of 16–512. The tap cap behind it rises from
+  8192 to 16384 samples and the MDF partition cap from 64 to 128 with it — the two are tied by a
+  static assert precisely so one cannot move without the other.
+
+  The old ceiling was derived from the tap cap at the wideband rate, and that is the defect: a tap
+  cap is a *sample* count, so a millisecond ceiling pinned to it is worth half as long at 16 kHz —
+  the rate every speech model wants, and the one the voice-AI guidance recommends. The same mistake
+  had already been made once at 4096 taps, where the wideband leg ran out at 256 ms; raising it to
+  8192 moved the wall to 512 ms without removing it. The ceiling is now stated as a duration both
+  supported rates can serve, so it means the same thing whichever rate a leg negotiates.
+
+  Past the tail the filter has no taps covering the echo, so it cancels nothing there while running
+  without error and reporting healthy from every accessor and counter — on a voice-AI bridge that
+  surfaces two components away, as an agent that hears its own returning voice, classifies it as
+  speech, and interrupts itself. On the regression fixture a 560 ms echo measures **−0.6 dB** ERLE
+  against a 512 ms tail (marginally worse than not cancelling) and **33.4 dB** against a 1 s one.
+
+  **Observable to a controller:** an offer with `echo_long_tail` and `echo_delay_search_ms` between
+  513 and 1000 flips from rejected to accepted. Nothing that was accepted before changes behaviour,
+  and no leg pays anything more unless it asks for a longer tail — the caps are validation only and
+  never size an allocation.
+
+- **Cost figures at the new ceiling, measured rather than scaled.** A 1 s tail is ~11.5× the 64 ms
+  residual tail's per-frame work (~207 µs at 8 kHz, ~463 µs at 16 kHz per 20 ms frame) against ~6×
+  at 512 ms, and per-leg canceller state goes 238 KiB → 424 KiB. **A deployment enabling a longer
+  tail should re-measure its concurrency ceiling**: the worst corner is now ~2.3 % of a core per
+  call rather than ~1.2 %.
+
+  This also corrects a figure the 0.5.0 entry, the control reference and the cookbook all published:
+  per-leg long-tail state was quoted as ~96 KiB, roughly half the truth, because the estimate counted
+  the filter weights and missed the equally sized `x_spectra` array the MDF holds for the partitioned
+  far-end spectra. It is now measured by a test rather than estimated, and the growth is affine
+  (~45 KiB of rate-fixed scratch plus ~6.0 KiB per partition), not proportional.
+
+### Added
+
+- **`siphon-rtp-proto` exports the accepted echo bounds** — `ECHO_DELAY_SEARCH_MS_MIN`/`_MAX` and
+  `ECHO_LONG_TAIL_MS_MIN`/`_MAX`. The engine reads them instead of restating the digits, and a
+  controller should validate against them rather than hardcoding a range.
+
+  The bounds are enforced in two places — the engine refuses an out-of-range value per offer, a
+  controller wants to refuse it once at config load — and duplicating the number is how the two came
+  to disagree: a controller checking both readings against one 16–1000 range accepted a long-tail
+  profile the engine refused on every call, so the node started healthy and then failed everything.
+  The two pairs are kept separate even though all four values currently coincide, because they bound
+  different things and have already diverged once.
+
 ## [0.5.1] — 2026-09-08
 
 Every attribute the engine adds to a media section was emitted ahead of that section's `c=`, so an

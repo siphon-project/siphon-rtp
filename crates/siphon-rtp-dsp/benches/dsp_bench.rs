@@ -242,8 +242,10 @@ fn bench_aec(criterion: &mut Criterion) {
     // cheap per frame and expensive at call setup. Swept at both media rates because the underlying
     // cap is a sample count: the same milliseconds buy a different block at 8 and 16 kHz.
     //
-    // 256 ms is the engine default and 512 ms the reachable maximum; 128 ms is the previous default,
-    // kept as the comparison point for what raising it actually cost per frame.
+    // 256 ms is the engine default and 512 ms the widest window the *search* cap reaches at 16 kHz;
+    // 128 ms is the previous default, kept as the comparison point for what raising it actually cost
+    // per frame. Note that is the search cap, not the tail cap — the two were the same number until
+    // the tail had to reach a relay-length echo path, and the long-tail sweep below now runs to 1 s.
     let mut window_group = criterion.benchmark_group("aec_delay_search_window");
     for &(rate, millis) in &[
         (8_000u32, 128u32),
@@ -328,15 +330,19 @@ fn bench_aec(criterion: &mut Criterion) {
     // the per-partition loop, so an adapting block is `2K + 3` transforms. The sweep starts at the
     // engine's own 64 ms residual tail (`K = 4`, what the estimating build uses once the estimator
     // has removed the bulk delay) so the ratio to a path-length tail is read straight off, at both
-    // media rates because the same milliseconds are twice the taps at 16 kHz.
+    // media rates because the same milliseconds are twice the taps at 16 kHz. It ends at the 1 s
+    // ceiling the engine accepts, which is the worst corner an operator sizing concurrency has to
+    // budget for.
     let mut tail_group = criterion.benchmark_group("aec_long_tail");
     for &(rate, millis) in &[
         (8_000u32, 64u32),
         (8_000, 256),
         (8_000, 512),
+        (8_000, 1_000),
         (16_000, 64),
         (16_000, 256),
         (16_000, 512),
+        (16_000, 1_000),
     ] {
         let (far, near_template) = if rate == 8_000 {
             (&far_loud_8k, &near_quiet_8k)

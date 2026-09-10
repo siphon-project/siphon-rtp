@@ -13,6 +13,10 @@ use siphon_rtp_dsp::EchoCanceller;
 struct CountingAllocator;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+/// Bytes requested while counting is armed. Separate from [`ALLOCATIONS`] because the hot-path tests
+/// want "how many times" and the footprint test wants "how much" — a leg's steady-state state size is
+/// published to operators sizing a fleet, and until this existed that figure was only ever estimated.
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     // Only the measuring thread arms counting. A *global* counter would also catch the libtest
@@ -20,6 +24,12 @@ thread_local! {
     // on a slow (CI) runner. `const`-initialised so accessing it in `alloc` never itself allocates
     // (no lazy Key / destructor registration), keeping the allocator re-entrancy-safe.
     static ARMED: Cell<bool> = const { Cell::new(false) };
+    // Arms the *byte* counter only, and deliberately does not touch [`ALLOCATIONS`]. The footprint
+    // test is the one test here that allocates heavily while measuring, and [`ALLOCATIONS`] is a
+    // global: arming both from it would add its construction to whatever hot-loop window another
+    // test has open on another thread, failing that test for allocations it did not make. Separate
+    // flags keep the two measurements from seeing each other.
+    static BYTES_ARMED: Cell<bool> = const { Cell::new(false) };
 }
 
 // SAFETY: every call delegates straight to the system allocator; we only bump a relaxed counter, and
@@ -28,6 +38,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARMED.with(Cell::get) {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        if BYTES_ARMED.with(Cell::get) {
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
         System.alloc(layout)
     }
@@ -220,17 +233,22 @@ fn cancel_mdf_makes_no_heap_allocation() {
     );
 }
 
-/// The long-tail mode at the widest tail the cap allows. Same backend as `with_mdf`, but this is the
-/// configuration with the most partitions in the tree — 32 of them at 16 kHz — so it runs the most
-/// per-block gradient-constraint IFFT/FFT pairs of anything here, and it is the one a relay leg
-/// actually gets. Each constructor carries its own test in this file because a preallocation miss
-/// would be invisible in any of the others.
+/// The long-tail mode at the widest tail the cap allows, run at the rate that turns that tail into
+/// the **most partitions** — 8 kHz, where the cap is 128 blocks of 128 samples against 64 blocks of
+/// 256 at 16 kHz. Same backend as `with_mdf`, but this is the configuration that runs the most
+/// per-block gradient-constraint IFFT/FFT pairs of anything here, so a preallocation miss in the
+/// per-partition loop shows up here first. Each constructor carries its own test in this file
+/// because such a miss would be invisible in any of the others.
+///
+/// `TAIL` reads the cap rather than restating it: this test used to pin 8192 and call it "the widest
+/// tail the cap allows", which stopped being true the moment the cap moved, leaving it quietly
+/// proving the preallocation for half the worst case.
 #[test]
 fn cancel_mdf_long_tail_makes_no_heap_allocation() {
-    const TAIL: usize = 8_192; // 512 ms @ 16 kHz — 32 partitions of 256
-    const FRAME: usize = 320; // 16 kHz / 20 ms
+    const TAIL: usize = EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED;
+    const FRAME: usize = 160; // 8 kHz / 20 ms
 
-    let mut canceller = EchoCanceller::with_mdf_long_tail(16_000, TAIL)
+    let mut canceller = EchoCanceller::with_mdf_long_tail(8_000, TAIL)
         .expect("build")
         .with_two_path_dtd();
     let reference: Vec<i16> = (0..FRAME)
@@ -349,5 +367,70 @@ fn cancel_with_residual_suppression_makes_no_heap_allocation() {
         before,
         "cancel-with-residual-suppression allocated {} times across 2000 frames (must be zero)",
         after - before
+    );
+}
+
+/// What a long-tail leg actually costs in memory, measured rather than estimated.
+///
+/// The per-leg state size is published to operators sizing concurrency (the control reference and
+/// the voice-AI cookbook both quote it), and it was quoted for a long time as roughly half what it
+/// is: the estimate counted the filter weights and missed that the MDF holds a second array of the
+/// same shape, `x_spectra`, for the partitioned far-end spectra. An estimate nothing checks drifts,
+/// so this pins it.
+///
+/// Asserted as a band rather than an exact figure — the allocator rounds, and the point is to catch
+/// a doubling, not a byte. Print the measured value with `DUMP_GOLDEN=1 cargo test -p siphon-rtp-dsp
+/// --test aec_zero_alloc -- --nocapture`.
+#[test]
+fn long_tail_construction_footprint_matches_the_published_figure() {
+    /// Bytes the heap is asked for while building a wideband long-tail canceller of `tail` taps.
+    fn footprint(tail: usize) -> (usize, usize) {
+        BYTES_ARMED.with(|armed| armed.set(true));
+        let before = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        let canceller = EchoCanceller::with_mdf_long_tail(16_000, tail)
+            .expect("build wideband tail")
+            .with_two_path_dtd();
+        let after = ALLOCATED_BYTES.load(Ordering::Relaxed);
+        BYTES_ARMED.with(|armed| armed.set(false));
+        (after - before, canceller.mdf_partitions().unwrap_or(0))
+    }
+
+    // The old ceiling and the new one, at the rate that makes both worst-case.
+    let (old_ceiling, old_partitions) = footprint(8_192);
+    let (new_ceiling, new_partitions) = footprint(16_000);
+
+    if std::env::var_os("DUMP_GOLDEN").is_some() {
+        eprintln!(
+            "long-tail footprint @16 kHz: {old_partitions} partitions {old_ceiling} B \
+             ({:.0} KiB) → {new_partitions} partitions {new_ceiling} B ({:.0} KiB)",
+            old_ceiling as f64 / 1024.0,
+            new_ceiling as f64 / 1024.0
+        );
+    }
+
+    // ~424 KiB at the 1 s ceiling: two `partitions × bins` complex arrays dominate, plus the far-end
+    // ring and the time-domain vectors the MDF path still allocates. A band, not an exact figure —
+    // the point is to catch a doubling, not a byte.
+    assert!(
+        (380 * 1024..470 * 1024).contains(&new_ceiling),
+        "long-tail leg footprint {new_ceiling} bytes is outside the published band; if this is a \
+         deliberate change, update the figure in docs/control/json.md, docs/cookbook/voice-ai.md \
+         and the ProfileFlags docs in the same commit"
+    );
+    // Footprint is **affine** in the partition count, not proportional: a fixed part (the bin- and
+    // block-sized scratch, which depends only on the rate) plus a marginal part per partition. That
+    // distinction is why doubling the tail is less than double the state — 238 KiB → 424 KiB here,
+    // 1.78× for 1.97× the partitions — and it is what lets an operator scale the published figure to
+    // whatever tail they configure instead of measuring each one.
+    //
+    // The marginal cost is exact and derivable: per partition the MDF holds one `weights` and one
+    // `x_spectra` complex bin array (2 × 257 × 8 B at this rate) and the tail grows the two
+    // time-domain vectors by a block each (2 × 256 × 4 B) — 6160 B. Asserting the margin rather than
+    // the ratio keeps this meaningful if the fixed part ever changes.
+    let marginal = (new_ceiling - old_ceiling) / (new_partitions - old_partitions);
+    assert_eq!(
+        marginal, 6_160,
+        "per-partition state changed: {old_partitions}→{new_partitions} partitions took \
+         {old_ceiling}→{new_ceiling} bytes, i.e. {marginal} B per partition"
     );
 }

@@ -92,6 +92,39 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// SDP and play-media blobs are the only large payloads and stay well under this.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
+/// Smallest [`ProfileFlags::echo_delay_search_ms`] the engine accepts as a **search window**, in
+/// milliseconds. The floor keeps a request from rounding to a degenerate range.
+///
+/// Exported because the bound is enforced in two places — the engine refuses an out-of-range value
+/// per offer, and a controller wants to refuse it once at config load, where the operator can still
+/// see it. Restating the number on the controller side is what put a range in siphon's config
+/// validator that the engine did not accept, so a profile could load, register and report healthy
+/// and then fail every call. Read these rather than copying the digits.
+pub const ECHO_DELAY_SEARCH_MS_MIN: u32 = 16;
+/// Largest [`ProfileFlags::echo_delay_search_ms`] the engine accepts as a **search window**, in
+/// milliseconds — the widest any supported media rate can express. See
+/// [`ECHO_DELAY_SEARCH_MS_MIN`].
+pub const ECHO_DELAY_SEARCH_MS_MAX: u32 = 1_000;
+/// Smallest [`ProfileFlags::echo_delay_search_ms`] the engine accepts as a **tail length**, i.e.
+/// with [`ProfileFlags::echo_long_tail`] set. See [`ECHO_LONG_TAIL_MS_MAX`].
+pub const ECHO_LONG_TAIL_MS_MIN: u32 = 16;
+/// Largest [`ProfileFlags::echo_delay_search_ms`] the engine accepts as a **tail length**, i.e. with
+/// [`ProfileFlags::echo_long_tail`] set, in milliseconds.
+///
+/// Kept as its own constant even though it currently equals [`ECHO_DELAY_SEARCH_MS_MAX`], because
+/// the two bound different things — a window the estimator scans versus a filter the leg pays for
+/// every frame — and they have already moved independently once. The tail ceiling was 512 ms while
+/// the window ceiling was 1000, which is exactly the gap a controller validating both against one
+/// hardcoded range fell into. Collapsing them into a single constant now would rebuild that.
+pub const ECHO_LONG_TAIL_MS_MAX: u32 = 1_000;
+
+/// A floor at or above its ceiling would accept nothing, and both consumers format the pair into an
+/// error string that would then read as an empty range. Asserted rather than tested, so it stops the
+/// build instead of a call.
+const _: () = assert!(ECHO_DELAY_SEARCH_MS_MIN < ECHO_DELAY_SEARCH_MS_MAX);
+/// See the assert above.
+const _: () = assert!(ECHO_LONG_TAIL_MS_MIN < ECHO_LONG_TAIL_MS_MAX);
+
 /// serde `default` for a `bool` field that should default to `true`.
 fn default_true() -> bool {
     true
@@ -922,7 +955,12 @@ pub struct ProfileFlags {
     /// exports `siphon_rtp_aec_delay_weak_locks_total`; on a voice-AI bridge the visible symptom of
     /// getting this wrong is an agent that barges in on its own voice.
     ///
-    /// Accepted range 16–1000 ms; a value outside it fails the offer/answer. Widening is not free:
+    /// Accepted range [`ECHO_DELAY_SEARCH_MS_MIN`]–[`ECHO_DELAY_SEARCH_MS_MAX`] (16–1000 ms) as a
+    /// search window, and [`ECHO_LONG_TAIL_MS_MIN`]–[`ECHO_LONG_TAIL_MS_MAX`] when `echo_long_tail`
+    /// is set and this is read as a tail instead; a value outside the applicable one fails the
+    /// offer/answer. The two currently coincide, but they are separate bounds and have differed
+    /// before — validate against the constant for the reading you are asking for, not against one
+    /// hardcoded range. Widening is not free:
     /// the estimation FFT is sized at ≥ 2× the window and rounded to a power of two, so crossing
     /// 256 ms at a 16 kHz rate doubles both the estimator's per-leg memory and the audio it needs
     /// before its first lock (roughly 1.5 s → 3 s of far-end speech). A value the negotiated rate
@@ -948,9 +986,17 @@ pub struct ProfileFlags {
     ///
     /// Not free, and deliberately opt-in: the MDF runs its gradient constraint's transform pair
     /// *inside* the per-partition loop, so per-frame cost scales with the tail. Going from the 64 ms
-    /// default to a 512 ms long tail is roughly **6×** the canceller's per-frame work and about
-    /// 96 KiB more state per leg — comfortably inside a 20 ms budget, and not something to pay on
-    /// every call. Reach is 1 s at an 8 kHz rate and 512 ms at 16 kHz (the tail cap is a tap count).
+    /// default to a 512 ms long tail is roughly **6×** the canceller's per-frame work, and to the
+    /// 1 s ceiling roughly **11.5×** — at a 16 kHz rate that is ~463 µs per 20 ms frame, about 2.3 %
+    /// of a core per call, with per-leg state going from 238 KiB to 424 KiB. Inside a 20 ms budget
+    /// throughout, and not something to pay on every call.
+    ///
+    /// Accepted range as a tail is [`ECHO_LONG_TAIL_MS_MIN`]–[`ECHO_LONG_TAIL_MS_MAX`], and that
+    /// ceiling is a *duration* both supported media rates can serve. It was 512 ms until it was
+    /// found to be short of a relayed echo path at 16 kHz — the tail cap is a tap count, so tying
+    /// the published ceiling to it made the ceiling mean half as long at the wideband rate, on
+    /// exactly the leg most likely to need it.
+    ///
     /// Inert without `echo_cancellation`. A native siphon-rtp extension — the NG/bencode front-end
     /// does not set it.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -3266,6 +3312,34 @@ mod tests {
                 assert_eq!(profile.beep_cadence_guard_ms, Some(1500));
             }
             other => panic!("expected offer, got {other:?}"),
+        }
+    }
+
+    /// The published echo bounds are internally consistent, and every one of them is expressible at
+    /// both supported media rates.
+    ///
+    /// These constants exist so the engine and a controller stop restating the same digits — which
+    /// is how a controller came to accept a long-tail profile the engine refused on every call. A
+    /// bound that no rate can serve would recreate that from the other direction, so the reach check
+    /// is the load-bearing half: at 8 kHz a millisecond ceiling costs `rate × ms / 1000` taps, and
+    /// that has to stay inside what the canceller accepts at **both** 8 and 16 kHz.
+    #[test]
+    fn the_published_echo_bounds_are_consistent_and_reachable_at_both_media_rates() {
+        // The floor-below-ceiling half is a static assert beside the constants — a `const` compared
+        // against a `const` is knowable at compile time, so asserting it at run time proves nothing
+        // a build could not already have refused.
+
+        // The tail ceiling in taps at each supported rate, against the canceller's own tap cap. Kept
+        // as a literal rather than importing siphon-rtp-dsp: this crate is the wire contract and
+        // deliberately depends on nothing, so the check is that the published number is *sane*, with
+        // the exact cap asserted on the dsp side.
+        const MAX_TAIL_SAMPLES_SUPPORTED: u32 = 16_384;
+        for rate in [8_000u32, 16_000] {
+            let taps = rate * ECHO_LONG_TAIL_MS_MAX / 1_000;
+            assert!(
+                taps <= MAX_TAIL_SAMPLES_SUPPORTED,
+                "a {ECHO_LONG_TAIL_MS_MAX} ms tail is {taps} taps at {rate} Hz, past the cap"
+            );
         }
     }
 

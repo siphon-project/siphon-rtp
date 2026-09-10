@@ -174,12 +174,13 @@ right speed and pitch instead of the wrong one.
   keeps the echo canceller's near-end and far-end reference in one rate. The suppressor exists only
   at 8 and 16 kHz, so another wire rate leaves it off (logged at `warn`) — the *feature* degrades,
   the negotiated rate does not change.
-- Picking 16 kHz here changes what the echo canceller can reach. Its delay-search cap is a *sample*
-  count, so the same cap is half as many milliseconds at 16 kHz as at 8 kHz — 512 ms against 1 s.
-  That is enough for anything the `echo_delay_search_ms` range allows, but it means a wideband
-  stream is the one that runs out first, and 16 kHz is exactly what a speech model wants. If the
-  caller is behind a carrier, set the window explicitly; see
-  [When the caller is far away](#when-the-caller-is-far-away).
+- Picking 16 kHz here changes what the echo canceller can reach. Its caps are *sample* counts, so
+  each is half as many milliseconds at 16 kHz as at 8 kHz: the delay search reaches 512 ms against
+  1 s, and the long-tail filter 1 s against 2 s. Both cover the whole range `echo_delay_search_ms`
+  accepts, but the wideband stream is always the one that runs out first, and 16 kHz is exactly what
+  a speech model wants — which is why the long-tail ceiling is published as a duration both rates can
+  serve rather than as whatever the taps happen to buy. If the caller is behind a carrier, set the
+  window explicitly; see [When the caller is far away](#when-the-caller-is-far-away).
 - The turn-taking VAD is unaffected: `ws_vad_threshold` is a **mean-square** (per-sample) energy, so
   it means the same thing at any rate, and `ws_vad_hangover_ms` is a duration in ptime frames.
 - Conversion is not free: expect a few microseconds per 20 ms frame per engaged direction, paid only
@@ -409,20 +410,30 @@ guess than tune it, `echo_long_tail` spans the whole path with the filter itself
 ```
 
 There is no estimator in this mode, so there is no lock to get wrong — `echo_delay_search_ms` becomes
-the **tail length** rather than a search window (16–512 ms). What it costs instead is honest and
+the **tail length** rather than a search window (16–1000 ms). What it costs instead is honest and
 gradual, because the filter is doing with taps what the estimator was doing with one number. Measured
 per 20 ms frame:
 
 | tail | 8 kHz | 16 kHz |
 |---|---|---|
-| 64 ms (what the estimating build uses) | 17.6 µs | 38.4 µs |
-| 256 ms | 55.7 µs | 121.9 µs |
-| 512 ms | 106.7 µs | 236.4 µs |
+| 64 ms (what the estimating build uses) | 18.0 µs | 40.6 µs |
+| 256 ms | 57.3 µs | 126.5 µs |
+| 512 ms | 110.1 µs | 242.4 µs |
+| 1000 ms | 206.8 µs | 462.7 µs |
 
-So a 512 ms tail is about **6×** the estimating build's filter cost, plus ~96 KiB more state per leg.
-It is still only ~1.2 % of a core per call at the worst corner, and it is not nothing at scale — a
-hundred concurrent wideband long-tail legs is a core and a bit of pure echo cancellation. Budget for
-it on the routes that need it rather than enabling it fleet-wide.
+So a 512 ms tail is about **6×** the estimating build's filter cost and a 1 s one about **11.5×**,
+with per-leg state going 238 KiB → 424 KiB over the same span. At the worst corner — the 1 s ceiling
+at 16 kHz — that is ~2.3 % of a core per call, so a hundred concurrent wideband long-tail legs is
+better than two cores of pure echo cancellation. Budget for it on the routes that need it rather than
+enabling it fleet-wide, and re-measure the box's concurrency ceiling if you raise an existing
+deployment's tail: the worst corner doubled when the ceiling moved from 512 ms to 1 s.
+
+**Ask for the tail the path needs, not the ceiling.** A relayed call to a mobile puts the media path
+in the loop twice with the acoustic reflection in the middle, so the echo can return anywhere from
+tens of milliseconds to most of a second; a tail shorter than that has no taps covering the echo and
+cancels nothing there while reporting no error, and a tail longer than it just costs more. The
+example above uses 512 ms because that suits a carrier-reached handset; raise it toward the ceiling
+only where the echo actually returns later.
 
 The trade is really about which failure you prefer. Estimation is precise and cheap when it works and
 cancels nothing when it does not. A long tail is never wrong about where the echo is, only slower and

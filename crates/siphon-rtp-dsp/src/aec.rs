@@ -78,15 +78,31 @@ use siphon_rtp_simd::fir_dot_f32;
 /// regularization, and Geigel threshold are all scale-independent pure ratios.
 const SAMPLE_SCALE: f32 = 32_768.0;
 
-/// Longest adaptive tail we preallocate for — **1 s @ 8 kHz / 0.5 s @ 16 kHz**, bounding a
+/// Longest adaptive tail any constructor accepts — **2 s @ 8 kHz / 1 s @ 16 kHz**, bounding a
 /// pathological request while leaving room for the long-tail mode
 /// ([`EchoCanceller::with_mdf_long_tail`]) to span a relay-length echo path with the filter itself.
 ///
-/// Raised from 4096 for the same reason the delay-search cap was: a sample count is a *duration*
-/// only once the rate is fixed, and this one was worth half as many milliseconds at 16 kHz — the
-/// rate every speech model wants and the one the voice-AI guidance recommends — so the wideband leg
-/// was the one that ran out first, at 256 ms, on exactly the deployment most likely to need more.
-const MAX_TAIL_SAMPLES: usize = 8_192;
+/// Raised from 4096, and then from 8192, for the same reason the delay-search cap was: a sample
+/// count is a *duration* only once the rate is fixed, and this one is worth half as many
+/// milliseconds at 16 kHz — the rate every speech model wants and the one the voice-AI guidance
+/// recommends — so the wideband leg is always the one that runs out first, on exactly the
+/// deployment most likely to need more. 4096 gave it 256 ms and 8192 gave it 512 ms; each raise
+/// moved the wall without removing it, because the *shape* of the limit is the rate dependence
+/// rather than any particular number. 16384 puts the wideband reach at a full second, which is past
+/// the whole media path traversed twice with an acoustic reflection in the middle — the longest
+/// echo a relayed leg can plausibly return. Expressing the cap in milliseconds and converting per
+/// rate is the change that would end the class; it touches every constructor and the error type, so
+/// it is deliberately not folded in here.
+///
+/// Note this is **no longer the same number** as [`MAX_SEARCH_RANGE_SAMPLES`]: the search cap bounds
+/// an FFT whose cost grows with the window, the tail cap bounds a filter. They were equal until the
+/// tail needed to reach further, and reading one for the other is a mistake worth guarding against.
+///
+/// It also caps the *time-domain* NLMS constructors ([`EchoCanceller::new`],
+/// [`EchoCanceller::with_bulk_delay`]), where the filter is O(tail) per **sample** rather than per
+/// block — a tail anywhere near this is only sane on the MDF backend, which is the one the engine
+/// builds. The cap bounds a pathological request; it is not a recommendation.
+const MAX_TAIL_SAMPLES: usize = 16_384;
 /// Longest bulk delay we preallocate the far-end ring for (1 s @ 16 kHz).
 const MAX_BULK_DELAY_SAMPLES: usize = 16_000;
 
@@ -148,6 +164,9 @@ const NCC_ENERGY_FLOOR: f64 = 1.0e-7;
 /// pushes the first lock out to `MIN_BLOCKS_BEFORE_LOCK` × 1024 ms of far-end-active audio. That
 /// cost is why the engine's default sits well below this and the range is configurable per leg
 /// rather than simply being pinned here — see `AEC_DELAY_SEARCH_MILLIS` in the engine.
+///
+/// Distinct from [`MAX_TAIL_SAMPLES`], which the two shared until the tail had to reach further.
+/// This one bounds an estimation FFT; that one bounds a filter.
 const MAX_SEARCH_RANGE_SAMPLES: usize = 8_192;
 /// Smallest GCC-PHAT block (a power of two). The block must be several times the search range so the
 /// circular cross-correlation approximates the linear one over the whole search span.
@@ -355,15 +374,20 @@ const MDF_STEP_SIZE: f32 = 0.5;
 /// division, so a near-silent bin yields a ~0 step instead of a blow-up (the frequency-domain analogue
 /// of the NLMS `δ`).
 const MDF_REGULARIZATION: f32 = 1.0e-4;
-/// Largest partition count the MDF preallocates for — 64 blocks of the (rate-dependent) block size,
-/// i.e. up to 8192 taps @ 8 kHz (block 128) and 16384 @ 16 kHz (block 256), which is **1 s at either
-/// rate**. Bounds a pathological tail.
+/// Largest partition count the MDF preallocates for — 128 blocks of the (rate-dependent) block
+/// size, i.e. up to 16384 taps @ 8 kHz (block 128) and 32768 @ 16 kHz (block 256), which is **2 s at
+/// either rate**. Bounds a pathological tail.
 ///
-/// A tail that needs more partitions than this is now rejected rather than quietly given a shorter
+/// A tail that needs more partitions than this is rejected rather than quietly given a shorter
 /// filter — see [`MdfFilter::new`]. It is not the binding limit in practice ([`MAX_TAIL_SAMPLES`]
 /// is), but a cap that silently shortens what it was asked for is the same class of defect as a
 /// delay search that silently locks on noise.
-const MDF_MAX_PARTITIONS: usize = 64;
+///
+/// Raised from 64 alongside [`MAX_TAIL_SAMPLES`] to keep the assert below satisfiable, not because
+/// any request needs it: the longest tail the engine will ask for is 1 s, which is 63 partitions at
+/// either rate. The binding case is the pathological one — the documented tap cap requested at the
+/// *narrowest* block, i.e. 16384 taps of 128 samples at 8 kHz, which is exactly 128 of them.
+const MDF_MAX_PARTITIONS: usize = 128;
 /// The smallest MDF block a supported media rate produces: 8 kHz gives a 160-sample frame, and the
 /// block is the largest power of two that fits, so 128. Every higher rate gives a larger block and
 /// therefore more taps per partition.
@@ -1574,10 +1598,14 @@ impl EchoCanceller {
     /// it (and say so) rather than have the constructor reject the request and leave the leg with no
     /// canceller at all, which is the failure this whole surface exists to stop being silent.
     pub const MAX_DELAY_SEARCH_SAMPLES: usize = MAX_SEARCH_RANGE_SAMPLES;
-    /// The longest adaptive tail any constructor accepts, in taps — 1 s at 8 kHz, 512 ms at 16 kHz.
+    /// The longest adaptive tail any constructor accepts, in taps — 2 s at 8 kHz, 1 s at 16 kHz.
     /// Exposed for the same reason as [`EchoCanceller::MAX_DELAY_SEARCH_SAMPLES`]: a caller turning a
     /// *duration* into taps needs to clamp against it and say so, rather than have the constructor
     /// refuse and leave the leg with no canceller.
+    ///
+    /// Being a tap count, it is a different duration per rate, so a caller publishing a *millisecond*
+    /// ceiling to an operator should state one both rates can serve rather than deriving it from this
+    /// — see `AEC_LONG_TAIL_MILLIS_MAX` in the engine.
     pub const MAX_TAIL_SAMPLES_SUPPORTED: usize = MAX_TAIL_SAMPLES;
 
     /// A canceller for `sample_rate_hz` with a `tail_samples`-tap adaptive filter and **no** bulk
@@ -1733,9 +1761,13 @@ impl EchoCanceller {
     /// **That cost is not small.** The MDF runs the gradient constraint's
     /// IFFT/FFT pair *inside* the per-partition loop, so an adapting block costs `2K + 3` transforms
     /// for `K = ceil(tail / block_size)` partitions, not one transform plus `O(K)` multiply-
-    /// accumulates. Going from a 64 ms tail (`K = 4`) to a 512 ms one (`K = 32`) is therefore roughly
-    /// six times the per-frame work, plus about 96 KiB more state per canceller. Both stay far inside
-    /// a 20 ms budget, and neither is free — which is why the engine exposes this per leg rather than
+    /// accumulates. Measured against the 64 ms tail (`K = 4`) the estimating build uses once the bulk
+    /// delay is removed, a 512 ms tail (`K = 32`) is roughly **6×** the per-frame work and a 1 s one
+    /// (`K = 63`) roughly **11.5×** — 40.6 µs → 242 µs → 463 µs per 20 ms frame at 16 kHz, and
+    /// 18.0 µs → 110 µs → 207 µs at 8 kHz. State grows with it: a wideband leg's canceller measures
+    /// 238 KiB at a 512 ms tail and 424 KiB at 1 s, which is affine rather than proportional
+    /// (~45 KiB of rate-fixed scratch plus ~6.0 KiB per partition). All of it stays inside a 20 ms
+    /// budget and none of it is free — which is why the engine exposes this per leg rather than
     /// defaulting to it.
     ///
     /// Chainable with [`EchoCanceller::with_two_path_dtd`] and
@@ -4511,16 +4543,101 @@ mod tests {
             EchoCanceller::with_mdf_long_tail(8_000, MAX_TAIL_SAMPLES + 1),
             Err(AecError::InvalidTail { .. })
         ));
-        // And the cap itself is reachable at both media rates, which is the property that was broken
-        // before it was raised: a sample count is a duration only once the rate is fixed.
+        // And the cap itself is reachable at both media rates, which is the property that keeps
+        // breaking: a sample count is a duration only once the rate is fixed. At 8 kHz the cap is
+        // exactly `MDF_MAX_PARTITIONS` blocks of 128, so this is also the assertion that fails if the
+        // tap cap is ever raised without the partition cap.
         assert!(EchoCanceller::with_mdf_long_tail(8_000, MAX_TAIL_SAMPLES).is_ok());
         assert!(EchoCanceller::with_mdf_long_tail(16_000, MAX_TAIL_SAMPLES).is_ok());
-        // 8 kHz reaches 1 s and 16 kHz reaches 0.5 s — the same *taps*, and the engine's knob is in
+        // 8 kHz reaches 2 s and 16 kHz reaches 1 s — the same *taps*, and the engine's knob is in
         // milliseconds, so the rate decides how far that goes.
         let narrowband = EchoCanceller::with_mdf_long_tail(8_000, MAX_TAIL_SAMPLES).expect("8k");
         let wideband = EchoCanceller::with_mdf_long_tail(16_000, MAX_TAIL_SAMPLES).expect("16k");
         assert_eq!(narrowband.tail_samples(), MAX_TAIL_SAMPLES);
         assert_eq!(wideband.tail_samples(), MAX_TAIL_SAMPLES);
+    }
+
+    /// The ceiling the engine enforces buys the same *duration* at both supported media rates, which
+    /// is the whole reason it is a single number.
+    ///
+    /// A sample count is a duration only once the rate is fixed, and that observation has now cost
+    /// this path two rate-dependent limits. Here it is asserted rather than commented: a 1 s tail
+    /// resolves to the same partition count at 8 kHz (128-sample blocks) as at 16 kHz (256-sample
+    /// blocks), so the filter covers a second of echo path either way. This is what would silently
+    /// break if [`MIN_MDF_BLOCK_SAMPLES`] — or the frame-to-block rounding — ever moved.
+    #[test]
+    fn a_one_second_tail_resolves_to_the_same_partition_count_at_both_media_rates() {
+        let narrowband = EchoCanceller::with_mdf_long_tail(8_000, 8_000).expect("8k 1 s");
+        let wideband = EchoCanceller::with_mdf_long_tail(16_000, 16_000).expect("16k 1 s");
+
+        // ceil(8000/128) == ceil(16000/256) == 63.
+        assert_eq!(narrowband.mdf_partitions(), Some(63));
+        assert_eq!(wideband.mdf_partitions(), Some(63));
+        // The realised tail is the request rounded up to a whole partition, so it is ≥ 1 s at both.
+        assert_eq!(narrowband.tail_samples(), 63 * 128);
+        assert_eq!(wideband.tail_samples(), 63 * 256);
+        assert!(narrowband.tail_samples() >= 8_000);
+        assert!(wideband.tail_samples() >= 16_000);
+    }
+
+    /// The acceptance test for the ceiling: a wideband leg whose echo returns past the old cap.
+    ///
+    /// A relayed path puts the media path in the loop twice with the acoustic reflection in the
+    /// middle, so the echo returns well beyond a handset-length delay — here 560 ms, which at 16 kHz
+    /// is 8960 samples and so lands *past* the 8192 taps the cap used to allow. The short filter has
+    /// no taps covering the echo at all, so it cancels nothing while running without error and
+    /// reporting healthy from every accessor; the long one covers the delay and the dispersion
+    /// together.
+    ///
+    /// The negative half is load-bearing. Without it this passes for the wrong reason on any later
+    /// change that reintroduces an estimator, or that quietly lets the short filter reach further.
+    #[test]
+    fn a_wideband_echo_past_the_old_tap_cap_is_cancelled_only_by_a_one_second_tail() {
+        let frame = 320; // 20 ms at 16 kHz
+        let frames = 900;
+        // 560 ms at 16 kHz: past the 512 ms (8192-tap) ceiling, inside the 1 s one.
+        let relay_delay = 8_960;
+        let rir = build_rir(128);
+        let mut prng = SplitMix64::new(0x5F0A_2B71);
+        let far = far_stream(&mut prng, 0.6, frames * frame);
+        let echo = synthesize_echo(&normalize(&far), &rir, relay_delay);
+
+        let run = |canceller: &mut EchoCanceller| -> f64 {
+            let mut residual_stream = vec![0i16; frames * frame];
+            for index in 0..frames {
+                let range = index * frame..(index + 1) * frame;
+                let mut mic = echo[range.clone()].to_vec();
+                canceller.cancel(&mut mic, &far[range.clone()]);
+                residual_stream[range].copy_from_slice(&mic);
+            }
+            steady_erle(&echo, &residual_stream, frame, 40)
+        };
+
+        // 512 ms of tail — the old ceiling — stops short of where the echo begins.
+        let mut short_tail = EchoCanceller::with_mdf_long_tail(16_000, 8_192)
+            .expect("build 512 ms tail")
+            .with_two_path_dtd();
+        let short_erle = run(&mut short_tail);
+        // 1 s of tail spans the whole path.
+        let mut long_tail = EchoCanceller::with_mdf_long_tail(16_000, 16_000)
+            .expect("build 1 s tail")
+            .with_two_path_dtd();
+        let long_erle = run(&mut long_tail);
+
+        if std::env::var_os("DUMP_GOLDEN").is_some() {
+            eprintln!(
+                "wideband relay ERLE: 512 ms tail {short_erle:.1} dB, 1 s tail {long_erle:.1} dB"
+            );
+        }
+        assert!(
+            long_erle >= 15.0,
+            "a 1 s tail must actually cancel a 560 ms echo, got {long_erle:.1} dB"
+        );
+        assert!(
+            short_erle < 3.0,
+            "a 512 ms tail has no taps covering a 560 ms echo, so it must cancel essentially \
+             nothing, got {short_erle:.1} dB"
+        );
     }
 
     /// Determinism: the MDF path is a pure function of the input (logical clock, fixed-seed PRNG), so

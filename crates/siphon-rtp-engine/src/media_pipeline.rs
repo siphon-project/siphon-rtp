@@ -119,9 +119,13 @@ const AEC_DELAY_SEARCH_MILLIS: u32 = 256;
 /// can express (1 s at 8 kHz, [`EchoCanceller::MAX_DELAY_SEARCH_SAMPLES`]). A value inside these
 /// bounds that the *negotiated* rate cannot reach is clamped with a warning rather than rejected —
 /// see [`build_echo_canceller`].
-const AEC_DELAY_SEARCH_MILLIS_MIN: u32 = 16;
+///
+/// Taken from `siphon-rtp-proto` rather than written here: a controller has to validate against the
+/// same bound to refuse a bad profile at config load instead of on every call, and the number being
+/// stated twice is what let the two disagree.
+const AEC_DELAY_SEARCH_MILLIS_MIN: u32 = siphon_rtp_proto::ECHO_DELAY_SEARCH_MS_MIN;
 /// See [`AEC_DELAY_SEARCH_MILLIS_MIN`].
-const AEC_DELAY_SEARCH_MILLIS_MAX: u32 = 1_000;
+const AEC_DELAY_SEARCH_MILLIS_MAX: u32 = siphon_rtp_proto::ECHO_DELAY_SEARCH_MS_MAX;
 /// Default adaptive tail in long-tail mode (`ProfileFlags::echo_long_tail`), in milliseconds — the
 /// filter spans the echo path itself, so this has to cover the whole relay delay rather than just the
 /// residual dispersion [`AEC_TAIL_MILLIS`] covers after the estimator removes the bulk.
@@ -130,13 +134,21 @@ const AEC_DELAY_SEARCH_MILLIS_MAX: u32 = 1_000;
 /// per-frame cost scales with the tail (the MDF's gradient constraint runs a transform pair *inside*
 /// the per-partition loop), so a leg that needs more asks for it.
 const AEC_LONG_TAIL_MILLIS: u32 = 256;
-/// Bounds accepted for a long-tail request. The ceiling is what the tap cap
-/// ([`EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED`]) buys at the *wideband* rate, so the same number is
-/// serviceable whichever rate the leg negotiates — asking for more at 8 kHz would succeed there and
-/// fail at 16 kHz, which is the rate-dependent limit this whole path exists to stop shipping.
-const AEC_LONG_TAIL_MILLIS_MIN: u32 = 16;
+/// Bounds accepted for a long-tail request. The ceiling is a duration both supported media rates can
+/// serve — asking for more at 8 kHz would succeed there and fail at 16 kHz, which is the
+/// rate-dependent limit this whole path exists to stop shipping.
+///
+/// It is deliberately **not** simply what the tap cap
+/// ([`EchoCanceller::MAX_TAIL_SAMPLES_SUPPORTED`]) buys, which is 2 s at 8 kHz and 1 s at 16 kHz.
+/// Pinning it to the wideband figure is how it ended up at 512 ms: the cap is a *tap* count, so
+/// tying a millisecond ceiling to it makes the ceiling move whenever the taps do, and the number an
+/// operator reads then means a different duration per rate. 1 s is the reach the narrower rate can
+/// also give, stated once.
+///
+/// Taken from `siphon-rtp-proto` for the same reason as [`AEC_DELAY_SEARCH_MILLIS_MIN`].
+const AEC_LONG_TAIL_MILLIS_MIN: u32 = siphon_rtp_proto::ECHO_LONG_TAIL_MS_MIN;
 /// See [`AEC_LONG_TAIL_MILLIS_MIN`].
-const AEC_LONG_TAIL_MILLIS_MAX: u32 = 512;
+const AEC_LONG_TAIL_MILLIS_MAX: u32 = siphon_rtp_proto::ECHO_LONG_TAIL_MS_MAX;
 
 /// How a leg cancels echo: whether at all, and in which of the two postures.
 ///
@@ -157,7 +169,8 @@ pub struct EchoProfile {
     /// echo outside the window is not found at all while the canceller goes on reporting no error.
     pub delay_search_ms: Option<u32>,
     /// Span the echo path with the filter instead of estimating a bulk delay first — no estimator, so
-    /// no lock to get wrong, at roughly 6× the per-frame cost at a 512 ms tail.
+    /// no lock to get wrong, at roughly 6× the per-frame cost at a 512 ms tail and 11.5× at the 1 s
+    /// ceiling.
     pub long_tail: bool,
     /// Chain the residual-echo WOLA post-filter after the linear canceller. Adds ~32 ms of latency,
     /// so it is opt-in on a turn-taking bridge.
@@ -445,8 +458,11 @@ pub(crate) fn build_echo_canceller(
 /// when it works, but it commits the tallest lag inside its window whatever that lag is, so an echo
 /// beyond the window leaves it adapting against a reference that is not the echo — cancelling nothing
 /// while every accessor reads healthy. This build makes no alignment decision, so it has nothing to
-/// get wrong; it simply pays for the taps, at roughly 6× the per-frame cost at 512 ms because the MDF
-/// runs its gradient constraint's transform pair inside the per-partition loop.
+/// get wrong; it simply pays for the taps, at roughly 6× the per-frame cost at 512 ms and 11.5× at
+/// the 1 s ceiling, because the MDF runs its gradient constraint's transform pair inside the
+/// per-partition loop. At the worst corner — 1 s at a 16 kHz rate — that is ~463 µs per 20 ms frame,
+/// about 2.3 % of a core per call, so a box sizing concurrency for long-tail legs should measure
+/// rather than assume the ceiling it had before.
 ///
 /// The mode is named on the build line on purpose. With no estimator there is no delay report, so a
 /// long-tail leg emits none of the lock/weak-lock/never-locked lines a reader uses to tell a working
@@ -8575,9 +8591,8 @@ mod tests {
         })
         .is_ok());
 
-        // In long-tail mode the field is a tail, whose ceiling is what the tap cap buys at the
-        // *wideband* rate — so the accepted range is narrower than the search window's, and a value
-        // between the two ceilings is accepted as a window and refused as a tail.
+        // In long-tail mode the field is a tail rather than a search window, and each reading is
+        // checked against its own bound.
         let as_tail = |millis: u32| {
             check(ProfileFlags {
                 echo_cancellation: true,
@@ -8586,21 +8601,62 @@ mod tests {
                 ..ProfileFlags::default()
             })
         };
-        assert!(as_tail(AEC_LONG_TAIL_MILLIS_MAX).is_ok());
-        assert!(as_tail(AEC_LONG_TAIL_MILLIS_MAX + 1).is_err());
-        assert!(
+        let as_window = |millis: u32| {
             check(ProfileFlags {
                 echo_cancellation: true,
-                echo_delay_search_ms: Some(AEC_DELAY_SEARCH_MILLIS_MAX),
+                echo_delay_search_ms: Some(millis),
                 ..ProfileFlags::default()
             })
-            .is_ok(),
-            "the same value is a valid search window — the flag decides which limit applies"
+        };
+        assert!(as_tail(AEC_LONG_TAIL_MILLIS_MAX).is_ok());
+        assert!(as_tail(AEC_LONG_TAIL_MILLIS_MAX + 1).is_err());
+        assert!(as_window(AEC_DELAY_SEARCH_MILLIS_MAX).is_ok());
+        assert!(as_window(AEC_DELAY_SEARCH_MILLIS_MAX + 1).is_err());
+
+        // The two ceilings currently coincide, so no *value* can tell the branches apart — this used
+        // to lean on a value between them being accepted as a window and refused as a tail, which
+        // silently became a tautology the moment the tail ceiling caught up. What still distinguishes
+        // them is the refusal text naming the reading it applied, which is also what an operator
+        // needs to tell why the number they used yesterday stopped being accepted today. Assert on
+        // that instead, so this keeps testing the branch whether or not the bounds agree.
+        let tail_error = as_tail(AEC_LONG_TAIL_MILLIS_MAX + 1).expect_err("out of range");
+        assert!(tail_error.contains("tail length"), "{tail_error}");
+        let window_error = as_window(AEC_DELAY_SEARCH_MILLIS_MAX + 1).expect_err("out of range");
+        assert!(
+            window_error.contains("searches for the returning echo"),
+            "{window_error}"
         );
-        // The refusal says which reading it applied, or the operator cannot tell why the number they
-        // used yesterday stopped being accepted today.
-        let error = as_tail(AEC_LONG_TAIL_MILLIS_MAX + 1).expect_err("out of range");
-        assert!(error.contains("tail"), "{error}");
+        assert_ne!(tail_error, window_error);
+    }
+
+    /// The accepted bounds, pinned as literals.
+    ///
+    /// Every other bound test here reads the constants, so it follows them silently wherever they
+    /// go — which is correct for testing the *plumbing* and useless for noticing that the contract
+    /// moved. This one fails when the numbers change, which is the point: the range is published to
+    /// controllers in the proto docs, the JSON control reference and the cookbook, and those have to
+    /// move in the same commit.
+    #[test]
+    fn the_published_echo_bounds_are_16_to_1000_ms_in_both_readings() {
+        let check = |profile: ProfileFlags| validate_echo_delay_search_ms(&profile);
+        let at = |millis: u32, long_tail: bool| {
+            check(ProfileFlags {
+                echo_cancellation: true,
+                echo_long_tail: long_tail,
+                echo_delay_search_ms: Some(millis),
+                ..ProfileFlags::default()
+            })
+        };
+        for long_tail in [false, true] {
+            assert!(at(15, long_tail).is_err(), "long_tail={long_tail}");
+            assert!(at(16, long_tail).is_ok(), "long_tail={long_tail}");
+            assert!(at(1_000, long_tail).is_ok(), "long_tail={long_tail}");
+            assert!(at(1_001, long_tail).is_err(), "long_tail={long_tail}");
+        }
+        // 513–1000 as a tail is the range that used to be refused. A controller validating both
+        // readings against one hardcoded 16–1000 accepted it at config load and then watched the
+        // engine refuse it on every offer.
+        assert!(at(600, true).is_ok());
     }
 
     #[test]
