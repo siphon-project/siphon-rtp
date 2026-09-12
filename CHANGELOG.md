@@ -7,6 +7,26 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`play_dtmf` reports failure when it has nowhere to send the digits.** The media actor already
+  refused a leg with no negotiated RFC 4733 `telephone-event` payload type — there is nothing to
+  carry the events on — but it returned a bare `bool` that the actor loop dropped, and the engine
+  answered the verb from whether the control message reached the mailbox. So the call was accepted,
+  `ok` went back, and nothing was put on the wire.
+
+  On a PBX that is a feature code forwarded to a carrier's voicemail, an attended-transfer helper, or
+  a flow step navigating a remote menu — and a silent no-op there reads as the far end ignoring the
+  digits, which is the worst place for it to look like someone else's fault.
+
+  The verb now awaits the actor's verdict through a `oneshot`, exactly as `stop_media` and
+  `set_play_gain` already do, and answers
+  `play_dtmf: no telephone-event payload type negotiated toward this leg`. The actor's outcome also
+  separates that case from an unusable digit string, which used to be the same `false`.
+
+  In-band (Goertzel) generation as a fallback remains out of scope: handsets and the trunks this
+  targets negotiate RFC 4733.
+
 ## [0.5.3] — 2026-09-12
 
 A re-offer handed the other party the re-offering party's own media port, so a call went one-way the
