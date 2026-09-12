@@ -48,10 +48,24 @@ automatically from the SDP; there is no separate knob.
 only because the controller asked for exactly that topology on the offer. The
 engine never silently downgrades a secure leg to plaintext, and a packet that
 fails SRTP authentication is dropped, never forwarded (see
-[Security & NAT](../security-and-nat.md)). Terminating SRTP that the *offerer*
-signals (a secure caller toward a plain callee) is wired for conference legs
-(`conference_join` answers `RTP/SAVP` + `a=crypto`) but not yet for the two-party
-offer/answer relay; there the secure side is the answerer's leg.
+[Security & NAT](../security-and-nat.md)).
+
+**Terminating SRTP the *offerer* signals** — a secure caller toward a plain callee
+— is wired for conference legs (`conference_join` answers `RTP/SAVP` + `a=crypto`)
+and now for the **two-party offer/answer relay**: the engine mints its own SDES
+key for the caller, answers with it, decrypts the caller's SRTP, and relays
+plaintext to the callee (and back again, encrypted). See
+[A secure caller toward a plain callee](#a-secure-caller-toward-a-plain-callee).
+
+Two shapes are refused rather than half-carried, because both need the caller's
+`SecureLeg` threaded into the transcoding pipeline:
+
+- **both parties secure** — a transcrypt between two different keys;
+- **a codec mismatch** on a secure caller.
+
+A **DTLS-SRTP offerer** on the two-party relay is unchanged: its keying is still
+relayed rather than terminated, which needs the engine's own `a=fingerprint` in
+the caller's answer plus a full ICE agent on its leg.
 
 ## Native JSON exchange
 
@@ -204,3 +218,31 @@ flows.
   do) on secure calls.
 - [Security & NAT](../security-and-nat.md) for the full threat model: source
   gating, latching, and why the bridge re-enforces the gate on the redirect path.
+
+
+## A secure caller toward a plain callee
+
+An SDES-SRTP desk phone calls a plaintext PSTN trunk. Nothing in the control flow
+changes — `offer` then `answer`, as always:
+
+```json
+{"id": 70, "command": "offer", "call_id": "…", "from_tag": "a7c31f", "sdp": "<the caller's RTP/SAVP offer with its a=crypto>"}
+```
+
+The offer presented to the **callee** is plaintext `RTP/AVP` with **no**
+`a=crypto`: the engine terminates the caller's SRTP, so the callee has no keying
+to receive and the caller's key never leaves the engine.
+
+The answer presented to the **caller** keeps `RTP/SAVP` and carries the engine's
+**own** `a=crypto` — never the caller's echoed back. From then on the engine
+decrypts the caller's ingress and encrypts everything it sends back, over a plain
+crypto bridge: no decode, no re-encode, the mirror of the secure-callee case.
+
+### What this fixed
+
+Before, a secure offer on this path did two wrong things at once. The offer the
+callee received **carried the caller's own `a=crypto`** — handing a third party
+the caller's SRTP key — and the answer the caller received was `RTP/AVP`,
+downgrading the very caller whose key had just been forwarded. Both are gone: an
+`RTP/SAVP` offer with no usable `a=crypto` is now refused outright
+(`secure-offerer-unkeyable`) rather than bridged in the clear.
