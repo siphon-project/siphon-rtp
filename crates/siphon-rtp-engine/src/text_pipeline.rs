@@ -41,7 +41,7 @@ use siphon_rtp_media::pcap::CapturedPacket;
 use siphon_rtp_media::rtp::RtpPacket;
 use siphon_rtp_media::t140::T140Reassembler;
 use siphon_rtp_proto::{Event, TextStreamStats};
-use siphon_rtp_srtp::leg::SecureLeg;
+use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use crate::media_pipeline::{rtp_source_ssrc, Outbound, PcapCapture, SymmetricLatch};
 
@@ -144,6 +144,10 @@ impl TextDirection {
     }
 }
 
+/// The two SDES-SRTP legs of a secure text stream, `(near, far)`: the near leg decrypts party A's
+/// ingress and encrypts egress toward A, the far leg does the same for party B.
+type SecureTextLegs = (Arc<Mutex<SecureLeg>>, Arc<Mutex<SecureLeg>>);
+
 /// Per-direction wiring for [`TextCall::new`] — the transport-only bits (endpoints, gate, PTs). The
 /// per-leg tags and direction label are assigned by [`TextCall::new`] from the call identity.
 pub struct TextDirectionConfig {
@@ -242,6 +246,18 @@ impl TextCall {
     #[must_use]
     pub fn endpoints(&self) -> [EndpointId; 2] {
         [self.a_to_b.ingress_endpoint, self.b_to_a.ingress_endpoint]
+    }
+
+    /// The two SDES-SRTP legs of a secure text stream, `(near, far)`: the near leg decrypts A's
+    /// ingress and encrypts egress toward A, the far leg does the same for B. `None` for a plaintext
+    /// stream. Kept reachable so a renegotiation can carry their SRTP rollover into the rebuilt legs
+    /// (RFC 3711 §3.3.1), the way [`crate::media_pipeline::MediaRegistry::rollover_snapshot`] does for
+    /// audio.
+    #[must_use]
+    fn secure_legs(&self) -> Option<SecureTextLegs> {
+        let near = self.a_to_b.secure_ingress.clone()?;
+        let far = self.a_to_b.secure_egress.clone()?;
+        Some((near, far))
     }
 
     /// Enable/disable the raw-RTP pcap capture (recording start/stop).
@@ -459,6 +475,8 @@ struct TextCallHandle {
     mailbox: flume::Sender<TextInput>,
     endpoints: [EndpointId; 2],
     task: tokio::task::JoinHandle<()>,
+    /// A secure stream's two SDES legs, kept reachable for [`TextRegistry::rollover_snapshots`].
+    secure_legs: Option<SecureTextLegs>,
 }
 
 impl TextRegistry {
@@ -495,6 +513,7 @@ impl TextRegistry {
     {
         let call_id = call.call_id.clone();
         let endpoints = call.endpoints();
+        let secure_legs = call.secure_legs();
         let (mailbox, inbox) = flume::bounded(256);
         for endpoint in endpoints {
             self.routes.insert(endpoint, mailbox.clone());
@@ -506,8 +525,24 @@ impl TextRegistry {
                 mailbox,
                 endpoints,
                 task,
+                secure_legs,
             },
         );
+    }
+
+    /// The SRTP rollover of a secure text stream's two legs, `(near, far)` — what a renegotiation
+    /// seeds the rebuilt legs with, so neither restarts its counter at 0 while the peer's keeps
+    /// counting (RFC 3711 §3.3.1). `None` for a plaintext stream, an unknown call, or a poisoned leg.
+    #[must_use]
+    pub fn rollover_snapshots(
+        &self,
+        call_id: &str,
+    ) -> Option<(SecureLegRollover, SecureLegRollover)> {
+        let handle = self.calls.get(call_id)?;
+        let (near, far) = handle.secure_legs.as_ref()?;
+        let near = near.lock().ok()?.rollover_snapshot();
+        let far = far.lock().ok()?.rollover_snapshot();
+        Some((near, far))
     }
 
     /// Send a control op to a call's text actor, returning `false` if there is no such text call.

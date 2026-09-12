@@ -1843,6 +1843,27 @@ pub fn force_answer_codec(sdp: &str, primary: &CodecSpec, telephone_event: Optio
         }
     }
 
+    // Where the engine's own attributes go: after the audio section's RFC 4566 §5 prelude
+    // (`i=` / `c=` / `b=` / `k=`), else the `m=` line itself. §5 fixes the order inside a media
+    // description — `m=`, `i=`, `c=`, `b=`, `k=`, then `a=` — and this runs on the output of
+    // [`rewrite`], so emitting at the media line would put an attribute straight back ahead of a
+    // connection line the rewriter had just placed correctly, on any SDP whose `c=` is media-level
+    // (RFC 4566 §5.7 permits it, and one with no session-level `c=` requires it). Same anchor
+    // [`apply_codec_policy`] uses, for the same reason.
+    let attributes_after = lines
+        .iter()
+        .enumerate()
+        .skip(media_index + 1)
+        .take_while(|(_, line)| !line.starts_with("m="))
+        .filter(|(_, line)| {
+            ["i=", "c=", "b=", "k="]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(media_index);
+
     let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
     for (index, line) in lines.iter().enumerate() {
         if index == media_index {
@@ -1854,7 +1875,24 @@ pub fn force_answer_codec(sdp: &str, primary: &CodecSpec, telephone_event: Optio
                 media_fields[2],
                 formats.join(" ")
             ));
-            // Re-emit our own codec attributes right after the media line (RFC 4566 is order-free).
+        } else if line.starts_with("a=ptime:") || line.starts_with("a=maxptime:") {
+            // Drop the far side's `a=ptime` / `a=maxptime` — we re-emit our own effective ptime and
+            // our own frame-duration ceiling below. Leaking the far side's would advertise a
+            // packetization this leg never receives.
+        } else if line
+            .strip_prefix("a=rtpmap:")
+            .or_else(|| line.strip_prefix("a=fmtp:"))
+            .and_then(|body| body.split(|c: char| c.is_whitespace() || c == '/').next())
+            .and_then(|pt| pt.trim().parse::<u8>().ok())
+            .is_some()
+        {
+            // Drop the far side's per-payload-type codec attributes; we re-emit our own below.
+        } else if !(index == lines.len() - 1 && line.is_empty()) {
+            // Preserve the trailing empty line if the input ended with CRLF.
+            out.push((*line).to_string());
+        }
+        if index == attributes_after {
+            // Our own codec attributes, at the head of the section's attribute region.
             out.push(rtpmap_line(primary));
             if let Some(fmtp) = egress_fmtp_line(primary) {
                 out.push(fmtp);
@@ -1872,27 +1910,6 @@ pub fn force_answer_codec(sdp: &str, primary: &CodecSpec, telephone_event: Optio
             if let Some(maxptime) = egress_maxptime_line(primary) {
                 out.push(maxptime);
             }
-            continue;
-        }
-        // Drop the far side's `a=ptime` / `a=maxptime` — we re-emit our own effective ptime and our
-        // own frame-duration ceiling above. Leaking the far side's would advertise a packetization
-        // this leg never receives.
-        if line.starts_with("a=ptime:") || line.starts_with("a=maxptime:") {
-            continue;
-        }
-        // Drop the far side's per-payload-type codec attributes; we re-emit our own above.
-        let is_codec_attr = line
-            .strip_prefix("a=rtpmap:")
-            .or_else(|| line.strip_prefix("a=fmtp:"))
-            .and_then(|body| body.split(|c: char| c.is_whitespace() || c == '/').next())
-            .and_then(|pt| pt.trim().parse::<u8>().ok())
-            .is_some();
-        if is_codec_attr {
-            continue;
-        }
-        // Preserve the trailing empty line if the input ended with CRLF.
-        if !(index == lines.len() - 1 && line.is_empty()) {
-            out.push((*line).to_string());
         }
     }
     let mut rewritten = out.join(CRLF);
@@ -3423,6 +3440,57 @@ mod tests {
                 .expect("codec")
                 .encoding_name,
             "PCMU"
+        );
+    }
+
+    #[test]
+    fn force_answer_codec_emits_its_attributes_after_a_media_level_connection_line() {
+        // RFC 4566 §5 fixes the order inside a media description — `m=`, `i=`, `c=`, `b=`, `k=`, then
+        // `a=` — and this runs on `rewrite`'s output, so emitting at the `m=` line puts an attribute
+        // straight back ahead of a connection line `rewrite` had just placed correctly. Same defect as
+        // the one `apply_codec_policy` and the rewriter itself were fixed for; a strict parser reads
+        // such a section as having no connection address at all.
+        let far = concat!(
+            "v=0\r\n",
+            "o=- 2 2 IN IP4 127.0.0.1\r\n",
+            "s=-\r\n",
+            "t=0 0\r\n",
+            "m=audio 40000 RTP/AVP 8 96\r\n",
+            "c=IN IP4 127.0.0.1\r\n",
+            "b=AS:64\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=rtpmap:96 telephone-event/8000\r\n",
+        );
+        let pcmu = CodecSpec::new(0, "PCMU", 8000, 1, 20);
+        let out = force_answer_codec(far, &pcmu, Some(96));
+        let lines: Vec<&str> = out.lines().collect();
+        let index_of = |prefix: &str| {
+            lines
+                .iter()
+                .position(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("{prefix} missing from {out}"))
+        };
+        let media = index_of("m=audio");
+        let connection = index_of("c=");
+        let bandwidth = index_of("b=");
+        let first_attribute = lines
+            .iter()
+            .position(|line| line.starts_with("a="))
+            .expect("attributes");
+        assert!(
+            media < connection && connection < bandwidth && bandwidth < first_attribute,
+            "§5 order kept — m=, c=, b=, then attributes: {out}"
+        );
+        // And the codec presentation still did its job.
+        assert!(out.contains("m=audio 40000 RTP/AVP 0 96"), "{out}");
+        assert!(out.contains("a=rtpmap:0 PCMU/8000"), "{out}");
+        assert!(!out.contains("PCMA"), "{out}");
+        assert_eq!(
+            parse(&out).expect("reparse").remote_rtp,
+            "127.0.0.1:40000"
+                .parse::<std::net::SocketAddr>()
+                .expect("addr"),
+            "the media-level connection line still resolves"
         );
     }
 

@@ -102,14 +102,26 @@ impl PipelineTarget {
 
     /// Hand the handshake's key to the owning actor. Returns `false` when it is already gone, in
     /// which case the caller leaves the leg unkeyed so media keeps being dropped.
-    fn key(&self, leg: SecureLeg) -> bool {
+    ///
+    /// A [`Self::Call`] target's leg is also **retained** under its secure endpoint, because that
+    /// actor is rebuilt by every renegotiation of the call: without a copy here, the rebuilt actor
+    /// would sit pending forever waiting for a handshake the peer has no reason to repeat (RFC 8842
+    /// §5.5 — it keeps the association). The other two targets own legs that no re-offer rebuilds.
+    fn key(
+        &self,
+        leg: SecureLeg,
+        retained: &DashMap<EndpointId, Arc<Mutex<SecureLeg>>>,
+        secure_endpoint: EndpointId,
+    ) -> bool {
         match self {
-            Self::Call { media, call_id } => media.control(
-                call_id,
-                crate::media_pipeline::MediaControl::AttachSecureLeg {
-                    leg: Arc::new(Mutex::new(leg)),
-                },
-            ),
+            Self::Call { media, call_id } => {
+                let leg = Arc::new(Mutex::new(leg));
+                retained.insert(secure_endpoint, leg.clone());
+                media.control(
+                    call_id,
+                    crate::media_pipeline::MediaControl::AttachSecureLeg { leg },
+                )
+            }
             Self::Conference {
                 conference,
                 conference_id,
@@ -126,6 +138,38 @@ impl PipelineTarget {
             // releases the first media packet.
             Self::Ws { ws, call_id } => ws.attach_secure_leg(call_id, leg),
         }
+    }
+
+    /// Re-key an actor the caller has just rebuilt, with the leg its predecessor was using — the
+    /// renegotiation counterpart of [`Self::key`]. Only a [`Self::Call`] target is rebuilt that way
+    /// (a conference seat and a WS takeover leg are re-registered through their own verbs, which
+    /// handshake afresh), so the others report `false` and keep whatever key they hold.
+    fn reattach(&self, leg: Arc<Mutex<SecureLeg>>) -> bool {
+        match self {
+            Self::Call { media, call_id } => media.control(
+                call_id,
+                crate::media_pipeline::MediaControl::AttachSecureLeg { leg },
+            ),
+            Self::Conference { .. } | Self::Ws { .. } => false,
+        }
+    }
+}
+
+/// The identity of a live DTLS association: the peer certificate it authenticated and the role the
+/// engine took. RFC 8842 §3.1 makes a change to either (or to the `tls-id`, which this engine does
+/// not signal) the definition of a *new* association — so while both hold, a renegotiation keeps the
+/// one that is already established rather than handshaking again.
+struct Association {
+    peer_fingerprint: Fingerprint,
+    role: DtlsRole,
+}
+
+impl Association {
+    /// Whether `plan` describes the association already running on this endpoint.
+    fn matches(&self, plan: &DtlsCallPlan) -> bool {
+        self.role == plan.role
+            && self.peer_fingerprint.hash_function == plan.peer_fingerprint.hash_function
+            && self.peer_fingerprint.bytes == plan.peer_fingerprint.bytes
     }
 }
 
@@ -204,6 +248,13 @@ pub struct DtlsBridge<D: Datapath> {
     sessions: DashMap<EndpointId, Vec<JoinHandle<()>>>,
     /// Per secure endpoint, the published DTLS destination — how ICE releases and re-points a leg.
     destinations: DashMap<EndpointId, SecureDestination>,
+    /// Per secure endpoint, the identity of the association running on it, so a renegotiation can
+    /// tell "same association, new addresses" from a genuinely new one (RFC 8842 §3.1).
+    associations: DashMap<EndpointId, Association>,
+    /// Per secure endpoint, the keyed leg a [`PipelineTarget::Call`] actor was handed — kept so a
+    /// renegotiation, which rebuilds that actor, can re-key it with the same leg. Shared with the
+    /// handshake task that fills it.
+    pipeline_keys: Arc<DashMap<EndpointId, Arc<Mutex<SecureLeg>>>>,
 }
 
 impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
@@ -215,13 +266,100 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             flows: DashMap::new(),
             sessions: DashMap::new(),
             destinations: DashMap::new(),
+            associations: DashMap::new(),
+            pipeline_keys: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Abort and forget the session currently owning `secure_endpoint` — the displaced half of a
+    /// re-registration, and part of teardown. Dropping the [`JoinHandle`]s alone only *detaches*
+    /// those tasks: the old handshake and record drain would keep running against the same endpoint,
+    /// unreachable and forever.
+    fn retire(&self, secure_endpoint: EndpointId) {
+        if let Some((_, tasks)) = self.sessions.remove(&secure_endpoint) {
+            for task in tasks {
+                task.abort();
+            }
+        }
+        self.associations.remove(&secure_endpoint);
+        self.pipeline_keys.remove(&secure_endpoint);
+    }
+
+    /// Keep the DTLS association already running on `plan`'s secure endpoint across a renegotiation,
+    /// re-pointing it at the addresses and gates the new SDP settled on. Returns `false` when there is
+    /// nothing to keep — no association on that endpoint, or the peer's fingerprint or the engine's
+    /// role changed, which is what RFC 8842 §3.1 defines as a *new* association — and the caller then
+    /// registers one.
+    ///
+    /// This is what stops a re-INVITE from silently killing a DTLS call. Re-registering drops the
+    /// keyed leg and waits for a handshake that a peer keeping its own association (RFC 8842 §5.5,
+    /// which is what an unchanged fingerprint tells it to do) has no reason to start, so media stops
+    /// with every counter still reading healthy.
+    pub fn renegotiate(&self, plan: &DtlsCallPlan) -> bool {
+        if !self
+            .associations
+            .get(&plan.secure_endpoint)
+            .is_some_and(|association| association.matches(plan))
+        {
+            return false;
+        }
+        // Each side's source gate, and — on whichever flow forwards to a fixed address — where the
+        // plain peer now is. The encrypt direction's destination is not fixed: it follows the DTLS
+        // peer's published address below.
+        if let Some(mut flow) = self.flows.get_mut(&plan.plain_endpoint) {
+            flow.accepted_source = plan.plain_source;
+            flow.out_dst = flow.out_dst.map(|_| plan.plain_dst);
+        }
+        if let Some(mut flow) = self.flows.get_mut(&plan.secure_endpoint) {
+            flow.accepted_source = plan.secure_source;
+            flow.out_dst = flow.out_dst.map(|_| plan.plain_dst);
+        }
+        // Where the DTLS peer is now. On an ICE leg the agent owns this and re-selects for itself, so
+        // a signalled address must never clobber a selected pair (RFC 8445 §12).
+        if !plan.gate_on_ice {
+            if let Some(destination) = self.destinations.get(&plan.secure_endpoint) {
+                destination.send_if_modified(|current| {
+                    if *current == Some(plan.secure_dst) {
+                        return false;
+                    }
+                    *current = Some(plan.secure_dst);
+                    true
+                });
+            }
+        }
+        // A pipeline leg's actor is rebuilt by the renegotiation that got us here, and it starts
+        // pending — hand it the key this association already produced.
+        if let Some(flow) = self.flows.get(&plan.secure_endpoint) {
+            if let Direction::Pipeline { target, keyed, .. } = &flow.direction {
+                if let Some(leg) = self.pipeline_keys.get(&plan.secure_endpoint) {
+                    let delivered = target.reattach(leg.clone());
+                    keyed.store(delivered, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        tracing::debug!(
+            target: "siphon_rtp::media",
+            "DTLS association kept across a renegotiation; no new handshake"
+        );
+        true
     }
 
     /// Register a call's DTLS-SRTP bridge: install the two endpoint flows and spawn the handshake +
     /// outbound-record drain tasks. The caller installs `FlowAction::Redirect` on both endpoints and
     /// tears them down on delete via [`Self::deregister`].
     pub fn register(&self, plan: DtlsCallPlan) {
+        // A re-registration replaces whatever association this endpoint had; retire it first.
+        self.retire(plan.secure_endpoint);
+        self.associations.insert(
+            plan.secure_endpoint,
+            Association {
+                peer_fingerprint: Fingerprint::new(
+                    plan.peer_fingerprint.hash_function.clone(),
+                    plan.peer_fingerprint.bytes.clone(),
+                ),
+                role: plan.role,
+            },
+        );
         let secure: SharedSecureLeg = Arc::new(Mutex::new(None));
         // Undecided until ICE selects a pair on a gated leg; fixed from the start otherwise.
         let initial = (!plan.gate_on_ice).then_some(plan.secure_dst);
@@ -323,6 +461,18 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
     /// actor's FIFO mailbox is guaranteed to hold the key ahead of the first media packet this bridge
     /// releases — no window in which media arrives at an unkeyed pipeline.
     pub fn register_for_pipeline(&self, plan: DtlsCallPlan, target: PipelineTarget) {
+        // As in [`Self::register`]: retire the displaced association before installing this one.
+        self.retire(plan.secure_endpoint);
+        self.associations.insert(
+            plan.secure_endpoint,
+            Association {
+                peer_fingerprint: Fingerprint::new(
+                    plan.peer_fingerprint.hash_function.clone(),
+                    plan.peer_fingerprint.bytes.clone(),
+                ),
+                role: plan.role,
+            },
+        );
         let initial = (!plan.gate_on_ice).then_some(plan.secure_dst);
         let destination: SecureDestination = Arc::new(tokio::sync::watch::Sender::new(initial));
         let (transport, channels) = DtlsTransport::new(plan.secure_local, plan.secure_dst);
@@ -353,6 +503,8 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
             let gate = destination.subscribe();
             let keyed = keyed.clone();
             let target = target.clone();
+            let retained = self.pipeline_keys.clone();
+            let secure_endpoint = plan.secure_endpoint;
             tokio::spawn(async move {
                 // RFC 8445 §12: key the path ICE chose, not the signalled one.
                 if let Err(error) = wait_for_destination(gate).await {
@@ -362,7 +514,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
                 match handshake(Arc::new(transport), &certificate, role, &peer_fingerprint).await {
                     Ok(leg) => {
                         // Key the actor before releasing media, so its mailbox holds the key first.
-                        if target.key(leg) {
+                        if target.key(leg, &retained, secure_endpoint) {
                             keyed.store(true, std::sync::atomic::Ordering::SeqCst);
                             tracing::info!(
                                 target: "siphon_rtp::media",
@@ -429,11 +581,7 @@ impl<D: Datapath + Clone + 'static> DtlsBridge<D> {
         for endpoint in endpoints {
             self.flows.remove(&endpoint);
             self.destinations.remove(&endpoint);
-            if let Some((_, tasks)) = self.sessions.remove(&endpoint) {
-                for task in tasks {
-                    task.abort();
-                }
-            }
+            self.retire(endpoint);
         }
     }
 

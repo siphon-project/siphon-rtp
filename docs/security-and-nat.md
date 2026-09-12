@@ -160,6 +160,25 @@ Only **accept** (and only latch from) media whose source matches the address lea
   path — the datapath Forward relay, the redirect-dispatched media/transcode actor's `accepted_source`,
   the SRTP bridge (`bridge_source_filter`), and the WS bridge — so no path silently keeps the private
   address.
+- **The hint belongs to a party, and moves with it on a renegotiation.** Each leg keeps its own
+  stored hint: A's from its offer, B's from its answer. A later SDP from that party that carries a
+  `received-from` replaces it — a re-offer from A or B (an app that switched from Wi-Fi to mobile data
+  re-INVITEs from a new public address), or A's answer to a re-offer from B — and one that carries none
+  keeps it, so a renegotiation that omits the hint keeps gating a NATed party on its public address
+  instead of falling back to the private `c=` it signalled. Without the refresh the re-wired gate would
+  be *(old public IP, new port)* and drop every packet from the new address; without the keep, a
+  re-answer from B with no hint gated B on its RFC 1918 `c=`. Neither case widens what the engine
+  accepts: one proxy-observed address replaces another, and the latch still governs from the first
+  accepted packet.
+- **A re-offer presents the leg facing its recipient, never the offerer's.** A re-offer from A is
+  delivered to B, so it carries the far leg's endpoints, candidates and keying exactly as the original
+  offer did; one from B is delivered to A and carries the near leg (RFC 3264 §8 — a subsequent offer
+  modifies the SDP its recipient last received). Presenting the offerer's own leg tells the recipient to
+  send into the offerer's socket, from an address the gate there correctly refuses — so the call goes
+  one-way while every counter looks healthy. The gate dropping that media is this layer doing its job;
+  the fix is in what the SDP says, never in loosening the gate. For the same reason a secure text
+  stream re-presents the recipient's own engine key: the other leg's key protects the engine's stream
+  toward the *other* party.
 - **The hint also aims the relay, not just the gate.** The same `(hint IP, signalled port)` pair is
   the destination each direction transmits to **until that peer's own first accepted packet moves the
   latch**. Gating on the hint while still *sending* to the private `c=` left the whole pre-latch
@@ -460,13 +479,19 @@ When SDP carries ICE, **connectivity checks replace latching** as the address-le
 - **ICE restart (RFC 8445 §9) rides the `reoffer` verb, and does not interrupt media.** A re-offer
   renegotiates on the *existing* ports (unlike a repeated `offer`, which replaces the call on fresh
   ones), so there is a session to restart in the first place. A re-offer whose `a=ice-ufrag`/`a=ice-pwd`
-  differ from the current ones is a restart (§9.1.1.1): the engine mints fresh credentials of its own,
-  re-gathers, and rebuilds the leg's agent against the new session — while **leaving the adopted
-  source untouched**, so under the layer-4 gate media keeps flowing on the previously selected pair
-  until the new session selects one (§9.3). Clearing it instead would silence every call for the
-  length of a fresh ICE exchange. Owner-only; a re-offer that changes the negotiated codec is
-  *rejected* rather than accepted-and-ignored, because rebuilding a live transcode pipeline is not
-  done here.
+  differ from the current ones is a restart (§9.1.1.1): the engine mints fresh credentials of its own
+  and rebuilds the **re-offering party's** leg agent against the new session — while **leaving the
+  adopted source untouched**, so under the layer-4 gate media keeps flowing on the previously selected
+  pair until the new session selects one (§9.3). Clearing it instead would silence every call for the
+  length of a fresh ICE exchange. Either party may re-offer (resolved by tag: the call's `from_tag` is
+  A, its `to_tag` B); the SDP returned presents the *other* party's leg with the candidates that leg
+  already advertised (layer 2, "A re-offer presents the leg facing its recipient"). A re-offer from B
+  is completed by A's answer, which arrives with the tags reversed and is accepted only while that
+  re-offer is outstanding. Owner-only; a re-offer that changes the negotiated codec is *rejected*
+  rather than accepted-and-ignored, because rebuilding a live transcode pipeline is not done here —
+  and so is a re-offer from B that drops the far leg's SRTP keying (layer 5), which would otherwise
+  have to be bridged in the clear. The engine's credentials are one set for both legs, so a restart
+  on one leg re-presents the other with the new set too (per-leg credentials are a known follow-up).
 - **A repeated `offer` on a live call-id is owner-only, and replaces cleanly.** Another client
   offering an existing call-id gets `unknown_call` and the live call is untouched — it cannot be
   destroyed, and its existence is not disclosed (A3, §5). For the owner the offer *replaces* the call:
@@ -525,6 +550,20 @@ is wrong, and encryption defeats A2 eavesdrop.
   engine's *own* offered key (the `a=crypto` it advertised); inbound (peer→engine) decrypts with the
   *peer's* answered key. The peer's `a=crypto` is always re-originated (dropped and replaced), like
   ICE — a secure leg's key never leaks onto the plaintext leg's rewritten SDP.
+- **A renegotiation keeps the crypto, and keeps it continuous.** Completing an offer/answer on a live
+  call re-runs the answer path, which rebuilds the leg's wiring; two things have to survive that, and
+  both are enforced rather than left to chance. A **DTLS association** is kept and re-pointed (each
+  side's gate, the plain peer's address, and — on a non-ICE leg — the DTLS peer's) whenever the peer's
+  fingerprint and the engine's role are unchanged: RFC 8842 §5.5 has the peer keep its own association
+  in exactly that case, so tearing ours down leaves the leg waiting for a handshake that never comes.
+  A change to either **is** a new association (§3.1) and re-handshakes. The **SRTP rollover** is
+  carried into every rebuilt leg (RFC 3711 §3.3.1): the counter is estimated per stream rather than
+  derived from the key, so restarting it at 0 while the peer keeps counting fails authentication on
+  everything after the first sequence wrap — about 21 minutes of a 20 ms-ptime call. That holds on the
+  SDES bridge, the secure transcode actor and both legs of a secure text stream, and across a re-key,
+  which does not restart the stream's packet index either. Neither carry-over widens what the engine
+  accepts: the gate and SRTP authentication are unchanged, and a kept association is still bound to
+  the certificate it authenticated.
 - **Seam (present):** `ProfileFlags.transport_protocol` (`RTP/SAVP[F]`, `UDP/TLS/RTP/SAVPF`) selects a
   secure leg; `profile.dtls` (`off`/`passive`/`active`/`actpass`) is now honoured and overrides the
 SDP-derived DTLS posture.
