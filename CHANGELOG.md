@@ -7,6 +7,46 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **A recorded prompt can play until it is stopped** — `"repeat_times": "inf"` on `play_media`. Hold
+  music, queue music and park music all play for an unbounded time, and until now only a *tone* could:
+  `repeat_times` was a pass count that `PcmPlayer` clamped with `.max(1)`, so the only way to
+  approximate a bed was a large finite count plus a controller-side timer to re-issue the play when
+  `PlayFinished{Completed}` arrived, which leaves an audible gap at every re-issue.
+
+  The spelling mirrors the `*inf` suffix a tone cadence has always taken, so "endless" is one word
+  everywhere in the contract. An endless play's accept carries **no** `duration_ms` — there is none to
+  report — exactly as an uncapped `*inf` tone already did, and it ends only on `stop_media`, on a
+  `duration_ms` cap, or with the leg. It never reports `completed` on its own.
+
+  A body it can never advance in (no samples, or `start_pos_ms` at or past the end) is exhausted
+  immediately and reports a zero duration rather than "endless" — otherwise the accept would promise a
+  bed that plays no sample and never finishes.
+
+  The NG/bencode front-end keeps rtpengine's integer `repeat-times`: that wire is rtpengine's, and it
+  has no spelling for an endless play.
+
+### Fixed
+
+- **`docs/cookbook/playback.md` shipped the bug as the recipe.** The ducking example started a hold
+  bed with `"repeat_times": 0` and printed `"duration_ms": 45000` in its own reply — which is the
+  file's single-pass length, not a bed. The example now uses `"inf"`, and the prose one screen below
+  that contradicted it is corrected.
+
+### Changed
+
+- **`Command::PlayMedia.repeat_times` is now `Option<PlayRepeat>`** rather than `Option<u64>`.
+
+  **Breaking (Rust API).** A controller constructing the variant passes
+  `repeat_times.map(PlayRepeat::Times)` (or `PlayRepeat::Forever`). The JSON wire is **unchanged for
+  every existing message**: a number still deserializes as a total play count and `0` still means
+  once, so nothing a controller sends today changes meaning.
+
+  `PlayRepeat`'s serde is hand-written rather than `#[serde(untagged)]`: untagged would accept any
+  string as `Forever`, so a typo would silently become an endless bed on every caller. A value that is
+  neither a non-negative number nor `"inf"` (case-insensitive) is a parse error naming both forms.
+
 ## [0.5.3] — 2026-09-12
 
 A re-offer handed the other party the re-offering party's own media port, so a call went one-way the

@@ -54,7 +54,7 @@ Stock rtpengine verbs, with the exact command strings the parser matches:
 | `query` | `query` | Answers `result: ok` with a `totals` dict of per-session counters (packets / bytes / loss); see parity notes. |
 | `list` | `list` | Returns the live call-ids under `calls`. |
 | `statistics` | `statistics` | Counters under a `statistics` sub-dict: `offers`, `answers`, `deletes`, `errors`, `sessions`. |
-| `play media` | `play_media` | Source from `file`, `blob`, or `db-id` (`db-id` parses but the engine rejects it: no media database). `repeat-times`, `start-pos`, `duration`, `to-tag`. |
+| `play media` | `play_media` | Source from `file`, `blob`, or `db-id` (`db-id` parses but the engine rejects it: no media database). `repeat-times`, `start-pos`, `duration`, `to-tag`. `repeat-times` is an integer here, as in rtpengine — the native contract's `"inf"` endless play has no NG spelling, so a looping hold bed needs the JSON control plane. |
 | `stop media` | `stop_media` | |
 | `play DTMF` | `play_dtmf` | `code`, `duration`, `volume`, `pause`, `to-tag` (RFC 4733 injection). |
 | `silence media` / `unsilence media` | `silence_media` / `unsilence_media` | Requires a transcoding call. |

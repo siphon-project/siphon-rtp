@@ -120,7 +120,9 @@ packet rate nor plays fast. There is no handover to manage.
 
 Two playbacks on one leg, at two levels, ended independently.
 
-Start the bed quietly:
+Start the bed quietly. `"repeat_times": "inf"` is what makes it a *bed*: it loops until something
+stops it, which is what hold, queue and park music all need. A number there is a total play count
+(`0` and `1` both mean once), so the file would run out mid-call.
 
 ```json
 {
@@ -130,14 +132,17 @@ Start the bed quietly:
   "from_tag": "a7c31f",
   "source": {"source": "file", "path": "/var/lib/siphon-rtp/prompts/hold.wav"},
   "overlay": true,
-  "repeat_times": 0,
+  "repeat_times": "inf",
   "gain_decibels": -12
 }
 ```
 
 ```json
-{"id": 30, "result": "ok", "play_id": 50, "duration_ms": 45000}
+{"id": 30, "result": "ok", "play_id": 50}
 ```
+
+No `duration_ms` in the accept: an endless bed has no length to report. Add a `duration_ms` to the
+request if you want one anyway — the cap then *is* the duration, and it comes back in the accept.
 
 Duck it and talk over it:
 
@@ -191,8 +196,13 @@ Recorded audio is 16-bit linear PCM WAV at any rate and channel count; it is dow
 mono and resampled onto the leg's codec rate. A tone is synthesised **at** the leg's rate,
 so it never resamples.
 
-`repeat_times` (`0`/`1` = once) and `start_pos_ms` apply to recorded audio; a tone's
-repetition is part of its cadence.
+`repeat_times` and `start_pos_ms` apply to recorded audio; a tone's repetition is part of its
+cadence. `repeat_times` is a **total play count** — `0` and `1` both mean once — or the string
+`"inf"` to play until stopped, which is the same "endless" spelling a tone cadence's `*inf` suffix
+uses. Each loop rewinds to `start_pos_ms`, not to the start of the file.
+
+An endless play ends only on `stop_media`, on a `duration_ms` cap, or when the leg goes away — it
+never reports `completed` on its own.
 
 ## Tone presets and cadences
 

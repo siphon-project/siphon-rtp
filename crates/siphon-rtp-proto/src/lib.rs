@@ -309,13 +309,20 @@ pub enum Command {
         call_id: String,
         from_tag: String,
         source: PlayMediaSource,
+        /// How many times to play the source: a **total play count** (`0` and `1` both mean once), or
+        /// `"inf"` to play until stopped. Absent means once.
+        ///
+        /// `"inf"` is what music on hold, queue music and park music need — they play for an
+        /// unbounded time, and a large finite count leaves an audible gap at every re-issue. It
+        /// mirrors the `*inf` suffix a [`PlayMediaSource::Tone`] cadence has always had.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        repeat_times: Option<u64>,
+        repeat_times: Option<PlayRepeat>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start_pos_ms: Option<u64>,
         /// Hard playout cap in milliseconds. The playback ends with [`PlayEndReason::Completed`]
         /// when the cap is reached, whichever comes first with the source running out. The only
-        /// bound, short of a stop, on an endless ([`PlayMediaSource::Tone`] `*inf`) source.
+        /// bound, short of a stop, on an endless source — a [`PlayMediaSource::Tone`] `*inf` cadence
+        /// or a `"repeat_times": "inf"` prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
         /// Mix this playback **under** the party's live egress instead of replacing it.
@@ -849,6 +856,93 @@ pub enum BridgeDirection {
     AToB,
     /// Only room B's participants are heard in room A.
     BToA,
+}
+
+/// How many times a [`Command::PlayMedia`] plays its source.
+///
+/// On the wire this is either a **number** — a total play count, where `0` and `1` both mean once —
+/// or the **string `"inf"`**, which plays until the playback is stopped or its `duration_ms` cap
+/// expires. `"inf"` deliberately mirrors the `*inf` suffix a [`PlayMediaSource::Tone`] cadence has
+/// always accepted, so one spelling means "endless" everywhere in the contract.
+///
+/// Music on hold, queue music and park music are why it exists: they play for an unbounded time, and
+/// approximating that with a large finite count leaves an audible gap at every re-issue and puts a
+/// per-caller timer in the controller for something the engine's player already does internally. An
+/// endless play's accept carries **no** `duration_ms`, because there is none to report.
+///
+/// Serde is hand-written rather than `#[serde(untagged)]`: untagged would accept any string as
+/// `Forever` or silently fall through on a typo, and the error message matters more than the four
+/// lines it saves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayRepeat {
+    /// Play the source this many times in total. `0` and `1` both mean once — `repeat_times` has
+    /// always been a total play count on this wire, not a count of *extra* repeats.
+    Times(u64),
+    /// Play until stopped (`"inf"`).
+    Forever,
+}
+
+impl PlayRepeat {
+    /// The wire token for an endless play — the same one the tone cadence grammar uses.
+    const FOREVER_TOKEN: &'static str = "inf";
+}
+
+impl From<u64> for PlayRepeat {
+    fn from(times: u64) -> Self {
+        PlayRepeat::Times(times)
+    }
+}
+
+impl Serialize for PlayRepeat {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PlayRepeat::Times(times) => serializer.serialize_u64(*times),
+            PlayRepeat::Forever => serializer.serialize_str(Self::FOREVER_TOKEN),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PlayRepeat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RepeatVisitor;
+
+        impl serde::de::Visitor<'_> for RepeatVisitor {
+            type Value = PlayRepeat;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "a play count (non-negative integer) or \"{}\"",
+                    PlayRepeat::FOREVER_TOKEN
+                )
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, times: u64) -> Result<Self::Value, E> {
+                Ok(PlayRepeat::Times(times))
+            }
+
+            // A JSON encoder that writes a small count as a signed integer still round-trips; a
+            // negative one is refused rather than wrapping into an enormous play count.
+            fn visit_i64<E: serde::de::Error>(self, times: i64) -> Result<Self::Value, E> {
+                u64::try_from(times)
+                    .map(PlayRepeat::Times)
+                    .map_err(|_| E::custom(format!("repeat_times must not be negative: {times}")))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value.eq_ignore_ascii_case(PlayRepeat::FOREVER_TOKEN) {
+                    Ok(PlayRepeat::Forever)
+                } else {
+                    Err(E::custom(format!(
+                        "repeat_times must be a number or \"{}\", got {value:?}",
+                        PlayRepeat::FOREVER_TOKEN
+                    )))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(RepeatVisitor)
+    }
 }
 
 /// Source for [`Command::PlayMedia`]. Tagged on `"source"`.
@@ -2491,7 +2585,7 @@ mod tests {
                 source: PlayMediaSource::File {
                     path: "/p.wav".into(),
                 },
-                repeat_times: Some(2),
+                repeat_times: Some(PlayRepeat::Times(2)),
                 start_pos_ms: None,
                 duration_ms: Some(5000),
                 overlay: false,
@@ -2517,7 +2611,7 @@ mod tests {
                 source: PlayMediaSource::Http {
                     url: "https://example.invalid/hold.wav".into(),
                 },
-                repeat_times: Some(0),
+                repeat_times: Some(PlayRepeat::Times(0)),
                 start_pos_ms: None,
                 duration_ms: None,
                 overlay: true,
@@ -2688,6 +2782,78 @@ mod tests {
             },
         };
         roundtrip(&request);
+    }
+
+    #[test]
+    fn repeat_times_accepts_a_count_or_inf_and_writes_back_what_it_read() {
+        for (json, expected) in [
+            ("0", PlayRepeat::Times(0)),
+            ("1", PlayRepeat::Times(1)),
+            ("5", PlayRepeat::Times(5)),
+            (r#""inf""#, PlayRepeat::Forever),
+        ] {
+            let parsed: PlayRepeat = serde_json::from_str(json).expect("deserialize");
+            assert_eq!(parsed, expected, "{json}");
+            assert_eq!(
+                serde_json::to_string(&parsed).expect("serialize"),
+                json,
+                "a count stays a number and inf stays a string"
+            );
+        }
+    }
+
+    #[test]
+    fn repeat_times_refuses_anything_that_is_not_a_count_or_inf() {
+        // A typo must be a loud parse error rather than silently becoming an endless bed on every
+        // caller — which is what an untagged enum with a string variant would have done.
+        for json in [r#""forever""#, r#""INFINITE""#, r#""""#, "-1", "true"] {
+            assert!(
+                serde_json::from_str::<PlayRepeat>(json).is_err(),
+                "{json} must not parse"
+            );
+        }
+        // The token is matched case-insensitively, like the tone cadence grammar's `*inf`.
+        assert_eq!(
+            serde_json::from_str::<PlayRepeat>(r#""INF""#).expect("deserialize"),
+            PlayRepeat::Forever
+        );
+    }
+
+    #[test]
+    fn an_endless_play_media_keeps_the_wire_shape_a_finite_one_has() {
+        let endless = serde_json::to_value(Command::PlayMedia {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            source: PlayMediaSource::File {
+                path: "/hold.wav".into(),
+            },
+            repeat_times: Some(PlayRepeat::Forever),
+            start_pos_ms: None,
+            duration_ms: None,
+            overlay: true,
+            gain_decibels: Some(-12),
+            to_tag: None,
+        })
+        .expect("serialize");
+        assert_eq!(endless["command"], "play_media");
+        assert_eq!(endless["repeat_times"], "inf");
+
+        // And `0` still means once, so nothing a controller sends today changes meaning.
+        let once = serde_json::to_value(Command::PlayMedia {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            source: PlayMediaSource::File {
+                path: "/hold.wav".into(),
+            },
+            repeat_times: Some(PlayRepeat::Times(0)),
+            start_pos_ms: None,
+            duration_ms: None,
+            overlay: false,
+            gain_decibels: None,
+            to_tag: None,
+        })
+        .expect("serialize");
+        assert_eq!(once["repeat_times"], 0);
     }
 
     #[test]

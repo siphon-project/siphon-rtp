@@ -16,7 +16,7 @@ use siphon_rtp_codec::g711::G711;
 use siphon_rtp_media::dtmf::{DtmfGenerator, DEFAULT_DTMF_VOLUME_DBM0};
 use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::fork::RtpForkSink;
-use siphon_rtp_media::player::{PcmPlayer, WavSource};
+use siphon_rtp_media::player::{PcmPlayer, PcmRepeat, WavSource};
 use siphon_rtp_media::wav::WavRecorder;
 
 /// A 1-second 8 kHz mono WAV source for the player bench.
@@ -35,7 +35,7 @@ fn bench_player_frame_pull(criterion: &mut Criterion) {
 
     criterion.bench_function("player_next_frame_160", |bencher| {
         // Loop forever so every iteration pulls a real frame (no exhaustion mid-bench).
-        let mut player = PcmPlayer::new(&source, u32::MAX, 0);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Forever, 0);
         bencher.iter(|| {
             let produced = player.next_frame(black_box(&mut frame));
             black_box(produced)
