@@ -30,19 +30,23 @@ use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_dsp::EnergyVad;
 use siphon_rtp_media::dtmf::DtmfDetector;
+use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::jitter::JitterBuffer;
 use siphon_rtp_media::leg::{MediaLeg, PcmFrame};
 use siphon_rtp_media::mixer::{MixInputs, Mixer, Monitor, Role, Whisper, MAX_PARTICIPANTS};
+use siphon_rtp_media::playback::{
+    FinishedPlayback, Gain, OverlayBus, PlaybackError, MAX_OVERLAY_SLOTS,
+};
 use siphon_rtp_media::rtcp;
 use siphon_rtp_media::rtp::{write_packet_with_csrcs, RtpHeader, RtpPacket};
 use siphon_rtp_media::t140::T140Reassembler;
 use siphon_rtp_media::text_mixer::{
     TextMixer, TextSourceConfig, MAX_PENDING_TEXT_BYTES, MAX_TEXT_REDUNDANCY,
 };
-use siphon_rtp_proto::Event;
+use siphon_rtp_proto::{Event, PlayEndReason};
 use siphon_rtp_srtp::leg::SecureLeg;
 
-use crate::media_pipeline::{Outbound, SymmetricLatch};
+use crate::media_pipeline::{Outbound, PlayRequest, SymmetricLatch};
 
 /// The narrowband fast-path room rate (all-G.711/G.726/PSTN, unbridged).
 pub const NARROWBAND_RATE_HZ: u32 = 8_000;
@@ -66,6 +70,14 @@ const ROOM_RATE_TIERS: [u32; 3] = [NARROWBAND_RATE_HZ, WIDEBAND_RATE_HZ, FULLBAN
 const BRIDGE_RATE_HZ: u32 = WIDEBAND_RATE_HZ;
 /// The highest room rate — the room-frame scratch capacity.
 pub const MAX_ROOM_RATE_HZ: u32 = FULLBAND_RATE_HZ;
+
+/// The rate a room recording is pinned to.
+///
+/// Wideband: the widest a room reaches short of a fullband participant, so a conference that goes
+/// wideband mid-recording is captured at its own quality rather than downsampled to whatever rate it
+/// happened to start at — while a narrowband room is upsampled into it rather than the file changing
+/// rate partway through, which no player handles.
+pub const WIDEBAND_RECORDING_RATE_HZ: u32 = 16_000;
 /// The room playout interval in milliseconds (RFC 3551 default ptime).
 const ROOM_TICK_MS: usize = 20;
 /// Samples in one 20 ms room frame at the **maximum** room rate — the scratch-buffer capacity. The
@@ -366,6 +378,35 @@ pub struct Conference {
     /// resampling is needed.
     bridge_in: Vec<flume::Receiver<Vec<i16>>>,
     bridge_out: Vec<flume::Sender<Vec<i16>>>,
+    /// Playbacks mixed **into** the room as a non-participant source: an entry tone, a
+    /// "this conference is being recorded" announcement, hold music for a lone participant. Up to
+    /// [`siphon_rtp_media::playback::MAX_OVERLAY_SLOTS`] at once, exactly as a leg's overlays.
+    ///
+    /// It renders at `overlay_rate`, which is the room rate at the moment the *first* playback
+    /// started and stays fixed for as long as any is running. The room rate can move underneath it
+    /// (a wideband participant joins, a bridge forces 16 kHz), and rebuilding a running `Playback`
+    /// at a new rate would mean restarting it — audibly, mid-announcement. Instead the mixed overlay
+    /// frame is resampled into the room rate by `overlay_to_room` when the two differ, which is
+    /// `None` in the ordinary case where they do not.
+    overlay: OverlayBus,
+    /// The rate `overlay` renders at; `None` when no playback is running, so the next one adopts the
+    /// then-current room rate and costs no conversion.
+    overlay_rate: Option<u32>,
+    /// One overlay frame at `overlay_rate`, reused per tick.
+    overlay_scratch: Vec<i16>,
+    /// Conversion from `overlay_rate` into the room rate, when a rate change moved them apart.
+    overlay_to_room: Option<Resampler>,
+    /// The converted overlay frame at the room rate, reused per tick.
+    overlay_room_scratch: Vec<i16>,
+    /// Room playbacks that ended since the last drain, staged because the mix happens where the event
+    /// vector is not in scope — the same reason `Direction` stages its own.
+    overlay_finished: Vec<FinishedPlayback>,
+    /// Sinks fed the room's **listener mix** every tick — what a listener actually hears, including
+    /// any bridged room and any room playback, which is the useful definition of "record the
+    /// conference".
+    room_taps: Vec<RoomTap>,
+    /// One room frame of scratch for the recording taps, so the per-tick copy allocates nothing.
+    tap_scratch: Vec<i16>,
     /// Scratch for summing bridged-in rooms into one external frame (reused each tick).
     bridge_accum: Vec<i32>,
     external_buf: Vec<i16>,
@@ -435,6 +476,14 @@ impl Conference {
             bridge_in: Vec::new(),
             bridge_out: Vec::new(),
             bridge_accum: vec![0i32; ROOM_FRAME],
+            overlay: OverlayBus::new(ROOM_FRAME),
+            overlay_rate: None,
+            overlay_scratch: vec![0i16; ROOM_FRAME],
+            overlay_to_room: None,
+            overlay_room_scratch: vec![0i16; ROOM_FRAME],
+            overlay_finished: Vec::with_capacity(MAX_OVERLAY_SLOTS),
+            room_taps: Vec::new(),
+            tap_scratch: Vec::with_capacity(ROOM_FRAME),
             external_buf: vec![0i16; ROOM_FRAME],
             share_classes: Vec::new(),
             share_count: 0,
@@ -1229,8 +1278,14 @@ impl Conference {
         // Resolve the sparse routing matrix (tags → current indices).
         self.build_routes();
 
-        // Pull any bridged rooms' audio into one external frame (heard by everyone this room).
-        let have_external = self.gather_external();
+        // Pull any bridged rooms' audio into one external frame (heard by everyone this room), then
+        // fold any room playback into the same frame. `external` is exactly the right seam for it:
+        // the mixer sums it into the room total so everyone hears it, and mixes nobody against it, so
+        // an announcement is never treated as a participant's own audio and never subtracted back out.
+        let mut have_external = self.gather_external();
+        if self.mix_room_playbacks(have_external) {
+            have_external = true;
+        }
 
         // Mix.
         let active_mask = {
@@ -1249,6 +1304,21 @@ impl Conference {
 
         // Feed this room's local-participant mix onward to every bridged room.
         self.send_to_bridges();
+
+        // Tap the listener mix for any room recording — what a listener hears, bridged audio and
+        // announcements included. Read here, after `mix`, because that is where the frame exists.
+        if !self.room_taps.is_empty() {
+            let frame_len = self.room_frame;
+            let mut mix = std::mem::take(&mut self.tap_scratch);
+            mix.clear();
+            mix.extend_from_slice(
+                &self.mixer.listener_mix()[..frame_len.min(self.mixer.listener_mix().len())],
+            );
+            for tap in &mut self.room_taps {
+                tap.write(&mix);
+            }
+            self.tap_scratch = mix;
+        }
 
         // Egress pass: each participant hears its distinct mix (active talker / routed) or the shared
         // listener mix; resample room → native, encode, packetize with the leg's own SSRC, transmit.
@@ -1613,6 +1683,175 @@ impl Conference {
         have
     }
 
+    /// Render any room playback and add it into `external_buf`, returning whether it produced audio.
+    ///
+    /// `already_have` says whether `gather_external` already filled the buffer with bridged audio, in
+    /// which case the playback is *added* to it (saturating) rather than replacing it — a bridged room
+    /// and an announcement are both things everybody hears.
+    fn mix_room_playbacks(&mut self, already_have: bool) -> bool {
+        if !self.overlay.is_active() {
+            return false;
+        }
+        let overlay_frame = self.overlay_scratch.len();
+        // `mix_into` adds under whatever the base already carries, so a silent base is what makes the
+        // playback audible on its own.
+        self.overlay_scratch[..overlay_frame].fill(0);
+        self.overlay_finished.clear();
+        let mut scratch = std::mem::take(&mut self.overlay_scratch);
+        self.overlay
+            .mix_into(&mut scratch, &mut self.overlay_finished);
+        self.overlay_scratch = scratch;
+
+        // Convert into the room rate when a rate change moved the two apart; otherwise the frame is
+        // already in the room's domain and is used as-is.
+        let room_frame = self.room_frame;
+        let converted: &[i16] = match self.overlay_to_room.as_mut() {
+            Some(resampler) => {
+                self.overlay_room_scratch.clear();
+                resampler.process(&self.overlay_scratch, &mut self.overlay_room_scratch);
+                &self.overlay_room_scratch
+            }
+            None => &self.overlay_scratch,
+        };
+
+        if already_have {
+            for (slot, &sample) in self.external_buf[..room_frame].iter_mut().zip(converted) {
+                *slot = saturate_i16(i32::from(*slot) + i32::from(sample));
+            }
+        } else {
+            let copied = room_frame.min(converted.len());
+            self.external_buf[..copied].copy_from_slice(&converted[..copied]);
+            self.external_buf[copied..room_frame].fill(0);
+        }
+        // A playback that drained on its own during this tick reports `Completed`.
+        self.drain_room_playback_completions(PlayEndReason::Completed);
+        true
+    }
+
+    /// Start a playback into the room, at the rate the room is running now (or the rate an already
+    /// running playback fixed).
+    fn start_room_playback(
+        &mut self,
+        request: PlayRequest,
+        gain: Gain,
+        play_id: u64,
+        duration_cap_ms: Option<u64>,
+    ) -> Result<(), PlaybackError> {
+        // The first playback fixes the render rate; every later one joins it, so all four slots share
+        // one frame length and the bus needs no per-slot conversion.
+        let rate = match self.overlay_rate {
+            Some(rate) => rate,
+            None => {
+                let rate = self.room_rate;
+                self.overlay_rate = Some(rate);
+                let frame = room_frame_for(rate);
+                self.overlay = OverlayBus::new(frame);
+                self.overlay_scratch = vec![0i16; frame];
+                self.rebuild_overlay_resampler();
+                rate
+            }
+        };
+        let playback =
+            request.into_playback_at(rate, ROOM_TICK_MS as u32, gain, play_id, duration_cap_ms)?;
+        self.overlay.start(playback)
+    }
+
+    /// Stop one room playback (or all of them), reporting each as [`PlayEndReason::Stopped`].
+    /// Returns whether anything was stopped.
+    fn stop_room_playback(&mut self, play_id: Option<u64>) -> bool {
+        self.overlay_finished.clear();
+        let stopped = match play_id {
+            Some(play_id) => match self.overlay.stop(play_id) {
+                Some(finished) => {
+                    self.overlay_finished.push(finished);
+                    true
+                }
+                None => false,
+            },
+            None => {
+                let mut finished = std::mem::take(&mut self.overlay_finished);
+                self.overlay.stop_all(&mut finished);
+                let any = !finished.is_empty();
+                self.overlay_finished = finished;
+                any
+            }
+        };
+        self.drain_room_playback_completions(PlayEndReason::Stopped);
+        stopped
+    }
+
+    /// Turn staged overlay completions into [`Event::PlayFinished`]s addressed by room.
+    ///
+    /// `reason` is what these completions report. The bus does not distinguish a drained playback
+    /// from a stopped one — `FinishedPlayback` carries only the id and the played duration — so the
+    /// caller says which, and it knows: a stop reports `Stopped`, the per-tick drain reports
+    /// `Completed` because the only way a slot empties during a tick is by running out.
+    fn drain_room_playback_completions(&mut self, reason: PlayEndReason) {
+        if self.overlay_finished.is_empty() {
+            return;
+        }
+        let conference_id = self.conference_id.clone();
+        let finished = std::mem::take(&mut self.overlay_finished);
+        for playback in &finished {
+            self.pending_events.push(Event::PlayFinished {
+                // A room playback is not on a call: `conference_id` is the correlator, and `call_id`
+                // is empty rather than carrying a room id in a field that means something else.
+                call_id: String::new(),
+                conference_id: Some(conference_id.clone()),
+                from_tag: String::new(),
+                to_tag: None,
+                play_id: playback.play_id,
+                reason,
+                played_ms: Some(playback.played_ms),
+            });
+        }
+        self.overlay_finished = finished;
+        self.overlay_finished.clear();
+        // With no slot left, the next playback adopts the room's then-current rate and pays no
+        // conversion — which is the common case and worth getting back to.
+        if !self.overlay.is_active() {
+            self.overlay_rate = None;
+            self.overlay_to_room = None;
+        }
+    }
+
+    /// Rebuild the overlay → room conversion after either rate moved.
+    fn rebuild_overlay_resampler(&mut self) {
+        self.overlay_to_room = match self.overlay_rate {
+            Some(rate) if rate != self.room_rate => Resampler::new(rate, self.room_rate).ok(),
+            _ => None,
+        };
+        self.overlay_room_scratch = Vec::with_capacity(self.room_frame.max(1));
+    }
+
+    /// Attach a sink to the room's listener mix at a fixed `rate` (a room recording).
+    ///
+    /// The rate is the tap's, not the room's, and it never moves: a recording is a file, and a room
+    /// that started narrowband and went wideband mid-recording would otherwise change sample rate
+    /// inside one WAV, which no player handles. The room converts into it — the room is the only
+    /// thing that knows when its own rate changes, so the conversion has to live here rather than
+    /// being baked into the sink at attach time.
+    pub fn add_room_tap(&mut self, sink: Box<dyn MediaSink>, rate: u32) {
+        let mut tap = RoomTap {
+            sink,
+            rate,
+            resampler: None,
+            scratch: Vec::new(),
+        };
+        tap.rebuild(self.room_rate);
+        self.room_taps.push(tap);
+    }
+
+    /// Detach the room taps carrying `tag`, finishing each so its consumer closes cleanly.
+    pub fn remove_room_taps_tagged(&mut self, tag: &str) {
+        for tap in &mut self.room_taps {
+            if tap.sink.tag() == Some(tag) {
+                tap.sink.finish();
+            }
+        }
+        self.room_taps.retain(|tap| tap.sink.tag() != Some(tag));
+    }
+
     /// Feed this room's local-participant mix to every bridged room (drop on a full channel — late
     /// bridge audio is worthless, same policy as the media mailboxes).
     fn send_to_bridges(&self) {
@@ -1669,6 +1908,17 @@ impl Conference {
             }
             // Rebuild the shared room→tier downsamplers for the tiers now below the room rate.
             self.listener_downsample = build_listener_downsamplers(target);
+            // A running room playback keeps rendering at its own rate; only the conversion into the
+            // room moves. Restarting it instead would cut an announcement off mid-word because a
+            // participant joined.
+            self.rebuild_overlay_resampler();
+            self.external_buf.resize(self.room_frame, 0);
+            self.tap_scratch = Vec::with_capacity(self.room_frame);
+            // A recording keeps its own rate; only the conversion into it moves, so a room that goes
+            // wideband mid-recording does not change sample rate inside the file.
+            for tap in &mut self.room_taps {
+                tap.rebuild(target);
+            }
         }
     }
 }
@@ -1777,6 +2027,31 @@ pub enum ConferenceControl {
     AddBridgeIn(flume::Receiver<BridgeFrame>),
     /// Attach an outbound bridge channel — feed this room's participant mix to another room.
     AddBridgeOut(flume::Sender<BridgeFrame>),
+    /// Start a playback into the room. `reply` carries the actor's verdict, so a slot cap or a rate
+    /// the engine cannot serve is answered as an error rather than as a hollow success.
+    StartPlay {
+        request: Box<PlayRequest>,
+        gain: Gain,
+        play_id: u64,
+        duration_cap_ms: Option<u64>,
+        reply: tokio::sync::oneshot::Sender<Result<(), PlaybackError>>,
+    },
+    /// Stop one room playback by `play_id`, or all of them when `None`. `reply` carries whether
+    /// anything was stopped.
+    StopPlay {
+        play_id: Option<u64>,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Retune a running room playback's gain. `reply` carries whether that `play_id` was running.
+    SetPlayGain {
+        play_id: u64,
+        gain: Gain,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Attach a sink to the room's listener mix at a fixed rate (a room recording).
+    AddRoomTap { sink: Box<dyn MediaSink>, rate: u32 },
+    /// Detach the room taps carrying `tag`.
+    RemoveRoomTapTagged { tag: String },
     /// Deliver a participant's [`SecureLeg`] once its DTLS handshake completed (RFC 5764), keying the
     /// seat and clearing its pending gate so its audio joins the mix and the mix reaches it.
     AttachSecureLeg { tag: String, leg: Box<SecureLeg> },
@@ -1849,6 +2124,38 @@ async fn run_conference<D>(
                     ConferenceInput::Control(ConferenceControl::SetTopM(top_m)) => {
                         conference.set_top_m(top_m);
                     }
+                    ConferenceInput::Control(ConferenceControl::StartPlay {
+                        request,
+                        gain,
+                        play_id,
+                        duration_cap_ms,
+                        reply,
+                    }) => {
+                        let outcome = conference.start_room_playback(
+                            *request,
+                            gain,
+                            play_id,
+                            duration_cap_ms,
+                        );
+                        let _ = reply.send(outcome);
+                    }
+                    ConferenceInput::Control(ConferenceControl::StopPlay { play_id, reply }) => {
+                        let stopped = conference.stop_room_playback(play_id);
+                        let _ = reply.send(stopped);
+                    }
+                    ConferenceInput::Control(ConferenceControl::SetPlayGain {
+                        play_id,
+                        gain,
+                        reply,
+                    }) => {
+                        let _ = reply.send(conference.overlay.set_gain(play_id, gain));
+                    }
+                    ConferenceInput::Control(ConferenceControl::AddRoomTap { sink, rate }) => {
+                        conference.add_room_tap(sink, rate);
+                    }
+                    ConferenceInput::Control(ConferenceControl::RemoveRoomTapTagged { tag }) => {
+                        conference.remove_room_taps_tagged(&tag);
+                    }
                     ConferenceInput::Control(ConferenceControl::AddBridgeIn(receiver)) => {
                         conference.add_bridge_in(receiver);
                     }
@@ -1863,11 +2170,31 @@ async fn run_conference<D>(
                     }
                     ConferenceInput::Control(ConferenceControl::Stop) => break,
                 }
+                // A control op can stage an event of its own — a stop reports its playback as
+                // `Stopped` right away rather than waiting for a tick that may never come.
+                for event in conference.drain_events() {
+                    if let Some(sink) = &events {
+                        if sink.try_send(event).is_err() {
+                            tracing::debug!("conference event dropped (sink full or closed)");
+                        }
+                    }
+                }
             }
             _ = ticker.tick() => {
                 outbound.clear();
                 let change = conference.tick(&mut outbound);
                 send_all(&datapath, &mut outbound).await;
+                // Anything the tick staged — a room playback that drained, and the DTMF/text events
+                // the packet arm also drains. Draining only on the packet arm stranded a tick-staged
+                // event in a room where nobody happens to be sending, which is exactly the room a
+                // lone-participant announcement plays into.
+                for event in conference.drain_events() {
+                    if let Some(sink) = &events {
+                        if sink.try_send(event).is_err() {
+                            tracing::debug!("conference event dropped (sink full or closed)");
+                        }
+                    }
+                }
                 if let (ActiveSpeakerChange::Changed(from_tag), Some(sink)) = (change, &events) {
                     let event = Event::ActiveSpeaker {
                         conference_id: conference.conference_id().to_string(),
@@ -1936,6 +2263,41 @@ async fn send_all<D: Datapath>(datapath: &D, outbound: &mut Vec<Outbound>) {
             .await
         {
             tracing::debug!(%error, "conference send failed");
+        }
+    }
+}
+
+/// One sink fed the room's listener mix, with the conversion from the room's rate into the sink's.
+struct RoomTap {
+    sink: Box<dyn MediaSink>,
+    /// The rate this tap consumes at, fixed for its lifetime.
+    rate: u32,
+    /// Room rate → `rate`; `None` while the two match.
+    resampler: Option<Resampler>,
+    /// Converted frame, reused per tick so the tap allocates nothing.
+    scratch: Vec<i16>,
+}
+
+impl RoomTap {
+    /// Rebuild the conversion after the room rate moved to `room_rate`.
+    fn rebuild(&mut self, room_rate: u32) {
+        self.resampler = if room_rate == self.rate {
+            None
+        } else {
+            Resampler::new(room_rate, self.rate).ok()
+        };
+        self.scratch = Vec::with_capacity((self.rate as usize / 1000) * ROOM_TICK_MS + 1);
+    }
+
+    /// Hand one room-rate frame to the sink, converting when the rates differ.
+    fn write(&mut self, room_frame: &[i16]) {
+        match self.resampler.as_mut() {
+            Some(resampler) => {
+                self.scratch.clear();
+                resampler.process(room_frame, &mut self.scratch);
+                self.sink.write_pcm(&self.scratch);
+            }
+            None => self.sink.write_pcm(room_frame),
         }
     }
 }
@@ -2073,6 +2435,17 @@ impl ConferenceRegistry {
             });
         }
         true
+    }
+
+    /// Whether a room exists, for a verb that must answer `unknown conference` rather than silently
+    /// doing nothing.
+    ///
+    /// Note the deliberate absence of a room-rate accessor here: the rate lives inside the actor and
+    /// moves on its own tick, so anything the registry could report would already be stale. A
+    /// recording pins its own rate instead and lets the room convert.
+    #[must_use]
+    pub fn has_room(&self, conference_id: &str) -> bool {
+        self.rooms.contains_key(conference_id)
     }
 
     /// Send a control op to a room's actor, returning `false` when there is no such room (it was torn

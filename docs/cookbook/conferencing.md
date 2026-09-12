@@ -229,3 +229,78 @@ reception report block (RFC 3550 §6.4.1) on the same muxed endpoint (RFC 5761).
 - Watch the control connection for `active_speaker` when the louder party starts talking, and
   `call_quality` every ~5 s per seat.
 - Leave with both tags and confirm `siphon_rtp_conference_rooms` drops back to 0.
+
+
+## Playing audio into a room
+
+A PBX conference announces joins and leaves, plays music to a lone participant, and says
+"this conference is being recorded". None of that is any participant's audio, so it goes in
+as a **non-participant source**: everyone hears it, and nobody is mixed-minus-self against
+it, which is what stops it being treated as somebody's own voice and subtracted back out.
+
+`play_media` cannot do this — it resolves through the call registry, which a conference never
+enters, so a room id answers `unknown call`. Use `conference_play`:
+
+```json
+{
+  "id": 50,
+  "command": "conference_play",
+  "conference_id": "bridge-4412",
+  "source": {"source": "tone", "tone": "425/200,0/200*2"},
+  "gain_decibels": -6
+}
+```
+
+```json
+{"id": 50, "result": "ok", "play_id": 12, "duration_ms": 800}
+```
+
+Up to four run at once, each with its own `play_id`, and each ends with its own
+`play_finished` — carrying `conference_id`, with `call_id` empty, because a room playback is
+not on a call:
+
+```json
+{"event": "play_finished", "call_id": "", "conference_id": "bridge-4412", "play_id": 12, "reason": "completed", "played_ms": 800}
+```
+
+`conference_set_play_gain` retunes a running one (how an announcement ducks under a
+conversation rather than burying it) and `conference_stop_play` ends it — by `play_id`, or
+all of them when none is given.
+
+**Rate changes are handled for you.** A room mixes at 8 kHz while everyone is narrowband and
+moves to 16 kHz when a wideband participant joins or the room is bridged. A playback keeps
+rendering at the rate it started at and the room converts, so an announcement is never cut
+off mid-word because somebody joined.
+
+## Recording a room
+
+```json
+{
+  "id": 51,
+  "command": "conference_start_recording",
+  "conference_id": "bridge-4412",
+  "recording_dir": "/var/spool/conferences",
+  "max_duration_ms": 7200000
+}
+```
+
+```json
+{"id": 51, "result": "ok", "recording_id": "rec-3"}
+```
+
+This records the **listener mix** — what a listener actually hears, including any bridged
+room and any room playback — which is the useful definition of "record the conference". (The
+participant-only mix, which feeds a bridge, deliberately excludes bridged audio so a bridge
+cannot echo a room back to itself.)
+
+It is the same streaming writer a call recording uses, so it produces the same file and the
+same completion event, and the same rule applies: **only act on the file when the event
+arrives**, because that is emitted after the WAV header is finalized and flushed.
+
+```json
+{"event": "recording_finished", "call_id": "", "conference_id": "bridge-4412", "recording_id": "rec-3", "path": "/var/spool/conferences/bridge-4412-rec-3.wav", "duration_ms": 1830000, "reason": "stopped"}
+```
+
+The file is pinned to 16 kHz for its lifetime. A room that starts narrowband and goes
+wideband mid-recording would otherwise change sample rate inside one WAV, which no player
+handles; the room converts into the recording's rate instead.

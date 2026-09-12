@@ -46,7 +46,9 @@ use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
 use siphon_rtp_srtp::StreamRollover;
 
 use crate::cluster::ClusterState;
-use crate::conference::{ConferenceRegistry, ParticipantConfig, ParticipantTextConfig, Routing};
+use crate::conference::{
+    ConferenceControl, ConferenceRegistry, ParticipantConfig, ParticipantTextConfig, Routing,
+};
 use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
 use crate::ice::driver::{AgentOutcome, AgentSupervisor, ConsentOutcome, ConsentSupervisor};
 use crate::ice::{self, IceCredentials};
@@ -1459,6 +1461,9 @@ struct AudioRecording {
     ingress_legs: Vec<bool>,
     /// Egress taps: which directions carry a sink (`true` = toward A).
     egress_legs: Vec<bool>,
+    /// The conference this recording taps, when it is a room recording rather than a call one. The
+    /// detach then targets the room actor's own tap list instead of a call's fan-out.
+    room: Option<String>,
     /// Why the recording ended when the *source* simply went away. Set by an explicit stop before it
     /// detaches; left at `CallEnded` otherwise, because a writer cannot tell a stop from a hangup —
     /// both are just "the sinks are gone" — and guessing would report one as the other.
@@ -2162,6 +2167,65 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 conference_id_b,
                 direction,
             } => self.conference_bridge(&conference_id_a, &conference_id_b, direction),
+            Command::ConferencePlay {
+                conference_id,
+                source,
+                repeat_times,
+                start_pos_ms,
+                duration_ms,
+                gain_decibels,
+            } => {
+                self.conference_play(
+                    &conference_id,
+                    source,
+                    PlayOptions {
+                        repeat_times,
+                        start_pos_ms,
+                        duration_ms,
+                        overlay: true,
+                        gain_decibels,
+                    },
+                )
+                .await
+            }
+            Command::ConferenceStopPlay {
+                conference_id,
+                play_id,
+            } => self.conference_stop_play(&conference_id, play_id).await,
+            Command::ConferenceSetPlayGain {
+                conference_id,
+                play_id,
+                gain_decibels,
+            } => {
+                self.conference_set_play_gain(&conference_id, play_id, gain_decibels)
+                    .await
+            }
+            Command::ConferenceStartRecording {
+                conference_id,
+                path,
+                recording_dir,
+                max_duration_ms,
+                silence_ms,
+            } => {
+                self.conference_start_recording(
+                    client,
+                    &conference_id,
+                    path,
+                    recording_dir,
+                    crate::recording::RecordingLimits {
+                        max_duration_ms,
+                        silence_ms,
+                    },
+                )
+                .await
+            }
+            Command::ConferenceStopRecording {
+                conference_id,
+                recording_id,
+            } => {
+                self.conference_stop_recording(&conference_id, recording_id.as_deref())
+                    .await
+            }
             Command::AttachWsTee {
                 call_id,
                 ws_uri,
@@ -8594,6 +8658,350 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         ok_empty()
     }
 
+    /// Play audio into a conference room ([`Command::ConferencePlay`]) — an entry tone, a
+    /// "this conference is being recorded" announcement, hold music for a lone participant.
+    ///
+    /// A room is not a call. The leg-addressed [`Command::PlayMedia`] resolves through `self.calls`,
+    /// which a conference never enters, so it answers `unknown call` for a room id; hence a verb of
+    /// its own. The audio goes in as a **non-participant source** on the mixer's `external` input,
+    /// which is exactly the seam for it: everyone hears it and nobody is mixed-minus-self against it,
+    /// so an announcement is never treated as a participant's own audio and subtracted back out.
+    async fn conference_play(
+        &self,
+        conference_id: &str,
+        source: PlayMediaSource,
+        options: PlayOptions,
+    ) -> CmdResult {
+        if !self.conference.has_room(conference_id) {
+            return error_result(
+                "conference_play",
+                &format!("unknown conference: {conference_id}"),
+            );
+        }
+        // Same mapping a leg playback uses, so `"inf"` means the same thing in a room as on a leg —
+        // which is what hold music for a lone participant needs.
+        let repeat = match options.repeat_times {
+            None => PcmRepeat::Times(0),
+            Some(PlayRepeat::Forever) => PcmRepeat::Forever,
+            Some(PlayRepeat::Times(times)) => {
+                PcmRepeat::Times(times.min(u64::from(u32::MAX)) as u32)
+            }
+        };
+        let start = options.start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        // Resolved here, off the room actor: a file read and a RIFF parse have no business on the
+        // 20 ms mix tick. A tone is only *parsed* here — it is synthesised at the room rate inside
+        // the actor, which is the only place that knows it.
+        let resolved = match source {
+            PlayMediaSource::Blob { data } => match parse_prompt_wav(&data) {
+                Ok(resolved) => resolved,
+                Err(error) => return error_result("conference_play: parse WAV", &error),
+            },
+            PlayMediaSource::File { path } => match tokio::fs::read(&path).await {
+                Ok(bytes) => match parse_prompt_wav(&bytes) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return error_result("conference_play: parse WAV", &error),
+                },
+                Err(error) => return error_result("conference_play: read file", &error),
+            },
+            PlayMediaSource::Tone { tone } => match ToneSpec::resolve(&tone) {
+                Ok(spec) => ResolvedPlaySource::Tone(spec),
+                Err(error) => return error_result("conference_play: tone", &error),
+            },
+            other => {
+                return error_result(
+                    "conference_play",
+                    &format!("media source {other:?} is not supported for a room"),
+                )
+            }
+        };
+        let (request, source_duration_ms) = match resolved {
+            ResolvedPlaySource::Wav(wav) => {
+                let player = PcmPlayer::new(&wav, repeat, start);
+                // `None` for an endless bed — there is no length to promise, exactly as on a leg.
+                let duration = player.duration_ms();
+                (PlayRequest::Pcm(Box::new(player)), duration)
+            }
+            ResolvedPlaySource::Tone(spec) => {
+                let duration = spec.total_duration_ms();
+                (PlayRequest::Tone(spec), duration)
+            }
+        };
+        let duration_ms = match (source_duration_ms, options.duration_ms) {
+            (Some(source), Some(cap)) => Some(source.min(cap)),
+            (Some(source), None) => Some(source),
+            (None, cap) => cap,
+        };
+        let gain = Gain::from_decibels(options.gain_decibels.unwrap_or(0));
+        let play_id = self.next_play_id();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.conference.control(
+            conference_id,
+            ConferenceControl::StartPlay {
+                request: Box::new(request),
+                gain,
+                play_id,
+                duration_cap_ms: options.duration_ms,
+                reply: sender,
+            },
+        ) {
+            return error_result("conference_play", &"conference is no longer running");
+        }
+        match receiver.await {
+            Ok(Ok(())) => CmdResult::Ok {
+                sdp: None,
+                duration_ms,
+                play_id: Some(play_id),
+                recording_id: None,
+                to_tag: None,
+                stats: None,
+            },
+            Ok(Err(error)) => error_result("conference_play", &error),
+            Err(_) => error_result(
+                "conference_play",
+                &"conference actor closed before the playback started",
+            ),
+        }
+    }
+
+    /// Stop audio playing into a room ([`Command::ConferenceStopPlay`]).
+    async fn conference_stop_play(&self, conference_id: &str, play_id: Option<u64>) -> CmdResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.conference.control(
+            conference_id,
+            ConferenceControl::StopPlay {
+                play_id,
+                reply: sender,
+            },
+        ) {
+            return error_result(
+                "conference_stop_play",
+                &format!("unknown conference: {conference_id}"),
+            );
+        }
+        match receiver.await {
+            Ok(true) => ok_empty(),
+            // An id that is not running is an error, not a hollow success: a controller that believes
+            // it stopped a playback and did not has no way to notice.
+            Ok(false) => match play_id {
+                Some(play_id) => error_result(
+                    "conference_stop_play",
+                    &format!("no playback {play_id} is running in this conference"),
+                ),
+                None => ok_empty(),
+            },
+            Err(_) => error_result("conference_stop_play", &"conference actor closed"),
+        }
+    }
+
+    /// Retune a running room playback's gain ([`Command::ConferenceSetPlayGain`]).
+    async fn conference_set_play_gain(
+        &self,
+        conference_id: &str,
+        play_id: u64,
+        gain_decibels: i32,
+    ) -> CmdResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.conference.control(
+            conference_id,
+            ConferenceControl::SetPlayGain {
+                play_id,
+                gain: Gain::from_decibels(gain_decibels),
+                reply: sender,
+            },
+        ) {
+            return error_result(
+                "conference_set_play_gain",
+                &format!("unknown conference: {conference_id}"),
+            );
+        }
+        match receiver.await {
+            Ok(true) => ok_empty(),
+            Ok(false) => error_result(
+                "conference_set_play_gain",
+                &format!("no playback {play_id} is running in this conference"),
+            ),
+            Err(_) => error_result("conference_set_play_gain", &"conference actor closed"),
+        }
+    }
+
+    /// Record a conference room's mix ([`Command::ConferenceStartRecording`]).
+    ///
+    /// Taps the **listener mix** — what a listener actually hears, including any bridged room and any
+    /// room playback — which is the useful definition of "record the conference". The alternative,
+    /// the participant-only mix, is what feeds a bridge and deliberately excludes bridged audio.
+    ///
+    /// From there it is P3's machinery unchanged: a tagged sink into the shared frame assembler, and
+    /// the same streaming WAV writer, so a room recording and a call recording produce the same file
+    /// and the same completion event.
+    async fn conference_start_recording(
+        &self,
+        client: ClientId,
+        conference_id: &str,
+        path: Option<String>,
+        recording_dir: Option<String>,
+        limits: crate::recording::RecordingLimits,
+    ) -> CmdResult {
+        use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
+        use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
+
+        if !self.conference.has_room(conference_id) {
+            return error_result(
+                "conference_start_recording",
+                &format!("unknown conference: {conference_id}"),
+            );
+        }
+        let recording_id = format!(
+            "rec-{}",
+            self.next_recording_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let path = match path {
+            Some(path) => std::path::PathBuf::from(path),
+            None => match recording_dir {
+                Some(directory) => std::path::PathBuf::from(directory)
+                    .join(format!("{conference_id}-{recording_id}.wav")),
+                None => {
+                    return error_result(
+                        "conference_start_recording",
+                        &"no output location (set `path`, or `recording_dir`)",
+                    )
+                }
+            },
+        };
+        // Opened before a sink is attached, so a bad path fails the verb with the room untouched.
+        let file = match tokio::fs::File::create(&path).await {
+            Ok(file) => file,
+            Err(error) => {
+                return error_result(
+                    "conference_start_recording",
+                    &format!("open {}: {error}", path.display()),
+                )
+            }
+        };
+
+        // The room mixes at its own rate, which moves with membership and bridging. A recording is a
+        // file, not a live stream, so it is pinned to one rate for its lifetime and the *room*
+        // converts into it — a room that started narrowband and went wideband mid-recording would
+        // otherwise change sample rate inside one WAV, which no player handles. Wideband is the pin:
+        // it is the widest a room reaches short of a fullband participant, so a conference that goes
+        // wideband is recorded at its own quality rather than downsampled to the rate it started at.
+        let rate = crate::conference::WIDEBAND_RECORDING_RATE_HZ;
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: rate,
+            channels: 1,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime: 20,
+        };
+        let plan = plan_ws_tee(format, false, false);
+        // No resampler on the sink: the room owns that conversion, because the room is the only thing
+        // that knows when its own rate moves.
+        let sink = WsTeeSink::new(
+            TeeChannel::Caller,
+            plan.mixer.clone(),
+            recording_id.clone(),
+            None,
+        );
+        if !self.conference.control(
+            conference_id,
+            ConferenceControl::AddRoomTap {
+                sink: Box::new(sink),
+                rate,
+            },
+        ) {
+            return error_result("conference_start_recording", &"conference actor closed");
+        }
+
+        let source_reason = Arc::new(std::sync::Mutex::new(RecordingEndReason::CallEnded));
+        let writer = {
+            let events = self.events.get(&client).map(|sink| sink.value().clone());
+            let conference_id = conference_id.to_string();
+            let recording_id = recording_id.clone();
+            let path = path.clone();
+            let source_reason = source_reason.clone();
+            let frames = plan.frames;
+            let recycle = plan.recycle;
+            tokio::spawn(async move {
+                let outcome = crate::recording::run_wav_recorder(
+                    file,
+                    path.clone(),
+                    rate,
+                    1,
+                    limits,
+                    frames,
+                    recycle,
+                )
+                .await;
+                let source_reason = source_reason
+                    .lock()
+                    .map(|reason| *reason)
+                    .unwrap_or(RecordingEndReason::CallEnded);
+                let reason = outcome.end.into_reason(source_reason);
+                if let Some(events) = events {
+                    let _ = events.try_send(Event::RecordingFinished {
+                        call_id: String::new(),
+                        conference_id: Some(conference_id),
+                        from_tag: String::new(),
+                        to_tag: None,
+                        recording_id,
+                        path: Some(path.to_string_lossy().into_owned()),
+                        duration_ms: outcome.duration_ms,
+                        reason,
+                    });
+                }
+            })
+        };
+
+        self.recordings.insert(
+            recording_id.clone(),
+            AudioRecording {
+                recording_id: recording_id.clone(),
+                call_id: conference_id.to_string(),
+                owner: client,
+                path,
+                ingress_legs: Vec::new(),
+                egress_legs: Vec::new(),
+                room: Some(conference_id.to_string()),
+                source_reason,
+                writer,
+            },
+        );
+        CmdResult::Ok {
+            sdp: None,
+            duration_ms: None,
+            play_id: None,
+            recording_id: Some(recording_id),
+            to_tag: None,
+            stats: None,
+        }
+    }
+
+    /// Stop a room recording ([`Command::ConferenceStopRecording`]).
+    async fn conference_stop_recording(
+        &self,
+        conference_id: &str,
+        recording_id: Option<&str>,
+    ) -> CmdResult {
+        match recording_id {
+            Some(recording_id) => {
+                if !self.recordings.contains_key(recording_id) {
+                    return error_result(
+                        "conference_stop_recording",
+                        &format!("no recording {recording_id} is running on this conference"),
+                    );
+                }
+                self.stop_wav_recording(recording_id, RecordingEndReason::Stopped)
+                    .await;
+            }
+            None => {
+                self.stop_wav_recordings_for_call(conference_id, RecordingEndReason::Stopped)
+                    .await;
+            }
+        }
+        ok_empty()
+    }
+
     /// Begin a runtime **decoded-audio** recording ([`Command::StartRecording`] with
     /// `format: "wav"`).
     ///
@@ -8859,6 +9267,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // reason the event exists.
                 if let Some(events) = events {
                     let _ = events.try_send(Event::RecordingFinished {
+                        conference_id: None,
                         call_id,
                         from_tag,
                         to_tag,
@@ -8880,6 +9289,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 path,
                 ingress_legs,
                 egress_legs,
+                room: None,
                 source_reason,
                 writer,
             },
@@ -8929,15 +9339,30 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Ok(mut stored) = recording.source_reason.lock() {
             *stored = reason;
         }
-        self.detach_recording_sinks(
-            &recording.call_id,
-            &recording.recording_id,
-            &recording.ingress_legs,
-            &recording.egress_legs,
-        );
-        let _ = recording.writer.await;
-        self.release_userspace_hold(&recording.call_id, PromotionReason::AudioRecording)
-            .await;
+        match recording.room.as_deref() {
+            // A room recording detaches from the room actor, which holds nothing else to release —
+            // a conference is always in userspace, so there is no promotion hold behind it.
+            Some(conference_id) => {
+                self.conference.control(
+                    conference_id,
+                    ConferenceControl::RemoveRoomTapTagged {
+                        tag: recording.recording_id.clone(),
+                    },
+                );
+                let _ = recording.writer.await;
+            }
+            None => {
+                self.detach_recording_sinks(
+                    &recording.call_id,
+                    &recording.recording_id,
+                    &recording.ingress_legs,
+                    &recording.egress_legs,
+                );
+                let _ = recording.writer.await;
+                self.release_userspace_hold(&recording.call_id, PromotionReason::AudioRecording)
+                    .await;
+            }
+        }
         tracing::info!(
             target: "siphon_rtp::media",
             call_id = %recording.call_id,
@@ -12981,6 +13406,11 @@ fn command_name(command: &Command) -> &'static str {
         Command::ConferenceLeave { .. } => "conference_leave",
         Command::ConferenceRoute { .. } => "conference_route",
         Command::ConferenceBridge { .. } => "conference_bridge",
+        Command::ConferencePlay { .. } => "conference_play",
+        Command::ConferenceStopPlay { .. } => "conference_stop_play",
+        Command::ConferenceSetPlayGain { .. } => "conference_set_play_gain",
+        Command::ConferenceStartRecording { .. } => "conference_start_recording",
+        Command::ConferenceStopRecording { .. } => "conference_stop_recording",
         Command::AttachWsTee { .. } => "attach_ws_tee",
         Command::DetachWsTee { .. } => "detach_ws_tee",
         Command::AttachWsBridge { .. } => "attach_ws_bridge",
@@ -13220,6 +13650,7 @@ impl PendingFetch {
     /// The completion event for this playback, keyed the same way the media actor keys its own.
     fn play_finished(&self, play_id: u64, reason: PlayEndReason) -> Event {
         Event::PlayFinished {
+            conference_id: None,
             call_id: self.call_id.clone(),
             from_tag: self.from_tag.clone(),
             to_tag: self.to_tag.clone(),
@@ -16337,6 +16768,413 @@ mod tests {
         assert!(
             engine.reap_idle_conferences(3, 1000).await >= 1,
             "and the held ceiling still frees an abandoned seat"
+        );
+    }
+
+    /// Seat one µ-law participant in `conference_id` and return the engine port it sends to.
+    async fn seat_participant(
+        engine: &Engine<UdpLoopbackDatapath>,
+        conference_id: &str,
+        tag: &str,
+        addr: SocketAddr,
+    ) -> SocketAddr {
+        let joined = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: conference_id.into(),
+                    from_tag: tag.into(),
+                    sdp: sdp_for(addr, true),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        sdp::parse(&ok_sdp_text(&joined))
+            .expect("the room's answer")
+            .remote_rtp
+    }
+
+    /// An 8 kHz mono WAV of `samples` constant-valued samples, as a `play_media` blob.
+    fn prompt_blob(samples: usize, value: i16) -> Vec<u8> {
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&vec![value; samples]);
+        recorder.into_wav()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_playback_is_heard_by_the_participants() {
+        // Nothing could be played into a room at all: every media verb resolves through `self.calls`,
+        // which a conference never enters, so `play_media` against a room id answered `unknown call`.
+        // An entry tone, a "this conference is being recorded" announcement and music for a lone
+        // participant are all this.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone, addr) = phone().await;
+        let _engine_port = seat_participant(&engine, "room-play", "alice", addr).await;
+
+        let played = engine
+            .handle(
+                CLIENT,
+                Command::ConferencePlay {
+                    conference_id: "room-play".into(),
+                    source: PlayMediaSource::Blob {
+                        data: prompt_blob(8000, 6000),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    gain_decibels: None,
+                },
+            )
+            .await;
+        let play_id = match played {
+            CmdResult::Ok {
+                play_id: Some(id), ..
+            } => id,
+            other => panic!("a room playback accepts with a play_id, got {other:?}"),
+        };
+
+        // The lone participant hears the announcement even though nobody in the room is talking —
+        // which is the case the mixer's `external` input exists for: heard by everyone, mixed against
+        // nobody.
+        let mut heard = false;
+        for _ in 0..40u16 {
+            let mut buffer = [0u8; 2048];
+            let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone.recv_from(&mut buffer)).await
+            else {
+                continue;
+            };
+            let parsed =
+                siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).expect("parse room egress");
+            if parsed
+                .payload
+                .iter()
+                .any(|&byte| byte != 0xFF && byte != 0x7F)
+            {
+                heard = true;
+                break;
+            }
+        }
+        assert!(heard, "the participant hears the room announcement");
+
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStopPlay {
+                    conference_id: "room-play".into(),
+                    play_id: Some(play_id),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stop accepted: {stopped:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_playback_reports_its_end_against_the_conference_not_a_call() {
+        // A room playback is not on a call, so the completion correlates by `conference_id` and
+        // leaves `call_id` empty rather than smuggling a room id into a field that means something
+        // else.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (_phone, addr) = phone().await;
+        seat_participant(&engine, "room-end", "alice", addr).await;
+
+        let played = engine
+            .handle(
+                CLIENT,
+                Command::ConferencePlay {
+                    conference_id: "room-end".into(),
+                    source: PlayMediaSource::Blob {
+                        data: prompt_blob(320, 4000),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    gain_decibels: None,
+                },
+            )
+            .await;
+        let play_id = match played {
+            CmdResult::Ok {
+                play_id: Some(id),
+                duration_ms: Some(40),
+                ..
+            } => id,
+            other => panic!("expected a 40 ms accept with a play_id, got {other:?}"),
+        };
+
+        let mut finished = None;
+        for _ in 0..60u16 {
+            match timeout(Duration::from_millis(200), events.recv_async()).await {
+                Ok(Ok(Event::PlayFinished {
+                    call_id,
+                    conference_id,
+                    play_id: id,
+                    reason,
+                    ..
+                })) => {
+                    finished = Some((call_id, conference_id, id, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        let (call_id, conference_id, id, reason) =
+            finished.expect("the room playback reports its end");
+        assert_eq!(id, play_id);
+        assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
+        assert_eq!(
+            conference_id.as_deref(),
+            Some("room-end"),
+            "correlated by room"
+        );
+        assert!(call_id.is_empty(), "and not by a call it never ran on");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_playback_verbs_refuse_an_unknown_room_or_play_id() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        seat_participant(&engine, "room-errors", "alice", addr).await;
+
+        for result in [
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferencePlay {
+                        conference_id: "no-such-room".into(),
+                        source: PlayMediaSource::Blob {
+                            data: prompt_blob(160, 1),
+                        },
+                        repeat_times: None,
+                        start_pos_ms: None,
+                        duration_ms: None,
+                        gain_decibels: None,
+                    },
+                )
+                .await,
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferenceStopPlay {
+                        conference_id: "no-such-room".into(),
+                        play_id: Some(1),
+                    },
+                )
+                .await,
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferenceSetPlayGain {
+                        conference_id: "no-such-room".into(),
+                        play_id: 1,
+                        gain_decibels: -6,
+                    },
+                )
+                .await,
+            // A real room, but an id that is not running: a hollow success would leave a controller
+            // believing it had stopped something it had not.
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferenceStopPlay {
+                        conference_id: "room-errors".into(),
+                        play_id: Some(9999),
+                    },
+                )
+                .await,
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferenceSetPlayGain {
+                        conference_id: "room-errors".into(),
+                        play_id: 9999,
+                        gain_decibels: -6,
+                    },
+                )
+                .await,
+        ] {
+            assert!(
+                matches!(result, CmdResult::Error { .. }),
+                "expected a refusal, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_recording_captures_the_mix_and_reports_the_finished_file() {
+        // Nothing could record a room either. This taps the *listener* mix — what a listener hears,
+        // bridged audio and announcements included — through the same streaming WAV writer a call
+        // recording uses, so both produce the same file and the same completion event.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone, addr) = phone().await;
+        let engine_port = seat_participant(&engine, "room-rec", "alice", addr).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStartRecording {
+                    conference_id: "room-rec".into(),
+                    path: None,
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    max_duration_ms: None,
+                    silence_ms: None,
+                },
+            )
+            .await;
+        let recording_id = match started {
+            CmdResult::Ok {
+                recording_id: Some(id),
+                ..
+            } => id,
+            other => panic!("a room recording accepts with a recording_id, got {other:?}"),
+        };
+
+        // Alice talks into the room.
+        for sequence in 0..12u16 {
+            phone
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), engine_port)
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStopRecording {
+                    conference_id: "room-rec".into(),
+                    recording_id: Some(recording_id.clone()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stop accepted: {stopped:?}"
+        );
+
+        let mut finished = None;
+        for _ in 0..60u16 {
+            match timeout(Duration::from_millis(200), events.recv_async()).await {
+                Ok(Ok(Event::RecordingFinished {
+                    conference_id,
+                    recording_id: id,
+                    path,
+                    duration_ms,
+                    reason,
+                    ..
+                })) => {
+                    finished = Some((conference_id, id, path, duration_ms, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        let (conference_id, id, path, duration_ms, reason) =
+            finished.expect("a recording_finished event arrives");
+        assert_eq!(id, recording_id);
+        assert_eq!(conference_id.as_deref(), Some("room-rec"));
+        assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::Stopped);
+        assert!(duration_ms > 0, "the room mix was recorded");
+
+        let bytes = std::fs::read(path.expect("the event names the file")).expect("read");
+        let parsed = siphon_rtp_media::player::WavSource::parse(&bytes)
+            .expect("the finished file is a valid WAV");
+        assert_eq!(
+            parsed.sample_rate_hz(),
+            crate::conference::WIDEBAND_RECORDING_RATE_HZ,
+            "a room recording is pinned to one rate for its lifetime"
+        );
+        assert_eq!(parsed.channels(), 1);
+        assert!(
+            !parsed.samples().is_empty(),
+            "the header was finalized with the audio it holds"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_recording_refuses_an_unknown_room_and_an_unwritable_path() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        seat_participant(&engine, "room-rec-errors", "alice", addr).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let unknown = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStartRecording {
+                    conference_id: "no-such-room".into(),
+                    path: None,
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    max_duration_ms: None,
+                    silence_ms: None,
+                },
+            )
+            .await;
+        assert!(matches!(unknown, CmdResult::Error { .. }));
+
+        let unwritable = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStartRecording {
+                    conference_id: "room-rec-errors".into(),
+                    path: Some(
+                        dir.path()
+                            .join("no-such-directory")
+                            .join("room.wav")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    recording_dir: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                },
+            )
+            .await;
+        match unwritable {
+            CmdResult::Error { reason } => assert!(reason.contains("open"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            engine.recordings.is_empty(),
+            "nothing was registered for a start that failed"
         );
     }
 
@@ -21966,6 +22804,7 @@ mod tests {
         for _ in 0..50u16 {
             match timeout(Duration::from_millis(200), events_rx.recv_async()).await {
                 Ok(Ok(Event::PlayFinished {
+                    conference_id: None,
                     call_id,
                     play_id: id,
                     reason,
@@ -22995,6 +23834,7 @@ mod tests {
         assert_eq!(
             event,
             Event::PlayFinished {
+                conference_id: None,
                 call_id: "url-stop".into(),
                 from_tag: "tag-a".into(),
                 to_tag: None,

@@ -359,6 +359,11 @@ before recording is a follow-up.
 | `conference_leave` | `conference_id`, `from_tag` | Leave; the room tears down when the last participant leaves. |
 | `conference_route` | `conference_id`, `from_tag`, `role` | Live-update a participant's routing role. |
 | `conference_bridge` | `conference_id_a`, `conference_id_b`, `direction` | Bridge two rooms (`both`, `a_to_b`, `b_to_a`). |
+| `conference_play` | `conference_id`, `source`, `repeat_times?`, `start_pos_ms?`, `duration_ms?`, `gain_decibels?` | Play audio **into a room** — an entry tone, a "this conference is being recorded" announcement, music for a lone participant. Mixed as a non-participant source: everyone hears it and nobody is mixed-minus-self against it. Up to four at once, each with its own `play_id`, accepting with that id and ending with a `play_finished` carrying `conference_id` (and an empty `call_id`). `play_media` cannot do this — it resolves through the call registry, which a conference never enters. |
+| `conference_stop_play` | `conference_id`, `play_id?` | Stop one room playback, or all of them when no `play_id` is given. An id that is not running is an error, not a hollow success. |
+| `conference_set_play_gain` | `conference_id`, `play_id`, `gain_decibels` | Retune a running room playback's gain, −60…+12 dB — how an announcement ducks under a conversation rather than burying it. |
+| `conference_start_recording` | `conference_id`, `path?`, `recording_dir?`, `max_duration_ms?`, `silence_ms?` | Record the room's **listener mix** (what a listener hears, including any bridged room and any room playback) to a decoded WAV, streamed to disk. Accepts with a `recording_id` and completes with a `recording_finished` carrying `conference_id`. Pinned to 16 kHz for its lifetime, so a room that goes wideband mid-recording does not change sample rate inside one file. |
+| `conference_stop_recording` | `conference_id`, `recording_id?` | Stop one room recording, or all of them. |
 
 `role` is tagged: `{"role": "talker"}` (default), `"listener"`, `"muted"`,
 `{"role": "whisper", "target": "..."}` (supervisor coaching, excluded from the room mix),

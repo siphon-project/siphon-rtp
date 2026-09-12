@@ -9,6 +9,48 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **Audio can be played into a conference room, and a room can be recorded.** Neither was possible:
+  every media verb resolves through the call registry, which a conference never enters, so
+  `play_media` and `start_recording` against a room id answered `unknown call`. A room's audio could
+  only ever come from its RTP participants.
+
+  A PBX conference announces joins and leaves, plays music to a lone participant, says "this
+  conference is being recorded", and is recorded on request.
+
+  Five verbs: `conference_play`, `conference_stop_play`, `conference_set_play_gain`,
+  `conference_start_recording`, `conference_stop_recording`. All additive — `Command` is
+  `#[non_exhaustive]`.
+
+  **Playback rides the mixer's existing `external` input**, which is exactly the seam for it: summed
+  into the room total so everyone hears it, and mixed-minus-self against nobody, so an announcement
+  is never treated as a participant's own audio and subtracted back out. Up to four at once through
+  the same `OverlayBus` a leg's overlays use, each with its own `play_id` and its own
+  `PlayFinished` — correlated by `conference_id`, with `call_id` empty rather than smuggling a room
+  id into a field that means something else.
+
+  **A running playback keeps its own rate and the room converts.** A room mixes at 8 kHz while
+  everyone is narrowband and moves to 16 kHz when a wideband participant joins or a bridge is added;
+  rebuilding a `Playback` at the new rate would mean restarting it, cutting an announcement off
+  mid-word because somebody joined.
+
+  **A room recording taps the listener mix** — what a listener hears, bridged audio and announcements
+  included, which is the useful definition of "record the conference"; the participant-only mix that
+  feeds a bridge deliberately excludes bridged audio. From there it is the call recorder's machinery
+  unchanged, so a room recording produces the same file and the same `RecordingFinished`. It is
+  pinned to 16 kHz for its lifetime and the *room* converts into it — a room that goes wideband
+  mid-recording would otherwise change sample rate inside one WAV, which no player handles.
+
+  **Measured** (criterion, `mixer_bench/mixer_room_playback_20ms`): the announcement costs ~10 ns per
+  tick at 8 kHz and ~18 ns at 16 kHz, flat in participant count — one extra `i32` add per sample,
+  against a 3-party 8 kHz tick of ~101 ns.
+
+### Fixed
+
+- **The conference actor drained its staged events only on the packet arm**, so an event raised by a
+  tick or by a control op was stranded until a participant happened to send media — and a room where
+  nobody is sending is exactly the room a lone-participant announcement plays into. It now drains on
+  all three arms.
+
 - **Runtime decoded-audio recording** — `start_recording` with `format: "wav"`, which streams
   **decoded** audio to a file and completes with a new `Event::RecordingFinished` naming it.
 
