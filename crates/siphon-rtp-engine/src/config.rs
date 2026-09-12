@@ -137,6 +137,8 @@ pub struct FileConfig {
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap, requests/second; 0 disables (`--max-control-rps`).
     pub max_control_rps: Option<u64>,
+    /// Bytes of decoded prompt audio to cache; `0` disables (`--prompt-cache-bytes`).
+    pub prompt_cache_bytes: Option<u64>,
     /// Reap a call after this many seconds with no accepted media (`--media-timeout-secs`).
     pub media_timeout_secs: Option<u64>,
     /// Bounded SIGTERM/SIGINT drain grace period, seconds (`--shutdown-grace-secs`).

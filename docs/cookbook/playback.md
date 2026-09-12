@@ -187,9 +187,17 @@ it believes is running has no way to notice.
 | `{"source": "tone", "tone": "…"}` | Call-progress audio with no files to ship. |
 | `{"source": "http", "url": "…"}` | Prompts held centrally, fetched by the engine. |
 
-Recorded audio is 16-bit linear PCM WAV at any rate and channel count; it is downmixed to
-mono and resampled onto the leg's codec rate. A tone is synthesised **at** the leg's rate,
-so it never resamples.
+Recorded audio is WAV at any rate and channel count: **16-bit linear PCM**, **G.711 A-law or
+µ-law** (which is how most telephony prompts are exported), or the `WAVE_FORMAT_EXTENSIBLE`
+container most modern encoders emit. It is downmixed to mono and resampled onto the leg's
+codec rate. A tone is synthesised **at** the leg's rate, so it never resamples.
+
+Prompts loaded from a **host file** are cached decoded, keyed by path plus modification time
+and size — so a hold bed playing to thirty queued callers is one decode and one shared
+buffer, and re-recording a prompt takes effect on the next play with no cache-clearing step.
+Size the cache with `--prompt-cache-bytes` (64 MiB by default, `0` to disable). Inline blobs
+and fetched URLs are not cached: a blob is different bytes on every request, and a URL's
+freshness is not this engine's to decide.
 
 `repeat_times` (`0`/`1` = once) and `start_pos_ms` apply to recorded audio; a tone's
 repetition is part of its cadence.

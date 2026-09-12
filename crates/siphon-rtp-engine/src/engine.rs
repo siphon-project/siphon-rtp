@@ -1356,6 +1356,9 @@ pub struct Engine<D: Datapath> {
     /// one. Held here (not in the media actor) because the transport task, the WS socket and the
     /// dropped/forwarded counters outlive individual control ops and must be torn down on `delete`.
     ws_tees: DashMap<String, WsTee>,
+    /// Decoded host-file prompts, so a bed played to many callers is decoded once
+    /// ([`crate::prompt_cache`]).
+    prompts: Arc<crate::prompt_cache::PromptCache>,
     /// Live WebSocket **takeover** bridges, keyed by call-id — the control-plane half of what the
     /// [`crate::ws_bridge::WsRegistry`] routes. One per call; attaching again re-points it. Held
     /// here for the same reason `ws_tees` is: the `ws_bridge_ended` event is emitted during teardown,
@@ -1496,6 +1499,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             turn_server: None,
             ice_relays: Arc::new(DashMap::new()),
             ws_tees: DashMap::new(),
+            prompts: Arc::new(crate::prompt_cache::PromptCache::new(
+                DEFAULT_PROMPT_CACHE_BYTES,
+            )),
             ws_bridges: DashMap::new(),
             // Lawful interception is unconfigured unless the daemon supplies `x3_*`, and `attach_x3`
             // refuses while it is — never accepted and left delivering nowhere.
@@ -1565,6 +1571,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ///
     /// Off by default: `a=ice-lite` is what the engine advertises, and a lite agent is a valid and
     /// simpler posture for a server on a routable address. Builder-style consuming setter.
+    /// Size the decoded-prompt cache, in bytes. `0` disables caching — every `play_media` on a file
+    /// then reads and decodes it afresh, which is exactly the behaviour before the cache existed.
+    ///
+    /// Builder-style consuming setter, called from the daemon's `--prompt-cache-bytes`.
+    #[must_use]
+    pub fn with_prompt_cache_bytes(mut self, capacity_bytes: usize) -> Self {
+        self.prompts = Arc::new(crate::prompt_cache::PromptCache::new(capacity_bytes));
+        self
+    }
+
+    /// The decoded-prompt cache, for tests and for metrics.
+    #[must_use]
+    pub fn prompts(&self) -> &Arc<crate::prompt_cache::PromptCache> {
+        &self.prompts
+    }
+
     #[must_use]
     pub fn with_full_ice(mut self) -> Self {
         self.ice_agents = Some(Arc::new(AgentSupervisor::new()));
@@ -7783,13 +7805,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // here — it is synthesised at the leg's egress rate inside the actor, which is the only place
         // that knows it, so a tone is never resampled.
         let resolved = match source {
+            // An inline blob is the controller's own bytes, different on every request by
+            // construction, so there is nothing to cache: decode it here.
             PlayMediaSource::Blob { data } => parse_prompt_wav(&data)
                 .map_err(|error| error_result("play_media: parse WAV", &error))?,
-            PlayMediaSource::File { path } => match tokio::fs::read(&path).await {
-                Ok(bytes) => parse_prompt_wav(&bytes)
-                    .map_err(|error| Box::new(error_result("play_media: parse WAV", &error)))?,
-                Err(error) => return Err(Box::new(error_result("play_media: read file", &error))),
-            },
+            // A host file is the case worth caching — a queue with thirty waiting callers plays the
+            // same hold music thirty times. Keyed by path + mtime + length, so re-recording a prompt
+            // takes effect on the next play with no cache-clearing step.
+            PlayMediaSource::File { path } => {
+                match self.prompts.get_or_load(std::path::Path::new(&path)).await {
+                    Ok(prompt) => ResolvedPlaySource::Pcm(prompt),
+                    Err(error) => {
+                        return Err(Box::new(error_result("play_media", &error)));
+                    }
+                }
+            }
             PlayMediaSource::Tone { tone } => match ToneSpec::resolve(&tone) {
                 Ok(spec) => ResolvedPlaySource::Tone(spec),
                 Err(error) => return Err(Box::new(error_result("play_media: tone", &error))),
@@ -7844,8 +7874,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         let (request, source_duration_ms) = match resolved {
-            ResolvedPlaySource::Wav(wav) => {
-                let player = PcmPlayer::new(&wav, repeat, start);
+            ResolvedPlaySource::Pcm(prompt) => {
+                let player =
+                    PcmPlayer::from_shared(prompt.mono, prompt.sample_rate_hz, repeat, start);
                 let duration = player.duration_ms();
                 (PlayRequest::Pcm(Box::new(player)), Some(duration))
             }
@@ -12515,11 +12546,20 @@ struct PlayOptions {
     gain_decibels: Option<i32>,
 }
 
+/// Default budget for the decoded-prompt cache: 64 MiB of samples.
+///
+/// Sized so an ordinary prompt library — a few dozen announcements and a hold bed, each a handful of
+/// seconds at 8 kHz — fits entirely, while a directory of long files still cannot grow the daemon
+/// without bound. At 8 kHz mono this is roughly an hour of audio in total.
+const DEFAULT_PROMPT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// A `play_media` source after it has been fetched/read and validated, but before the media actor
 /// has turned it into a playback on the leg's egress clock.
 enum ResolvedPlaySource {
-    /// Decoded linear PCM from a WAV (inline blob, host file, or fetched body).
-    Wav(WavSource),
+    /// Decoded, downmixed mono samples plus their native rate — from the prompt cache for a host
+    /// file, or decoded on the spot for an inline blob or a fetched body. Shared rather than owned,
+    /// so a hold bed playing to thirty callers is one buffer and thirty cursors.
+    Pcm(crate::prompt_cache::CachedPrompt),
     /// A parsed tone cadence, synthesised later at the leg's own rate.
     Tone(ToneSpec),
 }
@@ -12588,7 +12628,14 @@ async fn fetch_and_start(
     // The fetched bytes are as untrusted as anything else off the network: validated through the
     // same pure-Rust RIFF/WAVE reader every other source uses, which errors rather than panics.
     let wav = WavSource::parse(&bytes).map_err(|error| format!("parse WAV: {error}"))?;
-    let player = PcmPlayer::new(&wav, request.repeat, request.start_pos_ms);
+    // Not cached: a fetched body is keyed by a URL whose freshness this engine does not own, and
+    // caching it would serve a stale prompt after the origin changed with no way to notice.
+    let player = PcmPlayer::from_shared(
+        wav.to_mono(),
+        wav.sample_rate_hz(),
+        request.repeat,
+        request.start_pos_ms,
+    );
     let gain = Gain::from_decibels(request.options.gain_decibels.unwrap_or(0));
 
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -12620,7 +12667,12 @@ async fn fetch_and_start(
 /// fetched body — validates through this one point, so a malformed buffer is a typed error rather
 /// than something each source handles its own way.
 fn parse_prompt_wav(bytes: &[u8]) -> Result<ResolvedPlaySource, WavError> {
-    WavSource::parse(bytes).map(ResolvedPlaySource::Wav)
+    WavSource::parse(bytes).map(|source| {
+        ResolvedPlaySource::Pcm(crate::prompt_cache::CachedPrompt {
+            mono: source.to_mono(),
+            sample_rate_hz: source.sample_rate_hz(),
+        })
+    })
 }
 
 /// Map a control-plane [`ConferenceRole`] to the conference's internal [`Routing`]. A whisperer stays
@@ -21188,6 +21240,203 @@ mod tests {
         assert_eq!(id, play_id, "the completion carries the accept's play_id");
         assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
         assert_eq!(played_ms, Some(40), "the whole 40 ms prompt played");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prompt_played_to_many_callers_is_decoded_once() {
+        // The queue case: thirty waiting callers on one hold bed used to be thirty file reads, thirty
+        // RIFF parses and thirty downmixes — three allocations proportional to prompt length, per
+        // call. Now it is one decode and one shared buffer.
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hold.wav");
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[1000i16; 800]);
+        std::fs::write(&path, recorder.into_wav()).expect("write prompt");
+
+        for index in 0..3u8 {
+            let call_id = format!("queued-{index}");
+            let (_phone, addr) = phone().await;
+            engine
+                .handle(
+                    CLIENT,
+                    Command::Offer {
+                        call_id: call_id.clone(),
+                        from_tag: "tag-a".into(),
+                        sdp: sdp_for(addr, true),
+                        profile: Default::default(),
+                    },
+                )
+                .await;
+            let played = engine
+                .handle(
+                    CLIENT,
+                    Command::PlayMedia {
+                        call_id,
+                        from_tag: "tag-a".into(),
+                        source: PlayMediaSource::File {
+                            path: path.to_string_lossy().into_owned(),
+                        },
+                        repeat_times: None,
+                        start_pos_ms: None,
+                        duration_ms: None,
+                        overlay: false,
+                        gain_decibels: None,
+                        to_tag: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(played, CmdResult::Ok { .. }),
+                "caller {index} hears the bed: {played:?}"
+            );
+        }
+
+        let (hits, misses) = engine.prompts().stats();
+        assert_eq!(misses, 1, "the prompt was decoded exactly once");
+        assert_eq!(hits, 2, "the other two plays read the cached samples");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mu_law_prompt_plays_end_to_end() {
+        // Prompts exported from another system are very often G.711, and the reader used to refuse
+        // them outright (`unsupported WAV format tag 7`) — so a perfectly playable file could not be
+        // provisioned without converting it first.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("greeting-ulaw.wav");
+        let payload = vec![0x20u8; 800];
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"RIFF");
+        buffer.extend_from_slice(&0u32.to_le_bytes());
+        buffer.extend_from_slice(b"WAVE");
+        buffer.extend_from_slice(b"fmt ");
+        buffer.extend_from_slice(&16u32.to_le_bytes());
+        buffer.extend_from_slice(&7u16.to_le_bytes()); // mu-law
+        buffer.extend_from_slice(&1u16.to_le_bytes());
+        buffer.extend_from_slice(&8000u32.to_le_bytes());
+        buffer.extend_from_slice(&8000u32.to_le_bytes());
+        buffer.extend_from_slice(&1u16.to_le_bytes());
+        buffer.extend_from_slice(&8u16.to_le_bytes());
+        buffer.extend_from_slice(b"data");
+        buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&payload);
+        std::fs::write(&path, &buffer).expect("write prompt");
+
+        let (_phone, addr) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ulaw-prompt".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let played = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "ulaw-prompt".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::File {
+                        path: path.to_string_lossy().into_owned(),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                played,
+                CmdResult::Ok {
+                    duration_ms: Some(100),
+                    ..
+                }
+            ),
+            "800 mu-law bytes at 8 kHz is 100 ms of audio, got {played:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_recording_a_prompt_is_picked_up_without_restarting_the_engine() {
+        // An operator who re-records a greeting and keeps hearing the old one has no way to tell the
+        // cache is why, so freshness is part of the key rather than an operational step.
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("greeting.wav");
+
+        let play = |call_id: String, path: std::path::PathBuf| {
+            let engine = &engine;
+            async move {
+                let (_phone, addr) = phone().await;
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::Offer {
+                            call_id: call_id.clone(),
+                            from_tag: "tag-a".into(),
+                            sdp: sdp_for(addr, true),
+                            profile: Default::default(),
+                        },
+                    )
+                    .await;
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::PlayMedia {
+                            call_id,
+                            from_tag: "tag-a".into(),
+                            source: PlayMediaSource::File {
+                                path: path.to_string_lossy().into_owned(),
+                            },
+                            repeat_times: None,
+                            start_pos_ms: None,
+                            duration_ms: None,
+                            overlay: false,
+                            gain_decibels: None,
+                            to_tag: None,
+                        },
+                    )
+                    .await
+            }
+        };
+
+        let mut short = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        short.write_pcm(&[500i16; 800]); // 100 ms
+        std::fs::write(&path, short.into_wav()).expect("write");
+        let first = play("greet-1".to_string(), path.clone()).await;
+        assert!(matches!(
+            first,
+            CmdResult::Ok {
+                duration_ms: Some(100),
+                ..
+            }
+        ));
+
+        let mut longer = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        longer.write_pcm(&[500i16; 1600]); // 200 ms
+        std::fs::write(&path, longer.into_wav()).expect("rewrite");
+        let second = play("greet-2".to_string(), path).await;
+        assert!(
+            matches!(
+                second,
+                CmdResult::Ok {
+                    duration_ms: Some(200),
+                    ..
+                }
+            ),
+            "the re-recorded prompt is served, got {second:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

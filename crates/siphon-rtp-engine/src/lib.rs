@@ -26,6 +26,7 @@ pub mod interface;
 pub mod media_fetch;
 pub mod media_pipeline;
 pub mod metrics;
+pub mod prompt_cache;
 pub mod sdp;
 pub mod server;
 pub mod shutdown;

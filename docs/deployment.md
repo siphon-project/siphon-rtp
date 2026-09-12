@@ -78,6 +78,7 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 | `--media-dscp <DSCP>` | `EF` | DiffServ marking (RFC 2474) on outbound media. A name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`. `EF` is TOS byte 184 — Asterisk's `tos_audio`, rtpengine's `--tos`. `BE`/`0` disables marking and leaves the TOS byte untouched. Applies to every egress path (UDP sockets, AF_XDP TX, in-kernel XDP_TX); never to the control, metrics, HEP or WS sockets. |
 | `--metrics-addr <ADDR>` | off | Prometheus + health HTTP: `GET /metrics`, `GET /healthz`, `GET /readyz`. |
 | `--max-control-rps <N>` | `200` | Per-connection control request cap (requests/second). `0` disables the limit. |
+| `--prompt-cache-bytes <N>` | `67108864` (64 MiB) | Decoded prompt audio to cache, so a bed played to many callers is decoded once. Keyed by path + mtime + size, so re-recording a prompt takes effect on the next play. `0` disables caching. |
 | `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). |
 | `--shutdown-grace-secs <N>` | `25` | Bounded drain of live calls on SIGTERM/SIGINT before exiting. |
 | `--node-id <STRING>` | `$HOSTNAME`, else `siphon-rtp` | Stable cluster node id reported by `load` / `node_info`. |
