@@ -7,6 +7,8 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-09-12
+
 A re-offer handed the other party the re-offering party's own media port, so a call went one-way the
 moment either side re-INVITEd with a new address.
 
