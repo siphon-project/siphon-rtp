@@ -7,6 +7,79 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+A re-offer handed the other party the re-offering party's own media port, so a call went one-way the
+moment either side re-INVITEd with a new address.
+
+### Fixed
+
+- **A re-offer presents the leg facing the party it is delivered to.** `reoffer` rewrote the SDP with
+  the near leg — the offerer's own socket — but the controller forwards that SDP to the *other*
+  party. When A re-INVITEd from a new RTP port, B was told to send into A's leg, from an address the
+  near source gate correctly refuses, so A heard nothing for the rest of the call while B heard A fine
+  and every counter looked healthy. A re-offer from A now presents the far leg exactly as the original
+  offer did (RFC 3264 §8: a subsequent offer modifies what its recipient last received): endpoints and
+  advertised address, RTCP port, the far leg's ICE candidates, `m=text`, the engine's own SDES key or
+  DTLS fingerprint on a secure far leg (`a=setup:actpass` with an unchanged fingerprint, RFC 8842
+  §5.5), and the `rtcp-mux` directive, codec policy and `replace` the offer applied. `offer`, `answer`
+  and `reoffer` now build their SDP through one per-leg presentation, called with the leg their output
+  is delivered to, so the three can no longer drift apart.
+
+  The same mistake reached secure RFC 4103 text: B was re-presented the SDES key that protects the
+  engine's text toward A. It now gets the far text key it was given at offer.
+
+- **B can re-offer.** A re-offer carrying the call's `to_tag` was refused as `unknown call`, and so was
+  A's answer to it, which left the controller forwarding both SDPs unrewritten — both parties signalled
+  around the anchor. `reoffer` now resolves the re-offering party by tag, records B's new address on
+  the far leg and presents A the near leg as the answer did; A's answer arrives with the tags reversed,
+  is accepted only while B's re-offer is outstanding, re-wires the media path and presents B the far
+  leg. Each party stays on its own codec, so a session refresh from B on a transcoded call stays a
+  transcode. A re-offer from B that drops the far leg's SRTP keying is refused rather than bridged in
+  the clear.
+
+- **`received_from` moves with a renegotiation.** A re-offer's hint — and A's answer to a re-offer
+  from B — replaces the re-offering party's stored one, so an app that changes network is gated on its
+  new public address instead of *(old public IP, new port)*. B's hint is now stored at answer as well,
+  so a later renegotiation that omits it keeps gating a NATed B on its public address rather than the
+  private `c=` it signalled.
+
+  **Observable to a controller:** the re-offer SDP carries the other party's leg (the fix), and a
+  `reoffer` or `answer` that used to fail with `unknown call` / `from_tag mismatch on answer` for an
+  exchange started by B is accepted. No verb, field or type changed.
+
+- **A renegotiation keeps the DTLS association rather than restarting it.** Completing one re-runs the
+  answer on a live call, and that registered the DTLS bridge again from nothing: the keyed leg was
+  dropped and the engine sat waiting for a handshake the peer — told by the unchanged fingerprint to
+  keep the association it has (RFC 8842 §5.5) — has no reason to start. Every renegotiation of a
+  DTLS-SRTP call (a session refresh, a hold, an ICE restart) therefore ended its media, while the
+  control plane reported the answer applied and every counter stayed healthy. The association is kept
+  and re-pointed instead — source gates, the plain peer's address, and, on a non-ICE leg, the DTLS
+  peer's; ICE still owns that address on a leg running an agent (RFC 8445 §12). A changed peer
+  fingerprint or engine role is still a *new* association (RFC 8842 §3.1) and still handshakes. A DTLS
+  leg whose media goes through the transcoding pipeline is re-keyed with the same leg, since the actor
+  holding it is rebuilt by that same answer. Re-registering also *detached* the displaced handshake and
+  record-drain tasks instead of aborting them, leaving them running against the endpoint for the life
+  of the process; they are retired now.
+
+- **SRTP keeps its rollover across a renegotiation.** The rollover counter belongs to the stream, not
+  the key: both ends estimate it from the sequence numbers they have seen (RFC 3711 §3.3.1). Rebuilding
+  a leg from its keys alone restarted both counters at 0 while the peer's kept counting, so every
+  packet after the first sequence wrap authenticated against the wrong index. A call that had run past
+  a wrap — about 21 minutes at a 20 ms ptime, well inside session-timer territory — went silent in both
+  directions on its next re-INVITE. The live leg's rollover is now carried into the rebuilt one on all
+  three secure paths (the SDES bridge, the secure transcode actor, and both legs of a secure RFC 4103
+  text stream), including across a re-key, which does not restart the stream's packet index either.
+
+- **A transcoding DTLS call answers each party with its own codec.** The answer-side codec presentation
+  covered the plaintext and SDES transcode pipelines but not the DTLS one, so a WebRTC leg answering a
+  different codec had that codec relayed back to A — one A never offered and never receives, because
+  the engine transcodes (RFC 3264 §6).
+
+- **The engine's own codec attributes land in the attribute region.** `force_answer_codec` emitted
+  `a=rtpmap` / `a=fmtp` / `a=ptime` straight after the `m=` line, so on a section whose `c=` is
+  media-level they landed ahead of it — the RFC 4566 §5 ordering defect fixed elsewhere in 0.5.1, in
+  the one emitter that runs *after* the rewriter. A strict parser reads such a section as having no
+  connection address at all.
+
 ## [0.5.2] — 2026-09-10
 
 The long-tail echo canceller could not span an echo path longer than 512 ms on a wideband leg, which

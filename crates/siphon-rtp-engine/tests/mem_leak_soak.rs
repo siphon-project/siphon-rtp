@@ -314,6 +314,102 @@ async fn offer_answer_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize)
     assert_ok(&delete, "delete");
 }
 
+/// Churn one relay through `offer → answer → re-offer from A → answer → re-offer from B → A's
+/// reversed answer → delete`. Each re-offer records its party's state and each answer re-runs the
+/// media wiring on the live call; a re-offer from B also holds its SDP on the call until A answers.
+/// None of that may outlive the call.
+async fn offer_answer_reoffer_both_ways_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let call_id = format!("soak-reoffer-{index}");
+    let a_sdp = || sdp_for("198.51.100.1", 40_000);
+    let b_sdp = || sdp_for("203.0.113.1", 41_000);
+    let answer = |from_tag: &str, to_tag: &str, sdp: String| Command::Answer {
+        call_id: call_id.clone(),
+        from_tag: from_tag.into(),
+        to_tag: to_tag.into(),
+        sdp,
+        profile: Default::default(),
+    };
+    let reoffer = |from_tag: &str, sdp: String| Command::Reoffer {
+        call_id: call_id.clone(),
+        from_tag: from_tag.into(),
+        sdp,
+        profile: Default::default(),
+    };
+
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: a_sdp(),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&offer, "offer");
+    assert_ok(
+        &engine
+            .handle(CLIENT, answer("tag-a", "tag-b", b_sdp()))
+            .await,
+        "answer",
+    );
+    assert_ok(
+        &engine.handle(CLIENT, reoffer("tag-a", a_sdp())).await,
+        "re-offer from A",
+    );
+    assert_ok(
+        &engine
+            .handle(CLIENT, answer("tag-a", "tag-b", b_sdp()))
+            .await,
+        "B's answer to it",
+    );
+    assert_ok(
+        &engine.handle(CLIENT, reoffer("tag-b", b_sdp())).await,
+        "re-offer from B",
+    );
+    assert_ok(
+        &engine
+            .handle(CLIENT, answer("tag-b", "tag-a", a_sdp()))
+            .await,
+        "A's reversed answer to it",
+    );
+    let delete = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert_ok(&delete, "delete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reoffer_from_either_party_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    let mut gate = LeakGate::new("re-offer both ways", 100, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            offer_answer_reoffer_both_ways_delete(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// Let aborted receive tasks actually drop (freeing their socket + recv buffer) so a measurement
 /// reflects quiesced steady state, not in-flight teardown.
 async fn quiesce() {

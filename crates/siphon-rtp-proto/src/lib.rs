@@ -168,8 +168,16 @@ pub enum Command {
     /// a re-offer whose `a=ice-ufrag`/`a=ice-pwd` differ from the current ones restarts ICE while
     /// media keeps flowing on the previously selected pair.
     ///
-    /// Owner-only, like every verb that touches a live call. Returns the rewritten SDP, advertising
-    /// the same ports it already advertised (plus fresh ICE credentials when a restart was detected).
+    /// Either party may re-offer: `from_tag` is the re-offering party's tag — the call's `from_tag` for
+    /// the offerer (A), its `to_tag` for the answerer (B, once it has answered). Any other tag is an
+    /// unknown call.
+    ///
+    /// Owner-only, like every verb that touches a live call. Returns the rewritten SDP for the
+    /// **other** party, so it presents the ports facing that party, exactly as it last received them:
+    /// for a re-offer from A, the far-leg endpoints (and keying, candidates and codec policy) the
+    /// original offer gave B; for a re-offer from B, the near-leg endpoints the answer gave A. Fresh ICE
+    /// credentials are presented when a restart was detected. A's answer to a re-offer from B is an
+    /// [`Command::Answer`] with the tags reversed.
     Reoffer {
         call_id: String,
         from_tag: String,
@@ -204,6 +212,10 @@ pub enum Command {
         end_of_candidates: bool,
     },
     /// SDP answer (B→A). Completes negotiation; returns the rewritten SDP.
+    ///
+    /// A's answer to a [`Command::Reoffer`] from B is sent with the tags reversed — `from_tag` is B's,
+    /// `to_tag` is A's — and is accepted only while that re-offer is outstanding. Its SDP is A's and is
+    /// returned rewritten for B.
     Answer {
         call_id: String,
         from_tag: String,

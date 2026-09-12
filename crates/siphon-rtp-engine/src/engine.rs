@@ -146,6 +146,354 @@ impl Leg {
         self.endpoint_ids()
             .chain(self.text.map(|endpoint| endpoint.id))
     }
+
+    /// The engine endpoints this leg presents in SDP: its RTP port, its RTCP port unless muxed, and
+    /// the leg's advertised address (the named interface's, which need not be the bound one).
+    fn engine_media(&self) -> EngineMedia {
+        EngineMedia {
+            rtp: self.rtp.local_addr,
+            rtcp: self.rtcp.map(|endpoint| endpoint.local_addr),
+            advertised_ip: self.advertised_ip,
+        }
+    }
+
+    /// This leg's RFC 4103 text stream anchored at its own text endpoint and advertised address —
+    /// SDES-secured with the engine's `crypto` when the leg keys text (RFC 4568), plain otherwise.
+    /// `None` when the leg has no text endpoint.
+    fn text_anchor(&self, crypto: Option<CryptoAttribute>) -> Option<TextRewrite> {
+        let engine = EngineMedia {
+            rtp: self.text?.local_addr,
+            rtcp: None,
+            advertised_ip: self.advertised_ip,
+        };
+        Some(match crypto {
+            Some(crypto) => TextRewrite::AnchorSecure { engine, crypto },
+            None => TextRewrite::Anchor(engine),
+        })
+    }
+}
+
+/// One of a call's two parties, named by the leg that faces it: **near** is A, the offerer of the
+/// call's `offer` (`from_tag`), and **far** is B, the answerer (`to_tag`). Fixed at offer for the life
+/// of the dialog — a re-offer from B does not make B "the offerer" of the call, it is B's SDP recorded
+/// on B's leg.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Party {
+    /// A, facing the near leg.
+    Near,
+    /// B, facing the far leg.
+    Far,
+}
+
+impl Party {
+    fn label(self) -> &'static str {
+        match self {
+            Party::Near => "near",
+            Party::Far => "far",
+        }
+    }
+}
+
+/// What a re-offer needs from its call, copied out from under the registry guard: which party is
+/// re-offering, both legs, and everything either leg has already been presented with — a re-offer
+/// re-presents a leg, it never re-decides it.
+struct ReofferState {
+    /// The re-offering party.
+    party: Party,
+    near: Leg,
+    far: Option<Leg>,
+    /// The engine's current ICE credentials (one set for both legs).
+    ice: Option<IceCredentials>,
+    /// The re-offering party's ICE credentials as last signalled — a change is an ICE restart.
+    previous_remote_ice: Option<IceCredentials>,
+    /// The codec the re-offering party negotiated; a re-offer that no longer lists it is refused.
+    previous_codec: Option<CodecSpec>,
+    near_local_candidates: Vec<siphon_rtp_ice::Candidate>,
+    far_local_candidates: Vec<siphon_rtp_ice::Candidate>,
+    far_local_crypto: Option<CryptoAttribute>,
+    far_dtls: bool,
+    far_downgraded_to_plain: bool,
+    far_text_local_crypto: Option<CryptoAttribute>,
+    near_text_local_crypto: Option<CryptoAttribute>,
+    /// Whether the negotiated text stream is SDES-SRTP — presented secure on both legs or not at all.
+    text_secure: bool,
+    /// Whether B's answer accepted the text stream, so the near leg's text was presented anchored.
+    text_relayed: bool,
+    near_codec: Option<CodecSpec>,
+    near_telephone_event: Option<u8>,
+    /// Whether the call transcodes, so each party is presented only its own codec.
+    transcoding: bool,
+}
+
+impl ReofferState {
+    fn capture(call: &Call, party: Party) -> Self {
+        let (previous_remote_ice, previous_codec) = match party {
+            Party::Near => (call.near_remote_ice.clone(), call.near_codec.clone()),
+            Party::Far => (call.far_remote_ice.clone(), call.far_codec.clone()),
+        };
+        Self {
+            party,
+            near: call.near,
+            far: call.far,
+            ice: call.ice.clone(),
+            previous_remote_ice,
+            previous_codec,
+            near_local_candidates: call.near_local_candidates.clone(),
+            far_local_candidates: call.far_local_candidates.clone(),
+            far_local_crypto: call.far_local_crypto,
+            far_dtls: call.far_dtls,
+            far_downgraded_to_plain: call.far_downgraded_to_plain,
+            far_text_local_crypto: call.far_text_local_crypto,
+            near_text_local_crypto: call.near_text_local_crypto,
+            text_secure: call.text_secure,
+            text_relayed: call.far.is_some_and(|far| far.text_remote_rtp.is_some()),
+            near_codec: call.near_codec.clone(),
+            near_telephone_event: call.near_telephone_event,
+            transcoding: matches!(
+                call.pipeline,
+                PipelineKind::Media | PipelineKind::SrtpMedia | PipelineKind::DtlsMedia
+            ),
+        }
+    }
+}
+
+/// A's answer to a re-offer from B, as [`Engine::answer`] carries it: the far party's SDP (B's
+/// re-offer) drives the media wiring as B's answer usually does, A's answer SDP is what gets
+/// presented to B, and this is what else the answer needs from A's side.
+struct ReversedAnswer {
+    /// Whether A's answer carries an `m=text` section at all.
+    carries_text: bool,
+    /// Whether A's answer kept the text stream (a non-zero `m=text` port).
+    near_accepted_text: bool,
+    /// The engine's text key toward A, which A was shown when B's re-offer was presented to it and
+    /// has now answered against — reused, never re-minted (RFC 4568).
+    near_text_local_crypto: Option<CryptoAttribute>,
+    /// The engine's DTLS role on the far leg, kept unless B's re-offer forces the other one.
+    far_dtls_role: Option<DtlsRole>,
+}
+
+/// Move `codec` to the head of `info`'s format list, so the codec machinery reads it as the
+/// stream's primary codec. A no-op when `info` does not list it.
+fn lead_with_codec(info: &mut sdp::MediaInfo, codec: &CodecSpec) {
+    let Some(payload_type) = info
+        .audio_codecs()
+        .iter()
+        .find(|offered| same_codec(offered, codec))
+        .map(|offered| offered.payload_type)
+    else {
+        return;
+    };
+    if let Some(index) = info
+        .payload_types
+        .iter()
+        .position(|&listed| listed == payload_type)
+    {
+        let payload_type = info.payload_types.remove(index);
+        info.payload_types.insert(0, payload_type);
+    }
+}
+
+/// Why a re-offer from B cannot be taken on a secure far leg, or `None` when it keeps the leg keyed
+/// the way it is keyed. The answer that completes the exchange re-presents the engine's own key or
+/// fingerprint and re-keys the leg from B's SDP, so B must still offer something that answer can
+/// select: an `RTP/SAVP` `a=crypto` in the negotiated suite for SDES (RFC 4568 §5.1.2 — the answer
+/// keeps the chosen line's suite), a fingerprint for DTLS-SRTP (RFC 5763 §5). Anything else would
+/// mean bridging B in the clear or presenting keying the engine does not hold — never silently
+/// (docs/security-and-nat.md Layer 5).
+fn far_reoffer_security_refusal(state: &ReofferState, info: &sdp::MediaInfo) -> Option<String> {
+    if let Some(local) = state.far_local_crypto {
+        let keeps_sdes = info.secure
+            && !info.dtls
+            && info
+                .crypto
+                .first()
+                .is_some_and(|offered| offered.suite == local.suite);
+        if !keeps_sdes {
+            return Some(
+                "the far leg is SDES-SRTP (RFC 4568) and B's re-offer does not keep it on the \
+                 negotiated crypto-suite; not supported on a live call"
+                    .to_string(),
+            );
+        }
+    }
+    if state.far_dtls && !(info.dtls && info.fingerprint.is_some()) {
+        return Some(
+            "the far leg is DTLS-SRTP (RFC 5764) and B's re-offer carries no DTLS fingerprint; not \
+             supported on a live call"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// What the engine shows one party about the leg that faces it. Every SDP the engine hands a party is
+/// built from one of these and [`present_leg`]: `offer` presents the far leg to B, `answer` the near
+/// leg to A, and a re-offer or a reversed answer whichever leg faces the party it is *delivered to*.
+/// The leg decides what is shown, not the verb — three hand-built presentations drifting apart is how
+/// a re-offer came to hand B the offerer's own port.
+struct LegPresentation<'a> {
+    /// The leg's engine endpoints (`c=`, `m=audio`, `a=rtcp`).
+    engine: EngineMedia,
+    /// The leg's ICE posture (RFC 8839 §5).
+    ice: IceRewrite<'a>,
+    /// The leg's audio transport security, or `None` to leave the input's transport as it is.
+    security: Option<SecurityAdvertisement>,
+    /// The leg's bound RTCP mux state, when a `rtcp-mux` directive asked for it to be presented
+    /// explicitly (RFC 5761); `None` mirrors the input.
+    mux_override: Option<bool>,
+    /// The leg's RFC 4103 text stream.
+    text: TextRewrite,
+    /// Which audio codecs the party is shown.
+    codec: CodecPresentation<'a>,
+}
+
+/// Which audio codecs a presented SDP lists.
+enum CodecPresentation<'a> {
+    /// The input's own list, unchanged — a relay, where both parties share the codec.
+    AsReceived,
+    /// The offer-side codec policy (`codec-strip/mask/consume/offer/transcode/except`), as `offer`
+    /// applies it to B.
+    Policy(&'a sdp::CodecPolicy),
+    /// Only the leg's own negotiated codec (plus its telephone-event PT). A transcoding call sends
+    /// each party its own codec whatever the other one uses, so presenting the other party's list
+    /// would offer a codec this leg never receives (RFC 3264 §6).
+    Own {
+        codec: &'a CodecSpec,
+        telephone_event: Option<u8>,
+    },
+}
+
+/// Rewrite `sdp` to present one leg, as described by `presentation`, and apply the profile's
+/// rtpengine `replace` directives with that leg's advertised address. An unsupported `replace` token
+/// is logged rather than silently ignored (pre-public-review B15).
+fn present_leg(
+    sdp: &str,
+    presentation: LegPresentation<'_>,
+    replace: &[String],
+    call_id: &str,
+) -> Result<String, sdp::SdpError> {
+    let advertised_ip = presentation.engine.advertised_ip;
+    let mut presented = sdp::rewrite(
+        sdp,
+        presentation.engine,
+        presentation.ice,
+        presentation.security,
+        presentation.mux_override,
+        presentation.text,
+    )?
+    .sdp;
+    match presentation.codec {
+        CodecPresentation::AsReceived => {}
+        CodecPresentation::Policy(policy) => {
+            if !policy.is_noop() {
+                presented = sdp::apply_codec_policy(&presented, policy);
+            }
+        }
+        CodecPresentation::Own {
+            codec,
+            telephone_event,
+        } => {
+            presented = sdp::force_answer_codec(&presented, codec, telephone_event);
+        }
+    }
+    // rtpengine `replace`: rewrite the o= line to the leg's advertised address (topology hiding) —
+    // the interface's advertised IP, not the bound one.
+    let (replaced, unsupported_replace) =
+        apply_replace_directives(&presented, replace, advertised_ip);
+    if !unsupported_replace.is_empty() {
+        tracing::warn!(
+            %call_id,
+            tokens = ?unsupported_replace,
+            "ignoring unsupported rtpengine `replace` directive(s); only `origin` is honoured",
+        );
+    }
+    Ok(replaced)
+}
+
+/// The audio transport security the far leg presents to B. One rule for every SDP B is sent, so B is
+/// never told two different things about one leg: a `dtls: off` downgrade forces plaintext
+/// `RTP/AVP`; a DTLS-SRTP leg advertises the engine's fingerprint and `setup` (RFC 5764 / RFC 5763);
+/// an SDES leg advertises the engine's own `a=crypto` (RFC 4568); anything else passes the input's
+/// transport through.
+fn far_security(
+    downgraded_to_plain: bool,
+    dtls: Option<(sdp::Fingerprint, sdp::Setup)>,
+    local_crypto: Option<CryptoAttribute>,
+) -> Option<SecurityAdvertisement> {
+    if downgraded_to_plain {
+        Some(SecurityAdvertisement::Plain)
+    } else if let Some((fingerprint, setup)) = dtls {
+        Some(SecurityAdvertisement::Dtls { fingerprint, setup })
+    } else {
+        local_crypto.map(SecurityAdvertisement::Secure)
+    }
+}
+
+/// The audio transport security the near leg presents to A: on a secure (SDES or DTLS) far leg the
+/// engine terminates SRTP there and A's side is plaintext, so force `RTP/AVP` and strip the other
+/// party's keying; otherwise leave the transport alone.
+fn near_security(far_secure: bool) -> Option<SecurityAdvertisement> {
+    far_secure.then_some(SecurityAdvertisement::Plain)
+}
+
+/// The ICE posture an **offer** presents for a leg (RFC 8839 §5): ICE-lite re-originated with the
+/// engine's credentials and the leg's gathered candidates when the call has credentials; otherwise
+/// `a=ice-mismatch` when the offerer's SDP was altered in transit (§5.3, so it stops waiting for
+/// checks that will never come), the offerer's ICE stripped on `ice: remove`, or passed through.
+fn offer_ice_rewrite<'a>(
+    credentials: Option<&'a IceCredentials>,
+    candidates: &'a [siphon_rtp_ice::Candidate],
+    mismatch: bool,
+    directive: Option<IceDirective>,
+) -> IceRewrite<'a> {
+    match (credentials, directive) {
+        (Some(credentials), _) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+            ufrag: credentials.ufrag.as_str(),
+            pwd: credentials.pwd.as_str(),
+            candidates,
+        }),
+        (None, _) if mismatch => IceRewrite::Mismatch,
+        (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
+        (None, _) => IceRewrite::Keep,
+    }
+}
+
+/// The ICE posture `answer` presents for a leg, and so the one a leg re-presented as it was answered
+/// keeps: ICE-lite re-originated with the engine's credentials and the leg's candidates when the call
+/// has credentials (its ICE posture was decided at offer), the other party's ICE passed through
+/// otherwise.
+fn answer_ice_rewrite<'a>(
+    credentials: Option<&'a IceCredentials>,
+    candidates: &'a [siphon_rtp_ice::Candidate],
+) -> IceRewrite<'a> {
+    match credentials {
+        Some(credentials) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
+            ufrag: credentials.ufrag.as_str(),
+            pwd: credentials.pwd.as_str(),
+            candidates,
+        }),
+        None => IceRewrite::Keep,
+    }
+}
+
+/// The `a=setup` the engine puts in an **offer** for a DTLS-SRTP leg: `actpass` (RFC 5763 §5), or
+/// the role a control `dtls: passive|active|actpass` directive asks for (RFC 4145 §4). Subsequent
+/// offers included — RFC 8842 §5.5 has an offerer that keeps the existing association still send
+/// `actpass`; the unchanged fingerprint is what says "same association", not a pinned role.
+fn offered_dtls_setup(directive: Option<DtlsDirective>) -> sdp::Setup {
+    match directive {
+        Some(DtlsDirective::Role(role)) => role,
+        _ => sdp::Setup::Actpass,
+    }
+}
+
+/// The engine's `a=setup` for the DTLS role it plays (RFC 4145 §4): the client is `active`, the
+/// server `passive`.
+fn setup_for_role(role: DtlsRole) -> sdp::Setup {
+    match role {
+        DtlsRole::Client => sdp::Setup::Active,
+        DtlsRole::Server => sdp::Setup::Passive,
+    }
 }
 
 /// Which leg the **caller's** media rides on a call with no far party. `offer` must allocate both legs
@@ -195,7 +543,12 @@ struct Call {
     near_peer_is_lite: bool,
     /// The candidates gathered for the **far** leg at offer time, kept because the far agent is only
     /// started at answer (when B's own set arrives) and re-gathering would change what we advertised.
+    /// A re-offer from A presents these to B again, unchanged — the ports have not moved.
     far_local_candidates: Vec<siphon_rtp_ice::Candidate>,
+    /// The candidates gathered for the **near** leg at answer time — what A was told. A re-offer from
+    /// B presents these to A again, for the same reason [`Self::far_local_candidates`] exists. Empty
+    /// before an answer, and for a non-ICE call.
+    near_local_candidates: Vec<siphon_rtp_ice::Candidate>,
     from_tag: String,
     to_tag: Option<String>,
     near: Leg,
@@ -220,6 +573,16 @@ struct Call {
     /// its `a=fingerprint`/`a=setup` and, on the answer, keys the leg from the DTLS handshake rather
     /// than SDES. Mutually exclusive with `far_local_crypto`.
     far_dtls: bool,
+    /// The engine's DTLS role on the far leg once B has answered (RFC 5763 §5: the complement of the
+    /// answerer's `a=setup`). Kept so the engine, answering a re-offer *from* B, keeps the role in
+    /// force rather than re-deciding it — a role change is a new association. `None` before an
+    /// answer, and for a non-DTLS far leg.
+    far_dtls_role: Option<DtlsRole>,
+    /// Whether the offer forced the far leg to plaintext `RTP/AVP` (`dtls: off` on a `UDP/TLS`
+    /// transport, stripping the offerer's DTLS keying). Kept because nothing else records it —
+    /// `far_local_crypto` and `far_dtls` are both empty for it, exactly as for a far leg that simply
+    /// passes the offerer's transport through — and a re-offer from A must present B the same.
+    far_downgraded_to_plain: bool,
     /// Whether the **offerer's own** `m=audio` was a secure profile (`RTP/SAVP[F]` or
     /// `UDP/TLS/RTP/SAVP[F]`), captured at offer. Distinct from `far_local_crypto`/`far_dtls`, which
     /// describe the leg the engine *offers* to B. Read by `answer` to refuse a WebSocket takeover
@@ -267,8 +630,20 @@ struct Call {
     /// arrive from (`ProfileFlags.received_from`). Stored at offer so the **near** (A) leg's ingress
     /// source gate can be tightened to A's public IP at answer time, when A's `c=` advertised an
     /// unusable private address (docs/security-and-nat.md §4 layer 2). `None` when the offer carried
-    /// no `received-from`. (The answer's own `received-from` gates the far (B) leg directly.)
+    /// no `received-from`. Replaced by a re-offer from A that carries one (the app changed network),
+    /// and kept when it carries none.
     offer_received_from: Option<std::net::IpAddr>,
+    /// The **far** (B) leg's `received-from`, from B's answer — the far-side twin of
+    /// [`Self::offer_received_from`]. Stored so a later renegotiation can keep or refresh it: an answer
+    /// or a re-offer from B that carries one replaces it, one that carries none keeps it. Without it an
+    /// answer re-run with no hint would fall back to gating a NATed B on the private `c=` it signalled.
+    far_received_from: Option<std::net::IpAddr>,
+    /// B's re-offer SDP while it waits for A's answer (RFC 3264 §8). A re-offer from B is recorded on
+    /// the far leg straight away, but the media path is only re-wired once A answers — and that answer
+    /// arrives with the dialog's tags reversed, which [`Engine::answer`] accepts only while this holds
+    /// a re-offer, so a stray reversed answer cannot rewrite a live call. Cleared by any answer and by
+    /// a re-offer from A.
+    pending_far_reoffer: Option<String>,
     /// The RFC 3389 comfort-noise payload type negotiated in a **single-leg** local answer
     /// (`answer_local`), when the caller offered CN at the chosen codec's clock rate. Carried so the
     /// promoted single-leg [`MediaCall`] emits real CN packets on it while idle instead of looping the
@@ -311,14 +686,15 @@ struct Call {
     near_text_remote_crypto: Option<CryptoAttribute>,
     /// The engine's own SDES key advertised to the far (answerer, B) leg in the secure `m=text` offer —
     /// the local key the far text `SecureLeg` encrypts egress toward B with (RFC 4568). `None` for a
-    /// plaintext / audio-only call. Minted at offer, consumed at answer.
+    /// plaintext / audio-only call. Minted at offer, consumed at answer, and re-presented to B by a
+    /// re-offer from A (a re-offer re-presents the existing key, it never mints a new one).
     far_text_local_crypto: Option<CryptoAttribute>,
     /// The engine's own SDES key advertised to the near (offerer, A) leg in the secure `m=text` **answer**
     /// — the local key the near text `SecureLeg` encrypts egress toward A with (RFC 4568), minted at
-    /// `answer()`. Kept so an RFC 8839 §5.4 ICE-restart re-offer re-advertises the SAME `a=crypto` to A (a
-    /// re-offer re-presents the existing key, it never mints a new one). `None` for a plaintext /
-    /// audio-only call. (HA follow-up: the HA `CallSnapshot` does not yet carry this — secure-text HA
-    /// restore is deferred.)
+    /// `answer()`. Kept so a re-offer from B re-presents the SAME `a=crypto` to A, and A's answer to it
+    /// is keyed against that one. It protects the engine's text toward A, so it is never shown to B.
+    /// `None` for a plaintext / audio-only call. (HA follow-up: the HA `CallSnapshot` does not yet carry
+    /// this — secure-text HA restore is deferred.)
     near_text_local_crypto: Option<CryptoAttribute>,
 }
 
@@ -1691,6 +2067,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// The engine's DTLS certificate fingerprint as advertised in `a=fingerprint` (RFC 8122), or `None`
+    /// when the engine has no certificate. The same certificate backs every DTLS leg, so every SDP
+    /// presenting one — offer, re-offer or answer — carries the same value (RFC 8842 §5.5: an unchanged
+    /// fingerprint set is what keeps the existing association).
+    fn engine_fingerprint(&self) -> Option<sdp::Fingerprint> {
+        let fingerprint = self.dtls_certificate.as_ref()?.fingerprint();
+        Some(sdp::Fingerprint {
+            hash_function: fingerprint.hash_function,
+            bytes: fingerprint.bytes,
+        })
+    }
+
     /// Allocate `count` endpoints of `family`, rolling back all of them if any allocation fails. The
     /// family is the address family of the call's signalled `c=` line (RFC 4566 §5.7), so a
     /// `c=IN IP6` call gets v6 engine endpoints and a `c=IN IP4` call gets v4.
@@ -1975,71 +2363,59 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let anchor_secure_text =
             text_offered_secure && near_text_remote_crypto.is_some() && profile.ws_uri.is_none();
         let anchor_text = anchor_plain_text || anchor_secure_text;
-        let (near_text_endpoint, far_text_endpoint, text_rewrite, far_text_local_crypto) =
-            if anchor_text {
-                let near_text = match self.alloc_endpoints(1, near_family, near_bind).await {
-                    Ok(mut allocated) => allocated.remove(0),
-                    Err(reason) => {
-                        self.free(&endpoints).await;
-                        return CmdResult::Error { reason };
-                    }
-                };
-                let far_text = match self.alloc_endpoints(1, far_family, far_bind).await {
-                    Ok(mut allocated) => allocated.remove(0),
-                    Err(reason) => {
-                        self.datapath.remove_endpoint(near_text.id).await;
-                        self.free(&endpoints).await;
-                        return CmdResult::Error { reason };
-                    }
-                };
-                endpoints.push(near_text);
-                endpoints.push(far_text);
-                // The rewritten offer advertises the FAR text endpoint to B (same interface as far audio).
-                let far_text_engine = EngineMedia {
-                    rtp: far_text.local_addr,
-                    rtcp: None,
-                    advertised_ip: far_advertised,
-                };
-                if anchor_secure_text {
-                    // Mint the engine's own far text SDES key (advertised to B); the near text key is minted
-                    // at answer, when the near answer advertises `RTP/SAVP` + our `a=crypto` to A.
-                    let far_text_key =
-                        match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
-                            Ok(crypto) => crypto,
-                            Err(error) => {
-                                self.free(&endpoints).await;
-                                return error_result("generate text SDES key", &error);
-                            }
-                        };
-                    (
-                        Some(near_text),
-                        Some(far_text),
-                        TextRewrite::AnchorSecure {
-                            engine: far_text_engine,
-                            crypto: far_text_key,
-                        },
-                        Some(far_text_key),
-                    )
-                } else {
-                    (
-                        Some(near_text),
-                        Some(far_text),
-                        TextRewrite::Anchor(far_text_engine),
-                        None,
-                    )
+        let (near_text_endpoint, far_text_endpoint, far_text_local_crypto) = if anchor_text {
+            let near_text = match self.alloc_endpoints(1, near_family, near_bind).await {
+                Ok(mut allocated) => allocated.remove(0),
+                Err(reason) => {
+                    self.free(&endpoints).await;
+                    return CmdResult::Error { reason };
                 }
-            } else if text_offered_secure {
-                // A secure text stream we cannot key (no usable `a=crypto`) → decline it, never downgrade.
-                (None, None, TextRewrite::Decline, None)
-            } else {
-                (None, None, TextRewrite::None, None)
             };
+            let far_text = match self.alloc_endpoints(1, far_family, far_bind).await {
+                Ok(mut allocated) => allocated.remove(0),
+                Err(reason) => {
+                    self.datapath.remove_endpoint(near_text.id).await;
+                    self.free(&endpoints).await;
+                    return CmdResult::Error { reason };
+                }
+            };
+            endpoints.push(near_text);
+            endpoints.push(far_text);
+            // Mint the engine's own far text SDES key (advertised to B); the near text key is minted
+            // at answer, when the near answer advertises `RTP/SAVP` + our `a=crypto` to A.
+            let far_text_key = if anchor_secure_text {
+                match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+                    Ok(crypto) => Some(crypto),
+                    Err(error) => {
+                        self.free(&endpoints).await;
+                        return error_result("generate text SDES key", &error);
+                    }
+                }
+            } else {
+                None
+            };
+            (Some(near_text), Some(far_text), far_text_key)
+        } else {
+            (None, None, None)
+        };
 
-        // The rewritten offer is delivered to B, so it advertises the `far` leg.
-        let engine = EngineMedia {
-            rtp: far_rtp.local_addr,
-            rtcp: far_rtcp.map(|endpoint| endpoint.local_addr),
+        // The B-facing leg, as it will be recorded on the call. The rewritten offer is delivered to B,
+        // so it presents this leg — its audio and text endpoints on the far interface.
+        let far_leg = Leg {
+            rtp: far_rtp,
+            rtcp: far_rtcp,
+            remote_rtp: None,
+            remote_rtcp: None,
             advertised_ip: far_advertised,
+            text: far_text_endpoint,
+            // The far side's text address is unknown until its answer.
+            text_remote_rtp: None,
+        };
+        let text_rewrite = match far_leg.text_anchor(far_text_local_crypto) {
+            Some(anchor) => anchor,
+            // A secure text stream we cannot key (no usable `a=crypto`) → decline it, never downgrade.
+            None if text_offered_secure => TextRewrite::Decline,
+            None => TextRewrite::None,
         };
         // ICE rewrite mode (RFC 8839 §5): re-originate ICE-lite when we minted creds; on `ice: remove`
         // with none minted, strip the peer's ICE without advertising our own; otherwise pass it
@@ -2050,16 +2426,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // costs one bounded round trip on the control path.
         let far_ice_candidates = match ice_creds.as_ref() {
             Some(creds) => {
-                let far_leg = Leg {
-                    rtp: far_rtp,
-                    rtcp: far_rtcp,
-                    remote_rtp: None,
-                    remote_rtcp: None,
-                    advertised_ip: far_advertised,
-                    // A throwaway leg used only to gather ICE candidates — it carries no text stream.
-                    text: None,
-                    text_remote_rtp: None,
-                };
                 self.gather_leg_candidates(
                     &far_leg,
                     &IceConfig {
@@ -2071,18 +2437,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             None => Vec::new(),
         };
-        let ice_rewrite = match (ice_creds.as_ref(), ice_directive) {
-            (Some(creds), _) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
-                ufrag: creds.ufrag.as_str(),
-                pwd: creds.pwd.as_str(),
-                candidates: &far_ice_candidates,
-            }),
-            // Say why ICE is absent rather than dropping it silently, so the offerer stops waiting
-            // for connectivity checks that will never come (RFC 8839 §5.3).
-            (None, _) if ice_mismatch => IceRewrite::Mismatch,
-            (None, Some(IceDirective::Remove)) => IceRewrite::Strip,
-            (None, _) => IceRewrite::Keep,
-        };
+        let ice_rewrite = offer_ice_rewrite(
+            ice_creds.as_ref(),
+            &far_ice_candidates,
+            ice_mismatch,
+            ice_directive,
+        );
 
         // Secure far leg: when the control profile asks for a secure far leg, either DTLS-SRTP
         // (`UDP/TLS/RTP/SAVP[F]`, RFC 5764) — advertise the engine's fingerprint + `a=setup` role,
@@ -2095,7 +2455,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let dtls_transport = far_transport.contains("UDP/TLS");
         // `dtls: off` (rtpengine DTLS=off) forces a plaintext far leg even on a UDP/TLS transport —
         // no DTLS-SRTP and no SDES fallback (SDES applies only to a plain `RTP/SAVP[F]` transport).
+        // Downgrading forces AVP and strips the offer's DTLS keying (`a=fingerprint`/`a=setup`).
         let dtls_off = matches!(dtls_directive, Some(DtlsDirective::Off));
+        let far_downgraded_to_plain = dtls_transport && dtls_off;
         let far_dtls = dtls_transport && !dtls_off;
         let far_sdes = !dtls_transport && far_transport.contains("SAVP");
         let far_local_crypto = if far_sdes {
@@ -2109,43 +2471,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             None
         };
-        let security = if dtls_transport && dtls_off {
-            // Downgrade a requested DTLS-SRTP far transport to plaintext RTP/AVP (RFC 3264): force AVP
-            // and strip the offer's DTLS keying (`a=fingerprint`/`a=setup`).
-            Some(SecurityAdvertisement::Plain)
-        } else if far_dtls {
-            let Some(certificate) = self.dtls_certificate.as_ref() else {
+        let far_dtls_presentation = if far_dtls {
+            let Some(fingerprint) = self.engine_fingerprint() else {
                 self.free(&endpoints).await;
                 return error_result("DTLS-SRTP offer", &"engine has no DTLS certificate");
             };
-            let fingerprint = certificate.fingerprint();
-            // RFC 5763 §5: the offerer defaults to `actpass` (the answerer picks active/passive); a
-            // control `dtls: passive|active|actpass` overrides that offerer role (RFC 4145 §4 a=setup).
-            let setup = match dtls_directive {
-                Some(DtlsDirective::Role(role)) => role,
-                _ => sdp::Setup::Actpass,
-            };
-            Some(SecurityAdvertisement::Dtls {
-                fingerprint: sdp::Fingerprint {
-                    hash_function: fingerprint.hash_function,
-                    bytes: fingerprint.bytes,
-                },
-                setup,
-            })
+            Some((fingerprint, offered_dtls_setup(dtls_directive)))
         } else {
-            far_local_crypto.map(SecurityAdvertisement::Secure)
+            None
         };
 
         // RFC 5761: when a `rtcp-mux` directive was given, present the resolved far-side mux to B
         // explicitly (force `a=rtcp-mux` on, or strip it); otherwise mirror the offer (`None`).
         let far_mux_override = (!profile.rtcp_mux.is_empty()).then_some(far_mux);
-        let mut rewritten = match sdp::rewrite(
+        // rtpengine codec manipulation on the SDP offered to the far side: strip/mask/consume remove a
+        // codec, transcode/offer add or reorder, except/accept keep it (see `parse_codec_flags`). The
+        // far side may then select a transcode/offer codec, engaging the transcoder at answer.
+        let codec_policy = parse_codec_flags(&profile.flags);
+        let rewritten = match present_leg(
             sdp,
-            engine,
-            ice_rewrite,
-            security,
-            far_mux_override,
-            text_rewrite,
+            LegPresentation {
+                engine: far_leg.engine_media(),
+                ice: ice_rewrite,
+                security: far_security(
+                    far_downgraded_to_plain,
+                    far_dtls_presentation,
+                    far_local_crypto,
+                ),
+                mux_override: far_mux_override,
+                text: text_rewrite,
+                codec: CodecPresentation::Policy(&codec_policy),
+            },
+            &profile.replace,
+            &call_id,
         ) {
             Ok(rewritten) => rewritten,
             Err(error) => {
@@ -2155,26 +2513,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 };
             }
         };
-        // rtpengine codec manipulation on the SDP offered to the far side: strip/mask/consume remove a
-        // codec, transcode/offer add or reorder, except/accept keep it (see `parse_codec_flags`). The
-        // far side may then select a transcode/offer codec, engaging the transcoder at answer.
-        let codec_policy = parse_codec_flags(&profile.flags);
-        if !codec_policy.is_noop() {
-            rewritten.sdp = sdp::apply_codec_policy(&rewritten.sdp, &codec_policy);
-        }
-        // rtpengine `replace`: rewrite the o= line to the engine's advertised address (topology
-        // hiding) — the interface's advertised IP, not the bound one. Any other requested token is
-        // surfaced rather than silently ignored (pre-public-review B15).
-        let (replaced_sdp, unsupported_replace) =
-            apply_replace_directives(&rewritten.sdp, &profile.replace, engine.advertised_ip);
-        rewritten.sdp = replaced_sdp;
-        if !unsupported_replace.is_empty() {
-            tracing::warn!(
-                %call_id,
-                tokens = ?unsupported_replace,
-                "ignoring unsupported rtpengine `replace` directive(s); only `origin` is honoured",
-            );
-        }
 
         // WebSocket bridge (mod_audio_stream / voice-AI): a native siphon-rtp extension. When the
         // profile carries `ws_uri`, leg A (the offerer) is bridged to that WS server using A's
@@ -2195,7 +2533,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // relay that keeps the call up is the better failure mode.
         let near_codec_withheld = match near_codec.as_ref() {
             Some(primary) if !codec_policy.is_noop() => {
-                sdp::parse(&rewritten.sdp).is_ok_and(|far_offer| {
+                sdp::parse(&rewritten).is_ok_and(|far_offer| {
                     !far_offer
                         .audio_codecs()
                         .iter()
@@ -2263,6 +2601,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_remote_candidates: info.candidates.clone(),
                 near_peer_is_lite: info.ice_lite,
                 far_local_candidates: far_ice_candidates.clone(),
+                // Gathered at answer, when the near leg is first presented to A.
+                near_local_candidates: Vec::new(),
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -2276,16 +2616,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 },
                 // An offer always allocates a B-facing leg: a B side may still answer, and the offer
                 // being rewritten right here is what would be delivered to it.
-                far: Some(Leg {
-                    rtp: far_rtp,
-                    rtcp: far_rtcp,
-                    remote_rtp: None,
-                    remote_rtcp: None,
-                    advertised_ip: far_advertised,
-                    text: far_text_endpoint,
-                    // The far side's text address is unknown until its answer.
-                    text_remote_rtp: None,
-                }),
+                far: Some(far_leg),
                 // Where the caller's media lands if this call never gets an `answer`. A WS takeover
                 // bridges `near_rtp` (below), so the caller reaches the near socket; otherwise the
                 // offer-only UAS shape applies — the controller puts this rewritten offer, which
@@ -2300,6 +2631,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_local_crypto,
                 far_remote_crypto: None,
                 far_dtls,
+                // Decided by B's answer.
+                far_dtls_role: None,
+                far_downgraded_to_plain,
                 // A's own posture, for the late-`ws_uri` takeover guard in `answer`.
                 near_secure: info.secure,
                 near_codec: near_codec.clone(),
@@ -2312,6 +2646,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,
+                // B's arrives with its answer.
+                far_received_from: None,
+                pending_far_reoffer: None,
                 // A 2-party offer never idles a single leg on comfort noise.
                 comfort_noise_payload_type: None,
                 text_t140_payload_type,
@@ -2366,7 +2703,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        ok_sdp(rewritten.sdp, None)
+        ok_sdp(rewritten, None)
     }
 
     /// Single-leg UAS answer ([`Command::AnswerLocal`]): the engine *is* the far side (IVR / echo /
@@ -2661,6 +2998,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_remote_candidates: Vec::new(),
                 near_peer_is_lite: false,
                 far_local_candidates: Vec::new(),
+                near_local_candidates: Vec::new(),
                 from_tag,
                 to_tag: None,
                 near: Leg {
@@ -2680,6 +3018,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_local_crypto: None,
                 far_remote_crypto: None,
                 far_dtls: false,
+                far_dtls_role: None,
+                far_downgraded_to_plain: false,
                 // Recorded for symmetry; a single-leg call never reaches `answer`.
                 near_secure: info.secure,
                 near_codec: None,
@@ -2693,6 +3033,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 relay_flows: Vec::new(),
                 promotion_reasons: HashSet::new(),
                 offer_received_from: profile.received_from,
+                // No far party, so no far hint and no re-offer from one.
+                far_received_from: None,
+                pending_far_reoffer: None,
                 // Set below once the answered codec is known (a single-leg local answer negotiates CN
                 // at the chosen codec's clock rate); left `None` for the reject path.
                 comfort_noise_payload_type: None,
@@ -3469,13 +3812,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// undisturbed and the dialog continues — which is what a re-INVITE means, and what makes an ICE
     /// restart possible at all (there is nothing to restart if the call was replaced).
     ///
-    /// Owner-only (A3 — docs/security-and-nat.md §5).
+    /// **Either party may re-offer**, resolved by tag: the call's `from_tag` is A (the near leg), its
+    /// `to_tag` is B (the far leg), and anything else — including B's tag before B has answered — is
+    /// `unknown_call`. Owner-only first (A3 — docs/security-and-nat.md §5).
+    ///
+    /// **Which leg the SDP presents.** The offering party's SDP describes *its* leg, so that is where
+    /// its new address, ICE credentials and `received-from` hint are recorded. The rewritten SDP is
+    /// delivered to the *other* party, so it presents the leg facing that party — the far leg for a
+    /// re-offer from A, the near leg for one from B — exactly as that party last saw it (RFC 3264 §8:
+    /// a subsequent offer modifies the SDP its recipient last received, and an address in it tells the
+    /// recipient where to send). The ports do not move, and presenting the offerer's own leg instead
+    /// tells the recipient to send its media into the offerer's socket, where the source gate drops
+    /// it. A re-offer from B is completed by A's answer, which [`Self::answer`] accepts with the tags
+    /// reversed.
     ///
     /// **Scope, stated rather than silently ignored:** this renegotiates the peer's *transport* — its
     /// signalled address and its ICE credentials/candidates. A re-offer that changes the negotiated
     /// codec is **rejected**, not quietly accepted: rebuilding a live transcode pipeline mid-call is
     /// its own piece of work, and answering "ok" while continuing to run the old codec would be worse
-    /// than saying no.
+    /// than saying no. For the same reason a re-offer from B that drops the far leg's SRTP keying is
+    /// refused rather than bridged in the clear.
     async fn reoffer(
         &self,
         client: ClientId,
@@ -3493,41 +3849,43 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
 
-        // Snapshot what we need under the guard, enforcing ownership and dialog identity first. The text
-        // state (`near.text`, `text_secure`, and the engine's own near text SDES key) is carried so the
-        // re-offer re-anchors any negotiated `m=text` stream to its existing engine endpoint below.
-        let Some((
-            near,
-            ice_creds,
-            previous_remote_ice,
-            previous_codec,
-            advertised_ip,
-            text_secure,
-            near_text_local_crypto,
-        )) = self.calls.get(call_id).and_then(|call| {
-            (call.owner == client && call.from_tag == from_tag).then(|| {
-                (
-                    call.near,
-                    call.ice.clone(),
-                    call.near_remote_ice.clone(),
-                    call.near_codec.clone(),
-                    call.near.advertised_ip,
-                    call.text_secure,
-                    call.near_text_local_crypto,
-                )
-            })
-        })
-        else {
+        // Snapshot what we need under the guard: ownership first, then which party is re-offering.
+        let Some(state) = self.calls.get(call_id).and_then(|call| {
+            if call.owner != client {
+                return None;
+            }
+            let party = if call.from_tag == from_tag {
+                Party::Near
+            } else if call.to_tag.as_deref() == Some(from_tag) {
+                // `to_tag` is only ever set by an answer, so an unanswered call has no B to re-offer.
+                Party::Far
+            } else {
+                return None;
+            };
+            Some(ReofferState::capture(&call, party))
+        }) else {
             return unknown_call(call_id);
+        };
+        let party = state.party;
+        // The leg the re-offering party talks to, and the one the rewritten SDP presents. A call the
+        // engine answered itself (`answer_local`) has no far leg: its caller reaches the near socket,
+        // and that is the only leg there is to present.
+        let (offering_leg, presented_leg, presented_party) = match (party, state.far) {
+            (Party::Near, Some(far)) => (state.near, far, Party::Far),
+            (Party::Near, None) => (state.near, state.near, Party::Near),
+            (Party::Far, Some(far)) => (far, state.near, Party::Near),
+            // `Party::Far` is only resolved from a `to_tag`, which only `answer` sets, and `answer`
+            // refuses a call with no far leg.
+            (Party::Far, None) => return unknown_call(call_id),
         };
 
         // A codec change needs a pipeline rebuild we do not do here — say so. What counts as a change
-        // is whether the re-offer still *lists* the codec this call negotiated, not whether it leads
+        // is whether the re-offer still *lists* the codec this party negotiated, not whether it leads
         // with it: a phone that offered G.729 first and settled on G.711 restates that same preference
         // order on every re-INVITE (RFC 3264 §8 — a re-offer restates the whole session), and holding
         // it to its first entry would reject a re-offer that renegotiates nothing.
         let reoffered_codecs = info.audio_codecs();
-        if let Some(previous) = previous_codec.as_ref() {
+        if let Some(previous) = state.previous_codec.as_ref() {
             if !reoffered_codecs.is_empty()
                 && !reoffered_codecs
                     .iter()
@@ -3545,10 +3903,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 };
             }
         }
+        // A secure far leg stays secure: B's re-offer must keep keying it the way it is keyed, or the
+        // engine would have to bridge B in the clear or invent keying it cannot answer with — never
+        // silently (docs/security-and-nat.md Layer 5). The answer to it re-presents the engine's own
+        // key or fingerprint, so B must still offer something that answer can select (RFC 4568 §5.1.2:
+        // the answer picks one offered `a=crypto` and keeps its suite).
+        if party == Party::Far {
+            if let Some(reason) = far_reoffer_security_refusal(&state, &info) {
+                return CmdResult::Error {
+                    reason: format!("re-offer: {reason}"),
+                };
+            }
+        }
 
         // RFC 8445 §9.1.1.1: an ICE restart is signalled by new credentials on the re-offer.
         let new_remote_ice = peer_ice_credentials(&info);
-        let ice_restart = match (previous_remote_ice.as_ref(), new_remote_ice.as_ref()) {
+        let ice_restart = match (state.previous_remote_ice.as_ref(), new_remote_ice.as_ref()) {
             (Some(previous), Some(new)) => previous != new,
             // Peer added ICE where it had none, or dropped it: both change the ICE session.
             (None, Some(_)) | (Some(_), None) => true,
@@ -3560,36 +3930,44 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let ice_creds = if ice_restart && new_remote_ice.is_some() {
             ice::generate_credentials()
         } else {
-            ice_creds
+            state.ice.clone()
         };
 
         if ice_restart {
             tracing::info!(
                 target: "siphon_rtp::media",
                 %call_id,
+                offered_by = party.label(),
                 "ICE restart (RFC 8445 §9): the re-offer carries new peer credentials — new session, \
                  media continues on the current pair until the new one is selected"
             );
         }
 
-        // Re-gather for the leg we are re-advertising. Host-only gathering is instant and yields the
-        // same addresses, since the ports are unchanged — which is exactly the property that lets
-        // media keep flowing across the restart.
-        let candidates = match ice_creds.as_ref() {
+        // The offering leg's candidates, for its rebuilt agent, and the presented leg's, for the SDP.
+        // Both are the ones already advertised when stored — the ports are unchanged, which is exactly
+        // the property that lets media keep flowing across a restart — and are gathered only when
+        // there is nothing stored (ICE added mid-call, or a call restored from a snapshot).
+        let (offering_candidates, presented_candidates) = match ice_creds.as_ref() {
             Some(creds) => {
-                self.gather_leg_candidates(
-                    &near,
-                    &IceConfig {
-                        local_ufrag: creds.ufrag.clone(),
-                        local_pwd: creds.pwd.clone(),
-                    },
-                )
-                .await
+                let (offering_stored, presented_stored) = match party {
+                    Party::Near => (&state.near_local_candidates, &state.far_local_candidates),
+                    Party::Far => (&state.far_local_candidates, &state.near_local_candidates),
+                };
+                let offering = self
+                    .leg_candidates(&offering_leg, offering_stored, creds)
+                    .await;
+                let presented = if presented_party == party {
+                    offering.clone()
+                } else {
+                    self.leg_candidates(&presented_leg, presented_stored, creds)
+                        .await
+                };
+                (offering, presented)
             }
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
 
-        // Rebuild the near leg's agent against the new session. Crucially the datapath's adopted
+        // Rebuild the offering leg's agent against the new session. Crucially the datapath's adopted
         // source is left alone: under the layer-4 gate media keeps flowing on the previously selected
         // pair until the new agent selects one and calls `adopt_source` again (RFC 8445 §9.3 — an
         // agent continues using the old session's pair until the new one completes).
@@ -3603,11 +3981,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     local_ufrag: creds.ufrag.clone(),
                     local_pwd: creds.pwd.clone(),
                 };
-                for endpoint in near.endpoint_ids() {
+                for endpoint in offering_leg.endpoint_ids() {
                     let Some(local_addr) = self.endpoint_address(endpoint) else {
                         continue;
                     };
-                    let component = if endpoint == near.rtp.id { 1 } else { 2 };
+                    let component = if endpoint == offering_leg.rtp.id {
+                        1
+                    } else {
+                        2
+                    };
                     let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
                         siphon_rtp_ice::agent::Credentials::new(
                             creds.ufrag.clone(),
@@ -3623,7 +4005,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         ice_tie_breaker(),
                     )
                     .with_candidates(
-                        filter_component(&candidates, component),
+                        filter_component(&offering_candidates, component),
                         filter_component(&info.candidates, component),
                     );
                     self.datapath.set_ice_agent(
@@ -3637,77 +4019,204 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        // Record the new peer state.
+        // Record the offering party's new state on its own leg. Its `received-from` hint moves with
+        // it when the re-offer carries one (an app that switched network re-INVITEs from a new public
+        // address) and is kept when it carries none: one proxy-observed address replaces another, and
+        // the latch still governs from the first accepted packet (docs/security-and-nat.md §4 layer 2).
+        // The media path itself is re-wired by the answer that completes this exchange.
         if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.near.remote_rtp = Some(info.remote_rtp);
-            call.near.remote_rtcp = Some(info.remote_rtcp);
-            // A re-offer restates A's codec list, so an `answer` still to come negotiates against what
-            // A last offered rather than what it opened the dialog with (the guard above already
-            // refused a list that drops the negotiated codec). A re-offer that resolves no codec at
-            // all leaves the stored set alone rather than blanking it — it tells us nothing new.
-            if !reoffered_codecs.is_empty() {
-                call.near_offered_codecs = reoffered_codecs;
+            match party {
+                Party::Near => {
+                    call.near.remote_rtp = Some(info.remote_rtp);
+                    call.near.remote_rtcp = Some(info.remote_rtcp);
+                    // A re-offer restates A's codec list, so an `answer` still to come negotiates
+                    // against what A last offered rather than what it opened the dialog with (the
+                    // guard above already refused a list that drops the negotiated codec). A re-offer
+                    // that resolves no codec at all leaves the stored set alone — it tells us nothing.
+                    if !reoffered_codecs.is_empty() {
+                        call.near_offered_codecs = reoffered_codecs;
+                    }
+                    call.near_remote_ice = new_remote_ice;
+                    call.near_remote_candidates = info.candidates.clone();
+                    call.near_peer_is_lite = info.ice_lite;
+                    if profile.received_from.is_some() {
+                        call.offer_received_from = profile.received_from;
+                    }
+                    // A re-offer from A supersedes any from B still waiting for an answer.
+                    call.pending_far_reoffer = None;
+                }
+                Party::Far => {
+                    if let Some(far) = call.far.as_mut() {
+                        far.remote_rtp = Some(info.remote_rtp);
+                        far.remote_rtcp = Some(info.remote_rtcp);
+                    }
+                    call.far_remote_ice = new_remote_ice;
+                    if profile.received_from.is_some() {
+                        call.far_received_from = profile.received_from;
+                    }
+                    // Held for A's answer, which re-wires the media path against it.
+                    call.pending_far_reoffer = Some(sdp.to_string());
+                }
             }
-            call.near_remote_ice = new_remote_ice;
-            call.near_remote_candidates = info.candidates.clone();
-            call.near_peer_is_lite = info.ice_lite;
             call.ice = ice_creds.clone();
+            // Both legs' candidates, as now advertised or about to be: the presented leg's are what its
+            // party is being told, the offering leg's what its rebuilt agent runs on.
+            if ice_creds.is_some() {
+                let (near_candidates, far_candidates) = match party {
+                    Party::Near => (&offering_candidates, &presented_candidates),
+                    Party::Far => (&presented_candidates, &offering_candidates),
+                };
+                call.near_local_candidates = near_candidates.clone();
+                if call.far.is_some() {
+                    call.far_local_candidates = far_candidates.clone();
+                }
+            }
         }
 
-        // Re-advertise the *same* endpoints — the ports do not move on a re-offer.
-        let engine = EngineMedia {
-            rtp: near.rtp.local_addr,
-            rtcp: near.rtcp.map(|endpoint| endpoint.local_addr),
-            advertised_ip,
+        // A secure (SDES-SRTP) text stream is re-presented with the engine's own stored key for the
+        // presented leg — the key that party already holds (RFC 4568: a re-offer re-presents the key,
+        // it never mints one). That key always exists once the secure text leg registered at answer;
+        // fail closed rather than present a secure stream as plaintext if it is somehow absent
+        // (docs/security-and-nat.md Layer 5d — never bridge or present secure↔insecure).
+        let presented_text_key = match presented_party {
+            Party::Far => state.far_text_local_crypto,
+            Party::Near => state.near_text_local_crypto,
         };
-        let ice_rewrite = match ice_creds.as_ref() {
-            Some(creds) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
-                ufrag: creds.ufrag.as_str(),
-                pwd: creds.pwd.as_str(),
-                candidates: &candidates,
-            }),
-            None => IceRewrite::Keep,
-        };
-        let _ = profile;
-        // RFC 8839 §5.4: a re-offer re-advertises the SAME endpoints (the ports do not move), so an RFC
-        // 4103 `m=text` stream is re-anchored to its EXISTING engine text port — exactly as the audio leg
-        // is re-advertised above — never passed through pointing at the UE's own (often private) address
-        // (the leak the offer/answer path already closes). A secure (SDES-SRTP) text stream re-presents
-        // the engine's OWN stored near text `a=crypto` (the key minted at answer, RFC 4568): a re-offer
-        // re-presents the same key, it never mints a new one. A call with no text stream leaves any
-        // `m=text` section untouched.
-        let text_rewrite = match near.text {
-            None => TextRewrite::None,
-            Some(near_text) => {
-                let near_text_engine = EngineMedia {
-                    rtp: near_text.local_addr,
-                    rtcp: None,
-                    advertised_ip,
-                };
-                if text_secure {
-                    // `near_text_local_crypto` is always present once the secure text leg registered at
-                    // answer; fail closed rather than silently downgrade a secure text stream to plaintext
-                    // if it is somehow absent (docs/security-and-nat.md Layer 5d — never bridge/present
-                    // secure↔insecure).
-                    let Some(crypto) = near_text_local_crypto else {
+        if state.text_secure && presented_text_key.is_none() {
+            return error_result(
+                "re-offer secure text",
+                &"secure text stream has no stored engine a=crypto to re-present",
+            );
+        }
+        let presented_media = presented_leg.engine_media();
+        // RFC 5761: present the leg's bound mux state when a `rtcp-mux` directive asks for it, exactly
+        // as `offer` and `answer` do.
+        let mux_override = (!profile.rtcp_mux.is_empty()).then_some(presented_leg.rtcp.is_none());
+        let codec_policy = parse_codec_flags(&profile.flags);
+        let presentation = match presented_party {
+            // Delivered to B: the far leg, presented as the original offer presented it.
+            Party::Far => {
+                // RFC 8839 §5.3: the offerer's default destination matches none of its candidates.
+                let ice_mismatch =
+                    siphon_rtp_ice::is_ice_mismatch(info.remote_rtp, &info.candidates)
+                        && ice_directive(profile) != Some(IceDirective::Force);
+                let dtls = if state.far_dtls {
+                    let Some(fingerprint) = self.engine_fingerprint() else {
                         return error_result(
-                            "re-offer secure text",
-                            &"secure text stream has no stored near a=crypto to re-advertise",
+                            "re-offer DTLS-SRTP",
+                            &"engine has no DTLS certificate",
                         );
                     };
-                    TextRewrite::AnchorSecure {
-                        engine: near_text_engine,
-                        crypto,
-                    }
+                    Some((fingerprint, offered_dtls_setup(dtls_directive(profile))))
                 } else {
-                    TextRewrite::Anchor(near_text_engine)
+                    None
+                };
+                let text = match presented_leg.text_anchor(state.far_text_local_crypto) {
+                    Some(anchor) => anchor,
+                    // The engine has no text endpoint on this leg to anchor a stream the offerer
+                    // added mid-call, and passing it through would hand B the offerer's own (often
+                    // private) text address — decline it (RFC 3264 §6/§8.2).
+                    None if info.text.is_some() => TextRewrite::Decline,
+                    None => TextRewrite::None,
+                };
+                LegPresentation {
+                    engine: presented_media,
+                    ice: offer_ice_rewrite(
+                        ice_creds.as_ref(),
+                        &presented_candidates,
+                        ice_mismatch,
+                        ice_directive(profile),
+                    ),
+                    security: far_security(
+                        state.far_downgraded_to_plain,
+                        dtls,
+                        state.far_local_crypto,
+                    ),
+                    mux_override,
+                    text,
+                    codec: CodecPresentation::Policy(&codec_policy),
+                }
+            }
+            // Delivered to A: the near leg, presented as the answer presented it.
+            Party::Near => {
+                let text = if state.far.is_none() {
+                    // A single-leg call: the near leg's text, if it has any, as its caller knows it.
+                    presented_leg
+                        .text_anchor(state.near_text_local_crypto)
+                        .unwrap_or(TextRewrite::None)
+                } else if let Some(secure) = state.near_text_local_crypto {
+                    presented_leg
+                        .text_anchor(Some(secure))
+                        .unwrap_or(TextRewrite::Decline)
+                } else if state.text_relayed {
+                    presented_leg
+                        .text_anchor(None)
+                        .unwrap_or(TextRewrite::Decline)
+                } else if info.text.is_some() {
+                    // A never had a text stream accepted on this call: nothing to anchor it to.
+                    TextRewrite::Decline
+                } else {
+                    TextRewrite::None
+                };
+                LegPresentation {
+                    engine: presented_media,
+                    ice: answer_ice_rewrite(ice_creds.as_ref(), &presented_candidates),
+                    security: near_security(state.far_local_crypto.is_some() || state.far_dtls),
+                    mux_override,
+                    text,
+                    // A transcoding call sends A its own codec whatever B uses (RFC 3264 §6). A
+                    // single-leg call's re-offer keeps the codec list it was sent: the engine is the
+                    // far side there, and choosing for it is `answer_local`'s job.
+                    codec: match state.near_codec.as_ref() {
+                        Some(codec) if state.far.is_some() && state.transcoding => {
+                            CodecPresentation::Own {
+                                codec,
+                                telephone_event: state.near_telephone_event,
+                            }
+                        }
+                        _ => CodecPresentation::AsReceived,
+                    },
                 }
             }
         };
-        match sdp::rewrite(sdp, engine, ice_rewrite, None, None, text_rewrite) {
-            Ok(rewritten) => ok_sdp(rewritten.sdp, None),
+        // Media-plane lifecycle: which party re-offered and what the other one is being shown — the
+        // single line that tells an operator where each side has been told to send.
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id = %call_id,
+            offered_by = party.label(),
+            offerer = %info.remote_rtp,
+            presented_leg = presented_party.label(),
+            presented = %SocketAddr::new(presented_media.advertised_ip, presented_media.rtp.port()),
+            ice_restart,
+            "re-offer"
+        );
+        match present_leg(sdp, presentation, &profile.replace, call_id) {
+            Ok(presented) => ok_sdp(presented, None),
             Err(error) => error_result("re-offer rewrite", &error),
         }
+    }
+
+    /// The ICE candidates to present for `leg`: the ones already advertised for it when there are any
+    /// (the ports have not moved, so they are still exactly right, and re-gathering would change what
+    /// the peer holds), gathered now otherwise.
+    async fn leg_candidates(
+        &self,
+        leg: &Leg,
+        stored: &[siphon_rtp_ice::Candidate],
+        creds: &IceCredentials,
+    ) -> Vec<siphon_rtp_ice::Candidate> {
+        if !stored.is_empty() {
+            return stored.to_vec();
+        }
+        self.gather_leg_candidates(
+            leg,
+            &IceConfig {
+                local_ufrag: creds.ufrag.clone(),
+                local_pwd: creds.pwd.clone(),
+            },
+        )
+        .await
     }
 
     async fn answer(
@@ -3724,8 +4233,138 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: format!("answer: {reason}"),
             };
         }
-        // Snapshot the leg endpoints under the guard, then release it. Only the owning client may
-        // answer (A3 — docs/security-and-nat.md §5); to anyone else the call is unknown.
+        // Which exchange this answer completes. Usually B answering an offer or re-offer from A, with
+        // the tags as the call has them. The other is A answering a re-offer from B, which arrives with
+        // the dialog's tags reversed (`from_tag` is B's, `to_tag` is A's) and is accepted only while a
+        // re-offer from B is outstanding, so a stray reversed answer cannot rewrite a live call. Only
+        // the owning client may answer (A3 — docs/security-and-nat.md §5); to anyone else the call is
+        // unknown.
+        let far_reoffer_sdp = match self.calls.get(call_id) {
+            Some(call) if call.owner == client => {
+                if call.from_tag == from_tag {
+                    None
+                } else if call.to_tag.as_deref() == Some(from_tag) && call.from_tag == to_tag {
+                    let Some(far_reoffer_sdp) = call.pending_far_reoffer.clone() else {
+                        return CmdResult::Error {
+                            reason:
+                                "answer carries the dialog's tags reversed but no re-offer from \
+                                     the far party is outstanding"
+                                    .to_string(),
+                        };
+                    };
+                    Some(far_reoffer_sdp)
+                } else {
+                    return CmdResult::Error {
+                        reason: "from_tag mismatch on answer".to_string(),
+                    };
+                }
+            }
+            _ => return unknown_call(call_id),
+        };
+        // The answer's own `to_tag`, echoed back as given; from here on `from_tag`/`to_tag` are the
+        // dialog's (A's and B's) whichever party is answering.
+        let answer_to_tag = to_tag;
+        let dialog_from_tag = if far_reoffer_sdp.is_some() {
+            answer_to_tag.clone()
+        } else {
+            from_tag.to_string()
+        };
+        let to_tag = if far_reoffer_sdp.is_some() {
+            from_tag.to_string()
+        } else {
+            answer_to_tag.clone()
+        };
+        let from_tag: &str = &dialog_from_tag;
+
+        let answered = match sdp::parse(sdp) {
+            Ok(info) => info,
+            Err(error) => {
+                return CmdResult::Error {
+                    reason: format!("answer SDP parse failed: {error}"),
+                }
+            }
+        };
+        // `info` is the **far** party's SDP for the rest of this function, whichever way round the
+        // exchange ran: B's answer usually, B's re-offer when A is answering it. Everything below that
+        // wires the media path reads B's side from `info` and A's side from the call.
+        let (info, reversed) = match far_reoffer_sdp {
+            None => (answered, None),
+            Some(far_reoffer_sdp) => {
+                let mut far = match sdp::parse(&far_reoffer_sdp) {
+                    Ok(info) => info,
+                    Err(error) => {
+                        return error_result("answer: re-offer from the far party", &error);
+                    }
+                };
+                // A's answer is A's new state: record it on A's leg, exactly as a re-offer from A
+                // records A's offer. Its `received-from` is the address A's answer arrived from.
+                let Some(mut call) = self.calls.get_mut(call_id) else {
+                    return unknown_call(call_id);
+                };
+                call.near.remote_rtp = Some(answered.remote_rtp);
+                call.near.remote_rtcp = Some(answered.remote_rtcp);
+                let answered_codecs = answered.audio_codecs();
+                if !answered_codecs.is_empty() {
+                    call.near_offered_codecs = answered_codecs;
+                }
+                if let Some(telephone_event) = answered.telephone_event_payload_type() {
+                    call.near_telephone_event = Some(telephone_event);
+                }
+                call.near_remote_ice = peer_ice_credentials(&answered);
+                call.near_remote_candidates = answered.candidates.clone();
+                call.near_peer_is_lite = answered.ice_lite;
+                if profile.received_from.is_some() {
+                    call.offer_received_from = profile.received_from;
+                }
+                if let Some(text) = answered
+                    .text
+                    .as_ref()
+                    .filter(|text| text.remote_rtp.port() != 0)
+                {
+                    call.near.text_remote_rtp = Some(text.remote_rtp);
+                    if let Some(key) = text.crypto.first().filter(|_| text.secure) {
+                        call.near_text_remote_crypto = Some(*key);
+                    }
+                }
+                // Each party stays on the codec it negotiated. On a relay both share one, and it is
+                // the one A's answer selected from B's list (RFC 3264 §6.1); on a transcode A was shown
+                // only its own codec, so B's is the one B already had. Leading B's list with it lets
+                // the codec machinery below read it as B's primary, so the pipeline decision does not
+                // move on a renegotiation that changes no codec.
+                let transcoding = matches!(
+                    call.pipeline,
+                    PipelineKind::Media | PipelineKind::SrtpMedia | PipelineKind::DtlsMedia
+                );
+                let far_codec = match answered.primary_codec() {
+                    Some(selected)
+                        if !transcoding
+                            && far
+                                .audio_codecs()
+                                .iter()
+                                .any(|offered| same_codec(offered, &selected)) =>
+                    {
+                        Some(selected)
+                    }
+                    _ => call.far_codec.clone(),
+                };
+                if let Some(far_codec) = far_codec.as_ref() {
+                    lead_with_codec(&mut far, far_codec);
+                }
+                let context = ReversedAnswer {
+                    carries_text: answered.text.is_some(),
+                    near_accepted_text: answered
+                        .text
+                        .as_ref()
+                        .is_some_and(|text| text.remote_rtp.port() != 0),
+                    near_text_local_crypto: call.near_text_local_crypto,
+                    far_dtls_role: call.far_dtls_role,
+                };
+                drop(call);
+                (far, Some(context))
+            }
+        };
+
+        // Snapshot the leg endpoints under the guard, then release it.
         let (
             near,
             far,
@@ -3733,9 +4372,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_remote_ice,
             near_remote_candidates,
             near_peer_is_lite,
+            near_local_candidates,
             far_local_candidates,
             far_local_crypto,
             far_dtls,
+            far_downgraded_to_plain,
             near_secure,
             near_codec,
             near_offered_codecs,
@@ -3743,6 +4384,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_telephone_event,
             offer_pipeline,
             offer_received_from,
+            stored_far_received_from,
             near_text_remote_crypto,
             far_text_local_crypto,
             text_t140_payload_type,
@@ -3750,11 +4392,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             text_events,
         ) = match self.calls.get(call_id) {
             Some(call) if call.owner == client => {
-                if call.from_tag != from_tag {
-                    return CmdResult::Error {
-                        reason: "from_tag mismatch on answer".to_string(),
-                    };
-                }
                 // A call the engine answered itself (`answer_local`) has no B-facing leg and no second
                 // party to answer *with* — the caller is already talking to the single-leg pipeline on
                 // the engine's only socket. Refuse plainly: relaying B's media onto that socket would
@@ -3773,9 +4410,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.near_remote_ice.clone(),
                     call.near_remote_candidates.clone(),
                     call.near_peer_is_lite,
+                    call.near_local_candidates.clone(),
                     call.far_local_candidates.clone(),
                     call.far_local_crypto,
                     call.far_dtls,
+                    call.far_downgraded_to_plain,
                     call.near_secure,
                     call.near_codec.clone(),
                     call.near_offered_codecs.clone(),
@@ -3783,6 +4422,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.near_telephone_event,
                     call.pipeline,
                     call.offer_received_from,
+                    call.far_received_from,
                     call.near_text_remote_crypto,
                     call.far_text_local_crypto,
                     call.text_t140_payload_type,
@@ -3803,15 +4443,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None
         };
 
-        let info = match sdp::parse(sdp) {
-            Ok(info) => info,
-            Err(error) => {
-                return CmdResult::Error {
-                    reason: format!("answer SDP parse failed: {error}"),
-                }
-            }
-        };
-
         // RFC 3264 §6.1: B's answer selects the format, and that answer is relayed to A unmodified on
         // every non-transcoding pipeline — so if B picked something A offered, A sends it too and the
         // call is a plain relay. Adopt it as A's codec here, before anything reads `near_codec`: the
@@ -3825,17 +4456,25 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         );
 
         // rtpengine `received-from`: the real post-NAT source the SIP proxy saw each request come
-        // from. The **offer's** hint (stored on the call) tightens the near (A) leg's ingress gate;
-        // the **answer's** hint tightens the far (B) leg's. Both keep the signalled port and only
-        // override the gated source IP — every gate path below uses these effective addresses so the
-        // source gate is uniform (docs/security-and-nat.md §4 layer 2). `None` ⇒ the signalled
-        // address is used unchanged. The same pair is what the relay *aims* at before the latch forms
-        // — see the destination bindings below.
+        // from. A's hint (stored on the call: from its offer, refreshed by its re-offer or by its
+        // answer to B's) tightens the near (A) leg's ingress gate; B's tightens the far (B) leg's. B's
+        // is this answer's when B is answering and it carries one, and otherwise the one stored from B's
+        // earlier answer or re-offer — so a renegotiation that omits it keeps gating a NATed B on its
+        // public address instead of falling back to the private `c=` it signalled. Both keep the
+        // signalled port and only override the gated source IP — every gate path below uses these
+        // effective addresses so the source gate is uniform (docs/security-and-nat.md §4 layer 2).
+        // `None` ⇒ the signalled address is used unchanged. The same pair is what the relay *aims* at
+        // before the latch forms — see the destination bindings below.
+        let far_received_from = if reversed.is_some() {
+            stored_far_received_from
+        } else {
+            profile.received_from.or(stored_far_received_from)
+        };
         let near_gate_rtp = apply_received_from(near.remote_rtp, offer_received_from);
         let near_gate_rtcp = apply_received_from(near.remote_rtcp, offer_received_from);
-        let far_gate_rtp = apply_received_from(Some(info.remote_rtp), profile.received_from)
+        let far_gate_rtp = apply_received_from(Some(info.remote_rtp), far_received_from)
             .unwrap_or(info.remote_rtp);
-        let far_gate_rtcp = apply_received_from(Some(info.remote_rtcp), profile.received_from)
+        let far_gate_rtcp = apply_received_from(Some(info.remote_rtcp), far_received_from)
             .unwrap_or(info.remote_rtcp);
 
         // Where each peer's media is *aimed* until its own first packet moves the latch — the same
@@ -3856,67 +4495,65 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let far_media_dst = far_gate_rtp;
         let far_rtcp_dst = far_gate_rtcp;
 
-        // The rewritten answer is delivered to A, so it advertises the `near` leg — with the same
-        // advertised IP the offer picked for it (the near interface's advertised address), stored on
-        // the leg since the answer path does no re-allocation.
-        let engine = EngineMedia {
-            rtp: near.rtp.local_addr,
-            rtcp: near.rtcp.map(|endpoint| endpoint.local_addr),
-            advertised_ip: near.advertised_ip,
-        };
-        // The A-facing near leg re-originates ICE-lite iff the offer minted engine creds (the ICE
-        // posture was decided at offer); otherwise the peer's ICE (if any) passes through unchanged.
-        // The near leg's candidates, gathered now for the same reason the far leg's were at offer:
-        // this answer is the complete candidate list A will ever see from us.
-        let near_ice_candidates = match ice_creds.as_ref() {
-            Some(creds) => {
-                self.gather_leg_candidates(
-                    &near,
-                    &IceConfig {
-                        local_ufrag: creds.ufrag.clone(),
-                        local_pwd: creds.pwd.clone(),
-                    },
-                )
-                .await
-            }
-            None => Vec::new(),
-        };
-        let ice_rewrite = match ice_creds.as_ref() {
-            Some(creds) => IceRewrite::Reoriginate(sdp::IceAdvertisement {
-                ufrag: creds.ufrag.as_str(),
-                pwd: creds.pwd.as_str(),
-                candidates: &near_ice_candidates,
-            }),
-            None => IceRewrite::Keep,
-        };
-        // The answer to A advertises the near leg; on a secure (SDES or DTLS) far leg that side is
-        // plain (RTP/AVP), so force AVP and strip the peer's crypto/fingerprint. A plain relay leaves
-        // transport/crypto untouched.
-        let security =
-            (far_local_crypto.is_some() || far_dtls).then_some(SecurityAdvertisement::Plain);
-        // RFC 5761: the near (A-facing) mux state was fixed at offer — the companion RTCP endpoint
-        // exists iff the near side is non-muxed. When a `rtcp-mux` directive drove that decision,
-        // present it to A explicitly so the answer SDP matches the ports the engine actually bound;
-        // otherwise mirror B's answer (`None`).
-        let near_mux = near.rtcp.is_none();
-        let near_mux_override = (!profile.rtcp_mux.is_empty()).then_some(near_mux);
-        // RFC 4103 text: relay the stream when it was anchored at offer (both legs hold a text
-        // endpoint) AND B's answer accepted a *plaintext* text stream (a non-zero `m=text` port). B
-        // declining (port 0) or answering secure (`RTP/SAVP`) text → decline the near answer's text too
-        // (`m=text 0`, RFC 3264 §6), never bridged in PR 1. The near answer advertises the NEAR text
-        // endpoint to A (where A sends its text). A WS-bridged call has no B leg to relay text to, so a
-        // call turning into a WS leg here declines any text anchored at offer rather than advertising a
-        // text port it will not serve.
+        // Resolve how this call's media is carried — an SRTP bridge (secure far leg), the userspace
+        // media slow path (transcode / record), or the in-datapath plain relay — before the SDP is
+        // presented, because a transcoding call presents each party only its own codec.
+        let pipeline = resolve_pipeline(
+            near_codec.as_ref(),
+            &info,
+            profile,
+            far_local_crypto,
+            far_dtls,
+        );
+        // rtpengine `ptime=<N>` override: force the packetization of the synthesized (transcoded)
+        // egress toward both parties. Overriding the negotiated codec ptime here is the single source
+        // of truth — it flows to the egress encoder's frame size and the repacketizer (the RTP cadence,
+        // RFC 3550 §5.1), to the SDP `a=ptime` presented on a transcoding call, and to the HA snapshot
+        // (so a restore rebuilds at the same ptime). Inert on a plain relay / bridge (which forward RTP
+        // verbatim and never re-encode); only a transcoding pipeline can re-frame.
+        let ptime_override = parse_ptime_override(&profile.flags);
+        // A WS-bridged call has no B leg to relay to (the WS server is A's far side); it never
+        // transcodes A↔B, so its answer is never codec-rewritten.
         let becoming_ws = offer_pipeline == PipelineKind::Ws || profile.ws_uri.is_some();
+        let transcoding = !becoming_ws
+            && matches!(
+                pipeline,
+                PipelineKind::Media | PipelineKind::SrtpMedia | PipelineKind::DtlsMedia
+            );
+
+        // Each leg's ICE candidates: the near leg's are what A was (or is now being) shown, the far
+        // leg's what B was offered. Gathered the first time a leg is presented — for the same reason
+        // the far leg's were at offer, the SDP carrying them is the complete list that party will ever
+        // see from us — and re-used after that, since the ports never move.
+        let (near_ice_candidates, far_ice_candidates) = match ice_creds.as_ref() {
+            Some(creds) => (
+                self.leg_candidates(&near, &near_local_candidates, creds)
+                    .await,
+                self.leg_candidates(&far, &far_local_candidates, creds)
+                    .await,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        // RFC 4103 text: relay the stream when it was anchored at offer (both legs hold a text
+        // endpoint) AND both parties kept a matching stream (a non-zero `m=text` port). A party
+        // declining (port 0), or a secure/plaintext mismatch, declines the text in the SDP this answer
+        // presents too (`m=text 0`, RFC 3264 §6) — never bridged. A call turning into a WS leg here
+        // declines any text anchored at offer rather than advertising a text port it will not serve.
+        //
         // Whether A offered a secure (SDES-SRTP) text stream we anchored: both its own text key (A's,
         // from the offer) and the engine's far text key (minted at offer) are present iff we did.
         let a_offered_secure_text =
             near_text_remote_crypto.is_some() && far_text_local_crypto.is_some();
-        // Secure text is accepted only when A offered it AND B answered a secure text stream carrying a
-        // usable `a=crypto` on a non-zero port. A mixed case (A secure / B plaintext, or A plaintext / B
-        // secure) is refused below (declined), never bridged — the "never silently bridge
+        // When A is the one answering (B's re-offer), A must have kept the stream too.
+        let near_kept_text = reversed
+            .as_ref()
+            .is_none_or(|reversed| reversed.near_accepted_text);
+        // Secure text is accepted only when A offered it AND B's SDP carries a secure text stream with
+        // a usable `a=crypto` on a non-zero port. A mixed case (A secure / B plaintext, or A plaintext /
+        // B secure) is refused below (declined), never bridged — the "never silently bridge
         // secure↔insecure" rule (docs/security-and-nat.md Layer 5/5d).
         let secure_text_accepted = !becoming_ws
+            && near_kept_text
             && a_offered_secure_text
             && near.text.is_some()
             && far.text.is_some()
@@ -3924,55 +4561,150 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 text.secure && !text.crypto.is_empty() && text.remote_rtp.port() != 0
             });
         // Plaintext text is accepted only when A did NOT offer secure text (else it would be a downgrade
-        // of A's secure offer) and B answered a plaintext stream on a non-zero port.
+        // of A's secure offer) and B's SDP carries a plaintext stream on a non-zero port.
         let text_accepted = !becoming_ws
+            && near_kept_text
             && !a_offered_secure_text
             && info
                 .text
                 .as_ref()
                 .is_some_and(|text| !text.secure && text.remote_rtp.port() != 0);
-        // The engine's own near text SDES key, minted for the near answer to A (advertised as
-        // `RTP/SAVP` + `a=crypto`), and reused below to build the near text `SecureLeg`.
-        let near_text_local_crypto = if secure_text_accepted {
-            match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+        // The engine's own near text SDES key (RFC 4568), used below to build the near text
+        // `SecureLeg`. Minted for an answer to A, which advertises it as `RTP/SAVP` + `a=crypto`; when
+        // A is answering B's re-offer, A was already shown the stored one and answered against it, so
+        // that one is kept — failing closed rather than keying a stream A cannot decrypt.
+        let near_text_local_crypto = match (reversed.as_ref(), secure_text_accepted) {
+            (_, false) => None,
+            (Some(reversed), true) => match reversed.near_text_local_crypto {
+                Some(crypto) => Some(crypto),
+                None => {
+                    return error_result(
+                        "answer secure text",
+                        &"the re-offer A answered carried no engine near text a=crypto",
+                    )
+                }
+            },
+            (None, true) => match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
                 Ok(crypto) => Some(crypto),
                 Err(error) => return error_result("answer: generate text SDES key", &error),
-            }
-        } else {
-            None
+            },
         };
-        let text_rewrite = if let Some(near_text) = near.text {
-            let near_text_engine = EngineMedia {
-                rtp: near_text.local_addr,
-                rtcp: None,
-                advertised_ip: near.advertised_ip,
-            };
-            if let Some(crypto) = near_text_local_crypto {
-                // Secure text accepted: the near answer advertises `RTP/SAVP` + the engine's own text
-                // `a=crypto` to A (SDES-SRTP text leg). `near_text_local_crypto` is `Some` only when
-                // both near.text and far.text are present (see `secure_text_accepted`).
-                TextRewrite::AnchorSecure {
-                    engine: near_text_engine,
-                    crypto,
+        // The engine's DTLS role on a DTLS-SRTP far leg. Answering B, the engine is the offerer and
+        // takes the complement of B's `a=setup` (RFC 5763 §5): a `passive` peer makes it the client,
+        // anything else the server. A answering B's re-offer makes the engine B's answerer: to
+        // `active` or `passive` it takes the complement (RFC 4145 §4.1), and to `actpass` it keeps the
+        // role in force — a change of negotiated roles is a new association (RFC 8842 §3.1).
+        let dtls_role = match (reversed.as_ref(), info.setup) {
+            (None, Some(sdp::Setup::Passive)) => DtlsRole::Client,
+            (None, _) => DtlsRole::Server,
+            (Some(_), Some(sdp::Setup::Active)) => DtlsRole::Server,
+            (Some(_), Some(sdp::Setup::Passive)) => DtlsRole::Client,
+            (Some(reversed), _) => reversed.far_dtls_role.unwrap_or(DtlsRole::Server),
+        };
+        // RFC 5761: each leg's mux state was fixed at offer — its companion RTCP endpoint exists iff it
+        // is non-muxed. When a `rtcp-mux` directive drove that decision, present it explicitly so the
+        // SDP matches the ports the engine actually bound; otherwise mirror the input (`None`).
+        let mux_directive = !profile.rtcp_mux.is_empty();
+        // A transcoding call sends each party its own codec, so the SDP it is presented must advertise
+        // that codec, never leak the other party's (RFC 3264 §6). A plain relay / SRTP bridge / WS leg
+        // shares one codec across both sides, so its SDP already presents it — left untouched.
+        let presented_codec = match reversed.as_ref() {
+            None => near_codec.as_ref().map(|codec| {
+                (
+                    with_ptime_override(codec, ptime_override),
+                    near_telephone_event,
+                )
+            }),
+            Some(_) => info.primary_codec().map(|codec| {
+                (
+                    with_ptime_override(&codec, ptime_override),
+                    info.telephone_event_payload_type(),
+                )
+            }),
+        };
+        let codec = match presented_codec.as_ref() {
+            Some((codec, telephone_event)) if transcoding => CodecPresentation::Own {
+                codec,
+                telephone_event: *telephone_event,
+            },
+            _ => CodecPresentation::AsReceived,
+        };
+
+        let presentation = match reversed.as_ref() {
+            // B answered: this SDP is delivered to A, so it presents the near leg — with the same
+            // advertised IP the offer picked for it (the near interface's advertised address). On a
+            // secure (SDES or DTLS) far leg A's side is plain.
+            None => LegPresentation {
+                engine: near.engine_media(),
+                ice: answer_ice_rewrite(ice_creds.as_ref(), &near_ice_candidates),
+                security: near_security(far_local_crypto.is_some() || far_dtls),
+                mux_override: mux_directive.then_some(near.rtcp.is_none()),
+                text: if near.text.is_none() {
+                    TextRewrite::None
+                } else if secure_text_accepted {
+                    near.text_anchor(near_text_local_crypto)
+                        .unwrap_or(TextRewrite::Decline)
+                } else if text_accepted && far.text.is_some() {
+                    near.text_anchor(None).unwrap_or(TextRewrite::Decline)
+                } else {
+                    // A was offered text but B did not accept a matching stream (declined, mixed, or
+                    // WS) — decline it back to A (`m=text 0`, RFC 3264 §6), never downgraded or mixed.
+                    TextRewrite::Decline
+                },
+                codec,
+            },
+            // A answered B's re-offer: this SDP is delivered to B, so it presents the far leg as the
+            // original offer did, in an answer's terms — the engine's DTLS role in force rather than
+            // `actpass`, and its own SDES key under the tag of the line B's re-offer is keyed from
+            // (RFC 4568 §5.1.2: the answer echoes the chosen line's tag).
+            Some(reversed) => {
+                let dtls = if far_dtls {
+                    let Some(fingerprint) = self.engine_fingerprint() else {
+                        return error_result("DTLS-SRTP answer", &"engine has no DTLS certificate");
+                    };
+                    Some((fingerprint, setup_for_role(dtls_role)))
+                } else {
+                    None
+                };
+                let under_offered_tag =
+                    |local: CryptoAttribute, offered: Option<&CryptoAttribute>| CryptoAttribute {
+                        tag: offered.map_or(local.tag, |offered| offered.tag),
+                        ..local
+                    };
+                let far_crypto =
+                    far_local_crypto.map(|local| under_offered_tag(local, info.crypto.first()));
+                let far_text_crypto = far_text_local_crypto.map(|local| {
+                    under_offered_tag(
+                        local,
+                        info.text.as_ref().and_then(|text| text.crypto.first()),
+                    )
+                });
+                LegPresentation {
+                    engine: far.engine_media(),
+                    ice: answer_ice_rewrite(ice_creds.as_ref(), &far_ice_candidates),
+                    security: far_security(far_downgraded_to_plain, dtls, far_crypto),
+                    mux_override: mux_directive.then_some(far.rtcp.is_none()),
+                    text: if far.text.is_none() {
+                        // No far text endpoint to anchor A's text to, and passing it through would
+                        // hand B A's own text address.
+                        if reversed.carries_text {
+                            TextRewrite::Decline
+                        } else {
+                            TextRewrite::None
+                        }
+                    } else if secure_text_accepted {
+                        far.text_anchor(far_text_crypto)
+                            .unwrap_or(TextRewrite::Decline)
+                    } else if text_accepted && near.text.is_some() {
+                        far.text_anchor(None).unwrap_or(TextRewrite::Decline)
+                    } else {
+                        TextRewrite::Decline
+                    },
+                    codec,
                 }
-            } else if far.text.is_some() && text_accepted {
-                TextRewrite::Anchor(near_text_engine)
-            } else {
-                // A was offered text but B did not accept a matching stream (declined, mixed, or WS) —
-                // decline it back to A (`m=text 0`, RFC 3264 §6), never downgraded or mixed.
-                TextRewrite::Decline
             }
-        } else {
-            TextRewrite::None
         };
-        let mut rewritten = match sdp::rewrite(
-            sdp,
-            engine,
-            ice_rewrite,
-            security,
-            near_mux_override,
-            text_rewrite,
-        ) {
+        let rewritten = match present_leg(sdp, presentation, &profile.replace, call_id) {
             Ok(rewritten) => rewritten,
             Err(error) => {
                 return CmdResult::Error {
@@ -3980,19 +4712,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 }
             }
         };
-        // rtpengine `replace`: rewrite the o= line to the engine's advertised address (topology
-        // hiding) — the interface's advertised IP, not the bound one. Any other requested token is
-        // surfaced rather than silently ignored (pre-public-review B15).
-        let (replaced_sdp, unsupported_replace) =
-            apply_replace_directives(&rewritten.sdp, &profile.replace, engine.advertised_ip);
-        rewritten.sdp = replaced_sdp;
-        if !unsupported_replace.is_empty() {
-            tracing::warn!(
-                %call_id,
-                tokens = ?unsupported_replace,
-                "ignoring unsupported rtpengine `replace` directive(s); only `origin` is honoured",
-            );
-        }
 
         // WebSocket bridge: if this call is (or is now being) bridged to a WS media server, leg A's
         // audio is already (or now) pumped to the WS — the A↔B relay/transcode path is deliberately
@@ -4066,8 +4785,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     far.remote_rtcp = Some(info.remote_rtcp);
                 }
                 call.pipeline = PipelineKind::Ws;
+                call.far_received_from = far_received_from;
+                call.pending_far_reoffer = None;
+                call.near_local_candidates = near_ice_candidates;
             }
-            return ok_sdp(rewritten.sdp, Some(to_tag));
+            return ok_sdp(rewritten, Some(answer_to_tag));
         }
 
         // ICE applies to a leg only when both ends use it: `near` faces A (which offered ICE iff we
@@ -4127,6 +4849,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &far_remote_ice,
                 ),
             ];
+            // RFC 8445 §6.1.1: the offerer of the exchange controls, unless it is a lite agent, which
+            // never can. B answering: A offered, so A controls the near leg (we control it only when A
+            // is lite), and we offered to B, so we control the far leg either way. A answering B's
+            // re-offer is the same rule the other way round: B controls the far leg unless it is lite,
+            // and we offered B's re-offer to A, so we control the near leg.
+            let (near_controlling, far_controlling) = if reversed.is_some() {
+                (true, info.ice_lite)
+            } else {
+                (near_peer_is_lite, true)
+            };
             // Full RFC 8445 agent, when the operator enabled it and this side's peer gave us both
             // credentials and candidates. It supersedes consent on that side: a full agent runs its
             // own checks, and RFC 7675 consent is what a *lite* agent does instead.
@@ -4136,9 +4868,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &near_remote_ice,
                     &near_remote_candidates,
                     &near_ice_candidates,
-                    // RFC 8445 §6.1.1: the offerer controls. We answered A, so A controls — unless A
-                    // is a lite agent, which can never control (§6.1.1), leaving it to us.
-                    near_peer_is_lite,
+                    near_controlling,
                 ),
                 (
                     if info.is_ice() && !info.ice_mismatch {
@@ -4148,9 +4878,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     },
                     &far_remote_ice,
                     &info.candidates,
-                    &far_local_candidates,
-                    // We offered to B, so we control this leg either way.
-                    true,
+                    &far_ice_candidates,
+                    far_controlling,
                 ),
             ];
             if let Some(agents) = &self.ice_agents {
@@ -4235,22 +4964,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         }
 
-        // Resolve how this call's media is carried: an SRTP bridge (secure far leg), the userspace
-        // media slow path (transcode / record), or the in-datapath plain relay.
-        let pipeline = resolve_pipeline(
-            near_codec.as_ref(),
-            &info,
-            profile,
-            far_local_crypto,
-            far_dtls,
-        );
-        // rtpengine `ptime=<N>` override: force the packetization of the synthesized (transcoded)
-        // egress toward both parties. Overriding the negotiated codec ptime here is the single source
-        // of truth — it flows to the egress encoder's frame size and the repacketizer (the RTP cadence,
-        // RFC 3550 §5.1), to the answer SDP `a=ptime` presented to A, and to the HA snapshot (so a
-        // restore rebuilds at the same ptime). Inert on a plain relay / bridge (which forward RTP
-        // verbatim and never re-encode); only a transcoding pipeline can re-frame.
-        let ptime_override = parse_ptime_override(&profile.flags);
+        // The `ptime=<N>` override (resolved with the pipeline, above) applied to A's codec from here on.
         let near_codec = near_codec.map(|codec| with_ptime_override(&codec, ptime_override));
         // For a passthrough relay, remember the installed forward actions so `block` can flip the
         // endpoints to `Drop` and `unblock` can restore them.
@@ -4314,10 +5028,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     out_dst: near_rtcp_dst.unwrap_or(a_rtcp),
                 });
             }
-            self.bridge.register(BridgeCallPlan {
-                leg: SecureLeg::new(&far_local.key, &far_remote.key),
-                flows,
-            });
+            // RFC 3711 §3.3.1: the rollover counter belongs to the stream, not to the key — both
+            // sides estimate it from the sequence numbers they have seen. This runs again on every
+            // renegotiation of a live call, so a leg rebuilt from the keys alone would restart both
+            // counters at 0 while the peer's keep counting, and every packet past the first sequence
+            // wrap would then authenticate against the wrong index. Carry the live leg's rollover
+            // into the rebuilt one, exactly as an HA restore does — including across a re-key, since
+            // a new master key does not restart the stream's packet index.
+            let previous_rollover = self.bridge.rollover_snapshot(near.rtp.id);
+            let mut leg = SecureLeg::new(&far_local.key, &far_remote.key);
+            if let Some(rollover) = previous_rollover.as_ref() {
+                leg.seed_rollover(rollover);
+            }
+            self.bridge.register(BridgeCallPlan { leg, flows });
         } else if pipeline == PipelineKind::Dtls {
             // DTLS-SRTP far (B) leg → userspace DTLS bridge: the handshake keys the leg, then SRTP/SRTCP
             // is terminated on B and plaintext relayed on A. B's answer must carry its certificate
@@ -4333,18 +5056,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             let Some(a_rtp) = near.remote_rtp else {
                 return error_result("DTLS bridge", &"near leg has no signalled address");
             };
-            // The answerer (B) picks the DTLS role; the engine takes the complement (RFC 5763 §5): a
-            // `passive` peer makes us the client, anything else (active/actpass) makes us the server.
-            let role = match info.setup {
-                Some(sdp::Setup::Passive) => DtlsRole::Client,
-                _ => DtlsRole::Server,
-            };
+            // The engine's role, decided once above (the complement of B's `a=setup`, or the role in
+            // force when A is answering B's re-offer).
+            let role = dtls_role;
             for endpoint in [near.rtp.id, far.rtp.id] {
                 if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
                     return error_result("install DTLS bridge redirect", &error);
                 }
             }
-            self.dtls_bridge().register(DtlsCallPlan {
+            let plan = DtlsCallPlan {
                 plain_endpoint: near.rtp.id,
                 plain_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
                 plain_dst: near_media_dst.unwrap_or(a_rtp),
@@ -4362,7 +5082,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // (RFC 8445 §12). Without one there is no selection coming, and gating would hang a
                 // leg that works perfectly well against its signalled address.
                 gate_on_ice: agent_endpoints.contains(&far.rtp.id),
-            });
+            };
+            // On a renegotiation of a live call, keep the association already running and just
+            // re-point it: B keeps its own (RFC 8842 §5.5 — the fingerprint did not change), so a
+            // fresh registration would wait for a handshake that never comes.
+            if !self.dtls_bridge().renegotiate(&plan) {
+                self.dtls_bridge().register(plan);
+            }
         } else if pipeline == PipelineKind::DtlsMedia {
             // DTLS-SRTP far (B) leg whose media the pipeline must actually see — a different codec
             // per side, or recording / NS / AEC. The DTLS analogue of `SrtpMedia`, with one
@@ -4402,11 +5128,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &"answer carried no usable audio codec",
                 );
             };
-            // The answerer picks the DTLS role; the engine takes the complement (RFC 5763 §5).
-            let role = match info.setup {
-                Some(sdp::Setup::Passive) => DtlsRole::Client,
-                _ => DtlsRole::Server,
-            };
+            // The engine's role, decided once above.
+            let role = dtls_role;
             let record_path = profile
                 .record_call
                 .then(|| profile.record_path.clone())
@@ -4503,28 +5226,34 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
 
             // Now the handshake half: the bridge owns B's endpoint for the demux and keys the actor
             // when it completes.
-            self.dtls_bridge().register_for_pipeline(
-                DtlsCallPlan {
-                    plain_endpoint: near.rtp.id,
-                    plain_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
-                    plain_dst: near_media_dst.unwrap_or(a_rtp),
-                    secure_endpoint: far.rtp.id,
-                    secure_source: bridge_source_filter(profile, far_gate_rtp),
-                    secure_dst: far_media_dst,
-                    secure_local: far.rtp.local_addr,
-                    certificate,
-                    role,
-                    peer_fingerprint: DtlsFingerprint::new(
-                        peer_fingerprint.hash_function,
-                        peer_fingerprint.bytes,
-                    ),
-                    gate_on_ice: agent_endpoints.contains(&far.rtp.id),
-                },
-                crate::dtls_bridge::PipelineTarget::Call {
-                    media: self.media.clone(),
-                    call_id: call_id.to_string(),
-                },
-            );
+            let plan = DtlsCallPlan {
+                plain_endpoint: near.rtp.id,
+                plain_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
+                plain_dst: near_media_dst.unwrap_or(a_rtp),
+                secure_endpoint: far.rtp.id,
+                secure_source: bridge_source_filter(profile, far_gate_rtp),
+                secure_dst: far_media_dst,
+                secure_local: far.rtp.local_addr,
+                certificate,
+                role,
+                peer_fingerprint: DtlsFingerprint::new(
+                    peer_fingerprint.hash_function,
+                    peer_fingerprint.bytes,
+                ),
+                gate_on_ice: agent_endpoints.contains(&far.rtp.id),
+            };
+            // As on the bridge path above: a renegotiation keeps the live association, which also
+            // re-keys the actor this answer just rebuilt (it starts pending, and the handshake that
+            // would key it already happened).
+            if !self.dtls_bridge().renegotiate(&plan) {
+                self.dtls_bridge().register_for_pipeline(
+                    plan,
+                    crate::dtls_bridge::PipelineTarget::Call {
+                        media: self.media.clone(),
+                        call_id: call_id.to_string(),
+                    },
+                );
+            }
         } else if pipeline == PipelineKind::SrtpMedia {
             // Secure (RTP/SAVP) far (B) leg whose codec differs from the plaintext near (A) leg:
             // the media actor decrypts B's SRTP, transcodes, and encrypts toward B (and the reverse),
@@ -4609,7 +5338,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     return error_result("install secure media redirect", &error);
                 }
             }
-            let leg = Arc::new(Mutex::new(SecureLeg::new(&far_local.key, &far_remote.key)));
+            // Carry the live actor's SRTP rollover into the rebuilt leg (RFC 3711 §3.3.1) — see the
+            // `Srtp` branch above; a renegotiation must not restart either counter at 0.
+            let mut secure_leg = SecureLeg::new(&far_local.key, &far_remote.key);
+            if let Some(rollover) = self.media.rollover_snapshot(call_id) {
+                secure_leg.seed_rollover(&rollover);
+            }
+            let leg = Arc::new(Mutex::new(secure_leg));
 
             // Non-muxed companion RTCP: redirect both RTCP endpoints into the actor and relay them
             // through the shared SecureLeg — A's RTCP encrypted toward secure B, B's SRTCP decrypted
@@ -4930,12 +5665,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // One `SecureLeg` per text leg (its own SDES keys), each shared by both directions —
                     // exactly as the audio bridge shares a leg's contexts (single-owner actor ⇒ the
                     // `Mutex` is uncontended).
-                    let near_leg = Arc::new(Mutex::new(SecureLeg::new(
-                        &near_local.key,
-                        &near_remote.key,
-                    )));
-                    let far_leg =
-                        Arc::new(Mutex::new(SecureLeg::new(&far_local.key, &far_remote.key)));
+                    // Carry the live legs' SRTP rollover into the rebuilt ones (RFC 3711 §3.3.1) — a
+                    // renegotiation re-registers the text actor, and restarting either counter at 0
+                    // breaks a stream that has already run past a sequence wrap, exactly as it does
+                    // on the audio legs above.
+                    let previous_rollover = self.text.rollover_snapshots(call_id);
+                    let mut near_secure = SecureLeg::new(&near_local.key, &near_remote.key);
+                    let mut far_secure = SecureLeg::new(&far_local.key, &far_remote.key);
+                    if let Some((near_rollover, far_rollover)) = previous_rollover.as_ref() {
+                        near_secure.seed_rollover(near_rollover);
+                        far_secure.seed_rollover(far_rollover);
+                    }
+                    let near_leg = Arc::new(Mutex::new(near_secure));
+                    let far_leg = Arc::new(Mutex::new(far_secure));
                     // Redirect both text endpoints so the dispatcher routes them to the text actor.
                     for endpoint in [near_text.id, far_text.id] {
                         if let Err(error) =
@@ -5012,10 +5754,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.text_secure = secure_text_registered;
             if secure_text_registered {
                 call.text_promotion_reasons.insert(PromotionReason::Secure);
-                // Keep the engine's own near text SDES key (the one advertised to A in this answer) so an
-                // RFC 8839 §5.4 ICE-restart re-offer re-presents the SAME `a=crypto` to A, never minting a
-                // new one (RFC 4568). `near_text_local_crypto` is always `Some` once the secure text leg
-                // registered.
+                // Keep the engine's own near text SDES key (the one advertised to A in this answer) so a
+                // re-offer from B re-presents the SAME `a=crypto` to A, never minting a new one (RFC
+                // 4568). `near_text_local_crypto` is always `Some` once the secure text leg registered.
                 call.near_text_local_crypto = near_text_local_crypto;
             }
             // The peer's SDES key (secure answer), kept so an HA checkpoint can re-key the bridge.
@@ -5023,6 +5764,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // B's ICE credentials from its answer — what an outbound consent check to B is addressed
             // and signed with (RFC 8445 §7.1.2).
             call.far_remote_ice = peer_ice_credentials(&info);
+            // B's hint as this answer resolved it, for the next renegotiation to keep or refresh.
+            call.far_received_from = far_received_from;
+            // What A has now been shown for the near leg, re-presented on a re-offer from B.
+            call.near_local_candidates = near_ice_candidates;
+            if far_dtls {
+                call.far_dtls_role = Some(dtls_role);
+            }
+            // This answer completes whatever exchange was outstanding.
+            call.pending_far_reoffer = None;
         }
 
         // Text observability trigger: if the controller asked for control-plane text events and a
@@ -5031,35 +5781,31 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // independently at `start recording`. Best-effort — a promotion failure is logged and the call
         // still relays text in-kernel (PR-1 behaviour).
         self.maybe_promote_text_for_events(call_id).await;
-        // Answer-side codec presentation: on a transcoding call (Media / SrtpMedia) the engine sends
-        // A its *own* negotiated codec, so the answer relayed to A must advertise A's codec, never
-        // leak B's (RFC 3264 §6). A plain relay / SRTP bridge / WS leg shares one codec across both
-        // sides, so its answer already presents A's codec — leave those byte-for-byte untouched.
-        if matches!(pipeline, PipelineKind::Media | PipelineKind::SrtpMedia) {
-            if let Some(near_codec) = near_codec.as_ref() {
-                rewritten.sdp =
-                    sdp::force_answer_codec(&rewritten.sdp, near_codec, near_telephone_event);
-            }
-        }
         // Media-plane lifecycle: negotiation is complete — the call now relays or transcodes. The
         // pipeline kind tells an operator at a glance how the media is handled (Media/SrtpMedia
         // transcode, SRTP bridge, WS leg, or a plain Passthrough relay). Pairs with "call created".
+        // `answered_by` is `near` when A answered a re-offer from B.
         let near_codec_name = near_codec
             .as_ref()
             .map(|codec| codec.encoding_name.as_str())
             .unwrap_or("-");
         let far_codec_name = info.primary_codec().map(|codec| codec.encoding_name);
+        let (answered_by, answerer) = match reversed {
+            Some(_) => (Party::Near, near.remote_rtp),
+            None => (Party::Far, Some(info.remote_rtp)),
+        };
         tracing::info!(
             target: "siphon_rtp::media",
             call_id = %call_id,
             to_tag = %to_tag,
-            answerer = %info.remote_rtp,
+            answered_by = answered_by.label(),
+            answerer = %answerer.map_or_else(|| "-".to_string(), |address| address.to_string()),
             near_codec = near_codec_name,
             far_codec = far_codec_name.as_deref().unwrap_or("-"),
             pipeline = ?pipeline,
             "answer applied"
         );
-        ok_sdp(rewritten.sdp, Some(to_tag))
+        ok_sdp(rewritten, Some(answer_to_tag))
     }
 
     async fn delete(&self, client: ClientId, call_id: &str) -> CmdResult {
@@ -6062,7 +6808,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_remote_ice: None,
                 near_remote_candidates: Vec::new(),
                 near_peer_is_lite: false,
+                // Neither leg's gathered candidates are in the snapshot. A re-offer on a restored ICE
+                // call gathers them again — host candidates on the same ports come out the same.
                 far_local_candidates: Vec::new(),
+                near_local_candidates: Vec::new(),
                 from_tag: snapshot.from_tag,
                 to_tag: snapshot.to_tag,
                 near,
@@ -6075,6 +6824,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_remote_crypto,
                 // A DTLS-SRTP call is never restored (rejected above), so it is always plaintext/SDES here.
                 far_dtls: false,
+                far_dtls_role: None,
+                // Not in the snapshot. A `dtls: off` far leg is plaintext on the wire, so a restored
+                // one relays correctly; a later re-offer from A mirrors A's transport to B instead of
+                // forcing `RTP/AVP` — the same gap the other un-snapshotted presentation state has.
+                far_downgraded_to_plain: false,
                 // A restored call is a plaintext or SDES *far* leg; the offerer's own posture is
                 // not in the snapshot and a restored call is never re-answered.
                 near_secure: false,
@@ -6097,8 +6851,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 promotion_reasons: HashSet::new(),
                 // The source gate is reconstructed from the snapshot's per-flow `accepted_source`
                 // (which already folded in any `received-from` at the original answer), so the raw
-                // hint is not needed on the restored node.
+                // hint is not needed on the restored node — for either leg.
                 offer_received_from: None,
+                far_received_from: None,
+                pending_far_reoffer: None,
                 // Single-leg IVR calls are not part of the proven HA-restore set, and the CN PT is not
                 // carried in the snapshot; a restored single-leg leg degrades to audio-encoded comfort
                 // noise. 2-leg (relay/bridge/transcode) restores never use this.
@@ -21549,6 +22305,80 @@ mod tests {
         assert!(!parsed.is_ice(), "far offer carries no ICE");
     }
 
+    /// A DTLS-SRTP answer from B at `addr` advertising one codec, with `peer`'s fingerprint and the
+    /// `setup` role given — enough to drive the control path without running a handshake.
+    fn dtls_answer_sdp(
+        addr: SocketAddr,
+        payload_type: u8,
+        name: &str,
+        peer: &siphon_rtp_dtls::DtlsCertificate,
+        setup: sdp::Setup,
+    ) -> String {
+        let fingerprint = peer.fingerprint();
+        let fingerprint = sdp::Fingerprint {
+            hash_function: fingerprint.hash_function,
+            bytes: fingerprint.bytes,
+        };
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVPF {pt}\r\na=rtpmap:{pt} {name}/8000\r\na=rtcp-mux\r\n\
+             a=setup:{setup}\r\na={fingerprint}\r\n",
+            ip = addr.ip(),
+            port = addr.port(),
+            pt = payload_type,
+            setup = setup.token(),
+            fingerprint = fingerprint.to_attribute_value(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transcoding_dtls_call_answers_a_with_its_own_codec() {
+        // RFC 3264 §6: on a transcoding call each party is answered with the codec it will actually
+        // receive. That held for the plaintext and SDES transcode pipelines but not the DTLS one, so a
+        // WebRTC leg answering a different codec had its codec relayed back to A — which A never
+        // offered, and never receives, because the engine transcodes.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let peer = siphon_rtp_dtls::DtlsCertificate::generate().expect("peer cert");
+        offer_from_a(
+            &engine,
+            "dtls-xcode",
+            sdp_single_codec(addr_a, 0, "PCMU"),
+            ProfileFlags {
+                transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let answered = answer_from_b(
+            &engine,
+            "dtls-xcode",
+            dtls_answer_sdp(addr_b, 8, "PCMA", &peer, sdp::Setup::Active),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        assert_eq!(
+            engine.calls.get("dtls-xcode").map(|call| call.pipeline),
+            Some(PipelineKind::DtlsMedia),
+            "a codec mismatch on a DTLS far leg takes the media pipeline"
+        );
+        assert_eq!(
+            answered.primary_codec().map(|codec| codec.encoding_name),
+            Some("PCMU".to_string()),
+            "A is answered with its own codec"
+        );
+        assert_eq!(answered.payload_types, vec![0], "and only that codec");
+        assert!(
+            !answered
+                .rtpmaps
+                .iter()
+                .any(|map| map.encoding_name.eq_ignore_ascii_case("PCMA")),
+            "B's codec is never leaked to A"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dtls_srtp_offer_answer_bridges_media_end_to_end() {
         use crate::srtp_bridge::run_redirect_dispatcher;
@@ -23583,7 +24413,7 @@ mod tests {
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let (phone_a, addr_a) = phone().await;
         let (phone_b, addr_b) = phone().await;
-        engine
+        let offer = engine
             .handle(
                 CLIENT,
                 Command::Offer {
@@ -23594,6 +24424,9 @@ mod tests {
                 },
             )
             .await;
+        // The re-offer is delivered to B, so the reference is the last SDP B received from the
+        // engine: the original offer (RFC 3264 §8), not the answer A was sent.
+        let before = sdp::parse(&ok_sdp_text(&offer)).expect("parse").remote_rtp;
         let answer = engine
             .handle(
                 CLIENT,
@@ -23606,7 +24439,7 @@ mod tests {
                 },
             )
             .await;
-        let before = sdp::parse(&ok_sdp_text(&answer)).expect("parse").remote_rtp;
+        let answered = sdp::parse(&ok_sdp_text(&answer)).expect("parse").remote_rtp;
 
         let reoffer = engine
             .handle(
@@ -23625,7 +24458,11 @@ mod tests {
 
         assert_eq!(
             after, before,
-            "the re-offer re-advertises the same media port"
+            "the re-offer re-advertises the same far port B was offered"
+        );
+        assert_ne!(
+            after, answered,
+            "and never the near port, which is A's socket"
         );
         assert_eq!(
             engine.session_count(),
@@ -23633,14 +24470,9 @@ mod tests {
             "and does not create a second call"
         );
 
-        // Media still relays across the renegotiation, in both directions.
-        let far_rtp = engine
-            .calls
-            .get("re")
-            .map(|call| call.far_leg().rtp.local_addr)
-            .expect("call");
+        // Media still relays across the renegotiation, with B sending where the re-offer told it.
         phone_b
-            .send_to(&rtp(0x0B0B_0B0B), far_rtp)
+            .send_to(&rtp(0x0B0B_0B0B), after)
             .await
             .expect("send from B");
         let mut buffer = [0u8; 2048];
@@ -23688,14 +24520,14 @@ mod tests {
         // RFC 8839 §5.4 / RFC 4103: a re-offer re-advertises the SAME endpoints (ports do not move), so a
         // negotiated `m=text` stream MUST be re-anchored to the engine's existing text port — never passed
         // through pointing at the UE's own (often private) address, the exact leak the offer/answer path
-        // already closes.
+        // already closes. The re-offer is delivered to B, so the port is the FAR text port B was offered.
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let (_phone_a_audio, addr_a_audio) = phone().await;
         let (_phone_a_text, addr_a_text) = phone().await;
         let (_phone_b_audio, addr_b_audio) = phone().await;
         let (_phone_b_text, addr_b_text) = phone().await;
 
-        engine
+        let offer = engine
             .handle(
                 CLIENT,
                 Command::Offer {
@@ -23706,6 +24538,12 @@ mod tests {
                 },
             )
             .await;
+        // Ground truth: the engine's far text port, advertised to B in the offer.
+        let engine_far_text = sdp::parse(&ok_sdp_text(&offer))
+            .expect("parse offer")
+            .text
+            .expect("offer anchored an m=text")
+            .remote_rtp;
         let answer = engine
             .handle(
                 CLIENT,
@@ -23718,7 +24556,7 @@ mod tests {
                 },
             )
             .await;
-        // Ground truth: the engine text port advertised back to A in the answer.
+        // The engine text port advertised back to A in the answer — A's socket, never shown to B.
         let engine_near_text = sdp::parse(&ok_sdp_text(&answer))
             .expect("parse answer")
             .text
@@ -23742,8 +24580,12 @@ mod tests {
             .text
             .expect("re-offer re-anchored the m=text");
         assert_eq!(
+            text.remote_rtp, engine_far_text,
+            "the re-offer re-anchors m=text to the engine's far text port, as the offer did"
+        );
+        assert_ne!(
             text.remote_rtp, engine_near_text,
-            "the re-offer re-anchors m=text to the engine text port"
+            "and never presents B the near text port, which is A's"
         );
         assert_ne!(
             text.remote_rtp, addr_a_text,
@@ -23758,8 +24600,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reoffer_reanchors_a_secure_text_stream_re_presenting_the_same_engine_crypto() {
         // RFC 8839 §5.4 / RFC 4568: a secure (SDES-SRTP) `m=text` re-offer re-anchors to the engine text
-        // port AND re-advertises the engine's OWN stored near text `a=crypto` (the key minted at answer) —
-        // the same key A already holds, never a freshly minted one.
+        // port AND re-advertises the engine's OWN stored text `a=crypto` — the same key the recipient
+        // already holds, never a freshly minted one. The re-offer is delivered to B, so that is the FAR
+        // text port and the far text key B was given at offer. The near key protects the engine's text
+        // toward A: handing it to B would give B the key to A's stream.
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let (_phone_a_audio, addr_a_audio) = phone().await;
         let (_phone_a_text, addr_a_text) = phone().await;
@@ -23772,7 +24616,7 @@ mod tests {
         let b_text_key =
             CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen b");
 
-        engine
+        let offer = engine
             .handle(
                 CLIENT,
                 Command::Offer {
@@ -23783,6 +24627,17 @@ mod tests {
                 },
             )
             .await;
+        let offer_text = sdp::parse(&ok_sdp_text(&offer))
+            .expect("parse offer")
+            .text
+            .expect("offer anchored a secure m=text");
+        assert!(offer_text.secure, "the offer advertised RTP/SAVP text to B");
+        let engine_far_text = offer_text.remote_rtp;
+        let engine_far_text_key = offer_text
+            .crypto
+            .first()
+            .copied()
+            .expect("offer advertised the engine's far text a=crypto");
         let answer = engine
             .handle(
                 CLIENT,
@@ -23826,8 +24681,12 @@ mod tests {
             .expect("re-offer re-anchored the secure m=text");
         assert!(text.secure, "the re-offer re-advertises RTP/SAVP text");
         assert_eq!(
+            text.remote_rtp, engine_far_text,
+            "the re-offer re-anchors secure m=text to the engine's far text port"
+        );
+        assert_ne!(
             text.remote_rtp, engine_near_text,
-            "the re-offer re-anchors secure m=text to the engine text port"
+            "and never presents B the near text port"
         );
         let reoffer_text_key = text
             .crypto
@@ -23835,8 +24694,12 @@ mod tests {
             .copied()
             .expect("re-offer advertised a text a=crypto");
         assert_eq!(
+            reoffer_text_key.key, engine_far_text_key.key,
+            "the re-offer re-presents the SAME far text key B was offered, not a freshly minted one"
+        );
+        assert_ne!(
             reoffer_text_key.key, engine_near_text_key.key,
-            "the re-offer re-presents the SAME engine near text key, not a freshly minted one"
+            "and never the near text key, which protects the engine's text toward A"
         );
         assert_ne!(
             reoffer_text_key.key, a_text_key.key,
@@ -23912,7 +24775,7 @@ mod tests {
         let engine = Engine::new(UdpLoopbackDatapath::new()).with_full_ice();
         let (phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
-        engine
+        let offer = engine
             .handle(
                 CLIENT,
                 Command::Offer {
@@ -23923,6 +24786,8 @@ mod tests {
                 },
             )
             .await;
+        // What B was offered: the reference a re-offer delivered to B is judged against.
+        let offered = sdp::parse(&ok_sdp_text(&offer)).expect("parse offer");
         let answer = engine
             .handle(
                 CLIENT,
@@ -23978,8 +24843,15 @@ mod tests {
             "a restart advertises fresh local credentials (RFC 8445 §9.1.1.1)"
         );
         assert!(restarted.ice_pwd.is_some());
-        // The ports are unchanged even across a restart — that is what keeps media flowing.
-        assert_eq!(restarted.remote_rtp, first.remote_rtp);
+        // The ports are unchanged even across a restart — that is what keeps media flowing. The
+        // re-offer goes to B, so they are the far ports B was offered, candidates included.
+        assert_eq!(restarted.remote_rtp, offered.remote_rtp);
+        assert_ne!(restarted.remote_rtp, first.remote_rtp);
+        assert_eq!(
+            candidate_addresses(&restarted),
+            candidate_addresses(&offered),
+            "the restart re-presents the far leg's candidates, as the offer did"
+        );
         // And the peer's new credentials are what the leg now expects.
         let stored = engine
             .calls
@@ -24130,6 +25002,1454 @@ mod tests {
             }
             other => panic!("a codec change must be refused, got {other:?}"),
         }
+    }
+
+    // ---- a re-offer presents the leg facing the party it is delivered to -------------------------
+    //
+    // RFC 3264 §8: a re-offer modifies the SDP its *recipient* last received. The controller forwards
+    // the engine's rewritten re-offer to the other party, so the SDP must present the leg facing that
+    // party — the far leg for a re-offer from A, the near leg for one from B — exactly as the original
+    // offer and answer did. Every test below has the recipient act on the SDP it was actually sent,
+    // never on engine state, because that is the one thing a real peer does.
+
+    /// The `(component, address)` of every candidate an SDP carries, in order.
+    fn candidate_addresses(info: &sdp::MediaInfo) -> Vec<(u16, SocketAddr)> {
+        info.candidates
+            .iter()
+            .map(|candidate| (candidate.component, candidate.address))
+            .collect()
+    }
+
+    /// `offer` from A (tag `a`) and return the rewritten SDP delivered to B.
+    async fn offer_from_a(
+        engine: &Engine<UdpLoopbackDatapath>,
+        call_id: &str,
+        sdp: String,
+        profile: ProfileFlags,
+    ) -> sdp::MediaInfo {
+        let offer = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    sdp,
+                    profile,
+                },
+            )
+            .await;
+        sdp::parse(&ok_sdp_text(&offer)).expect("parse the offer B receives")
+    }
+
+    /// `answer` from B (tags `a` → `b`) and return the rewritten SDP delivered to A.
+    async fn answer_from_b(
+        engine: &Engine<UdpLoopbackDatapath>,
+        call_id: &str,
+        sdp: String,
+        profile: ProfileFlags,
+    ) -> sdp::MediaInfo {
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "a".into(),
+                    to_tag: "b".into(),
+                    sdp,
+                    profile,
+                },
+            )
+            .await;
+        sdp::parse(&ok_sdp_text(&answer)).expect("parse the answer A receives")
+    }
+
+    /// `reoffer` from the party whose tag is `tag`.
+    async fn reoffer_from(
+        engine: &Engine<UdpLoopbackDatapath>,
+        call_id: &str,
+        tag: &str,
+        sdp: String,
+        profile: ProfileFlags,
+    ) -> CmdResult {
+        engine
+            .handle(
+                CLIENT,
+                Command::Reoffer {
+                    call_id: call_id.into(),
+                    from_tag: tag.into(),
+                    sdp,
+                    profile,
+                },
+            )
+            .await
+    }
+
+    /// Assert nothing arrives on `socket` within a short window.
+    async fn assert_silent(socket: &UdpSocket, why: &str) {
+        let mut scratch = [0u8; 2048];
+        assert!(
+            timeout(Duration::from_millis(150), socket.recv_from(&mut scratch))
+                .await
+                .is_err(),
+            "{why}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_a_on_a_new_port_lets_b_reach_a_through_the_far_leg() {
+        // A two-party plain relay. A moves its RTP port and re-offers the same session (RFC 3264 §8);
+        // B answers the re-offer unchanged and starts sending where it was told. The engine used to
+        // present the re-offer with the near leg — A's own socket — so B's media landed on A's leg
+        // from an address that is not A's, the near source gate dropped all of it, and A heard
+        // nothing for the rest of the call while B heard A fine.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a_before, addr_a_before) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+
+        let offered = offer_from_a(
+            &engine,
+            "moved",
+            sdp_for(addr_a_before, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        let answered = answer_from_b(
+            &engine,
+            "moved",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let reoffer = reoffer_from(
+            &engine,
+            "moved",
+            "a",
+            sdp_for(addr_a, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        let presented = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse the re-offer B receives");
+        assert_eq!(
+            presented.remote_rtp, offered.remote_rtp,
+            "B is re-offered the far port it was offered, not A's near port"
+        );
+        // B answers the re-offer with its SDP unchanged, as the peer in this scenario does.
+        answer_from_b(
+            &engine,
+            "moved",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        // B sends where the re-offer told it to, and A — now on its new port — hears it.
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), presented.remote_rtp)
+            .await
+            .expect("send from B");
+        let (data, _) = recv(&phone_a).await;
+        assert_eq!(data, rtp(0x0B0B_0B0B), "A hears B after the re-offer");
+
+        // A's own audio from its new port still reaches B.
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), answered.remote_rtp)
+            .await
+            .expect("send from A");
+        let (data, _) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A), "B hears A after the re-offer");
+
+        // And the fix did not come from loosening the gate: B's address sending into A's leg is still
+        // dropped, and relays to nobody.
+        phone_b
+            .send_to(&rtp(0x0BAD_0BAD), answered.remote_rtp)
+            .await
+            .expect("send from B into the near leg");
+        assert_silent(&phone_a, "B's media on A's leg must not reach A").await;
+        assert_silent(&phone_b, "B's media on A's leg must not be relayed at all").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_a_presents_the_original_offers_far_endpoints() {
+        // Non-muxed, so the RTCP port is presented too. The re-offer must match what B was offered in
+        // `c=`, `m=audio` and `a=rtcp`, and differ from what A was answered.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offered = offer_from_a(
+            &engine,
+            "rtcp",
+            sdp_for(addr_a, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        let answered = answer_from_b(
+            &engine,
+            "rtcp",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let reoffer = reoffer_from(
+            &engine,
+            "rtcp",
+            "a",
+            sdp_for(addr_a, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        let presented = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse re-offer");
+        assert_eq!(presented.remote_rtp, offered.remote_rtp);
+        assert_eq!(presented.remote_rtcp, offered.remote_rtcp);
+        assert_ne!(presented.remote_rtp, answered.remote_rtp);
+        assert_ne!(presented.remote_rtcp, answered.remote_rtcp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_a_carries_the_far_interfaces_advertised_address() {
+        // Per-leg named interfaces (rtpengine `direction`): near on `internal`, far on `external`, which
+        // binds 127.0.0.2 but advertises 127.0.0.3. The re-offer goes to B, so it carries the external
+        // advertised address — never the internal one A was answered with.
+        let table = InterfaceTable::from_entries(
+            vec![
+                crate::interface::InterfaceEntry::new(
+                    "internal",
+                    "127.0.0.1".parse().expect("ip"),
+                    None,
+                ),
+                crate::interface::InterfaceEntry::new(
+                    "external",
+                    "127.0.0.2".parse().expect("ip"),
+                    Some("127.0.0.3".parse().expect("ip")),
+                ),
+            ],
+            None,
+        )
+        .expect("interface table");
+        let engine = Engine::new(UdpLoopbackDatapath::new()).with_interfaces(table);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let profile = ProfileFlags {
+            direction: vec!["internal".into(), "external".into()],
+            ..Default::default()
+        };
+        let offered = offer_from_a(&engine, "dir", sdp_for(addr_a, false), profile.clone()).await;
+        assert_eq!(
+            offered.remote_rtp.ip(),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3))
+        );
+        answer_from_b(&engine, "dir", sdp_for(addr_b, false), profile.clone()).await;
+
+        let reoffer = reoffer_from(&engine, "dir", "a", sdp_for(addr_a, false), profile).await;
+        let text = ok_sdp_text(&reoffer);
+        assert!(
+            text.contains("c=IN IP4 127.0.0.3"),
+            "the re-offer carries the far interface's advertised address: {text}"
+        );
+        assert_eq!(
+            sdp::parse(&text).expect("parse").remote_rtp,
+            offered.remote_rtp
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_a_carries_the_far_legs_ice_candidates() {
+        // Without a restart: the same credentials, and the far leg's candidates exactly as the offer
+        // presented them — not the near leg's, which are what A was answered with.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offered = offer_from_a(
+            &engine,
+            "ice-cands",
+            ice_offer_with_candidate(addr_a),
+            ProfileFlags::default(),
+        )
+        .await;
+        assert!(
+            !offered.candidates.is_empty(),
+            "the offer re-originated ICE"
+        );
+        let answered = answer_from_b(
+            &engine,
+            "ice-cands",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let reoffer = reoffer_from(
+            &engine,
+            "ice-cands",
+            "a",
+            reoffer_sdp(addr_a, A_UFRAG, A_PWD),
+            ProfileFlags::default(),
+        )
+        .await;
+        let presented = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse re-offer");
+        assert_eq!(
+            candidate_addresses(&presented),
+            candidate_addresses(&offered)
+        );
+        assert_ne!(
+            candidate_addresses(&presented),
+            candidate_addresses(&answered)
+        );
+        assert_eq!(
+            presented.ice_ufrag, offered.ice_ufrag,
+            "no restart, no churn"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_a_re_presents_an_sdes_far_leg_with_the_same_engine_key() {
+        // A secure (SDES, RFC 4568) far leg: B was offered `RTP/SAVP` and the engine's own `a=crypto`.
+        // A's plaintext re-offer must reach B the same way — passing A's plain transport through would
+        // tell B to drop SRTP mid-call.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let profile = ProfileFlags {
+            transport_protocol: Some("RTP/SAVP".into()),
+            ..Default::default()
+        };
+        let offered = offer_from_a(&engine, "sdes", sdp_for(addr_a, true), profile.clone()).await;
+        let engine_key = *offered.crypto.first().expect("engine a=crypto to B");
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        answer_from_b(
+            &engine,
+            "sdes",
+            savp_answer_sdp(addr_b, &b_key),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let reoffer = reoffer_from(&engine, "sdes", "a", sdp_for(addr_a, true), profile).await;
+        let presented = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse re-offer");
+        assert!(presented.secure, "the re-offer keeps B on RTP/SAVP");
+        assert!(!presented.dtls);
+        assert_eq!(presented.crypto.len(), 1, "one key, the engine's");
+        assert_eq!(
+            presented.crypto[0].key, engine_key.key,
+            "the same engine key B was offered"
+        );
+        assert_eq!(presented.remote_rtp, offered.remote_rtp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_a_re_presents_a_dtls_far_leg_with_the_same_fingerprint() {
+        // A DTLS-SRTP far leg (RFC 5764). A subsequent offer that keeps the association carries the
+        // same fingerprint and `a=setup:actpass` (RFC 8842 §5.5 — the offer's role is always actpass;
+        // what signals "same association" is the unchanged fingerprint).
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let profile = ProfileFlags {
+            transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+            ..Default::default()
+        };
+        let offered = offer_from_a(&engine, "dtls", sdp_for(addr_a, true), profile.clone()).await;
+        let engine_fingerprint = offered.fingerprint.clone().expect("engine a=fingerprint");
+        let peer = siphon_rtp_dtls::DtlsCertificate::generate().expect("peer cert");
+        let peer_fingerprint = sdp::Fingerprint {
+            hash_function: peer.fingerprint().hash_function,
+            bytes: peer.fingerprint().bytes,
+        };
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+             a=setup:active\r\na={fingerprint}\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+            fingerprint = peer_fingerprint.to_attribute_value(),
+        );
+        answer_from_b(&engine, "dtls", answer_sdp, ProfileFlags::default()).await;
+
+        let reoffer = reoffer_from(&engine, "dtls", "a", sdp_for(addr_a, true), profile).await;
+        let presented = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse re-offer");
+        assert!(presented.dtls, "the re-offer keeps B on UDP/TLS/RTP/SAVPF");
+        assert_eq!(
+            presented.fingerprint,
+            Some(engine_fingerprint),
+            "the same engine fingerprint B was offered"
+        );
+        assert_eq!(presented.setup, Some(sdp::Setup::Actpass));
+        assert!(presented.crypto.is_empty(), "no SDES keying on a DTLS leg");
+        assert_eq!(presented.remote_rtp, offered.remote_rtp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_a_applies_the_rtcp_mux_directive_and_codec_policy_as_the_offer_did() {
+        // A muxes, but the `rtcp-mux: demux` directive bound the far leg non-muxed; and `codec-mask`
+        // took PCMA out of what B was offered. The re-offer must present B the same.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let profile = ProfileFlags {
+            rtcp_mux: vec!["demux".into()],
+            flags: vec!["codec-mask-PCMA".into()],
+            ..Default::default()
+        };
+        let offered = offer_from_a(&engine, "policy", sdp_for(addr_a, true), profile.clone()).await;
+        assert!(!offered.rtcp_mux, "the far leg was offered demuxed");
+        assert_eq!(offered.payload_types, vec![0], "PCMA masked from B");
+        answer_from_b(
+            &engine,
+            "policy",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let reoffer = reoffer_from(&engine, "policy", "a", sdp_for(addr_a, true), profile).await;
+        let presented = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse re-offer");
+        assert!(!presented.rtcp_mux, "the re-offer keeps B demuxed");
+        assert_eq!(presented.remote_rtcp, offered.remote_rtcp);
+        assert_eq!(presented.payload_types, offered.payload_types);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_b_presents_the_near_leg_and_the_reversed_answer_the_far_leg() {
+        // B (the answerer of the original offer) re-INVITEs from a new port. The engine records it on
+        // the far leg and presents A the near leg — exactly what A was answered with. A's answer comes
+        // back with the tags reversed and is presented to B on the far leg — exactly what B was offered.
+        // Then each party sends where its own SDP told it, and both directions flow.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (_phone_b_before, addr_b_before) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let offered = offer_from_a(
+            &engine,
+            "from-b",
+            sdp_for(addr_a, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        let answered = answer_from_b(
+            &engine,
+            "from-b",
+            sdp_for(addr_b_before, false),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let reoffer = reoffer_from(
+            &engine,
+            "from-b",
+            "b",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        let to_a = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse the re-offer A receives");
+        assert_eq!(to_a.remote_rtp, answered.remote_rtp, "A sees the near leg");
+        assert_eq!(to_a.remote_rtcp, answered.remote_rtcp);
+        assert_eq!(
+            engine
+                .calls
+                .get("from-b")
+                .and_then(|call| call.far_leg().remote_rtp),
+            Some(addr_b),
+            "B's new address is recorded on the far leg"
+        );
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "from-b".into(),
+                    from_tag: "b".into(),
+                    to_tag: "a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let to_b = sdp::parse(&ok_sdp_text(&answer)).expect("parse the answer B receives");
+        assert_eq!(to_b.remote_rtp, offered.remote_rtp, "B sees the far leg");
+        assert_eq!(to_b.remote_rtcp, offered.remote_rtcp);
+        {
+            let call = engine.calls.get("from-b").expect("call");
+            assert_eq!(call.from_tag, "a", "the dialog's tags are not swapped");
+            assert_eq!(call.to_tag.as_deref(), Some("b"));
+        }
+
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), to_a.remote_rtp)
+            .await
+            .expect("send from A");
+        let (data, _) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A), "B hears A on its new port");
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), to_b.remote_rtp)
+            .await
+            .expect("send from B");
+        let (data, _) = recv(&phone_a).await;
+        assert_eq!(data, rtp(0x0B0B_0B0B), "A hears B");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_b_on_a_transcoded_call_keeps_each_party_on_its_own_codec() {
+        // The common B-side re-offer is a session refresh that restates B's codec. On a transcoded call
+        // A must be shown its own codec, never B's (RFC 3264 §6 — A negotiated PCMU and the engine
+        // transcodes), and A's answer must reach B as B's codec. The call stays a transcode.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        // A offers PCMU and PCMA; the mask holds A on PCMU and offers B PCMA alone (the same shape as
+        // `codec_mask_still_holds_the_near_leg_on_the_masked_codec`).
+        let profile = ProfileFlags {
+            flags: vec!["codec-mask-PCMU".into()],
+            ..Default::default()
+        };
+        let offered = offer_from_a(&engine, "transcoded", sdp_for(addr_a, true), profile).await;
+        assert_eq!(offered.payload_types, vec![8], "B is offered PCMA only");
+        answer_from_b(
+            &engine,
+            "transcoded",
+            sdp_single_codec(addr_b, 8, "PCMA"),
+            ProfileFlags::default(),
+        )
+        .await;
+        assert_eq!(
+            engine.calls.get("transcoded").map(|call| call.pipeline),
+            Some(PipelineKind::Media)
+        );
+
+        let reoffer = reoffer_from(
+            &engine,
+            "transcoded",
+            "b",
+            sdp_single_codec(addr_b, 8, "PCMA"),
+            ProfileFlags::default(),
+        )
+        .await;
+        let to_a = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse re-offer to A");
+        assert_eq!(
+            to_a.primary_codec().map(|codec| codec.encoding_name),
+            Some("PCMU".to_string()),
+            "A is shown its own codec"
+        );
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "transcoded".into(),
+                    from_tag: "b".into(),
+                    to_tag: "a".into(),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let to_b = sdp::parse(&ok_sdp_text(&answer)).expect("parse answer to B");
+        assert_eq!(
+            to_b.primary_codec().map(|codec| codec.encoding_name),
+            Some("PCMA".to_string()),
+            "B is shown its own codec"
+        );
+        let call = engine.calls.get("transcoded").expect("call");
+        assert_eq!(call.pipeline, PipelineKind::Media, "still a transcode");
+        assert_eq!(
+            call.near_codec
+                .as_ref()
+                .map(|codec| codec.encoding_name.as_str()),
+            Some("PCMU")
+        );
+        assert_eq!(
+            call.far_codec
+                .as_ref()
+                .map(|codec| codec.encoding_name.as_str()),
+            Some("PCMA")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_b_re_presents_the_near_text_key_to_a_and_the_far_one_to_b() {
+        // The secure-text key leak, the other way round: B's re-offer goes to A, so it carries the near
+        // text key A was answered with, and A's answer goes to B with the far text key B was offered.
+        // Neither party is ever handed the key that protects the engine's text toward the other.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a_audio, addr_a_audio) = phone().await;
+        let (_phone_a_text, addr_a_text) = phone().await;
+        let (_phone_b_audio, addr_b_audio) = phone().await;
+        let (_phone_b_text, addr_b_text) = phone().await;
+        let a_text_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen a");
+        let b_text_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen b");
+        let offered = offer_from_a(
+            &engine,
+            "sec-rtt-from-b",
+            audio_secure_text_sdp(addr_a_audio, addr_a_text, &a_text_key),
+            ProfileFlags::default(),
+        )
+        .await;
+        let far_text = offered.text.expect("offer anchored secure text");
+        let answered = answer_from_b(
+            &engine,
+            "sec-rtt-from-b",
+            audio_secure_text_sdp(addr_b_audio, addr_b_text, &b_text_key),
+            ProfileFlags::default(),
+        )
+        .await;
+        let near_text = answered.text.expect("answer anchored secure text");
+
+        let reoffer = reoffer_from(
+            &engine,
+            "sec-rtt-from-b",
+            "b",
+            audio_secure_text_sdp(addr_b_audio, addr_b_text, &b_text_key),
+            ProfileFlags::default(),
+        )
+        .await;
+        let to_a = sdp::parse(&ok_sdp_text(&reoffer))
+            .expect("parse re-offer to A")
+            .text
+            .expect("text re-anchored");
+        assert!(to_a.secure);
+        assert_eq!(to_a.remote_rtp, near_text.remote_rtp, "A's own text port");
+        assert_eq!(to_a.crypto[0].key, near_text.crypto[0].key, "A's own key");
+        assert_ne!(to_a.crypto[0].key, far_text.crypto[0].key, "never B's");
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "sec-rtt-from-b".into(),
+                    from_tag: "b".into(),
+                    to_tag: "a".into(),
+                    sdp: audio_secure_text_sdp(addr_a_audio, addr_a_text, &a_text_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let to_b = sdp::parse(&ok_sdp_text(&answer))
+            .expect("parse answer to B")
+            .text
+            .expect("text anchored");
+        assert!(to_b.secure);
+        assert_eq!(to_b.remote_rtp, far_text.remote_rtp, "B's own text port");
+        assert_eq!(to_b.crypto[0].key, far_text.crypto[0].key, "B's own key");
+        assert_ne!(to_b.crypto[0].key, near_text.crypto[0].key, "never A's");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_b_keeps_an_sdes_far_leg_secure_or_is_refused() {
+        // B's re-offer on an SDES far leg: A is shown its plaintext near leg, and A's answer reaches B
+        // as `RTP/SAVP` with the engine's own far key under the tag B offered (RFC 4568 §5.1.2). A
+        // re-offer from B that drops SRTP is refused — never bridged in the clear.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let profile = ProfileFlags {
+            transport_protocol: Some("RTP/SAVP".into()),
+            ..Default::default()
+        };
+        let offered = offer_from_a(&engine, "sdes-from-b", sdp_for(addr_a, true), profile).await;
+        let engine_key = offered.crypto[0];
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answered = answer_from_b(
+            &engine,
+            "sdes-from-b",
+            savp_answer_sdp(addr_b, &b_key),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let downgrade = reoffer_from(
+            &engine,
+            "sdes-from-b",
+            "b",
+            sdp_for(addr_b, true),
+            ProfileFlags::default(),
+        )
+        .await;
+        match downgrade {
+            CmdResult::Error { reason } => assert!(reason.contains("SDES"), "{reason}"),
+            other => panic!("a re-offer dropping SRTP must be refused, got {other:?}"),
+        }
+
+        // B re-keys under another tag: allowed (RFC 4568 §5.1.4), answered under B's tag.
+        let b_new_key =
+            CryptoAttribute::generate(2, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let reoffer = reoffer_from(
+            &engine,
+            "sdes-from-b",
+            "b",
+            savp_answer_sdp(addr_b, &b_new_key),
+            ProfileFlags::default(),
+        )
+        .await;
+        let to_a = sdp::parse(&ok_sdp_text(&reoffer)).expect("parse re-offer to A");
+        assert!(!to_a.secure, "A's side of an SDES bridge is plaintext");
+        assert!(to_a.crypto.is_empty(), "and never carries B's key");
+        assert_eq!(to_a.remote_rtp, answered.remote_rtp);
+
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "sdes-from-b".into(),
+                    from_tag: "b".into(),
+                    to_tag: "a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let to_b = sdp::parse(&ok_sdp_text(&answer)).expect("parse answer to B");
+        assert!(to_b.secure, "B stays on RTP/SAVP");
+        assert_eq!(to_b.crypto.len(), 1);
+        assert_eq!(to_b.crypto[0].key, engine_key.key, "the engine's far key");
+        assert_eq!(to_b.crypto[0].tag, 2, "under the tag B's re-offer used");
+        assert_eq!(to_b.remote_rtp, offered.remote_rtp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dtls_leg_keeps_its_association_across_a_renegotiation() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        // RFC 8842 §5.5: a subsequent offer carrying the same fingerprint tells the peer to keep the
+        // DTLS association it already has, so it does not handshake again. The engine's answer re-run
+        // rebuilt the bridge from nothing — dropping the keyed leg and waiting for a handshake that
+        // never comes — so any renegotiation of a DTLS call (a session refresh, hold, an ICE restart)
+        // silently ended its media while every counter still read healthy. Only a changed fingerprint
+        // or role is a new association (RFC 8842 §3.1), and that case is the second half of this test.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let peer_b = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind b"),
+        );
+        let addr_b = peer_b.local_addr().expect("addr b");
+        let profile = ProfileFlags {
+            transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+            ..Default::default()
+        };
+        let offered = offer_from_a(
+            &engine,
+            "dtls-reneg",
+            sdp_for(addr_a, true),
+            profile.clone(),
+        )
+        .await;
+        let engine_fingerprint = offered.fingerprint.clone().expect("engine a=fingerprint");
+        let engine_far = offered.remote_rtp;
+        let peer_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("peer cert");
+        answer_from_b(
+            &engine,
+            "dtls-reneg",
+            dtls_answer_sdp(addr_b, 0, "PCMU", &peer_cert, sdp::Setup::Active),
+            ProfileFlags::default(),
+        )
+        .await;
+        let mut peer_leg = peer_dtls_handshake(
+            peer_b.clone(),
+            addr_b,
+            engine_far,
+            &peer_cert,
+            &engine_fingerprint,
+        )
+        .await;
+
+        // One protected packet from B, relayed to A as plaintext. Every attempt carries a fresh
+        // sequence number: SRTP replay protection (RFC 3711 §3.3.2) rejects a repeat, and a real peer
+        // never sends one. Retried to absorb the window between B finishing its handshake and the
+        // engine installing the leg.
+        let mut sequence = 100u16;
+        let mut protect_next = |peer_leg: &mut siphon_rtp_srtp::leg::SecureLeg| {
+            sequence = sequence.wrapping_add(1);
+            let media = rtp_packet(sequence, 0x0B0B_0B0B);
+            let mut sealed = Vec::new();
+            peer_leg
+                .protect(&media, &mut sealed)
+                .expect("peer protects");
+            (media, sealed)
+        };
+        let mut relayed = None;
+        for _ in 0..25 {
+            let (media, sealed) = protect_next(&mut peer_leg);
+            peer_b.send_to(&sealed, engine_far).await.expect("b sends");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                relayed = Some((buffer[..len].to_vec(), media));
+                break;
+            }
+        }
+        let (relayed, expected) =
+            relayed.expect("A receives B's media once the handshake completes");
+        assert_eq!(relayed, expected);
+
+        // The renegotiation: A re-offers, B answers with the same fingerprint and role — and, like a
+        // real peer, does not handshake again.
+        reoffer_from(
+            &engine,
+            "dtls-reneg",
+            "a",
+            sdp_for(addr_a, true),
+            profile.clone(),
+        )
+        .await;
+        answer_from_b(
+            &engine,
+            "dtls-reneg",
+            dtls_answer_sdp(addr_b, 0, "PCMU", &peer_cert, sdp::Setup::Active),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let mut relayed = None;
+        for _ in 0..25 {
+            let (media, sealed) = protect_next(&mut peer_leg);
+            peer_b.send_to(&sealed, engine_far).await.expect("b sends");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                relayed = Some((buffer[..len].to_vec(), media));
+                break;
+            }
+        }
+        let (relayed, expected) =
+            relayed.expect("the association survived the renegotiation, with no second handshake");
+        assert_eq!(relayed, expected);
+
+        // A different peer certificate *is* a new association (RFC 8842 §3.1): the old leg's media
+        // stops being relayed, because the engine is now waiting for the handshake that goes with it.
+        let other_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("second peer cert");
+        reoffer_from(&engine, "dtls-reneg", "a", sdp_for(addr_a, true), profile).await;
+        answer_from_b(
+            &engine,
+            "dtls-reneg",
+            dtls_answer_sdp(addr_b, 0, "PCMU", &other_cert, sdp::Setup::Active),
+            ProfileFlags::default(),
+        )
+        .await;
+        let (_, sealed) = protect_next(&mut peer_leg);
+        peer_b.send_to(&sealed, engine_far).await.expect("b sends");
+        assert_silent(
+            &phone_a,
+            "a changed fingerprint starts a new association, so the old leg's media is dropped",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transcoding_dtls_leg_is_re_keyed_when_its_answer_rebuilds_its_actor() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+
+        // The other half of keeping a DTLS association: on a leg whose media goes through the
+        // transcode pipeline, the answer rebuilds the media actor, and a rebuilt actor starts
+        // *pending* — it drops media until a key arrives. The handshake that produced that key already
+        // happened and will not happen again, so the kept association has to hand the rebuilt actor
+        // the same leg. Without that the call is silent from the renegotiation onward.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let peer_b = Arc::new(
+            UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+                .await
+                .expect("bind b"),
+        );
+        let addr_b = peer_b.local_addr().expect("addr b");
+        let profile = ProfileFlags {
+            transport_protocol: Some("UDP/TLS/RTP/SAVPF".into()),
+            ..Default::default()
+        };
+        // A on PCMU, B on PCMA: a codec mismatch on a DTLS far leg is what takes the media pipeline.
+        let offered = offer_from_a(
+            &engine,
+            "dtls-xcode-reneg",
+            sdp_single_codec(addr_a, 0, "PCMU"),
+            profile.clone(),
+        )
+        .await;
+        let engine_fingerprint = offered.fingerprint.clone().expect("engine a=fingerprint");
+        let engine_far = offered.remote_rtp;
+        let peer_cert = siphon_rtp_dtls::DtlsCertificate::generate().expect("peer cert");
+        answer_from_b(
+            &engine,
+            "dtls-xcode-reneg",
+            dtls_answer_sdp(addr_b, 8, "PCMA", &peer_cert, sdp::Setup::Active),
+            ProfileFlags::default(),
+        )
+        .await;
+        assert_eq!(
+            engine
+                .calls
+                .get("dtls-xcode-reneg")
+                .map(|call| call.pipeline),
+            Some(PipelineKind::DtlsMedia)
+        );
+        let mut peer_leg = peer_dtls_handshake(
+            peer_b.clone(),
+            addr_b,
+            engine_far,
+            &peer_cert,
+            &engine_fingerprint,
+        )
+        .await;
+
+        // A full 20 ms A-law frame per attempt, so the transcoder has something to re-encode, each
+        // with a fresh sequence number (SRTP replay, RFC 3711 §3.3.2).
+        let mut sequence = 200u16;
+        let mut protect_next = |peer_leg: &mut siphon_rtp_srtp::leg::SecureLeg| {
+            sequence = sequence.wrapping_add(1);
+            let mut media = vec![0x80, 8];
+            media.extend_from_slice(&sequence.to_be_bytes());
+            media.extend_from_slice(&u32::from(sequence).to_be_bytes());
+            media.extend_from_slice(&0x0B0B_0B0Bu32.to_be_bytes());
+            media.extend_from_slice(&[0xD5; 160]);
+            let mut sealed = Vec::new();
+            peer_leg
+                .protect(&media, &mut sealed)
+                .expect("peer protects");
+            sealed
+        };
+        // The transcoded egress reaches A as PCMU (payload type 0), which is only possible once the
+        // actor holds the key.
+        let mut transcoded = None;
+        for _ in 0..25 {
+            let sealed = protect_next(&mut peer_leg);
+            peer_b.send_to(&sealed, engine_far).await.expect("b sends");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                transcoded = Some(buffer[..len].to_vec());
+                break;
+            }
+        }
+        let relayed =
+            transcoded.expect("A receives the transcoded stream once the handshake keys it");
+        assert_eq!(relayed[1] & 0x7f, 0, "re-encoded to A's PCMU");
+
+        // The renegotiation rebuilds the actor; the association (and its key) must carry over.
+        reoffer_from(
+            &engine,
+            "dtls-xcode-reneg",
+            "a",
+            sdp_single_codec(addr_a, 0, "PCMU"),
+            profile,
+        )
+        .await;
+        answer_from_b(
+            &engine,
+            "dtls-xcode-reneg",
+            dtls_answer_sdp(addr_b, 8, "PCMA", &peer_cert, sdp::Setup::Active),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let mut transcoded = None;
+        for _ in 0..25 {
+            let sealed = protect_next(&mut peer_leg);
+            peer_b.send_to(&sealed, engine_far).await.expect("b sends");
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(150), phone_a.recv_from(&mut buffer)).await
+            {
+                transcoded = Some(buffer[..len].to_vec());
+                break;
+            }
+        }
+        let relayed =
+            transcoded.expect("the rebuilt actor was re-keyed with the association's own leg");
+        assert_eq!(relayed[1] & 0x7f, 0, "still re-encoded to A's PCMU");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_sdes_bridge_keeps_its_srtp_rollover_across_a_renegotiation() {
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::SrtpContext;
+
+        // RFC 3711 §3.3.1: the rollover counter belongs to the *stream*, not to the key — each side
+        // estimates it from the sequence numbers it has seen. An answer re-run on a live call (what
+        // every renegotiation does here) rebuilt the leg's SRTP contexts from the keys alone, which
+        // restarts both counters at 0 while the peer's keep counting, so every packet after that
+        // authenticates against the wrong index and the call goes silent in both directions. It only
+        // bites once a call has run past a sequence wrap — about 21 minutes at a 20 ms ptime, which is
+        // squarely inside session-timer territory.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        let profile = ProfileFlags {
+            transport_protocol: Some("RTP/SAVP".into()),
+            ..Default::default()
+        };
+        let offered =
+            offer_from_a(&engine, "srtp-roc", sdp_for(addr_a, true), profile.clone()).await;
+        let engine_far_key = offered.crypto[0];
+        let b_key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("gen");
+        let answered = answer_from_b(
+            &engine,
+            "srtp-roc",
+            savp_answer_sdp(addr_b, &b_key),
+            ProfileFlags::default(),
+        )
+        .await;
+        let engine_near = answered.remote_rtp;
+        let engine_far = offered.remote_rtp;
+
+        // B's own contexts: it decrypts the engine's stream with the engine's key and encrypts with
+        // its own — the mapping `SecureLeg::new` pins.
+        let mut b_inbound = SrtpContext::from_key_material(&engine_far_key.key);
+        let mut b_outbound = SrtpContext::from_key_material(&b_key.key);
+        // Run both directions across a sequence-number wrap, so every counter involved is at 1.
+        for sequence in [65_534u16, 65_535, 0, 1] {
+            let from_a = rtp_packet(sequence, 0x0A0A_0A0A);
+            phone_a
+                .send_to(&from_a, engine_near)
+                .await
+                .expect("A sends");
+            let (sealed, _) = recv(&phone_b).await;
+            let mut plain = Vec::new();
+            b_inbound
+                .unprotect(&sealed, &mut plain)
+                .expect("B decrypts the engine's stream");
+            assert_eq!(plain, from_a);
+
+            let from_b = rtp_packet(sequence, 0x0B0B_0B0B);
+            let mut sealed_b = Vec::new();
+            b_outbound
+                .protect(&from_b, &mut sealed_b)
+                .expect("B protects");
+            phone_b
+                .send_to(&sealed_b, engine_far)
+                .await
+                .expect("B sends");
+            let (relayed, _) = recv(&phone_a).await;
+            assert_eq!(relayed, from_b);
+        }
+
+        // The renegotiation: A re-offers, B answers with the key it already had.
+        reoffer_from(&engine, "srtp-roc", "a", sdp_for(addr_a, true), profile).await;
+        answer_from_b(
+            &engine,
+            "srtp-roc",
+            savp_answer_sdp(addr_b, &b_key),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        // Both directions still authenticate, so the leg continued its rollover rather than restarting.
+        let from_a = rtp_packet(2, 0x0A0A_0A0A);
+        phone_a
+            .send_to(&from_a, engine_near)
+            .await
+            .expect("A sends");
+        let (sealed, _) = recv(&phone_b).await;
+        let mut plain = Vec::new();
+        b_inbound
+            .unprotect(&sealed, &mut plain)
+            .expect("B still decrypts the engine's stream after the renegotiation");
+        assert_eq!(plain, from_a);
+
+        let from_b = rtp_packet(2, 0x0B0B_0B0B);
+        let mut sealed_b = Vec::new();
+        b_outbound
+            .protect(&from_b, &mut sealed_b)
+            .expect("B protects");
+        phone_b
+            .send_to(&sealed_b, engine_far)
+            .await
+            .expect("B sends");
+        let (relayed, _) = recv(&phone_a).await;
+        assert_eq!(
+            relayed, from_b,
+            "the engine still decrypts B's stream after the renegotiation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_on_a_locally_answered_call_presents_the_callers_only_leg() {
+        // `answer_local` owns one leg, and its caller reaches it: a re-offer from the caller can only
+        // present that leg.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "ivr".into(),
+                    from_tag: "a".into(),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let answered = sdp::parse(&ok_sdp_text(&answered)).expect("parse local answer");
+        let reoffer = reoffer_from(
+            &engine,
+            "ivr",
+            "a",
+            sdp_single_codec(addr_a, 0, "PCMU"),
+            ProfileFlags::default(),
+        )
+        .await;
+        assert_eq!(
+            sdp::parse(&ok_sdp_text(&reoffer))
+                .expect("parse re-offer")
+                .remote_rtp,
+            answered.remote_rtp
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_is_refused_for_an_unknown_tag_another_client_or_b_before_an_answer() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        offer_from_a(
+            &engine,
+            "tags",
+            sdp_for(addr_a, false),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        // No answered B yet, so there is no B to re-offer from.
+        let early = reoffer_from(
+            &engine,
+            "tags",
+            "b",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        assert!(matches!(early, CmdResult::Error { .. }), "{early:?}");
+
+        answer_from_b(
+            &engine,
+            "tags",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        let stranger = reoffer_from(
+            &engine,
+            "tags",
+            "c",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        match stranger {
+            CmdResult::Error { reason } => assert!(reason.contains("unknown"), "{reason}"),
+            other => panic!("an unknown tag must be refused, got {other:?}"),
+        }
+        let intruder = engine
+            .handle(
+                ClientId(99),
+                Command::Reoffer {
+                    call_id: "tags".into(),
+                    from_tag: "b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        assert!(matches!(intruder, CmdResult::Error { .. }), "{intruder:?}");
+
+        // B cannot silently switch codec either: the guard applies to whichever party re-offers.
+        let switched = reoffer_from(
+            &engine,
+            "tags",
+            "b",
+            sdp_single_codec(addr_b, 8, "PCMA"),
+            ProfileFlags::default(),
+        )
+        .await;
+        match switched {
+            CmdResult::Error { reason } => assert!(reason.contains("codec"), "{reason}"),
+            other => panic!("a codec change from B must be refused, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reversed_answer_with_no_reoffer_from_b_outstanding_is_refused_and_changes_nothing() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let (_phone_x, addr_x) = phone().await;
+        offer_from_a(
+            &engine,
+            "stray",
+            sdp_for(addr_a, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        answer_from_b(
+            &engine,
+            "stray",
+            sdp_for(addr_b, false),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        let stray = || Command::Answer {
+            call_id: "stray".into(),
+            from_tag: "b".into(),
+            to_tag: "a".into(),
+            sdp: sdp_for(addr_x, false),
+            profile: ProfileFlags::default(),
+        };
+        let refused = engine.handle(CLIENT, stray()).await;
+        assert!(matches!(refused, CmdResult::Error { .. }), "{refused:?}");
+
+        // A re-offer from A is outstanding, not one from B: still refused.
+        reoffer_from(
+            &engine,
+            "stray",
+            "a",
+            sdp_for(addr_a, false),
+            ProfileFlags::default(),
+        )
+        .await;
+        let refused = engine.handle(CLIENT, stray()).await;
+        assert!(matches!(refused, CmdResult::Error { .. }), "{refused:?}");
+
+        let call = engine.calls.get("stray").expect("call");
+        assert_eq!(call.near.remote_rtp, Some(addr_a), "A's leg untouched");
+        assert_eq!(call.far_leg().remote_rtp, Some(addr_b), "B's leg untouched");
+        assert_eq!(call.from_tag, "a");
+        assert_eq!(call.to_tag.as_deref(), Some("b"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_a_new_public_address_moves_the_near_gate_with_it() {
+        // A NATed app switches network: new public address, new private `c=`. The re-offer's
+        // `received-from` is the proxy-observed new source and must replace the stored hint, or the
+        // answer rebuilds the near gate as (old public IP, new port) and every packet from the new
+        // address is dropped.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a_before, addr_a_before) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 4)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        offer_from_a(
+            &engine,
+            "roam-a",
+            sdp_with_conn(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                addr_a_before.port(),
+                0,
+                "PCMU",
+            ),
+            ProfileFlags {
+                received_from: Some(addr_a_before.ip()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let answered = answer_from_b(
+            &engine,
+            "roam-a",
+            sdp_single_codec(addr_b, 0, "PCMU"),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        reoffer_from(
+            &engine,
+            "roam-a",
+            "a",
+            sdp_with_conn(
+                IpAddr::V4(Ipv4Addr::new(10, 1, 0, 2)),
+                addr_a.port(),
+                0,
+                "PCMU",
+            ),
+            ProfileFlags {
+                received_from: Some(addr_a.ip()),
+                ..Default::default()
+            },
+        )
+        .await;
+        answer_from_b(
+            &engine,
+            "roam-a",
+            sdp_single_codec(addr_b, 0, "PCMU"),
+            ProfileFlags::default(),
+        )
+        .await;
+
+        phone_a_before
+            .send_to(&rtp(0x0101_0101), answered.remote_rtp)
+            .await
+            .expect("send from the old address");
+        assert_silent(&phone_b, "the old public address no longer passes the gate").await;
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), answered.remote_rtp)
+            .await
+            .expect("send from the new address");
+        let (data, _) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A), "the new public address is relayed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reoffer_from_b_on_a_new_public_address_moves_the_far_gate_with_it() {
+        // The same, for B: its answer's hint is stored, and its re-offer's hint replaces it.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b_before, addr_b_before) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 5)).await;
+        let offered = offer_from_a(
+            &engine,
+            "roam-b",
+            sdp_single_codec(addr_a, 0, "PCMU"),
+            ProfileFlags::default(),
+        )
+        .await;
+        answer_from_b(
+            &engine,
+            "roam-b",
+            sdp_with_conn(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+                addr_b_before.port(),
+                0,
+                "PCMU",
+            ),
+            ProfileFlags {
+                received_from: Some(addr_b_before.ip()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let reoffer = reoffer_from(
+            &engine,
+            "roam-b",
+            "b",
+            sdp_with_conn(
+                IpAddr::V4(Ipv4Addr::new(10, 1, 0, 3)),
+                addr_b.port(),
+                0,
+                "PCMU",
+            ),
+            ProfileFlags {
+                received_from: Some(addr_b.ip()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(matches!(reoffer, CmdResult::Ok { .. }), "{reoffer:?}");
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "roam-b".into(),
+                    from_tag: "b".into(),
+                    to_tag: "a".into(),
+                    sdp: sdp_single_codec(addr_a, 0, "PCMU"),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        assert!(matches!(answer, CmdResult::Ok { .. }), "{answer:?}");
+
+        phone_b_before
+            .send_to(&rtp(0x0101_0101), offered.remote_rtp)
+            .await
+            .expect("send from the old address");
+        assert_silent(&phone_a, "B's old public address no longer passes the gate").await;
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), offered.remote_rtp)
+            .await
+            .expect("send from the new address");
+        let (data, _) = recv(&phone_a).await;
+        assert_eq!(data, rtp(0x0B0B_0B0B), "B's new public address is relayed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renegotiation_without_received_from_keeps_each_stored_hint() {
+        // Both parties NATed behind private `c=` addresses, each hint supplied once. A re-offer without
+        // a hint, and B's answer to it without one, must keep gating each party to its public address
+        // rather than falling back to the private one it signalled.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (phone_a, addr_a) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+        let (phone_b, addr_b) = phone_at(Ipv4Addr::new(127, 0, 0, 3)).await;
+        let a_sdp = || {
+            sdp_with_conn(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                addr_a.port(),
+                0,
+                "PCMU",
+            )
+        };
+        let b_sdp = || {
+            sdp_with_conn(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+                addr_b.port(),
+                0,
+                "PCMU",
+            )
+        };
+        let offered = offer_from_a(
+            &engine,
+            "keep-hints",
+            a_sdp(),
+            ProfileFlags {
+                received_from: Some(addr_a.ip()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let answered = answer_from_b(
+            &engine,
+            "keep-hints",
+            b_sdp(),
+            ProfileFlags {
+                received_from: Some(addr_b.ip()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        reoffer_from(&engine, "keep-hints", "a", a_sdp(), ProfileFlags::default()).await;
+        answer_from_b(&engine, "keep-hints", b_sdp(), ProfileFlags::default()).await;
+
+        phone_a
+            .send_to(&rtp(0x0A0A_0A0A), answered.remote_rtp)
+            .await
+            .expect("send from A");
+        let (data, _) = recv(&phone_b).await;
+        assert_eq!(data, rtp(0x0A0A_0A0A), "A still passes its gate");
+        phone_b
+            .send_to(&rtp(0x0B0B_0B0B), offered.remote_rtp)
+            .await
+            .expect("send from B");
+        let (data, _) = recv(&phone_a).await;
+        assert_eq!(data, rtp(0x0B0B_0B0B), "B still passes its gate");
     }
 
     // ---- duplicate offer on a live call-id -------------------------------------------------------
