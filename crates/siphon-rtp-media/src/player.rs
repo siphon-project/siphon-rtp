@@ -168,6 +168,34 @@ fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 
+/// How many times a [`PcmPlayer`] plays its body.
+///
+/// The exact twin of [`crate::tone::ToneRepeat`], and deliberately so: a tone has been able to play
+/// until stopped since it was introduced (the `*inf` cadence suffix), while a recorded prompt could
+/// only ever count passes. Music on hold, queue music and park music all play for an unbounded time,
+/// and approximating that with a large finite count leaves an audible gap at every re-issue and puts
+/// a per-caller timer in the controller for something the player already does internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcmRepeat {
+    /// A fixed number of passes. `0` and `1` both mean once, which is what `repeat_times` has always
+    /// meant on the wire.
+    Times(u32),
+    /// Endless — the prompt plays until it is stopped, or until the playback's duration cap expires.
+    Forever,
+}
+
+impl PcmRepeat {
+    /// Total passes to perform, or `None` when endless.
+    #[must_use]
+    fn total_plays(self) -> Option<u32> {
+        match self {
+            // `0`/`1` both mean once: `repeat_times` is a *total play count*, not a repeat count.
+            PcmRepeat::Times(times) => Some(times.max(1)),
+            PcmRepeat::Forever => None,
+        }
+    }
+}
+
 /// Serves decoded PCM as fixed-size mono frames on demand, with looping and seek.
 ///
 /// The player downmixes multi-channel sources to mono (channel average) and yields one frame per
@@ -180,20 +208,22 @@ pub struct PcmPlayer {
     sample_rate_hz: u32,
     /// Read cursor into `mono` (per-channel sample index).
     position: usize,
-    /// How many times the body has been played so far.
+    /// How many times the body has been played so far. Saturates rather than wrapping on an endless
+    /// play, where it is never compared against a total.
     plays_done: u32,
-    /// Total plays to perform; 0 or 1 means play once.
-    repeat_times: u32,
+    /// How many times to play the body.
+    repeat: PcmRepeat,
     /// The first sample index a fresh loop rewinds to (the seek point persists across loops).
     loop_start: usize,
 }
 
 impl PcmPlayer {
-    /// Build a player over a parsed [`WavSource`], downmixing to mono. `repeat_times` is the total
-    /// number of plays (`0` or `1` = play once); `start_pos_ms` seeks into the body before the
-    /// first frame (and is where each loop rewinds to). A seek past the end yields no frames.
+    /// Build a player over a parsed [`WavSource`], downmixing to mono. `repeat` is how many passes to
+    /// perform ([`PcmRepeat::Forever`] to play until stopped); `start_pos_ms` seeks into the body
+    /// before the first frame (and is where each loop rewinds to). A seek past the end yields no
+    /// frames — including for an endless play, which must not spin on a body it can never advance in.
     #[must_use]
-    pub fn new(source: &WavSource, repeat_times: u32, start_pos_ms: u32) -> Self {
+    pub fn new(source: &WavSource, repeat: PcmRepeat, start_pos_ms: u32) -> Self {
         let channels = source.channels().max(1) as usize;
         let frame_count = source.samples().len() / channels;
         let mut mono = Vec::with_capacity(frame_count);
@@ -212,7 +242,7 @@ impl PcmPlayer {
             sample_rate_hz,
             position: loop_start,
             plays_done: 0,
-            repeat_times,
+            repeat,
             loop_start,
         }
     }
@@ -229,48 +259,74 @@ impl PcmPlayer {
         self.mono.len()
     }
 
-    /// Total plays this player will perform (`0`/`1` both mean once).
+    /// Total passes this player will perform, or `None` when it plays until stopped.
     #[must_use]
-    fn total_plays(&self) -> u32 {
-        self.repeat_times.max(1)
+    fn total_plays(&self) -> Option<u32> {
+        self.repeat.total_plays()
+    }
+
+    /// Whether an endless play can actually produce frames. A body that is empty, or whose seek point
+    /// sits at or past the end, can never advance — so it is exhausted immediately rather than looping
+    /// forever over nothing.
+    #[must_use]
+    fn body_can_advance(&self) -> bool {
+        !self.mono.is_empty() && self.loop_start < self.mono.len()
     }
 
     /// Total playout duration in milliseconds for the whole prompt, measured from the current
-    /// position — what a blocking `play_media` reports as `duration_ms` when it drains. Each pass
-    /// rewinds to the seek point (`loop_start`), so the remaining time is the tail of the current
-    /// pass plus every full pass still to come. Zero for an empty body or an unknown rate.
+    /// position — what a `play_media` accept reports as `duration_ms`. Each pass rewinds to the seek
+    /// point (`loop_start`), so the remaining time is the tail of the current pass plus every full
+    /// pass still to come. Zero for an empty body or an unknown rate.
+    ///
+    /// `None` for a [`PcmRepeat::Forever`] prompt that can actually advance: such a play has no
+    /// duration to report, and the accept carries no `duration_ms` — the same answer a `*inf` tone
+    /// already gives ([`crate::playback::PlaybackSource::total_duration_ms`]).
     #[must_use]
-    pub fn duration_ms(&self) -> u64 {
+    pub fn duration_ms(&self) -> Option<u64> {
         if self.mono.is_empty() || self.sample_rate_hz == 0 {
-            return 0;
+            return Some(0);
         }
-        let total_plays = u64::from(self.total_plays());
+        // An endless play over a body that cannot advance is over before it starts, so it reports a
+        // duration (zero) rather than "endless" — otherwise the accept would promise a bed that never
+        // plays a sample and never finishes.
+        let Some(total_plays) = self.total_plays() else {
+            return if self.body_can_advance() {
+                None
+            } else {
+                Some(0)
+            };
+        };
+        let total_plays = u64::from(total_plays);
         let played = u64::from(self.plays_done).min(total_plays);
         let tail_of_pass = self.mono.len().saturating_sub(self.position) as u64;
         let full_passes_left = total_plays.saturating_sub(played + 1);
         let per_pass = self.mono.len().saturating_sub(self.loop_start) as u64;
         let samples = tail_of_pass + full_passes_left * per_pass;
-        samples * 1000 / u64::from(self.sample_rate_hz)
+        Some(samples * 1000 / u64::from(self.sample_rate_hz))
     }
 
     /// Whether the player has produced its last frame and will only yield `None` from now on.
     #[must_use]
     pub fn is_exhausted(&self) -> bool {
+        let Some(total_plays) = self.total_plays() else {
+            // Endless: only a body it can never advance in is exhausted.
+            return !self.body_can_advance();
+        };
         self.mono.is_empty()
-            || (self.plays_done >= self.total_plays())
-            || (self.plays_done + 1 >= self.total_plays() && self.position >= self.mono.len())
+            || (self.plays_done >= total_plays)
+            || (self.plays_done + 1 >= total_plays && self.position >= self.mono.len())
     }
 
     /// Pull the next mono frame into `out`, returning the number of samples written, or `None` when
     /// exhausted. A short final frame is zero-padded to `out.len()` and the produced count reflects
-    /// only the real samples. Loops up to `repeat_times`, rewinding to the seek point each pass.
+    /// only the real samples. Loops per [`PcmPlayer::repeat`], rewinding to the seek point each pass.
     pub fn next_frame(&mut self, out: &mut [i16]) -> Option<usize> {
         if out.is_empty() {
             return None;
         }
         let total_plays = self.total_plays();
         loop {
-            if self.plays_done >= total_plays {
+            if total_plays.is_some_and(|total| self.plays_done >= total) {
                 return None;
             }
             if self.position < self.mono.len() {
@@ -282,14 +338,16 @@ impl PcmPlayer {
                 self.position += take;
                 return Some(take);
             }
-            // Reached the end of this pass — start the next loop, or finish.
-            self.plays_done += 1;
-            if self.plays_done >= total_plays {
+            // Reached the end of this pass — start the next loop, or finish. Saturating because an
+            // endless play never compares this against a total and must not wrap after 4.3 billion
+            // passes (a 20 ms prompt would reach that in under three years of continuous hold).
+            self.plays_done = self.plays_done.saturating_add(1);
+            if total_plays.is_some_and(|total| self.plays_done >= total) {
                 return None;
             }
             self.position = self.loop_start;
             // An empty body (or a loop_start at the very end) can never advance — bail to avoid
-            // spinning forever.
+            // spinning forever. Load-bearing for an endless play, whose loop has no other exit.
             if self.position >= self.mono.len() {
                 return None;
             }
@@ -492,7 +550,7 @@ mod tests {
     #[test]
     fn pulls_frames_then_exhausts() {
         let source = five_sample_source();
-        let mut player = PcmPlayer::new(&source, 1, 0);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(1), 0);
         let mut out = [0i16; 2];
         assert_eq!(player.next_frame(&mut out), Some(2));
         assert_eq!(out, [10, 20]);
@@ -510,7 +568,7 @@ mod tests {
     fn repeats_the_body_n_times() {
         let source = five_sample_source();
         // Play twice, frame size 5 so each pass is one frame.
-        let mut player = PcmPlayer::new(&source, 2, 0);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(2), 0);
         let mut out = [0i16; 5];
         assert_eq!(player.next_frame(&mut out), Some(5));
         assert_eq!(out, [10, 20, 30, 40, 50]);
@@ -524,10 +582,75 @@ mod tests {
     #[test]
     fn repeat_zero_plays_once() {
         let source = five_sample_source();
-        let mut player = PcmPlayer::new(&source, 0, 0);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(0), 0);
         let mut out = [0i16; 5];
         assert_eq!(player.next_frame(&mut out), Some(5));
         assert_eq!(player.next_frame(&mut out), None);
+    }
+
+    #[test]
+    fn an_endless_prompt_keeps_playing_far_past_any_finite_count() {
+        // The music-on-hold case. 2000 passes over a 5-sample body is already past anything a
+        // controller would spell as a repeat count, and the player is still producing audio.
+        let source = five_sample_source();
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Forever, 0);
+        let mut out = [0i16; 5];
+        for pass in 0..2000 {
+            assert_eq!(
+                player.next_frame(&mut out),
+                Some(5),
+                "pass {pass} of an endless prompt"
+            );
+            assert!(!player.is_exhausted(), "an endless prompt never exhausts");
+        }
+    }
+
+    #[test]
+    fn an_endless_prompt_reports_no_duration() {
+        // `None` is what the accept turns into an absent `duration_ms`: there is no length to
+        // promise. A finite play still reports one, so nothing that relies on it moves.
+        let source = five_sample_source();
+        assert_eq!(
+            PcmPlayer::new(&source, PcmRepeat::Forever, 0).duration_ms(),
+            None
+        );
+        assert!(PcmPlayer::new(&source, PcmRepeat::Times(3), 0)
+            .duration_ms()
+            .is_some());
+    }
+
+    #[test]
+    fn an_endless_prompt_over_a_body_it_cannot_advance_in_is_over_before_it_starts() {
+        // The one way an endless play must *not* be endless: a body with no samples to serve, or a
+        // seek point at or past the end. Reporting `Forever` there would promise a bed that never
+        // plays a sample and never finishes, and the frame loop would have no exit at all.
+        let mut empty = WavRecorder::new(8000, 1);
+        empty.write_pcm(&[]);
+        let empty = WavSource::parse(&empty.into_wav()).expect("parse");
+        let mut player = PcmPlayer::new(&empty, PcmRepeat::Forever, 0);
+        let mut out = [0i16; 4];
+        assert_eq!(player.next_frame(&mut out), None);
+        assert!(player.is_exhausted());
+        assert_eq!(player.duration_ms(), Some(0));
+
+        let source = five_sample_source();
+        let mut seeked = PcmPlayer::new(&source, PcmRepeat::Forever, 10_000);
+        assert_eq!(seeked.next_frame(&mut out), None);
+        assert!(seeked.is_exhausted());
+        assert_eq!(seeked.duration_ms(), Some(0));
+    }
+
+    #[test]
+    fn an_endless_prompt_rewinds_to_its_seek_point_like_a_finite_one() {
+        // Looping semantics must not fork between the two repeat modes: each pass rewinds to the
+        // seek point, not to sample zero.
+        let source = five_sample_source();
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Forever, 0);
+        let mut first = [0i16; 5];
+        assert_eq!(player.next_frame(&mut first), Some(5));
+        let mut second = [0i16; 5];
+        assert_eq!(player.next_frame(&mut second), Some(5));
+        assert_eq!(first, second, "the second pass replays the same body");
     }
 
     #[test]
@@ -539,7 +662,7 @@ mod tests {
         recorder.write_pcm(&body);
         let source = WavSource::parse(&recorder.into_wav()).expect("parse");
         // Seek 1000 ms → 8000 samples in; the value at index 8000 is (8000 as i16).
-        let mut player = PcmPlayer::new(&source, 1, 1000);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(1), 1000);
         let mut out = [0i16; 1];
         assert_eq!(player.next_frame(&mut out), Some(1));
         assert_eq!(out[0], body[8000]);
@@ -549,7 +672,7 @@ mod tests {
     fn seek_past_end_yields_nothing() {
         let source = five_sample_source();
         // Seek far past the 5-sample body.
-        let mut player = PcmPlayer::new(&source, 1, 10_000);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(1), 10_000);
         let mut out = [0i16; 4];
         assert_eq!(player.next_frame(&mut out), None);
         assert!(player.is_exhausted());
@@ -561,7 +684,7 @@ mod tests {
         recorder.write_pcm(&[1, 2, 3, 4]);
         let source = WavSource::parse(&recorder.into_wav()).expect("parse");
         // Seek 2 ms (→ sample index 2), play twice. Each pass yields [3, 4].
-        let mut player = PcmPlayer::new(&source, 2, 2);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(2), 2);
         let mut out = [0i16; 2];
         assert_eq!(player.next_frame(&mut out), Some(2));
         assert_eq!(out, [3, 4]);
@@ -578,24 +701,36 @@ mod tests {
         let source = WavSource::parse(&recorder.into_wav()).expect("parse");
 
         // One pass = 1000 ms.
-        assert_eq!(PcmPlayer::new(&source, 1, 0).duration_ms(), 1000);
+        assert_eq!(
+            PcmPlayer::new(&source, PcmRepeat::Times(1), 0).duration_ms(),
+            Some(1000)
+        );
         // Three passes = 3000 ms.
-        assert_eq!(PcmPlayer::new(&source, 3, 0).duration_ms(), 3000);
+        assert_eq!(
+            PcmPlayer::new(&source, PcmRepeat::Times(3), 0).duration_ms(),
+            Some(3000)
+        );
         // Seek 250 ms in → 750 ms for the pass; twice = 1500 ms (each loop rewinds to the seek).
-        assert_eq!(PcmPlayer::new(&source, 2, 250).duration_ms(), 1500);
+        assert_eq!(
+            PcmPlayer::new(&source, PcmRepeat::Times(2), 250).duration_ms(),
+            Some(1500)
+        );
 
         // The estimate shrinks as frames are pulled: after consuming 2000 samples (250 ms) of a
         // single 1000 ms pass, 750 ms remain.
-        let mut player = PcmPlayer::new(&source, 1, 0);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(1), 0);
         let mut out = [0i16; 2000];
         assert_eq!(player.next_frame(&mut out), Some(2000));
-        assert_eq!(player.duration_ms(), 750);
+        assert_eq!(player.duration_ms(), Some(750));
 
         // An empty body has no duration.
         let mut empty = WavRecorder::new(8000, 1);
         empty.write_pcm(&[]);
         let empty = WavSource::parse(&empty.into_wav()).expect("parse");
-        assert_eq!(PcmPlayer::new(&empty, 4, 0).duration_ms(), 0);
+        assert_eq!(
+            PcmPlayer::new(&empty, PcmRepeat::Times(4), 0).duration_ms(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -604,7 +739,7 @@ mod tests {
         // L/R pairs: (10, 20) → 15, (-100, 100) → 0, (32767, -1) → 16383.
         recorder.write_pcm(&[10, 20, -100, 100, 32767, -1]);
         let source = WavSource::parse(&recorder.into_wav()).expect("parse");
-        let mut player = PcmPlayer::new(&source, 1, 0);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(1), 0);
         let mut out = [0i16; 3];
         assert_eq!(player.next_frame(&mut out), Some(3));
         assert_eq!(out, [15, 0, 16383]);
@@ -615,7 +750,7 @@ mod tests {
         let mut recorder = WavRecorder::new(8000, 1);
         recorder.write_pcm(&[]);
         let source = WavSource::parse(&recorder.into_wav()).expect("parse");
-        let mut player = PcmPlayer::new(&source, 5, 0);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(5), 0);
         let mut out = [0i16; 4];
         assert_eq!(player.next_frame(&mut out), None);
         assert!(player.is_exhausted());
@@ -624,7 +759,7 @@ mod tests {
     #[test]
     fn zero_length_output_buffer_yields_none() {
         let source = five_sample_source();
-        let mut player = PcmPlayer::new(&source, 1, 0);
+        let mut player = PcmPlayer::new(&source, PcmRepeat::Times(1), 0);
         let mut out: [i16; 0] = [];
         assert_eq!(player.next_frame(&mut out), None);
     }

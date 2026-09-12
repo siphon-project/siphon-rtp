@@ -7,7 +7,7 @@
 //! (`codec-transcode-PCMA`, `codec-mask-AMR-WB`, …) and/or the structured `codec` dict — both are
 //! normalized into [`ProfileFlags::flags`] for the engine.
 
-use siphon_rtp_proto::{CmdResult, Command, PlayMediaSource, ProfileFlags};
+use siphon_rtp_proto::{CmdResult, Command, PlayMediaSource, PlayRepeat, ProfileFlags};
 
 use crate::bencode::{self, Value};
 
@@ -376,7 +376,11 @@ fn parse_play_media(request: &Value) -> Result<Command, NgError> {
         call_id: required_str(request, "call-id")?,
         from_tag: required_str(request, "from-tag")?,
         source,
-        repeat_times: optional_u64(request, "repeat-times"),
+        // rtpengine's `repeat-times` is an integer and has no spelling for an endless play, so this
+        // stays an integer here: the bencode wire is rtpengine's, not ours. A controller that wants
+        // `"repeat_times": "inf"` uses the native JSON contract, exactly as it must for the three
+        // extensions below.
+        repeat_times: optional_u64(request, "repeat-times").map(PlayRepeat::Times),
         start_pos_ms: optional_u64(request, "start-pos"),
         duration_ms: optional_u64(request, "duration"),
         // Overlay mixing, playout gain and the synthesised/URL sources are native-contract

@@ -32,13 +32,13 @@ use siphon_rtp_hep::text_report::TextQosReport;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
 use siphon_rtp_media::playback::Gain;
-use siphon_rtp_media::player::{PcmPlayer, WavError, WavSource};
+use siphon_rtp_media::player::{PcmPlayer, PcmRepeat, WavError, WavSource};
 use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    PlayEndReason, PlayMediaSource, ProfileFlags, SessionStats, WsBridgeEndReason, WsTeeDirection,
-    WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
+    PlayEndReason, PlayMediaSource, PlayRepeat, ProfileFlags, SessionStats, WsBridgeEndReason,
+    WsTeeDirection, WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
@@ -7775,8 +7775,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return Err(Box::new(error_result("play_media: promote call", &reason)));
             }
         }
-        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
-        let repeat = options.repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        // `repeat_times` is the total play count; 0/None plays once (PcmRepeat treats 0/1 alike), and
+        // `"inf"` plays until stopped — what music on hold, queue music and park music need.
+        let repeat = match options.repeat_times {
+            None => PcmRepeat::Times(0),
+            Some(PlayRepeat::Forever) => PcmRepeat::Forever,
+            Some(PlayRepeat::Times(times)) => {
+                PcmRepeat::Times(times.min(u64::from(u32::MAX)) as u32)
+            }
+        };
         let start = options.start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
         // Resolve the source into something the media actor can play. A recorded prompt is decoded
         // here (the source rate is a property of the file, not of the leg); a tone is only *parsed*
@@ -7847,7 +7854,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ResolvedPlaySource::Wav(wav) => {
                 let player = PcmPlayer::new(&wav, repeat, start);
                 let duration = player.duration_ms();
-                (PlayRequest::Pcm(Box::new(player)), Some(duration))
+                (PlayRequest::Pcm(Box::new(player)), duration)
             }
             ResolvedPlaySource::Tone(spec) => {
                 let duration = spec.total_duration_ms();
@@ -7855,7 +7862,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         // The accepted duration is the source's own length bounded by the `duration_ms` cap; a cap
-        // on an endless tone *is* the duration, and an uncapped endless tone reports none.
+        // on an endless source *is* the duration, and an uncapped endless one — a `*inf` tone or a
+        // `"repeat_times": "inf"` prompt — reports none.
         let duration_ms = match (source_duration_ms, options.duration_ms) {
             (Some(source), Some(cap)) => Some(source.min(cap)),
             (Some(source), None) => Some(source),
@@ -12503,11 +12511,13 @@ fn unknown_call(call_id: &str) -> CmdResult {
 /// thread through three call sites).
 #[derive(Debug, Clone, Copy, Default)]
 struct PlayOptions {
-    /// Total play count for a recorded prompt; `0`/`None` plays it once.
-    repeat_times: Option<u64>,
+    /// How many times to play a recorded prompt: a total play count (`0`/`None` plays it once), or
+    /// [`PlayRepeat::Forever`] to play until stopped.
+    repeat_times: Option<PlayRepeat>,
     /// Seek into a recorded prompt before the first frame (and the point each loop rewinds to).
     start_pos_ms: Option<u64>,
-    /// Hard playout cap. The only bound on an endless tone short of a stop.
+    /// Hard playout cap. The only bound on an endless source short of a stop — a `*inf` tone or a
+    /// `PlayRepeat::Forever` prompt.
     duration_ms: Option<u64>,
     /// Mix under the party's live egress instead of replacing it.
     overlay: bool,
@@ -12533,8 +12543,8 @@ struct MediaFetchRequest {
     url: String,
     toward_a: bool,
     options: PlayOptions,
-    /// Total play count for the fetched prompt (`0`/`1` play it once).
-    repeat: u32,
+    /// How many times to play the fetched prompt (`0`/`1` play it once, `Forever` until stopped).
+    repeat: PcmRepeat,
     /// Seek into the fetched prompt before the first frame.
     start_pos_ms: u32,
     play_id: u64,
@@ -21188,6 +21198,183 @@ mod tests {
         assert_eq!(id, play_id, "the completion carries the accept's play_id");
         assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
         assert_eq!(played_ms, Some(40), "the whole 40 ms prompt played");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_endless_hold_bed_accepts_with_no_duration_and_keeps_playing_until_stopped() {
+        // Music on hold, end to end. The accept must carry **no** `duration_ms` — there is none to
+        // report — and the bed must still be playing long after a finite prompt of the same length
+        // would have drained, ending only when the controller stops it.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events_rx = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "hold-bed".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        // A 40 ms bed: two frames at a 20 ms ptime, so a finite play would be over almost at once.
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[1000i16; 320]);
+        let wav = recorder.into_wav();
+
+        let accepted = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "hold-bed".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Blob { data: wav },
+                    repeat_times: Some(PlayRepeat::Forever),
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
+                    to_tag: None,
+                },
+            )
+            .await;
+        let play_id = match accepted {
+            CmdResult::Ok {
+                duration_ms,
+                play_id: Some(id),
+                ..
+            } => {
+                assert_eq!(
+                    duration_ms, None,
+                    "an endless bed has no duration to promise"
+                );
+                id
+            }
+            other => panic!("an endless play accepts with a play_id, got {other:?}"),
+        };
+
+        // Well past the 40 ms the body is long: still producing audio, and no PlayFinished.
+        let mut frames = 0u32;
+        for _ in 0..8u16 {
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+            {
+                assert!(
+                    siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).is_ok(),
+                    "the bed keeps emitting well-formed RTP"
+                );
+                frames += 1;
+            }
+        }
+        assert!(
+            frames >= 4,
+            "the bed looped well past its own 40 ms body, got {frames} frames"
+        );
+        assert!(
+            events_rx.try_recv().is_err(),
+            "an endless bed does not finish on its own"
+        );
+
+        // It ends when, and only when, the controller says so.
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopMedia {
+                    call_id: "hold-bed".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: Some(play_id),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stop accepted: {stopped:?}"
+        );
+        let mut finished = None;
+        for _ in 0..50u16 {
+            match timeout(Duration::from_millis(200), events_rx.recv_async()).await {
+                Ok(Ok(Event::PlayFinished {
+                    play_id: id,
+                    reason,
+                    ..
+                })) => {
+                    finished = Some((id, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            finished,
+            Some((play_id, siphon_rtp_proto::PlayEndReason::Stopped)),
+            "the endless bed ends as Stopped, never as Completed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_duration_cap_still_bounds_an_endless_prompt() {
+        // The cap is the one bound on an endless source short of a stop, and it must report the cap
+        // as the accepted duration rather than nothing — the same answer a capped `*inf` tone gives.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "capped-bed".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[1000i16; 320]);
+        let accepted = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "capped-bed".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Blob {
+                        data: recorder.into_wav(),
+                    },
+                    repeat_times: Some(PlayRepeat::Forever),
+                    start_pos_ms: None,
+                    duration_ms: Some(45_000),
+                    overlay: true,
+                    gain_decibels: Some(-12),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                accepted,
+                CmdResult::Ok {
+                    duration_ms: Some(45_000),
+                    play_id: Some(_),
+                    ..
+                }
+            ),
+            "a capped endless bed reports the cap, got {accepted:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
