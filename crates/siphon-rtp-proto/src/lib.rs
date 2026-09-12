@@ -434,21 +434,65 @@ pub enum Command {
         #[serde(default = "default_true")]
         enabled: bool,
     },
-    /// Begin recording an established call's media to a `.pcap` at runtime (rtpengine
-    /// `start recording`). Unlike the offer/answer `record_call` flag, this toggles recording on a
-    /// live call: a plain relay is promoted to the userspace media pipeline so its packets can be
-    /// tapped, and each accepted RTP/RTCP datagram is captured verbatim (raw wire bytes, any codec).
-    /// The pcap is written under `recording_dir` (the request's `recording-dir` flag). Rejected on a
-    /// secure (SRTP) or WebSocket-bridged call, whose on-the-wire bytes are not the clear media.
+    /// Begin recording an established call at runtime (rtpengine `start recording`). Unlike the
+    /// offer/answer `record_call` flag, this toggles recording on a **live** call, at a point in it
+    /// the controller chooses.
+    ///
+    /// Two formats, and they record different things:
+    ///
+    /// * [`RecordingFormat::Pcap`] (the default, and what this verb has always done) captures each
+    ///   accepted RTP/RTCP datagram verbatim — raw wire bytes, any codec — to
+    ///   `{recording_dir}/{call_id}.pcap`. An audit artefact. Rejected on a secure (SRTP) or
+    ///   WebSocket-bridged call, whose on-the-wire bytes are not the clear media.
+    /// * [`RecordingFormat::Wav`] writes **decoded** audio, streamed to disk as it arrives, and
+    ///   completes with an [`Event::RecordingFinished`] naming the finished file. A product artefact:
+    ///   a voicemail message to be emailed, transcribed and played back. It works on a single-leg
+    ///   (`answer_local`) call — which is what a voicemail box is — as well as a two-party one.
+    ///
+    /// The accept carries a `recording_id`; [`Command::StopRecording`] takes it, and the
+    /// [`Event::RecordingFinished`] echoes it.
     StartRecording {
         call_id: String,
         from_tag: String,
+        /// Output directory for a pcap recording. Ignored when `path` is given.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recording_dir: Option<String>,
+        /// What to write. Absent ⇒ [`RecordingFormat::Pcap`], so an existing caller is unmoved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<RecordingFormat>,
+        /// Which audio a `wav` recording captures. Absent ⇒ [`RecordingDirection::Ingress`] — the
+        /// audio the parties *sent*, which is what a voicemail message is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<RecordingDirection>,
+        /// Whether a `wav` recording is one mixed track or two separated ones. Absent ⇒ mono.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channels: Option<RecordingChannels>,
+        /// Stop after this many milliseconds of audio and report
+        /// [`RecordingEndReason::MaxDuration`]. The time limit a voicemail greeting announces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_duration_ms: Option<u64>,
+        /// Stop after this many milliseconds with no speech and report
+        /// [`RecordingEndReason::Silence`] — the caller stopped talking and hung up, or never spoke.
+        /// Evaluated in the engine, where the decoded audio already is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        silence_ms: Option<u64>,
+        /// Explicit output file path, overriding `recording_dir` and the engine's own naming. The
+        /// directory must already exist.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
-    /// Stop a runtime recording started with [`Command::StartRecording`] (rtpengine `stop recording`):
-    /// finalize the `.pcap` and demote the relay back to the fast path if nothing else holds it.
-    StopRecording { call_id: String, from_tag: String },
+    /// Stop a runtime recording started with [`Command::StartRecording`] (rtpengine
+    /// `stop recording`): finalize the file and demote the relay back to the fast path if nothing
+    /// else holds it.
+    ///
+    /// `recording_id` names one recording; absent stops **every** recording on the call, which is
+    /// what rtpengine's `stop recording` means and what the NG front-end (which has no id) sends.
+    StopRecording {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recording_id: Option<String>,
+    },
     /// Create a media subscription (SIPREC / MPTY). `from_tags` may list multiple legs.
     SubscribeRequest {
         call_id: String,
@@ -851,6 +895,77 @@ pub enum BridgeDirection {
     BToA,
 }
 
+/// What [`Command::StartRecording`] writes.
+///
+/// Deliberately **not** `#[non_exhaustive]`: a controller that asks for a format the engine answers
+/// with something else has been silently given a different artefact, and the two here are not
+/// substitutes — one is raw wire bytes for an audit, the other decoded audio for a person to listen
+/// to. Losing compilation on a new format is the feature.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingFormat {
+    /// Raw RTP/RTCP datagrams, verbatim, in a `.pcap`. The historical behaviour and the default.
+    #[default]
+    Pcap,
+    /// Decoded 16-bit linear PCM, streamed to a RIFF/WAVE file as it arrives.
+    Wav,
+}
+
+/// Which audio a [`RecordingFormat::Wav`] recording captures.
+///
+/// "Ingress" and "egress" are relative to the **engine**: ingress is what the parties sent *to* it
+/// (a voicemail message, a call recording), egress is what the engine sent *to* them (its prompts,
+/// an injected announcement, the mixed audio a party heard).
+///
+/// Exhaustive for the same reason as [`RecordingFormat`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingDirection {
+    /// What the parties sent. On a two-party call this is both legs' inbound audio; on a single-leg
+    /// (`answer_local`) call it is the caller's. The default, and what a voicemail needs.
+    #[default]
+    Ingress,
+    /// What the engine sent to the parties — prompts, announcements, the conference mix it produced.
+    Egress,
+    /// Both, which on a mono recording is the two summed and on a stereo one is the two separated.
+    Both,
+}
+
+/// Whether a [`RecordingFormat::Wav`] recording is one mixed track or two separated ones.
+///
+/// Exhaustive for the same reason as [`RecordingFormat`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingChannels {
+    /// One track. Sources selected by [`RecordingDirection`] are summed (saturating).
+    #[default]
+    Mono,
+    /// Two tracks, interleaved: the caller's audio left, the callee's right. Needs two sources — a
+    /// single-leg call has only one, so it records mono whatever is asked for.
+    Stereo,
+}
+
+/// How a [`RecordingFormat::Wav`] recording ended ([`Event::RecordingFinished`]).
+///
+/// `#[non_exhaustive]`: engine-emitted and informational. A consumer that does not recognise a reason
+/// still has the finished file, which is the part it acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RecordingEndReason {
+    /// Ended by [`Command::StopRecording`].
+    Stopped,
+    /// The `max_duration_ms` limit was reached.
+    MaxDuration,
+    /// `silence_ms` elapsed with no speech.
+    Silence,
+    /// The call ended (hangup, `delete`, or a media timeout) while the recording was running.
+    CallEnded,
+    /// The recording aborted — a write failed, or the file could not be finalized. The file may be
+    /// truncated or missing; its `duration_ms` is what had been written when the error hit.
+    Error,
+}
+
 /// Source for [`Command::PlayMedia`]. Tagged on `"source"`.
 ///
 /// `#[non_exhaustive]`: the source list grows with the engine (this release added `tone` and
@@ -1188,6 +1303,11 @@ pub enum CmdResult {
         /// controller correlates the completion with the accept it awaited.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         play_id: Option<u64>,
+        /// The accepted recording's identifier (`start_recording` with `format: "wav"`). The matching
+        /// [`Event::RecordingFinished`] carries the same value, and [`Command::StopRecording`] takes
+        /// it to stop this recording without disturbing another on the same call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recording_id: Option<String>,
         /// UAS To-tag (subscribe_request / siprec).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
@@ -1448,6 +1568,25 @@ pub enum Event {
         /// Actual played duration in milliseconds, for observability / CDR. `None` when not tracked.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         played_ms: Option<u64>,
+    },
+    /// A [`RecordingFormat::Wav`] recording ended and its file is **closed**.
+    ///
+    /// Emitted after the WAV header has been finalized and the file flushed, so a consumer that acts
+    /// on this event never reads a half-written file — which is the whole reason the event exists.
+    /// `recording_id` is the one the [`Command::StartRecording`] accept returned.
+    RecordingFinished {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+        /// Correlates with the `recording_id` returned by the accept.
+        recording_id: String,
+        /// The finished file. Absent only when the recording aborted before a file existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// Audio actually written, in milliseconds.
+        duration_ms: u64,
+        reason: RecordingEndReason,
     },
     /// The active (dominant) speaker in a conference changed. `from_tag` is the new speaker's leg
     /// tag, or `None` when the floor went silent (no one speaking). Drives floor control / UI.
@@ -2883,6 +3022,7 @@ mod tests {
                 sdp: None,
                 duration_ms: Some(4000),
                 play_id: Some(7),
+                recording_id: None,
                 to_tag: None,
                 stats: None,
             },
@@ -2897,6 +3037,7 @@ mod tests {
             sdp: Some("v=0".into()),
             duration_ms: None,
             play_id: None,
+            recording_id: None,
             to_tag: None,
             stats: None,
         })
@@ -2915,6 +3056,7 @@ mod tests {
                 sdp: Some("v=0".into()),
                 duration_ms: None,
                 play_id: None,
+                recording_id: None,
                 to_tag: None,
                 stats: None,
             },
@@ -3011,6 +3153,7 @@ mod tests {
                 sdp: None,
                 duration_ms: None,
                 play_id: None,
+                recording_id: None,
                 to_tag: None,
                 stats: Some(SessionStats {
                     packets_in: 100,
