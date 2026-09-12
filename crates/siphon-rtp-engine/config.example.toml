@@ -12,10 +12,15 @@
 # key is optional — set only the ones you want to override; unset keys fall through to the default.
 # Unknown/mistyped keys are a hard error (so a typo is loud, not silently ignored).
 #
-# Secrets are deliberately NOT config-file keys and are never on the command line either: the
+# Secret *values* are deliberately NOT config-file keys and are never on the command line either: the
 # control-plane shared secret, TURN realm/secret, and HEP collector are read from the environment
 # (SIPHON_RTP_CONTROL_SECRET, SIPHON_RTP_TURN_REALM, SIPHON_RTP_TURN_SECRET, SIPHON_RTP_HEP_COLLECTOR,
 # SIPHON_RTP_HEP_AGENT_ID) so they never land in argv or a world-readable file.
+#
+# control_secret_file is the one exception, and it is not one in substance: it names a *path*, not a
+# secret. It exists for container deployments whose secrets are generated at first start into a
+# volume, where the environment is read on the host before any container runs and a generated secret
+# therefore cannot reach a variable without a wrapper shell.
 
 # --- Control plane ------------------------------------------------------------------------------
 
@@ -50,6 +55,12 @@ control = "127.0.0.1:8080"
 # untouched, so an upstream marker is not overwritten. Applies to every media egress path (UDP
 # sockets, AF_XDP TX frames, the in-kernel XDP_TX rewrite); never to control/metrics/HEP/WS sockets.
 # media_dscp = "EF"
+
+# File holding the control-plane shared secret, read once at start and trimmed of surrounding
+# whitespace (CLI: --control-secret-file; SIPHON_RTP_CONTROL_SECRET_FILE names it from the
+# environment). Setting this and SIPHON_RTP_CONTROL_SECRET together is a fatal startup error, and an
+# empty file is refused rather than read as "no secret".
+# control_secret_file = "/run/secrets/siphon-rtp-control"
 
 # Reap a call after this many seconds with no accepted media (CLI: --media-timeout-secs).
 # Default: 30.

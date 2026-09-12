@@ -78,6 +78,7 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 | `--media-dscp <DSCP>` | `EF` | DiffServ marking (RFC 2474) on outbound media. A name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`. `EF` is TOS byte 184 — Asterisk's `tos_audio`, rtpengine's `--tos`. `BE`/`0` disables marking and leaves the TOS byte untouched. Applies to every egress path (UDP sockets, AF_XDP TX, in-kernel XDP_TX); never to the control, metrics, HEP or WS sockets. |
 | `--metrics-addr <ADDR>` | off | Prometheus + health HTTP: `GET /metrics`, `GET /healthz`, `GET /readyz`. |
 | `--max-control-rps <N>` | `200` | Per-connection control request cap (requests/second). `0` disables the limit. |
+| `--control-secret-file <PATH>` | none | File holding the control-plane shared secret, read once at start. Surrounding whitespace (including the trailing newline) is trimmed. Mutually exclusive with `SIPHON_RTP_CONTROL_SECRET`. |
 | `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). |
 | `--shutdown-grace-secs <N>` | `25` | Bounded drain of live calls on SIGTERM/SIGINT before exiting. |
 | `--node-id <STRING>` | `$HOSTNAME`, else `siphon-rtp` | Stable cluster node id reported by `load` / `node_info`. |
@@ -93,12 +94,13 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 
 ## Environment variables
 
-Secrets are deliberately not flags and not config-file keys, so they never land in argv or a
+Secret *values* are deliberately not flags and not config-file keys, so they never land in argv or a
 world-readable file:
 
 | Variable | Effect |
 |---|---|
 | `SIPHON_RTP_CONTROL_SECRET` | Enables control-plane authentication: a JSON-over-TCP connection must send `authenticate` with this token before any other verb is honoured. The NG front-end is never authenticated (see the runbook). |
+| `SIPHON_RTP_CONTROL_SECRET_FILE` | The same secret, read from a file instead — the `*_FILE` convention container images use. Equivalent to `--control-secret-file`, which wins if both are given. Setting it **and** `SIPHON_RTP_CONTROL_SECRET` is a fatal startup error rather than a silent preference: the two would be different secrets in every case worth worrying about, and quietly picking one means the controller authenticates against a secret you did not think was in use. An empty file is refused, so a provisioning mistake cannot silently turn authentication off. |
 | `SIPHON_RTP_TURN_REALM` + `SIPHON_RTP_TURN_SECRET` | Enable the built-in TURN server (coturn `static-auth-secret` REST credential profile). At least one `--turn-*` listener must then be given. |
 | `SIPHON_RTP_HEP_COLLECTOR` (+ optional `SIPHON_RTP_HEP_AGENT_ID`) | Export relayed RTCP as HEP3 to a Homer / VoIPmonitor collector (`ip:port`). |
 | `RUST_LOG` | `tracing` env-filter directive (e.g. `info,siphon_rtp_engine=debug`). Wins over the config file's `log_filter`. |
