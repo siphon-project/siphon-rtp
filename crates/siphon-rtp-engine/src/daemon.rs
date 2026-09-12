@@ -150,6 +150,17 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = server::DEFAULT_MAX_CONTROL_RPS)]
     pub max_control_rps: u64,
 
+    /// File holding the control-plane shared secret, read once at start (`SIPHON_RTP_CONTROL_SECRET`
+    /// is the direct-value alternative; `SIPHON_RTP_CONTROL_SECRET_FILE` names this file from the
+    /// environment). Surrounding whitespace, including the trailing newline every tool writes, is
+    /// trimmed. Setting both this and `SIPHON_RTP_CONTROL_SECRET` is a fatal startup error.
+    ///
+    /// The `*_FILE` convention exists because a compose stack that generates its secrets at first
+    /// start into a volume reads its environment files on the host before any container runs, so a
+    /// generated secret cannot reach an environment variable without a wrapper shell.
+    #[arg(long, value_name = "PATH")]
+    pub control_secret_file: Option<PathBuf>,
+
     /// Reap a call after this many seconds with no accepted media (dead-path detection,
     /// docs/security-and-nat.md §4 layer 6). Advanced on the same logical clock as the sweeper.
     #[arg(long, default_value_t = DEFAULT_MEDIA_TIMEOUT_SECS)]
@@ -278,6 +289,9 @@ pub struct RunConfig {
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap (requests/second); `0` disables.
     pub max_control_rps: u64,
+    /// File holding the control-plane shared secret; `None` ⇒ the environment variable, or no
+    /// authentication at all.
+    pub control_secret_file: Option<PathBuf>,
     /// Reap a call after this many seconds with no accepted media.
     pub media_timeout_secs: u64,
     /// Bounded SIGTERM/SIGINT drain grace period (seconds).
@@ -357,6 +371,10 @@ impl RunConfig {
                 explicit("max_control_rps"),
                 file.max_control_rps,
                 server::DEFAULT_MAX_CONTROL_RPS,
+            ),
+            control_secret_file: resolve_optional(
+                args.control_secret_file,
+                file.control_secret_file,
             ),
             media_timeout_secs: resolve_defaulted(
                 args.media_timeout_secs,
@@ -623,6 +641,74 @@ const DEFAULT_CONSENT_TIMEOUT_SECS: u64 = 30;
 /// The media-timeout sweep advances the backend's logical clock via [`Datapath::advance_clock`] — a
 /// no-op on real-time backends (the XDP fast path derives `now_ticks` from a monotonic kernel clock),
 /// which keeps this runner generic without a shim trait that would hit the orphan rule.
+/// Environment variable naming a file that holds the control-plane shared secret.
+///
+/// The `*_FILE` convention container images use (the Postgres image's, most visibly), and the reason
+/// it exists: a compose stack that generates its secrets at first start into a volume reads its
+/// environment files on the host *before* any container runs, so a generated secret cannot reach an
+/// environment variable without a wrapper shell — which then puts it on a command line or in a
+/// shell's process environment.
+const CONTROL_SECRET_FILE_ENV: &str = "SIPHON_RTP_CONTROL_SECRET_FILE";
+
+/// Environment variable carrying the control-plane shared secret directly.
+const CONTROL_SECRET_ENV: &str = "SIPHON_RTP_CONTROL_SECRET";
+
+/// Resolve the optional control-plane shared secret from a file (`--control-secret-file`, the
+/// `SIPHON_RTP_CONTROL_SECRET_FILE` environment variable, or the config file) or from
+/// `SIPHON_RTP_CONTROL_SECRET`. Neither form ever appears in argv.
+///
+/// **Both at once is a fatal startup error**, not a silent preference. The two would be different
+/// secrets in every case worth worrying about — a stale variable left in a unit file beside a freshly
+/// provisioned volume — and quietly picking one means the operator's controller authenticates against
+/// a secret they did not think was in use, which is indistinguishable from the other secret leaking.
+///
+/// One trailing newline is trimmed (every tool that writes a secret to a file adds one), along with
+/// any other surrounding whitespace. An empty or whitespace-only file is refused rather than read as
+/// "no secret", since that would silently turn authentication *off* on a node provisioned to require
+/// it — the failure mode this option exists to prevent.
+fn resolve_control_secret(
+    file: Option<&std::path::Path>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let from_env = std::env::var(CONTROL_SECRET_ENV).ok();
+    let owned;
+    let path = match file {
+        Some(path) => Some(path),
+        None => match std::env::var(CONTROL_SECRET_FILE_ENV) {
+            Ok(value) if !value.is_empty() => {
+                owned = PathBuf::from(value);
+                Some(owned.as_path())
+            }
+            _ => None,
+        },
+    };
+    let Some(path) = path else {
+        return Ok(from_env);
+    };
+    if from_env.is_some() {
+        return Err(format!(
+            "both {CONTROL_SECRET_ENV} and a control-secret file ({}) are set; \
+             pick one — refusing to guess which secret the control plane should require",
+            path.display()
+        )
+        .into());
+    }
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read control-secret file {}: {error}",
+            path.display()
+        )
+    })?;
+    let secret = contents.trim();
+    if secret.is_empty() {
+        return Err(format!(
+            "control-secret file {} is empty; remove the option to run without authentication",
+            path.display()
+        )
+        .into());
+    }
+    Ok(Some(secret.to_string()))
+}
+
 pub async fn run_with_datapath<D>(
     datapath: D,
     config: RunConfig,
@@ -718,8 +804,9 @@ where
     let listener = TcpListener::bind(config.control).await?;
     tracing::info!(control = %config.control, "siphon-rtp-engine control server listening");
 
-    // Optional control-plane shared secret, read from the environment so it never appears in argv.
-    let control_secret = std::env::var("SIPHON_RTP_CONTROL_SECRET").ok();
+    // Optional control-plane shared secret: from a file, or from the environment. Neither ever
+    // appears in argv. Refuses to start if both are given rather than silently preferring one.
+    let control_secret = resolve_control_secret(config.control_secret_file.as_deref())?;
     if control_secret.is_some() {
         tracing::info!("control connections require authentication");
     }
@@ -1016,12 +1103,149 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_port_range, resolve_x3, EngineArgs, RunConfig};
+    use super::{
+        resolve_control_secret, resolve_port_range, resolve_x3, EngineArgs, RunConfig,
+        CONTROL_SECRET_ENV, CONTROL_SECRET_FILE_ENV,
+    };
     use crate::config::{FileConfig, InterfaceConfig};
     use crate::media_fetch::MediaFetchLimits;
     use siphon_rtp_datapath::{AddressFamily, Dscp};
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
+
+    /// The control-secret tests mutate process-wide environment variables, so they run under one
+    /// mutex and always restore what they found. Nothing else in this binary reads these two
+    /// variables outside `resolve_control_secret`.
+    static SECRET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Clear both control-secret environment variables for the duration of a test, then restore.
+    fn with_clean_secret_env<T>(body: impl FnOnce() -> T) -> T {
+        let _guard = SECRET_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved_secret = std::env::var(CONTROL_SECRET_ENV).ok();
+        let saved_file = std::env::var(CONTROL_SECRET_FILE_ENV).ok();
+        std::env::remove_var(CONTROL_SECRET_ENV);
+        std::env::remove_var(CONTROL_SECRET_FILE_ENV);
+        let outcome = body();
+        match saved_secret {
+            Some(value) => std::env::set_var(CONTROL_SECRET_ENV, value),
+            None => std::env::remove_var(CONTROL_SECRET_ENV),
+        }
+        match saved_file {
+            Some(value) => std::env::set_var(CONTROL_SECRET_FILE_ENV, value),
+            None => std::env::remove_var(CONTROL_SECRET_FILE_ENV),
+        }
+        outcome
+    }
+
+    #[test]
+    fn a_control_secret_file_is_read_and_its_trailing_newline_trimmed() {
+        // Every tool that writes a secret to a file adds a trailing newline, and a secret compared
+        // byte-for-byte against the controller's would never match with one attached.
+        with_clean_secret_env(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("control.secret");
+            std::fs::write(&path, "s3cret\n").expect("write");
+            assert_eq!(
+                resolve_control_secret(Some(&path)).expect("resolve"),
+                Some("s3cret".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn the_secret_file_can_come_from_the_environment_too() {
+        // The compose case: the path is known to the image, the file is written into a volume at
+        // first start, and nothing has to reach argv.
+        with_clean_secret_env(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("control.secret");
+            std::fs::write(&path, "  from-env-path  ").expect("write");
+            std::env::set_var(CONTROL_SECRET_FILE_ENV, &path);
+            assert_eq!(
+                resolve_control_secret(None).expect("resolve"),
+                Some("from-env-path".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn the_flag_wins_over_the_secret_file_environment_variable() {
+        with_clean_secret_env(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let from_flag = dir.path().join("flag.secret");
+            let from_env = dir.path().join("env.secret");
+            std::fs::write(&from_flag, "flag").expect("write");
+            std::fs::write(&from_env, "env").expect("write");
+            std::env::set_var(CONTROL_SECRET_FILE_ENV, &from_env);
+            assert_eq!(
+                resolve_control_secret(Some(&from_flag)).expect("resolve"),
+                Some("flag".to_string()),
+                "an explicit path beats the environment's, as every other option resolves"
+            );
+        });
+    }
+
+    #[test]
+    fn the_direct_environment_secret_still_works_on_its_own() {
+        with_clean_secret_env(|| {
+            std::env::set_var(CONTROL_SECRET_ENV, "from-env");
+            assert_eq!(
+                resolve_control_secret(None).expect("resolve"),
+                Some("from-env".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn no_secret_anywhere_leaves_the_control_plane_unauthenticated() {
+        with_clean_secret_env(|| {
+            assert_eq!(resolve_control_secret(None).expect("resolve"), None);
+        });
+    }
+
+    #[test]
+    fn a_file_and_the_environment_secret_together_refuse_to_start() {
+        // The two would be different secrets in every case worth worrying about — a stale variable in
+        // a unit file beside a freshly provisioned volume. Quietly picking one means the controller
+        // authenticates against a secret the operator did not think was in use.
+        with_clean_secret_env(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("control.secret");
+            std::fs::write(&path, "from-file").expect("write");
+            std::env::set_var(CONTROL_SECRET_ENV, "from-env");
+            let error = resolve_control_secret(Some(&path)).expect_err("must refuse");
+            let text = error.to_string();
+            assert!(text.contains("pick one"), "{text}");
+            assert!(text.contains(CONTROL_SECRET_ENV), "{text}");
+        });
+    }
+
+    #[test]
+    fn an_empty_secret_file_refuses_to_start_rather_than_disabling_authentication() {
+        // Reading an empty file as "no secret" would silently turn authentication *off* on a node
+        // provisioned to require it — the failure this option exists to prevent.
+        with_clean_secret_env(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("control.secret");
+            std::fs::write(&path, "   \n\t ").expect("write");
+            let error = resolve_control_secret(Some(&path)).expect_err("must refuse");
+            assert!(error.to_string().contains("is empty"), "{error}");
+        });
+    }
+
+    #[test]
+    fn a_missing_secret_file_is_a_startup_error_naming_the_path() {
+        with_clean_secret_env(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("not-there.secret");
+            let error = resolve_control_secret(Some(&path)).expect_err("must refuse");
+            let text = error.to_string();
+            assert!(text.contains("cannot read control-secret file"), "{text}");
+            assert!(text.contains("not-there.secret"), "{text}");
+        });
+    }
 
     /// `EngineArgs` is a flattenable `clap::Args`, not a top-level `Parser`, so a test parses it the
     /// same way the real binaries do — through a wrapper that flattens it.
@@ -1173,6 +1397,7 @@ mod tests {
             media_dscp: Dscp::DEFAULT,
             metrics_addr: None,
             max_control_rps: 0,
+            control_secret_file: None,
             media_timeout_secs: 30,
             shutdown_grace_secs: 25,
             stun_servers: Vec::new(),

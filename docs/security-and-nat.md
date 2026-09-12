@@ -1068,8 +1068,12 @@ Distinct from the media latch but part of the same security surface.
   this binds identity to the *connection*; it assumes one persistent control connection per SIPhon
   instance. A shared identity across a connection pool needs the deferred control-channel auth.
 - **Channel security.** **Landed:** optional shared-secret authentication — when
-  `$SIPHON_RTP_CONTROL_SECRET` is set, a control connection must send `Authenticate` with the
-  matching token (constant-time compared) before any other verb is honoured (`serve_with_auth`).
+  `$SIPHON_RTP_CONTROL_SECRET` is set, or `--control-secret-file` /
+  `$SIPHON_RTP_CONTROL_SECRET_FILE` names a file holding the secret, a control connection must send
+  `Authenticate` with the matching token (constant-time compared) before any other verb is honoured
+  (`serve_with_auth`). Neither form reaches argv. Setting both is a fatal startup error and an empty
+  secret file is refused, so a provisioning mistake cannot silently leave the control plane
+  unauthenticated on a node configured to require a secret.
   **Remaining:** TLS on the control socket (mandatory the day SDES key material rides it) and binding
   it to a private interface by config.
 - **Reflector/amplifier hygiene.** Do not forward toward a destination until it is validated (the

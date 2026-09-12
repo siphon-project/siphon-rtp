@@ -7,6 +7,33 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **The control-plane shared secret can come from a file** — `--control-secret-file <PATH>`, the
+  `SIPHON_RTP_CONTROL_SECRET_FILE` environment variable, or a `control_secret_file` config key. It
+  was `SIPHON_RTP_CONTROL_SECRET` only, and there was no `*_FILE`-style option anywhere in the tree.
+
+  A compose stack that generates its secrets at first start into a volume reads its environment files
+  **on the host, before any container runs**, so a generated secret cannot reach an environment
+  variable without a wrapper shell — which then puts it on a command line or in a shell's process
+  environment. The `*_FILE` convention (the Postgres image's, most visibly) is the standard answer.
+
+  Neither form reaches argv. Surrounding whitespace is trimmed, including the trailing newline every
+  tool that writes a secret adds.
+
+  Two refusals rather than silent behaviour, both because the failure they prevent is invisible:
+
+  - **A file plus `SIPHON_RTP_CONTROL_SECRET` is a fatal startup error.** They would be different
+    secrets in every case worth worrying about — a stale variable in a unit file beside a freshly
+    provisioned volume — and quietly preferring one means the controller authenticates against a
+    secret the operator did not think was in use.
+  - **An empty or whitespace-only secret file is refused.** Reading it as "no secret" would turn
+    authentication *off* on a node provisioned to require it, which is exactly the failure the option
+    exists to prevent.
+
+  `control_secret_file` is the one secret-adjacent key the config file accepts, and only because it
+  names a **path** rather than carrying the secret.
+
 ## [0.5.3] — 2026-09-12
 
 A re-offer handed the other party the re-offering party's own media port, so a call went one-way the

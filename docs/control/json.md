@@ -41,7 +41,13 @@ A request and its response:
 
 ## Authentication
 
-Set `SIPHON_RTP_CONTROL_SECRET` in the daemon's environment to require a shared secret.
+Set `SIPHON_RTP_CONTROL_SECRET` in the daemon's environment to require a shared secret, or
+point `--control-secret-file` (equivalently `SIPHON_RTP_CONTROL_SECRET_FILE`) at a file
+holding it — the convention for a container whose secrets are generated at first start into
+a volume. Surrounding whitespace, including the trailing newline every tool writes, is
+trimmed. Setting both forms is a fatal startup error, and an empty file is refused rather
+than read as "no secret".
+
 When set, the first command on every connection must be:
 
 ```json
