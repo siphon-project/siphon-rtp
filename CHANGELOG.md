@@ -7,6 +7,41 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Added
+
+- **An SDES-SRTP caller can reach an IVR, an announcement, an echo test or a voicemail box.**
+  `answer_local` refused a secure offerer outright (`secure-offerer-unsupported`), so a TLS/SRTP desk
+  phone could not reach any of them.
+
+  The *answer* was always correct — `answer_local` writes A's answer itself and already minted the
+  engine's own `a=crypto` — and it was the **media path** that had nothing behind it, which is why
+  refusing was the right call at the time: answering keying no path backs is worse than refusing.
+
+  The single-leg pipeline now holds its own `SecureLeg`, exactly as a conference seat and a WebSocket
+  takeover leg already did. The shape is its own and needed a method of its own: a single-leg call's
+  two directions face the *same* caller on the *same* endpoint, and the caller is the secure side, so
+  each direction both decrypts what arrives and encrypts what leaves. The two-leg method keys
+  A-plaintext/B-secure and would have left an IVR that decrypted the caller and answered it in the
+  clear.
+
+  `resolve_ws_takeover_security` becomes `resolve_offerer_security` and no longer takes a `takeover`
+  flag: it reads the offerer's SDP and nothing else. Which media paths can *honour* a resolved
+  posture is the caller's business.
+
+### Not done, and refused rather than half-done
+
+- **DTLS-SRTP (WebRTC) on `answer_local`** still needs a WebSocket takeover. It requires the full ICE
+  agent attached to the promoted (`Redirect`) leg so the handshake can be gated on the selected pair
+  (RFC 8445 §12), plus the pending-key plumbing that goes with it. It is refused with
+  `secure-offerer-unsupported`, naming DTLS, rather than answering a fingerprint no media path backs.
+
+  For the same reason the ICE rewrite on `answer_local` stays scoped to a takeover: un-gating it
+  would re-originate ICE credentials on a leg that runs no agent — half a fix, and the half that
+  hides the other.
+
+- **SRTP termination on the offerer side of a two-party relay** is unchanged; there the secure side
+  is still only the answerer's leg.
+
 ## [0.5.3] — 2026-09-12
 
 A re-offer handed the other party the re-offering party's own media port, so a call went one-way the
