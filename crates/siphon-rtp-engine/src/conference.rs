@@ -1950,6 +1950,11 @@ struct ConferenceMember {
     /// The logical tick at which this participant joined — the idle-reap baseline before it has sent
     /// any media (a just-joined silent leg is not reaped until `idle_ticks` elapse).
     joined_tick: u64,
+    /// Whether this participant told us it would **not** send (`a=recvonly` / `a=inactive`, RFC 4566
+    /// §6): a seat on hold, or a listen-only attendee in a webinar. Its silence is the session state
+    /// its own SDP asked for, so it is measured against the held ceiling rather than the media timeout
+    /// — the same rule [`crate::engine::Engine::reap_idle`] applies to a two-party call.
+    held: bool,
 }
 
 /// A handle to a running conference actor.
@@ -2018,6 +2023,7 @@ impl ConferenceRegistry {
         conference_id: &str,
         config: ParticipantConfig,
         joined_tick: u64,
+        held: bool,
         datapath: D,
         events: Option<flume::Sender<Event>>,
     ) -> bool
@@ -2063,6 +2069,7 @@ impl ConferenceRegistry {
                 endpoint,
                 text_endpoint,
                 joined_tick,
+                held,
             });
         }
         true
@@ -2222,15 +2229,21 @@ impl ConferenceRegistry {
         endpoints
     }
 
-    /// Reap participants whose media has been idle (no accepted packet) for at least `idle_ticks`, and
-    /// tear down any room left empty. `last_activity` returns an endpoint's last-accepted-packet tick
-    /// (the datapath's logical clock). Returns the freed participant endpoints for the engine to
-    /// release. Deterministic — driven by the logical clock, never `Instant::now()`
+    /// Reap participants whose media has been idle for at least `idle_ticks`, and tear down any room
+    /// left empty. `last_activity` returns an endpoint's last-accepted-packet tick (the datapath's
+    /// logical clock). Returns the freed participant endpoints for the engine to release.
+    /// Deterministic — driven by the logical clock, never `Instant::now()`
     /// (docs/security-and-nat.md §4 layer 6).
+    ///
+    /// A participant that signalled `a=recvonly` or `a=inactive` (a seat on hold, a listen-only
+    /// attendee) told us it would send nothing, so its silence means nothing about its liveness. It is
+    /// measured against `held_idle_ticks` instead, and `0` there means such a seat never ages out —
+    /// the same rule the two-party reaper applies (RFC 3264 §8.4).
     pub fn reap_idle(
         &self,
         now: u64,
         idle_ticks: u64,
+        held_idle_ticks: u64,
         last_activity: impl Fn(EndpointId) -> Option<u64>,
     ) -> Vec<EndpointId> {
         let mut freed = Vec::new();
@@ -2249,7 +2262,16 @@ impl ConferenceRegistry {
                     .and_then(&last_activity)
                     .unwrap_or(member.joined_tick);
                 let last = last_audio.max(last_text).max(member.joined_tick);
-                if now.saturating_sub(last) >= idle_ticks {
+                let budget = if member.held {
+                    held_idle_ticks
+                } else {
+                    idle_ticks
+                };
+                if member.held && budget == 0 {
+                    kept.push(member);
+                    continue;
+                }
+                if now.saturating_sub(last) >= budget {
                     let _ = handle.mailbox.try_send(ConferenceInput::Control(
                         ConferenceControl::Remove(member.tag.clone()),
                     ));
@@ -3609,6 +3631,7 @@ mod tests {
             "room",
             ulaw_text_config(0, "10.0.0.1", "10.0.0.1:4000"),
             0,
+            false,
             datapath.clone(),
             None,
         ));
