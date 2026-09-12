@@ -53,7 +53,7 @@ use crate::interface::{Interface, InterfaceTable};
 use crate::media_fetch::{self, MediaFetchLimits};
 use crate::media_pipeline::{
     DirectionConfig, DirectionQuality, FinalCallQuality, MediaCall, MediaControl, MediaRegistry,
-    PcapCapture, PlayRequest, RawTee, RelayConfig, RtcpRelay, SecureSide,
+    PcapCapture, PlayDtmfOutcome, PlayRequest, RawTee, RelayConfig, RtcpRelay, SecureSide,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
@@ -1958,16 +1958,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 volume_dbm0,
                 pause_ms,
                 to_tag,
-            } => self.play_dtmf(
-                client,
-                &call_id,
-                &from_tag,
-                &code,
-                duration_ms,
-                volume_dbm0,
-                pause_ms,
-                to_tag.as_deref(),
-            ),
+            } => {
+                self.play_dtmf(
+                    client,
+                    &call_id,
+                    &from_tag,
+                    &code,
+                    duration_ms,
+                    volume_dbm0,
+                    pause_ms,
+                    to_tag.as_deref(),
+                )
+                .await
+            }
             Command::SubscribeRequest {
                 call_id,
                 from_tags,
@@ -8152,7 +8155,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// `pause_ms` of inter-digit silence (RFC 4733). The target leg is resolved from `from_tag` /
     /// `to_tag` the same way `block_dtmf` resolves its source leg.
     #[allow(clippy::too_many_arguments)]
-    fn play_dtmf(
+    #[allow(clippy::too_many_arguments)]
+    async fn play_dtmf(
         &self,
         client: ClientId,
         call_id: &str,
@@ -8192,7 +8196,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .map(|value| value.unsigned_abs().min(63) as u8)
             .unwrap_or(10);
         let toward_a = resolve_toward_a(from_tag, call_to.as_deref(), to_tag);
-        if self.media.control(
+        // Await the actor's verdict rather than answering from whether the mailbox accepted the
+        // message. Only the actor knows whether this leg negotiated a `telephone-event` payload type
+        // to carry the digits on, and answering `ok` without one sends nothing — which, on a PBX
+        // forwarding a feature code to a carrier or navigating a remote menu, reads as the far end
+        // ignoring the digits. Same shape as `stop_media` / `set_play_gain`.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.media.control(
             call_id,
             MediaControl::PlayDtmf {
                 toward_a,
@@ -8200,11 +8210,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 duration_ms: duration,
                 volume,
                 pause_ms: pause,
+                reply: sender,
             },
         ) {
-            ok_empty()
-        } else {
-            error_result("play_dtmf", &"call is not a media-processing call")
+            return error_result("play_dtmf", &"call is not a media-processing call");
+        }
+        match receiver.await {
+            Ok(PlayDtmfOutcome::Started) => ok_empty(),
+            Ok(PlayDtmfOutcome::NoTelephoneEvent) => error_result(
+                "play_dtmf",
+                &"no telephone-event payload type negotiated toward this leg",
+            ),
+            // Unreachable through the control plane — the code is validated above — but a hollow
+            // success here would be the same defect one layer down.
+            Ok(PlayDtmfOutcome::InvalidDigits) => {
+                error_result("play_dtmf", &format!("unusable DTMF code {code:?}"))
+            }
+            Err(_) => error_result(
+                "play_dtmf",
+                &"media actor closed before the DTMF sequence started",
+            ),
         }
     }
 
@@ -19583,6 +19608,82 @@ mod tests {
             matches!(result, CmdResult::Error { .. }),
             "an unsupported DTMF digit is rejected, not truncated"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_dtmf_toward_a_leg_with_no_telephone_event_is_an_error_not_a_silent_no_op() {
+        // The defect: the engine answered from whether the control message reached the actor's
+        // mailbox, so a `play_dtmf` toward a leg that never negotiated `telephone-event` was accepted
+        // and nothing went on the wire. On a PBX that is a feature code forwarded to a carrier or a
+        // flow step navigating a remote menu, and a silent no-op there reads as the far end ignoring
+        // the digits.
+        //
+        // A transcoding call (µ-law ↔ A-law, so the media path is userspace) where **neither** party
+        // offered a telephone-event payload type.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+        );
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=rtcp-mux\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+        );
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dtmf-none".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dtmf-none".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            engine.media().is_transcoding_call("dtmf-none"),
+            "the codec mismatch puts this call on the userspace media path"
+        );
+
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::PlayDtmf {
+                    call_id: "dtmf-none".into(),
+                    from_tag: "tag-a".into(),
+                    code: "123".into(),
+                    duration_ms: None,
+                    volume_dbm0: None,
+                    pause_ms: None,
+                    to_tag: Some("tag-b".into()),
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("no telephone-event payload type negotiated"),
+                "the refusal names why nothing could be sent, got: {reason}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
