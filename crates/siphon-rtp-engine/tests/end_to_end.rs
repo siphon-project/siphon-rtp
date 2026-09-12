@@ -737,7 +737,7 @@ async fn text_events_promotes_only_text_emits_events_and_carries_cdr_counters() 
     // Reap the call (advance the clock past the timeout) → the CallSummary CDR is pushed with the
     // per-leg RFC 4103 text counters folded in.
     engine.datapath().advance_clock(40);
-    assert_eq!(engine.reap_idle(30).await, vec!["rtt-obs".to_string()]);
+    assert_eq!(engine.reap_idle(30, 0).await, vec!["rtt-obs".to_string()]);
 
     let mut summary_text_chars = None;
     for _ in 0..2 {
@@ -1712,7 +1712,7 @@ async fn media_timeout_event_is_pushed_over_the_control_connection() {
 
     // Drive the media-timeout sweep on the shared engine handle: the call is silent, so it is reaped.
     engine.datapath().advance_clock(40);
-    assert_eq!(engine.reap_idle(30).await, vec!["doomed".to_string()]);
+    assert_eq!(engine.reap_idle(30, 0).await, vec!["doomed".to_string()]);
 
     // Reaping pushes two events down the same control connection: the end-of-call `CallSummary` (CDR)
     // and the `MediaTimeout` dead-path signal SIPhon already relies on. Both arrive; confirm each.
@@ -1727,9 +1727,18 @@ async fn media_timeout_event_is_pushed_over_the_control_connection() {
                 assert_eq!(reason, "media_timeout");
                 got_summary = true;
             }
-            Event::MediaTimeout { call_id, from_tag } => {
+            Event::MediaTimeout {
+                call_id,
+                from_tag,
+                reason,
+            } => {
                 assert_eq!(call_id, "doomed");
                 assert_eq!(from_tag, "ft");
+                assert_eq!(
+                    reason,
+                    siphon_rtp_proto::MediaTimeoutReason::NoMedia,
+                    "neither party held the call, so its silence is a dead path"
+                );
                 got_timeout = true;
             }
             other => panic!("unexpected event pushed on reap: {other:?}"),

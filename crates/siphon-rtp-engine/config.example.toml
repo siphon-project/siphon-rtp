@@ -52,8 +52,15 @@ control = "127.0.0.1:8080"
 # media_dscp = "EF"
 
 # Reap a call after this many seconds with no accepted media (CLI: --media-timeout-secs).
-# Default: 30.
+# Counts only while the call is on two-way media — a party on hold may legitimately send nothing
+# (RFC 3264 §8.4), so a held call uses held_media_timeout_secs instead. Default: 30.
 # media_timeout_secs = 30
+
+# Reap a *held* call after this many seconds — one where a party signalled a=sendonly, a=recvonly or
+# a=inactive, so no media is owed at all. Hold, park and queue are this state and they last minutes,
+# so this is a backstop against a call nobody comes back to, not a dead-path timer. 0 disables it.
+# (CLI: --held-media-timeout-secs). Default: 7200 (two hours).
+# held_media_timeout_secs = 7200
 
 # --- play_media from an http(s) URL --------------------------------------------------------------
 #
