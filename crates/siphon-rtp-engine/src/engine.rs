@@ -10395,7 +10395,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// anyone" tears down a call whose user is still holding the handset. Hold, park and queue are all
     /// exactly that state, and they last minutes.
     ///
-    /// So a call the signalling has taken off two-way media ([`Call::is_held`]) is measured against
+    /// So a call the signalling has taken off two-way media (`Call::is_held`) is measured against
     /// `held_idle_ticks` — a much longer ceiling (`--held-media-timeout-secs`) so a call abandoned on
     /// hold still ends eventually, with `0` disabling it so such a call never ages out. Everything else
     /// keeps the dead-path rule unchanged, down to reading the same endpoint set. The
