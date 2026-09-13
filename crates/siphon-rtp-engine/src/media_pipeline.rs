@@ -1028,7 +1028,7 @@ impl PlayRequest {
         )
     }
 
-    /// As [`PlayRequest::into_playback`], but against an explicit rate and frame length rather than a
+    /// As `PlayRequest::into_playback`, but against an explicit rate and frame length rather than a
     /// leg's. A conference room has no `Direction` — it renders one mix at the room rate on a fixed
     /// 20 ms tick — so it needs the same construction without one.
     pub fn into_playback_at(
