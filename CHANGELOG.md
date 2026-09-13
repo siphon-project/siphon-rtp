@@ -374,6 +374,74 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `Event::MediaTimeout { call_id, from_tag }` without `..` must add the field or `..`. The JSON wire
   stays backward compatible — an older consumer ignores the added key.
 
+### Added
+
+- **A relay capacity harness** (`siphon-rtp-loadgen`) — boots the engine on the real userspace UDP
+  datapath, establishes N plain relay calls through the engine's own control surface and drives real
+  RTP through all of them. It exists because nothing in the tree had ever load tested the datapath:
+  the leak soak drives **one** session at a time and sends **zero** RTP packets, so a leak check was
+  standing in for a capacity test.
+
+  It reports **engine CPU microseconds per relayed packet** rather than "N calls worked" — the latter
+  says only that the box was not saturated, where a per-packet cost is saturation-independent and is
+  the one figure a sizing table can honestly be derived from. Unpublished and not a workspace binary,
+  so it reaches neither `cargo install` nor the runtime image, and it adds no new runtime dependency.
+
+- **Two operator pages.** [Capacity & sizing](docs/capacity.md) carries the measured per-packet costs
+  for two hardware classes, the arithmetic to size any box from them, and a profile of where the
+  kernel time goes. [Performance & tuning](docs/performance.md) carries the knobs in the order they
+  are worth turning, each with the measurement that justifies it and a way to confirm it did
+  anything — including the file-descriptor ceiling that caps a node at roughly 250 calls on a default
+  1024 soft limit and fails as bind errors naming nothing, and the connection-tracking exemption worth
+  about a tenth of relay CPU for two rules and no code.
+
+### Changed
+
+- **The published relay cost figure described a code path no packet takes, and the conclusion drawn
+  from it was wrong in the direction that matters for capacity.** `README.md` said the relay rewrite
+  is "~8 ns/packet … the CPU is never the relay bottleneck", benchmarking
+  `parse → re-originate SSRC/seq → write_packet`. The shipping relay never calls `write_packet`: it
+  forwards the received bytes verbatim. The measured end-to-end cost with sockets is **~7–9 µs per
+  relayed packet**, about 70 % of it kernel time — three orders of magnitude from the published
+  number, and anyone who sized a deployment against the old line has a wrong figure in their planning.
+
+  The packet handling really is free; that was never the error. Profiled at 100 000 pps the engine's
+  **own** relay logic — flow lookup, signalled-source gate, latch check, RFC 3550 §A.1 loss counter —
+  is **0.04 %** of the cost and Tokio is 0.15 %. Which is the substantive point: there is no userspace
+  optimisation available on this path, and no criterion bench of the packet handling can move a
+  capacity number however fast it gets.
+
+- **The claimed criterion CI regression gate did not exist.** `README.md` said every hot path carries
+  "a CI regression gate (>10 % over the committed baseline fails the build)". There are no committed
+  criterion baselines in the tree and CI only compile-checks the benches. The real gate is
+  iai-callgrind **instruction counts** on three benches against the pull request's own base, which is
+  deterministic on a shared runner in a way wall-clock figures are not. The text now describes that.
+
+- **The datapath page told every operator to size around transcode CPU**, which is right for a
+  transcoding node and leaves a relay-only node with no guidance at all. It now separates the two and
+  names the limit that in practice binds a relay node before either kind of CPU does.
+
+### Not done, and refused rather than half-done
+
+- **An `io_uring` datapath backend.** Measured rather than assumed, and the answer is
+  hardware-conditional: against an `epoll` control arm at 50 pps per socket it was about 9 % *more*
+  expensive per packet on a modern desktop part and 13–18 % *cheaper* on a virtualised Skylake host
+  with page-table isolation and IBRS active. On both hosts it cut kernel crossings by roughly a
+  **thousandfold**. That is the finding — the cost is the work *inside* the kernel, not the boundary
+  crossing to reach it, so removing the crossing only pays where mitigations have made it expensive.
+
+  An implementation therefore has to sit behind a runtime-selectable backend or it regresses the hosts
+  that needed it least, and it would inherit the signalled-source gate and the SSRC latch, which are
+  not yet shared as a backend-independent decision path. The experiment ships as an example with
+  `io-uring` as a **dev-dependency only**; the backend does not.
+
+- **`recvmmsg`/`sendmmsg`**, recorded so it is not proposed again. They batch datagrams on *one*
+  socket, and each media socket carries one stream at 50 pps — one packet every 20 ms, so there is
+  never a second packet queued to batch with. It would return a single message per call, identically to
+  `recv_from`, unless you block waiting for a second one, which costs up to a full packetisation
+  interval of added latency. One socket per endpoint is forced by SDP, so the traffic cannot be
+  concentrated to make batching work.
+
 ## [0.5.3] — 2026-09-12
 
 A re-offer handed the other party the re-offering party's own media port, so a call went one-way the
