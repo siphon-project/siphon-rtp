@@ -59,6 +59,8 @@ nav:
   - Running in production:
       - Deployment & operations: deployment.md
       - Scaling, clustering & HA: scaling-and-ha.md
+      - Capacity & sizing (relay): capacity.md
+      - Performance & tuning: performance.md
       - Datapath (UDP default, XDP via a separate daemon): datapath.md
       - Supply chain & SBOM: supply-chain.md
       - Lawful interception (ETSI X3): lawful-interception.md

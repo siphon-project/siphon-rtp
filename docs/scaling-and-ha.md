@@ -183,6 +183,9 @@ standby is warm, not hot: it holds no state until `restore` hands it some.
   `--max-sessions` so session pressure shows up in the score before CPU does.
 - Always run a bounded `--port-min`/`--port-max` in production, HA or not: it makes the media
   plane firewallable and keeps the HA option open.
+- Derive `--max-sessions` from a measurement rather than a guess, and check the file-descriptor
+  ceiling before the CPU one — on a relay node it is usually the lower of the two. See
+  [Capacity & sizing](capacity.md#deriving-an-honest-max-sessions).
 - Drain before you stop. It costs one control verb and turns an upgrade into a non-event.
 - Reserve warm-standby HA for the call types it actually covers today (relay, SDES-SRTP bridge,
   plaintext transcode, secure transcode). For everything else, fast failover of *new* calls via

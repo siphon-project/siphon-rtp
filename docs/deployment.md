@@ -16,6 +16,10 @@ read [Scaling, clustering & HA](scaling-and-ha.md).
 - [docker-compose profiles](#docker-compose-profiles)
 - [Operations runbook](#operations-runbook)
 
+For how many calls a node carries and which limit you hit first, see
+[Capacity & sizing](capacity.md); for the host and engine settings that move those numbers, see
+[Performance & tuning](performance.md).
+
 ---
 
 ## Install

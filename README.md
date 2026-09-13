@@ -94,8 +94,12 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 
 ## Performance
 
-Every hot path carries a [criterion](https://github.com/bheisler/criterion.rs) bench and a CI
-regression gate (>10 % over the committed baseline fails the build). The numbers below were taken
+Every hot path carries a [criterion](https://github.com/bheisler/criterion.rs) bench. The CI perf
+gate is narrower and deliberately so: three [iai-callgrind](https://github.com/iai-callgrind/iai-callgrind)
+benches (`codec_iai`, `media_iai`, `srtp_iai`) count *instructions executed*, and a >10 % regression
+against the pull request's own base fails the build — deterministic on a shared runner in a way
+wall-clock numbers are not. The criterion benches themselves are compile-checked in CI, not gated.
+The numbers below were taken
 with `cargo bench` on a **single core** of an **AMD Ryzen AI 9 HX 370**, release build — pure
 per-frame / per-packet compute, no socket I/O and no jitter buffer. One frame is **20 ms**;
 **× real-time** is the 20 ms frame budget ÷ the measured time, i.e. how many concurrent real-time
@@ -106,8 +110,15 @@ streams one core sustains on that operation alone.
   frame in **~28 µs**, i.e. **~720 concurrent VoLTE decodes per core**. The hot kernels (LPC
   synthesis, pitch interpolation, 12.8→16 kHz oversampling) run on runtime-detected **AVX2 SIMD**
   (pure Rust, scalar fallback) — ~1.6× faster than the scalar port, staying byte-exact.
-- **The userspace relay rewrite is ~8 ns/packet** (parse → re-originate SSRC/seq → write), with
-  zero per-packet heap — the CPU is never the relay bottleneck.
+- **The userspace relay costs ~7–9 µs of CPU per relayed packet**, end to end with sockets, of
+  which **about 70 % is kernel time** — one `recvmsg` plus one `sendmsg` per packet. Profiled at
+  100 000 pps, the engine's **own** relay logic (flow lookup, source gate, latch check, loss counter)
+  is **0.04 %** of that and Tokio is 0.15 %; the rest is the kernel's UDP path and its overheads, the
+  three largest being spinlocks, `epoll` readiness tracking, and `netfilter` connection tracking. The
+  packet handling really is free (parse ~1.9 ns; parse → re-originate SSRC/seq → write ~8 ns, zero
+  per-packet heap) — which is exactly why the syscalls, not the packet handling, are what a kernel
+  fast path buys back. Measured with the `siphon-rtp-loadgen` harness at 100–2 000 concurrent calls;
+  see [Capacity & sizing](docs/capacity.md).
 - **A secure (SRTP) leg adds ~0.5 µs of crypto per packet round-trip** over a plaintext leg.
 
 ### Codecs — per 20 ms frame
