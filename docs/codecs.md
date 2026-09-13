@@ -62,7 +62,9 @@ stepping the level rather than jumping so the two ends stay together frame for f
 
 RFC 3555 §4.1.13 makes `annexb=yes` the **default** when the attribute is absent, and the engine
 follows that: a peer that sends no `a=fmtp:18 annexb=` is taken to want Annex B, and only an explicit
-`annexb=no` turns discontinuous transmission off for what the engine *sends*. Descriptors are decoded
+`annexb=no` turns discontinuous transmission off for what the engine *sends*. The engine states its
+own posture explicitly in every G.729 answer it presents (`a=fmtp:18 annexb=yes` or `…=no`), rather
+than leaving it implied — the parameter's default means silence is itself a declaration. Descriptors are decoded
 whatever the leg negotiated — a peer that sends one despite answering `no` is better decoded than
 dropped. A frame the encoder chooses not to send produces no RTP packet at all; the egress timestamp
 still advances (the audio happened) while the sequence number does not (a skipped frame is not a lost

@@ -1894,6 +1894,16 @@ fn egress_fmtp_line(codec: &CodecSpec) -> Option<String> {
             codec.payload_type
         ));
     }
+    if codec.encoding_name == "G729" {
+        // RFC 3555 §4.1.13. The engine states its posture rather than leaving it implied: the
+        // parameter's default is *yes*, so silence is itself a declaration, and a leg the peer asked
+        // to run without discontinuous transmission has to say so or the peer is entitled to assume
+        // two-octet descriptors are coming back. The value is what this leg negotiated — `annexb=no`
+        // from the peer is carried into the answer, which is how RFC 3264 §6.1 settles a parameter
+        // both sides have to agree on.
+        let value = if codec.annex_b { "yes" } else { "no" };
+        return Some(format!("a=fmtp:{} annexb={value}", codec.payload_type));
+    }
     if codec.encoding_name != "AMR-WB" {
         return None;
     }
@@ -2647,6 +2657,28 @@ mod tests {
             Some("a=fmtp:96 octet-align=1;mode-set=2")
         );
         assert_eq!(egress_maxptime_line(&amr), None);
+    }
+
+    #[test]
+    fn the_g729_answer_states_the_annex_b_posture_rather_than_leaving_it_implied() {
+        // RFC 3555 §4.1.13 gives `annexb` the default *yes*, so saying nothing is itself a
+        // declaration — and the wrong one for a leg the peer asked to run without discontinuous
+        // transmission. The engine states what this leg negotiated, either way.
+        let g729 = CodecSpec::new(18, "G729", 8000, 1, 20);
+        assert!(g729.annex_b, "absent means yes");
+        assert_eq!(
+            egress_fmtp_line(&g729).as_deref(),
+            Some("a=fmtp:18 annexb=yes")
+        );
+        assert_eq!(
+            egress_fmtp_line(&g729.with_annex_b(false)).as_deref(),
+            Some("a=fmtp:18 annexb=no")
+        );
+        // Its frame duration is fixed, so it advertises no maxptime.
+        assert_eq!(
+            egress_maxptime_line(&CodecSpec::new(18, "G729", 8000, 1, 20)),
+            None
+        );
     }
 
     #[test]

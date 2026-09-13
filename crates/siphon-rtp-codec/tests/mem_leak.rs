@@ -97,6 +97,55 @@ fn codec_construct_churn_does_not_leak() {
     );
 }
 
+/// Churning whole G.729 codec instances through construct → encode → decode → drop, which is what a
+/// node carrying short calls does all day: one codec pair per leg, built at answer and dropped at
+/// delete. The state is large for a codec of this rate (excitation history, predictor memories, the
+/// background estimate), so a constructor that leaked would show up as a node that grows with call
+/// count rather than with concurrency — the shape that is hardest to catch in production.
+#[cfg(feature = "g729")]
+#[test]
+fn g729_call_churn_does_not_leak() {
+    use siphon_rtp_codec::g729::G729;
+
+    let pcm: Vec<i16> = (0..160)
+        .map(|i| {
+            let t = i as f32;
+            (((t * 0.21).sin() + 0.6 * (t * 0.63).sin()) * 9000.0) as i16
+        })
+        .collect();
+    let mut payload = vec![0u8; 20];
+    let mut out = vec![0i16; 160];
+
+    // One "call": a codec pair built, a few packets each way, then dropped. Annex B on, because a
+    // real call spends most of its time inactive and that is the path with the most state.
+    let mut call = || {
+        let mut encoder = G729::new(20).with_annex_b(true);
+        let mut decoder = G729::new(20).with_annex_b(true);
+        for _ in 0..5 {
+            let written = Encoder::encode(&mut encoder, &pcm, &mut payload).expect("encode");
+            if written > 0 {
+                Decoder::decode(&mut decoder, &payload[..written], &mut out).expect("decode");
+            }
+        }
+    };
+
+    let _prime = allocated_bytes();
+    for _ in 0..200 {
+        call();
+    }
+    let before = allocated_bytes();
+    for _ in 0..5_000 {
+        call();
+    }
+    let after = allocated_bytes();
+
+    assert!(
+        after <= before,
+        "G.729 call churn leaked {} bytes over 5k calls",
+        after.saturating_sub(before)
+    );
+}
+
 // NOTE: the AMR encode-core zero-allocation gates (AMR-NB *and* AMR-WB) live in the sibling
 // `tests/amr_zero_alloc.rs`, which uses a **counting** global allocator. A jemalloc `stats.allocated`
 // byte-delta (this file's instrument) moves in coarse arena-sized steps, so it is too noisy to gate a

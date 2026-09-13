@@ -44,7 +44,9 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   follows that rather than the convenient reading: a peer that sends no `a=fmtp:18 annexb=` is taken
   to want Annex B, and only an explicit `annexb=no` turns discontinuous transmission off for what the
   engine sends. Descriptors are decoded whatever the leg negotiated. A frame the encoder chooses not
-  to send produces no RTP packet; the egress timestamp still advances, because the audio happened,
+  to send produces no RTP packet; the engine states its own posture explicitly in every G.729 answer
+  it presents rather than leaving it implied, since the parameter's default means silence is itself a
+  declaration. The egress timestamp still advances, because the audio happened,
   while the sequence number does not, because a skipped frame is not a lost one and counting it as
   loss would corrupt the peer's RFC 3550 §6.4.1 reception report.
 
