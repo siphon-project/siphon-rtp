@@ -675,6 +675,15 @@ impl UdpLoopbackDatapath {
     /// Bind an endpoint on the next free port in the configured range. Tries each reservable port
     /// once; a port reservable in our range but held by another process on the host is released and
     /// skipped. `PoolExhausted` when the whole range is taken.
+    ///
+    /// **Only `EADDRINUSE` is retried.** It is the one failure that is a property of the *port*
+    /// rather than of the bind, so another port can still succeed. Every other errno fails for the
+    /// whole range — `EMFILE`/`ENFILE` (no descriptors left), `EADDRNOTAVAIL` (the bind address is
+    /// not assigned to this host), `ENOBUFS`, `EACCES` — so retrying spends up to `span()` syscalls
+    /// to reach the same answer and, worse, reports it as `PoolExhausted`, which names a cause the
+    /// operator can act on and is not the real one. The descriptor case is the one that bites: a
+    /// container's default 1024 soft limit caps a relay node at roughly 253 calls, and an operator
+    /// told the port pool is exhausted widens a range that was never full.
     async fn bind_in_range(
         bind_ip: IpAddr,
         pool: &PortAllocator,
@@ -686,7 +695,12 @@ impl UdpLoopbackDatapath {
             };
             match Self::bind_ephemeral(bind_ip, port, dscp).await {
                 Ok(bound) => return Ok(bound),
-                Err(_) => pool.release(port),
+                Err(error) => {
+                    pool.release(port);
+                    if !is_port_in_use(&error) {
+                        return Err(error);
+                    }
+                }
             }
         }
         Err(DatapathError::PoolExhausted { limit: pool.span() })
@@ -713,6 +727,15 @@ impl UdpLoopbackDatapath {
         );
         Endpoint { id, local_addr }
     }
+}
+
+/// Whether a bind failure means "this port is taken" rather than "this bind cannot work".
+///
+/// `EADDRINUSE` is the only errno for which the next port in the range is worth trying: the port is
+/// held by another process on the host (or another instance sharing the range), and nothing about
+/// the address, the process's descriptors or its permissions is wrong. See `bind_in_range`.
+fn is_port_in_use(error: &DatapathError) -> bool {
+    matches!(error, DatapathError::Bind(io) if io.kind() == std::io::ErrorKind::AddrInUse)
 }
 
 /// Mark a bound media socket with `dscp` (RFC 2474) so the network can police it as voice.
@@ -2189,6 +2212,67 @@ mod tests {
                 "port {port} must be within [{min}, {max}]"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_port_held_by_another_process_is_skipped() {
+        // The documented reason `bind_in_range` retries at all: a port reservable in our range but
+        // already bound on the host (another process, or another siphon-rtp instance sharing the
+        // range) is released and skipped, and the allocation lands on the next one.
+        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 43_100))
+            .expect("hold the first port of the range");
+
+        let datapath =
+            UdpLoopbackDatapath::with_port_range(IpAddr::V4(Ipv4Addr::LOCALHOST), 43_100, 43_101);
+        let endpoint = datapath
+            .alloc_endpoint()
+            .await
+            .expect("alloc skips the held port");
+
+        assert_eq!(
+            endpoint.local_addr.port(),
+            43_101,
+            "the held port is skipped, not reported as a failure"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_bind_error_that_is_not_addr_in_use_is_reported_as_itself() {
+        // Every bind failure used to be swallowed and retried, so the loop walked the whole span and
+        // renamed the cause `PoolExhausted` — on a range that was entirely free. The failure that
+        // matters in production is EMFILE (a container's default 1024-descriptor soft limit caps a
+        // relay node at ~253 calls), which no other port can fix. EADDRNOTAVAIL on a TEST-NET-1
+        // address (RFC 5737 §3) is the deterministic stand-in: unassigned on any conforming host.
+        let datapath = UdpLoopbackDatapath::with_port_range(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            43_200,
+            43_209,
+        );
+
+        let error = datapath
+            .alloc_endpoint()
+            .await
+            .expect_err("binding an unassigned address cannot succeed");
+
+        match error {
+            DatapathError::Bind(io) => assert_eq!(
+                io.kind(),
+                std::io::ErrorKind::AddrNotAvailable,
+                "the operating system's own reason is preserved"
+            ),
+            other => panic!("expected the bind error itself, got {other:?}"),
+        }
+
+        let pool = datapath
+            .inner
+            .ports
+            .as_ref()
+            .expect("the range is configured");
+        assert!(
+            pool.reserved.is_empty(),
+            "the attempted port is released, not leaked out of the pool"
+        );
     }
 
     #[tokio::test]
