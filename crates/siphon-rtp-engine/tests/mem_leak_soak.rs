@@ -514,6 +514,12 @@ async fn record_start_stop(engine: &Engine<UdpLoopbackDatapath>, dir: &str, inde
                 call_id: call_id.clone(),
                 from_tag: "tag-a".into(),
                 recording_dir: Some(dir.to_string()),
+                format: None,
+                direction: None,
+                channels: None,
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
             },
         )
         .await;
@@ -524,6 +530,7 @@ async fn record_start_stop(engine: &Engine<UdpLoopbackDatapath>, dir: &str, inde
             Command::StopRecording {
                 call_id: call_id.clone(),
                 from_tag: "tag-a".into(),
+                recording_id: None,
             },
         )
         .await;

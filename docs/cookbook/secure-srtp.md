@@ -50,22 +50,29 @@ engine never silently downgrades a secure leg to plaintext, and a packet that
 fails SRTP authentication is dropped, never forwarded (see
 [Security & NAT](../security-and-nat.md)).
 
-**Terminating SRTP the *offerer* signals** — a secure caller toward a plain callee
-— is wired for conference legs (`conference_join` answers `RTP/SAVP` + `a=crypto`)
-and now for the **two-party offer/answer relay**: the engine mints its own SDES
-key for the caller, answers with it, decrypts the caller's SRTP, and relays
-plaintext to the callee (and back again, encrypted). See
-[A secure caller toward a plain callee](#a-secure-caller-toward-a-plain-callee).
+**Terminating SRTP the *offerer* signals** — a secure caller, rather than a secure
+callee — is now wired in three places:
 
-Two shapes are refused rather than half-carried, because both need the caller's
-`SecureLeg` threaded into the transcoding pipeline:
+- **conference legs** (`conference_join` answers `RTP/SAVP` + `a=crypto`);
+- **`answer_local`** — an SDES-SRTP caller reaches an IVR, an announcement, an
+  echo test or a voicemail box directly, with the engine answering its own
+  `a=crypto` and terminating the caller's SRTP on the single-leg media pipeline.
+  See [A secure caller into an IVR](#a-secure-caller-into-an-ivr);
+- the **two-party offer/answer relay** — the engine mints its own SDES key for the
+  caller, answers with it, decrypts the caller's SRTP and relays plaintext to the
+  callee (and back again, encrypted). See
+  [A secure caller toward a plain callee](#a-secure-caller-toward-a-plain-callee).
+
+Three shapes are refused rather than half-carried, each because the media path
+behind it is not built:
 
 - **both parties secure** — a transcrypt between two different keys;
-- **a codec mismatch** on a secure caller.
-
-A **DTLS-SRTP offerer** on the two-party relay is unchanged: its keying is still
-relayed rather than terminated, which needs the engine's own `a=fingerprint` in
-the caller's answer plus a full ICE agent on its leg.
+- **a codec mismatch** on a secure caller — its `SecureLeg` would have to be
+  threaded into the transcoding pipeline;
+- a **DTLS-SRTP (WebRTC) offerer** on either path — it needs the engine's own
+  `a=fingerprint` in the caller's answer plus a full ICE agent on its leg. On
+  `answer_local` it is answered `secure-offerer-unsupported`, naming DTLS; on the
+  two-party relay its keying is relayed as before, unchanged.
 
 ## Native JSON exchange
 
@@ -246,3 +253,30 @@ the caller's SRTP key — and the answer the caller received was `RTP/AVP`,
 downgrading the very caller whose key had just been forwarded. Both are gone: an
 `RTP/SAVP` offer with no usable `a=crypto` is now refused outright
 (`secure-offerer-unkeyable`) rather than bridged in the clear.
+## A secure caller into an IVR
+
+An SDES-SRTP desk phone calls voicemail. `answer_local` is the verb — the engine
+*is* the far side — and it answers the caller's `RTP/SAVP` offer with `RTP/SAVP`
+and the engine's **own** `a=crypto`, never echoing the caller's key back:
+
+```json
+{
+  "id": 60,
+  "command": "answer_local",
+  "call_id": "7f9a2b1c@198.51.100.20",
+  "from_tag": "a7c31f",
+  "sdp": "<the caller's RTP/SAVP offer with its a=crypto>"
+}
+```
+
+From there it is an ordinary single-leg call: `play_media` plays the greeting,
+`start_recording` with `format: "wav"` records the message, `play_dtmf` and the
+`dtmf` event work as they do on a plaintext leg. The engine decrypts the caller's
+SRTP before the transcoder sees it and encrypts everything it sends back, so
+nothing in the media path handles the caller's audio in the clear on the wire.
+
+This used to be refused outright (`secure-offerer-unsupported`), which meant a
+TLS/SRTP phone could not reach an IVR or a voicemail box at all.
+
+A **DTLS-SRTP** caller (a browser softphone) still needs a WebSocket takeover;
+see the note above.

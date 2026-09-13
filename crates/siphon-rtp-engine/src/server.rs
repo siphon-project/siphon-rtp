@@ -238,6 +238,7 @@ fn auth_ok() -> CmdResult {
         sdp: None,
         duration_ms: None,
         play_id: None,
+        recording_id: None,
         to_tag: None,
         stats: None,
     }

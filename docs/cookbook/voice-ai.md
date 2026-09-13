@@ -83,9 +83,12 @@ that negotiated encryption. Two further consequences on a secure takeover:
 
 - `ICE=remove` is the escape hatch when you want a takeover on an ICE offerer without running the
   full agent: the caller's ICE is stripped and the leg falls back to the signalled address.
-- A secure caller with **no** `ws_uri` is refused by `answer_local` (`secure-offerer-unsupported`).
-  The single-leg IVR / echo / announcement pipeline terminates no SRTP, so it cannot be a secure
-  caller's far side at all.
+- An **SDES-SRTP** caller with no `ws_uri` is terminated by `answer_local` on the single-leg media
+  pipeline: the engine answers its own `a=crypto` and holds the `SecureLeg`, so an IVR, announcement,
+  echo test or voicemail box works for a secure caller directly.
+- A **DTLS-SRTP** caller with no `ws_uri` is still refused (`secure-offerer-unsupported`): it needs
+  the full ICE agent on the promoted leg to gate the handshake on the selected pair, so a browser
+  softphone still reaches the engine through a takeover.
 
 ## The WebSocket wire
 

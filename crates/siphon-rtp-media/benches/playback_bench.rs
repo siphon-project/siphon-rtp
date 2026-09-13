@@ -18,7 +18,7 @@ use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::playback::{
     FinishedPlayback, Gain, OverlayBus, Playback, PlaybackSource, MAX_OVERLAY_SLOTS,
 };
-use siphon_rtp_media::player::{PcmPlayer, WavSource};
+use siphon_rtp_media::player::{PcmPlayer, PcmRepeat, WavSource};
 use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
 use siphon_rtp_media::wav::WavRecorder;
 
@@ -36,7 +36,7 @@ fn prompt_source(rate_hz: u32, value: i16) -> PlaybackSource {
     recorder.write_pcm(&vec![value; rate_hz as usize]);
     let wav = recorder.into_wav();
     let parsed = WavSource::parse(&wav).expect("fixture parses");
-    PlaybackSource::Pcm(Box::new(PcmPlayer::new(&parsed, u32::MAX, 0)))
+    PlaybackSource::Pcm(Box::new(PcmPlayer::new(&parsed, PcmRepeat::Forever, 0)))
 }
 
 fn overlay_bus(slots: usize, source_rate_hz: u32, egress_rate_hz: u32, frame: usize) -> OverlayBus {
@@ -160,11 +160,56 @@ fn bench_gain(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// What a prompt costs to make playable: the RIFF parse plus the downmix a cache miss pays, against
+/// the cursor construction a cache hit pays.
+///
+/// This is a **call-setup** cost, not a per-frame one, so the absolute figures matter less than the
+/// ratio — it is what a queue with thirty waiting callers multiplies by thirty.
+fn bench_prompt_load(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("prompt_load");
+    for (label, seconds) in [("1s_8k", 1usize), ("30s_8k", 30)] {
+        let mut recorder = WavRecorder::new(8000, 1);
+        recorder.write_pcm(&vec![1234i16; 8000 * seconds]);
+        let bytes = recorder.into_wav();
+
+        // Cache miss: parse the RIFF container and downmix to a shared buffer.
+        group.bench_with_input(
+            BenchmarkId::new("decode", label),
+            &bytes,
+            |bencher, bytes| {
+                bencher.iter(|| {
+                    let parsed = WavSource::parse(black_box(bytes)).expect("parse");
+                    black_box(parsed.to_mono())
+                });
+            },
+        );
+
+        // Cache hit: one `Arc` clone and a cursor.
+        let shared = WavSource::parse(&bytes).expect("parse").to_mono();
+        group.bench_with_input(
+            BenchmarkId::new("cached", label),
+            &shared,
+            |bencher, shared| {
+                bencher.iter(|| {
+                    black_box(PcmPlayer::from_shared(
+                        black_box(shared).clone(),
+                        8000,
+                        PcmRepeat::Times(1),
+                        0,
+                    ))
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_overlay_mix,
     bench_overlay_mix_resampled,
     bench_tone_generation,
-    bench_gain
+    bench_gain,
+    bench_prompt_load
 );
 criterion_main!(benches);

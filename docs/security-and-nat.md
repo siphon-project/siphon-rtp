@@ -970,7 +970,8 @@ copy of Layers 1–4.
   |---|---|---|
   | Secure (SDES or DTLS) offerer + `ws_uri` | `offer` / `answer` | `ws-takeover-secure-offerer` |
   | ICE offerer + `ws_uri` | `offer` / `answer` | `ws-takeover-ice-offerer` |
-  | Secure offerer, **no** `ws_uri` (single-leg IVR/echo) | `answer_local` | `secure-offerer-unsupported` |
+  | **SDES** offerer, no `ws_uri` (single-leg IVR/echo/voicemail) | `answer_local` | terminated on the single-leg media pipeline — the engine answers its own `a=crypto` and holds the `SecureLeg` |
+| **DTLS** offerer, **no** `ws_uri` (single-leg IVR/echo) | `answer_local` | `secure-offerer-unsupported` — needs the full ICE agent on the promoted leg to gate the handshake on the selected pair (RFC 8445 §12) |
   | `RTP/SAVP` with no usable `a=crypto`; `UDP/TLS/RTP/SAVPF` with no `a=fingerprint`; no engine certificate | `answer_local` | `ws-takeover-unkeyable` |
   | ICE offerer with no full agent available | `answer_local` | `ws-takeover-ice-unsupported` |
 
@@ -1017,17 +1018,43 @@ copy of Layers 1–4.
 ### Layer 6 — Media timeout & dead-path teardown
 A flow that has received no *accepted* packet for `T` ticks is torn down and reported.
 
-> **Status (landed):** the **reaper + event delivery** — `Engine::reap_idle(idle_ticks)` frees calls
-> whose media has been idle (returning their ports/FDs and registry/quota slots) and pushes
-> `Event::MediaTimeout` to the owning control connection over the server's per-connection event
-> channel (`Engine::register_client` + the connection `select!`-loop; bounded, drop-on-backpressure).
-> Activity is stamped on every accepted packet against the datapath's logical clock (`now_ticks` /
-> `advance_clock` / `last_activity`); the daemon advances it ~1 tick/s and sweeps.
+> **Status (landed):** the **reaper + event delivery** — `Engine::reap_idle(idle_ticks,
+> held_idle_ticks)` frees calls whose media has been idle (returning their ports/FDs and
+> registry/quota slots) and pushes `Event::MediaTimeout` to the owning control connection over the
+> server's per-connection event channel (`Engine::register_client` + the connection `select!`-loop;
+> bounded, drop-on-backpressure). Activity is stamped on every accepted packet against the datapath's
+> logical clock (`now_ticks` / `advance_clock` / `last_activity`); the daemon advances it ~1 tick/s
+> and sweeps.
 
 - Frees ports/FDs (availability), surfaces one-way-audio and failed-NAT cases, and is the non-ICE
   analogue of consent loss.
 - **Determinism:** the sweep clock is an injected tick source — `tokio::time` advances it in
   production, tests advance it explicitly via `advance_clock` (project rule: never `Instant::now()`).
+- **Silence is only evidence while someone was expected to speak.** A dead media path and a call on
+  hold are *identical* at the packet layer, and only the SDP distinguishes them. RFC 3264 §8.4 defines
+  hold as an offer marked `sendonly` (answered `recvonly`), or `inactive` when both ends hold it, and
+  is explicit that the holding party *"MAY send media (e.g., music on hold) or MAY send nothing"* — so
+  `sendonly` guarantees a packet no more than `recvonly` does. Hold, park and queue are all this state
+  and they last minutes, so a rule that reads "no packets from anyone" tears the call down while the
+  user is still holding the handset.
+
+  The engine therefore parses the direction attribute (RFC 4566 §6 / RFC 8866 §6.7, media-level
+  winning over session-level — `sdp::MediaDirection`) on every offer, answer and `reoffer`, records it
+  per party (`Call::near_direction` / `far_direction`), and treats a call where **either** party has
+  taken the stream off `sendrecv` as *held* (`Call::is_held`). A held call is measured against
+  `--held-media-timeout-secs` (default 7200, `0` = never) rather than `--media-timeout-secs`; an
+  unhold re-offer re-arms the short timer, and the `Event::MediaTimeout` `reason`
+  (`no_media` / `held_too_long`) reports which rule fired. Everything else is unchanged, down to the
+  endpoint set read — a held call carrying music-on-hold refreshes its own ceiling like any other.
+
+  **This does not weaken the gate.** The direction attribute only selects *which ceiling* applies; it
+  never makes a packet acceptable. Liveness is still claimed only for media that cleared the source
+  gate and, where there is crypto, SRTP authentication, so an attacker cannot extend a call's life by
+  spraying it — and cannot shorten one either, since the attribute comes from the signalling path the
+  controller already owns, not from the media path.
+- **Conference seats follow the same rule** (`ConferenceRegistry::reap_idle`): a participant that
+  joined `recvonly` or `inactive` — a listen-only webinar attendee — owes the room no media, so it is
+  measured against the held ceiling instead of the media timeout.
 
 ### 4.7 Data-model changes implied
 > **Landed in M-S1:** `SourceFilter` (`Exact`/`Subnet`/`Any`) and `LatchPolicy`
@@ -1068,8 +1095,12 @@ Distinct from the media latch but part of the same security surface.
   this binds identity to the *connection*; it assumes one persistent control connection per SIPhon
   instance. A shared identity across a connection pool needs the deferred control-channel auth.
 - **Channel security.** **Landed:** optional shared-secret authentication — when
-  `$SIPHON_RTP_CONTROL_SECRET` is set, a control connection must send `Authenticate` with the
-  matching token (constant-time compared) before any other verb is honoured (`serve_with_auth`).
+  `$SIPHON_RTP_CONTROL_SECRET` is set, or `--control-secret-file` /
+  `$SIPHON_RTP_CONTROL_SECRET_FILE` names a file holding the secret, a control connection must send
+  `Authenticate` with the matching token (constant-time compared) before any other verb is honoured
+  (`serve_with_auth`). Neither form reaches argv. Setting both is a fatal startup error and an empty
+  secret file is refused, so a provisioning mistake cannot silently leave the control plane
+  unauthenticated on a node configured to require a secret.
   **Remaining:** TLS on the control socket (mandatory the day SDES key material rides it) and binding
   it to a private interface by config.
 - **Reflector/amplifier hygiene.** Do not forward toward a destination until it is validated (the

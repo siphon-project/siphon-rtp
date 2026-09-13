@@ -309,13 +309,20 @@ pub enum Command {
         call_id: String,
         from_tag: String,
         source: PlayMediaSource,
+        /// How many times to play the source: a **total play count** (`0` and `1` both mean once), or
+        /// `"inf"` to play until stopped. Absent means once.
+        ///
+        /// `"inf"` is what music on hold, queue music and park music need — they play for an
+        /// unbounded time, and a large finite count leaves an audible gap at every re-issue. It
+        /// mirrors the `*inf` suffix a [`PlayMediaSource::Tone`] cadence has always had.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        repeat_times: Option<u64>,
+        repeat_times: Option<PlayRepeat>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start_pos_ms: Option<u64>,
         /// Hard playout cap in milliseconds. The playback ends with [`PlayEndReason::Completed`]
         /// when the cap is reached, whichever comes first with the source running out. The only
-        /// bound, short of a stop, on an endless ([`PlayMediaSource::Tone`] `*inf`) source.
+        /// bound, short of a stop, on an endless source — a [`PlayMediaSource::Tone`] `*inf` cadence
+        /// or a `"repeat_times": "inf"` prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
         /// Mix this playback **under** the party's live egress instead of replacing it.
@@ -434,21 +441,65 @@ pub enum Command {
         #[serde(default = "default_true")]
         enabled: bool,
     },
-    /// Begin recording an established call's media to a `.pcap` at runtime (rtpengine
-    /// `start recording`). Unlike the offer/answer `record_call` flag, this toggles recording on a
-    /// live call: a plain relay is promoted to the userspace media pipeline so its packets can be
-    /// tapped, and each accepted RTP/RTCP datagram is captured verbatim (raw wire bytes, any codec).
-    /// The pcap is written under `recording_dir` (the request's `recording-dir` flag). Rejected on a
-    /// secure (SRTP) or WebSocket-bridged call, whose on-the-wire bytes are not the clear media.
+    /// Begin recording an established call at runtime (rtpengine `start recording`). Unlike the
+    /// offer/answer `record_call` flag, this toggles recording on a **live** call, at a point in it
+    /// the controller chooses.
+    ///
+    /// Two formats, and they record different things:
+    ///
+    /// * [`RecordingFormat::Pcap`] (the default, and what this verb has always done) captures each
+    ///   accepted RTP/RTCP datagram verbatim — raw wire bytes, any codec — to
+    ///   `{recording_dir}/{call_id}.pcap`. An audit artefact. Rejected on a secure (SRTP) or
+    ///   WebSocket-bridged call, whose on-the-wire bytes are not the clear media.
+    /// * [`RecordingFormat::Wav`] writes **decoded** audio, streamed to disk as it arrives, and
+    ///   completes with an [`Event::RecordingFinished`] naming the finished file. A product artefact:
+    ///   a voicemail message to be emailed, transcribed and played back. It works on a single-leg
+    ///   (`answer_local`) call — which is what a voicemail box is — as well as a two-party one.
+    ///
+    /// The accept carries a `recording_id`; [`Command::StopRecording`] takes it, and the
+    /// [`Event::RecordingFinished`] echoes it.
     StartRecording {
         call_id: String,
         from_tag: String,
+        /// Output directory for a pcap recording. Ignored when `path` is given.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recording_dir: Option<String>,
+        /// What to write. Absent ⇒ [`RecordingFormat::Pcap`], so an existing caller is unmoved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<RecordingFormat>,
+        /// Which audio a `wav` recording captures. Absent ⇒ [`RecordingDirection::Ingress`] — the
+        /// audio the parties *sent*, which is what a voicemail message is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<RecordingDirection>,
+        /// Whether a `wav` recording is one mixed track or two separated ones. Absent ⇒ mono.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channels: Option<RecordingChannels>,
+        /// Stop after this many milliseconds of audio and report
+        /// [`RecordingEndReason::MaxDuration`]. The time limit a voicemail greeting announces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_duration_ms: Option<u64>,
+        /// Stop after this many milliseconds with no speech and report
+        /// [`RecordingEndReason::Silence`] — the caller stopped talking and hung up, or never spoke.
+        /// Evaluated in the engine, where the decoded audio already is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        silence_ms: Option<u64>,
+        /// Explicit output file path, overriding `recording_dir` and the engine's own naming. The
+        /// directory must already exist.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
-    /// Stop a runtime recording started with [`Command::StartRecording`] (rtpengine `stop recording`):
-    /// finalize the `.pcap` and demote the relay back to the fast path if nothing else holds it.
-    StopRecording { call_id: String, from_tag: String },
+    /// Stop a runtime recording started with [`Command::StartRecording`] (rtpengine
+    /// `stop recording`): finalize the file and demote the relay back to the fast path if nothing
+    /// else holds it.
+    ///
+    /// `recording_id` names one recording; absent stops **every** recording on the call, which is
+    /// what rtpengine's `stop recording` means and what the NG front-end (which has no id) sends.
+    StopRecording {
+        call_id: String,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recording_id: Option<String>,
+    },
     /// Create a media subscription (SIPREC / MPTY). `from_tags` may list multiple legs.
     SubscribeRequest {
         call_id: String,
@@ -503,6 +554,73 @@ pub enum Command {
         conference_id_b: String,
         #[serde(default)]
         direction: BridgeDirection,
+    },
+    /// Play audio **into a conference room** — an entry tone, a "this conference is being recorded"
+    /// announcement, hold music for a lone participant.
+    ///
+    /// Mixed as a non-participant source: everyone in the room hears it, and nobody is
+    /// mixed-minus-self against it (so it is not treated as anyone's own audio). Up to four run at
+    /// once, each with its own `play_id`, exactly as a leg's overlay playbacks do — and ending with
+    /// its own [`Event::PlayFinished`] carrying `conference_id` rather than `call_id`.
+    ///
+    /// A room is not a call: the leg-addressed [`Command::PlayMedia`] resolves through the call
+    /// registry, which a conference never enters, so it answers `unknown call` for a room id. Hence a
+    /// verb of its own rather than a field.
+    ConferencePlay {
+        conference_id: String,
+        source: PlayMediaSource,
+        /// How many times to play it: a total play count (`0`/absent plays once), or `"inf"` until
+        /// stopped — which is what hold music for a lone participant needs. Same
+        /// [`PlayRepeat`] as [`Command::PlayMedia`]'s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repeat_times: Option<PlayRepeat>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_pos_ms: Option<u64>,
+        /// Hard playout cap in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// Playout gain in whole decibels relative to the source's own level, clamped -60..=+12 — how
+        /// an announcement sits over a live conversation rather than burying it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gain_decibels: Option<i32>,
+    },
+    /// Stop audio playing into a room. With a `play_id`, stops that one; without, stops all of them.
+    ConferenceStopPlay {
+        conference_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        play_id: Option<u64>,
+    },
+    /// Retune a running room playback's gain, addressed by the `play_id` its accept returned.
+    ConferenceSetPlayGain {
+        conference_id: String,
+        play_id: u64,
+        gain_decibels: i32,
+    },
+    /// Record a conference room's mix to a decoded WAV, streamed to disk.
+    ///
+    /// Records what a **listener** hears — the full room including any bridged room — which is the
+    /// useful definition of "record the conference". Accepts with a `recording_id` and completes with
+    /// an [`Event::RecordingFinished`], the same contract [`Command::StartRecording`] has on a call.
+    ConferenceStartRecording {
+        conference_id: String,
+        /// Explicit output file path. The directory must already exist.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// Output directory, when no explicit `path` is given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recording_dir: Option<String>,
+        /// Stop after this many milliseconds and report [`RecordingEndReason::MaxDuration`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_duration_ms: Option<u64>,
+        /// Stop after this long with no speech in the room.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        silence_ms: Option<u64>,
+    },
+    /// Stop a room recording. Without a `recording_id`, stops every recording on the room.
+    ConferenceStopRecording {
+        conference_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recording_id: Option<String>,
     },
     /// Attach a **WebSocket tee** to a live call: stream its decoded audio to `ws_uri` while the call
     /// keeps relaying. Unlike `ProfileFlags::ws_uri` (takeover — the WS server *becomes* leg A's far
@@ -851,6 +969,164 @@ pub enum BridgeDirection {
     BToA,
 }
 
+/// What [`Command::StartRecording`] writes.
+///
+/// Deliberately **not** `#[non_exhaustive]`: a controller that asks for a format the engine answers
+/// with something else has been silently given a different artefact, and the two here are not
+/// substitutes — one is raw wire bytes for an audit, the other decoded audio for a person to listen
+/// to. Losing compilation on a new format is the feature.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingFormat {
+    /// Raw RTP/RTCP datagrams, verbatim, in a `.pcap`. The historical behaviour and the default.
+    #[default]
+    Pcap,
+    /// Decoded 16-bit linear PCM, streamed to a RIFF/WAVE file as it arrives.
+    Wav,
+}
+
+/// Which audio a [`RecordingFormat::Wav`] recording captures.
+///
+/// "Ingress" and "egress" are relative to the **engine**: ingress is what the parties sent *to* it
+/// (a voicemail message, a call recording), egress is what the engine sent *to* them (its prompts,
+/// an injected announcement, the mixed audio a party heard).
+///
+/// Exhaustive for the same reason as [`RecordingFormat`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingDirection {
+    /// What the parties sent. On a two-party call this is both legs' inbound audio; on a single-leg
+    /// (`answer_local`) call it is the caller's. The default, and what a voicemail needs.
+    #[default]
+    Ingress,
+    /// What the engine sent to the parties — prompts, announcements, the conference mix it produced.
+    Egress,
+    /// Both, which on a mono recording is the two summed and on a stereo one is the two separated.
+    Both,
+}
+
+/// Whether a [`RecordingFormat::Wav`] recording is one mixed track or two separated ones.
+///
+/// Exhaustive for the same reason as [`RecordingFormat`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingChannels {
+    /// One track. Sources selected by [`RecordingDirection`] are summed (saturating).
+    #[default]
+    Mono,
+    /// Two tracks, interleaved: the caller's audio left, the callee's right. Needs two sources — a
+    /// single-leg call has only one, so it records mono whatever is asked for.
+    Stereo,
+}
+
+/// How a [`RecordingFormat::Wav`] recording ended ([`Event::RecordingFinished`]).
+///
+/// `#[non_exhaustive]`: engine-emitted and informational. A consumer that does not recognise a reason
+/// still has the finished file, which is the part it acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RecordingEndReason {
+    /// Ended by [`Command::StopRecording`].
+    Stopped,
+    /// The `max_duration_ms` limit was reached.
+    MaxDuration,
+    /// `silence_ms` elapsed with no speech.
+    Silence,
+    /// The call ended (hangup, `delete`, or a media timeout) while the recording was running.
+    CallEnded,
+    /// The recording aborted — a write failed, or the file could not be finalized. The file may be
+    /// truncated or missing; its `duration_ms` is what had been written when the error hit.
+    Error,
+}
+
+/// How many times a [`Command::PlayMedia`] plays its source.
+///
+/// On the wire this is either a **number** — a total play count, where `0` and `1` both mean once —
+/// or the **string `"inf"`**, which plays until the playback is stopped or its `duration_ms` cap
+/// expires. `"inf"` deliberately mirrors the `*inf` suffix a [`PlayMediaSource::Tone`] cadence has
+/// always accepted, so one spelling means "endless" everywhere in the contract.
+///
+/// Music on hold, queue music and park music are why it exists: they play for an unbounded time, and
+/// approximating that with a large finite count leaves an audible gap at every re-issue and puts a
+/// per-caller timer in the controller for something the engine's player already does internally. An
+/// endless play's accept carries **no** `duration_ms`, because there is none to report.
+///
+/// Serde is hand-written rather than `#[serde(untagged)]`: untagged would accept any string as
+/// `Forever` or silently fall through on a typo, and the error message matters more than the four
+/// lines it saves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayRepeat {
+    /// Play the source this many times in total. `0` and `1` both mean once — `repeat_times` has
+    /// always been a total play count on this wire, not a count of *extra* repeats.
+    Times(u64),
+    /// Play until stopped (`"inf"`).
+    Forever,
+}
+
+impl PlayRepeat {
+    /// The wire token for an endless play — the same one the tone cadence grammar uses.
+    const FOREVER_TOKEN: &'static str = "inf";
+}
+
+impl From<u64> for PlayRepeat {
+    fn from(times: u64) -> Self {
+        PlayRepeat::Times(times)
+    }
+}
+
+impl Serialize for PlayRepeat {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PlayRepeat::Times(times) => serializer.serialize_u64(*times),
+            PlayRepeat::Forever => serializer.serialize_str(Self::FOREVER_TOKEN),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PlayRepeat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RepeatVisitor;
+
+        impl serde::de::Visitor<'_> for RepeatVisitor {
+            type Value = PlayRepeat;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "a play count (non-negative integer) or \"{}\"",
+                    PlayRepeat::FOREVER_TOKEN
+                )
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, times: u64) -> Result<Self::Value, E> {
+                Ok(PlayRepeat::Times(times))
+            }
+
+            // A JSON encoder that writes a small count as a signed integer still round-trips; a
+            // negative one is refused rather than wrapping into an enormous play count.
+            fn visit_i64<E: serde::de::Error>(self, times: i64) -> Result<Self::Value, E> {
+                u64::try_from(times)
+                    .map(PlayRepeat::Times)
+                    .map_err(|_| E::custom(format!("repeat_times must not be negative: {times}")))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value.eq_ignore_ascii_case(PlayRepeat::FOREVER_TOKEN) {
+                    Ok(PlayRepeat::Forever)
+                } else {
+                    Err(E::custom(format!(
+                        "repeat_times must be a number or \"{}\", got {value:?}",
+                        PlayRepeat::FOREVER_TOKEN
+                    )))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(RepeatVisitor)
+    }
+}
+
 /// Source for [`Command::PlayMedia`]. Tagged on `"source"`.
 ///
 /// `#[non_exhaustive]`: the source list grows with the engine (this release added `tone` and
@@ -1188,6 +1464,11 @@ pub enum CmdResult {
         /// controller correlates the completion with the accept it awaited.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         play_id: Option<u64>,
+        /// The accepted recording's identifier (`start_recording` with `format: "wav"`). The matching
+        /// [`Event::RecordingFinished`] carries the same value, and [`Command::StopRecording`] takes
+        /// it to stop this recording without disturbing another on the same call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recording_id: Option<String>,
         /// UAS To-tag (subscribe_request / siprec).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
@@ -1387,6 +1668,28 @@ pub enum PlayEndReason {
     Error,
 }
 
+/// Which idle rule tore a call down ([`Event::MediaTimeout`]).
+///
+/// The engine judges a leg idle only while its peer is **expected to send**: a party that signalled
+/// `a=recvonly` or `a=inactive` has told us it will send nothing (RFC 3264 §8.4), so its silence is
+/// the session state the signalling asked for. A call where no leg is expected to send is *held*, and
+/// held calls are measured against their own, much longer ceiling.
+///
+/// `#[non_exhaustive]`: engine-emitted and purely informational. A consumer that does not recognise a
+/// reason still knows the call is gone, which is the part it must act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MediaTimeoutReason {
+    /// A leg that was expected to be sending sent nothing for `--media-timeout-secs` — the media path
+    /// died (or was never established). The historical, and still the default, reason.
+    NoMedia,
+    /// Every leg is held (`a=recvonly` / `a=inactive` / a `sendonly`+`recvonly` pair), so no silence
+    /// was unexpected, but the call stayed that way past `--held-media-timeout-secs`. Nobody came back
+    /// to it.
+    HeldTooLong,
+}
+
 /// An asynchronous event pushed from the engine to SIPhon (no request correlation).
 /// `#[serde(other)]` keeps forward-compatibility: SIPhon tolerates new event kinds.
 ///
@@ -1428,9 +1731,15 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direction: Option<String>,
     },
-    /// A call's media went silent past the timeout and the engine tore it down (dead-path
-    /// detection). Lets SIPhon release its own per-call state.
-    MediaTimeout { call_id: String, from_tag: String },
+    /// A call's media went silent past a timeout and the engine tore it down. Lets SIPhon release its
+    /// own per-call state. `reason` says **which** rule fired, because the two mean opposite things
+    /// operationally: [`MediaTimeoutReason::NoMedia`] is a path that died while a party was expected
+    /// to be sending, and [`MediaTimeoutReason::HeldTooLong`] is a call nobody ever took off hold.
+    MediaTimeout {
+        call_id: String,
+        from_tag: String,
+        reason: MediaTimeoutReason,
+    },
     /// A [`Command::PlayMedia`] playback ended. Carries the `play_id` the play's accept returned, so a
     /// controller awaiting a specific prompt matches the completion to the accept it holds — the
     /// load-bearing correlation, since a leg may play several prompts in sequence. `reason` says *how*
@@ -1438,7 +1747,11 @@ pub enum Event {
     /// the `duration_ms` cap); `Stopped` / `Superseded` / `Error` resolve the await as not-completed so
     /// a script does not run its next step on a prompt that never finished.
     PlayFinished {
+        /// The call the playback ran on. Empty for a room playback, which names `conference_id`.
         call_id: String,
+        /// The room a [`Command::ConferencePlay`] ran in. Absent for a leg playback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
         from_tag: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
@@ -1448,6 +1761,29 @@ pub enum Event {
         /// Actual played duration in milliseconds, for observability / CDR. `None` when not tracked.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         played_ms: Option<u64>,
+    },
+    /// A [`RecordingFormat::Wav`] recording ended and its file is **closed**.
+    ///
+    /// Emitted after the WAV header has been finalized and the file flushed, so a consumer that acts
+    /// on this event never reads a half-written file — which is the whole reason the event exists.
+    /// `recording_id` is the one the [`Command::StartRecording`] accept returned.
+    RecordingFinished {
+        /// The call the recording ran on. Empty for a room recording, which names `conference_id`.
+        call_id: String,
+        /// The room a [`Command::ConferenceStartRecording`] recorded. Absent for a call recording.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
+        from_tag: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_tag: Option<String>,
+        /// Correlates with the `recording_id` returned by the accept.
+        recording_id: String,
+        /// The finished file. Absent only when the recording aborted before a file existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// Audio actually written, in milliseconds.
+        duration_ms: u64,
+        reason: RecordingEndReason,
     },
     /// The active (dominant) speaker in a conference changed. `from_tag` is the new speaker's leg
     /// tag, or `None` when the floor went silent (no one speaking). Drives floor control / UI.
@@ -2491,7 +2827,7 @@ mod tests {
                 source: PlayMediaSource::File {
                     path: "/p.wav".into(),
                 },
-                repeat_times: Some(2),
+                repeat_times: Some(PlayRepeat::Times(2)),
                 start_pos_ms: None,
                 duration_ms: Some(5000),
                 overlay: false,
@@ -2517,7 +2853,7 @@ mod tests {
                 source: PlayMediaSource::Http {
                     url: "https://example.invalid/hold.wav".into(),
                 },
-                repeat_times: Some(0),
+                repeat_times: Some(PlayRepeat::Times(0)),
                 start_pos_ms: None,
                 duration_ms: None,
                 overlay: true,
@@ -2688,6 +3024,78 @@ mod tests {
             },
         };
         roundtrip(&request);
+    }
+
+    #[test]
+    fn repeat_times_accepts_a_count_or_inf_and_writes_back_what_it_read() {
+        for (json, expected) in [
+            ("0", PlayRepeat::Times(0)),
+            ("1", PlayRepeat::Times(1)),
+            ("5", PlayRepeat::Times(5)),
+            (r#""inf""#, PlayRepeat::Forever),
+        ] {
+            let parsed: PlayRepeat = serde_json::from_str(json).expect("deserialize");
+            assert_eq!(parsed, expected, "{json}");
+            assert_eq!(
+                serde_json::to_string(&parsed).expect("serialize"),
+                json,
+                "a count stays a number and inf stays a string"
+            );
+        }
+    }
+
+    #[test]
+    fn repeat_times_refuses_anything_that_is_not_a_count_or_inf() {
+        // A typo must be a loud parse error rather than silently becoming an endless bed on every
+        // caller — which is what an untagged enum with a string variant would have done.
+        for json in [r#""forever""#, r#""INFINITE""#, r#""""#, "-1", "true"] {
+            assert!(
+                serde_json::from_str::<PlayRepeat>(json).is_err(),
+                "{json} must not parse"
+            );
+        }
+        // The token is matched case-insensitively, like the tone cadence grammar's `*inf`.
+        assert_eq!(
+            serde_json::from_str::<PlayRepeat>(r#""INF""#).expect("deserialize"),
+            PlayRepeat::Forever
+        );
+    }
+
+    #[test]
+    fn an_endless_play_media_keeps_the_wire_shape_a_finite_one_has() {
+        let endless = serde_json::to_value(Command::PlayMedia {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            source: PlayMediaSource::File {
+                path: "/hold.wav".into(),
+            },
+            repeat_times: Some(PlayRepeat::Forever),
+            start_pos_ms: None,
+            duration_ms: None,
+            overlay: true,
+            gain_decibels: Some(-12),
+            to_tag: None,
+        })
+        .expect("serialize");
+        assert_eq!(endless["command"], "play_media");
+        assert_eq!(endless["repeat_times"], "inf");
+
+        // And `0` still means once, so nothing a controller sends today changes meaning.
+        let once = serde_json::to_value(Command::PlayMedia {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            source: PlayMediaSource::File {
+                path: "/hold.wav".into(),
+            },
+            repeat_times: Some(PlayRepeat::Times(0)),
+            start_pos_ms: None,
+            duration_ms: None,
+            overlay: false,
+            gain_decibels: None,
+            to_tag: None,
+        })
+        .expect("serialize");
+        assert_eq!(once["repeat_times"], 0);
     }
 
     #[test]
@@ -2883,6 +3291,7 @@ mod tests {
                 sdp: None,
                 duration_ms: Some(4000),
                 play_id: Some(7),
+                recording_id: None,
                 to_tag: None,
                 stats: None,
             },
@@ -2897,6 +3306,7 @@ mod tests {
             sdp: Some("v=0".into()),
             duration_ms: None,
             play_id: None,
+            recording_id: None,
             to_tag: None,
             stats: None,
         })
@@ -2915,6 +3325,7 @@ mod tests {
                 sdp: Some("v=0".into()),
                 duration_ms: None,
                 play_id: None,
+                recording_id: None,
                 to_tag: None,
                 stats: None,
             },
@@ -3011,6 +3422,7 @@ mod tests {
                 sdp: None,
                 duration_ms: None,
                 play_id: None,
+                recording_id: None,
                 to_tag: None,
                 stats: Some(SessionStats {
                     packets_in: 100,
@@ -3424,11 +3836,27 @@ mod tests {
     }
 
     #[test]
-    fn media_timeout_event_roundtrip() {
-        roundtrip(&Event::MediaTimeout {
+    fn media_timeout_event_roundtrip_for_each_reason() {
+        for reason in [MediaTimeoutReason::NoMedia, MediaTimeoutReason::HeldTooLong] {
+            roundtrip(&Event::MediaTimeout {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                reason,
+            });
+        }
+    }
+
+    #[test]
+    fn media_timeout_reason_serializes_snake_case() {
+        // The wire token is what a controller branches on, so pin it rather than trusting the derive.
+        let json = serde_json::to_value(Event::MediaTimeout {
             call_id: "c".into(),
             from_tag: "f".into(),
-        });
+            reason: MediaTimeoutReason::HeldTooLong,
+        })
+        .expect("serialize");
+        assert_eq!(json["event"], "media_timeout");
+        assert_eq!(json["reason"], "held_too_long");
     }
 
     #[test]
@@ -3440,6 +3868,7 @@ mod tests {
             PlayEndReason::Error,
         ] {
             roundtrip(&Event::PlayFinished {
+                conference_id: None,
                 call_id: "c".into(),
                 from_tag: "f".into(),
                 to_tag: Some("t".into()),
@@ -3451,6 +3880,7 @@ mod tests {
         // The wire tag is snake_case (SIPhon dispatches on "play_finished"), the reason is snake_case,
         // and an absent `to_tag` / `played_ms` are omitted.
         let event = Event::PlayFinished {
+            conference_id: None,
             call_id: "c".into(),
             from_tag: "f".into(),
             to_tag: None,
