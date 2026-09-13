@@ -319,7 +319,7 @@ impl PcmPlayer {
 
     /// Pull the next mono frame into `out`, returning the number of samples written, or `None` when
     /// exhausted. A short final frame is zero-padded to `out.len()` and the produced count reflects
-    /// only the real samples. Loops per [`PcmPlayer::repeat`], rewinding to the seek point each pass.
+    /// only the real samples. Loops per its [`PcmRepeat`], rewinding to the seek point each pass.
     pub fn next_frame(&mut self, out: &mut [i16]) -> Option<usize> {
         if out.is_empty() {
             return None;
