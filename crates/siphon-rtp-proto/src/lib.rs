@@ -555,6 +555,73 @@ pub enum Command {
         #[serde(default)]
         direction: BridgeDirection,
     },
+    /// Play audio **into a conference room** — an entry tone, a "this conference is being recorded"
+    /// announcement, hold music for a lone participant.
+    ///
+    /// Mixed as a non-participant source: everyone in the room hears it, and nobody is
+    /// mixed-minus-self against it (so it is not treated as anyone's own audio). Up to four run at
+    /// once, each with its own `play_id`, exactly as a leg's overlay playbacks do — and ending with
+    /// its own [`Event::PlayFinished`] carrying `conference_id` rather than `call_id`.
+    ///
+    /// A room is not a call: the leg-addressed [`Command::PlayMedia`] resolves through the call
+    /// registry, which a conference never enters, so it answers `unknown call` for a room id. Hence a
+    /// verb of its own rather than a field.
+    ConferencePlay {
+        conference_id: String,
+        source: PlayMediaSource,
+        /// How many times to play it: a total play count (`0`/absent plays once), or `"inf"` until
+        /// stopped — which is what hold music for a lone participant needs. Same
+        /// [`PlayRepeat`] as [`Command::PlayMedia`]'s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repeat_times: Option<PlayRepeat>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_pos_ms: Option<u64>,
+        /// Hard playout cap in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        /// Playout gain in whole decibels relative to the source's own level, clamped -60..=+12 — how
+        /// an announcement sits over a live conversation rather than burying it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gain_decibels: Option<i32>,
+    },
+    /// Stop audio playing into a room. With a `play_id`, stops that one; without, stops all of them.
+    ConferenceStopPlay {
+        conference_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        play_id: Option<u64>,
+    },
+    /// Retune a running room playback's gain, addressed by the `play_id` its accept returned.
+    ConferenceSetPlayGain {
+        conference_id: String,
+        play_id: u64,
+        gain_decibels: i32,
+    },
+    /// Record a conference room's mix to a decoded WAV, streamed to disk.
+    ///
+    /// Records what a **listener** hears — the full room including any bridged room — which is the
+    /// useful definition of "record the conference". Accepts with a `recording_id` and completes with
+    /// an [`Event::RecordingFinished`], the same contract [`Command::StartRecording`] has on a call.
+    ConferenceStartRecording {
+        conference_id: String,
+        /// Explicit output file path. The directory must already exist.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// Output directory, when no explicit `path` is given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recording_dir: Option<String>,
+        /// Stop after this many milliseconds and report [`RecordingEndReason::MaxDuration`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_duration_ms: Option<u64>,
+        /// Stop after this long with no speech in the room.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        silence_ms: Option<u64>,
+    },
+    /// Stop a room recording. Without a `recording_id`, stops every recording on the room.
+    ConferenceStopRecording {
+        conference_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recording_id: Option<String>,
+    },
     /// Attach a **WebSocket tee** to a live call: stream its decoded audio to `ws_uri` while the call
     /// keeps relaying. Unlike `ProfileFlags::ws_uri` (takeover — the WS server *becomes* leg A's far
     /// side and A↔B is not wired), a tee is send-only and additive: the relay/transcode path, any
@@ -1680,7 +1747,11 @@ pub enum Event {
     /// the `duration_ms` cap); `Stopped` / `Superseded` / `Error` resolve the await as not-completed so
     /// a script does not run its next step on a prompt that never finished.
     PlayFinished {
+        /// The call the playback ran on. Empty for a room playback, which names `conference_id`.
         call_id: String,
+        /// The room a [`Command::ConferencePlay`] ran in. Absent for a leg playback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
         from_tag: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
@@ -1697,7 +1768,11 @@ pub enum Event {
     /// on this event never reads a half-written file — which is the whole reason the event exists.
     /// `recording_id` is the one the [`Command::StartRecording`] accept returned.
     RecordingFinished {
+        /// The call the recording ran on. Empty for a room recording, which names `conference_id`.
         call_id: String,
+        /// The room a [`Command::ConferenceStartRecording`] recorded. Absent for a call recording.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_id: Option<String>,
         from_tag: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_tag: Option<String>,
@@ -3793,6 +3868,7 @@ mod tests {
             PlayEndReason::Error,
         ] {
             roundtrip(&Event::PlayFinished {
+                conference_id: None,
                 call_id: "c".into(),
                 from_tag: "f".into(),
                 to_tag: Some("t".into()),
@@ -3804,6 +3880,7 @@ mod tests {
         // The wire tag is snake_case (SIPhon dispatches on "play_finished"), the reason is snake_case,
         // and an absent `to_tag` / `played_ms` are omitted.
         let event = Event::PlayFinished {
+            conference_id: None,
             call_id: "c".into(),
             from_tag: "f".into(),
             to_tag: None,

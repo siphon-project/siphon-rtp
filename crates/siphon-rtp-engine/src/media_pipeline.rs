@@ -1019,8 +1019,26 @@ impl PlayRequest {
         play_id: u64,
         duration_cap_ms: Option<u64>,
     ) -> Result<Playback, PlaybackError> {
-        let egress_rate = direction.egress_sample_rate;
-        let packetization_time_ms = direction.egress_ptime_ms();
+        self.into_playback_at(
+            direction.egress_sample_rate,
+            direction.egress_ptime_ms(),
+            gain,
+            play_id,
+            duration_cap_ms,
+        )
+    }
+
+    /// As `PlayRequest::into_playback`, but against an explicit rate and frame length rather than a
+    /// leg's. A conference room has no `Direction` — it renders one mix at the room rate on a fixed
+    /// 20 ms tick — so it needs the same construction without one.
+    pub fn into_playback_at(
+        self,
+        egress_rate: u32,
+        packetization_time_ms: u32,
+        gain: Gain,
+        play_id: u64,
+        duration_cap_ms: Option<u64>,
+    ) -> Result<Playback, PlaybackError> {
         let source = match self {
             PlayRequest::Pcm(player) => PlaybackSource::Pcm(player),
             PlayRequest::Tone(spec) => {
@@ -3250,6 +3268,7 @@ impl MediaCall {
     /// (the same `call_id` / `from_tag` / `to_tag` triple as [`Event::Dtmf`]).
     fn play_finished_event(&self, finished: FinishedPlay) -> Event {
         Event::PlayFinished {
+            conference_id: None,
             call_id: self.call_id.clone(),
             from_tag: self.from_tag.clone(),
             to_tag: self.to_tag.clone(),

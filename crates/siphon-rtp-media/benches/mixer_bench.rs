@@ -95,5 +95,44 @@ fn bench_webinar(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_full_room, bench_webinar);
+/// What a room playback costs the mix: the same tick with an `external` frame summed in.
+///
+/// `external` is the seam a room announcement rides — heard by everyone, mixed against nobody — and
+/// it is one extra `i32` add per sample over the participant sum, so this should be a small constant
+/// on top of the same-sized room without one. The comparison is the point; the absolute figure is
+/// only meaningful against `mixer_full_room_20ms` in the same run.
+fn bench_room_playback(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("mixer_room_playback_20ms");
+    for (rate_name, frame) in ROOM_RATES {
+        for participants in [3usize, 10, 32] {
+            let pcm = talker_frames(participants, frame);
+            let (roles, energy, speaking) = columns(participants, participants);
+            let announcement = vec![4_000i16; frame];
+            let mut mixer = Mixer::new(participants, frame);
+            for (label, external) in [("without", None), ("with", Some(&announcement[..]))] {
+                let inputs = MixInputs {
+                    pcm: &pcm,
+                    roles: &roles,
+                    energy: &energy,
+                    speaking: &speaking,
+                    external,
+                    frame_len: frame,
+                };
+                group.bench_with_input(
+                    BenchmarkId::from_parameter(format!("{rate_name}/{participants}p/{label}")),
+                    &participants,
+                    |bencher, _| {
+                        bencher.iter(|| {
+                            let active = mixer.mix(black_box(&inputs), &[], &[], 0);
+                            black_box(active)
+                        });
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_full_room, bench_webinar, bench_room_playback);
 criterion_main!(benches);
