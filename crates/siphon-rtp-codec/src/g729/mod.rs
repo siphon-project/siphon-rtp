@@ -15,6 +15,7 @@
 //! relaying G.729 never executes a codec and never reaches this module. See
 //! `docs/codec-licensing.md`.
 
+pub mod acelp;
 pub mod analysis;
 pub mod bitstream;
 pub mod decoder;
