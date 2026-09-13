@@ -260,7 +260,28 @@ jobs:
       - name: eBPF toolchain (pinned nightly + rust-src + bpf-linker)
         run: |
           rustup toolchain install nightly-2026-01-15 --component rust-src --profile minimal
-          command -v bpf-linker >/dev/null 2>&1 || cargo install bpf-linker --locked
+          # bpf-linker comes from upstream's prebuilt release rather than `cargo install`, and is
+          # pinned + checksummed like every other tool this CI installs. Building it from source
+          # links llvm-sys against a *system* LLVM — 0.11.1 wants LLVM 21-23 and this runner carries
+          # Ubuntu 24.04's 18 and 19, with no unversioned libLLVM.so for `-lLLVM` to resolve — so the
+          # build died in the linker. Upstream recommends against building from source for exactly
+          # this reason; the musl release is static and needs no system LLVM at all. Unpinned was the
+          # real defect: this step stayed green on a cached binary for months and only broke when the
+          # box lost it and resolved 0.11.1, whose LLVM floor had moved.
+          if ! command -v bpf-linker >/dev/null 2>&1; then
+            version=0.11.1
+            asset=bpf-linker-x86_64-unknown-linux-musl.tar.zst
+            sha256=e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
+            work="$(mktemp -d)"
+            curl -fsSL --proto '=https' --tlsv1.2 -o "$work/$asset" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$version/$asset"
+            echo "$sha256  $work/$asset" | sha256sum -c -
+            tar --zstd -xf "$work/$asset" -C "$work"
+            install -m 0755 "$(find "$work" -type f -name bpf-linker | head -1)" \
+              "$HOME/.cargo/bin/bpf-linker"
+            rm -rf "$work"
+          fi
+          bpf-linker --version
       # No --locked below: this is a separate workspace whose Cargo.lock pins the sibling `siphon-rtp`
       # crates by path and records their versions, so any main-workspace version bump or new dep
       # restales it (and it is not auto-synced). This job is excluded from the `CI passed` rollup and
