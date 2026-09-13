@@ -1387,6 +1387,28 @@ pub enum PlayEndReason {
     Error,
 }
 
+/// Which idle rule tore a call down ([`Event::MediaTimeout`]).
+///
+/// The engine judges a leg idle only while its peer is **expected to send**: a party that signalled
+/// `a=recvonly` or `a=inactive` has told us it will send nothing (RFC 3264 §8.4), so its silence is
+/// the session state the signalling asked for. A call where no leg is expected to send is *held*, and
+/// held calls are measured against their own, much longer ceiling.
+///
+/// `#[non_exhaustive]`: engine-emitted and purely informational. A consumer that does not recognise a
+/// reason still knows the call is gone, which is the part it must act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MediaTimeoutReason {
+    /// A leg that was expected to be sending sent nothing for `--media-timeout-secs` — the media path
+    /// died (or was never established). The historical, and still the default, reason.
+    NoMedia,
+    /// Every leg is held (`a=recvonly` / `a=inactive` / a `sendonly`+`recvonly` pair), so no silence
+    /// was unexpected, but the call stayed that way past `--held-media-timeout-secs`. Nobody came back
+    /// to it.
+    HeldTooLong,
+}
+
 /// An asynchronous event pushed from the engine to SIPhon (no request correlation).
 /// `#[serde(other)]` keeps forward-compatibility: SIPhon tolerates new event kinds.
 ///
@@ -1428,9 +1450,15 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direction: Option<String>,
     },
-    /// A call's media went silent past the timeout and the engine tore it down (dead-path
-    /// detection). Lets SIPhon release its own per-call state.
-    MediaTimeout { call_id: String, from_tag: String },
+    /// A call's media went silent past a timeout and the engine tore it down. Lets SIPhon release its
+    /// own per-call state. `reason` says **which** rule fired, because the two mean opposite things
+    /// operationally: [`MediaTimeoutReason::NoMedia`] is a path that died while a party was expected
+    /// to be sending, and [`MediaTimeoutReason::HeldTooLong`] is a call nobody ever took off hold.
+    MediaTimeout {
+        call_id: String,
+        from_tag: String,
+        reason: MediaTimeoutReason,
+    },
     /// A [`Command::PlayMedia`] playback ended. Carries the `play_id` the play's accept returned, so a
     /// controller awaiting a specific prompt matches the completion to the accept it holds — the
     /// load-bearing correlation, since a leg may play several prompts in sequence. `reason` says *how*
@@ -3424,11 +3452,27 @@ mod tests {
     }
 
     #[test]
-    fn media_timeout_event_roundtrip() {
-        roundtrip(&Event::MediaTimeout {
+    fn media_timeout_event_roundtrip_for_each_reason() {
+        for reason in [MediaTimeoutReason::NoMedia, MediaTimeoutReason::HeldTooLong] {
+            roundtrip(&Event::MediaTimeout {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                reason,
+            });
+        }
+    }
+
+    #[test]
+    fn media_timeout_reason_serializes_snake_case() {
+        // The wire token is what a controller branches on, so pin it rather than trusting the derive.
+        let json = serde_json::to_value(Event::MediaTimeout {
             call_id: "c".into(),
             from_tag: "f".into(),
-        });
+            reason: MediaTimeoutReason::HeldTooLong,
+        })
+        .expect("serialize");
+        assert_eq!(json["event"], "media_timeout");
+        assert_eq!(json["reason"], "held_too_long");
     }
 
     #[test]

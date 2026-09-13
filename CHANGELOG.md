@@ -7,6 +7,53 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A call on hold is no longer reaped for being quiet.** The idle sweep took the latest accepted
+  packet across a call's endpoints against one global `--media-timeout-secs` (default 30) and the
+  engine parsed the SDP direction attribute nowhere, so hold — the most common mid-call operation on a
+  PBX, and precisely the state in which both parties legitimately stop sending — was torn down after
+  30 s with a `media_timeout` event while the user was still holding the handset. Park and queue are
+  the same state and fail the same way.
+
+  A dead media path and a held call are *identical* at the packet layer; only the SDP tells them
+  apart. RFC 3264 §8.4 defines hold as an offer marked `sendonly` (answered `recvonly`), or `inactive`
+  when both ends hold it, and is explicit that the holding party *"MAY send media (e.g., music on
+  hold) or MAY send nothing"* — so `sendonly` guarantees a packet no more than `recvonly` does, and a
+  per-direction flow analysis would still have reaped the commonest hold of all (a handset that marks
+  the stream `sendonly` and then simply stops transmitting).
+
+  The engine now parses the direction attribute (RFC 4566 §6 / RFC 8866 §6.7, media-level winning over
+  session-level) on every offer, answer and `reoffer`, records it per party, and measures a call where
+  **either** party has taken the stream off `sendrecv` against a new `--held-media-timeout-secs`
+  (default 7200, `0` = never) instead. An unhold re-offer re-arms the short timer — including one that
+  carries no direction attribute at all, which is what RFC 4566 §6 says `sendrecv` means. Everything
+  else is unchanged, down to the endpoint set read, so a held call carrying music-on-hold refreshes
+  its own ceiling like any other and a `sendrecv` call that goes silent still reaps at 30 s.
+
+  A conference seat that joined `recvonly` or `inactive` — a listen-only webinar attendee — is treated
+  the same way on the same sweep.
+
+  The gate is not weakened: the direction attribute only selects *which ceiling* applies and never
+  makes a packet acceptable. Liveness is still claimed only for media that cleared the source gate
+  and, where there is crypto, SRTP authentication.
+
+- **A restored (HA) call keeps the short ceiling.** Neither party's direction is carried in the
+  checkpoint — the standby never saw either SDP — so both default to `sendrecv` rather than a call
+  being granted the long held budget on a guess. A re-offer after the restore corrects it.
+
+### Changed
+
+- **`Event::MediaTimeout` gains `reason`** (`no_media` / `held_too_long`), so a controller can tell
+  "the media path died" from "nobody came back to a held call". An ICE or consent failure reports
+  `no_media`. The end-of-call `CallSummary` CDR records the same distinction (`media_timeout` /
+  `held_timeout`).
+
+  **Breaking (Rust API).** `Event` is `#[non_exhaustive]` at the enum level, which does not make
+  adding a field to an existing variant additive: a consumer destructuring
+  `Event::MediaTimeout { call_id, from_tag }` without `..` must add the field or `..`. The JSON wire
+  stays backward compatible — an older consumer ignores the added key.
+
 ## [0.5.3] — 2026-09-12
 
 A re-offer handed the other party the re-offering party's own media port, so a call went one-way the
