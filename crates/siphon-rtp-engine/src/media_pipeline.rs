@@ -7174,7 +7174,7 @@ mod tests {
     #[test]
     fn play_audio_injects_prompt_in_the_target_legs_codec() {
         use siphon_rtp_media::fanout::MediaSink as _;
-        use siphon_rtp_media::player::WavSource;
+        use siphon_rtp_media::player::{PcmRepeat, WavSource};
 
         let mut call = ulaw_alaw_call();
         // An 8 kHz mono prompt: 320 samples = 40 ms → 2 frames at 20 ms ptime.
@@ -7182,7 +7182,7 @@ mod tests {
         recorder.write_pcm(&[2000i16; 320]);
         let wav = recorder.into_wav();
         let source = WavSource::parse(&wav).expect("parse wav");
-        let player = PcmPlayer::new(&source, 1, 0);
+        let player = PcmPlayer::new(&source, PcmRepeat::Times(1), 0);
 
         call.start_prompt(true, player, 1, &mut Vec::new()); // toward A (b_to_a egress, µ-law PT 0)
         assert!(call.has_injection());
@@ -7226,12 +7226,12 @@ mod tests {
 
     /// Build an 8 kHz mono prompt of `frames` × 20 ms (160 samples/frame) as a fresh `PcmPlayer`.
     fn prompt_player(frames: usize) -> PcmPlayer {
-        use siphon_rtp_media::player::WavSource;
+        use siphon_rtp_media::player::{PcmRepeat, WavSource};
         let mut recorder = WavRecorder::new(8000, 1);
         recorder.write_pcm(&vec![2000i16; 160 * frames.max(1)]);
         let wav = recorder.into_wav();
         let source = WavSource::parse(&wav).expect("parse wav");
-        PcmPlayer::new(&source, 1, 0)
+        PcmPlayer::new(&source, PcmRepeat::Times(1), 0)
     }
 
     /// Assert exactly one [`Event::PlayFinished`] was emitted, returning `(play_id, reason,
@@ -7329,13 +7329,13 @@ mod tests {
 
     #[test]
     fn a_repeated_prompt_emits_play_finished_once_at_the_very_end() {
-        use siphon_rtp_media::player::WavSource;
+        use siphon_rtp_media::player::{PcmRepeat, WavSource};
         let mut call = ulaw_alaw_call();
         // A 1-frame (160-sample) body played twice (repeat_times = 2) → 2 frames, then exhausted.
         let mut recorder = WavRecorder::new(8000, 1);
         recorder.write_pcm(&vec![2000i16; 160]);
         let source = WavSource::parse(&recorder.into_wav()).expect("parse");
-        let player = PcmPlayer::new(&source, 2, 0);
+        let player = PcmPlayer::new(&source, PcmRepeat::Times(2), 0);
         call.start_prompt(true, player, 5, &mut Vec::new());
 
         let mut out = Vec::new();

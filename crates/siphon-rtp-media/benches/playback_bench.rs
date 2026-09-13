@@ -18,7 +18,7 @@ use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::playback::{
     FinishedPlayback, Gain, OverlayBus, Playback, PlaybackSource, MAX_OVERLAY_SLOTS,
 };
-use siphon_rtp_media::player::{PcmPlayer, WavSource};
+use siphon_rtp_media::player::{PcmPlayer, PcmRepeat, WavSource};
 use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
 use siphon_rtp_media::wav::WavRecorder;
 
@@ -36,7 +36,7 @@ fn prompt_source(rate_hz: u32, value: i16) -> PlaybackSource {
     recorder.write_pcm(&vec![value; rate_hz as usize]);
     let wav = recorder.into_wav();
     let parsed = WavSource::parse(&wav).expect("fixture parses");
-    PlaybackSource::Pcm(Box::new(PcmPlayer::new(&parsed, u32::MAX, 0)))
+    PlaybackSource::Pcm(Box::new(PcmPlayer::new(&parsed, PcmRepeat::Forever, 0)))
 }
 
 fn overlay_bus(slots: usize, source_rate_hz: u32, egress_rate_hz: u32, frame: usize) -> OverlayBus {
