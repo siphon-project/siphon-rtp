@@ -180,28 +180,49 @@ pub fn clamp_sharpening(gain_pitch: i16) -> i16 {
     gain_pitch.clamp(SHARP_MIN, SHARP_MAX)
 }
 
-/// The gains' decoder, which carries the predictor state the codebook gain is coded against.
+/// The reference's initial past energy: -14 dB in Q10, repeated.
+const INITIAL_ENERGY: i16 = -14_336;
+
+/// The moving-average predictor the fixed-codebook gain is coded against.
+///
+/// The gain is never sent absolutely. What the index carries is a correction to an energy predicted
+/// from the four previous subframes' quantised energies, so both halves of the codec must run the
+/// same predictor over the same history — the reference keeps one file-scope copy per direction,
+/// and sharing the type is what keeps them in step without coupling them.
 #[derive(Debug, Clone)]
-pub struct GainDecoder {
+pub struct GainPredictor {
     /// The four previous subframes' quantised codebook-gain energies, most recent first. Q10.
     past_energy: [i16; 4],
 }
 
-impl Default for GainDecoder {
+impl Default for GainPredictor {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// The reference's initial past energy: -14 dB in Q10, repeated.
-const INITIAL_ENERGY: i16 = -14_336;
+impl GainPredictor {
+    /// A predictor at its reset state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            past_energy: [INITIAL_ENERGY; 4],
+        }
+    }
+}
+
+/// The gains' decoder, which carries the predictor state the codebook gain is coded against.
+#[derive(Debug, Clone, Default)]
+pub struct GainDecoder {
+    predictor: GainPredictor,
+}
 
 impl GainDecoder {
     /// A decoder at its reset state.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            past_energy: [INITIAL_ENERGY; 4],
+            predictor: GainPredictor::new(),
         }
     }
 
@@ -216,7 +237,7 @@ impl GainDecoder {
 
         let pitch_gain = add(GBK1[first][0], GBK2[second][0]);
 
-        let (predicted, predicted_exponent) = self.predict(code);
+        let (predicted, predicted_exponent) = self.predictor.predict(code);
 
         // The two codebook halves sum to a correction factor in Q13, applied to the prediction.
         let correction = l_add(l_deposit_l(GBK1[first][1]), l_deposit_l(GBK2[second][1]));
@@ -225,7 +246,7 @@ impl GainDecoder {
         let scaled = l_shl(scaled, add(negate(predicted_exponent), -12 - 1 + 1 + 16));
         let code_gain = extract_h(scaled);
 
-        self.update(correction);
+        self.predictor.update(correction);
         (pitch_gain, code_gain)
     }
 
@@ -240,13 +261,19 @@ impl GainDecoder {
             pitch_gain = 29_491;
         }
         let code_gain = mult(previous_code, 32_111); // 0.98 in Q15
-        self.update_erased();
+        self.predictor.update_erased();
         (pitch_gain, code_gain)
     }
+}
 
+impl GainPredictor {
     /// Predict this subframe's codebook gain from the energy of its innovation and the four
     /// previous quantised energies (`Gain_predict`).
-    fn predict(&self, code: &[i16; SUBFRAME_SAMPLES]) -> (i16, i16) {
+    ///
+    /// Returns a mantissa and the exponent it is scaled by, because the prediction spans far more
+    /// dynamic range than 16 bits hold.
+    #[must_use]
+    pub fn predict(&self, code: &[i16; SUBFRAME_SAMPLES]) -> (i16, i16) {
         let mut energy = 0_i32;
         for &sample in code.iter() {
             energy = l_mac(energy, sample, sample);
@@ -272,7 +299,7 @@ impl GainDecoder {
     }
 
     /// Push this subframe's quantised energy onto the predictor history (`Gain_update`).
-    fn update(&mut self, correction: i32) {
+    pub fn update(&mut self, correction: i32) {
         for i in (1..4).rev() {
             self.past_energy[i] = self.past_energy[i - 1];
         }
@@ -286,7 +313,7 @@ impl GainDecoder {
     /// Decay the predictor through an erased subframe (`Gain_update_erasure`): push the mean of the
     /// history, 4 dB down and floored, so a long erasure fades rather than either freezing or
     /// collapsing.
-    fn update_erased(&mut self) {
+    pub fn update_erased(&mut self) {
         let mut total = 0_i32;
         for &energy in &self.past_energy {
             total = l_add(total, l_deposit_l(energy));
@@ -516,8 +543,8 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_gain_decoder_starts_from_the_reference_energy_floor() {
-        assert_eq!(GainDecoder::new().past_energy, [INITIAL_ENERGY; 4]);
+    fn a_fresh_gain_predictor_starts_from_the_reference_energy_floor() {
+        assert_eq!(GainPredictor::new().past_energy, [INITIAL_ENERGY; 4]);
     }
 
     #[test]
@@ -559,13 +586,13 @@ mod tests {
 
     #[test]
     fn a_long_erasure_decays_the_predictor_towards_its_floor_and_stops() {
-        let mut decoder = GainDecoder::new();
-        decoder.past_energy = [0; 4];
+        let mut predictor = GainPredictor::new();
+        predictor.past_energy = [0; 4];
         for _ in 0..50 {
-            decoder.update_erased();
+            predictor.update_erased();
         }
         assert_eq!(
-            decoder.past_energy, [INITIAL_ENERGY; 4],
+            predictor.past_energy, [INITIAL_ENERGY; 4],
             "the decay floors rather than running away"
         );
     }

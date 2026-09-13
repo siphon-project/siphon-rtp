@@ -253,6 +253,30 @@ pub static GBK2: [[i16; 2]; 16] = [
 ];
 
 /// Gain-codebook index maps, and their inverses, between transmitted and codebook order.
+/// Pre-selection thresholds for the first gain codebook stage, Q14 (`thr1`).
+///
+/// The search does not score all 8 × 16 pairs. It walks these thresholds to pick a starting index
+/// and then scores only four consecutive first-stage vectors and eight second-stage ones.
+pub static THR1: [i16; 4] = [10_808, 12_374, 19_778, 32_567];
+
+/// Pre-selection thresholds for the second gain codebook stage, Q15 (`thr2`).
+pub static THR2: [i16; 8] = [
+    14_087, 16_188, 20_274, 21_321, 23_525, 25_232, 27_873, 30_542,
+];
+
+/// Coefficients of the quadratic whose minimum the unquantised gain pair solves (`coef`), Q15.
+pub static COEF: [[i16; 2]; 2] = [[31_881, 26_416], [31_548, 27_816]];
+
+/// The same coefficients at full 32-bit precision (`L_coef`), which the pre-selection needs where
+/// the 16-bit copies would lose the difference it is testing.
+pub static L_COEF: [[i32; 2]; 2] = [
+    [2_089_405_952, 1_731_217_536],
+    [2_067_549_984, 1_822_990_272],
+];
+
+/// Reciprocal of the coefficient determinant, Q19 (`INV_COEF`).
+pub const INV_COEF: i16 = -17_103;
+
 pub static MAP1: [i16; 8] = [5, 1, 4, 7, 3, 0, 6, 2];
 /// Inverse of [`MAP1`].
 pub static IMAP1: [i16; 8] = [5, 1, 7, 4, 2, 0, 6, 3];

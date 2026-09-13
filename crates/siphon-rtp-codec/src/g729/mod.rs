@@ -28,6 +28,7 @@ pub mod overflow;
 pub mod pitch;
 pub mod postfilter;
 pub mod postproc;
+pub mod quagain;
 pub mod qualsp;
 pub mod tables;
 pub mod weighting;
