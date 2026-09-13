@@ -3507,6 +3507,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_g729_offer_resolves_without_an_rtpmap() {
+        // G.729 is static payload type 18 (RFC 3551 §6 / §4.5.6), so the rtpmap is optional and
+        // plenty of gateways omit it. Before this resolved, such an offer picked the peer's *second*
+        // codec — or none at all — which reads downstream as "unknown or unsupported codec" on a
+        // call the engine could have carried.
+        let sdp = "v=0\r\n\
+             o=- 0 0 IN IP4 host.invalid\r\n\
+             s=-\r\n\
+             c=IN IP4 203.0.113.9\r\n\
+             t=0 0\r\n\
+             m=audio 5000 RTP/AVP 18 8\r\n";
+        let info = parse(sdp).expect("parse");
+        let primary = info.primary_codec().expect("static G.729 resolves");
+        assert_eq!(
+            primary.encoding_name, "G729",
+            "the offerer's first choice wins (RFC 3264 §6.1), not its second"
+        );
+        assert_eq!(primary.clock_rate_hz, 8000);
+    }
+
+    #[test]
     fn parse_handles_l16_rtpmap_with_clock_rate() {
         let sdp = "v=0\r\n\
              o=- 0 0 IN IP4 host.invalid\r\n\

@@ -73,9 +73,15 @@ descriptor from speech. Where a packet time spans several codec frames and they 
 frames win — dropping coded speech to describe the background would take a word off the front of a
 sentence.
 
-**Annex A** needs nothing: it is a reduced-complexity encoder whose bitstream the base decoder reads,
-so a peer running it interoperates already. Relaying is unaffected by any of this — the engine never
-executes a codec on that path.
+**Annex A** needs nothing of its own: it is a reduced-complexity encoder whose bitstream the base
+decoder reads (ITU-T G.729 Annex A §A.1), so a peer running it interoperates already.
+
+**Payload type 18 resolves without an `a=rtpmap`**, because RFC 3551 §6 assigns it statically and
+plenty of gateways leave the attribute out. And the annex spellings gateways send in the rtpmap —
+`G729A`, `G729B`, `G729AB` — all fold onto the one registered name: they are the same bitstream
+family, and Annex B is selected by `annexb=`, not by the name.
+
+Relaying is unaffected by any of this — the engine never executes a codec on that path.
 
 The engine resolves a codec from the `a=rtpmap` encoding name (case-insensitive, RFC
 4566 §6), falling back to the RFC 3551 §6 static payload-type table (`PCMU` 0, `GSM` 3,

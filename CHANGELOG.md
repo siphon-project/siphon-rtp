@@ -48,7 +48,16 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   while the sequence number does not, because a skipped frame is not a lost one and counting it as
   loss would corrupt the peer's RFC 3550 §6.4.1 reception report.
 
-  Annex A needs nothing — it is a reduced-complexity encoder whose bitstream the base decoder reads.
+  Annex A needs nothing of its own — it is a reduced-complexity encoder whose bitstream the base
+  decoder reads (ITU-T G.729 Annex A §A.1).
+
+  Two signalling gaps went with it, both of which would have read downstream as "unknown or
+  unsupported codec" on a call the engine could carry. **Payload type 18 was missing from the RFC
+  3551 §6 static table**, so an offer of `m=audio 5004 RTP/AVP 18 8` with no `a=rtpmap` — legal, and
+  common from gateways — resolved to the peer's *second* codec, and an offer of 18 alone resolved to
+  nothing. And the annex spellings gateways put in the rtpmap (`G729A`, `G729B`, `G729AB`) were
+  refused outright; they now fold onto the one registered encoding name, since they are the same
+  bitstream family and Annex B is chosen by `annexb=` rather than by the name.
 
 ## [0.6.0] — 2026-09-13
 

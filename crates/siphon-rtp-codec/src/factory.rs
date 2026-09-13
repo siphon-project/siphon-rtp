@@ -206,7 +206,7 @@ impl CodecSpec {
         channels: u8,
         ptime_ms: u8,
     ) -> Self {
-        let encoding_name = encoding_name.to_ascii_uppercase();
+        let encoding_name = normalise_encoding_name(&encoding_name.to_ascii_uppercase());
         let is_opus = encoding_name == OPUS_ENCODING_NAME;
         Self {
             payload_type,
@@ -336,6 +336,7 @@ impl CodecSpec {
             8 => ("PCMA", 8000, 1),
             9 => ("G722", 8000, 1), // RTP clock is 8000 even though G.722 samples at 16 kHz.
             13 => ("CN", 8000, 1),  // RFC 3389 comfort noise.
+            18 => ("G729", 8000, 1), // §4.5.6 — an `a=rtpmap` for it is optional, and often absent.
             _ => return None,
         };
         Some(Self::new(payload_type, name, clock, channels, ptime_ms))
@@ -512,6 +513,21 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
     }
 }
 
+/// Fold the G.729 annex spellings onto the one registered encoding name.
+///
+/// `G729` is the only name IANA registers (RFC 3551 §6): Annex A, Annex B and their combination are
+/// selected by `a=fmtp:18 annexb=` and by the encoder's own complexity, not by the rtpmap. Gateways
+/// send `G729A` / `G729B` / `G729AB` anyway, and refusing them would decline a call the engine can
+/// carry — ITU-T G.729 Annex A §A.1 makes the Annex A bitstream identical to the base codec's, so
+/// the codec this resolves to is the right one for every spelling. Annex B is then decided by
+/// `annexb=` as it always is.
+fn normalise_encoding_name(uppercased: &str) -> String {
+    match uppercased {
+        "G729A" | "G729B" | "G729AB" => "G729".to_owned(),
+        _ => uppercased.to_owned(),
+    }
+}
+
 /// Map an encoding name to a stable `&'static str` for the `Unsupported` error (the error type holds
 /// `&'static str`, so we can only name codecs we know about).
 fn unsupported_name(encoding_name: &str) -> &'static str {
@@ -545,18 +561,9 @@ fn unsupported_name(encoding_name: &str) -> &'static str {
             "G.729 transcoding requires the `g729` build feature (patent-licensed — see \
              docs/codec-licensing.md); G.729 passthrough/relay is always available"
         }
-        // None of these is a registered RTP encoding name: a peer signals the base codec as `G729`
-        // and asks for Annex B through `a=fmtp:18 annexb=yes`. Annex A is bitstream-interoperable
-        // with the base codec, so it needs no entry of its own, but Annex B's VAD/DTX/CNG is not
-        // implemented — treating one of these names as the base codec would drop every silence
-        // descriptor the peer sends.
-        "G729A" | "G729B" | "G729AB" => {
-            "G.729 is signalled as encoding name `G729`, with Annex B selected by \
-             `a=fmtp:18 annexb=`; these names are not registered and Annex B (VAD/DTX/CNG) is not \
-             implemented — the base codec is available behind the `g729` build feature \
-             (patent-licensed — see docs/codec-licensing.md) and G.729 passthrough/relay is always \
-             available"
-        }
+        // `G729A` / `G729B` / `G729AB` never reach here: `CodecSpec::new` folds them onto the one
+        // registered name, since they are the same bitstream family and Annex B is selected by
+        // `annexb=` rather than by the rtpmap.
         "G723" => {
             "G.723.1 transcoding is not implemented (planned behind the `g729` build feature, \
              patent-licensed — see docs/codec-licensing.md); G.723.1 passthrough/relay is always \
@@ -587,6 +594,19 @@ mod tests {
         let decoder = decoder_for(&spec).expect("ulaw decoder");
         assert_eq!(decoder.params().sample_rate_hz, 8000);
         assert!(encoder_for(&spec).is_ok());
+    }
+
+    #[test]
+    fn g729_resolves_from_its_static_payload_type_without_an_rtpmap() {
+        // RFC 3551 §6 assigns G.729 payload type 18, so `a=rtpmap:18 G729/8000` is optional and is
+        // routinely left out. Without this the offer `m=audio 5004 RTP/AVP 18 8` resolves to
+        // *PCMA* — the peer's second choice — because its first does not resolve at all, and an
+        // offer of 18 alone resolves to nothing.
+        let spec = CodecSpec::from_static_payload_type(18, 20).expect("G.729 is static PT 18");
+        assert_eq!(spec.encoding_name, "G729");
+        assert_eq!(spec.clock_rate_hz, 8000);
+        assert_eq!(spec.channels, 1);
+        assert!(spec.annex_b, "RFC 3555 §4.1.13: absent annexb means yes");
     }
 
     #[test]
@@ -1270,22 +1290,17 @@ mod tests {
     }
 
     #[test]
-    fn the_annex_b_names_stay_unsupported_in_either_build() {
-        // None of these is a registered RTP encoding name — the base codec is signalled as `G729`
-        // and Annex B is selected by `a=fmtp:18 annexb=`. Annex B's VAD/DTX/CNG is not implemented
-        // in either build, and treating one of these names as the base codec would silently drop
-        // every silence descriptor the peer sends.
-        for name in ["G729A", "G729B", "G729AB"] {
+    fn the_g729_annex_spellings_resolve_to_the_one_registered_codec() {
+        // `G729` is the only registered encoding name (RFC 3551 §6); the annex spellings are what
+        // gateways send anyway. They are the same bitstream family — ITU-T G.729 Annex A §A.1 makes
+        // the Annex A bitstream identical to the base codec's — so refusing them would decline a
+        // call the engine can carry, and Annex B is selected by `annexb=` rather than by the name.
+        for name in ["G729", "G729A", "G729B", "G729AB", "g729a"] {
             let spec = CodecSpec::new(18, name, 8000, 1, 20);
-            assert!(
-                matches!(decoder_for(&spec), Err(CodecError::Unsupported(_))),
-                "{name}"
-            );
-            assert!(
-                matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))),
-                "{name}"
-            );
+            assert_eq!(spec.encoding_name, "G729", "{name}");
         }
+        // Nothing else beginning the same way is folded in: G.723.1 is a different codec.
+        assert_eq!(CodecSpec::new(4, "G723", 8000, 1, 20).encoding_name, "G723");
     }
 
     #[cfg(feature = "amr")]
