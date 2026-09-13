@@ -864,6 +864,7 @@ mod tests {
             sdp: Some(pcmu_sdp("127.0.0.1:31000".parse().expect("address"), 1)),
             duration_ms: None,
             play_id: None,
+            recording_id: None,
             to_tag: None,
             stats: None,
         };
