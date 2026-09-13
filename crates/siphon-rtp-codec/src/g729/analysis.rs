@@ -121,11 +121,11 @@ pub fn autocorrelation(window: &[i16]) -> ([(i16, i16); VAD_ORDER + 1], i16) {
     correlations[0] = l_extract(l_shl(energy, normalisation));
     let exponent = sub(exponent, normalisation);
 
+    // The lag terms cannot saturate — Cauchy-Schwarz bounds each by `r[0]`, which the loop above
+    // has just scaled to fit — so they are a wrapping dot product. `r[0]` itself stays scalar: its
+    // saturation is observed, not avoided, and is what drove the rescale.
     for lag in 1..=VAD_ORDER {
-        let mut sum = 0_i32;
-        for j in 0..WINDOW - lag {
-            sum = l_mac(sum, windowed[j], windowed[j + lag]);
-        }
+        let sum = dspfunc::doubled_dot(&windowed[..WINDOW - lag], &windowed[lag..]);
         correlations[lag] = l_extract(l_shl(sum, normalisation));
     }
     (correlations, exponent)

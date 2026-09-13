@@ -66,6 +66,17 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   room and `MediaLeg::encode_rtp`. All three keep the egress clock across the gap and none advances
   the sequence number.
 
+  **Encoding is 21 % faster than it landed** — 97.5 µs to 76.8 µs per 20 ms packet, and 48.1 µs to
+  27.3 µs on the inactive path a call on hold spends its time in. The open-loop pitch correlation and
+  the autocorrelation's lag terms are wrapping-`i32` SIMD dot products rather than saturating
+  accumulations, which is exact rather than approximate: both callers first scale their input until a
+  total energy fits in 32 bits, and Cauchy-Schwarz then bounds every correlation inside that window
+  by it, so the saturating operator's guard can never fire. The equivalence is a `debug_assert`
+  against the loop it replaces, so every conformance run re-proves it. What is *not* vectorised is
+  deliberate and recorded: the synthesis filter's saturation is load-bearing — the `overflow`
+  sequence exists because the decoder reacts to it — and the two inverse filters accumulate products
+  with no provable bound.
+
 ## [0.6.0] — 2026-09-13
 
 Eight gaps a PBX runs into that a trunk-facing SBC and a voice-AI bridge never did. A call on hold
