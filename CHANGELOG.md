@@ -7,22 +7,91 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-13
+
+Eight gaps a PBX runs into that a trunk-facing SBC and a voice-AI bridge never did. A call on hold
+was torn down after 30 seconds, because hold and a dead media path are identical at the packet layer
+and the engine parsed the SDP direction attribute nowhere. A prompt could not play as a bed, so hold,
+queue and park music all stopped after one pass. `play_dtmf` answered `ok` on a leg it had nothing to
+send the digits on. The two recorders that existed are audit artefacts rather than voicemail
+messages. A prompt was decoded from scratch on every call that played it, and A-law, µ-law and
+extensible WAV were refused outright. The shared secret could only come from the environment. A
+conference room could not be played into or recorded. And an SDES-SRTP caller could not reach an
+announcement, an IVR or a voicemail box at all — while on the two-party relay that same caller's own
+key was handed to the callee.
+
+**A minor, not a patch.** Four changes to `siphon-rtp-proto` add a field to an existing struct
+variant or change a field's type, which `#[non_exhaustive]` does not make additive: `repeat_times` on
+`Command::PlayMedia` becomes `Option<PlayRepeat>`, `Event::MediaTimeout` gains `reason`,
+`CmdResult::Ok` gains `recording_id`, and `Command::StartRecording` / `Command::StopRecording` grow
+recording fields. A controller floating on `^0.5` does **not** pick this up and must move to `^0.6`.
+The **JSON wire stays backward compatible throughout** — every message a controller sends today keeps
+its meaning, and every added key is one an older consumer ignores. The internal path-deps move from
+`"0.5.0"` to `"0.6.0"` with it, which a patch cut did not need.
+
+**Two behaviour changes to be aware of.** A call either party has taken off `sendrecv` is measured
+against a new `--held-media-timeout-secs` (default 7200) instead of `--media-timeout-secs` (default
+30); a `sendrecv` call that goes silent still reaps at 30 s. And an `RTP/SAVP` offer on the two-party
+relay is now terminated by the engine rather than passed along, so the callee is offered plaintext
+`RTP/AVP` where it previously received the caller's own `a=crypto`.
+
 ### Fixed
 
-- **A secure `answer_local` leg could emit comfort noise in the clear** in the window between being
-  promoted and being keyed. `answer_local` promotes the media actor and *then* sends it the
-  `SecureLeg`, so the actor is briefly running, ticking and unkeyed — and a single-leg IVR's idle
-  egress is a continuous comfort-noise stream produced by the playout tick with no ingress needed. On
-  a secure offerer that stream could start before the key landed.
+- **A call on hold is no longer reaped for being quiet.** The idle sweep took the latest accepted
+  packet across a call's endpoints against one global `--media-timeout-secs` (default 30) and the
+  engine parsed the SDP direction attribute nowhere, so hold — the most common mid-call operation on a
+  PBX, and precisely the state in which both parties legitimately stop sending — was torn down after
+  30 s with a `media_timeout` event while the user was still holding the handset. Park and queue are
+  the same state and fail the same way.
 
-  The promoted actor now starts **gated** when the offerer is secure, at construction rather than by
-  a control message — a message would race the very tick it is meant to beat. Pinned by a
-  deterministic test: without the gate, 50 plaintext datagrams escape in 50 ticks.
+  A dead media path and a held call are *identical* at the packet layer; only the SDP tells them
+  apart. RFC 3264 §8.4 defines hold as an offer marked `sendonly` (answered `recvonly`), or `inactive`
+  when both ends hold it, and is explicit that the holding party *"MAY send media (e.g., music on
+  hold) or MAY send nothing"* — so `sendonly` guarantees a packet no more than `recvonly` does, and a
+  per-direction flow analysis would still have reaped the commonest hold of all (a handset that marks
+  the stream `sendonly` and then simply stops transmitting).
 
-  Found by a parallel test run, not by inspection; the equivalent end-to-end probe passes on an idle
-  box, which is why the pinning test drives `MediaCall` directly.
+  The engine now parses the direction attribute (RFC 4566 §6 / RFC 8866 §6.7, media-level winning over
+  session-level) on every offer, answer and `reoffer`, records it per party, and measures a call where
+  **either** party has taken the stream off `sendrecv` against a new `--held-media-timeout-secs`
+  (default 7200, `0` = never) instead. An unhold re-offer re-arms the short timer — including one that
+  carries no direction attribute at all, which is what RFC 4566 §6 says `sendrecv` means. Everything
+  else is unchanged, down to the endpoint set read, so a held call carrying music-on-hold refreshes
+  its own ceiling like any other and a `sendrecv` call that goes silent still reaps at 30 s.
 
-### Fixed
+  A conference seat that joined `recvonly` or `inactive` — a listen-only webinar attendee — is treated
+  the same way on the same sweep.
+
+  The gate is not weakened: the direction attribute only selects *which ceiling* applies and never
+  makes a packet acceptable. Liveness is still claimed only for media that cleared the source gate
+  and, where there is crypto, SRTP authentication.
+
+- **A restored (HA) call keeps the short ceiling.** Neither party's direction is carried in the
+  checkpoint — the standby never saw either SDP — so both default to `sendrecv` rather than a call
+  being granted the long held budget on a guess. A re-offer after the restore corrects it.
+
+- **`docs/cookbook/playback.md` shipped the bug as the recipe.** The ducking example started a hold
+  bed with `"repeat_times": 0` and printed `"duration_ms": 45000` in its own reply — which is the
+  file's single-pass length, not a bed. The example now uses `"inf"`, and the prose one screen below
+  that contradicted it is corrected.
+
+- **`play_dtmf` reports failure when it has nowhere to send the digits.** The media actor already
+  refused a leg with no negotiated RFC 4733 `telephone-event` payload type — there is nothing to
+  carry the events on — but it returned a bare `bool` that the actor loop dropped, and the engine
+  answered the verb from whether the control message reached the mailbox. So the call was accepted,
+  `ok` went back, and nothing was put on the wire.
+
+  On a PBX that is a feature code forwarded to a carrier's voicemail, an attended-transfer helper, or
+  a flow step navigating a remote menu — and a silent no-op there reads as the far end ignoring the
+  digits, which is the worst place for it to look like someone else's fault.
+
+  The verb now awaits the actor's verdict through a `oneshot`, exactly as `stop_media` and
+  `set_play_gain` already do, and answers
+  `play_dtmf: no telephone-event payload type negotiated toward this leg`. The actor's outcome also
+  separates that case from an unusable digit string, which used to be the same `false`.
+
+  In-band (Goertzel) generation as a fallback remains out of scope: handsets and the trunks this
+  targets negotiate RFC 4733.
 
 - **A secure offerer's SDES key was forwarded to the callee, and the offerer was answered in the
   clear.** On the two-party `offer`/`answer` relay the engine had no key of its own toward the
@@ -44,61 +113,96 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   An `RTP/SAVP` offer carrying no usable `a=crypto` is refused (`secure-offerer-unkeyable`) rather
   than bridged in the clear.
 
-### Added
+- **A secure `answer_local` leg could emit comfort noise in the clear** in the window between being
+  promoted and being keyed. `answer_local` promotes the media actor and *then* sends it the
+  `SecureLeg`, so the actor is briefly running, ticking and unkeyed — and a single-leg IVR's idle
+  egress is a continuous comfort-noise stream produced by the playout tick with no ingress needed. On
+  a secure offerer that stream could start before the key landed.
 
-- **A secure caller can reach a plain callee** on the two-party relay — the topology the cookbook
-  described as "not yet wired". Same-codec, over the crypto bridge, so it costs no decode or
-  re-encode.
+  The promoted actor now starts **gated** when the offerer is secure, at construction rather than by
+  a control message — a message would race the very tick it is meant to beat. Pinned by a
+  deterministic test: without the gate, 50 plaintext datagrams escape in 50 ticks.
 
-### Not done, and refused rather than half-done
+  Found by a parallel test run, not by inspection; the equivalent end-to-end probe passes on an idle
+  box, which is why the pinning test drives `MediaCall` directly.
 
-- **Both parties secure** (a transcrypt between two different keys) and **a codec mismatch on a
-  secure caller** both need the caller's `SecureLeg` threaded into the transcoding pipeline's
-  A-facing directions. Each is refused with `secure-offerer-unsupported`, naming which case it is,
-  rather than answering `ok` and relaying the caller's audio undecrypted or unencrypted.
-
-- **A DTLS-SRTP offerer on the two-party relay is unchanged.** Terminating one needs the engine's own
-  `a=fingerprint` in the caller's answer plus a full ICE agent on its leg, and refusing it outright
-  would break `dtls: off` — the rtpengine directive that legitimately downgrades such an offer. Its
-  behaviour is kept byte for byte; only the SDES path moves.
-
-- **A restored (HA) call treats the caller as plaintext.** A secure *offerer*'s keying is not in the
-  checkpoint, and inventing a key the peer never received would be worse than the honest default.
+- **The conference actor drained its staged events only on the packet arm**, so an event raised by a
+  tick or by a control op was stranded until a participant happened to send media — and a room where
+  nobody is sending is exactly the room a lone-participant announcement plays into. It now drains on
+  all three arms.
 
 ### Added
 
-- **An SDES-SRTP caller can reach an IVR, an announcement, an echo test or a voicemail box.**
-  `answer_local` refused a secure offerer outright (`secure-offerer-unsupported`), so a TLS/SRTP desk
-  phone could not reach any of them.
+- **A recorded prompt can play until it is stopped** — `"repeat_times": "inf"` on `play_media`. Hold
+  music, queue music and park music all play for an unbounded time, and until now only a *tone* could:
+  `repeat_times` was a pass count that `PcmPlayer` clamped with `.max(1)`, so the only way to
+  approximate a bed was a large finite count plus a controller-side timer to re-issue the play when
+  `PlayFinished{Completed}` arrived, which leaves an audible gap at every re-issue.
 
-  The *answer* was always correct — `answer_local` writes A's answer itself and already minted the
-  engine's own `a=crypto` — and it was the **media path** that had nothing behind it, which is why
-  refusing was the right call at the time: answering keying no path backs is worse than refusing.
+  The spelling mirrors the `*inf` suffix a tone cadence has always taken, so "endless" is one word
+  everywhere in the contract. An endless play's accept carries **no** `duration_ms` — there is none to
+  report — exactly as an uncapped `*inf` tone already did, and it ends only on `stop_media`, on a
+  `duration_ms` cap, or with the leg. It never reports `completed` on its own.
 
-  The single-leg pipeline now holds its own `SecureLeg`, exactly as a conference seat and a WebSocket
-  takeover leg already did. The shape is its own and needed a method of its own: a single-leg call's
-  two directions face the *same* caller on the *same* endpoint, and the caller is the secure side, so
-  each direction both decrypts what arrives and encrypts what leaves. The two-leg method keys
-  A-plaintext/B-secure and would have left an IVR that decrypted the caller and answered it in the
-  clear.
+  A body it can never advance in (no samples, or `start_pos_ms` at or past the end) is exhausted
+  immediately and reports a zero duration rather than "endless" — otherwise the accept would promise a
+  bed that plays no sample and never finishes.
 
-  `resolve_ws_takeover_security` becomes `resolve_offerer_security` and no longer takes a `takeover`
-  flag: it reads the offerer's SDP and nothing else. Which media paths can *honour* a resolved
-  posture is the caller's business.
+  The NG/bencode front-end keeps rtpengine's integer `repeat-times`: that wire is rtpengine's, and it
+  has no spelling for an endless play.
 
-### Not done, and refused rather than half-done
+- **Runtime decoded-audio recording** — `start_recording` with `format: "wav"`, which streams
+  **decoded** audio to a file and completes with a new `Event::RecordingFinished` naming it.
 
-- **DTLS-SRTP (WebRTC) on `answer_local`** still needs a WebSocket takeover. It requires the full ICE
-  agent attached to the promoted (`Redirect`) leg so the handshake can be gated on the selected pair
-  (RFC 8445 §12), plus the pending-key plumbing that goes with it. It is refused with
-  `secure-offerer-unsupported`, naming DTLS, rather than answering a fingerprint no media path backs.
+  Neither of the two recorders that already existed is a voicemail message. `start_recording` wrote a
+  pcap of the **raw wire packets** — any codec, undecoded, and refused outright on a secure or
+  WebSocket-bridged call — which is an audit artefact nobody listens to. The offer/answer
+  `record_call` flag does write decoded WAV, but it is set at offer/answer time rather than at a point
+  in the call the controller chooses, it needs two legs (it is *structurally* unreachable on an
+  `answer_local` call: `promote_to_processing` hardcodes `record_path = None`), it accumulates the
+  whole call in `WavRecorder`'s in-memory `Vec<i16>` — roughly 115 MB per hour per direction at 16 kHz
+  — and flushes once at teardown with no event at all, so a hard task abort loses the file.
 
-  For the same reason the ICE rewrite on `answer_local` stays scoped to a takeover: un-gating it
-  would re-originate ICE credentials on a leg that runs no agent — half a fix, and the half that
-  hides the other.
+  A voicemail box needs all four of the things neither has: start at a moment the controller picks
+  (after the beep, not at answer), decoded audio, a single leg, and a signal that the file is
+  complete.
 
-- **SRTP termination on the offerer side of a two-party relay** is unchanged; there the secure side
-  is still only the answerer's leg.
+  The media path is untouched. A recording attaches the **same** `MediaSink` a WebSocket tee does,
+  onto the same post-decode fan-out, feeding the same shared frame assembler — which already
+  interleaves two legs, hands off over a bounded channel and recycles its buffers with no per-frame
+  allocation, and whose frames are little-endian 16-bit PCM, i.e. exactly a WAV `data` payload. So the
+  only new per-frame code is a file append.
+
+  **All of the stop-condition policy lives in the writer task, off the media path**: `max_duration_ms`
+  (truncated to a whole sample frame, so a 60-second limit writes 60 seconds rather than 60.02) and
+  `silence_ms` (the existing `EnergyVad`, on a per-sample mean square so it means the same thing at
+  8 kHz and 16 kHz) both read bytes the writer already holds. Asking for either costs the per-packet
+  path nothing.
+
+  Details worth knowing:
+
+  - The header is written first with both sizes zero and fixed by seeking back at close, so a writer
+    killed mid-recording leaves a *valid* WAV declaring zero samples rather than a corrupt file.
+  - `RecordingFinished` is emitted only after that finalize and flush, which is the entire reason the
+    event exists — a consumer that acts on it never reads a half-written file.
+  - **The stop is the detach.** Dropping the sinks drops the last reference to the frame assembler,
+    which closes the writer's input, which makes it finalize. There is no kill signal to race the
+    finalize, and the writer is never aborted. A call torn down under a recording ends it the same
+    way, reporting `call_ended` — which is the *normal* way a voicemail message ends.
+  - The output file is opened before anything is promoted or attached, so a bad path fails the verb
+    with the call untouched rather than surfacing minutes later as a `RecordingFinished{Error}`.
+  - A new `PromotionReason::AudioRecording` holds the call in a **processing** pipeline. The existing
+    `Recording` variant is a *relay-only* hold (a pcap never decodes); sharing it would let stopping
+    one demote the other's pipeline out from under it.
+  - Unlike the pcap form, this works on a secure **transcoded** call — it taps after decryption and
+    decode. A secure crypto *bridge* and a WebSocket-takeover call still have no post-decode audio and
+    are refused.
+
+- **An egress tap on the media pipeline** (`MediaControl::AddEgressFork` / `RemoveEgressForkTagged`),
+  fed from exactly the point the echo canceller's far-end reference is, for the same reason: that is
+  the definition of what a party hears, whatever produced it. It is what `direction: "egress"` records,
+  and on a single-leg IVR call it is the only way to capture the engine's own audio — there is no
+  second party whose ingress it would be.
 
 - **A decoded-prompt cache**, so a bed played to many callers is decoded once. Every `play_media` on
   a file used to do a fresh `tokio::fs::read` (the whole file), a fresh RIFF parse (allocating and
@@ -172,76 +276,6 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   tick at 8 kHz and ~18 ns at 16 kHz, flat in participant count — one extra `i32` add per sample,
   against a 3-party 8 kHz tick of ~101 ns.
 
-### Fixed
-
-- **The conference actor drained its staged events only on the packet arm**, so an event raised by a
-  tick or by a control op was stranded until a participant happened to send media — and a room where
-  nobody is sending is exactly the room a lone-participant announcement plays into. It now drains on
-  all three arms.
-
-- **Runtime decoded-audio recording** — `start_recording` with `format: "wav"`, which streams
-  **decoded** audio to a file and completes with a new `Event::RecordingFinished` naming it.
-
-  Neither of the two recorders that already existed is a voicemail message. `start_recording` wrote a
-  pcap of the **raw wire packets** — any codec, undecoded, and refused outright on a secure or
-  WebSocket-bridged call — which is an audit artefact nobody listens to. The offer/answer
-  `record_call` flag does write decoded WAV, but it is set at offer/answer time rather than at a point
-  in the call the controller chooses, it needs two legs (it is *structurally* unreachable on an
-  `answer_local` call: `promote_to_processing` hardcodes `record_path = None`), it accumulates the
-  whole call in `WavRecorder`'s in-memory `Vec<i16>` — roughly 115 MB per hour per direction at 16 kHz
-  — and flushes once at teardown with no event at all, so a hard task abort loses the file.
-
-  A voicemail box needs all four of the things neither has: start at a moment the controller picks
-  (after the beep, not at answer), decoded audio, a single leg, and a signal that the file is
-  complete.
-
-  The media path is untouched. A recording attaches the **same** `MediaSink` a WebSocket tee does,
-  onto the same post-decode fan-out, feeding the same shared frame assembler — which already
-  interleaves two legs, hands off over a bounded channel and recycles its buffers with no per-frame
-  allocation, and whose frames are little-endian 16-bit PCM, i.e. exactly a WAV `data` payload. So the
-  only new per-frame code is a file append.
-
-  **All of the stop-condition policy lives in the writer task, off the media path**: `max_duration_ms`
-  (truncated to a whole sample frame, so a 60-second limit writes 60 seconds rather than 60.02) and
-  `silence_ms` (the existing `EnergyVad`, on a per-sample mean square so it means the same thing at
-  8 kHz and 16 kHz) both read bytes the writer already holds. Asking for either costs the per-packet
-  path nothing.
-
-  Details worth knowing:
-
-  - The header is written first with both sizes zero and fixed by seeking back at close, so a writer
-    killed mid-recording leaves a *valid* WAV declaring zero samples rather than a corrupt file.
-  - `RecordingFinished` is emitted only after that finalize and flush, which is the entire reason the
-    event exists — a consumer that acts on it never reads a half-written file.
-  - **The stop is the detach.** Dropping the sinks drops the last reference to the frame assembler,
-    which closes the writer's input, which makes it finalize. There is no kill signal to race the
-    finalize, and the writer is never aborted. A call torn down under a recording ends it the same
-    way, reporting `call_ended` — which is the *normal* way a voicemail message ends.
-  - The output file is opened before anything is promoted or attached, so a bad path fails the verb
-    with the call untouched rather than surfacing minutes later as a `RecordingFinished{Error}`.
-  - A new `PromotionReason::AudioRecording` holds the call in a **processing** pipeline. The existing
-    `Recording` variant is a *relay-only* hold (a pcap never decodes); sharing it would let stopping
-    one demote the other's pipeline out from under it.
-  - Unlike the pcap form, this works on a secure **transcoded** call — it taps after decryption and
-    decode. A secure crypto *bridge* and a WebSocket-takeover call still have no post-decode audio and
-    are refused.
-
-- **An egress tap on the media pipeline** (`MediaControl::AddEgressFork` / `RemoveEgressForkTagged`),
-  fed from exactly the point the echo canceller's far-end reference is, for the same reason: that is
-  the definition of what a party hears, whatever produced it. It is what `direction: "egress"` records,
-  and on a single-leg IVR call it is the only way to capture the engine's own audio — there is no
-  second party whose ingress it would be.
-
-### Changed
-
-- **`Command::StartRecording` and `Command::StopRecording` grew fields**, and `CmdResult::Ok` gained
-  `recording_id`. `format` absent still means `pcap`, so every existing message keeps its meaning and
-  the NG/bencode front-end (which has no spelling for anything else, and no event rail to carry a
-  completion) is unchanged.
-
-  **Breaking (Rust API)**, for anything that constructs those variants or `CmdResult::Ok`
-  exhaustively. The JSON wire stays backward compatible.
-
 - **The control-plane shared secret can come from a file** — `--control-secret-file <PATH>`, the
   `SIPHON_RTP_CONTROL_SECRET_FILE` environment variable, or a `control_secret_file` config key. It
   was `SIPHON_RTP_CONTROL_SECRET` only, and there was no `*_FILE`-style option anywhere in the tree.
@@ -267,114 +301,28 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   `control_secret_file` is the one secret-adjacent key the config file accepts, and only because it
   names a **path** rather than carrying the secret.
 
-### Fixed
+- **An SDES-SRTP caller can reach an IVR, an announcement, an echo test or a voicemail box.**
+  `answer_local` refused a secure offerer outright (`secure-offerer-unsupported`), so a TLS/SRTP desk
+  phone could not reach any of them.
 
-- **`play_dtmf` reports failure when it has nowhere to send the digits.** The media actor already
-  refused a leg with no negotiated RFC 4733 `telephone-event` payload type — there is nothing to
-  carry the events on — but it returned a bare `bool` that the actor loop dropped, and the engine
-  answered the verb from whether the control message reached the mailbox. So the call was accepted,
-  `ok` went back, and nothing was put on the wire.
+  The *answer* was always correct — `answer_local` writes A's answer itself and already minted the
+  engine's own `a=crypto` — and it was the **media path** that had nothing behind it, which is why
+  refusing was the right call at the time: answering keying no path backs is worse than refusing.
 
-  On a PBX that is a feature code forwarded to a carrier's voicemail, an attended-transfer helper, or
-  a flow step navigating a remote menu — and a silent no-op there reads as the far end ignoring the
-  digits, which is the worst place for it to look like someone else's fault.
+  The single-leg pipeline now holds its own `SecureLeg`, exactly as a conference seat and a WebSocket
+  takeover leg already did. The shape is its own and needed a method of its own: a single-leg call's
+  two directions face the *same* caller on the *same* endpoint, and the caller is the secure side, so
+  each direction both decrypts what arrives and encrypts what leaves. The two-leg method keys
+  A-plaintext/B-secure and would have left an IVR that decrypted the caller and answered it in the
+  clear.
 
-  The verb now awaits the actor's verdict through a `oneshot`, exactly as `stop_media` and
-  `set_play_gain` already do, and answers
-  `play_dtmf: no telephone-event payload type negotiated toward this leg`. The actor's outcome also
-  separates that case from an unusable digit string, which used to be the same `false`.
+  `resolve_ws_takeover_security` becomes `resolve_offerer_security` and no longer takes a `takeover`
+  flag: it reads the offerer's SDP and nothing else. Which media paths can *honour* a resolved
+  posture is the caller's business.
 
-  In-band (Goertzel) generation as a fallback remains out of scope: handsets and the trunks this
-  targets negotiate RFC 4733.
-
-### Added
-
-- **A recorded prompt can play until it is stopped** — `"repeat_times": "inf"` on `play_media`. Hold
-  music, queue music and park music all play for an unbounded time, and until now only a *tone* could:
-  `repeat_times` was a pass count that `PcmPlayer` clamped with `.max(1)`, so the only way to
-  approximate a bed was a large finite count plus a controller-side timer to re-issue the play when
-  `PlayFinished{Completed}` arrived, which leaves an audible gap at every re-issue.
-
-  The spelling mirrors the `*inf` suffix a tone cadence has always taken, so "endless" is one word
-  everywhere in the contract. An endless play's accept carries **no** `duration_ms` — there is none to
-  report — exactly as an uncapped `*inf` tone already did, and it ends only on `stop_media`, on a
-  `duration_ms` cap, or with the leg. It never reports `completed` on its own.
-
-  A body it can never advance in (no samples, or `start_pos_ms` at or past the end) is exhausted
-  immediately and reports a zero duration rather than "endless" — otherwise the accept would promise a
-  bed that plays no sample and never finishes.
-
-  The NG/bencode front-end keeps rtpengine's integer `repeat-times`: that wire is rtpengine's, and it
-  has no spelling for an endless play.
-
-### Fixed
-
-- **`docs/cookbook/playback.md` shipped the bug as the recipe.** The ducking example started a hold
-  bed with `"repeat_times": 0` and printed `"duration_ms": 45000` in its own reply — which is the
-  file's single-pass length, not a bed. The example now uses `"inf"`, and the prose one screen below
-  that contradicted it is corrected.
-
-### Changed
-
-- **`Command::PlayMedia.repeat_times` is now `Option<PlayRepeat>`** rather than `Option<u64>`.
-
-  **Breaking (Rust API).** A controller constructing the variant passes
-  `repeat_times.map(PlayRepeat::Times)` (or `PlayRepeat::Forever`). The JSON wire is **unchanged for
-  every existing message**: a number still deserializes as a total play count and `0` still means
-  once, so nothing a controller sends today changes meaning.
-
-  `PlayRepeat`'s serde is hand-written rather than `#[serde(untagged)]`: untagged would accept any
-  string as `Forever`, so a typo would silently become an endless bed on every caller. A value that is
-  neither a non-negative number nor `"inf"` (case-insensitive) is a parse error naming both forms.
-
-### Fixed
-
-- **A call on hold is no longer reaped for being quiet.** The idle sweep took the latest accepted
-  packet across a call's endpoints against one global `--media-timeout-secs` (default 30) and the
-  engine parsed the SDP direction attribute nowhere, so hold — the most common mid-call operation on a
-  PBX, and precisely the state in which both parties legitimately stop sending — was torn down after
-  30 s with a `media_timeout` event while the user was still holding the handset. Park and queue are
-  the same state and fail the same way.
-
-  A dead media path and a held call are *identical* at the packet layer; only the SDP tells them
-  apart. RFC 3264 §8.4 defines hold as an offer marked `sendonly` (answered `recvonly`), or `inactive`
-  when both ends hold it, and is explicit that the holding party *"MAY send media (e.g., music on
-  hold) or MAY send nothing"* — so `sendonly` guarantees a packet no more than `recvonly` does, and a
-  per-direction flow analysis would still have reaped the commonest hold of all (a handset that marks
-  the stream `sendonly` and then simply stops transmitting).
-
-  The engine now parses the direction attribute (RFC 4566 §6 / RFC 8866 §6.7, media-level winning over
-  session-level) on every offer, answer and `reoffer`, records it per party, and measures a call where
-  **either** party has taken the stream off `sendrecv` against a new `--held-media-timeout-secs`
-  (default 7200, `0` = never) instead. An unhold re-offer re-arms the short timer — including one that
-  carries no direction attribute at all, which is what RFC 4566 §6 says `sendrecv` means. Everything
-  else is unchanged, down to the endpoint set read, so a held call carrying music-on-hold refreshes
-  its own ceiling like any other and a `sendrecv` call that goes silent still reaps at 30 s.
-
-  A conference seat that joined `recvonly` or `inactive` — a listen-only webinar attendee — is treated
-  the same way on the same sweep.
-
-  The gate is not weakened: the direction attribute only selects *which ceiling* applies and never
-  makes a packet acceptable. Liveness is still claimed only for media that cleared the source gate
-  and, where there is crypto, SRTP authentication.
-
-- **A restored (HA) call keeps the short ceiling.** Neither party's direction is carried in the
-  checkpoint — the standby never saw either SDP — so both default to `sendrecv` rather than a call
-  being granted the long held budget on a guess. A re-offer after the restore corrects it.
-
-### Changed
-
-- **`Event::MediaTimeout` gains `reason`** (`no_media` / `held_too_long`), so a controller can tell
-  "the media path died" from "nobody came back to a held call". An ICE or consent failure reports
-  `no_media`. The end-of-call `CallSummary` CDR records the same distinction (`media_timeout` /
-  `held_timeout`).
-
-  **Breaking (Rust API).** `Event` is `#[non_exhaustive]` at the enum level, which does not make
-  adding a field to an existing variant additive: a consumer destructuring
-  `Event::MediaTimeout { call_id, from_tag }` without `..` must add the field or `..`. The JSON wire
-  stays backward compatible — an older consumer ignores the added key.
-
-### Added
+- **A secure caller can reach a plain callee** on the two-party relay — the topology the cookbook
+  described as "not yet wired". Same-codec, over the crypto bridge, so it costs no decode or
+  re-encode.
 
 - **A relay capacity harness** (`siphon-rtp-loadgen`) — boots the engine on the real userspace UDP
   datapath, establishes N plain relay calls through the engine's own control surface and drives real
@@ -396,6 +344,35 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   about a tenth of relay CPU for two rules and no code.
 
 ### Changed
+
+- **`Event::MediaTimeout` gains `reason`** (`no_media` / `held_too_long`), so a controller can tell
+  "the media path died" from "nobody came back to a held call". An ICE or consent failure reports
+  `no_media`. The end-of-call `CallSummary` CDR records the same distinction (`media_timeout` /
+  `held_timeout`).
+
+  **Breaking (Rust API).** `Event` is `#[non_exhaustive]` at the enum level, which does not make
+  adding a field to an existing variant additive: a consumer destructuring
+  `Event::MediaTimeout { call_id, from_tag }` without `..` must add the field or `..`. The JSON wire
+  stays backward compatible — an older consumer ignores the added key.
+
+- **`Command::PlayMedia.repeat_times` is now `Option<PlayRepeat>`** rather than `Option<u64>`.
+
+  **Breaking (Rust API).** A controller constructing the variant passes
+  `repeat_times.map(PlayRepeat::Times)` (or `PlayRepeat::Forever`). The JSON wire is **unchanged for
+  every existing message**: a number still deserializes as a total play count and `0` still means
+  once, so nothing a controller sends today changes meaning.
+
+  `PlayRepeat`'s serde is hand-written rather than `#[serde(untagged)]`: untagged would accept any
+  string as `Forever`, so a typo would silently become an endless bed on every caller. A value that is
+  neither a non-negative number nor `"inf"` (case-insensitive) is a parse error naming both forms.
+
+- **`Command::StartRecording` and `Command::StopRecording` grew fields**, and `CmdResult::Ok` gained
+  `recording_id`. `format` absent still means `pcap`, so every existing message keeps its meaning and
+  the NG/bencode front-end (which has no spelling for anything else, and no event rail to carry a
+  completion) is unchanged.
+
+  **Breaking (Rust API)**, for anything that constructs those variants or `CmdResult::Ok`
+  exhaustively. The JSON wire stays backward compatible.
 
 - **The published relay cost figure described a code path no packet takes, and the conclusion drawn
   from it was wrong in the direction that matters for capacity.** `README.md` said the relay rewrite
@@ -422,6 +399,28 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   names the limit that in practice binds a relay node before either kind of CPU does.
 
 ### Not done, and refused rather than half-done
+
+- **DTLS-SRTP (WebRTC) on `answer_local`** still needs a WebSocket takeover. It requires the full ICE
+  agent attached to the promoted (`Redirect`) leg so the handshake can be gated on the selected pair
+  (RFC 8445 §12), plus the pending-key plumbing that goes with it. It is refused with
+  `secure-offerer-unsupported`, naming DTLS, rather than answering a fingerprint no media path backs.
+
+  For the same reason the ICE rewrite on `answer_local` stays scoped to a takeover: un-gating it
+  would re-originate ICE credentials on a leg that runs no agent — half a fix, and the half that
+  hides the other.
+
+- **Both parties secure** (a transcrypt between two different keys) and **a codec mismatch on a
+  secure caller** both need the caller's `SecureLeg` threaded into the transcoding pipeline's
+  A-facing directions. Each is refused with `secure-offerer-unsupported`, naming which case it is,
+  rather than answering `ok` and relaying the caller's audio undecrypted or unencrypted.
+
+- **A DTLS-SRTP offerer on the two-party relay is unchanged.** Terminating one needs the engine's own
+  `a=fingerprint` in the caller's answer plus a full ICE agent on its leg, and refusing it outright
+  would break `dtls: off` — the rtpengine directive that legitimately downgrades such an offer. Its
+  behaviour is kept byte for byte; only the SDES path moves.
+
+- **A restored (HA) call treats the caller as plaintext.** A secure *offerer*'s keying is not in the
+  checkpoint, and inventing a key the peer never received would be worse than the honest default.
 
 - **An `io_uring` datapath backend.** Measured rather than assumed, and the answer is
   hardware-conditional: against an `epoll` control arm at 50 pps per socket it was about 9 % *more*
