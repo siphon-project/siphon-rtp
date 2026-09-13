@@ -1658,6 +1658,19 @@ impl Direction {
         let Ok(payload_len) = encoded else {
             return;
         };
+        // An encoder that produced nothing is a codec in discontinuous transmission (G.729 Annex B)
+        // saying this frame need not be sent. Emitting an RTP packet with an empty payload instead
+        // would defeat the saving and give the peer a frame it cannot classify — the gap is the
+        // point. The timestamp still advances, because it is a sampling instant and the audio
+        // happened whether or not it was sent; the sequence number does not, because a frame the
+        // sender chose to skip is not one the network lost and counting it as loss would corrupt
+        // the peer's RFC 3550 §6.4.1 reception report.
+        if payload_len == 0 {
+            self.egress_timestamp = self
+                .egress_timestamp
+                .wrapping_add(self.egress_timestamp_increment);
+            return;
+        }
         let header = RtpHeader {
             marker: false,
             payload_type: self.egress_payload_type,
@@ -2381,6 +2394,19 @@ impl Direction {
         let Ok(payload_len) = encoded else {
             return;
         };
+        // An encoder that produced nothing is a codec in discontinuous transmission (G.729 Annex B)
+        // saying this frame need not be sent. Emitting an RTP packet with an empty payload instead
+        // would defeat the saving and give the peer a frame it cannot classify — the gap is the
+        // point. The timestamp still advances, because it is a sampling instant and the audio
+        // happened whether or not it was sent; the sequence number does not, because a frame the
+        // sender chose to skip is not one the network lost and counting it as loss would corrupt
+        // the peer's RFC 3550 §6.4.1 reception report.
+        if payload_len == 0 {
+            self.egress_timestamp = self
+                .egress_timestamp
+                .wrapping_add(self.egress_timestamp_increment);
+            return;
+        }
         let header = RtpHeader {
             marker,
             payload_type: self.egress_payload_type,

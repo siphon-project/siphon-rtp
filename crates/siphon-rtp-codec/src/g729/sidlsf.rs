@@ -4,9 +4,8 @@
 //! One bit chooses between two moving-average predictors, five address a subset of the speech
 //! quantiser's first-stage codebook and four a subset of its second. Reusing the speech codebooks
 //! rather than carrying a second pair is the whole trick: the subsets
-//! ([`SID_LSF_STAGE1`](super::tables::SID_LSF_STAGE1),
-//! [`SID_LSF_STAGE2`](super::tables::SID_LSF_STAGE2)) are chosen to span the space the entries
-//! cover, and what the descriptor loses is resolution, not reach.
+//! ([`SID_LSF_STAGE1`], [`SID_LSF_STAGE2`]) are chosen to span the space the entries cover, and
+//! what the descriptor loses is resolution, not reach.
 //!
 //! The two halves share one predictor memory with the speech quantiser — a descriptor sent in the
 //! middle of a call predicts from the frames before it, speech or not — which is why both of these

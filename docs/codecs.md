@@ -52,20 +52,30 @@ stream the far side cannot decode.
 | AMR-WB | `AMR-WB` (dynamic) | all 9 modes | all 9 modes | 3GPP TS 26.174 vectors, per mode | `amr` |
 | AMR-NB | `AMR` (dynamic) | all 8 modes | all 8 modes | 3GPP TS 26.074 vectors | `amr` |
 | Opus | `opus` (dynamic, `opus/48000/2`) | yes — SILK, CELT and Hybrid, mono and stereo, all bandwidths and frame durations, PLC and in-band FEC | yes — SILK, CELT and Hybrid, mono and stereo, VBR / constrained VBR / CBR, LBRR/FEC and DTX | all 12 official RFC 6716 vectors (mono + stereo), plus exact per-packet `final_range`; the encoder against libopus' own decoder over the full configuration matrix | none (royalty-free) |
-| G.729 | `G729` (18) | yes | yes | ITU-T G.729 Release 3 sequences — all nine decode byte-exact, and all six that ship an input encode byte-exact | `g729` |
+| G.729 (+ Annex B) | `G729` (18) | yes | yes | ITU-T G.729 Release 3 sequences — all nine decode byte-exact, all six with an input encode byte-exact; Annex B all six decode and all four encode byte-exact | `g729` |
 | EVS | | no | no | | absent |
 
-**G.729 Annex B is not implemented.** Annex A needs nothing: it is a reduced-complexity encoder
-whose bitstream the base decoder reads, so a peer running it interoperates already. Annex B is
-different — it adds VAD, discontinuous transmission and comfort-noise generation, and puts two-octet
-silence-insertion descriptors on the wire that this decoder refuses rather than misreading as
-truncated speech. RFC 3555 §4.1.13 makes `annexb=yes` the **default** when the attribute is absent,
-so a transcoded leg must be offered and answered with `a=fmtp:18 annexb=no`; honouring `annexb=` on
-both legs is still to come. Until it does, a peer that sends silence descriptors has them refused by
-the decoder and dropped by the media pipeline, which logs and counts the failure — so a call with an
-Annex B peer carries its speech and plays silence through the peer's discontinuous transmission
-rather than comfort noise, and the loss is visible rather than silent. Relaying is unaffected either
-way: the engine never executes a codec on that path.
+**G.729 Annex B** — voice-activity detection, discontinuous transmission and comfort-noise
+generation — is implemented in both directions. An inactive frame becomes either a two-octet silence
+descriptor or nothing at all, and the decoder makes the background the descriptor last described,
+stepping the level rather than jumping so the two ends stay together frame for frame.
+
+RFC 3555 §4.1.13 makes `annexb=yes` the **default** when the attribute is absent, and the engine
+follows that: a peer that sends no `a=fmtp:18 annexb=` is taken to want Annex B, and only an explicit
+`annexb=no` turns discontinuous transmission off for what the engine *sends*. Descriptors are decoded
+whatever the leg negotiated — a peer that sends one despite answering `no` is better decoded than
+dropped. A frame the encoder chooses not to send produces no RTP packet at all; the egress timestamp
+still advances (the audio happened) while the sequence number does not (a skipped frame is not a lost
+one, and counting it as loss would corrupt the peer's RFC 3550 §6.4.1 reception report).
+
+A payload carries one kind or the other, never a mixture: the length is all a receiver has to tell a
+descriptor from speech. Where a packet time spans several codec frames and they disagree, the speech
+frames win — dropping coded speech to describe the background would take a word off the front of a
+sentence.
+
+**Annex A** needs nothing: it is a reduced-complexity encoder whose bitstream the base decoder reads,
+so a peer running it interoperates already. Relaying is unaffected by any of this — the engine never
+executes a codec on that path.
 
 The engine resolves a codec from the `a=rtpmap` encoding name (case-insensitive, RFC
 4566 §6), falling back to the RFC 3551 §6 static payload-type table (`PCMU` 0, `GSM` 3,

@@ -33,7 +33,7 @@ default binary.
 | Cargo feature | Codecs | Status |
 |---|---|---|
 | `amr` | AMR-NB (TS 26.071), AMR-WB / G.722.2 (TS 26.171) | implemented, bit-exact (AMR-WB decode + encode, all 9 modes; AMR-NB decode + encode, all 8 speech modes) |
-| `g729` | G.729, G.729A | decoder **and** encoder implemented, bit-exact against the ITU-T Release 3 sequences in both directions; Annex B (VAD/DTX/CNG) not yet |
+| `g729` | G.729, G.729A, G.729B | decoder **and** encoder implemented, bit-exact against the ITU-T Release 3 sequences in both directions, Annex B (VAD/DTX/CNG) included |
 | `evs` *(planned)* | EVS (TS 26.441…) | not yet implemented (largest effort; post-Opus) |
 
 **Enabling any feature above is an explicit statement that you, the operator, hold the necessary

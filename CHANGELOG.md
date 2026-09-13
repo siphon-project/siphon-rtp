@@ -31,14 +31,24 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   held by both directions — the reference keeps a file-scope copy per direction, and sharing the type
   is what keeps them in step without coupling them.
 
-  **Annex B (VAD/DTX/CNG) is not implemented.** RFC 3555 §4.1.13 makes `annexb=yes` the default when
-  the attribute is absent, so a transcoded leg must be offered and answered with
-  `a=fmtp:18 annexb=no`; honouring `annexb=` on both legs is still to come. Until it does, a
-  two-octet silence-insertion descriptor is refused rather than decoded as a truncated speech frame,
-  which would put full-level noise on the call; the media pipeline drops it and counts the failure,
-  so such a call carries its speech and plays silence through the peer's discontinuous transmission
-  instead of comfort noise. Relaying is unaffected. Annex A needs nothing — it is a reduced-complexity
-  encoder whose bitstream the base decoder reads.
+  **Annex B — voice-activity detection, discontinuous transmission and comfort noise — is included**,
+  and is bit-exact too: all six `annexb` sequences decode to their `.out` and all four that ship a
+  `.bin` encode to their `.bit`. An inactive frame becomes a two-octet silence descriptor or nothing
+  at all, and the decoder makes the background the descriptor last described, stepping the level
+  rather than jumping so both ends stay together frame for frame. Exactly one thing in that port is
+  not obvious from the base codec and only the vectors would have caught it: the adaptive postfilter
+  must skip its harmonic filter on an inactive frame, or the search finds a pitch in the random
+  comfort-noise excitation and the background buzzes.
+
+  RFC 3555 §4.1.13 makes `annexb=yes` the default when the attribute is absent, and the engine
+  follows that rather than the convenient reading: a peer that sends no `a=fmtp:18 annexb=` is taken
+  to want Annex B, and only an explicit `annexb=no` turns discontinuous transmission off for what the
+  engine sends. Descriptors are decoded whatever the leg negotiated. A frame the encoder chooses not
+  to send produces no RTP packet; the egress timestamp still advances, because the audio happened,
+  while the sequence number does not, because a skipped frame is not a lost one and counting it as
+  loss would corrupt the peer's RFC 3550 §6.4.1 reception report.
+
+  Annex A needs nothing — it is a reduced-complexity encoder whose bitstream the base decoder reads.
 
 ## [0.6.0] — 2026-09-13
 
