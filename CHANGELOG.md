@@ -7,6 +7,64 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A secure `answer_local` leg could emit comfort noise in the clear** in the window between being
+  promoted and being keyed. `answer_local` promotes the media actor and *then* sends it the
+  `SecureLeg`, so the actor is briefly running, ticking and unkeyed — and a single-leg IVR's idle
+  egress is a continuous comfort-noise stream produced by the playout tick with no ingress needed. On
+  a secure offerer that stream could start before the key landed.
+
+  The promoted actor now starts **gated** when the offerer is secure, at construction rather than by
+  a control message — a message would race the very tick it is meant to beat. Pinned by a
+  deterministic test: without the gate, 50 plaintext datagrams escape in 50 ticks.
+
+  Found by a parallel test run, not by inspection; the equivalent end-to-end probe passes on an idle
+  box, which is why the pinning test drives `MediaCall` directly.
+
+### Fixed
+
+- **A secure offerer's SDES key was forwarded to the callee, and the offerer was answered in the
+  clear.** On the two-party `offer`/`answer` relay the engine had no key of its own toward the
+  caller, so `near_security` could only ever say "plaintext" or "unchanged". The result, on any
+  `RTP/SAVP` offer:
+
+  - the offer presented to the **callee** carried the **caller's own `a=crypto`**, handing a third
+    party the caller's SRTP key;
+  - the answer presented to the **caller** was `RTP/AVP` — downgrading the very caller whose key had
+    just been forwarded.
+
+  Neither was reported anywhere: the control plane answered `ok` and both legs' counters read healthy.
+
+  The engine now mints its own SDES key for the caller at `offer`, advertises **that** key in the
+  answer (never echoing the caller's back), and terminates the caller's SRTP on a crypto bridge —
+  the exact mirror of the existing secure-callee bridge, with the endpoints and the crypto ops
+  swapped. The offer the callee receives is plaintext `RTP/AVP` with no keying at all.
+
+  An `RTP/SAVP` offer carrying no usable `a=crypto` is refused (`secure-offerer-unkeyable`) rather
+  than bridged in the clear.
+
+### Added
+
+- **A secure caller can reach a plain callee** on the two-party relay — the topology the cookbook
+  described as "not yet wired". Same-codec, over the crypto bridge, so it costs no decode or
+  re-encode.
+
+### Not done, and refused rather than half-done
+
+- **Both parties secure** (a transcrypt between two different keys) and **a codec mismatch on a
+  secure caller** both need the caller's `SecureLeg` threaded into the transcoding pipeline's
+  A-facing directions. Each is refused with `secure-offerer-unsupported`, naming which case it is,
+  rather than answering `ok` and relaying the caller's audio undecrypted or unencrypted.
+
+- **A DTLS-SRTP offerer on the two-party relay is unchanged.** Terminating one needs the engine's own
+  `a=fingerprint` in the caller's answer plus a full ICE agent on its leg, and refusing it outright
+  would break `dtls: off` — the rtpengine directive that legitimately downgrades such an offer. Its
+  behaviour is kept byte for byte; only the SDES path moves.
+
+- **A restored (HA) call treats the caller as plaintext.** A secure *offerer*'s keying is not in the
+  checkpoint, and inventing a key the peer never received would be worse than the honest default.
+
 ### Added
 
 - **An SDES-SRTP caller can reach an IVR, an announcement, an echo test or a voicemail box.**

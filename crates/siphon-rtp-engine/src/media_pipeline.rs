@@ -4220,6 +4220,44 @@ mod tests {
     /// reach the wire through `push_egress`, so an unkeyed DTLS peer must receive none of them —
     /// otherwise the engine puts the other party's cleartext on a link that negotiated encryption.
     #[test]
+    fn an_unkeyed_single_leg_secure_call_emits_no_comfort_noise() {
+        // A single-leg IVR's idle egress is a *continuous* comfort-noise stream, produced by the
+        // playout tick with no ingress needed. On a secure offerer that stream must not start before
+        // the `SecureLeg` lands — and `answer_local` promotes the actor first and keys it after, so
+        // there is a real window. Before the actor was gated at construction, comfort noise went out
+        // in the clear in that window: the leak the whole secure-offerer path exists to prevent.
+        //
+        // The single-leg gate is its own (`with_near_secure_pending` / `attach_near_secure_leg`),
+        // because both directions face the same caller and each must both decrypt and encrypt.
+        let mut call = ulaw_alaw_call()
+            .with_comfort_idle(None)
+            .with_near_secure_pending();
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        for _ in 0..50 {
+            call.tick(&mut out, &mut events);
+        }
+        assert!(
+            out.is_empty(),
+            "comfort noise reached an unkeyed secure caller: {} datagram(s) escaped",
+            out.len()
+        );
+
+        // Once the key lands the same call emits normally — a hold, not a mute.
+        let key = siphon_rtp_srtp::sdes::SrtpKeyMaterial::from_inline_bytes(&[7u8; 30])
+            .expect("30 bytes");
+        call.attach_near_secure_leg(Arc::new(Mutex::new(SecureLeg::new(&key, &key))));
+        out.clear();
+        for _ in 0..5 {
+            call.tick(&mut out, &mut events);
+        }
+        assert!(
+            !out.is_empty(),
+            "after the key is attached the comfort-idle egress must resume"
+        );
+    }
+
+    #[test]
     fn an_unkeyed_dtls_leg_emits_nothing_even_from_an_injected_prompt() {
         let mut call = ulaw_alaw_call().with_far_secure_pending();
         let mut out = Vec::new();

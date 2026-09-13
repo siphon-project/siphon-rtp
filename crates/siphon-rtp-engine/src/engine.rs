@@ -214,6 +214,9 @@ struct ReofferState {
     near_local_candidates: Vec<siphon_rtp_ice::Candidate>,
     far_local_candidates: Vec<siphon_rtp_ice::Candidate>,
     far_local_crypto: Option<CryptoAttribute>,
+    /// The engine's own SDES key toward A, so a re-offer re-presents the key A already holds rather
+    /// than minting a new one (RFC 4568 — a re-offer restates the session, it does not re-key it).
+    near_local_crypto: Option<CryptoAttribute>,
     far_dtls: bool,
     far_downgraded_to_plain: bool,
     far_text_local_crypto: Option<CryptoAttribute>,
@@ -244,6 +247,7 @@ impl ReofferState {
             near_local_candidates: call.near_local_candidates.clone(),
             far_local_candidates: call.far_local_candidates.clone(),
             far_local_crypto: call.far_local_crypto,
+            near_local_crypto: call.near_local_crypto,
             far_dtls: call.far_dtls,
             far_downgraded_to_plain: call.far_downgraded_to_plain,
             far_text_local_crypto: call.far_text_local_crypto,
@@ -432,11 +436,44 @@ fn far_security(
     }
 }
 
-/// The audio transport security the near leg presents to A: on a secure (SDES or DTLS) far leg the
-/// engine terminates SRTP there and A's side is plaintext, so force `RTP/AVP` and strip the other
-/// party's keying; otherwise leave the transport alone.
-fn near_security(far_secure: bool) -> Option<SecurityAdvertisement> {
-    far_secure.then_some(SecurityAdvertisement::Plain)
+/// The audio transport security the near leg presents to A. The mirror of [`far_security`], and it
+/// had to become one: it could previously only ever say "plaintext" or "unchanged", which is why a
+/// secure *offerer* was never terminated on this path.
+///
+/// * `near_local_crypto` set — the engine minted its own SDES key for A, so it **is** A's
+///   cryptographic far side: advertise that key and strip A's own (RFC 4568).
+/// * otherwise, a secure far leg means the engine terminates SRTP there and A's side is plaintext:
+///   force `RTP/AVP` and strip the other party's keying.
+/// * otherwise, leave the transport alone.
+fn near_security(
+    near_local_crypto: Option<CryptoAttribute>,
+    far_secure: bool,
+) -> Option<SecurityAdvertisement> {
+    match near_local_crypto {
+        Some(local) => Some(SecurityAdvertisement::Secure(local)),
+        None => far_secure.then_some(SecurityAdvertisement::Plain),
+    }
+}
+
+/// The transport the **far** leg presents when the engine terminates a secure *offerer*.
+///
+/// A's keying must not reach B. Before this, `far_security` was handed `far_local_crypto` — `None`
+/// whenever B's own profile did not ask for a secure far leg — so the rewrite passed A's `a=crypto`
+/// straight through to B, handing a third party the offerer's SRTP key while answering A in the
+/// clear. Terminating A's SRTP means the far leg is plaintext unless B asked for its own keying.
+fn far_security_with_secure_near(
+    near_terminated: bool,
+    downgraded_to_plain: bool,
+    dtls: Option<(sdp::Fingerprint, sdp::Setup)>,
+    local_crypto: Option<CryptoAttribute>,
+) -> Option<SecurityAdvertisement> {
+    match far_security(downgraded_to_plain, dtls, local_crypto) {
+        Some(advertisement) => Some(advertisement),
+        // B has no keying of its own, and A's must not be forwarded: say plaintext explicitly, which
+        // is what forces `RTP/AVP` and strips the `a=crypto` A offered.
+        None if near_terminated => Some(SecurityAdvertisement::Plain),
+        None => None,
+    }
 }
 
 /// The ICE posture an **offer** presents for a leg (RFC 8839 §5): ICE-lite re-originated with the
@@ -592,6 +629,13 @@ struct Call {
     /// arriving late on a secure offerer: the two-leg answer is rewritten from B's SDP and cannot
     /// carry the engine's own keying, so the takeover would terminate no SRTP.
     near_secure: bool,
+    /// The engine's **own** SDES key advertised to A, minted at offer when A offered `RTP/SAVP`
+    /// (RFC 4568). `Some` means the engine is A's cryptographic far side and terminates A's SRTP —
+    /// the near-leg twin of `far_local_crypto`. `None` for a plaintext or DTLS offerer.
+    near_local_crypto: Option<CryptoAttribute>,
+    /// A's own SDES key, from its offer — what decrypts A's ingress. The near twin of
+    /// `far_remote_crypto`.
+    near_remote_crypto: Option<CryptoAttribute>,
     /// The near (offerer) leg's primary audio codec, captured at offer — paired with the answer's
     /// codec to decide whether the call transcodes (the media slow path). Replaced at answer by the
     /// codec B actually selected whenever that codec is one A offered (RFC 3264 §6.1 — see
@@ -1021,7 +1065,10 @@ fn pipeline_snapshot(pipeline: PipelineKind) -> crate::ha::PipelineSnapshot {
     use crate::ha::PipelineSnapshot;
     match pipeline {
         PipelineKind::Passthrough => PipelineSnapshot::Passthrough,
-        PipelineKind::Srtp => PipelineSnapshot::Srtp,
+        // A secure *offerer* bridge is snapshotted as a crypto bridge; the restore path rebuilds a
+        // far-secure one from the keys it does carry, and the offerer's own keying is not in the
+        // snapshot at all (a restored call treats A as plaintext — see `Call::near_local_crypto`).
+        PipelineKind::Srtp | PipelineKind::SrtpOfferer => PipelineSnapshot::Srtp,
         PipelineKind::Media => PipelineSnapshot::Media,
         PipelineKind::SrtpMedia => PipelineSnapshot::SrtpMedia,
         PipelineKind::Ws => PipelineSnapshot::Ws,
@@ -1153,8 +1200,13 @@ struct Subscription {
 enum PipelineKind {
     /// Plain in-datapath relay (the `Forward` fast path) — both legs share a codec, no record/stream.
     Passthrough,
-    /// Userspace SRTP bridge (an `RTP/AVP` ↔ `RTP/SAVP` secure leg).
+    /// Userspace SRTP bridge (an `RTP/AVP` ↔ `RTP/SAVP` secure leg) — the **far** (answerer) leg is
+    /// the secure one.
     Srtp,
+    /// Userspace SRTP bridge where the **near** (offerer) leg is the secure one: a secure caller
+    /// toward a plain callee. The mirror of [`PipelineKind::Srtp`] — the same flows with the
+    /// endpoints and crypto ops swapped — over the engine's own key toward A.
+    SrtpOfferer,
     /// Userspace media slow path: transcode / record / DTMF-extraction via a [`MediaCall`] actor.
     Media,
     /// Secure **and** transcoding: the far (`RTP/SAVP`) leg's codec differs from the near (plaintext)
@@ -2688,6 +2740,41 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             None
         };
+        // The engine's own key toward **A**, minted when A offered SDES-SRTP. This is what makes the
+        // engine A's cryptographic far side, and it is the whole reason a secure offerer can be
+        // terminated on this path at all: the answer A receives is rewritten from B's SDP, so without
+        // a key of our own there is nothing to advertise and A's own key was passed through to B
+        // instead — handing a third party the offerer's SRTP key while answering A in the clear.
+        //
+        // SDES only. A DTLS offerer is refused below: binding a handshake to the signalling needs an
+        // `a=fingerprint` in A's answer *and* an ICE agent on A's leg, neither of which this path has.
+        let near_sdes = info.secure && !info.dtls;
+        let near_remote_crypto = info.crypto.first().copied();
+        let near_local_crypto = if near_sdes {
+            match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+                Ok(crypto) => Some(crypto),
+                Err(error) => {
+                    self.free(&endpoints).await;
+                    return error_result("generate SDES key", &error);
+                }
+            }
+        } else {
+            None
+        };
+        // A secure offerer with no key to decrypt is refused, never bridged in the clear: answering a
+        // `RTP/SAVP` offer that carries no usable `a=crypto` would advertise keying against nothing.
+        if near_sdes && near_remote_crypto.is_none() {
+            self.free(&endpoints).await;
+            return error_result(
+                "offer",
+                &"secure-offerer-unkeyable: the RTP/SAVP offer carries no usable a=crypto",
+            );
+        }
+        // A **DTLS** offerer is deliberately untouched here. Terminating one needs the engine's own
+        // `a=fingerprint` in A's answer plus a full ICE agent on A's leg — the same missing piece
+        // `answer_local` names for a DTLS offerer without a takeover — and refusing it outright would
+        // break `dtls: off`, the rtpengine directive that legitimately downgrades such an offer. So
+        // its existing behaviour is kept byte for byte, and only the SDES path changes.
         let far_dtls_presentation = if far_dtls {
             let Some(fingerprint) = self.engine_fingerprint() else {
                 self.free(&endpoints).await;
@@ -2710,7 +2797,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             LegPresentation {
                 engine: far_leg.engine_media(),
                 ice: ice_rewrite,
-                security: far_security(
+                security: far_security_with_secure_near(
+                    near_local_crypto.is_some(),
                     far_downgraded_to_plain,
                     far_dtls_presentation,
                     far_local_crypto,
@@ -2853,6 +2941,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_downgraded_to_plain,
                 // A's own posture, for the late-`ws_uri` takeover guard in `answer`.
                 near_secure: info.secure,
+                near_local_crypto,
+                near_remote_crypto,
                 near_codec: near_codec.clone(),
                 near_offered_codecs,
                 near_codec_withheld,
@@ -3247,6 +3337,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far_downgraded_to_plain: false,
                 // Recorded for symmetry; a single-leg call never reaches `answer`.
                 near_secure: info.secure,
+                // A single-leg call's keying lives on the takeover leg, not on the two-party pair.
+                near_local_crypto: None,
+                near_remote_crypto: None,
                 near_codec: None,
                 // A single-leg local answer never reaches `answer`, so the offered set is unused.
                 near_offered_codecs: Vec::new(),
@@ -4458,7 +4551,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 LegPresentation {
                     engine: presented_media,
                     ice: answer_ice_rewrite(ice_creds.as_ref(), &presented_candidates),
-                    security: near_security(state.far_local_crypto.is_some() || state.far_dtls),
+                    security: near_security(
+                        state.near_local_crypto,
+                        state.far_local_crypto.is_some() || state.far_dtls,
+                    ),
                     mux_override,
                     text,
                     // A transcoding call sends A its own codec whatever B uses (RFC 3264 §6). A
@@ -4677,6 +4773,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             near_local_candidates,
             far_local_candidates,
             far_local_crypto,
+            near_local_crypto,
+            near_remote_crypto,
             far_dtls,
             far_downgraded_to_plain,
             near_secure,
@@ -4715,6 +4813,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     call.near_local_candidates.clone(),
                     call.far_local_candidates.clone(),
                     call.far_local_crypto,
+                    call.near_local_crypto,
+                    call.near_remote_crypto,
                     call.far_dtls,
                     call.far_downgraded_to_plain,
                     call.near_secure,
@@ -4805,8 +4905,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             &info,
             profile,
             far_local_crypto,
+            near_local_crypto,
             far_dtls,
         );
+        // A secure offerer is terminated only in the crypto-bridge shape. Every other combination
+        // would have to thread A's `SecureLeg` onto the A-facing directions of the media actor — the
+        // other half of this work — and until it exists the honest answer is a refusal, not a call
+        // that answers `ok` and relays A's audio somewhere it should not go. `resolve_pipeline`
+        // already picked the shape, so this reads its verdict rather than re-deriving the conditions.
+        if near_local_crypto.is_some() && pipeline != PipelineKind::SrtpOfferer {
+            let why = if far_dtls || far_local_crypto.is_some() {
+                "both parties are secure, which needs a transcrypt between two different keys"
+            } else {
+                "the two legs' codecs differ, which needs the secure offerer's leg threaded into \
+                 the transcoding pipeline"
+            };
+            return CmdResult::Error {
+                reason: format!(
+                    "answer: secure-offerer-unsupported: {why}; a secure caller toward a plain \
+                     callee on a shared codec is supported"
+                ),
+            };
+        }
         // rtpengine `ptime=<N>` override: force the packetization of the synthesized (transcoded)
         // egress toward both parties. Overriding the negotiated codec ptime here is the single source
         // of truth — it flows to the egress encoder's frame size and the repacketizer (the RTP cadence,
@@ -4939,7 +5059,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None => LegPresentation {
                 engine: near.engine_media(),
                 ice: answer_ice_rewrite(ice_creds.as_ref(), &near_ice_candidates),
-                security: near_security(far_local_crypto.is_some() || far_dtls),
+                security: near_security(near_local_crypto, far_local_crypto.is_some() || far_dtls),
                 mux_override: mux_directive.then_some(near.rtcp.is_none()),
                 text: if near.text.is_none() {
                     TextRewrite::None
@@ -5339,6 +5459,74 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // a new master key does not restart the stream's packet index.
             let previous_rollover = self.bridge.rollover_snapshot(near.rtp.id);
             let mut leg = SecureLeg::new(&far_local.key, &far_remote.key);
+            if let Some(rollover) = previous_rollover.as_ref() {
+                leg.seed_rollover(rollover);
+            }
+            self.bridge.register(BridgeCallPlan { leg, flows });
+        } else if pipeline == PipelineKind::SrtpOfferer {
+            // A secure **offerer** toward a plain callee: the exact mirror of the arm above, with the
+            // endpoints and the crypto ops swapped. The engine is A's cryptographic far side — it
+            // advertised its own key in the answer A received — so A's ingress is decrypted here and
+            // relayed to B in the clear, and B's plaintext is encrypted toward A under the engine's
+            // key. A's own key never reaches B, which is the defect this closes: without a key of its
+            // own the engine passed A's `a=crypto` straight through to the callee and answered A in
+            // the clear.
+            let (Some(near_local), Some(near_remote)) = (near_local_crypto, near_remote_crypto)
+            else {
+                return error_result(
+                    "SRTP bridge",
+                    &"secure offerer has no engine key or no peer key (internal)",
+                );
+            };
+            let (Some(a_rtp), Some(a_rtcp)) = (near.remote_rtp, near.remote_rtcp) else {
+                return error_result("SRTP bridge", &"near leg has no signalled address");
+            };
+            for endpoint in near.endpoint_ids().chain(far.endpoint_ids()) {
+                if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                    return error_result("install SRTP bridge redirect", &error);
+                }
+            }
+            let mut flows = vec![
+                // A (secure) ingress → decrypt for B → out the far endpoint toward B.
+                BridgeFlowPlan {
+                    endpoint: near.rtp.id,
+                    op: BridgeOp::Decrypt,
+                    accepted_source: bridge_source_filter(profile, near_gate_rtp.unwrap_or(a_rtp)),
+                    out_endpoint: far.rtp.id,
+                    out_dst: far_media_dst,
+                },
+                // B (plain) ingress → encrypt for A → out the near endpoint toward A.
+                BridgeFlowPlan {
+                    endpoint: far.rtp.id,
+                    op: BridgeOp::Encrypt,
+                    accepted_source: bridge_source_filter(profile, far_gate_rtp),
+                    out_endpoint: near.rtp.id,
+                    out_dst: near_media_dst.unwrap_or(a_rtp),
+                },
+            ];
+            if let (Some(near_rtcp), Some(far_rtcp)) = (near.rtcp, far.rtcp) {
+                flows.push(BridgeFlowPlan {
+                    endpoint: near_rtcp.id,
+                    op: BridgeOp::Decrypt,
+                    accepted_source: bridge_source_filter(
+                        profile,
+                        near_gate_rtcp.unwrap_or(a_rtcp),
+                    ),
+                    out_endpoint: far_rtcp.id,
+                    out_dst: far_rtcp_dst,
+                });
+                flows.push(BridgeFlowPlan {
+                    endpoint: far_rtcp.id,
+                    op: BridgeOp::Encrypt,
+                    accepted_source: bridge_source_filter(profile, far_gate_rtcp),
+                    out_endpoint: near_rtcp.id,
+                    out_dst: near_rtcp_dst.unwrap_or(a_rtcp),
+                });
+            }
+            // RFC 3711 §3.3.1, exactly as the far-secure arm: the rollover belongs to the stream, not
+            // to the key, so a renegotiation carries the live leg's counters into the rebuilt one.
+            let previous_rollover = self.bridge.rollover_snapshot(near.rtp.id);
+            let mut leg = SecureLeg::new(&near_local.key, &near_remote.key);
             if let Some(rollover) = previous_rollover.as_ref() {
                 leg.seed_rollover(rollover);
             }
@@ -7140,6 +7328,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // A restored call is a plaintext or SDES *far* leg; the offerer's own posture is
                 // not in the snapshot and a restored call is never re-answered.
                 near_secure: false,
+                // Likewise the offerer's own keying: a secure *offerer* is not carried in the HA
+                // snapshot, so a restored call treats A as plaintext rather than inventing a key the
+                // peer never received.
+                near_local_crypto: None,
+                near_remote_crypto: None,
                 // Set for a transcode (`Media`) call; `None` for relay/bridge, which don't transcode.
                 near_codec: near_codec_out,
                 // The offered set is not carried in the HA snapshot: a restored call is already
@@ -10057,7 +10250,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // A crypto bridge relays without decoding, so its media never reaches the pipeline. This
             // is the ordinary same-codec WebRTC / SDES shape, so it is a tap site rather than a
             // rejection — a warrant has to be servable on any call.
-            PipelineKind::Srtp | PipelineKind::Dtls => {
+            PipelineKind::Srtp | PipelineKind::SrtpOfferer | PipelineKind::Dtls => {
                 let Some(b_endpoint) = b_endpoint else {
                     return Err("the call has no answered second leg to intercept".to_string());
                 };
@@ -10826,6 +11019,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             caller_signalled_rtp,
             offer_received_from,
             comfort_noise_pt,
+            near_secure,
         )) = self.owned_call_internal(call_id, |call| {
             (
                 call.owner,
@@ -10847,6 +11041,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // The negotiated RFC 3389 CN egress payload type for a single-leg local answer (`None`
                 // for the echo/play promote paths and 2-leg calls). Wires the comfort-idle egress.
                 call.comfort_noise_payload_type,
+                // Whether the offerer's own media is secure. The actor must start **gated** in that
+                // case — see the `with_near_secure_pending` call below.
+                call.near_secure,
             )
         })
         else {
@@ -11000,6 +11197,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the caller offered CN, else audio-encoded low-level noise. The `echo` verb still reflects.
         let call = if offer_only_restore.is_some() {
             call.with_comfort_idle(comfort_noise_pt)
+        } else {
+            call
+        };
+        // A secure offerer's actor starts **gated**, before it is registered and can tick.
+        //
+        // `answer_local` keys this leg by sending `AttachNearSecureLeg` *after* the promote returns,
+        // and the actor is already running by then — so its comfort-idle playout tick could emit a
+        // frame in the window before the key lands, and on a secure leg that frame would go out in
+        // the clear. Which is exactly the leak the whole secure-offerer path exists to prevent, and
+        // it is not a theoretical window: it is what a parallel test run actually caught.
+        //
+        // Gating here rather than with a control message is what closes it completely — a message
+        // would race the very tick it is meant to beat.
+        let call = if near_secure {
+            call.with_near_secure_pending()
         } else {
             call
         };
@@ -12968,6 +13180,7 @@ fn resolve_pipeline(
     info: &sdp::MediaInfo,
     profile: &ProfileFlags,
     far_local_crypto: Option<CryptoAttribute>,
+    near_local_crypto: Option<CryptoAttribute>,
     far_dtls: bool,
 ) -> PipelineKind {
     // Transcode when the two legs' primary codecs differ in encoding or clock rate.
@@ -12990,6 +13203,22 @@ fn resolve_pipeline(
         } else {
             PipelineKind::Dtls
         };
+    }
+    // A secure **offerer** toward a plain callee: the mirror of the secure-far-leg bridge below. Only
+    // the crypto-bridge shape is wired, so this yields `SrtpOfferer` exactly when nothing needs the
+    // decoded audio. Anything that does — a codec mismatch, recording, NS, AEC, beep detection —
+    // falls through to a media pipeline that has no A-facing `SecureLeg` threaded into it, which the
+    // caller then refuses rather than silently relaying the caller's audio undecrypted or unencrypted.
+    if near_local_crypto.is_some()
+        && far_local_crypto.is_none()
+        && !far_dtls
+        && !transcode
+        && !profile.record_call
+        && !profile.noise_suppression
+        && !profile.echo_cancellation
+        && !profile.beep_detection
+    {
+        return PipelineKind::SrtpOfferer;
     }
     if far_local_crypto.is_some() {
         // Secure far leg: the plain SRTP bridge when both legs share a codec and nothing needs the
@@ -20166,6 +20395,282 @@ mod tests {
         let decrypted = decrypted.expect("an SRTP downlink packet reached the caller");
         let packet = siphon_rtp_media::rtp::RtpPacket::parse(&decrypted).expect("parse rtp");
         assert_eq!(packet.payload_type, 0, "encoded in the caller's codec");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_secure_offerers_key_is_never_forwarded_to_the_callee() {
+        // The defect, stated as the test: with no key of its own toward A the engine passed A's
+        // `a=crypto` straight through into the offer B receives — handing a third party the offerer's
+        // SRTP key — while answering A `RTP/AVP`, i.e. downgrading the caller it had just leaked the
+        // key of. Now the engine mints its own key for A, terminates A's SRTP, and B sees plaintext.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let caller_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+
+        let offered = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "secure-caller".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let far_offer = ok_sdp_text(&offered);
+        assert!(
+            !far_offer.contains("a=crypto"),
+            "the callee must never be handed the caller's SRTP key: {far_offer}"
+        );
+        assert!(
+            far_offer.contains("RTP/AVP") && !far_offer.contains("SAVP"),
+            "and is offered plaintext, since the engine terminates the caller's SRTP: {far_offer}"
+        );
+
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "secure-caller".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let answer = ok_sdp_text(&answered);
+        let parsed = sdp::parse(&answer).expect("answer parses");
+        assert!(
+            parsed.secure,
+            "the caller keeps the secure profile it offered, rather than being downgraded: {answer}"
+        );
+        let engine_key = parsed
+            .crypto
+            .first()
+            .expect("the answer carries the engine's own a=crypto");
+        assert_ne!(
+            engine_key.key.to_inline_bytes(),
+            caller_key.key.to_inline_bytes(),
+            "the engine answers its OWN key, never echoing the caller's back"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_secure_caller_reaches_a_plain_callee_through_the_bridge() {
+        // End to end: the caller's SRTP is decrypted and relayed to the callee in the clear, and the
+        // callee's plaintext comes back encrypted under the engine's own key. This is the topology the
+        // change request names — "a secure caller toward a plain callee" — and it could not be built.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::SrtpContext;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        let (phone_b, addr_b) = phone().await;
+        let caller_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+
+        let offered = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "secure-relay".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let engine_far = sdp::parse(&ok_sdp_text(&offered))
+            .expect("far offer")
+            .remote_rtp;
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "secure-relay".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let near = sdp::parse(&ok_sdp_text(&answered)).expect("answer");
+        let engine_near = near.remote_rtp;
+        let engine_key = *near.crypto.first().expect("the engine's key");
+
+        // A → B: the caller's SRTP arrives, is decrypted, and reaches B as plaintext RTP.
+        let mut protect = SrtpContext::from_key_material(&caller_key.key);
+        let plain = g711_rtp(0, 7, 0x0A0A_0A0A, 0x20);
+        let mut encrypted = Vec::new();
+        protect.protect(&plain, &mut encrypted).expect("protect");
+        phone_a
+            .send_to(&encrypted, engine_near)
+            .await
+            .expect("caller send");
+        let mut buffer = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_millis(500), phone_b.recv_from(&mut buffer))
+            .await
+            .expect("the callee receives")
+            .expect("recv");
+        assert_eq!(
+            &buffer[..len],
+            plain.as_slice(),
+            "the callee sees the caller's audio in the clear, byte for byte"
+        );
+
+        // B → A: the callee's plaintext comes back encrypted under the engine's own key.
+        let reply = g711_rtp(0, 11, 0x0B0B_0B0B, 0x40);
+        phone_b
+            .send_to(&reply, engine_far)
+            .await
+            .expect("callee send");
+        let (len, _) = timeout(Duration::from_millis(500), phone_a.recv_from(&mut buffer))
+            .await
+            .expect("the caller receives")
+            .expect("recv");
+        assert_ne!(
+            &buffer[..len],
+            reply.as_slice(),
+            "a secure caller must never be handed plaintext"
+        );
+        let mut unprotect = SrtpContext::from_key_material(&engine_key.key);
+        let mut decrypted = Vec::new();
+        unprotect
+            .unprotect(&buffer[..len], &mut decrypted)
+            .expect("it authenticates under the engine's own advertised key");
+        assert_eq!(
+            decrypted, reply,
+            "and decrypts to exactly what the callee sent"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_secure_offerer_is_refused_where_the_bridge_cannot_carry_it() {
+        // The two shapes that are *not* wired refuse rather than answering `ok` and relaying the
+        // caller's audio somewhere it should not go. Both need A's `SecureLeg` threaded into the
+        // transcoding pipeline, which is the other half of this work.
+        let caller_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("caller key");
+
+        // (a) both parties secure — a transcrypt between two different keys.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "both-secure".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                    profile: ProfileFlags {
+                        transport_protocol: Some("RTP/SAVP".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let callee_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("callee key");
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "both-secure".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdes_offerer_sdp(addr_b, &callee_key),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => {
+                assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
+                assert!(reason.contains("transcrypt"), "{reason}");
+            }
+            other => panic!("expected a refusal for secure↔secure, got {other:?}"),
+        }
+
+        // (b) a codec mismatch — the secure offerer's leg would have to reach the transcoder.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "secure-transcode".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr_a, &caller_key),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "secure-transcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => {
+                assert!(reason.contains("secure-offerer-unsupported"), "{reason}");
+                assert!(reason.contains("codecs differ"), "{reason}");
+            }
+            other => panic!("expected a refusal for a transcoding secure offerer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_secure_offer_with_no_usable_key_is_refused_not_bridged_in_the_clear() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let savp_without_crypto = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+        );
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "savp-no-key".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: savp_without_crypto,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("secure-offerer-unkeyable"),
+                "the refusal names why, got: {reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!engine.calls.contains_key("savp-no-key"));
+        assert_eq!(engine.client_call_count(CLIENT), 0, "no quota slot leaked");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

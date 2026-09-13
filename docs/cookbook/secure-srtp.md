@@ -51,21 +51,28 @@ fails SRTP authentication is dropped, never forwarded (see
 [Security & NAT](../security-and-nat.md)).
 
 **Terminating SRTP the *offerer* signals** — a secure caller, rather than a secure
-callee — is wired for conference legs (`conference_join` answers `RTP/SAVP` +
-`a=crypto`), for a WebSocket takeover, and now for **`answer_local`**: an
-SDES-SRTP caller reaches an IVR, an announcement, an echo test or a voicemail box
-directly, with the engine answering its own `a=crypto` and terminating the
-caller's SRTP on the single-leg media pipeline. See
-[A secure caller into an IVR](#a-secure-caller-into-an-ivr).
+callee — is now wired in three places:
 
-Two shapes are still not wired, and both refuse rather than answer keying no media
-path backs:
+- **conference legs** (`conference_join` answers `RTP/SAVP` + `a=crypto`);
+- **`answer_local`** — an SDES-SRTP caller reaches an IVR, an announcement, an
+  echo test or a voicemail box directly, with the engine answering its own
+  `a=crypto` and terminating the caller's SRTP on the single-leg media pipeline.
+  See [A secure caller into an IVR](#a-secure-caller-into-an-ivr);
+- the **two-party offer/answer relay** — the engine mints its own SDES key for the
+  caller, answers with it, decrypts the caller's SRTP and relays plaintext to the
+  callee (and back again, encrypted). See
+  [A secure caller toward a plain callee](#a-secure-caller-toward-a-plain-callee).
 
-- the **two-party offer/answer relay**, where the secure side is still only the
-  answerer's leg;
-- a **DTLS-SRTP (WebRTC) offerer on `answer_local`**, which needs the full ICE
-  agent on the promoted leg so the handshake can be gated on the selected pair
-  (RFC 8445 §12). It is answered `secure-offerer-unsupported`, naming DTLS.
+Three shapes are refused rather than half-carried, each because the media path
+behind it is not built:
+
+- **both parties secure** — a transcrypt between two different keys;
+- **a codec mismatch** on a secure caller — its `SecureLeg` would have to be
+  threaded into the transcoding pipeline;
+- a **DTLS-SRTP (WebRTC) offerer** on either path — it needs the engine's own
+  `a=fingerprint` in the caller's answer plus a full ICE agent on its leg. On
+  `answer_local` it is answered `secure-offerer-unsupported`, naming DTLS; on the
+  two-party relay its keying is relayed as before, unchanged.
 
 ## Native JSON exchange
 
@@ -220,6 +227,32 @@ flows.
   gating, latching, and why the bridge re-enforces the gate on the redirect path.
 
 
+## A secure caller toward a plain callee
+
+An SDES-SRTP desk phone calls a plaintext PSTN trunk. Nothing in the control flow
+changes — `offer` then `answer`, as always:
+
+```json
+{"id": 70, "command": "offer", "call_id": "…", "from_tag": "a7c31f", "sdp": "<the caller's RTP/SAVP offer with its a=crypto>"}
+```
+
+The offer presented to the **callee** is plaintext `RTP/AVP` with **no**
+`a=crypto`: the engine terminates the caller's SRTP, so the callee has no keying
+to receive and the caller's key never leaves the engine.
+
+The answer presented to the **caller** keeps `RTP/SAVP` and carries the engine's
+**own** `a=crypto` — never the caller's echoed back. From then on the engine
+decrypts the caller's ingress and encrypts everything it sends back, over a plain
+crypto bridge: no decode, no re-encode, the mirror of the secure-callee case.
+
+### What this fixed
+
+Before, a secure offer on this path did two wrong things at once. The offer the
+callee received **carried the caller's own `a=crypto`** — handing a third party
+the caller's SRTP key — and the answer the caller received was `RTP/AVP`,
+downgrading the very caller whose key had just been forwarded. Both are gone: an
+`RTP/SAVP` offer with no usable `a=crypto` is now refused outright
+(`secure-offerer-unkeyable`) rather than bridged in the clear.
 ## A secure caller into an IVR
 
 An SDES-SRTP desk phone calls voicemail. `answer_local` is the verb — the engine
