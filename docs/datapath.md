@@ -185,13 +185,19 @@ The docker-compose profiles grant the capabilities this needs (`NET_ADMIN`, `BPF
 
 ## What this means for capacity planning
 
-The userspace relay is cheap enough that the missing kernel path is a throughput ceiling concern,
-not a per-call latency one. Measured on one core (see the README benchmarks): RTP parse ~1.9 ns,
-full parse-rewrite-write ~8 ns per packet, zero per-packet heap. At a typical 50 pps per media
-stream, packet processing is nowhere near the bottleneck; syscall overhead and the NIC's pps
-budget are what XDP will eventually buy back at very high channel counts. Until then, plan
-capacity around transcode CPU (`siphon_rtp_transcode_sessions`, the `load` score) rather than
-relay cost.
+The missing kernel path is a throughput ceiling concern, not a per-call latency one — but the
+ceiling is set by syscalls, not by packet handling, and the two differ by three orders of magnitude.
+The *compute* is negligible: RTP parse ~1.9 ns, full parse-rewrite-write ~8 ns per packet, zero
+per-packet heap (see the README benchmarks, measured on one core with no socket I/O). The *relay*,
+measured end to end with its sockets, costs **~7–9 µs of CPU per packet, about 70 % of it in the
+kernel** — one `recvmsg` and one `sendmsg` each way. That kernel share is what `XDP_TX` removes, and
+it is why the fast path is worth building even though the packet handling is already free.
+
+For sizing, follow whichever cost dominates the pipeline you actually run: a transcoding node is
+bounded by codec CPU (`siphon_rtp_transcode_sessions`, the `load` score), while a **relay-only** node
+is bounded by the syscall cost above — and, more often than by either, by its file-descriptor limit.
+[Capacity & sizing](capacity.md) has the measured table, the arithmetic, and the limits that bite
+first.
 
 See also: [Security & NAT design](security-and-nat.md) for why a packet is accepted, latched and
 forwarded, [Deployment & operations](deployment.md) for `--relay-bind-ip` and the port pool, and
