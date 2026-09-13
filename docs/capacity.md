@@ -224,44 +224,20 @@ spike, a re-INVITE storm, the control plane, or anything else sharing the box.
 
 ## The limits that bite before CPU
 
-**File descriptors, almost always first.** Each relay call binds four media endpoints — RTP and
-RTCP on each leg — or two with `rtcp-mux` (RFC 5761). Every one is a socket:
+On a relay node, CPU is usually not what runs out first. Two other things do, and neither shows up as
+a CPU graph. They are stated here because they belong in a capacity estimate; the fixes are in
+[Performance & tuning](performance.md).
 
-| Soft `nofile` | Calls at 4 fds/call | Calls with `rtcp-mux` |
-|---|--:|--:|
-| 1 024 (a container default) | ~250 | ~500 |
-| 65 536 | ~16 000 | ~32 000 |
+| Limit | Where it bites | Fix |
+|---|--:|---|
+| **File-descriptor ceiling** | ~250 calls on a default 1 024 soft `nofile` (4 sockets per call, 2 with `rtcp-mux`) | [Raise `nofile`](performance.md#host-file-descriptors) |
+| **Connection tracking** | 10.6 % of relay CPU, on every packet, deciding nothing | [Exempt the media range](performance.md#host-connection-tracking) |
+| **Passive capture** | Scales with your *media*, not your calls: 100 000 pps through libpcap at 500 concurrent calls, on the same cores | [Budget for it](performance.md#passive-capture-is-part-of-the-budget) |
+| **Receive queues** | A single-queue virtualised NIC puts all ingress on one CPU, and the count is often not raisable from the guest | [Check `ethtool -l`](performance.md#host-receive-queues-and-interrupts) |
+| **Socket buffers** | Distribution defaults assume ordinary traffic, not tens of thousands of small datagrams per second | [Raise backlog and `wmem_max`](performance.md#host-socket-buffers-and-backlog) |
 
-A container started without an explicit limit commonly gets **1 024**, which caps a relay node at
-roughly **250 concurrent calls** and fails as confusing bind errors rather than as anything that
-names the real cause. Set it explicitly:
-
-```sh
-# docker / podman
-docker run --ulimit nofile=65536:65536 ...
-```
-
-```ini
-# systemd unit
-[Service]
-LimitNOFILE=65536
-```
-
-`rtcp-mux` is worth treating as a capacity lever and not only an interop flag: it halves both the
-descriptor count and the number of receive tasks.
-
-**Passive capture is not free, and it scales with your media, not your calls.** A sniffer filtered
-on the media port range sees every packet the relay forwards — at 500 concurrent calls that is
-100 000 packets per second through `libpcap`, plus whatever per-stream analysis and compression it
-does, competing for the same cores as the engine. On a small node this is frequently the largest
-consumer on the box. Give it its own cores, narrow its filter, or move it off the media node.
-
-**Ports.** Already covered under
-[the port pool](deployment.md#production-posture): up to 4 per call, 2 with `rtcp-mux`.
-
-**Socket buffers.** `net.core.netdev_max_backlog` and `net.core.wmem_max` at distribution defaults
-are sized for ordinary traffic, not for tens of thousands of small datagrams per second arriving on
-one receive queue. Raise them before concluding a loss figure is the engine's.
+The descriptor ceiling is the one to check first, because it fails as bind errors that name nothing
+about descriptors — and because at 4 sockets per call it lands at half of a 500-call target.
 
 ## Deriving an honest `--max-sessions`
 
@@ -277,7 +253,8 @@ from whichever limit is lowest on your node, not from CPU alone:
 4. Advertise the **lower** of the two.
 
 If the descriptor ceiling is the lower one, raise the limit rather than advertising the smaller
-number — it is a one-line fix, and CPU is the limit you actually want to be sized against.
+number — it is [a one-line fix](performance.md#host-file-descriptors), and CPU is the limit you
+actually want to be sized against.
 
 ## What these numbers do not tell you
 
@@ -298,7 +275,8 @@ Stated plainly, because a capacity table invites more confidence than one deserv
 
 ---
 
-See also: [Deployment & operations](deployment.md) for the port pool and production posture,
+See also: [Performance & tuning](performance.md) for the knobs these limits are fixed with,
+[Deployment & operations](deployment.md) for the port pool and production posture,
 [Scaling, clustering & HA](scaling-and-ha.md) for the dispatcher's load score and how nodes are
 ranked, and [Datapath](datapath.md) for why the syscall share is what a kernel fast path would buy
 back.
