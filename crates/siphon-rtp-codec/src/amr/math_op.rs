@@ -6,38 +6,12 @@
 //! They operate on the codec's own validated internal state (never raw network bytes), so they
 //! mirror the reference's direct table indexing exactly — diverging would break bit-exactness.
 
+use crate::itu::tables::{ISQRT as TABLE_ISQRT, LOG2 as TABLE_LOG2, POW2 as TABLE_POW2};
+
 use super::basic_ops::{
     extract_h, extract_l, l_add, l_deposit_h, l_mac, l_msu, l_mult, l_shl, l_shr, l_shr_r, negate,
     norm_l, shr, sub,
 };
-
-/// `1/sqrt` table (TS 26.173 `math_op.c`), 49 entries.
-#[rustfmt::skip]
-static TABLE_ISQRT: [i16; 49] = [
-    32767, 31790, 30894, 30070, 29309, 28602, 27945, 27330, 26755, 26214,
-    25705, 25225, 24770, 24339, 23930, 23541, 23170, 22817, 22479, 22155,
-    21845, 21548, 21263, 20988, 20724, 20470, 20225, 19988, 19760, 19539,
-    19326, 19119, 18919, 18725, 18536, 18354, 18176, 18004, 17837, 17674,
-    17515, 17361, 17211, 17064, 16921, 16782, 16646, 16514, 16384,
-];
-
-/// `2^x` table (TS 26.173 `math_op.c`), 33 entries.
-#[rustfmt::skip]
-static TABLE_POW2: [i16; 33] = [
-    16384, 16743, 17109, 17484, 17867, 18258, 18658, 19066, 19484, 19911,
-    20347, 20792, 21247, 21713, 22188, 22674, 23170, 23678, 24196, 24726,
-    25268, 25821, 26386, 26964, 27554, 28158, 28774, 29405, 30048, 30706,
-    31379, 32066, 32767,
-];
-
-/// `log2` table (TS 26.173 `log2_tab.h`), 33 entries.
-#[rustfmt::skip]
-static TABLE_LOG2: [i16; 33] = [
-    0, 1455, 2866, 4236, 5568, 6863, 8124, 9352, 10549, 11716,
-    12855, 13967, 15054, 16117, 17156, 18172, 19167, 20142, 21097, 22033,
-    22951, 23852, 24735, 25603, 26455, 27291, 28113, 28922, 29716, 30497,
-    31266, 32023, 32767,
-];
 
 /// Inverse square root `1/sqrt(value)` of a normalized fraction, in place.
 ///
