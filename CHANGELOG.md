@@ -9,6 +9,69 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **Runtime decoded-audio recording** — `start_recording` with `format: "wav"`, which streams
+  **decoded** audio to a file and completes with a new `Event::RecordingFinished` naming it.
+
+  Neither of the two recorders that already existed is a voicemail message. `start_recording` wrote a
+  pcap of the **raw wire packets** — any codec, undecoded, and refused outright on a secure or
+  WebSocket-bridged call — which is an audit artefact nobody listens to. The offer/answer
+  `record_call` flag does write decoded WAV, but it is set at offer/answer time rather than at a point
+  in the call the controller chooses, it needs two legs (it is *structurally* unreachable on an
+  `answer_local` call: `promote_to_processing` hardcodes `record_path = None`), it accumulates the
+  whole call in `WavRecorder`'s in-memory `Vec<i16>` — roughly 115 MB per hour per direction at 16 kHz
+  — and flushes once at teardown with no event at all, so a hard task abort loses the file.
+
+  A voicemail box needs all four of the things neither has: start at a moment the controller picks
+  (after the beep, not at answer), decoded audio, a single leg, and a signal that the file is
+  complete.
+
+  The media path is untouched. A recording attaches the **same** `MediaSink` a WebSocket tee does,
+  onto the same post-decode fan-out, feeding the same shared frame assembler — which already
+  interleaves two legs, hands off over a bounded channel and recycles its buffers with no per-frame
+  allocation, and whose frames are little-endian 16-bit PCM, i.e. exactly a WAV `data` payload. So the
+  only new per-frame code is a file append.
+
+  **All of the stop-condition policy lives in the writer task, off the media path**: `max_duration_ms`
+  (truncated to a whole sample frame, so a 60-second limit writes 60 seconds rather than 60.02) and
+  `silence_ms` (the existing `EnergyVad`, on a per-sample mean square so it means the same thing at
+  8 kHz and 16 kHz) both read bytes the writer already holds. Asking for either costs the per-packet
+  path nothing.
+
+  Details worth knowing:
+
+  - The header is written first with both sizes zero and fixed by seeking back at close, so a writer
+    killed mid-recording leaves a *valid* WAV declaring zero samples rather than a corrupt file.
+  - `RecordingFinished` is emitted only after that finalize and flush, which is the entire reason the
+    event exists — a consumer that acts on it never reads a half-written file.
+  - **The stop is the detach.** Dropping the sinks drops the last reference to the frame assembler,
+    which closes the writer's input, which makes it finalize. There is no kill signal to race the
+    finalize, and the writer is never aborted. A call torn down under a recording ends it the same
+    way, reporting `call_ended` — which is the *normal* way a voicemail message ends.
+  - The output file is opened before anything is promoted or attached, so a bad path fails the verb
+    with the call untouched rather than surfacing minutes later as a `RecordingFinished{Error}`.
+  - A new `PromotionReason::AudioRecording` holds the call in a **processing** pipeline. The existing
+    `Recording` variant is a *relay-only* hold (a pcap never decodes); sharing it would let stopping
+    one demote the other's pipeline out from under it.
+  - Unlike the pcap form, this works on a secure **transcoded** call — it taps after decryption and
+    decode. A secure crypto *bridge* and a WebSocket-takeover call still have no post-decode audio and
+    are refused.
+
+- **An egress tap on the media pipeline** (`MediaControl::AddEgressFork` / `RemoveEgressForkTagged`),
+  fed from exactly the point the echo canceller's far-end reference is, for the same reason: that is
+  the definition of what a party hears, whatever produced it. It is what `direction: "egress"` records,
+  and on a single-leg IVR call it is the only way to capture the engine's own audio — there is no
+  second party whose ingress it would be.
+
+### Changed
+
+- **`Command::StartRecording` and `Command::StopRecording` grew fields**, and `CmdResult::Ok` gained
+  `recording_id`. `format` absent still means `pcap`, so every existing message keeps its meaning and
+  the NG/bencode front-end (which has no spelling for anything else, and no event rail to carry a
+  completion) is unchanged.
+
+  **Breaking (Rust API)**, for anything that constructs those variants or `CmdResult::Ok`
+  exhaustively. The JSON wire stays backward compatible.
+
 - **The control-plane shared secret can come from a file** — `--control-secret-file <PATH>`, the
   `SIPHON_RTP_CONTROL_SECRET_FILE` environment variable, or a `control_secret_file` config key. It
   was `SIPHON_RTP_CONTROL_SECRET` only, and there was no `*_FILE`-style option anywhere in the tree.

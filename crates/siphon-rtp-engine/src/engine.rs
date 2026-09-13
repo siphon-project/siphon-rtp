@@ -37,7 +37,8 @@ use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    MediaTimeoutReason, PlayEndReason, PlayMediaSource, PlayRepeat, ProfileFlags, SessionStats,
+    MediaTimeoutReason, PlayEndReason, PlayMediaSource, PlayRepeat, ProfileFlags,
+    RecordingChannels, RecordingDirection, RecordingEndReason, RecordingFormat, SessionStats,
     WsBridgeEndReason, WsTeeDirection, WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
@@ -716,6 +717,13 @@ struct Call {
 enum PromotionReason {
     /// A raw-RTP pcap recording is active (`start recording`).
     Recording,
+    /// A **decoded-audio** recording is active (`start_recording` with `format: "wav"`). Distinct
+    /// from `Recording` because that one is a *relay-only* hold — a pcap forwards RTP verbatim and
+    /// never decodes — while this one taps the post-decode fan-out and so needs a **processing**
+    /// pipeline. Sharing the variant would let stopping one demote the other's pipeline out from
+    /// under it, and would make `upgrade_relay_to_processing` refuse over a hold that does not
+    /// conflict with it.
+    AudioRecording,
     /// A per-leg RFC 4733 telephone-event (DTMF) relay block is active (`block DTMF`) — the relay is
     /// held in userspace so the actor can gate the telephone-event PT per direction.
     DtmfBlock,
@@ -1387,6 +1395,11 @@ pub struct Engine<D: Datapath> {
     /// one. Held here (not in the media actor) because the transport task, the WS socket and the
     /// dropped/forwarded counters outlive individual control ops and must be torn down on `delete`.
     ws_tees: DashMap<String, WsTee>,
+    /// Live decoded-audio recordings, keyed by their `recording_id`. Several may run on one call (a
+    /// per-leg pair, or an audit recording alongside a voicemail), so this is not keyed by call.
+    recordings: DashMap<String, AudioRecording>,
+    /// Monotonic source for `recording_id`, so two recordings on one call never collide.
+    next_recording_id: std::sync::atomic::AtomicU64,
     /// Live WebSocket **takeover** bridges, keyed by call-id — the control-plane half of what the
     /// [`crate::ws_bridge::WsRegistry`] routes. One per call; attaching again re-points it. Held
     /// here for the same reason `ws_tees` is: the `ws_bridge_ended` event is emitted during teardown,
@@ -1427,6 +1440,53 @@ struct HepExport {
 
 /// A live WebSocket tee on one call: the shared mixer (for its counters), its transport task, and the
 /// per-leg fork tags so a detach removes exactly this tee's sinks and nothing else.
+/// A live decoded-audio recording, as the engine tracks it.
+///
+/// Mirrors [`WsTee`], and for the same reasons — the correlation ids are copied in at start because
+/// teardown runs *after* `delete` has removed the call, so the completion event cannot look them up.
+///
+/// Note what is deliberately **not** here: the shared frame assembler. Only the sinks hold it, so
+/// detaching them drops the last reference, closes the frame channel, and the writer task finalizes
+/// the file on its own. That is the whole stop mechanism — there is no separate kill signal to race
+/// the finalize, and a call torn down underneath a recording ends it exactly the same way.
+struct AudioRecording {
+    /// Also the fork tag on every leg it taps, and the event correlator.
+    recording_id: String,
+    call_id: String,
+    owner: ClientId,
+    path: std::path::PathBuf,
+    /// Ingress taps: which source legs carry a sink (`true` = leg A / caller).
+    ingress_legs: Vec<bool>,
+    /// Egress taps: which directions carry a sink (`true` = toward A).
+    egress_legs: Vec<bool>,
+    /// Why the recording ended when the *source* simply went away. Set by an explicit stop before it
+    /// detaches; left at `CallEnded` otherwise, because a writer cannot tell a stop from a hangup —
+    /// both are just "the sinks are gone" — and guessing would report one as the other.
+    source_reason: Arc<std::sync::Mutex<RecordingEndReason>>,
+    /// The writer task. **Never aborted**: aborting it would skip the header finalize and leave a
+    /// file declaring zero samples. It is ended by closing its input, and then awaited.
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl AudioRecording {
+    /// Whether this recording belongs to `call_id` — how an unnamed `stop_recording` (and a call
+    /// teardown) finds every recording it must end.
+    fn call_id_matches(&self, call_id: &str) -> bool {
+        self.call_id == call_id
+    }
+}
+
+/// The decoded-recording knobs, grouped so the start path takes one parameter rather than six.
+struct WavRecordingRequest {
+    direction: RecordingDirection,
+    channels: RecordingChannels,
+    limits: crate::recording::RecordingLimits,
+    /// Explicit output path, overriding the directory + generated name.
+    path: Option<String>,
+    /// Output directory, when no explicit path was given.
+    recording_dir: Option<String>,
+}
+
 struct WsTee {
     /// The tee's stream id — also the fork tag on every leg it taps, and the event correlator.
     stream_id: String,
@@ -1527,6 +1587,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             turn_server: None,
             ice_relays: Arc::new(DashMap::new()),
             ws_tees: DashMap::new(),
+            recordings: DashMap::new(),
+            next_recording_id: std::sync::atomic::AtomicU64::new(1),
             ws_bridges: DashMap::new(),
             // Lawful interception is unconfigured unless the daemon supplies `x3_*`, and `attach_x3`
             // refuses while it is — never accepted and left delivering nowhere.
@@ -2037,10 +2099,45 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             Command::StartRecording {
                 call_id,
+                from_tag,
                 recording_dir,
+                format,
+                direction,
+                channels,
+                max_duration_ms,
+                silence_ms,
+                path,
+            } => match format.unwrap_or_default() {
+                RecordingFormat::Pcap => {
+                    self.start_recording(client, &call_id, recording_dir).await
+                }
+                RecordingFormat::Wav => {
+                    self.start_wav_recording(
+                        client,
+                        &call_id,
+                        &from_tag,
+                        WavRecordingRequest {
+                            direction: direction.unwrap_or_default(),
+                            channels: channels.unwrap_or_default(),
+                            limits: crate::recording::RecordingLimits {
+                                max_duration_ms,
+                                silence_ms,
+                            },
+                            path,
+                            recording_dir,
+                        },
+                    )
+                    .await
+                }
+            },
+            Command::StopRecording {
+                call_id,
+                recording_id,
                 ..
-            } => self.start_recording(client, &call_id, recording_dir).await,
-            Command::StopRecording { call_id, .. } => self.stop_recording(client, &call_id).await,
+            } => {
+                self.stop_recording(client, &call_id, recording_id.as_deref())
+                    .await
+            }
             Command::ConferenceJoin {
                 conference_id,
                 from_tag,
@@ -3736,6 +3833,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // …and any WS tee riding the same fan-out, so its transport closes and the controller
             // gets its `ws_tee_ended` rather than a silently dead stream.
             self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+            // …and any decoded recording on it, **before** the media actor is deregistered. This is
+            // what turns a hangup into a finished, playable file rather than a valid WAV declaring
+            // zero samples: it detaches the sinks, waits for the writer to finalize the header, and
+            // lets the completion event go out naming `call_ended`. A voicemail box depends on it —
+            // the caller hanging up is the normal way a message ends.
+            self.stop_wav_recordings_for_call(call_id, RecordingEndReason::CallEnded)
+                .await;
             // …and any lawful interception, so the controller gets a final `x3_ended` carrying the
             // delivered/dropped counts its compliance record needs, rather than a silently dead
             // delivery connection.
@@ -5881,6 +5985,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     sdp: None,
                     duration_ms: None,
                     play_id: None,
+                    recording_id: None,
                     to_tag: None,
                     stats: None,
                 }
@@ -6260,6 +6365,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             sdp: None,
             duration_ms: None,
             play_id: None,
+            recording_id: None,
             to_tag: None,
             stats: Some(stats),
         }
@@ -8126,6 +8232,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp: None,
                 duration_ms,
                 play_id: Some(play_id),
+                recording_id: None,
                 to_tag: None,
                 stats: None,
             },
@@ -8441,9 +8548,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// rtpengine `stop recording`): tell the actor to drop its capture sink (the drain task then
     /// finalizes the `.pcap`) and release the recording hold, demoting the relay back to the in-kernel
     /// `Forward` fast path if no other hold (a SIPREC subscription) remains.
-    async fn stop_recording(&self, client: ClientId, call_id: &str) -> CmdResult {
+    async fn stop_recording(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        recording_id: Option<&str>,
+    ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
+        }
+        // A named recording is a decoded-audio one: stop exactly it and leave everything else — the
+        // pcap, another recording on the same call — running.
+        if let Some(recording_id) = recording_id {
+            if !self.recordings.contains_key(recording_id) {
+                return error_result(
+                    "stop_recording",
+                    &format!("no recording {recording_id} is running on this call"),
+                );
+            }
+            self.stop_wav_recording(recording_id, RecordingEndReason::Stopped)
+                .await;
+            return ok_empty();
+        }
+        // Unnamed: stop everything this call is recording, which is what rtpengine's `stop recording`
+        // means and the only thing the NG front-end can express.
+        let running: Vec<String> = self
+            .recordings
+            .iter()
+            .filter(|entry| entry.value().call_id_matches(call_id))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for recording_id in running {
+            self.stop_wav_recording(&recording_id, RecordingEndReason::Stopped)
+                .await;
         }
         // No-op in the actor if not recording; ignored if the call has no actor (never promoted).
         self.media.control(call_id, MediaControl::StopRecording);
@@ -8455,6 +8592,374 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.release_text_hold(call_id, PromotionReason::Recording)
             .await;
         ok_empty()
+    }
+
+    /// Begin a runtime **decoded-audio** recording ([`Command::StartRecording`] with
+    /// `format: "wav"`).
+    ///
+    /// The point of the verb: a voicemail box answers locally, plays a greeting and a beep, and only
+    /// *then* records the caller — so recording has to start at a moment the controller picks, capture
+    /// decoded audio (the file is emailed, transcribed and played back on handsets), work on a
+    /// single-leg call, and tell the controller when the file is complete. None of `record_call`
+    /// (offer/answer-time, two legs, buffered in RAM, flushed at teardown) or the pcap recorder (raw
+    /// wire bytes) does any of that.
+    ///
+    /// It attaches the **same** sinks a WebSocket tee does, onto the same post-decode fan-out, feeding
+    /// the same shared frame assembler — which already interleaves two legs, hands off over a bounded
+    /// channel and recycles its buffers with no per-frame allocation. Its wire frames are little-endian
+    /// 16-bit PCM, i.e. exactly a WAV `data` payload, so the writer appends them verbatim.
+    async fn start_wav_recording(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+        request: WavRecordingRequest,
+    ) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        match self.begin_wav_recording(call_id, from_tag, request).await {
+            Ok(recording_id) => CmdResult::Ok {
+                sdp: None,
+                duration_ms: None,
+                play_id: None,
+                recording_id: Some(recording_id),
+                to_tag: None,
+                stats: None,
+            },
+            Err(reason) => error_result("start_recording", &reason),
+        }
+    }
+
+    /// Stand the recording up. Split out so every failure returns `Err` with the call untouched —
+    /// nothing is promoted, no file is created and no sink is attached until every input has been
+    /// validated, exactly as `start_ws_tee` does.
+    async fn begin_wav_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        request: WavRecordingRequest,
+    ) -> Result<String, String> {
+        use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
+        use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
+        use siphon_rtp_media::bridge::wire_rate::wire_resampler;
+
+        // Same exclusions the tee has, and for the same reason: a WS-takeover call's media never
+        // reaches the pipeline, and a crypto *bridge* relays ciphertext without decoding, so neither
+        // has a post-decode fan-out to tap. A secure call that runs through the media pipeline
+        // (`SrtpMedia` / `DtlsMedia`) decodes like any other and records fine — which is the case the
+        // pcap recorder has to refuse and this one does not.
+        let pipeline = self
+            .owned_call_internal(call_id, |call| call.pipeline)
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        if self.ws.is_ws_call(call_id) || pipeline == PipelineKind::Ws {
+            return Err(
+                "a WebSocket-takeover call (ws_uri) has no relay path to record".to_string(),
+            );
+        }
+        if matches!(pipeline, PipelineKind::Srtp | PipelineKind::Dtls) {
+            return Err(
+                "recording a secure crypto-bridge call is not supported — the bridge relays \
+                 ciphertext without decoding; a transcoded secure call records fine"
+                    .to_string(),
+            );
+        }
+
+        let (near_codec, far_codec, two_leg, to_tag, owner) = self
+            .owned_call_internal(call_id, |call| {
+                (
+                    call.near_codec.clone(),
+                    call.far_codec.clone(),
+                    call.far
+                        .as_ref()
+                        .is_some_and(|far| far.remote_rtp.is_some()),
+                    call.to_tag.clone(),
+                    call.owner,
+                )
+            })
+            .ok_or_else(|| "call no longer exists".to_string())?;
+
+        let caller_rate = near_codec.as_ref().map(pcm_rate_of).transpose()?;
+        let callee_rate = far_codec.as_ref().map(pcm_rate_of).transpose()?;
+        // The recording rate is the caller leg's decoded PCM rate — not its RTP clock, which for G.722
+        // is half of it (RFC 3551 §4.5.2) and would replay the file at the wrong pitch. A second leg at
+        // another rate is resampled into it.
+        let rate = caller_rate
+            .or(callee_rate)
+            .ok_or_else(|| "the call has no negotiated codec to record".to_string())?;
+        let ptime = near_codec
+            .as_ref()
+            .map_or(20, |codec| codec.ptime_ms.max(1));
+
+        // Which taps. Ingress is what the parties *sent* (a voicemail message); egress is what the
+        // engine sent them (its prompts), which on a single-leg call is the only way to capture the
+        // engine's own audio at all — there is no second party whose ingress it would be.
+        let (want_ingress, want_egress) = match request.direction {
+            RecordingDirection::Ingress => (true, false),
+            RecordingDirection::Egress => (false, true),
+            RecordingDirection::Both => (true, true),
+        };
+        // Two sources exist only on an answered two-party call. A single-leg call records mono
+        // whatever was asked for, rather than stalling on a stereo frame whose second ring never
+        // fills — the same degradation the tee applies.
+        let two_sources = two_leg && !(want_ingress && want_egress);
+        let stereo = matches!(request.channels, RecordingChannels::Stereo) && two_sources;
+        let channels: u8 = if stereo { 2 } else { 1 };
+
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: rate,
+            channels,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime,
+        };
+
+        // Every conversion is built before anything is touched, so a rate this engine cannot serve
+        // fails with the call exactly as it was.
+        let mut taps: Vec<(
+            bool,
+            bool,
+            TeeChannel,
+            Option<siphon_rtp_dsp::resample::Resampler>,
+        )> = Vec::new();
+        for (is_ingress, source_a, channel, leg_rate, wanted) in [
+            (true, true, TeeChannel::Caller, caller_rate, want_ingress),
+            (
+                true,
+                false,
+                TeeChannel::Callee,
+                callee_rate,
+                want_ingress && two_leg,
+            ),
+            // Egress toward A is the engine's audio for the caller; on a two-party call it is what B
+            // sent, already covered by B's ingress, so only the caller-facing side is tapped unless
+            // both directions were asked for.
+            (false, true, TeeChannel::Callee, caller_rate, want_egress),
+        ] {
+            if !wanted {
+                continue;
+            }
+            // A stereo recording puts the caller left and everything else right; a mono one folds
+            // every source into ring 0 so the assembler sums them.
+            let channel = if stereo { channel } else { TeeChannel::Caller };
+            let resampler = match leg_rate {
+                Some(leg_rate) => {
+                    wire_resampler(leg_rate, rate).map_err(|error| error.to_string())?
+                }
+                None => None,
+            };
+            taps.push((is_ingress, source_a, channel, resampler));
+        }
+        if taps.is_empty() {
+            return Err("the call has no leg matching the requested direction".to_string());
+        }
+
+        let recording_id = format!(
+            "rec-{}",
+            self.next_recording_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let path = match request.path {
+            Some(path) => std::path::PathBuf::from(path),
+            None => {
+                let directory = request.recording_dir.ok_or_else(|| {
+                    "no output location (set `path`, or `recording_dir`)".to_string()
+                })?;
+                std::path::PathBuf::from(directory).join(format!("{call_id}-{recording_id}.wav"))
+            }
+        };
+
+        // Open the output up front, exactly as the pcap path does: a bad path must fail the verb with
+        // the call untouched — nothing promoted, no sink attached — rather than being reported minutes
+        // later as a `RecordingFinished{Error}` for a recording the controller believes is running.
+        let file = tokio::fs::File::create(&path)
+            .await
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+
+        // A relay-only actor (a pcap recording, a DTMF block) forwards RTP verbatim and never decodes,
+        // so the fan-out this taps would stay dry. Rebuild it as a processing actor, then hold it for
+        // the recording's lifetime.
+        if self.media.is_relay_call(call_id) {
+            self.upgrade_relay_to_processing(call_id).await?;
+        }
+        self.hold_in_userspace(
+            call_id,
+            PromotionReason::AudioRecording,
+            PromoteMode::Processing,
+        )
+        .await?;
+
+        let plan = plan_ws_tee(format, stereo, false);
+        let mut ingress_legs = Vec::new();
+        let mut egress_legs = Vec::new();
+        for (is_ingress, source_a, channel, resampler) in taps {
+            let sink = WsTeeSink::new(channel, plan.mixer.clone(), recording_id.clone(), resampler);
+            let attached = if is_ingress {
+                self.media.control(
+                    call_id,
+                    MediaControl::AddFork {
+                        source_a,
+                        sink: Box::new(sink),
+                    },
+                )
+            } else {
+                self.media.control(
+                    call_id,
+                    MediaControl::AddEgressFork {
+                        toward_a: source_a,
+                        sink: Box::new(sink),
+                    },
+                )
+            };
+            if !attached {
+                self.detach_recording_sinks(call_id, &recording_id, &ingress_legs, &egress_legs);
+                self.release_userspace_hold(call_id, PromotionReason::AudioRecording)
+                    .await;
+                return Err("media actor unavailable".to_string());
+            }
+            if is_ingress {
+                ingress_legs.push(source_a);
+            } else {
+                egress_legs.push(source_a);
+            }
+        }
+
+        // `CallEnded` is the default because it is the truthful answer when nothing set it: the sinks
+        // went away and nobody asked them to.
+        let source_reason = Arc::new(std::sync::Mutex::new(RecordingEndReason::CallEnded));
+        let writer = {
+            let events = self.events.get(&owner).map(|sink| sink.value().clone());
+            let call_id = call_id.to_string();
+            let from_tag = from_tag.to_string();
+            let to_tag = to_tag.clone();
+            let recording_id = recording_id.clone();
+            let path = path.clone();
+            let source_reason = source_reason.clone();
+            let frames = plan.frames;
+            let recycle = plan.recycle;
+            tokio::spawn(async move {
+                let outcome = crate::recording::run_wav_recorder(
+                    file,
+                    path.clone(),
+                    rate,
+                    u16::from(channels),
+                    request.limits,
+                    frames,
+                    recycle,
+                )
+                .await;
+                let source_reason = source_reason
+                    .lock()
+                    .map(|reason| *reason)
+                    .unwrap_or(RecordingEndReason::CallEnded);
+                let reason = outcome.end.into_reason(source_reason);
+                // Emitted only now — after the header has been finalized and the file flushed — so a
+                // consumer that acts on this event never opens a half-written file. That is the whole
+                // reason the event exists.
+                if let Some(events) = events {
+                    let _ = events.try_send(Event::RecordingFinished {
+                        call_id,
+                        from_tag,
+                        to_tag,
+                        recording_id,
+                        path: Some(path.to_string_lossy().into_owned()),
+                        duration_ms: outcome.duration_ms,
+                        reason,
+                    });
+                }
+            })
+        };
+
+        self.recordings.insert(
+            recording_id.clone(),
+            AudioRecording {
+                recording_id: recording_id.clone(),
+                call_id: call_id.to_string(),
+                owner,
+                path,
+                ingress_legs,
+                egress_legs,
+                source_reason,
+                writer,
+            },
+        );
+        Ok(recording_id)
+    }
+
+    /// Detach every sink a recording attached, without touching anything else on the same legs.
+    fn detach_recording_sinks(
+        &self,
+        call_id: &str,
+        recording_id: &str,
+        ingress_legs: &[bool],
+        egress_legs: &[bool],
+    ) {
+        for source_a in ingress_legs {
+            self.media.control(
+                call_id,
+                MediaControl::RemoveForkTagged {
+                    source_a: *source_a,
+                    tag: recording_id.to_string(),
+                },
+            );
+        }
+        for toward_a in egress_legs {
+            self.media.control(
+                call_id,
+                MediaControl::RemoveEgressForkTagged {
+                    toward_a: *toward_a,
+                    tag: recording_id.to_string(),
+                },
+            );
+        }
+    }
+
+    /// End one decoded-audio recording and wait for its file to be closed.
+    ///
+    /// The stop **is** the detach: dropping the sinks drops the last reference to the shared frame
+    /// assembler, which closes the writer's input, which makes it finalize the header and emit
+    /// [`Event::RecordingFinished`]. The writer is never aborted — that would skip the finalize and
+    /// leave a valid-but-empty WAV — and awaiting it is what makes the event ordering a guarantee
+    /// rather than a race for a controller that stops a recording and immediately reads the file.
+    async fn stop_wav_recording(&self, recording_id: &str, reason: RecordingEndReason) {
+        let Some((_, recording)) = self.recordings.remove(recording_id) else {
+            return;
+        };
+        if let Ok(mut stored) = recording.source_reason.lock() {
+            *stored = reason;
+        }
+        self.detach_recording_sinks(
+            &recording.call_id,
+            &recording.recording_id,
+            &recording.ingress_legs,
+            &recording.egress_legs,
+        );
+        let _ = recording.writer.await;
+        self.release_userspace_hold(&recording.call_id, PromotionReason::AudioRecording)
+            .await;
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id = %recording.call_id,
+            recording_id,
+            path = %recording.path.display(),
+            owner = recording.owner.0,
+            ?reason,
+            "decoded recording stopped"
+        );
+    }
+
+    /// End every decoded recording on a call, for a teardown that is not an operator stop.
+    async fn stop_wav_recordings_for_call(&self, call_id: &str, reason: RecordingEndReason) {
+        let running: Vec<String> = self
+            .recordings
+            .iter()
+            .filter(|entry| entry.value().call_id_matches(call_id))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for recording_id in running {
+            self.stop_wav_recording(&recording_id, reason).await;
+        }
     }
 
     /// Attach a **WebSocket tee** to an established call ([`Command::AttachWsTee`]): stream the call's
@@ -9694,6 +10199,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             sdp: Some(offer),
             duration_ms: None,
             play_id: None,
+            recording_id: None,
             to_tag: Some(subscription_id),
             stats: None,
         }
@@ -11365,6 +11871,7 @@ fn ok_sdp(sdp: String, to_tag: Option<String>) -> CmdResult {
         sdp: Some(sdp),
         duration_ms: None,
         play_id: None,
+        recording_id: None,
         to_tag,
         stats: None,
     }
@@ -11526,6 +12033,7 @@ fn ok_empty() -> CmdResult {
         sdp: None,
         duration_ms: None,
         play_id: None,
+        recording_id: None,
         to_tag: None,
         stats: None,
     }
@@ -19144,6 +19652,12 @@ mod tests {
                             call_id: "egress-audit".into(),
                             from_tag: "tag-a".into(),
                             recording_dir: None,
+                            format: None,
+                            direction: None,
+                            channels: None,
+                            max_duration_ms: None,
+                            silence_ms: None,
+                            path: None,
                         },
                     )
                     .await,
@@ -20835,6 +21349,12 @@ mod tests {
                     call_id: "rec-e2e".into(),
                     from_tag: "tag-a".into(),
                     recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;
@@ -20911,6 +21431,7 @@ mod tests {
                 Command::StopRecording {
                     call_id: "rec-e2e".into(),
                     from_tag: "tag-a".into(),
+                    recording_id: None,
                 },
             )
             .await;
@@ -20962,6 +21483,12 @@ mod tests {
                     call_id: "savp-rec".into(),
                     from_tag: "tag-a".into(),
                     recording_dir: Some("/tmp".into()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;
@@ -20977,6 +21504,12 @@ mod tests {
                     call_id: "nope".into(),
                     from_tag: "f".into(),
                     recording_dir: Some("/tmp".into()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;
@@ -21452,6 +21985,387 @@ mod tests {
         assert_eq!(id, play_id, "the completion carries the accept's play_id");
         assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
         assert_eq!(played_ms, Some(40), "the whole 40 ms prompt played");
+    }
+
+    /// Offer + `answer_local` a single-leg µ-law call and start a decoded recording on it — the
+    /// voicemail shape: one party, the engine as the far side, recording begun at a moment the
+    /// controller picks rather than at answer.
+    async fn voicemail_call(
+        engine: &Engine<UdpLoopbackDatapath>,
+        call_id: &str,
+        addr: SocketAddr,
+    ) -> SocketAddr {
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        sdp::parse(&ok_sdp_text(&answered))
+            .expect("the engine's answer")
+            .remote_rtp
+    }
+
+    /// Wait for the `recording_finished` event for `recording_id`, skipping anything else.
+    async fn next_recording_finished(
+        events: &flume::Receiver<Event>,
+    ) -> Option<(
+        String,
+        Option<String>,
+        u64,
+        siphon_rtp_proto::RecordingEndReason,
+    )> {
+        for _ in 0..60u16 {
+            match timeout(Duration::from_millis(200), events.recv_async()).await {
+                Ok(Ok(Event::RecordingFinished {
+                    recording_id,
+                    path,
+                    duration_ms,
+                    reason,
+                    ..
+                })) => return Some((recording_id, path, duration_ms, reason)),
+                Ok(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_voicemail_records_the_caller_and_reports_the_finished_file() {
+        // The whole P3 shape end to end: a single-leg `answer_local` call (which `record_call` cannot
+        // reach at all — `promote_to_processing` hardcodes `record_path: None`), recording started at
+        // runtime, decoded audio streamed to disk, and a completion event that arrives only once the
+        // file is closed. A consumer that acts on the event must never read a half-written file.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone, addr) = phone().await;
+        let engine_near = voicemail_call(&engine, "vm", addr).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "vm".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                    direction: Some(siphon_rtp_proto::RecordingDirection::Ingress),
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
+                },
+            )
+            .await;
+        let recording_id = match started {
+            CmdResult::Ok {
+                recording_id: Some(id),
+                ..
+            } => id,
+            other => panic!("a wav recording accepts with a recording_id, got {other:?}"),
+        };
+
+        // The caller speaks: ten µ-law frames of a constant non-zero level.
+        for sequence in 0..10u16 {
+            phone
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), engine_near)
+                .await
+                .expect("caller send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopRecording {
+                    call_id: "vm".into(),
+                    from_tag: "tag-a".into(),
+                    recording_id: Some(recording_id.clone()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stop accepted: {stopped:?}"
+        );
+
+        let (finished_id, path, duration_ms, reason) = next_recording_finished(&events)
+            .await
+            .expect("a recording_finished event arrives");
+        assert_eq!(finished_id, recording_id, "the event correlates by id");
+        assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::Stopped);
+        assert!(duration_ms > 0, "the caller's audio was recorded");
+
+        // The file the event names is closed, complete, and readable by the tree's own WAV reader.
+        let path = path.expect("the event names the file");
+        let bytes = std::fs::read(&path).expect("the file exists when the event arrives");
+        let parsed = siphon_rtp_media::player::WavSource::parse(&bytes)
+            .expect("the finished file is a valid WAV");
+        assert_eq!(parsed.sample_rate_hz(), 8000, "µ-law decodes to 8 kHz PCM");
+        assert_eq!(parsed.channels(), 1);
+        assert!(
+            parsed.samples().iter().any(|&sample| sample != 0),
+            "the recording holds the caller's audio, not silence"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recording_is_finalized_when_the_call_ends_under_it() {
+        // A caller hanging up is the *normal* way a voicemail message ends, so teardown has to
+        // produce a finished, playable file and a `call_ended` completion — not a valid WAV declaring
+        // zero samples, which is what aborting the writer task would leave.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone, addr) = phone().await;
+        let engine_near = voicemail_call(&engine, "vm-hangup", addr).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "vm-hangup".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            started,
+            CmdResult::Ok {
+                recording_id: Some(_),
+                ..
+            }
+        ));
+        for sequence in 0..6u16 {
+            phone
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), engine_near)
+                .await
+                .expect("caller send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "vm-hangup".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+
+        let (_id, path, duration_ms, reason) = next_recording_finished(&events)
+            .await
+            .expect("teardown still produces a completion event");
+        assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::CallEnded);
+        assert!(
+            duration_ms > 0,
+            "the audio recorded before the hangup is kept"
+        );
+        let bytes = std::fs::read(path.expect("path")).expect("read");
+        let parsed = siphon_rtp_media::player::WavSource::parse(&bytes)
+            .expect("a hangup still leaves a valid WAV");
+        assert!(
+            !parsed.samples().is_empty(),
+            "the header was finalized, so the file declares the audio it holds"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_explicit_path_is_honoured_and_an_unknown_recording_id_is_refused() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let _events = engine.register_client(CLIENT);
+        let (_phone, addr) = phone().await;
+        let _ = voicemail_call(&engine, "vm-path", addr).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wanted = dir.path().join("greeting-reply.wav");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "vm-path".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: None,
+                    format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: Some(wanted.to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+        assert!(matches!(
+            started,
+            CmdResult::Ok {
+                recording_id: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            wanted.exists(),
+            "the recording opened exactly the file it was told to"
+        );
+
+        // A stop for an id that is not running is an error, not a hollow success — a controller that
+        // believes it stopped a recording and did not has no way to notice.
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopRecording {
+                    call_id: "vm-path".into(),
+                    from_tag: "tag-a".into(),
+                    recording_id: Some("rec-does-not-exist".into()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Error { .. }),
+            "an unknown recording id is refused, got {stopped:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unwritable_recording_path_fails_the_verb_with_the_call_untouched() {
+        // The file is opened before anything is promoted or attached, so a provisioning mistake is a
+        // clean error on the verb rather than a `RecordingFinished{Error}` minutes later for a
+        // recording the controller believes is running.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let _ = voicemail_call(&engine, "vm-bad-path", addr).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unwritable = dir.path().join("no-such-directory").join("message.wav");
+
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "vm-bad-path".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: None,
+                    format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: Some(unwritable.to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+        match started {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("open"),
+                "the refusal names the path problem, got: {reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            engine.recordings.is_empty(),
+            "no recording was registered for a start that failed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pcap_recording_is_unchanged_by_the_wav_form() {
+        // `format` absent must still mean pcap, byte for byte what it meant before — an existing
+        // controller (and the whole NG front-end) sends exactly this.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "pcap-default".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "pcap-default".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "pcap-default".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                started,
+                CmdResult::Ok {
+                    recording_id: None,
+                    ..
+                }
+            ),
+            "a pcap recording carries no recording_id, got {started:?}"
+        );
+        assert!(
+            dir.path().join("pcap-default.pcap").exists(),
+            "the pcap landed at its historical path"
+        );
+        assert!(
+            engine.media().is_relay_call("pcap-default"),
+            "a pcap recording still takes the relay-only hold, not a processing one"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22414,6 +23328,12 @@ mod tests {
                     call_id: "bd-2".into(),
                     from_tag: "tag-a".into(),
                     recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;
@@ -22455,6 +23375,7 @@ mod tests {
                 Command::StopRecording {
                     call_id: "bd-2".into(),
                     from_tag: "tag-a".into(),
+                    recording_id: None,
                 },
             )
             .await;
@@ -30087,6 +31008,12 @@ mod tests {
                     call_id: "tee-vs-pcap".into(),
                     from_tag: "tag-a".into(),
                     recording_dir: Some(directory.path().to_string_lossy().into_owned()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;

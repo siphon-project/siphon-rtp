@@ -764,6 +764,14 @@ pub struct Direction {
     /// PCM the recorder sees). Each re-encodes for a send-only subscriber (a Session Recording Server,
     /// RFC 7866 §6). Empty unless a `subscribe_request`/`subscribe_answer` attached one.
     forks: Vec<Box<dyn MediaSink>>,
+    /// Sinks fed the **egress** PCM — what this party actually hears, overlay and injected prompt
+    /// included, immediately before it is encoded. The mirror of `forks`, and fed from exactly the
+    /// point `echo_reference` is, for the same reason: that is the definition of "what the party
+    /// hears", whatever produced it (transcode, prompt, echo reflect, conference mix).
+    ///
+    /// Empty unless a recording asked for `direction: egress`. A single-leg IVR leg is the case that
+    /// needs it — there is no second party whose *ingress* is the engine's own audio.
+    egress_taps: Vec<Box<dyn MediaSink>>,
     /// Replace egress audio with comfort silence (digit-suppression / hold).
     silenced: bool,
     /// Drop egress audio entirely (not even silence).
@@ -1376,6 +1384,7 @@ impl Direction {
             dtmf: DtmfDetector::new(),
             recorder: config.recorder,
             forks: Vec::new(),
+            egress_taps: Vec::new(),
             silenced: false,
             blocked: false,
             dtmf_blocked: false,
@@ -1452,6 +1461,7 @@ impl Direction {
             dtmf: DtmfDetector::new(),
             recorder: None,
             forks: Vec::new(),
+            egress_taps: Vec::new(),
             silenced: false,
             blocked: false,
             dtmf_blocked: false,
@@ -1620,6 +1630,10 @@ impl Direction {
         // swap) so `blend_overlays` can borrow `self` mutably, and put back before returning.
         let mut scratch = std::mem::take(&mut self.overlay_scratch);
         let mixed = self.blend_overlays(pcm, &mut scratch);
+        // After the blend, before the encode: exactly what this party hears.
+        for tap in &mut self.egress_taps {
+            tap.write_pcm(mixed);
+        }
         let mut payload = [0u8; MAX_RTP];
         let encoded = self.encoder.encode(mixed, &mut payload);
         self.overlay_scratch = scratch;
@@ -2338,6 +2352,10 @@ impl Direction {
         // — transcode, injected prompt, or echo-test reflect — it is what the party hears.
         if let Some(reference) = self.echo_reference.as_mut() {
             reference.push(pcm);
+        }
+        // The egress tap reads the same frame for the same reason: it is what the party hears.
+        for tap in &mut self.egress_taps {
+            tap.write_pcm(pcm);
         }
         let mut payload = [0u8; MAX_RTP];
         let encoded = self.encoder.encode(pcm, &mut payload);
@@ -3260,6 +3278,24 @@ impl MediaCall {
         self.ingress_direction(source_a).forks.push(sink);
     }
 
+    /// Attach a sink to a party's **egress** audio — what that party hears, rather than what it sent.
+    /// `toward_a` selects the direction the way every other egress op does.
+    pub fn add_egress_fork(&mut self, toward_a: bool, sink: Box<dyn MediaSink>) {
+        self.direction_toward(toward_a).egress_taps.push(sink);
+    }
+
+    /// Detach the egress taps a direction carries under `tag`, leaving any others attached — the
+    /// egress twin of [`MediaCall::remove_forks_tagged`].
+    pub fn remove_egress_forks_tagged(&mut self, toward_a: bool, tag: &str) {
+        let direction = self.direction_toward(toward_a);
+        for tap in &mut direction.egress_taps {
+            if tap.tag() == Some(tag) {
+                tap.finish();
+            }
+        }
+        direction.egress_taps.retain(|tap| tap.tag() != Some(tag));
+    }
+
     /// Detach every fork on a source leg's ingress ([`MediaControl::RemoveFork`]). Finalizes each sink
     /// (a no-op for `RtpForkSink`) and drops it, closing its output channel so the engine's drain task
     /// exits cleanly.
@@ -3542,6 +3578,13 @@ pub enum MediaControl {
     /// Detach only the forks a source leg carries under `tag`, leaving the others attached — how a WS
     /// tee detaches without disturbing a SIPREC subscription forking the same leg.
     RemoveForkTagged { source_a: bool, tag: String },
+    /// Attach a sink to a party's **egress** audio (what it hears), rather than its ingress.
+    AddEgressFork {
+        toward_a: bool,
+        sink: Box<dyn MediaSink>,
+    },
+    /// Detach the egress taps a direction carries under `tag`.
+    RemoveEgressForkTagged { toward_a: bool, tag: String },
     /// Attach a SIPREC / monitor **raw-RTP tee** to a source leg's ingress (`source_a` selects leg A
     /// vs leg B). The leg's original ingress RTP is copied byte-for-byte toward the SRS — its
     /// negotiated codec, no re-encode (RFC 7866 §6). Send-only: the engine installs no inbound flow on
@@ -3899,6 +3942,12 @@ async fn run_media_call<D>(
                     }
                     MediaInput::Control(MediaControl::RemoveFork { source_a }) => {
                         call.remove_forks(source_a);
+                    }
+                    MediaInput::Control(MediaControl::AddEgressFork { toward_a, sink }) => {
+                        call.add_egress_fork(toward_a, sink);
+                    }
+                    MediaInput::Control(MediaControl::RemoveEgressForkTagged { toward_a, tag }) => {
+                        call.remove_egress_forks_tagged(toward_a, &tag);
                     }
                     MediaInput::Control(MediaControl::RemoveForkTagged { source_a, tag }) => {
                         call.remove_forks_tagged(source_a, &tag);
