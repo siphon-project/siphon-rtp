@@ -59,6 +59,11 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   refused outright; they now fold onto the one registered encoding name, since they are the same
   bitstream family and Annex B is chosen by `annexb=` rather than by the name.
 
+  Every egress path that can carry a codec in discontinuous transmission now sends no packet for a
+  frame the encoder declined, rather than an empty datagram: the transcode pipeline, the conference
+  room and `MediaLeg::encode_rtp`. All three keep the egress clock across the gap and none advances
+  the sequence number.
+
 ## [0.6.0] — 2026-09-13
 
 Eight gaps a PBX runs into that a trunk-facing SBC and a voice-AI bridge never did. A call on hold

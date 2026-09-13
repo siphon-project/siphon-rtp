@@ -1439,6 +1439,14 @@ impl Conference {
         if self.participants[index].secure_pending || self.participants[index].ice_pending {
             return;
         }
+        // An encoder that produced nothing is a codec in discontinuous transmission (G.729 Annex B)
+        // saying this frame need not be sent. Send no packet, but keep the egress clock: the mix
+        // happened whether or not it went out, and a timestamp that stalled would drift the leg
+        // against the room for the rest of the call.
+        if payload_len == 0 {
+            self.participants[index].leg.skip_egress_frame();
+            return;
+        }
         let marker = !self.participants[index].started;
         let rtp_len = match self.participants[index].leg.packetize(
             &self.payload[..payload_len],
