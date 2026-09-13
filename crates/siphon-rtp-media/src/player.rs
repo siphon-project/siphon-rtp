@@ -11,8 +11,24 @@
 
 /// WAVE format tag for uncompressed linear PCM (Microsoft `WAVE_FORMAT_PCM`).
 const WAVE_FORMAT_PCM: u16 = 1;
-/// Bits per sample this reader accepts (16-bit linear PCM, matching [`crate::wav::WavRecorder`]).
+/// WAVE format tag for ITU-T G.711 A-law (`WAVE_FORMAT_ALAW`). Telephony prompts exported from
+/// another system arrive in this and in µ-law far more often than in 16-bit linear PCM.
+const WAVE_FORMAT_ALAW: u16 = 6;
+/// WAVE format tag for ITU-T G.711 µ-law (`WAVE_FORMAT_MULAW`).
+const WAVE_FORMAT_MULAW: u16 = 7;
+/// WAVE format tag for the extensible container (`WAVE_FORMAT_EXTENSIBLE`). Its real format is the
+/// first two bytes of the `SubFormat` GUID in the `fmt ` chunk's extension — most modern encoders
+/// emit this even for ordinary 16-bit mono PCM, so refusing it refused files that are byte-for-byte
+/// playable.
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+/// Bits per sample for the linear-PCM form (matching [`crate::wav::WavRecorder`]).
 const SUPPORTED_BITS_PER_SAMPLE: u16 = 16;
+/// Bits per sample for the G.711 forms: one byte per sample, decoded to 16-bit linear on load.
+const G711_BITS_PER_SAMPLE: u16 = 8;
+/// Byte offset of the `SubFormat` GUID inside the `fmt ` chunk's extension block, measured from the
+/// start of the chunk body: 16 bytes of `WAVEFORMATEX`, 2 of `cbSize`, 2 of samples-per-block, 4 of
+/// the channel mask.
+const SUBFORMAT_GUID_OFFSET: usize = 24;
 /// Size of a RIFF/WAVE chunk header: 4-byte FourCC + 4-byte little-endian length.
 const CHUNK_HEADER_LEN: usize = 8;
 
@@ -31,12 +47,12 @@ pub enum WavError {
     /// No `data` chunk was present.
     #[error("missing data chunk")]
     MissingData,
-    /// The `fmt ` chunk declared a non-PCM format tag.
-    #[error("unsupported WAV format tag {0} (only linear PCM = 1)")]
+    /// The `fmt ` chunk declared a format tag this reader cannot decode.
+    #[error("unsupported WAV format tag {0} (linear PCM = 1, A-law = 6, mu-law = 7, extensible = 65534)")]
     NotPcm(u16),
-    /// The `fmt ` chunk declared a sample width this reader does not support.
-    #[error("unsupported bits-per-sample {0} (only 16-bit)")]
-    BadBitsPerSample(u16),
+    /// The `fmt ` chunk declared a sample width the format does not use.
+    #[error("unsupported bits-per-sample {0} for WAV format tag {1}")]
+    BadBitsPerSample(u16, u16),
     /// The `fmt ` chunk declared zero channels.
     #[error("invalid channel count {0}")]
     BadChannels(u16),
@@ -71,8 +87,8 @@ impl WavSource {
         }
 
         let mut offset = 12;
-        let mut format: Option<(u16, u32, u16)> = None; // (channels, sample_rate, bits_per_sample)
-        let mut samples: Option<Vec<i16>> = None;
+        let mut format: Option<(u16, u32, u16)> = None; // (channels, sample_rate, format_tag)
+        let mut data: Option<Vec<u8>> = None;
 
         // Chunk-walk: each sub-chunk is "<FourCC><u32 length><payload>", payload padded to even.
         while offset + CHUNK_HEADER_LEN <= buffer.len() {
@@ -90,35 +106,67 @@ impl WavSource {
                 if body.len() < 16 {
                     return Err(WavError::Truncated);
                 }
-                let format_tag = read_u16_le(body, 0);
-                if format_tag != WAVE_FORMAT_PCM {
-                    return Err(WavError::NotPcm(format_tag));
-                }
+                let declared_tag = read_u16_le(body, 0);
+                // `WAVE_FORMAT_EXTENSIBLE` is a container: the real format is the first two bytes of
+                // the `SubFormat` GUID in the extension. Resolving it here is what lets an ordinary
+                // 16-bit mono file written by a modern encoder load at all.
+                let format_tag = if declared_tag == WAVE_FORMAT_EXTENSIBLE {
+                    if body.len() < SUBFORMAT_GUID_OFFSET + 2 {
+                        return Err(WavError::Truncated);
+                    }
+                    read_u16_le(body, SUBFORMAT_GUID_OFFSET)
+                } else {
+                    declared_tag
+                };
                 let channels = read_u16_le(body, 2);
                 if channels == 0 {
                     return Err(WavError::BadChannels(channels));
                 }
                 let sample_rate = read_u32_le(body, 4);
                 let bits_per_sample = read_u16_le(body, 14);
-                if bits_per_sample != SUPPORTED_BITS_PER_SAMPLE {
-                    return Err(WavError::BadBitsPerSample(bits_per_sample));
+                let expected_bits = match format_tag {
+                    WAVE_FORMAT_PCM => SUPPORTED_BITS_PER_SAMPLE,
+                    WAVE_FORMAT_ALAW | WAVE_FORMAT_MULAW => G711_BITS_PER_SAMPLE,
+                    other => return Err(WavError::NotPcm(other)),
+                };
+                if bits_per_sample != expected_bits {
+                    return Err(WavError::BadBitsPerSample(bits_per_sample, format_tag));
                 }
-                format = Some((channels, sample_rate, bits_per_sample));
+                format = Some((channels, sample_rate, format_tag));
             } else if chunk_id == b"data" {
-                // Truncate a stray trailing odd byte: 16-bit PCM is always sample-aligned.
-                let aligned = body.len() & !1;
-                let mut decoded = Vec::with_capacity(aligned / 2);
-                for pair in body[..aligned].as_chunks::<2>().0 {
-                    decoded.push(i16::from_le_bytes([pair[0], pair[1]]));
-                }
-                samples = Some(decoded);
+                // Held undecoded until the `fmt ` chunk is known: RIFF does not require `fmt ` to come
+                // first, and the sample width decides how to read these bytes.
+                data = Some(body.to_vec());
             }
             // Skip the chunk body plus its pad byte if the length is odd (RIFF alignment rule).
             offset = body_start + chunk_len + (chunk_len & 1);
         }
 
-        let (channels, sample_rate, _bits) = format.ok_or(WavError::MissingFmt)?;
-        let samples = samples.ok_or(WavError::MissingData)?;
+        let (channels, sample_rate, format_tag) = format.ok_or(WavError::MissingFmt)?;
+        let data = data.ok_or(WavError::MissingData)?;
+        let samples = match format_tag {
+            WAVE_FORMAT_PCM => {
+                // Truncate a stray trailing odd byte: 16-bit PCM is always sample-aligned.
+                let aligned = data.len() & !1;
+                data[..aligned]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| i16::from_le_bytes(*pair))
+                    .collect()
+            }
+            // One byte per sample, decoded through the same tables the G.711 codec uses, so a prompt
+            // loaded from a µ-law file is bit-identical to the same audio arriving on the wire.
+            WAVE_FORMAT_MULAW => data
+                .iter()
+                .map(|&byte| siphon_rtp_codec::g711::ULAW_DECODE[usize::from(byte)])
+                .collect(),
+            WAVE_FORMAT_ALAW => data
+                .iter()
+                .map(|&byte| siphon_rtp_codec::g711::ALAW_DECODE[usize::from(byte)])
+                .collect(),
+            other => return Err(WavError::NotPcm(other)),
+        };
         Ok(Self {
             sample_rate_hz: sample_rate,
             channels,
@@ -148,6 +196,25 @@ impl WavSource {
     #[must_use]
     pub fn frame_count(&self) -> usize {
         self.samples.len() / self.channels.max(1) as usize
+    }
+
+    /// Downmix to mono by averaging the interleaved channels per frame, into a shared buffer.
+    ///
+    /// Separate from [`PcmPlayer::new`] so a prompt cache can do the work **once** and hand the same
+    /// `Arc` to every player that follows.
+    #[must_use]
+    pub fn to_mono(&self) -> std::sync::Arc<[i16]> {
+        let channels = self.channels.max(1) as usize;
+        if channels == 1 {
+            return self.samples.as_slice().into();
+        }
+        let frame_count = self.samples.len() / channels;
+        let mut mono = Vec::with_capacity(frame_count);
+        for frame in self.samples.chunks_exact(channels) {
+            let sum: i32 = frame.iter().map(|&sample| i32::from(sample)).sum();
+            mono.push((sum / channels as i32) as i16);
+        }
+        mono.into()
     }
 }
 
@@ -204,7 +271,12 @@ impl PcmRepeat {
 #[derive(Debug, Clone)]
 pub struct PcmPlayer {
     /// Downmixed mono samples at the source rate.
-    mono: Vec<i16>,
+    ///
+    /// Shared rather than owned: a prompt played to thirty queued callers is one decode and one
+    /// buffer, read by thirty players at their own offsets. Nothing here ever mutates it — the cursor
+    /// state (`position`, `plays_done`, `loop_start`) is entirely separate — which is exactly what
+    /// makes sharing safe, and it also makes `Clone` O(1).
+    mono: std::sync::Arc<[i16]>,
     sample_rate_hz: u32,
     /// Read cursor into `mono` (per-channel sample index).
     position: usize,
@@ -224,16 +296,26 @@ impl PcmPlayer {
     /// frames — including for an endless play, which must not spin on a body it can never advance in.
     #[must_use]
     pub fn new(source: &WavSource, repeat: PcmRepeat, start_pos_ms: u32) -> Self {
-        let channels = source.channels().max(1) as usize;
-        let frame_count = source.samples().len() / channels;
-        let mut mono = Vec::with_capacity(frame_count);
-        // Downmix: average the interleaved channels per frame (stereo → mono, etc.).
-        for frame in source.samples().chunks_exact(channels) {
-            let sum: i32 = frame.iter().map(|&sample| i32::from(sample)).sum();
-            mono.push((sum / channels as i32) as i16);
-        }
+        Self::from_shared(
+            source.to_mono(),
+            source.sample_rate_hz(),
+            repeat,
+            start_pos_ms,
+        )
+    }
 
-        let sample_rate_hz = source.sample_rate_hz();
+    /// Build a player over an **already downmixed** mono buffer — what a prompt cache hands out.
+    ///
+    /// This is the whole point of the shared buffer: the file read, the RIFF parse and the downmix
+    /// happen once per distinct prompt, and every player after that is a cursor over the same
+    /// samples. Thirty callers on one hold bed is one buffer, not thirty.
+    #[must_use]
+    pub fn from_shared(
+        mono: std::sync::Arc<[i16]>,
+        sample_rate_hz: u32,
+        repeat: PcmRepeat,
+        start_pos_ms: u32,
+    ) -> Self {
         let loop_start = ((start_pos_ms as u64 * sample_rate_hz as u64) / 1000) as usize;
         let loop_start = loop_start.min(mono.len());
 
@@ -489,21 +571,183 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_pcm_format() {
-        // fmt with format tag 6 (A-law), which this 16-bit-linear reader rejects.
+    fn rejects_a_format_it_cannot_decode() {
+        // IEEE float (tag 3) is a real WAVE format this reader does not implement, and must be a
+        // typed error rather than garbage samples.
+        let buffer = wav_bytes(3, 32, 1, 8000, &[0u8; 8]);
+        assert_eq!(WavSource::parse(&buffer), Err(WavError::NotPcm(3)));
+    }
+
+    /// Assemble a minimal RIFF/WAVE file around a `fmt ` chunk and a `data` payload.
+    fn wav_bytes(
+        format_tag: u16,
+        bits_per_sample: u16,
+        channels: u16,
+        sample_rate: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let block_align = channels * bits_per_sample / 8;
         let mut buffer = Vec::new();
         buffer.extend_from_slice(b"RIFF");
         buffer.extend_from_slice(&0u32.to_le_bytes());
         buffer.extend_from_slice(b"WAVE");
         buffer.extend_from_slice(b"fmt ");
         buffer.extend_from_slice(&16u32.to_le_bytes());
-        buffer.extend_from_slice(&6u16.to_le_bytes()); // A-law
+        buffer.extend_from_slice(&format_tag.to_le_bytes());
+        buffer.extend_from_slice(&channels.to_le_bytes());
+        buffer.extend_from_slice(&sample_rate.to_le_bytes());
+        buffer.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+        buffer.extend_from_slice(&block_align.to_le_bytes());
+        buffer.extend_from_slice(&bits_per_sample.to_le_bytes());
+        buffer.extend_from_slice(b"data");
+        buffer.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            buffer.push(0);
+        }
+        buffer
+    }
+
+    #[test]
+    fn reads_a_mu_law_prompt_through_the_same_tables_the_codec_uses() {
+        // Telephony prompts exported from another system are far more often G.711 than 16-bit linear
+        // PCM, and refusing them refused files the engine can trivially decode. Decoding through the
+        // codec's own tables is what makes a prompt loaded from a file bit-identical to the same
+        // audio arriving on the wire.
+        let payload: Vec<u8> = vec![0x00, 0x7F, 0x80, 0xFF, 0x20];
+        let parsed = WavSource::parse(&wav_bytes(7, 8, 1, 8000, &payload)).expect("mu-law parses");
+        assert_eq!(parsed.sample_rate_hz(), 8000);
+        assert_eq!(parsed.channels(), 1);
+        let expected: Vec<i16> = payload
+            .iter()
+            .map(|&byte| siphon_rtp_codec::g711::ULAW_DECODE[usize::from(byte)])
+            .collect();
+        assert_eq!(parsed.samples(), expected.as_slice());
+    }
+
+    #[test]
+    fn reads_an_a_law_prompt() {
+        let payload: Vec<u8> = vec![0x55, 0xD5, 0x00, 0xAA];
+        let parsed = WavSource::parse(&wav_bytes(6, 8, 1, 8000, &payload)).expect("A-law parses");
+        let expected: Vec<i16> = payload
+            .iter()
+            .map(|&byte| siphon_rtp_codec::g711::ALAW_DECODE[usize::from(byte)])
+            .collect();
+        assert_eq!(parsed.samples(), expected.as_slice());
+    }
+
+    #[test]
+    fn a_g711_prompt_with_the_wrong_sample_width_is_refused() {
+        // 16 bits per sample on a G.711 tag is a malformed header, not a linear file: reading it as
+        // one byte per sample would halve the pitch and double the length.
+        assert_eq!(
+            WavSource::parse(&wav_bytes(7, 16, 1, 8000, &[0u8; 8])),
+            Err(WavError::BadBitsPerSample(16, 7))
+        );
+    }
+
+    #[test]
+    fn resolves_an_extensible_header_to_its_real_subformat() {
+        // `WAVE_FORMAT_EXTENSIBLE` is what most modern encoders emit even for ordinary 16-bit mono
+        // PCM, so refusing the tag refused files that are byte-for-byte playable. The real format is
+        // the first two bytes of the SubFormat GUID.
+        let samples: Vec<i16> = vec![100, -200, 300];
+        let mut data = Vec::new();
+        for sample in &samples {
+            data.extend_from_slice(&sample.to_le_bytes());
+        }
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"RIFF");
+        buffer.extend_from_slice(&0u32.to_le_bytes());
+        buffer.extend_from_slice(b"WAVE");
+        buffer.extend_from_slice(b"fmt ");
+        buffer.extend_from_slice(&40u32.to_le_bytes()); // extensible fmt chunk
+        buffer.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        buffer.extend_from_slice(&1u16.to_le_bytes()); // mono
+        buffer.extend_from_slice(&8000u32.to_le_bytes());
+        buffer.extend_from_slice(&16000u32.to_le_bytes());
+        buffer.extend_from_slice(&2u16.to_le_bytes());
+        buffer.extend_from_slice(&16u16.to_le_bytes());
+        buffer.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        buffer.extend_from_slice(&16u16.to_le_bytes()); // valid bits
+        buffer.extend_from_slice(&4u32.to_le_bytes()); // channel mask
+                                                       // SubFormat GUID: KSDATAFORMAT_SUBTYPE_PCM begins with the little-endian tag 0x0001.
+        buffer.extend_from_slice(&1u16.to_le_bytes());
+        buffer.extend_from_slice(&[0u8; 14]);
+        buffer.extend_from_slice(b"data");
+        buffer.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&data);
+
+        let parsed = WavSource::parse(&buffer).expect("an extensible PCM header parses");
+        assert_eq!(parsed.samples(), samples.as_slice());
+        assert_eq!(parsed.sample_rate_hz(), 8000);
+    }
+
+    #[test]
+    fn a_fmt_chunk_after_the_data_chunk_still_decodes() {
+        // RIFF does not require `fmt ` to come first, and the sample width decides how to read the
+        // data — so the reader must hold the payload undecoded until it knows the format. Before the
+        // G.711 support this happened to work because there was only one width.
+        let payload: Vec<u8> = vec![0x10, 0x20, 0x30];
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"RIFF");
+        buffer.extend_from_slice(&0u32.to_le_bytes());
+        buffer.extend_from_slice(b"WAVE");
+        buffer.extend_from_slice(b"data");
+        buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&payload);
+        buffer.push(0); // RIFF pad for the odd length
+        buffer.extend_from_slice(b"fmt ");
+        buffer.extend_from_slice(&16u32.to_le_bytes());
+        buffer.extend_from_slice(&7u16.to_le_bytes()); // mu-law
         buffer.extend_from_slice(&1u16.to_le_bytes());
         buffer.extend_from_slice(&8000u32.to_le_bytes());
         buffer.extend_from_slice(&8000u32.to_le_bytes());
         buffer.extend_from_slice(&1u16.to_le_bytes());
         buffer.extend_from_slice(&8u16.to_le_bytes());
-        assert_eq!(WavSource::parse(&buffer), Err(WavError::NotPcm(6)));
+
+        let parsed = WavSource::parse(&buffer).expect("fmt after data parses");
+        assert_eq!(parsed.samples().len(), 3, "one sample per mu-law byte");
+    }
+
+    #[test]
+    fn players_over_one_cached_prompt_share_its_samples_and_keep_their_own_cursors() {
+        // The whole point of the shared buffer: a hold bed playing to many callers is one decode and
+        // one allocation, with each caller at its own offset. Nothing mutates the samples, which is
+        // what makes that safe.
+        let source = five_sample_source();
+        let shared = source.to_mono();
+        assert_eq!(std::sync::Arc::strong_count(&shared), 1);
+
+        let mut first = PcmPlayer::from_shared(shared.clone(), 8000, PcmRepeat::Times(1), 0);
+        let mut second = PcmPlayer::from_shared(shared.clone(), 8000, PcmRepeat::Times(1), 0);
+        assert_eq!(
+            std::sync::Arc::strong_count(&shared),
+            3,
+            "both players read the same buffer rather than copying it"
+        );
+
+        let mut out = [0i16; 2];
+        assert_eq!(first.next_frame(&mut out), Some(2));
+        let first_head = out;
+        // The second player is untouched by the first's progress.
+        let mut second_out = [0i16; 2];
+        assert_eq!(second.next_frame(&mut second_out), Some(2));
+        assert_eq!(
+            second_out, first_head,
+            "the second player starts at its own beginning"
+        );
+        assert_eq!(first.next_frame(&mut out), Some(2));
+        assert_ne!(out, first_head, "and the first has moved on independently");
+    }
+
+    #[test]
+    fn a_mono_source_shares_its_samples_without_a_downmix_copy() {
+        // The common case — a mono prompt — must not pay for a downmix pass that would produce the
+        // identical buffer.
+        let source = five_sample_source();
+        let mono = source.to_mono();
+        assert_eq!(&*mono, source.samples());
     }
 
     #[test]
@@ -524,7 +768,7 @@ mod tests {
         buffer.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(
             WavSource::parse(&buffer),
-            Err(WavError::BadBitsPerSample(32))
+            Err(WavError::BadBitsPerSample(32, WAVE_FORMAT_PCM))
         );
     }
 

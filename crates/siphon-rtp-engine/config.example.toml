@@ -56,6 +56,10 @@ control = "127.0.0.1:8080"
 # sockets, AF_XDP TX frames, the in-kernel XDP_TX rewrite); never to control/metrics/HEP/WS sockets.
 # media_dscp = "EF"
 
+# Bytes of decoded prompt audio to cache, so a hold bed played to many callers is decoded once
+# (CLI: --prompt-cache-bytes). Keyed by path + mtime + size, so re-recording a prompt takes effect on
+# the next play with no cache-clearing step. 0 disables caching. Default: 67108864 (64 MiB).
+# prompt_cache_bytes = 67108864
 # File holding the control-plane shared secret, read once at start and trimmed of surrounding
 # whitespace (CLI: --control-secret-file; SIPHON_RTP_CONTROL_SECRET_FILE names it from the
 # environment). Setting this and SIPHON_RTP_CONTROL_SECRET together is a fatal startup error, and an

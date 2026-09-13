@@ -150,6 +150,11 @@ pub struct EngineArgs {
     #[arg(long, default_value_t = server::DEFAULT_MAX_CONTROL_RPS)]
     pub max_control_rps: u64,
 
+    /// Bytes of decoded prompt audio to cache, so a bed played to many callers is decoded once.
+    /// `0` disables caching. Keyed by path + mtime + size, so re-recording a prompt takes effect on
+    /// the next play with no cache-clearing step.
+    #[arg(long, default_value_t = DEFAULT_PROMPT_CACHE_BYTES)]
+    pub prompt_cache_bytes: u64,
     /// File holding the control-plane shared secret, read once at start (`SIPHON_RTP_CONTROL_SECRET`
     /// is the direct-value alternative; `SIPHON_RTP_CONTROL_SECRET_FILE` names this file from the
     /// environment). Surrounding whitespace, including the trailing newline every tool writes, is
@@ -302,6 +307,9 @@ pub struct RunConfig {
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap (requests/second); `0` disables.
     pub max_control_rps: u64,
+    /// Bytes of decoded prompt audio to cache; `0` disables caching.
+    pub prompt_cache_bytes: u64,
+    /// Reap a call after this many seconds with no accepted media.
     /// File holding the control-plane shared secret; `None` ⇒ the environment variable, or no
     /// authentication at all.
     pub control_secret_file: Option<PathBuf>,
@@ -388,6 +396,12 @@ impl RunConfig {
                 explicit("max_control_rps"),
                 file.max_control_rps,
                 server::DEFAULT_MAX_CONTROL_RPS,
+            ),
+            prompt_cache_bytes: resolve_defaulted(
+                args.prompt_cache_bytes,
+                explicit("prompt_cache_bytes"),
+                file.prompt_cache_bytes,
+                DEFAULT_PROMPT_CACHE_BYTES,
             ),
             control_secret_file: resolve_optional(
                 args.control_secret_file,
@@ -642,6 +656,12 @@ fn default_node_id() -> String {
         .unwrap_or_else(|| "siphon-rtp".to_string())
 }
 
+/// Built-in default for `--prompt-cache-bytes` (mirrors the clap `default_value_t`): 64 MiB.
+///
+/// Sized so an ordinary prompt library — a few dozen announcements and a hold bed, each a handful of
+/// seconds at 8 kHz — fits entirely, while a directory of long files still cannot grow the daemon
+/// without bound.
+const DEFAULT_PROMPT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 /// Built-in default for `--media-timeout-secs` (mirrors the clap `default_value_t`).
 const DEFAULT_MEDIA_TIMEOUT_SECS: u64 = 30;
 /// Built-in default for `--held-media-timeout-secs` (mirrors the clap `default_value_t`): two hours.
@@ -783,6 +803,7 @@ where
     let mut engine = Engine::new(datapath.clone())
         .with_cluster(cluster.clone())
         .with_interfaces(interfaces)
+        .with_prompt_cache_bytes(usize::try_from(config.prompt_cache_bytes).unwrap_or(usize::MAX))
         .with_media_fetch_limits(config.media_fetch.clone());
     if let Some(x3) = config.x3.clone() {
         // Logged at startup so an operator can see, without placing a call, that this node will
@@ -1431,6 +1452,7 @@ mod tests {
             media_dscp: Dscp::DEFAULT,
             metrics_addr: None,
             max_control_rps: 0,
+            prompt_cache_bytes: super::DEFAULT_PROMPT_CACHE_BYTES,
             control_secret_file: None,
             media_timeout_secs: 30,
             held_media_timeout_secs: super::DEFAULT_HELD_MEDIA_TIMEOUT_SECS,

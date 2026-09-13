@@ -9,6 +9,43 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **A decoded-prompt cache**, so a bed played to many callers is decoded once. Every `play_media` on
+  a file used to do a fresh `tokio::fs::read` (the whole file), a fresh RIFF parse (allocating and
+  filling a `Vec<i16>` sample by sample) and a fresh downmix (a second `Vec<i16>`) — three
+  allocations proportional to prompt length, on every call. A queue with thirty waiting callers plays
+  the same hold music thirty times; an office PBX plays the same handful of prompts thousands of
+  times a day.
+
+  `PcmPlayer` now holds its samples as `Arc<[i16]>` rather than `Vec<i16>`. Nothing ever mutated that
+  buffer — the cursor state was always separate — so N players over one prompt is one buffer and N
+  cursors, and `Clone` became O(1) as a side effect.
+
+  Keyed by path **plus modification time and size**, so re-recording a prompt takes effect on the
+  next play with no cache-clearing step. That is deliberate: an operator who re-records a greeting
+  and keeps hearing the old one has no way to tell a cache is why.
+
+  Bounded in bytes and evicted least-recently-used (`--prompt-cache-bytes`, 64 MiB default, `0`
+  disables). A prompt larger than the whole budget is played but never cached, since caching it would
+  evict everything to hold one entry the next prompt immediately evicts. Inline blobs and fetched
+  URLs are not cached — a blob is different bytes per request by construction, and a URL's freshness
+  is not this engine's to decide.
+
+  **Measured** (criterion, `playback_bench/prompt_load`): a 1 s 8 kHz prompt costs **478 ns** to
+  decode and **12.8 ns** to serve from cache (~37×); a 30 s one costs **20.4 µs** against the same
+  ~13 ns (~1600×). A call-setup cost, not a per-frame one — but it is what a queue multiplies by its
+  depth.
+
+- **G.711 and extensible WAV prompts.** The reader accepted only `WAVE_FORMAT_PCM` at exactly 16
+  bits, so A-law (tag 6) and µ-law (tag 7) — the two formats a telephony prompt most often arrives in
+  — were refused outright, as was `WAVE_FORMAT_EXTENSIBLE` (0xFFFE), which is what most modern
+  encoders emit *even for ordinary 16-bit mono PCM*. G.711 decodes through the same tables the codec
+  uses, so a prompt loaded from a µ-law file is bit-identical to the same audio arriving on the wire;
+  the extensible container is resolved to its real format through the `SubFormat` GUID.
+
+  The reader also now holds the `data` chunk undecoded until `fmt ` has been seen. RIFF does not
+  require `fmt ` to come first, and with more than one sample width the payload cannot be interpreted
+  before the format is known.
+
 - **Audio can be played into a conference room, and a room can be recorded.** Neither was possible:
   every media verb resolves through the call registry, which a conference never enters, so
   `play_media` and `start_recording` against a room id answered `unknown call`. A room's audio could

@@ -137,6 +137,8 @@ pub struct FileConfig {
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap, requests/second; 0 disables (`--max-control-rps`).
     pub max_control_rps: Option<u64>,
+    /// Bytes of decoded prompt audio to cache; `0` disables (`--prompt-cache-bytes`).
+    pub prompt_cache_bytes: Option<u64>,
     /// File holding the control-plane shared secret, read once at start
     /// (`--control-secret-file`). The one secret the config file may name, because it names a
     /// *path* rather than carrying the secret itself.

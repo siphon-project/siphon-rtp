@@ -78,6 +78,8 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 | `--media-dscp <DSCP>` | `EF` | DiffServ marking (RFC 2474) on outbound media. A name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`. `EF` is TOS byte 184 — Asterisk's `tos_audio`, rtpengine's `--tos`. `BE`/`0` disables marking and leaves the TOS byte untouched. Applies to every egress path (UDP sockets, AF_XDP TX, in-kernel XDP_TX); never to the control, metrics, HEP or WS sockets. |
 | `--metrics-addr <ADDR>` | off | Prometheus + health HTTP: `GET /metrics`, `GET /healthz`, `GET /readyz`. |
 | `--max-control-rps <N>` | `200` | Per-connection control request cap (requests/second). `0` disables the limit. |
+| `--prompt-cache-bytes <N>` | `67108864` (64 MiB) | Decoded prompt audio to cache, so a bed played to many callers is decoded once. Keyed by path + mtime + size, so re-recording a prompt takes effect on the next play. `0` disables caching. |
+| `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). |
 | `--control-secret-file <PATH>` | none | File holding the control-plane shared secret, read once at start. Surrounding whitespace (including the trailing newline) is trimmed. Mutually exclusive with `SIPHON_RTP_CONTROL_SECRET`. |
 | `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). Applies only while the call is on two-way media; a held call uses the setting below. |
 | `--held-media-timeout-secs <N>` | `7200` | Reap a **held** call (one party signalled `sendonly` / `recvonly` / `inactive`) after N seconds. `0` never reaps one. |
