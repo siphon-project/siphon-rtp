@@ -1,12 +1,18 @@
 # Recording & forking (SIPREC)
 
-Two independent ways to get a call's media out of the engine:
+Three independent ways to get a call's media out of the engine:
 
-1. **Runtime pcap recording**: `start_recording` / `stop_recording` writes the
-   raw wire packets of a live call to a `.pcap` file on the engine host. Any
-   codec, byte-for-byte, toggleable mid-call. This is rtpengine's
-   `start recording` shape.
-2. **SIPREC-style media forking**: `subscribe_request` / `subscribe_answer` /
+1. **Runtime pcap recording**: `start_recording` / `stop_recording` with
+   `format: "pcap"` (the default) writes the raw wire packets of a live call to
+   a `.pcap` file on the engine host. Any codec, byte-for-byte, toggleable
+   mid-call. This is rtpengine's `start recording` shape, and it is an *audit*
+   artefact — nobody listens to a pcap.
+2. **Runtime decoded recording**: the same verb with `format: "wav"` writes
+   **decoded audio**, streamed to disk as it arrives, and completes with a
+   `recording_finished` event naming the finished file. A *product* artefact:
+   a voicemail message to be emailed, transcribed and played back. See
+   [Recording a voicemail message](#recording-a-voicemail-message).
+3. **SIPREC-style media forking**: `subscribe_request` / `subscribe_answer` /
    `unsubscribe` tees a leg's RTP in real time to a Session Recording Server
    (the media half of SIPREC, RFC 7866). The recorder is another RTP endpoint,
    not a file.
@@ -197,3 +203,82 @@ decoded audio.
   metrics rather than payload.
 - [Security & NAT](../security-and-nat.md) on why the fork endpoint is
   send-only and what "accepted ingress" means.
+
+
+## Recording a voicemail message
+
+A voicemail box answers the caller locally, plays a greeting and a beep, and
+*then* records — which is the point of the runtime form: recording starts at a
+moment you pick, not at answer.
+
+```json
+{
+  "id": 40,
+  "command": "start_recording",
+  "call_id": "7f9a2b1c@198.51.100.20",
+  "from_tag": "a7c31f",
+  "format": "wav",
+  "direction": "ingress",
+  "max_duration_ms": 120000,
+  "silence_ms": 4000,
+  "path": "/var/spool/voicemail/7f9a2b1c.wav"
+}
+```
+
+```json
+{"id": 40, "result": "ok", "recording_id": "rec-1"}
+```
+
+`direction: "ingress"` is what the caller *sent* — the message. `max_duration_ms`
+is the time limit the greeting announced, and `silence_ms` ends the message when
+the caller stops talking; both are evaluated in the engine, where the decoded
+audio already is, so neither costs the media path anything.
+
+The message ends by whichever comes first, and the event says which:
+
+```json
+{
+  "event": "recording_finished",
+  "call_id": "7f9a2b1c@198.51.100.20",
+  "from_tag": "a7c31f",
+  "recording_id": "rec-1",
+  "path": "/var/spool/voicemail/7f9a2b1c.wav",
+  "duration_ms": 8740,
+  "reason": "silence"
+}
+```
+
+**Only attach the file when this event arrives.** It is emitted after the WAV
+header has been finalized and the file flushed, so acting on it is the one way
+to be sure you are not reading a half-written file. `reason` is `silence`,
+`max_duration`, `stopped` (you sent `stop_recording`), `call_ended` (the caller
+hung up — the *normal* way a message ends, and the file is complete and playable),
+or `error`.
+
+To end it yourself, name the recording so anything else on the call keeps running:
+
+```json
+{"id": 41, "command": "stop_recording", "call_id": "7f9a2b1c@198.51.100.20", "from_tag": "a7c31f", "recording_id": "rec-1"}
+```
+
+### What a decoded recording captures
+
+| | |
+|---|---|
+| `direction` | `ingress` (default) = what the parties sent. `egress` = what the engine sent them (its prompts and announcements) — the only way to capture the engine's own audio on a single-leg call, where there is no second party whose ingress it would be. `both` = both. |
+| `channels` | `mono` (default) mixes the sources; `stereo` puts the caller left and the callee right. A single-leg call has one source, so it records mono whatever is asked. |
+| rate | The caller leg's decoded PCM rate — **not** its RTP clock, which for G.722 is half of it (RFC 3551 §4.5.2) and would replay the file at the wrong pitch. A second leg at another rate is resampled into it. |
+| where | `path` names the file exactly; otherwise `recording_dir` plus a generated `{call_id}-{recording_id}.wav`. A path that cannot be opened fails the verb immediately, with the call untouched. |
+
+Unlike the pcap form, a decoded recording works on a **secure transcoded** call:
+it taps the audio after decryption and decode, so there is nothing ciphered about
+it. A secure *crypto bridge* (which relays ciphertext without ever decoding) and a
+WebSocket-takeover call still have no post-decode audio to tap, and are refused.
+
+### Why not the `record_call` offer flag
+
+`record_call` writes decoded WAV too, but it is set at offer/answer time rather
+than at a point in the call you choose, it needs two legs (it never reaches an
+`answer_local` call at all), it accumulates the whole call in memory and flushes
+once at teardown, and it emits no event. It stays as it was for calls recorded
+from setup; a voicemail needs the runtime form.

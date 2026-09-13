@@ -41,7 +41,13 @@ A request and its response:
 
 ## Authentication
 
-Set `SIPHON_RTP_CONTROL_SECRET` in the daemon's environment to require a shared secret.
+Set `SIPHON_RTP_CONTROL_SECRET` in the daemon's environment to require a shared secret, or
+point `--control-secret-file` (equivalently `SIPHON_RTP_CONTROL_SECRET_FILE`) at a file
+holding it — the convention for a container whose secrets are generated at first start into
+a volume. Surrounding whitespace, including the trailing newline every tool writes, is
+trimmed. Setting both forms is a fatal startup error, and an empty file is refused rather
+than read as "no secret".
+
 When set, the first command on every connection must be:
 
 ```json
@@ -152,10 +158,10 @@ on the node is also rejected.
 
 | Verb | Fields | Purpose |
 |---|---|---|
-| `play_media` | `call_id`, `from_tag`, `source`, `repeat_times?`, `start_pos_ms?`, `duration_ms?`, `overlay?`, `gain_decibels?`, `to_tag?` | Play audio toward a leg. `source` is tagged — see [Playback sources](#playback-sources). Accepts immediately (accept-on-start) with a `play_id`; the playback's end is reported later by a matching `play_finished` event carrying the same `play_id`, so a controller correlates the completion without a late response racing the request timeout. By default the playback **supersedes** the leg's egress; `overlay` mixes it **under** the live stream instead — see [Overlay playback](#overlay-playback). |
+| `play_media` | `call_id`, `from_tag`, `source`, `repeat_times?`, `start_pos_ms?`, `duration_ms?`, `overlay?`, `gain_decibels?`, `to_tag?` | Play audio toward a leg. `source` is tagged — see [Playback sources](#playback-sources). `repeat_times` is a **total play count** (`0` and `1` both mean once) **or** the string `"inf"` to play until stopped, which is what hold, queue and park music need; an endless play's accept carries no `duration_ms`, and it ends only on `stop_media`, on a `duration_ms` cap, or with the leg. Accepts immediately (accept-on-start) with a `play_id`; the playback's end is reported later by a matching `play_finished` event carrying the same `play_id`, so a controller correlates the completion without a late response racing the request timeout. By default the playback **supersedes** the leg's egress; `overlay` mixes it **under** the live stream instead — see [Overlay playback](#overlay-playback). |
 | `stop_media` | `call_id`, `from_tag`, `play_id?` | Stop playback. Without `play_id`, stops everything on the call (the superseding prompt, any DTMF burst, every overlay) — the original behaviour. With one, stops only that playback. Each stopped playback reports `play_finished` with reason `stopped`. |
 | `set_play_gain` | `call_id`, `from_tag`, `play_id`, `gain_decibels`, `to_tag?` | Retune a running playback's level without restarting it — how a music bed is ducked under a prompt and lifted again. An unknown `play_id` is an error, not a silent success. |
-| `play_dtmf` | `call_id`, `from_tag`, `code`, `duration_ms?`, `volume_dbm0?`, `pause_ms?`, `to_tag?` | Inject RFC 4733 telephone-events toward a leg. |
+| `play_dtmf` | `call_id`, `from_tag`, `code`, `duration_ms?`, `volume_dbm0?`, `pause_ms?`, `to_tag?` | Inject RFC 4733 telephone-events toward a leg. Answered from what the media actor actually did: a leg that negotiated **no** `telephone-event` payload type is an error naming that, not an `ok` that sends nothing. In-band (tone) generation is not a fallback — the leg must have negotiated RFC 4733. |
 | `silence_media` / `unsilence_media` | `call_id`, `from_tag` | Replace egress audio with comfort silence / resume. |
 | `block_media` / `unblock_media` | `call_id`, `from_tag` | Drop egress packets entirely / resume. |
 | `block_dtmf` / `unblock_dtmf` | `call_id`, `from_tag`, `to_tag?` | Stop relaying one leg's RFC 4733 telephone-events to the peer. The digit is still detected and surfaced as a `dtmf` event; only the relay is suppressed. Drop mode only (no tone/PCM replacement yet). |
@@ -333,8 +339,8 @@ while reading, so a chunked response that declares nothing is cut off too.
 
 | Verb | Fields | Purpose |
 |---|---|---|
-| `start_recording` | `call_id`, `from_tag`, `recording_dir?` | Record the live call's raw RTP/RTCP byte-for-byte to `{recording_dir}/{call_id}.pcap`. A plain relay is promoted to the userspace pipeline for the tap. |
-| `stop_recording` | `call_id`, `from_tag` | Finalize the pcap; the relay demotes back to the fast path if nothing else holds it. |
+| `start_recording` | `call_id`, `from_tag`, `format?`, `recording_dir?`, `path?`, `direction?`, `channels?`, `max_duration_ms?`, `silence_ms?` | Begin recording a live call. `format` is `pcap` (default — raw RTP/RTCP datagrams verbatim, any codec, to `{recording_dir}/{call_id}.pcap`; refused on a secure or WebSocket-bridged call) or `wav` (**decoded** audio, streamed to disk, which a secure *transcoded* call supports fine). A `wav` recording accepts with a `recording_id` and completes with a `recording_finished` event carrying the same id, emitted only once the file is closed. `direction` is `ingress` (default — what the parties sent, i.e. a voicemail message), `egress` (what the engine sent them: prompts, announcements) or `both`; `channels` is `mono` (default) or `stereo` (caller left, callee right — a single-leg call records mono whatever is asked). `max_duration_ms` and `silence_ms` are evaluated in the engine. Works on a single-leg `answer_local` call, which is what a voicemail box is. |
+| `stop_recording` | `call_id`, `from_tag`, `recording_id?` | Stop a recording. With a `recording_id`, stops exactly that one and leaves anything else on the call running; without one, stops every recording on the call (what rtpengine's `stop recording` means). A `wav` recording's `recording_finished` event is emitted after its file is finalized, so a controller that stops and then reads the file never sees a partial one. |
 | `subscribe_request` | `call_id`, `from_tags[]`, `sdp?`, `profile` | SIPREC fork (RFC 7866): the engine *offers* the named legs' media to a recording server, `a=sendonly`. Send `sdp: null`; an SDP-bearing request (SRS offering first) is rejected. Returns the offer SDP and a `to_tag`. |
 | `subscribe_answer` | `call_id`, `from_tag`, `to_tag`, `sdp` | Complete the subscription with the SRS's answer; the tee starts. |
 | `unsubscribe` | `call_id`, `from_tag`, `to_tag` | Tear down the subscription. |
@@ -353,6 +359,11 @@ before recording is a follow-up.
 | `conference_leave` | `conference_id`, `from_tag` | Leave; the room tears down when the last participant leaves. |
 | `conference_route` | `conference_id`, `from_tag`, `role` | Live-update a participant's routing role. |
 | `conference_bridge` | `conference_id_a`, `conference_id_b`, `direction` | Bridge two rooms (`both`, `a_to_b`, `b_to_a`). |
+| `conference_play` | `conference_id`, `source`, `repeat_times?`, `start_pos_ms?`, `duration_ms?`, `gain_decibels?` | Play audio **into a room** — an entry tone, a "this conference is being recorded" announcement, music for a lone participant. Mixed as a non-participant source: everyone hears it and nobody is mixed-minus-self against it. Up to four at once, each with its own `play_id`, accepting with that id and ending with a `play_finished` carrying `conference_id` (and an empty `call_id`). `play_media` cannot do this — it resolves through the call registry, which a conference never enters. |
+| `conference_stop_play` | `conference_id`, `play_id?` | Stop one room playback, or all of them when no `play_id` is given. An id that is not running is an error, not a hollow success. |
+| `conference_set_play_gain` | `conference_id`, `play_id`, `gain_decibels` | Retune a running room playback's gain, −60…+12 dB — how an announcement ducks under a conversation rather than burying it. |
+| `conference_start_recording` | `conference_id`, `path?`, `recording_dir?`, `max_duration_ms?`, `silence_ms?` | Record the room's **listener mix** (what a listener hears, including any bridged room and any room playback) to a decoded WAV, streamed to disk. Accepts with a `recording_id` and completes with a `recording_finished` carrying `conference_id`. Pinned to 16 kHz for its lifetime, so a room that goes wideband mid-recording does not change sample rate inside one file. |
+| `conference_stop_recording` | `conference_id`, `recording_id?` | Stop one room recording, or all of them. |
 
 `role` is tagged: `{"role": "talker"}` (default), `"listener"`, `"muted"`,
 `{"role": "whisper", "target": "..."}` (supervisor coaching, excluded from the room mix),
@@ -387,8 +398,9 @@ Events are pushed down the same TCP connection, tagged on `"event"`, with no `id
 | Event | Fields | When |
 |---|---|---|
 | `dtmf` | `call_id`, `from_tag`, `to_tag?`, `digit`, `duration_ms`, `volume`, `source?` | An RFC 4733 telephone-event completed on a leg of a media-processing call or a conference participant. Fires even while that leg's DTMF relay is blocked. |
-| `media_timeout` | `call_id`, `from_tag` | The call went silent past `--media-timeout-secs` and the engine reaped it. Release your own per-call state. |
+| `media_timeout` | `call_id`, `from_tag`, `reason` | The call went silent past its idle ceiling and the engine reaped it. Release your own per-call state. `reason` is `no_media` (a party that was expected to be sending stopped — `--media-timeout-secs`, and also what an ICE or consent failure reports) or `held_too_long` (nobody was expected to send at all, and the call stayed held past `--held-media-timeout-secs`). A call is *held* when either party signalled `a=sendonly` / `a=recvonly` / `a=inactive` (RFC 3264 §8.4), which is why hold, park and queue do not reap at 30 s. |
 | `play_finished` | `call_id`, `from_tag`, `to_tag?`, `play_id`, `reason`, `played_ms?` | A `play_media` playback ended. `play_id` matches the accept; `reason` is `completed` (drained in full, all repeats / the `duration_ms` cap), `stopped` (`stop_media`, by `play_id` or call-wide), `superseded` (a newer non-overlay `play_media` on the same leg — an overlay supersedes nothing), or `error` (decode / source / URL-fetch failure, or the leg was torn down mid-play). Only `completed` means the playback finished on its own. **One event per playback**: four overlays ending give four events, each under its own `play_id`. |
+| `recording_finished` | `call_id`, `from_tag`, `to_tag?`, `recording_id`, `path?`, `duration_ms`, `reason` | A `wav` recording ended and **its file is closed** — emitted after the WAV header is finalized and flushed, so a consumer that acts on this event never reads a half-written file. `reason` is `stopped` (`stop_recording`), `max_duration`, `silence`, `call_ended` (the call ended under it — the normal way a voicemail message ends), or `error`. |
 | `active_speaker` | `conference_id`, `from_tag?` | The dominant speaker in a conference changed; `from_tag` absent means the floor went silent. |
 | `call_quality` | `conference_id?` xor `call_id?`, `from_tag`, `jitter_ms`, `loss_percent`, `mos` | Periodic reception quality: RFC 3550 §6.4.1 interarrival jitter, residual loss, and an ITU-T G.107 E-model MOS estimate (1.0..=4.5). Fires every few seconds per conference participant (keyed by `conference_id`) and per 2-party relay or transcode leg (keyed by `call_id`); exactly one identifier is present. |
 | `text` | `call_id`, `from_tag`, `to_tag?`, `text`, `direction?` | Newly-recovered RFC 4103 real-time text (T.140) on a call's `m=text` stream. `text` is the UTF-8 increment this packet delivered (U+FFFD markers preserved where loss occurred, RFC 4103 §5.3); `from_tag` is the sending leg; `direction` is `a_to_b` / `b_to_a`. Requires `text_events`. |

@@ -32,20 +32,23 @@ use siphon_rtp_hep::text_report::TextQosReport;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
 use siphon_rtp_media::playback::Gain;
-use siphon_rtp_media::player::{PcmPlayer, WavError, WavSource};
+use siphon_rtp_media::player::{PcmPlayer, PcmRepeat, WavError, WavSource};
 use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    PlayEndReason, PlayMediaSource, ProfileFlags, SessionStats, WsBridgeEndReason, WsTeeDirection,
-    WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
+    MediaTimeoutReason, PlayEndReason, PlayMediaSource, PlayRepeat, ProfileFlags,
+    RecordingChannels, RecordingDirection, RecordingEndReason, RecordingFormat, SessionStats,
+    WsBridgeEndReason, WsTeeDirection, WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
 use siphon_rtp_srtp::StreamRollover;
 
 use crate::cluster::ClusterState;
-use crate::conference::{ConferenceRegistry, ParticipantConfig, ParticipantTextConfig, Routing};
+use crate::conference::{
+    ConferenceControl, ConferenceRegistry, ParticipantConfig, ParticipantTextConfig, Routing,
+};
 use crate::dtls_bridge::{DtlsBridge, DtlsCallPlan};
 use crate::ice::driver::{AgentOutcome, AgentSupervisor, ConsentOutcome, ConsentSupervisor};
 use crate::ice::{self, IceCredentials};
@@ -53,7 +56,7 @@ use crate::interface::{Interface, InterfaceTable};
 use crate::media_fetch::{self, MediaFetchLimits};
 use crate::media_pipeline::{
     DirectionConfig, DirectionQuality, FinalCallQuality, MediaCall, MediaControl, MediaRegistry,
-    PcapCapture, PlayRequest, RawTee, RelayConfig, RtcpRelay, SecureSide,
+    PcapCapture, PlayDtmfOutcome, PlayRequest, RawTee, RelayConfig, RtcpRelay, SecureSide,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
@@ -608,6 +611,17 @@ struct Call {
     /// The far (answerer) leg's primary audio codec, captured at answer — the fork codec for a
     /// `subscribe_request` that forks leg B. `None` until the call is answered.
     far_codec: Option<CodecSpec>,
+    /// The direction the **near** (offerer) party declared for itself (RFC 4566 §6 / RFC 8866 §6.7),
+    /// captured at offer / `answer_local` and refreshed on each of that party's re-offers. Read only by
+    /// the idle reaper, which must not judge a party's silence when the party told us it would be
+    /// silent (RFC 3264 §8.4 — a held party may send nothing at all). `SendRecv` for a call restored
+    /// from an HA snapshot, whose SDP the standby never saw; that is the conservative default, since it
+    /// keeps the shorter dead-path ceiling rather than granting a restored call the held one.
+    near_direction: sdp::MediaDirection,
+    /// The direction the **far** (answerer) party declared for itself, captured at answer and refreshed
+    /// on its re-offers. `SendRecv` until the call is answered — an unanswered call has no far party
+    /// whose silence could be expected.
+    far_direction: sdp::MediaDirection,
     /// The near leg's negotiated RFC 4733 telephone-event payload type, if any.
     near_telephone_event: Option<u8>,
     /// The far leg's negotiated RFC 4733 telephone-event payload type, captured at answer. Paired
@@ -705,6 +719,13 @@ struct Call {
 enum PromotionReason {
     /// A raw-RTP pcap recording is active (`start recording`).
     Recording,
+    /// A **decoded-audio** recording is active (`start_recording` with `format: "wav"`). Distinct
+    /// from `Recording` because that one is a *relay-only* hold — a pcap forwards RTP verbatim and
+    /// never decodes — while this one taps the post-decode fan-out and so needs a **processing**
+    /// pipeline. Sharing the variant would let stopping one demote the other's pipeline out from
+    /// under it, and would make `upgrade_relay_to_processing` refuse over a hold that does not
+    /// conflict with it.
+    AudioRecording,
     /// A per-leg RFC 4733 telephone-event (DTMF) relay block is active (`block DTMF`) — the relay is
     /// held in userspace so the actor can gate the telephone-event PT per direction.
     DtmfBlock,
@@ -793,6 +814,26 @@ impl Call {
     #[cfg(test)]
     fn far_leg(&self) -> &Leg {
         self.far.as_ref().expect("an answered call has a far leg")
+    }
+
+    /// Whether the signalling has taken this call off two-way media — hold, park or queue — so that
+    /// nobody owes us a packet and silence proves nothing about the path.
+    ///
+    /// RFC 3264 §8.4 is the whole basis: a party places a call on hold by offering `sendonly` (answered
+    /// `recvonly`), or `inactive` when both ends hold it, and in **every** one of those shapes the spec
+    /// permits the remaining direction to carry nothing at all — *"the party placing the call on hold
+    /// MAY send media (e.g., music on hold) or MAY send nothing"*. So `sendonly` guarantees a packet no
+    /// more than `recvonly` does, and a per-direction flow analysis would still reap the commonest hold
+    /// of all (a handset that marks the stream `sendonly` and then simply stops transmitting).
+    ///
+    /// The test is therefore "has either party taken the stream off `sendrecv`". On a two-party call a
+    /// direction attribute other than `sendrecv` exists precisely to suspend the two-way flow, and that
+    /// is exactly the state whose silence must not be read as a dead path. On a single-leg call
+    /// (`answer_local`: IVR, announcement, voicemail) there is no second party — `far_direction` stays
+    /// at its `sendrecv` default and the caller's own attribute decides.
+    fn is_held(&self) -> bool {
+        self.near_direction != sdp::MediaDirection::SendRecv
+            || self.far_direction != sdp::MediaDirection::SendRecv
     }
 
     /// The role of one of this call's four possible endpoints, or `None` if the id is not one of
@@ -1356,6 +1397,14 @@ pub struct Engine<D: Datapath> {
     /// one. Held here (not in the media actor) because the transport task, the WS socket and the
     /// dropped/forwarded counters outlive individual control ops and must be torn down on `delete`.
     ws_tees: DashMap<String, WsTee>,
+    /// Decoded host-file prompts, so a bed played to many callers is decoded once
+    /// ([`crate::prompt_cache`]).
+    prompts: Arc<crate::prompt_cache::PromptCache>,
+    /// Live decoded-audio recordings, keyed by their `recording_id`. Several may run on one call (a
+    /// per-leg pair, or an audit recording alongside a voicemail), so this is not keyed by call.
+    recordings: DashMap<String, AudioRecording>,
+    /// Monotonic source for `recording_id`, so two recordings on one call never collide.
+    next_recording_id: std::sync::atomic::AtomicU64,
     /// Live WebSocket **takeover** bridges, keyed by call-id — the control-plane half of what the
     /// [`crate::ws_bridge::WsRegistry`] routes. One per call; attaching again re-points it. Held
     /// here for the same reason `ws_tees` is: the `ws_bridge_ended` event is emitted during teardown,
@@ -1396,6 +1445,56 @@ struct HepExport {
 
 /// A live WebSocket tee on one call: the shared mixer (for its counters), its transport task, and the
 /// per-leg fork tags so a detach removes exactly this tee's sinks and nothing else.
+/// A live decoded-audio recording, as the engine tracks it.
+///
+/// Mirrors [`WsTee`], and for the same reasons — the correlation ids are copied in at start because
+/// teardown runs *after* `delete` has removed the call, so the completion event cannot look them up.
+///
+/// Note what is deliberately **not** here: the shared frame assembler. Only the sinks hold it, so
+/// detaching them drops the last reference, closes the frame channel, and the writer task finalizes
+/// the file on its own. That is the whole stop mechanism — there is no separate kill signal to race
+/// the finalize, and a call torn down underneath a recording ends it exactly the same way.
+struct AudioRecording {
+    /// Also the fork tag on every leg it taps, and the event correlator.
+    recording_id: String,
+    call_id: String,
+    owner: ClientId,
+    path: std::path::PathBuf,
+    /// Ingress taps: which source legs carry a sink (`true` = leg A / caller).
+    ingress_legs: Vec<bool>,
+    /// Egress taps: which directions carry a sink (`true` = toward A).
+    egress_legs: Vec<bool>,
+    /// The conference this recording taps, when it is a room recording rather than a call one. The
+    /// detach then targets the room actor's own tap list instead of a call's fan-out.
+    room: Option<String>,
+    /// Why the recording ended when the *source* simply went away. Set by an explicit stop before it
+    /// detaches; left at `CallEnded` otherwise, because a writer cannot tell a stop from a hangup —
+    /// both are just "the sinks are gone" — and guessing would report one as the other.
+    source_reason: Arc<std::sync::Mutex<RecordingEndReason>>,
+    /// The writer task. **Never aborted**: aborting it would skip the header finalize and leave a
+    /// file declaring zero samples. It is ended by closing its input, and then awaited.
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl AudioRecording {
+    /// Whether this recording belongs to `call_id` — how an unnamed `stop_recording` (and a call
+    /// teardown) finds every recording it must end.
+    fn call_id_matches(&self, call_id: &str) -> bool {
+        self.call_id == call_id
+    }
+}
+
+/// The decoded-recording knobs, grouped so the start path takes one parameter rather than six.
+struct WavRecordingRequest {
+    direction: RecordingDirection,
+    channels: RecordingChannels,
+    limits: crate::recording::RecordingLimits,
+    /// Explicit output path, overriding the directory + generated name.
+    path: Option<String>,
+    /// Output directory, when no explicit path was given.
+    recording_dir: Option<String>,
+}
+
 struct WsTee {
     /// The tee's stream id — also the fork tag on every leg it taps, and the event correlator.
     stream_id: String,
@@ -1496,6 +1595,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             turn_server: None,
             ice_relays: Arc::new(DashMap::new()),
             ws_tees: DashMap::new(),
+            prompts: Arc::new(crate::prompt_cache::PromptCache::new(
+                DEFAULT_PROMPT_CACHE_BYTES,
+            )),
+            recordings: DashMap::new(),
+            next_recording_id: std::sync::atomic::AtomicU64::new(1),
             ws_bridges: DashMap::new(),
             // Lawful interception is unconfigured unless the daemon supplies `x3_*`, and `attach_x3`
             // refuses while it is — never accepted and left delivering nowhere.
@@ -1565,6 +1669,22 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ///
     /// Off by default: `a=ice-lite` is what the engine advertises, and a lite agent is a valid and
     /// simpler posture for a server on a routable address. Builder-style consuming setter.
+    /// Size the decoded-prompt cache, in bytes. `0` disables caching — every `play_media` on a file
+    /// then reads and decodes it afresh, which is exactly the behaviour before the cache existed.
+    ///
+    /// Builder-style consuming setter, called from the daemon's `--prompt-cache-bytes`.
+    #[must_use]
+    pub fn with_prompt_cache_bytes(mut self, capacity_bytes: usize) -> Self {
+        self.prompts = Arc::new(crate::prompt_cache::PromptCache::new(capacity_bytes));
+        self
+    }
+
+    /// The decoded-prompt cache, for tests and for metrics.
+    #[must_use]
+    pub fn prompts(&self) -> &Arc<crate::prompt_cache::PromptCache> {
+        &self.prompts
+    }
+
     #[must_use]
     pub fn with_full_ice(mut self) -> Self {
         self.ice_agents = Some(Arc::new(AgentSupervisor::new()));
@@ -1958,16 +2078,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 volume_dbm0,
                 pause_ms,
                 to_tag,
-            } => self.play_dtmf(
-                client,
-                &call_id,
-                &from_tag,
-                &code,
-                duration_ms,
-                volume_dbm0,
-                pause_ms,
-                to_tag.as_deref(),
-            ),
+            } => {
+                self.play_dtmf(
+                    client,
+                    &call_id,
+                    &from_tag,
+                    &code,
+                    duration_ms,
+                    volume_dbm0,
+                    pause_ms,
+                    to_tag.as_deref(),
+                )
+                .await
+            }
             Command::SubscribeRequest {
                 call_id,
                 from_tags,
@@ -2003,10 +2126,45 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             Command::StartRecording {
                 call_id,
+                from_tag,
                 recording_dir,
+                format,
+                direction,
+                channels,
+                max_duration_ms,
+                silence_ms,
+                path,
+            } => match format.unwrap_or_default() {
+                RecordingFormat::Pcap => {
+                    self.start_recording(client, &call_id, recording_dir).await
+                }
+                RecordingFormat::Wav => {
+                    self.start_wav_recording(
+                        client,
+                        &call_id,
+                        &from_tag,
+                        WavRecordingRequest {
+                            direction: direction.unwrap_or_default(),
+                            channels: channels.unwrap_or_default(),
+                            limits: crate::recording::RecordingLimits {
+                                max_duration_ms,
+                                silence_ms,
+                            },
+                            path,
+                            recording_dir,
+                        },
+                    )
+                    .await
+                }
+            },
+            Command::StopRecording {
+                call_id,
+                recording_id,
                 ..
-            } => self.start_recording(client, &call_id, recording_dir).await,
-            Command::StopRecording { call_id, .. } => self.stop_recording(client, &call_id).await,
+            } => {
+                self.stop_recording(client, &call_id, recording_id.as_deref())
+                    .await
+            }
             Command::ConferenceJoin {
                 conference_id,
                 from_tag,
@@ -2031,6 +2189,65 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 conference_id_b,
                 direction,
             } => self.conference_bridge(&conference_id_a, &conference_id_b, direction),
+            Command::ConferencePlay {
+                conference_id,
+                source,
+                repeat_times,
+                start_pos_ms,
+                duration_ms,
+                gain_decibels,
+            } => {
+                self.conference_play(
+                    &conference_id,
+                    source,
+                    PlayOptions {
+                        repeat_times,
+                        start_pos_ms,
+                        duration_ms,
+                        overlay: true,
+                        gain_decibels,
+                    },
+                )
+                .await
+            }
+            Command::ConferenceStopPlay {
+                conference_id,
+                play_id,
+            } => self.conference_stop_play(&conference_id, play_id).await,
+            Command::ConferenceSetPlayGain {
+                conference_id,
+                play_id,
+                gain_decibels,
+            } => {
+                self.conference_set_play_gain(&conference_id, play_id, gain_decibels)
+                    .await
+            }
+            Command::ConferenceStartRecording {
+                conference_id,
+                path,
+                recording_dir,
+                max_duration_ms,
+                silence_ms,
+            } => {
+                self.conference_start_recording(
+                    client,
+                    &conference_id,
+                    path,
+                    recording_dir,
+                    crate::recording::RecordingLimits {
+                        max_duration_ms,
+                        silence_ms,
+                    },
+                )
+                .await
+            }
+            Command::ConferenceStopRecording {
+                conference_id,
+                recording_id,
+            } => {
+                self.conference_stop_recording(&conference_id, recording_id.as_deref())
+                    .await
+            }
             Command::AttachWsTee {
                 call_id,
                 ws_uri,
@@ -2640,6 +2857,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_offered_codecs,
                 near_codec_withheld,
                 far_codec: None,
+                // A's own direction, for the idle reaper. B's arrives with its answer; until then the
+                // far party is not a party yet, so it defaults to sendrecv and contributes nothing.
+                near_direction: info.direction,
+                far_direction: sdp::MediaDirection::default(),
                 near_telephone_event: info.telephone_event_payload_type(),
                 far_telephone_event: None,
                 pipeline,
@@ -3031,6 +3252,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_offered_codecs: Vec::new(),
                 near_codec_withheld: false,
                 far_codec: None,
+                // The caller's own direction. A single-leg call has no second party, so the far default
+                // never contributes — `legs_expected_to_send` only walks a far leg that exists.
+                near_direction: info.direction,
+                far_direction: sdp::MediaDirection::default(),
                 near_telephone_event: info.telephone_event_payload_type(),
                 far_telephone_event: None,
                 pipeline: PipelineKind::Passthrough,
@@ -3751,6 +3976,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // …and any WS tee riding the same fan-out, so its transport closes and the controller
             // gets its `ws_tee_ended` rather than a silently dead stream.
             self.stop_ws_tee(call_id, WsTeeEndReason::Detached).await;
+            // …and any decoded recording on it, **before** the media actor is deregistered. This is
+            // what turns a hangup into a finished, playable file rather than a valid WAV declaring
+            // zero samples: it detaches the sinks, waits for the writer to finalize the header, and
+            // lets the completion event go out naming `call_ended`. A voicemail box depends on it —
+            // the caller hanging up is the normal way a message ends.
+            self.stop_wav_recordings_for_call(call_id, RecordingEndReason::CallEnded)
+                .await;
             // …and any lawful interception, so the controller gets a final `x3_ended` carrying the
             // delivered/dropped counts its compliance record needs, rather than a silently dead
             // delivery connection.
@@ -4101,6 +4333,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     }
                     // A re-offer from A supersedes any from B still waiting for an answer.
                     call.pending_far_reoffer = None;
+                    // A re-offer restates the offering party's own direction, so this is where hold is
+                    // applied *and* where the unhold re-arms the dead-path timer (RFC 3264 §8 — a
+                    // subsequent offer modifies the session, and §8.4 makes hold/unhold exactly such an
+                    // offer). Taken unconditionally: `sendrecv` is the meaning of an absent attribute,
+                    // so "no direction line in this re-offer" genuinely means the party is active again.
+                    call.near_direction = info.direction;
                 }
                 Party::Far => {
                     if let Some(far) = call.far.as_mut() {
@@ -4113,6 +4351,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     }
                     // Held for A's answer, which re-wires the media path against it.
                     call.pending_far_reoffer = Some(sdp.to_string());
+                    // As above, for a re-offer the answering party initiated.
+                    call.far_direction = info.direction;
                 }
             }
             call.ice = ice_creds.clone();
@@ -4367,6 +4607,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 if let Some(telephone_event) = answered.telephone_event_payload_type() {
                     call.near_telephone_event = Some(telephone_event);
                 }
+                // A's answer states A's own direction — this is how A accepts (or declines) a hold B
+                // asked for. `far_direction` needs nothing here: `info` below is B's re-offer, i.e. B's
+                // own SDP, so the single write at the end of `answer` is right whichever way round the
+                // exchange ran.
+                call.near_direction = answered.direction;
                 call.near_remote_ice = peer_ice_credentials(&answered);
                 call.near_remote_candidates = answered.candidates.clone();
                 call.near_peer_is_lite = answered.ice_lite;
@@ -5799,6 +6044,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // The far leg's RFC 4733 telephone-event PT from its answer, so `block DTMF` can gate leg
             // B's telephone-event even on a plain relay.
             call.far_telephone_event = info.telephone_event_payload_type();
+            // B's own direction, for the idle reaper. This is where hold becomes visible on an answered
+            // call: A offers `sendonly` and B answers `recvonly` (RFC 3264 §8.4), so neither party is
+            // expected to send and the call is held rather than dead.
+            call.far_direction = info.direction;
             call.pipeline = pipeline;
             call.relay_flows = relay_flows;
             // The in-kernel text `Forward` flows, kept so text observability can promote/demote the
@@ -5879,6 +6128,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     sdp: None,
                     duration_ms: None,
                     play_id: None,
+                    recording_id: None,
                     to_tag: None,
                     stats: None,
                 }
@@ -6258,6 +6508,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             sdp: None,
             duration_ms: None,
             play_id: None,
+            recording_id: None,
             to_tag: None,
             stats: Some(stats),
         }
@@ -6897,6 +7148,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_offered_codecs: Vec::new(),
                 near_codec_withheld: false,
                 far_codec: far_codec_out,
+                // Neither party's direction attribute is carried in the HA snapshot — the standby never
+                // saw either SDP. Both default to sendrecv, which is the conservative reading: a
+                // restored call is measured against the short dead-path ceiling rather than being
+                // granted the long held one on a guess. A re-offer after the restore corrects it.
+                near_direction: sdp::MediaDirection::default(),
+                far_direction: sdp::MediaDirection::default(),
                 near_telephone_event: snapshot.near_telephone_event,
                 // The far leg's telephone-event PT is not carried in the HA snapshot (a restored call
                 // is not DTMF-blocked — the reason set is cleared above too); resolved only on a fresh
@@ -7605,10 +7862,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let events = self.events.get(&client).map(|sink| sink.value().clone());
         let joined_tick = self.datapath.now_ticks();
+        // A seat that offered `a=recvonly` / `a=inactive` told us it will not send (RFC 4566 §6), so
+        // the idle sweep must not read its silence as a dead path — a held seat and a listen-only
+        // attendee are both legitimately quiet for the whole conference.
+        let held = !info.direction.peer_sends();
         if !self.conference.join(
             conference_id,
             config,
             joined_tick,
+            held,
             self.datapath.clone(),
             events,
         ) {
@@ -7832,21 +8094,36 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return Err(Box::new(error_result("play_media: promote call", &reason)));
             }
         }
-        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
-        let repeat = options.repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        // `repeat_times` is the total play count; 0/None plays once (PcmRepeat treats 0/1 alike), and
+        // `"inf"` plays until stopped — what music on hold, queue music and park music need.
+        let repeat = match options.repeat_times {
+            None => PcmRepeat::Times(0),
+            Some(PlayRepeat::Forever) => PcmRepeat::Forever,
+            Some(PlayRepeat::Times(times)) => {
+                PcmRepeat::Times(times.min(u64::from(u32::MAX)) as u32)
+            }
+        };
         let start = options.start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
         // Resolve the source into something the media actor can play. A recorded prompt is decoded
         // here (the source rate is a property of the file, not of the leg); a tone is only *parsed*
         // here — it is synthesised at the leg's egress rate inside the actor, which is the only place
         // that knows it, so a tone is never resampled.
         let resolved = match source {
+            // An inline blob is the controller's own bytes, different on every request by
+            // construction, so there is nothing to cache: decode it here.
             PlayMediaSource::Blob { data } => parse_prompt_wav(&data)
                 .map_err(|error| error_result("play_media: parse WAV", &error))?,
-            PlayMediaSource::File { path } => match tokio::fs::read(&path).await {
-                Ok(bytes) => parse_prompt_wav(&bytes)
-                    .map_err(|error| Box::new(error_result("play_media: parse WAV", &error)))?,
-                Err(error) => return Err(Box::new(error_result("play_media: read file", &error))),
-            },
+            // A host file is the case worth caching — a queue with thirty waiting callers plays the
+            // same hold music thirty times. Keyed by path + mtime + length, so re-recording a prompt
+            // takes effect on the next play with no cache-clearing step.
+            PlayMediaSource::File { path } => {
+                match self.prompts.get_or_load(std::path::Path::new(&path)).await {
+                    Ok(prompt) => ResolvedPlaySource::Pcm(prompt),
+                    Err(error) => {
+                        return Err(Box::new(error_result("play_media", &error)));
+                    }
+                }
+            }
             PlayMediaSource::Tone { tone } => match ToneSpec::resolve(&tone) {
                 Ok(spec) => ResolvedPlaySource::Tone(spec),
                 Err(error) => return Err(Box::new(error_result("play_media: tone", &error))),
@@ -7901,10 +8178,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         let (request, source_duration_ms) = match resolved {
-            ResolvedPlaySource::Wav(wav) => {
-                let player = PcmPlayer::new(&wav, repeat, start);
+            ResolvedPlaySource::Pcm(prompt) => {
+                let player =
+                    PcmPlayer::from_shared(prompt.mono, prompt.sample_rate_hz, repeat, start);
                 let duration = player.duration_ms();
-                (PlayRequest::Pcm(Box::new(player)), Some(duration))
+                (PlayRequest::Pcm(Box::new(player)), duration)
             }
             ResolvedPlaySource::Tone(spec) => {
                 let duration = spec.total_duration_ms();
@@ -7912,7 +8190,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         // The accepted duration is the source's own length bounded by the `duration_ms` cap; a cap
-        // on an endless tone *is* the duration, and an uncapped endless tone reports none.
+        // on an endless source *is* the duration, and an uncapped endless one — a `*inf` tone or a
+        // `"repeat_times": "inf"` prompt — reports none.
         let duration_ms = match (source_duration_ms, options.duration_ms) {
             (Some(source), Some(cap)) => Some(source.min(cap)),
             (Some(source), None) => Some(source),
@@ -8105,6 +8384,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 sdp: None,
                 duration_ms,
                 play_id: Some(play_id),
+                recording_id: None,
                 to_tag: None,
                 stats: None,
             },
@@ -8209,7 +8489,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// `pause_ms` of inter-digit silence (RFC 4733). The target leg is resolved from `from_tag` /
     /// `to_tag` the same way `block_dtmf` resolves its source leg.
     #[allow(clippy::too_many_arguments)]
-    fn play_dtmf(
+    #[allow(clippy::too_many_arguments)]
+    async fn play_dtmf(
         &self,
         client: ClientId,
         call_id: &str,
@@ -8249,7 +8530,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .map(|value| value.unsigned_abs().min(63) as u8)
             .unwrap_or(10);
         let toward_a = resolve_toward_a(from_tag, call_to.as_deref(), to_tag);
-        if self.media.control(
+        // Await the actor's verdict rather than answering from whether the mailbox accepted the
+        // message. Only the actor knows whether this leg negotiated a `telephone-event` payload type
+        // to carry the digits on, and answering `ok` without one sends nothing — which, on a PBX
+        // forwarding a feature code to a carrier or navigating a remote menu, reads as the far end
+        // ignoring the digits. Same shape as `stop_media` / `set_play_gain`.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.media.control(
             call_id,
             MediaControl::PlayDtmf {
                 toward_a,
@@ -8257,11 +8544,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 duration_ms: duration,
                 volume,
                 pause_ms: pause,
+                reply: sender,
             },
         ) {
-            ok_empty()
-        } else {
-            error_result("play_dtmf", &"call is not a media-processing call")
+            return error_result("play_dtmf", &"call is not a media-processing call");
+        }
+        match receiver.await {
+            Ok(PlayDtmfOutcome::Started) => ok_empty(),
+            Ok(PlayDtmfOutcome::NoTelephoneEvent) => error_result(
+                "play_dtmf",
+                &"no telephone-event payload type negotiated toward this leg",
+            ),
+            // Unreachable through the control plane — the code is validated above — but a hollow
+            // success here would be the same defect one layer down.
+            Ok(PlayDtmfOutcome::InvalidDigits) => {
+                error_result("play_dtmf", &format!("unusable DTMF code {code:?}"))
+            }
+            Err(_) => error_result(
+                "play_dtmf",
+                &"media actor closed before the DTMF sequence started",
+            ),
         }
     }
 
@@ -8398,9 +8700,39 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// rtpengine `stop recording`): tell the actor to drop its capture sink (the drain task then
     /// finalizes the `.pcap`) and release the recording hold, demoting the relay back to the in-kernel
     /// `Forward` fast path if no other hold (a SIPREC subscription) remains.
-    async fn stop_recording(&self, client: ClientId, call_id: &str) -> CmdResult {
+    async fn stop_recording(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        recording_id: Option<&str>,
+    ) -> CmdResult {
         if self.owned_call(client, call_id, |_| ()).is_none() {
             return unknown_call(call_id);
+        }
+        // A named recording is a decoded-audio one: stop exactly it and leave everything else — the
+        // pcap, another recording on the same call — running.
+        if let Some(recording_id) = recording_id {
+            if !self.recordings.contains_key(recording_id) {
+                return error_result(
+                    "stop_recording",
+                    &format!("no recording {recording_id} is running on this call"),
+                );
+            }
+            self.stop_wav_recording(recording_id, RecordingEndReason::Stopped)
+                .await;
+            return ok_empty();
+        }
+        // Unnamed: stop everything this call is recording, which is what rtpengine's `stop recording`
+        // means and the only thing the NG front-end can express.
+        let running: Vec<String> = self
+            .recordings
+            .iter()
+            .filter(|entry| entry.value().call_id_matches(call_id))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for recording_id in running {
+            self.stop_wav_recording(&recording_id, RecordingEndReason::Stopped)
+                .await;
         }
         // No-op in the actor if not recording; ignored if the call has no actor (never promoted).
         self.media.control(call_id, MediaControl::StopRecording);
@@ -8412,6 +8744,738 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         self.release_text_hold(call_id, PromotionReason::Recording)
             .await;
         ok_empty()
+    }
+
+    /// Play audio into a conference room ([`Command::ConferencePlay`]) — an entry tone, a
+    /// "this conference is being recorded" announcement, hold music for a lone participant.
+    ///
+    /// A room is not a call. The leg-addressed [`Command::PlayMedia`] resolves through `self.calls`,
+    /// which a conference never enters, so it answers `unknown call` for a room id; hence a verb of
+    /// its own. The audio goes in as a **non-participant source** on the mixer's `external` input,
+    /// which is exactly the seam for it: everyone hears it and nobody is mixed-minus-self against it,
+    /// so an announcement is never treated as a participant's own audio and subtracted back out.
+    async fn conference_play(
+        &self,
+        conference_id: &str,
+        source: PlayMediaSource,
+        options: PlayOptions,
+    ) -> CmdResult {
+        if !self.conference.has_room(conference_id) {
+            return error_result(
+                "conference_play",
+                &format!("unknown conference: {conference_id}"),
+            );
+        }
+        // Same mapping a leg playback uses, so `"inf"` means the same thing in a room as on a leg —
+        // which is what hold music for a lone participant needs.
+        let repeat = match options.repeat_times {
+            None => PcmRepeat::Times(0),
+            Some(PlayRepeat::Forever) => PcmRepeat::Forever,
+            Some(PlayRepeat::Times(times)) => {
+                PcmRepeat::Times(times.min(u64::from(u32::MAX)) as u32)
+            }
+        };
+        let start = options.start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        // Resolved here, off the room actor: a file read and a RIFF parse have no business on the
+        // 20 ms mix tick. A tone is only *parsed* here — it is synthesised at the room rate inside
+        // the actor, which is the only place that knows it.
+        let resolved = match source {
+            PlayMediaSource::Blob { data } => match parse_prompt_wav(&data) {
+                Ok(resolved) => resolved,
+                Err(error) => return error_result("conference_play: parse WAV", &error),
+            },
+            // Through the prompt cache, like a leg playback: an entry tone or a "being recorded"
+            // announcement is played into every room on the box, so decoding it per room is exactly
+            // the waste the cache exists to remove.
+            PlayMediaSource::File { path } => {
+                match self.prompts.get_or_load(std::path::Path::new(&path)).await {
+                    Ok(prompt) => ResolvedPlaySource::Pcm(prompt),
+                    Err(error) => return error_result("conference_play", &error),
+                }
+            }
+            PlayMediaSource::Tone { tone } => match ToneSpec::resolve(&tone) {
+                Ok(spec) => ResolvedPlaySource::Tone(spec),
+                Err(error) => return error_result("conference_play: tone", &error),
+            },
+            other => {
+                return error_result(
+                    "conference_play",
+                    &format!("media source {other:?} is not supported for a room"),
+                )
+            }
+        };
+        let (request, source_duration_ms) = match resolved {
+            ResolvedPlaySource::Pcm(prompt) => {
+                let player =
+                    PcmPlayer::from_shared(prompt.mono, prompt.sample_rate_hz, repeat, start);
+                // `None` for an endless bed — there is no length to promise, exactly as on a leg.
+                let duration = player.duration_ms();
+                (PlayRequest::Pcm(Box::new(player)), duration)
+            }
+            ResolvedPlaySource::Tone(spec) => {
+                let duration = spec.total_duration_ms();
+                (PlayRequest::Tone(spec), duration)
+            }
+        };
+        let duration_ms = match (source_duration_ms, options.duration_ms) {
+            (Some(source), Some(cap)) => Some(source.min(cap)),
+            (Some(source), None) => Some(source),
+            (None, cap) => cap,
+        };
+        let gain = Gain::from_decibels(options.gain_decibels.unwrap_or(0));
+        let play_id = self.next_play_id();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.conference.control(
+            conference_id,
+            ConferenceControl::StartPlay {
+                request: Box::new(request),
+                gain,
+                play_id,
+                duration_cap_ms: options.duration_ms,
+                reply: sender,
+            },
+        ) {
+            return error_result("conference_play", &"conference is no longer running");
+        }
+        match receiver.await {
+            Ok(Ok(())) => CmdResult::Ok {
+                sdp: None,
+                duration_ms,
+                play_id: Some(play_id),
+                recording_id: None,
+                to_tag: None,
+                stats: None,
+            },
+            Ok(Err(error)) => error_result("conference_play", &error),
+            Err(_) => error_result(
+                "conference_play",
+                &"conference actor closed before the playback started",
+            ),
+        }
+    }
+
+    /// Stop audio playing into a room ([`Command::ConferenceStopPlay`]).
+    async fn conference_stop_play(&self, conference_id: &str, play_id: Option<u64>) -> CmdResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.conference.control(
+            conference_id,
+            ConferenceControl::StopPlay {
+                play_id,
+                reply: sender,
+            },
+        ) {
+            return error_result(
+                "conference_stop_play",
+                &format!("unknown conference: {conference_id}"),
+            );
+        }
+        match receiver.await {
+            Ok(true) => ok_empty(),
+            // An id that is not running is an error, not a hollow success: a controller that believes
+            // it stopped a playback and did not has no way to notice.
+            Ok(false) => match play_id {
+                Some(play_id) => error_result(
+                    "conference_stop_play",
+                    &format!("no playback {play_id} is running in this conference"),
+                ),
+                None => ok_empty(),
+            },
+            Err(_) => error_result("conference_stop_play", &"conference actor closed"),
+        }
+    }
+
+    /// Retune a running room playback's gain ([`Command::ConferenceSetPlayGain`]).
+    async fn conference_set_play_gain(
+        &self,
+        conference_id: &str,
+        play_id: u64,
+        gain_decibels: i32,
+    ) -> CmdResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.conference.control(
+            conference_id,
+            ConferenceControl::SetPlayGain {
+                play_id,
+                gain: Gain::from_decibels(gain_decibels),
+                reply: sender,
+            },
+        ) {
+            return error_result(
+                "conference_set_play_gain",
+                &format!("unknown conference: {conference_id}"),
+            );
+        }
+        match receiver.await {
+            Ok(true) => ok_empty(),
+            Ok(false) => error_result(
+                "conference_set_play_gain",
+                &format!("no playback {play_id} is running in this conference"),
+            ),
+            Err(_) => error_result("conference_set_play_gain", &"conference actor closed"),
+        }
+    }
+
+    /// Record a conference room's mix ([`Command::ConferenceStartRecording`]).
+    ///
+    /// Taps the **listener mix** — what a listener actually hears, including any bridged room and any
+    /// room playback — which is the useful definition of "record the conference". The alternative,
+    /// the participant-only mix, is what feeds a bridge and deliberately excludes bridged audio.
+    ///
+    /// From there it is P3's machinery unchanged: a tagged sink into the shared frame assembler, and
+    /// the same streaming WAV writer, so a room recording and a call recording produce the same file
+    /// and the same completion event.
+    async fn conference_start_recording(
+        &self,
+        client: ClientId,
+        conference_id: &str,
+        path: Option<String>,
+        recording_dir: Option<String>,
+        limits: crate::recording::RecordingLimits,
+    ) -> CmdResult {
+        use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
+        use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
+
+        if !self.conference.has_room(conference_id) {
+            return error_result(
+                "conference_start_recording",
+                &format!("unknown conference: {conference_id}"),
+            );
+        }
+        let recording_id = format!(
+            "rec-{}",
+            self.next_recording_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let path = match path {
+            Some(path) => std::path::PathBuf::from(path),
+            None => match recording_dir {
+                Some(directory) => std::path::PathBuf::from(directory)
+                    .join(format!("{conference_id}-{recording_id}.wav")),
+                None => {
+                    return error_result(
+                        "conference_start_recording",
+                        &"no output location (set `path`, or `recording_dir`)",
+                    )
+                }
+            },
+        };
+        // Opened before a sink is attached, so a bad path fails the verb with the room untouched.
+        let file = match tokio::fs::File::create(&path).await {
+            Ok(file) => file,
+            Err(error) => {
+                return error_result(
+                    "conference_start_recording",
+                    &format!("open {}: {error}", path.display()),
+                )
+            }
+        };
+
+        // The room mixes at its own rate, which moves with membership and bridging. A recording is a
+        // file, not a live stream, so it is pinned to one rate for its lifetime and the *room*
+        // converts into it — a room that started narrowband and went wideband mid-recording would
+        // otherwise change sample rate inside one WAV, which no player handles. Wideband is the pin:
+        // it is the widest a room reaches short of a fullband participant, so a conference that goes
+        // wideband is recorded at its own quality rather than downsampled to the rate it started at.
+        let rate = crate::conference::WIDEBAND_RECORDING_RATE_HZ;
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: rate,
+            channels: 1,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime: 20,
+        };
+        let plan = plan_ws_tee(format, false, false);
+        // No resampler on the sink: the room owns that conversion, because the room is the only thing
+        // that knows when its own rate moves.
+        let sink = WsTeeSink::new(
+            TeeChannel::Caller,
+            plan.mixer.clone(),
+            recording_id.clone(),
+            None,
+        );
+        if !self.conference.control(
+            conference_id,
+            ConferenceControl::AddRoomTap {
+                sink: Box::new(sink),
+                rate,
+            },
+        ) {
+            return error_result("conference_start_recording", &"conference actor closed");
+        }
+
+        let source_reason = Arc::new(std::sync::Mutex::new(RecordingEndReason::CallEnded));
+        let writer = {
+            let events = self.events.get(&client).map(|sink| sink.value().clone());
+            let conference_id = conference_id.to_string();
+            let recording_id = recording_id.clone();
+            let path = path.clone();
+            let source_reason = source_reason.clone();
+            let frames = plan.frames;
+            let recycle = plan.recycle;
+            tokio::spawn(async move {
+                let outcome = crate::recording::run_wav_recorder(
+                    file,
+                    path.clone(),
+                    rate,
+                    1,
+                    limits,
+                    frames,
+                    recycle,
+                )
+                .await;
+                let source_reason = source_reason
+                    .lock()
+                    .map(|reason| *reason)
+                    .unwrap_or(RecordingEndReason::CallEnded);
+                let reason = outcome.end.into_reason(source_reason);
+                if let Some(events) = events {
+                    let _ = events.try_send(Event::RecordingFinished {
+                        call_id: String::new(),
+                        conference_id: Some(conference_id),
+                        from_tag: String::new(),
+                        to_tag: None,
+                        recording_id,
+                        path: Some(path.to_string_lossy().into_owned()),
+                        duration_ms: outcome.duration_ms,
+                        reason,
+                    });
+                }
+            })
+        };
+
+        self.recordings.insert(
+            recording_id.clone(),
+            AudioRecording {
+                recording_id: recording_id.clone(),
+                call_id: conference_id.to_string(),
+                owner: client,
+                path,
+                ingress_legs: Vec::new(),
+                egress_legs: Vec::new(),
+                room: Some(conference_id.to_string()),
+                source_reason,
+                writer,
+            },
+        );
+        CmdResult::Ok {
+            sdp: None,
+            duration_ms: None,
+            play_id: None,
+            recording_id: Some(recording_id),
+            to_tag: None,
+            stats: None,
+        }
+    }
+
+    /// Stop a room recording ([`Command::ConferenceStopRecording`]).
+    async fn conference_stop_recording(
+        &self,
+        conference_id: &str,
+        recording_id: Option<&str>,
+    ) -> CmdResult {
+        match recording_id {
+            Some(recording_id) => {
+                if !self.recordings.contains_key(recording_id) {
+                    return error_result(
+                        "conference_stop_recording",
+                        &format!("no recording {recording_id} is running on this conference"),
+                    );
+                }
+                self.stop_wav_recording(recording_id, RecordingEndReason::Stopped)
+                    .await;
+            }
+            None => {
+                self.stop_wav_recordings_for_call(conference_id, RecordingEndReason::Stopped)
+                    .await;
+            }
+        }
+        ok_empty()
+    }
+
+    /// Begin a runtime **decoded-audio** recording ([`Command::StartRecording`] with
+    /// `format: "wav"`).
+    ///
+    /// The point of the verb: a voicemail box answers locally, plays a greeting and a beep, and only
+    /// *then* records the caller — so recording has to start at a moment the controller picks, capture
+    /// decoded audio (the file is emailed, transcribed and played back on handsets), work on a
+    /// single-leg call, and tell the controller when the file is complete. None of `record_call`
+    /// (offer/answer-time, two legs, buffered in RAM, flushed at teardown) or the pcap recorder (raw
+    /// wire bytes) does any of that.
+    ///
+    /// It attaches the **same** sinks a WebSocket tee does, onto the same post-decode fan-out, feeding
+    /// the same shared frame assembler — which already interleaves two legs, hands off over a bounded
+    /// channel and recycles its buffers with no per-frame allocation. Its wire frames are little-endian
+    /// 16-bit PCM, i.e. exactly a WAV `data` payload, so the writer appends them verbatim.
+    async fn start_wav_recording(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: &str,
+        request: WavRecordingRequest,
+    ) -> CmdResult {
+        if self.owned_call(client, call_id, |_| ()).is_none() {
+            return unknown_call(call_id);
+        }
+        match self.begin_wav_recording(call_id, from_tag, request).await {
+            Ok(recording_id) => CmdResult::Ok {
+                sdp: None,
+                duration_ms: None,
+                play_id: None,
+                recording_id: Some(recording_id),
+                to_tag: None,
+                stats: None,
+            },
+            Err(reason) => error_result("start_recording", &reason),
+        }
+    }
+
+    /// Stand the recording up. Split out so every failure returns `Err` with the call untouched —
+    /// nothing is promoted, no file is created and no sink is attached until every input has been
+    /// validated, exactly as `start_ws_tee` does.
+    async fn begin_wav_recording(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        request: WavRecordingRequest,
+    ) -> Result<String, String> {
+        use siphon_rtp_media::bridge::protocol::{Encoding, Endianness, MediaFormat};
+        use siphon_rtp_media::bridge::tee::{plan_ws_tee, TeeChannel, WsTeeSink};
+        use siphon_rtp_media::bridge::wire_rate::wire_resampler;
+
+        // Same exclusions the tee has, and for the same reason: a WS-takeover call's media never
+        // reaches the pipeline, and a crypto *bridge* relays ciphertext without decoding, so neither
+        // has a post-decode fan-out to tap. A secure call that runs through the media pipeline
+        // (`SrtpMedia` / `DtlsMedia`) decodes like any other and records fine — which is the case the
+        // pcap recorder has to refuse and this one does not.
+        let pipeline = self
+            .owned_call_internal(call_id, |call| call.pipeline)
+            .ok_or_else(|| "call no longer exists".to_string())?;
+        if self.ws.is_ws_call(call_id) || pipeline == PipelineKind::Ws {
+            return Err(
+                "a WebSocket-takeover call (ws_uri) has no relay path to record".to_string(),
+            );
+        }
+        if matches!(pipeline, PipelineKind::Srtp | PipelineKind::Dtls) {
+            return Err(
+                "recording a secure crypto-bridge call is not supported — the bridge relays \
+                 ciphertext without decoding; a transcoded secure call records fine"
+                    .to_string(),
+            );
+        }
+
+        let (near_codec, far_codec, two_leg, to_tag, owner) = self
+            .owned_call_internal(call_id, |call| {
+                (
+                    call.near_codec.clone(),
+                    call.far_codec.clone(),
+                    call.far
+                        .as_ref()
+                        .is_some_and(|far| far.remote_rtp.is_some()),
+                    call.to_tag.clone(),
+                    call.owner,
+                )
+            })
+            .ok_or_else(|| "call no longer exists".to_string())?;
+
+        let caller_rate = near_codec.as_ref().map(pcm_rate_of).transpose()?;
+        let callee_rate = far_codec.as_ref().map(pcm_rate_of).transpose()?;
+        // The recording rate is the caller leg's decoded PCM rate — not its RTP clock, which for G.722
+        // is half of it (RFC 3551 §4.5.2) and would replay the file at the wrong pitch. A second leg at
+        // another rate is resampled into it.
+        let rate = caller_rate
+            .or(callee_rate)
+            .ok_or_else(|| "the call has no negotiated codec to record".to_string())?;
+        let ptime = near_codec
+            .as_ref()
+            .map_or(20, |codec| codec.ptime_ms.max(1));
+
+        // Which taps. Ingress is what the parties *sent* (a voicemail message); egress is what the
+        // engine sent them (its prompts), which on a single-leg call is the only way to capture the
+        // engine's own audio at all — there is no second party whose ingress it would be.
+        let (want_ingress, want_egress) = match request.direction {
+            RecordingDirection::Ingress => (true, false),
+            RecordingDirection::Egress => (false, true),
+            RecordingDirection::Both => (true, true),
+        };
+        // Two sources exist only on an answered two-party call. A single-leg call records mono
+        // whatever was asked for, rather than stalling on a stereo frame whose second ring never
+        // fills — the same degradation the tee applies.
+        let two_sources = two_leg && !(want_ingress && want_egress);
+        let stereo = matches!(request.channels, RecordingChannels::Stereo) && two_sources;
+        let channels: u8 = if stereo { 2 } else { 1 };
+
+        let format = MediaFormat {
+            encoding: Encoding::L16,
+            sample_rate: rate,
+            channels,
+            bit_depth: 16,
+            endianness: Endianness::Little,
+            ptime,
+        };
+
+        // Every conversion is built before anything is touched, so a rate this engine cannot serve
+        // fails with the call exactly as it was.
+        let mut taps: Vec<(
+            bool,
+            bool,
+            TeeChannel,
+            Option<siphon_rtp_dsp::resample::Resampler>,
+        )> = Vec::new();
+        for (is_ingress, source_a, channel, leg_rate, wanted) in [
+            (true, true, TeeChannel::Caller, caller_rate, want_ingress),
+            (
+                true,
+                false,
+                TeeChannel::Callee,
+                callee_rate,
+                want_ingress && two_leg,
+            ),
+            // Egress toward A is the engine's audio for the caller; on a two-party call it is what B
+            // sent, already covered by B's ingress, so only the caller-facing side is tapped unless
+            // both directions were asked for.
+            (false, true, TeeChannel::Callee, caller_rate, want_egress),
+        ] {
+            if !wanted {
+                continue;
+            }
+            // A stereo recording puts the caller left and everything else right; a mono one folds
+            // every source into ring 0 so the assembler sums them.
+            let channel = if stereo { channel } else { TeeChannel::Caller };
+            let resampler = match leg_rate {
+                Some(leg_rate) => {
+                    wire_resampler(leg_rate, rate).map_err(|error| error.to_string())?
+                }
+                None => None,
+            };
+            taps.push((is_ingress, source_a, channel, resampler));
+        }
+        if taps.is_empty() {
+            return Err("the call has no leg matching the requested direction".to_string());
+        }
+
+        let recording_id = format!(
+            "rec-{}",
+            self.next_recording_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let path = match request.path {
+            Some(path) => std::path::PathBuf::from(path),
+            None => {
+                let directory = request.recording_dir.ok_or_else(|| {
+                    "no output location (set `path`, or `recording_dir`)".to_string()
+                })?;
+                std::path::PathBuf::from(directory).join(format!("{call_id}-{recording_id}.wav"))
+            }
+        };
+
+        // Open the output up front, exactly as the pcap path does: a bad path must fail the verb with
+        // the call untouched — nothing promoted, no sink attached — rather than being reported minutes
+        // later as a `RecordingFinished{Error}` for a recording the controller believes is running.
+        let file = tokio::fs::File::create(&path)
+            .await
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+
+        // A relay-only actor (a pcap recording, a DTMF block) forwards RTP verbatim and never decodes,
+        // so the fan-out this taps would stay dry. Rebuild it as a processing actor, then hold it for
+        // the recording's lifetime.
+        if self.media.is_relay_call(call_id) {
+            self.upgrade_relay_to_processing(call_id).await?;
+        }
+        self.hold_in_userspace(
+            call_id,
+            PromotionReason::AudioRecording,
+            PromoteMode::Processing,
+        )
+        .await?;
+
+        let plan = plan_ws_tee(format, stereo, false);
+        let mut ingress_legs = Vec::new();
+        let mut egress_legs = Vec::new();
+        for (is_ingress, source_a, channel, resampler) in taps {
+            let sink = WsTeeSink::new(channel, plan.mixer.clone(), recording_id.clone(), resampler);
+            let attached = if is_ingress {
+                self.media.control(
+                    call_id,
+                    MediaControl::AddFork {
+                        source_a,
+                        sink: Box::new(sink),
+                    },
+                )
+            } else {
+                self.media.control(
+                    call_id,
+                    MediaControl::AddEgressFork {
+                        toward_a: source_a,
+                        sink: Box::new(sink),
+                    },
+                )
+            };
+            if !attached {
+                self.detach_recording_sinks(call_id, &recording_id, &ingress_legs, &egress_legs);
+                self.release_userspace_hold(call_id, PromotionReason::AudioRecording)
+                    .await;
+                return Err("media actor unavailable".to_string());
+            }
+            if is_ingress {
+                ingress_legs.push(source_a);
+            } else {
+                egress_legs.push(source_a);
+            }
+        }
+
+        // `CallEnded` is the default because it is the truthful answer when nothing set it: the sinks
+        // went away and nobody asked them to.
+        let source_reason = Arc::new(std::sync::Mutex::new(RecordingEndReason::CallEnded));
+        let writer = {
+            let events = self.events.get(&owner).map(|sink| sink.value().clone());
+            let call_id = call_id.to_string();
+            let from_tag = from_tag.to_string();
+            let to_tag = to_tag.clone();
+            let recording_id = recording_id.clone();
+            let path = path.clone();
+            let source_reason = source_reason.clone();
+            let frames = plan.frames;
+            let recycle = plan.recycle;
+            tokio::spawn(async move {
+                let outcome = crate::recording::run_wav_recorder(
+                    file,
+                    path.clone(),
+                    rate,
+                    u16::from(channels),
+                    request.limits,
+                    frames,
+                    recycle,
+                )
+                .await;
+                let source_reason = source_reason
+                    .lock()
+                    .map(|reason| *reason)
+                    .unwrap_or(RecordingEndReason::CallEnded);
+                let reason = outcome.end.into_reason(source_reason);
+                // Emitted only now — after the header has been finalized and the file flushed — so a
+                // consumer that acts on this event never opens a half-written file. That is the whole
+                // reason the event exists.
+                if let Some(events) = events {
+                    let _ = events.try_send(Event::RecordingFinished {
+                        conference_id: None,
+                        call_id,
+                        from_tag,
+                        to_tag,
+                        recording_id,
+                        path: Some(path.to_string_lossy().into_owned()),
+                        duration_ms: outcome.duration_ms,
+                        reason,
+                    });
+                }
+            })
+        };
+
+        self.recordings.insert(
+            recording_id.clone(),
+            AudioRecording {
+                recording_id: recording_id.clone(),
+                call_id: call_id.to_string(),
+                owner,
+                path,
+                ingress_legs,
+                egress_legs,
+                room: None,
+                source_reason,
+                writer,
+            },
+        );
+        Ok(recording_id)
+    }
+
+    /// Detach every sink a recording attached, without touching anything else on the same legs.
+    fn detach_recording_sinks(
+        &self,
+        call_id: &str,
+        recording_id: &str,
+        ingress_legs: &[bool],
+        egress_legs: &[bool],
+    ) {
+        for source_a in ingress_legs {
+            self.media.control(
+                call_id,
+                MediaControl::RemoveForkTagged {
+                    source_a: *source_a,
+                    tag: recording_id.to_string(),
+                },
+            );
+        }
+        for toward_a in egress_legs {
+            self.media.control(
+                call_id,
+                MediaControl::RemoveEgressForkTagged {
+                    toward_a: *toward_a,
+                    tag: recording_id.to_string(),
+                },
+            );
+        }
+    }
+
+    /// End one decoded-audio recording and wait for its file to be closed.
+    ///
+    /// The stop **is** the detach: dropping the sinks drops the last reference to the shared frame
+    /// assembler, which closes the writer's input, which makes it finalize the header and emit
+    /// [`Event::RecordingFinished`]. The writer is never aborted — that would skip the finalize and
+    /// leave a valid-but-empty WAV — and awaiting it is what makes the event ordering a guarantee
+    /// rather than a race for a controller that stops a recording and immediately reads the file.
+    async fn stop_wav_recording(&self, recording_id: &str, reason: RecordingEndReason) {
+        let Some((_, recording)) = self.recordings.remove(recording_id) else {
+            return;
+        };
+        if let Ok(mut stored) = recording.source_reason.lock() {
+            *stored = reason;
+        }
+        match recording.room.as_deref() {
+            // A room recording detaches from the room actor, which holds nothing else to release —
+            // a conference is always in userspace, so there is no promotion hold behind it.
+            Some(conference_id) => {
+                self.conference.control(
+                    conference_id,
+                    ConferenceControl::RemoveRoomTapTagged {
+                        tag: recording.recording_id.clone(),
+                    },
+                );
+                let _ = recording.writer.await;
+            }
+            None => {
+                self.detach_recording_sinks(
+                    &recording.call_id,
+                    &recording.recording_id,
+                    &recording.ingress_legs,
+                    &recording.egress_legs,
+                );
+                let _ = recording.writer.await;
+                self.release_userspace_hold(&recording.call_id, PromotionReason::AudioRecording)
+                    .await;
+            }
+        }
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id = %recording.call_id,
+            recording_id,
+            path = %recording.path.display(),
+            owner = recording.owner.0,
+            ?reason,
+            "decoded recording stopped"
+        );
+    }
+
+    /// End every decoded recording on a call, for a teardown that is not an operator stop.
+    async fn stop_wav_recordings_for_call(&self, call_id: &str, reason: RecordingEndReason) {
+        let running: Vec<String> = self
+            .recordings
+            .iter()
+            .filter(|entry| entry.value().call_id_matches(call_id))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for recording_id in running {
+            self.stop_wav_recording(&recording_id, reason).await;
+        }
     }
 
     /// Attach a **WebSocket tee** to an established call ([`Command::AttachWsTee`]): stream the call's
@@ -9651,6 +10715,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             sdp: Some(offer),
             duration_ms: None,
             play_id: None,
+            recording_id: None,
             to_tag: Some(subscription_id),
             stats: None,
         }
@@ -10373,31 +11438,62 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// Reap calls whose media has been idle (no accepted packet) for at least `idle_ticks`, freeing
-    /// their ports/FDs and registry/quota slots, and return the reaped call ids. Deterministic: it
-    /// reads the datapath's logical clock, so tests drive it via `advance_clock` rather than wall
-    /// time (never `Instant::now()`). (docs/security-and-nat.md §4 layer 6.)
-    pub async fn reap_idle(&self, idle_ticks: u64) -> Vec<String> {
+    /// Reap calls whose media has been idle for at least `idle_ticks`, freeing their ports/FDs and
+    /// registry/quota slots, and return the reaped call ids. Deterministic: it reads the datapath's
+    /// logical clock, so tests drive it via `advance_clock` rather than wall time (never
+    /// `Instant::now()`). (docs/security-and-nat.md §4 layer 6.)
+    ///
+    /// **Silence only means a dead path while someone was expected to speak.** A dead media path and a
+    /// held call are indistinguishable at the packet layer — both are silence — and only the SDP says
+    /// which it is. RFC 3264 §8.4 lets a party that holds a call send nothing at all, and its peer
+    /// answers `recvonly` and correctly sends nothing back, so a rule that reads "no packets from
+    /// anyone" tears down a call whose user is still holding the handset. Hold, park and queue are all
+    /// exactly that state, and they last minutes.
+    ///
+    /// So a call the signalling has taken off two-way media (`Call::is_held`) is measured against
+    /// `held_idle_ticks` — a much longer ceiling (`--held-media-timeout-secs`) so a call abandoned on
+    /// hold still ends eventually, with `0` disabling it so such a call never ages out. Everything else
+    /// keeps the dead-path rule unchanged, down to reading the same endpoint set. The
+    /// [`MediaTimeoutReason`] on the event says which rule fired.
+    pub async fn reap_idle(&self, idle_ticks: u64, held_idle_ticks: u64) -> Vec<String> {
         let now = self.datapath.now_ticks();
         // First pass (no `.await`, so holding the shard guards is fine): find the idle calls.
         let mut stale = Vec::new();
         for entry in self.calls.iter() {
             let call = entry.value();
+            let (budget, reason) = if call.is_held() {
+                (held_idle_ticks, MediaTimeoutReason::HeldTooLong)
+            } else {
+                (idle_ticks, MediaTimeoutReason::NoMedia)
+            };
+            // `0` disables the held ceiling. It is never a valid *media* timeout, so this only ever
+            // spares a held call.
+            if budget == 0 {
+                continue;
+            }
+            // Measured exactly as before — the latest accepted packet across every endpoint, text
+            // included (RFC 4103 text is media too, and a text-only exchange is not a dead path),
+            // falling back to the call's creation. A held call that *does* carry music-on-hold refreshes
+            // its own ceiling, which is right: it is demonstrably alive.
             let mut last_activity = call.created_tick;
             for endpoint in call.all_endpoint_ids() {
                 if let Some(seen) = self.datapath.last_activity(endpoint) {
                     last_activity = last_activity.max(seen);
                 }
             }
-            if now.saturating_sub(last_activity) >= idle_ticks {
-                stale.push(entry.key().clone());
+            if now.saturating_sub(last_activity) >= budget {
+                stale.push((entry.key().clone(), reason));
             }
         }
         // Second pass: tear each idle call down (no map guard held across the awaits). Shared with
         // consent failure — both are dead-path detections and must free identical state.
         let mut reaped = Vec::new();
-        for call_id in stale {
-            if self.reap_call(&call_id, "media_timeout").await {
+        for (call_id, reason) in stale {
+            let cdr_reason = match reason {
+                MediaTimeoutReason::HeldTooLong => "held_timeout",
+                _ => "media_timeout",
+            };
+            if self.reap_call(&call_id, cdr_reason, reason).await {
                 reaped.push(call_id);
             }
         }
@@ -10743,7 +11839,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         failed.push(conference_id);
                         continue;
                     }
-                    if self.reap_call(&call_id, "ice_failed").await {
+                    // An ICE failure is a dead path: no candidate pair ever succeeded, so there is no
+                    // media path to be held on. `NoMedia`, never the held reason.
+                    if self
+                        .reap_call(&call_id, "ice_failed", MediaTimeoutReason::NoMedia)
+                        .await
+                    {
                         tracing::warn!(
                             target: "siphon_rtp::media",
                             %call_id, ?endpoint,
@@ -10896,7 +11997,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // tick: `reap_call` removes it from the registry, so the second attempt is a
                     // no-op and must not double-count.
                     consent.unregister(endpoint);
-                    if self.reap_call(&call_id, "consent_failed").await {
+                    // A consent failure is a dead path by definition — the peer stopped answering
+                    // checks — so it reports `NoMedia` rather than either idle rule.
+                    if self
+                        .reap_call(&call_id, "consent_failed", MediaTimeoutReason::NoMedia)
+                        .await
+                    {
                         tracing::warn!(
                             target: "siphon_rtp::media",
                             %call_id,
@@ -10918,8 +12024,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ///
     /// The event is `MediaTimeout` for a consent failure too: the control contract has no dedicated
     /// ICE-state event yet, and to a controller both mean the same thing — this call's media path is
-    /// gone, tear the dialog down. The distinction is preserved in the CDR `reason` and the log.
-    async fn reap_call(&self, call_id: &str, reason: &str) -> bool {
+    /// gone, tear the dialog down. The distinction is preserved in the CDR `reason`, the log, and (for
+    /// the two idle rules) the event's own [`MediaTimeoutReason`].
+    async fn reap_call(
+        &self,
+        call_id: &str,
+        reason: &str,
+        timeout_reason: MediaTimeoutReason,
+    ) -> bool {
         let Some((_, call)) = self.calls.remove(call_id) else {
             return false;
         };
@@ -10929,6 +12041,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Event::MediaTimeout {
                 call_id: call_id.to_string(),
                 from_tag: call.from_tag,
+                reason: timeout_reason,
             },
         );
         true
@@ -10995,11 +12108,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// endpoints and tearing down any room left empty (the conference analogue of [`Engine::reap_idle`]
     /// — abandoned legs / a control client that disconnected without leaving never leak a room). Driven
     /// by the datapath's logical clock, so tests advance it via `advance_clock`.
-    pub async fn reap_idle_conferences(&self, idle_ticks: u64) -> usize {
+    pub async fn reap_idle_conferences(&self, idle_ticks: u64, held_idle_ticks: u64) -> usize {
         let now = self.datapath.now_ticks();
-        let freed = self.conference.reap_idle(now, idle_ticks, |endpoint| {
-            self.datapath.last_activity(endpoint)
-        });
+        let freed = self
+            .conference
+            .reap_idle(now, idle_ticks, held_idle_ticks, |endpoint| {
+                self.datapath.last_activity(endpoint)
+            });
         for endpoint in &freed {
             self.datapath.remove_endpoint(*endpoint).await;
             self.endpoint_calls.remove(endpoint);
@@ -11272,6 +12387,7 @@ fn ok_sdp(sdp: String, to_tag: Option<String>) -> CmdResult {
         sdp: Some(sdp),
         duration_ms: None,
         play_id: None,
+        recording_id: None,
         to_tag,
         stats: None,
     }
@@ -11433,6 +12549,7 @@ fn ok_empty() -> CmdResult {
         sdp: None,
         duration_ms: None,
         play_id: None,
+        recording_id: None,
         to_tag: None,
         stats: None,
     }
@@ -12373,6 +13490,11 @@ fn command_name(command: &Command) -> &'static str {
         Command::ConferenceLeave { .. } => "conference_leave",
         Command::ConferenceRoute { .. } => "conference_route",
         Command::ConferenceBridge { .. } => "conference_bridge",
+        Command::ConferencePlay { .. } => "conference_play",
+        Command::ConferenceStopPlay { .. } => "conference_stop_play",
+        Command::ConferenceSetPlayGain { .. } => "conference_set_play_gain",
+        Command::ConferenceStartRecording { .. } => "conference_start_recording",
+        Command::ConferenceStopRecording { .. } => "conference_stop_recording",
         Command::AttachWsTee { .. } => "attach_ws_tee",
         Command::DetachWsTee { .. } => "detach_ws_tee",
         Command::AttachWsBridge { .. } => "attach_ws_bridge",
@@ -12553,11 +13675,13 @@ fn unknown_call(call_id: &str) -> CmdResult {
 /// thread through three call sites).
 #[derive(Debug, Clone, Copy, Default)]
 struct PlayOptions {
-    /// Total play count for a recorded prompt; `0`/`None` plays it once.
-    repeat_times: Option<u64>,
+    /// How many times to play a recorded prompt: a total play count (`0`/`None` plays it once), or
+    /// [`PlayRepeat::Forever`] to play until stopped.
+    repeat_times: Option<PlayRepeat>,
     /// Seek into a recorded prompt before the first frame (and the point each loop rewinds to).
     start_pos_ms: Option<u64>,
-    /// Hard playout cap. The only bound on an endless tone short of a stop.
+    /// Hard playout cap. The only bound on an endless source short of a stop — a `*inf` tone or a
+    /// `PlayRepeat::Forever` prompt.
     duration_ms: Option<u64>,
     /// Mix under the party's live egress instead of replacing it.
     overlay: bool,
@@ -12565,11 +13689,20 @@ struct PlayOptions {
     gain_decibels: Option<i32>,
 }
 
+/// Default budget for the decoded-prompt cache: 64 MiB of samples.
+///
+/// Sized so an ordinary prompt library — a few dozen announcements and a hold bed, each a handful of
+/// seconds at 8 kHz — fits entirely, while a directory of long files still cannot grow the daemon
+/// without bound. At 8 kHz mono this is roughly an hour of audio in total.
+const DEFAULT_PROMPT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// A `play_media` source after it has been fetched/read and validated, but before the media actor
 /// has turned it into a playback on the leg's egress clock.
 enum ResolvedPlaySource {
-    /// Decoded linear PCM from a WAV (inline blob, host file, or fetched body).
-    Wav(WavSource),
+    /// Decoded, downmixed mono samples plus their native rate — from the prompt cache for a host
+    /// file, or decoded on the spot for an inline blob or a fetched body. Shared rather than owned,
+    /// so a hold bed playing to thirty callers is one buffer and thirty cursors.
+    Pcm(crate::prompt_cache::CachedPrompt),
     /// A parsed tone cadence, synthesised later at the leg's own rate.
     Tone(ToneSpec),
 }
@@ -12583,8 +13716,8 @@ struct MediaFetchRequest {
     url: String,
     toward_a: bool,
     options: PlayOptions,
-    /// Total play count for the fetched prompt (`0`/`1` play it once).
-    repeat: u32,
+    /// How many times to play the fetched prompt (`0`/`1` play it once, `Forever` until stopped).
+    repeat: PcmRepeat,
     /// Seek into the fetched prompt before the first frame.
     start_pos_ms: u32,
     play_id: u64,
@@ -12610,6 +13743,7 @@ impl PendingFetch {
     /// The completion event for this playback, keyed the same way the media actor keys its own.
     fn play_finished(&self, play_id: u64, reason: PlayEndReason) -> Event {
         Event::PlayFinished {
+            conference_id: None,
             call_id: self.call_id.clone(),
             from_tag: self.from_tag.clone(),
             to_tag: self.to_tag.clone(),
@@ -12638,7 +13772,14 @@ async fn fetch_and_start(
     // The fetched bytes are as untrusted as anything else off the network: validated through the
     // same pure-Rust RIFF/WAVE reader every other source uses, which errors rather than panics.
     let wav = WavSource::parse(&bytes).map_err(|error| format!("parse WAV: {error}"))?;
-    let player = PcmPlayer::new(&wav, request.repeat, request.start_pos_ms);
+    // Not cached: a fetched body is keyed by a URL whose freshness this engine does not own, and
+    // caching it would serve a stale prompt after the origin changed with no way to notice.
+    let player = PcmPlayer::from_shared(
+        wav.to_mono(),
+        wav.sample_rate_hz(),
+        request.repeat,
+        request.start_pos_ms,
+    );
     let gain = Gain::from_decibels(request.options.gain_decibels.unwrap_or(0));
 
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -12670,7 +13811,12 @@ async fn fetch_and_start(
 /// fetched body — validates through this one point, so a malformed buffer is a typed error rather
 /// than something each source handles its own way.
 fn parse_prompt_wav(bytes: &[u8]) -> Result<ResolvedPlaySource, WavError> {
-    WavSource::parse(bytes).map(ResolvedPlaySource::Wav)
+    WavSource::parse(bytes).map(|source| {
+        ResolvedPlaySource::Pcm(crate::prompt_cache::CachedPrompt {
+            mono: source.to_mono(),
+            sample_rate_hz: source.sample_rate_hz(),
+        })
+    })
 }
 
 /// Map a control-plane [`ConferenceRole`] to the conference's internal [`Routing`]. A whisperer stays
@@ -15193,13 +16339,13 @@ mod tests {
         assert_eq!(recovered, from_a);
 
         assert!(
-            engine.reap_idle(5).await.is_empty(),
+            engine.reap_idle(5, 0).await.is_empty(),
             "a secure bridge carrying audio is not idle"
         );
 
         engine.datapath().advance_clock(10);
         assert_eq!(
-            engine.reap_idle(5).await,
+            engine.reap_idle(5, 0).await,
             vec!["savp-idle".to_string()],
             "and one that has genuinely gone quiet is still reaped"
         );
@@ -15673,7 +16819,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await; // let the datapath stamp activity
 
         assert_eq!(
-            engine.reap_idle_conferences(3).await,
+            engine.reap_idle_conferences(3, 0).await,
             1,
             "the silent participant is reaped"
         );
@@ -15685,12 +16831,455 @@ mod tests {
         // Advance past alice's activity too — now the room drains and is torn down.
         engine.datapath().advance_clock(5);
         assert!(
-            engine.reap_idle_conferences(3).await >= 1,
+            engine.reap_idle_conferences(3, 0).await >= 1,
             "the now-idle participant is reaped"
         );
         assert!(
             !engine.conference().contains("room"),
             "empty room torn down"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listen_only_conference_seat_is_not_reaped_for_being_silent() {
+        // A webinar attendee joins `recvonly` and never sends a packet for the whole session — that is
+        // the seat working as signalled, not a dead one. The same rule the two-party reaper applies:
+        // silence is only evidence when the party said it would send.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let joined = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "webinar".into(),
+                    from_tag: "attendee".into(),
+                    sdp: sdp_with_direction(addr, "recvonly"),
+                    role: ConferenceRole::Listener,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        assert!(matches!(joined, CmdResult::Ok { .. }), "seated: {joined:?}");
+
+        engine.datapath().advance_clock(100);
+        assert_eq!(
+            engine.reap_idle_conferences(3, 1000).await,
+            0,
+            "a listen-only seat owes the room no media"
+        );
+        assert!(engine.conference().contains("webinar"), "room still up");
+
+        engine.datapath().advance_clock(1000);
+        assert!(
+            engine.reap_idle_conferences(3, 1000).await >= 1,
+            "and the held ceiling still frees an abandoned seat"
+        );
+    }
+
+    /// Seat one µ-law participant in `conference_id` and return the engine port it sends to.
+    async fn seat_participant(
+        engine: &Engine<UdpLoopbackDatapath>,
+        conference_id: &str,
+        tag: &str,
+        addr: SocketAddr,
+    ) -> SocketAddr {
+        let joined = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: conference_id.into(),
+                    from_tag: tag.into(),
+                    sdp: sdp_for(addr, true),
+                    role: ConferenceRole::Talker,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        sdp::parse(&ok_sdp_text(&joined))
+            .expect("the room's answer")
+            .remote_rtp
+    }
+
+    /// An 8 kHz mono WAV of `samples` constant-valued samples, as a `play_media` blob.
+    fn prompt_blob(samples: usize, value: i16) -> Vec<u8> {
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&vec![value; samples]);
+        recorder.into_wav()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_playback_is_heard_by_the_participants() {
+        // Nothing could be played into a room at all: every media verb resolves through `self.calls`,
+        // which a conference never enters, so `play_media` against a room id answered `unknown call`.
+        // An entry tone, a "this conference is being recorded" announcement and music for a lone
+        // participant are all this.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone, addr) = phone().await;
+        let _engine_port = seat_participant(&engine, "room-play", "alice", addr).await;
+
+        let played = engine
+            .handle(
+                CLIENT,
+                Command::ConferencePlay {
+                    conference_id: "room-play".into(),
+                    source: PlayMediaSource::Blob {
+                        data: prompt_blob(8000, 6000),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    gain_decibels: None,
+                },
+            )
+            .await;
+        let play_id = match played {
+            CmdResult::Ok {
+                play_id: Some(id), ..
+            } => id,
+            other => panic!("a room playback accepts with a play_id, got {other:?}"),
+        };
+
+        // The lone participant hears the announcement even though nobody in the room is talking —
+        // which is the case the mixer's `external` input exists for: heard by everyone, mixed against
+        // nobody.
+        let mut heard = false;
+        for _ in 0..40u16 {
+            let mut buffer = [0u8; 2048];
+            let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone.recv_from(&mut buffer)).await
+            else {
+                continue;
+            };
+            let parsed =
+                siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).expect("parse room egress");
+            if parsed
+                .payload
+                .iter()
+                .any(|&byte| byte != 0xFF && byte != 0x7F)
+            {
+                heard = true;
+                break;
+            }
+        }
+        assert!(heard, "the participant hears the room announcement");
+
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStopPlay {
+                    conference_id: "room-play".into(),
+                    play_id: Some(play_id),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stop accepted: {stopped:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_playback_reports_its_end_against_the_conference_not_a_call() {
+        // A room playback is not on a call, so the completion correlates by `conference_id` and
+        // leaves `call_id` empty rather than smuggling a room id into a field that means something
+        // else.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (_phone, addr) = phone().await;
+        seat_participant(&engine, "room-end", "alice", addr).await;
+
+        let played = engine
+            .handle(
+                CLIENT,
+                Command::ConferencePlay {
+                    conference_id: "room-end".into(),
+                    source: PlayMediaSource::Blob {
+                        data: prompt_blob(320, 4000),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    gain_decibels: None,
+                },
+            )
+            .await;
+        let play_id = match played {
+            CmdResult::Ok {
+                play_id: Some(id),
+                duration_ms: Some(40),
+                ..
+            } => id,
+            other => panic!("expected a 40 ms accept with a play_id, got {other:?}"),
+        };
+
+        let mut finished = None;
+        for _ in 0..60u16 {
+            match timeout(Duration::from_millis(200), events.recv_async()).await {
+                Ok(Ok(Event::PlayFinished {
+                    call_id,
+                    conference_id,
+                    play_id: id,
+                    reason,
+                    ..
+                })) => {
+                    finished = Some((call_id, conference_id, id, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        let (call_id, conference_id, id, reason) =
+            finished.expect("the room playback reports its end");
+        assert_eq!(id, play_id);
+        assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
+        assert_eq!(
+            conference_id.as_deref(),
+            Some("room-end"),
+            "correlated by room"
+        );
+        assert!(call_id.is_empty(), "and not by a call it never ran on");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn room_playback_verbs_refuse_an_unknown_room_or_play_id() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        seat_participant(&engine, "room-errors", "alice", addr).await;
+
+        for result in [
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferencePlay {
+                        conference_id: "no-such-room".into(),
+                        source: PlayMediaSource::Blob {
+                            data: prompt_blob(160, 1),
+                        },
+                        repeat_times: None,
+                        start_pos_ms: None,
+                        duration_ms: None,
+                        gain_decibels: None,
+                    },
+                )
+                .await,
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferenceStopPlay {
+                        conference_id: "no-such-room".into(),
+                        play_id: Some(1),
+                    },
+                )
+                .await,
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferenceSetPlayGain {
+                        conference_id: "no-such-room".into(),
+                        play_id: 1,
+                        gain_decibels: -6,
+                    },
+                )
+                .await,
+            // A real room, but an id that is not running: a hollow success would leave a controller
+            // believing it had stopped something it had not.
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferenceStopPlay {
+                        conference_id: "room-errors".into(),
+                        play_id: Some(9999),
+                    },
+                )
+                .await,
+            engine
+                .handle(
+                    CLIENT,
+                    Command::ConferenceSetPlayGain {
+                        conference_id: "room-errors".into(),
+                        play_id: 9999,
+                        gain_decibels: -6,
+                    },
+                )
+                .await,
+        ] {
+            assert!(
+                matches!(result, CmdResult::Error { .. }),
+                "expected a refusal, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_recording_captures_the_mix_and_reports_the_finished_file() {
+        // Nothing could record a room either. This taps the *listener* mix — what a listener hears,
+        // bridged audio and announcements included — through the same streaming WAV writer a call
+        // recording uses, so both produce the same file and the same completion event.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone, addr) = phone().await;
+        let engine_port = seat_participant(&engine, "room-rec", "alice", addr).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStartRecording {
+                    conference_id: "room-rec".into(),
+                    path: None,
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    max_duration_ms: None,
+                    silence_ms: None,
+                },
+            )
+            .await;
+        let recording_id = match started {
+            CmdResult::Ok {
+                recording_id: Some(id),
+                ..
+            } => id,
+            other => panic!("a room recording accepts with a recording_id, got {other:?}"),
+        };
+
+        // Alice talks into the room.
+        for sequence in 0..12u16 {
+            phone
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), engine_port)
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStopRecording {
+                    conference_id: "room-rec".into(),
+                    recording_id: Some(recording_id.clone()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stop accepted: {stopped:?}"
+        );
+
+        let mut finished = None;
+        for _ in 0..60u16 {
+            match timeout(Duration::from_millis(200), events.recv_async()).await {
+                Ok(Ok(Event::RecordingFinished {
+                    conference_id,
+                    recording_id: id,
+                    path,
+                    duration_ms,
+                    reason,
+                    ..
+                })) => {
+                    finished = Some((conference_id, id, path, duration_ms, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        let (conference_id, id, path, duration_ms, reason) =
+            finished.expect("a recording_finished event arrives");
+        assert_eq!(id, recording_id);
+        assert_eq!(conference_id.as_deref(), Some("room-rec"));
+        assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::Stopped);
+        assert!(duration_ms > 0, "the room mix was recorded");
+
+        let bytes = std::fs::read(path.expect("the event names the file")).expect("read");
+        let parsed = siphon_rtp_media::player::WavSource::parse(&bytes)
+            .expect("the finished file is a valid WAV");
+        assert_eq!(
+            parsed.sample_rate_hz(),
+            crate::conference::WIDEBAND_RECORDING_RATE_HZ,
+            "a room recording is pinned to one rate for its lifetime"
+        );
+        assert_eq!(parsed.channels(), 1);
+        assert!(
+            !parsed.samples().is_empty(),
+            "the header was finalized with the audio it holds"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_recording_refuses_an_unknown_room_and_an_unwritable_path() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        seat_participant(&engine, "room-rec-errors", "alice", addr).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let unknown = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStartRecording {
+                    conference_id: "no-such-room".into(),
+                    path: None,
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    max_duration_ms: None,
+                    silence_ms: None,
+                },
+            )
+            .await;
+        assert!(matches!(unknown, CmdResult::Error { .. }));
+
+        let unwritable = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceStartRecording {
+                    conference_id: "room-rec-errors".into(),
+                    path: Some(
+                        dir.path()
+                            .join("no-such-directory")
+                            .join("room.wav")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    recording_dir: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                },
+            )
+            .await;
+        match unwritable {
+            CmdResult::Error { reason } => assert!(reason.contains("open"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            engine.recordings.is_empty(),
+            "nothing was registered for a start that failed"
         );
     }
 
@@ -17646,7 +19235,7 @@ mod tests {
 
         // The caller never sends a packet, so the leg is idle from creation and the sweeper takes it.
         engine.datapath().advance_clock(10);
-        assert_eq!(engine.reap_idle(5).await, vec!["al-ws-reap".to_string()]);
+        assert_eq!(engine.reap_idle(5, 0).await, vec!["al-ws-reap".to_string()]);
         assert!(
             !engine.ws().is_ws_call("al-ws-reap"),
             "the reaped call's WS bridge is deregistered"
@@ -17945,7 +19534,7 @@ mod tests {
         );
 
         assert!(
-            engine.reap_idle(5).await.is_empty(),
+            engine.reap_idle(5, 0).await.is_empty(),
             "a takeover call being talked into is not idle"
         );
         assert!(
@@ -17956,7 +19545,7 @@ mod tests {
         // Now the caller goes quiet: the sweep must still do its job.
         engine.datapath().advance_clock(10);
         assert_eq!(
-            engine.reap_idle(5).await,
+            engine.reap_idle(5, 0).await,
             vec!["ws-idle".to_string()],
             "a takeover call whose caller has stopped sending is still reaped"
         );
@@ -18705,6 +20294,13 @@ mod tests {
             else {
                 continue;
             };
+            // Skip the periodic RTCP sender report: it rides the same muxed socket (RFC 5761) and is
+            // SRTCP, which the SRTP context deliberately cannot authenticate. Under load it can be the
+            // first datagram to arrive, so a test that assumed RTP here failed for the wrong reason.
+            // RFC 3550 §A.11: a muxed RTCP packet's payload type is 200..=204.
+            if matches!(buffer[1] & 0x7F, 200..=204) {
+                continue;
+            }
             // Authenticating under the engine's advertised key is the whole assertion: SRTP appends a
             // keyed auth tag over the header and the encrypted payload (RFC 3711 §3.1), so a
             // plaintext frame — the leak this path used to refuse rather than risk — cannot pass it.
@@ -19153,6 +20749,12 @@ mod tests {
                             call_id: "egress-audit".into(),
                             from_tag: "tag-a".into(),
                             recording_dir: None,
+                            format: None,
+                            direction: None,
+                            channels: None,
+                            max_duration_ms: None,
+                            silence_ms: None,
+                            path: None,
                         },
                     )
                     .await,
@@ -19774,6 +21376,82 @@ mod tests {
             matches!(result, CmdResult::Error { .. }),
             "an unsupported DTMF digit is rejected, not truncated"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_dtmf_toward_a_leg_with_no_telephone_event_is_an_error_not_a_silent_no_op() {
+        // The defect: the engine answered from whether the control message reached the actor's
+        // mailbox, so a `play_dtmf` toward a leg that never negotiated `telephone-event` was accepted
+        // and nothing went on the wire. On a PBX that is a feature code forwarded to a carrier or a
+        // flow step navigating a remote menu, and a silent no-op there reads as the far end ignoring
+        // the digits.
+        //
+        // A transcoding call (µ-law ↔ A-law, so the media path is userspace) where **neither** party
+        // offered a telephone-event payload type.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+        );
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=rtcp-mux\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+        );
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dtmf-none".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dtmf-none".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            engine.media().is_transcoding_call("dtmf-none"),
+            "the codec mismatch puts this call on the userspace media path"
+        );
+
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::PlayDtmf {
+                    call_id: "dtmf-none".into(),
+                    from_tag: "tag-a".into(),
+                    code: "123".into(),
+                    duration_ms: None,
+                    volume_dbm0: None,
+                    pause_ms: None,
+                    to_tag: Some("tag-b".into()),
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("no telephone-event payload type negotiated"),
+                "the refusal names why nothing could be sent, got: {reason}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -20762,6 +22440,12 @@ mod tests {
                     call_id: "rec-e2e".into(),
                     from_tag: "tag-a".into(),
                     recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;
@@ -20838,6 +22522,7 @@ mod tests {
                 Command::StopRecording {
                     call_id: "rec-e2e".into(),
                     from_tag: "tag-a".into(),
+                    recording_id: None,
                 },
             )
             .await;
@@ -20889,6 +22574,12 @@ mod tests {
                     call_id: "savp-rec".into(),
                     from_tag: "tag-a".into(),
                     recording_dir: Some("/tmp".into()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;
@@ -20904,6 +22595,12 @@ mod tests {
                     call_id: "nope".into(),
                     from_tag: "f".into(),
                     recording_dir: Some("/tmp".into()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;
@@ -21360,6 +23057,7 @@ mod tests {
         for _ in 0..50u16 {
             match timeout(Duration::from_millis(200), events_rx.recv_async()).await {
                 Ok(Ok(Event::PlayFinished {
+                    conference_id: None,
                     call_id,
                     play_id: id,
                     reason,
@@ -21379,6 +23077,761 @@ mod tests {
         assert_eq!(id, play_id, "the completion carries the accept's play_id");
         assert_eq!(reason, siphon_rtp_proto::PlayEndReason::Completed);
         assert_eq!(played_ms, Some(40), "the whole 40 ms prompt played");
+    }
+
+    /// Offer + `answer_local` a single-leg µ-law call and start a decoded recording on it — the
+    /// voicemail shape: one party, the engine as the far side, recording begun at a moment the
+    /// controller picks rather than at answer.
+    async fn voicemail_call(
+        engine: &Engine<UdpLoopbackDatapath>,
+        call_id: &str,
+        addr: SocketAddr,
+    ) -> SocketAddr {
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        sdp::parse(&ok_sdp_text(&answered))
+            .expect("the engine's answer")
+            .remote_rtp
+    }
+
+    /// Wait for the `recording_finished` event for `recording_id`, skipping anything else.
+    async fn next_recording_finished(
+        events: &flume::Receiver<Event>,
+    ) -> Option<(
+        String,
+        Option<String>,
+        u64,
+        siphon_rtp_proto::RecordingEndReason,
+    )> {
+        for _ in 0..60u16 {
+            match timeout(Duration::from_millis(200), events.recv_async()).await {
+                Ok(Ok(Event::RecordingFinished {
+                    recording_id,
+                    path,
+                    duration_ms,
+                    reason,
+                    ..
+                })) => return Some((recording_id, path, duration_ms, reason)),
+                Ok(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_voicemail_records_the_caller_and_reports_the_finished_file() {
+        // The whole P3 shape end to end: a single-leg `answer_local` call (which `record_call` cannot
+        // reach at all — `promote_to_processing` hardcodes `record_path: None`), recording started at
+        // runtime, decoded audio streamed to disk, and a completion event that arrives only once the
+        // file is closed. A consumer that acts on the event must never read a half-written file.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone, addr) = phone().await;
+        let engine_near = voicemail_call(&engine, "vm", addr).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "vm".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                    direction: Some(siphon_rtp_proto::RecordingDirection::Ingress),
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
+                },
+            )
+            .await;
+        let recording_id = match started {
+            CmdResult::Ok {
+                recording_id: Some(id),
+                ..
+            } => id,
+            other => panic!("a wav recording accepts with a recording_id, got {other:?}"),
+        };
+
+        // The caller speaks: ten µ-law frames of a constant non-zero level.
+        for sequence in 0..10u16 {
+            phone
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), engine_near)
+                .await
+                .expect("caller send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopRecording {
+                    call_id: "vm".into(),
+                    from_tag: "tag-a".into(),
+                    recording_id: Some(recording_id.clone()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stop accepted: {stopped:?}"
+        );
+
+        let (finished_id, path, duration_ms, reason) = next_recording_finished(&events)
+            .await
+            .expect("a recording_finished event arrives");
+        assert_eq!(finished_id, recording_id, "the event correlates by id");
+        assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::Stopped);
+        assert!(duration_ms > 0, "the caller's audio was recorded");
+
+        // The file the event names is closed, complete, and readable by the tree's own WAV reader.
+        let path = path.expect("the event names the file");
+        let bytes = std::fs::read(&path).expect("the file exists when the event arrives");
+        let parsed = siphon_rtp_media::player::WavSource::parse(&bytes)
+            .expect("the finished file is a valid WAV");
+        assert_eq!(parsed.sample_rate_hz(), 8000, "µ-law decodes to 8 kHz PCM");
+        assert_eq!(parsed.channels(), 1);
+        assert!(
+            parsed.samples().iter().any(|&sample| sample != 0),
+            "the recording holds the caller's audio, not silence"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recording_is_finalized_when_the_call_ends_under_it() {
+        // A caller hanging up is the *normal* way a voicemail message ends, so teardown has to
+        // produce a finished, playable file and a `call_ended` completion — not a valid WAV declaring
+        // zero samples, which is what aborting the writer task would leave.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone, addr) = phone().await;
+        let engine_near = voicemail_call(&engine, "vm-hangup", addr).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "vm-hangup".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            started,
+            CmdResult::Ok {
+                recording_id: Some(_),
+                ..
+            }
+        ));
+        for sequence in 0..6u16 {
+            phone
+                .send_to(&g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20), engine_near)
+                .await
+                .expect("caller send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        engine
+            .handle(
+                CLIENT,
+                Command::Delete {
+                    call_id: "vm-hangup".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: None,
+                },
+            )
+            .await;
+
+        let (_id, path, duration_ms, reason) = next_recording_finished(&events)
+            .await
+            .expect("teardown still produces a completion event");
+        assert_eq!(reason, siphon_rtp_proto::RecordingEndReason::CallEnded);
+        assert!(
+            duration_ms > 0,
+            "the audio recorded before the hangup is kept"
+        );
+        let bytes = std::fs::read(path.expect("path")).expect("read");
+        let parsed = siphon_rtp_media::player::WavSource::parse(&bytes)
+            .expect("a hangup still leaves a valid WAV");
+        assert!(
+            !parsed.samples().is_empty(),
+            "the header was finalized, so the file declares the audio it holds"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_explicit_path_is_honoured_and_an_unknown_recording_id_is_refused() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let _events = engine.register_client(CLIENT);
+        let (_phone, addr) = phone().await;
+        let _ = voicemail_call(&engine, "vm-path", addr).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wanted = dir.path().join("greeting-reply.wav");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "vm-path".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: None,
+                    format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: Some(wanted.to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+        assert!(matches!(
+            started,
+            CmdResult::Ok {
+                recording_id: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            wanted.exists(),
+            "the recording opened exactly the file it was told to"
+        );
+
+        // A stop for an id that is not running is an error, not a hollow success — a controller that
+        // believes it stopped a recording and did not has no way to notice.
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopRecording {
+                    call_id: "vm-path".into(),
+                    from_tag: "tag-a".into(),
+                    recording_id: Some("rec-does-not-exist".into()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Error { .. }),
+            "an unknown recording id is refused, got {stopped:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unwritable_recording_path_fails_the_verb_with_the_call_untouched() {
+        // The file is opened before anything is promoted or attached, so a provisioning mistake is a
+        // clean error on the verb rather than a `RecordingFinished{Error}` minutes later for a
+        // recording the controller believes is running.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let _ = voicemail_call(&engine, "vm-bad-path", addr).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unwritable = dir.path().join("no-such-directory").join("message.wav");
+
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "vm-bad-path".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: None,
+                    format: Some(siphon_rtp_proto::RecordingFormat::Wav),
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: Some(unwritable.to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+        match started {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("open"),
+                "the refusal names the path problem, got: {reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            engine.recordings.is_empty(),
+            "no recording was registered for a start that failed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pcap_recording_is_unchanged_by_the_wav_form() {
+        // `format` absent must still mean pcap, byte for byte what it meant before — an existing
+        // controller (and the whole NG front-end) sends exactly this.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "pcap-default".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "pcap-default".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = engine
+            .handle(
+                CLIENT,
+                Command::StartRecording {
+                    call_id: "pcap-default".into(),
+                    from_tag: "tag-a".into(),
+                    recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                started,
+                CmdResult::Ok {
+                    recording_id: None,
+                    ..
+                }
+            ),
+            "a pcap recording carries no recording_id, got {started:?}"
+        );
+        assert!(
+            dir.path().join("pcap-default.pcap").exists(),
+            "the pcap landed at its historical path"
+        );
+        assert!(
+            engine.media().is_relay_call("pcap-default"),
+            "a pcap recording still takes the relay-only hold, not a processing one"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_endless_hold_bed_accepts_with_no_duration_and_keeps_playing_until_stopped() {
+        // Music on hold, end to end. The accept must carry **no** `duration_ms` — there is none to
+        // report — and the bed must still be playing long after a finite prompt of the same length
+        // would have drained, ending only when the controller stops it.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events_rx = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "hold-bed".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        // A 40 ms bed: two frames at a 20 ms ptime, so a finite play would be over almost at once.
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[1000i16; 320]);
+        let wav = recorder.into_wav();
+
+        let accepted = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "hold-bed".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Blob { data: wav },
+                    repeat_times: Some(PlayRepeat::Forever),
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
+                    to_tag: None,
+                },
+            )
+            .await;
+        let play_id = match accepted {
+            CmdResult::Ok {
+                duration_ms,
+                play_id: Some(id),
+                ..
+            } => {
+                assert_eq!(
+                    duration_ms, None,
+                    "an endless bed has no duration to promise"
+                );
+                id
+            }
+            other => panic!("an endless play accepts with a play_id, got {other:?}"),
+        };
+
+        // Well past the 40 ms the body is long: still producing audio, and no PlayFinished.
+        let mut frames = 0u32;
+        for _ in 0..8u16 {
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+            {
+                assert!(
+                    siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).is_ok(),
+                    "the bed keeps emitting well-formed RTP"
+                );
+                frames += 1;
+            }
+        }
+        assert!(
+            frames >= 4,
+            "the bed looped well past its own 40 ms body, got {frames} frames"
+        );
+        assert!(
+            events_rx.try_recv().is_err(),
+            "an endless bed does not finish on its own"
+        );
+
+        // It ends when, and only when, the controller says so.
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopMedia {
+                    call_id: "hold-bed".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: Some(play_id),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stop accepted: {stopped:?}"
+        );
+        let mut finished = None;
+        for _ in 0..50u16 {
+            match timeout(Duration::from_millis(200), events_rx.recv_async()).await {
+                Ok(Ok(Event::PlayFinished {
+                    play_id: id,
+                    reason,
+                    ..
+                })) => {
+                    finished = Some((id, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            finished,
+            Some((play_id, siphon_rtp_proto::PlayEndReason::Stopped)),
+            "the endless bed ends as Stopped, never as Completed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_duration_cap_still_bounds_an_endless_prompt() {
+        // The cap is the one bound on an endless source short of a stop, and it must report the cap
+        // as the accepted duration rather than nothing — the same answer a capped `*inf` tone gives.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "capped-bed".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[1000i16; 320]);
+        let accepted = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "capped-bed".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Blob {
+                        data: recorder.into_wav(),
+                    },
+                    repeat_times: Some(PlayRepeat::Forever),
+                    start_pos_ms: None,
+                    duration_ms: Some(45_000),
+                    overlay: true,
+                    gain_decibels: Some(-12),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                accepted,
+                CmdResult::Ok {
+                    duration_ms: Some(45_000),
+                    play_id: Some(_),
+                    ..
+                }
+            ),
+            "a capped endless bed reports the cap, got {accepted:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prompt_played_to_many_callers_is_decoded_once() {
+        // The queue case: thirty waiting callers on one hold bed used to be thirty file reads, thirty
+        // RIFF parses and thirty downmixes — three allocations proportional to prompt length, per
+        // call. Now it is one decode and one shared buffer.
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hold.wav");
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[1000i16; 800]);
+        std::fs::write(&path, recorder.into_wav()).expect("write prompt");
+
+        for index in 0..3u8 {
+            let call_id = format!("queued-{index}");
+            let (_phone, addr) = phone().await;
+            engine
+                .handle(
+                    CLIENT,
+                    Command::Offer {
+                        call_id: call_id.clone(),
+                        from_tag: "tag-a".into(),
+                        sdp: sdp_for(addr, true),
+                        profile: Default::default(),
+                    },
+                )
+                .await;
+            let played = engine
+                .handle(
+                    CLIENT,
+                    Command::PlayMedia {
+                        call_id,
+                        from_tag: "tag-a".into(),
+                        source: PlayMediaSource::File {
+                            path: path.to_string_lossy().into_owned(),
+                        },
+                        repeat_times: None,
+                        start_pos_ms: None,
+                        duration_ms: None,
+                        overlay: false,
+                        gain_decibels: None,
+                        to_tag: None,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(played, CmdResult::Ok { .. }),
+                "caller {index} hears the bed: {played:?}"
+            );
+        }
+
+        let (hits, misses) = engine.prompts().stats();
+        assert_eq!(misses, 1, "the prompt was decoded exactly once");
+        assert_eq!(hits, 2, "the other two plays read the cached samples");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mu_law_prompt_plays_end_to_end() {
+        // Prompts exported from another system are very often G.711, and the reader used to refuse
+        // them outright (`unsupported WAV format tag 7`) — so a perfectly playable file could not be
+        // provisioned without converting it first.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("greeting-ulaw.wav");
+        let payload = vec![0x20u8; 800];
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"RIFF");
+        buffer.extend_from_slice(&0u32.to_le_bytes());
+        buffer.extend_from_slice(b"WAVE");
+        buffer.extend_from_slice(b"fmt ");
+        buffer.extend_from_slice(&16u32.to_le_bytes());
+        buffer.extend_from_slice(&7u16.to_le_bytes()); // mu-law
+        buffer.extend_from_slice(&1u16.to_le_bytes());
+        buffer.extend_from_slice(&8000u32.to_le_bytes());
+        buffer.extend_from_slice(&8000u32.to_le_bytes());
+        buffer.extend_from_slice(&1u16.to_le_bytes());
+        buffer.extend_from_slice(&8u16.to_le_bytes());
+        buffer.extend_from_slice(b"data");
+        buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&payload);
+        std::fs::write(&path, &buffer).expect("write prompt");
+
+        let (_phone, addr) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "ulaw-prompt".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let played = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "ulaw-prompt".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::File {
+                        path: path.to_string_lossy().into_owned(),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                played,
+                CmdResult::Ok {
+                    duration_ms: Some(100),
+                    ..
+                }
+            ),
+            "800 mu-law bytes at 8 kHz is 100 ms of audio, got {played:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_recording_a_prompt_is_picked_up_without_restarting_the_engine() {
+        // An operator who re-records a greeting and keeps hearing the old one has no way to tell the
+        // cache is why, so freshness is part of the key rather than an operational step.
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("greeting.wav");
+
+        let play = |call_id: String, path: std::path::PathBuf| {
+            let engine = &engine;
+            async move {
+                let (_phone, addr) = phone().await;
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::Offer {
+                            call_id: call_id.clone(),
+                            from_tag: "tag-a".into(),
+                            sdp: sdp_for(addr, true),
+                            profile: Default::default(),
+                        },
+                    )
+                    .await;
+                engine
+                    .handle(
+                        CLIENT,
+                        Command::PlayMedia {
+                            call_id,
+                            from_tag: "tag-a".into(),
+                            source: PlayMediaSource::File {
+                                path: path.to_string_lossy().into_owned(),
+                            },
+                            repeat_times: None,
+                            start_pos_ms: None,
+                            duration_ms: None,
+                            overlay: false,
+                            gain_decibels: None,
+                            to_tag: None,
+                        },
+                    )
+                    .await
+            }
+        };
+
+        let mut short = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        short.write_pcm(&[500i16; 800]); // 100 ms
+        std::fs::write(&path, short.into_wav()).expect("write");
+        let first = play("greet-1".to_string(), path.clone()).await;
+        assert!(matches!(
+            first,
+            CmdResult::Ok {
+                duration_ms: Some(100),
+                ..
+            }
+        ));
+
+        let mut longer = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        longer.write_pcm(&[500i16; 1600]); // 200 ms
+        std::fs::write(&path, longer.into_wav()).expect("rewrite");
+        let second = play("greet-2".to_string(), path).await;
+        assert!(
+            matches!(
+                second,
+                CmdResult::Ok {
+                    duration_ms: Some(200),
+                    ..
+                }
+            ),
+            "the re-recorded prompt is served, got {second:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21831,6 +24284,7 @@ mod tests {
         assert_eq!(
             event,
             Event::PlayFinished {
+                conference_id: None,
                 call_id: "url-stop".into(),
                 from_tag: "tag-a".into(),
                 to_tag: None,
@@ -21980,7 +24434,7 @@ mod tests {
         // Tick 14: only 4 ticks since the stamp (< 5) → recent media keeps the active call alive.
         engine.datapath().advance_clock(4);
         assert!(
-            engine.reap_idle(5).await.is_empty(),
+            engine.reap_idle(5, 0).await.is_empty(),
             "an actively-echoing call is not reaped"
         );
         assert!(
@@ -21991,7 +24445,7 @@ mod tests {
         // Tick 20: 10 ticks of silence (>= 5) → the now-silent call times out and is reaped.
         engine.datapath().advance_clock(6);
         assert_eq!(
-            engine.reap_idle(5).await,
+            engine.reap_idle(5, 0).await,
             vec!["echo-idle".to_string()],
             "a silent single-leg echo call is reaped"
         );
@@ -22164,6 +24618,12 @@ mod tests {
                     call_id: "bd-2".into(),
                     from_tag: "tag-a".into(),
                     recording_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;
@@ -22205,6 +24665,7 @@ mod tests {
                 Command::StopRecording {
                     call_id: "bd-2".into(),
                     from_tag: "tag-a".into(),
+                    recording_id: None,
                 },
             )
             .await;
@@ -24034,15 +26495,304 @@ mod tests {
         // Tick 8: idle since the packet (tick 4) is 4 < 5 → recent media keeps the call alive.
         engine.datapath().advance_clock(4);
         assert!(
-            engine.reap_idle(5).await.is_empty(),
+            engine.reap_idle(5, 0).await.is_empty(),
             "recent media defers reaping"
         );
         assert_eq!(engine.session_count(), 1);
 
         // Tick 13: idle since tick 4 is 9 >= 5 → the silent call is reaped and its ports freed.
         engine.datapath().advance_clock(5);
-        assert_eq!(engine.reap_idle(5).await, vec!["c".to_string()]);
+        assert_eq!(engine.reap_idle(5, 0).await, vec!["c".to_string()]);
         assert_eq!(engine.session_count(), 0);
+    }
+
+    /// `sdp_for` with a direction attribute appended — the one line that separates a held call from a
+    /// dead one (RFC 4566 §6).
+    fn sdp_with_direction(rtp: SocketAddr, direction: &str) -> String {
+        format!("{}a={direction}\r\n", sdp_for(rtp, false))
+    }
+
+    /// Offer + answer a two-party call whose parties declare `offer_direction` / `answer_direction`.
+    async fn held_call(
+        engine: &Engine<UdpLoopbackDatapath>,
+        client: ClientId,
+        call_id: &str,
+        addr_a: SocketAddr,
+        addr_b: SocketAddr,
+        offer_direction: &str,
+        answer_direction: &str,
+    ) {
+        engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_with_direction(addr_a, offer_direction),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                client,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_with_direction(addr_b, answer_direction),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_call_outlives_the_media_timeout_and_reaps_on_its_own_ceiling() {
+        // The defect this closes: hold is the most common mid-call operation on a PBX and it is
+        // precisely the state where both parties legitimately stop sending (RFC 3264 §8.4 lets a held
+        // endpoint transmit nothing at all). Judged by "no packets from anyone", such a call was torn
+        // down 30 s in, while the person was still holding the handset.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(11);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "held", addr_a, addr_b, "sendonly", "recvonly",
+        )
+        .await;
+
+        // Far past the media timeout, and not one packet has been sent by either party.
+        engine.datapath().advance_clock(100);
+        assert!(
+            engine.reap_idle(5, 1000).await.is_empty(),
+            "neither party is expected to send, so their silence is not a dead path"
+        );
+        assert_eq!(engine.session_count(), 1);
+
+        // Past the held ceiling, it does end — a call abandoned on hold is still freed eventually.
+        engine.datapath().advance_clock(1000);
+        assert_eq!(engine.reap_idle(5, 1000).await, vec!["held".to_string()]);
+        assert_eq!(engine.session_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_shape_of_hold_is_recognised_and_an_active_call_is_not() {
+        // The shapes RFC 3264 §8.4 defines for hold, plus the control. `sendonly`/`recvonly` counts as
+        // held in *both* orientations: §8.4 lets the sending side send nothing, so the attribute pair
+        // is what identifies the state, not which end wrote which half.
+        for (offer_direction, answer_direction, held) in [
+            ("inactive", "inactive", true),
+            ("sendonly", "recvonly", true),
+            ("recvonly", "sendonly", true),
+            ("sendrecv", "inactive", true), // only one end holds; the call is still off two-way media
+            ("sendrecv", "sendrecv", false),
+        ] {
+            let engine = Engine::new(UdpLoopbackDatapath::new());
+            let client = ClientId(12);
+            let (_phone_a, addr_a) = phone().await;
+            let (_phone_b, addr_b) = phone().await;
+            held_call(
+                &engine,
+                client,
+                "c",
+                addr_a,
+                addr_b,
+                offer_direction,
+                answer_direction,
+            )
+            .await;
+
+            engine.datapath().advance_clock(100);
+            let reaped = engine.reap_idle(5, 0).await;
+            assert_eq!(
+                reaped.is_empty(),
+                held,
+                "offer a={offer_direction} / answer a={answer_direction}: held={held}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_call_never_ages_out_when_the_held_ceiling_is_disabled() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(13);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "parked", addr_a, addr_b, "inactive", "inactive",
+        )
+        .await;
+
+        engine.datapath().advance_clock(1_000_000);
+        assert!(
+            engine.reap_idle(5, 0).await.is_empty(),
+            "`0` disables the held ceiling — such a call is freed by `delete` alone"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn taking_a_call_off_hold_re_arms_the_dead_path_timer() {
+        // A re-offer restates the offering party's own direction, so the unhold must put the call back
+        // under the short ceiling — otherwise a call that was ever held would keep the two-hour budget
+        // for the rest of its life and a genuinely dead path after an unhold would never be reaped.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(14);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "unhold", addr_a, addr_b, "sendonly", "recvonly",
+        )
+        .await;
+        engine.datapath().advance_clock(100);
+        assert!(engine.reap_idle(5, 1000).await.is_empty(), "still held");
+
+        // A re-offers with `sendrecv` — the unhold. It carries no direction attribute at all, which is
+        // exactly what RFC 4566 §6 says `sendrecv` means, so the absence has to re-arm too.
+        let reoffer = engine
+            .handle(
+                client,
+                Command::Reoffer {
+                    call_id: "unhold".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(reoffer, CmdResult::Ok { .. }),
+            "the re-offer is accepted: {reoffer:?}"
+        );
+        engine
+            .handle(
+                client,
+                Command::Answer {
+                    call_id: "unhold".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        engine.datapath().advance_clock(100);
+        assert_eq!(
+            engine.reap_idle(5, 1000).await,
+            vec!["unhold".to_string()],
+            "off hold and silent is a dead path again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_leg_call_is_held_by_its_only_partys_own_direction() {
+        // An `answer_local` call (IVR, announcement, voicemail) has no second party: the engine is the
+        // far side, and its own egress is not something to time out on. So the caller's direction is
+        // the whole question — a caller that holds the IVR sends nothing and must not be reaped.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(15);
+        let (_phone, addr) = phone().await;
+        engine
+            .handle(
+                client,
+                Command::AnswerLocal {
+                    call_id: "ivr-held".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_with_direction(addr, "inactive"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        engine.datapath().advance_clock(100);
+        assert!(
+            engine.reap_idle(5, 1000).await.is_empty(),
+            "the caller told us it would send nothing"
+        );
+        engine.datapath().advance_clock(1000);
+        assert_eq!(
+            engine.reap_idle(5, 1000).await,
+            vec!["ivr-held".to_string()],
+            "and the held ceiling still ends it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn music_on_hold_refreshes_a_held_calls_own_ceiling() {
+        // A held call that *does* carry audio — the `sendonly` party streaming music on hold — is
+        // demonstrably alive, so its ceiling restarts from the media rather than from call setup. The
+        // held budget is a backstop against an abandoned call, not a cap on how long hold may last.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(16);
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "moh", addr_a, addr_b, "sendonly", "recvonly",
+        )
+        .await;
+        let near_rtp = engine
+            .calls
+            .get("moh")
+            .map(|call| call.near.rtp.local_addr)
+            .expect("the call has a near leg");
+
+        engine.datapath().advance_clock(8);
+        phone_a
+            .send_to(&rtp(0x9999_0000), near_rtp)
+            .await
+            .expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Tick 16: 8 since the music, under the 10-tick held ceiling.
+        engine.datapath().advance_clock(8);
+        assert!(
+            engine.reap_idle(5, 10).await.is_empty(),
+            "the hold music refreshed the ceiling"
+        );
+
+        engine.datapath().advance_clock(20);
+        assert_eq!(
+            engine.reap_idle(5, 10).await,
+            vec!["moh".to_string()],
+            "and once even the music stops, the held ceiling still ends it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reaped_event_names_which_rule_fired() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(17);
+        let events = engine.register_client(client);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "held", addr_a, addr_b, "inactive", "inactive",
+        )
+        .await;
+
+        engine.datapath().advance_clock(20);
+        assert_eq!(engine.reap_idle(5, 10).await, vec!["held".to_string()]);
+
+        let mut reason = None;
+        let mut cdr_reason = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::MediaTimeout { reason: seen, .. } => reason = Some(seen),
+                Event::CallSummary { reason: seen, .. } => cdr_reason = Some(seen),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            reason,
+            Some(MediaTimeoutReason::HeldTooLong),
+            "a controller can tell 'the path died' from 'held too long'"
+        );
+        assert_eq!(
+            cdr_reason.as_deref(),
+            Some("held_timeout"),
+            "and the CDR records the same distinction"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -24065,7 +26815,7 @@ mod tests {
             .await;
 
         engine.datapath().advance_clock(10);
-        assert_eq!(engine.reap_idle(5).await, vec!["gone".to_string()]);
+        assert_eq!(engine.reap_idle(5, 0).await, vec!["gone".to_string()]);
 
         // Reaping pushes two events to the owner: the end-of-call `CallSummary` (CDR) and the
         // `MediaTimeout` dead-path signal SIPhon already relies on. Both must fire (additive).
@@ -24080,9 +26830,18 @@ mod tests {
                     assert_eq!(reason, "media_timeout");
                     got_summary = true;
                 }
-                Event::MediaTimeout { call_id, from_tag } => {
+                Event::MediaTimeout {
+                    call_id,
+                    from_tag,
+                    reason,
+                } => {
                     assert_eq!(call_id, "gone");
                     assert_eq!(from_tag, "ft");
+                    assert_eq!(
+                        reason,
+                        MediaTimeoutReason::NoMedia,
+                        "a sendrecv call that went quiet is a dead path, not a hold"
+                    );
                     got_timeout = true;
                 }
                 other => panic!("unexpected event pushed on reap: {other:?}"),
@@ -29539,6 +32298,12 @@ mod tests {
                     call_id: "tee-vs-pcap".into(),
                     from_tag: "tag-a".into(),
                     recording_dir: Some(directory.path().to_string_lossy().into_owned()),
+                    format: None,
+                    direction: None,
+                    channels: None,
+                    max_duration_ms: None,
+                    silence_ms: None,
+                    path: None,
                 },
             )
             .await;

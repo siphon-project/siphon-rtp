@@ -80,6 +80,7 @@ mod tests {
                 sdp: Some(sdp.replace("RTP/SAVP", "RTP/AVP")),
                 duration_ms: None,
                 play_id: None,
+                recording_id: None,
                 to_tag: None,
                 stats: None,
             },
