@@ -180,6 +180,14 @@ pub struct CodecSpec {
     /// declared nothing — a consumer reads [`OpusParams::default`] then, which *is* the RFC default
     /// set. Ignored by every non-Opus codec.
     pub opus: Option<OpusParams>,
+    /// Whether G.729 Annex B (VAD / DTX / comfort noise) is in force on this stream — the SDP
+    /// `a=fmtp:18 annexb=` parameter, RFC 3555 §4.1.13.
+    ///
+    /// **The default is `true`**, because the RFC's is: a peer that sends no `annexb=` at all is
+    /// asking for Annex B. Treating the absent attribute as `no` is the mistake that leaves an
+    /// engine unable to decode the two-octet descriptors such a peer then sends. Ignored by every
+    /// other codec.
+    pub annex_b: bool,
 }
 
 impl CodecSpec {
@@ -217,7 +225,16 @@ impl CodecSpec {
             encode_mode: None,
             allowed_modes: Vec::new(),
             opus: None,
+            // RFC 3555 §4.1.13: absent means yes.
+            annex_b: true,
         }
+    }
+
+    /// Set the G.729 Annex B posture this stream negotiated.
+    #[must_use]
+    pub fn with_annex_b(mut self, enabled: bool) -> Self {
+        self.annex_b = enabled;
+        self
     }
 
     /// Whether this spec names Opus (RFC 7587).
@@ -379,7 +396,9 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         // (VAD/DTX/CNG) is not implemented, so a two-octet SID payload is refused rather than
         // decoded as a truncated speech frame — see docs/codec-licensing.md and docs/codecs.md.
         #[cfg(feature = "g729")]
-        "G729" => Ok(Box::new(G729::new(spec.ptime_ms))),
+        "G729" => Ok(Box::new(
+            G729::new(spec.ptime_ms).with_annex_b(spec.annex_b),
+        )),
         // AMR-WB decode + encode are bit-exact for all 9 modes (the RTP path un-/re-sorts the RFC 4867
         // payload), validated against the 3GPP TS 26.174 vectors. Gated behind the `amr` feature
         // (patent-encumbered transcoding — see docs/codec-licensing.md); AMR passthrough/relay does not
@@ -432,7 +451,7 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
         // frame is 10 ms, so a packet carries `ptime/10` of them concatenated with no payload header
         // (RFC 3551 §4.5.6). Same `g729`-feature gate as decode.
         #[cfg(feature = "g729")]
-        "G729" => Ok(Box::new(G729::new(spec.ptime_ms))),
+        "G729" => Ok(Box::new(G729::new(spec.ptime_ms).with_annex_b(spec.annex_b))),
         // AMR-WB encode is bit-exact (all 9 modes, 0..=8) against 3GPP TS 26.174 — same `amr`-feature gate as
         // decode (docs/codec-licensing.md). The egress mode is the SDP `mode-set`-resolved
         // `spec.encode_mode` when present, else the codec default (mode 2 / 12.65 kbit/s). The full
@@ -1236,6 +1255,18 @@ mod tests {
             !encoder.is_stateless(),
             "every stage carries state across frames"
         );
+    }
+
+    #[cfg(feature = "g729")]
+    #[test]
+    fn the_g729_annex_b_posture_comes_from_the_spec() {
+        // RFC 3555 §4.1.13 makes Annex B the default, so a spec built from an offer that said
+        // nothing arrives here with it on and the factory must not quietly turn it off.
+        let spec = CodecSpec::new(18, "G729", 8000, 1, 20);
+        assert!(spec.annex_b, "the RFC default reaches the factory");
+        assert!(encoder_for(&spec).is_ok());
+        assert!(encoder_for(&spec.clone().with_annex_b(false)).is_ok());
+        assert!(decoder_for(&spec.with_annex_b(false)).is_ok());
     }
 
     #[test]

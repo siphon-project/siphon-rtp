@@ -224,6 +224,33 @@ fn bench_g729(criterion: &mut Criterion) {
                 Decoder::conceal(&mut concealer, black_box(&mut out_pcm)).expect("conceal")
             });
         });
+
+        // Annex B on the same input. The voice-activity decision calls this synthetic tone
+        // background, so what this measures is the discontinuous-transmission path: the decision
+        // itself plus comfort-noise generation, in place of the pitch and codebook searches. It is
+        // cheaper than coding speech, not dearer — which is the point of a leg on hold.
+        let mut annex_b = G729::new(20).with_annex_b(true);
+        criterion.bench_function("g729_encode_20ms_annex_b_inactive", |bencher| {
+            bencher.iter(|| {
+                Encoder::encode(&mut annex_b, black_box(&pcm), black_box(&mut payload))
+                    .expect("encode")
+            });
+        });
+
+        // One frame of comfort noise from a two-octet descriptor, which is what a leg on hold runs.
+        let mut silence = G729::new(10);
+        let descriptor = [0x2a_u8, 0x80];
+        let mut noise_pcm = vec![0i16; 80];
+        criterion.bench_function("g729_decode_silence_descriptor", |bencher| {
+            bencher.iter(|| {
+                Decoder::decode(
+                    &mut silence,
+                    black_box(&descriptor),
+                    black_box(&mut noise_pcm),
+                )
+                .expect("decode")
+            });
+        });
     }
     #[cfg(not(feature = "g729"))]
     {

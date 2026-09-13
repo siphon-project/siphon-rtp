@@ -87,6 +87,78 @@ impl FrameParameters {
     }
 }
 
+/// Octets a G.729 Annex B silence descriptor occupies.
+///
+/// The descriptor is fifteen bits. RFC 3551 §4.5.6 carries it as two octets, which is the ITU's own
+/// "octet transmission mode": a sixteenth zero bit is appended so the payload lands on a boundary.
+pub const SILENCE_BYTES: usize = 2;
+
+/// Widths of the silence descriptor's four parameters, in transmission order.
+const SILENCE_PARAMETER_BITS: [u32; 4] = [1, 5, 4, 5];
+
+/// The parameters a silence descriptor carries: a spectrum in nine bits and a level in five.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SilenceParameters {
+    /// Which moving-average predictor the spectrum was coded against.
+    pub lsp_mode: u16,
+    /// First-stage spectrum index.
+    pub lsp_stage1: u16,
+    /// Second-stage spectrum index.
+    pub lsp_stage2: u16,
+    /// Level index.
+    pub gain: u16,
+}
+
+/// Unpack a two-octet silence descriptor.
+///
+/// # Errors
+///
+/// [`CodecError::Malformed`] when the payload is not exactly [`SILENCE_BYTES`] long.
+pub fn unpack_silence(frame: &[u8]) -> Result<SilenceParameters, CodecError> {
+    if frame.len() != SILENCE_BYTES {
+        return Err(CodecError::Malformed(
+            "G.729 silence descriptor must be exactly 2 octets",
+        ));
+    }
+    let mut reader = BitReader::new(frame);
+    let mut parameters = [0_u16; 4];
+    for (parameter, bits) in parameters.iter_mut().zip(SILENCE_PARAMETER_BITS) {
+        *parameter = reader.read(bits);
+    }
+    Ok(SilenceParameters {
+        lsp_mode: parameters[0],
+        lsp_stage1: parameters[1],
+        lsp_stage2: parameters[2],
+        gain: parameters[3],
+    })
+}
+
+/// Pack a silence descriptor into its two octets, with the sixteenth bit left clear.
+#[must_use]
+pub fn pack_silence(parameters: SilenceParameters) -> [u8; SILENCE_BYTES] {
+    let values = [
+        parameters.lsp_mode,
+        parameters.lsp_stage1,
+        parameters.lsp_stage2,
+        parameters.gain,
+    ];
+    let mut frame = [0_u8; SILENCE_BYTES];
+    let mut position = 0_u32;
+    for (value, bits) in values.into_iter().zip(SILENCE_PARAMETER_BITS) {
+        for bit_index in (0..bits).rev() {
+            if (value >> bit_index) & 1 == 1 {
+                frame[(position / 8) as usize] |= 1 << (7 - position % 8);
+            }
+            position += 1;
+        }
+    }
+    debug_assert_eq!(
+        position, 15,
+        "the descriptor is fifteen bits plus a pad bit"
+    );
+    frame
+}
+
 /// The parity bit the encoder transmits alongside the first subframe's pitch lag
 /// (`Parity_Pitch`): odd parity over bits 7..2 of the lag index.
 ///
@@ -194,6 +266,41 @@ pub fn pack(parameters: [u16; 11]) -> [u8; FRAME_BYTES] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_silence_descriptor_round_trips_through_its_two_octets() {
+        // Fifteen bits in sixteen. Every index the quantiser can produce has to survive the wire, and
+        // the sixteenth bit must stay clear — RFC 3551 §4.5.6 carries the padded form, and a peer
+        // that reads the descriptor without masking would see a level that is not the one sent.
+        for mode in 0..2_u16 {
+            for stage1 in 0..32_u16 {
+                for stage2 in 0..16_u16 {
+                    for gain in [0_u16, 1, 15, 31] {
+                        let parameters = SilenceParameters {
+                            lsp_mode: mode,
+                            lsp_stage1: stage1,
+                            lsp_stage2: stage2,
+                            gain,
+                        };
+                        let octets = pack_silence(parameters);
+                        assert_eq!(octets[1] & 1, 0, "the pad bit is clear");
+                        assert_eq!(unpack_silence(&octets).expect("two octets"), parameters);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_silence_descriptor_that_is_not_two_octets_is_refused() {
+        assert!(unpack_silence(&[]).is_err());
+        assert!(unpack_silence(&[0]).is_err());
+        assert!(unpack_silence(&[0; 3]).is_err());
+        assert!(
+            unpack_silence(&[0; 2]).is_ok(),
+            "any 15-bit pattern decodes"
+        );
+    }
 
     #[test]
     fn the_eleven_parameters_occupy_exactly_eighty_bits() {

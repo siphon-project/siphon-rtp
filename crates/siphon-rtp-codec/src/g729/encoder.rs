@@ -23,7 +23,12 @@
 
 use super::acelp::CodebookSearch;
 use super::analysis::{autocorrelation, lag_window, lp_to_lsp, Levinson, PreProcessor, WINDOW};
-use super::bitstream::{pack, pitch_parity, FRAME_BYTES, FRAME_SAMPLES, SUBFRAME_SAMPLES};
+use super::bitstream::{
+    pack, pack_silence, pitch_parity, SilenceParameters, FRAME_BYTES, FRAME_SAMPLES, SILENCE_BYTES,
+    SUBFRAME_SAMPLES,
+};
+use super::cng::{Random, INITIAL_SEED};
+use super::dtx::{ComfortNoiseEncoder, InactiveFrame};
 use super::excitation::{
     adaptive_codebook, clamp_sharpening, PitchLag, EXCITATION_HISTORY, PITCH_MAX, SHARP_MIN,
 };
@@ -34,6 +39,7 @@ use super::lpcfunc::{
 use super::pitch::{closed_loop_lag, encode_lag, first_subframe_range, open_loop_lag, pitch_gain};
 use super::quagain::{distortion_terms, GainQuantiser};
 use super::qualsp::LspQuantiser;
+use super::vad::{Activity, VoiceActivityDetector};
 use super::weighting::{lsp_to_normalised_lsf, PerceptualWeighting, Taming, TAMED_PITCH_GAIN};
 use crate::itu::basic_ops::{add, extract_h, l_mac, l_mult, l_shl, round_word, sub};
 
@@ -55,6 +61,17 @@ const INITIAL_LSP: [i16; ORDER] = [
     30_000, 26_000, 21_000, 15_000, 8000, 0, -8000, -15_000, -21_000, -26_000,
 ];
 
+/// What one frame of input produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedFrame {
+    /// Ten octets of coded speech.
+    Speech([u8; FRAME_BYTES]),
+    /// Two octets describing the background (Annex B silence descriptor).
+    Silence([u8; SILENCE_BYTES]),
+    /// Nothing to send: the background has not changed since the last descriptor.
+    Untransmitted,
+}
+
 /// One stream's encoder state.
 #[derive(Debug, Clone)]
 pub struct Encoder {
@@ -65,6 +82,22 @@ pub struct Encoder {
     taming: Taming,
     codebook: CodebookSearch,
     gains: GainQuantiser,
+    detector: VoiceActivityDetector,
+    comfort: ComfortNoiseEncoder,
+    comfort_random: Random,
+
+    /// Whether discontinuous transmission is on. Off by default: RFC 3555 §4.1.13 makes Annex B the
+    /// SDP *default*, but sending descriptors to a peer that answered `annexb=no` would put a
+    /// two-octet payload on a leg expecting ten, so this is switched on by the negotiation rather
+    /// than assumed.
+    discontinuous: bool,
+    /// Frames encoded so far. The voice-activity decision needs it to know how far its background
+    /// estimate has settled; it wraps the way the reference's does rather than saturating, so a long
+    /// call keeps the settled behaviour instead of freezing at the cap.
+    frame: i16,
+    /// The two previous frames' activity decisions, which the hangover consults.
+    previous_activity: Activity,
+    before_previous_activity: Activity,
 
     /// Input speech: history, the frame being coded, and the lookahead.
     speech: [i16; SPEECH_HISTORY],
@@ -108,6 +141,13 @@ impl Encoder {
             taming: Taming::new(),
             codebook: CodebookSearch::new(),
             gains: GainQuantiser::new(),
+            detector: VoiceActivityDetector::new(),
+            comfort: ComfortNoiseEncoder::new(),
+            comfort_random: Random::new(INITIAL_SEED),
+            discontinuous: false,
+            frame: 0,
+            previous_activity: Activity::Speech,
+            before_previous_activity: Activity::Speech,
             speech: [0; SPEECH_HISTORY],
             weighted: [0; WEIGHTED_HISTORY + FRAME_SAMPLES],
             excitation: [0; EXCITATION_HISTORY + FRAME_SAMPLES],
@@ -126,46 +166,114 @@ impl Encoder {
     /// The octets carry the frame that ended 40 samples ago, not the one just handed in: the
     /// analysis window reaches into the future, so the codec runs 5 ms behind its input.
     pub fn encode(&mut self, samples: &[i16; FRAME_SAMPLES]) -> [u8; FRAME_BYTES] {
+        match self.encode_frame(samples) {
+            EncodedFrame::Speech(octets) => octets,
+            // Unreachable with discontinuous transmission off, which is the default and the only
+            // state `encode` is used in.
+            EncodedFrame::Silence(_) | EncodedFrame::Untransmitted => [0; FRAME_BYTES],
+        }
+    }
+
+    /// Turn Annex B discontinuous transmission on or off.
+    ///
+    /// With it off every frame is coded as speech, which is what a peer that answered
+    /// `a=fmtp:18 annexb=no` expects. With it on, a frame the voice-activity decision calls
+    /// background becomes either a two-octet silence descriptor or nothing at all.
+    pub fn set_discontinuous_transmission(&mut self, enabled: bool) {
+        self.discontinuous = enabled;
+    }
+
+    /// Encode one 10 ms frame, which may produce speech, a silence descriptor, or nothing
+    /// (`Coder_ld8k`).
+    ///
+    /// The octets carry the frame that ended 40 samples ago, not the one just handed in: the
+    /// analysis window reaches into the future, so the codec runs 5 ms behind its input.
+    pub fn encode_frame(&mut self, samples: &[i16; FRAME_SAMPLES]) -> EncodedFrame {
         self.speech[NEW_SPEECH..].copy_from_slice(samples);
         // The high-pass also halves the signal; the decoder's output stage doubles it back.
         self.preprocessor.process(&mut self.speech[NEW_SPEECH..]);
 
-        let parameters = self.code_frame();
+        // The reference's own counter: it wraps back to 256 rather than saturating, which keeps the
+        // decision in its settled regime instead of pinning it at the initialisation boundary.
+        self.frame = if self.frame == 32_767 {
+            256
+        } else {
+            self.frame + 1
+        };
+
+        let frame = self.code_frame();
 
         // Slide every buffer down one frame for the next call.
         self.speech.copy_within(FRAME_SAMPLES.., 0);
         self.weighted.copy_within(FRAME_SAMPLES.., 0);
         self.excitation.copy_within(FRAME_SAMPLES.., 0);
 
-        pack(parameters)
+        frame
     }
 
     /// The frame's analysis and its two subframes, in the reference's order.
-    fn code_frame(&mut self) -> [u16; 11] {
+    fn code_frame(&mut self) -> EncodedFrame {
         // Linear prediction over the whole 30 ms window, once per frame.
-        let mut correlations = autocorrelation(&self.speech);
+        let (mut correlations, energy_exponent) = autocorrelation(&self.speech);
+        // The unwindowed correlations are what the comfort-noise path averages: the lag window is a
+        // fit-conditioning step for the recursion, and a background estimate wants the spectrum as
+        // measured.
+        let unwindowed = correlations;
         lag_window(&mut correlations);
-        let (second_filter, reflection) = self.levinson.solve(&correlations);
+        let prediction = self.levinson.solve(&correlations);
+        let second_filter = prediction.coefficients;
+        let reflection = prediction.reflection;
         let lsp = lp_to_lsp(&second_filter, &self.previous_lsp);
 
-        let (lsp_stage1, lsp_stage2, quantised_lsp) = self.lsp_quantiser.quantise(&lsp);
+        // The voice-activity decision runs on the frame's own analysis, before anything is coded.
+        let new_lsf = lsp_to_normalised_lsf(&lsp);
+        let activity = self.detector.decide(
+            reflection[1],
+            &new_lsf,
+            &correlations,
+            energy_exponent,
+            &self.speech,
+            self.frame,
+            self.previous_activity,
+            self.before_previous_activity,
+        );
+        self.comfort
+            .observe(&unwindowed, energy_exponent, activity.is_speech());
 
         // The first subframe interpolates; the second uses the frame's own filter. The unquantised
-        // pair drives the perceptual weighting, the quantised pair the synthesis both ends run.
+        // pair drives the perceptual weighting, and the frame always needs it — a frame that is not
+        // transmitted still has to update the filter memories the next one predicts from.
         let midpoint = midpoint_lsp(&self.previous_lsp, &lsp);
         let unquantised = [lsp_to_lp(&midpoint), second_filter];
-        let quantised = interpolate_subframe_filters(&self.previous_quantised_lsp, &quantised_lsp);
-
         self.previous_lsp = lsp;
-        self.previous_quantised_lsp = quantised_lsp;
 
         let factors = self.weighting.factors(
             &lsp_to_normalised_lsf(&midpoint),
-            &lsp_to_normalised_lsf(&lsp),
+            &new_lsf,
             &[reflection[0], reflection[1]],
         );
 
         let open_loop = self.weighted_speech(&unquantised, &factors);
+
+        if self.discontinuous && !activity.is_speech() {
+            let frame = self.code_inactive(&unquantised, &factors);
+            self.before_previous_activity = self.previous_activity;
+            self.previous_activity = activity;
+            return frame;
+        }
+
+        // Every speech frame re-seeds the comfort-noise generator, so both ends start the next
+        // silence from the same point however long the talk spurt was.
+        self.comfort_random.reseed(INITIAL_SEED);
+        self.before_previous_activity = self.previous_activity;
+        self.previous_activity = activity;
+
+        // The quantised pair, which the synthesis both ends run is built from, is only needed once
+        // the frame is known to be speech.
+        let (lsp_stage1, lsp_stage2, quantised_lsp) = self.lsp_quantiser.quantise(&lsp);
+        let quantised = interpolate_subframe_filters(&self.previous_quantised_lsp, &quantised_lsp);
+        self.previous_quantised_lsp = quantised_lsp;
+
         let (mut lag_min, mut lag_max) = first_subframe_range(open_loop);
 
         let mut parameters = [0_u16; 11];
@@ -282,7 +390,102 @@ impl Encoder {
             );
         }
 
-        parameters
+        EncodedFrame::Speech(pack(parameters))
+    }
+
+    /// One inactive frame: decide whether to describe the background, and carry every filter memory
+    /// forward as if the frame had been coded (`Cod_cng` plus the memory update around it).
+    ///
+    /// The memories matter more than the frame does. The encoder has to stay on the same excitation
+    /// history as the decoder across a silence, or the first frame of the next word is coded against
+    /// a state the decoder does not have.
+    fn code_inactive(
+        &mut self,
+        unquantised: &[[i16; COEFFICIENTS]; 2],
+        factors: &[(i16, i16); 2],
+    ) -> EncodedFrame {
+        let after_speech = self.previous_activity.is_speech();
+        let (frame, quantised) = {
+            let Self {
+                comfort,
+                levinson,
+                lsp_quantiser,
+                previous_quantised_lsp,
+                excitation,
+                comfort_random,
+                taming,
+                ..
+            } = self;
+            comfort.encode(
+                after_speech,
+                levinson,
+                lsp_quantiser.predictor_mut(),
+                previous_quantised_lsp,
+                excitation,
+                EXCITATION_HISTORY,
+                comfort_random,
+                taming,
+            )
+        };
+
+        for subframe in 0..2 {
+            let start = subframe * SUBFRAME_SAMPLES;
+            let origin = EXCITATION_HISTORY + start;
+            let (gamma1, gamma2) = factors[subframe];
+            let numerator = weight_lp(&unquantised[subframe], gamma1);
+            let denominator = weight_lp(&unquantised[subframe], gamma2);
+
+            let mut excitation = [0_i16; SUBFRAME_SAMPLES];
+            excitation.copy_from_slice(&self.excitation[origin..origin + SUBFRAME_SAMPLES]);
+            let mut synthesised = [0_i16; SUBFRAME_SAMPLES];
+            let _ = syn_filt(
+                &quantised[subframe],
+                &excitation,
+                &mut synthesised,
+                SUBFRAME_SAMPLES,
+                &mut self.synthesis_memory,
+                true,
+            );
+
+            for (index, &sample) in synthesised.iter().enumerate() {
+                self.error[ORDER + index] = sub(self.speech[CURRENT_FRAME + start + index], sample);
+            }
+            let mut weighted = [0_i16; SUBFRAME_SAMPLES];
+            residu(
+                &numerator,
+                &self.error,
+                ORDER,
+                &mut weighted,
+                SUBFRAME_SAMPLES,
+            );
+            let mut filtered = [0_i16; SUBFRAME_SAMPLES];
+            let _ = syn_filt(
+                &denominator,
+                &weighted,
+                &mut filtered,
+                SUBFRAME_SAMPLES,
+                &mut self.target_memory,
+                true,
+            );
+
+            self.error.copy_within(SUBFRAME_SAMPLES.., 0);
+        }
+
+        // A silence resets the sharpening, so the first subframe of the next talk spurt does not
+        // fold in a pitch gain measured on noise.
+        self.sharpening = SHARP_MIN;
+
+        match frame {
+            InactiveFrame::Untransmitted => EncodedFrame::Untransmitted,
+            InactiveFrame::Descriptor { spectrum, gain } => {
+                EncodedFrame::Silence(pack_silence(SilenceParameters {
+                    lsp_mode: spectrum.mode,
+                    lsp_stage1: spectrum.stage1,
+                    lsp_stage2: spectrum.stage2,
+                    gain,
+                }))
+            }
+        }
     }
 
     /// Filter the frame through `W(z)` and return the open-loop pitch lag it suggests.

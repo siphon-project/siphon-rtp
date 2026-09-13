@@ -18,9 +18,12 @@
 pub mod acelp;
 pub mod analysis;
 pub mod bitstream;
+pub mod cng;
 pub mod codec;
+pub mod deccng;
 pub mod decoder;
 pub mod dspfunc;
+pub mod dtx;
 pub mod encoder;
 pub mod excitation;
 pub mod filter;
@@ -32,13 +35,17 @@ pub mod postfilter;
 pub mod postproc;
 pub mod quagain;
 pub mod qualsp;
+pub mod sidgain;
+pub mod sidlsf;
 pub mod tables;
+pub mod vad;
 pub mod weighting;
 
 pub use bitstream::{FRAME_BYTES, FRAME_SAMPLES};
 pub use codec::G729;
 
-use bitstream::{FrameParameters, SUBFRAME_SAMPLES};
+use bitstream::SUBFRAME_SAMPLES;
+pub use decoder::FrameInput;
 use filter::ORDER;
 
 /// A complete G.729 encoder: input conditioning, linear-prediction analysis and the two-subframe
@@ -93,16 +100,37 @@ impl G729Decoder {
     /// [`crate::CodecError::Malformed`] when the payload is not exactly ten octets long.
     pub fn decode(&mut self, frame: &[u8]) -> Result<[i16; FRAME_SAMPLES], crate::CodecError> {
         let parameters = bitstream::unpack(frame)?;
-        Ok(self.decode_parameters(Some(&parameters)))
+        Ok(self.decode_input(FrameInput::Speech(&parameters)))
+    }
+
+    /// Decode one Annex B silence descriptor into 80 samples of comfort noise.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CodecError::Malformed`] when the payload is not exactly two octets long.
+    pub fn decode_silence(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<[i16; FRAME_SAMPLES], crate::CodecError> {
+        let parameters = bitstream::unpack_silence(frame)?;
+        Ok(self.decode_input(FrameInput::Silence(&parameters)))
+    }
+
+    /// Produce 80 samples for an Annex B frame the sender chose not to transmit: the background it
+    /// last described, at the level it last gave.
+    pub fn decode_untransmitted(&mut self) -> [i16; FRAME_SAMPLES] {
+        self.decode_input(FrameInput::Untransmitted)
     }
 
     /// Conceal one lost frame, producing 80 samples from the decoder's own state.
     pub fn conceal(&mut self) -> [i16; FRAME_SAMPLES] {
-        self.decode_parameters(None)
+        self.decode_input(FrameInput::Lost)
     }
 
-    fn decode_parameters(&mut self, parameters: Option<&FrameParameters>) -> [i16; FRAME_SAMPLES] {
-        let (synthesised, filters, first_lag) = self.core.decode_frame(parameters, self.voicing);
+    /// Decode one frame of any kind.
+    pub fn decode_input(&mut self, input: FrameInput<'_>) -> [i16; FRAME_SAMPLES] {
+        let active = matches!(input, FrameInput::Speech(_) | FrameInput::Lost);
+        let (synthesised, filters, first_lag) = self.core.decode_frame(input, self.voicing);
         self.synthesis[ORDER..].copy_from_slice(&synthesised);
 
         // Both subframes are postfiltered against the *first* subframe's pitch lag: the harmonic
@@ -118,6 +146,7 @@ impl G729Decoder {
                 ORDER + start,
                 filter,
                 &mut postfiltered[start..start + SUBFRAME_SAMPLES],
+                active,
             );
             if subframe_voicing != 0 {
                 voicing = subframe_voicing;
