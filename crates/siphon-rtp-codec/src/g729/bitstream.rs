@@ -87,6 +87,21 @@ impl FrameParameters {
     }
 }
 
+/// The parity bit the encoder transmits alongside the first subframe's pitch lag
+/// (`Parity_Pitch`): odd parity over bits 7..2 of the lag index.
+///
+/// Only the six most significant bits are protected. They are the ones whose corruption moves the
+/// lag far enough to be audible; an error in the low bits shifts the delay by a fraction of a
+/// sample and is not worth a bit to detect.
+#[must_use]
+pub fn pitch_parity(lag_index: u16) -> u16 {
+    let mut sum = 1_u16;
+    for shift in 2..=7 {
+        sum += (lag_index >> shift) & 1;
+    }
+    sum & 1
+}
+
 /// Unpack one 10-octet G.729 frame into its eleven parameters.
 ///
 /// # Errors

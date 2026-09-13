@@ -24,6 +24,7 @@ pub mod filter;
 pub mod lpcfunc;
 pub mod lspdec;
 pub mod overflow;
+pub mod pitch;
 pub mod postfilter;
 pub mod postproc;
 pub mod qualsp;
