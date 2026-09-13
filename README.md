@@ -69,6 +69,7 @@ piece standing between SIPhon and a fully self-owned media path for PBX and real
 | **L16 / PCM** | RFC 3551 | Implemented — big-endian, round-trip tested |
 | **AMR-WB** | TS 26.171 / .190, RFC 4867 | Implemented (`amr` feature) — decode and encode bit-exact, all 9 modes (6.60–23.85 kbit/s) vs 3GPP TS 26.174 |
 | **AMR-NB** | TS 26.071 / .090, RFC 4867 | Implemented (`amr` feature) — decode and encode bit-exact, all 8 modes (4.75–12.2 kbit/s) vs 3GPP TS 26.074; DTX/SID out of scope |
+| **G.729** | ITU-T G.729 | Implemented (`g729` feature) — decode and encode bit-exact vs the ITU-T Release 3 sequences in both directions; Annex B (VAD/DTX/CNG) out of scope |
 | **Control: native JSON-over-TCP** | — | Implemented — length-prefixed JSON, async events, optional shared-secret auth |
 | **Control: rtpengine NG / bencode** | rtpengine NG | Implemented — drop-in for existing Kamailio / OpenSIPS |
 | **Datapath: UDP backend** | — | Implemented — the production datapath today (NIC-free, symmetric-RTP latching) |
@@ -307,7 +308,8 @@ paired perf + memory-leak check before every commit.
 Pre-1.0, but the core is built and wired end-to-end. Shipping today: both control front-ends (native
 JSON-over-TCP and rtpengine NG/bencode), the userspace relay on the UDP datapath (with symmetric-RTP
 latching), the IMS-priority codecs (G.711, G.722, G.726, GSM-FR, comfort noise, and bit-exact
-AMR-NB/AMR-WB behind the `amr` feature), Opus (SILK / CELT / Hybrid, decode and encode), SRTP-SDES
+AMR-NB/AMR-WB behind the `amr` feature), G.729 behind the `g729` feature, Opus (SILK / CELT / Hybrid,
+decode and encode), SRTP-SDES
 and DTLS-SRTP (including DTLS-SRTP transcoding), ICE-lite plus the full RFC 8445 ICE agent
 (`--ice-full`), a built-in TURN server and a TURN client at the engine API (`Engine::with_turn_server`),
 RFC 4103 / 9071 real-time text, RTCP with G.107 MOS plus HEP/Homer export, the jitter buffer / PLC /

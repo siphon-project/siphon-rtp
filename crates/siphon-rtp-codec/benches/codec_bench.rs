@@ -181,6 +181,56 @@ fn bench_cn(criterion: &mut Criterion) {
     });
 }
 
+/// G.729 encode and decode cost per 20 ms packet — two 10 ms CS-ACELP frames.
+///
+/// The gate itself carries no feature, so the bench list stays one shape whatever is enabled; the
+/// body is compiled away when `g729` is off.
+fn bench_g729(criterion: &mut Criterion) {
+    #[cfg(feature = "g729")]
+    {
+        use siphon_rtp_codec::g729::G729;
+
+        // Two frames' worth: a G.729 leg at the default 20 ms ptime carries exactly this.
+        let pcm: Vec<i16> = (0..160usize)
+            .map(|i| {
+                let voiced = (i as f32 * 0.21).sin() * 6000.0;
+                let noise = (i as f32 * 1.71).sin() * 600.0;
+                (voiced + noise) as i16
+            })
+            .collect();
+        let mut payload = vec![0u8; 20];
+        let mut out_pcm = vec![0i16; 160];
+
+        let mut encoder = G729::new(20);
+        criterion.bench_function("g729_encode_20ms", |bencher| {
+            bencher.iter(|| {
+                Encoder::encode(&mut encoder, black_box(&pcm), black_box(&mut payload))
+                    .expect("encode")
+            });
+        });
+
+        Encoder::encode(&mut G729::new(20), &pcm, &mut payload).expect("seed payload");
+        let mut decoder = G729::new(20);
+        criterion.bench_function("g729_decode_20ms", |bencher| {
+            bencher.iter(|| {
+                Decoder::decode(&mut decoder, black_box(&payload), black_box(&mut out_pcm))
+                    .expect("decode")
+            });
+        });
+
+        let mut concealer = G729::new(20);
+        criterion.bench_function("g729_conceal_20ms", |bencher| {
+            bencher.iter(|| {
+                Decoder::conceal(&mut concealer, black_box(&mut out_pcm)).expect("conceal")
+            });
+        });
+    }
+    #[cfg(not(feature = "g729"))]
+    {
+        let _ = criterion;
+    }
+}
+
 #[cfg(feature = "amr")]
 fn bench_basic_ops(criterion: &mut Criterion) {
     // A correlation-style MAC loop — the shape of the AMR pitch/FIR hot kernels.
@@ -2003,6 +2053,7 @@ criterion_group!(
     bench_g726,
     bench_gsm_fr,
     bench_cn,
+    bench_g729,
     bench_celt_encode,
     bench_opus_encode,
     bench_celt_decode,
@@ -2031,6 +2082,7 @@ criterion_group!(
     bench_g726,
     bench_gsm_fr,
     bench_cn,
+    bench_g729,
     bench_celt_encode,
     bench_opus_encode,
     bench_celt_decode,

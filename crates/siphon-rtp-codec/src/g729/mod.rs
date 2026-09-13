@@ -18,8 +18,10 @@
 pub mod acelp;
 pub mod analysis;
 pub mod bitstream;
+pub mod codec;
 pub mod decoder;
 pub mod dspfunc;
+pub mod encoder;
 pub mod excitation;
 pub mod filter;
 pub mod lpcfunc;
@@ -33,8 +35,18 @@ pub mod qualsp;
 pub mod tables;
 pub mod weighting;
 
-use bitstream::{FrameParameters, FRAME_SAMPLES, SUBFRAME_SAMPLES};
+pub use bitstream::{FRAME_BYTES, FRAME_SAMPLES};
+pub use codec::G729;
+
+use bitstream::{FrameParameters, SUBFRAME_SAMPLES};
 use filter::ORDER;
+
+/// A complete G.729 encoder: input conditioning, linear-prediction analysis and the two-subframe
+/// coding loop, in the order `Pre_Process` / `Coder_ld8k` run in the reference's own `coder.c`.
+///
+/// One instance encodes one stream. Unlike the decoder it has no stage after the frame loop — the
+/// postfilter is a decoder-side cosmetic — so the frame loop is the whole of it.
+pub use encoder::Encoder as G729Encoder;
 
 /// A complete G.729 decoder: the frame loop, the adaptive postfilter and the output
 /// post-processing, in the order `dec_ld8k` / `Post` / `Post_Process` run in the reference's own

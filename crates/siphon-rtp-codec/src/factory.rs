@@ -10,6 +10,8 @@ use crate::cn::Cn;
 use crate::g711::{Variant, G711};
 use crate::g722::G722;
 use crate::g726::{Rate, G726};
+#[cfg(feature = "g729")]
+use crate::g729::G729;
 use crate::gsm_fr::GsmFr;
 use crate::l16::L16;
 use crate::opus::codec::OpusCodec;
@@ -370,6 +372,14 @@ pub fn decoder_for(spec: &CodecSpec) -> Result<Box<dyn Decoder>, CodecError> {
         // RFC 3389 comfort noise: a decode-side generator. There is no audio "encoder" — CN packets
         // are emitted by a VAD/DTX media-path policy, not by a per-frame encoder (see `encoder_for`).
         "CN" => Ok(Box::new(Cn::new(spec.clock_rate_hz, spec.ptime_ms))),
+        // G.729 decode and encode are both bit-exact against the ITU-T reference vectors — each
+        // `*.bit` reproduces its `*.pst` and each `*.in` its `*.bit`. Gated behind the `g729`
+        // feature for the same reason as `amr`: the gate is on *transcoding* only, and relaying
+        // G.729 never executes a codec, so a relayed call needs no feature at all. Annex B
+        // (VAD/DTX/CNG) is not implemented, so a two-octet SID payload is refused rather than
+        // decoded as a truncated speech frame — see docs/codec-licensing.md and docs/codecs.md.
+        #[cfg(feature = "g729")]
+        "G729" => Ok(Box::new(G729::new(spec.ptime_ms))),
         // AMR-WB decode + encode are bit-exact for all 9 modes (the RTP path un-/re-sorts the RFC 4867
         // payload), validated against the 3GPP TS 26.174 vectors. Gated behind the `amr` feature
         // (patent-encumbered transcoding — see docs/codec-licensing.md); AMR passthrough/relay does not
@@ -418,6 +428,11 @@ pub fn encoder_for(spec: &CodecSpec) -> Result<Box<dyn Encoder>, CodecError> {
         "G722" => Ok(Box::new(G722::new(spec.ptime_ms))),
         "GSM" => Ok(Box::new(GsmFr::new())),
         "L16" => Ok(Box::new(L16::new(spec.clock_rate_hz, spec.ptime_ms))),
+        // G.729 encode is bit-exact against every ITU-T sequence that ships an input. The codec's
+        // frame is 10 ms, so a packet carries `ptime/10` of them concatenated with no payload header
+        // (RFC 3551 §4.5.6). Same `g729`-feature gate as decode.
+        #[cfg(feature = "g729")]
+        "G729" => Ok(Box::new(G729::new(spec.ptime_ms))),
         // AMR-WB encode is bit-exact (all 9 modes, 0..=8) against 3GPP TS 26.174 — same `amr`-feature gate as
         // decode (docs/codec-licensing.md). The egress mode is the SDP `mode-set`-resolved
         // `spec.encode_mode` when present, else the codec default (mode 2 / 12.65 kbit/s). The full
@@ -504,9 +519,23 @@ fn unsupported_name(encoding_name: &str) -> &'static str {
         // claiming a flag exists that would fix the build today — there is no code to gate yet — and
         // each repeats the rule that matters to the operator reading this in a call trace: only
         // transcoding is missing, relaying the codec is always available (docs/codec-licensing.md).
-        "G729" | "G729A" | "G729B" | "G729AB" => {
-            "G.729 transcoding is not implemented (planned behind the `g729` build feature, \
-             patent-licensed — see docs/codec-licensing.md); G.729 passthrough/relay is always \
+        // G.729 is wired in both directions when the feature is on, so a supported spec never
+        // reaches here; without it, transcoding is refused and relaying is unaffected.
+        #[cfg(not(feature = "g729"))]
+        "G729" => {
+            "G.729 transcoding requires the `g729` build feature (patent-licensed — see \
+             docs/codec-licensing.md); G.729 passthrough/relay is always available"
+        }
+        // None of these is a registered RTP encoding name: a peer signals the base codec as `G729`
+        // and asks for Annex B through `a=fmtp:18 annexb=yes`. Annex A is bitstream-interoperable
+        // with the base codec, so it needs no entry of its own, but Annex B's VAD/DTX/CNG is not
+        // implemented — treating one of these names as the base codec would drop every silence
+        // descriptor the peer sends.
+        "G729A" | "G729B" | "G729AB" => {
+            "G.729 is signalled as encoding name `G729`, with Annex B selected by \
+             `a=fmtp:18 annexb=`; these names are not registered and Annex B (VAD/DTX/CNG) is not \
+             implemented — the base codec is available behind the `g729` build feature \
+             (patent-licensed — see docs/codec-licensing.md) and G.729 passthrough/relay is always \
              available"
         }
         "G723" => {
@@ -1134,9 +1163,9 @@ mod tests {
         // work out which codec the engine declined. The planned-but-unbuilt ones say what they are,
         // where they are planned, and that only *transcoding* is missing — the distinction that
         // decides whether a call had to fail at all (docs/codec-licensing.md).
+        // G.729 has its own pair of tests below, because whether it is implemented depends on the
+        // build and the message has to say which.
         for (name, expected) in [
-            ("G729", "G.729 transcoding is not implemented"),
-            ("G729A", "G.729 transcoding is not implemented"),
             ("G723", "G.723.1 transcoding is not implemented"),
             ("EVS", "EVS transcoding is not implemented"),
         ] {
@@ -1163,6 +1192,60 @@ mod tests {
         // return Unsupported — never panic. (Passthrough/relay never reaches the factory.)
         for name in ["AMR", "AMR-WB"] {
             let spec = CodecSpec::new(96, name, 16000, 1, 20);
+            assert!(
+                matches!(decoder_for(&spec), Err(CodecError::Unsupported(_))),
+                "{name}"
+            );
+            assert!(
+                matches!(encoder_for(&spec), Err(CodecError::Unsupported(_))),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "g729"))]
+    #[test]
+    fn g729_transcoding_is_unsupported_without_the_g729_feature() {
+        // Default build: G.729 transcoding is gated off (patent-licensed). Both directions return
+        // Unsupported rather than panicking, and relaying never reaches the factory at all — which
+        // is the distinction the error text has to make, because an operator reading it in a call
+        // trace needs to know whether the call can be carried at all.
+        let spec = CodecSpec::new(18, "G729", 8000, 1, 20);
+        assert!(matches!(
+            decoder_for(&spec),
+            Err(CodecError::Unsupported(_))
+        ));
+        assert!(matches!(
+            encoder_for(&spec),
+            Err(CodecError::Unsupported(_))
+        ));
+    }
+
+    #[cfg(feature = "g729")]
+    #[test]
+    fn g729_decodes_and_encodes_with_the_g729_feature() {
+        // Both directions are bit-exact against the ITU-T vectors, so the factory offers both and a
+        // G.729 leg can be transcoded either way.
+        let spec = CodecSpec::new(18, "G729", 8000, 1, 20);
+        let decoder = decoder_for(&spec).expect("g729 decoder");
+        let encoder = encoder_for(&spec).expect("g729 encoder");
+        assert_eq!(decoder.frame_samples(), 160);
+        assert_eq!(encoder.frame_samples(), 160);
+        assert_eq!(decoder.rtp_clock_rate_hz(), 8_000);
+        assert!(
+            !encoder.is_stateless(),
+            "every stage carries state across frames"
+        );
+    }
+
+    #[test]
+    fn the_annex_b_names_stay_unsupported_in_either_build() {
+        // None of these is a registered RTP encoding name — the base codec is signalled as `G729`
+        // and Annex B is selected by `a=fmtp:18 annexb=`. Annex B's VAD/DTX/CNG is not implemented
+        // in either build, and treating one of these names as the base codec would silently drop
+        // every silence descriptor the peer sends.
+        for name in ["G729A", "G729B", "G729AB"] {
+            let spec = CodecSpec::new(18, name, 8000, 1, 20);
             assert!(
                 matches!(decoder_for(&spec), Err(CodecError::Unsupported(_))),
                 "{name}"

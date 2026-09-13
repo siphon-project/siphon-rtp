@@ -52,13 +52,20 @@ stream the far side cannot decode.
 | AMR-WB | `AMR-WB` (dynamic) | all 9 modes | all 9 modes | 3GPP TS 26.174 vectors, per mode | `amr` |
 | AMR-NB | `AMR` (dynamic) | all 8 modes | all 8 modes | 3GPP TS 26.074 vectors | `amr` |
 | Opus | `opus` (dynamic, `opus/48000/2`) | yes — SILK, CELT and Hybrid, mono and stereo, all bandwidths and frame durations, PLC and in-band FEC | yes — SILK, CELT and Hybrid, mono and stereo, VBR / constrained VBR / CBR, LBRR/FEC and DTX | all 12 official RFC 6716 vectors (mono + stereo), plus exact per-packet `final_range`; the encoder against libopus' own decoder over the full configuration matrix | none (royalty-free) |
-| G.729 / G.729A | `G729` (18) | yes | no | ITU-T G.729 Release 3 sequences, all nine, decode direction byte-exact | `g729` |
+| G.729 | `G729` (18) | yes | yes | ITU-T G.729 Release 3 sequences — all nine decode byte-exact, and all six that ship an input encode byte-exact | `g729` |
 | EVS | | no | no | | absent |
 
-G.729 is **decode-only so far**, so it is not yet wired into the codec factory: a transcoding call
-needs both directions, and half a codec in the factory would look enabled while failing at answer.
-The decoder is complete and conformant; the encoder is the next piece, and the factory entry lands
-with it.
+**G.729 Annex B is not implemented.** Annex A needs nothing: it is a reduced-complexity encoder
+whose bitstream the base decoder reads, so a peer running it interoperates already. Annex B is
+different — it adds VAD, discontinuous transmission and comfort-noise generation, and puts two-octet
+silence-insertion descriptors on the wire that this decoder refuses rather than misreading as
+truncated speech. RFC 3555 §4.1.13 makes `annexb=yes` the **default** when the attribute is absent,
+so a transcoded leg must be offered and answered with `a=fmtp:18 annexb=no`; honouring `annexb=` on
+both legs is still to come. Until it does, a peer that sends silence descriptors has them refused by
+the decoder and dropped by the media pipeline, which logs and counts the failure — so a call with an
+Annex B peer carries its speech and plays silence through the peer's discontinuous transmission
+rather than comfort noise, and the loss is visible rather than silent. Relaying is unaffected either
+way: the engine never executes a codec on that path.
 
 The engine resolves a codec from the `a=rtpmap` encoding name (case-insensitive, RFC
 4566 §6), falling back to the RFC 3551 §6 static payload-type table (`PCMU` 0, `GSM` 3,

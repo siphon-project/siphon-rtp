@@ -169,26 +169,31 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// Pack eleven parameters into the wire octets, most significant bit first (`prm2bits_ld8k`, minus
+/// the reference's one-word-per-bit serial framing, which is a file format rather than a payload).
+///
+/// The parameter order and widths are [`PARAMETER_BITS`]: the two LSP indices, then each subframe's
+/// pitch lag, algebraic-codebook positions and signs and joint gain index, with the first
+/// subframe's lag followed by its parity bit.
+#[must_use]
+pub fn pack(parameters: [u16; 11]) -> [u8; FRAME_BYTES] {
+    let mut frame = [0_u8; FRAME_BYTES];
+    let mut position = 0_u32;
+    for (value, bits) in parameters.into_iter().zip(PARAMETER_BITS) {
+        for bit_index in (0..bits).rev() {
+            if (value >> bit_index) & 1 == 1 {
+                frame[(position / 8) as usize] |= 1 << (7 - position % 8);
+            }
+            position += 1;
+        }
+    }
+    debug_assert_eq!(position, 80, "the frame is exactly 80 bits");
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Pack eleven parameters back into the wire octets, so a test can build a frame from named
-    /// values instead of a hex literal. Test-only: the decoder never writes a bitstream.
-    fn pack(parameters: [u16; 11]) -> [u8; FRAME_BYTES] {
-        let mut frame = [0_u8; FRAME_BYTES];
-        let mut position = 0_u32;
-        for (value, bits) in parameters.into_iter().zip(PARAMETER_BITS) {
-            for bit_index in (0..bits).rev() {
-                if (value >> bit_index) & 1 == 1 {
-                    frame[(position / 8) as usize] |= 1 << (7 - position % 8);
-                }
-                position += 1;
-            }
-        }
-        assert_eq!(position, 80, "the frame is exactly 80 bits");
-        frame
-    }
 
     #[test]
     fn the_eleven_parameters_occupy_exactly_eighty_bits() {
