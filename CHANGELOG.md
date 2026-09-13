@@ -37,6 +37,29 @@ relay is now terminated by the engine rather than passed along, so the callee is
 
 ### Fixed
 
+- **A failed bind is no longer reported as an exhausted port pool.** `bind_in_range` tried each
+  reservable port once and treated every bind failure alike — release the port, try the next — so
+  after walking the whole span it answered `media-port pool exhausted (limit 10001)` on a range that
+  was almost entirely free. The real errno was never logged anywhere.
+
+  Only `EADDRINUSE` is a property of the *port*; it means another process on the host holds it and
+  the next port can still work, which is the whole reason the loop retries. Every other failure is a
+  property of the bind and no other port can fix it: `EMFILE`/`ENFILE` (no descriptors left),
+  `EADDRNOTAVAIL` (the bind address is not assigned to this host), `ENOBUFS`, `EACCES`. Those now
+  release the port and return `DatapathError::Bind` immediately, so the controller reads
+  `endpoint bind failed: Too many open files (os error 24)` and the engine's existing control-error
+  warning logs that reason. It also stops spending up to 10,001 failed `socket()` calls on the
+  call-setup path to reach the same answer.
+
+  The descriptor case is the one this was hiding. A container inherits a 1024 soft limit, nothing
+  raises it, an idle daemon holds 12 descriptors and a plain relay call binds four sockets, so a node
+  runs out at roughly 253 concurrent calls — and the operator was told to widen a port range that was
+  never the constraint. `alloc_specific_on` already returned bind errors as-is, so the two allocation
+  paths no longer disagree about the same failure.
+
+  `PoolExhausted` keeps its real meaning: every port in the span is reserved or held. The skip
+  behaviour, which existed only in a doc comment, now has a test.
+
 - **A call on hold is no longer reaped for being quiet.** The idle sweep took the latest accepted
   packet across a call's endpoints against one global `--media-timeout-secs` (default 30) and the
   engine parsed the SDP direction attribute nowhere, so hold — the most common mid-call operation on a
