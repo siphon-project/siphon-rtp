@@ -970,7 +970,8 @@ copy of Layers 1–4.
   |---|---|---|
   | Secure (SDES or DTLS) offerer + `ws_uri` | `offer` / `answer` | `ws-takeover-secure-offerer` |
   | ICE offerer + `ws_uri` | `offer` / `answer` | `ws-takeover-ice-offerer` |
-  | Secure offerer, **no** `ws_uri` (single-leg IVR/echo) | `answer_local` | `secure-offerer-unsupported` |
+  | **SDES** offerer, no `ws_uri` (single-leg IVR/echo/voicemail) | `answer_local` | terminated on the single-leg media pipeline — the engine answers its own `a=crypto` and holds the `SecureLeg` |
+| **DTLS** offerer, **no** `ws_uri` (single-leg IVR/echo) | `answer_local` | `secure-offerer-unsupported` — needs the full ICE agent on the promoted leg to gate the handshake on the selected pair (RFC 8445 §12) |
   | `RTP/SAVP` with no usable `a=crypto`; `UDP/TLS/RTP/SAVPF` with no `a=fingerprint`; no engine certificate | `answer_local` | `ws-takeover-unkeyable` |
   | ICE offerer with no full agent available | `answer_local` | `ws-takeover-ice-unsupported` |
 

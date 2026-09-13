@@ -2596,6 +2596,43 @@ impl MediaCall {
         self
     }
 
+    /// Mark a **single-leg** call's one party as secure, keyed later by the DTLS handshake.
+    ///
+    /// The single-leg twin of [`MediaCall::with_far_secure_pending`], and it gates the same way:
+    /// until the leg arrives, both directions drop rather than treat SRTP as plaintext.
+    #[must_use]
+    pub fn with_near_secure_pending(mut self) -> Self {
+        self.mark_near_secure_pending();
+        self
+    }
+
+    /// As [`MediaCall::with_near_secure_pending`], on an actor that is already running — the DTLS
+    /// case, where the pipeline is promoted before the handshake has produced a key.
+    pub fn mark_near_secure_pending(&mut self) {
+        self.a_to_b.secure_pending = true;
+        self.b_to_a.secure_pending = true;
+    }
+
+    /// Install the [`SecureLeg`] for a **single-leg** (`answer_local`) call, where the one party is
+    /// the secure side.
+    ///
+    /// Distinct from [`MediaCall::attach_secure_leg`], which keys the two-leg shape — A plaintext, B
+    /// secure — by putting the leg on `a_to_b`'s *egress* and `b_to_a`'s *ingress*. A single-leg call
+    /// has no second party: both of its directions face the same caller on the same endpoint, and the
+    /// caller is the secure side, so the same direction both decrypts what arrives and encrypts what
+    /// leaves. Reusing the two-leg method here would key exactly one half of each direction and leave
+    /// an IVR that decrypted the caller and answered it in the clear.
+    pub fn attach_near_secure_leg(&mut self, leg: Arc<Mutex<SecureLeg>>) {
+        for direction in [&mut self.a_to_b, &mut self.b_to_a] {
+            direction.secure_ingress = Some(leg.clone());
+            direction.secure_egress = Some(leg.clone());
+            direction.secure_pending = false;
+        }
+        for relay in &mut self.rtcp {
+            relay.attach_secure_leg(&leg);
+        }
+    }
+
     /// Install the far (B) leg's [`SecureLeg`] once the DTLS handshake has produced it
     /// ([`MediaControl::AttachSecureLeg`]), keying the same two directions
     /// [`MediaCall::with_far_secure_leg`] does and clearing the pending gate so media starts flowing.
@@ -3631,6 +3668,12 @@ pub enum MediaControl {
     /// the directions that face B and clearing the pending gate so media starts flowing. Sent by the
     /// handshake task, which cannot key the pipeline at answer time because no key exists yet.
     AttachSecureLeg { leg: Arc<Mutex<SecureLeg>> },
+    /// Install the [`SecureLeg`] for a **single-leg** call, where the one party is the secure side
+    /// and each direction both decrypts and encrypts against it.
+    AttachNearSecureLeg { leg: Arc<Mutex<SecureLeg>> },
+    /// Mark a **single-leg** call's party as DTLS-keyed-later: both directions drop rather than treat
+    /// SRTP as plaintext until [`MediaControl::AttachNearSecureLeg`] delivers the leg.
+    MarkNearSecurePending,
     /// Tear the call down: flush recordings and exit the actor loop.
     Stop,
 }
@@ -3983,6 +4026,12 @@ async fn run_media_call<D>(
                     MediaInput::Control(MediaControl::StopRecording) => call.stop_recording(),
                     MediaInput::Control(MediaControl::StartX3(taps)) => call.start_x3(*taps),
                     MediaInput::Control(MediaControl::StopX3) => call.stop_x3(),
+                    MediaInput::Control(MediaControl::AttachNearSecureLeg { leg }) => {
+                        call.attach_near_secure_leg(leg);
+                    }
+                    MediaInput::Control(MediaControl::MarkNearSecurePending) => {
+                        call.mark_near_secure_pending();
+                    }
                     MediaInput::Control(MediaControl::AttachSecureLeg { leg }) => {
                         call.attach_secure_leg(leg);
                         tracing::debug!(target: "siphon_rtp::media", "DTLS-SRTP key installed on the media pipeline");

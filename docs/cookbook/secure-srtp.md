@@ -48,10 +48,24 @@ automatically from the SDP; there is no separate knob.
 only because the controller asked for exactly that topology on the offer. The
 engine never silently downgrades a secure leg to plaintext, and a packet that
 fails SRTP authentication is dropped, never forwarded (see
-[Security & NAT](../security-and-nat.md)). Terminating SRTP that the *offerer*
-signals (a secure caller toward a plain callee) is wired for conference legs
-(`conference_join` answers `RTP/SAVP` + `a=crypto`) but not yet for the two-party
-offer/answer relay; there the secure side is the answerer's leg.
+[Security & NAT](../security-and-nat.md)).
+
+**Terminating SRTP the *offerer* signals** — a secure caller, rather than a secure
+callee — is wired for conference legs (`conference_join` answers `RTP/SAVP` +
+`a=crypto`), for a WebSocket takeover, and now for **`answer_local`**: an
+SDES-SRTP caller reaches an IVR, an announcement, an echo test or a voicemail box
+directly, with the engine answering its own `a=crypto` and terminating the
+caller's SRTP on the single-leg media pipeline. See
+[A secure caller into an IVR](#a-secure-caller-into-an-ivr).
+
+Two shapes are still not wired, and both refuse rather than answer keying no media
+path backs:
+
+- the **two-party offer/answer relay**, where the secure side is still only the
+  answerer's leg;
+- a **DTLS-SRTP (WebRTC) offerer on `answer_local`**, which needs the full ICE
+  agent on the promoted leg so the handshake can be gated on the selected pair
+  (RFC 8445 §12). It is answered `secure-offerer-unsupported`, naming DTLS.
 
 ## Native JSON exchange
 
@@ -204,3 +218,32 @@ flows.
   do) on secure calls.
 - [Security & NAT](../security-and-nat.md) for the full threat model: source
   gating, latching, and why the bridge re-enforces the gate on the redirect path.
+
+
+## A secure caller into an IVR
+
+An SDES-SRTP desk phone calls voicemail. `answer_local` is the verb — the engine
+*is* the far side — and it answers the caller's `RTP/SAVP` offer with `RTP/SAVP`
+and the engine's **own** `a=crypto`, never echoing the caller's key back:
+
+```json
+{
+  "id": 60,
+  "command": "answer_local",
+  "call_id": "7f9a2b1c@198.51.100.20",
+  "from_tag": "a7c31f",
+  "sdp": "<the caller's RTP/SAVP offer with its a=crypto>"
+}
+```
+
+From there it is an ordinary single-leg call: `play_media` plays the greeting,
+`start_recording` with `format: "wav"` records the message, `play_dtmf` and the
+`dtmf` event work as they do on a plaintext leg. The engine decrypts the caller's
+SRTP before the transcoder sees it and encrypts everything it sends back, so
+nothing in the media path handles the caller's audio in the clear on the wire.
+
+This used to be refused outright (`secure-offerer-unsupported`), which meant a
+TLS/SRTP phone could not reach an IVR or a voicemail box at all.
+
+A **DTLS-SRTP** caller (a browser softphone) still needs a WebSocket takeover;
+see the note above.

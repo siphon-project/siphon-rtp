@@ -2996,7 +2996,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // with keying nothing backs (which is what it used to do: it echoed A's own `a=crypto` /
         // `a=fingerprint` straight back).
         let takeover = profile.ws_uri.is_some();
-        let offerer_security = match resolve_ws_takeover_security(&info, takeover) {
+        let offerer_security = match resolve_offerer_security(&info) {
             Ok(security) => security,
             Err(reason) => return CmdResult::Error { reason },
         };
@@ -3009,6 +3009,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // the signalled address instead of negotiating ICE we cannot trust.
         let ice_mismatch = siphon_rtp_ice::is_ice_mismatch(info.remote_rtp, &info.candidates)
             && ice_directive(profile) != Some(IceDirective::Force);
+        // Still gated on `takeover`, deliberately. An ICE agent is attached only on the takeover arm,
+        // so un-gating this would re-originate ICE credentials on a local leg that runs no agent —
+        // half a fix, and the half that hides the other. The full ICE agent on the promoted
+        // (`Redirect`) local leg is the same missing piece DTLS-SRTP needs; both land together.
         let want_ice = takeover
             && match ice_directive(profile) {
                 _ if ice_mismatch => false,
@@ -3531,6 +3535,59 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.far_codec = Some(chosen);
             call.pipeline = PipelineKind::Media;
+        }
+
+        // Key the single-leg pipeline for a secure offerer. The answer above already advertises the
+        // engine's own SDES key or DTLS fingerprint — that part was always correct — and until now it
+        // was the *media path* that had nothing behind it, which is why the verb refused a secure
+        // offerer outright rather than answering keying it could not honour.
+        //
+        // The single-leg shape is its own: both directions face the same caller on the same endpoint,
+        // and the caller is the secure side, so each direction both decrypts what arrives and encrypts
+        // what leaves (`attach_near_secure_leg`). The two-leg method keys A-plaintext/B-secure and
+        // would leave an IVR that decrypted the caller and answered it in the clear.
+        match &offerer_security {
+            WsTakeoverSecurity::Plain => {}
+            WsTakeoverSecurity::Sdes { peer_key } => {
+                // SDES is keyed synchronously: this answer carries the engine's key and the offer
+                // carried the peer's, so both halves are known now (RFC 4568). Key direction per
+                // `SecureLeg::new`: encrypt egress with ours, decrypt ingress with theirs.
+                let Some(local) = near_local_crypto else {
+                    self.teardown_call(call_id).await;
+                    return error_result(
+                        "answer_local",
+                        &"secure-offerer-unkeyable: no engine SDES key was minted (internal)",
+                    );
+                };
+                let leg = Arc::new(std::sync::Mutex::new(SecureLeg::new(
+                    &local.key,
+                    &peer_key.key,
+                )));
+                if !self
+                    .media
+                    .control(call_id, MediaControl::AttachNearSecureLeg { leg })
+                {
+                    self.teardown_call(call_id).await;
+                    return error_result(
+                        "answer_local",
+                        &"secure-offerer-unkeyable: media actor unavailable",
+                    );
+                }
+            }
+            // DTLS-SRTP on the local pipeline is **not** done, and says so rather than answering a
+            // fingerprint no media path backs. It needs two things this change does not build: the
+            // full ICE agent attached to the promoted (Redirect) leg so the handshake can be gated on
+            // the selected pair (RFC 8445 §12), and the `gate_on_ice` / pending-key plumbing that goes
+            // with it. A WebRTC caller reaching an IVR is the case, and it is the second half of the
+            // secure-offerer work.
+            WsTakeoverSecurity::Dtls { .. } => {
+                self.teardown_call(call_id).await;
+                return error_result(
+                    "answer_local",
+                    &"secure-offerer-unsupported: a DTLS-SRTP (WebRTC) offerer needs a WebSocket \
+                      takeover (ws_uri); SDES-SRTP is terminated on the local pipeline",
+                );
+            }
         }
 
         ok_sdp(answer_sdp, None)
@@ -12809,28 +12866,21 @@ enum WsTakeoverSecurity {
     },
 }
 
-/// Resolve a WebSocket-takeover offerer's security posture, refusing every shape the takeover leg
-/// cannot actually terminate rather than accepting it and bridging nothing.
+/// Resolve a single-leg offerer's security posture, refusing every shape the engine cannot actually
+/// terminate rather than accepting it and bridging nothing.
 ///
-/// `takeover` is whether the control profile asked for a takeover (`ws_uri`). A secure offerer
-/// **without** one is refused: the single-leg local pipeline (IVR / echo / announcement) carries no
-/// `SecureLeg`, so answering it would advertise keying no media path backs.
+/// It no longer takes `takeover`. A secure offerer without one used to be refused here, because the
+/// single-leg local pipeline carried no `SecureLeg` — it now terminates SDES-SRTP on one, exactly as
+/// a conference seat and a takeover leg already did, so the posture is the same question whichever
+/// media path will consume it. Which paths can *honour* a resolved posture is the caller's business,
+/// and `answer_local` still refuses a DTLS offerer without a takeover for want of an ICE agent on the
+/// promoted leg.
 ///
-/// The reason strings lead with a stable token (`secure-offerer-unsupported`,
-/// `ws-takeover-unkeyable`) so a controller can branch on the failure without parsing prose.
-fn resolve_ws_takeover_security(
-    info: &sdp::MediaInfo,
-    takeover: bool,
-) -> Result<WsTakeoverSecurity, String> {
+/// The reason strings lead with a stable token (`ws-takeover-unkeyable`) so a controller can branch
+/// on the failure without parsing prose.
+fn resolve_offerer_security(info: &sdp::MediaInfo) -> Result<WsTakeoverSecurity, String> {
     if !info.secure {
         return Ok(WsTakeoverSecurity::Plain);
-    }
-    if !takeover {
-        return Err(
-            "answer_local: secure-offerer-unsupported: a secure (SRTP) offerer needs a WebSocket \
-             takeover (ws_uri) — the single-leg local media pipeline terminates no SRTP"
-                .to_string(),
-        );
     }
     if info.dtls {
         // RFC 5763 §5: without the peer's certificate fingerprint the handshake cannot be bound to
@@ -20119,10 +20169,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn answer_local_refuses_a_secure_offerer_without_a_takeover() {
-        // The single-leg IVR / echo / announcement pipeline holds no `SecureLeg`, so it cannot be a
-        // secure caller's far side. It used to answer `ok` — echoing the caller's own `a=crypto`
-        // straight back — and then feed the transcoder ciphertext.
+    async fn answer_local_terminates_an_sdes_offerer_on_the_local_pipeline() {
+        // This used to be refused outright (`secure-offerer-unsupported`): the answer already minted
+        // the engine's own `a=crypto`, but the single-leg pipeline held no `SecureLeg`, so answering
+        // would have advertised keying no media path backed. A TLS/SRTP desk phone therefore could not
+        // reach an IVR or a voicemail box at all.
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let (_phone_a, addr_a) = phone().await;
         let peer_key =
@@ -20138,14 +20189,167 @@ mod tests {
                 },
             )
             .await;
+        let answer = ok_sdp_text(&result);
+        let parsed = sdp::parse(&answer).expect("the answer parses");
+        assert!(
+            parsed.secure,
+            "the answer keeps the caller's secure profile: {answer}"
+        );
+        let answered_key = parsed
+            .crypto
+            .first()
+            .expect("the answer carries the engine's own a=crypto");
+        assert_ne!(
+            answered_key.key.to_inline_bytes(),
+            peer_key.key.to_inline_bytes(),
+            "the engine answers its OWN key, never echoing the caller's back"
+        );
+        assert!(
+            engine.media().is_transcoding_call("al-sdes-ivr"),
+            "the call is on the userspace media pipeline, which is what now holds the SecureLeg"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_secure_ivr_decrypts_the_caller_and_answers_it_encrypted() {
+        // The property the refusal existed to protect, now proven the other way round: the caller's
+        // SRTP is decrypted before the transcoder sees it, and the prompt the engine plays back comes
+        // out encrypted under the engine's own key. Answering a secure caller in the clear is the
+        // failure this must never have.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        use siphon_rtp_srtp::SrtpContext;
+
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone, addr) = phone().await;
+        let peer_key =
+            CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("peer key");
+        let answered = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "al-sdes-flow".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdes_offerer_sdp(addr, &peer_key),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        let answer = sdp::parse(&ok_sdp_text(&answered)).expect("answer");
+        let engine_port = answer.remote_rtp;
+        let engine_key = *answer.crypto.first().expect("the engine's key");
+
+        // Play a prompt so the IVR has something to send back.
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[6000i16; 1600]);
+        let played = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "al-sdes-flow".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Blob {
+                        data: recorder.into_wav(),
+                    },
+                    repeat_times: None,
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(played, CmdResult::Ok { .. }),
+            "the prompt starts: {played:?}"
+        );
+
+        // The caller sends SRTP encrypted under its own key — what an SDES desk phone actually emits.
+        let mut protect = SrtpContext::from_key_material(&peer_key.key);
+        for sequence in 0..8u16 {
+            let plain = g711_rtp(0, sequence, 0x0A0A_0A0A, 0x20);
+            let mut encrypted = Vec::new();
+            protect.protect(&plain, &mut encrypted).expect("protect");
+            phone.send_to(&encrypted, engine_port).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Everything the caller hears back must authenticate under the engine's advertised key. A
+        // plaintext datagram here would be the exact leak this path used to refuse rather than risk.
+        let mut unprotect = SrtpContext::from_key_material(&engine_key.key);
+        let mut heard = false;
+        for _ in 0..40u16 {
+            let mut buffer = [0u8; 2048];
+            let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone.recv_from(&mut buffer)).await
+            else {
+                continue;
+            };
+            // Skip the periodic RTCP sender report: it rides the same muxed socket (RFC 5761) and is
+            // SRTCP, which the SRTP context deliberately cannot authenticate. Under load it can be the
+            // first datagram to arrive, so a test that assumed RTP here failed for the wrong reason.
+            // RFC 3550 §A.11: a muxed RTCP packet's payload type is 200..=204.
+            if matches!(buffer[1] & 0x7F, 200..=204) {
+                continue;
+            }
+            // Authenticating under the engine's advertised key is the whole assertion: SRTP appends a
+            // keyed auth tag over the header and the encrypted payload (RFC 3711 §3.1), so a
+            // plaintext frame — the leak this path used to refuse rather than risk — cannot pass it.
+            let mut plain = Vec::new();
+            unprotect
+                .unprotect(&buffer[..len], &mut plain)
+                .expect("the IVR's egress authenticates under the engine's own key");
+            let packet = siphon_rtp_media::rtp::RtpPacket::parse(&plain).expect("decrypted rtp");
+            assert_eq!(packet.payload_type, 0, "encoded in the caller's own codec");
+            heard = true;
+            break;
+        }
+        assert!(heard, "the secure caller hears the IVR");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_local_still_refuses_a_dtls_offerer_without_a_takeover() {
+        // Deliberately still refused, and it names why: DTLS on the local pipeline needs the full ICE
+        // agent on the promoted (`Redirect`) leg so the handshake can be gated on the selected pair,
+        // which this change does not build. Answering a fingerprint with no media path behind it is
+        // exactly the failure the SDES half just stopped having.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("cert");
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::AnswerLocal {
+                    call_id: "al-dtls-ivr".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: dtls_offerer_sdp(addr_a, &certificate.fingerprint(), "actpass"),
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
         match result {
-            CmdResult::Error { reason } => assert!(
-                reason.contains("secure-offerer-unsupported"),
-                "the refusal must name the reason, got: {reason}"
-            ),
+            CmdResult::Error { reason } => {
+                assert!(
+                    reason.contains("secure-offerer-unsupported"),
+                    "the refusal keeps its stable token, got: {reason}"
+                );
+                assert!(
+                    reason.contains("DTLS"),
+                    "and names which posture is unsupported, got: {reason}"
+                );
+            }
             other => panic!("expected a refusal, got {other:?}"),
         }
-        assert!(!engine.calls.contains_key("al-sdes-ivr"));
+        assert!(!engine.calls.contains_key("al-dtls-ivr"));
         assert_eq!(engine.client_call_count(CLIENT), 0, "no quota slot leaked");
     }
 
@@ -20627,22 +20831,20 @@ mod tests {
 
     #[test]
     fn ws_takeover_security_resolves_the_offerers_own_posture() {
-        // Unit cover for the resolver the takeover verbs branch on. A plaintext offer is `Plain`
-        // whether or not a takeover was asked for; a secure one is only ever resolved for a takeover.
+        // Unit cover for the resolver every single-leg verb branches on. It reads the offerer's SDP
+        // and nothing else: it used to take a `takeover` flag and refuse a secure offerer without
+        // one, which is no longer its decision to make — the local pipeline terminates SDES now, and
+        // which media paths can honour a resolved posture is the caller's business.
         let plain = sdp::parse(plain_offer_sdp()).expect("plain offer");
         assert!(matches!(
-            resolve_ws_takeover_security(&plain, false),
-            Ok(WsTakeoverSecurity::Plain)
-        ));
-        assert!(matches!(
-            resolve_ws_takeover_security(&plain, true),
+            resolve_offerer_security(&plain),
             Ok(WsTakeoverSecurity::Plain)
         ));
 
         let key = CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80).expect("key");
         let address: SocketAddr = "203.0.113.7:30000".parse().expect("addr");
         let sdes = sdp::parse(&sdes_offerer_sdp(address, &key)).expect("sdes offer");
-        match resolve_ws_takeover_security(&sdes, true) {
+        match resolve_offerer_security(&sdes) {
             Ok(WsTakeoverSecurity::Sdes { peer_key }) => assert_eq!(
                 peer_key.key.to_inline_bytes(),
                 key.key.to_inline_bytes(),
@@ -20650,16 +20852,12 @@ mod tests {
             ),
             other => panic!("expected Sdes, got {other:?}"),
         }
-        match resolve_ws_takeover_security(&sdes, false) {
-            Err(reason) => assert!(reason.contains("secure-offerer-unsupported"), "{reason}"),
-            other => panic!("expected a refusal, got {other:?}"),
-        }
 
         let certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("cert");
         let fingerprint = certificate.fingerprint();
         let dtls =
             sdp::parse(&dtls_offerer_sdp(address, &fingerprint, "active")).expect("dtls offer");
-        match resolve_ws_takeover_security(&dtls, true) {
+        match resolve_offerer_security(&dtls) {
             Ok(WsTakeoverSecurity::Dtls {
                 peer_fingerprint,
                 peer_setup,
@@ -20676,7 +20874,7 @@ mod tests {
              m=audio 30000 RTP/SAVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
         )
         .expect("savp without crypto");
-        match resolve_ws_takeover_security(&no_crypto, true) {
+        match resolve_offerer_security(&no_crypto) {
             Err(reason) => assert!(
                 reason.contains("ws-takeover-unkeyable") && reason.contains("a=crypto"),
                 "{reason}"
@@ -20688,7 +20886,7 @@ mod tests {
              m=audio 30000 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=setup:actpass\r\n",
         )
         .expect("dtls without fingerprint");
-        match resolve_ws_takeover_security(&no_fingerprint, true) {
+        match resolve_offerer_security(&no_fingerprint) {
             Err(reason) => assert!(
                 reason.contains("ws-takeover-unkeyable") && reason.contains("a=fingerprint"),
                 "{reason}"
