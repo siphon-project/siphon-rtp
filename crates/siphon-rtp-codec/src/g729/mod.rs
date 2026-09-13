@@ -28,6 +28,7 @@ pub mod postfilter;
 pub mod postproc;
 pub mod qualsp;
 pub mod tables;
+pub mod weighting;
 
 use bitstream::{FrameParameters, FRAME_SAMPLES, SUBFRAME_SAMPLES};
 use filter::ORDER;
