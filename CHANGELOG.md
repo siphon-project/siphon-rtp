@@ -72,6 +72,138 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   **Breaking (Rust API)**, for anything that constructs those variants or `CmdResult::Ok`
   exhaustively. The JSON wire stays backward compatible.
 
+- **The control-plane shared secret can come from a file** — `--control-secret-file <PATH>`, the
+  `SIPHON_RTP_CONTROL_SECRET_FILE` environment variable, or a `control_secret_file` config key. It
+  was `SIPHON_RTP_CONTROL_SECRET` only, and there was no `*_FILE`-style option anywhere in the tree.
+
+  A compose stack that generates its secrets at first start into a volume reads its environment files
+  **on the host, before any container runs**, so a generated secret cannot reach an environment
+  variable without a wrapper shell — which then puts it on a command line or in a shell's process
+  environment. The `*_FILE` convention (the Postgres image's, most visibly) is the standard answer.
+
+  Neither form reaches argv. Surrounding whitespace is trimmed, including the trailing newline every
+  tool that writes a secret adds.
+
+  Two refusals rather than silent behaviour, both because the failure they prevent is invisible:
+
+  - **A file plus `SIPHON_RTP_CONTROL_SECRET` is a fatal startup error.** They would be different
+    secrets in every case worth worrying about — a stale variable in a unit file beside a freshly
+    provisioned volume — and quietly preferring one means the controller authenticates against a
+    secret the operator did not think was in use.
+  - **An empty or whitespace-only secret file is refused.** Reading it as "no secret" would turn
+    authentication *off* on a node provisioned to require it, which is exactly the failure the option
+    exists to prevent.
+
+  `control_secret_file` is the one secret-adjacent key the config file accepts, and only because it
+  names a **path** rather than carrying the secret.
+
+### Fixed
+
+- **`play_dtmf` reports failure when it has nowhere to send the digits.** The media actor already
+  refused a leg with no negotiated RFC 4733 `telephone-event` payload type — there is nothing to
+  carry the events on — but it returned a bare `bool` that the actor loop dropped, and the engine
+  answered the verb from whether the control message reached the mailbox. So the call was accepted,
+  `ok` went back, and nothing was put on the wire.
+
+  On a PBX that is a feature code forwarded to a carrier's voicemail, an attended-transfer helper, or
+  a flow step navigating a remote menu — and a silent no-op there reads as the far end ignoring the
+  digits, which is the worst place for it to look like someone else's fault.
+
+  The verb now awaits the actor's verdict through a `oneshot`, exactly as `stop_media` and
+  `set_play_gain` already do, and answers
+  `play_dtmf: no telephone-event payload type negotiated toward this leg`. The actor's outcome also
+  separates that case from an unusable digit string, which used to be the same `false`.
+
+  In-band (Goertzel) generation as a fallback remains out of scope: handsets and the trunks this
+  targets negotiate RFC 4733.
+
+### Added
+
+- **A recorded prompt can play until it is stopped** — `"repeat_times": "inf"` on `play_media`. Hold
+  music, queue music and park music all play for an unbounded time, and until now only a *tone* could:
+  `repeat_times` was a pass count that `PcmPlayer` clamped with `.max(1)`, so the only way to
+  approximate a bed was a large finite count plus a controller-side timer to re-issue the play when
+  `PlayFinished{Completed}` arrived, which leaves an audible gap at every re-issue.
+
+  The spelling mirrors the `*inf` suffix a tone cadence has always taken, so "endless" is one word
+  everywhere in the contract. An endless play's accept carries **no** `duration_ms` — there is none to
+  report — exactly as an uncapped `*inf` tone already did, and it ends only on `stop_media`, on a
+  `duration_ms` cap, or with the leg. It never reports `completed` on its own.
+
+  A body it can never advance in (no samples, or `start_pos_ms` at or past the end) is exhausted
+  immediately and reports a zero duration rather than "endless" — otherwise the accept would promise a
+  bed that plays no sample and never finishes.
+
+  The NG/bencode front-end keeps rtpengine's integer `repeat-times`: that wire is rtpengine's, and it
+  has no spelling for an endless play.
+
+### Fixed
+
+- **`docs/cookbook/playback.md` shipped the bug as the recipe.** The ducking example started a hold
+  bed with `"repeat_times": 0` and printed `"duration_ms": 45000` in its own reply — which is the
+  file's single-pass length, not a bed. The example now uses `"inf"`, and the prose one screen below
+  that contradicted it is corrected.
+
+### Changed
+
+- **`Command::PlayMedia.repeat_times` is now `Option<PlayRepeat>`** rather than `Option<u64>`.
+
+  **Breaking (Rust API).** A controller constructing the variant passes
+  `repeat_times.map(PlayRepeat::Times)` (or `PlayRepeat::Forever`). The JSON wire is **unchanged for
+  every existing message**: a number still deserializes as a total play count and `0` still means
+  once, so nothing a controller sends today changes meaning.
+
+  `PlayRepeat`'s serde is hand-written rather than `#[serde(untagged)]`: untagged would accept any
+  string as `Forever`, so a typo would silently become an endless bed on every caller. A value that is
+  neither a non-negative number nor `"inf"` (case-insensitive) is a parse error naming both forms.
+
+### Fixed
+
+- **A call on hold is no longer reaped for being quiet.** The idle sweep took the latest accepted
+  packet across a call's endpoints against one global `--media-timeout-secs` (default 30) and the
+  engine parsed the SDP direction attribute nowhere, so hold — the most common mid-call operation on a
+  PBX, and precisely the state in which both parties legitimately stop sending — was torn down after
+  30 s with a `media_timeout` event while the user was still holding the handset. Park and queue are
+  the same state and fail the same way.
+
+  A dead media path and a held call are *identical* at the packet layer; only the SDP tells them
+  apart. RFC 3264 §8.4 defines hold as an offer marked `sendonly` (answered `recvonly`), or `inactive`
+  when both ends hold it, and is explicit that the holding party *"MAY send media (e.g., music on
+  hold) or MAY send nothing"* — so `sendonly` guarantees a packet no more than `recvonly` does, and a
+  per-direction flow analysis would still have reaped the commonest hold of all (a handset that marks
+  the stream `sendonly` and then simply stops transmitting).
+
+  The engine now parses the direction attribute (RFC 4566 §6 / RFC 8866 §6.7, media-level winning over
+  session-level) on every offer, answer and `reoffer`, records it per party, and measures a call where
+  **either** party has taken the stream off `sendrecv` against a new `--held-media-timeout-secs`
+  (default 7200, `0` = never) instead. An unhold re-offer re-arms the short timer — including one that
+  carries no direction attribute at all, which is what RFC 4566 §6 says `sendrecv` means. Everything
+  else is unchanged, down to the endpoint set read, so a held call carrying music-on-hold refreshes
+  its own ceiling like any other and a `sendrecv` call that goes silent still reaps at 30 s.
+
+  A conference seat that joined `recvonly` or `inactive` — a listen-only webinar attendee — is treated
+  the same way on the same sweep.
+
+  The gate is not weakened: the direction attribute only selects *which ceiling* applies and never
+  makes a packet acceptable. Liveness is still claimed only for media that cleared the source gate
+  and, where there is crypto, SRTP authentication.
+
+- **A restored (HA) call keeps the short ceiling.** Neither party's direction is carried in the
+  checkpoint — the standby never saw either SDP — so both default to `sendrecv` rather than a call
+  being granted the long held budget on a guess. A re-offer after the restore corrects it.
+
+### Changed
+
+- **`Event::MediaTimeout` gains `reason`** (`no_media` / `held_too_long`), so a controller can tell
+  "the media path died" from "nobody came back to a held call". An ICE or consent failure reports
+  `no_media`. The end-of-call `CallSummary` CDR records the same distinction (`media_timeout` /
+  `held_timeout`).
+
+  **Breaking (Rust API).** `Event` is `#[non_exhaustive]` at the enum level, which does not make
+  adding a field to an existing variant additive: a consumer destructuring
+  `Event::MediaTimeout { call_id, from_tag }` without `..` must add the field or `..`. The JSON wire
+  stays backward compatible — an older consumer ignores the added key.
+
 ## [0.5.3] — 2026-09-12
 
 A re-offer handed the other party the re-offering party's own media port, so a call went one-way the

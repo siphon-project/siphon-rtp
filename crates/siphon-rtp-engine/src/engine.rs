@@ -32,14 +32,14 @@ use siphon_rtp_hep::text_report::TextQosReport;
 use siphon_rtp_hep::{protocol_type, Capture};
 use siphon_rtp_media::pcap::{self, CapturedPacket};
 use siphon_rtp_media::playback::Gain;
-use siphon_rtp_media::player::{PcmPlayer, WavError, WavSource};
+use siphon_rtp_media::player::{PcmPlayer, PcmRepeat, WavError, WavSource};
 use siphon_rtp_media::tone::ToneSpec;
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{
     BridgeDirection, CmdResult, Command, ConferenceRole, EngineStatistics, Event, LegSummary,
-    PlayEndReason, PlayMediaSource, ProfileFlags, RecordingChannels, RecordingDirection,
-    RecordingEndReason, RecordingFormat, SessionStats, WsBridgeEndReason, WsTeeDirection,
-    WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
+    MediaTimeoutReason, PlayEndReason, PlayMediaSource, PlayRepeat, ProfileFlags,
+    RecordingChannels, RecordingDirection, RecordingEndReason, RecordingFormat, SessionStats,
+    WsBridgeEndReason, WsTeeDirection, WsTeeEndReason, WsVadEngine, X3EndReason, X3TargetLeg, Xid,
 };
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 use siphon_rtp_srtp::sdes::{CryptoAttribute, CryptoSuite, SrtpKeyMaterial};
@@ -54,7 +54,7 @@ use crate::interface::{Interface, InterfaceTable};
 use crate::media_fetch::{self, MediaFetchLimits};
 use crate::media_pipeline::{
     DirectionConfig, DirectionQuality, FinalCallQuality, MediaCall, MediaControl, MediaRegistry,
-    PcapCapture, PlayRequest, RawTee, RelayConfig, RtcpRelay, SecureSide,
+    PcapCapture, PlayDtmfOutcome, PlayRequest, RawTee, RelayConfig, RtcpRelay, SecureSide,
 };
 use crate::metrics::Metrics;
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
@@ -609,6 +609,17 @@ struct Call {
     /// The far (answerer) leg's primary audio codec, captured at answer — the fork codec for a
     /// `subscribe_request` that forks leg B. `None` until the call is answered.
     far_codec: Option<CodecSpec>,
+    /// The direction the **near** (offerer) party declared for itself (RFC 4566 §6 / RFC 8866 §6.7),
+    /// captured at offer / `answer_local` and refreshed on each of that party's re-offers. Read only by
+    /// the idle reaper, which must not judge a party's silence when the party told us it would be
+    /// silent (RFC 3264 §8.4 — a held party may send nothing at all). `SendRecv` for a call restored
+    /// from an HA snapshot, whose SDP the standby never saw; that is the conservative default, since it
+    /// keeps the shorter dead-path ceiling rather than granting a restored call the held one.
+    near_direction: sdp::MediaDirection,
+    /// The direction the **far** (answerer) party declared for itself, captured at answer and refreshed
+    /// on its re-offers. `SendRecv` until the call is answered — an unanswered call has no far party
+    /// whose silence could be expected.
+    far_direction: sdp::MediaDirection,
     /// The near leg's negotiated RFC 4733 telephone-event payload type, if any.
     near_telephone_event: Option<u8>,
     /// The far leg's negotiated RFC 4733 telephone-event payload type, captured at answer. Paired
@@ -801,6 +812,26 @@ impl Call {
     #[cfg(test)]
     fn far_leg(&self) -> &Leg {
         self.far.as_ref().expect("an answered call has a far leg")
+    }
+
+    /// Whether the signalling has taken this call off two-way media — hold, park or queue — so that
+    /// nobody owes us a packet and silence proves nothing about the path.
+    ///
+    /// RFC 3264 §8.4 is the whole basis: a party places a call on hold by offering `sendonly` (answered
+    /// `recvonly`), or `inactive` when both ends hold it, and in **every** one of those shapes the spec
+    /// permits the remaining direction to carry nothing at all — *"the party placing the call on hold
+    /// MAY send media (e.g., music on hold) or MAY send nothing"*. So `sendonly` guarantees a packet no
+    /// more than `recvonly` does, and a per-direction flow analysis would still reap the commonest hold
+    /// of all (a handset that marks the stream `sendonly` and then simply stops transmitting).
+    ///
+    /// The test is therefore "has either party taken the stream off `sendrecv`". On a two-party call a
+    /// direction attribute other than `sendrecv` exists precisely to suspend the two-way flow, and that
+    /// is exactly the state whose silence must not be read as a dead path. On a single-leg call
+    /// (`answer_local`: IVR, announcement, voicemail) there is no second party — `far_direction` stays
+    /// at its `sendrecv` default and the caller's own attribute decides.
+    fn is_held(&self) -> bool {
+        self.near_direction != sdp::MediaDirection::SendRecv
+            || self.far_direction != sdp::MediaDirection::SendRecv
     }
 
     /// The role of one of this call's four possible endpoints, or `None` if the id is not one of
@@ -2020,16 +2051,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 volume_dbm0,
                 pause_ms,
                 to_tag,
-            } => self.play_dtmf(
-                client,
-                &call_id,
-                &from_tag,
-                &code,
-                duration_ms,
-                volume_dbm0,
-                pause_ms,
-                to_tag.as_deref(),
-            ),
+            } => {
+                self.play_dtmf(
+                    client,
+                    &call_id,
+                    &from_tag,
+                    &code,
+                    duration_ms,
+                    volume_dbm0,
+                    pause_ms,
+                    to_tag.as_deref(),
+                )
+                .await
+            }
             Command::SubscribeRequest {
                 call_id,
                 from_tags,
@@ -2737,6 +2771,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_offered_codecs,
                 near_codec_withheld,
                 far_codec: None,
+                // A's own direction, for the idle reaper. B's arrives with its answer; until then the
+                // far party is not a party yet, so it defaults to sendrecv and contributes nothing.
+                near_direction: info.direction,
+                far_direction: sdp::MediaDirection::default(),
                 near_telephone_event: info.telephone_event_payload_type(),
                 far_telephone_event: None,
                 pipeline,
@@ -3124,6 +3162,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_offered_codecs: Vec::new(),
                 near_codec_withheld: false,
                 far_codec: None,
+                // The caller's own direction. A single-leg call has no second party, so the far default
+                // never contributes — `legs_expected_to_send` only walks a far leg that exists.
+                near_direction: info.direction,
+                far_direction: sdp::MediaDirection::default(),
                 near_telephone_event: info.telephone_event_payload_type(),
                 far_telephone_event: None,
                 pipeline: PipelineKind::Passthrough,
@@ -4148,6 +4190,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     }
                     // A re-offer from A supersedes any from B still waiting for an answer.
                     call.pending_far_reoffer = None;
+                    // A re-offer restates the offering party's own direction, so this is where hold is
+                    // applied *and* where the unhold re-arms the dead-path timer (RFC 3264 §8 — a
+                    // subsequent offer modifies the session, and §8.4 makes hold/unhold exactly such an
+                    // offer). Taken unconditionally: `sendrecv` is the meaning of an absent attribute,
+                    // so "no direction line in this re-offer" genuinely means the party is active again.
+                    call.near_direction = info.direction;
                 }
                 Party::Far => {
                     if let Some(far) = call.far.as_mut() {
@@ -4160,6 +4208,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     }
                     // Held for A's answer, which re-wires the media path against it.
                     call.pending_far_reoffer = Some(sdp.to_string());
+                    // As above, for a re-offer the answering party initiated.
+                    call.far_direction = info.direction;
                 }
             }
             call.ice = ice_creds.clone();
@@ -4414,6 +4464,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 if let Some(telephone_event) = answered.telephone_event_payload_type() {
                     call.near_telephone_event = Some(telephone_event);
                 }
+                // A's answer states A's own direction — this is how A accepts (or declines) a hold B
+                // asked for. `far_direction` needs nothing here: `info` below is B's re-offer, i.e. B's
+                // own SDP, so the single write at the end of `answer` is right whichever way round the
+                // exchange ran.
+                call.near_direction = answered.direction;
                 call.near_remote_ice = peer_ice_credentials(&answered);
                 call.near_remote_candidates = answered.candidates.clone();
                 call.near_peer_is_lite = answered.ice_lite;
@@ -5846,6 +5901,10 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             // The far leg's RFC 4733 telephone-event PT from its answer, so `block DTMF` can gate leg
             // B's telephone-event even on a plain relay.
             call.far_telephone_event = info.telephone_event_payload_type();
+            // B's own direction, for the idle reaper. This is where hold becomes visible on an answered
+            // call: A offers `sendonly` and B answers `recvonly` (RFC 3264 §8.4), so neither party is
+            // expected to send and the call is held rather than dead.
+            call.far_direction = info.direction;
             call.pipeline = pipeline;
             call.relay_flows = relay_flows;
             // The in-kernel text `Forward` flows, kept so text observability can promote/demote the
@@ -6946,6 +7005,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_offered_codecs: Vec::new(),
                 near_codec_withheld: false,
                 far_codec: far_codec_out,
+                // Neither party's direction attribute is carried in the HA snapshot — the standby never
+                // saw either SDP. Both default to sendrecv, which is the conservative reading: a
+                // restored call is measured against the short dead-path ceiling rather than being
+                // granted the long held one on a guess. A re-offer after the restore corrects it.
+                near_direction: sdp::MediaDirection::default(),
+                far_direction: sdp::MediaDirection::default(),
                 near_telephone_event: snapshot.near_telephone_event,
                 // The far leg's telephone-event PT is not carried in the HA snapshot (a restored call
                 // is not DTMF-blocked — the reason set is cleared above too); resolved only on a fresh
@@ -7654,10 +7719,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
         let events = self.events.get(&client).map(|sink| sink.value().clone());
         let joined_tick = self.datapath.now_ticks();
+        // A seat that offered `a=recvonly` / `a=inactive` told us it will not send (RFC 4566 §6), so
+        // the idle sweep must not read its silence as a dead path — a held seat and a listen-only
+        // attendee are both legitimately quiet for the whole conference.
+        let held = !info.direction.peer_sends();
         if !self.conference.join(
             conference_id,
             config,
             joined_tick,
+            held,
             self.datapath.clone(),
             events,
         ) {
@@ -7881,8 +7951,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 return Err(Box::new(error_result("play_media: promote call", &reason)));
             }
         }
-        // `repeat_times` is the total play count; 0/None plays once (PcmPlayer treats 0/1 alike).
-        let repeat = options.repeat_times.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        // `repeat_times` is the total play count; 0/None plays once (PcmRepeat treats 0/1 alike), and
+        // `"inf"` plays until stopped — what music on hold, queue music and park music need.
+        let repeat = match options.repeat_times {
+            None => PcmRepeat::Times(0),
+            Some(PlayRepeat::Forever) => PcmRepeat::Forever,
+            Some(PlayRepeat::Times(times)) => {
+                PcmRepeat::Times(times.min(u64::from(u32::MAX)) as u32)
+            }
+        };
         let start = options.start_pos_ms.unwrap_or(0).min(u64::from(u32::MAX)) as u32;
         // Resolve the source into something the media actor can play. A recorded prompt is decoded
         // here (the source rate is a property of the file, not of the leg); a tone is only *parsed*
@@ -7953,7 +8030,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ResolvedPlaySource::Wav(wav) => {
                 let player = PcmPlayer::new(&wav, repeat, start);
                 let duration = player.duration_ms();
-                (PlayRequest::Pcm(Box::new(player)), Some(duration))
+                (PlayRequest::Pcm(Box::new(player)), duration)
             }
             ResolvedPlaySource::Tone(spec) => {
                 let duration = spec.total_duration_ms();
@@ -7961,7 +8038,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
         // The accepted duration is the source's own length bounded by the `duration_ms` cap; a cap
-        // on an endless tone *is* the duration, and an uncapped endless tone reports none.
+        // on an endless source *is* the duration, and an uncapped endless one — a `*inf` tone or a
+        // `"repeat_times": "inf"` prompt — reports none.
         let duration_ms = match (source_duration_ms, options.duration_ms) {
             (Some(source), Some(cap)) => Some(source.min(cap)),
             (Some(source), None) => Some(source),
@@ -8259,7 +8337,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// `pause_ms` of inter-digit silence (RFC 4733). The target leg is resolved from `from_tag` /
     /// `to_tag` the same way `block_dtmf` resolves its source leg.
     #[allow(clippy::too_many_arguments)]
-    fn play_dtmf(
+    #[allow(clippy::too_many_arguments)]
+    async fn play_dtmf(
         &self,
         client: ClientId,
         call_id: &str,
@@ -8299,7 +8378,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .map(|value| value.unsigned_abs().min(63) as u8)
             .unwrap_or(10);
         let toward_a = resolve_toward_a(from_tag, call_to.as_deref(), to_tag);
-        if self.media.control(
+        // Await the actor's verdict rather than answering from whether the mailbox accepted the
+        // message. Only the actor knows whether this leg negotiated a `telephone-event` payload type
+        // to carry the digits on, and answering `ok` without one sends nothing — which, on a PBX
+        // forwarding a feature code to a carrier or navigating a remote menu, reads as the far end
+        // ignoring the digits. Same shape as `stop_media` / `set_play_gain`.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.media.control(
             call_id,
             MediaControl::PlayDtmf {
                 toward_a,
@@ -8307,11 +8392,26 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 duration_ms: duration,
                 volume,
                 pause_ms: pause,
+                reply: sender,
             },
         ) {
-            ok_empty()
-        } else {
-            error_result("play_dtmf", &"call is not a media-processing call")
+            return error_result("play_dtmf", &"call is not a media-processing call");
+        }
+        match receiver.await {
+            Ok(PlayDtmfOutcome::Started) => ok_empty(),
+            Ok(PlayDtmfOutcome::NoTelephoneEvent) => error_result(
+                "play_dtmf",
+                &"no telephone-event payload type negotiated toward this leg",
+            ),
+            // Unreachable through the control plane — the code is validated above — but a hollow
+            // success here would be the same defect one layer down.
+            Ok(PlayDtmfOutcome::InvalidDigits) => {
+                error_result("play_dtmf", &format!("unusable DTMF code {code:?}"))
+            }
+            Err(_) => error_result(
+                "play_dtmf",
+                &"media actor closed before the DTMF sequence started",
+            ),
         }
     }
 
@@ -10822,31 +10922,62 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
-    /// Reap calls whose media has been idle (no accepted packet) for at least `idle_ticks`, freeing
-    /// their ports/FDs and registry/quota slots, and return the reaped call ids. Deterministic: it
-    /// reads the datapath's logical clock, so tests drive it via `advance_clock` rather than wall
-    /// time (never `Instant::now()`). (docs/security-and-nat.md §4 layer 6.)
-    pub async fn reap_idle(&self, idle_ticks: u64) -> Vec<String> {
+    /// Reap calls whose media has been idle for at least `idle_ticks`, freeing their ports/FDs and
+    /// registry/quota slots, and return the reaped call ids. Deterministic: it reads the datapath's
+    /// logical clock, so tests drive it via `advance_clock` rather than wall time (never
+    /// `Instant::now()`). (docs/security-and-nat.md §4 layer 6.)
+    ///
+    /// **Silence only means a dead path while someone was expected to speak.** A dead media path and a
+    /// held call are indistinguishable at the packet layer — both are silence — and only the SDP says
+    /// which it is. RFC 3264 §8.4 lets a party that holds a call send nothing at all, and its peer
+    /// answers `recvonly` and correctly sends nothing back, so a rule that reads "no packets from
+    /// anyone" tears down a call whose user is still holding the handset. Hold, park and queue are all
+    /// exactly that state, and they last minutes.
+    ///
+    /// So a call the signalling has taken off two-way media (`Call::is_held`) is measured against
+    /// `held_idle_ticks` — a much longer ceiling (`--held-media-timeout-secs`) so a call abandoned on
+    /// hold still ends eventually, with `0` disabling it so such a call never ages out. Everything else
+    /// keeps the dead-path rule unchanged, down to reading the same endpoint set. The
+    /// [`MediaTimeoutReason`] on the event says which rule fired.
+    pub async fn reap_idle(&self, idle_ticks: u64, held_idle_ticks: u64) -> Vec<String> {
         let now = self.datapath.now_ticks();
         // First pass (no `.await`, so holding the shard guards is fine): find the idle calls.
         let mut stale = Vec::new();
         for entry in self.calls.iter() {
             let call = entry.value();
+            let (budget, reason) = if call.is_held() {
+                (held_idle_ticks, MediaTimeoutReason::HeldTooLong)
+            } else {
+                (idle_ticks, MediaTimeoutReason::NoMedia)
+            };
+            // `0` disables the held ceiling. It is never a valid *media* timeout, so this only ever
+            // spares a held call.
+            if budget == 0 {
+                continue;
+            }
+            // Measured exactly as before — the latest accepted packet across every endpoint, text
+            // included (RFC 4103 text is media too, and a text-only exchange is not a dead path),
+            // falling back to the call's creation. A held call that *does* carry music-on-hold refreshes
+            // its own ceiling, which is right: it is demonstrably alive.
             let mut last_activity = call.created_tick;
             for endpoint in call.all_endpoint_ids() {
                 if let Some(seen) = self.datapath.last_activity(endpoint) {
                     last_activity = last_activity.max(seen);
                 }
             }
-            if now.saturating_sub(last_activity) >= idle_ticks {
-                stale.push(entry.key().clone());
+            if now.saturating_sub(last_activity) >= budget {
+                stale.push((entry.key().clone(), reason));
             }
         }
         // Second pass: tear each idle call down (no map guard held across the awaits). Shared with
         // consent failure — both are dead-path detections and must free identical state.
         let mut reaped = Vec::new();
-        for call_id in stale {
-            if self.reap_call(&call_id, "media_timeout").await {
+        for (call_id, reason) in stale {
+            let cdr_reason = match reason {
+                MediaTimeoutReason::HeldTooLong => "held_timeout",
+                _ => "media_timeout",
+            };
+            if self.reap_call(&call_id, cdr_reason, reason).await {
                 reaped.push(call_id);
             }
         }
@@ -11192,7 +11323,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         failed.push(conference_id);
                         continue;
                     }
-                    if self.reap_call(&call_id, "ice_failed").await {
+                    // An ICE failure is a dead path: no candidate pair ever succeeded, so there is no
+                    // media path to be held on. `NoMedia`, never the held reason.
+                    if self
+                        .reap_call(&call_id, "ice_failed", MediaTimeoutReason::NoMedia)
+                        .await
+                    {
                         tracing::warn!(
                             target: "siphon_rtp::media",
                             %call_id, ?endpoint,
@@ -11345,7 +11481,12 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     // tick: `reap_call` removes it from the registry, so the second attempt is a
                     // no-op and must not double-count.
                     consent.unregister(endpoint);
-                    if self.reap_call(&call_id, "consent_failed").await {
+                    // A consent failure is a dead path by definition — the peer stopped answering
+                    // checks — so it reports `NoMedia` rather than either idle rule.
+                    if self
+                        .reap_call(&call_id, "consent_failed", MediaTimeoutReason::NoMedia)
+                        .await
+                    {
                         tracing::warn!(
                             target: "siphon_rtp::media",
                             %call_id,
@@ -11367,8 +11508,14 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     ///
     /// The event is `MediaTimeout` for a consent failure too: the control contract has no dedicated
     /// ICE-state event yet, and to a controller both mean the same thing — this call's media path is
-    /// gone, tear the dialog down. The distinction is preserved in the CDR `reason` and the log.
-    async fn reap_call(&self, call_id: &str, reason: &str) -> bool {
+    /// gone, tear the dialog down. The distinction is preserved in the CDR `reason`, the log, and (for
+    /// the two idle rules) the event's own [`MediaTimeoutReason`].
+    async fn reap_call(
+        &self,
+        call_id: &str,
+        reason: &str,
+        timeout_reason: MediaTimeoutReason,
+    ) -> bool {
         let Some((_, call)) = self.calls.remove(call_id) else {
             return false;
         };
@@ -11378,6 +11525,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Event::MediaTimeout {
                 call_id: call_id.to_string(),
                 from_tag: call.from_tag,
+                reason: timeout_reason,
             },
         );
         true
@@ -11444,11 +11592,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// endpoints and tearing down any room left empty (the conference analogue of [`Engine::reap_idle`]
     /// — abandoned legs / a control client that disconnected without leaving never leak a room). Driven
     /// by the datapath's logical clock, so tests advance it via `advance_clock`.
-    pub async fn reap_idle_conferences(&self, idle_ticks: u64) -> usize {
+    pub async fn reap_idle_conferences(&self, idle_ticks: u64, held_idle_ticks: u64) -> usize {
         let now = self.datapath.now_ticks();
-        let freed = self.conference.reap_idle(now, idle_ticks, |endpoint| {
-            self.datapath.last_activity(endpoint)
-        });
+        let freed = self
+            .conference
+            .reap_idle(now, idle_ticks, held_idle_ticks, |endpoint| {
+                self.datapath.last_activity(endpoint)
+            });
         for endpoint in &freed {
             self.datapath.remove_endpoint(*endpoint).await;
             self.endpoint_calls.remove(endpoint);
@@ -13011,11 +13161,13 @@ fn unknown_call(call_id: &str) -> CmdResult {
 /// thread through three call sites).
 #[derive(Debug, Clone, Copy, Default)]
 struct PlayOptions {
-    /// Total play count for a recorded prompt; `0`/`None` plays it once.
-    repeat_times: Option<u64>,
+    /// How many times to play a recorded prompt: a total play count (`0`/`None` plays it once), or
+    /// [`PlayRepeat::Forever`] to play until stopped.
+    repeat_times: Option<PlayRepeat>,
     /// Seek into a recorded prompt before the first frame (and the point each loop rewinds to).
     start_pos_ms: Option<u64>,
-    /// Hard playout cap. The only bound on an endless tone short of a stop.
+    /// Hard playout cap. The only bound on an endless source short of a stop — a `*inf` tone or a
+    /// `PlayRepeat::Forever` prompt.
     duration_ms: Option<u64>,
     /// Mix under the party's live egress instead of replacing it.
     overlay: bool,
@@ -13041,8 +13193,8 @@ struct MediaFetchRequest {
     url: String,
     toward_a: bool,
     options: PlayOptions,
-    /// Total play count for the fetched prompt (`0`/`1` play it once).
-    repeat: u32,
+    /// How many times to play the fetched prompt (`0`/`1` play it once, `Forever` until stopped).
+    repeat: PcmRepeat,
     /// Seek into the fetched prompt before the first frame.
     start_pos_ms: u32,
     play_id: u64,
@@ -15651,13 +15803,13 @@ mod tests {
         assert_eq!(recovered, from_a);
 
         assert!(
-            engine.reap_idle(5).await.is_empty(),
+            engine.reap_idle(5, 0).await.is_empty(),
             "a secure bridge carrying audio is not idle"
         );
 
         engine.datapath().advance_clock(10);
         assert_eq!(
-            engine.reap_idle(5).await,
+            engine.reap_idle(5, 0).await,
             vec!["savp-idle".to_string()],
             "and one that has genuinely gone quiet is still reaped"
         );
@@ -16131,7 +16283,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await; // let the datapath stamp activity
 
         assert_eq!(
-            engine.reap_idle_conferences(3).await,
+            engine.reap_idle_conferences(3, 0).await,
             1,
             "the silent participant is reaped"
         );
@@ -16143,12 +16295,48 @@ mod tests {
         // Advance past alice's activity too — now the room drains and is torn down.
         engine.datapath().advance_clock(5);
         assert!(
-            engine.reap_idle_conferences(3).await >= 1,
+            engine.reap_idle_conferences(3, 0).await >= 1,
             "the now-idle participant is reaped"
         );
         assert!(
             !engine.conference().contains("room"),
             "empty room torn down"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listen_only_conference_seat_is_not_reaped_for_being_silent() {
+        // A webinar attendee joins `recvonly` and never sends a packet for the whole session — that is
+        // the seat working as signalled, not a dead one. The same rule the two-party reaper applies:
+        // silence is only evidence when the party said it would send.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone, addr) = phone().await;
+        let joined = engine
+            .handle(
+                CLIENT,
+                Command::ConferenceJoin {
+                    conference_id: "webinar".into(),
+                    from_tag: "attendee".into(),
+                    sdp: sdp_with_direction(addr, "recvonly"),
+                    role: ConferenceRole::Listener,
+                    profile: ProfileFlags::default(),
+                },
+            )
+            .await;
+        assert!(matches!(joined, CmdResult::Ok { .. }), "seated: {joined:?}");
+
+        engine.datapath().advance_clock(100);
+        assert_eq!(
+            engine.reap_idle_conferences(3, 1000).await,
+            0,
+            "a listen-only seat owes the room no media"
+        );
+        assert!(engine.conference().contains("webinar"), "room still up");
+
+        engine.datapath().advance_clock(1000);
+        assert!(
+            engine.reap_idle_conferences(3, 1000).await >= 1,
+            "and the held ceiling still frees an abandoned seat"
         );
     }
 
@@ -18104,7 +18292,7 @@ mod tests {
 
         // The caller never sends a packet, so the leg is idle from creation and the sweeper takes it.
         engine.datapath().advance_clock(10);
-        assert_eq!(engine.reap_idle(5).await, vec!["al-ws-reap".to_string()]);
+        assert_eq!(engine.reap_idle(5, 0).await, vec!["al-ws-reap".to_string()]);
         assert!(
             !engine.ws().is_ws_call("al-ws-reap"),
             "the reaped call's WS bridge is deregistered"
@@ -18403,7 +18591,7 @@ mod tests {
         );
 
         assert!(
-            engine.reap_idle(5).await.is_empty(),
+            engine.reap_idle(5, 0).await.is_empty(),
             "a takeover call being talked into is not idle"
         );
         assert!(
@@ -18414,7 +18602,7 @@ mod tests {
         // Now the caller goes quiet: the sweep must still do its job.
         engine.datapath().advance_clock(10);
         assert_eq!(
-            engine.reap_idle(5).await,
+            engine.reap_idle(5, 0).await,
             vec!["ws-idle".to_string()],
             "a takeover call whose caller has stopped sending is still reaped"
         );
@@ -20097,6 +20285,82 @@ mod tests {
             matches!(result, CmdResult::Error { .. }),
             "an unsupported DTMF digit is rejected, not truncated"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn play_dtmf_toward_a_leg_with_no_telephone_event_is_an_error_not_a_silent_no_op() {
+        // The defect: the engine answered from whether the control message reached the actor's
+        // mailbox, so a `play_dtmf` toward a leg that never negotiated `telephone-event` was accepted
+        // and nothing went on the wire. On a PBX that is a feature code forwarded to a carrier or a
+        // flow step navigating a remote menu, and a silent no-op there reads as the far end ignoring
+        // the digits.
+        //
+        // A transcoding call (µ-law ↔ A-law, so the media path is userspace) where **neither** party
+        // offered a telephone-event payload type.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        let offer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n",
+            ip = addr_a.ip(),
+            port = addr_a.port(),
+        );
+        let answer_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=rtcp-mux\r\n",
+            ip = addr_b.ip(),
+            port = addr_b.port(),
+        );
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "dtmf-none".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: offer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "dtmf-none".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: answer_sdp,
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            engine.media().is_transcoding_call("dtmf-none"),
+            "the codec mismatch puts this call on the userspace media path"
+        );
+
+        let result = engine
+            .handle(
+                CLIENT,
+                Command::PlayDtmf {
+                    call_id: "dtmf-none".into(),
+                    from_tag: "tag-a".into(),
+                    code: "123".into(),
+                    duration_ms: None,
+                    volume_dbm0: None,
+                    pause_ms: None,
+                    to_tag: Some("tag-b".into()),
+                },
+            )
+            .await;
+        match result {
+            CmdResult::Error { reason } => assert!(
+                reason.contains("no telephone-event payload type negotiated"),
+                "the refusal names why nothing could be sent, got: {reason}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22105,6 +22369,183 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_endless_hold_bed_accepts_with_no_duration_and_keeps_playing_until_stopped() {
+        // Music on hold, end to end. The accept must carry **no** `duration_ms` — there is none to
+        // report — and the bed must still be playing long after a finite prompt of the same length
+        // would have drained, ending only when the controller stops it.
+        use crate::srtp_bridge::run_redirect_dispatcher;
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let events_rx = engine.register_client(CLIENT);
+        tokio::spawn(run_redirect_dispatcher(
+            engine.datapath().rx(),
+            engine.bridge(),
+            engine.media(),
+            engine.ws(),
+            engine.conference(),
+            None,
+        ));
+        let (phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "hold-bed".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        // A 40 ms bed: two frames at a 20 ms ptime, so a finite play would be over almost at once.
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[1000i16; 320]);
+        let wav = recorder.into_wav();
+
+        let accepted = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "hold-bed".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Blob { data: wav },
+                    repeat_times: Some(PlayRepeat::Forever),
+                    start_pos_ms: None,
+                    duration_ms: None,
+                    overlay: false,
+                    gain_decibels: None,
+                    to_tag: None,
+                },
+            )
+            .await;
+        let play_id = match accepted {
+            CmdResult::Ok {
+                duration_ms,
+                play_id: Some(id),
+                ..
+            } => {
+                assert_eq!(
+                    duration_ms, None,
+                    "an endless bed has no duration to promise"
+                );
+                id
+            }
+            other => panic!("an endless play accepts with a play_id, got {other:?}"),
+        };
+
+        // Well past the 40 ms the body is long: still producing audio, and no PlayFinished.
+        let mut frames = 0u32;
+        for _ in 0..8u16 {
+            let mut buffer = [0u8; 2048];
+            if let Ok(Ok((len, _))) =
+                timeout(Duration::from_millis(200), phone_a.recv_from(&mut buffer)).await
+            {
+                assert!(
+                    siphon_rtp_media::rtp::RtpPacket::parse(&buffer[..len]).is_ok(),
+                    "the bed keeps emitting well-formed RTP"
+                );
+                frames += 1;
+            }
+        }
+        assert!(
+            frames >= 4,
+            "the bed looped well past its own 40 ms body, got {frames} frames"
+        );
+        assert!(
+            events_rx.try_recv().is_err(),
+            "an endless bed does not finish on its own"
+        );
+
+        // It ends when, and only when, the controller says so.
+        let stopped = engine
+            .handle(
+                CLIENT,
+                Command::StopMedia {
+                    call_id: "hold-bed".into(),
+                    from_tag: "tag-a".into(),
+                    play_id: Some(play_id),
+                },
+            )
+            .await;
+        assert!(
+            matches!(stopped, CmdResult::Ok { .. }),
+            "stop accepted: {stopped:?}"
+        );
+        let mut finished = None;
+        for _ in 0..50u16 {
+            match timeout(Duration::from_millis(200), events_rx.recv_async()).await {
+                Ok(Ok(Event::PlayFinished {
+                    play_id: id,
+                    reason,
+                    ..
+                })) => {
+                    finished = Some((id, reason));
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            finished,
+            Some((play_id, siphon_rtp_proto::PlayEndReason::Stopped)),
+            "the endless bed ends as Stopped, never as Completed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_duration_cap_still_bounds_an_endless_prompt() {
+        // The cap is the one bound on an endless source short of a stop, and it must report the cap
+        // as the accepted duration rather than nothing — the same answer a capped `*inf` tone gives.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "capped-bed".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, true),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        use siphon_rtp_media::fanout::MediaSink as _;
+        let mut recorder = siphon_rtp_media::wav::WavRecorder::new(8000, 1);
+        recorder.write_pcm(&[1000i16; 320]);
+        let accepted = engine
+            .handle(
+                CLIENT,
+                Command::PlayMedia {
+                    call_id: "capped-bed".into(),
+                    from_tag: "tag-a".into(),
+                    source: PlayMediaSource::Blob {
+                        data: recorder.into_wav(),
+                    },
+                    repeat_times: Some(PlayRepeat::Forever),
+                    start_pos_ms: None,
+                    duration_ms: Some(45_000),
+                    overlay: true,
+                    gain_decibels: Some(-12),
+                    to_tag: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                accepted,
+                CmdResult::Ok {
+                    duration_ms: Some(45_000),
+                    play_id: Some(_),
+                    ..
+                }
+            ),
+            "a capped endless bed reports the cap, got {accepted:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn overlay_tone_playback_runs_end_to_end_through_the_control_plane() {
         // Every new control-plane surface on one call: an overlay tone start, a second overlay, a
         // gain retune, a `play_id`-targeted stop, and the four-slot cap. Proves each field reaches
@@ -22703,7 +23144,7 @@ mod tests {
         // Tick 14: only 4 ticks since the stamp (< 5) → recent media keeps the active call alive.
         engine.datapath().advance_clock(4);
         assert!(
-            engine.reap_idle(5).await.is_empty(),
+            engine.reap_idle(5, 0).await.is_empty(),
             "an actively-echoing call is not reaped"
         );
         assert!(
@@ -22714,7 +23155,7 @@ mod tests {
         // Tick 20: 10 ticks of silence (>= 5) → the now-silent call times out and is reaped.
         engine.datapath().advance_clock(6);
         assert_eq!(
-            engine.reap_idle(5).await,
+            engine.reap_idle(5, 0).await,
             vec!["echo-idle".to_string()],
             "a silent single-leg echo call is reaped"
         );
@@ -24764,15 +25205,304 @@ mod tests {
         // Tick 8: idle since the packet (tick 4) is 4 < 5 → recent media keeps the call alive.
         engine.datapath().advance_clock(4);
         assert!(
-            engine.reap_idle(5).await.is_empty(),
+            engine.reap_idle(5, 0).await.is_empty(),
             "recent media defers reaping"
         );
         assert_eq!(engine.session_count(), 1);
 
         // Tick 13: idle since tick 4 is 9 >= 5 → the silent call is reaped and its ports freed.
         engine.datapath().advance_clock(5);
-        assert_eq!(engine.reap_idle(5).await, vec!["c".to_string()]);
+        assert_eq!(engine.reap_idle(5, 0).await, vec!["c".to_string()]);
         assert_eq!(engine.session_count(), 0);
+    }
+
+    /// `sdp_for` with a direction attribute appended — the one line that separates a held call from a
+    /// dead one (RFC 4566 §6).
+    fn sdp_with_direction(rtp: SocketAddr, direction: &str) -> String {
+        format!("{}a={direction}\r\n", sdp_for(rtp, false))
+    }
+
+    /// Offer + answer a two-party call whose parties declare `offer_direction` / `answer_direction`.
+    async fn held_call(
+        engine: &Engine<UdpLoopbackDatapath>,
+        client: ClientId,
+        call_id: &str,
+        addr_a: SocketAddr,
+        addr_b: SocketAddr,
+        offer_direction: &str,
+        answer_direction: &str,
+    ) {
+        engine
+            .handle(
+                client,
+                Command::Offer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_with_direction(addr_a, offer_direction),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        engine
+            .handle(
+                client,
+                Command::Answer {
+                    call_id: call_id.into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_with_direction(addr_b, answer_direction),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_call_outlives_the_media_timeout_and_reaps_on_its_own_ceiling() {
+        // The defect this closes: hold is the most common mid-call operation on a PBX and it is
+        // precisely the state where both parties legitimately stop sending (RFC 3264 §8.4 lets a held
+        // endpoint transmit nothing at all). Judged by "no packets from anyone", such a call was torn
+        // down 30 s in, while the person was still holding the handset.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(11);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "held", addr_a, addr_b, "sendonly", "recvonly",
+        )
+        .await;
+
+        // Far past the media timeout, and not one packet has been sent by either party.
+        engine.datapath().advance_clock(100);
+        assert!(
+            engine.reap_idle(5, 1000).await.is_empty(),
+            "neither party is expected to send, so their silence is not a dead path"
+        );
+        assert_eq!(engine.session_count(), 1);
+
+        // Past the held ceiling, it does end — a call abandoned on hold is still freed eventually.
+        engine.datapath().advance_clock(1000);
+        assert_eq!(engine.reap_idle(5, 1000).await, vec!["held".to_string()]);
+        assert_eq!(engine.session_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_shape_of_hold_is_recognised_and_an_active_call_is_not() {
+        // The shapes RFC 3264 §8.4 defines for hold, plus the control. `sendonly`/`recvonly` counts as
+        // held in *both* orientations: §8.4 lets the sending side send nothing, so the attribute pair
+        // is what identifies the state, not which end wrote which half.
+        for (offer_direction, answer_direction, held) in [
+            ("inactive", "inactive", true),
+            ("sendonly", "recvonly", true),
+            ("recvonly", "sendonly", true),
+            ("sendrecv", "inactive", true), // only one end holds; the call is still off two-way media
+            ("sendrecv", "sendrecv", false),
+        ] {
+            let engine = Engine::new(UdpLoopbackDatapath::new());
+            let client = ClientId(12);
+            let (_phone_a, addr_a) = phone().await;
+            let (_phone_b, addr_b) = phone().await;
+            held_call(
+                &engine,
+                client,
+                "c",
+                addr_a,
+                addr_b,
+                offer_direction,
+                answer_direction,
+            )
+            .await;
+
+            engine.datapath().advance_clock(100);
+            let reaped = engine.reap_idle(5, 0).await;
+            assert_eq!(
+                reaped.is_empty(),
+                held,
+                "offer a={offer_direction} / answer a={answer_direction}: held={held}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_call_never_ages_out_when_the_held_ceiling_is_disabled() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(13);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "parked", addr_a, addr_b, "inactive", "inactive",
+        )
+        .await;
+
+        engine.datapath().advance_clock(1_000_000);
+        assert!(
+            engine.reap_idle(5, 0).await.is_empty(),
+            "`0` disables the held ceiling — such a call is freed by `delete` alone"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn taking_a_call_off_hold_re_arms_the_dead_path_timer() {
+        // A re-offer restates the offering party's own direction, so the unhold must put the call back
+        // under the short ceiling — otherwise a call that was ever held would keep the two-hour budget
+        // for the rest of its life and a genuinely dead path after an unhold would never be reaped.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(14);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "unhold", addr_a, addr_b, "sendonly", "recvonly",
+        )
+        .await;
+        engine.datapath().advance_clock(100);
+        assert!(engine.reap_idle(5, 1000).await.is_empty(), "still held");
+
+        // A re-offers with `sendrecv` — the unhold. It carries no direction attribute at all, which is
+        // exactly what RFC 4566 §6 says `sendrecv` means, so the absence has to re-arm too.
+        let reoffer = engine
+            .handle(
+                client,
+                Command::Reoffer {
+                    call_id: "unhold".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_for(addr_a, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(reoffer, CmdResult::Ok { .. }),
+            "the re-offer is accepted: {reoffer:?}"
+        );
+        engine
+            .handle(
+                client,
+                Command::Answer {
+                    call_id: "unhold".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_for(addr_b, false),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        engine.datapath().advance_clock(100);
+        assert_eq!(
+            engine.reap_idle(5, 1000).await,
+            vec!["unhold".to_string()],
+            "off hold and silent is a dead path again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_single_leg_call_is_held_by_its_only_partys_own_direction() {
+        // An `answer_local` call (IVR, announcement, voicemail) has no second party: the engine is the
+        // far side, and its own egress is not something to time out on. So the caller's direction is
+        // the whole question — a caller that holds the IVR sends nothing and must not be reaped.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(15);
+        let (_phone, addr) = phone().await;
+        engine
+            .handle(
+                client,
+                Command::AnswerLocal {
+                    call_id: "ivr-held".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_with_direction(addr, "inactive"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+
+        engine.datapath().advance_clock(100);
+        assert!(
+            engine.reap_idle(5, 1000).await.is_empty(),
+            "the caller told us it would send nothing"
+        );
+        engine.datapath().advance_clock(1000);
+        assert_eq!(
+            engine.reap_idle(5, 1000).await,
+            vec!["ivr-held".to_string()],
+            "and the held ceiling still ends it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn music_on_hold_refreshes_a_held_calls_own_ceiling() {
+        // A held call that *does* carry audio — the `sendonly` party streaming music on hold — is
+        // demonstrably alive, so its ceiling restarts from the media rather than from call setup. The
+        // held budget is a backstop against an abandoned call, not a cap on how long hold may last.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(16);
+        let (phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "moh", addr_a, addr_b, "sendonly", "recvonly",
+        )
+        .await;
+        let near_rtp = engine
+            .calls
+            .get("moh")
+            .map(|call| call.near.rtp.local_addr)
+            .expect("the call has a near leg");
+
+        engine.datapath().advance_clock(8);
+        phone_a
+            .send_to(&rtp(0x9999_0000), near_rtp)
+            .await
+            .expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Tick 16: 8 since the music, under the 10-tick held ceiling.
+        engine.datapath().advance_clock(8);
+        assert!(
+            engine.reap_idle(5, 10).await.is_empty(),
+            "the hold music refreshed the ceiling"
+        );
+
+        engine.datapath().advance_clock(20);
+        assert_eq!(
+            engine.reap_idle(5, 10).await,
+            vec!["moh".to_string()],
+            "and once even the music stops, the held ceiling still ends it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reaped_event_names_which_rule_fired() {
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let client = ClientId(17);
+        let events = engine.register_client(client);
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        held_call(
+            &engine, client, "held", addr_a, addr_b, "inactive", "inactive",
+        )
+        .await;
+
+        engine.datapath().advance_clock(20);
+        assert_eq!(engine.reap_idle(5, 10).await, vec!["held".to_string()]);
+
+        let mut reason = None;
+        let mut cdr_reason = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::MediaTimeout { reason: seen, .. } => reason = Some(seen),
+                Event::CallSummary { reason: seen, .. } => cdr_reason = Some(seen),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            reason,
+            Some(MediaTimeoutReason::HeldTooLong),
+            "a controller can tell 'the path died' from 'held too long'"
+        );
+        assert_eq!(
+            cdr_reason.as_deref(),
+            Some("held_timeout"),
+            "and the CDR records the same distinction"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -24795,7 +25525,7 @@ mod tests {
             .await;
 
         engine.datapath().advance_clock(10);
-        assert_eq!(engine.reap_idle(5).await, vec!["gone".to_string()]);
+        assert_eq!(engine.reap_idle(5, 0).await, vec!["gone".to_string()]);
 
         // Reaping pushes two events to the owner: the end-of-call `CallSummary` (CDR) and the
         // `MediaTimeout` dead-path signal SIPhon already relies on. Both must fire (additive).
@@ -24810,9 +25540,18 @@ mod tests {
                     assert_eq!(reason, "media_timeout");
                     got_summary = true;
                 }
-                Event::MediaTimeout { call_id, from_tag } => {
+                Event::MediaTimeout {
+                    call_id,
+                    from_tag,
+                    reason,
+                } => {
                     assert_eq!(call_id, "gone");
                     assert_eq!(from_tag, "ft");
+                    assert_eq!(
+                        reason,
+                        MediaTimeoutReason::NoMedia,
+                        "a sendrecv call that went quiet is a dead path, not a hold"
+                    );
                     got_timeout = true;
                 }
                 other => panic!("unexpected event pushed on reap: {other:?}"),

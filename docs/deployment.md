@@ -78,7 +78,9 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 | `--media-dscp <DSCP>` | `EF` | DiffServ marking (RFC 2474) on outbound media. A name (`EF`, `CS3`, `AF41`, `VA`, `BE`, …) or a raw `0`–`63`. `EF` is TOS byte 184 — Asterisk's `tos_audio`, rtpengine's `--tos`. `BE`/`0` disables marking and leaves the TOS byte untouched. Applies to every egress path (UDP sockets, AF_XDP TX, in-kernel XDP_TX); never to the control, metrics, HEP or WS sockets. |
 | `--metrics-addr <ADDR>` | off | Prometheus + health HTTP: `GET /metrics`, `GET /healthz`, `GET /readyz`. |
 | `--max-control-rps <N>` | `200` | Per-connection control request cap (requests/second). `0` disables the limit. |
-| `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). |
+| `--control-secret-file <PATH>` | none | File holding the control-plane shared secret, read once at start. Surrounding whitespace (including the trailing newline) is trimmed. Mutually exclusive with `SIPHON_RTP_CONTROL_SECRET`. |
+| `--media-timeout-secs <N>` | `30` | Reap a call after N seconds with no accepted media (dead-path detection). Applies only while the call is on two-way media; a held call uses the setting below. |
+| `--held-media-timeout-secs <N>` | `7200` | Reap a **held** call (one party signalled `sendonly` / `recvonly` / `inactive`) after N seconds. `0` never reaps one. |
 | `--shutdown-grace-secs <N>` | `25` | Bounded drain of live calls on SIGTERM/SIGINT before exiting. |
 | `--node-id <STRING>` | `$HOSTNAME`, else `siphon-rtp` | Stable cluster node id reported by `load` / `node_info`. |
 | `--max-sessions <N>` | `0` (unlimited) | Advertised session capacity for cluster load scoring. Does not itself cap admission. |
@@ -93,12 +95,13 @@ the XDP datapath ships as the separate `siphon-rtp-xdp-daemon` binary, which add
 
 ## Environment variables
 
-Secrets are deliberately not flags and not config-file keys, so they never land in argv or a
+Secret *values* are deliberately not flags and not config-file keys, so they never land in argv or a
 world-readable file:
 
 | Variable | Effect |
 |---|---|
 | `SIPHON_RTP_CONTROL_SECRET` | Enables control-plane authentication: a JSON-over-TCP connection must send `authenticate` with this token before any other verb is honoured. The NG front-end is never authenticated (see the runbook). |
+| `SIPHON_RTP_CONTROL_SECRET_FILE` | The same secret, read from a file instead — the `*_FILE` convention container images use. Equivalent to `--control-secret-file`, which wins if both are given. Setting it **and** `SIPHON_RTP_CONTROL_SECRET` is a fatal startup error rather than a silent preference: the two would be different secrets in every case worth worrying about, and quietly picking one means the controller authenticates against a secret you did not think was in use. An empty file is refused, so a provisioning mistake cannot silently turn authentication off. |
 | `SIPHON_RTP_TURN_REALM` + `SIPHON_RTP_TURN_SECRET` | Enable the built-in TURN server (coturn `static-auth-secret` REST credential profile). At least one `--turn-*` listener must then be given. |
 | `SIPHON_RTP_HEP_COLLECTOR` (+ optional `SIPHON_RTP_HEP_AGENT_ID`) | Export relayed RTCP as HEP3 to a Homer / VoIPmonitor collector (`ip:port`). |
 | `RUST_LOG` | `tracing` env-filter directive (e.g. `info,siphon_rtp_engine=debug`). Wins over the config file's `log_filter`. |
@@ -281,6 +284,24 @@ channel. "Accepted" is measured after the source gate, so an attacker spraying p
 port cannot keep a dead call alive (see
 [Security & NAT design](security-and-nat.md), layer 6). Conference participants are reaped on the
 same sweep and empty rooms are torn down.
+
+**A held call is not a dead one.** Hold, park and queue are exactly the states in which both parties
+legitimately stop sending, and RFC 3264 §8.4 says so explicitly — the party placing a call on hold
+*"MAY send media (e.g., music on hold) or MAY send nothing"*, and its peer answers `recvonly` and
+correctly sends nothing back. At the packet layer that is indistinguishable from a dead path; only
+the SDP tells them apart. So the engine reads the direction attribute (RFC 4566 §6: `a=sendrecv` /
+`a=sendonly` / `a=recvonly` / `a=inactive`, media-level winning over session-level) on every offer,
+answer and `reoffer`, and a call where either party has taken the stream off `sendrecv` is measured
+against `--held-media-timeout-secs` (default 7200) instead. Taking the call off hold re-arms the
+short timer. The `media_timeout` event's `reason` says which rule fired — `no_media` or
+`held_too_long` — so a controller can tell "the path died" from "nobody came back to it". A held
+call that *does* carry music-on-hold refreshes its own ceiling like any other media.
+
+A conference seat that joined `recvonly` or `inactive` (a listen-only webinar attendee) is treated
+the same way on the same sweep.
+
+Raising `--media-timeout-secs` globally is **not** the way to support hold: it would stop the engine
+cleaning up a genuinely dead path in reasonable time, which is the whole reason the reaper exists.
 
 ### Control-plane protection
 

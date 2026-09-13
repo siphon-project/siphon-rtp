@@ -187,12 +187,13 @@ impl PlaybackSource {
         }
     }
 
-    /// Total playout duration in milliseconds, or `None` when the source is endless (a `*inf`
-    /// tone) — such a playback only ends on a stop or a duration cap.
+    /// Total playout duration in milliseconds, or `None` when the source is endless (a `*inf` tone or
+    /// a [`crate::player::PcmRepeat::Forever`] prompt) — such a playback only ends on a stop or a
+    /// duration cap.
     #[must_use]
     pub fn total_duration_ms(&self) -> Option<u64> {
         match self {
-            PlaybackSource::Pcm(player) => Some(player.duration_ms()),
+            PlaybackSource::Pcm(player) => player.duration_ms(),
             PlaybackSource::Tone(tone) => tone.total_duration_ms(),
         }
     }
@@ -589,7 +590,7 @@ fn frame_samples(rate_hz: u32, packetization_time_ms: u32) -> usize {
 mod tests {
     use super::*;
     use crate::fanout::MediaSink;
-    use crate::player::WavSource;
+    use crate::player::{PcmRepeat, WavSource};
     use crate::tone::{ToneSpec, MAX_TONE_SEGMENTS};
     use crate::wav::WavRecorder;
 
@@ -604,7 +605,7 @@ mod tests {
     fn constant_source(rate_hz: u32, value: i16, samples: usize) -> PlaybackSource {
         let wav = constant_wav(rate_hz, value, samples);
         let parsed = WavSource::parse(&wav).expect("fixture parses");
-        PlaybackSource::Pcm(Box::new(PcmPlayer::new(&parsed, 1, 0)))
+        PlaybackSource::Pcm(Box::new(PcmPlayer::new(&parsed, PcmRepeat::Times(1), 0)))
     }
 
     /// A [`PlaybackSource`] over a tone rendered at `rate_hz`.

@@ -137,8 +137,15 @@ pub struct FileConfig {
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap, requests/second; 0 disables (`--max-control-rps`).
     pub max_control_rps: Option<u64>,
+    /// File holding the control-plane shared secret, read once at start
+    /// (`--control-secret-file`). The one secret the config file may name, because it names a
+    /// *path* rather than carrying the secret itself.
+    pub control_secret_file: Option<PathBuf>,
     /// Reap a call after this many seconds with no accepted media (`--media-timeout-secs`).
     pub media_timeout_secs: Option<u64>,
+    /// Reap a **held** call — one where no party is expected to send — after this many seconds;
+    /// `0` disables it (`--held-media-timeout-secs`).
+    pub held_media_timeout_secs: Option<u64>,
     /// Bounded SIGTERM/SIGINT drain grace period, seconds (`--shutdown-grace-secs`).
     pub shutdown_grace_secs: Option<u64>,
     /// STUN servers asked for a server-reflexive ICE candidate when gathering (`--stun-server`).
@@ -288,7 +295,9 @@ mod tests {
             "port_max = 40000\n",
             "metrics_addr = \"127.0.0.1:9090\"\n",
             "max_control_rps = 500\n",
+            "control_secret_file = \"/run/secrets/siphon-rtp-control\"\n",
             "media_timeout_secs = 45\n",
+            "held_media_timeout_secs = 3600\n",
             "shutdown_grace_secs = 30\n",
             "turn_udp = \"0.0.0.0:3478\"\n",
             "turn_tcp = \"0.0.0.0:3478\"\n",
@@ -324,7 +333,13 @@ mod tests {
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9090)))
         );
         assert_eq!(config.max_control_rps, Some(500));
+        assert_eq!(
+            config.control_secret_file,
+            Some(PathBuf::from("/run/secrets/siphon-rtp-control")),
+            "the config file names the secret's *path*, never the secret"
+        );
         assert_eq!(config.media_timeout_secs, Some(45));
+        assert_eq!(config.held_media_timeout_secs, Some(3600));
         assert_eq!(config.shutdown_grace_secs, Some(30));
         assert_eq!(
             config.turn_tls_cert.as_deref(),
