@@ -9,7 +9,7 @@
 //! What the codebook holds for the fixed-codebook gain is a *correction factor*, not the gain: the
 //! gain itself is predicted from the energy of the innovation and the four previous subframes'
 //! quantised energies, and only the ratio between prediction and reality is transmitted. See
-//! [`GainPredictor`](super::excitation::GainPredictor), which both directions run.
+//! [`GainPredictor`], which both directions run.
 //!
 //! Scoring all 128 pairs per subframe was more than the reference was willing to spend, so a
 //! pre-selection solves the unconstrained minimum in closed form and scores only 4 × 8 pairs around

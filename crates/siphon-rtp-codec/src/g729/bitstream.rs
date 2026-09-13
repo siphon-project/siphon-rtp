@@ -172,7 +172,7 @@ impl<'a> BitReader<'a> {
 /// Pack eleven parameters into the wire octets, most significant bit first (`prm2bits_ld8k`, minus
 /// the reference's one-word-per-bit serial framing, which is a file format rather than a payload).
 ///
-/// The parameter order and widths are [`PARAMETER_BITS`]: the two LSP indices, then each subframe's
+/// The parameter order and widths are the reference's `bitsno`: the two LSP indices, then each subframe's
 /// pitch lag, algebraic-codebook positions and signs and joint gain index, with the first
 /// subframe's lag followed by its parity bit.
 #[must_use]
