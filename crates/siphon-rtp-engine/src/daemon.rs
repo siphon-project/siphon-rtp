@@ -152,8 +152,21 @@ pub struct EngineArgs {
 
     /// Reap a call after this many seconds with no accepted media (dead-path detection,
     /// docs/security-and-nat.md §4 layer 6). Advanced on the same logical clock as the sweeper.
+    ///
+    /// Only legs whose party signalled that it *would* send are measured: a party on hold
+    /// (`a=recvonly` / `a=inactive`, RFC 3264 §8.4) may legitimately send nothing, so its silence is
+    /// not a dead path. A call where neither party is expected to send is judged by
+    /// `--held-media-timeout-secs` instead.
     #[arg(long, default_value_t = DEFAULT_MEDIA_TIMEOUT_SECS)]
     pub media_timeout_secs: u64,
+
+    /// Reap a **held** call after this many seconds — one where no party is expected to send at all,
+    /// so there is no media whose absence could mean anything. Hold, park and queue are exactly this
+    /// state, and they last minutes, so this is deliberately far longer than `--media-timeout-secs`;
+    /// it exists only so a call abandoned on hold still ends. `0` disables it (a held call then never
+    /// ages out and is freed by `delete` alone).
+    #[arg(long, default_value_t = DEFAULT_HELD_MEDIA_TIMEOUT_SECS)]
+    pub held_media_timeout_secs: u64,
 
     /// Bounded grace period (seconds) to drain live calls on SIGTERM/SIGINT before exiting. The
     /// daemon stops accepting new control connections immediately, then waits up to this long for
@@ -278,8 +291,12 @@ pub struct RunConfig {
     pub metrics_addr: Option<SocketAddr>,
     /// Per-connection control request cap (requests/second); `0` disables.
     pub max_control_rps: u64,
-    /// Reap a call after this many seconds with no accepted media.
+    /// Reap a call after this many seconds with no accepted media, counting only legs whose party
+    /// signalled it would send.
     pub media_timeout_secs: u64,
+    /// Reap a **held** call — one where no party is expected to send — after this many seconds;
+    /// `0` disables it.
+    pub held_media_timeout_secs: u64,
     /// Bounded SIGTERM/SIGINT drain grace period (seconds).
     pub shutdown_grace_secs: u64,
     /// STUN servers asked for a server-reflexive candidate when gathering; empty ⇒ host-only.
@@ -363,6 +380,12 @@ impl RunConfig {
                 explicit("media_timeout_secs"),
                 file.media_timeout_secs,
                 DEFAULT_MEDIA_TIMEOUT_SECS,
+            ),
+            held_media_timeout_secs: resolve_defaulted(
+                args.held_media_timeout_secs,
+                explicit("held_media_timeout_secs"),
+                file.held_media_timeout_secs,
+                DEFAULT_HELD_MEDIA_TIMEOUT_SECS,
             ),
             shutdown_grace_secs: resolve_defaulted(
                 args.shutdown_grace_secs,
@@ -603,6 +626,13 @@ fn default_node_id() -> String {
 
 /// Built-in default for `--media-timeout-secs` (mirrors the clap `default_value_t`).
 const DEFAULT_MEDIA_TIMEOUT_SECS: u64 = 30;
+/// Built-in default for `--held-media-timeout-secs` (mirrors the clap `default_value_t`): two hours.
+///
+/// A held call is not silent by accident — no party is expected to send at all — so this is not a
+/// dead-path timer and must not be sized like one. It is a backstop against a call abandoned on hold
+/// (a park slot nobody retrieves, a queue whose caller hung up without the proxy noticing), and two
+/// hours is comfortably past any hold, park or queue wait a PBX has a legitimate reason to hold.
+const DEFAULT_HELD_MEDIA_TIMEOUT_SECS: u64 = 7200;
 /// Built-in default for `--shutdown-grace-secs` (mirrors the clap `default_value_t`).
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 25;
 /// How often the full-ICE driver polls its agents. Below the RFC 8445 §14.2 `Ta` of 50 ms, so pacing
@@ -772,9 +802,11 @@ where
     let sweeper = engine.clone();
     let turn_sweeper = turn.clone();
     let timeout_ticks = config.media_timeout_secs;
+    let held_timeout_ticks = config.held_media_timeout_secs;
     tracing::info!(
         target: "siphon_rtp::media",
         media_timeout_secs = timeout_ticks,
+        held_media_timeout_secs = held_timeout_ticks,
         "media-timeout sweeper enabled"
     );
     tokio::spawn(async move {
@@ -790,10 +822,12 @@ where
             // whose peer stopped answering. A no-op unless `--ice-consent` is set. Runs *before* the
             // idle reap so a call the peer just refreshed is not also evaluated as idle this tick.
             sweeper.drive_consent().await;
-            for call_id in sweeper.reap_idle(timeout_ticks).await {
-                tracing::warn!(target: "siphon_rtp::media", %call_id, idle_secs = timeout_ticks, "media timeout — call reaped");
+            for call_id in sweeper.reap_idle(timeout_ticks, held_timeout_ticks).await {
+                tracing::warn!(target: "siphon_rtp::media", %call_id, idle_secs = timeout_ticks, held_idle_secs = held_timeout_ticks, "media timeout — call reaped");
             }
-            let reaped = sweeper.reap_idle_conferences(timeout_ticks).await;
+            let reaped = sweeper
+                .reap_idle_conferences(timeout_ticks, held_timeout_ticks)
+                .await;
             if reaped > 0 {
                 tracing::warn!(
                     target: "siphon_rtp::media",
@@ -1174,6 +1208,7 @@ mod tests {
             metrics_addr: None,
             max_control_rps: 0,
             media_timeout_secs: 30,
+            held_media_timeout_secs: super::DEFAULT_HELD_MEDIA_TIMEOUT_SECS,
             shutdown_grace_secs: 25,
             stun_servers: Vec::new(),
             ice_full: false,
