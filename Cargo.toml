@@ -19,6 +19,8 @@ members = [
     "crates/siphon-rtp-li",
     "crates/siphon-rtp-ngcompat",
     "crates/siphon-rtp-engine",
+    # Development-only capacity harness (unpublished, never in the runtime image).
+    "crates/siphon-rtp-loadgen",
 ]
 # The XDP loader is its own workspace (with the eBPF program crate at crates/siphon-rtp-xdp/ebpf,
 # built on a pinned nightly via aya-build). Excluded so the stable workspace / `cargo test` never

@@ -1,0 +1,59 @@
+# siphon-rtp-loadgen — the relay capacity harness.
+#
+# Boots the real engine on the real userspace UDP datapath, allocates N plain relay calls, and
+# drives real RTP through all of them, to answer "how many concurrent relay calls does one node
+# sustain?" — a question no criterion bench can answer, because the cost being measured is syscalls
+# and scheduling, not per-packet compute.
+#
+# Kept unpublishable: this is a measurement tool, not part of the product. It must never reach
+# crates.io and must never be built into the distroless runtime image (which is why it is its own
+# crate rather than a second `[[bin]]` on `siphon-rtp`, the crate users install).
+[package]
+name = "siphon-rtp-loadgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Relay capacity harness for siphon-rtp (development tool, not published)"
+publish = false
+
+[[bin]]
+name = "siphon-rtp-loadgen"
+path = "src/main.rs"
+
+[lib]
+name = "siphon_rtp_loadgen"
+path = "src/lib.rs"
+
+# Path-only deps (no `version = `): this crate is unpublished, so it never needs a registry
+# coordinate for its siblings.
+[dependencies]
+# The engine's package is named `siphon-rtp` (its directory is not); its lib target is
+# `siphon_rtp_engine`, which is what the `use` paths below name.
+siphon-rtp = { path = "../siphon-rtp-engine" }
+siphon-rtp-datapath = { path = "../siphon-rtp-datapath" }
+siphon-rtp-proto = { path = "../siphon-rtp-proto" }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `join_all` only, to drive a shard's sockets concurrently inside one task. Already a workspace
+# dependency (the engine's WebSocket bridge pulls it), so this adds no new supply-chain surface.
+futures-util = { workspace = true }
+
+# Dev-only: the io_uring feasibility experiment in examples/uring_vs_syscall.rs.
+#
+# A dev-dependency deliberately, so it reaches neither the engine nor the runtime image — this is a
+# measurement of whether batched submission is worth a production backend, not the backend. Audit:
+# published by the tokio-rs org (MIT OR Apache-2.0); its three default dependencies (bitflags 2,
+# cfg-if, libc) are already in this tree, so it adds no new crate; its build.rs is a no-op unless the
+# non-default `bindgen` feature is enabled, so the zero-C rule holds.
+#
+# `libc` is needed directly for the syscall-mode control arm (setsockopt/recvfrom/sendto) and for the
+# msghdr/iovec/sockaddr plumbing io_uring submissions point at.
+[dev-dependencies]
+io-uring = { version = "0.7", default-features = false }
+libc = "0.2"
