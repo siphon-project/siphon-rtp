@@ -51,6 +51,9 @@ pub struct MediaInfo {
     pub rtcp_mux: bool,
     /// Whether the `m=audio` transport is a secure profile (`RTP/SAVP` or `RTP/SAVPF`) — an SRTP stream.
     pub secure: bool,
+    /// The direction this party declared for the audio stream (RFC 4566 §6 / RFC 8866 §6.7),
+    /// media-level winning over session-level. [`MediaDirection::SendRecv`] when absent.
+    pub direction: MediaDirection,
     /// The `a=crypto` lines offered (RFC 4568 SDES), in order — the peer's SRTP key candidates.
     pub crypto: Vec<CryptoAttribute>,
     /// The peer's DTLS certificate fingerprint (`a=fingerprint`, RFC 8122), present on a DTLS-SRTP
@@ -218,6 +221,62 @@ impl Setup {
             Setup::Passive => "passive",
             Setup::Actpass => "actpass",
             Setup::Holdconn => "holdconn",
+        }
+    }
+}
+
+/// The stream direction a party declares **for itself** (RFC 4566 §6 / RFC 8866 §6.7): `a=sendrecv`,
+/// `a=sendonly`, `a=recvonly`, `a=inactive`.
+///
+/// Read from the perspective of whoever wrote the SDP, which is what makes it usable for hold
+/// detection: a party that signals `recvonly` or `inactive` has told us it will send nothing, so its
+/// silence is the session state the signalling asked for, not a dead media path. Absent means
+/// `sendrecv` (RFC 4566 §6 — "if none of the attributes are present, `sendrecv` is assumed").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaDirection {
+    /// `sendrecv`, or no direction attribute at all — the party sends and receives.
+    #[default]
+    SendRecv,
+    /// `sendonly` — the party sends but does not receive.
+    SendOnly,
+    /// `recvonly` — the party receives but does not send. The classic hold-the-far-end direction
+    /// answered to a `sendonly` offer (RFC 3264 §8.4).
+    RecvOnly,
+    /// `inactive` — the party neither sends nor receives (RFC 3264 §8.4, the both-ends-on-hold case).
+    Inactive,
+}
+
+impl MediaDirection {
+    /// Parse a bare direction attribute body. Returns `None` for any other attribute.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "sendrecv" => Some(MediaDirection::SendRecv),
+            "sendonly" => Some(MediaDirection::SendOnly),
+            "recvonly" => Some(MediaDirection::RecvOnly),
+            "inactive" => Some(MediaDirection::Inactive),
+            _ => None,
+        }
+    }
+
+    /// Whether the party that wrote this attribute said it will **send** media.
+    ///
+    /// This is the whole question the idle reaper needs to ask: a leg whose peer is not expected to
+    /// send cannot be judged dead by its silence (RFC 3264 §8.4 permits a held party to send nothing
+    /// at all).
+    #[must_use]
+    pub fn peer_sends(self) -> bool {
+        matches!(self, MediaDirection::SendRecv | MediaDirection::SendOnly)
+    }
+
+    /// The direction attribute token, as it appears after `a=`.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            MediaDirection::SendRecv => "sendrecv",
+            MediaDirection::SendOnly => "sendonly",
+            MediaDirection::RecvOnly => "recvonly",
+            MediaDirection::Inactive => "inactive",
         }
     }
 }
@@ -413,6 +472,9 @@ struct AudioScan {
     audio_media: Option<(usize, u16)>,
     audio_conn: Option<(usize, IpAddr)>,
     rtcp_mux: bool,
+    /// The audio stream's direction attribute (RFC 4566 §6), session- or media-level with media-level
+    /// winning. `None` until one is seen; absence resolves to [`MediaDirection::SendRecv`].
+    direction: Option<MediaDirection>,
     /// `a=rtcp:` line within the audio section: (line index, port).
     audio_rtcp: Option<(usize, u16)>,
     /// The `m=audio` transport profile (the third field, e.g. `RTP/AVP` or `RTP/SAVP`).
@@ -650,6 +712,7 @@ fn scan(sdp: &str) -> AudioScan {
         audio_media: None,
         audio_conn: None,
         rtcp_mux: false,
+        direction: None,
         audio_rtcp: None,
         transport: None,
         candidates: Vec::new(),
@@ -805,6 +868,19 @@ fn scan(sdp: &str) -> AudioScan {
                             scan.setup = Some(setup);
                         }
                     }
+                } else if let Some(direction) = MediaDirection::parse(value) {
+                    // RFC 4566 §6 / RFC 8866 §6.7 direction attribute — session- or media-level, with
+                    // media-level winning, exactly like the ICE credentials and `a=setup` above. It is
+                    // the only thing in the SDP that distinguishes a held call from a dead media path:
+                    // at the packet layer both are silence (RFC 3264 §8.4 lets a held party send
+                    // nothing at all), so the idle reaper reads this rather than guessing.
+                    //
+                    // Matched last in the `session_or_audio` chain because a bare token cannot collide
+                    // with the prefixed attributes above, and matched *before* the `in_text`/`in_audio`
+                    // arms because a session-level direction line is in neither section.
+                    if session_or_audio && (in_audio || scan.direction.is_none()) {
+                        scan.direction = Some(direction);
+                    }
                 } else if in_text {
                     // Text section attributes needed to anchor + relay the RFC 4103 stream: its RTCP
                     // multiplexing intent, explicit RTCP port, and the `t140`/`red` rtpmaps.
@@ -889,6 +965,8 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
             .transport
             .as_deref()
             .is_some_and(|transport| transport.contains("SAVP")),
+        // RFC 4566 §6: no direction attribute means `sendrecv`.
+        direction: scan.direction.unwrap_or_default(),
         crypto: scan.crypto.clone(),
         // DTLS-SRTP: the transport is `UDP/TLS/RTP/SAVP[F]` (RFC 5764), keyed by the handshake, not SDES.
         dtls: scan
@@ -2033,6 +2111,126 @@ mod tests {
              a=rtpmap:8 PCMA/8000\r\n\
              a=rtpmap:96 telephone-event/8000\r\n"
         )
+    }
+
+    #[test]
+    fn an_absent_direction_attribute_reads_as_sendrecv() {
+        // RFC 4566 §6: "If none of the attributes are present, `sendrecv` is assumed." Every SDP the
+        // engine has ever parsed took this path, so it is the branch that must not move.
+        let info = parse(&offer("203.0.113.7", 30000)).expect("parse");
+        assert_eq!(info.direction, MediaDirection::SendRecv);
+        assert!(info.direction.peer_sends());
+    }
+
+    #[test]
+    fn parses_each_direction_attribute_at_media_level() {
+        for (token, expected, sends) in [
+            ("sendrecv", MediaDirection::SendRecv, true),
+            ("sendonly", MediaDirection::SendOnly, true),
+            ("recvonly", MediaDirection::RecvOnly, false),
+            ("inactive", MediaDirection::Inactive, false),
+        ] {
+            let sdp = format!("{}a={token}\r\n", offer("203.0.113.7", 30000));
+            let info = parse(&sdp).expect("parse");
+            assert_eq!(info.direction, expected, "a={token}");
+            assert_eq!(
+                info.direction.peer_sends(),
+                sends,
+                "a={token}: whether the peer said it will send"
+            );
+            assert_eq!(info.direction.token(), token, "round-trips its own token");
+        }
+    }
+
+    #[test]
+    fn a_media_level_direction_wins_over_the_session_level_one() {
+        // RFC 4566 §6 / RFC 8866 §6.7: a media-level attribute overrides the session-level default,
+        // in both directions — the same precedence the ICE credentials and `a=setup` already apply.
+        let held_session = concat!(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n",
+            "a=inactive\r\n",
+            "m=audio 30000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            "a=sendrecv\r\n",
+        );
+        assert_eq!(
+            parse(held_session).expect("parse").direction,
+            MediaDirection::SendRecv,
+            "the audio section's own sendrecv overrides a session-level inactive"
+        );
+
+        let active_session = concat!(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n",
+            "a=sendrecv\r\n",
+            "m=audio 30000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            "a=recvonly\r\n",
+        );
+        assert_eq!(
+            parse(active_session).expect("parse").direction,
+            MediaDirection::RecvOnly,
+            "and a media-level recvonly overrides a session-level sendrecv"
+        );
+    }
+
+    #[test]
+    fn a_session_level_direction_applies_when_the_audio_section_has_none() {
+        let sdp = concat!(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n",
+            "a=sendonly\r\n",
+            "m=audio 30000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+        );
+        assert_eq!(
+            parse(sdp).expect("parse").direction,
+            MediaDirection::SendOnly
+        );
+    }
+
+    #[test]
+    fn another_sections_direction_never_reaches_the_audio_stream() {
+        // The parse-side twin of the multi-`m=` scoping the ICE/crypto strips already respect: a text
+        // or video section holding the call's *text* on hold must not read as the audio being held.
+        let sdp = concat!(
+            "v=0\r\no=- 1 1 IN IP4 203.0.113.7\r\ns=-\r\nc=IN IP4 203.0.113.7\r\nt=0 0\r\n",
+            "m=audio 30000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
+            "m=text 30002 RTP/AVP 98\r\na=rtpmap:98 t140/1000\r\n",
+            "a=inactive\r\n",
+        );
+        let info = parse(sdp).expect("parse");
+        assert_eq!(
+            info.direction,
+            MediaDirection::SendRecv,
+            "the text section's inactive belongs to the text stream, not the audio one"
+        );
+        assert!(info.text.is_some(), "and the text stream still parses");
+    }
+
+    #[test]
+    fn a_direction_attribute_survives_a_rewrite_untouched() {
+        // The engine contributes no direction attribute of its own and must not disturb the peer's:
+        // it anchors transport, not session state (RFC 3264 §8.4 is the endpoints' business).
+        let sdp = format!("{}a=inactive\r\n", offer("203.0.113.7", 30000));
+        let engine = EngineMedia {
+            rtp: "198.51.100.1:40000".parse().expect("addr"),
+            rtcp: None,
+            advertised_ip: "198.51.100.1".parse().expect("ip"),
+        };
+        let result = rewrite(
+            &sdp,
+            engine,
+            IceRewrite::Keep,
+            None,
+            None,
+            TextRewrite::None,
+        )
+        .expect("rewrite");
+        assert!(
+            result.sdp.contains("a=inactive\r\n"),
+            "the peer's own direction is passed through verbatim: {}",
+            result.sdp
+        );
+        assert_eq!(
+            parse(&result.sdp).expect("reparse").direction,
+            MediaDirection::Inactive
+        );
     }
 
     #[test]

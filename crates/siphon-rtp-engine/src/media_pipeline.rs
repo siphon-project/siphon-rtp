@@ -764,6 +764,14 @@ pub struct Direction {
     /// PCM the recorder sees). Each re-encodes for a send-only subscriber (a Session Recording Server,
     /// RFC 7866 §6). Empty unless a `subscribe_request`/`subscribe_answer` attached one.
     forks: Vec<Box<dyn MediaSink>>,
+    /// Sinks fed the **egress** PCM — what this party actually hears, overlay and injected prompt
+    /// included, immediately before it is encoded. The mirror of `forks`, and fed from exactly the
+    /// point `echo_reference` is, for the same reason: that is the definition of "what the party
+    /// hears", whatever produced it (transcode, prompt, echo reflect, conference mix).
+    ///
+    /// Empty unless a recording asked for `direction: egress`. A single-leg IVR leg is the case that
+    /// needs it — there is no second party whose *ingress* is the engine's own audio.
+    egress_taps: Vec<Box<dyn MediaSink>>,
     /// Replace egress audio with comfort silence (digit-suppression / hold).
     silenced: bool,
     /// Drop egress audio entirely (not even silence).
@@ -1011,8 +1019,26 @@ impl PlayRequest {
         play_id: u64,
         duration_cap_ms: Option<u64>,
     ) -> Result<Playback, PlaybackError> {
-        let egress_rate = direction.egress_sample_rate;
-        let packetization_time_ms = direction.egress_ptime_ms();
+        self.into_playback_at(
+            direction.egress_sample_rate,
+            direction.egress_ptime_ms(),
+            gain,
+            play_id,
+            duration_cap_ms,
+        )
+    }
+
+    /// As `PlayRequest::into_playback`, but against an explicit rate and frame length rather than a
+    /// leg's. A conference room has no `Direction` — it renders one mix at the room rate on a fixed
+    /// 20 ms tick — so it needs the same construction without one.
+    pub fn into_playback_at(
+        self,
+        egress_rate: u32,
+        packetization_time_ms: u32,
+        gain: Gain,
+        play_id: u64,
+        duration_cap_ms: Option<u64>,
+    ) -> Result<Playback, PlaybackError> {
         let source = match self {
             PlayRequest::Pcm(player) => PlaybackSource::Pcm(player),
             PlayRequest::Tone(spec) => {
@@ -1376,6 +1402,7 @@ impl Direction {
             dtmf: DtmfDetector::new(),
             recorder: config.recorder,
             forks: Vec::new(),
+            egress_taps: Vec::new(),
             silenced: false,
             blocked: false,
             dtmf_blocked: false,
@@ -1452,6 +1479,7 @@ impl Direction {
             dtmf: DtmfDetector::new(),
             recorder: None,
             forks: Vec::new(),
+            egress_taps: Vec::new(),
             silenced: false,
             blocked: false,
             dtmf_blocked: false,
@@ -1620,6 +1648,10 @@ impl Direction {
         // swap) so `blend_overlays` can borrow `self` mutably, and put back before returning.
         let mut scratch = std::mem::take(&mut self.overlay_scratch);
         let mixed = self.blend_overlays(pcm, &mut scratch);
+        // After the blend, before the encode: exactly what this party hears.
+        for tap in &mut self.egress_taps {
+            tap.write_pcm(mixed);
+        }
         let mut payload = [0u8; MAX_RTP];
         let encoded = self.encoder.encode(mixed, &mut payload);
         self.overlay_scratch = scratch;
@@ -2338,6 +2370,10 @@ impl Direction {
         // — transcode, injected prompt, or echo-test reflect — it is what the party hears.
         if let Some(reference) = self.echo_reference.as_mut() {
             reference.push(pcm);
+        }
+        // The egress tap reads the same frame for the same reason: it is what the party hears.
+        for tap in &mut self.egress_taps {
+            tap.write_pcm(pcm);
         }
         let mut payload = [0u8; MAX_RTP];
         let encoded = self.encoder.encode(pcm, &mut payload);
@@ -3135,9 +3171,11 @@ impl MediaCall {
     }
 
     /// Start a DTMF sequence toward a party (`Command::PlayDtmf`): `digits` is played as one RFC 4733
-    /// event per digit, each `duration_ms` long, separated by `pause_ms` of silence. Returns `false`
-    /// if the party has no negotiated telephone-event payload type to carry it, or `digits` is empty /
-    /// carries a non-DTMF character (the engine validates the code, so this is a defensive guard).
+    /// event per digit, each `duration_ms` long, separated by `pause_ms` of silence.
+    ///
+    /// The outcome is reported rather than swallowed. A leg that negotiated no `telephone-event`
+    /// payload type has nowhere to put the digits, and the engine answering `ok` there is
+    /// indistinguishable — to the controller and to the user — from the far end ignoring them.
     pub fn start_play_dtmf(
         &mut self,
         toward_a: bool,
@@ -3145,17 +3183,17 @@ impl MediaCall {
         duration_ms: u32,
         volume: u8,
         pause_ms: u32,
-    ) -> bool {
+    ) -> PlayDtmfOutcome {
         let direction = self.direction_toward(toward_a);
         let Some(payload_type) = direction.telephone_event_out else {
-            return false;
+            return PlayDtmfOutcome::NoTelephoneEvent;
         };
         let clock_rate = direction.egress_sample_rate;
         let ptime = direction.egress_ptime_ms() as u8;
         let Some(sequence) =
             DtmfSequence::new(digits, duration_ms, volume, clock_rate, ptime, pause_ms)
         else {
-            return false;
+            return PlayDtmfOutcome::InvalidDigits;
         };
         let base_timestamp = direction.egress_timestamp;
         direction.injection = Some(Injection::Dtmf {
@@ -3163,7 +3201,7 @@ impl MediaCall {
             payload_type,
             base_timestamp,
         });
-        true
+        PlayDtmfOutcome::Started
     }
 
     /// Stop any prompt / DTMF injection on both directions (`Command::StopMedia`). A `play_media`
@@ -3230,6 +3268,7 @@ impl MediaCall {
     /// (the same `call_id` / `from_tag` / `to_tag` triple as [`Event::Dtmf`]).
     fn play_finished_event(&self, finished: FinishedPlay) -> Event {
         Event::PlayFinished {
+            conference_id: None,
             call_id: self.call_id.clone(),
             from_tag: self.from_tag.clone(),
             to_tag: self.to_tag.clone(),
@@ -3256,6 +3295,24 @@ impl MediaCall {
     /// frame toward the subscriber; the engine drains its output channel to the datapath.
     pub fn add_fork(&mut self, source_a: bool, sink: Box<dyn MediaSink>) {
         self.ingress_direction(source_a).forks.push(sink);
+    }
+
+    /// Attach a sink to a party's **egress** audio — what that party hears, rather than what it sent.
+    /// `toward_a` selects the direction the way every other egress op does.
+    pub fn add_egress_fork(&mut self, toward_a: bool, sink: Box<dyn MediaSink>) {
+        self.direction_toward(toward_a).egress_taps.push(sink);
+    }
+
+    /// Detach the egress taps a direction carries under `tag`, leaving any others attached — the
+    /// egress twin of [`MediaCall::remove_forks_tagged`].
+    pub fn remove_egress_forks_tagged(&mut self, toward_a: bool, tag: &str) {
+        let direction = self.direction_toward(toward_a);
+        for tap in &mut direction.egress_taps {
+            if tap.tag() == Some(tag) {
+                tap.finish();
+            }
+        }
+        direction.egress_taps.retain(|tap| tap.tag() != Some(tag));
     }
 
     /// Detach every fork on a source leg's ingress ([`MediaControl::RemoveFork`]). Finalizes each sink
@@ -3446,6 +3503,24 @@ impl MediaCall {
     }
 }
 
+/// What a [`MediaControl::PlayDtmf`] did, reported back to the control plane.
+///
+/// The engine used to answer `play_dtmf` from whether the message reached the actor's mailbox, which
+/// meant a leg that negotiated no `telephone-event` payload type was accepted and nothing was sent.
+/// On a PBX that is a feature code forwarded to a carrier, an attended-transfer helper or a flow step
+/// navigating a remote menu, and a silent no-op there reads as the far end ignoring the digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayDtmfOutcome {
+    /// The sequence is queued on the leg's egress.
+    Started,
+    /// The leg negotiated no RFC 4733 `telephone-event` payload type, so there is nothing to carry
+    /// the digits. In-band (Goertzel) generation as a fallback is a later, separate detector.
+    NoTelephoneEvent,
+    /// The digit string was empty or held a non-DTMF character. The engine validates the code before
+    /// dispatching, so this is a defensive guard rather than a reachable control-plane answer.
+    InvalidDigits,
+}
+
 /// A control message to a running [`MediaCall`] actor.
 pub enum MediaControl {
     /// Replace egress audio with silence (`true`) or resume (`false`).
@@ -3479,12 +3554,15 @@ pub enum MediaControl {
     },
     /// Play a DTMF sequence toward a party: `digits` is the (validated) multi-digit code, each digit
     /// played `duration_ms` long with `pause_ms` of inter-digit silence (RFC 4733 telephone-events).
+    /// `reply` carries the actor's verdict, so a leg with no negotiated telephone-event payload type
+    /// is answered as an error rather than as a success that sends nothing.
     PlayDtmf {
         toward_a: bool,
         digits: String,
         duration_ms: u32,
         volume: u8,
         pause_ms: u32,
+        reply: tokio::sync::oneshot::Sender<PlayDtmfOutcome>,
     },
     /// Stop every prompt / DTMF injection **and every overlay** on both directions.
     StopPlay,
@@ -3519,6 +3597,13 @@ pub enum MediaControl {
     /// Detach only the forks a source leg carries under `tag`, leaving the others attached — how a WS
     /// tee detaches without disturbing a SIPREC subscription forking the same leg.
     RemoveForkTagged { source_a: bool, tag: String },
+    /// Attach a sink to a party's **egress** audio (what it hears), rather than its ingress.
+    AddEgressFork {
+        toward_a: bool,
+        sink: Box<dyn MediaSink>,
+    },
+    /// Detach the egress taps a direction carries under `tag`.
+    RemoveEgressForkTagged { toward_a: bool, tag: String },
     /// Attach a SIPREC / monitor **raw-RTP tee** to a source leg's ingress (`source_a` selects leg A
     /// vs leg B). The leg's original ingress RTP is copied byte-for-byte toward the SRS — its
     /// negotiated codec, no re-encode (RFC 7866 §6). Send-only: the engine installs no inbound flow on
@@ -3852,8 +3937,9 @@ async fn run_media_call<D>(
                         }
                         emit_events(&mut emitted, &events);
                     }
-                    MediaInput::Control(MediaControl::PlayDtmf { toward_a, digits, duration_ms, volume, pause_ms }) => {
-                        call.start_play_dtmf(toward_a, &digits, duration_ms, volume, pause_ms);
+                    MediaInput::Control(MediaControl::PlayDtmf { toward_a, digits, duration_ms, volume, pause_ms, reply }) => {
+                        let outcome = call.start_play_dtmf(toward_a, &digits, duration_ms, volume, pause_ms);
+                        let _ = reply.send(outcome);
                     }
                     MediaInput::Control(MediaControl::StopPlay) => {
                         // An explicit stop ends every prompt and overlay with `PlayFinished{Stopped}`.
@@ -3875,6 +3961,12 @@ async fn run_media_call<D>(
                     }
                     MediaInput::Control(MediaControl::RemoveFork { source_a }) => {
                         call.remove_forks(source_a);
+                    }
+                    MediaInput::Control(MediaControl::AddEgressFork { toward_a, sink }) => {
+                        call.add_egress_fork(toward_a, sink);
+                    }
+                    MediaInput::Control(MediaControl::RemoveEgressForkTagged { toward_a, tag }) => {
+                        call.remove_egress_forks_tagged(toward_a, &tag);
                     }
                     MediaInput::Control(MediaControl::RemoveForkTagged { source_a, tag }) => {
                         call.remove_forks_tagged(source_a, &tag);
@@ -7174,7 +7266,7 @@ mod tests {
     #[test]
     fn play_audio_injects_prompt_in_the_target_legs_codec() {
         use siphon_rtp_media::fanout::MediaSink as _;
-        use siphon_rtp_media::player::WavSource;
+        use siphon_rtp_media::player::{PcmRepeat, WavSource};
 
         let mut call = ulaw_alaw_call();
         // An 8 kHz mono prompt: 320 samples = 40 ms → 2 frames at 20 ms ptime.
@@ -7182,7 +7274,7 @@ mod tests {
         recorder.write_pcm(&[2000i16; 320]);
         let wav = recorder.into_wav();
         let source = WavSource::parse(&wav).expect("parse wav");
-        let player = PcmPlayer::new(&source, 1, 0);
+        let player = PcmPlayer::new(&source, PcmRepeat::Times(1), 0);
 
         call.start_prompt(true, player, 1, &mut Vec::new()); // toward A (b_to_a egress, µ-law PT 0)
         assert!(call.has_injection());
@@ -7226,12 +7318,12 @@ mod tests {
 
     /// Build an 8 kHz mono prompt of `frames` × 20 ms (160 samples/frame) as a fresh `PcmPlayer`.
     fn prompt_player(frames: usize) -> PcmPlayer {
-        use siphon_rtp_media::player::WavSource;
+        use siphon_rtp_media::player::{PcmRepeat, WavSource};
         let mut recorder = WavRecorder::new(8000, 1);
         recorder.write_pcm(&vec![2000i16; 160 * frames.max(1)]);
         let wav = recorder.into_wav();
         let source = WavSource::parse(&wav).expect("parse wav");
-        PcmPlayer::new(&source, 1, 0)
+        PcmPlayer::new(&source, PcmRepeat::Times(1), 0)
     }
 
     /// Assert exactly one [`Event::PlayFinished`] was emitted, returning `(play_id, reason,
@@ -7329,13 +7421,13 @@ mod tests {
 
     #[test]
     fn a_repeated_prompt_emits_play_finished_once_at_the_very_end() {
-        use siphon_rtp_media::player::WavSource;
+        use siphon_rtp_media::player::{PcmRepeat, WavSource};
         let mut call = ulaw_alaw_call();
         // A 1-frame (160-sample) body played twice (repeat_times = 2) → 2 frames, then exhausted.
         let mut recorder = WavRecorder::new(8000, 1);
         recorder.write_pcm(&vec![2000i16; 160]);
         let source = WavSource::parse(&recorder.into_wav()).expect("parse");
-        let player = PcmPlayer::new(&source, 2, 0);
+        let player = PcmPlayer::new(&source, PcmRepeat::Times(2), 0);
         call.start_prompt(true, player, 5, &mut Vec::new());
 
         let mut out = Vec::new();
@@ -7359,8 +7451,9 @@ mod tests {
     #[test]
     fn play_dtmf_injects_telephone_events_toward_the_target() {
         let mut call = ulaw_alaw_call();
-        assert!(
+        assert_eq!(
             call.start_play_dtmf(true, "5", 100, 10, 40),
+            PlayDtmfOutcome::Started,
             "A negotiated telephone-event"
         );
         let mut out = Vec::new();
@@ -7381,7 +7474,10 @@ mod tests {
         // opening with the marker, the second event's timestamp advanced past the first, and an
         // inter-digit gap (no telephone-event) between them. The injection clears when the code drains.
         let mut call = ulaw_alaw_call();
-        assert!(call.start_play_dtmf(true, "12", 100, 10, 40));
+        assert_eq!(
+            call.start_play_dtmf(true, "12", 100, 10, 40),
+            PlayDtmfOutcome::Started
+        );
 
         let mut first_event_timestamp = None;
         let mut second_event_timestamp = None;
@@ -7471,9 +7567,27 @@ mod tests {
             ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
         };
         let mut call = MediaCall::new("c", "a", None, a_to_b, b_to_a, true, None);
-        assert!(
-            !call.start_play_dtmf(true, "5", 100, 10, 40),
-            "no telephone-event ⇒ cannot inject"
+        assert_eq!(
+            call.start_play_dtmf(true, "5", 100, 10, 40),
+            PlayDtmfOutcome::NoTelephoneEvent,
+            "no telephone-event ⇒ cannot inject, and the actor says which reason"
+        );
+    }
+
+    #[test]
+    fn start_play_dtmf_separates_a_missing_payload_type_from_an_unusable_code() {
+        // The two refusals used to be one `false`, which is why the engine could not report either.
+        // A leg that *did* negotiate telephone-event still refuses a code with no usable digits, and
+        // it must not be reported as a missing payload type.
+        let mut call = ulaw_alaw_call();
+        assert_eq!(
+            call.start_play_dtmf(true, "", 100, 10, 40),
+            PlayDtmfOutcome::InvalidDigits,
+            "an empty code is not a missing payload type"
+        );
+        assert_eq!(
+            call.start_play_dtmf(true, "1", 100, 10, 40),
+            PlayDtmfOutcome::Started
         );
     }
 

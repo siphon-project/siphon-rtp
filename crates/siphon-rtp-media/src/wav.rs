@@ -6,6 +6,46 @@
 
 use crate::fanout::MediaSink;
 
+/// Bytes in a canonical RIFF/WAVE header: the 12-byte RIFF envelope, a 24-byte `fmt ` chunk, and the
+/// 8-byte `data` chunk header the samples follow.
+pub const WAV_HEADER_LEN: usize = 44;
+
+/// Byte offset of the RIFF chunk size (total file length − 8), for a streaming writer that seeks back
+/// and fills it in once the recording is complete.
+pub const WAV_RIFF_SIZE_OFFSET: u64 = 4;
+
+/// Byte offset of the `data` chunk size (the sample bytes), likewise.
+pub const WAV_DATA_SIZE_OFFSET: u64 = 40;
+
+/// Render a canonical RIFF/WAVE (PCM16 LE) header for `data_len` bytes of samples.
+///
+/// Shared by [`WavRecorder::into_wav`] and the engine's streaming recorder, which writes this header
+/// with `data_len = 0` up front and seeks back to fix the two sizes when the recording closes. One
+/// function so the buffered and streamed forms cannot drift into writing different headers.
+#[must_use]
+pub fn wav_header(sample_rate: u32, channels: u16, data_len: u32) -> [u8; WAV_HEADER_LEN] {
+    let channels = channels.max(1);
+    let bits_per_sample: u16 = 16;
+    let block_align = channels * (bits_per_sample / 8);
+    let byte_rate = sample_rate * u32::from(block_align);
+
+    let mut header = [0u8; WAV_HEADER_LEN];
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&(36 + data_len).to_le_bytes());
+    header[8..12].copy_from_slice(b"WAVE");
+    header[12..16].copy_from_slice(b"fmt ");
+    header[16..20].copy_from_slice(&16u32.to_le_bytes());
+    header[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
+    header[22..24].copy_from_slice(&channels.to_le_bytes());
+    header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    header[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    header[32..34].copy_from_slice(&block_align.to_le_bytes());
+    header[34..36].copy_from_slice(&bits_per_sample.to_le_bytes());
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&data_len.to_le_bytes());
+    header
+}
+
 /// Accumulates PCM samples and renders a RIFF/WAVE (PCM16 LE) byte stream.
 #[derive(Debug, Clone)]
 pub struct WavRecorder {
@@ -34,27 +74,9 @@ impl WavRecorder {
     /// Render the recording as a complete WAV byte stream.
     #[must_use]
     pub fn into_wav(self) -> Vec<u8> {
-        let bits_per_sample: u16 = 16;
-        let block_align = self.channels * (bits_per_sample / 8);
-        let byte_rate = self.sample_rate * u32::from(block_align);
         let data_len = (self.samples.len() * 2) as u32;
-
-        let mut out = Vec::with_capacity(44 + self.samples.len() * 2);
-        out.extend_from_slice(b"RIFF");
-        out.extend_from_slice(&(36 + data_len).to_le_bytes());
-        out.extend_from_slice(b"WAVE");
-        // fmt chunk
-        out.extend_from_slice(b"fmt ");
-        out.extend_from_slice(&16u32.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        out.extend_from_slice(&self.channels.to_le_bytes());
-        out.extend_from_slice(&self.sample_rate.to_le_bytes());
-        out.extend_from_slice(&byte_rate.to_le_bytes());
-        out.extend_from_slice(&block_align.to_le_bytes());
-        out.extend_from_slice(&bits_per_sample.to_le_bytes());
-        // data chunk
-        out.extend_from_slice(b"data");
-        out.extend_from_slice(&data_len.to_le_bytes());
+        let mut out = Vec::with_capacity(WAV_HEADER_LEN + self.samples.len() * 2);
+        out.extend_from_slice(&wav_header(self.sample_rate, self.channels, data_len));
         for sample in &self.samples {
             out.extend_from_slice(&sample.to_le_bytes());
         }

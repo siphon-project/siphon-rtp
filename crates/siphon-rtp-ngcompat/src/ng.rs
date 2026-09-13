@@ -7,7 +7,7 @@
 //! (`codec-transcode-PCMA`, `codec-mask-AMR-WB`, …) and/or the structured `codec` dict — both are
 //! normalized into [`ProfileFlags::flags`] for the engine.
 
-use siphon_rtp_proto::{CmdResult, Command, PlayMediaSource, ProfileFlags};
+use siphon_rtp_proto::{CmdResult, Command, PlayMediaSource, PlayRepeat, ProfileFlags};
 
 use crate::bencode::{self, Value};
 
@@ -131,10 +131,23 @@ pub fn parse_command(request: &Value) -> Result<Command, NgError> {
             call_id: required_str(request, "call-id")?,
             from_tag: optional_str(request, "from-tag").unwrap_or_default(),
             recording_dir: optional_str(request, "recording-dir"),
+            // rtpengine's `start recording` is a pcap of the raw wire packets and has no spelling for
+            // anything else, so an NG recording stays exactly that. The decoded-WAV form, its stop
+            // conditions and the completion event are native-contract extensions, like overlay
+            // playback and the tee — and they need an event rail the NG front-end does not have.
+            format: None,
+            direction: None,
+            channels: None,
+            max_duration_ms: None,
+            silence_ms: None,
+            path: None,
         }),
         "stop recording" => Ok(Command::StopRecording {
             call_id: required_str(request, "call-id")?,
             from_tag: optional_str(request, "from-tag").unwrap_or_default(),
+            // No per-recording handle in rtpengine's NG: `stop recording` stops the call's recording,
+            // which is what `None` means.
+            recording_id: None,
         }),
         "play media" => parse_play_media(request),
         "play DTMF" => parse_play_dtmf(request),
@@ -286,6 +299,9 @@ pub fn serialize_result(result: &CmdResult) -> Value {
             // `play_id` correlates the native async `PlayFinished` event; NG `play media` is
             // fire-and-forget and has no event rail, so it is not rendered into the bencode reply.
             play_id: _,
+            // Likewise `recording_id`: an NG `start recording` is always a pcap, which has no
+            // completion event to correlate and no per-recording stop to address.
+            recording_id: _,
         } => {
             dict.insert(b"result".to_vec(), Value::string("ok"));
             if let Some(sdp) = sdp {
@@ -376,7 +392,11 @@ fn parse_play_media(request: &Value) -> Result<Command, NgError> {
         call_id: required_str(request, "call-id")?,
         from_tag: required_str(request, "from-tag")?,
         source,
-        repeat_times: optional_u64(request, "repeat-times"),
+        // rtpengine's `repeat-times` is an integer and has no spelling for an endless play, so this
+        // stays an integer here: the bencode wire is rtpengine's, not ours. A controller that wants
+        // `"repeat_times": "inf"` uses the native JSON contract, exactly as it must for the three
+        // extensions below.
+        repeat_times: optional_u64(request, "repeat-times").map(PlayRepeat::Times),
         start_pos_ms: optional_u64(request, "start-pos"),
         duration_ms: optional_u64(request, "duration"),
         // Overlay mixing, playout gain and the synthesised/URL sources are native-contract
@@ -608,6 +628,12 @@ mod tests {
                 call_id: "call-rec".into(),
                 from_tag: "ft".into(),
                 recording_dir: Some("/records".into()),
+                format: None,
+                direction: None,
+                channels: None,
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
             }
         );
     }
@@ -630,6 +656,12 @@ mod tests {
                 call_id: "c".into(),
                 from_tag: String::new(),
                 recording_dir: None,
+                format: None,
+                direction: None,
+                channels: None,
+                max_duration_ms: None,
+                silence_ms: None,
+                path: None,
             }
         );
     }
@@ -650,6 +682,7 @@ mod tests {
             Command::StopRecording {
                 call_id: "call-rec".into(),
                 from_tag: "ft".into(),
+                recording_id: None,
             }
         );
     }
@@ -1247,6 +1280,7 @@ mod tests {
             sdp: Some("v=0\r\nm=audio 30000 RTP/SAVP 96\r\n".into()),
             duration_ms: None,
             play_id: None,
+            recording_id: None,
             to_tag: None,
             stats: None,
         });
@@ -1265,6 +1299,7 @@ mod tests {
             sdp: None,
             duration_ms: None,
             play_id: None,
+            recording_id: None,
             to_tag: None,
             stats: Some(siphon_rtp_proto::SessionStats {
                 packets_in: 100,
