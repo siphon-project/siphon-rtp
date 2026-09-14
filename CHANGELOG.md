@@ -96,6 +96,18 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   the `Datapath` trait in `siphon_rtp_datapath::conformance`, behind a `conformance` feature, so the
   next backend runs them instead of inheriting no cover.
 
+### Security
+
+- **A userspace pipeline now drops a packet its latch rejects.** On the datapath relay, a new source
+  that cannot prove it is the latched stream (a different SSRC, or no SSRC at all) is dropped. The
+  userspace pipelines (transcode, conference audio and text, the text relay, WebSocket takeover) only
+  declined to move the reply address and still decoded, mixed or forwarded the packet, so with
+  `symmetric` set, where the source gate is open and the latch is the only constraint left, such a leg
+  accepted injected media from any address. They now decide the latch after SRTP authentication and
+  before the packet is used, and drop a rejected one without counting it as media activity. The same
+  drop applies under the default signalled-source gate, where only a sender on the signalled address
+  can reach the latch in the first place.
+
 ## [0.6.0] — 2026-09-13
 
 Eight gaps a PBX runs into that a trunk-facing SBC and a voice-AI bridge never did. A call on hold

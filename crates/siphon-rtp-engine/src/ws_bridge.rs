@@ -47,7 +47,7 @@ use dashmap::DashMap;
 use siphon_rtp_datapath::{rtp_media_ssrc, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_srtp::leg::{is_rtcp, SecureLeg};
 
-use crate::media_pipeline::SymmetricLatch;
+use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
 /// The SRTP (RFC 3711) crypto of one secure WebSocket-takeover leg: the engine's own key material
 /// against the offerer's.
@@ -238,41 +238,44 @@ impl WsEgress {
         let _ = self.destination.send_replace(remote);
     }
 
-    /// Offer one **accepted** ingress datagram to the symmetric-RTP latch, re-pointing the downlink at
-    /// the source the leg's media actually arrives from (docs/security-and-nat.md §4 layer 3).
+    /// Admit one **authenticated** ingress datagram through the symmetric-RTP latch, re-pointing the
+    /// downlink at the source the leg's media actually arrives from (docs/security-and-nat.md §4
+    /// layer 3). Returns `false` when the latch rejects it: a new source that cannot prove it is the
+    /// leg's stream, which the caller then drops rather than feeding to the bridge, exactly as the
+    /// datapath's `Forward` path drops it.
     ///
     /// `data` must be the plaintext the bridge will consume: the caller applies the source gate and,
     /// on a secure leg, SRTP `unprotect` first, so a forged packet that fails authentication can never
-    /// move the destination — the same ordering [`crate::media_pipeline`] enforces. A datagram that is
-    /// not RTP media yields no SSRC and is ignored, which is the RFC 7983 layer-1 guard in passing: a
-    /// STUN or DTLS record on a muxed takeover port cannot steer the downlink.
+    /// reach the latch — the same ordering [`crate::media_pipeline`] enforces. A datagram that is not
+    /// RTP media carries no SSRC, so it never aims the downlink, and once a stream is latched it is
+    /// accepted only from the latched source: the RFC 7983 layer-1 guard in passing, since a STUN or
+    /// DTLS record on a muxed takeover port cannot steer the downlink either way.
     ///
-    /// A rejected source only fails to *move* the latch; the packet itself is not dropped, matching
-    /// the media pipeline. The gate is the security boundary and this packet has already cleared it.
-    fn observe_ingress(&self, source: SocketAddr, data: &[u8]) {
+    /// An ICE leg is admitted without consulting the latch: the agent's selection owns its transport
+    /// (§4 layer 4).
+    fn admit_ingress(&self, source: SocketAddr, data: &[u8]) -> bool {
         if self.ice_managed {
-            return;
+            return true;
         }
-        let Some(ssrc) = rtp_media_ssrc(data) else {
-            return;
-        };
         // Scoped so the latch is released before the watch is touched — the two are never nested.
         let adopted = {
             let Ok(mut latch) = self.latch.lock() else {
                 tracing::error!(
-                    "ws egress latch mutex poisoned; the downlink keeps its destination"
+                    "ws egress latch mutex poisoned; dropping the datagram rather than admitting it \
+                     past a latch that can no longer decide"
                 );
-                return;
+                return false;
             };
-            match latch.observe(source, ssrc) {
-                Some(adopted) => adopted,
-                None => return, // a new source carrying a different SSRC: keep the current latch
+            match latch.admit(source, rtp_media_ssrc(data)) {
+                ReplyLatch::Reject => return false,
+                ReplyLatch::Accept(None) => return true,
+                ReplyLatch::Accept(Some(adopted)) => adopted,
             }
         };
         // Steady state — the latch is already where this packet came from. Skip the watch write so
         // the per-packet path does not mark it changed on every single frame.
         if self.destination.borrow().eq(&adopted) {
-            return;
+            return true;
         }
         let previous = self.destination.send_replace(adopted);
         tracing::info!(
@@ -281,6 +284,7 @@ impl WsEgress {
             %adopted,
             "ws bridge latched its downlink to the observed media source"
         );
+        true
     }
 }
 
@@ -497,27 +501,36 @@ impl WsRegistry {
                 None => return,
             },
         };
-        // The packet is accepted: it cleared the source gate and, on a secure leg, SRTP
-        // authentication. Stamp the endpoint's liveness for the engine's idle sweep
-        // (docs/security-and-nat.md §4 layer 6) — the `Redirect` arm never touches the datapath's
-        // `last_seen`, so without this a takeover call is reaped at the media timeout no matter how
-        // much audio is arriving, which is what every other userspace `Redirect` consumer avoids by
-        // stamping from its per-call actor.
-        //
-        // Deliberately after both checks and before the mailbox: an off-source or forged packet must
-        // not be able to hold a dead call open, and a bridge whose mailbox is momentarily full is
-        // still a live call.
-        route.activity.stamp(packet.endpoint);
         // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3): aim the downlink at the source
         // this leg's media actually arrives from. Offered after the gate above and after SRTP auth,
         // so only an authentic packet from an accepted source can move it, and skipped entirely on an
-        // ICE leg where the agent's selection owns the transport (§4 layer 4).
+        // ICE leg where the agent's selection owns the transport (§4 layer 4). A packet the latch
+        // rejects is dropped here, before it counts as liveness or reaches the bridge.
         //
         // Nothing else corrects this destination. A relay leg is aimed by its `ForwardRule` and
         // re-aimed by the datapath's own latch on the peer's first accepted packet; a takeover leg has
         // no reverse relay direction and no forward rule, so a destination the signalling got wrong
         // stays wrong for the life of the call unless it is fixed here.
-        route.egress.observe_ingress(packet.source, &payload);
+        if !route.egress.admit_ingress(packet.source, &payload) {
+            tracing::debug!(
+                endpoint = ?packet.endpoint,
+                source = %packet.source,
+                "ws-bridge dropped a datagram from a new source that could not prove it is the \
+                 latched stream"
+            );
+            return;
+        }
+        // The packet is accepted: it cleared the source gate, SRTP authentication on a secure leg,
+        // and the latch. Stamp the endpoint's liveness for the engine's idle sweep
+        // (docs/security-and-nat.md §4 layer 6) — the `Redirect` arm never touches the datapath's
+        // `last_seen`, so without this a takeover call is reaped at the media timeout no matter how
+        // much audio is arriving, which is what every other userspace `Redirect` consumer avoids by
+        // stamping from its per-call actor.
+        //
+        // Deliberately after every check and before the mailbox: an off-source, forged or rejected
+        // packet must not be able to hold a dead call open, and a bridge whose mailbox is momentarily
+        // full is still a live call.
+        route.activity.stamp(packet.endpoint);
         // Drop on a full or closed mailbox — late audio is worthless, and a closed channel means the
         // bridge task has already exited.
         if route.rtp_in.try_send(payload).is_err() {
@@ -1075,7 +1088,7 @@ mod tests {
         // docs/security-and-nat.md §4 layer 3 / RFC 3550 §8, the one state machine every latch runs
         // (`source_latch_verdict`): follow a genuine NAT rebind, resist a spray.
         let registry = WsRegistry::default();
-        let (rtp_in_tx, _rtp_in_rx) = flume::unbounded::<Bytes>();
+        let (rtp_in_tx, rtp_in_rx) = flume::unbounded::<Bytes>();
         registry.register(plan(
             "rebind",
             endpoint(1),
@@ -1101,6 +1114,13 @@ mod tests {
             downlink(&registry, "rebind"),
             address("127.0.0.2:41001"),
             "a new source carrying a different SSRC never moves the downlink"
+        );
+        // ...and its media is dropped rather than fed to the bridge: only the stream's own two
+        // packets reached the mailbox.
+        assert_eq!(
+            rtp_in_rx.len(),
+            2,
+            "a rejected source's media never reaches the bridge"
         );
 
         let _ = registry.deregister("rebind");
