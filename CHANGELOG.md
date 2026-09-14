@@ -5,7 +5,28 @@ All notable changes to siphon-rtp are documented here. The format loosely follow
 [Semantic Versioning](https://semver.org/). Versioning is one number across the whole
 workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
-## [Unreleased]
+## [0.7.0] — 2026-09-14
+
+G.729, RFC 6035 voice-quality reports, and one SSRC latch for the whole relay. The latch work closes a
+gap the security design had named but left open: a userspace media leg set to `symmetric` accepted
+injected media from any address, because its latch only declined to move the reply instead of
+dropping the packet. Every datapath and pipeline now runs the same state machine and drops what it
+rejects.
+
+**A minor, not a patch.** `Event::CallSummary` gains `started_at_unix_ms` and `ended_at_unix_ms`, and
+`LegSummary` gains `local_address`, `remote_address`, `egress_ssrc` and `payload_type`. A new field on
+an existing struct variant or a plain struct breaks construction from another crate, so a controller
+on `^0.6` must move to `^0.7`. The JSON wire stays backward compatible: every added key is optional and
+one an older consumer ignores. The internal path-deps move from `"0.6.0"` to `"0.7.0"` with it.
+
+**One behaviour change to be aware of.** A transcode, conference, text or WebSocket-takeover leg now
+drops a packet from a new source that cannot prove it is the latched stream, as the relay path always
+did, where it used to decode, mix or forward it. That includes a sender on the signalled address that
+changes both port and SSRC at once.
+
+**Known issue.** On the separate `siphon-rtp-xdp-daemon`, the kernel verifier rejects the XDP program
+on at least a 7.0 kernel (`R1 offset is outside of the packet` at the forward path's first payload
+read), so the daemon falls back to the UDP datapath. The default `siphon-rtp` binary is unaffected.
 
 ### Added
 
@@ -122,6 +143,15 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   before the packet is used, and drop a rejected one without counting it as media activity. The same
   drop applies under the default signalled-source gate, where only a sender on the signalled address
   can reach the latch in the first place.
+
+- **rustls 0.23.45, for RUSTSEC-2026-0285.** 0.23.44 accepted a TLS 1.3 handshake message sent at the
+  wrong encryption level when it followed a key-changing message in the same record, where RFC 8446
+  §5.1 requires the connection to be closed with `unexpected_message`. The handshake transcript is
+  still authenticated, so a peer on the path could not alter or complete a handshake with it. rustls
+  carries the engine's TLS: the `wss://` bridge and tee, `play_media` over https, X3 delivery and TURN
+  over TLS. Updated in all three lockfiles (workspace, `fuzz/`, `crates/siphon-rtp-xdp/`), and the XDP
+  lockfile also moves off the yanked `spin` 0.9.8 to 0.9.9. `siphon-rtp-proto` does not depend on
+  rustls.
 
 ## [0.6.0] — 2026-09-13
 
