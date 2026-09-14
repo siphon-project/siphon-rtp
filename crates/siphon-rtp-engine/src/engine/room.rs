@@ -379,23 +379,27 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // it nothing, so an unkeyed seat can neither inject noise into the mix nor receive the other
         // participants in the clear.
         let dtls_leg = info.dtls;
-        if dtls_leg {
-            if self.dtls_certificate.is_none() {
+        // The handshake needs the engine's certificate and the offer's fingerprint. Both are bound
+        // here, once, and carried to the answer and to the handshake plan below.
+        let dtls_keys = if dtls_leg {
+            let Some(certificate) = self.dtls_certificate.clone() else {
                 self.free(&[endpoint]).await;
                 return error_result("conference_join", &"engine has no DTLS certificate");
-            }
-            if info.fingerprint.is_none() {
+            };
+            let Some(peer_fingerprint) = info.fingerprint.clone() else {
                 self.free(&[endpoint]).await;
                 return error_result(
                     "conference_join",
                     &"UDP/TLS/RTP/SAVPF offer without an a=fingerprint",
                 );
-            }
-        }
-        let (secure, security) = if dtls_leg {
+            };
+            Some((certificate, peer_fingerprint))
+        } else {
+            None
+        };
+        let (secure, security) = if let Some((certificate, _)) = dtls_keys.as_ref() {
             // The answer advertises the engine's fingerprint and its DTLS role — the complement of the
             // offerer's `a=setup` (RFC 5763 §5): an `active` peer makes the engine passive (server).
-            let certificate = self.dtls_certificate.clone().expect("checked above");
             let setup = match info.setup {
                 Some(sdp::Setup::Active) => sdp::Setup::Passive,
                 _ => sdp::Setup::Active,
@@ -494,9 +498,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         // demux (DTLS records drive the handshake) and forwards accepted media to the room actor
         // still encrypted, which decrypts it on the seat's own `SecureLeg` once keyed. The seat was
         // taken `secure_pending`, so until then it is neither mixed nor sent to.
-        if dtls_leg {
-            let certificate = self.dtls_certificate.clone().expect("checked above");
-            let peer_fingerprint = info.fingerprint.clone().expect("checked above");
+        if let Some((certificate, peer_fingerprint)) = dtls_keys {
             // The offerer picks; the engine takes the complement (RFC 5763 §5), matching the
             // `a=setup` advertised in the answer above.
             let role = match info.setup {
