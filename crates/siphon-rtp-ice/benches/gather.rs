@@ -4,6 +4,12 @@
 //! setup. The host-only case is the one that matters most: it is the default deployment, it must stay
 //! free of any network round trip, and it is pure computation the engine pays on every ICE call.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use std::net::SocketAddr;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};

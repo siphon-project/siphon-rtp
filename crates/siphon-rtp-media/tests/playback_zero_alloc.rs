@@ -4,6 +4,12 @@
 //! scratch — is sized once when the playback is built. A counting global allocator proves a tight
 //! mix loop allocates nothing after warm-up.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};

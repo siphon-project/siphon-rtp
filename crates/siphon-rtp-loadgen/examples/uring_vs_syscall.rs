@@ -30,6 +30,12 @@
 //! Both arms read the source address (`recvfrom` / `RecvMsg`), because a relay needs it for the
 //! source gate. Measuring with plain `recv` would overstate the gain.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "example: a panic reports failure"
+)]
+
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};

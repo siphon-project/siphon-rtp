@@ -4,6 +4,12 @@
 //! call-setup hot path even though it never touches a media packet. Both directions are measured,
 //! plus the priority/foundation arithmetic that gathering will run once per candidate.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_ice::{priority, Candidate, CandidateKind, Transport};
 

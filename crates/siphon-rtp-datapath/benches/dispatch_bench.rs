@@ -15,6 +15,12 @@
 //!   it isolates what the `Redirect` arm newly pays per packet from the syscall noise above it.
 //!   This is the number to gate on.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use std::net::{Ipv4Addr, SocketAddr};
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};

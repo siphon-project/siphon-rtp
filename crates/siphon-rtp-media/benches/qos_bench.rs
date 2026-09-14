@@ -2,6 +2,12 @@
 //! it must be negligible next to decode/mix; this proves it. (MOS itself is a per-report cost in the
 //! `siphon-rtp-hep` G.107 estimator, off the per-packet path.)
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_media::jitter::JitterBuffer;

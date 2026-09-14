@@ -10,6 +10,12 @@
 //! No per-frame heap allocation on the player/DTMF paths (caller-owned buffers); the fork copies
 //! the finished packet into a `Bytes` for the channel, which is the unavoidable handoff cost.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_codec::g711::G711;

@@ -4,6 +4,12 @@
 //! RTP packet (RFC 3550 §5), rewrite its SSRC/sequence (re-origination / topology hiding), and
 //! serialize it into a caller-owned buffer. No per-packet heap allocation — that is the whole point.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_media::rtp::{write_packet, RtpHeader, RtpPacket, FIXED_HEADER_LEN};
 

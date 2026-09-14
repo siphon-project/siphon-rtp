@@ -5,6 +5,12 @@
 //! `/readyz`, and an unknown path — asserting the exposition body and the health/404 status lines.
 //! NIC-free (UDP-loopback datapath + loopback HTTP socket).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;

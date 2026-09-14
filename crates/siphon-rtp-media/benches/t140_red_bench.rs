@@ -5,6 +5,12 @@
 //! RFC 4103 §4), so parse and build must be a handful of nanoseconds — negligible next to the media
 //! path. The paired zero-per-packet-alloc proof lives in `tests/t140_zero_alloc.rs`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_media::t140::{RedBuilder, RedGeneration, RedPacket};
 

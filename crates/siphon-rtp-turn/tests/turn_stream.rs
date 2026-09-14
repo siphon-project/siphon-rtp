@@ -3,6 +3,12 @@
 //! ChannelBind → bidirectional relay over any `AsyncRead + AsyncWrite` stream, exercised over a raw
 //! TCP connection and over a rustls-encrypted one (with a self-signed cert) against real UDP peers.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

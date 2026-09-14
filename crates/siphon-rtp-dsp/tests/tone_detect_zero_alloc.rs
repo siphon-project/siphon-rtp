@@ -5,6 +5,12 @@
 //! tight `process` loop allocates nothing after warm-up. Mirrors `ns_zero_alloc` / the media crate's
 //! `mixer_zero_alloc` pattern.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};

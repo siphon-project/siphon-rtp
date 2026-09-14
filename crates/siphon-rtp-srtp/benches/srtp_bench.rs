@@ -15,6 +15,12 @@
 //!   - `srtp_context_new` — per-leg key setup (three RFC 3711 §4.3 KDF derives); call-setup cost,
 //!     not per-packet, but tracked so a KDF regression can't hide behind the media benches.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::SrtpKeyMaterial;

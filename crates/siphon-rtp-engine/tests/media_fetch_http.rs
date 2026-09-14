@@ -7,6 +7,12 @@
 //! No external network — every server here is a `TcpListener` on 127.0.0.1 speaking just enough
 //! HTTP/1.1 to be answered by a real client.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};

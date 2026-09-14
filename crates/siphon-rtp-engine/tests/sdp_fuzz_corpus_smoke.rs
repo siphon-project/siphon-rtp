@@ -8,6 +8,12 @@
 //! arbitrary text; this file additionally exercises the persisted seed corpus and hand-picked
 //! attacks. All addresses are the 3GPP/documentation test range — never real subscriber endpoints.)
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::path::PathBuf;
 
 use siphon_rtp_engine::sdp::{self, EngineMedia};

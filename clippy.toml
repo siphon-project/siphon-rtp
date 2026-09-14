@@ -11,3 +11,8 @@ too-many-arguments-threshold = 12
 # that grew by accretion, while the codec reference ports, whose function boundaries mirror the spec's
 # C so they can be diffed against it, carry an explicit allow. See "Size limits" in CONTRIBUTING.md.
 too-many-lines-threshold = 300
+
+# unwrap_used / expect_used (enabled in the workspace lint table): production code never panics on a
+# `None` or an `Err`; tests may, since a panic there is the failure report.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
