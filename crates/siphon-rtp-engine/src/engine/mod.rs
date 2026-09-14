@@ -24,6 +24,7 @@ mod dispatch;
 mod fork;
 mod gather;
 mod inject;
+mod install;
 mod intercept;
 mod negotiate;
 mod offer;
@@ -858,6 +859,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    /// Hand each of `endpoints` to the userspace dispatcher (`FlowAction::Redirect`), refusing under
+    /// `context` at the first one the datapath will not take.
+    fn redirect_endpoints(
+        &self,
+        endpoints: impl IntoIterator<Item = EndpointId>,
+        context: &str,
+    ) -> Result<(), Box<CmdResult>> {
+        for endpoint in endpoints {
+            if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
+                return Err(boxed_error_result(context, &error));
+            }
+        }
+        Ok(())
+    }
+
     /// Current live call count for `client`.
     fn client_call_count(&self, client: ClientId) -> usize {
         self.client_calls.get(&client).map_or(0, |count| *count)
@@ -928,6 +944,12 @@ fn error_result(context: &str, error: &dyn std::fmt::Display) -> CmdResult {
     CmdResult::Error {
         reason: format!("{context}: {error}"),
     }
+}
+
+/// [`error_result`], boxed for the `Err` of an internal `Result`: a `CmdResult` is too large to
+/// return by value on every success path.
+fn boxed_error_result(context: &str, error: &dyn std::fmt::Display) -> Box<CmdResult> {
+    Box::new(error_result(context, error))
 }
 
 #[cfg(test)]

@@ -48,7 +48,6 @@ jobs:
           threshold=1500
           # path  max production lines  # why
           allowlist='
-          crates/siphon-rtp-engine/src/engine/answer.rs 1982 # debt: the answer verb, de-duplication planned
           crates/siphon-rtp-engine/src/media_pipeline.rs 4145 # large, no function over 250 lines
           crates/siphon-rtp-engine/src/conference.rs 2685 # large, no function over 250 lines
           crates/siphon-rtp-engine/src/sdp.rs 2144 # large, no function over 250 lines
