@@ -98,6 +98,11 @@ pub struct MediaInfo {
     /// resolves to Opus; an Opus stream that declared no fmtp is absent here and reads the RFC
     /// defaults ([`OpusParams::default`]).
     pub opus_params: Vec<(u8, OpusParams)>,
+    /// `a=fmtp` `annexb=` declarations (payload type → whether G.729 Annex B is wanted), RFC 3555
+    /// §4.1.13. A payload type that declared nothing is **absent here and defaults to `true`**,
+    /// which is the RFC's default and not a convenient one: a peer that sends no `annexb=` is asking
+    /// for Annex B and will send two-octet silence descriptors.
+    pub annex_b: Vec<(u8, bool)>,
     /// The stream's `a=ptime` in milliseconds, if present (else the 20 ms telephony default).
     pub ptime_ms: u8,
     /// The stream's `a=maxptime` in milliseconds, if present (RFC 4566 §6): the longest packet the
@@ -403,6 +408,14 @@ impl MediaInfo {
                     );
                 }
             }
+            // Honour the peer's G.729 `annexb=` (RFC 3555 §4.1.13). Absent means yes, which is what
+            // `CodecSpec::new` already sets, so only an explicit declaration moves it.
+            if spec.encoding_name == "G729" {
+                if let Some((_, wanted)) = self.annex_b.iter().find(|(pt, _)| *pt == payload_type) {
+                    return Some(spec.with_annex_b(*wanted));
+                }
+                return Some(spec);
+            }
             // Carry the peer's RFC 7587 §6.1 Opus parameters onto the spec: `sprop-stereo` decides
             // the ingress channel layout the decoder is built for, `maxptime` caps the egress ptime,
             // and the rest are the rate-control/FEC/DTX limits the Opus encoder honours. An `a=maxptime`
@@ -487,6 +500,8 @@ struct AudioScan {
     fmtp_mode_sets: Vec<(u8, Vec<u8>)>,
     /// `a=fmtp` RFC 7587 Opus parameters in the audio section (payload type → parameter set).
     fmtp_opus: Vec<(u8, OpusParams)>,
+    /// `a=fmtp` `annexb=` declarations in the audio section (payload type → wanted).
+    fmtp_annex_b: Vec<(u8, bool)>,
     /// The audio stream's `a=ptime`, if present.
     ptime_ms: Option<u8>,
     /// The audio stream's `a=maxptime`, if present (RFC 4566 §6).
@@ -594,6 +609,23 @@ fn parse_fmtp_mode_set(value: &str) -> Option<(u8, Vec<u8>)> {
         .filter(|&mode| mode <= 8)
         .collect();
     (!modes.is_empty()).then_some((payload_type, modes))
+}
+
+/// Parse an `a=fmtp:<pt> …annexb=<yes|no>…` body into `(payload_type, wanted)` (RFC 3555 §4.1.13).
+///
+/// Returns `None` when the line has no parseable payload type or carries no `annexb=` parameter, so
+/// that a payload type which declared nothing keeps the RFC's default of *yes* rather than being
+/// recorded as an explicit no.
+fn parse_fmtp_annex_b(value: &str) -> Option<(u8, bool)> {
+    let (payload_type, params) = split_fmtp(value)?;
+    let field = fmtp_param(params, "annexb")?;
+    match field.trim().to_ascii_lowercase().as_str() {
+        "yes" => Some((payload_type, true)),
+        "no" => Some((payload_type, false)),
+        // Anything else is malformed. RFC 3555 defines two values; guessing at a third would pick a
+        // posture the peer did not ask for, so the default stands.
+        _ => None,
+    }
 }
 
 /// Parse an `a=fmtp:<pt> …` body into `(payload_type, OpusParams)` (RFC 7587 §6.1).
@@ -723,6 +755,7 @@ fn scan(sdp: &str) -> AudioScan {
         payload_types: Vec::new(),
         rtpmaps: Vec::new(),
         fmtp_mode_sets: Vec::new(),
+        fmtp_annex_b: Vec::new(),
         fmtp_opus: Vec::new(),
         ptime_ms: None,
         maxptime_ms: None,
@@ -925,6 +958,9 @@ fn scan(sdp: &str) -> AudioScan {
                         if let Some(opus) = parse_fmtp_opus(value) {
                             scan.fmtp_opus.push(opus);
                         }
+                        if let Some(annex_b) = parse_fmtp_annex_b(value) {
+                            scan.fmtp_annex_b.push(annex_b);
+                        }
                     } else if let Some(maxptime) = value.strip_prefix("maxptime:") {
                         // RFC 4566 §6 / RFC 7587 §7: the longest packet the peer will accept.
                         scan.maxptime_ms = maxptime.trim().parse::<u8>().ok();
@@ -985,6 +1021,7 @@ fn media_info(scan: &AudioScan) -> Result<MediaInfo, SdpError> {
         payload_types: scan.payload_types.clone(),
         rtpmaps: scan.rtpmaps.clone(),
         mode_sets: scan.fmtp_mode_sets.clone(),
+        annex_b: scan.fmtp_annex_b.clone(),
         opus_params: scan.fmtp_opus.clone(),
         ptime_ms: scan.ptime_ms.unwrap_or(DEFAULT_PTIME_MS),
         maxptime_ms: scan.maxptime_ms,
@@ -1857,6 +1894,16 @@ fn egress_fmtp_line(codec: &CodecSpec) -> Option<String> {
             codec.payload_type
         ));
     }
+    if codec.encoding_name == "G729" {
+        // RFC 3555 §4.1.13. The engine states its posture rather than leaving it implied: the
+        // parameter's default is *yes*, so silence is itself a declaration, and a leg the peer asked
+        // to run without discontinuous transmission has to say so or the peer is entitled to assume
+        // two-octet descriptors are coming back. The value is what this leg negotiated — `annexb=no`
+        // from the peer is carried into the answer, which is how RFC 3264 §6.1 settles a parameter
+        // both sides have to agree on.
+        let value = if codec.annex_b { "yes" } else { "no" };
+        return Some(format!("a=fmtp:{} annexb={value}", codec.payload_type));
+    }
     if codec.encoding_name != "AMR-WB" {
         return None;
     }
@@ -2359,6 +2406,40 @@ mod tests {
         assert_eq!(amr_wb_encode_mode(Some("9,42")), None);
     }
 
+    /// A G.729 offer (static payload type 18), with an optional `a=fmtp:18` body appended.
+    fn g729_offer(fmtp: Option<&str>) -> String {
+        let fmtp = fmtp.map_or_else(String::new, |body| format!("a=fmtp:18 {body}\r\n"));
+        format!(
+            "v=0\r\no=- 1 1 IN IP4 198.51.100.7\r\ns=-\r\nc=IN IP4 198.51.100.7\r\nt=0 0\r\n\
+             m=audio 40000 RTP/AVP 18\r\na=rtpmap:18 G729/8000\r\n{fmtp}"
+        )
+    }
+
+    fn g729_annex_b(fmtp: Option<&str>) -> bool {
+        let info = parse(&g729_offer(fmtp)).expect("parse");
+        info.codec_spec(18).expect("spec").annex_b
+    }
+
+    #[test]
+    fn the_g729_annexb_parameter_decides_discontinuous_transmission_and_defaults_to_yes() {
+        // RFC 3555 §4.1.13: absent means *yes*. Reading the absent attribute as "no" is the mistake
+        // that leaves an engine unable to decode the two-octet descriptors such a peer then sends,
+        // so the default has to be the RFC's and not the convenient one.
+        assert!(g729_annex_b(None), "absent annexb means yes");
+        assert!(g729_annex_b(Some("annexb=yes")));
+        assert!(!g729_annex_b(Some("annexb=no")));
+        // Case-insensitive, and tolerant of the other parameters a peer may send alongside.
+        assert!(!g729_annex_b(Some("annexb=NO")));
+        assert!(!g729_annex_b(Some("maxptime=40;annexb=no")));
+        // RFC 3555 defines two values; anything else is malformed and leaves the default standing
+        // rather than guessing at a posture the peer did not ask for.
+        assert!(g729_annex_b(Some("annexb=maybe")));
+        assert!(g729_annex_b(Some("annexb=")));
+        // An fmtp for a different payload type says nothing about this one.
+        let info = parse(&g729_offer(Some("annexb=no"))).expect("parse");
+        assert_eq!(info.annex_b, vec![(18u8, false)]);
+    }
+
     /// An Opus offer (PT 111, RFC 7587 `opus/48000/2`) at 203.0.113.9, with optional `a=fmtp` /
     /// `a=ptime` / `a=maxptime` attribute lines appended verbatim.
     fn opus_offer(attributes: &str) -> String {
@@ -2576,6 +2657,28 @@ mod tests {
             Some("a=fmtp:96 octet-align=1;mode-set=2")
         );
         assert_eq!(egress_maxptime_line(&amr), None);
+    }
+
+    #[test]
+    fn the_g729_answer_states_the_annex_b_posture_rather_than_leaving_it_implied() {
+        // RFC 3555 §4.1.13 gives `annexb` the default *yes*, so saying nothing is itself a
+        // declaration — and the wrong one for a leg the peer asked to run without discontinuous
+        // transmission. The engine states what this leg negotiated, either way.
+        let g729 = CodecSpec::new(18, "G729", 8000, 1, 20);
+        assert!(g729.annex_b, "absent means yes");
+        assert_eq!(
+            egress_fmtp_line(&g729).as_deref(),
+            Some("a=fmtp:18 annexb=yes")
+        );
+        assert_eq!(
+            egress_fmtp_line(&g729.with_annex_b(false)).as_deref(),
+            Some("a=fmtp:18 annexb=no")
+        );
+        // Its frame duration is fixed, so it advertises no maxptime.
+        assert_eq!(
+            egress_maxptime_line(&CodecSpec::new(18, "G729", 8000, 1, 20)),
+            None
+        );
     }
 
     #[test]
@@ -3432,6 +3535,27 @@ mod tests {
         let info = parse(sdp).expect("parse");
         let primary = info.primary_codec().expect("static PCMA resolves");
         assert_eq!(primary.encoding_name, "PCMA");
+        assert_eq!(primary.clock_rate_hz, 8000);
+    }
+
+    #[test]
+    fn a_bare_g729_offer_resolves_without_an_rtpmap() {
+        // G.729 is static payload type 18 (RFC 3551 §6 / §4.5.6), so the rtpmap is optional and
+        // plenty of gateways omit it. Before this resolved, such an offer picked the peer's *second*
+        // codec — or none at all — which reads downstream as "unknown or unsupported codec" on a
+        // call the engine could have carried.
+        let sdp = "v=0\r\n\
+             o=- 0 0 IN IP4 host.invalid\r\n\
+             s=-\r\n\
+             c=IN IP4 203.0.113.9\r\n\
+             t=0 0\r\n\
+             m=audio 5000 RTP/AVP 18 8\r\n";
+        let info = parse(sdp).expect("parse");
+        let primary = info.primary_codec().expect("static G.729 resolves");
+        assert_eq!(
+            primary.encoding_name, "G729",
+            "the offerer's first choice wins (RFC 3264 §6.1), not its second"
+        );
         assert_eq!(primary.clock_rate_hz, 8000);
     }
 

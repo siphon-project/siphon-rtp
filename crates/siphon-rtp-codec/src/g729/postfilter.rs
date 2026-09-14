@@ -119,6 +119,9 @@ impl PostFilter {
     /// that produces the residual reaches back that far. `lag` is the decoder's own pitch lag, used
     /// only as the centre of the harmonic search. Returns the voicing decision the concealment path
     /// needs on the next frame: the delay the search settled on, or zero for unvoiced.
+    /// `active` says the frame carried speech. An Annex B inactive frame skips the harmonic filter
+    /// outright: there is no pitch in comfort noise to enhance, and running the search on it would
+    /// find one in the random excitation and make the background buzz.
     pub fn process(
         &mut self,
         lag: i16,
@@ -126,6 +129,7 @@ impl PostFilter {
         offset: usize,
         coefficients: &[i16; COEFFICIENTS],
         output: &mut [i16],
+        active: bool,
     ) -> i16 {
         let denominator_weights = weight_lp(coefficients, GAMMA1);
         let numerator = weight_lp(coefficients, GAMMA2);
@@ -139,7 +143,12 @@ impl PostFilter {
         // `harmonic[0]` is the previous subframe's last short-term output, which the tilt filter
         // needs as its one sample of history; the subframe itself starts at index 1.
         let mut harmonic = [0_i16; SUBFRAME_P1];
-        let voicing = self.harmonic_filter(lag, &mut harmonic[1..]);
+        let voicing = if active {
+            self.harmonic_filter(lag, &mut harmonic[1..])
+        } else {
+            harmonic[1..].copy_from_slice(&self.residual[RESIDUAL_HISTORY..]);
+            0
+        };
         harmonic[0] = self.short_term_memory[ORDER - 1];
 
         let reflection = self.short_term_gain(&denominator_weights, &mut harmonic[1..]);
@@ -695,7 +704,7 @@ mod tests {
         let mut filter = PostFilter::new();
         let speech = [0_i16; ORDER + SUBFRAME_SAMPLES];
         let mut output = [0_i16; SUBFRAME_SAMPLES];
-        let voicing = filter.process(40, &speech, ORDER, &FILTER, &mut output);
+        let voicing = filter.process(40, &speech, ORDER, &FILTER, &mut output, true);
         assert_eq!(voicing, 0, "silence is not voiced");
         assert!(output.iter().all(|&s| s == 0));
     }
@@ -711,7 +720,7 @@ mod tests {
         for subframe in 0..8 {
             let offset = ORDER + subframe * SUBFRAME_SAMPLES;
             let mut output = [0_i16; SUBFRAME_SAMPLES];
-            filter.process(40, &speech, offset, &FILTER, &mut output);
+            filter.process(40, &speech, offset, &FILTER, &mut output, true);
             if subframe >= 4 {
                 input_level += speech[offset..offset + SUBFRAME_SAMPLES]
                     .iter()
@@ -737,7 +746,7 @@ mod tests {
         for subframe in 0..12 {
             let offset = ORDER + subframe * SUBFRAME_SAMPLES;
             let mut output = [0_i16; SUBFRAME_SAMPLES];
-            voicings.push(filter.process(40, &speech, offset, &FILTER, &mut output));
+            voicings.push(filter.process(40, &speech, offset, &FILTER, &mut output, true));
         }
         assert!(
             voicings[6..].iter().any(|&v| v > 0),
@@ -793,9 +802,16 @@ mod tests {
         let mut filter = PostFilter::new();
         let speech = periodic_speech(ORDER + SUBFRAME_SAMPLES * 2, 37);
         let mut output = [0_i16; SUBFRAME_SAMPLES];
-        filter.process(40, &speech, ORDER, &FILTER, &mut output);
+        filter.process(40, &speech, ORDER, &FILTER, &mut output, true);
         let before: Vec<i16> = filter.residual[SUBFRAME_SAMPLES..RESIDUAL_HISTORY].to_vec();
-        filter.process(40, &speech, ORDER + SUBFRAME_SAMPLES, &FILTER, &mut output);
+        filter.process(
+            40,
+            &speech,
+            ORDER + SUBFRAME_SAMPLES,
+            &FILTER,
+            &mut output,
+            true,
+        );
         assert_eq!(
             filter.residual[..RESIDUAL_HISTORY - SUBFRAME_SAMPLES],
             before[..RESIDUAL_HISTORY - SUBFRAME_SAMPLES],

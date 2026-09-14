@@ -14,7 +14,9 @@
 
 use std::path::{Path, PathBuf};
 
-use siphon_rtp_codec::g729::{G729Decoder, G729Encoder};
+use siphon_rtp_codec::g729::bitstream::{unpack, unpack_silence};
+use siphon_rtp_codec::g729::encoder::EncodedFrame;
+use siphon_rtp_codec::g729::{FrameInput, G729Decoder, G729Encoder};
 
 /// The sequences and what each is designed to exercise, per upstream's own `readmetv.txt`.
 const SEQUENCES: &[(&str, &str)] = &[
@@ -163,6 +165,140 @@ fn encodes_every_itu_test_sequence_bit_exactly() {
                 index / SERIAL_WORDS,
                 index % SERIAL_WORDS
             );
+        }
+    }
+}
+
+/// The Annex B sequences. The first four ship a `.bin` input as well, so they pin both directions;
+/// the last two are decoder-side only.
+const ANNEX_B_SEQUENCES: &[&str] = &[
+    "tstseq1", "tstseq2", "tstseq3", "tstseq4", "tstseq5", "tstseq6",
+];
+
+fn annex_b_dir() -> Option<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/g729/testv/annexb");
+    dir.is_dir().then_some(dir)
+}
+
+/// Gather the `count` bit-words of one serial frame into the octets a payload would carry.
+fn bits_to_octets(bits: &[i16], octets: usize) -> Vec<u8> {
+    let mut out = vec![0_u8; octets];
+    for (index, &word) in bits.iter().enumerate() {
+        if word == BIT_SET {
+            out[index / 8] |= 1 << (7 - index % 8);
+        }
+    }
+    out
+}
+
+#[test]
+fn decodes_every_annex_b_test_sequence_bit_exactly() {
+    let Some(dir) = annex_b_dir() else {
+        eprintln!("skipping: reference/g729/testv/annexb absent (see reference/g729/README.md)");
+        return;
+    };
+
+    for name in ANNEX_B_SEQUENCES {
+        let stream = read_words(&dir.join(format!("{name}.bit")));
+        let expected = read_words(&dir.join(format!("{name}.out")));
+
+        let mut decoder = G729Decoder::new();
+        let mut produced = Vec::with_capacity(expected.len());
+
+        // Annex B frames are not all the same length, so the serial format's length word is what
+        // says which of the three kinds arrived.
+        let mut at = 0;
+        while at + 1 < stream.len() {
+            let sync = stream[at];
+            let count = stream[at + 1] as usize;
+            let bits = &stream[at + 2..at + 2 + count];
+            at += 2 + count;
+
+            // The format signals an erasure by zeroing the bit words, or the sync word on a frame
+            // that carries none. On the wire that comes from the jitter buffer instead.
+            let lost = if count == 0 {
+                sync != SYNC_WORD
+            } else {
+                bits.contains(&0)
+            };
+
+            let samples = if lost {
+                decoder.conceal()
+            } else if count == 80 {
+                let parameters = unpack(&bits_to_octets(bits, 10))
+                    .unwrap_or_else(|error| panic!("{name}: speech frame: {error}"));
+                decoder.decode_input(FrameInput::Speech(&parameters))
+            } else if count == 15 || count == 16 {
+                let parameters = unpack_silence(&bits_to_octets(bits, 2))
+                    .unwrap_or_else(|error| panic!("{name}: silence descriptor: {error}"));
+                decoder.decode_input(FrameInput::Silence(&parameters))
+            } else {
+                decoder.decode_untransmitted()
+            };
+            produced.extend_from_slice(&samples);
+        }
+
+        assert_eq!(produced.len(), expected.len(), "{name}: sample count");
+        if let Some((index, (&got, &want))) = produced
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .find(|(_, (got, want))| got != want)
+        {
+            panic!(
+                "{name} diverges at sample {index} (frame {}, offset {}): got {got}, \
+                 reference has {want}",
+                index / 80,
+                index % 80
+            );
+        }
+    }
+}
+
+#[test]
+fn encodes_every_annex_b_test_sequence_bit_exactly() {
+    let Some(dir) = annex_b_dir() else {
+        eprintln!("skipping: reference/g729/testv/annexb absent (see reference/g729/README.md)");
+        return;
+    };
+
+    for name in ANNEX_B_SEQUENCES {
+        let input = dir.join(format!("{name}.bin"));
+        if !input.is_file() {
+            continue;
+        }
+        let samples = read_words(&input);
+        let expected = read_words(&dir.join(format!("{name}.bit")));
+
+        let mut encoder = G729Encoder::new();
+        encoder.set_discontinuous_transmission(true);
+        let mut produced = Vec::with_capacity(expected.len());
+
+        for frame in samples.as_chunks::<80>().0 {
+            let encoded = encoder.encode_frame(frame);
+            let (octets, bits): (&[u8], usize) = match encoded {
+                EncodedFrame::Speech(ref octets) => (octets, 80),
+                // Sixteen, not fifteen: the descriptor is padded to an octet boundary, which is
+                // what RFC 3551 §4.5.6 carries and what these vectors were generated with.
+                EncodedFrame::Silence(ref octets) => (octets, 16),
+                EncodedFrame::Untransmitted => (&[], 0),
+            };
+            produced.push(SYNC_WORD);
+            produced.push(bits as i16);
+            for bit in 0..bits {
+                let set = (octets[bit / 8] >> (7 - bit % 8)) & 1 == 1;
+                produced.push(if set { BIT_SET } else { BIT_CLEAR });
+            }
+        }
+
+        assert_eq!(produced.len(), expected.len(), "{name}: serial length");
+        if let Some((index, (&got, &want))) = produced
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .find(|(_, (got, want))| got != want)
+        {
+            panic!("{name} diverges at word {index}: got {got:#06x}, reference has {want:#06x}");
         }
     }
 }

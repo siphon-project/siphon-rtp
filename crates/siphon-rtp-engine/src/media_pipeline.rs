@@ -1658,6 +1658,19 @@ impl Direction {
         let Ok(payload_len) = encoded else {
             return;
         };
+        // An encoder that produced nothing is a codec in discontinuous transmission (G.729 Annex B)
+        // saying this frame need not be sent. Emitting an RTP packet with an empty payload instead
+        // would defeat the saving and give the peer a frame it cannot classify — the gap is the
+        // point. The timestamp still advances, because it is a sampling instant and the audio
+        // happened whether or not it was sent; the sequence number does not, because a frame the
+        // sender chose to skip is not one the network lost and counting it as loss would corrupt
+        // the peer's RFC 3550 §6.4.1 reception report.
+        if payload_len == 0 {
+            self.egress_timestamp = self
+                .egress_timestamp
+                .wrapping_add(self.egress_timestamp_increment);
+            return;
+        }
         let header = RtpHeader {
             marker: false,
             payload_type: self.egress_payload_type,
@@ -2381,6 +2394,19 @@ impl Direction {
         let Ok(payload_len) = encoded else {
             return;
         };
+        // An encoder that produced nothing is a codec in discontinuous transmission (G.729 Annex B)
+        // saying this frame need not be sent. Emitting an RTP packet with an empty payload instead
+        // would defeat the saving and give the peer a frame it cannot classify — the gap is the
+        // point. The timestamp still advances, because it is a sampling instant and the audio
+        // happened whether or not it was sent; the sequence number does not, because a frame the
+        // sender chose to skip is not one the network lost and counting it as loss would corrupt
+        // the peer's RFC 3550 §6.4.1 reception report.
+        if payload_len == 0 {
+            self.egress_timestamp = self
+                .egress_timestamp
+                .wrapping_add(self.egress_timestamp_increment);
+            return;
+        }
         let header = RtpHeader {
             marker,
             payload_type: self.egress_payload_type,
@@ -5693,6 +5719,167 @@ mod tests {
         assert!(
             packet.payload.iter().any(|&byte| byte != 0xD5),
             "transcoded G.711a carries non-silence audio"
+        );
+    }
+
+    /// G.729 Annex B end to end on the transcode path: a µ-law leg carrying silence is re-encoded
+    /// as G.729 with discontinuous transmission, and the frames the encoder declines to send have to
+    /// produce no RTP packet at all. A packet with an empty payload would defeat the saving and hand
+    /// the peer a frame it cannot classify.
+    ///
+    /// The egress clock still has to advance across the gap — the audio happened whether or not it
+    /// was sent — while the sequence number must not, because a skipped frame is not a lost one and
+    /// counting it as loss would corrupt the peer's RFC 3550 §6.4.1 reception report.
+    #[cfg(feature = "g729")]
+    #[test]
+    fn g729_discontinuous_transmission_sends_nothing_for_a_silent_frame() {
+        use siphon_rtp_codec::factory::{decoder_for, encoder_for, CodecSpec};
+
+        let g729 = CodecSpec::new(18, "G729", 8000, 1, 20);
+        assert!(g729.annex_b, "RFC 3555 §4.1.13: absent annexb means yes");
+        let ulaw = CodecSpec::new(0, "PCMU", 8000, 1, 20);
+
+        let a_to_b = DirectionConfig {
+            ingress_endpoint: endpoint(1),
+            accepted_source: SourceFilter::Exact(addr(A_ADDR).ip()),
+            egress_endpoint: endpoint(2),
+            egress_dst: addr(B_ADDR),
+            decoder: decoder_for(&ulaw).expect("ulaw decoder"),
+            encoder: encoder_for(&g729).expect("g729 encoder"),
+            egress_ssrc: 0xB000_0012,
+            egress_payload_type: 18,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo: EchoProfile::default(),
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+        };
+        let b_to_a = DirectionConfig {
+            ingress_endpoint: endpoint(2),
+            accepted_source: SourceFilter::Exact(addr(B_ADDR).ip()),
+            egress_endpoint: endpoint(1),
+            egress_dst: addr(A_ADDR),
+            decoder: decoder_for(&g729).expect("g729 decoder"),
+            encoder: encoder_for(&ulaw).expect("ulaw encoder"),
+            egress_ssrc: 0xA000_0000,
+            egress_payload_type: 0,
+            telephone_event_in: None,
+            telephone_event_out: None,
+            recorder: None,
+            noise_suppression: false,
+            echo: EchoProfile::default(),
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
+            produce_echo_reference: false,
+            ingress_mos_codec: siphon_rtp_hep::mos::Codec::G711,
+        };
+        let mut call = MediaCall::new(
+            "g729b-call",
+            "tag-a",
+            Some("tag-b".into()),
+            a_to_b,
+            b_to_a,
+            true,
+            None,
+        );
+
+        // A µ-law packet carrying `samples` of the given PCM, so the test can send real silence and
+        // then real audio without the constant-byte payload the other helpers build (a constant
+        // µ-law byte is DC, which the encoder's own high-pass removes — it would be silence too).
+        fn ulaw_pcm_rtp(sequence: u16, pcm: &[i16]) -> Vec<u8> {
+            use siphon_rtp_codec::factory::{encoder_for, CodecSpec};
+            let mut encoder =
+                encoder_for(&CodecSpec::new(0, "PCMU", 8000, 1, 20)).expect("ulaw encoder");
+            let mut payload = vec![0u8; pcm.len()];
+            let written = encoder.encode(pcm, &mut payload).expect("encode");
+            payload.truncate(written);
+            let header = RtpHeader {
+                marker: false,
+                payload_type: 0,
+                sequence,
+                timestamp: u32::from(sequence) * 160,
+                ssrc: 0x1234_5678,
+            };
+            let mut buffer = vec![0u8; 12 + payload.len()];
+            let length = write_packet(&header, &payload, &mut buffer).expect("write");
+            buffer.truncate(length);
+            buffer
+        }
+
+        let silence = [0_i16; 160];
+        let speech: Vec<i16> = (0..160)
+            .map(|i| {
+                let f = i as f32;
+                (((f * 0.21).sin() + 0.5 * (f * 0.63).sin()) * 9000.0) as i16
+            })
+            .collect();
+
+        let mut lengths = Vec::new();
+        let mut sequences = Vec::new();
+        let mut timestamps = Vec::new();
+        let feed = |call: &mut MediaCall, sequence: u16, pcm: &[i16]| {
+            let mut out = Vec::new();
+            let mut events = Vec::new();
+            call.process(
+                &rx(1, A_ADDR, ulaw_pcm_rtp(sequence, pcm)),
+                &mut out,
+                &mut events,
+            );
+            out
+        };
+
+        // Forty packets of true silence, then ten of a loud two-tone — the first stretch is what
+        // discontinuous transmission is for, the second is what has to come back.
+        for sequence in 1..=50_u16 {
+            let pcm: &[i16] = if sequence <= 40 { &silence } else { &speech };
+            for datagram in feed(&mut call, sequence, pcm) {
+                let packet = RtpPacket::parse(&datagram.data).expect("parse");
+                lengths.push(packet.payload.len());
+                sequences.push(packet.sequence);
+                timestamps.push(packet.timestamp);
+            }
+        }
+
+        assert!(
+            lengths.len() < 50,
+            "every frame was still transmitted: {lengths:?}"
+        );
+        assert!(
+            lengths.contains(&2),
+            "the background was never described: {lengths:?}"
+        );
+        assert!(lengths.contains(&20), "speech never resumed: {lengths:?}");
+        assert!(
+            lengths.iter().all(|&length| length > 0),
+            "an empty payload reached the wire: {lengths:?}"
+        );
+
+        // Contiguous sequence numbers across the gaps: a frame the sender skipped is not one the
+        // network lost, and a gap here would show up in the peer's reception report as loss.
+        for pair in sequences.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0].wrapping_add(1),
+                "the sequence skipped: {sequences:?}"
+            );
+        }
+        // ...and a timestamp that kept the media clock across them.
+        for pair in timestamps.windows(2) {
+            let step = pair[1].wrapping_sub(pair[0]);
+            assert!(
+                step >= 160 && step % 160 == 0,
+                "the egress clock did not keep time across the gap: {timestamps:?}"
+            );
+        }
+        assert!(
+            timestamps
+                .windows(2)
+                .any(|pair| pair[1].wrapping_sub(pair[0]) > 160),
+            "no frame was actually skipped: {timestamps:?}"
         );
     }
 

@@ -253,6 +253,98 @@ pub static GBK2: [[i16; 2]; 16] = [
 ];
 
 /// Gain-codebook index maps, and their inverses, between transmitted and codebook order.
+/// Moving-average predictor coefficients for the Annex B silence descriptor's line frequencies
+/// (`noise_fg`). Q15.
+///
+/// The first set is the speech quantiser's own; the second is a blend of the speech quantiser's two
+/// (0.6 of the first plus 0.4 of the second, in Q15), which predicts background noise better than
+/// either — noise moves less between frames than speech does. The reference computes this blend at
+/// start-up; it is a fixed function of [`FG`] and is written out here instead.
+#[rustfmt::skip]
+pub static NOISE_FG: [[[i16; 10]; 4]; 2] = [
+    [
+        [8421, 9109, 9175, 8965, 9034, 9057, 8765, 8775, 9106, 8673],
+        [7018, 7189, 7638, 7307, 7444, 7379, 7038, 6956, 6930, 6868],
+        [5472, 4990, 5134, 5177, 5246, 5141, 5206, 5095, 4830, 5147],
+        [4056, 3031, 2614, 3024, 2916, 2713, 3309, 3237, 2857, 3473],
+    ],
+    [
+        [8145, 8617, 8779, 8648, 8718, 8829, 8713, 8705, 8806, 8231],
+        [5894, 5525, 5603, 5773, 6016, 5968, 5896, 5835, 5721, 5707],
+        [4568, 3765, 3605, 3963, 4144, 4038, 4225, 4139, 3914, 4255],
+        [3643, 2455, 1944, 2466, 2438, 2259, 2798, 2775, 2479, 3124],
+    ],
+];
+
+/// Per-set sum of [`NOISE_FG`]'s taps (`noise_fg_sum`). Q15.
+#[rustfmt::skip]
+pub static NOISE_FG_SUM: [[i16; 10]; 2] = [
+    [7798, 8447, 8205, 8293, 8126, 8477, 8447, 8703, 9043, 8604],
+    [10514, 12402, 12833, 11914, 11447, 11670, 11132, 11311, 11844, 11447],
+];
+
+/// Reciprocal of [`NOISE_FG_SUM`] (`noise_fg_sum_inv`). Q12.
+#[rustfmt::skip]
+pub static NOISE_FG_SUM_INV: [[i16; 10]; 2] = [
+    [17210, 15888, 16357, 16183, 16516, 15833, 15888, 15421, 14840, 15597],
+    [12764, 10821, 10458, 11264, 11724, 11500, 12056, 11865, 11331, 11724],
+];
+
+/// The 32 first-stage entries of [`LSPCB1`] the silence descriptor's five bits may address
+/// (`PtrTab_1`). The descriptor spends nine bits on a spectrum the speech frame spends eighteen on,
+/// so it addresses a subset chosen to span the space rather than a coarser codebook of its own.
+pub static SID_LSF_STAGE1: [i16; 32] = [
+    96, 52, 20, 54, 86, 114, 82, 68, 36, 121, 48, 92, 18, 120, 94, 124, 50, 125, 4, 100, 28, 76,
+    12, 117, 81, 22, 90, 116, 127, 21, 108, 66,
+];
+
+/// The 16 second-stage entries of [`LSPCB2`] its four bits may address, one row per half of the
+/// vector (`PtrTab_2`).
+pub static SID_LSF_STAGE2: [[i16; 16]; 2] = [
+    [31, 21, 9, 3, 10, 2, 19, 26, 4, 3, 11, 29, 15, 27, 21, 12],
+    [16, 1, 0, 0, 8, 25, 22, 20, 19, 23, 20, 31, 4, 31, 20, 31],
+];
+
+/// Weight applied to each predictor set's first-stage distortion before they are compared (`Mp`),
+/// which is what lets one search cover both sets and still pick between them.
+pub static SID_MODE_WEIGHT: [i16; 2] = [8644, 16572];
+
+/// Reconstruction levels for the silence descriptor's five-bit gain (`tab_Sidgain`).
+pub static SID_GAIN: [i16; 32] = [
+    2, 5, 8, 13, 20, 32, 50, 64, 80, 101, 127, 160, 201, 253, 318, 401, 505, 635, 800, 1007, 1268,
+    1596, 2010, 2530, 3185, 4009, 5048, 6355, 8000, 10_071, 12_679, 15_962,
+];
+
+/// Scale applied when averaging one, two or no frames' residual energies before quantising the
+/// silence descriptor's gain (`fact`), with the extra headroom each needs (`marg`).
+pub static SID_ENERGY_FACTOR: [i16; 3] = [410, 26, 13];
+/// Headroom that goes with [`SID_ENERGY_FACTOR`].
+pub static SID_ENERGY_MARGIN: [i16; 3] = [0, 0, 1];
+
+/// Low-band filter the Annex B voice-activity decision correlates the autocorrelation against
+/// (`lbf_corr`), one weight per lag up to the twelfth.
+///
+/// Correlating an autocorrelation with a filter's own autocorrelation gives the energy that filter
+/// would pass, so this measures the 0–1 kHz energy without running a filter over the samples.
+pub static LOW_BAND_CORRELATION: [i16; 13] = [
+    7869, 7011, 4838, 2299, 321, -660, -782, -484, -164, 3, 39, 21, 4,
+];
+
+/// Reciprocal of the number of frames the initial means were averaged over, as a shift (`shift_fx`).
+pub static INITIAL_MEAN_SHIFT: [i16; 33] = [
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 5,
+    0,
+];
+
+/// The mantissa that goes with [`INITIAL_MEAN_SHIFT`] (`factor_fx`): together they divide by the
+/// number of frames that actually contributed, which is the initialisation window minus the silent
+/// frames that were skipped.
+pub static INITIAL_MEAN_FACTOR: [i16; 33] = [
+    32_767, 16_913, 17_476, 18_079, 18_725, 19_418, 20_165, 20_972, 21_845, 22_795, 23_831, 24_966,
+    26_214, 27_594, 29_127, 30_840, 32_767, 17_476, 18_725, 20_165, 21_845, 23_831, 26_214, 29_127,
+    32_767, 18_725, 21_845, 26_214, 32_767, 21_845, 32_767, 32_767, 0,
+];
+
 /// Pre-selection thresholds for the first gain codebook stage, Q14 (`thr1`).
 ///
 /// The search does not score all 8 × 16 pairs. It walks these thresholds to pick a starting index
@@ -414,13 +506,15 @@ pub static HAMWINDOW: [i16; 240] = [
 ];
 
 /// Lag window applied to the autocorrelation, high halves. Q15.
-pub static LAG_H: [i16; 10] = [
-    32728, 32619, 32438, 32187, 31867, 31480, 31029, 30517, 29946, 29321,
+/// The last two entries are used only by the Annex B voice-activity decision, which fits a
+/// twelfth-order autocorrelation to get a low-band energy the tenth-order fit cannot separate.
+pub static LAG_H: [i16; 12] = [
+    32728, 32619, 32438, 32187, 31867, 31480, 31029, 30517, 29946, 29321, 28_645, 27_923,
 ];
 
 /// Lag window applied to the autocorrelation, low halves.
-pub static LAG_L: [i16; 10] = [
-    11904, 17280, 30720, 25856, 24192, 28992, 24384, 7360, 19520, 14784,
+pub static LAG_L: [i16; 12] = [
+    11904, 17280, 30720, 25856, 24192, 28992, 24384, 7360, 19520, 14784, 22_092, 12_924,
 ];
 
 /// Grid the LSP root search evaluates the Chebyshev polynomials on, plus its endpoint. Q15.

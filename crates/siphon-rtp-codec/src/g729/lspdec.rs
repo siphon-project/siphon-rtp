@@ -70,11 +70,25 @@ impl Predictor {
     /// Add the moving-average prediction back onto a residual (`Lsp_prev_compose`).
     #[must_use]
     pub fn compose(&self, residual: &[i16; ORDER], mode: usize) -> [i16; ORDER] {
+        self.compose_with(residual, &FG[mode], &FG_SUM[mode])
+    }
+
+    /// [`Self::compose`] against an explicit coefficient set, which is what lets the Annex B
+    /// silence descriptor run the same predictor over its own noise-fitted coefficients while
+    /// sharing this instance's history with the speech quantiser — the reference shares that memory
+    /// through a pair of copy-in/copy-out calls, and the two must not drift apart.
+    #[must_use]
+    pub fn compose_with(
+        &self,
+        residual: &[i16; ORDER],
+        coefficients: &[[i16; ORDER]; MA_ORDER],
+        sum: &[i16; ORDER],
+    ) -> [i16; ORDER] {
         let mut lsf = [0_i16; ORDER];
         for j in 0..ORDER {
-            let mut accumulator = l_mult(residual[j], FG_SUM[mode][j]);
-            for (previous, coefficients) in self.history.iter().zip(&FG[mode]) {
-                accumulator = l_mac(accumulator, previous[j], coefficients[j]);
+            let mut accumulator = l_mult(residual[j], sum[j]);
+            for (previous, taps) in self.history.iter().zip(coefficients.iter()) {
+                accumulator = l_mac(accumulator, previous[j], taps[j]);
             }
             lsf[j] = extract_h(accumulator);
         }
@@ -86,14 +100,25 @@ impl Predictor {
     /// every frame, since it is what the codebook search is run against.
     #[must_use]
     pub fn extract_residual(&self, lsf: &[i16; ORDER], mode: usize) -> [i16; ORDER] {
+        self.extract_residual_with(lsf, &FG[mode], &FG_SUM_INV[mode])
+    }
+
+    /// [`Self::extract_residual`] against an explicit coefficient set — see [`Self::compose_with`].
+    #[must_use]
+    pub fn extract_residual_with(
+        &self,
+        lsf: &[i16; ORDER],
+        coefficients: &[[i16; ORDER]; MA_ORDER],
+        inverse_sum: &[i16; ORDER],
+    ) -> [i16; ORDER] {
         let mut residual = [0_i16; ORDER];
         for j in 0..ORDER {
             let mut accumulator = l_deposit_h(lsf[j]);
-            for (previous, coefficients) in self.history.iter().zip(&FG[mode]) {
-                accumulator = l_msu(accumulator, previous[j], coefficients[j]);
+            for (previous, taps) in self.history.iter().zip(coefficients.iter()) {
+                accumulator = l_msu(accumulator, previous[j], taps[j]);
             }
             let temp = extract_h(accumulator);
-            let scaled = l_mult(temp, FG_SUM_INV[mode][j]);
+            let scaled = l_mult(temp, inverse_sum[j]);
             residual[j] = extract_h(l_shl(scaled, 3));
         }
         residual
@@ -135,6 +160,13 @@ impl LspDecoder {
             previous: RESET,
             previous_mode: 0,
         }
+    }
+
+    /// The predictor memory, which the Annex B silence descriptor's own quantiser shares — a
+    /// descriptor predicts from the frames before it whether those were speech or not
+    /// (`Get_decfreq_prev` / `Update_decfreq_prev`).
+    pub fn predictor_mut(&mut self) -> &mut Predictor {
+        &mut self.predictor
     }
 
     /// Decode one frame's LSPs from its two transmitted indices.

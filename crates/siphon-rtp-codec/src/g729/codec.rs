@@ -5,7 +5,10 @@
 //! number of codec frames concatenated, with no header of any kind (RFC 3551 §4.5.6 assigns static
 //! payload type 18 and defines the payload as exactly that).
 
+use super::bitstream::SILENCE_BYTES;
+use super::encoder::EncodedFrame;
 use super::{G729Decoder, G729Encoder, FRAME_BYTES, FRAME_SAMPLES};
+
 use crate::{CodecError, CodecParams, Decoder, Encoder};
 
 /// A G.729 codec instance, usable as either a [`Decoder`] or an [`Encoder`].
@@ -17,6 +20,8 @@ pub struct G729 {
     params: CodecParams,
     decoder: G729Decoder,
     encoder: G729Encoder,
+    /// Whether Annex B discontinuous transmission is negotiated on this leg.
+    annex_b: bool,
 }
 
 impl G729 {
@@ -33,7 +38,22 @@ impl G729 {
             },
             decoder: G729Decoder::new(),
             encoder: G729Encoder::new(),
+            annex_b: false,
         }
+    }
+
+    /// Turn Annex B on for this leg.
+    ///
+    /// RFC 3555 §4.1.13 makes `annexb=yes` the SDP default when the attribute is absent, so the
+    /// negotiation decides this, not the build. It changes what the *encoder* puts on the wire — a
+    /// silence descriptor or nothing, where it would otherwise send speech. The decoder accepts
+    /// descriptors either way: refusing one from a peer that sent it would be worse than decoding
+    /// it, and a peer that answered `annexb=no` will not send any.
+    #[must_use]
+    pub fn with_annex_b(mut self, enabled: bool) -> Self {
+        self.annex_b = enabled;
+        self.encoder.set_discontinuous_transmission(enabled);
+        self
     }
 
     /// The codec's parameters (8 kHz, mono).
@@ -58,9 +78,20 @@ impl Decoder for G729 {
     }
 
     fn decode(&mut self, payload: &[u8], out: &mut [i16]) -> Result<usize, CodecError> {
-        // A two-octet payload is an Annex B silence-insertion descriptor. Annex B is not implemented,
-        // and decoding it as a truncated speech frame would emit noise at full level, so it is
-        // refused rather than guessed at.
+        // A two-octet payload is an Annex B silence descriptor: one frame's worth of comfort noise,
+        // whatever the leg's packet time is. Nothing else in G.729 is two octets, so the length
+        // identifies it — which is why a payload never mixes a descriptor with speech frames.
+        if payload.len() == SILENCE_BYTES {
+            if out.len() < FRAME_SAMPLES {
+                return Err(CodecError::OutputTooSmall {
+                    needed: FRAME_SAMPLES,
+                    have: out.len(),
+                });
+            }
+            let samples = self.decoder.decode_silence(payload)?;
+            out[..FRAME_SAMPLES].copy_from_slice(&samples);
+            return Ok(FRAME_SAMPLES);
+        }
         if !payload.len().is_multiple_of(FRAME_BYTES) {
             return Err(CodecError::Malformed(
                 "G.729 payload is not a whole number of 10-octet frames",
@@ -117,11 +148,48 @@ impl Encoder for G729 {
                 have: out.len(),
             });
         }
-        for (index, frame) in pcm.as_chunks::<FRAME_SAMPLES>().0.iter().enumerate() {
-            let encoded = self.encoder.encode(frame);
-            out[index * FRAME_BYTES..(index + 1) * FRAME_BYTES].copy_from_slice(&encoded);
+        if !self.annex_b {
+            for (index, frame) in pcm.as_chunks::<FRAME_SAMPLES>().0.iter().enumerate() {
+                let encoded = self.encoder.encode(frame);
+                out[index * FRAME_BYTES..(index + 1) * FRAME_BYTES].copy_from_slice(&encoded);
+            }
+            return Ok(bytes);
         }
-        Ok(bytes)
+
+        // With Annex B on, the packet's frames need not agree. A payload has no framing of its own —
+        // the length is all a receiver has to tell speech from a descriptor — so a packet carries
+        // one kind or the other, never a mixture. The speech frames win when there are any, because
+        // dropping coded speech to send a description of the background would take a word off the
+        // front of a sentence; when there are none, the newest descriptor goes out, and when there
+        // is no descriptor either, nothing does.
+        let mut written = 0;
+        let mut descriptor = None;
+        for frame in pcm.as_chunks::<FRAME_SAMPLES>().0 {
+            match self.encoder.encode_frame(frame) {
+                EncodedFrame::Speech(encoded) => {
+                    out[written..written + FRAME_BYTES].copy_from_slice(&encoded);
+                    written += FRAME_BYTES;
+                }
+                EncodedFrame::Silence(encoded) => descriptor = Some(encoded),
+                EncodedFrame::Untransmitted => {}
+            }
+        }
+        if written > 0 {
+            return Ok(written);
+        }
+        match descriptor {
+            Some(encoded) => {
+                if out.len() < SILENCE_BYTES {
+                    return Err(CodecError::OutputTooSmall {
+                        needed: SILENCE_BYTES,
+                        have: out.len(),
+                    });
+                }
+                out[..SILENCE_BYTES].copy_from_slice(&encoded);
+                Ok(SILENCE_BYTES)
+            }
+            None => Ok(0),
+        }
     }
 }
 
@@ -144,9 +212,11 @@ mod tests {
     fn a_payload_that_is_not_whole_frames_is_refused() {
         let mut codec = G729::new(20);
         let mut out = [0_i16; 160];
-        // Two octets is an Annex B silence descriptor, which this build does not implement. Reading
-        // it as a truncated speech frame would put full-level noise on the call.
-        assert!(Decoder::decode(&mut codec, &[0; 2], &mut out).is_err());
+        // Two octets is the one other length that means something — an Annex B silence descriptor —
+        // and it has its own test. Everything else is malformed, and reading a short payload as a
+        // truncated speech frame would put full-level noise on the call.
+        assert!(Decoder::decode(&mut codec, &[0; 1], &mut out).is_err());
+        assert!(Decoder::decode(&mut codec, &[0; 3], &mut out).is_err());
         assert!(Decoder::decode(&mut codec, &[0; 15], &mut out).is_err());
         assert!(Decoder::decode(&mut codec, &[0; 10], &mut out).is_ok());
         assert!(Decoder::decode(&mut codec, &[0; 20], &mut out).is_ok());
@@ -206,6 +276,101 @@ mod tests {
         let codec = G729::new(20);
         assert_eq!(Decoder::rtp_clock_rate_hz(&codec), 8_000);
         assert_eq!(Encoder::rtp_clock_rate_hz(&codec), 8_000);
+    }
+
+    /// A long stretch of quiet input at the codec's own scale.
+    fn quiet(frames: usize) -> Vec<i16> {
+        let mut seed = 1_u32;
+        (0..frames * FRAME_SAMPLES)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((((seed >> 16) & 0x7fff) as i32 - 16_384) / 512) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_annex_b_every_packet_is_a_full_speech_frame() {
+        // The posture a peer that answered `annexb=no` expects: whatever the input, ten octets per
+        // 10 ms. Sending it two octets would put a payload on the wire it did not agree to.
+        let mut codec = G729::new(20);
+        let input = quiet(60);
+        let mut out = [0_u8; 20];
+        for frame in input.as_chunks::<160>().0 {
+            assert_eq!(
+                Encoder::encode(&mut codec, frame, &mut out).expect("encode"),
+                20
+            );
+        }
+    }
+
+    #[test]
+    fn with_annex_b_a_long_silence_stops_being_transmitted() {
+        // The whole point: a quiet leg costs two octets every few frames instead of twenty every
+        // frame. The first inactive frame always describes the background, and once the description
+        // stops changing there is nothing left to send.
+        let mut codec = G729::new(20).with_annex_b(true);
+        let input = quiet(240);
+        let mut out = [0_u8; 20];
+        let mut lengths = Vec::new();
+        for frame in input.as_chunks::<160>().0 {
+            lengths.push(Encoder::encode(&mut codec, frame, &mut out).expect("encode"));
+        }
+
+        // The first packets are the background estimate settling; the interesting half is after it.
+        let tail = &lengths[60..];
+        assert!(
+            tail.contains(&0),
+            "nothing was ever left untransmitted: {tail:?}"
+        );
+        assert!(
+            tail.contains(&SILENCE_BYTES),
+            "the background was never described: {tail:?}"
+        );
+        let sent: usize = tail.iter().sum();
+        let speech = tail.len() * 20;
+        assert!(
+            sent * 4 < speech,
+            "{sent} octets against {speech} for the same audio as speech"
+        );
+    }
+
+    #[test]
+    fn a_silence_descriptor_decodes_to_one_frame_of_comfort_noise() {
+        // Two octets in, 80 samples out — and not silence: a call that goes completely quiet between
+        // words reads as a dropped line, which is the reason comfort noise exists at all.
+        let mut encoder = G729::new(10).with_annex_b(true);
+        let mut decoder = G729::new(10);
+        let input = quiet(200);
+        let mut payload = [0_u8; 10];
+        let mut decoded = [0_i16; 80];
+
+        let mut described = 0;
+        for frame in input.as_chunks::<80>().0 {
+            let written = Encoder::encode(&mut encoder, frame, &mut payload).expect("encode");
+            if written != SILENCE_BYTES {
+                continue;
+            }
+            let samples = Decoder::decode(&mut decoder, &payload[..written], &mut decoded)
+                .expect("decode a descriptor");
+            assert_eq!(samples, 80);
+            described += 1;
+        }
+        assert!(described > 0, "the encoder never sent a descriptor");
+        assert!(
+            decoded.iter().any(|&sample| sample != 0),
+            "the comfort noise was silence"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_is_decoded_even_on_a_leg_that_did_not_negotiate_annex_b() {
+        // The decoder accepts descriptors whatever the leg negotiated, deliberately: a peer that
+        // sends one despite answering `annexb=no` is better decoded than dropped. What the
+        // negotiation controls is what *we* send.
+        let mut codec = G729::new(20);
+        let mut out = [0_i16; 160];
+        assert!(Decoder::decode(&mut codec, &[0x00, 0x00], &mut out).is_ok());
     }
 
     #[test]

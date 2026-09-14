@@ -330,9 +330,16 @@ impl MediaLeg {
 
     /// Encode and packetize one PCM frame into `out`, returning the RTP packet length. The egress
     /// sequence advances by one and the timestamp by one codec frame.
+    /// A codec in discontinuous transmission (G.729 Annex B) can decline to send a frame at all; the
+    /// packet length is then `0`, the egress clock still advances ([`MediaLeg::skip_egress_frame`]),
+    /// and the caller must send nothing rather than an empty datagram.
     pub fn encode_rtp(&mut self, pcm: &[i16], out: &mut [u8]) -> Result<usize, LegError> {
         let mut payload = [0u8; MAX_PAYLOAD];
         let payload_len = self.encode_payload(pcm, &mut payload)?;
+        if payload_len == 0 {
+            self.skip_egress_frame();
+            return Ok(0);
+        }
         self.packetize(&payload[..payload_len], false, out)
     }
 
@@ -369,6 +376,19 @@ impl MediaLeg {
         self.egress_packets = self.egress_packets.wrapping_add(1);
         self.egress_octets = self.egress_octets.wrapping_add(payload.len() as u32);
         Ok(total)
+    }
+
+    /// Advance the egress clock past one frame that is **not** being sent, for a codec in
+    /// discontinuous transmission (G.729 Annex B).
+    ///
+    /// The timestamp advances because it is a sampling instant and the audio happened whether or not
+    /// it went out. The sequence number does not, and neither do the sender counters: a frame the
+    /// sender chose to skip is not one the network lost, and counting it would put phantom loss in
+    /// the peer's RFC 3550 §6.4.1 reception report and overstate this leg's own RTCP SR.
+    pub fn skip_egress_frame(&mut self) {
+        self.egress_timestamp = self
+            .egress_timestamp
+            .wrapping_add(self.egress_timestamp_increment);
     }
 
     /// The current egress RTP timestamp (the value the next packet will carry) — the RTCP SR's RTP
@@ -652,6 +672,35 @@ mod tests {
         direct.encode(&pcm_in, &mut payload).expect("ref encode");
         direct.decode(&payload, &mut reference).expect("ref decode");
         assert_eq!(pcm_out, reference);
+    }
+
+    #[test]
+    fn a_frame_the_encoder_declines_to_send_advances_the_clock_but_not_the_sequence() {
+        // Discontinuous transmission: the codec says this frame need not go out. The RTP timestamp
+        // is a sampling instant and the audio happened, so it advances; the sequence number does
+        // not, because a frame the sender skipped is not one the network lost and counting it would
+        // put phantom loss in the peer's RFC 3550 §6.4.1 reception report.
+        let mut leg = ulaw_leg();
+        let before_timestamp = leg.egress_timestamp();
+        let before_packets = leg.egress_packets();
+        leg.skip_egress_frame();
+        assert_eq!(
+            leg.egress_timestamp(),
+            before_timestamp.wrapping_add(160),
+            "the egress clock keeps the media time across the gap"
+        );
+        assert_eq!(
+            leg.egress_packets(),
+            before_packets,
+            "a skipped frame is not a sent packet"
+        );
+
+        // The next packet that *is* sent carries the advanced timestamp and the next sequence.
+        let pcm = vec![0i16; 160];
+        let mut out = vec![0u8; 256];
+        let length = leg.encode_rtp(&pcm, &mut out).expect("encode");
+        let packet = RtpPacket::parse(&out[..length]).expect("parse");
+        assert_eq!(packet.timestamp, before_timestamp.wrapping_add(160));
     }
 
     #[test]

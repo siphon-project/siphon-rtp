@@ -25,6 +25,10 @@ pub const WINDOW: usize = 240;
 /// Points the root search sweeps across the unit circle.
 const GRID_POINTS: usize = 60;
 
+/// Autocorrelation lags the Annex B voice-activity decision needs, two beyond the LP order: it
+/// measures a low-band energy that a tenth-order fit cannot separate from the full band.
+pub const VAD_ORDER: usize = 12;
+
 /// Input conditioning (`Pre_Process`): a 140 Hz high-pass that also halves the signal.
 ///
 /// The halving is deliberate headroom for everything downstream, and it is why the decoder's output
@@ -77,8 +81,12 @@ impl PreProcessor {
 /// The windowed signal is scaled down and the whole thing retried whenever `r[0]` saturates, which
 /// is the reference's own loop: an analysis frame of loud speech would otherwise clip its own
 /// energy and give a filter fitted to the clipping.
+/// Returns the correlations for lags `0..=VAD_ORDER` together with the exponent the whole vector was
+/// normalised by. The extra two lags and the exponent are wanted only by the Annex B voice-activity
+/// decision; computing them unconditionally costs two more passes over the window and keeps one
+/// analysis routine instead of two that must agree.
 #[must_use]
-pub fn autocorrelation(window: &[i16]) -> [(i16, i16); ORDER + 1] {
+pub fn autocorrelation(window: &[i16]) -> ([(i16, i16); VAD_ORDER + 1], i16) {
     debug_assert_eq!(window.len(), WINDOW);
     let mut windowed = [0_i16; WINDOW];
     for (destination, (&sample, &weight)) in
@@ -88,6 +96,10 @@ pub fn autocorrelation(window: &[i16]) -> [(i16, i16); ORDER + 1] {
     }
 
     let mut energy;
+    // Each rescale is two bits on the samples, so four on their squares; the exponent records how
+    // far the reported correlations sit from the signal's own scale, which is what lets the
+    // voice-activity decision compare one frame's energy against another's.
+    let mut exponent = 1_i16;
     loop {
         let mut flag = Overflow::clear();
         // Seeded at 1 rather than 0 so an all-zero frame still normalises.
@@ -101,28 +113,30 @@ pub fn autocorrelation(window: &[i16]) -> [(i16, i16); ORDER + 1] {
         for sample in &mut windowed {
             *sample = shr(*sample, 2);
         }
+        exponent = add(exponent, 4);
     }
 
     let normalisation = norm_l(energy);
-    let mut correlations = [(0_i16, 0_i16); ORDER + 1];
+    let mut correlations = [(0_i16, 0_i16); VAD_ORDER + 1];
     correlations[0] = l_extract(l_shl(energy, normalisation));
+    let exponent = sub(exponent, normalisation);
 
-    for lag in 1..=ORDER {
-        let mut sum = 0_i32;
-        for j in 0..WINDOW - lag {
-            sum = l_mac(sum, windowed[j], windowed[j + lag]);
-        }
+    // The lag terms cannot saturate — Cauchy-Schwarz bounds each by `r[0]`, which the loop above
+    // has just scaled to fit — so they are a wrapping dot product. `r[0]` itself stays scalar: its
+    // saturation is observed, not avoided, and is what drove the rescale.
+    for lag in 1..=VAD_ORDER {
+        let sum = dspfunc::doubled_dot(&windowed[..WINDOW - lag], &windowed[lag..]);
         correlations[lag] = l_extract(l_shl(sum, normalisation));
     }
-    correlations
+    (correlations, exponent)
 }
 
 /// Apply the lag window to the autocorrelation (`Lag_window`).
 ///
 /// It widens the spectral peaks slightly, which keeps the Levinson recursion away from the
 /// ill-conditioned cases a perfectly periodic input would otherwise produce.
-pub fn lag_window(correlations: &mut [(i16, i16); ORDER + 1]) {
-    for lag in 1..=ORDER {
+pub fn lag_window(correlations: &mut [(i16, i16); VAD_ORDER + 1]) {
+    for lag in 1..=VAD_ORDER {
         let (high, low) = correlations[lag];
         let windowed = mpy_32(high, low, LAG_H[lag - 1], LAG_L[lag - 1]);
         correlations[lag] = l_extract(windowed);
@@ -156,16 +170,17 @@ impl Levinson {
         }
     }
 
-    /// Solve for the LP coefficients (Q12) and reflection coefficients (Q15).
+    /// Solve for the LP coefficients (Q12), the reflection coefficients (Q15) and the residual
+    /// energy the recursion ends on.
     ///
     /// A reflection coefficient at the edge of the representable range means the recursion has gone
     /// unstable — the autocorrelation was too ill-conditioned to fit — and the reference answers
     /// with the previous frame's filter rather than an unstable one. A filter that rings is far
     /// worse than one that is a frame out of date.
-    pub fn solve(
-        &mut self,
-        correlations: &[(i16, i16); ORDER + 1],
-    ) -> ([i16; COEFFICIENTS], [i16; ORDER]) {
+    ///
+    /// Only the first `ORDER + 1` correlations are read; the wider array is what the Annex B
+    /// voice-activity decision needs from the same analysis.
+    pub fn solve(&mut self, correlations: &[(i16, i16); VAD_ORDER + 1]) -> LinearPrediction {
         let mut reflection = [0_i16; ORDER];
         let (r0_hi, r0_lo) = correlations[0];
 
@@ -221,7 +236,16 @@ impl Levinson {
                 // Unstable: keep the previous frame's filter and its first two reflections.
                 reflection[0] = self.previous_reflection[0];
                 reflection[1] = self.previous_reflection[1];
-                return (self.previous, reflection);
+                // The reference returns here without writing its residual-energy output, leaving
+                // the caller's variable at whatever it held; reporting the energy reached so far is
+                // defined instead. Nothing reads it on this path — the frame analysis discards it,
+                // and the comfort-noise path that does read it fits a filter it has just built
+                // from smoothed autocorrelations, which is the well-conditioned case.
+                return LinearPrediction {
+                    coefficients: self.previous,
+                    reflection,
+                    residual_energy: shr(alpha_hi, alpha_exponent),
+                };
             }
 
             let mut new_hi = [0_i16; COEFFICIENTS];
@@ -261,8 +285,24 @@ impl Levinson {
         }
         self.previous = coefficients;
         self.previous_reflection = [reflection[0], reflection[1]];
-        (coefficients, reflection)
+        LinearPrediction {
+            coefficients,
+            reflection,
+            residual_energy: shr(alpha_hi, alpha_exponent),
+        }
     }
+}
+
+/// What one frame's Levinson-Durbin recursion produces.
+#[derive(Debug, Clone, Copy)]
+pub struct LinearPrediction {
+    /// The prediction filter `A(z)`, Q12.
+    pub coefficients: [i16; COEFFICIENTS],
+    /// The reflection coefficients the recursion passed through, Q15.
+    pub reflection: [i16; ORDER],
+    /// The energy still unpredicted at the end of the recursion. The Annex B comfort-noise path
+    /// uses it as the excitation energy for a frame it is not transmitting.
+    pub residual_energy: i16,
 }
 
 /// Which precision the Chebyshev evaluation runs at.
@@ -464,7 +504,7 @@ mod tests {
     fn autocorrelation_is_largest_at_lag_zero() {
         // r[0] is the frame's energy and no other lag can exceed it; a normalisation that got the
         // exponent wrong would break that immediately.
-        let correlations = autocorrelation(&voiced_window());
+        let (correlations, _) = autocorrelation(&voiced_window());
         let zero = l_comp(correlations[0].0, correlations[0].1);
         for (lag, &(high, low)) in correlations.iter().enumerate().skip(1) {
             let value = l_comp(high, low).abs();
@@ -476,13 +516,13 @@ mod tests {
     fn a_silent_frame_still_normalises() {
         // The reference seeds the energy at 1 precisely so an all-zero frame does not divide by
         // zero further down; without it the Levinson step below would be undefined.
-        let correlations = autocorrelation(&[0_i16; WINDOW]);
+        let (correlations, _) = autocorrelation(&[0_i16; WINDOW]);
         assert!(l_comp(correlations[0].0, correlations[0].1) > 0);
     }
 
     #[test]
     fn lag_windowing_only_shrinks_the_higher_lags() {
-        let mut correlations = autocorrelation(&voiced_window());
+        let (mut correlations, _) = autocorrelation(&voiced_window());
         let before: Vec<i32> = correlations
             .iter()
             .map(|&(hi, lo)| l_comp(hi, lo))
@@ -501,9 +541,10 @@ mod tests {
 
     #[test]
     fn levinson_produces_a_stable_filter_from_real_speech_shaped_input() {
-        let mut correlations = autocorrelation(&voiced_window());
+        let (mut correlations, _) = autocorrelation(&voiced_window());
         lag_window(&mut correlations);
-        let (a, reflection) = Levinson::new().solve(&correlations);
+        let solved = Levinson::new().solve(&correlations);
+        let (a, reflection) = (solved.coefficients, solved.reflection);
         assert_eq!(a[0], 4096, "monic in Q12");
         for (order, &k) in reflection.iter().enumerate() {
             assert!(
@@ -519,12 +560,12 @@ mod tests {
         // reflection coefficient to the limit. The reference answers with the last good filter,
         // because an unstable synthesis filter rings and a stale one merely sounds dated.
         let mut levinson = Levinson::new();
-        let mut correlations = autocorrelation(&voiced_window());
+        let (mut correlations, _) = autocorrelation(&voiced_window());
         lag_window(&mut correlations);
-        let (good, _) = levinson.solve(&correlations);
+        let good = levinson.solve(&correlations).coefficients;
 
-        let degenerate = [correlations[0]; ORDER + 1];
-        let (fallback, _) = levinson.solve(&degenerate);
+        let degenerate = [correlations[0]; VAD_ORDER + 1];
+        let fallback = levinson.solve(&degenerate).coefficients;
         assert_eq!(fallback, good, "the previous filter is repeated");
     }
 
@@ -532,9 +573,9 @@ mod tests {
     fn the_line_spectral_pairs_are_ordered_and_invert_back_to_the_filter() {
         // LSPs must descend across the band, and converting them back must reproduce the filter
         // they came from — which exercises this against `lsp_to_lp` from the decoder side.
-        let mut correlations = autocorrelation(&voiced_window());
+        let (mut correlations, _) = autocorrelation(&voiced_window());
         lag_window(&mut correlations);
-        let (a, _) = Levinson::new().solve(&correlations);
+        let a = Levinson::new().solve(&correlations).coefficients;
         let previous = [
             30_000, 26_000, 21_000, 15_000, 8000, 0, -8000, -15_000, -21_000, -26_000,
         ];

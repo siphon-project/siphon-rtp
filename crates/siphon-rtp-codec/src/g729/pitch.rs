@@ -14,7 +14,7 @@
 //! is precisely how the reference asks the question.
 
 use super::bitstream::SUBFRAME_SAMPLES;
-use super::dspfunc::inv_sqrt;
+use super::dspfunc::{doubled_dot, inv_sqrt};
 use super::excitation::{PITCH_MAX, PITCH_MIN};
 use super::filter::convolve;
 use super::overflow::{self, Overflow};
@@ -104,13 +104,11 @@ fn lag_max(scaled: &[i16], origin: usize, high: i16, low: i16) -> (i16, i16) {
     let mut best_correlation = i32::MIN;
     let mut best_lag = high;
 
+    let frame = &scaled[origin..origin + FRAME_SAMPLES];
     let mut lag = high;
     while lag >= low {
         let delayed = origin - lag as usize;
-        let mut correlation = 0_i32;
-        for j in 0..FRAME_SAMPLES {
-            correlation = l_mac(correlation, scaled[origin + j], scaled[delayed + j]);
-        }
+        let correlation = doubled_dot(frame, &scaled[delayed..delayed + FRAME_SAMPLES]);
         // `>=` rather than `>`, so a tie within a section also resolves to the smaller lag.
         if l_sub(correlation, best_correlation) >= 0 {
             best_correlation = correlation;
@@ -120,10 +118,8 @@ fn lag_max(scaled: &[i16], origin: usize, high: i16, low: i16) -> (i16, i16) {
     }
 
     let delayed = origin - best_lag as usize;
-    let mut energy = 0_i32;
-    for j in 0..FRAME_SAMPLES {
-        energy = l_mac(energy, scaled[delayed + j], scaled[delayed + j]);
-    }
+    let window = &scaled[delayed..delayed + FRAME_SAMPLES];
+    let energy = doubled_dot(window, window);
 
     let (correlation_high, correlation_low) = l_extract(best_correlation);
     let (energy_high, energy_low) = l_extract(inv_sqrt(energy));

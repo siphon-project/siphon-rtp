@@ -24,6 +24,8 @@ const REQUIRED_VECTOR_DIRS: &[&str] = &[
     // *.pst the reference decoder produced from it, and six also carry the *.in the reference
     // encoder produced the bitstream from, so the two directions are pinned independently.
     "../../reference/g729/testv/base",
+    // Annex B: the VAD/DTX/CNG sequences, four of which ship the .bin the .bit was encoded from.
+    "../../reference/g729/testv/annexb",
     // Opus: the official RFC 6716 `testvectorNN.bit`/`.dec` set, plus the locally generated
     // CELT-only and SILK-only oracle streams (`celt_only/`, `silk_only/`, see CONTRIBUTING.md — they
     // need a local libopus build). `silk_only/` must also carry the `.trace` dumps from the

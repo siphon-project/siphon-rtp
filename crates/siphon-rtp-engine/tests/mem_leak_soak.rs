@@ -443,6 +443,87 @@ async fn offer_answer_delete_does_not_leak() {
     gate.assert_no_leak();
 }
 
+/// Churn one **transcoding** call through `offer → answer → delete`. A transcode call is heavier
+/// than a relay in exactly the way a leak likes: it builds a per-direction codec pair and a media
+/// actor on top of the endpoints a relay allocates, and a G.729 codec carries far more state than a
+/// G.711 one (excitation history, three predictor memories, the voice-activity background estimate).
+#[cfg(feature = "g729")]
+async fn g729_transcode_offer_answer_delete(engine: &Engine<UdpLoopbackDatapath>, index: usize) {
+    let call_id = format!("soak-g729-{index}");
+    let g729_sdp =
+        "v=0\r\no=- 1 1 IN IP4 198.51.100.1\r\ns=-\r\nc=IN IP4 198.51.100.1\r\nt=0 0\r\n\
+         m=audio 40000 RTP/AVP 18\r\na=rtpmap:18 G729/8000\r\n"
+            .to_owned();
+
+    let offer = engine
+        .handle(
+            CLIENT,
+            Command::Offer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                sdp: g729_sdp,
+                profile: siphon_rtp_proto::ProfileFlags {
+                    flags: vec!["codec-transcode-PCMA".into()],
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+    assert_ok(&offer, "g729 offer");
+
+    let answer = engine
+        .handle(
+            CLIENT,
+            Command::Answer {
+                call_id: call_id.clone(),
+                from_tag: "tag-a".into(),
+                to_tag: "tag-b".into(),
+                sdp: sdp_for("203.0.113.1", 41_000),
+                profile: Default::default(),
+            },
+        )
+        .await;
+    assert_ok(&answer, "g729 answer");
+
+    let delete = engine
+        .handle(
+            CLIENT,
+            Command::Delete {
+                call_id,
+                from_tag: "tag-a".into(),
+                to_tag: None,
+            },
+        )
+        .await;
+    assert_ok(&delete, "g729 delete");
+}
+
+#[cfg(feature = "g729")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g729_transcode_does_not_leak() {
+    let _serialized = SOAK.lock().await;
+    let engine = Engine::new(UdpLoopbackDatapath::new());
+
+    // Fewer cycles per segment than the relay soak: each one builds two codecs and a media actor,
+    // so the same number of segments covers the same ground in less wall clock.
+    let mut gate = LeakGate::new("g729 transcode", 40, 50).await;
+    let mut index = 0;
+    while gate.needs_more_churn() {
+        for _ in 0..gate.cycles_per_segment() {
+            g729_transcode_offer_answer_delete(&engine, index).await;
+            index += 1;
+        }
+        quiesce().await;
+        assert_eq!(
+            engine.session_count(),
+            0,
+            "registry drained after every segment"
+        );
+        gate.sample().await;
+    }
+    gate.assert_no_leak();
+}
+
 /// Churn one conference room through `join ×3 → leave ×3` — the room actor spawns on the first join
 /// and is torn down (task aborted, endpoint freed) on the last leave.
 async fn conference_join_leave(engine: &Engine<UdpLoopbackDatapath>, index: usize) {

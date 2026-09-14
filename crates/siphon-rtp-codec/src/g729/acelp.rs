@@ -302,6 +302,25 @@ fn target_correlations(
     narrow
 }
 
+/// `L_mac(accumulator, term, weight)` where the accumulation provably cannot saturate, as plain
+/// wrapping arithmetic.
+///
+/// Every term in the codebook search's energy is one 16-bit correlation weighted by one or two, and
+/// a candidate sums at most sixteen of them. That bounds the total by `2 · 16 · 2^15 = 2^20`, four
+/// orders of magnitude inside what the saturating operator guards, so the guard costs two branches
+/// per term and can never fire. A debug build checks that on every call, which makes the conformance
+/// run — a debug run — a proof obligation rather than a claim.
+#[inline]
+fn accumulate(accumulator: i32, term: i16, weight: i16) -> i32 {
+    let summed = accumulator.wrapping_add(2 * i32::from(term) * i32::from(weight));
+    debug_assert_eq!(
+        summed,
+        l_mac(accumulator, term, weight),
+        "the codebook search's energy saturated, so wrapping arithmetic is not equivalent"
+    );
+    summed
+}
+
 /// Search the four pulse positions that maximise `(x·y)²/(y·y)` (`D4i40_17`).
 fn search_pulses(
     projections: &mut [i16; SUBFRAME_SAMPLES],
@@ -395,8 +414,8 @@ fn search_pulses(
         for i1 in (1..SUBFRAME_SAMPLES).step_by(STEP) {
             let correlation1 = add(correlation0, projections[i1]);
             let mut energy1 = l_mult(energy0, 1);
-            energy1 = l_mac(energy1, rr[RR11 + (i1 - 1) / STEP], 1);
-            energy1 = l_mac(energy1, rr[r01], 2);
+            energy1 = accumulate(energy1, rr[RR11 + (i1 - 1) / STEP], 1);
+            energy1 = accumulate(energy1, rr[r01], 2);
             r01 += 1;
 
             let mut r23 = RR23;
@@ -404,10 +423,10 @@ fn search_pulses(
 
             for i2 in (2..SUBFRAME_SAMPLES).step_by(STEP) {
                 let correlation2 = add(correlation1, projections[i2]);
-                let mut energy2 = l_mac(energy1, rr[RR22 + (i2 - 2) / STEP], 1);
-                energy2 = l_mac(energy2, rr[r02], 2);
+                let mut energy2 = accumulate(energy1, rr[RR22 + (i2 - 2) / STEP], 1);
+                energy2 = accumulate(energy2, rr[r02], 2);
                 r02 += 1;
-                energy2 = l_mac(energy2, rr[r12], 2);
+                energy2 = accumulate(energy2, rr[r12], 2);
                 r12 += 1;
 
                 if sub(correlation2, threshold) <= 0 {
@@ -418,12 +437,12 @@ fn search_pulses(
 
                 for i3 in (3..SUBFRAME_SAMPLES).step_by(STEP) {
                     let correlation3 = add(correlation2, projections[i3]);
-                    let mut energy3 = l_mac(energy2, rr[RR33 + (i3 - 3) / STEP], 1);
-                    energy3 = l_mac(energy3, rr[r03], 2);
+                    let mut energy3 = accumulate(energy2, rr[RR33 + (i3 - 3) / STEP], 1);
+                    energy3 = accumulate(energy3, rr[r03], 2);
                     r03 += 1;
-                    energy3 = l_mac(energy3, rr[r13], 2);
+                    energy3 = accumulate(energy3, rr[r13], 2);
                     r13 += 1;
-                    energy3 = l_mac(energy3, rr[r23], 2);
+                    energy3 = accumulate(energy3, rr[r23], 2);
                     r23 += 1;
                     let energy = extract_l(l_shr(energy3, 5));
 
@@ -440,12 +459,12 @@ fn search_pulses(
 
                 for i3 in (4..SUBFRAME_SAMPLES).step_by(STEP) {
                     let correlation3 = add(correlation2, projections[i3]);
-                    let mut energy3 = l_mac(energy2, rr[RR44 + (i3 - 4) / STEP], 1);
-                    energy3 = l_mac(energy3, rr[r04], 2);
+                    let mut energy3 = accumulate(energy2, rr[RR44 + (i3 - 4) / STEP], 1);
+                    energy3 = accumulate(energy3, rr[r04], 2);
                     r04 += 1;
-                    energy3 = l_mac(energy3, rr[r14], 2);
+                    energy3 = accumulate(energy3, rr[r14], 2);
                     r14 += 1;
-                    energy3 = l_mac(energy3, rr[r24], 2);
+                    energy3 = accumulate(energy3, rr[r24], 2);
                     r24 += 1;
                     let energy = extract_l(l_shr(energy3, 5));
 

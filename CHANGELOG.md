@@ -31,14 +31,51 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   held by both directions — the reference keeps a file-scope copy per direction, and sharing the type
   is what keeps them in step without coupling them.
 
-  **Annex B (VAD/DTX/CNG) is not implemented.** RFC 3555 §4.1.13 makes `annexb=yes` the default when
-  the attribute is absent, so a transcoded leg must be offered and answered with
-  `a=fmtp:18 annexb=no`; honouring `annexb=` on both legs is still to come. Until it does, a
-  two-octet silence-insertion descriptor is refused rather than decoded as a truncated speech frame,
-  which would put full-level noise on the call; the media pipeline drops it and counts the failure,
-  so such a call carries its speech and plays silence through the peer's discontinuous transmission
-  instead of comfort noise. Relaying is unaffected. Annex A needs nothing — it is a reduced-complexity
-  encoder whose bitstream the base decoder reads.
+  **Annex B — voice-activity detection, discontinuous transmission and comfort noise — is included**,
+  and is bit-exact too: all six `annexb` sequences decode to their `.out` and all four that ship a
+  `.bin` encode to their `.bit`. An inactive frame becomes a two-octet silence descriptor or nothing
+  at all, and the decoder makes the background the descriptor last described, stepping the level
+  rather than jumping so both ends stay together frame for frame. Exactly one thing in that port is
+  not obvious from the base codec and only the vectors would have caught it: the adaptive postfilter
+  must skip its harmonic filter on an inactive frame, or the search finds a pitch in the random
+  comfort-noise excitation and the background buzzes.
+
+  RFC 3555 §4.1.13 makes `annexb=yes` the default when the attribute is absent, and the engine
+  follows that rather than the convenient reading: a peer that sends no `a=fmtp:18 annexb=` is taken
+  to want Annex B, and only an explicit `annexb=no` turns discontinuous transmission off for what the
+  engine sends. Descriptors are decoded whatever the leg negotiated. A frame the encoder chooses not
+  to send produces no RTP packet; the engine states its own posture explicitly in every G.729 answer
+  it presents rather than leaving it implied, since the parameter's default means silence is itself a
+  declaration. The egress timestamp still advances, because the audio happened,
+  while the sequence number does not, because a skipped frame is not a lost one and counting it as
+  loss would corrupt the peer's RFC 3550 §6.4.1 reception report.
+
+  Annex A needs nothing of its own — it is a reduced-complexity encoder whose bitstream the base
+  decoder reads (ITU-T G.729 Annex A §A.1).
+
+  Two signalling gaps went with it, both of which would have read downstream as "unknown or
+  unsupported codec" on a call the engine could carry. **Payload type 18 was missing from the RFC
+  3551 §6 static table**, so an offer of `m=audio 5004 RTP/AVP 18 8` with no `a=rtpmap` — legal, and
+  common from gateways — resolved to the peer's *second* codec, and an offer of 18 alone resolved to
+  nothing. And the annex spellings gateways put in the rtpmap (`G729A`, `G729B`, `G729AB`) were
+  refused outright; they now fold onto the one registered encoding name, since they are the same
+  bitstream family and Annex B is chosen by `annexb=` rather than by the name.
+
+  Every egress path that can carry a codec in discontinuous transmission now sends no packet for a
+  frame the encoder declined, rather than an empty datagram: the transcode pipeline, the conference
+  room and `MediaLeg::encode_rtp`. All three keep the egress clock across the gap and none advances
+  the sequence number.
+
+  **Encoding is 21 % faster than it landed** — 97.5 µs to 76.8 µs per 20 ms packet, and 48.1 µs to
+  27.3 µs on the inactive path a call on hold spends its time in. The open-loop pitch correlation and
+  the autocorrelation's lag terms are wrapping-`i32` SIMD dot products rather than saturating
+  accumulations, which is exact rather than approximate: both callers first scale their input until a
+  total energy fits in 32 bits, and Cauchy-Schwarz then bounds every correlation inside that window
+  by it, so the saturating operator's guard can never fire. The equivalence is a `debug_assert`
+  against the loop it replaces, so every conformance run re-proves it. What is *not* vectorised is
+  deliberate and recorded: the synthesis filter's saturation is load-bearing — the `overflow`
+  sequence exists because the decoder reacts to it — and the two inverse filters accumulate products
+  with no provable bound.
 
 ## [0.6.0] — 2026-09-13
 

@@ -6,7 +6,9 @@
 //! next: the excitation history the adaptive codebook reaches into, the synthesis filter's memory,
 //! the pitch-sharpening factor, and the two gain values an erased frame falls back on.
 
-use super::bitstream::{FrameParameters, FRAME_SAMPLES, SUBFRAME_SAMPLES};
+use super::bitstream::{FrameParameters, SilenceParameters, FRAME_SAMPLES, SUBFRAME_SAMPLES};
+use super::cng::{Random, INITIAL_SEED};
+use super::deccng::ComfortNoiseDecoder;
 use super::excitation::{
     adaptive_codebook, clamp_sharpening, decode_first_lag, decode_second_lag, fixed_codebook,
     sharpen, GainDecoder, PitchLag, EXCITATION_HISTORY, PITCH_MAX, SHARP_MIN,
@@ -14,7 +16,8 @@ use super::excitation::{
 use super::filter::{syn_filt, ORDER};
 use super::lpcfunc::{interpolate_subframe_filters, COEFFICIENTS};
 use super::lspdec::LspDecoder;
-use crate::itu::basic_ops::{add, extract_l, l_add, l_mac, l_mult, l_shl, l_shr, round_word, shr};
+use super::sidlsf::SpectrumIndices;
+use crate::itu::basic_ops::{add, l_mac, l_mult, l_shl, norm_l, round_word, shr, sub};
 
 /// The excitation buffer: history the adaptive codebook reaches into, then the frame itself.
 const EXCITATION_LENGTH: usize = EXCITATION_HISTORY + FRAME_SAMPLES;
@@ -24,23 +27,22 @@ const INITIAL_LSP: [i16; ORDER] = [
     30_000, 26_000, 21_000, 15_000, 8000, 0, -8000, -15_000, -21_000, -26_000,
 ];
 
-/// The reference's `Random()`: a linear congruential generator whose only job is to fill in a
-/// codebook index for an erased frame, so that a lost packet gives noise rather than a repeat.
-#[derive(Debug, Clone)]
-struct Noise {
-    seed: i16,
-}
-
-impl Noise {
-    fn new() -> Self {
-        Self { seed: 21_845 }
-    }
-
-    fn next(&mut self) -> i16 {
-        // seed = seed * 31821 + 13849, in the reference's fixed-point form.
-        self.seed = extract_l(l_add(l_shr(l_mult(self.seed, 31_821), 1), 13_849));
-        self.seed
-    }
+/// What arrived for one frame.
+///
+/// Annex B puts three things on the wire where the base codec put one: ten octets of speech, two
+/// octets describing the background, or nothing at all. The fourth case is not on the wire — it is
+/// the jitter buffer saying a frame that should have arrived did not, which only it knows.
+#[derive(Debug, Clone, Copy)]
+pub enum FrameInput<'a> {
+    /// A ten-octet speech frame.
+    Speech(&'a FrameParameters),
+    /// A two-octet silence descriptor.
+    Silence(&'a SilenceParameters),
+    /// An Annex B untransmitted frame: the sender is in discontinuous transmission and the
+    /// background has not changed.
+    Untransmitted,
+    /// Nothing arrived.
+    Lost,
 }
 
 /// The G.729 decoder's per-call state.
@@ -48,7 +50,16 @@ impl Noise {
 pub struct Decoder {
     lsp: LspDecoder,
     gains: GainDecoder,
-    noise: Noise,
+    noise: Random,
+    /// Comfort noise, and the generator it shares with the encoder.
+    comfort: ComfortNoiseDecoder,
+    comfort_random: Random,
+    /// Whether the previous frame carried speech, which decides how a lost frame is treated and
+    /// whether the comfort-noise level jumps or steps.
+    previous_was_speech: bool,
+    /// Energy of the last decoded frame's excitation and its exponent, which recovers a level when
+    /// the first silence descriptor of a silence is lost.
+    saved_energy: (i16, i16),
     /// Past excitation, long enough for the deepest pitch lag the bitstream can express.
     excitation: [i16; EXCITATION_LENGTH],
     /// The synthesis filter's memory between subframes.
@@ -77,7 +88,11 @@ impl Decoder {
         Self {
             lsp: LspDecoder::new(),
             gains: GainDecoder::new(),
-            noise: Noise::new(),
+            noise: Random::new(21_845),
+            comfort: ComfortNoiseDecoder::new(),
+            comfort_random: Random::new(INITIAL_SEED),
+            previous_was_speech: true,
+            saved_energy: (0, 1),
             excitation: [0; EXCITATION_LENGTH],
             synthesis_memory: [0; ORDER],
             previous_lsp: INITIAL_LSP,
@@ -96,7 +111,7 @@ impl Decoder {
     /// whether a concealed frame leans on its periodic or its noise-like contribution.
     ///
     /// Returns the synthesised frame and the per-subframe LP filters, which the postfilter needs.
-    pub fn decode_frame(
+    fn decode_speech(
         &mut self,
         parameters: Option<&FrameParameters>,
         voicing: i16,
@@ -204,42 +219,156 @@ impl Decoder {
             }
 
             // ---- synthesis --------------------------------------------------------------------
-            let mut output = [0_i16; SUBFRAME_SAMPLES];
-            let overflow = syn_filt(
+            self.synthesise(filter, offset, &mut synthesis, start);
+        }
+
+        (synthesis, filters, first_lag.integer)
+    }
+
+    /// Decode one frame, whatever kind arrived.
+    ///
+    /// `voicing` is the previous frame's postfilter voicing decision, which decides whether a
+    /// concealed speech frame leans on its periodic or its noise-like contribution.
+    ///
+    /// Returns the synthesised frame, the per-subframe LP filters the postfilter needs, and the
+    /// first subframe's pitch lag.
+    pub fn decode_frame(
+        &mut self,
+        input: FrameInput<'_>,
+        voicing: i16,
+    ) -> ([i16; FRAME_SAMPLES], [[i16; COEFFICIENTS]; 2], i16) {
+        // A frame that never arrived is concealed as speech only if the frame before it was speech.
+        // In the middle of a silence there was nothing to lose: the sender is in discontinuous
+        // transmission and the right answer is to keep making the background it last described.
+        let speech = match input {
+            FrameInput::Speech(_) => true,
+            FrameInput::Lost => self.previous_was_speech,
+            FrameInput::Silence(_) | FrameInput::Untransmitted => false,
+        };
+
+        let result = if speech {
+            // Every speech frame re-seeds the comfort-noise generator, so that both ends start the
+            // next silence from the same point however long the talk spurt was.
+            self.comfort_random.reseed(INITIAL_SEED);
+            let parameters = match input {
+                FrameInput::Speech(parameters) => Some(parameters),
+                _ => None,
+            };
+            self.decode_speech(parameters, voicing)
+        } else {
+            let descriptor = match input {
+                FrameInput::Silence(parameters) => Some((
+                    SpectrumIndices {
+                        mode: parameters.lsp_mode,
+                        stage1: parameters.lsp_stage1,
+                        stage2: parameters.lsp_stage2,
+                    },
+                    parameters.gain,
+                )),
+                _ => None,
+            };
+            self.decode_comfort(descriptor)
+        };
+
+        // The excitation this frame ended on, which recovers a level if the first descriptor of the
+        // next silence is lost. A frame that never arrived says nothing about it.
+        if !matches!(input, FrameInput::Lost) {
+            let mut energy = 0_i32;
+            for &sample in &self.excitation[EXCITATION_HISTORY..EXCITATION_HISTORY + FRAME_SAMPLES]
+            {
+                energy = l_mac(energy, sample, sample);
+            }
+            let normalisation = norm_l(energy);
+            self.saved_energy = (
+                round_word(l_shl(energy, normalisation)),
+                sub(16, normalisation),
+            );
+        }
+
+        // Shift the excitation history left by one frame, ready for the next.
+        self.excitation.copy_within(FRAME_SAMPLES.., 0);
+        self.previous_was_speech = speech;
+        result
+    }
+
+    /// One inactive frame: comfort noise at the level the last descriptor asked for, through the
+    /// filter it described.
+    fn decode_comfort(
+        &mut self,
+        descriptor: Option<(SpectrumIndices, u16)>,
+    ) -> ([i16; FRAME_SAMPLES], [[i16; COEFFICIENTS]; 2], i16) {
+        let after_speech = self.previous_was_speech;
+        let saved_energy = self.saved_energy;
+        let Self {
+            comfort,
+            lsp,
+            previous_lsp,
+            excitation,
+            comfort_random,
+            ..
+        } = self;
+        let filters = comfort.decode(
+            descriptor,
+            after_speech,
+            saved_energy,
+            lsp.predictor_mut(),
+            previous_lsp,
+            excitation,
+            EXCITATION_HISTORY,
+            comfort_random,
+        );
+
+        let mut synthesis = [0_i16; FRAME_SAMPLES];
+        for (subframe, filter) in filters.iter().enumerate() {
+            let start = subframe * SUBFRAME_SAMPLES;
+            self.synthesise(filter, EXCITATION_HISTORY + start, &mut synthesis, start);
+        }
+
+        // A silence resets the sharpening, so the first subframe of the next talk spurt does not
+        // fold in a pitch gain measured on noise.
+        self.sharp = SHARP_MIN;
+        (synthesis, filters, self.previous_lag)
+    }
+
+    /// Filter one subframe of excitation into `synthesis`, rescaling the whole excitation history
+    /// and refiltering if it saturates.
+    fn synthesise(
+        &mut self,
+        filter: &[i16; COEFFICIENTS],
+        offset: usize,
+        synthesis: &mut [i16; FRAME_SAMPLES],
+        start: usize,
+    ) {
+        let mut output = [0_i16; SUBFRAME_SAMPLES];
+        let overflow = syn_filt(
+            filter,
+            &self.excitation[offset..],
+            &mut output,
+            SUBFRAME_SAMPLES,
+            &mut self.synthesis_memory,
+            false,
+        );
+        if overflow.raised() {
+            // The excitation drove the filter past what it can represent. Scale the *whole* history
+            // down by four and synthesise again — filtering the clipped result instead would leave a
+            // burst of distortion the next subframes would then predict from. This is what the
+            // `overflow` conformance sequence exists to exercise.
+            for sample in &mut self.excitation {
+                *sample = shr(*sample, 2);
+            }
+            let _ = syn_filt(
                 filter,
                 &self.excitation[offset..],
                 &mut output,
                 SUBFRAME_SAMPLES,
                 &mut self.synthesis_memory,
-                false,
+                true,
             );
-            if overflow.raised() {
-                // The excitation drove the filter past what it can represent. Scale the *whole*
-                // history down by four and synthesise again — filtering the clipped result instead
-                // would leave a burst of distortion that the next subframes would then predict
-                // from. This is what the `overflow` conformance sequence exists to exercise.
-                for sample in &mut self.excitation {
-                    *sample = shr(*sample, 2);
-                }
-                let _ = syn_filt(
-                    filter,
-                    &self.excitation[offset..],
-                    &mut output,
-                    SUBFRAME_SAMPLES,
-                    &mut self.synthesis_memory,
-                    true,
-                );
-            } else {
-                self.synthesis_memory
-                    .copy_from_slice(&output[SUBFRAME_SAMPLES - ORDER..]);
-            }
-            synthesis[start..start + SUBFRAME_SAMPLES].copy_from_slice(&output);
+        } else {
+            self.synthesis_memory
+                .copy_from_slice(&output[SUBFRAME_SAMPLES - ORDER..]);
         }
-
-        // Shift the excitation history left by one frame, ready for the next.
-        self.excitation.copy_within(FRAME_SAMPLES.., 0);
-
-        (synthesis, filters, first_lag.integer)
+        synthesis[start..start + SUBFRAME_SAMPLES].copy_from_slice(&output);
     }
 }
 
@@ -261,9 +390,9 @@ mod tests {
         // The concealment path depends on this exact sequence, so a decoder that seeded or stepped
         // it differently would diverge from the reference only on lost frames — the case least
         // likely to be noticed and most likely to matter.
-        let mut noise = Noise::new();
+        let mut noise = Random::new(21_845);
         let first: Vec<i16> = (0..4).map(|_| noise.next()).collect();
-        let mut again = Noise::new();
+        let mut again = Random::new(21_845);
         let repeat: Vec<i16> = (0..4).map(|_| again.next()).collect();
         assert_eq!(first, repeat, "deterministic from the same seed");
         assert_ne!(first[0], first[1], "and it does advance");
@@ -275,7 +404,7 @@ mod tests {
         let frame = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22];
         let parameters = unpack(&frame).expect("ten octets");
         for _ in 0..10 {
-            let (samples, filters, _) = decoder.decode_frame(Some(&parameters), 60);
+            let (samples, filters, _) = decoder.decode_frame(FrameInput::Speech(&parameters), 60);
             assert_eq!(samples.len(), FRAME_SAMPLES);
             assert_eq!(filters[0][0], 4096, "each subframe filter is monic in Q12");
             assert_eq!(filters[1][0], 4096);
@@ -290,9 +419,9 @@ mod tests {
         let frame = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22];
         let parameters = unpack(&frame).expect("ten octets");
         for _ in 0..5 {
-            let _ = decoder.decode_frame(Some(&parameters), 60);
+            let _ = decoder.decode_frame(FrameInput::Speech(&parameters), 60);
         }
-        let (concealed, _, _) = decoder.decode_frame(None, 60);
+        let (concealed, _, _) = decoder.decode_frame(FrameInput::Lost, 60);
         assert_eq!(concealed.len(), FRAME_SAMPLES);
         assert!(
             concealed.iter().any(|&s| s != 0),
@@ -308,11 +437,11 @@ mod tests {
         let frame = [0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa];
         let parameters = unpack(&frame).expect("ten octets");
         for _ in 0..10 {
-            let _ = decoder.decode_frame(Some(&parameters), 60);
+            let _ = decoder.decode_frame(FrameInput::Speech(&parameters), 60);
         }
         let mut energies = Vec::new();
         for _ in 0..30 {
-            let (samples, _, _) = decoder.decode_frame(None, 60);
+            let (samples, _, _) = decoder.decode_frame(FrameInput::Lost, 60);
             let energy: i64 = samples.iter().map(|&s| i64::from(s) * i64::from(s)).sum();
             energies.push(energy);
         }
@@ -331,9 +460,9 @@ mod tests {
         let mut decoder = Decoder::new();
         let frame = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22];
         let parameters = unpack(&frame).expect("ten octets");
-        let _ = decoder.decode_frame(Some(&parameters), 60);
+        let _ = decoder.decode_frame(FrameInput::Speech(&parameters), 60);
         let before: Vec<i16> = decoder.excitation[FRAME_SAMPLES..EXCITATION_HISTORY].to_vec();
-        let _ = decoder.decode_frame(Some(&parameters), 60);
+        let _ = decoder.decode_frame(FrameInput::Speech(&parameters), 60);
         assert_eq!(
             decoder.excitation[..EXCITATION_HISTORY - FRAME_SAMPLES],
             before[..EXCITATION_HISTORY - FRAME_SAMPLES],

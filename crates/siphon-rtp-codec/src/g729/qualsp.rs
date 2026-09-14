@@ -49,6 +49,13 @@ impl LspQuantiser {
         }
     }
 
+    /// The predictor memory, which the Annex B silence descriptor's own quantiser shares — a
+    /// descriptor predicts from the frames before it whether those were speech or not
+    /// (`Get_freq_prev` / `Update_freq_prev`).
+    pub fn predictor_mut(&mut self) -> &mut Predictor {
+        &mut self.predictor
+    }
+
     /// Quantise one frame's line spectral pairs.
     ///
     /// Returns the two transmitted parameters — the 8-bit MA-set-and-first-stage index and the
@@ -143,7 +150,7 @@ pub fn lsp_to_lsf(lsp: &[i16; ORDER]) -> [i16; ORDER] {
 /// Each frequency's weight rises as its neighbours close in, because a narrow pair is a sharp
 /// formant and an error there is heard. The middle of the band gets a further 1.2x, which is where
 /// the ear is most sensitive.
-fn weights(lsf: &[i16; ORDER]) -> [i16; ORDER] {
+pub(super) fn weights(lsf: &[i16; ORDER]) -> [i16; ORDER] {
     let mut spacing = [0_i16; ORDER];
     spacing[0] = sub(lsf[1], add(PI_LOW, 8192));
     for i in 1..ORDER - 1 {
@@ -240,7 +247,7 @@ fn total_distortion(
 
 /// Force a minimum spacing across part of the vector (`Lsp_expand_1` / `_2` / `_1_2`, which are the
 /// same routine over different ranges).
-fn expand(buffer: &mut [i16; ORDER], gap: i16, range: std::ops::Range<usize>) {
+pub(super) fn expand(buffer: &mut [i16; ORDER], gap: i16, range: std::ops::Range<usize>) {
     for j in range {
         let difference = sub(buffer[j - 1], buffer[j]);
         let correction = crate::itu::basic_ops::shr(add(difference, gap), 1);

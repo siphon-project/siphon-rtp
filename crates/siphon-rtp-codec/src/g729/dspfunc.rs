@@ -9,7 +9,7 @@
 //! own reference.
 
 use crate::itu::basic_ops::{
-    extract_h, extract_l, l_deposit_h, l_msu, l_mult, l_shl, l_shr, l_shr_r, norm_l, sub,
+    extract_h, extract_l, l_deposit_h, l_mac, l_msu, l_mult, l_shl, l_shr, l_shr_r, norm_l, sub,
 };
 use crate::itu::tables::{ISQRT, LOG2, POW2};
 
@@ -207,5 +207,77 @@ mod tests {
             assert!(got <= previous, "1/sqrt fell then rose at {value}");
             previous = got;
         }
+    }
+}
+
+/// `Σ L_mac(·, a[i], b[i])` — the ITU accumulation of `2·a·b` — computed as a wrapping dot product
+/// and doubled.
+///
+/// The two are the same value **only** while the ITU accumulation never saturates, so every caller
+/// owes an argument that it cannot. Both of the ones here scale their input until a total energy
+/// fits in 32 bits — the open-loop pitch search over its 223-sample window, the autocorrelation over
+/// its 240-sample one — and by Cauchy-Schwarz every correlation and every partial energy inside such
+/// a window is bounded by that total. So `|2·Σab| < 2^31`, the wrapping sum is exact, and the
+/// doubling cannot overflow either.
+///
+/// A debug build checks that argument on every call against the saturating loop it replaces, so the
+/// conformance run — which is a debug run — is also a proof obligation rather than a claim.
+#[inline]
+#[must_use]
+pub fn doubled_dot(a: &[i16], b: &[i16]) -> i32 {
+    let doubled = siphon_rtp_simd::fir_dot_i16(a, b).wrapping_mul(2);
+    debug_assert_eq!(
+        doubled,
+        {
+            let mut saturating = 0_i32;
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                saturating = l_mac(saturating, x, y);
+            }
+            saturating
+        },
+        "this correlation saturated, so the wrapping dot is not equivalent to the ITU accumulation"
+    );
+    doubled
+}
+
+#[cfg(test)]
+mod dot_tests {
+    use super::doubled_dot;
+    use crate::itu::basic_ops::l_mac;
+    use proptest::prelude::*;
+
+    /// The ITU accumulation the wrapping dot replaces.
+    fn saturating(a: &[i16], b: &[i16]) -> i32 {
+        let mut accumulator = 0_i32;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            accumulator = l_mac(accumulator, x, y);
+        }
+        accumulator
+    }
+
+    proptest! {
+        /// Over the domain the callers guarantee — a total energy that fits, so no partial sum can
+        /// saturate — the wrapping dot is the ITU accumulation exactly. The bound below is generous:
+        /// 240 terms of ±2^11 reach 2^30, which is still inside what the callers admit.
+        #[test]
+        fn the_wrapping_dot_matches_the_itu_accumulation_where_it_cannot_saturate(
+            values in proptest::collection::vec(-2048_i16..=2047, 1..240),
+            offsets in proptest::collection::vec(-2048_i16..=2047, 1..240),
+        ) {
+            let length = values.len().min(offsets.len());
+            let (a, b) = (&values[..length], &offsets[..length]);
+            prop_assert_eq!(doubled_dot(a, b), saturating(a, b));
+        }
+    }
+
+    #[test]
+    fn a_vector_against_itself_is_twice_its_energy() {
+        // The energy form the open-loop search uses, where the identity is easiest to state.
+        let values: Vec<i16> = (0..80).map(|i| ((i * 37) % 2000 - 1000) as i16).collect();
+        let expected: i32 = values
+            .iter()
+            .map(|&v| 2 * i32::from(v) * i32::from(v))
+            .sum();
+        assert_eq!(doubled_dot(&values, &values), expected);
     }
 }
