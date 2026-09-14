@@ -670,6 +670,14 @@ XDP path rides `aya`. Do not add a C-linking dependency.
   3GPP test range (MCC 001 / MNC 01) and RFC 5737 / RFC 1918 addresses for examples.
 - If you touch the latch / source-gate / NAT / ICE / SRTP path or the `ForwardRule` model, update
   [docs/security-and-nat.md](docs/security-and-nat.md) in the same change.
+- **Size limits.** A function over 300 code lines fails clippy (`too_many_lines`), and a source file
+  over 1,500 production lines (everything above its last `#[cfg(test)]`) fails the `repo hygiene`
+  workflow. An oversized function that is debt carries
+  `#[expect(clippy::too_many_lines, reason = "…")]`, which starts failing once the function is split
+  under the limit, so the marker cannot outlive the debt. A codec reference port, whose function
+  boundaries mirror the spec's C so it can be diffed against it, carries a plain
+  `#[allow(clippy::too_many_lines)]` instead. Files already over the limit are allowlisted in
+  `.github/workflows/hygiene.yml` at their current size and may only shrink.
 
 ## Submitting a change
 

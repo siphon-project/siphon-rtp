@@ -253,6 +253,7 @@ fn scale_sig(x: &mut [i16], lg: usize, exp: i16) {
 /// Encode one 20 ms speech frame (`coder()`), modes 0..=8, non-DTX. The 16 kHz input `speech16k`
 /// (320 samples) is encoded into `prms` (`nb_of_bits[mode]` `BIT_0`/`BIT_1` words, encoder order).
 /// Returns the number of parameter bits written.
+#[allow(clippy::too_many_lines)]
 pub fn coder(state: &mut EncoderState, mode: u8, speech16k: &[i16], prms: &mut [i16]) -> usize {
     let ser_size = NB_OF_BITS[mode as usize];
     let mut pos = 0usize; // parameter write cursor into prms

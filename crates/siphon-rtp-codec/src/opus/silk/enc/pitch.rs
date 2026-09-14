@@ -426,6 +426,7 @@ fn calc_energies_stage3(
 /// Both are in 0..=1.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub fn pitch_analysis_core(
     frame: &[f32],
     ltp_correlation: f32,

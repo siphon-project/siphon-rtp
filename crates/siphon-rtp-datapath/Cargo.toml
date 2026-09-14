@@ -38,3 +38,6 @@ criterion = { workspace = true }
 [[bench]]
 name = "dispatch_bench"
 harness = false
+
+[lints]
+workspace = true

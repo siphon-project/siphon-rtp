@@ -48,3 +48,6 @@ harness = false
 [[bench]]
 name = "codec_iai"
 harness = false
+
+[lints]
+workspace = true

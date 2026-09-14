@@ -310,6 +310,7 @@ impl Coverage {
 }
 
 /// Decode one stream's LP-layer side info and compare it, packet by packet, against the dump.
+#[allow(clippy::too_many_lines)]
 fn check_stream(
     packets: &[BitPacket],
     trace: &BTreeMap<usize, Vec<TraceEvent>>,

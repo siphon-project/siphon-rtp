@@ -21,3 +21,6 @@ categories = ["network-programming"]
 # 1071 recompute. Never compiled for downstream (the no_std kernel program pulls no dev-deps).
 [dev-dependencies]
 proptest = { workspace = true }
+
+[lints]
+workspace = true

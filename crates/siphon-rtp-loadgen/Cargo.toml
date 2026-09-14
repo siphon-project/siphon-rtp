@@ -57,3 +57,6 @@ futures-util = { workspace = true }
 [dev-dependencies]
 io-uring = { version = "0.7", default-features = false }
 libc = "0.2"
+
+[lints]
+workspace = true

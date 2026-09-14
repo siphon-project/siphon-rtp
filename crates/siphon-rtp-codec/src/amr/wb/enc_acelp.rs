@@ -1290,6 +1290,7 @@ fn search_ixiy(
 /// 4-track algebraic codebook search (`c4t64fx.c` `ACELP_4t64_fx`). Writes `code`/`y` (Q9) and the
 /// per-track indices to `index`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub fn acelp_4t64_search(
     dn: &mut [i16],
     cn: &[i16],

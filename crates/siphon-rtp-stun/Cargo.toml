@@ -27,3 +27,6 @@ proptest = { workspace = true }
 [[bench]]
 name = "stun_client"
 harness = false
+
+[lints]
+workspace = true

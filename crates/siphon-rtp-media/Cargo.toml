@@ -75,3 +75,6 @@ harness = false
 [[bench]]
 name = "text_mixer_bench"
 harness = false
+
+[lints]
+workspace = true
