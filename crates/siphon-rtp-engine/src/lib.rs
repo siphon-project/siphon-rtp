@@ -28,6 +28,7 @@ pub mod media_pipeline;
 pub mod metrics;
 pub mod prompt_cache;
 pub mod recording;
+mod reply_latch;
 pub mod sdp;
 pub mod server;
 pub mod shutdown;

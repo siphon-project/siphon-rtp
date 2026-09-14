@@ -48,8 +48,8 @@ jobs:
           threshold=1500
           # path  max production lines  # why
           allowlist='
-          crates/siphon-rtp-engine/src/media_pipeline.rs 4119 # large, no function over 250 lines
-          crates/siphon-rtp-engine/src/conference.rs 2685 # large, no function over 250 lines
+          crates/siphon-rtp-engine/src/media_pipeline.rs 4133 # large, no function over 250 lines
+          crates/siphon-rtp-engine/src/conference.rs 2712 # large, no function over 250 lines
           crates/siphon-rtp-engine/src/sdp.rs 2144 # large, no function over 250 lines
           crates/siphon-rtp-dsp/src/aec.rs 2554 # one algorithm
           crates/siphon-rtp-proto/src/lib.rs 2068 # the control contract, type definitions

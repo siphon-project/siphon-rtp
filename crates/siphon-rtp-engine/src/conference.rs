@@ -26,7 +26,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 
 use siphon_rtp_codec::{Decoder, Encoder};
-use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{rtp_media_ssrc, Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_dsp::EnergyVad;
 use siphon_rtp_media::dtmf::DtmfDetector;
@@ -46,7 +46,8 @@ use siphon_rtp_media::text_mixer::{
 use siphon_rtp_proto::{Event, PlayEndReason};
 use siphon_rtp_srtp::leg::SecureLeg;
 
-use crate::media_pipeline::{Outbound, PlayRequest, SymmetricLatch};
+use crate::media_pipeline::{Outbound, PlayRequest};
+use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
 /// The narrowband fast-path room rate (all-G.711/G.726/PSTN, unbridged).
 pub const NARROWBAND_RATE_HZ: u32 = 8_000;
@@ -853,6 +854,29 @@ impl Conference {
         } else {
             &packet.data
         };
+        // Layer 3 — constrained, SSRC-consistent latch (docs/security-and-nat.md §4 layer 3; RFC 3550
+        // §8), decided after SRTP unprotect above (a forged packet was already dropped) and before the
+        // packet is consumed: a new source that cannot prove it is this participant's stream is
+        // dropped, never mixed and never counted as activity, exactly as the datapath's `Forward` path
+        // drops it; an accepted stream aims the reply at the latched source.
+        if participant.latch {
+            match participant
+                .reverse_latch
+                .admit(packet.source, rtp_media_ssrc(data))
+            {
+                ReplyLatch::Reject => {
+                    tracing::debug!(
+                        source = %packet.source,
+                        conference = %conference_id,
+                        "conference dropped a packet from a new source that could not prove it is \
+                         the latched stream"
+                    );
+                    return false;
+                }
+                ReplyLatch::Accept(Some(dst)) => participant.egress_dst = dst,
+                ReplyLatch::Accept(None) => {}
+            }
+        }
         if data.len() < 2 {
             return true; // gated in; too short to be audio, but the path is alive
         }
@@ -893,18 +917,6 @@ impl Conference {
         let Ok(parsed) = RtpPacket::parse(data) else {
             return true;
         };
-        // Layer 3 — constrained, SSRC-consistent latch (docs/security-and-nat.md §4 layer 3; RFC 3550
-        // §8): learn the reply address from an accepted stream only *after* SRTP unprotect above (a
-        // forged packet was already dropped) and only when the source is SSRC-consistent — a new
-        // source carrying a different SSRC (a hijack spray) never re-points the reply.
-        if participant.latch {
-            if let Some(dst) = participant
-                .reverse_latch
-                .observe(packet.source, parsed.ssrc)
-            {
-                participant.egress_dst = dst;
-            }
-        }
         // RFC 4733 telephone-event: never feed DTMF to the audio decoder (it would mangle the mix);
         // detect the key press and surface it on the control channel instead.
         if Some(parsed.payload_type) == participant.telephone_event_in {
@@ -979,16 +991,31 @@ impl Conference {
             } else {
                 &packet.data
             };
+            // Layer 3 — constrained, SSRC-consistent latch (§4 layer 3; RFC 3550 §8), decided on the
+            // plaintext before anything reassembles or mixes it: a new source that cannot prove it is
+            // this participant's text stream is dropped and not counted as activity, and an accepted
+            // stream aims the text reply address at the latched source.
+            if text.latch {
+                match text
+                    .reverse_latch
+                    .admit(packet.source, rtp_media_ssrc(plaintext))
+                {
+                    ReplyLatch::Reject => {
+                        tracing::debug!(
+                            source = %packet.source,
+                            conference = %self.conference_id,
+                            "conference dropped a text packet from a new source that could not prove \
+                             it is the latched stream"
+                        );
+                        return false;
+                    }
+                    ReplyLatch::Accept(Some(dst)) => text.egress_dst = dst,
+                    ReplyLatch::Accept(None) => {}
+                }
+            }
             let Ok(parsed) = RtpPacket::parse(plaintext) else {
                 return true; // gated in; not a parseable RTP packet
             };
-            // Layer 3 — constrained, SSRC-consistent latch (§4 layer 3; RFC 3550 §8): only an
-            // SSRC-consistent stream re-points the text reply address.
-            if text.latch {
-                if let Some(dst) = text.reverse_latch.observe(packet.source, parsed.ssrc) {
-                    text.egress_dst = dst;
-                }
-            }
             // Classify the payload: RED (RFC 2198) vs bare T.140 (RFC 4103 §4). Anything else on this
             // endpoint is gated-in but not distributed (it is not text).
             let is_red = Some(parsed.payload_type) == text.red_payload_type;
@@ -4096,6 +4123,55 @@ mod tests {
         assert!(
             frame_energy(&decode_ulaw(&party_one.data)) < VAD_THRESHOLD,
             "the spoofed source was rejected → the listener hears silence"
+        );
+    }
+
+    #[test]
+    fn a_symmetric_seat_drops_a_wrong_ssrc_spray_instead_of_mixing_it() {
+        // docs/security-and-nat.md §4 layer 3: a `symmetric` seat runs its gate open, so the latch is
+        // the only constraint left. Party 0 latches its own quiet stream; an attacker then sprays loud
+        // audio under another SSRC from an address party 0 never sent from. The latch rejects it, so
+        // it is dropped rather than mixed and party 1 hears silence, the same drop the datapath's
+        // Forward path makes.
+        let mut conference = Conference::new("room".into(), 0);
+        let mut symmetric = ulaw_config(0, "10.0.0.1", "10.0.0.1:4000");
+        symmetric.accepted_source = SourceFilter::Any;
+        symmetric.latch = true;
+        conference.add_participant(symmetric);
+        conference.add_participant(ulaw_config(1, "10.0.0.2", "10.0.0.2:4000"));
+
+        let quiet = [0i16; 160];
+        assert!(
+            conference.ingest(&rx(1, "10.0.0.1:7000", ulaw_rtp(0, 0, &quiet))),
+            "party 0's own stream latches"
+        );
+        let loud = [6000i16; 160];
+        for sequence in 1..10 {
+            let mut spray = ulaw_rtp(0, sequence, &loud);
+            spray[8..12].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
+            assert!(
+                !conference.ingest(&rx(1, "10.0.0.99:5000", spray)),
+                "a rejected source is not activity"
+            );
+        }
+        assert_eq!(
+            conference.participants[0].egress_dst,
+            addr("10.0.0.1:7000"),
+            "the spray never moves the reply"
+        );
+
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.clear();
+            conference.tick(&mut out);
+        }
+        let party_one = out
+            .iter()
+            .find(|datagram| datagram.endpoint == EndpointId(2))
+            .expect("party 1 egress");
+        assert!(
+            frame_energy(&decode_ulaw(&party_one.data)) < VAD_THRESHOLD,
+            "the spray never entered the mix"
         );
     }
 

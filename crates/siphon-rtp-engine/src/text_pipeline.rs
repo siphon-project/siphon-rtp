@@ -36,16 +36,15 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{rtp_media_ssrc, Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_media::pcap::CapturedPacket;
 use siphon_rtp_media::rtp::RtpPacket;
 use siphon_rtp_media::t140::T140Reassembler;
 use siphon_rtp_proto::{Event, TextStreamStats};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
-use siphon_rtp_datapath::rtp_media_ssrc;
-
-use crate::media_pipeline::{Outbound, PcapCapture, SymmetricLatch};
+use crate::media_pipeline::{Outbound, PcapCapture};
+use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 
 /// One direction of the text relay: the sending party's ingress text endpoint (+ its RTPBleed gate and
 /// symmetric latch), the peer's egress text endpoint/address, and the RFC 4103 reassembler + content
@@ -280,7 +279,7 @@ impl TextCall {
     /// Process one redirected text datagram: enforce the source gate, forward it verbatim to the peer,
     /// observe it (Event::Text + QoS), capture it (recording), and drive the symmetric latch. Returns
     /// `true` when the packet was accepted (so the actor stamps datapath activity for the timeout
-    /// sweep), `false` when the source gate dropped it or it was for an unowned endpoint.
+    /// sweep), `false` when the source gate or the latch dropped it or it was for an unowned endpoint.
     pub fn process(
         &mut self,
         packet: &RxPacket,
@@ -378,6 +377,30 @@ impl TextCall {
             &packet.data
         };
 
+        // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3; RFC 3550 §8), decided on the
+        // plaintext: after SRTP auth, so a forged packet never reaches it, and before anything forwards
+        // or observes the packet, so a new source that cannot prove it is the latched stream is dropped
+        // outright (no forward, no `Event::Text`, no activity), exactly as the datapath's `Forward` path
+        // drops it. An accepted stream aims the reverse direction's egress at the latched source.
+        if *latch {
+            match direction
+                .source_latch
+                .admit(packet.source, rtp_media_ssrc(plaintext))
+            {
+                ReplyLatch::Reject => {
+                    tracing::debug!(
+                        target: "siphon_rtp::text",
+                        source = %packet.source,
+                        "text-pipeline dropped a packet from a new source that could not prove it is \
+                         the latched stream"
+                    );
+                    return false;
+                }
+                ReplyLatch::Accept(Some(new_dst)) => reverse.egress_dst = new_dst,
+                ReplyLatch::Accept(None) => {}
+            }
+        }
+
         // Egress toward the peer text endpoint: encrypt with the *receiving* leg's own key when that
         // side is secure (a secure↔secure text bridge re-keys per leg), else forward the plaintext
         // verbatim (RFC 4103 transparent relay — observe, don't transform; the 1000 Hz clock passes
@@ -417,18 +440,6 @@ impl TextCall {
         // (Event::Text, the CDR counters, and the recording all see cleartext text — observe after
         // decrypt, before encrypt.)
         direction.observe(plaintext, call_id, events);
-
-        // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3; RFC 3550 §8): only an authentic,
-        // SSRC-consistent packet re-points the reverse direction's egress to the observed source — for a
-        // secure leg that means *after* SRTP auth succeeded (a forged packet returned above), so a
-        // spoofed source can never move the latch. RTCP / non-RTP yields `None` and never moves it.
-        if *latch {
-            if let Some(ssrc) = rtp_media_ssrc(plaintext) {
-                if let Some(new_dst) = direction.source_latch.observe(packet.source, ssrc) {
-                    reverse.egress_dst = new_dst;
-                }
-            }
-        }
         true
     }
 }
@@ -983,6 +994,57 @@ mod tests {
             addr(B_ADDR),
             "A->B egress latched to B's observed source"
         );
+    }
+
+    #[test]
+    fn a_wrong_ssrc_packet_from_a_new_source_is_dropped_once_latched() {
+        // docs/security-and-nat.md §4 layer 3: on an accept-any latching call the latch is the only
+        // constraint left, so a packet it rejects is dropped (no forward, no Event::Text, no activity),
+        // exactly as the datapath's Forward path drops it.
+        let direction = |ingress: u64, egress: u64, dst: &str| TextDirectionConfig {
+            ingress_endpoint: EndpointId(ingress),
+            accepted_source: SourceFilter::Any,
+            egress_endpoint: EndpointId(egress),
+            egress_dst: addr(dst),
+            t140_payload_type: Some(T140_PT),
+            red_payload_type: Some(RED_PT),
+            secure_ingress: None,
+            secure_egress: None,
+        };
+        let mut call = TextCall::new(
+            "c",
+            "ft-a",
+            Some("tt-b".to_string()),
+            direction(NEAR_TEXT, FAR_TEXT, B_ADDR),
+            direction(FAR_TEXT, NEAR_TEXT, A_ADDR),
+            true,
+        );
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        assert!(
+            call.process(
+                &rx(NEAR_TEXT, A_ADDR, red_rtp(1, 1000, b"Hi", &[])),
+                &mut out,
+                &mut events
+            ),
+            "A's stream latches"
+        );
+        out.clear();
+        events.clear();
+
+        // Another stream (a different SSRC) from a source A never sent from.
+        let mut spray = red_rtp(2, 2000, b"Xx", &[]);
+        spray[8..12].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
+        assert!(
+            !call.process(
+                &rx(NEAR_TEXT, "127.0.0.9:7000", spray),
+                &mut out,
+                &mut events
+            ),
+            "a rejected source is not activity"
+        );
+        assert!(out.is_empty(), "nothing is forwarded to B");
+        assert!(events.is_empty(), "no text is surfaced");
     }
 
     #[test]

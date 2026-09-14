@@ -28,10 +28,7 @@ use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use siphon_rtp_codec::cn::{Cn, COMFORT_NOISE_LEVEL_DBOV};
 use siphon_rtp_codec::{Decoder, Encoder};
-use siphon_rtp_datapath::{
-    rtp_media_ssrc, source_latch_verdict, Datapath, EndpointId, RxPacket, SourceFilter,
-    SourceLatch, SourceLatchVerdict,
-};
+use siphon_rtp_datapath::{rtp_media_ssrc, Datapath, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_dsp::{EchoCanceller, NoiseSuppressor, RecordToneDetector, ToneOutcome};
 use siphon_rtp_media::dtmf::{DtmfDetector, DtmfSequence, DtmfStep};
@@ -48,6 +45,7 @@ use siphon_rtp_media::tone::{ToneGenerator, ToneSpec};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::{Event, PlayEndReason, ProfileFlags};
 
+use crate::reply_latch::{ReplyLatch, SymmetricLatch};
 use crate::x3::X3Tap;
 
 /// The playout-clock tick driving injected media (PlayMedia / PlayDtmf): one egress packet per
@@ -241,34 +239,6 @@ pub(crate) fn validate_echo_delay_search_ms(profile: &ProfileFlags) -> Result<()
         "echo-delay-search-range: echo_delay_search_ms must be {low}-{high} ms (got {requested}); \
          it is {meaning}"
     ))
-}
-
-/// The SSRC-consistent symmetric-RTP latch for a `Redirect`-path leg: the datapath's own state
-/// machine, [`source_latch_verdict`], held per direction (docs/security-and-nat.md §4 layer 3; RFC
-/// 3550 §8, RFC 4961). The reverse egress destination follows a genuine NAT rebind (a new source that
-/// keeps the stream's SSRC) but resists a hijack spray (a new source with a different SSRC). Only
-/// **authenticated** RTP is ever offered here — on a secure leg the caller offers a packet only
-/// *after* SRTP `unprotect` succeeds — so a forged, auth-failing packet can never move the reply
-/// direction (the fix for the pre-auth, no-SSRC-check re-latch).
-#[derive(Default)]
-pub(crate) struct SymmetricLatch {
-    latch: Option<SourceLatch<SocketAddr>>,
-}
-
-impl SymmetricLatch {
-    /// Offer an accepted RTP packet's `source` and `ssrc`. Returns `Some(source)` when the reverse
-    /// egress should be (re)pointed there, or `None` to keep the current latch (a likely hijack: a new
-    /// source carrying a different SSRC than the latched stream).
-    pub(crate) fn observe(&mut self, source: SocketAddr, ssrc: u32) -> Option<SocketAddr> {
-        match source_latch_verdict(self.latch, source, Some(ssrc)) {
-            SourceLatchVerdict::Keep => Some(source),
-            SourceLatchVerdict::Learn(latch) => {
-                self.latch = Some(latch);
-                Some(source)
-            }
-            SourceLatchVerdict::Reject => None,
-        }
-    }
 }
 
 /// A preallocated FIFO of far-end **reference** PCM: the egress samples one direction produced toward
@@ -1862,20 +1832,22 @@ impl Direction {
     }
 
     /// Transform one accepted datagram for this direction, appending any outbound datagrams and DTMF
-    /// events. `source`-gating and latching are the caller's responsibility (it owns both directions).
+    /// events. `source`-gating is the caller's responsibility (it owns both directions); the reply
+    /// latch is decided here, because only here is the packet both authenticated and not yet consumed.
     /// `arrival_micros` is the datapath's receive-time stamp on the datagram, folded into the ingress
     /// interarrival-jitter estimate (RFC 3550 §6.4.1) that feeds this direction's quality report.
     ///
-    /// Returns `Some(ssrc)` when the datagram is an **authentic** RTP media/telephone-event packet
-    /// (post SRTP `unprotect` on a secure leg) — the caller then offers it to the reverse direction's
-    /// [`SymmetricLatch`] so the reply follows a NAT rebind. Returns `None` for a packet that must
-    /// never move the latch: a failed-auth SRTP packet, RTCP, or a malformed/too-short datagram
-    /// (docs/security-and-nat.md §4 layer 3 — the reply direction only ever follows an authenticated
-    /// stream).
+    /// Returns [`ReplyLatch::Reject`] when `latch` is set and the packet comes from a new source that
+    /// cannot prove it is the latched stream: it was dropped before the tee, the interception tap, the
+    /// relay and the decode, and the caller must not count it as activity. Otherwise
+    /// [`ReplyLatch::Accept`], carrying the address the reverse direction should reply to when the
+    /// latch has one (docs/security-and-nat.md §4 layer 3). A failed-auth SRTP packet never reaches
+    /// the latch at all.
     fn handle(
         &mut self,
         data: &[u8],
         source: SocketAddr,
+        latch: bool,
         arrival_micros: u64,
         leg_meta: LegMeta<'_>,
         // The far-end reference for this direction's echo canceller: the *opposite* direction's egress
@@ -1884,28 +1856,28 @@ impl Direction {
         echo_reference: Option<&mut EchoReference>,
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
-    ) -> Option<u32> {
+    ) -> ReplyLatch {
         if data.len() < 2 {
-            return None;
+            return ReplyLatch::Accept(None);
         }
         // A DTLS leg whose handshake has not keyed it yet: drop, never interpret. Decoding SRTP as
         // plaintext would emit noise at the peer, and forwarding it verbatim would leak the encrypted
         // stream to a party that never negotiated it (docs/security-and-nat.md §4).
         if self.secure_pending {
-            return None;
+            return ReplyLatch::Accept(None);
         }
         // Secure ingress (SDES-SRTP): decrypt before anything else, so the tee / relay / RFC 5761
         // demux / decode all operate on plaintext. SecureLeg auto-demuxes SRTP vs SRTCP. A failed
-        // unprotect (bad auth / replay / wrong key) drops the datagram — never forward garbage, and
-        // (crucially) returns `None` so an inauthentic packet never moves the reverse latch.
+        // unprotect (bad auth / replay / wrong key) drops the datagram — never forward garbage — and
+        // (crucially) before the reply latch below, so an inauthentic packet never reaches it.
         let decrypted;
         let data: &[u8] = if let Some(leg) = self.secure_ingress.as_ref() {
             let mut plain = Vec::new();
             let Ok(mut guard) = leg.lock() else {
-                return None;
+                return ReplyLatch::Accept(None);
             };
             if guard.unprotect(data, &mut plain).is_err() {
-                return None;
+                return ReplyLatch::Accept(None);
             }
             drop(guard);
             decrypted = plain;
@@ -1913,6 +1885,14 @@ impl Direction {
         } else {
             data
         };
+        // Layer 3, the SSRC-consistent reply latch (docs/security-and-nat.md §4 layer 3; RFC 3550 §8):
+        // after the decrypt, so only an authenticated packet reaches it, and before the tee, the tap,
+        // the relay and the decode below, so a packet it rejects is dropped outright rather than
+        // merely kept from moving the reply, exactly as the datapath's `Forward` path drops it.
+        let admitted = self.admit_to_reply_latch(latch, source, data);
+        if admitted == ReplyLatch::Reject {
+            return admitted;
+        }
         // SIPREC raw tee (RFC 7866 §6): copy the original ingress RTP/RTCP/DTMF byte-for-byte to each
         // subscriber's SRS before any transcode/relay. The SRS records the leg's *actual* media in its
         // negotiated codec — independent of hold/mute/transcode on the A↔B path.
@@ -1962,7 +1942,7 @@ impl Direction {
                             });
                         }
                     }
-                    return None;
+                    return admitted;
                 }
             }
             if !self.blocked {
@@ -1972,14 +1952,14 @@ impl Direction {
                     data: Bytes::copy_from_slice(data),
                 });
             }
-            // A promoted-passthrough leg still latches the reply symmetrically: offer the verbatim
-            // packet's SSRC (RTP only; RTCP/non-RTP yields `None` and never moves the latch).
-            return rtp_media_ssrc(data);
+            // A promoted-passthrough leg latches the reply symmetrically too; `admitted` says where.
+            return admitted;
         }
 
         // RFC 5761 demux: payload-type byte 64..=95 marks RTCP — relay it (re-encrypting toward a
         // secure egress), untranscoded apart from the report sender SSRC. RTCP carries no per-stream
-        // SSRC at the latch offset, so it never drives the SSRC re-latch (return `None`).
+        // SSRC at the latch offset, so it never aims the reply; the latch above admitted it only from
+        // the latched source, or from anywhere before a stream was latched.
         let packet_type = data[1] & 0x7f;
         if (64..=95).contains(&packet_type) {
             // This direction re-originates RTP under `egress_ssrc`, so the party on the other end has
@@ -2007,14 +1987,13 @@ impl Direction {
                 // exactly as it arrived rather than risk a half-edited datagram on the wire.
                 self.push_egress(data, out);
             }
-            return None;
+            return admitted;
         }
 
         let Ok(parsed) = RtpPacket::parse(data) else {
-            return None; // malformed RTP — drop (never forward garbage)
+            return admitted; // malformed RTP — drop (never forward garbage)
         };
-        // The authenticated stream's SSRC (RFC 3550 §5.1) — returned so the caller re-points the
-        // reverse direction's egress only for this authentic, SSRC-consistent stream.
+        // The authenticated stream's SSRC (RFC 3550 §5.1).
         let stream_ssrc = parsed.ssrc;
 
         // Fold this RTP packet into the per-direction reception statistics (RFC 3550 §6.4.1): SSRC +
@@ -2047,16 +2026,16 @@ impl Direction {
             if !self.dtmf_blocked && self.comfort.is_none() {
                 self.relay_telephone_event(&parsed, out);
             }
-            return Some(stream_ssrc);
+            return admitted;
         }
 
         if self.blocked {
-            return Some(stream_ssrc);
+            return admitted;
         }
         // While a prompt / DTMF burst plays toward this party, suppress the transcoded audio so the
         // injection is heard cleanly (the playout clock drives the egress instead — see `tick_injection`).
         if self.injection.is_some() {
-            return Some(stream_ssrc);
+            return admitted;
         }
 
         // Decode → fold to mono → (noise suppression) → echo cancel → record/fork → (silence) →
@@ -2074,7 +2053,7 @@ impl Direction {
             events,
         );
         self.decode_scratch = scratch;
-        Some(stream_ssrc)
+        admitted
     }
 
     /// Run the record-tone ("voicemail beep") detector over one decoded ingress frame and, on a
@@ -2398,6 +2377,24 @@ impl Direction {
         }
     }
 
+    /// Offer one authenticated datagram to this direction's reply latch when the call latches
+    /// (docs/security-and-nat.md §4 layer 3); a call that does not latch accepts it and aims nothing.
+    /// Logs a rejection, so both callers drop it with the same trace.
+    fn admit_to_reply_latch(&mut self, latch: bool, source: SocketAddr, data: &[u8]) -> ReplyLatch {
+        if !latch {
+            return ReplyLatch::Accept(None);
+        }
+        let verdict = self.source_latch.admit(source, rtp_media_ssrc(data));
+        if verdict == ReplyLatch::Reject {
+            tracing::debug!(
+                %source,
+                "media-pipeline dropped a datagram from a new source that could not prove it is the \
+                 latched stream"
+            );
+        }
+        verdict
+    }
+
     /// Echo this direction's ingress audio straight back to the party that sent it (the classic echo
     /// test). `self` decodes the ingress (its decoder faces the sending party); `egress` is the
     /// direction whose egress faces that same party, used to re-encode + transmit the audio home.
@@ -2406,26 +2403,32 @@ impl Direction {
     /// the test on `#`) but are not echoed; RTCP is ignored. Both directions carry the party's single
     /// negotiated codec, so no resampling is needed — the decoded PCM feeds the egress encoder directly.
     ///
-    /// Returns `Some(ssrc)` for an authentic RTP packet (the caller offers it to the reverse latch,
-    /// exactly as [`Direction::handle`]) and `None` for RTCP / malformed input.
+    /// Decides the reply latch before anything is reflected and returns its verdict, exactly as
+    /// [`Direction::handle`] does.
     fn echo_into(
         &mut self,
         egress: &mut Direction,
         data: &[u8],
+        source: SocketAddr,
+        latch: bool,
         leg_meta: LegMeta<'_>,
         out: &mut Vec<Outbound>,
         events: &mut Vec<Event>,
-    ) -> Option<u32> {
+    ) -> ReplyLatch {
         if data.len() < 2 {
-            return None;
+            return ReplyLatch::Accept(None);
+        }
+        let admitted = self.admit_to_reply_latch(latch, source, data);
+        if admitted == ReplyLatch::Reject {
+            return admitted;
         }
         // RFC 5761 demux: ignore RTCP on the echo path (nothing to reflect).
         let packet_type = data[1] & 0x7f;
         if (64..=95).contains(&packet_type) {
-            return None;
+            return admitted;
         }
         let Ok(parsed) = RtpPacket::parse(data) else {
-            return None;
+            return admitted;
         };
         let stream_ssrc = parsed.ssrc;
         // Detect DTMF so the caller can end the echo test on a digit; do not echo the tone itself.
@@ -2441,7 +2444,7 @@ impl Direction {
                     source: None,
                 });
             }
-            return Some(stream_ssrc);
+            return admitted;
         }
         // The same preallocated decode scratch `handle` uses (`egress` is a different `Direction`, so no
         // move out of `self` is needed here — the borrows are already disjoint).
@@ -2471,7 +2474,7 @@ impl Direction {
                         "echo-path ingress frame failed to decode — audio dropped"
                     );
                 }
-                return Some(stream_ssrc);
+                return admitted;
             }
         };
         // Same single fold at the codec boundary as `handle` — the echo reflect re-encodes mono PCM.
@@ -2484,7 +2487,7 @@ impl Direction {
         self.detect_record_tone(&decoded[..samples], leg_meta, events);
         egress.emit_pcm(&decoded[..samples], parsed.marker, out);
         std::mem::swap(&mut self.decode_scratch, &mut decoded);
-        Some(stream_ssrc)
+        admitted
     }
 
     /// Repacketize a telephone-event onto the egress stream: keep the event's RTP timestamp (RFC 4733
@@ -2789,17 +2792,25 @@ impl MediaCall {
             }
             // Raw-RTP pcap capture (accepted A→B ingress, post source-gate, before any transcode).
             self.capture_ingress(true, packet.source, packet.arrival, &packet.data);
-            let latch_ssrc = if self.echo {
+            let admitted = if self.echo {
                 // Echo A back to A: decode on a_to_b (faces A), re-encode on b_to_a (egress faces A).
-                self.a_to_b
-                    .echo_into(&mut self.b_to_a, &packet.data, meta, out, events)
+                self.a_to_b.echo_into(
+                    &mut self.b_to_a,
+                    &packet.data,
+                    packet.source,
+                    self.latch,
+                    meta,
+                    out,
+                    events,
+                )
             } else {
                 // Cancel A's uplink echo against what the engine last sent *toward* A — the `b_to_a`
                 // egress reference ring (§"Reference/near-end plumbing"). Disjoint field borrows
                 // (`a_to_b` receiver, `b_to_a` reference) hand it across with no lock, as `echo_into`.
-                let latch_ssrc = self.a_to_b.handle(
+                let admitted = self.a_to_b.handle(
                     &packet.data,
                     packet.source,
+                    self.latch,
                     packet.arrival,
                     meta,
                     self.b_to_a.echo_reference.as_mut(),
@@ -2811,19 +2822,16 @@ impl MediaCall {
                 if let Some(mode) = self.a_to_b.decoder.last_mode_request() {
                     self.b_to_a.encoder.request_mode(mode);
                 }
-                latch_ssrc
+                admitted
             };
-            // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3; RFC 3550 §8): re-point the
-            // B→A reply to A's observed source only for an **authentic**, SSRC-consistent stream —
-            // after SRTP auth (a forged packet returned `None` above) and never for a new source
-            // carrying a different SSRC (a hijack). The exact-source default path is unchanged: the
-            // gate above already pinned the source to A's signalled IP.
-            if self.latch {
-                if let Some(ssrc) = latch_ssrc {
-                    if let Some(dst) = self.a_to_b.source_latch.observe(packet.source, ssrc) {
-                        self.b_to_a.egress_dst = dst;
-                    }
-                }
+            // Symmetric-RTP latch (docs/security-and-nat.md §4 layer 3; RFC 3550 §8), decided inside
+            // the direction after SRTP auth and before the packet was consumed. A new source that
+            // could not prove it is A's stream was dropped there, so it reached nobody and is not
+            // activity; an accepted stream aims the B→A reply at A's latched source.
+            match admitted {
+                ReplyLatch::Reject => return false,
+                ReplyLatch::Accept(Some(dst)) => self.b_to_a.egress_dst = dst,
+                ReplyLatch::Accept(None) => {}
             }
             // Passive per-leg RTT (RFC 3550 §6.4.1) from the plaintext RTCP this leg relays: the
             // engine↔A round trip feeds A's one-way delay so its MOS gains the delay term. A secure
@@ -2845,15 +2853,23 @@ impl MediaCall {
             }
             // Raw-RTP pcap capture (accepted B→A ingress, post source-gate, before any transcode).
             self.capture_ingress(false, packet.source, packet.arrival, &packet.data);
-            let latch_ssrc = if self.echo {
-                self.b_to_a
-                    .echo_into(&mut self.a_to_b, &packet.data, meta, out, events)
+            let admitted = if self.echo {
+                self.b_to_a.echo_into(
+                    &mut self.a_to_b,
+                    &packet.data,
+                    packet.source,
+                    self.latch,
+                    meta,
+                    out,
+                    events,
+                )
             } else {
                 // Symmetric: cancel B's uplink echo against the `a_to_b` egress reference (what the
                 // engine last sent toward B).
-                let latch_ssrc = self.b_to_a.handle(
+                let admitted = self.b_to_a.handle(
                     &packet.data,
                     packet.source,
+                    self.latch,
                     packet.arrival,
                     meta,
                     self.a_to_b.echo_reference.as_mut(),
@@ -2864,17 +2880,15 @@ impl MediaCall {
                 if let Some(mode) = self.b_to_a.decoder.last_mode_request() {
                     self.a_to_b.encoder.request_mode(mode);
                 }
-                latch_ssrc
+                admitted
             };
-            // Symmetric-RTP latch for the A→B reply, mirroring the A branch: only an authentic,
-            // SSRC-consistent B stream re-points `a_to_b.egress_dst` (docs/security-and-nat.md §4
-            // layer 3; RFC 3550 §8).
-            if self.latch {
-                if let Some(ssrc) = latch_ssrc {
-                    if let Some(dst) = self.b_to_a.source_latch.observe(packet.source, ssrc) {
-                        self.a_to_b.egress_dst = dst;
-                    }
-                }
+            // Symmetric-RTP latch for the A→B reply, mirroring the A branch: a rejected B source was
+            // dropped inside the direction, and an accepted B stream aims `a_to_b.egress_dst` at B's
+            // latched source (docs/security-and-nat.md §4 layer 3; RFC 3550 §8).
+            match admitted {
+                ReplyLatch::Reject => return false,
+                ReplyLatch::Accept(Some(dst)) => self.a_to_b.egress_dst = dst,
+                ReplyLatch::Accept(None) => {}
             }
             // Passive per-leg RTT, mirrored for the B leg (engine↔B round trip).
             if self.b_to_a.secure_ingress.is_none() && is_rtcp_datagram(&packet.data) {
@@ -4125,28 +4139,6 @@ mod tests {
     use siphon_rtp_codec::l16::L16;
     use std::net::{IpAddr, Ipv4Addr};
 
-    #[test]
-    fn the_reply_latch_keeps_the_first_ssrc_through_a_same_source_ssrc_change() {
-        // docs/security-and-nat.md §4 layer 3, the datapath's own state machine: the latched source
-        // may change SSRC and stays latched, but the change does not re-pin the latch, so only the
-        // stream's first SSRC can move the reply to a new source.
-        let first = addr(A_ADDR);
-        let rebound = addr("127.0.0.2:5002");
-        let mut latch = SymmetricLatch::default();
-        assert_eq!(latch.observe(first, 0x1111_1111), Some(first));
-        assert_eq!(latch.observe(first, 0x2222_2222), Some(first));
-        assert_eq!(
-            latch.observe(rebound, 0x2222_2222),
-            None,
-            "a later SSRC is not the rebind key"
-        );
-        assert_eq!(
-            latch.observe(rebound, 0x1111_1111),
-            Some(rebound),
-            "the first SSRC is"
-        );
-    }
-
     const A_ADDR: &str = "127.0.0.2:5000";
     const B_ADDR: &str = "127.0.0.3:6000";
 
@@ -4753,11 +4745,20 @@ mod tests {
             "the first accepted source latches the reply"
         );
 
-        // A spray from a NEW source carrying a DIFFERENT SSRC is a hijack — the reply must not move.
-        call.process(
-            &rx(1, "127.0.0.9:5000", ulaw_rtp_with_ssrc(2, 0x9999_9999)),
-            &mut out,
-            &mut events,
+        // A spray from a NEW source carrying a DIFFERENT SSRC is a hijack: dropped, not merely kept
+        // from moving the reply. Nothing reaches B, and it does not count as activity.
+        out.clear();
+        assert!(
+            !call.process(
+                &rx(1, "127.0.0.9:5000", ulaw_rtp_with_ssrc(2, 0x9999_9999)),
+                &mut out,
+                &mut events,
+            ),
+            "a rejected source is not activity"
+        );
+        assert!(
+            out.is_empty(),
+            "a wrong-SSRC source's media never reaches B"
         );
         assert_eq!(
             call.b_to_a.egress_dst,

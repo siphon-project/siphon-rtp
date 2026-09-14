@@ -266,20 +266,18 @@ Latch state machine, per direction:
   the peer's real post-latch source with no cross-leg reference in the per-flow kernel ABI. The engine
   mirrors **only** a source the kernel *already* validated (its own source-gate + SSRC re-latch), so no
   new trust is introduced. A FIB miss / unresolved neighbour still falls back to `Redirect`.
-- **Known divergence — the userspace latch declines, it does not drop.** On the `Forward` path a
+- **The `Redirect` consumers drop on reject, as the `Forward` path does.** On the `Forward` path a
   latch rejection is a **drop**: `Inner::update_latch` returns `Reject` and `dispatch` discards the
-  packet, so under `symmetric` (`SourceFilter::Any` + `LatchPolicy::Symmetric`) the first source
-  latches and a later different-SSRC spray is thrown away. The `Redirect` consumers mirror the state
-  machine but not that consequence: `SymmetricLatch::observe` returning `None` only means "keep the
-  current reply address", and the packet is still decoded, mixed or relayed
-  (`MediaCall::process`, `Conference::ingest`, the text pipeline). For the default `Exact` gate this
-  is immaterial — layer 2 already pinned the source. It matters **only** under the opt-in
-  `symmetric` flag, where layer 2 is open and the latch is the sole remaining constraint: such a
-  redirected leg accepts injected media from any source (it cannot be *stolen* — egress stays pinned
-  to the latched source). Tracked as a deliberate, named gap rather than a silent one; closing it
-  means giving the userspace latch the same drop-on-reject semantics across all three consumers,
-  which is a behaviour change to an operator-selected rtpengine-parity flag and belongs in its own
-  change.
+  packet. The userspace consumers (`MediaCall::process`, `Conference::ingest` and its text path, the
+  text pipeline, and the WebSocket takeover's `WsEgress`) do the same through
+  `SymmetricLatch::admit`: they decide the latch after SRTP authentication and **before** the packet
+  is teed, intercepted, relayed, decoded, mixed or forwarded, and a rejected packet is dropped without
+  counting as media activity. They used to only decline to move the reply address and still consume
+  the packet, which under the opt-in `symmetric` flag (`SourceFilter::Any`, where the latch is the
+  only constraint left) let such a leg accept injected media from any source. The userspace latch
+  shares the kernel adapter's one restriction: a datagram with no SSRC (RTCP) never aims the reply
+  before a stream is latched, and once one is, such a datagram is accepted only from the latched
+  source.
 - **Effect on A1:** even inside the learning window, a hijack must reproduce the victim's live SSRC,
   which the blind attacker does not know.
 
@@ -731,13 +729,13 @@ so it carries the **same** RTPBleed posture as Layers 5a/5b — and, unlike the 
   gated elsewhere, not here:** an **ICE** seat, which is covered by the datapath's layer-4 gate on the
   redirected path (Layer 4, and the `ice_pending` note in Layer 5d) — proven by
   `an_ice_lite_conference_seat_mixes_only_a_stun_validated_source`; and a **`symmetric`** seat, whose
-  only remaining constraint is the reply latch, which declines rather than drops (see the known
-  divergence in Layer 3).
+  only remaining constraint is the reply latch, which drops a rejected source before it reaches the
+  mix (Layer 3).
 - **Constrained, SSRC-consistent latch (after auth).** An accepted participant's egress destination
   is latched to its observed source (symmetric RTP), so a NATed leg is replied to where its media
-  originates — but only for an authenticated, SSRC-consistent stream: the re-latch runs **after** the
-  SRTP `unprotect` and only when the source is SSRC-consistent (`SymmetricLatch`, RFC 3550 §8), so a
-  forged/auth-failing or wrong-SSRC packet from the gated address never moves the reply
+  originates — but only for an authenticated, SSRC-consistent stream: the latch is decided **after**
+  the SRTP `unprotect` (`SymmetricLatch`, RFC 3550 §8), so a forged/auth-failing packet never reaches
+  it, and a wrong-SSRC packet from a new source is dropped before it is mixed or counted as activity
   (`Conference::ingest` → the participant's `reverse_latch`).
 - **SDES-SRTP secure legs.** A participant offering `RTP/SAVP` + `a=crypto` gets a per-participant
   `SecureLeg` (the same primitive Layer 5a uses): `conference_join` mints the engine's key, answers
