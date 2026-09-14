@@ -466,6 +466,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Call {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
+                // The checkpoint does not carry when the call started, and the restore time is not
+                // it, so a restored call has no start for a voice-quality report to claim.
+                started_at_unix_ms: None,
                 ice: snapshot.ice.map(|ice| IceCredentials {
                     ufrag: ice.ufrag,
                     pwd: ice.pwd,

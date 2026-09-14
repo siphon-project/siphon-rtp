@@ -886,6 +886,9 @@ impl QualityAggregate {
 #[derive(Debug, Clone, Default)]
 pub struct DirectionQuality {
     pub ssrc: Option<u32>,
+    /// The SSRC this direction originated its egress stream under, or `None` for a relay-only
+    /// direction, which forwards the sender's packets (and its SSRC) without reading them.
+    pub egress_ssrc: Option<u32>,
     pub packets_received: u64,
     pub packets_expected: u32,
     pub packets_lost: u32,
@@ -1814,6 +1817,7 @@ impl Direction {
     fn quality_snapshot(&self) -> DirectionQuality {
         DirectionQuality {
             ssrc: self.ingress.ssrc(),
+            egress_ssrc: (!self.relay_only).then_some(self.egress_ssrc),
             packets_received: self.ingress.received(),
             packets_expected: self.ingress.expected(),
             packets_lost: self.ingress.cumulative_lost(),

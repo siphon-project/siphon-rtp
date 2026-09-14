@@ -9,6 +9,21 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
+- **RFC 6035 voice-quality reports.** A controller can now send a SIP `vq-rtcpxr` report (a PUBLISH,
+  or a NOTIFY to a subscribed collector) for each leg of a finished call. `siphon_rtp_proto::vq_rtcpxr`
+  models the RFC's whole `VQSessionReport` grammar and writes the body, and `SessionReport::for_leg`
+  builds one from a `call_summary` leg plus the SIP identities only the controller knows. For that the
+  `call_summary` event now carries the call's wall-clock start and end, and each leg its local and
+  remote media address, the SSRC the engine sent and the payload type.
+
+  The body is checked against the RFC's own example (§4.7.3) rather than against itself, with two
+  corrections the ABNF forces on that example: its `LocalAddr` SSRC lacks the `0x` prefix, and its
+  STOP is dated before its START. A report is written from the engine's side of the leg, and the
+  engine's G.107 MOS goes out as `MOSCQ` only when it includes the delay term. Two kinds of leg have no
+  report, and `for_leg` says so instead of inventing a field: a leg relayed without a userspace media
+  actor has no measured SSRC, and a call restored from an HA checkpoint does not know when it started.
+  Sending the report is the controller's job; the engine speaks no SIP.
+
 - **G.729, bit-exact in both directions against the official ITU-T test sequences**, behind the
   off-by-default `g729` Cargo feature — the same posture `amr` has, and for the same reason: the
   feature gates *transcoding*, and relaying G.729 has always worked without executing a codec.
