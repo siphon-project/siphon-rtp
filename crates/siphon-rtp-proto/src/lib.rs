@@ -1627,6 +1627,21 @@ pub struct LegSummary {
     /// no content-level text QoS — that is only measured when text is promoted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<TextStreamStats>,
+    /// The engine's media address toward this party: the advertised IP and the RTP port. The
+    /// `LocalAddr` of an RFC 6035 report sent from the engine's side of the leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_address: Option<std::net::SocketAddr>,
+    /// Where this party's media came from: the source the datapath latched, else its signalled
+    /// address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_address: Option<std::net::SocketAddr>,
+    /// The SSRC of the stream the engine sent this party (RFC 3550), when a userspace media actor
+    /// originated it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_ssrc: Option<u32>,
+    /// The RTP payload type of the leg's negotiated audio codec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_type: Option<u8>,
 }
 
 /// RFC 4103 Real-Time Text reception counters for one leg's inbound T.140 stream, measured by the
@@ -1830,6 +1845,14 @@ pub enum Event {
         reason: String,
         /// Call lifetime in milliseconds (logical-clock resolution, ~1 s granularity).
         duration_ms: u64,
+        /// When the call started by the wall clock, in milliseconds since the Unix epoch: the
+        /// `Timestamps` an RFC 6035 report correlates with other records (§4.6.2.2). Absent on a call
+        /// restored from an HA checkpoint, which does not carry it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_unix_ms: Option<u64>,
+        /// When the call ended by the wall clock, in milliseconds since the Unix epoch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended_at_unix_ms: Option<u64>,
         /// One entry per **party**, not per socket. A two-party call has two: index 0 the near
         /// (offerer, `from_tag`) leg, index 1 the far (answerer, `to_tag`) leg. A **single-leg** call —
         /// one answered by the engine itself with no far party (IVR / announcement / echo / voice-AI,
@@ -2066,6 +2089,8 @@ pub mod frame {
     }
 }
 
+pub mod vq_rtcpxr;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2114,6 +2139,8 @@ mod tests {
             call_id: "abc@host".to_string(),
             reason: "delete".to_string(),
             duration_ms: 94_000,
+            started_at_unix_ms: Some(1_757_000_000_000),
+            ended_at_unix_ms: Some(1_757_000_094_000),
             legs: vec![
                 // A measured (transcode) leg carries the full quality set.
                 LegSummary {
@@ -2134,6 +2161,10 @@ mod tests {
                     mos_max: Some(4.40),
                     mos_basis: Some("full".to_string()),
                     text: None,
+                    local_address: Some("192.0.2.10:30000".parse().expect("address")),
+                    remote_address: Some("198.51.100.7:4000".parse().expect("address")),
+                    egress_ssrc: Some(0x1f2e_3d4c),
+                    payload_type: Some(8),
                 },
                 // A counters-only leg (no media actor) omits every quality field.
                 LegSummary {
@@ -2153,6 +2184,10 @@ mod tests {
                     mos_min: None,
                     mos_max: None,
                     mos_basis: None,
+                    local_address: None,
+                    remote_address: None,
+                    egress_ssrc: None,
+                    payload_type: None,
                     text: Some(TextStreamStats {
                         packets: 5,
                         characters: 11,
@@ -2167,6 +2202,13 @@ mod tests {
         let json = serde_json::to_value(&event).expect("to_value");
         assert_eq!(json["event"], "call_summary", "snake_case event tag");
         assert_eq!(json["duration_ms"], 94_000);
+        assert_eq!(json["started_at_unix_ms"], 1_757_000_000_000_u64);
+        assert_eq!(json["legs"][0]["local_address"], "192.0.2.10:30000");
+        assert_eq!(json["legs"][0]["egress_ssrc"], 0x1f2e_3d4c);
+        assert!(
+            json["legs"][1].get("local_address").is_none(),
+            "an address the engine does not know is omitted, never zeroed"
+        );
         assert_eq!(json["legs"][0]["mos_basis"], "full");
         assert!(
             json["legs"][1].get("mos_average").is_none(),

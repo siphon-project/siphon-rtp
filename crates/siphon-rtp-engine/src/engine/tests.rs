@@ -4353,13 +4353,16 @@ async fn finish_call_emits_a_call_summary_event_for_the_cdr() {
             call_id,
             reason,
             legs,
+            started_at_unix_ms,
+            ended_at_unix_ms,
             ..
         } = event
         {
-            summary = Some((call_id, reason, legs));
+            summary = Some((call_id, reason, legs, started_at_unix_ms, ended_at_unix_ms));
         }
     }
-    let (call_id, reason, legs) = summary.expect("CallSummary emitted on delete");
+    let (call_id, reason, legs, started_at, ended_at) =
+        summary.expect("CallSummary emitted on delete");
     assert_eq!(call_id, "sum-1");
     assert_eq!(reason, "delete");
     assert_eq!(legs.len(), 2, "near + far legs");
@@ -4369,6 +4372,22 @@ async fn finish_call_emits_a_call_summary_event_for_the_cdr() {
         legs[0].mos_average.is_none(),
         "a plain relay has no media actor ⇒ counters-only, no MOS"
     );
+
+    // What an RFC 6035 report needs beyond the counters: the wall-clock span, and each leg's
+    // addressing. No media flowed, so the parties' addresses are the signalled ones, and a plain relay
+    // has no media actor to have originated a stream under an SSRC of its own.
+    let started_at = started_at.expect("a wall-clock start");
+    let ended_at = ended_at.expect("a wall-clock end");
+    assert!(ended_at >= started_at, "the call ends after it starts");
+    assert_eq!(legs[0].remote_address, Some(addr_a));
+    assert_eq!(legs[1].remote_address, Some(addr_b));
+    assert!(
+        legs[0]
+            .local_address
+            .is_some_and(|address| address.port() != 0),
+        "the engine's near-leg media address"
+    );
+    assert_eq!(legs[0].egress_ssrc, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

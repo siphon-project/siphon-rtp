@@ -9,7 +9,7 @@ use siphon_rtp_proto::{
 
 use crate::media_pipeline::{DirectionQuality, FinalCallQuality};
 
-use super::{unknown_call, Call, ClientId, Engine, Leg};
+use super::{unix_time_ms, unknown_call, Call, ClientId, Engine, Leg};
 
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Tear down a call's datapath + slow-path state without an ownership check (an internal cleanup
@@ -164,6 +164,18 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &far_counters,
                     b_to_a,
                 );
+                // The stream the engine sends A is the one B→A carries, and the one it sends B is
+                // A→B's, so each leg's egress SSRC comes from the other direction.
+                let near_media = LegMedia {
+                    local_address: advertised_address(&call.near),
+                    remote_address: self.observed_remote(&call.near),
+                    egress_ssrc: b_to_a.and_then(|quality| quality.egress_ssrc),
+                };
+                let far_media = LegMedia {
+                    local_address: advertised_address(far),
+                    remote_address: self.observed_remote(far),
+                    egress_ssrc: a_to_b.and_then(|quality| quality.egress_ssrc),
+                };
                 vec![
                     leg_summary(
                         &call.from_tag,
@@ -171,6 +183,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         &near_counters,
                         a_to_b,
                         near_text,
+                        near_media,
                     ),
                     leg_summary(
                         call.to_tag.as_deref().unwrap_or("-"),
@@ -178,6 +191,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                         &far_counters,
                         b_to_a,
                         far_text,
+                        far_media,
                     ),
                 ]
             }
@@ -198,12 +212,24 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                     &caller_counters,
                     a_to_b,
                 );
+                // The caller may reach either socket (see [`CallerMediaLeg`]), but its signalled
+                // address is on the near leg, as for the log line above.
+                let caller = call.caller_leg();
+                let caller_media = LegMedia {
+                    local_address: advertised_address(caller),
+                    remote_address: self
+                        .datapath
+                        .latched_source(caller.rtp.id)
+                        .or(call.near.remote_rtp),
+                    egress_ssrc: b_to_a.and_then(|quality| quality.egress_ssrc),
+                };
                 vec![leg_summary(
                     &call.from_tag,
                     call.near_codec.as_ref(),
                     &caller_counters,
                     a_to_b,
                     near_text,
+                    caller_media,
                 )]
             }
         };
@@ -218,6 +244,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 call_id: call_id.to_string(),
                 reason: reason.to_string(),
                 duration_ms: duration_s.saturating_mul(1000),
+                started_at_unix_ms: call.started_at_unix_ms,
+                ended_at_unix_ms: unix_time_ms(),
                 legs,
             },
         );
@@ -277,6 +305,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             total.packets_lost += stats.packets_lost;
         }
         total
+    }
+
+    /// Where a leg's party actually sent from: the source the datapath latched, else its signalled
+    /// address. A `Redirect` leg's media actor keeps its own latch, so there the signalled address
+    /// stands.
+    fn observed_remote(&self, leg: &Leg) -> Option<std::net::SocketAddr> {
+        self.datapath.latched_source(leg.rtp.id).or(leg.remote_rtp)
     }
 
     /// Render one CDR leg line (target `siphon_rtp::cdr`): the datapath byte/packet counters, plus —
@@ -384,6 +419,22 @@ fn format_call_offset(milliseconds: u64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
+/// Where one leg's media ran: the addressing half of [`LegSummary`] an RFC 6035 report needs.
+struct LegMedia {
+    /// The engine's advertised media address toward the party.
+    local_address: std::net::SocketAddr,
+    /// Where the party sent from, when known.
+    remote_address: Option<std::net::SocketAddr>,
+    /// The SSRC of the stream the engine sent the party, when a media actor originated it.
+    egress_ssrc: Option<u32>,
+}
+
+/// A leg's media address as its party sees it: the advertised IP (a named interface's, which need
+/// not be the bound one) and the RTP port.
+fn advertised_address(leg: &Leg) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(leg.advertised_ip, leg.rtp.local_addr.port())
+}
+
 /// Assemble one leg's [`LegSummary`] for [`Event::CallSummary`] from its datapath counters and, when a
 /// media actor measured it, its reception quality — the structured mirror of [`Engine::log_cdr_leg`].
 /// The quality half is filled only when a direction actually measured a stream (an SSRC or inbound
@@ -394,10 +445,15 @@ fn leg_summary(
     counters: &siphon_rtp_datapath::EndpointStats,
     quality: Option<&DirectionQuality>,
     text: Option<siphon_rtp_proto::TextStreamStats>,
+    media: LegMedia,
 ) -> LegSummary {
     let mut summary = LegSummary {
         tag: tag.to_string(),
         codec: codec.map(|codec| codec.encoding_name.clone()),
+        payload_type: codec.map(|codec| codec.payload_type),
+        local_address: Some(media.local_address),
+        remote_address: media.remote_address,
+        egress_ssrc: media.egress_ssrc,
         packets_in: counters.packets_in,
         bytes_in: counters.bytes_in,
         packets_out: counters.packets_out,

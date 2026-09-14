@@ -608,10 +608,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             _ => false,
         };
         let ws_uri = profile.ws_uri.clone();
-        let pipeline = if ws_uri.is_some() {
-            PipelineKind::Ws
+        // Where the caller's media lands if this call never gets an `answer` follows from the same
+        // choice. A WS takeover bridges `near_rtp` (below), so the caller reaches the near socket;
+        // otherwise the offer-only UAS shape applies — the controller puts this rewritten offer, which
+        // advertises the far leg, into its own 200 OK, so the caller reaches the far socket (the same
+        // endpoint `promote_to_processing`'s single-leg arm reflects on). Unread once `answer` lands
+        // and both legs face a real party.
+        let (pipeline, caller_media_leg) = if ws_uri.is_some() {
+            (PipelineKind::Ws, CallerMediaLeg::Near)
         } else {
-            PipelineKind::Passthrough
+            (PipelineKind::Passthrough, CallerMediaLeg::Far)
         };
 
         // Media-plane lifecycle (target `siphon_rtp::media`): the offer allocated ports and is about to
@@ -658,6 +664,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             Call {
                 owner: client,
                 created_tick: self.datapath.now_ticks(),
+                started_at_unix_ms: super::unix_time_ms(),
                 ice: ice_creds,
                 // A's own credentials, from the offer — needed to *address* checks to A later
                 // (RFC 8445 §7.1.2); B's arrive with its answer.
@@ -682,17 +689,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // An offer always allocates a B-facing leg: a B side may still answer, and the offer
                 // being rewritten right here is what would be delivered to it.
                 far: Some(far_leg),
-                // Where the caller's media lands if this call never gets an `answer`. A WS takeover
-                // bridges `near_rtp` (below), so the caller reaches the near socket; otherwise the
-                // offer-only UAS shape applies — the controller puts this rewritten offer, which
-                // advertises the far leg, into its own 200 OK, so the caller reaches the far socket
-                // (the same endpoint `promote_to_processing`'s single-leg arm reflects on). Unread
-                // once `answer` lands and both legs face a real party.
-                caller_media_leg: if ws_uri.is_some() {
-                    CallerMediaLeg::Near
-                } else {
-                    CallerMediaLeg::Far
-                },
+                caller_media_leg,
                 far_local_crypto,
                 far_remote_crypto: None,
                 far_dtls,

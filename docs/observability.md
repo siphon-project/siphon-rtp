@@ -175,6 +175,23 @@ party and so no second leg. An *unanswered* `offer` is the one single-leg shape 
 the offer allocated a B-facing leg in case a B side answered, and none did. Its idle leg contributes
 zero to the totals above.
 
+### RFC 6035 voice-quality reports
+
+A controller that reports call quality to a collector over SIP (the `vq-rtcpxr` event package, RFC
+6035) builds the report body from a `call_summary` leg with `siphon_rtp_proto::vq_rtcpxr`. It supplies
+what only it knows, the Call-ID, the parties' identities, the groups and the dialog, and
+`SessionReport::for_leg` fills in the rest from the leg. The report is written from the engine's side
+of that leg: `LocalAddr` is the engine's media address with the SSRC it sent the party, `RemoteAddr` is
+where the party sent from with its own SSRC, and `LocalMetrics` carries the payload type and codec, the
+network loss rate and the interarrival jitter, plus the round-trip delay and the G.107 MOS as `MOSCQ`
+when an RTT was measured. A MOS estimated from loss and jitter alone is left out rather than labelled a
+conversational score.
+
+Two kinds of leg have no report. A leg relayed without a userspace media actor has no measured SSRC,
+and a call restored from an HA checkpoint does not know when it started. `for_leg` refuses both with
+`VqReportError::Missing` instead of inventing the field. Sending the report, as a PUBLISH or a NOTIFY
+to a subscribed collector, is the controller's job: the engine speaks no SIP.
+
 ## 5. RFC 4103 Real-Time Text content QoS on HEP
 
 When a call negotiated a plaintext `m=text` (RFC 4103) stream **and** a text-observability feature

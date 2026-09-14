@@ -96,6 +96,16 @@ pub struct TurnServerConfig {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ClientId(pub u64);
 
+/// Milliseconds since the Unix epoch by the wall clock, for reports that must line up with other
+/// network records (RFC 6035 §4.6.2.2). Never for the media-timeout sweep, which runs on the
+/// datapath's logical clock. `None` only for a clock set before 1970.
+fn unix_time_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+}
+
 /// One side of a call: an RTP endpoint, an optional companion RTCP endpoint (absent under
 /// rtcp-mux), and the remote addresses learned from that side's SDP.
 #[derive(Debug, Clone, Copy)]
@@ -212,6 +222,10 @@ struct Call {
     owner: ClientId,
     /// Logical-clock tick at creation (offer), the media-timeout baseline before any media arrives.
     created_tick: u64,
+    /// Wall-clock creation time in milliseconds since the Unix epoch, for the `Timestamps` an RFC 6035
+    /// report correlates with other records (§4.6.2.2). `None` on a call restored from an HA
+    /// checkpoint, which does not carry the original.
+    started_at_unix_ms: Option<u64>,
     /// The engine's own ICE-lite credentials for this call (its identity as the ICE server), or
     /// `None` for a non-ICE call.
     ice: Option<IceCredentials>,
