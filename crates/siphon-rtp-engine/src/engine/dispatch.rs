@@ -82,7 +82,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Dispatch one control command to its handler (the metric-free inner of [`Self::handle`]).
-    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     async fn dispatch(&self, client: ClientId, command: Command) -> CmdResult {
         // Drain gate: a draining node runs its live calls to completion but admits no new session, so
         // it can be taken out of a rolling upgrade cleanly. Reject the two session-creating verbs;
@@ -190,6 +189,67 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
             Command::SilenceMedia { call_id, .. } => self.set_silence(client, &call_id, true),
             Command::UnsilenceMedia { call_id, .. } => self.set_silence(client, &call_id, false),
+            command @ (Command::PlayMedia { .. }
+            | Command::StopMedia { .. }
+            | Command::SetPlayGain { .. }
+            | Command::PlayDtmf { .. }
+            | Command::SubscribeRequest { .. }
+            | Command::SubscribeAnswer { .. }
+            | Command::Unsubscribe { .. }
+            | Command::Echo { .. }
+            | Command::StartRecording { .. }
+            | Command::StopRecording { .. }) => self.dispatch_call_media(client, command).await,
+            command @ (Command::ConferenceJoin { .. }
+            | Command::ConferenceLeave { .. }
+            | Command::ConferenceRoute { .. }
+            | Command::ConferenceBridge { .. }
+            | Command::ConferencePlay { .. }
+            | Command::ConferenceStopPlay { .. }
+            | Command::ConferenceSetPlayGain { .. }
+            | Command::ConferenceStartRecording { .. }
+            | Command::ConferenceStopRecording { .. }) => {
+                self.dispatch_conference(client, command).await
+            }
+            Command::AttachWsTee {
+                call_id,
+                ws_uri,
+                direction,
+                channels,
+                sample_rate,
+                ..
+            } => {
+                self.attach_ws_tee(client, &call_id, &ws_uri, direction, channels, sample_rate)
+                    .await
+            }
+            Command::DetachWsTee { call_id, .. } => self.detach_ws_tee(client, &call_id).await,
+            Command::AttachWsBridge {
+                call_id, ws_uri, ..
+            } => self.attach_ws_bridge(client, &call_id, &ws_uri).await,
+            Command::DetachWsBridge { call_id, .. } => {
+                self.detach_ws_bridge(client, &call_id).await
+            }
+            Command::AttachX3 {
+                call_id,
+                delivery,
+                xid,
+                correlation_id,
+                target_leg,
+                ..
+            } => {
+                self.attach_x3(client, &call_id, &delivery, xid, correlation_id, target_leg)
+                    .await
+            }
+            Command::DetachX3 { call_id, .. } => self.detach_x3(client, &call_id).await,
+            other => CmdResult::Error {
+                reason: format!("unsupported command: {}", command_name(&other)),
+            },
+        }
+    }
+
+    /// Dispatch a call's media-control command: playback, DTMF injection, SIPREC subscriptions, echo
+    /// and recording. [`Self::dispatch`] routes only those verbs here.
+    async fn dispatch_call_media(&self, client: ClientId, command: Command) -> CmdResult {
+        match command {
             Command::PlayMedia {
                 call_id,
                 from_tag,
@@ -327,6 +387,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.stop_recording(client, &call_id, recording_id.as_deref())
                     .await
             }
+            other => CmdResult::Error {
+                reason: format!("unsupported command: {}", command_name(&other)),
+            },
+        }
+    }
+
+    /// Dispatch a conference command: seating, routing, bridging, and room-wide playback and
+    /// recording. [`Self::dispatch`] routes only those verbs here.
+    async fn dispatch_conference(&self, client: ClientId, command: Command) -> CmdResult {
+        match command {
             Command::ConferenceJoin {
                 conference_id,
                 from_tag,
@@ -410,36 +480,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 self.conference_stop_recording(&conference_id, recording_id.as_deref())
                     .await
             }
-            Command::AttachWsTee {
-                call_id,
-                ws_uri,
-                direction,
-                channels,
-                sample_rate,
-                ..
-            } => {
-                self.attach_ws_tee(client, &call_id, &ws_uri, direction, channels, sample_rate)
-                    .await
-            }
-            Command::DetachWsTee { call_id, .. } => self.detach_ws_tee(client, &call_id).await,
-            Command::AttachWsBridge {
-                call_id, ws_uri, ..
-            } => self.attach_ws_bridge(client, &call_id, &ws_uri).await,
-            Command::DetachWsBridge { call_id, .. } => {
-                self.detach_ws_bridge(client, &call_id).await
-            }
-            Command::AttachX3 {
-                call_id,
-                delivery,
-                xid,
-                correlation_id,
-                target_leg,
-                ..
-            } => {
-                self.attach_x3(client, &call_id, &delivery, xid, correlation_id, target_leg)
-                    .await
-            }
-            Command::DetachX3 { call_id, .. } => self.detach_x3(client, &call_id).await,
             other => CmdResult::Error {
                 reason: format!("unsupported command: {}", command_name(&other)),
             },
