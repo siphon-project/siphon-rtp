@@ -672,7 +672,8 @@ XDP path rides `aya`. Do not add a C-linking dependency.
   [docs/security-and-nat.md](docs/security-and-nat.md) in the same change.
 - **Size limits.** A function over 300 code lines fails clippy (`too_many_lines`), and a source file
   over 1,500 production lines (everything above its last `#[cfg(test)]`) fails the `repo hygiene`
-  workflow. An oversized function that is debt carries
+  workflow. A test module moved into its own file opens with `#![cfg(test)]` and counts as none.
+  An oversized function that is debt carries
   `#[expect(clippy::too_many_lines, reason = "…")]`, which starts failing once the function is split
   under the limit, so the marker cannot outlive the debt. A codec reference port, whose function
   boundaries mirror the spec's C so it can be diffed against it, carries a plain

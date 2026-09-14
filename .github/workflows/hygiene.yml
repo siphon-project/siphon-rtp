@@ -40,14 +40,15 @@ jobs:
       - name: Check production lines per source file
         run: |
           # A source file may hold at most 1500 production lines: the lines above its last
-          # `#[cfg(test)]`, so inline tests never count against it. Files already past that sit on the
+          # `#[cfg(test)]`, so inline tests never count against it, and none at all for a test module
+          # moved into its own file, which opens with `#![cfg(test)]`. Files already past that sit on the
           # allowlist at their current size and may shrink but not grow; an entry whose file has shrunk
           # under the threshold, or no longer exists, must be removed. The scan walks tracked files, so
           # it also covers the excluded XDP workspace, which the clippy job never builds.
           threshold=1500
           # path  max production lines  # why
           allowlist='
-          crates/siphon-rtp-engine/src/engine.rs 14222 # debt: control verbs, split planned
+          crates/siphon-rtp-engine/src/engine/answer.rs 1982 # debt: the answer verb, de-duplication planned
           crates/siphon-rtp-engine/src/media_pipeline.rs 4145 # large, no function over 250 lines
           crates/siphon-rtp-engine/src/conference.rs 2685 # large, no function over 250 lines
           crates/siphon-rtp-engine/src/sdp.rs 2144 # large, no function over 250 lines
@@ -61,7 +62,7 @@ jobs:
           '
           status=0
           while IFS= read -r file; do
-            production=$(awk '/^[[:space:]]*#\[cfg\(test\)\]/ {cut = NR - 1; seen = 1} END {print (seen ? cut : NR)}' "$file")
+            production=$(awk '/^[[:space:]]*#!?\[cfg\(test\)\]/ {cut = NR - 1; seen = 1} END {print (seen ? cut : NR)}' "$file")
             limit=$(printf '%s\n' "$allowlist" | awk -v path="$file" '$1 == path {print $2}')
             if [ -n "$limit" ]; then
               if [ "$production" -gt "$limit" ]; then

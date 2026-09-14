@@ -52,7 +52,7 @@ siphon-rtp-dsp = { path = "../siphon-rtp-dsp", version = "0.6.0" }
 tokio = { workspace = true }
 # `rustls-tls-webpki-roots` gives the WebSocket bridge a `wss://` client (RFC 6455 over RFC 8446).
 # Pure Rust: it pulls tokio-rustls/rustls with `default-features = false`, so no aws-lc-rs — the
-# ring provider (installed explicitly, see engine.rs) is the only backend compiled.
+# ring provider (installed explicitly, see engine/configure.rs) is the only backend compiled.
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 # Build the explicit ring-backed `wss://` client config (RootCertStore + no client auth).
 rustls = { workspace = true }
