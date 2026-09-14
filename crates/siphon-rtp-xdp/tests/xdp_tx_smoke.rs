@@ -13,7 +13,7 @@
 //!
 //! It **self-skips** (logs + returns Ok) when it lacks `CAP_NET_ADMIN` / veth / generic-XDP support
 //! — creating the veth pair or attaching the program fails — so `cargo test` stays green on an
-//! unprivileged box. On the self-hosted CI runner (root, kernel-capable) it runs for real.
+//! unprivileged box. Run as root on a kernel-capable box, it runs for real.
 //!
 //! Only RFC 5737 / TEST-NET documentation addresses are used (no real subscriber data).
 

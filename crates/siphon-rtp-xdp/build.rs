@@ -11,7 +11,11 @@
 //! built for `bpfel-unknown-none` with `build-std=core` and bpf-linker on PATH (the Dockerfile.xdp
 //! toolchain). Keep the toolchain string in lockstep with `ebpf/rust-toolchain.toml` and the
 //! Dockerfile.
+//!
+//! Every failure is returned from `main` naming the step that failed, so cargo stops the build and
+//! prints it; nothing here panics.
 
+use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -23,12 +27,12 @@ const EBPF_PACKAGE: &str = "siphon-rtp-ebpf";
 /// our deploy targets are LE; aya defaults to `bpfel` likewise).
 const BPF_TARGET: &str = "bpfel-unknown-none";
 
-fn main() {
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+fn main() -> Result<(), Box<dyn Error>> {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or("OUT_DIR not set")?);
     let ebpf_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("ebpf")
         .canonicalize()
-        .expect("locate the siphon-rtp-ebpf crate directory");
+        .map_err(|error| format!("locate the siphon-rtp-ebpf crate directory: {error}"))?;
 
     // Rebuild the embedded object when any eBPF source changes.
     println!("cargo:rerun-if-changed={}", ebpf_dir.display());
@@ -66,24 +70,27 @@ fn main() {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CARGO")
         .status()
-        .expect("spawn the eBPF cargo build");
-    assert!(status.success(), "eBPF build failed: {status:?}");
+        .map_err(|error| format!("spawn the eBPF cargo build: {error}"))?;
+    if !status.success() {
+        return Err(format!("eBPF build failed: {status:?}").into());
+    }
 
     let artifact = ebpf_target
         .join(BPF_TARGET)
         .join("release")
         .join(EBPF_PACKAGE);
     let embed = out_dir.join(EBPF_PACKAGE);
-    copy_artifact(&artifact, &embed);
+    copy_artifact(&artifact, &embed)
 }
 
 /// Copy the built eBPF object to the embed path the loader includes with `include_bytes_aligned!`.
-fn copy_artifact(artifact: &Path, embed: &Path) {
-    std::fs::copy(artifact, embed).unwrap_or_else(|error| {
-        panic!(
+fn copy_artifact(artifact: &Path, embed: &Path) -> Result<(), Box<dyn Error>> {
+    std::fs::copy(artifact, embed).map_err(|error| {
+        format!(
             "copy eBPF object {} -> {}: {error}",
             artifact.display(),
             embed.display()
         )
-    });
+    })?;
+    Ok(())
 }

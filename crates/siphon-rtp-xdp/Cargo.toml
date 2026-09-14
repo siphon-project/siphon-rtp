@@ -76,6 +76,9 @@ libc = "0.2"
 # check is authenticated by the real STUN encoder rather than a hand-rolled fixture.
 siphon-rtp-stun = { path = "../siphon-rtp-stun" }
 
+[lints]
+workspace = true
+
 # The TX-path next-hop-MAC cache-hit microbench (µs/frame gate; the Stage-1 neighbour resolver).
 [[bench]]
 name = "neighbor_bench"
@@ -99,3 +102,16 @@ harness = false
 # docker xdp build invokes it explicitly with nightly + bpf-linker on PATH.
 [workspace]
 members = ["ebpf"]
+
+# The same lint levels as the parent workspace's `[workspace.lints.clippy]`, restated because an
+# excluded workspace inherits nothing from it; keep the two tables in lockstep. The parent's
+# clippy.toml (thresholds, and the test exemption for unwrap/expect) still applies: clippy searches
+# upward from the manifest directory. Only lints that are off by default belong here: restating a
+# default group such as `clippy::all = "warn"` would downgrade its deny-by-default correctness lints
+# to warnings.
+[workspace.lints.clippy]
+too_many_lines = "warn"
+# Production code never panics on a `None` or an `Err`. Tests are exempt through clippy.toml; a bench
+# or integration-test harness file that needs to panic carries its own inner allow.
+unwrap_used = "warn"
+expect_used = "warn"

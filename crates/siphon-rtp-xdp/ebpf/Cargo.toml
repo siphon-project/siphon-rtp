@@ -22,6 +22,9 @@ siphon-rtp-ebpf-common = { path = "../../siphon-rtp-ebpf-common", version = "0.6
 name = "siphon-rtp-ebpf"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 # eBPF programs must be optimized (the verifier rejects un-optimized output) and panic=abort.
 [profile.dev]
 opt-level = 3

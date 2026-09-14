@@ -18,9 +18,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Most jobs run on free GitHub-hosted runners (ubuntu-latest) now that the repo is public.
-# Only two stay on the RTT self-hosted runner: perf-gate (iai-callgrind builds base + head twice
-# and wants the beefy box) and xdp-integration (privileged kernel / eBPF, self-hosted only).
+# Every job runs on free GitHub-hosted runners (ubuntu-latest). The org runner group refuses public
+# repositories, so a job that asks for the self-hosted runner never starts; perf-gate and
+# xdp-integration below both used to, and both say why they moved.
 jobs:
   fmt:
     name: rustfmt
@@ -165,7 +165,7 @@ jobs:
 
   # ── Docker image builds (musl/distroless runtime target — no push, no privileged run) ────
   # GitHub runners can't grant the NET_ADMIN/BPF caps the compose profiles need, so we only prove
-  # the image builds; the privileged XDP run is a self-hosted-runner / local concern.
+  # the image builds; the privileged XDP run is a local concern for now (see xdp-integration below).
   docker-build:
     name: docker build (runtime)
     runs-on: ubuntu-latest
@@ -195,8 +195,8 @@ jobs:
   #  1. It silently stopped running. The org runner group sets `allows_public_repositories=false`, so
   #     from the moment this repo went public the self-hosted runners refused every job it queued —
   #     the gate sat queued forever and nothing enforced the 10% rule.
-  #  2. It is the same hazard `xdp-integration` below already refuses by name: a self-hosted runner
-  #     must not execute untrusted PR code, and this job *is* PR-triggered.
+  #  2. A self-hosted runner must not execute untrusted PR code, and this job *is* PR-triggered (the
+  #     same hazard that kept `xdp-integration` below push-only until it moved to a hosted runner too).
   #
   # Nothing is lost by moving. Callgrind counts instructions, not wall-clock, so the numbers are just
   # as valid on a shared runner — the beefy box only ever bought build time. Both sides of the
@@ -240,26 +240,41 @@ jobs:
             cargo bench $BENCHES
           fi
 
-  # ── XDP / eBPF datapath (self-hosted, kernel-capable runner) ─────────────────────────────
-  # The eBPF loader is a separate, excluded workspace on a pinned nightly + bpf-linker, so the normal
-  # jobs never build it and it can bit-rot. This builds the eBPF program + the AF_XDP loader and runs
-  # its unit tests. push / manual only, never on a (possibly fork) PR: a self-hosted runner must not
-  # execute untrusted PR code. Kept out of the `CI passed` rollup while it is new.
+  # ── XDP / eBPF datapath (excluded workspace: build, lint, format, test) ──────────────────
+  # The eBPF loader is a separate, excluded workspace on a pinned nightly + bpf-linker, so none of the
+  # jobs above reach it: the root `cargo clippy`, `cargo test` and even `cargo fmt --all` all stop at
+  # the workspace boundary, and it can bit-rot. This job holds it to the same gates: build the eBPF
+  # program, the AF_XDP loader and the daemon; clippy -D warnings on the loader and on the no_std eBPF
+  # program (the same lint table, restated in its Cargo.toml); rustfmt; and the tests.
+  #
+  # Runs on a **hosted** runner, on every PR and push, for the reason perf-gate above moved. It used to
+  # ask for `[self-hosted, linux, x64]`, which the org runner group refuses for a public repository,
+  # so it stopped running the day the repository went public. It was push/manual-only because a
+  # self-hosted runner must not execute untrusted PR code; a throwaway hosted VM carries no such
+  # hazard, so it gates PRs like everything else.
   xdp-integration:
-    name: xdp build + loader tests (self-hosted)
-    runs-on: [self-hosted, linux, x64]
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    name: xdp build + clippy + fmt + tests
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: crates/siphon-rtp-xdp
     steps:
       - uses: actions/checkout@v7
       # Puts rustup + cargo on PATH (stable, for the loader crate); the eBPF sub-crate pins its own
-      # nightly via ebpf/rust-toolchain.toml, installed in the next step.
+      # nightly via ebpf/rust-toolchain.toml, installed in the step after the cache.
       - uses: dtolnay/rust-toolchain@stable
-      - name: eBPF toolchain (pinned nightly + rust-src + bpf-linker)
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/siphon-rtp-xdp
+          # Never restore ~/.cargo/bin: bpf-linker lands there, and a cached copy would skip the pinned,
+          # checksummed download below (the exact "green on a stale binary" failure it describes).
+          cache-bin: "false"
+      - name: eBPF toolchain (pinned nightly + rust-src + clippy + bpf-linker)
         run: |
-          rustup toolchain install nightly-2026-01-15 --component rust-src --profile minimal
+          # clippy as well as rust-src: the eBPF program is linted on this same nightly below.
+          rustup toolchain install nightly-2026-01-15 --component rust-src,clippy --profile minimal
           # bpf-linker comes from upstream's prebuilt release rather than `cargo install`, and is
           # pinned + checksummed like every other tool this CI installs. Building it from source
           # links llvm-sys against a *system* LLVM — 0.11.1 wants LLVM 21-23 and this runner carries
@@ -284,8 +299,9 @@ jobs:
           bpf-linker --version
       # No --locked below: this is a separate workspace whose Cargo.lock pins the sibling `siphon-rtp`
       # crates by path and records their versions, so any main-workspace version bump or new dep
-      # restales it (and it is not auto-synced). This job is excluded from the `CI passed` rollup and
-      # is push/manual-only experimental, so resolve fresh rather than red the whole run on a lock skew.
+      # restales it (and it is not auto-synced). Now that this job gates every PR, --locked would fail
+      # a PR that only touches the main workspace over a lockfile it never opened, so resolve fresh;
+      # the main-workspace jobs keep --locked.
       - name: Build the eBPF program + XDP/AF_XDP loader
         run: cargo build
       # The XDP-enabled daemon binary: depends UP into the stable engine (`siphon-rtp`) + this crate,
@@ -294,24 +310,53 @@ jobs:
       # and stays xdp-free in every normal job.
       - name: Build the siphon-rtp-xdp-daemon binary
         run: cargo build --bin siphon-rtp-xdp-daemon
-      # Loader unit tests + the daemon's pure `choose_datapath` selection tests (NIC-free).
-      - name: Run the loader + daemon unit tests
+      # The house gate on the loader package: its lib, the daemon binary, build.rs, benches and tests.
+      # The lint table in its Cargo.toml restates the root one, and the root clippy.toml (thresholds,
+      # the test exemption for unwrap/expect) applies because clippy searches upward for it.
+      - name: clippy (-D warnings) on the loader + daemon
+        run: cargo clippy --all-targets -- -D warnings
+      # The no_std eBPF program is a member of this workspace but not its root package, so the step
+      # above never reaches it. Linted the way build.rs compiles it: the pinned nightly, the BPF target,
+      # build-std=core and the same bpf_target_arch cfg (the BTF/debuginfo flags only matter at link).
+      # Check-only, so bpf-linker is not involved; its own target dir keeps it from invalidating the
+      # loader's build.
+      - name: clippy (-D warnings) on the eBPF program
+        working-directory: crates/siphon-rtp-xdp/ebpf
+        env:
+          CARGO_ENCODED_RUSTFLAGS: '--cfg=bpf_target_arch="x86_64"'
+        run: >-
+          rustup run nightly-2026-01-15 cargo clippy --release --bins
+          -Z build-std=core --target bpfel-unknown-none --target-dir ../target/ebpf-clippy
+          -- -D warnings
+      # The `fmt` job's `cargo fmt --all` stops at the workspace boundary too, so these files are
+      # format-checked here or nowhere. `--all` covers the loader and the eBPF member.
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      # Loader unit tests, the daemon's pure `choose_datapath` selection tests and the zero-alloc TX
+      # test, all NIC-free. The veth smoke is compiled in here too and self-skips, unprivileged.
+      - name: Run the loader + daemon tests
         run: cargo test
       # Live veth XDP_TX relay smoke: attach the classifier in SKB mode, install a FORWARD flow,
       # inject an RTP/UDP datagram and capture the frame the program relays — asserting the L2/L3/L4
       # rewrite + both checksums. Self-skips (logs + passes) without CAP_NET_ADMIN / veth / generic
       # XDP, so it never fails an unprivileged runner; `--nocapture` surfaces the skip/run message.
+      #
+      # Deliberately NOT run under sudo yet, although this runner could. Run as root on a 7.0 kernel
+      # (this nightly, bpf-linker 0.10.3), the verifier rejects the program at load: "R1 offset is
+      # outside of the packet" on the FORWARD path's first payload-byte read. And the smoke counts any
+      # attach failure as a skip, so a root run stays green without loading anything. Run it as root
+      # here once the program loads and an attach failure under root fails the test.
       - name: veth XDP_TX relay smoke (self-skips without CAP_NET_ADMIN)
         run: cargo test --test xdp_tx_smoke -- --nocapture
 
   # Single required status check for branch protection: green only if every job above is green.
   # perf-gate is included: it runs on pull_request (success) and is skipped on the push-to-main build,
   # and `if: always()` + the failure/cancelled check treats a skipped job as non-failing. xdp-integration
-  # is deliberately excluded (push/manual-only, experimental toolchain) until it is proven stable.
+  # is included now that it runs on a hosted runner for every PR and push.
   ci:
     name: CI passed
     if: always()
-    needs: [fmt, clippy, test, msrv, docs, benches, deny, sbom, fuzz, docker-build, perf-gate]
+    needs: [fmt, clippy, test, msrv, docs, benches, deny, sbom, fuzz, docker-build, perf-gate, xdp-integration]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job failed or was cancelled
@@ -319,6 +364,6 @@ jobs:
         run: exit 1
 
 # NOTE: the eBPF/XDP loader is an excluded workspace on its own pinned nightly + bpf-linker; the
-# `xdp-integration` job above builds and unit-tests it on the self-hosted runner (push/manual only).
-# A privileged veth + SKB-XDP attach smoke (the docker-compose `dev` profile) is a follow-up. CD
+# `xdp-integration` job above builds, lints, format-checks and tests it on a hosted runner (every PR
+# and push). Running its veth + SKB-XDP attach smoke as root is a follow-up (see that job). CD
 # (release / container) is intentionally omitted for now.
