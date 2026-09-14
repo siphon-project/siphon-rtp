@@ -411,6 +411,7 @@ struct Coverage {
     twenty_ms: usize,
 }
 
+#[allow(clippy::too_many_lines)]
 fn score_frame(
     stream: &str,
     unit: i64,

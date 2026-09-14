@@ -270,6 +270,7 @@ pub fn conceal(state: &mut DecoderState, mode: u8, synth16k: &mut [i16]) -> usiz
 /// callers want [`decode_frame`] / [`conceal`], which also run the homing protocol / 14-bit mask.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::needless_range_loop)]
+#[allow(clippy::too_many_lines)]
 pub fn decode_speech(
     state: &mut DecoderState,
     mode: u8,

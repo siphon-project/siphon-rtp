@@ -31,3 +31,60 @@ jobs:
             exit 1
           fi
           echo "clean: no stray local-tooling references"
+
+  production-file-size:
+    name: production file size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check production lines per source file
+        run: |
+          # A source file may hold at most 1500 production lines: the lines above its last
+          # `#[cfg(test)]`, so inline tests never count against it. Files already past that sit on the
+          # allowlist at their current size and may shrink but not grow; an entry whose file has shrunk
+          # under the threshold, or no longer exists, must be removed. The scan walks tracked files, so
+          # it also covers the excluded XDP workspace, which the clippy job never builds.
+          threshold=1500
+          # path  max production lines  # why
+          allowlist='
+          crates/siphon-rtp-engine/src/engine.rs 14222 # debt: control verbs, split planned
+          crates/siphon-rtp-engine/src/media_pipeline.rs 4145 # large, no function over 250 lines
+          crates/siphon-rtp-engine/src/conference.rs 2685 # large, no function over 250 lines
+          crates/siphon-rtp-engine/src/sdp.rs 2144 # large, no function over 250 lines
+          crates/siphon-rtp-dsp/src/aec.rs 2554 # one algorithm
+          crates/siphon-rtp-proto/src/lib.rs 2068 # the control contract, type definitions
+          crates/siphon-rtp-codec/src/opus/celt/encoder.rs 1996 # reference port
+          crates/siphon-rtp-codec/src/amr/nb/enc_cb.rs 1905 # reference port
+          crates/siphon-rtp-codec/src/amr/wb/enc_acelp.rs 1850 # reference port
+          crates/siphon-rtp-codec/src/opus/enc/encoder.rs 1791 # reference port
+          crates/siphon-rtp-xdp/src/lib.rs 1567 # excluded workspace
+          '
+          status=0
+          while IFS= read -r file; do
+            production=$(awk '/^[[:space:]]*#\[cfg\(test\)\]/ {cut = NR - 1; seen = 1} END {print (seen ? cut : NR)}' "$file")
+            limit=$(printf '%s\n' "$allowlist" | awk -v path="$file" '$1 == path {print $2}')
+            if [ -n "$limit" ]; then
+              if [ "$production" -gt "$limit" ]; then
+                echo "::error file=$file::$production production lines against an allowlist entry of $limit; split the file, or raise the entry and say why in the diff"
+                status=1
+              elif [ "$production" -le "$threshold" ]; then
+                echo "::error file=$file::$production production lines is within the $threshold limit; remove its allowlist entry"
+                status=1
+              elif [ "$production" -lt "$limit" ]; then
+                echo "::notice file=$file::$production production lines, allowlisted at $limit; lower the entry to lock in the gain"
+              fi
+            elif [ "$production" -gt "$threshold" ]; then
+              echo "::error file=$file::$production production lines, over the $threshold limit; split the file"
+              status=1
+            fi
+          done < <(git ls-files ':(glob)crates/**/src/**/*.rs')
+          while read -r path _; do
+            if [ -n "$path" ] && [ ! -f "$path" ]; then
+              echo "::error::allowlist entry $path names a file that no longer exists; remove it"
+              status=1
+            fi
+          done <<< "$allowlist"
+          if [ "$status" -eq 0 ]; then
+            echo "clean: every production source file is within its size limit"
+          fi
+          exit "$status"

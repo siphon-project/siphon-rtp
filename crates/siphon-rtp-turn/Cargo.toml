@@ -40,3 +40,6 @@ tikv-jemalloc-ctl = { workspace = true }
 [[bench]]
 name = "turn_bench"
 harness = false
+
+[lints]
+workspace = true

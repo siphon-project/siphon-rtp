@@ -34,3 +34,6 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # In-memory handshake driving in the loopback tests.
 tokio = { workspace = true }
+
+[lints]
+workspace = true

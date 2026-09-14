@@ -1973,6 +1973,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     }
 
     /// Dispatch one control command to its handler (the metric-free inner of [`Self::handle`]).
+    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     async fn dispatch(&self, client: ClientId, command: Command) -> CmdResult {
         // Drain gate: a draining node runs its live calls to completion but admits no new session, so
         // it can be taken out of a rolling upgrade cleanly. Reject the two session-creating verbs;
@@ -2420,6 +2421,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         }
     }
 
+    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     async fn offer(
         &self,
         client: ClientId,
@@ -3046,6 +3048,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// (the "AI answers the call" shape), exactly as [`Self::offer`] does for a 2-party call. The
     /// transcoder is not engaged in that mode — the bridge owns the leg — and a failed dial fails the
     /// command rather than answering `ok` with nothing attached.
+    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     async fn answer_local(
         &self,
         client: ClientId,
@@ -4612,6 +4615,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         .await
     }
 
+    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     async fn answer(
         &self,
         client: ClientId,
@@ -6823,6 +6827,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// leg (`Ws`, whose bridge is an external session that cannot be resumed from a snapshot) or a DTLS
     /// leg (whose keys are handshake-derived, not signalled) is not restorable and is rejected up
     /// front. Any endpoint bind or flow install that fails rolls back the endpoints already bound.
+    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     async fn restore(&self, client: ClientId, blob: &str) -> CmdResult {
         use crate::ha::{self, EndpointRole, PipelineSnapshot};
         let snapshot = match ha::CallSnapshot::from_json(blob) {
@@ -7695,6 +7700,7 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// the engine endpoint advertising the participant's codec (sendrecv) — the participant then hears
     /// the room's mixed-minus-self audio. Each participant endpoint is a full inbound surface, so the
     /// source gate + constrained latch are enforced on ingress (RTPBleed, docs §4).
+    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     async fn conference_join(
         &self,
         client: ClientId,
@@ -8681,7 +8687,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// whole `code` is played as one telephone-event per digit, each `duration_ms` long, separated by
     /// `pause_ms` of inter-digit silence (RFC 4733). The target leg is resolved from `from_tag` /
     /// `to_tag` the same way `block_dtmf` resolves its source leg.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     async fn play_dtmf(
         &self,

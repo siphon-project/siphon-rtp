@@ -24,3 +24,6 @@ proptest = { workspace = true }
 [[bench]]
 name = "dsp_bench"
 harness = false
+
+[lints]
+workspace = true

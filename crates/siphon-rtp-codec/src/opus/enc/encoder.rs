@@ -814,6 +814,7 @@ impl OpusEncoder {
     ///
     /// The payload (everything but the TOC) is staged into the packet builder.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn encode_one_frame(
         &mut self,
         pcm: &[f32],
