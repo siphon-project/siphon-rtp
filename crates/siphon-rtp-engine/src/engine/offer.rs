@@ -39,8 +39,336 @@ fn far_security_with_secure_near(
     }
 }
 
+/// WebSocket **takeover** (`ws_uri`) on a leg the two-leg verbs cannot bridge. Refuse here, at
+/// offer, before a single port is allocated and before the controller commits to the dialog —
+/// the failure mode this replaces is the worst one available: a clean `ok` on a call whose
+/// media goes nowhere.
+///
+/// - A **secure offerer** (SDES-SRTP RFC 4568, or DTLS-SRTP RFC 5764). The answer delivered to
+///   A on this path is rewritten from *B's* SDP, so there is nowhere to advertise the engine's
+///   own `a=crypto` / `a=fingerprint` — and without that the engine is not A's cryptographic
+///   far side, so A's SRTP would reach the bridge as ciphertext and the downlink would leave in
+///   the clear. `answer_local` writes A's answer itself and does support this; that is where a
+///   secure takeover belongs, and the reason string says so.
+/// - An **ICE offerer** (RFC 8445). A takeover leg's egress is owned by the bridge's drain
+///   task, and only the full agent's selection re-points it; on this path no agent is armed for
+///   a takeover leg at all, so the downlink would keep going to the signalled `c=`.
+fn offer_takeover_refusal(profile: &ProfileFlags, info: &sdp::MediaInfo) -> Option<CmdResult> {
+    if profile.ws_uri.is_some() {
+        if info.secure {
+            let keying = if info.dtls { "DTLS-SRTP" } else { "SDES-SRTP" };
+            return Some(CmdResult::Error {
+                reason: format!(
+                    "offer: ws-takeover-secure-offerer: a WebSocket takeover (ws_uri) on a \
+                     {keying} offerer is not supported on offer/answer — the answer to the \
+                     offerer is derived from the far leg's SDP and cannot carry the engine's own \
+                     keying; use answer_local, which terminates SRTP on the takeover leg"
+                ),
+            });
+        }
+        if info.is_ice() && ice_directive(profile) != Some(IceDirective::Remove) {
+            return Some(CmdResult::Error {
+                reason: "offer: ws-takeover-ice-offerer: a WebSocket takeover (ws_uri) on an \
+                         ICE offerer is not supported on offer/answer — no ICE agent is armed \
+                         for a takeover leg here, so its downlink would never follow the \
+                         selected pair; use answer_local, or ICE=remove to drop ICE"
+                    .to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// An offer's ICE posture: the control directive, whether the offer's ICE was altered in transit
+/// (RFC 8839 §5.3), and the engine's own credentials when the leg uses ICE.
+fn offer_ice(
+    profile: &ProfileFlags,
+    info: &sdp::MediaInfo,
+    call_id: &str,
+) -> (Option<IceDirective>, bool, Option<ice::IceCredentials>) {
+    // ICE-lite posture (docs/security-and-nat.md §4 layer 4): mint our own short-term credentials
+    // when the leg uses ICE — advertised in the rewritten SDP and installed on the endpoints so
+    // the responder can validate the peer's connectivity checks. The control `profile.ice` field
+    // overrides the SDP-derived default (RFC 8445): `force`/`force-relay` mint them regardless of
+    // the offer, `remove` suppresses them, otherwise mirror whether the offer carried ICE.
+    let ice_directive = ice_directive(profile);
+    // RFC 8839 §5.3: the offer carried candidates but its default destination is none of them, so
+    // the SDP was rewritten in transit (a SIP ALG). ICE describes a topology that no longer
+    // matches where media actually goes, so it must not be used — we say `a=ice-mismatch` and both
+    // sides fall back to the signalled address. An explicit `ICE=force` still wins: an operator
+    // who forces ICE has said they know better than the heuristic.
+    let ice_mismatch = siphon_rtp_ice::is_ice_mismatch(info.remote_rtp, &info.candidates)
+        && ice_directive != Some(IceDirective::Force);
+    if ice_mismatch {
+        tracing::info!(
+            target: "siphon_rtp::control",
+            %call_id,
+            signalled = %info.remote_rtp,
+            candidates = info.candidates.len(),
+            "ICE mismatch (RFC 8839 §5.3): the offer's default destination matches none of its \
+             candidates — the SDP was altered in transit; falling back to non-ICE"
+        );
+    }
+    let want_ice = match ice_directive {
+        _ if ice_mismatch => false,
+        Some(IceDirective::Force) => true,
+        Some(IceDirective::Remove) => false,
+        None => info.is_ice(),
+    };
+    let ice_creds = if want_ice {
+        ice::generate_credentials()
+    } else {
+        None
+    };
+    (ice_directive, ice_mismatch, ice_creds)
+}
+
+/// The transport security an offer settles for both legs.
+struct OfferSecurity {
+    /// `dtls: off` forced the far leg to plaintext `RTP/AVP`.
+    far_downgraded_to_plain: bool,
+    /// The far leg is DTLS-SRTP.
+    far_dtls: bool,
+    /// The engine's own SDES key toward B.
+    far_local_crypto: Option<CryptoAttribute>,
+    /// The engine's own SDES key toward a secure offerer A.
+    near_local_crypto: Option<CryptoAttribute>,
+    /// A's own SDES key, from its offer.
+    near_remote_crypto: Option<CryptoAttribute>,
+    /// The fingerprint and `a=setup` a DTLS far leg advertises.
+    far_dtls_presentation: Option<(sdp::Fingerprint, sdp::Setup)>,
+}
+
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
-    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
+    /// Settle an offer's transport security: the far leg's (DTLS-SRTP, SDES, a `dtls: off`
+    /// downgrade, or the offer's own) and the engine's key toward a secure SDES offerer. The caller
+    /// frees the offer's endpoints on a refusal.
+    fn offer_security(
+        &self,
+        profile: &ProfileFlags,
+        info: &sdp::MediaInfo,
+    ) -> Result<OfferSecurity, Box<CmdResult>> {
+        // Secure far leg: when the control profile asks for a secure far leg, either DTLS-SRTP
+        // (`UDP/TLS/RTP/SAVP[F]`, RFC 5764) — advertise the engine's fingerprint + `a=setup` role,
+        // keyed by the handshake at answer — or SDES (`RTP/SAVP[F]`, RFC 4568) — mint an `a=crypto` key.
+        // B's answer brings its keying and `answer` wires the bridge. (`UDP/TLS/...` also matches
+        // "SAVP", so DTLS is tested first.) The control `profile.dtls` field refines the DTLS case:
+        // `off` downgrades the leg to plaintext, `passive`/`active`/`actpass` sets the offerer role.
+        let far_transport = profile.transport_protocol.as_deref().unwrap_or_default();
+        let dtls_directive = dtls_directive(profile);
+        let dtls_transport = far_transport.contains("UDP/TLS");
+        // `dtls: off` (rtpengine DTLS=off) forces a plaintext far leg even on a UDP/TLS transport —
+        // no DTLS-SRTP and no SDES fallback (SDES applies only to a plain `RTP/SAVP[F]` transport).
+        // Downgrading forces AVP and strips the offer's DTLS keying (`a=fingerprint`/`a=setup`).
+        let dtls_off = matches!(dtls_directive, Some(DtlsDirective::Off));
+        let far_downgraded_to_plain = dtls_transport && dtls_off;
+        let far_dtls = dtls_transport && !dtls_off;
+        let far_sdes = !dtls_transport && far_transport.contains("SAVP");
+        let far_local_crypto = if far_sdes {
+            match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+                Ok(crypto) => Some(crypto),
+                Err(error) => {
+                    return Err(Box::new(error_result("generate SDES key", &error)));
+                }
+            }
+        } else {
+            None
+        };
+        // The engine's own key toward **A**, minted when A offered SDES-SRTP. This is what makes the
+        // engine A's cryptographic far side, and it is the whole reason a secure offerer can be
+        // terminated on this path at all: the answer A receives is rewritten from B's SDP, so without
+        // a key of our own there is nothing to advertise and A's own key was passed through to B
+        // instead — handing a third party the offerer's SRTP key while answering A in the clear.
+        //
+        // SDES only. A DTLS offerer is refused below: binding a handshake to the signalling needs an
+        // `a=fingerprint` in A's answer *and* an ICE agent on A's leg, neither of which this path has.
+        let near_sdes = info.secure && !info.dtls;
+        let near_remote_crypto = info.crypto.first().copied();
+        let near_local_crypto = if near_sdes {
+            match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+                Ok(crypto) => Some(crypto),
+                Err(error) => {
+                    return Err(Box::new(error_result("generate SDES key", &error)));
+                }
+            }
+        } else {
+            None
+        };
+        // A secure offerer with no key to decrypt is refused, never bridged in the clear: answering a
+        // `RTP/SAVP` offer that carries no usable `a=crypto` would advertise keying against nothing.
+        if near_sdes && near_remote_crypto.is_none() {
+            return Err(Box::new(error_result(
+                "offer",
+                &"secure-offerer-unkeyable: the RTP/SAVP offer carries no usable a=crypto",
+            )));
+        }
+        // A **DTLS** offerer is deliberately untouched here. Terminating one needs the engine's own
+        // `a=fingerprint` in A's answer plus a full ICE agent on A's leg — the same missing piece
+        // `answer_local` names for a DTLS offerer without a takeover — and refusing it outright would
+        // break `dtls: off`, the rtpengine directive that legitimately downgrades such an offer. So
+        // its existing behaviour is kept byte for byte, and only the SDES path changes.
+        let far_dtls_presentation = if far_dtls {
+            let Some(fingerprint) = self.engine_fingerprint() else {
+                return Err(Box::new(error_result(
+                    "DTLS-SRTP offer",
+                    &"engine has no DTLS certificate",
+                )));
+            };
+            Some((fingerprint, offered_dtls_setup(dtls_directive)))
+        } else {
+            None
+        };
+        Ok(OfferSecurity {
+            far_downgraded_to_plain,
+            far_dtls,
+            far_local_crypto,
+            near_local_crypto,
+            near_remote_crypto,
+            far_dtls_presentation,
+        })
+    }
+}
+
+/// What anchoring an offer's RFC 4103 text stream leaves for the call.
+struct OfferText {
+    /// The offer's text stream is secure (`RTP/SAVP`).
+    text_offered_secure: bool,
+    /// A's own text SDES key, from a secure text offer.
+    near_text_remote_crypto: Option<CryptoAttribute>,
+    /// A text stream is anchored, plaintext or secure.
+    anchor_text: bool,
+    /// A secure text stream is anchored.
+    anchor_secure_text: bool,
+    near_text_endpoint: Option<siphon_rtp_datapath::Endpoint>,
+    far_text_endpoint: Option<siphon_rtp_datapath::Endpoint>,
+    /// The engine's own text SDES key toward B.
+    far_text_local_crypto: Option<CryptoAttribute>,
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// An offer for a call-id that already exists.
+    ///
+    /// Ownership first (A3 — docs/security-and-nat.md §5): only the client that created a call may
+    /// affect it. Another client offering the same id must not be able to disturb it, and must not
+    /// learn that it exists — so it gets the same `unknown_call` any other cross-client reference
+    /// does, and the live call is left completely untouched.
+    ///
+    /// For the owner, this replaces the call. That was already the effect (the registry entry was
+    /// overwritten), but the previous `Call` was dropped without freeing anything: its 2-4 datapath
+    /// endpoints leaked their ports and FDs, and its quota slot was never released, so a client
+    /// repeating an offer bled both until the node refused new calls. Tear the old one down
+    /// properly first — same path as `delete`, so the CDR is emitted and every resource is
+    /// released — then build the replacement.
+    ///
+    /// Note this is *replacement*, not re-negotiation: the new call gets fresh ports, so the peer
+    /// must be told the new address. A true re-offer (SIP re-INVITE — renegotiating codecs or
+    /// addresses on the *existing* ports, and the trigger an RFC 8445 §9 ICE restart needs) is a
+    /// separate control verb that does not exist yet.
+    async fn replace_offered_call(&self, client: ClientId, call_id: &str) -> Option<CmdResult> {
+        if let Some(existing) = self.calls.get(call_id) {
+            if existing.owner != client {
+                drop(existing);
+                return Some(unknown_call(call_id));
+            }
+            drop(existing);
+            tracing::info!(
+                target: "siphon_rtp::control",
+                %call_id,
+                "offer replaces an existing call with the same id — tearing the old one down first"
+            );
+            if let Some((_, previous)) = self.calls.remove(call_id) {
+                // `finish_call` emits the CDR and frees endpoints, pipelines, subscriptions and the
+                // quota slot. No `MediaTimeout` event: the controller caused this, it is not a dead
+                // path, and telling it otherwise would be a lie.
+                self.finish_call(call_id, &previous, "replaced").await;
+            }
+        }
+        None
+    }
+
+    /// Anchor an offer's RFC 4103 text stream: one text endpoint per leg, on each leg's family and
+    /// interface, and the engine's own far text key for a secure stream. Adds the text endpoints to
+    /// `endpoints`, and frees everything in it on a refusal.
+    #[allow(clippy::too_many_arguments)]
+    async fn anchor_offer_text(
+        &self,
+        profile: &ProfileFlags,
+        info: &sdp::MediaInfo,
+        near_family: AddressFamily,
+        near_bind: Option<std::net::IpAddr>,
+        far_family: AddressFamily,
+        far_bind: Option<std::net::IpAddr>,
+        endpoints: &mut Vec<siphon_rtp_datapath::Endpoint>,
+    ) -> Result<OfferText, Box<CmdResult>> {
+        // RFC 4103 Real-Time Text: when the offer carries an `m=text` stream (and this is not a WS
+        // bridge, which has no B leg to relay to), anchor + relay it as a second stream — one text RTP
+        // endpoint per leg, sharing each leg's family/interface. A **plaintext** (`RTP/AVP`) stream is a
+        // second in-kernel relay. A **secure** (`RTP/SAVP` + `a=crypto`) stream is anchored as an
+        // SDES-SRTP text leg: the engine mints its own far text SDES key, advertises `RTP/SAVP` + our
+        // `a=crypto` to B, and terminates SRTP in the userspace text processor (docs/security-and-nat.md
+        // Layer 5d — mirrors the audio SDES bridge). A secure text stream we cannot key (no usable
+        // `a=crypto`) is declined (`m=text 0`, RFC 3264 §6), never downgraded to plaintext. Text RTCP is
+        // not separately endpointed (single text port; text SRTCP rides the muxed port).
+        let text_offered_secure = info.text.as_ref().is_some_and(|text| text.secure);
+        // The near (A) leg's own text SDES key, from a secure text offer — decrypts A's text ingress.
+        let near_text_remote_crypto = info
+            .text
+            .as_ref()
+            .filter(|_| text_offered_secure)
+            .and_then(|text| text.crypto.first().copied());
+        let anchor_plain_text =
+            info.text.is_some() && !text_offered_secure && profile.ws_uri.is_none();
+        let anchor_secure_text =
+            text_offered_secure && near_text_remote_crypto.is_some() && profile.ws_uri.is_none();
+        let anchor_text = anchor_plain_text || anchor_secure_text;
+        let (near_text_endpoint, far_text_endpoint, far_text_local_crypto) = if anchor_text {
+            let near_text = match self.alloc_endpoints(1, near_family, near_bind).await {
+                Ok(mut allocated) => allocated.remove(0),
+                Err(reason) => {
+                    self.free(endpoints).await;
+                    return Err(Box::new(CmdResult::Error { reason }));
+                }
+            };
+            let far_text = match self.alloc_endpoints(1, far_family, far_bind).await {
+                Ok(mut allocated) => allocated.remove(0),
+                Err(reason) => {
+                    self.datapath.remove_endpoint(near_text.id).await;
+                    self.free(endpoints).await;
+                    return Err(Box::new(CmdResult::Error { reason }));
+                }
+            };
+            endpoints.push(near_text);
+            endpoints.push(far_text);
+            // Mint the engine's own far text SDES key (advertised to B); the near text key is minted
+            // at answer, when the near answer advertises `RTP/SAVP` + our `a=crypto` to A.
+            let far_text_key = if anchor_secure_text {
+                match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
+                    Ok(crypto) => Some(crypto),
+                    Err(error) => {
+                        self.free(endpoints).await;
+                        return Err(Box::new(error_result("generate text SDES key", &error)));
+                    }
+                }
+            } else {
+                None
+            };
+            (Some(near_text), Some(far_text), far_text_key)
+        } else {
+            (None, None, None)
+        };
+        Ok(OfferText {
+            text_offered_secure,
+            near_text_remote_crypto,
+            anchor_text,
+            anchor_secure_text,
+            near_text_endpoint,
+            far_text_endpoint,
+            far_text_local_crypto,
+        })
+    }
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     pub(super) async fn offer(
         &self,
         client: ClientId,
@@ -61,41 +389,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 reason: format!("offer: {reason}"),
             };
         }
-        // An offer for a call-id that already exists.
-        //
-        // Ownership first (A3 — docs/security-and-nat.md §5): only the client that created a call may
-        // affect it. Another client offering the same id must not be able to disturb it, and must not
-        // learn that it exists — so it gets the same `unknown_call` any other cross-client reference
-        // does, and the live call is left completely untouched.
-        //
-        // For the owner, this replaces the call. That was already the effect (the registry entry was
-        // overwritten), but the previous `Call` was dropped without freeing anything: its 2-4 datapath
-        // endpoints leaked their ports and FDs, and its quota slot was never released, so a client
-        // repeating an offer bled both until the node refused new calls. Tear the old one down
-        // properly first — same path as `delete`, so the CDR is emitted and every resource is
-        // released — then build the replacement.
-        //
-        // Note this is *replacement*, not re-negotiation: the new call gets fresh ports, so the peer
-        // must be told the new address. A true re-offer (SIP re-INVITE — renegotiating codecs or
-        // addresses on the *existing* ports, and the trigger an RFC 8445 §9 ICE restart needs) is a
-        // separate control verb that does not exist yet.
-        if let Some(existing) = self.calls.get(&call_id) {
-            if existing.owner != client {
-                drop(existing);
-                return unknown_call(&call_id);
-            }
-            drop(existing);
-            tracing::info!(
-                target: "siphon_rtp::control",
-                %call_id,
-                "offer replaces an existing call with the same id — tearing the old one down first"
-            );
-            if let Some((_, previous)) = self.calls.remove(&call_id) {
-                // `finish_call` emits the CDR and frees endpoints, pipelines, subscriptions and the
-                // quota slot. No `MediaTimeout` event: the controller caused this, it is not a dead
-                // path, and telling it otherwise would be a lie.
-                self.finish_call(&call_id, &previous, "replaced").await;
-            }
+        if let Some(refusal) = self.replace_offered_call(client, &call_id).await {
+            return refusal;
         }
         let info = match sdp::parse(sdp) {
             Ok(info) => info,
@@ -106,77 +401,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             }
         };
 
-        // WebSocket **takeover** (`ws_uri`) on a leg the two-leg verbs cannot bridge. Refuse here, at
-        // offer, before a single port is allocated and before the controller commits to the dialog —
-        // the failure mode this replaces is the worst one available: a clean `ok` on a call whose
-        // media goes nowhere.
-        //
-        // - A **secure offerer** (SDES-SRTP RFC 4568, or DTLS-SRTP RFC 5764). The answer delivered to
-        //   A on this path is rewritten from *B's* SDP, so there is nowhere to advertise the engine's
-        //   own `a=crypto` / `a=fingerprint` — and without that the engine is not A's cryptographic
-        //   far side, so A's SRTP would reach the bridge as ciphertext and the downlink would leave in
-        //   the clear. `answer_local` writes A's answer itself and does support this; that is where a
-        //   secure takeover belongs, and the reason string says so.
-        // - An **ICE offerer** (RFC 8445). A takeover leg's egress is owned by the bridge's drain
-        //   task, and only the full agent's selection re-points it; on this path no agent is armed for
-        //   a takeover leg at all, so the downlink would keep going to the signalled `c=`.
-        if profile.ws_uri.is_some() {
-            if info.secure {
-                let keying = if info.dtls { "DTLS-SRTP" } else { "SDES-SRTP" };
-                return CmdResult::Error {
-                    reason: format!(
-                        "offer: ws-takeover-secure-offerer: a WebSocket takeover (ws_uri) on a \
-                         {keying} offerer is not supported on offer/answer — the answer to the \
-                         offerer is derived from the far leg's SDP and cannot carry the engine's own \
-                         keying; use answer_local, which terminates SRTP on the takeover leg"
-                    ),
-                };
-            }
-            if info.is_ice() && ice_directive(profile) != Some(IceDirective::Remove) {
-                return CmdResult::Error {
-                    reason: "offer: ws-takeover-ice-offerer: a WebSocket takeover (ws_uri) on an \
-                             ICE offerer is not supported on offer/answer — no ICE agent is armed \
-                             for a takeover leg here, so its downlink would never follow the \
-                             selected pair; use answer_local, or ICE=remove to drop ICE"
-                        .to_string(),
-                };
-            }
+        if let Some(refusal) = offer_takeover_refusal(profile, &info) {
+            return refusal;
         }
 
-        // ICE-lite posture (docs/security-and-nat.md §4 layer 4): mint our own short-term credentials
-        // when the leg uses ICE — advertised in the rewritten SDP and installed on the endpoints so
-        // the responder can validate the peer's connectivity checks. The control `profile.ice` field
-        // overrides the SDP-derived default (RFC 8445): `force`/`force-relay` mint them regardless of
-        // the offer, `remove` suppresses them, otherwise mirror whether the offer carried ICE.
-        let ice_directive = ice_directive(profile);
-        // RFC 8839 §5.3: the offer carried candidates but its default destination is none of them, so
-        // the SDP was rewritten in transit (a SIP ALG). ICE describes a topology that no longer
-        // matches where media actually goes, so it must not be used — we say `a=ice-mismatch` and both
-        // sides fall back to the signalled address. An explicit `ICE=force` still wins: an operator
-        // who forces ICE has said they know better than the heuristic.
-        let ice_mismatch = siphon_rtp_ice::is_ice_mismatch(info.remote_rtp, &info.candidates)
-            && ice_directive != Some(IceDirective::Force);
-        if ice_mismatch {
-            tracing::info!(
-                target: "siphon_rtp::control",
-                %call_id,
-                signalled = %info.remote_rtp,
-                candidates = info.candidates.len(),
-                "ICE mismatch (RFC 8839 §5.3): the offer's default destination matches none of its \
-                 candidates — the SDP was altered in transit; falling back to non-ICE"
-            );
-        }
-        let want_ice = match ice_directive {
-            _ if ice_mismatch => false,
-            Some(IceDirective::Force) => true,
-            Some(IceDirective::Remove) => false,
-            None => info.is_ice(),
-        };
-        let ice_creds = if want_ice {
-            ice::generate_credentials()
-        } else {
-            None
-        };
+        let (ice_directive, ice_mismatch, ice_creds) = offer_ice(profile, &info, &call_id);
 
         // One RTP endpoint per leg, plus a companion RTCP endpoint unless the stream is muxed. The
         // *near* leg binds the family of the offer's signalled `c=` line (RFC 4566 §5.7). The *far*
@@ -232,61 +461,28 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             .copied()
             .collect();
 
-        // RFC 4103 Real-Time Text: when the offer carries an `m=text` stream (and this is not a WS
-        // bridge, which has no B leg to relay to), anchor + relay it as a second stream — one text RTP
-        // endpoint per leg, sharing each leg's family/interface. A **plaintext** (`RTP/AVP`) stream is a
-        // second in-kernel relay. A **secure** (`RTP/SAVP` + `a=crypto`) stream is anchored as an
-        // SDES-SRTP text leg: the engine mints its own far text SDES key, advertises `RTP/SAVP` + our
-        // `a=crypto` to B, and terminates SRTP in the userspace text processor (docs/security-and-nat.md
-        // Layer 5d — mirrors the audio SDES bridge). A secure text stream we cannot key (no usable
-        // `a=crypto`) is declined (`m=text 0`, RFC 3264 §6), never downgraded to plaintext. Text RTCP is
-        // not separately endpointed (single text port; text SRTCP rides the muxed port).
-        let text_offered_secure = info.text.as_ref().is_some_and(|text| text.secure);
-        // The near (A) leg's own text SDES key, from a secure text offer — decrypts A's text ingress.
-        let near_text_remote_crypto = info
-            .text
-            .as_ref()
-            .filter(|_| text_offered_secure)
-            .and_then(|text| text.crypto.first().copied());
-        let anchor_plain_text =
-            info.text.is_some() && !text_offered_secure && profile.ws_uri.is_none();
-        let anchor_secure_text =
-            text_offered_secure && near_text_remote_crypto.is_some() && profile.ws_uri.is_none();
-        let anchor_text = anchor_plain_text || anchor_secure_text;
-        let (near_text_endpoint, far_text_endpoint, far_text_local_crypto) = if anchor_text {
-            let near_text = match self.alloc_endpoints(1, near_family, near_bind).await {
-                Ok(mut allocated) => allocated.remove(0),
-                Err(reason) => {
-                    self.free(&endpoints).await;
-                    return CmdResult::Error { reason };
-                }
-            };
-            let far_text = match self.alloc_endpoints(1, far_family, far_bind).await {
-                Ok(mut allocated) => allocated.remove(0),
-                Err(reason) => {
-                    self.datapath.remove_endpoint(near_text.id).await;
-                    self.free(&endpoints).await;
-                    return CmdResult::Error { reason };
-                }
-            };
-            endpoints.push(near_text);
-            endpoints.push(far_text);
-            // Mint the engine's own far text SDES key (advertised to B); the near text key is minted
-            // at answer, when the near answer advertises `RTP/SAVP` + our `a=crypto` to A.
-            let far_text_key = if anchor_secure_text {
-                match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
-                    Ok(crypto) => Some(crypto),
-                    Err(error) => {
-                        self.free(&endpoints).await;
-                        return error_result("generate text SDES key", &error);
-                    }
-                }
-            } else {
-                None
-            };
-            (Some(near_text), Some(far_text), far_text_key)
-        } else {
-            (None, None, None)
+        let OfferText {
+            text_offered_secure,
+            near_text_remote_crypto,
+            anchor_text,
+            anchor_secure_text,
+            near_text_endpoint,
+            far_text_endpoint,
+            far_text_local_crypto,
+        } = match self
+            .anchor_offer_text(
+                profile,
+                &info,
+                near_family,
+                near_bind,
+                far_family,
+                far_bind,
+                &mut endpoints,
+            )
+            .await
+        {
+            Ok(text) => text,
+            Err(result) => return *result,
         };
 
         // The B-facing leg, as it will be recorded on the call. The rewritten offer is delivered to B,
@@ -334,76 +530,19 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             ice_directive,
         );
 
-        // Secure far leg: when the control profile asks for a secure far leg, either DTLS-SRTP
-        // (`UDP/TLS/RTP/SAVP[F]`, RFC 5764) — advertise the engine's fingerprint + `a=setup` role,
-        // keyed by the handshake at answer — or SDES (`RTP/SAVP[F]`, RFC 4568) — mint an `a=crypto` key.
-        // B's answer brings its keying and `answer` wires the bridge. (`UDP/TLS/...` also matches
-        // "SAVP", so DTLS is tested first.) The control `profile.dtls` field refines the DTLS case:
-        // `off` downgrades the leg to plaintext, `passive`/`active`/`actpass` sets the offerer role.
-        let far_transport = profile.transport_protocol.as_deref().unwrap_or_default();
-        let dtls_directive = dtls_directive(profile);
-        let dtls_transport = far_transport.contains("UDP/TLS");
-        // `dtls: off` (rtpengine DTLS=off) forces a plaintext far leg even on a UDP/TLS transport —
-        // no DTLS-SRTP and no SDES fallback (SDES applies only to a plain `RTP/SAVP[F]` transport).
-        // Downgrading forces AVP and strips the offer's DTLS keying (`a=fingerprint`/`a=setup`).
-        let dtls_off = matches!(dtls_directive, Some(DtlsDirective::Off));
-        let far_downgraded_to_plain = dtls_transport && dtls_off;
-        let far_dtls = dtls_transport && !dtls_off;
-        let far_sdes = !dtls_transport && far_transport.contains("SAVP");
-        let far_local_crypto = if far_sdes {
-            match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
-                Ok(crypto) => Some(crypto),
-                Err(error) => {
-                    self.free(&endpoints).await;
-                    return error_result("generate SDES key", &error);
-                }
-            }
-        } else {
-            None
-        };
-        // The engine's own key toward **A**, minted when A offered SDES-SRTP. This is what makes the
-        // engine A's cryptographic far side, and it is the whole reason a secure offerer can be
-        // terminated on this path at all: the answer A receives is rewritten from B's SDP, so without
-        // a key of our own there is nothing to advertise and A's own key was passed through to B
-        // instead — handing a third party the offerer's SRTP key while answering A in the clear.
-        //
-        // SDES only. A DTLS offerer is refused below: binding a handshake to the signalling needs an
-        // `a=fingerprint` in A's answer *and* an ICE agent on A's leg, neither of which this path has.
-        let near_sdes = info.secure && !info.dtls;
-        let near_remote_crypto = info.crypto.first().copied();
-        let near_local_crypto = if near_sdes {
-            match CryptoAttribute::generate(1, CryptoSuite::AesCm128HmacSha1_80) {
-                Ok(crypto) => Some(crypto),
-                Err(error) => {
-                    self.free(&endpoints).await;
-                    return error_result("generate SDES key", &error);
-                }
-            }
-        } else {
-            None
-        };
-        // A secure offerer with no key to decrypt is refused, never bridged in the clear: answering a
-        // `RTP/SAVP` offer that carries no usable `a=crypto` would advertise keying against nothing.
-        if near_sdes && near_remote_crypto.is_none() {
-            self.free(&endpoints).await;
-            return error_result(
-                "offer",
-                &"secure-offerer-unkeyable: the RTP/SAVP offer carries no usable a=crypto",
-            );
-        }
-        // A **DTLS** offerer is deliberately untouched here. Terminating one needs the engine's own
-        // `a=fingerprint` in A's answer plus a full ICE agent on A's leg — the same missing piece
-        // `answer_local` names for a DTLS offerer without a takeover — and refusing it outright would
-        // break `dtls: off`, the rtpengine directive that legitimately downgrades such an offer. So
-        // its existing behaviour is kept byte for byte, and only the SDES path changes.
-        let far_dtls_presentation = if far_dtls {
-            let Some(fingerprint) = self.engine_fingerprint() else {
+        let OfferSecurity {
+            far_downgraded_to_plain,
+            far_dtls,
+            far_local_crypto,
+            near_local_crypto,
+            near_remote_crypto,
+            far_dtls_presentation,
+        } = match self.offer_security(profile, &info) {
+            Ok(security) => security,
+            Err(result) => {
                 self.free(&endpoints).await;
-                return error_result("DTLS-SRTP offer", &"engine has no DTLS certificate");
-            };
-            Some((fingerprint, offered_dtls_setup(dtls_directive)))
-        } else {
-            None
+                return *result;
+            }
         };
 
         // RFC 5761: when a `rtcp-mux` directive was given, present the resolved far-side mux to B
