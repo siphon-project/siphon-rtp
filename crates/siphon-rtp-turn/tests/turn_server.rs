@@ -7,6 +7,12 @@
 //! acceptance tests: the full Allocate → CreatePermission → ChannelBind → relay round-trip plus the
 //! error paths (401/437/438/403, relay-without-permission, Refresh(0) teardown).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

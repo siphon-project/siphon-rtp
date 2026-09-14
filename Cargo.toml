@@ -40,6 +40,10 @@ homepage = "https://github.com/siphon-project/siphon-rtp"
 # deny-by-default correctness lints to warnings.
 [workspace.lints.clippy]
 too_many_lines = "warn"
+# Production code never panics on a `None` or an `Err`. Tests are exempt through clippy.toml; bench,
+# example and integration-test harness files carry their own inner allow.
+unwrap_used = "warn"
+expect_used = "warn"
 
 # Shared dependency pins — kept in lockstep with siphon-sip's house versions.
 [workspace.dependencies]

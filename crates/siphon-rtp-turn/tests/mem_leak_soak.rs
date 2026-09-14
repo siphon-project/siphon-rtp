@@ -8,6 +8,12 @@
 //! allocations. Gate on `allocated` (live bytes), never RSS. A rising `allocated` at steady state is
 //! a real leak (a stranded `Allocation`, a relay recv task whose socket never freed).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

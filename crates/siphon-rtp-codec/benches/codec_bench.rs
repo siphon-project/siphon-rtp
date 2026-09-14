@@ -3,6 +3,12 @@
 //! These lock per-frame / per-subframe cost so a regression fails CI. The AMR-WB decoder kernels
 //! are benched per-tier, plus the full mode-0 frame decode (`dec_main`) once it is wired.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 #[cfg(feature = "amr")]
 use criterion::BatchSize;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};

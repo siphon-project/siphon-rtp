@@ -20,6 +20,12 @@
 //! self-consistency check would not count here. It is not a build or test dependency — see
 //! `reference/silero-vad/` for the scripts that regenerate the vectors.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::fs;
 use std::path::PathBuf;
 

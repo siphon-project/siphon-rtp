@@ -660,7 +660,10 @@ XDP path rides `aya`. Do not add a C-linking dependency.
 ## Coding conventions
 
 - **Errors via `thiserror`**, propagated with `?` / `map_err` / `ok_or_else` / `match`. **No
-  `.unwrap()` / `.expect()` in production code** — only in `#[cfg(test)]` and `main()`.
+  `.unwrap()` / `.expect()` outside tests**, `main()` included. Clippy's `unwrap_used` and
+  `expect_used` enforce it: `#[cfg(test)]` code is exempt through `clippy.toml`, and each bench,
+  example and integration-test file carries one inner `#![allow]` saying its panics are the failure
+  report.
 - **`tracing` for logs**, never `println!`. Always answer a control request (even on error) rather
   than silently dropping it.
 - **Follow the spec.** RFC / 3GPP / ITU-T text is the source of truth. Cite the spec at the point a

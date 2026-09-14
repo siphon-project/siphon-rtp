@@ -5,6 +5,12 @@
 //! request processing are paid per connectivity check, which on a busy box is per call times the
 //! checklist size.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use std::net::SocketAddr;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};

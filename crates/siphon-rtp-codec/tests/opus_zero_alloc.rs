@@ -22,6 +22,12 @@
 //! paths a lossy leg takes under load, which is exactly when an allocator round-trip is least
 //! affordable.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

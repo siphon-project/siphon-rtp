@@ -8,6 +8,12 @@
 //! Setup (codec construction, buffer allocation) runs in a `setup` fn so it is excluded from the
 //! measured instruction count; only the per-frame `decode`/`encode` call is counted.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use iai_callgrind::{
     library_benchmark, library_benchmark_group, main, Callgrind, EventKind, LibraryBenchmarkConfig,
 };

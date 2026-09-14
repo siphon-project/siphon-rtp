@@ -8,6 +8,12 @@
 //! the gate. Always gate on `allocated` (live bytes), never RSS: jemalloc retains freed pages, so
 //! RSS is too noisy to mean anything here.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::{Decoder, Encoder};
 

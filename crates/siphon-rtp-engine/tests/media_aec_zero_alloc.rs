@@ -6,6 +6,12 @@
 //! times with echo cancellation enabled as without — the canceller + ring contribute nothing on the
 //! datapath.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::net::SocketAddr;

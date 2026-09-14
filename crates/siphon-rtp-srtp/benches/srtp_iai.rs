@@ -5,6 +5,12 @@
 //! AES-CM + HMAC-SHA1-80 on protect, verify + decrypt on unprotect (RFC 3711). Key setup and packet
 //! sealing run in the `setup` fn and are not counted. See the CI `perf-gate` job.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use iai_callgrind::{
     library_benchmark, library_benchmark_group, main, Callgrind, EventKind, LibraryBenchmarkConfig,
 };

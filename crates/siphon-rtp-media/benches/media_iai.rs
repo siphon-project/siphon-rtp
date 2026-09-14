@@ -6,6 +6,12 @@
 //! worthless) to fail on a `>10%` regression. Setup — seed packet, output buffers, a bridge session
 //! with its jitter pre-filled — runs in a `setup` fn and is not counted. See the CI `perf-gate` job.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use iai_callgrind::{
     library_benchmark, library_benchmark_group, main, Callgrind, EventKind, LibraryBenchmarkConfig,
 };

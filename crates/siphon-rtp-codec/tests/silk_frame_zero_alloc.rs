@@ -15,6 +15,12 @@
 //! The whole-frame case needs a real bitstream, so it reads one from `reference/opus/silk_only` and
 //! skips (loudly) when the vectors are absent; every other case is synthetic and always runs.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::Path;

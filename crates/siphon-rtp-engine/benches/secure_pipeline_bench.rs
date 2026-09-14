@@ -17,6 +17,12 @@
 //!
 //! `cargo bench -p siphon-rtp --bench secure_pipeline_bench`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 

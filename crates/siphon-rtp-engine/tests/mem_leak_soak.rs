@@ -13,6 +13,12 @@
 //! [`malloc_conf`]), and the engine's own *bounded* one-off steady-state cost has to be behind us
 //! before the window opens (see [`LeakGate`]).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 

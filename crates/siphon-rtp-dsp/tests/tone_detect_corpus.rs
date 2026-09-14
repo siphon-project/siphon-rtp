@@ -18,6 +18,12 @@
 //! The corpus summary is printed (`cargo test -p siphon-rtp-dsp --test tone_detect_corpus --
 //! --nocapture`) and the counts are asserted.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use siphon_rtp_dsp::{RecordToneDetector, ToneOutcome};
 
 // ---------------------------------------------------------------------------------------------

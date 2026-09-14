@@ -7,6 +7,12 @@
 //! watch for regressions. The codec/crypto here is pure and synchronous; the async actor dispatch
 //! around it is not benched (it is dominated by the socket I/O it wraps).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use siphon_rtp_stun::{self as stun, turn};
 

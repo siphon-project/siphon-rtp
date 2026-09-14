@@ -10,6 +10,12 @@
 //! control proves a bridge that did not ask pays nothing. `ws_tee_write_pcm_20ms/mono_8k_to_16k` is
 //! the same cost isolated to a single (send-only) direction. `cargo bench -p siphon-rtp-media`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_codec::g711::G711;
 use siphon_rtp_codec::l16::L16;

@@ -11,6 +11,12 @@
 //!
 //! All addresses are the RFC 5737 documentation range.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use std::net::SocketAddr;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};

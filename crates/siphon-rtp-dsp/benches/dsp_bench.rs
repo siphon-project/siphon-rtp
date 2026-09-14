@@ -32,6 +32,12 @@
 //! and the canceller's weights/ring are all preallocated (a counting-allocator test asserts zero
 //! per-frame allocation).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use siphon_rtp_dsp::{
     EchoCanceller, EnergyVad, NeuralVad, NeuralVadStream, NoiseSuppressor, RecordToneDetector,

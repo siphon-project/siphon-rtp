@@ -11,6 +11,12 @@
 //! Skips (rather than fails) when the dissector or the Wireshark tools are absent, matching how the
 //! codec reference-vector tests behave. Run `reference/x2x3-dissector/fetch.sh` to enable it.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;

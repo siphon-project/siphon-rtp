@@ -4,6 +4,12 @@
 //! enabling VAD adds no allocation over the baseline tick across a long steady-speech run — the leg's
 //! jitter is pre-filled outside the armed window, so the measured ticks are pure pop → decode → VAD.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};

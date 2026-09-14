@@ -13,6 +13,12 @@
 //! `i32` bus and saturated once) with the source render folded in, so it should land in the same
 //! order of magnitude — and, like the conference mix, at zero per-tick heap allocation.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: a panic reports failure"
+)]
+
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use siphon_rtp_media::fanout::MediaSink;
 use siphon_rtp_media::playback::{
