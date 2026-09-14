@@ -33,6 +33,11 @@
 //! NIC-free: UDP-loopback datapath, loopback WebSocket server, and the deterministic logical clock
 //! the datapath already exposes (`advance_clock`), never `Instant::now()`, so the reaping guard
 //! costs milliseconds rather than the 30 s the real timeout would.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test harness: a panic reports failure"
+)]
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -347,7 +352,7 @@ async fn a_takeover_leg_stamps_liveness_so_the_sweep_spares_a_live_call() {
         .expect("agent uplink channel open");
 
     assert!(
-        engine.reap_idle(5).await.is_empty(),
+        engine.reap_idle(5, 0).await.is_empty(),
         "a takeover leg carrying media must not be reaped: the caller's audio arrived after the \
          clock advanced, so the sweep has fresh liveness to read and the call is plainly alive"
     );
@@ -357,7 +362,7 @@ async fn a_takeover_leg_stamps_liveness_so_the_sweep_spares_a_live_call() {
     // media stopped and the clock advanced again, the same call is reaped.
     engine.datapath().advance_clock(50);
     assert_eq!(
-        engine.reap_idle(5).await,
+        engine.reap_idle(5, 0).await,
         vec!["live".to_string()],
         "a takeover leg that genuinely went quiet is still reaped"
     );
