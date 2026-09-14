@@ -77,6 +77,25 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
   sequence exists because the decoder reacts to it — and the two inverse filters accumulate products
   with no provable bound.
 
+### Changed
+
+- **One SSRC latch state machine instead of three.** The UDP datapath, the userspace pipelines
+  (transcode, conference, text, WebSocket takeover) and the in-kernel XDP fast path each carried their
+  own copy of the RFC 3550 §8 latch that tells a NAT rebind from an RTPBleed hijack, and the copies had
+  already drifted apart. All of them now run `source_latch_verdict`. The kernel reaches it through a
+  thin adapter, because its latch map has no room for a latch without an SSRC: RTCP that arrives
+  before any RTP is forwarded there without latching. An exhaustive test pins that adapter to the
+  kernel's previous decisions, case for case, since the verifier-loaded program cannot run under
+  `cargo test`.
+
+  One userspace behaviour moves. A pipeline used to re-pin its latch to a new SSRC whenever the
+  latched source changed stream; it now keeps the first SSRC, as both datapaths always did, so a new
+  source has to carry that SSRC to move the latch.
+
+  The RTPBleed checks (the off-path race, hijack versus rebind, the demux) are now written against
+  the `Datapath` trait in `siphon_rtp_datapath::conformance`, behind a `conformance` feature, so the
+  next backend runs them instead of inheriting no cover.
+
 ## [0.6.0] — 2026-09-13
 
 Eight gaps a PBX runs into that a trunk-facing SBC and a voice-AI bridge never did. A call on hold

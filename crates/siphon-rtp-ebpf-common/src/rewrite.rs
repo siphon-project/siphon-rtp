@@ -155,9 +155,78 @@ pub fn udp_checksum_after_rewrite(
 
 // -------------------------------------------------------------------------------------------------
 // RFC 3550 §8 SSRC-consistent symmetric-RTP latch (RTPBleed defence, docs/security-and-nat.md §4
-// layer 3). Mirrors the userspace loopback backend's `update_latch` exactly for RTP media; RTCP and
-// short datagrams (no readable SSRC) are gated + forwarded but never move the SSRC latch.
+// layer 3). One state machine, `source_latch_verdict`, decides for every latch: the UDP-loopback
+// backend, the userspace `Redirect` pipelines (through `siphon-rtp-datapath`'s re-export) and the
+// in-kernel XDP_TX fast path (through the `latch_decision` adapter).
 // -------------------------------------------------------------------------------------------------
+
+/// A peer source a latch has adopted, and the RTP SSRC it carried: generic over how the source is
+/// represented, because the kernel keys a flow on a host-order IPv4 address and port while userspace
+/// holds a `SocketAddr`.
+///
+/// `ssrc` is `None` when the source was learned from a datagram with no readable SSRC (RTCP, RFC 5761
+/// §4) or adopted by an ICE connectivity check rather than by media (RFC 8445 §7.3). Such a latch is
+/// confirmed by its own source but never moved: nothing proves a new source is the same stream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SourceLatch<Source> {
+    /// Where the peer's media arrives from.
+    pub source: Source,
+    /// The RTP SSRC the stream carried when its source was learned; the re-latch consistency key.
+    pub ssrc: Option<u32>,
+}
+
+/// What the SSRC-consistent latch decides for one datagram already accepted by the source gate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SourceLatchVerdict<Source> {
+    /// Accept the datagram and leave the latch as it is.
+    Keep,
+    /// Accept the datagram and store this as the latch: a first learn, the first SSRC read from a
+    /// source latched without one, or a same-SSRC NAT rebind.
+    Learn(SourceLatch<Source>),
+    /// Reject the datagram: a new source that cannot prove it is the latched stream.
+    Reject,
+}
+
+/// The SSRC-consistent latch state machine (RFC 3550 §8; RFC 4961) for one datagram that has already
+/// passed the RFC 7983 demux (layer 1) and the signalled-source gate (layer 2). `current` is the latch
+/// (`None` before anything was learned), `source` the datagram's transport source and `ssrc` its
+/// [`rtp_media_ssrc`].
+///
+/// - Nothing latched: learn `source`, with whatever SSRC it carries.
+/// - The latched source: keep, except that a latch learned without an SSRC records the first one its
+///   source sends. A later SSRC change on that source is a legitimate RTP SSRC change, not a hijack,
+///   and does not re-pin the latch; re-pinning on every change would let a transport carrying several
+///   SSRCs rewrite the latch packet by packet.
+/// - A new source: learn it only when both SSRCs are known and equal, because a genuine NAT rebind
+///   keeps its SSRC and a hijack spray does not. Anything else, a datagram with no SSRC included, is
+///   rejected and the latch stays where it is.
+///
+/// Pure, so it is exhaustively unit-tested on the host, and the one definition every latch runs: the
+/// kernel fast path, the UDP backend and the userspace pipelines cannot drift on what counts as a
+/// rebind and what counts as a hijack.
+#[inline(always)]
+#[must_use]
+pub fn source_latch_verdict<Source: Copy + PartialEq>(
+    current: Option<SourceLatch<Source>>,
+    source: Source,
+    ssrc: Option<u32>,
+) -> SourceLatchVerdict<Source> {
+    let learn = SourceLatchVerdict::Learn(SourceLatch { source, ssrc });
+    match current {
+        None => learn,
+        Some(latched) if latched.source == source => {
+            if latched.ssrc.is_none() && ssrc.is_some() {
+                learn
+            } else {
+                SourceLatchVerdict::Keep
+            }
+        }
+        Some(latched) => match (latched.ssrc, ssrc) {
+            (Some(known), Some(seen)) if known == seen => learn,
+            _ => SourceLatchVerdict::Reject,
+        },
+    }
+}
 
 /// The learned source of a flow's peer: address + port + the RTP SSRC it carries, all in **host**
 /// byte order — the kernel reads the wire fields with `from_be_bytes` before comparing/storing, so the
@@ -192,8 +261,8 @@ pub enum LatchVerdict {
 /// The RTP SSRC (RFC 3550 §5.1, bytes 8..12 of the RTP header / UDP payload) if `payload` is an RTP
 /// **media** packet, else `None`. Returns `None` for a datagram too short to hold the fixed RTP
 /// header, a non-RTP version, or an RTCP payload type (64..=95, RFC 5761 §4) — RTCP carries no
-/// comparable per-stream SSRC at this offset, so it never drives an SSRC re-latch. Mirrors the
-/// loopback backend's `rtp_ssrc`.
+/// comparable per-stream SSRC at this offset, so it never drives an SSRC re-latch. The one reader
+/// every latch keys on, kernel and userspace alike.
 #[inline(always)]
 #[must_use]
 pub fn rtp_media_ssrc(payload: &[u8]) -> Option<u32> {
@@ -252,14 +321,15 @@ pub fn ice_media_allowed(current: Option<Latched>, source_ipv4: u32, source_port
     }
 }
 
-/// Apply the SSRC-consistent latch policy to one datagram that has already passed the RFC 7983 demux
-/// (layer 1) and the signalled-source gate (layer 2). `current` is the flow's latch state (`None`
-/// when not yet latched), `source_*` is the datagram's L3/L4 source (host order — the kernel reads the
-/// wire fields with `from_be_bytes` before calling), and `ssrc` is [`rtp_media_ssrc`] of its payload.
-/// Returns the [`LatchVerdict`]. RFC 3550 §8; RFC 4961.
+/// The in-kernel form of [`source_latch_verdict`]: the same state machine over the kernel's host-order
+/// IPv4 address and port (the kernel reads the wire fields with `from_be_bytes` before calling), with
+/// `ssrc` the [`rtp_media_ssrc`] of the payload, returning the [`LatchVerdict`] the program acts on.
+/// RFC 3550 §8; RFC 4961.
 ///
-/// This is a pure function of `(current, source, ssrc)` — no I/O — so it is exhaustively unit-tested
-/// on the host and reused verbatim by the kernel program.
+/// The kernel's latch map has no room for a latch without an SSRC ([`Latched::ssrc`] is always set),
+/// so where the state machine would learn a source from a datagram carrying none (RTCP before any
+/// RTP), the kernel forwards the datagram without latching and learns from the first RTP instead.
+/// That only ever narrows the gate; every other outcome is the state machine's own.
 #[inline(always)]
 #[must_use]
 pub fn latch_decision(
@@ -268,36 +338,19 @@ pub fn latch_decision(
     source_port: u16,
     ssrc: Option<u32>,
 ) -> LatchVerdict {
-    match current {
-        // Not yet latched: learn the first source that carries an SSRC. A datagram with no readable
-        // SSRC (RTCP / too short) is forwarded but does not pin the media path (stricter than the
-        // loopback's latch-on-any-accepted, and never weaker — it only ever narrows the gate).
-        None => match ssrc {
-            Some(ssrc) => LatchVerdict::Learn(Latched {
-                ipv4: source_ipv4,
-                port: source_port,
-                ssrc,
-            }),
-            None => LatchVerdict::Forward,
-        },
-        Some(latched) => {
-            if latched.ipv4 == source_ipv4 && latched.port == source_port {
-                // Same path — forward; a same-source SSRC change is a legitimate RTP SSRC change
-                // (RFC 3550 §8), not a hijack, so we keep forwarding without re-pinning.
-                LatchVerdict::Forward
-            } else {
-                // New source: re-latch only on a matching SSRC (a genuine NAT rebind keeps its
-                // SSRC); anything else — a different SSRC, or a non-RTP datagram — is a spray/hijack.
-                match ssrc {
-                    Some(seen) if seen == latched.ssrc => LatchVerdict::Learn(Latched {
-                        ipv4: source_ipv4,
-                        port: source_port,
-                        ssrc: seen,
-                    }),
-                    _ => LatchVerdict::Drop,
-                }
-            }
+    let current = current.map(|latched| SourceLatch {
+        source: (latched.ipv4, latched.port),
+        ssrc: Some(latched.ssrc),
+    });
+    match source_latch_verdict(current, (source_ipv4, source_port), ssrc) {
+        SourceLatchVerdict::Keep | SourceLatchVerdict::Learn(SourceLatch { ssrc: None, .. }) => {
+            LatchVerdict::Forward
         }
+        SourceLatchVerdict::Learn(SourceLatch {
+            source: (ipv4, port),
+            ssrc: Some(ssrc),
+        }) => LatchVerdict::Learn(Latched { ipv4, port, ssrc }),
+        SourceLatchVerdict::Reject => LatchVerdict::Drop,
     }
 }
 
@@ -568,7 +621,146 @@ mod tests {
         assert_ne!(checksum, 0);
     }
 
-    // --- Latch state machine (mirrors the loopback backend's update_latch outcomes for RTP). ---
+    // --- The state machine every latch runs, `source_latch_verdict`. ---
+
+    const CALLER: &str = "caller";
+    const REBOUND: &str = "caller after a NAT rebind";
+
+    fn latch(source: &'static str, ssrc: Option<u32>) -> SourceLatch<&'static str> {
+        SourceLatch { source, ssrc }
+    }
+
+    #[test]
+    fn an_unlatched_flow_learns_its_first_source_with_or_without_an_ssrc() {
+        assert_eq!(
+            source_latch_verdict(None, CALLER, Some(0x1111_2222)),
+            SourceLatchVerdict::Learn(latch(CALLER, Some(0x1111_2222)))
+        );
+        // RTCP before any RTP: the source is learned, its SSRC is not known yet.
+        assert_eq!(
+            source_latch_verdict(None, CALLER, None),
+            SourceLatchVerdict::Learn(latch(CALLER, None))
+        );
+    }
+
+    #[test]
+    fn a_latch_learned_without_an_ssrc_records_the_first_ssrc_its_source_sends() {
+        let current = Some(latch(CALLER, None));
+        assert_eq!(
+            source_latch_verdict(current, CALLER, Some(0x1111_2222)),
+            SourceLatchVerdict::Learn(latch(CALLER, Some(0x1111_2222)))
+        );
+        assert_eq!(
+            source_latch_verdict(current, CALLER, None),
+            SourceLatchVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn a_latch_learned_without_an_ssrc_never_moves_to_a_new_source() {
+        // Nothing proves the new source is the same stream, whatever it carries.
+        let current = Some(latch(CALLER, None));
+        assert_eq!(
+            source_latch_verdict(current, REBOUND, Some(0x1111_2222)),
+            SourceLatchVerdict::Reject
+        );
+        assert_eq!(
+            source_latch_verdict(current, REBOUND, None),
+            SourceLatchVerdict::Reject
+        );
+    }
+
+    #[test]
+    fn a_same_source_ssrc_change_keeps_the_first_ssrc_as_the_rebind_key() {
+        let current = Some(latch(CALLER, Some(0x1111_2222)));
+        // A legitimate RTP SSRC change on the latched source (RFC 3550 §8) is accepted...
+        assert_eq!(
+            source_latch_verdict(current, CALLER, Some(0x3333_4444)),
+            SourceLatchVerdict::Keep
+        );
+        // ...but does not re-pin: only the first SSRC can move the latch to a new source.
+        assert_eq!(
+            source_latch_verdict(current, REBOUND, Some(0x3333_4444)),
+            SourceLatchVerdict::Reject
+        );
+        assert_eq!(
+            source_latch_verdict(current, REBOUND, Some(0x1111_2222)),
+            SourceLatchVerdict::Learn(latch(REBOUND, Some(0x1111_2222)))
+        );
+    }
+
+    #[test]
+    fn a_new_source_without_an_ssrc_is_rejected_while_latched() {
+        let current = Some(latch(CALLER, Some(0x1111_2222)));
+        assert_eq!(
+            source_latch_verdict(current, REBOUND, None),
+            SourceLatchVerdict::Reject
+        );
+    }
+
+    /// `latch_decision` exactly as the kernel ran it before it became an adapter over
+    /// [`source_latch_verdict`]. Kept as the oracle proving that change left the kernel's behaviour
+    /// untouched, since the verifier-loaded program cannot run under `cargo test`.
+    fn kernel_latch_before_the_shared_state_machine(
+        current: Option<Latched>,
+        source_ipv4: u32,
+        source_port: u16,
+        ssrc: Option<u32>,
+    ) -> LatchVerdict {
+        match current {
+            None => match ssrc {
+                Some(ssrc) => LatchVerdict::Learn(Latched {
+                    ipv4: source_ipv4,
+                    port: source_port,
+                    ssrc,
+                }),
+                None => LatchVerdict::Forward,
+            },
+            Some(latched) if latched.ipv4 == source_ipv4 && latched.port == source_port => {
+                LatchVerdict::Forward
+            }
+            Some(latched) => match ssrc {
+                Some(seen) if seen == latched.ssrc => LatchVerdict::Learn(Latched {
+                    ipv4: source_ipv4,
+                    port: source_port,
+                    ssrc: seen,
+                }),
+                _ => LatchVerdict::Drop,
+            },
+        }
+    }
+
+    #[test]
+    fn the_kernel_adapter_decides_exactly_as_the_kernel_did_before_it() {
+        // Every equivalence class of (latch, source, SSRC): unlatched, or latched on either SSRC at
+        // any of the transports; the latched transport, a new port on the same address, or a new
+        // address; no SSRC, the latched one, or another.
+        let transports = [
+            (0x0A00_0001_u32, 5000_u16),
+            (0x0A00_0001, 5002),
+            (0xC000_0209, 5000),
+        ];
+        let ssrcs = [None, Some(0x1111_2222_u32), Some(0x3333_4444)];
+        let mut currents = vec![None];
+        for (ipv4, port) in transports {
+            for ssrc in [0x1111_2222, 0x3333_4444] {
+                currents.push(Some(Latched { ipv4, port, ssrc }));
+            }
+        }
+        for current in currents {
+            for (ipv4, port) in transports {
+                for ssrc in ssrcs {
+                    assert_eq!(
+                        latch_decision(current, ipv4, port, ssrc),
+                        kernel_latch_before_the_shared_state_machine(current, ipv4, port, ssrc),
+                        "latch {current:?}, source {ipv4:#010x}:{port}, ssrc {ssrc:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- The kernel adapter, `latch_decision`. ---
 
     fn latched(ipv4: u32, port: u16, ssrc: u32) -> Latched {
         Latched { ipv4, port, ssrc }

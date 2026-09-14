@@ -28,7 +28,10 @@ use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
 use siphon_rtp_codec::cn::{Cn, COMFORT_NOISE_LEVEL_DBOV};
 use siphon_rtp_codec::{Decoder, Encoder};
-use siphon_rtp_datapath::{Datapath, EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{
+    rtp_media_ssrc, source_latch_verdict, Datapath, EndpointId, RxPacket, SourceFilter,
+    SourceLatch, SourceLatchVerdict,
+};
 use siphon_rtp_dsp::resample::Resampler;
 use siphon_rtp_dsp::{EchoCanceller, NoiseSuppressor, RecordToneDetector, ToneOutcome};
 use siphon_rtp_media::dtmf::{DtmfDetector, DtmfSequence, DtmfStep};
@@ -240,17 +243,16 @@ pub(crate) fn validate_echo_delay_search_ms(profile: &ProfileFlags) -> Result<()
     ))
 }
 
-/// The SSRC-consistent symmetric-RTP latch for a `Redirect`-path leg — the userspace mirror of the
-/// datapath's `update_latch` (docs/security-and-nat.md §4 layer 3; RFC 3550 §8, RFC 4961). The reverse
-/// egress destination follows a genuine NAT rebind (a new source that keeps the stream's SSRC) but
-/// resists a hijack spray (a new source with a different SSRC). Only **authenticated** RTP is ever
-/// offered here — on a secure leg the caller offers a packet only *after* SRTP `unprotect` succeeds —
-/// so a forged, auth-failing packet can never move the reply direction (the fix for the pre-auth,
-/// no-SSRC-check re-latch).
+/// The SSRC-consistent symmetric-RTP latch for a `Redirect`-path leg: the datapath's own state
+/// machine, [`source_latch_verdict`], held per direction (docs/security-and-nat.md §4 layer 3; RFC
+/// 3550 §8, RFC 4961). The reverse egress destination follows a genuine NAT rebind (a new source that
+/// keeps the stream's SSRC) but resists a hijack spray (a new source with a different SSRC). Only
+/// **authenticated** RTP is ever offered here — on a secure leg the caller offers a packet only
+/// *after* SRTP `unprotect` succeeds — so a forged, auth-failing packet can never move the reply
+/// direction (the fix for the pre-auth, no-SSRC-check re-latch).
 #[derive(Default)]
 pub(crate) struct SymmetricLatch {
-    source: Option<SocketAddr>,
-    ssrc: Option<u32>,
+    latch: Option<SourceLatch<SocketAddr>>,
 }
 
 impl SymmetricLatch {
@@ -258,43 +260,15 @@ impl SymmetricLatch {
     /// egress should be (re)pointed there, or `None` to keep the current latch (a likely hijack: a new
     /// source carrying a different SSRC than the latched stream).
     pub(crate) fn observe(&mut self, source: SocketAddr, ssrc: u32) -> Option<SocketAddr> {
-        match self.source {
-            // First accepted stream member: latch its source and record its SSRC.
-            None => {
-                self.source = Some(source);
-                self.ssrc = Some(ssrc);
+        match source_latch_verdict(self.latch, source, Some(ssrc)) {
+            SourceLatchVerdict::Keep => Some(source),
+            SourceLatchVerdict::Learn(latch) => {
+                self.latch = Some(latch);
                 Some(source)
             }
-            // Same source: stay latched (refresh the SSRC we track for it).
-            Some(current) if current == source => {
-                self.ssrc = Some(ssrc);
-                Some(source)
-            }
-            // New source keeping the SSRC — a genuine NAT rebind (RFC 3550 §8): follow it.
-            Some(_) if self.ssrc == Some(ssrc) => {
-                self.source = Some(source);
-                Some(source)
-            }
-            // New source with a different SSRC — a spray/hijack: reject, keep the current latch.
-            Some(_) => None,
+            SourceLatchVerdict::Reject => None,
         }
     }
-}
-
-/// The RTP SSRC (RFC 3550 §5.1, bytes 8..12) of an RTP media packet, or `None` when `data` is not one
-/// (too short, wrong version, or RTCP — RFC 5761: RTCP carries no comparable per-stream SSRC at this
-/// offset, so it never drives the SSRC re-latch). Mirrors the datapath's `rtp_ssrc` for the userspace
-/// relay-only path, which forwards the datagram verbatim and so does not otherwise parse it. Shared
-/// with [`crate::text_pipeline`], whose RFC 4103 text relay latches the same way.
-pub(crate) fn rtp_source_ssrc(data: &[u8]) -> Option<u32> {
-    if data.len() < 12 || data[0] >> 6 != 2 {
-        return None;
-    }
-    let payload_type = data[1] & 0x7f;
-    if (64..=95).contains(&payload_type) {
-        return None; // RTCP (RFC 5761 §4)
-    }
-    Some(u32::from_be_bytes([data[8], data[9], data[10], data[11]]))
 }
 
 /// A preallocated FIFO of far-end **reference** PCM: the egress samples one direction produced toward
@@ -2000,7 +1974,7 @@ impl Direction {
             }
             // A promoted-passthrough leg still latches the reply symmetrically: offer the verbatim
             // packet's SSRC (RTP only; RTCP/non-RTP yields `None` and never moves the latch).
-            return rtp_source_ssrc(data);
+            return rtp_media_ssrc(data);
         }
 
         // RFC 5761 demux: payload-type byte 64..=95 marks RTCP — relay it (re-encrypting toward a
@@ -4150,6 +4124,28 @@ mod tests {
     use siphon_rtp_codec::g722::G722;
     use siphon_rtp_codec::l16::L16;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn the_reply_latch_keeps_the_first_ssrc_through_a_same_source_ssrc_change() {
+        // docs/security-and-nat.md §4 layer 3, the datapath's own state machine: the latched source
+        // may change SSRC and stays latched, but the change does not re-pin the latch, so only the
+        // stream's first SSRC can move the reply to a new source.
+        let first = addr(A_ADDR);
+        let rebound = addr("127.0.0.2:5002");
+        let mut latch = SymmetricLatch::default();
+        assert_eq!(latch.observe(first, 0x1111_1111), Some(first));
+        assert_eq!(latch.observe(first, 0x2222_2222), Some(first));
+        assert_eq!(
+            latch.observe(rebound, 0x2222_2222),
+            None,
+            "a later SSRC is not the rebind key"
+        );
+        assert_eq!(
+            latch.observe(rebound, 0x1111_1111),
+            Some(rebound),
+            "the first SSRC is"
+        );
+    }
 
     const A_ADDR: &str = "127.0.0.2:5000";
     const B_ADDR: &str = "127.0.0.3:6000";

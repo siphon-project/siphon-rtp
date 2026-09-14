@@ -19,10 +19,18 @@ use std::net::{IpAddr, SocketAddr};
 
 use bytes::Bytes;
 
+#[cfg(any(test, feature = "conformance"))]
+pub mod conformance;
 pub mod dscp;
 pub mod udp;
 
 pub use dscp::{Dscp, DscpParseError};
+/// The SSRC-consistent latch state machine (docs/security-and-nat.md §4 layer 3) and the RTP SSRC
+/// reader it keys on, re-exported so every userspace latch runs the one definition the in-kernel fast
+/// path runs.
+pub use siphon_rtp_ebpf_common::rewrite::{
+    rtp_media_ssrc, source_latch_verdict, SourceLatch, SourceLatchVerdict,
+};
 
 /// Opaque handle to an allocated endpoint (one bound socket / media port).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]

@@ -44,10 +44,10 @@ use std::sync::{
 use bytes::Bytes;
 use dashmap::DashMap;
 
-use siphon_rtp_datapath::{EndpointId, RxPacket, SourceFilter};
+use siphon_rtp_datapath::{rtp_media_ssrc, EndpointId, RxPacket, SourceFilter};
 use siphon_rtp_srtp::leg::{is_rtcp, SecureLeg};
 
-use crate::media_pipeline::{rtp_source_ssrc, SymmetricLatch};
+use crate::media_pipeline::SymmetricLatch;
 
 /// The SRTP (RFC 3711) crypto of one secure WebSocket-takeover leg: the engine's own key material
 /// against the offerer's.
@@ -253,7 +253,7 @@ impl WsEgress {
         if self.ice_managed {
             return;
         }
-        let Some(ssrc) = rtp_source_ssrc(data) else {
+        let Some(ssrc) = rtp_media_ssrc(data) else {
             return;
         };
         // Scoped so the latch is released before the watch is touched — the two are never nested.
@@ -1072,8 +1072,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_same_ssrc_rebind_moves_the_downlink_but_a_different_ssrc_spray_does_not() {
-        // docs/security-and-nat.md §4 layer 3 / RFC 3550 §8, matching the datapath's `update_latch`
-        // and the media pipeline's `SymmetricLatch`: follow a genuine NAT rebind, resist a spray.
+        // docs/security-and-nat.md §4 layer 3 / RFC 3550 §8, the one state machine every latch runs
+        // (`source_latch_verdict`): follow a genuine NAT rebind, resist a spray.
         let registry = WsRegistry::default();
         let (rtp_in_tx, _rtp_in_rx) = flume::unbounded::<Bytes>();
         registry.register(plan(
