@@ -31,13 +31,216 @@ use super::play::{parse_prompt_wav, PlayOptions, ResolvedPlaySource};
 use super::record::AudioRecording;
 use super::{error_result, ok_empty, ok_sdp, ClientId, Engine, Leg};
 
+/// What anchoring a conference seat's RFC 9071 text stream leaves for the seat.
+struct SeatText {
+    /// The seat's text configuration for the room, when a text stream was anchored.
+    config: Option<ParticipantTextConfig>,
+    /// How the answer presents the participant's `m=text` section.
+    rewrite: TextRewrite,
+    /// The seat's text endpoint, when one was allocated.
+    endpoint: Option<siphon_rtp_datapath::Endpoint>,
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// A full RFC 8445 agent runs when the operator enabled it and the peer gave us both
+    /// credentials and candidates; otherwise the datapath's ice-lite responder answers checks and
+    /// adopts the validated source, exactly as on a 2-party leg.
+    ///
+    /// Only a full agent sets `ice_pending` on the seat, and that is a *room-level* gate for the
+    /// window in which a selection is still coming. An ice-lite seat never sets it, because no
+    /// selection is coming and a seat left pending forever would never be mixed at all; what
+    /// covers an ice-lite seat is the datapath's layer-4 ICE gate on the redirected path, which
+    /// hands the room only the source a connectivity check validated (`Inner::ice_gate`;
+    /// docs/security-and-nat.md §4 layer 4). Both gates are armed by the credentials installed
+    /// below — without them the seat would fall back to its `accepted_source` filter alone, which
+    /// an ICE seat deliberately leaves open.
+    ///
+    /// Returns whether a full agent now runs on the seat, which holds it `ice_pending`.
+    fn arm_seat_ice(
+        &self,
+        conference_id: &str,
+        endpoint: siphon_rtp_datapath::Endpoint,
+        info: &sdp::MediaInfo,
+        ice_config: Option<&IceConfig>,
+        ice_candidates: &[siphon_rtp_ice::Candidate],
+    ) -> bool {
+        let peer_ice = peer_ice_credentials(info);
+        let mut ice_pending = false;
+        if let Some(config) = ice_config {
+            let full_agent = self.ice_agents.as_ref().and_then(|agents| {
+                let peer = peer_ice.as_ref()?;
+                (!info.candidates.is_empty()).then(|| (agents.clone(), peer.clone()))
+            });
+            match full_agent {
+                Some((agents, peer)) => {
+                    let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
+                        siphon_rtp_ice::agent::Credentials::new(
+                            config.local_ufrag.clone(),
+                            config.local_pwd.clone(),
+                        ),
+                        siphon_rtp_ice::agent::Credentials::new(
+                            peer.ufrag.clone(),
+                            peer.pwd.clone(),
+                        ),
+                        // RFC 8445 §6.1.1: the offerer controls. The participant offered, so it
+                        // controls — unless it is a lite agent, which can never control.
+                        info.ice_lite,
+                        ice_tie_breaker(),
+                    )
+                    .with_candidates(
+                        filter_component(ice_candidates, 1),
+                        filter_component(&info.candidates, 1),
+                    );
+                    self.datapath.set_ice_agent(
+                        endpoint.id,
+                        config.clone(),
+                        // The agent owns request handling and is the only thing that may select a
+                        // pair; the datapath answers nothing on this endpoint.
+                        IceAgentMode::ForwardOnly,
+                        agents.events(),
+                    );
+                    agents.register(
+                        endpoint.id,
+                        conference_id,
+                        endpoint.local_addr,
+                        agent_config,
+                        0,
+                    );
+                    ice_pending = true;
+                }
+                None => self.datapath.set_ice(endpoint.id, Some(config.clone())),
+            }
+        }
+        ice_pending
+    }
+
+    /// RFC 9071 conference text: anchor a participant's `m=text` (RFC 4103) stream — its own
+    /// redirected endpoint, its own per-stream RTPBleed gate + latch — for a **plaintext**
+    /// (`RTP/AVP`) leg *or* a **secure** (SDES-SRTP, `RTP/SAVP` + `a=crypto`) one. A secure text leg
+    /// is keyed exactly like the secure audio leg above: mint the engine's own per-participant text
+    /// SDES key, answer `RTP/SAVP` + our `a=crypto`, and terminate SRTP on a per-participant
+    /// `SecureLeg` — each participant's text is secured independently while the room's text mix stays
+    /// internal plaintext, the same model as the conference audio (docs/security-and-nat.md §4). A
+    /// secure text section we cannot key/anchor (no usable `t140`, or no usable `a=crypto`) is
+    /// declined (`m=text 0`, RFC 3264 §6), never downgraded to plaintext. The room mixes each
+    /// participant's text across the others with per-source CSRC identification. Allocated after the
+    /// audio SDES/DTLS block so an audio-keying failure above never leaks a text port.
+    ///
+    /// Frees the seat's endpoints itself on a refusal.
+    async fn anchor_seat_text(
+        &self,
+        info: &sdp::MediaInfo,
+        profile: &ProfileFlags,
+        family: AddressFamily,
+        bind: Option<std::net::IpAddr>,
+        endpoint: siphon_rtp_datapath::Endpoint,
+        advertised: std::net::IpAddr,
+    ) -> Result<SeatText, Box<CmdResult>> {
+        let symmetric = profile.flags.iter().any(|flag| flag == "symmetric");
+        let (text_config, text_rewrite, text_endpoint) = match info.text.as_ref() {
+            Some(text) => {
+                let text_remote_crypto = text.crypto.first().copied();
+                // Anchorable iff it has a usable `t140` PT and — for a secure leg — a usable peer key.
+                match text.t140_payload_type {
+                    Some(t140_pt) if !text.secure || text_remote_crypto.is_some() => {
+                        let text_endpoint = match self.alloc_endpoints(1, family, bind).await {
+                            Ok(mut endpoints) => endpoints.remove(0),
+                            Err(reason) => {
+                                self.free(&[endpoint]).await;
+                                return Err(Box::new(error_result(
+                                    "conference_join: text endpoint",
+                                    &reason,
+                                )));
+                            }
+                        };
+                        if let Err(error) = self
+                            .datapath
+                            .install_flow(text_endpoint.id, FlowAction::Redirect)
+                        {
+                            self.free(&[endpoint, text_endpoint]).await;
+                            return Err(Box::new(error_result(
+                                "conference_join: install text redirect",
+                                &error,
+                            )));
+                        }
+                        let text_source = if symmetric {
+                            SourceFilter::Any
+                        } else {
+                            SourceFilter::Exact(text.remote_rtp.ip())
+                        };
+                        let text_engine = EngineMedia {
+                            rtp: text_endpoint.local_addr,
+                            rtcp: None,
+                            advertised_ip: advertised,
+                        };
+                        // Secure text: mint the engine's own text SDES key, build the participant's text
+                        // `SecureLeg` (decrypt its ingress with theirs, encrypt its egress with ours),
+                        // and answer `RTP/SAVP` + our text `a=crypto` (RFC 4568). Plaintext: anchor
+                        // plainly.
+                        let (text_secure, text_rewrite) = match text_remote_crypto {
+                            Some(remote) if text.secure => {
+                                let local = match CryptoAttribute::generate(
+                                    1,
+                                    CryptoSuite::AesCm128HmacSha1_80,
+                                ) {
+                                    Ok(local) => local,
+                                    Err(error) => {
+                                        self.free(&[endpoint, text_endpoint]).await;
+                                        return Err(Box::new(error_result(
+                                            "conference_join: generate text SDES key",
+                                            &error,
+                                        )));
+                                    }
+                                };
+                                (
+                                    Some(SecureLeg::new(&local.key, &remote.key)),
+                                    TextRewrite::AnchorSecure {
+                                        engine: text_engine,
+                                        crypto: local,
+                                    },
+                                )
+                            }
+                            _ => (None, TextRewrite::Anchor(text_engine)),
+                        };
+                        (
+                            Some(ParticipantTextConfig {
+                                ingress_endpoint: text_endpoint.id,
+                                egress_endpoint: text_endpoint.id,
+                                egress_dst: text.remote_rtp,
+                                accepted_source: text_source,
+                                latch: true,
+                                t140_payload_type: t140_pt,
+                                red_payload_type: text.red_payload_type,
+                                egress_ssrc: random_ssrc(),
+                                secure: text_secure,
+                            }),
+                            text_rewrite,
+                            Some(text_endpoint),
+                        )
+                    }
+                    // A secure text section we cannot key/anchor (no usable `t140`, or no usable
+                    // `a=crypto`) is declined (`m=text 0`), never downgraded to plaintext.
+                    _ if text.secure => (None, TextRewrite::Decline, None),
+                    // A plaintext `m=text` with no usable `t140` rtpmap is left untouched.
+                    _ => (None, TextRewrite::None, None),
+                }
+            }
+            None => (None, TextRewrite::None, None),
+        };
+        Ok(SeatText {
+            config: text_config,
+            rewrite: text_rewrite,
+            endpoint: text_endpoint,
+        })
+    }
+}
+
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Join (or lazily create) an audio conference ([`Command::ConferenceJoin`]). The participant
     /// offers SDP; the engine allocates one endpoint, seats it in the room's mixer, and answers with
     /// the engine endpoint advertising the participant's codec (sendrecv) — the participant then hears
     /// the room's mixed-minus-self audio. Each participant endpoint is a full inbound surface, so the
     /// source gate + constrained latch are enforced on ingress (RTPBleed, docs §4).
-    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     pub(super) async fn conference_join(
         &self,
         client: ClientId,
@@ -160,65 +363,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             None => (Vec::new(), None),
         };
 
-        // A full RFC 8445 agent runs when the operator enabled it and the peer gave us both
-        // credentials and candidates; otherwise the datapath's ice-lite responder answers checks and
-        // adopts the validated source, exactly as on a 2-party leg.
-        //
-        // Only a full agent sets `ice_pending` on the seat, and that is a *room-level* gate for the
-        // window in which a selection is still coming. An ice-lite seat never sets it, because no
-        // selection is coming and a seat left pending forever would never be mixed at all; what
-        // covers an ice-lite seat is the datapath's layer-4 ICE gate on the redirected path, which
-        // hands the room only the source a connectivity check validated (`Inner::ice_gate`;
-        // docs/security-and-nat.md §4 layer 4). Both gates are armed by the credentials installed
-        // below — without them the seat would fall back to its `accepted_source` filter alone, which
-        // an ICE seat deliberately leaves open.
-        let peer_ice = peer_ice_credentials(&info);
-        let mut ice_pending = false;
-        if let Some(config) = ice_config.as_ref() {
-            let full_agent = self.ice_agents.as_ref().and_then(|agents| {
-                let peer = peer_ice.as_ref()?;
-                (!info.candidates.is_empty()).then(|| (agents.clone(), peer.clone()))
-            });
-            match full_agent {
-                Some((agents, peer)) => {
-                    let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
-                        siphon_rtp_ice::agent::Credentials::new(
-                            config.local_ufrag.clone(),
-                            config.local_pwd.clone(),
-                        ),
-                        siphon_rtp_ice::agent::Credentials::new(
-                            peer.ufrag.clone(),
-                            peer.pwd.clone(),
-                        ),
-                        // RFC 8445 §6.1.1: the offerer controls. The participant offered, so it
-                        // controls — unless it is a lite agent, which can never control.
-                        info.ice_lite,
-                        ice_tie_breaker(),
-                    )
-                    .with_candidates(
-                        filter_component(&ice_candidates, 1),
-                        filter_component(&info.candidates, 1),
-                    );
-                    self.datapath.set_ice_agent(
-                        endpoint.id,
-                        config.clone(),
-                        // The agent owns request handling and is the only thing that may select a
-                        // pair; the datapath answers nothing on this endpoint.
-                        IceAgentMode::ForwardOnly,
-                        agents.events(),
-                    );
-                    agents.register(
-                        endpoint.id,
-                        conference_id,
-                        endpoint.local_addr,
-                        agent_config,
-                        0,
-                    );
-                    ice_pending = true;
-                }
-                None => self.datapath.set_ice(endpoint.id, Some(config.clone())),
-            }
-        }
+        let ice_pending = self.arm_seat_ice(
+            conference_id,
+            endpoint,
+            &info,
+            ice_config.as_ref(),
+            &ice_candidates,
+        );
         // SDES-SRTP (RTP/SAVP): the participant offered a secure leg + its a=crypto. Mint our own key,
         // build the secure leg (decrypt inbound with theirs, encrypt outbound with ours), and answer
         // RTP/SAVP + a=crypto. (DTLS-SRTP / ICE WebRTC legs remain a follow-up — see the is_ice() guard.)
@@ -281,101 +432,16 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         } else {
             (None, None)
         };
-        // RFC 9071 conference text: anchor a participant's `m=text` (RFC 4103) stream — its own
-        // redirected endpoint, its own per-stream RTPBleed gate + latch — for a **plaintext**
-        // (`RTP/AVP`) leg *or* a **secure** (SDES-SRTP, `RTP/SAVP` + `a=crypto`) one. A secure text leg
-        // is keyed exactly like the secure audio leg above: mint the engine's own per-participant text
-        // SDES key, answer `RTP/SAVP` + our `a=crypto`, and terminate SRTP on a per-participant
-        // `SecureLeg` — each participant's text is secured independently while the room's text mix stays
-        // internal plaintext, the same model as the conference audio (docs/security-and-nat.md §4). A
-        // secure text section we cannot key/anchor (no usable `t140`, or no usable `a=crypto`) is
-        // declined (`m=text 0`, RFC 3264 §6), never downgraded to plaintext. The room mixes each
-        // participant's text across the others with per-source CSRC identification. Allocated after the
-        // audio SDES/DTLS block so an audio-keying failure above never leaks a text port.
-        let symmetric = profile.flags.iter().any(|flag| flag == "symmetric");
-        let (text_config, text_rewrite, text_endpoint) = match info.text.as_ref() {
-            Some(text) => {
-                let text_remote_crypto = text.crypto.first().copied();
-                // Anchorable iff it has a usable `t140` PT and — for a secure leg — a usable peer key.
-                match text.t140_payload_type {
-                    Some(t140_pt) if !text.secure || text_remote_crypto.is_some() => {
-                        let text_endpoint = match self.alloc_endpoints(1, family, bind).await {
-                            Ok(mut endpoints) => endpoints.remove(0),
-                            Err(reason) => {
-                                self.free(&[endpoint]).await;
-                                return error_result("conference_join: text endpoint", &reason);
-                            }
-                        };
-                        if let Err(error) = self
-                            .datapath
-                            .install_flow(text_endpoint.id, FlowAction::Redirect)
-                        {
-                            self.free(&[endpoint, text_endpoint]).await;
-                            return error_result("conference_join: install text redirect", &error);
-                        }
-                        let text_source = if symmetric {
-                            SourceFilter::Any
-                        } else {
-                            SourceFilter::Exact(text.remote_rtp.ip())
-                        };
-                        let text_engine = EngineMedia {
-                            rtp: text_endpoint.local_addr,
-                            rtcp: None,
-                            advertised_ip: advertised,
-                        };
-                        // Secure text: mint the engine's own text SDES key, build the participant's text
-                        // `SecureLeg` (decrypt its ingress with theirs, encrypt its egress with ours),
-                        // and answer `RTP/SAVP` + our text `a=crypto` (RFC 4568). Plaintext: anchor
-                        // plainly.
-                        let (text_secure, text_rewrite) = match text_remote_crypto {
-                            Some(remote) if text.secure => {
-                                let local = match CryptoAttribute::generate(
-                                    1,
-                                    CryptoSuite::AesCm128HmacSha1_80,
-                                ) {
-                                    Ok(local) => local,
-                                    Err(error) => {
-                                        self.free(&[endpoint, text_endpoint]).await;
-                                        return error_result(
-                                            "conference_join: generate text SDES key",
-                                            &error,
-                                        );
-                                    }
-                                };
-                                (
-                                    Some(SecureLeg::new(&local.key, &remote.key)),
-                                    TextRewrite::AnchorSecure {
-                                        engine: text_engine,
-                                        crypto: local,
-                                    },
-                                )
-                            }
-                            _ => (None, TextRewrite::Anchor(text_engine)),
-                        };
-                        (
-                            Some(ParticipantTextConfig {
-                                ingress_endpoint: text_endpoint.id,
-                                egress_endpoint: text_endpoint.id,
-                                egress_dst: text.remote_rtp,
-                                accepted_source: text_source,
-                                latch: true,
-                                t140_payload_type: t140_pt,
-                                red_payload_type: text.red_payload_type,
-                                egress_ssrc: random_ssrc(),
-                                secure: text_secure,
-                            }),
-                            text_rewrite,
-                            Some(text_endpoint),
-                        )
-                    }
-                    // A secure text section we cannot key/anchor (no usable `t140`, or no usable
-                    // `a=crypto`) is declined (`m=text 0`), never downgraded to plaintext.
-                    _ if text.secure => (None, TextRewrite::Decline, None),
-                    // A plaintext `m=text` with no usable `t140` rtpmap is left untouched.
-                    _ => (None, TextRewrite::None, None),
-                }
-            }
-            None => (None, TextRewrite::None, None),
+        let SeatText {
+            config: text_config,
+            rewrite: text_rewrite,
+            endpoint: text_endpoint,
+        } = match self
+            .anchor_seat_text(&info, profile, family, bind, endpoint, advertised)
+            .await
+        {
+            Ok(text) => text,
+            Err(result) => return *result,
         };
         let config = ParticipantConfig {
             tag: from_tag.clone(),
