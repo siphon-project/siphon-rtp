@@ -234,8 +234,17 @@ Latch state machine, per direction:
   rebind keeps its SSRC; an attacker spraying a fresh stream does not. (With SRTP later, gate re-latch
   on a valid auth tag instead — strictly stronger.)
 - **Spec:** RFC 3550 §8 (SSRC identity/collision), RFC 4961 (symmetric RTP/RTCP).
-- **Enforcement:** datapath latch state carries `ssrc`; needs the RTP header parse already in
-  `siphon-rtp-media`.
+- **Enforcement:** one state machine, `source_latch_verdict` in `siphon-rtp-ebpf-common::rewrite`,
+  decides every latch: the UDP backend's `Inner::update_latch`, the `Redirect` consumers'
+  `SymmetricLatch` (through the `siphon-rtp-datapath` re-export) and the kernel program through the
+  `latch_decision` adapter, so none of them can drift on what counts as a rebind. Two rules belong to
+  the state machine rather than to any consumer. A first datagram with no readable SSRC (RTCP) latches
+  its source without one, which is what lets a non-muxed RTCP port reply symmetrically behind NAT;
+  such a latch is confirmed by its own source but never moved. And an SSRC change on the latched
+  source keeps the first SSRC as the rebind key rather than re-pinning, so a transport carrying
+  several SSRCs cannot rewrite the latch packet by packet. The kernel's latch map has no room for a
+  latch without an SSRC, so the adapter forwards that first SSRC-less datagram without latching and
+  learns from the first RTP instead, which only narrows the gate.
 - **In-kernel enforcement (XDP_TX fast path) — shipped in the separate `siphon-rtp-xdp-daemon`.** The
   default `siphon-rtp` binary runs the userspace UDP datapath, which enforces layers 1–3 in
   [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs). The in-kernel `XDP_TX` fast path, with the same
@@ -1138,8 +1147,12 @@ inspection:
   the engine does **not** latch to the attacker and the real peer still establishes. The headline
   test — it must fail against today's `or_insert` and pass after layer 2–3.
 - **Mid-call hijack:** mid-stream spray from a new source with a *wrong* SSRC is rejected; a new source
-  with the *correct* SSRC (simulated NAT rebind) re-latches. Two tests, opposite verdicts.
+  with the *correct* SSRC (simulated NAT rebind) re-latches. One check, opposite verdicts.
 - **Demux:** STUN/DTLS/garbage to a media port never moves the media latch (layer 1).
+- **Every backend, not only UDP-loopback:** the RTPBleed race, the hijack-versus-rebind check and the
+  demux check are written against the `Datapath` trait (`siphon_rtp_datapath::conformance`, behind
+  the `conformance` feature), so another backend runs the same adversarial tests instead of
+  inheriting none of their cover.
 - **Source gate:** `SignalledOnly` rejects an off-address source; `Symmetric` (opt-in) accepts it.
 - **Media timeout:** a flow goes silent → teardown + `Event::MediaTimeout`, driven by a logical clock.
 - **Control authz:** client B cannot `Delete`/`Query` a call created by client A.

@@ -30,6 +30,13 @@ tracing = { workspace = true }
 # option is set on the already-bound tokio socket without a conversion round trip.
 socket2 = { workspace = true }
 
+[features]
+# The backend-agnostic security conformance checks (`conformance` module): the RTPBleed source gate,
+# the SSRC-consistent latch and the RFC 7983 demux, written against the `Datapath` trait so a backend
+# other than UDP-loopback runs the same adversarial tests instead of inheriting none. Test support
+# only; nothing in a shipped binary enables it.
+conformance = []
+
 [dev-dependencies]
 tokio = { workspace = true }
 criterion = { workspace = true }

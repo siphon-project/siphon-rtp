@@ -43,7 +43,9 @@ use siphon_rtp_media::t140::T140Reassembler;
 use siphon_rtp_proto::{Event, TextStreamStats};
 use siphon_rtp_srtp::leg::{SecureLeg, SecureLegRollover};
 
-use crate::media_pipeline::{rtp_source_ssrc, Outbound, PcapCapture, SymmetricLatch};
+use siphon_rtp_datapath::rtp_media_ssrc;
+
+use crate::media_pipeline::{Outbound, PcapCapture, SymmetricLatch};
 
 /// One direction of the text relay: the sending party's ingress text endpoint (+ its RTPBleed gate and
 /// symmetric latch), the peer's egress text endpoint/address, and the RFC 4103 reassembler + content
@@ -421,7 +423,7 @@ impl TextCall {
         // secure leg that means *after* SRTP auth succeeded (a forged packet returned above), so a
         // spoofed source can never move the latch. RTCP / non-RTP yields `None` and never moves it.
         if *latch {
-            if let Some(ssrc) = rtp_source_ssrc(plaintext) {
+            if let Some(ssrc) = rtp_media_ssrc(plaintext) {
                 if let Some(new_dst) = direction.source_latch.observe(packet.source, ssrc) {
                     reverse.egress_dst = new_dst;
                 }
