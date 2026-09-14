@@ -11951,6 +11951,108 @@ async fn a_dtls_media_leg_can_be_ws_teed_but_a_dtls_bridge_leg_cannot() {
     }
 }
 
+/// A WebRTC-shaped (`UDP/TLS/RTP/SAVPF`) conference offer from `addr`, with an `a=fingerprint` line
+/// when `fingerprint` carries one.
+fn dtls_conference_offer(
+    addr: SocketAddr,
+    fingerprint: Option<&siphon_rtp_dtls::Fingerprint>,
+) -> String {
+    let fingerprint_line = fingerprint.map_or_else(String::new, |fingerprint| {
+        let hex = fingerprint
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        format!("a=fingerprint:{} {hex}\r\n", fingerprint.hash_function)
+    });
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 {ip}\r\ns=-\r\nc=IN IP4 {ip}\r\nt=0 0\r\n\
+         m=audio {port} UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtcp-mux\r\n\
+         a=setup:actpass\r\n{fingerprint_line}",
+        ip = addr.ip(),
+        port = addr.port(),
+    )
+}
+
+/// Join a plain participant, proving the one-endpoint pool has a free port again.
+async fn a_plain_seat_still_fits<D: Datapath + Clone + Send + 'static>(engine: &Engine<D>) {
+    let (_phone, phone_addr) = phone_at(Ipv4Addr::new(127, 0, 0, 2)).await;
+    let joined = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "dtls-refusal-room".into(),
+                from_tag: "tag-plain".into(),
+                sdp: sdp_for(phone_addr, true),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(joined, CmdResult::Ok { .. }),
+        "the refused DTLS seat did not give its port back: {joined:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_dtls_conference_offer_without_a_fingerprint_is_refused_and_frees_its_port() {
+    // One endpoint in the pool, so the plain seat after the refusal can bind only if the refused seat
+    // released its port.
+    let engine = Engine::new(UdpLoopbackDatapath::with_max_endpoints(1));
+    let webrtc_addr = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 3), 40_000));
+    let refused = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "dtls-refusal-room".into(),
+                from_tag: "tag-webrtc".into(),
+                sdp: dtls_conference_offer(webrtc_addr, None),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    match refused {
+        CmdResult::Error { reason } => assert_eq!(
+            reason,
+            "conference_join: UDP/TLS/RTP/SAVPF offer without an a=fingerprint"
+        ),
+        other => panic!("a fingerprint-less DTLS seat must be refused, got {other:?}"),
+    }
+    a_plain_seat_still_fits(&engine).await;
+}
+
+#[tokio::test]
+async fn a_dtls_conference_offer_to_an_engine_without_a_certificate_is_refused_and_frees_its_port()
+{
+    let mut engine = Engine::new(UdpLoopbackDatapath::with_max_endpoints(1));
+    // An engine that could not generate its DTLS certificate (the OS RNG failed at start-up).
+    engine.dtls_certificate = None;
+    let peer_certificate = siphon_rtp_dtls::DtlsCertificate::generate().expect("peer certificate");
+    let webrtc_addr = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 3), 40_000));
+    let refused = engine
+        .handle(
+            CLIENT,
+            Command::ConferenceJoin {
+                conference_id: "dtls-refusal-room".into(),
+                from_tag: "tag-webrtc".into(),
+                sdp: dtls_conference_offer(webrtc_addr, Some(&peer_certificate.fingerprint())),
+                role: ConferenceRole::Talker,
+                profile: ProfileFlags::default(),
+            },
+        )
+        .await;
+    match refused {
+        CmdResult::Error { reason } => {
+            assert_eq!(reason, "conference_join: engine has no DTLS certificate");
+        }
+        other => panic!("a DTLS seat on a certificate-less engine must be refused, got {other:?}"),
+    }
+    a_plain_seat_still_fits(&engine).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dtls_participant_joins_a_conference_and_is_mixed_once_its_handshake_keys_the_seat() {
     // The last WP-R4 acceptance criterion: `conference_join` used to refuse a DTLS leg outright.
