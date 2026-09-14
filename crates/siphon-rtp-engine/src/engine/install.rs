@@ -1,23 +1,27 @@
-//! Installing an answered call's media path: the SRTP and DTLS crypto bridges, the transcoding
-//! media actor (plaintext or with a secure far party), and the in-datapath plain relay.
+//! Installing an answered call's media path: ICE on its endpoints, the SRTP and DTLS crypto
+//! bridges, the transcoding media actor (plaintext or with a secure far party), the in-datapath
+//! plain relay, and the RFC 4103 text stream.
 
 use siphon_rtp_codec::factory::CodecSpec;
-use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction};
+use siphon_rtp_datapath::{Datapath, EndpointId, FlowAction, IceAgentMode, IceConfig, LatchPolicy};
 use siphon_rtp_dtls::{DtlsCertificate, DtlsRole, Fingerprint as DtlsFingerprint};
 use siphon_rtp_proto::{CmdResult, Event, ProfileFlags};
 use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use crate::dtls_bridge::DtlsCallPlan;
+use crate::ice::IceCredentials;
 use crate::media_pipeline::{DirectionConfig, EchoProfile, MediaCall, RtcpRelay};
 use crate::sdp;
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp};
+use crate::text_pipeline::{TextCall, TextDirectionConfig};
 
 use super::answer::{ingress_rule, with_ptime_override};
 use super::negotiate::{
-    bridge_source_filter, build_transcode_pair, secure_rtcp_relays, RtcpKeying, TranscodePair,
+    apply_received_from, bridge_source_filter, build_transcode_pair, filter_component,
+    ice_tie_breaker, peer_ice_credentials, secure_rtcp_relays, RtcpKeying, TranscodePair,
 };
 use super::{boxed_error_result, Engine, Leg, PipelineKind};
 
@@ -661,5 +665,441 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             relay_flows.push((far_rtcp.id, far_rtcp_action));
         }
         Ok(relay_flows)
+    }
+}
+
+/// What arming an answered call's ICE reads: the engine's credentials, both legs, what each peer
+/// signalled, and the candidates each leg presented.
+pub(super) struct AnswerIce<'a> {
+    pub(super) call_id: &'a str,
+    /// The engine's own ICE-lite credentials for the call.
+    pub(super) creds: &'a IceCredentials,
+    /// The far party's SDP: B's answer, or B's re-offer when A is answering it.
+    pub(super) info: &'a sdp::MediaInfo,
+    pub(super) near: Leg,
+    pub(super) far: Leg,
+    pub(super) near_remote_ice: &'a Option<IceCredentials>,
+    pub(super) near_remote_candidates: &'a Vec<siphon_rtp_ice::Candidate>,
+    /// What the near leg presents to A.
+    pub(super) near_ice_candidates: &'a Vec<siphon_rtp_ice::Candidate>,
+    /// What the far leg presents to B.
+    pub(super) far_ice_candidates: &'a Vec<siphon_rtp_ice::Candidate>,
+    /// A is answering a re-offer from B.
+    pub(super) reversed: bool,
+    pub(super) near_peer_is_lite: bool,
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Arm ICE on an answered call's endpoints — a full RFC 8445 agent where the operator enabled one
+    /// and the peer gave credentials and candidates, RFC 7675 consent or the ice-lite responder
+    /// otherwise — and return the endpoints a full agent now runs on.
+    pub(super) fn arm_answer_ice(&self, ice: &AnswerIce<'_>) -> Vec<EndpointId> {
+        let AnswerIce {
+            call_id,
+            creds,
+            info,
+            near,
+            far,
+            near_remote_ice,
+            near_remote_candidates,
+            near_ice_candidates,
+            far_ice_candidates,
+            reversed,
+            near_peer_is_lite,
+        } = *ice;
+        let mut agent_endpoints: Vec<EndpointId> = Vec::new();
+        let config = IceConfig {
+            local_ufrag: creds.ufrag.clone(),
+            local_pwd: creds.pwd.clone(),
+        };
+        // `near` faces A (which offered ICE); enable the responder on its RTP and, under
+        // non-mux, its companion RTCP endpoint. `far` faces B; enable only when B also offered
+        // ICE. With consent freshness on, each side is promoted to the datapath's **full-agent**
+        // seam instead (responder + STUN forwarding) and registered with the credentials of the
+        // peer *that* side faces — an outbound check is signed with the peer's password, so the
+        // two legs are not interchangeable (RFC 8445 §7.1.2).
+        let far_remote_ice = if info.ice_mismatch {
+            // RFC 8839 §5.3: B says our offer's ICE reached it altered, so ICE is unusable on that
+            // leg. Treat B as non-ICE — the endpoints below are cleared and the leg falls back to
+            // the signalled-source gate.
+            tracing::info!(
+                target: "siphon_rtp::control",
+                %call_id,
+                "peer answered a=ice-mismatch (RFC 8839 §5.3) — running the far leg without ICE"
+            );
+            None
+        } else {
+            peer_ice_credentials(info)
+        };
+        if !info.is_ice() || info.ice_mismatch {
+            // B answered without ICE. Gathering at offer time installed the responder on the far
+            // endpoints (that is how it received its own Binding responses), and leaving it there
+            // would arm the layer-4 gate — which forwards media *only* from a STUN-validated
+            // source — on a leg that will never send a check, blackholing B's media. Clear it, so
+            // the far leg falls back to the signalled-source gate like any non-ICE leg.
+            for endpoint in far.endpoint_ids() {
+                self.datapath.set_ice(endpoint, None);
+            }
+        }
+        let sides = [
+            (near.endpoint_ids().collect::<Vec<_>>(), near_remote_ice),
+            (
+                if info.is_ice() && !info.ice_mismatch {
+                    far.endpoint_ids().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                },
+                &far_remote_ice,
+            ),
+        ];
+        // RFC 8445 §6.1.1: the offerer of the exchange controls, unless it is a lite agent, which
+        // never can. B answering: A offered, so A controls the near leg (we control it only when A
+        // is lite), and we offered to B, so we control the far leg either way. A answering B's
+        // re-offer is the same rule the other way round: B controls the far leg unless it is lite,
+        // and we offered B's re-offer to A, so we control the near leg.
+        let (near_controlling, far_controlling) = if reversed {
+            (true, info.ice_lite)
+        } else {
+            (near_peer_is_lite, true)
+        };
+        // Full RFC 8445 agent, when the operator enabled it and this side's peer gave us both
+        // credentials and candidates. It supersedes consent on that side: a full agent runs its
+        // own checks, and RFC 7675 consent is what a *lite* agent does instead.
+        let full_ice_sides = [
+            (
+                near.endpoint_ids().collect::<Vec<_>>(),
+                near_remote_ice,
+                near_remote_candidates,
+                near_ice_candidates,
+                near_controlling,
+            ),
+            (
+                if info.is_ice() && !info.ice_mismatch {
+                    far.endpoint_ids().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                },
+                &far_remote_ice,
+                &info.candidates,
+                far_ice_candidates,
+                far_controlling,
+            ),
+        ];
+        if let Some(agents) = &self.ice_agents {
+            for (endpoints, remote, remote_candidates, local_candidates, controlling) in
+                full_ice_sides
+            {
+                let (Some(remote), false) = (remote, remote_candidates.is_empty()) else {
+                    continue;
+                };
+                for endpoint in endpoints {
+                    let Some(local_addr) = self.endpoint_address(endpoint) else {
+                        continue;
+                    };
+                    // Only this endpoint's own component takes part in its checklist.
+                    let component = if endpoint == near.rtp.id || endpoint == far.rtp.id {
+                        1
+                    } else {
+                        2
+                    };
+                    let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
+                        siphon_rtp_ice::agent::Credentials::new(
+                            creds.ufrag.clone(),
+                            creds.pwd.clone(),
+                        ),
+                        siphon_rtp_ice::agent::Credentials::new(
+                            remote.ufrag.clone(),
+                            remote.pwd.clone(),
+                        ),
+                        controlling,
+                        ice_tie_breaker(),
+                    )
+                    .with_candidates(
+                        filter_component(local_candidates, component),
+                        filter_component(remote_candidates, component),
+                    );
+                    self.datapath.set_ice_agent(
+                        endpoint,
+                        config.clone(),
+                        // The agent owns request handling: answering needs the role (§7.3.1.1),
+                        // the checklist (§7.3.1.3) and the nomination flag (§7.3.1.5), none of
+                        // which the datapath has. It is also then the only thing that may adopt a
+                        // source, so media cannot start before ICE has chosen a pair.
+                        IceAgentMode::ForwardOnly,
+                        agents.events(),
+                    );
+                    agents.register(endpoint, call_id, local_addr, agent_config, 0);
+                    agent_endpoints.push(endpoint);
+                }
+            }
+        }
+
+        for (endpoints, remote) in sides {
+            for endpoint in endpoints {
+                if agent_endpoints.contains(&endpoint) {
+                    continue; // a full agent already owns this endpoint
+                }
+                match (&self.consent, remote) {
+                    (Some(consent), Some(remote)) => {
+                        self.datapath.set_ice_agent(
+                            endpoint,
+                            config.clone(),
+                            // Consent is a lite-agent behaviour: the datapath keeps answering
+                            // checks, and the sink exists only so Binding *responses* reach the
+                            // checker (RFC 7675 §4).
+                            IceAgentMode::RespondAndForward,
+                            consent.events(),
+                        );
+                        consent.register(
+                            endpoint,
+                            call_id,
+                            &creds.ufrag,
+                            &remote.ufrag,
+                            &remote.pwd,
+                        );
+                    }
+                    // Consent is off, or this peer signalled ICE without usable credentials:
+                    // the ice-lite responder alone (RFC 7675 §4 — a lite agent answers checks
+                    // and never initiates them).
+                    _ => self.datapath.set_ice(endpoint, Some(config.clone())),
+                }
+            }
+        }
+        agent_endpoints
+    }
+}
+
+/// What installing an answered call's RFC 4103 text stream reads: both legs, what each party kept,
+/// and the keys a secure stream is bridged with.
+#[derive(Clone, Copy)]
+pub(super) struct AnswerText<'a> {
+    pub(super) call_id: &'a str,
+    pub(super) from_tag: &'a str,
+    pub(super) to_tag: &'a str,
+    pub(super) profile: &'a ProfileFlags,
+    /// The far party's SDP: B's answer, or B's re-offer when A is answering it.
+    pub(super) info: &'a sdp::MediaInfo,
+    pub(super) near: Leg,
+    pub(super) far: Leg,
+    /// Both parties kept a plaintext text stream.
+    pub(super) text_accepted: bool,
+    /// Both parties kept a secure (SDES-SRTP) text stream.
+    pub(super) secure_text_accepted: bool,
+    /// A's `received-from`, which tightens the near text gate like the audio one.
+    pub(super) offer_received_from: Option<IpAddr>,
+    pub(super) near_text_local_crypto: Option<CryptoAttribute>,
+    pub(super) near_text_remote_crypto: Option<CryptoAttribute>,
+    pub(super) far_text_local_crypto: Option<CryptoAttribute>,
+    pub(super) text_t140_payload_type: Option<u8>,
+    pub(super) text_red_payload_type: Option<u8>,
+}
+
+/// What installing the text stream leaves for the call record.
+pub(super) struct AnsweredText {
+    /// B's signalled text address, when a text stream was relayed.
+    pub(super) far_text_remote: Option<SocketAddr>,
+    /// The in-kernel plaintext text flows (near text, then far text); empty otherwise.
+    pub(super) text_relay_flows: Vec<(EndpointId, FlowAction)>,
+    /// A secure text stream is now registered on the userspace text processor.
+    pub(super) secure_text_registered: bool,
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Install an answered call's RFC 4103 text stream: the in-kernel relay for a plaintext stream,
+    /// or the userspace SDES-SRTP bridge for a secure one. `secure_text_events_sink` receives
+    /// `Event::Text` from a secure stream when the controller asked for it.
+    pub(super) fn install_answer_text(
+        &self,
+        text: &AnswerText<'_>,
+        secure_text_events_sink: Option<flume::Sender<Event>>,
+    ) -> Result<AnsweredText, Box<CmdResult>> {
+        let AnswerText {
+            call_id,
+            from_tag,
+            to_tag,
+            profile,
+            info,
+            near,
+            far,
+            text_accepted,
+            secure_text_accepted,
+            offer_received_from,
+            near_text_local_crypto,
+            near_text_remote_crypto,
+            far_text_local_crypto,
+            text_t140_payload_type,
+            text_red_payload_type,
+        } = *text;
+        // RFC 4103 text relay — a second stream, wired independently of the audio pipeline kind (its
+        // endpoints are distinct, so it relays whether audio is a plain relay, transcode, or SRTP
+        // bridge). When both legs hold a text endpoint and B accepted a plaintext stream, install the
+        // in-datapath Forward flows `near.text ↔ far.text`. Each direction carries its OWN RTPBleed
+        // source-gate + symmetric latch (`ingress_rule` — the same defence the audio relay uses; the
+        // gate is per-stream, docs/security-and-nat.md §4). Text is forwarded verbatim (RED/T.140 is
+        // not parsed in PR 1). Text does not use ICE here (`ice = false`).
+        let mut far_text_remote = None;
+        // The two installed text `Forward` flows (near text, then far text), kept so a text-observability
+        // feature can promote the text stream to userspace and demote it back to these (mirrors the audio
+        // `relay_flows`). Empty when no plaintext text stream was negotiated.
+        let mut text_relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
+        if let (Some(near_text), Some(far_text), Some(b_text)) =
+            (near.text, far.text, info.text.as_ref())
+        {
+            // `text_accepted` already excludes a secure-text offer (no plaintext downgrade) and a WS
+            // takeover; only a genuine plaintext↔plaintext stream installs the in-kernel `Forward` relay.
+            if text_accepted && !b_text.secure && b_text.remote_rtp.port() != 0 {
+                let b_text_rtp = b_text.remote_rtp;
+                far_text_remote = Some(b_text_rtp);
+                // Gate each side's text ingress to its signalled source, tightened to the
+                // `received-from` public IP when the proxy supplied one, and aim each direction at
+                // that same effective address until the latch forms (the audio-leg posture).
+                let near_text_gate = apply_received_from(near.text_remote_rtp, offer_received_from);
+                let far_text_gate = apply_received_from(Some(b_text_rtp), profile.received_from)
+                    .unwrap_or(b_text_rtp);
+                let near_text_action = FlowAction::Forward(ingress_rule(
+                    far_text.id,
+                    Some(far_text_gate),
+                    near_text_gate,
+                    profile,
+                    false,
+                ));
+                if let Err(error) = self.datapath.install_flow(near_text.id, near_text_action) {
+                    return Err(boxed_error_result("install near->far text flow", &error));
+                }
+                let far_text_action = FlowAction::Forward(ingress_rule(
+                    near_text.id,
+                    near_text_gate,
+                    Some(far_text_gate),
+                    profile,
+                    false,
+                ));
+                if let Err(error) = self.datapath.install_flow(far_text.id, far_text_action) {
+                    return Err(boxed_error_result("install far->near text flow", &error));
+                }
+                text_relay_flows.push((near_text.id, near_text_action));
+                text_relay_flows.push((far_text.id, far_text_action));
+            }
+        }
+
+        // RFC 4103 SECURE text (SDES-SRTP) — the per-leg `SecureLeg` bridge. Unlike the plaintext relay
+        // it cannot run in-kernel (SRTP must be terminated in userspace), so it is registered on the
+        // text processor from the start: both text endpoints `Redirect`ed, one `SecureLeg` per leg with
+        // its OWN SDES keys (near = engine↔A, far = engine↔B), and held there for the call's life
+        // (docs/security-and-nat.md Layer 5d — mirrors the audio SDES bridge). A→B text is decrypted on
+        // the near leg and re-encrypted on the far leg (and B→A the reverse), so the two sides re-key
+        // independently and no plaintext ever crosses to a secure peer. A mixed secure/plaintext text
+        // bridge was refused above (declined), never keyed here.
+        let mut secure_text_registered = false;
+        if secure_text_accepted {
+            if let (
+                Some(near_text),
+                Some(far_text),
+                Some(b_text),
+                Some(near_local),
+                Some(near_remote),
+                Some(far_local),
+                Some(a_text_dst),
+            ) = (
+                near.text,
+                far.text,
+                info.text.as_ref(),
+                near_text_local_crypto,
+                near_text_remote_crypto,
+                far_text_local_crypto,
+                near.text_remote_rtp,
+            ) {
+                if let Some(far_remote) = b_text.crypto.first().copied() {
+                    let b_text_rtp = b_text.remote_rtp;
+                    far_text_remote = Some(b_text_rtp);
+                    // Same per-stream source gate + symmetric-latch posture as the plaintext text relay
+                    // and the audio SDES bridge: gate each side to its signalled source, tightened to the
+                    // `received-from` public IP when the proxy supplied one, and aim each direction at
+                    // that same effective address until the latch forms (docs/security-and-nat.md §4).
+                    let near_text_gate =
+                        apply_received_from(near.text_remote_rtp, offer_received_from);
+                    let far_text_gate =
+                        apply_received_from(Some(b_text_rtp), profile.received_from)
+                            .unwrap_or(b_text_rtp);
+                    let near_rule = ingress_rule(
+                        far_text.id,
+                        Some(far_text_gate),
+                        near_text_gate,
+                        profile,
+                        false,
+                    );
+                    let far_rule = ingress_rule(
+                        near_text.id,
+                        Some(near_text_gate.unwrap_or(a_text_dst)),
+                        Some(far_text_gate),
+                        profile,
+                        false,
+                    );
+                    let latch =
+                        near_rule.latch != LatchPolicy::Off || far_rule.latch != LatchPolicy::Off;
+                    // One `SecureLeg` per text leg (its own SDES keys), each shared by both directions —
+                    // exactly as the audio bridge shares a leg's contexts (single-owner actor ⇒ the
+                    // `Mutex` is uncontended).
+                    // Carry the live legs' SRTP rollover into the rebuilt ones (RFC 3711 §3.3.1) — a
+                    // renegotiation re-registers the text actor, and restarting either counter at 0
+                    // breaks a stream that has already run past a sequence wrap, exactly as it does
+                    // on the audio legs above.
+                    let previous_rollover = self.text.rollover_snapshots(call_id);
+                    let mut near_secure = SecureLeg::new(&near_local.key, &near_remote.key);
+                    let mut far_secure = SecureLeg::new(&far_local.key, &far_remote.key);
+                    if let Some((near_rollover, far_rollover)) = previous_rollover.as_ref() {
+                        near_secure.seed_rollover(near_rollover);
+                        far_secure.seed_rollover(far_rollover);
+                    }
+                    let near_leg = Arc::new(Mutex::new(near_secure));
+                    let far_leg = Arc::new(Mutex::new(far_secure));
+                    // Redirect both text endpoints so the dispatcher routes them to the text actor.
+                    for endpoint in [near_text.id, far_text.id] {
+                        if let Err(error) =
+                            self.datapath.install_flow(endpoint, FlowAction::Redirect)
+                        {
+                            return Err(boxed_error_result("install secure text redirect", &error));
+                        }
+                    }
+                    let a_to_b = TextDirectionConfig {
+                        ingress_endpoint: near_text.id,
+                        accepted_source: near_rule.accepted_source,
+                        egress_endpoint: far_text.id,
+                        egress_dst: b_text_rtp,
+                        t140_payload_type: text_t140_payload_type,
+                        red_payload_type: text_red_payload_type,
+                        secure_ingress: Some(near_leg.clone()), // decrypt A's ingress
+                        secure_egress: Some(far_leg.clone()),   // encrypt egress toward B
+                    };
+                    let b_to_a = TextDirectionConfig {
+                        ingress_endpoint: far_text.id,
+                        accepted_source: far_rule.accepted_source,
+                        egress_endpoint: near_text.id,
+                        egress_dst: a_text_dst,
+                        t140_payload_type: text_t140_payload_type,
+                        red_payload_type: text_red_payload_type,
+                        secure_ingress: Some(far_leg), // decrypt B's ingress
+                        secure_egress: Some(near_leg), // encrypt egress toward A
+                    };
+                    let text_call = TextCall::new(
+                        call_id,
+                        from_tag,
+                        Some(to_tag.to_string()),
+                        a_to_b,
+                        b_to_a,
+                        latch,
+                    );
+                    // Event::Text flows only when the controller asked for it (parity with the plaintext
+                    // path); the CDR content QoS accrues regardless (read via `final_counters`).
+                    self.text
+                        .register(text_call, self.datapath.clone(), secure_text_events_sink);
+                    secure_text_registered = true;
+                }
+            }
+        }
+        Ok(AnsweredText {
+            far_text_remote,
+            text_relay_flows,
+            secure_text_registered,
+        })
     }
 }
