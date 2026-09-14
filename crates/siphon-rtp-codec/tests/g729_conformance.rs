@@ -1,9 +1,10 @@
-//! Bit-exact conformance of the G.729 decoder against the official ITU-T test sequences.
+//! Bit-exact conformance of the G.729 codec against the official ITU-T test sequences.
 //!
 //! Upstream generated every sequence by running the reference binaries in each direction, so the
-//! files pin both independently: `coder file.in file.bit`, then `decoder file.bit file.pst`. This
-//! test takes the decode half — every `*.bit` must produce its `*.pst` byte for byte — which is a
-//! claim a round trip could never make, since a shared encode/decode bug passes one and fails here.
+//! files pin both independently: `coder file.in file.bit`, then `decoder file.bit file.pst`. Both
+//! halves are checked here — every `*.in` must produce its `*.bit` and every `*.bit` its `*.pst`,
+//! byte for byte — which is a claim a round trip could never make, since a shared encode/decode bug
+//! passes one and fails both of these.
 //!
 //! The vectors are copyrighted and gitignored, so this skips when they are absent (which keeps a
 //! fresh checkout green) and `SIPHON_RTP_REQUIRE_VECTORS=1` turns that skip into a hard failure.
@@ -13,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use siphon_rtp_codec::g729::G729Decoder;
+use siphon_rtp_codec::g729::{G729Decoder, G729Encoder};
 
 /// The sequences and what each is designed to exercise, per upstream's own `readmetv.txt`.
 const SEQUENCES: &[(&str, &str)] = &[
@@ -33,6 +34,10 @@ const SERIAL_WORDS: usize = 82;
 /// The reference's marker for a set bit; anything else in that position is a clear bit, and an
 /// all-zero frame is how the format flags an erasure.
 const BIT_SET: i16 = 0x0081;
+/// Its counterpart for a clear bit.
+const BIT_CLEAR: i16 = 0x007f;
+/// The word every frame opens with. On reception it doubles as the bad-frame indicator.
+const SYNC_WORD: i16 = 0x6b21;
 
 fn vectors_dir() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/g729/testv/base");
@@ -105,6 +110,58 @@ fn decodes_every_itu_test_sequence_bit_exactly() {
                  got {got}, reference has {want}",
                 index / 80,
                 index % 80
+            );
+        }
+    }
+}
+
+#[test]
+fn encodes_every_itu_test_sequence_bit_exactly() {
+    let Some(dir) = vectors_dir() else {
+        eprintln!("skipping: reference/g729/testv/base absent (see reference/g729/README.md)");
+        return;
+    };
+
+    for (name, exercises) in SEQUENCES {
+        // Three sequences are decoder-side robustness cases — their bitstreams are not the output
+        // of encoding anything, so there is nothing to encode.
+        let input = dir.join(format!("{name}.in"));
+        if !input.is_file() {
+            continue;
+        }
+        let samples = read_words(&input);
+        let expected = read_words(&dir.join(format!("{name}.bit")));
+
+        let mut encoder = G729Encoder::new();
+        let mut produced = Vec::with_capacity(expected.len());
+        for frame in samples.as_chunks::<80>().0 {
+            let octets = encoder.encode(frame);
+            produced.push(SYNC_WORD);
+            produced.push(80);
+            for bit in 0..80 {
+                let set = (octets[bit / 8] >> (7 - bit % 8)) & 1 == 1;
+                produced.push(if set { BIT_SET } else { BIT_CLEAR });
+            }
+        }
+
+        assert_eq!(
+            produced.len(),
+            expected.len(),
+            "{name} ({exercises}): encoded {} frames, reference has {}",
+            produced.len() / SERIAL_WORDS,
+            expected.len() / SERIAL_WORDS
+        );
+        if let Some((index, (&got, &want))) = produced
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .find(|(_, (got, want))| got != want)
+        {
+            panic!(
+                "{name} ({exercises}) diverges at frame {}, word {}: got {got:#06x}, \
+                 reference has {want:#06x}",
+                index / SERIAL_WORDS,
+                index % SERIAL_WORDS
             );
         }
     }

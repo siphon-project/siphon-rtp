@@ -71,21 +71,30 @@ pub fn lsp_to_lp(lsp: &[i16; ORDER]) -> [i16; COEFFICIENTS] {
     a
 }
 
+/// The line spectral pairs halfway between two frames', which is what the first subframe's filter
+/// is built from — interpolating stops the spectrum stepping abruptly at the frame boundary.
+#[must_use]
+pub fn midpoint_lsp(previous: &[i16; ORDER], current: &[i16; ORDER]) -> [i16; ORDER] {
+    let mut midpoint = [0_i16; ORDER];
+    for i in 0..ORDER {
+        midpoint[i] = add(shr(current[i], 1), shr(previous[i], 1));
+    }
+    midpoint
+}
+
 /// The two subframes' LP filters for a frame (`Int_qlpc`).
 ///
 /// The first subframe's filter comes from the midpoint between the previous frame's LSPs and this
-/// one's, which is what stops the spectrum stepping abruptly at the frame boundary; the second uses
-/// this frame's LSPs as transmitted.
+/// one's; the second uses this frame's LSPs as transmitted.
 #[must_use]
 pub fn interpolate_subframe_filters(
     previous: &[i16; ORDER],
     current: &[i16; ORDER],
 ) -> [[i16; COEFFICIENTS]; 2] {
-    let mut midpoint = [0_i16; ORDER];
-    for i in 0..ORDER {
-        midpoint[i] = add(shr(current[i], 1), shr(previous[i], 1));
-    }
-    [lsp_to_lp(&midpoint), lsp_to_lp(current)]
+    [
+        lsp_to_lp(&midpoint_lsp(previous, current)),
+        lsp_to_lp(current),
+    ]
 }
 
 /// Bandwidth-expand an LP filter by `gamma`, giving `A(z/gamma)` (`Weight_Az`).

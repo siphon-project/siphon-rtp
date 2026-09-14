@@ -9,29 +9,36 @@ workspace, driven by the git tag (see [VERSIONING.md](VERSIONING.md)).
 
 ### Added
 
-- **A G.729 decoder, bit-exact against all nine official ITU-T test sequences**, behind the
+- **G.729, bit-exact in both directions against the official ITU-T test sequences**, behind the
   off-by-default `g729` Cargo feature — the same posture `amr` has, and for the same reason: the
   feature gates *transcoding*, and relaying G.729 has always worked without executing a codec.
 
   Ported from the ITU-T G.729 Release 3 fixed-point reference, function by function, and validated
-  the way `docs/codecs.md` requires: every `*.bit` must reproduce its `*.pst` byte for byte. That is
-  726 720 samples across `algthm`, `erasure`, `fixed`, `lsp`, `overflow`, `parity`, `pitch`,
-  `speech` and `tame`, with zero mismatches — a claim a round trip could not make, since a shared
-  encode/decode bug passes one and fails this.
+  the way `docs/codecs.md` requires: every `*.bit` must reproduce its `*.pst` and every `*.in` its
+  `*.bit`. That is 726 720 samples across `algthm`, `erasure`, `fixed`, `lsp`, `overflow`, `parity`,
+  `pitch`, `speech` and `tame` in the decode direction, and 8100 frames across the six sequences that
+  ship an input in the encode direction, with zero mismatches — a claim a round trip could not make,
+  since a shared encode/decode bug passes one and fails both of these.
 
-  Two details worth knowing. The ITU basic operators the codec is written against were already in
+  Three details worth knowing. The ITU basic operators the codec is written against were already in
   the tree under `amr/`, so they moved to a shared `itu` module rather than being restated; their
   interpolation tables are shared too, but the routines indexing them deliberately are not, because
-  the two lineages differ in Q format and in the direction of a denormalising shift. And G.729's
-  decoder *reacts* to arithmetic saturation, rescaling its whole excitation history and
-  re-synthesising, so the ITU `Overflow` flag had to be exact: it is observed by comparing each
-  saturating operator's result against the same arithmetic done wide, rather than reimplemented, and
-  the `overflow` sequence is what proves that equivalent.
+  the two lineages differ in Q format and in the direction of a denormalising shift. G.729's decoder
+  *reacts* to arithmetic saturation, rescaling its whole excitation history and re-synthesising, so
+  the ITU `Overflow` flag had to be exact: it is observed by comparing each saturating operator's
+  result against the same arithmetic done wide, rather than reimplemented, and the `overflow`
+  sequence is what proves that equivalent. And the gain and LSP predictors are now one type each,
+  held by both directions — the reference keeps a file-scope copy per direction, and sharing the type
+  is what keeps them in step without coupling them.
 
-  **Not yet wired into the codec factory.** A transcoding call needs both directions, so a decoder
-  alone enables nothing, and a half-populated factory entry would read as enabled while failing at
-  answer. The factory entry lands with the encoder. Annex B (VAD/DTX/CNG) is also still to come,
-  along with honouring `annexb=` on both legs.
+  **Annex B (VAD/DTX/CNG) is not implemented.** RFC 3555 §4.1.13 makes `annexb=yes` the default when
+  the attribute is absent, so a transcoded leg must be offered and answered with
+  `a=fmtp:18 annexb=no`; honouring `annexb=` on both legs is still to come. Until it does, a
+  two-octet silence-insertion descriptor is refused rather than decoded as a truncated speech frame,
+  which would put full-level noise on the call; the media pipeline drops it and counts the failure,
+  so such a call carries its speech and plays silence through the peer's discontinuous transmission
+  instead of comfort noise. Relaying is unaffected. Annex A needs nothing — it is a reduced-complexity
+  encoder whose bitstream the base decoder reads.
 
 ## [0.6.0] — 2026-09-13
 

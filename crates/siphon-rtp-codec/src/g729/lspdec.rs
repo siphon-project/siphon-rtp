@@ -41,11 +41,78 @@ const RESET: [i16; ORDER] = [
     2339, 4679, 7018, 9358, 11_698, 14_037, 16_377, 18_717, 21_056, 23_396,
 ];
 
-/// The LSP decoder's state: the predictor history, and what to fall back on when a frame is lost.
+/// The moving-average predictor the LSF quantiser is built around, held by both sides of the codec.
+///
+/// The encoder and decoder each keep their own instance and drive it identically — the reference
+/// has two file-scope copies of exactly this state, one per direction. Sharing the type rather than
+/// the instance is what keeps them in step without coupling them.
 #[derive(Debug, Clone)]
-pub struct LspDecoder {
+pub struct Predictor {
     /// The four previous frames' LSF residuals, most recent first. Q13.
     history: [[i16; ORDER]; MA_ORDER],
+}
+
+impl Default for Predictor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Predictor {
+    /// A predictor at its reset state: LSFs evenly spaced across the band.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            history: [RESET; MA_ORDER],
+        }
+    }
+
+    /// Add the moving-average prediction back onto a residual (`Lsp_prev_compose`).
+    #[must_use]
+    pub fn compose(&self, residual: &[i16; ORDER], mode: usize) -> [i16; ORDER] {
+        let mut lsf = [0_i16; ORDER];
+        for j in 0..ORDER {
+            let mut accumulator = l_mult(residual[j], FG_SUM[mode][j]);
+            for (previous, coefficients) in self.history.iter().zip(&FG[mode]) {
+                accumulator = l_mac(accumulator, previous[j], coefficients[j]);
+            }
+            lsf[j] = extract_h(accumulator);
+        }
+        lsf
+    }
+
+    /// Recover the residual a given LSF vector would have had (`Lsp_prev_extract`), the inverse of
+    /// [`Self::compose`]. The decoder needs it only on the erasure path; the encoder needs it on
+    /// every frame, since it is what the codebook search is run against.
+    #[must_use]
+    pub fn extract_residual(&self, lsf: &[i16; ORDER], mode: usize) -> [i16; ORDER] {
+        let mut residual = [0_i16; ORDER];
+        for j in 0..ORDER {
+            let mut accumulator = l_deposit_h(lsf[j]);
+            for (previous, coefficients) in self.history.iter().zip(&FG[mode]) {
+                accumulator = l_msu(accumulator, previous[j], coefficients[j]);
+            }
+            let temp = extract_h(accumulator);
+            let scaled = l_mult(temp, FG_SUM_INV[mode][j]);
+            residual[j] = extract_h(l_shl(scaled, 3));
+        }
+        residual
+    }
+
+    /// Push a residual onto the history, dropping the oldest (`Lsp_prev_update`).
+    pub fn push(&mut self, residual: &[i16; ORDER]) {
+        for k in (1..MA_ORDER).rev() {
+            self.history[k] = self.history[k - 1];
+        }
+        self.history[0] = *residual;
+    }
+}
+
+/// The LSP decoder's state: the predictor, and what to fall back on when a frame is lost.
+#[derive(Debug, Clone)]
+pub struct LspDecoder {
+    /// The moving-average predictor over previous frames' residuals.
+    predictor: Predictor,
     /// The last successfully decoded LSF vector, repeated when a frame is erased. Q13.
     previous: [i16; ORDER],
     /// Which MA coefficient set the last good frame selected, so an erased frame predicts with the
@@ -64,7 +131,7 @@ impl LspDecoder {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            history: [RESET; MA_ORDER],
+            predictor: Predictor::new(),
             previous: RESET,
             previous_mode: 0,
         }
@@ -91,8 +158,8 @@ impl LspDecoder {
             // keeps the next good frame predicting from a sane place.
             let previous = self.previous;
             let mode = self.previous_mode;
-            let residual = self.extract_residual(&previous, mode);
-            self.push_history(&residual);
+            let residual = self.predictor.extract_residual(&previous, mode);
+            self.predictor.push(&residual);
             return previous;
         }
 
@@ -115,50 +182,13 @@ impl LspDecoder {
         expand(&mut residual, GAP1);
         expand(&mut residual, GAP2);
 
-        let mut lsf = self.compose(&residual, mode);
-        self.push_history(&residual);
+        let mut lsf = self.predictor.compose(&residual, mode);
+        self.predictor.push(&residual);
         stabilise(&mut lsf);
 
         self.previous = lsf;
         self.previous_mode = mode;
         lsf
-    }
-
-    /// Add the moving-average prediction back onto a residual (`Lsp_prev_compose`).
-    fn compose(&self, residual: &[i16; ORDER], mode: usize) -> [i16; ORDER] {
-        let mut lsf = [0_i16; ORDER];
-        for j in 0..ORDER {
-            let mut accumulator = l_mult(residual[j], FG_SUM[mode][j]);
-            for (previous, coefficients) in self.history.iter().zip(&FG[mode]) {
-                accumulator = l_mac(accumulator, previous[j], coefficients[j]);
-            }
-            lsf[j] = extract_h(accumulator);
-        }
-        lsf
-    }
-
-    /// Recover the residual a given LSF vector would have had (`Lsp_prev_extract`) — the inverse of
-    /// [`Self::compose`], needed only on the erasure path.
-    fn extract_residual(&self, lsf: &[i16; ORDER], mode: usize) -> [i16; ORDER] {
-        let mut residual = [0_i16; ORDER];
-        for j in 0..ORDER {
-            let mut accumulator = l_deposit_h(lsf[j]);
-            for (previous, coefficients) in self.history.iter().zip(&FG[mode]) {
-                accumulator = l_msu(accumulator, previous[j], coefficients[j]);
-            }
-            let temp = extract_h(accumulator);
-            let scaled = l_mult(temp, FG_SUM_INV[mode][j]);
-            residual[j] = extract_h(l_shl(scaled, 3));
-        }
-        residual
-    }
-
-    /// Push a residual onto the predictor history, dropping the oldest (`Lsp_prev_update`).
-    fn push_history(&mut self, residual: &[i16; ORDER]) {
-        for k in (1..MA_ORDER).rev() {
-            self.history[k] = self.history[k - 1];
-        }
-        self.history[0] = *residual;
     }
 }
 
@@ -173,6 +203,14 @@ fn expand(buffer: &mut [i16; ORDER], gap: i16) {
             buffer[j] = add(buffer[j], correction);
         }
     }
+}
+
+/// Sort, clamp and space a predicted LSF vector, for the encoder's local reconstruction.
+///
+/// The encoder has to arrive at exactly the vector the decoder will, so it runs the same final step
+/// rather than approximating it.
+pub fn stabilise_public(buffer: &mut [i16; ORDER]) {
+    stabilise(buffer);
 }
 
 /// Sort, clamp and space the predicted LSFs (`Lsp_stability`).
@@ -228,7 +266,7 @@ mod tests {
     fn a_fresh_decoder_starts_from_evenly_spaced_line_frequencies() {
         let decoder = LspDecoder::new();
         assert_eq!(decoder.previous, RESET);
-        assert!(decoder.history.iter().all(|row| *row == RESET));
+        assert!(decoder.predictor.history.iter().all(|row| *row == RESET));
         assert!(
             RESET.windows(2).all(|w| w[0] < w[1]),
             "the reset vector is ordered, or the first frame decodes against nonsense"
@@ -303,12 +341,12 @@ mod tests {
         // the *next* good frame is right. A decoder that skipped the update would drift silently.
         let mut decoder = LspDecoder::new();
         let good = decoder.decode_lsf(0x2a, 0x155, false);
-        let history_before = decoder.history;
+        let history_before = decoder.predictor.history;
 
         let repeated = decoder.decode_lsf(0, 0, true);
         assert_eq!(repeated, good, "the previous vector is repeated verbatim");
         assert_ne!(
-            decoder.history, history_before,
+            decoder.predictor.history, history_before,
             "the predictor history advanced through the erasure"
         );
     }
@@ -318,13 +356,13 @@ mod tests {
         // `Lsp_prev_extract` is the inverse `Lsp_prev_compose`, used only on the erasure path. They
         // are fixed-point inverses, so agreement is close rather than exact; a sign or scaling error
         // in either would show up here as a gross mismatch.
-        let decoder = LspDecoder::new();
+        let predictor = Predictor::new();
         let residual = [
             500_i16, 1200, 2400, 3600, 4800, 6000, 7200, 8400, 9600, 10_800,
         ];
         for mode in 0..2 {
-            let composed = decoder.compose(&residual, mode);
-            let extracted = decoder.extract_residual(&composed, mode);
+            let composed = predictor.compose(&residual, mode);
+            let extracted = predictor.extract_residual(&composed, mode);
             for (index, (&back, &original)) in extracted.iter().zip(&residual).enumerate() {
                 let error = (i32::from(back) - i32::from(original)).abs();
                 assert!(

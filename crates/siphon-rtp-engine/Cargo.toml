@@ -20,6 +20,9 @@ default = []
 # Build the patent-encumbered AMR-NB/AMR-WB codecs into the engine (transcode + conference egress).
 # Off by default; passthrough/relay of AMR is always available. See docs/codec-licensing.md.
 amr = ["siphon-rtp-codec/amr"]
+# Build the patent-licensed G.729 codec into the engine (transcode). Off by default; passthrough of
+# G.729 is always available and never executes a codec. See docs/codec-licensing.md.
+g729 = ["siphon-rtp-codec/g729"]
 
 [[bin]]
 name = "siphon-rtp"

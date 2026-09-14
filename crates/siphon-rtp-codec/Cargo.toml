@@ -20,7 +20,7 @@ default = []
 # statement that YOU, the operator, hold the necessary patent licence for that codec in your
 # jurisdiction. See docs/codec-licensing.md. (evs added when that codec lands.)
 amr = [] # AMR-NB / AMR-WB (3GPP TS 26.071 / 26.171) — the VoLTE codecs.
-g729 = [] # G.729 / G.729A / G.729B (ITU-T G.729) — 8 kbit/s CS-ACELP.
+g729 = [] # G.729 (ITU-T G.729) — 8 kbit/s CS-ACELP. Annex B (VAD/DTX/CNG) is not implemented.
 
 [dependencies]
 thiserror = { workspace = true }

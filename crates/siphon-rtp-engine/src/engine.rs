@@ -18053,10 +18053,54 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn answer_naming_an_unimplemented_codec_says_which_codec_it_is() {
-        // The genuine-divergence case on a codec the engine cannot build: A offers only G.729,
-        // `codec-transcode-PCMA` offers B A-law, and B takes it. That *does* need a G.729 decoder the
-        // engine does not have, so the answer is refused — and the refusal has to name the codec, not
-        // just say "unsupported".
+        // The genuine-divergence case on a codec the engine cannot build: A offers only G.723.1,
+        // `codec-transcode-PCMA` offers B A-law, and B takes it. That *does* need a G.723.1 decoder
+        // the engine does not have, so the answer is refused — and the refusal has to name the
+        // codec, not just say "unsupported". G.723.1 rather than G.729, which the `g729` feature
+        // now builds in both directions.
+        let engine = Engine::new(UdpLoopbackDatapath::new());
+        let (_phone_a, addr_a) = phone().await;
+        let (_phone_b, addr_b) = phone().await;
+        engine
+            .handle(
+                CLIENT,
+                Command::Offer {
+                    call_id: "g723-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    sdp: sdp_single_codec(addr_a, 4, "G723"),
+                    profile: ProfileFlags {
+                        flags: vec!["codec-transcode-PCMA".into()],
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+        let answer = engine
+            .handle(
+                CLIENT,
+                Command::Answer {
+                    call_id: "g723-xcode".into(),
+                    from_tag: "tag-a".into(),
+                    to_tag: "tag-b".into(),
+                    sdp: sdp_single_codec(addr_b, 8, "PCMA"),
+                    profile: Default::default(),
+                },
+            )
+            .await;
+        let CmdResult::Error { reason } = &answer else {
+            panic!("a transcode the engine cannot run is refused, got {answer:?}");
+        };
+        assert!(
+            reason.contains("G.723.1"),
+            "the refusal names the codec it could not build: {reason}"
+        );
+    }
+
+    #[cfg(feature = "g729")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_g729_leg_transcodes_to_g711_with_the_g729_feature_built_in() {
+        // The counterpart to the refusal above, and the reason it had to change codec: the same
+        // shape on G.729 now succeeds, because the engine has both directions of it.
         let engine = Engine::new(UdpLoopbackDatapath::new());
         let (_phone_a, addr_a) = phone().await;
         let (_phone_b, addr_b) = phone().await;
@@ -18086,12 +18130,9 @@ mod tests {
                 },
             )
             .await;
-        let CmdResult::Error { reason } = &answer else {
-            panic!("a transcode the engine cannot run is refused, got {answer:?}");
-        };
         assert!(
-            reason.contains("G729"),
-            "the refusal names the codec it could not build: {reason}"
+            matches!(answer, CmdResult::Ok { .. }),
+            "a G.729 transcode the engine can run is accepted, got {answer:?}"
         );
     }
 

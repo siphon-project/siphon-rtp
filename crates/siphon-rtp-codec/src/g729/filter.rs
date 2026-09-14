@@ -7,7 +7,7 @@
 //! its global after the call — see [`super::overflow`] for why observing it is exact.
 
 use super::overflow::{self, Overflow};
-use crate::itu::basic_ops::l_mult;
+use crate::itu::basic_ops::{extract_h, l_mac, l_mult, l_shl};
 
 /// LP filter order.
 pub const ORDER: usize = 10;
@@ -67,6 +67,23 @@ pub fn residu(a: &[i16], x: &[i16], offset: usize, y: &mut [i16], length: usize)
         }
         sum = crate::itu::basic_ops::l_shl(sum, 3);
         y[i] = crate::itu::basic_ops::round_word(sum);
+    }
+}
+
+/// Convolve `x` with the impulse response `h` (Q12), keeping `length` samples (`Convolve`).
+///
+/// Only the causal part is produced — output `n` sees inputs `0..=n` — which is exactly what the
+/// closed-loop pitch search and the codebook search want: a subframe of excitation seen through the
+/// weighted synthesis filter, with nothing carried in from before the subframe started.
+pub fn convolve(x: &[i16], h: &[i16], y: &mut [i16], length: usize) {
+    debug_assert!(x.len() >= length && h.len() >= length && y.len() >= length);
+    for n in 0..length {
+        let mut sum = 0_i32;
+        for i in 0..=n {
+            sum = l_mac(sum, x[i], h[n - i]);
+        }
+        // h is Q12, so the product is Q12: shift back to Q0, saturating rather than wrapping.
+        y[n] = extract_h(l_shl(sum, 3));
     }
 }
 
@@ -149,6 +166,31 @@ mod tests {
         let mut mem = [i16::MAX; ORDER];
         let flag = syn_filt(&a, &x, &mut y, 40, &mut mem, false);
         assert!(flag.raised(), "runaway synthesis must report saturation");
+    }
+
+    #[test]
+    fn convolving_with_a_unit_impulse_reproduces_the_input() {
+        // h[0] = 1.0 in Q12, the rest zero: y[n] = x[n].
+        let mut h = [0_i16; 40];
+        h[0] = 4096;
+        let x: Vec<i16> = (0..40).map(|i| (i * 37 - 500) as i16).collect();
+        let mut y = [0_i16; 40];
+        convolve(&x, &h, &mut y, 40);
+        assert_eq!(&y[..], &x[..]);
+    }
+
+    #[test]
+    fn convolution_is_causal_and_truncated_to_the_subframe() {
+        // A delayed impulse shifts the input right and drops what runs off the end — no wraparound
+        // and no contribution from before the subframe, which is the property the pitch search
+        // relies on when it slides the excitation one sample at a time.
+        let mut h = [0_i16; 40];
+        h[3] = 4096;
+        let x: Vec<i16> = (1..=40).map(|i| i as i16).collect();
+        let mut y = [0_i16; 40];
+        convolve(&x, &h, &mut y, 40);
+        assert_eq!(&y[..3], &[0, 0, 0]);
+        assert_eq!(&y[3..], &x[..37]);
     }
 
     #[test]
