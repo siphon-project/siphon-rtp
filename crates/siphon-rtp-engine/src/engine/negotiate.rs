@@ -4,10 +4,12 @@ use siphon_rtp_codec::factory::{self, CodecSpec};
 use siphon_rtp_datapath::{EndpointId, SourceFilter};
 use siphon_rtp_media::wav::WavRecorder;
 use siphon_rtp_proto::ProfileFlags;
+use siphon_rtp_srtp::leg::SecureLeg;
 use siphon_rtp_srtp::sdes::CryptoAttribute;
+use std::sync::{Arc, Mutex};
 
 use crate::ice::IceCredentials;
-use crate::media_pipeline::DirectionConfig;
+use crate::media_pipeline::{DirectionConfig, RtcpRelay, SecureSide};
 use crate::sdp::{self, EngineMedia, IceRewrite, SecurityAdvertisement, TextRewrite};
 
 /// What the engine shows one party about the leg that faces it. Every SDP the engine hands a party is
@@ -452,6 +454,102 @@ pub(super) fn build_direction(
         // in its periodic quality report — mapped the same way as the HEP QoS / conference paths.
         ingress_mos_codec: crate::conference::hep_codec_for_name(&ingress_codec.encoding_name),
     })
+}
+
+/// The two directions of a two-party transcoding call, described once: A→B decodes the near leg's
+/// codec and encodes the far leg's toward B, B→A the reverse. Each side's gate and destination are
+/// resolved by the caller (the answer's effective addresses, or a snapshot's signalled ones).
+pub(super) struct TranscodePair<'a> {
+    pub(super) near_endpoint: EndpointId,
+    pub(super) near_source: SourceFilter,
+    pub(super) near_dst: std::net::SocketAddr,
+    pub(super) far_endpoint: EndpointId,
+    pub(super) far_source: SourceFilter,
+    pub(super) far_dst: std::net::SocketAddr,
+    pub(super) near_codec: &'a CodecSpec,
+    pub(super) far_codec: &'a CodecSpec,
+    pub(super) near_telephone_event: Option<u8>,
+    pub(super) far_telephone_event: Option<u8>,
+    pub(super) record_path: Option<&'a str>,
+    pub(super) noise_suppression: bool,
+    pub(super) echo: crate::media_pipeline::EchoProfile,
+    pub(super) beep_detection: bool,
+    pub(super) beep_cadence_guard_ms: Option<u32>,
+}
+
+/// Build both directions of `pair`, A→B first. A failure names the direction that could not be
+/// built (`"A→B"` or `"B→A"`) alongside the reason, so the caller can put it in its own context.
+pub(super) fn build_transcode_pair(
+    pair: &TranscodePair<'_>,
+) -> Result<(DirectionConfig, DirectionConfig), (&'static str, String)> {
+    let a_to_b = build_direction(
+        pair.near_endpoint,
+        pair.near_source,
+        pair.far_endpoint,
+        pair.far_dst,
+        pair.near_codec,
+        pair.far_codec,
+        pair.near_telephone_event,
+        pair.far_telephone_event,
+        pair.record_path,
+        pair.noise_suppression,
+        pair.echo,
+        pair.beep_detection,
+        pair.beep_cadence_guard_ms,
+    )
+    .map_err(|reason| ("A→B", reason))?;
+    let b_to_a = build_direction(
+        pair.far_endpoint,
+        pair.far_source,
+        pair.near_endpoint,
+        pair.near_dst,
+        pair.far_codec,
+        pair.near_codec,
+        pair.far_telephone_event,
+        pair.near_telephone_event,
+        pair.record_path,
+        pair.noise_suppression,
+        pair.echo,
+        pair.beep_detection,
+        pair.beep_cadence_guard_ms,
+    )
+    .map_err(|reason| ("B→A", reason))?;
+    Ok((a_to_b, b_to_a))
+}
+
+/// How the companion RTCP relays of a transcoding call with a secure far (B) party are keyed.
+pub(super) enum RtcpKeying {
+    /// With the SDES leg the call already holds.
+    Leg(Arc<Mutex<SecureLeg>>),
+    /// Pending until the DTLS handshake delivers a leg; the relays drop until then (RFC 5764).
+    Pending,
+}
+
+/// The two companion (non-muxed) RTCP relays of a transcoding call whose far (B) party is secure:
+/// A's RTCP encrypted toward B, B's SRTCP decrypted toward A (RFC 3711; RFC 5761 keeps RTCP on its
+/// own port). The caller redirects both endpoints to the actor.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn secure_rtcp_relays(
+    near_rtcp: EndpointId,
+    near_source: SourceFilter,
+    far_dst: std::net::SocketAddr,
+    far_rtcp: EndpointId,
+    far_source: SourceFilter,
+    near_dst: std::net::SocketAddr,
+    keying: &RtcpKeying,
+) -> Vec<RtcpRelay> {
+    let toward_far = RtcpRelay::new(near_rtcp, near_source, far_rtcp, far_dst);
+    let toward_near = RtcpRelay::new(far_rtcp, far_source, near_rtcp, near_dst);
+    match keying {
+        RtcpKeying::Leg(leg) => vec![
+            toward_far.with_secure_egress(leg.clone()),
+            toward_near.with_secure_ingress(leg.clone()),
+        ],
+        RtcpKeying::Pending => vec![
+            toward_far.with_pending_secure(SecureSide::Egress),
+            toward_near.with_pending_secure(SecureSide::Ingress),
+        ],
+    }
 }
 
 /// Apply the supported rtpengine `replace` directives to `sdp`, returning the rewritten SDP and the

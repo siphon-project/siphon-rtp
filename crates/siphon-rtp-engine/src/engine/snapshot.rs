@@ -12,13 +12,14 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::ice::IceCredentials;
-use crate::media_pipeline::{MediaCall, RtcpRelay};
+use crate::media_pipeline::{EchoProfile, MediaCall};
 use crate::sdp;
 use crate::srtp_bridge::{BridgeCallPlan, BridgeFlowPlan, BridgeOp};
 
-use super::negotiate::build_direction;
+use super::negotiate::{build_transcode_pair, secure_rtcp_relays, RtcpKeying, TranscodePair};
 use super::{
-    error_result, ok_empty, unknown_call, Call, CallerMediaLeg, ClientId, Engine, Leg, PipelineKind,
+    boxed_error_result, error_result, ok_empty, unknown_call, Call, CallerMediaLeg, ClientId,
+    Engine, Leg, PipelineKind,
 };
 
 /// Map a [`Leg`] to its portable snapshot (local media ports + the peer's remote addresses). The
@@ -341,9 +342,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// leg (`Ws`, whose bridge is an external session that cannot be resumed from a snapshot) or a DTLS
     /// leg (whose keys are handshake-derived, not signalled) is not restorable and is rejected up
     /// front. Any endpoint bind or flow install that fails rolls back the endpoints already bound.
-    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     pub(super) async fn restore(&self, client: ClientId, blob: &str) -> CmdResult {
-        use crate::ha::{self, EndpointRole, PipelineSnapshot};
+        use crate::ha::{self, PipelineSnapshot};
         let snapshot = match ha::CallSnapshot::from_json(blob) {
             Ok(snapshot) => snapshot,
             Err(error) => return error_result("restore: parse snapshot", &error),
@@ -372,11 +372,29 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             };
         }
 
-        // Bind the endpoints at their exact ports (shared by both pipelines).
+        // Bind the endpoints at their exact ports (shared by every pipeline).
         let bound = match self.bind_snapshot_endpoints(&snapshot).await {
             Ok(bound) => bound,
             Err(reason) => return *reason,
         };
+        // Whichever step refuses from here on, the endpoints bound above are rolled back.
+        if let Err(result) = self.restore_bound(client, snapshot, &bound) {
+            self.free_bound(&bound).await;
+            return *result;
+        }
+        ok_empty()
+    }
+
+    /// Rebuild a snapshotted call on endpoints already bound at its ports: the legs, the media path
+    /// its pipeline names, and the call record under `client`. The caller rolls `bound` back on any
+    /// refusal.
+    fn restore_bound(
+        &self,
+        client: ClientId,
+        snapshot: crate::ha::CallSnapshot,
+        bound: &[(crate::ha::EndpointRole, Endpoint)],
+    ) -> Result<(), Box<CmdResult>> {
+        use crate::ha::{EndpointRole, PipelineSnapshot};
         let role_endpoint = |role: EndpointRole| -> Option<Endpoint> {
             bound
                 .iter()
@@ -388,10 +406,9 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             role_endpoint(EndpointRole::NearRtp),
             role_endpoint(EndpointRole::FarRtp),
         ) else {
-            self.free_bound(&bound).await;
-            return CmdResult::Error {
+            return Err(Box::new(CmdResult::Error {
                 reason: "restore: snapshot is missing a required RTP endpoint".to_string(),
-            };
+            }));
         };
         let near = Leg {
             rtp: near_rtp,
@@ -424,382 +441,21 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         };
 
         // Install the datapath flows and resolve the crypto per pipeline.
-        let mut relay_flows: Vec<(EndpointId, FlowAction)> = Vec::new();
-        let mut far_local_crypto: Option<CryptoAttribute> = None;
-        let mut far_remote_crypto: Option<CryptoAttribute> = None;
-        let mut near_codec_out: Option<CodecSpec> = None;
-        let mut far_codec_out: Option<CodecSpec> = None;
-        let pipeline;
-        match snapshot.pipeline {
-            PipelineSnapshot::Passthrough => {
-                pipeline = PipelineKind::Passthrough;
-                // Reinstall the forward rules, resolving each role to its freshly-bound id.
-                for flow in &snapshot.flows {
-                    let (Some(installed_on), Some(out)) =
-                        (role_endpoint(flow.installed_on), role_endpoint(flow.out))
-                    else {
-                        self.free_bound(&bound).await;
-                        return CmdResult::Error {
-                            reason: "restore: a snapshot flow references an unknown endpoint role"
-                                .to_string(),
-                        };
-                    };
-                    let action = FlowAction::Forward(ForwardRule {
-                        out_endpoint: out.id,
-                        out_dst: flow.out_dst,
-                        accepted_source: restore_source_filter(flow.accepted_source),
-                        latch: restore_latch(flow.latch),
-                    });
-                    if let Err(error) = self.datapath.install_flow(installed_on.id, action) {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: install forward flow", &error);
-                    }
-                    relay_flows.push((installed_on.id, action));
-                }
-            }
-            PipelineSnapshot::Srtp => {
-                pipeline = PipelineKind::Srtp;
-                // The early validation admits `Srtp` only with `secure` present; if a hand-crafted
-                // snapshot violates that, free the ports and error rather than panic (mirrors the
-                // graceful returns just below for a missing/bad far_local key).
-                let Some(secure) = snapshot.secure.as_ref() else {
-                    self.free_bound(&bound).await;
-                    return CmdResult::Error {
-                        reason: "restore: secure call missing secure snapshot".to_string(),
-                    };
-                };
-                // Reconstruct the two SDES keys (the engine's own + the peer's).
-                let far_local = match snapshot.far_local_crypto.as_ref().map(restore_crypto) {
-                    Some(Ok(crypto)) => crypto,
-                    Some(Err(reason)) => {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: far_local key", &reason);
-                    }
-                    None => {
-                        self.free_bound(&bound).await;
-                        return CmdResult::Error {
-                            reason: "restore: secure call missing far_local_crypto".to_string(),
-                        };
-                    }
-                };
-                let far_remote = match restore_crypto(&secure.far_remote_crypto) {
-                    Ok(crypto) => crypto,
-                    Err(reason) => {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: far_remote key", &reason);
-                    }
-                };
-                // Rebuild the bridge flow plans (roles → freshly-bound ids).
-                let mut bridge_flows = Vec::with_capacity(secure.bridge_flows.len());
-                for plan in &secure.bridge_flows {
-                    let (Some(endpoint), Some(out)) =
-                        (role_endpoint(plan.endpoint), role_endpoint(plan.out))
-                    else {
-                        self.free_bound(&bound).await;
-                        return CmdResult::Error {
-                            reason: "restore: a secure bridge flow references an unknown role"
-                                .to_string(),
-                        };
-                    };
-                    bridge_flows.push(BridgeFlowPlan {
-                        endpoint: endpoint.id,
-                        op: match plan.op {
-                            ha::BridgeOpSnapshot::Encrypt => BridgeOp::Encrypt,
-                            ha::BridgeOpSnapshot::Decrypt => BridgeOp::Decrypt,
-                        },
-                        accepted_source: restore_source_filter(plan.accepted_source),
-                        out_endpoint: out.id,
-                        out_dst: plan.out_dst,
-                    });
-                }
-                // Redirect every endpoint to the bridge so it crypts both directions.
-                for (_, endpoint) in &bound {
-                    if let Err(error) = self
-                        .datapath
-                        .install_flow(endpoint.id, FlowAction::Redirect)
-                    {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: install SRTP bridge redirect", &error);
-                    }
-                }
-                // Rebuild the secure leg from the two keys and seed its rollover, then register.
-                let mut leg = SecureLeg::new(&far_local.key, &far_remote.key);
-                leg.seed_rollover(&restore_rollover(&secure.rollover));
-                self.bridge.register(BridgeCallPlan {
-                    leg,
-                    flows: bridge_flows,
-                });
-                far_local_crypto = Some(far_local);
-                far_remote_crypto = Some(far_remote);
-            }
+        let media = match snapshot.pipeline {
+            PipelineSnapshot::Passthrough => self.restore_relay_flows(&snapshot, bound)?,
+            PipelineSnapshot::Srtp => self.restore_srtp_bridge(&snapshot, bound)?,
             PipelineSnapshot::Media => {
-                pipeline = PipelineKind::Media;
-                // Both codecs were validated present above; the two remote addresses are required to
-                // target egress. Rebuild the transcoding actor — jitter/codec state restarts fresh
-                // (the cold-restore glitch); the egress SSRC/seq/ts also reset, so the far side re-syncs.
-                let (Some(near_codec_snap), Some(far_codec_snap)) =
-                    (snapshot.near_codec.as_ref(), snapshot.far_codec.as_ref())
-                else {
-                    self.free_bound(&bound).await;
-                    return CmdResult::Error {
-                        reason: "restore: media call missing a codec".to_string(),
-                    };
-                };
-                let (Some(a_rtp), Some(b_rtp)) = (near.remote_rtp, far.remote_rtp) else {
-                    self.free_bound(&bound).await;
-                    return CmdResult::Error {
-                        reason: "restore: media call missing a remote address".to_string(),
-                    };
-                };
-                let near_codec = restore_codec(near_codec_snap);
-                let far_codec = restore_codec(far_codec_snap);
-                let near_te = snapshot.near_telephone_event;
-                let a_to_b = match build_direction(
-                    near_rtp.id,
-                    SourceFilter::Exact(a_rtp.ip()),
-                    far_rtp.id,
-                    b_rtp,
-                    &near_codec,
-                    &far_codec,
-                    near_te,
-                    None,
-                    None,
-                    // Noise suppression, echo cancellation and record-tone detection are not carried
-                    // in the checkpoint snapshot, so a cold restore resumes without them — matching how
-                    // recording (`record_path`) is not restored. The controller re-arms them by
-                    // re-issuing the profile.
-                    false,                                         // noise_suppression
-                    crate::media_pipeline::EchoProfile::default(), // echo (re-armed when the controller re-issues the profile)
-                    false, // beep_detection (likewise not carried in the snapshot)
-                    None,  // beep_cadence_guard_ms
-                ) {
-                    Ok(direction) => direction,
-                    Err(reason) => {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: media pipeline (A→B)", &reason);
-                    }
-                };
-                let b_to_a = match build_direction(
-                    far_rtp.id,
-                    SourceFilter::Exact(b_rtp.ip()),
-                    near_rtp.id,
-                    a_rtp,
-                    &far_codec,
-                    &near_codec,
-                    None,
-                    near_te,
-                    None,
-                    false,                                         // noise_suppression
-                    crate::media_pipeline::EchoProfile::default(), // echo (re-armed when the controller re-issues the profile)
-                    false, // beep_detection (likewise not carried in the snapshot)
-                    None,  // beep_cadence_guard_ms
-                ) {
-                    Ok(direction) => direction,
-                    Err(reason) => {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: media pipeline (B→A)", &reason);
-                    }
-                };
-                // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them).
-                for endpoint in [near_rtp.id, far_rtp.id] {
-                    if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: install media redirect", &error);
-                    }
-                }
-                let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
-                let media_call = MediaCall::new(
-                    snapshot.call_id.clone(),
-                    snapshot.from_tag.clone(),
-                    snapshot.to_tag.clone(),
-                    a_to_b,
-                    b_to_a,
-                    true, // relay latch (the `no-latch` flag is not carried in the snapshot)
-                    None, // recording restarts on the new node if the proxy re-issues it
-                );
-                self.media
-                    .register(media_call, self.datapath.clone(), owner_events);
-                near_codec_out = Some(near_codec);
-                far_codec_out = Some(far_codec);
+                self.restore_transcode(client, &snapshot, near, far, false)?
             }
             PipelineSnapshot::SrtpMedia => {
-                pipeline = PipelineKind::SrtpMedia;
-                // Secure transcode = the `Srtp` bridge's crypto (rebuild both SDES keys + the shared
-                // SecureLeg, seed its rollover) merged with the `Media` slow path's transcode (rebuild
-                // the two directions + redirect the RTP legs to the actor), threaded together by
-                // `with_far_secure_leg` so the actor decrypts the secure peer's ingress and encrypts
-                // its egress (BGCF/SBC PSTN breakout). Jitter / codec state and the egress SSRC-seq-ts
-                // restart fresh (the cold-restore glitch); the SRTP rollover is *seeded* so the inbound
-                // decrypt keeps authenticating past a sequence wrap and the outbound never re-uses an
-                // index — no two-time-pad (RFC 3711 §3.3.1 / §3.4).
-                let Some(secure) = snapshot.secure.as_ref() else {
-                    self.free_bound(&bound).await;
-                    return CmdResult::Error {
-                        reason: "restore: secure transcode call missing secure snapshot"
-                            .to_string(),
-                    };
-                };
-                let (Some(near_codec_snap), Some(far_codec_snap)) =
-                    (snapshot.near_codec.as_ref(), snapshot.far_codec.as_ref())
-                else {
-                    self.free_bound(&bound).await;
-                    return CmdResult::Error {
-                        reason: "restore: secure transcode call missing a codec".to_string(),
-                    };
-                };
-                let (Some(a_rtp), Some(b_rtp)) = (near.remote_rtp, far.remote_rtp) else {
-                    self.free_bound(&bound).await;
-                    return CmdResult::Error {
-                        reason: "restore: secure transcode call missing a remote address"
-                            .to_string(),
-                    };
-                };
-                // Reconstruct the two SDES keys (the engine's own + the peer's), as for `Srtp`.
-                let far_local = match snapshot.far_local_crypto.as_ref().map(restore_crypto) {
-                    Some(Ok(crypto)) => crypto,
-                    Some(Err(reason)) => {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: far_local key", &reason);
-                    }
-                    None => {
-                        self.free_bound(&bound).await;
-                        return CmdResult::Error {
-                            reason: "restore: secure transcode call missing far_local_crypto"
-                                .to_string(),
-                        };
-                    }
-                };
-                let far_remote = match restore_crypto(&secure.far_remote_crypto) {
-                    Ok(crypto) => crypto,
-                    Err(reason) => {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: far_remote key", &reason);
-                    }
-                };
-                let near_codec = restore_codec(near_codec_snap);
-                let far_codec = restore_codec(far_codec_snap);
-                let near_te = snapshot.near_telephone_event;
-                // Build the two transcode directions (as for `Media`): A (plaintext) ↔ B (secure). The
-                // source gate is reconstructed from the peer's signalled address (a Redirect pipeline
-                // carries no portable `flows`), mirroring the plaintext transcode restore.
-                let a_to_b = match build_direction(
-                    near_rtp.id,
-                    SourceFilter::Exact(a_rtp.ip()),
-                    far_rtp.id,
-                    b_rtp,
-                    &near_codec,
-                    &far_codec,
-                    near_te,
-                    None,
-                    None,
-                    false,                                         // noise_suppression
-                    crate::media_pipeline::EchoProfile::default(), // echo (re-armed when the controller re-issues the profile)
-                    false, // beep_detection (likewise not carried in the snapshot)
-                    None,  // beep_cadence_guard_ms
-                ) {
-                    Ok(direction) => direction,
-                    Err(reason) => {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: secure media pipeline (A→B)", &reason);
-                    }
-                };
-                let b_to_a = match build_direction(
-                    far_rtp.id,
-                    SourceFilter::Exact(b_rtp.ip()),
-                    near_rtp.id,
-                    a_rtp,
-                    &far_codec,
-                    &near_codec,
-                    None,
-                    near_te,
-                    None,
-                    false,                                         // noise_suppression
-                    crate::media_pipeline::EchoProfile::default(), // echo (re-armed when the controller re-issues the profile)
-                    false, // beep_detection (likewise not carried in the snapshot)
-                    None,  // beep_cadence_guard_ms
-                ) {
-                    Ok(direction) => direction,
-                    Err(reason) => {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: secure media pipeline (B→A)", &reason);
-                    }
-                };
-                // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them, (de)crypted inside).
-                for endpoint in [near_rtp.id, far_rtp.id] {
-                    if let Err(error) = self.datapath.install_flow(endpoint, FlowAction::Redirect) {
-                        self.free_bound(&bound).await;
-                        return error_result("restore: install secure media redirect", &error);
-                    }
-                }
-                // Rebuild the shared SecureLeg from the two keys and seed its rollover *before* wrapping
-                // it (the fresh leg is unshared, so no lock is needed), then thread it into both
-                // directions + the RTCP relays.
-                let mut secure_leg = SecureLeg::new(&far_local.key, &far_remote.key);
-                secure_leg.seed_rollover(&restore_rollover(&secure.rollover));
-                let leg = Arc::new(Mutex::new(secure_leg));
-                // Non-muxed companion RTCP: redirect both RTCP endpoints into the actor and relay them
-                // through the shared SecureLeg (A's RTCP encrypted toward secure B, B's SRTCP decrypted
-                // toward plaintext A), exactly as the live builder does (RFC 3711 SRTCP; RFC 5761 keeps
-                // RTCP on its own port). Muxed calls leave this empty.
-                let mut rtcp_relays = Vec::new();
-                if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp), Some(b_rtcp)) =
-                    (near.rtcp, far.rtcp, near.remote_rtcp, far.remote_rtcp)
-                {
-                    for endpoint in [near_rtcp.id, far_rtcp.id] {
-                        if let Err(error) =
-                            self.datapath.install_flow(endpoint, FlowAction::Redirect)
-                        {
-                            self.free_bound(&bound).await;
-                            return error_result(
-                                "restore: install secure media RTCP redirect",
-                                &error,
-                            );
-                        }
-                    }
-                    rtcp_relays.push(
-                        RtcpRelay::new(
-                            near_rtcp.id,
-                            SourceFilter::Exact(a_rtcp.ip()),
-                            far_rtcp.id,
-                            b_rtcp,
-                        )
-                        .with_secure_egress(leg.clone()),
-                    );
-                    rtcp_relays.push(
-                        RtcpRelay::new(
-                            far_rtcp.id,
-                            SourceFilter::Exact(b_rtcp.ip()),
-                            near_rtcp.id,
-                            a_rtcp,
-                        )
-                        .with_secure_ingress(leg.clone()),
-                    );
-                }
-                let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
-                let media_call = MediaCall::new(
-                    snapshot.call_id.clone(),
-                    snapshot.from_tag.clone(),
-                    snapshot.to_tag.clone(),
-                    a_to_b,
-                    b_to_a,
-                    true, // relay latch (the `no-latch` flag is not carried in the snapshot)
-                    None, // recording restarts on the new node if the proxy re-issues it
-                )
-                .with_far_secure_leg(leg)
-                .with_rtcp_relays(rtcp_relays);
-                self.media
-                    .register(media_call, self.datapath.clone(), owner_events);
-                near_codec_out = Some(near_codec);
-                far_codec_out = Some(far_codec);
-                far_local_crypto = Some(far_local);
-                far_remote_crypto = Some(far_remote);
+                self.restore_transcode(client, &snapshot, near, far, true)?
             }
             _ => unreachable!("pipeline validated above"),
-        }
+        };
 
         // Register the reconstructed call under the requesting (standby) client.
         *self.client_calls.entry(client).or_insert(0) += 1;
-        for (_, endpoint) in &bound {
+        for (_, endpoint) in bound {
             self.endpoint_calls
                 .insert(endpoint.id, snapshot.call_id.clone());
         }
@@ -835,8 +491,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 far: Some(far),
                 // Both parties own a leg on a restored (2-leg) call, so this is never read there.
                 caller_media_leg: CallerMediaLeg::Near,
-                far_local_crypto,
-                far_remote_crypto,
+                far_local_crypto: media.far_local_crypto,
+                far_remote_crypto: media.far_remote_crypto,
                 // A DTLS-SRTP call is never restored (rejected above), so it is always plaintext/SDES here.
                 far_dtls: false,
                 far_dtls_role: None,
@@ -853,13 +509,13 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 near_local_crypto: None,
                 near_remote_crypto: None,
                 // Set for a transcode (`Media`) call; `None` for relay/bridge, which don't transcode.
-                near_codec: near_codec_out,
+                near_codec: media.near_codec,
                 // The offered set is not carried in the HA snapshot: a restored call is already
                 // answered, so the answer-time negotiation never runs again, and a re-offer is judged
                 // against the negotiated codec itself rather than the original offer.
                 near_offered_codecs: Vec::new(),
                 near_codec_withheld: false,
-                far_codec: far_codec_out,
+                far_codec: media.far_codec,
                 // Neither party's direction attribute is carried in the HA snapshot — the standby never
                 // saw either SDP. Both default to sendrecv, which is the conservative reading: a
                 // restored call is measured against the short dead-path ceiling rather than being
@@ -872,8 +528,8 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                 // answer. `block DTMF` after a restore on a plain relay gates whichever side's PT is
                 // known (near), which is the documented relay-path limitation.
                 far_telephone_event: None,
-                pipeline,
-                relay_flows,
+                pipeline: media.pipeline,
+                relay_flows: media.relay_flows,
                 promotion_reasons: HashSet::new(),
                 // The source gate is reconstructed from the snapshot's per-flow `accepted_source`
                 // (which already folded in any `received-from` at the original answer), so the raw
@@ -911,7 +567,239 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
                  no peer ICE credentials; dead-path detection falls back to the media-timeout sweep"
             );
         }
-        ok_empty()
+        Ok(())
+    }
+
+    /// Reinstall a plain relay's forward rules, resolving each snapshot role to its freshly-bound id.
+    fn restore_relay_flows(
+        &self,
+        snapshot: &crate::ha::CallSnapshot,
+        bound: &[(crate::ha::EndpointRole, Endpoint)],
+    ) -> Result<RestoredMedia, Box<CmdResult>> {
+        let mut relay_flows = Vec::new();
+        for flow in &snapshot.flows {
+            let (Some(installed_on), Some(out)) = (
+                bound_endpoint(bound, flow.installed_on),
+                bound_endpoint(bound, flow.out),
+            ) else {
+                return Err(Box::new(CmdResult::Error {
+                    reason: "restore: a snapshot flow references an unknown endpoint role"
+                        .to_string(),
+                }));
+            };
+            let action = FlowAction::Forward(ForwardRule {
+                out_endpoint: out.id,
+                out_dst: flow.out_dst,
+                accepted_source: restore_source_filter(flow.accepted_source),
+                latch: restore_latch(flow.latch),
+            });
+            if let Err(error) = self.datapath.install_flow(installed_on.id, action) {
+                return Err(boxed_error_result("restore: install forward flow", &error));
+            }
+            relay_flows.push((installed_on.id, action));
+        }
+        Ok(RestoredMedia::unkeyed(
+            PipelineKind::Passthrough,
+            relay_flows,
+        ))
+    }
+
+    /// Rebuild a secure SDES-SRTP bridge: the two keys (the engine's own + the peer's), the bridge flow
+    /// plans with roles resolved to freshly-bound ids, a redirect on every endpoint so the bridge crypts
+    /// both directions, and the secure leg with its rollover seeded.
+    fn restore_srtp_bridge(
+        &self,
+        snapshot: &crate::ha::CallSnapshot,
+        bound: &[(crate::ha::EndpointRole, Endpoint)],
+    ) -> Result<RestoredMedia, Box<CmdResult>> {
+        // The early validation admits `Srtp` only with `secure` present; if a hand-crafted snapshot
+        // violates that, refuse (the caller frees the ports) rather than panic.
+        let Some(secure) = snapshot.secure.as_ref() else {
+            return Err(Box::new(CmdResult::Error {
+                reason: "restore: secure call missing secure snapshot".to_string(),
+            }));
+        };
+        let (far_local, far_remote) = restore_sdes_keys(snapshot, secure, "secure call")?;
+        let mut bridge_flows = Vec::with_capacity(secure.bridge_flows.len());
+        for plan in &secure.bridge_flows {
+            let (Some(endpoint), Some(out)) = (
+                bound_endpoint(bound, plan.endpoint),
+                bound_endpoint(bound, plan.out),
+            ) else {
+                return Err(Box::new(CmdResult::Error {
+                    reason: "restore: a secure bridge flow references an unknown role".to_string(),
+                }));
+            };
+            bridge_flows.push(BridgeFlowPlan {
+                endpoint: endpoint.id,
+                op: match plan.op {
+                    crate::ha::BridgeOpSnapshot::Encrypt => BridgeOp::Encrypt,
+                    crate::ha::BridgeOpSnapshot::Decrypt => BridgeOp::Decrypt,
+                },
+                accepted_source: restore_source_filter(plan.accepted_source),
+                out_endpoint: out.id,
+                out_dst: plan.out_dst,
+            });
+        }
+        self.redirect_endpoints(
+            bound.iter().map(|(_, endpoint)| endpoint.id),
+            "restore: install SRTP bridge redirect",
+        )?;
+        let mut leg = SecureLeg::new(&far_local.key, &far_remote.key);
+        leg.seed_rollover(&restore_rollover(&secure.rollover));
+        self.bridge.register(BridgeCallPlan {
+            leg,
+            flows: bridge_flows,
+        });
+        Ok(RestoredMedia {
+            far_local_crypto: Some(far_local),
+            far_remote_crypto: Some(far_remote),
+            ..RestoredMedia::unkeyed(PipelineKind::Srtp, Vec::new())
+        })
+    }
+
+    /// Rebuild a transcoding call's actor: plaintext (`Media`), or with a secure far party
+    /// (`SrtpMedia`) when `secure`, where the `Srtp` bridge's crypto (both SDES keys and the shared
+    /// SecureLeg, its rollover seeded) is threaded into the transcode by `with_far_secure_leg` so the
+    /// actor decrypts the secure peer's ingress and encrypts its egress (BGCF/SBC PSTN breakout).
+    ///
+    /// Jitter / codec state and the egress SSRC-seq-ts restart fresh (the cold-restore glitch), so the
+    /// far side re-syncs. The SRTP rollover is *seeded* so the inbound decrypt keeps authenticating
+    /// past a sequence wrap and the outbound never re-uses an index — no two-time-pad (RFC 3711
+    /// §3.3.1 / §3.4). The source gates are reconstructed from the peers' signalled addresses: a
+    /// Redirect pipeline carries no portable `flows`.
+    fn restore_transcode(
+        &self,
+        client: ClientId,
+        snapshot: &crate::ha::CallSnapshot,
+        near: Leg,
+        far: Leg,
+        secure: bool,
+    ) -> Result<RestoredMedia, Box<CmdResult>> {
+        let (call, pipeline) = if secure {
+            ("secure transcode call", "secure media pipeline")
+        } else {
+            ("media call", "media pipeline")
+        };
+        let refuse = |what: &str| {
+            Box::new(CmdResult::Error {
+                reason: format!("restore: {call} missing {what}"),
+            })
+        };
+        let secure_snapshot = match (secure, snapshot.secure.as_ref()) {
+            (false, _) => None,
+            (true, Some(secure_snapshot)) => Some(secure_snapshot),
+            (true, None) => return Err(refuse("secure snapshot")),
+        };
+        // Both codecs were validated present up front; the two remote addresses target egress.
+        let (Some(near_codec_snap), Some(far_codec_snap)) =
+            (snapshot.near_codec.as_ref(), snapshot.far_codec.as_ref())
+        else {
+            return Err(refuse("a codec"));
+        };
+        let (Some(a_rtp), Some(b_rtp)) = (near.remote_rtp, far.remote_rtp) else {
+            return Err(refuse("a remote address"));
+        };
+        let keys = match secure_snapshot {
+            Some(secure_snapshot) => Some(restore_sdes_keys(snapshot, secure_snapshot, call)?),
+            None => None,
+        };
+        let near_codec = restore_codec(near_codec_snap);
+        let far_codec = restore_codec(far_codec_snap);
+        let (a_to_b, b_to_a) = build_transcode_pair(&TranscodePair {
+            near_endpoint: near.rtp.id,
+            near_source: SourceFilter::Exact(a_rtp.ip()),
+            near_dst: a_rtp,
+            far_endpoint: far.rtp.id,
+            far_source: SourceFilter::Exact(b_rtp.ip()),
+            far_dst: b_rtp,
+            near_codec: &near_codec,
+            far_codec: &far_codec,
+            near_telephone_event: snapshot.near_telephone_event,
+            far_telephone_event: None,
+            record_path: None,
+            // Noise suppression, echo cancellation and record-tone detection are not carried in the
+            // checkpoint snapshot, so a cold restore resumes without them — matching how recording
+            // (`record_path`) is not restored. The controller re-arms them by re-issuing the profile.
+            noise_suppression: false,
+            echo: EchoProfile::default(),
+            beep_detection: false,
+            beep_cadence_guard_ms: None,
+        })
+        .map_err(|(direction, reason)| {
+            boxed_error_result(&format!("restore: {pipeline} ({direction})"), &reason)
+        })?;
+        // Redirect the RTP legs to the actor (rtcp-mux ⇒ RTCP rides them, (de)crypted inside).
+        self.redirect_endpoints(
+            [near.rtp.id, far.rtp.id],
+            &format!(
+                "restore: install {} redirect",
+                pipeline.trim_end_matches(" pipeline")
+            ),
+        )?;
+        let mut secure_parts = None;
+        if let (Some((far_local, far_remote)), Some(secure_snapshot)) = (keys, secure_snapshot) {
+            // Rebuild the shared SecureLeg and seed its rollover *before* wrapping it (the fresh leg
+            // is unshared, so no lock is needed).
+            let mut secure_leg = SecureLeg::new(&far_local.key, &far_remote.key);
+            secure_leg.seed_rollover(&restore_rollover(&secure_snapshot.rollover));
+            let leg = Arc::new(Mutex::new(secure_leg));
+            // Non-muxed companion RTCP relayed through the shared SecureLeg, exactly as the live
+            // builder does (RFC 3711 SRTCP; RFC 5761 keeps RTCP on its own port). Muxed: empty.
+            let mut rtcp_relays = Vec::new();
+            if let (Some(near_rtcp), Some(far_rtcp), Some(a_rtcp), Some(b_rtcp)) =
+                (near.rtcp, far.rtcp, near.remote_rtcp, far.remote_rtcp)
+            {
+                self.redirect_endpoints(
+                    [near_rtcp.id, far_rtcp.id],
+                    "restore: install secure media RTCP redirect",
+                )?;
+                rtcp_relays = secure_rtcp_relays(
+                    near_rtcp.id,
+                    SourceFilter::Exact(a_rtcp.ip()),
+                    b_rtcp,
+                    far_rtcp.id,
+                    SourceFilter::Exact(b_rtcp.ip()),
+                    a_rtcp,
+                    &RtcpKeying::Leg(leg.clone()),
+                );
+            }
+            secure_parts = Some((far_local, far_remote, leg, rtcp_relays));
+        }
+        let owner_events = self.events.get(&client).map(|sink| sink.value().clone());
+        let media_call = MediaCall::new(
+            snapshot.call_id.clone(),
+            snapshot.from_tag.clone(),
+            snapshot.to_tag.clone(),
+            a_to_b,
+            b_to_a,
+            true, // relay latch (the `no-latch` flag is not carried in the snapshot)
+            None, // recording restarts on the new node if the proxy re-issues it
+        );
+        let (media_call, far_local_crypto, far_remote_crypto) = match secure_parts {
+            Some((far_local, far_remote, leg, rtcp_relays)) => (
+                media_call
+                    .with_far_secure_leg(leg)
+                    .with_rtcp_relays(rtcp_relays),
+                Some(far_local),
+                Some(far_remote),
+            ),
+            None => (media_call, None, None),
+        };
+        self.media
+            .register(media_call, self.datapath.clone(), owner_events);
+        Ok(RestoredMedia {
+            pipeline: if secure {
+                PipelineKind::SrtpMedia
+            } else {
+                PipelineKind::Media
+            },
+            relay_flows: Vec::new(),
+            far_local_crypto,
+            far_remote_crypto,
+            near_codec: Some(near_codec),
+            far_codec: Some(far_codec),
+        })
     }
 
     /// Bind a snapshot's endpoints at their exact ports (HA restore), in role order. On any bind
@@ -957,4 +845,60 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let endpoints: Vec<Endpoint> = bound.iter().map(|(_, endpoint)| *endpoint).collect();
         self.free(&endpoints).await;
     }
+}
+
+/// What a restored call's media path installed, for its call record.
+struct RestoredMedia {
+    pipeline: PipelineKind,
+    relay_flows: Vec<(EndpointId, FlowAction)>,
+    far_local_crypto: Option<CryptoAttribute>,
+    far_remote_crypto: Option<CryptoAttribute>,
+    near_codec: Option<CodecSpec>,
+    far_codec: Option<CodecSpec>,
+}
+
+impl RestoredMedia {
+    /// A restored media path with no keys and no transcode codecs.
+    fn unkeyed(pipeline: PipelineKind, relay_flows: Vec<(EndpointId, FlowAction)>) -> Self {
+        Self {
+            pipeline,
+            relay_flows,
+            far_local_crypto: None,
+            far_remote_crypto: None,
+            near_codec: None,
+            far_codec: None,
+        }
+    }
+}
+
+/// The freshly-bound endpoint a snapshot `role` maps to, if the snapshot bound one.
+fn bound_endpoint(
+    bound: &[(crate::ha::EndpointRole, Endpoint)],
+    role: crate::ha::EndpointRole,
+) -> Option<Endpoint> {
+    bound
+        .iter()
+        .find(|(bound_role, _)| *bound_role == role)
+        .map(|(_, endpoint)| *endpoint)
+}
+
+/// The two SDES keys of a secure restored call — the engine's own and the peer's — or the refusal
+/// naming what is missing or malformed. `call` names the call's shape in that refusal.
+fn restore_sdes_keys(
+    snapshot: &crate::ha::CallSnapshot,
+    secure: &crate::ha::SecureSnapshot,
+    call: &str,
+) -> Result<(CryptoAttribute, CryptoAttribute), Box<CmdResult>> {
+    let far_local = match snapshot.far_local_crypto.as_ref().map(restore_crypto) {
+        Some(Ok(crypto)) => crypto,
+        Some(Err(reason)) => return Err(boxed_error_result("restore: far_local key", &reason)),
+        None => {
+            return Err(Box::new(CmdResult::Error {
+                reason: format!("restore: {call} missing far_local_crypto"),
+            }))
+        }
+    };
+    let far_remote = restore_crypto(&secure.far_remote_crypto)
+        .map_err(|reason| boxed_error_result("restore: far_remote key", &reason))?;
+    Ok((far_local, far_remote))
 }
