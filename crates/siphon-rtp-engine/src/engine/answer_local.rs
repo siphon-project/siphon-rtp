@@ -24,6 +24,381 @@ use super::{
     PromotionReason,
 };
 
+/// What bridging a single-leg answer to a WebSocket server reads: the negotiated codec and SDP,
+/// the caller's keying and ICE, and the endpoint the answer advertised.
+struct LocalTakeover<'a> {
+    call_id: &'a str,
+    ws_uri: String,
+    chosen: CodecSpec,
+    offerer_security: &'a WsTakeoverSecurity,
+    near_local_crypto: Option<CryptoAttribute>,
+    ice_config: Option<IceConfig>,
+    info: &'a sdp::MediaInfo,
+    profile: &'a ProfileFlags,
+    near_rtp: siphon_rtp_datapath::Endpoint,
+    peer_ice: &'a Option<ice::IceCredentials>,
+    ice_candidates: &'a [siphon_rtp_ice::Candidate],
+    answer_sdp: String,
+}
+
+impl<D: Datapath + Clone + Send + 'static> Engine<D> {
+    /// Record the half-built call before selecting the codec, so the reject path exercises the same
+    /// teardown as a live call (frees the ports + releases the client quota). `to_tag: None` — there
+    /// is no far leg. `near_codec` is set to the chosen codec below, right before promotion.
+    #[allow(clippy::too_many_arguments)]
+    fn register_local_call(
+        &self,
+        client: ClientId,
+        call_id: &str,
+        from_tag: String,
+        near_rtp: siphon_rtp_datapath::Endpoint,
+        near_rtcp: Option<siphon_rtp_datapath::Endpoint>,
+        near_advertised: std::net::IpAddr,
+        info: &sdp::MediaInfo,
+        profile: &ProfileFlags,
+    ) {
+        *self.client_calls.entry(client).or_insert(0) += 1;
+        for endpoint in [Some(near_rtp), near_rtcp].into_iter().flatten() {
+            self.endpoint_calls.insert(endpoint.id, call_id.to_string());
+        }
+        self.calls.insert(
+            call_id.to_string(),
+            Call {
+                owner: client,
+                created_tick: self.datapath.now_ticks(),
+                ice: None,
+                // A single-leg local answer mints no ICE of its own, so there is no pair to keep
+                // consent on either side.
+                near_remote_ice: None,
+                far_remote_ice: None,
+                near_remote_candidates: Vec::new(),
+                near_peer_is_lite: false,
+                far_local_candidates: Vec::new(),
+                near_local_candidates: Vec::new(),
+                from_tag,
+                to_tag: None,
+                near: Leg {
+                    rtp: near_rtp,
+                    rtcp: near_rtcp,
+                    remote_rtp: Some(info.remote_rtp),
+                    remote_rtcp: Some(info.remote_rtcp),
+                    advertised_ip: near_advertised,
+                    // A single-leg local answer relays no text stream.
+                    text: None,
+                    text_remote_rtp: None,
+                },
+                // No B-facing leg, and never will be: this verb *is* the answer (see the allocation
+                // comment above). `answer` refuses to run on such a call rather than inventing one.
+                far: None,
+                caller_media_leg: CallerMediaLeg::Near,
+                far_local_crypto: None,
+                far_remote_crypto: None,
+                far_dtls: false,
+                far_dtls_role: None,
+                far_downgraded_to_plain: false,
+                // Recorded for symmetry; a single-leg call never reaches `answer`.
+                near_secure: info.secure,
+                // A single-leg call's keying lives on the takeover leg, not on the two-party pair.
+                near_local_crypto: None,
+                near_remote_crypto: None,
+                near_codec: None,
+                // A single-leg local answer never reaches `answer`, so the offered set is unused.
+                near_offered_codecs: Vec::new(),
+                near_codec_withheld: false,
+                far_codec: None,
+                // The caller's own direction. A single-leg call has no second party, so the far default
+                // never contributes — `legs_expected_to_send` only walks a far leg that exists.
+                near_direction: info.direction,
+                far_direction: sdp::MediaDirection::default(),
+                near_telephone_event: info.telephone_event_payload_type(),
+                far_telephone_event: None,
+                pipeline: PipelineKind::Passthrough,
+                relay_flows: Vec::new(),
+                promotion_reasons: HashSet::new(),
+                offer_received_from: profile.received_from,
+                // No far party, so no far hint and no re-offer from one.
+                far_received_from: None,
+                pending_far_reoffer: None,
+                // Set below once the answered codec is known (a single-leg local answer negotiates CN
+                // at the chosen codec's clock rate); left `None` for the reject path.
+                comfort_noise_payload_type: None,
+                text_t140_payload_type: None,
+                text_red_payload_type: None,
+                // A single-leg local answer negotiates no text stream.
+                text_relay_flows: Vec::new(),
+                text_promotion_reasons: HashSet::new(),
+                text_events: false,
+                text_secure: false,
+                near_text_remote_crypto: None,
+                far_text_local_crypto: None,
+                near_text_local_crypto: None,
+            },
+        );
+    }
+
+    /// WebSocket bridge (mod_audio_stream / voice-AI) on a single-leg answer — the same
+    /// `ProfileFlags::ws_uri` takeover `offer` honours, and the shape the voice-AI feature actually
+    /// wants: "the AI answers the call". `answer_local` already means *the engine is the far side*,
+    /// so `ws_uri` simply replaces the locally-generated far side (prompt / echo) with the WS server.
+    /// There is no leg B to reconcile, no `to_tag`, and no ordering question about which side arrives
+    /// first — and the answer above already picked exactly ONE encodable codec, so the L16 bridge
+    /// format is unambiguous here in a way it is not on the offer path.
+    ///
+    /// It bridges the call's only endpoint, which is also the one this answer advertised — the same
+    /// rule `offer` follows ("bridge what the peer was told to send to") and the same endpoint
+    /// `promote_to_processing`'s single-leg branch reflects on.
+    ///
+    /// A dial failure fails the command: returning `ok` while the requested bridge is not up would
+    /// connect a caller to nothing and give the controller no way to notice, so it is torn down and
+    /// reported exactly like `no-encodable-codec` (the controller renders a real SIP failure).
+    async fn answer_local_takeover(&self, takeover: LocalTakeover<'_>) -> CmdResult {
+        let LocalTakeover {
+            call_id,
+            ws_uri,
+            chosen,
+            offerer_security,
+            near_local_crypto,
+            ice_config,
+            info,
+            profile,
+            near_rtp,
+            peer_ice,
+            ice_candidates,
+            answer_sdp,
+        } = takeover;
+        // Record the negotiated ingress codec + the takeover pipeline before the bridge is built.
+        // `far_codec` stays `None`: the WS server is the far side and it speaks L16, not an RTP
+        // codec — a `far_codec` here would claim a far RTP party that does not exist (`offer`'s WS
+        // arm records the same shape).
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.near_codec = Some(chosen.clone());
+            call.pipeline = PipelineKind::Ws;
+        }
+        // The takeover leg's SRTP state (RFC 3711). SDES is keyed right here — the answer above
+        // carries the engine's own key and the offer carried the peer's, so both halves are known
+        // synchronously. DTLS starts **unkeyed**: the RFC 5764 handshake only completes after this
+        // command has returned, and until it does the registry drops ingress *and* refuses egress
+        // rather than emitting anything in the clear.
+        let secure = match offerer_security {
+            WsTakeoverSecurity::Plain => None,
+            WsTakeoverSecurity::Sdes { peer_key } => {
+                // Key direction (RFC 4568 / `SecureLeg::new`): encrypt egress with the key this
+                // answer advertised, decrypt ingress with the key the offer carried.
+                let Some(local) = near_local_crypto else {
+                    self.teardown_call(call_id).await;
+                    return error_result(
+                        "ws bridge",
+                        &"ws-takeover-unkeyable: no engine SDES key was minted (internal)",
+                    );
+                };
+                Some(Arc::new(crate::ws_bridge::WsSecureLeg::keyed(
+                    SecureLeg::new(&local.key, &peer_key.key),
+                )))
+            }
+            WsTakeoverSecurity::Dtls { .. } => {
+                Some(Arc::new(crate::ws_bridge::WsSecureLeg::pending()))
+            }
+        };
+        // An ICE takeover leg starts with the source gate OPEN, because a connectivity check
+        // legitimately arrives from a peer-reflexive transport the SDP never carried (RFC 8445
+        // §7.3.1.3) — safe only because `ice_pending` drops **all** media until the agent selects,
+        // at which point the gate narrows to the selected pair.
+        let ice_pending = ice_config.is_some();
+        // Aim the downlink at the caller's `received-from` public IP when the control supplied
+        // one, and gate its ingress on the same address — identical to the offer path.
+        let a_media = ws_takeover_media_address(info.remote_rtp, profile.received_from);
+        let accepted_source = if ice_pending {
+            SourceFilter::Any
+        } else {
+            bridge_source_filter(profile, a_media)
+        };
+        if let Err(reason) = self
+            .setup_ws_bridge(WsBridgeSetup {
+                call_id,
+                ws_uri: &ws_uri,
+                endpoint_a: near_rtp.id,
+                a_rtp: a_media,
+                codec: Some(&chosen),
+                accepted_source,
+                ice_pending,
+                secure,
+                noise_suppression: profile.noise_suppression,
+                echo: crate::media_pipeline::EchoProfile::from_profile(profile),
+                vad_config: WsVadConfig::from_profile(profile),
+                wire_sample_rate: profile.ws_sample_rate,
+                // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
+                // yet) — so there is nothing for a detach to put back either.
+                egress: None,
+                takeover: None,
+                socket: None,
+            })
+            .await
+        {
+            self.teardown_call(call_id).await;
+            return error_result("ws bridge", &reason);
+        }
+        // Arm the full RFC 8445 agent on the takeover endpoint. `ForwardOnly`: the agent owns
+        // request handling (the §7.3.1.1 role conflict, §7.3.1.3 peer-reflexive discovery and
+        // §7.3.1.5 nomination all need state the datapath does not have), so the datapath answers
+        // nothing here. Done after the bridge is registered so a selection always finds its route.
+        if let Some(config) = ice_config {
+            // Both checked before any allocation, so this cannot fail here.
+            let (Some(agents), Some(peer)) = (self.ice_agents.clone(), peer_ice.clone()) else {
+                self.teardown_call(call_id).await;
+                return error_result(
+                    "ws bridge",
+                    &"ws-takeover-ice-unsupported: no ICE agent available (internal)",
+                );
+            };
+            let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
+                siphon_rtp_ice::agent::Credentials::new(
+                    config.local_ufrag.clone(),
+                    config.local_pwd.clone(),
+                ),
+                siphon_rtp_ice::agent::Credentials::new(peer.ufrag.clone(), peer.pwd.clone()),
+                // RFC 8445 §6.1.1: the offerer controls — unless it is a lite agent, which never can.
+                info.ice_lite,
+                ice_tie_breaker(),
+            )
+            .with_candidates(
+                filter_component(ice_candidates, 1),
+                filter_component(&info.candidates, 1),
+            );
+            self.datapath.set_ice_agent(
+                near_rtp.id,
+                config,
+                IceAgentMode::ForwardOnly,
+                agents.events(),
+            );
+            agents.register(near_rtp.id, call_id, near_rtp.local_addr, agent_config, 0);
+        }
+        // A DTLS-SRTP takeover leg needs the handshake in front of its endpoint: the bridge keeps
+        // the RFC 7983 demux (DTLS records drive the handshake, media is forwarded on) and hands
+        // the derived key to the WS leg, which is the single owner of the crypto — the same shape
+        // a DTLS conference seat and a `DtlsMedia` call use. Registered last so the WS route
+        // exists before any packet can be released to it.
+        if let WsTakeoverSecurity::Dtls {
+            peer_fingerprint,
+            peer_setup,
+        } = offerer_security
+        {
+            let Some(certificate) = self.dtls_certificate.clone() else {
+                self.teardown_call(call_id).await;
+                return error_result(
+                    "ws bridge",
+                    &"ws-takeover-unkeyable: engine has no DTLS certificate",
+                );
+            };
+            // The offerer picks; the engine takes the complement (RFC 5763 §5) — matching the
+            // `a=setup` this answer advertised.
+            let role = match peer_setup {
+                Some(sdp::Setup::Active) => DtlsRole::Server,
+                _ => DtlsRole::Client,
+            };
+            self.dtls_bridge().register_for_pipeline(
+                DtlsCallPlan {
+                    // A takeover leg is one muxed endpoint; the "plain" side is unused in pipeline
+                    // mode (the WS bridge owns egress), so it mirrors the secure one.
+                    plain_endpoint: near_rtp.id,
+                    plain_source: accepted_source,
+                    plain_dst: info.remote_rtp,
+                    secure_endpoint: near_rtp.id,
+                    secure_source: accepted_source,
+                    secure_dst: info.remote_rtp,
+                    secure_local: near_rtp.local_addr,
+                    certificate,
+                    role,
+                    peer_fingerprint: DtlsFingerprint::new(
+                        peer_fingerprint.hash_function.clone(),
+                        peer_fingerprint.bytes.clone(),
+                    ),
+                    // RFC 8445 §12: key the pair ICE chose, but only when an agent is actually
+                    // running — otherwise no selection is coming and the handshake would hang.
+                    gate_on_ice: ice_pending,
+                },
+                crate::dtls_bridge::PipelineTarget::Ws {
+                    ws: self.ws.clone(),
+                    call_id: call_id.to_string(),
+                },
+            );
+        }
+        tracing::info!(
+            target: "siphon_rtp::media",
+            call_id = %call_id,
+            offerer = %info.remote_rtp,
+            codec = %chosen.encoding_name,
+            role = "uas_local_ws",
+            "websocket bridge attached to the single-leg answer"
+        );
+        // Deliberately no RFC 3389 comfort noise on this path: CN egress is generated by the
+        // promoted media actor, which a takeover call does not have. Advertising CN the bridge can
+        // never send would be an answer the media path cannot back, so the answer stays silent
+        // about it (`force_answer_codec` already dropped it from the m-line).
+        ok_sdp(answer_sdp, None)
+    }
+
+    /// Key the single-leg pipeline for a secure offerer. The answer above already advertises the
+    /// engine's own SDES key or DTLS fingerprint — that part was always correct — and until now it
+    /// was the *media path* that had nothing behind it, which is why the verb refused a secure
+    /// offerer outright rather than answering keying it could not honour.
+    ///
+    /// The single-leg shape is its own: both directions face the same caller on the same endpoint,
+    /// and the caller is the secure side, so each direction both decrypts what arrives and encrypts
+    /// what leaves (`attach_near_secure_leg`). The two-leg method keys A-plaintext/B-secure and
+    /// would leave an IVR that decrypted the caller and answered it in the clear.
+    async fn key_local_pipeline(
+        &self,
+        call_id: &str,
+        offerer_security: &WsTakeoverSecurity,
+        near_local_crypto: Option<CryptoAttribute>,
+    ) -> Option<CmdResult> {
+        match offerer_security {
+            WsTakeoverSecurity::Plain => {}
+            WsTakeoverSecurity::Sdes { peer_key } => {
+                // SDES is keyed synchronously: this answer carries the engine's key and the offer
+                // carried the peer's, so both halves are known now (RFC 4568). Key direction per
+                // `SecureLeg::new`: encrypt egress with ours, decrypt ingress with theirs.
+                let Some(local) = near_local_crypto else {
+                    self.teardown_call(call_id).await;
+                    return Some(error_result(
+                        "answer_local",
+                        &"secure-offerer-unkeyable: no engine SDES key was minted (internal)",
+                    ));
+                };
+                let leg = Arc::new(std::sync::Mutex::new(SecureLeg::new(
+                    &local.key,
+                    &peer_key.key,
+                )));
+                if !self
+                    .media
+                    .control(call_id, MediaControl::AttachNearSecureLeg { leg })
+                {
+                    self.teardown_call(call_id).await;
+                    return Some(error_result(
+                        "answer_local",
+                        &"secure-offerer-unkeyable: media actor unavailable",
+                    ));
+                }
+            }
+            // DTLS-SRTP on the local pipeline is **not** done, and says so rather than answering a
+            // fingerprint no media path backs. It needs two things this change does not build: the
+            // full ICE agent attached to the promoted (Redirect) leg so the handshake can be gated on
+            // the selected pair (RFC 8445 §12), and the `gate_on_ice` / pending-key plumbing that goes
+            // with it. A WebRTC caller reaching an IVR is the case, and it is the second half of the
+            // secure-offerer work.
+            WsTakeoverSecurity::Dtls { .. } => {
+                self.teardown_call(call_id).await;
+                return Some(error_result(
+                    "answer_local",
+                    &"secure-offerer-unsupported: a DTLS-SRTP (WebRTC) offerer needs a WebSocket \
+                      takeover (ws_uri); SDES-SRTP is terminated on the local pipeline",
+                ));
+            }
+        }
+        None
+    }
+}
+
 impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// Single-leg UAS answer ([`Command::AnswerLocal`]): the engine *is* the far side (IVR / echo /
     /// announcement). Given the offerer's SDP and **no** peer, it synthesises an RFC 3264 answer that
@@ -54,7 +429,6 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
     /// (the "AI answers the call" shape), exactly as [`Self::offer`] does for a 2-party call. The
     /// transcoder is not engaged in that mode — the bridge owns the leg — and a failed dial fails the
     /// command rather than answering `ok` with nothing attached.
-    #[expect(clippy::too_many_lines, reason = "debt: to be split")]
     pub(super) async fn answer_local(
         &self,
         client: ClientId,
@@ -302,85 +676,15 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             rewritten.sdp = sdp::rewrite_origin(&rewritten.sdp, engine.advertised_ip);
         }
 
-        // Record the half-built call before selecting the codec, so the reject path exercises the same
-        // teardown as a live call (frees the ports + releases the client quota). `to_tag: None` — there
-        // is no far leg. `near_codec` is set to the chosen codec below, right before promotion.
-        *self.client_calls.entry(client).or_insert(0) += 1;
-        for endpoint in [Some(near_rtp), near_rtcp].into_iter().flatten() {
-            self.endpoint_calls.insert(endpoint.id, call_id.to_string());
-        }
-        self.calls.insert(
-            call_id.to_string(),
-            Call {
-                owner: client,
-                created_tick: self.datapath.now_ticks(),
-                ice: None,
-                // A single-leg local answer mints no ICE of its own, so there is no pair to keep
-                // consent on either side.
-                near_remote_ice: None,
-                far_remote_ice: None,
-                near_remote_candidates: Vec::new(),
-                near_peer_is_lite: false,
-                far_local_candidates: Vec::new(),
-                near_local_candidates: Vec::new(),
-                from_tag,
-                to_tag: None,
-                near: Leg {
-                    rtp: near_rtp,
-                    rtcp: near_rtcp,
-                    remote_rtp: Some(info.remote_rtp),
-                    remote_rtcp: Some(info.remote_rtcp),
-                    advertised_ip: near_advertised,
-                    // A single-leg local answer relays no text stream.
-                    text: None,
-                    text_remote_rtp: None,
-                },
-                // No B-facing leg, and never will be: this verb *is* the answer (see the allocation
-                // comment above). `answer` refuses to run on such a call rather than inventing one.
-                far: None,
-                caller_media_leg: CallerMediaLeg::Near,
-                far_local_crypto: None,
-                far_remote_crypto: None,
-                far_dtls: false,
-                far_dtls_role: None,
-                far_downgraded_to_plain: false,
-                // Recorded for symmetry; a single-leg call never reaches `answer`.
-                near_secure: info.secure,
-                // A single-leg call's keying lives on the takeover leg, not on the two-party pair.
-                near_local_crypto: None,
-                near_remote_crypto: None,
-                near_codec: None,
-                // A single-leg local answer never reaches `answer`, so the offered set is unused.
-                near_offered_codecs: Vec::new(),
-                near_codec_withheld: false,
-                far_codec: None,
-                // The caller's own direction. A single-leg call has no second party, so the far default
-                // never contributes — `legs_expected_to_send` only walks a far leg that exists.
-                near_direction: info.direction,
-                far_direction: sdp::MediaDirection::default(),
-                near_telephone_event: info.telephone_event_payload_type(),
-                far_telephone_event: None,
-                pipeline: PipelineKind::Passthrough,
-                relay_flows: Vec::new(),
-                promotion_reasons: HashSet::new(),
-                offer_received_from: profile.received_from,
-                // No far party, so no far hint and no re-offer from one.
-                far_received_from: None,
-                pending_far_reoffer: None,
-                // Set below once the answered codec is known (a single-leg local answer negotiates CN
-                // at the chosen codec's clock rate); left `None` for the reject path.
-                comfort_noise_payload_type: None,
-                text_t140_payload_type: None,
-                text_red_payload_type: None,
-                // A single-leg local answer negotiates no text stream.
-                text_relay_flows: Vec::new(),
-                text_promotion_reasons: HashSet::new(),
-                text_events: false,
-                text_secure: false,
-                near_text_remote_crypto: None,
-                far_text_local_crypto: None,
-                near_text_local_crypto: None,
-            },
+        self.register_local_call(
+            client,
+            call_id,
+            from_tag,
+            near_rtp,
+            near_rtcp,
+            near_advertised,
+            &info,
+            profile,
         );
 
         // Pick the ONE negotiated codec (RFC 3264 §6.1). The candidate set is the offerer's own
@@ -419,191 +723,23 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
         let mut answer_sdp =
             sdp::force_answer_codec(&rewritten.sdp, &chosen, info.telephone_event_payload_type());
 
-        // WebSocket bridge (mod_audio_stream / voice-AI) on a single-leg answer — the same
-        // `ProfileFlags::ws_uri` takeover `offer` honours, and the shape the voice-AI feature actually
-        // wants: "the AI answers the call". `answer_local` already means *the engine is the far side*,
-        // so `ws_uri` simply replaces the locally-generated far side (prompt / echo) with the WS server.
-        // There is no leg B to reconcile, no `to_tag`, and no ordering question about which side arrives
-        // first — and the answer above already picked exactly ONE encodable codec, so the L16 bridge
-        // format is unambiguous here in a way it is not on the offer path.
-        //
-        // It bridges the call's only endpoint, which is also the one this answer advertised — the same
-        // rule `offer` follows ("bridge what the peer was told to send to") and the same endpoint
-        // `promote_to_processing`'s single-leg branch reflects on.
-        //
-        // A dial failure fails the command: returning `ok` while the requested bridge is not up would
-        // connect a caller to nothing and give the controller no way to notice, so it is torn down and
-        // reported exactly like `no-encodable-codec` (the controller renders a real SIP failure).
         if let Some(ws_uri) = profile.ws_uri.clone() {
-            // Record the negotiated ingress codec + the takeover pipeline before the bridge is built.
-            // `far_codec` stays `None`: the WS server is the far side and it speaks L16, not an RTP
-            // codec — a `far_codec` here would claim a far RTP party that does not exist (`offer`'s WS
-            // arm records the same shape).
-            if let Some(mut call) = self.calls.get_mut(call_id) {
-                call.near_codec = Some(chosen.clone());
-                call.pipeline = PipelineKind::Ws;
-            }
-            // The takeover leg's SRTP state (RFC 3711). SDES is keyed right here — the answer above
-            // carries the engine's own key and the offer carried the peer's, so both halves are known
-            // synchronously. DTLS starts **unkeyed**: the RFC 5764 handshake only completes after this
-            // command has returned, and until it does the registry drops ingress *and* refuses egress
-            // rather than emitting anything in the clear.
-            let secure = match &offerer_security {
-                WsTakeoverSecurity::Plain => None,
-                WsTakeoverSecurity::Sdes { peer_key } => {
-                    // Key direction (RFC 4568 / `SecureLeg::new`): encrypt egress with the key this
-                    // answer advertised, decrypt ingress with the key the offer carried.
-                    let Some(local) = near_local_crypto else {
-                        self.teardown_call(call_id).await;
-                        return error_result(
-                            "ws bridge",
-                            &"ws-takeover-unkeyable: no engine SDES key was minted (internal)",
-                        );
-                    };
-                    Some(Arc::new(crate::ws_bridge::WsSecureLeg::keyed(
-                        SecureLeg::new(&local.key, &peer_key.key),
-                    )))
-                }
-                WsTakeoverSecurity::Dtls { .. } => {
-                    Some(Arc::new(crate::ws_bridge::WsSecureLeg::pending()))
-                }
-            };
-            // An ICE takeover leg starts with the source gate OPEN, because a connectivity check
-            // legitimately arrives from a peer-reflexive transport the SDP never carried (RFC 8445
-            // §7.3.1.3) — safe only because `ice_pending` drops **all** media until the agent selects,
-            // at which point the gate narrows to the selected pair.
-            let ice_pending = ice_config.is_some();
-            // Aim the downlink at the caller's `received-from` public IP when the control supplied
-            // one, and gate its ingress on the same address — identical to the offer path.
-            let a_media = ws_takeover_media_address(info.remote_rtp, profile.received_from);
-            let accepted_source = if ice_pending {
-                SourceFilter::Any
-            } else {
-                bridge_source_filter(profile, a_media)
-            };
-            if let Err(reason) = self
-                .setup_ws_bridge(WsBridgeSetup {
+            return self
+                .answer_local_takeover(LocalTakeover {
                     call_id,
-                    ws_uri: &ws_uri,
-                    endpoint_a: near_rtp.id,
-                    a_rtp: a_media,
-                    codec: Some(&chosen),
-                    accepted_source,
-                    ice_pending,
-                    secure,
-                    noise_suppression: profile.noise_suppression,
-                    echo: crate::media_pipeline::EchoProfile::from_profile(profile),
-                    vad_config: WsVadConfig::from_profile(profile),
-                    wire_sample_rate: profile.ws_sample_rate,
-                    // Negotiation-time: a fresh egress watch, and no relay displaced (there is none
-                    // yet) — so there is nothing for a detach to put back either.
-                    egress: None,
-                    takeover: None,
-                    socket: None,
+                    ws_uri,
+                    chosen,
+                    offerer_security: &offerer_security,
+                    near_local_crypto,
+                    ice_config,
+                    info: &info,
+                    profile,
+                    near_rtp,
+                    peer_ice: &peer_ice,
+                    ice_candidates: &ice_candidates,
+                    answer_sdp,
                 })
-                .await
-            {
-                self.teardown_call(call_id).await;
-                return error_result("ws bridge", &reason);
-            }
-            // Arm the full RFC 8445 agent on the takeover endpoint. `ForwardOnly`: the agent owns
-            // request handling (the §7.3.1.1 role conflict, §7.3.1.3 peer-reflexive discovery and
-            // §7.3.1.5 nomination all need state the datapath does not have), so the datapath answers
-            // nothing here. Done after the bridge is registered so a selection always finds its route.
-            if let Some(config) = ice_config {
-                // Both checked before any allocation, so this cannot fail here.
-                let (Some(agents), Some(peer)) = (self.ice_agents.clone(), peer_ice.clone()) else {
-                    self.teardown_call(call_id).await;
-                    return error_result(
-                        "ws bridge",
-                        &"ws-takeover-ice-unsupported: no ICE agent available (internal)",
-                    );
-                };
-                let agent_config = siphon_rtp_ice::agent::AgentConfig::new(
-                    siphon_rtp_ice::agent::Credentials::new(
-                        config.local_ufrag.clone(),
-                        config.local_pwd.clone(),
-                    ),
-                    siphon_rtp_ice::agent::Credentials::new(peer.ufrag.clone(), peer.pwd.clone()),
-                    // RFC 8445 §6.1.1: the offerer controls — unless it is a lite agent, which never can.
-                    info.ice_lite,
-                    ice_tie_breaker(),
-                )
-                .with_candidates(
-                    filter_component(&ice_candidates, 1),
-                    filter_component(&info.candidates, 1),
-                );
-                self.datapath.set_ice_agent(
-                    near_rtp.id,
-                    config,
-                    IceAgentMode::ForwardOnly,
-                    agents.events(),
-                );
-                agents.register(near_rtp.id, call_id, near_rtp.local_addr, agent_config, 0);
-            }
-            // A DTLS-SRTP takeover leg needs the handshake in front of its endpoint: the bridge keeps
-            // the RFC 7983 demux (DTLS records drive the handshake, media is forwarded on) and hands
-            // the derived key to the WS leg, which is the single owner of the crypto — the same shape
-            // a DTLS conference seat and a `DtlsMedia` call use. Registered last so the WS route
-            // exists before any packet can be released to it.
-            if let WsTakeoverSecurity::Dtls {
-                peer_fingerprint,
-                peer_setup,
-            } = &offerer_security
-            {
-                let Some(certificate) = self.dtls_certificate.clone() else {
-                    self.teardown_call(call_id).await;
-                    return error_result(
-                        "ws bridge",
-                        &"ws-takeover-unkeyable: engine has no DTLS certificate",
-                    );
-                };
-                // The offerer picks; the engine takes the complement (RFC 5763 §5) — matching the
-                // `a=setup` this answer advertised.
-                let role = match peer_setup {
-                    Some(sdp::Setup::Active) => DtlsRole::Server,
-                    _ => DtlsRole::Client,
-                };
-                self.dtls_bridge().register_for_pipeline(
-                    DtlsCallPlan {
-                        // A takeover leg is one muxed endpoint; the "plain" side is unused in pipeline
-                        // mode (the WS bridge owns egress), so it mirrors the secure one.
-                        plain_endpoint: near_rtp.id,
-                        plain_source: accepted_source,
-                        plain_dst: info.remote_rtp,
-                        secure_endpoint: near_rtp.id,
-                        secure_source: accepted_source,
-                        secure_dst: info.remote_rtp,
-                        secure_local: near_rtp.local_addr,
-                        certificate,
-                        role,
-                        peer_fingerprint: DtlsFingerprint::new(
-                            peer_fingerprint.hash_function.clone(),
-                            peer_fingerprint.bytes.clone(),
-                        ),
-                        // RFC 8445 §12: key the pair ICE chose, but only when an agent is actually
-                        // running — otherwise no selection is coming and the handshake would hang.
-                        gate_on_ice: ice_pending,
-                    },
-                    crate::dtls_bridge::PipelineTarget::Ws {
-                        ws: self.ws.clone(),
-                        call_id: call_id.to_string(),
-                    },
-                );
-            }
-            tracing::info!(
-                target: "siphon_rtp::media",
-                call_id = %call_id,
-                offerer = %info.remote_rtp,
-                codec = %chosen.encoding_name,
-                role = "uas_local_ws",
-                "websocket bridge attached to the single-leg answer"
-            );
-            // Deliberately no RFC 3389 comfort noise on this path: CN egress is generated by the
-            // promoted media actor, which a takeover call does not have. Advertising CN the bridge can
-            // never send would be an answer the media path cannot back, so the answer stays silent
-            // about it (`force_answer_codec` already dropped it from the m-line).
-            return ok_sdp(answer_sdp, None);
+                .await;
         }
 
         // When the caller offered RFC 3389 comfort noise at the chosen codec's clock rate, negotiate it
@@ -639,57 +775,11 @@ impl<D: Datapath + Clone + Send + 'static> Engine<D> {
             call.pipeline = PipelineKind::Media;
         }
 
-        // Key the single-leg pipeline for a secure offerer. The answer above already advertises the
-        // engine's own SDES key or DTLS fingerprint — that part was always correct — and until now it
-        // was the *media path* that had nothing behind it, which is why the verb refused a secure
-        // offerer outright rather than answering keying it could not honour.
-        //
-        // The single-leg shape is its own: both directions face the same caller on the same endpoint,
-        // and the caller is the secure side, so each direction both decrypts what arrives and encrypts
-        // what leaves (`attach_near_secure_leg`). The two-leg method keys A-plaintext/B-secure and
-        // would leave an IVR that decrypted the caller and answered it in the clear.
-        match &offerer_security {
-            WsTakeoverSecurity::Plain => {}
-            WsTakeoverSecurity::Sdes { peer_key } => {
-                // SDES is keyed synchronously: this answer carries the engine's key and the offer
-                // carried the peer's, so both halves are known now (RFC 4568). Key direction per
-                // `SecureLeg::new`: encrypt egress with ours, decrypt ingress with theirs.
-                let Some(local) = near_local_crypto else {
-                    self.teardown_call(call_id).await;
-                    return error_result(
-                        "answer_local",
-                        &"secure-offerer-unkeyable: no engine SDES key was minted (internal)",
-                    );
-                };
-                let leg = Arc::new(std::sync::Mutex::new(SecureLeg::new(
-                    &local.key,
-                    &peer_key.key,
-                )));
-                if !self
-                    .media
-                    .control(call_id, MediaControl::AttachNearSecureLeg { leg })
-                {
-                    self.teardown_call(call_id).await;
-                    return error_result(
-                        "answer_local",
-                        &"secure-offerer-unkeyable: media actor unavailable",
-                    );
-                }
-            }
-            // DTLS-SRTP on the local pipeline is **not** done, and says so rather than answering a
-            // fingerprint no media path backs. It needs two things this change does not build: the
-            // full ICE agent attached to the promoted (Redirect) leg so the handshake can be gated on
-            // the selected pair (RFC 8445 §12), and the `gate_on_ice` / pending-key plumbing that goes
-            // with it. A WebRTC caller reaching an IVR is the case, and it is the second half of the
-            // secure-offerer work.
-            WsTakeoverSecurity::Dtls { .. } => {
-                self.teardown_call(call_id).await;
-                return error_result(
-                    "answer_local",
-                    &"secure-offerer-unsupported: a DTLS-SRTP (WebRTC) offerer needs a WebSocket \
-                      takeover (ws_uri); SDES-SRTP is terminated on the local pipeline",
-                );
-            }
+        if let Some(refusal) = self
+            .key_local_pipeline(call_id, &offerer_security, near_local_crypto)
+            .await
+        {
+            return refusal;
         }
 
         ok_sdp(answer_sdp, None)
