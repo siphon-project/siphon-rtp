@@ -4854,7 +4854,7 @@ mod tests {
     #[test]
     fn an_added_codecs_rtpmap_lands_after_a_media_level_connection_line() {
         // `apply_codec_policy` inserts an `a=rtpmap` per added codec, and it runs on the output of
-        // `rewrite` (`engine.rs`, the `Offer` path), so inserting at the `m=` line would put an
+        // `rewrite` (`present_leg`, the `Offer` path), so inserting at the `m=` line would put an
         // attribute back ahead of the connection line `rewrite` had just placed correctly — the same
         // RFC 4566 §5 defect one call later, on every `codec-transcode-X` offer.
         let sdp = concat!(

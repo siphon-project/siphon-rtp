@@ -37,7 +37,7 @@ attacker). This document defines the one policy that satisfies both.
 > **Status — M-S1 (landed):** layers 2–3 below are implemented. The blind first-source `or_insert`
 > latch is gone; ingress is now **source-gated** and the latch is **SSRC-consistent** (`update_latch`
 > in [`udp.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-datapath/src/udp.rs); rules built by `ingress_rule` in
-> [`engine.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-engine/src/engine.rs) from the parsed SDP + `ProfileFlags`).
+> [`engine/answer.rs`](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-engine/src/engine/answer.rs) from the parsed SDP + `ProfileFlags`).
 > Layer 1 (RFC 7983 demux) is in too; only layer 6 (media-timeout) remains — see §8. The original
 > hole, for the record:
 
@@ -1071,7 +1071,7 @@ Concrete, minimal, additive to the existing datapath seam:
   instead of a bare `SocketAddr`.
 - **`recv_loop`** gains the pipeline: demux byte0 → source-gate → SSRC-consistent latch/relatch →
   dispatch. The unconditional `or_insert` is removed.
-- **Engine** ([engine/src/engine.rs](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-engine/src/engine.rs)) fills
+- **Engine** ([engine/src/engine/answer.rs](https://github.com/siphon-project/siphon-rtp/blob/main/crates/siphon-rtp-engine/src/engine/answer.rs)) fills
   `accepted_source` / `latch` from the parsed SDP remote address and `ProfileFlags.flags` at
   `answer` time, and starts the timeout sweep.
 - **`siphon-rtp-media`** supplies the RTP header parse (version, PT, SSRC) the latch needs — already
